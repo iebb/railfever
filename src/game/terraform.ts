@@ -16,6 +16,7 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Stamp>, coreOnly = false
   const core = hw + 0.45;
   const fd = formationDepth(e);
   const s1 = w.size + 1;
+  const tunnels = e.sections.filter((sec) => sec.type === 'tunnel');
   let lastS = -1;
   for (let i = 0; i < g.n; i++) {
     const s = g.cum[i];
@@ -23,14 +24,21 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Stamp>, coreOnly = false
     lastS = s;
     if (net.sectionAt(e, s) !== 'ground') continue;
     const px = g.pts[i * 3], py = g.pts[i * 3 + 1], pz = g.pts[i * 3 + 2];
+    const tx = g.tan[i * 2], tz = g.tan[i * 2 + 1];
     const target = py - fd;
     const terr = w.heightAt(px, pz);
     const ext = coreOnly ? 0 : Math.min(6, Math.abs(target - terr) * 1.7 + 0.8);
     const R = core + ext;
+    // grading stops at tunnel portals so the hillside behind them stays intact
+    const nearTunnel = tunnels.some((t) => s > t.s0 - R - 0.5 && s < t.s1 + R + 0.5);
     for (let z = Math.max(0, Math.floor(pz - R)); z <= Math.min(w.size, Math.ceil(pz + R)); z++) {
       for (let x = Math.max(0, Math.floor(px - R)); x <= Math.min(w.size, Math.ceil(px + R)); x++) {
         const d = Math.hypot(x - px, z - pz);
         if (d > R) continue;
+        if (nearTunnel) {
+          const sv = s + (x - px) * tx + (z - pz) * tz;
+          if (tunnels.some((t) => sv > t.s0 && sv < t.s1)) continue;
+        }
         const k = z * s1 + x;
         const cur = out.get(k);
         if (!cur || d < cur.d) out.set(k, { d, target, core, ext });
