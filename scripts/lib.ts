@@ -74,6 +74,7 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
   log(`  corridor: ${path.length} pts, expanded ${cs.expanded}, ${fmt(performance.now() - t0)} ms; ${way.length} waypoints, min radius ${fmt(al.minR)}${prof ? ', crossings ' + prof.crossings.map((c) => c.mode).join('/') : ', PROFILE INFEASIBLE'}`);
   const res = buildChain(g, a0.id, way, railOpts(owner, tracks), b0.id, prof, (s) => log('   ' + s));
   log(`  chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels} cost=${Math.round(res.cost)}`);
+  for (const n of res.notes ?? []) log('   ' + n);
   if (!res.ok) return { ...fail, len: res.built };
   // switches: track 1 joins the leads 14 units out
   const s1 = edgeSnapAt(g, 'rail', a0.x + fA.x * 14, a0.z + fA.z * 14);
@@ -106,7 +107,8 @@ export function busStopSites(g: Game, town: Town, owner: number, minD = 10, maxD
     if (e.len < 4) continue;
     const p = { x: 0, y: 0, z: 0 };
     g.world.net.pointAt(e, e.len / 2, p);
-    if (g.stations.planBusStop(p.x, p.z, owner).ok) cands.push([p.x, p.z]);
+    const bp = g.stations.planBusStop(p.x, p.z, owner);
+    if (bp.ok && !bp.join) cands.push([p.x, p.z]);
   }
   cands.sort((a, b) => Math.hypot(a[0] - town.x, a[1] - town.z) - Math.hypot(b[0] - town.x, b[1] - town.z));
   for (const a of cands) for (const b of cands) {
@@ -117,8 +119,8 @@ export function busStopSites(g: Game, town: Town, owner: number, minD = 10, maxD
 }
 
 /** Road depot next to a street near (x,z). Returns depot id or -1. */
-export function roadDepotNear(g: Game, x: number, z: number, owner: number): number {
-  return buildRoadDepot(g, x, z, owner);
+export function roadDepotNear(g: Game, x: number, z: number, owner: number, onEdges?: number[]): number {
+  return buildRoadDepot(g, x, z, owner, 26, onEdges ? (e) => onEdges.includes(e.id) : undefined);
 }
 
 export function checkReservations(g: Game): string[] {
@@ -308,6 +310,9 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
         if (dd < bd) { bd = dd; best = eid; }
       }
       n.signal = net.sideAt(net.edges.get(best)!, n.id) > 0 ? 2 : 3;
+      // keep the line usable: if the signal cuts a station off, it faces the wrong way
+      const routesOk = () => [[A, B], [B, A]].every(([st, o]) => st.rail!.edges.some((eid) => [1, -1].some((dir) => !!findRailRoute(g, railNext(g, net.edges.get(eid)!, dir, owner), o.id, owner, -1))));
+      if (!routesOk()) { n.signal = n.signal === 2 ? 3 : 2; if (!routesOk()) { n.signal = 0; continue; } }
       signals++;
     }
   }

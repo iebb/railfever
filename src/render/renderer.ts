@@ -284,7 +284,7 @@ export class Renderer {
     };
     gtao.updateGtaoMaterial({ radius: 0.4, distanceExponent: 1.5, thickness: 1.2, scale: 1.0, samples: 8, distanceFallOff: 1.0 });
     gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 5, rings: 2, samples: 8 });
-    gtao.blendIntensity = 0.75;
+    gtao.blendIntensity = 0.65;
     composer.addPass(gtao);
     composer.addPass(new OutputPass());
     composer.setPixelRatio(pr);
@@ -381,7 +381,7 @@ export class Renderer {
     this.sunDir.set(Math.cos(sunEl) * Math.sin(az), Math.sin(sunEl), Math.cos(sunEl) * Math.cos(az)).normalize();
     const day = THREE.MathUtils.smoothstep(elev, -0.06, 0.2);
     this.night = 1 - THREE.MathUtils.smoothstep(elev, -0.2, 0.05);
-    this.light = 0.14 + 0.86 * day;
+    this.light = 0.2 + 0.8 * day;
     this.sky.material.uniforms.sunPosition.value.copy(this.sunDir);
     const warm = 1 - THREE.MathUtils.smoothstep(elev, 0.05, 0.5);
     // moon opposite the sun: takes over the directional light (and its shadows) once the sun has set;
@@ -395,12 +395,14 @@ export class Renderer {
       this.moonDir.set(-this.sunDir.x * 0.6, Math.max(0.25, -this.sunDir.y), -this.sunDir.z * 0.6 + 0.3).normalize();
       this.lightDir.copy(this.moonDir);
       this.sun.color.setRGB(0.62, 0.72, 1.0);
-      this.sun.intensity = 0.42 * moon;
+      this.sun.intensity = 0.9 * moon;
     }
-    this.hemi.intensity = 0.24 + 0.76 * day;
-    this.hemi.color.setRGB(0.32 + 0.43 * day, 0.42 + 0.43 * day, 0.75 + 0.25 * day);
-    this.hemi.groundColor.setRGB(0.1 + 0.25 * day, 0.1 + 0.23 * day, 0.12 + 0.13 * day);
-    this.renderer.toneMappingExposure = 0.9 + 0.35 * this.night;
+    // sky light: neutral by day (less blue on shaded slopes), moonlit blue at night; the night stays
+    // readable (moonlit grass ~0.3, rock ~0.27, asphalt ~0.1 in sRGB) while windows and lamps stand out
+    this.hemi.intensity = 0.9 + 0.1 * day;
+    this.hemi.color.setRGB(0.28 + 0.52 * day, 0.38 + 0.48 * day, 0.72 + 0.23 * day);
+    this.hemi.groundColor.setRGB(0.1 + 0.25 * day, 0.1 + 0.23 * day, 0.13 + 0.12 * day);
+    this.renderer.toneMappingExposure = 0.9 + 0.55 * this.night;
     const fog = this.scene.fog as THREE.Fog;
     const horizon = this.horizon.setRGB(0.72 * day + 0.04, 0.8 * day + 0.06, 0.9 * day + 0.12);
     horizon.lerp(WARM, warm * day * 0.35).lerp(NIGHT_FOG, this.night * 0.6);
@@ -548,7 +550,8 @@ export class Renderer {
     this.gpu?.begin();
     if (useAO) {
       if (!this.composer) this.setupComposer();
-      const r = Math.round(Math.max(0.12, Math.min(3, 0.1 + dist * 0.012)) * 50) / 50;
+      // contact-scale AO only: a large radius smears dark blotches over hillsides
+      const r = Math.round(Math.max(0.1, Math.min(0.8, 0.08 + dist * 0.004)) * 50) / 50;
       const gt = this.gtao!;
       if (r !== this.gtaoRadius) { this.gtaoRadius = r; gt.updateGtaoMaterial({ radius: r }); }
       const dtex = this.composer!.readBuffer.depthTexture;

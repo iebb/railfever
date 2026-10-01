@@ -49,18 +49,19 @@ function terrRef(g: Game, x: number, z: number, tx: number, tz: number, tracks: 
 }
 
 /** Grade-limited profile through constraints (same scheme as the construction planner). */
-export function solveHeights(desired: number[], step: number, lo0: number[], hi0: number[], grade: number): number[] | null {
+export function solveHeights(desired: number[], step: number | number[], lo0: number[], hi0: number[], grade: number): number[] | null {
   const n = desired.length;
   const lo = lo0.slice(), hi = hi0.slice();
-  const gs = grade * step;
-  for (let i = 1; i < n; i++) { hi[i] = Math.min(hi[i], hi[i - 1] + gs); lo[i] = Math.max(lo[i], lo[i - 1] - gs); }
-  for (let i = n - 2; i >= 0; i--) { hi[i] = Math.min(hi[i], hi[i + 1] + gs); lo[i] = Math.max(lo[i], lo[i + 1] - gs); }
+  // gs(i): allowed height change between samples i-1 and i
+  const gs = (i: number) => grade * (typeof step === 'number' ? step : step[i]);
+  for (let i = 1; i < n; i++) { hi[i] = Math.min(hi[i], hi[i - 1] + gs(i)); lo[i] = Math.max(lo[i], lo[i - 1] - gs(i)); }
+  for (let i = n - 2; i >= 0; i--) { hi[i] = Math.min(hi[i], hi[i + 1] + gs(i + 1)); lo[i] = Math.max(lo[i], lo[i + 1] - gs(i + 1)); }
   for (let i = 0; i < n; i++) if (lo[i] > hi[i] + 1e-4) return null;
   const f = new Array(n), b = new Array(n);
   f[0] = Math.min(hi[0], Math.max(lo[0], desired[0]));
-  for (let i = 1; i < n; i++) f[i] = Math.min(hi[i], Math.max(lo[i], Math.min(f[i - 1] + gs, Math.max(f[i - 1] - gs, desired[i]))));
+  for (let i = 1; i < n; i++) f[i] = Math.min(hi[i], Math.max(lo[i], Math.min(f[i - 1] + gs(i), Math.max(f[i - 1] - gs(i), desired[i]))));
   b[n - 1] = Math.min(hi[n - 1], Math.max(lo[n - 1], desired[n - 1]));
-  for (let i = n - 2; i >= 0; i--) b[i] = Math.min(hi[i], Math.max(lo[i], Math.min(b[i + 1] + gs, Math.max(b[i + 1] - gs, desired[i]))));
+  for (let i = n - 2; i >= 0; i--) b[i] = Math.min(hi[i], Math.max(lo[i], Math.min(b[i + 1] + gs(i + 1), Math.max(b[i + 1] - gs(i + 1), desired[i]))));
   const y = new Array(n);
   for (let i = 0; i < n; i++) y[i] = (f[i] + b[i]) / 2;
   return y;
@@ -404,7 +405,7 @@ export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, 
 
 // ============================================================================ chained construction
 
-export interface ChainResult { ok: boolean; error?: string; cost: number; endNode: number; edges: number; bridges: number; tunnels: number; built: number }
+export interface ChainResult { ok: boolean; error?: string; cost: number; endNode: number; edges: number; bridges: number; tunnels: number; built: number; notes?: string[] }
 
 export interface ChainProfile {
   s: number[]; x: number[]; z: number[]; y: number[]; terr: number[];
@@ -444,7 +445,7 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
     hi.push(1e9);
   }
   lo[0] = hi[0] = y0; lo[n - 1] = hi[n - 1] = y1;
-  const step = n > 1 ? acc / (n - 1) : 1;
+  const step = ss.map((v, i) => (i ? v - ss[i - 1] : 0));
   const grade = (kind === 'rail' ? TRACK_TYPES.standard.maxGrade : ROAD_TYPES.road.maxGrade) * 0.85;
   let y = solveHeights(desired, step, lo, hi, grade);
   if (!y) return null;
@@ -581,7 +582,9 @@ function buildSegment(g: Game, start: Snap, end: Snap, opts: BuildOptions, endY:
   const tries: Partial<BuildOptions>[] = [{}, { crossing: 'level' }, { crossing: 'over' }, { crossing: 'under' }];
   let last: Proposal | null = null;
   const cl = Math.hypot(end.x - start.x, end.z - start.z) || 1;
+  let firstErr = '';
   for (const useH of endY !== null ? [true, false] : [false]) {
+    if (!useH && endY !== null && last) firstErr = last.errors.join(', ') + ` (crossings ${last.crossings.map((c) => c.mode).join('/')})`;
     for (const t of tries) {
       const o: BuildOptions = { ...opts, ...t };
       if (useH && endY !== null && end.kind === 'free') {
@@ -595,6 +598,7 @@ function buildSegment(g: Game, start: Snap, end: Snap, opts: BuildOptions, endY:
       if (p.warnings.includes('Not enough money')) { res.error = 'Not enough money'; return null; }
       const err = commitProposal(g, p);
       if (err) { res.error = err; return null; }
+      if (firstErr) (res.notes ??= []).push(`end height relaxed: ${firstErr}`);
       res.cost += p.cost;
       res.edges += p.tracks.length;
       res.bridges += p.stats.bridges;
@@ -646,7 +650,7 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     const en: Snap = goal ? nodeSnap(g, goalNode!, opts.kind) : { kind: 'free', x: q.x, z: q.z, y: g.world.heightAt(q.x, q.z) };
     const endY = goal || !prof ? null : profileAt(prof, q.x, q.z);
     const before = res.error;
-    const p = buildSegment(g, st, en, opts, endY, res, allowSplit ? undefined : log);
+    const p = buildSegment(g, st, en, opts, endY, res, allowSplit && !goal ? undefined : log);
     if (p) {
       if (goal) { cur = goalNode!; return true; }
       // the new end node (one member of the group for multi-track)
@@ -670,6 +674,7 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     if (!m) return false;
     return step(m, false, false) && step(q, false, false);
   };
+  const yEnd = prof ? prof.y[prof.y.length - 1] : 0;
   for (let i = 0; i < way.length; i++) {
     const n = net.nodes.get(cur);
     if (!n) { res.error = 'Lost the chain'; return res; }
@@ -678,6 +683,15 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     const c = groupCentre(g, cur, opts.kind, opts.tracks);
     const t0 = nodeTangent(g, cur, wp);
     const a: OPoint = { x: c.x, z: c.z, tx: t0.tx, tz: t0.tz };
+    // the last segment ended off the planned heights: re-plan the rest of the profile from here
+    if (prof && i > 0 && Math.abs(n.y - profileAt(prof, c.x, c.z)) > 0.12) {
+      const ex = new Set<number>(n.edges);
+      if (goalNode !== null) for (const id of nodeSnap(g, goalNode, opts.kind).group ?? [goalNode]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
+      for (const id of nodeSnap(g, cur, opts.kind).group ?? [cur]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
+      const np = chainProfile(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex);
+      if (!np) { res.error = 'Too steep: the route left its planned heights'; log?.(`re-plan of heights failed at waypoint ${i}`); return res; }
+      prof = np;
+    }
     const L = Math.hypot(wp.x - a.x, wp.z - a.z);
     if (L < 1.2 && !isGoal) continue;
     const ux = (wp.x - a.x) / L, uz = (wp.z - a.z) / L;
@@ -909,7 +923,7 @@ export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: numb
 }
 
 /** Road depot beside a street near (x,z), connected to it. Prefers sites that demolish nothing. */
-export function buildRoadDepot(g: Game, x: number, z: number, owner: number, maxR = 26): number {
+export function buildRoadDepot(g: Game, x: number, z: number, owner: number, maxR = 26, pred?: (e: NEdge) => boolean): number {
   const net = g.world.net;
   for (const maxPop of [0, 30]) {
     for (let r = 2.5; r < maxR; r += 1.5) {
@@ -917,6 +931,7 @@ export function buildRoadDepot(g: Game, x: number, z: number, owner: number, max
         const a = ((k + (r % 2) * 0.5) / 12) * Math.PI * 2;
         const px = x + Math.sin(a) * r, pz = z + Math.cos(a) * r;
         const ne = net.nearestEdge(px, pz, 3.6, 'road', (e) => e.depot < 0 && e.station < 0);
+        if (ne && pred && !pred(ne.edge)) continue;
         if (!ne || ne.d < 2.1 || net.sectionAt(ne.edge, ne.s) !== 'ground') continue;
         const q = { x: 0, y: 0, z: 0 };
         net.pointAt(ne.edge, ne.s, q);

@@ -520,7 +520,7 @@ export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
       if (atEnd && continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel')) continue;
       const p = sampleAt(net.geo(e), s);
       const { ow, oh } = portalDims(e);
-      const gl = galleryLength(ctx, e, s, o, oh + 0.16);
+      const gl = galleryLength(ctx, e, s, o, oh + 0.1);
       out.push({ x: p.x, z: p.z, ox: p.tx * o, oz: p.tz * o, lx: p.lx, lz: p.lz, f0: -(gl + 1.0), f1: 2.3, l0: -(ow + 1.9), l1: ow + 1.9 });
     }
   }
@@ -594,7 +594,7 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
     W.twall(cx, cz, dx, dz, yb, TOP[TOP.length - 1], yb, TOP[TOP.length - 1], lx, lz, sc);
   }
   // --- opening reveals (jambs and arch soffit) and the dark gallery behind
-  const gl = galleryLength(ctx, e, sb, out, oh + 0.16);
+  const gl = galleryLength(ctx, e, sb, out, oh + 0.1);
   const run = tunnelRun(e, ctx, sb - out * (T - ff), out, gl);
   for (const [a, b] of ops) {
     const c = (a + b) / 2, r = (b - a) / 2;
@@ -614,16 +614,25 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
     // dark interior along the tunnel curve: walls and ceiling facing inwards, floor facing up
     W.use(WC.PLAIN, DARK);
     sweep(W, run, [[b, -0.05], [b, oh], [a, oh], [a, -0.05]]);
-    sweep(W, run, [[a, -0.02], [b, -0.02]]);
+    sweep(W, run, [[a, 0.004], [b, 0.004]]);
     const pe = out > 0 ? run[0] : run[run.length - 1];
     const ex = pe.tx * out, ez = pe.tz * out;
     W.twall(pe.x + pe.lx * a, pe.z + pe.lz * a, pe.x + pe.lx * b, pe.z + pe.lz * b, pe.y - 0.05, pe.y + oh, pe.y - 0.05, pe.y + oh, ex, ez);
   }
-  // gallery shell (cut-and-cover) behind the facade, until the hillside covers it
+  // cut-and-cover gallery behind the facade, earthed over like the hillside it re-creates
   {
-    const a0 = ops[0][0] - 0.12, b0 = ops[ops.length - 1][1] + 0.12;
-    W.use(cell, dark);
-    sweep(W, run, [[a0, -0.35, 0], [a0, oh + 0.16, (oh + 0.51) / sc], [b0, oh + 0.16, (oh + 0.51 + b0 - a0) / sc], [b0, -0.35, (2 * oh + 1.02 + b0 - a0) / sc]], sc);
+    const a0 = ops[0][0] - 0.1, b0 = ops[ops.length - 1][1] + 0.1, top = oh + 0.1, sl = top + 0.35;
+    W.use(WC.GRAVEL, 0x9a8f78);
+    sweep(W, run, [[a0 - sl, -0.35, 0], [a0, top, sl * 1.41 / 0.5]], 0.5);
+    sweep(W, run, [[b0, top, 0], [b0 + sl, -0.35, sl * 1.41 / 0.5]], 0.5);
+    W.use(WC.GRAVEL, 0x86905e);
+    sweep(W, run, [[a0, top, 0], [b0, top, (b0 - a0) / 0.5]], 0.5);
+    // close the mound's front ends beside the facade
+    const p0 = out > 0 ? run[run.length - 1] : run[0];
+    const P = (l: number, h: number): [number, number, number] => [p0.x + p0.lx * l, p0.y + h, p0.z + p0.lz * l];
+    W.use(WC.GRAVEL, 0x9a8f78);
+    W.ttri(...P(a0 - sl, -0.35), 0, 0, ...P(a0, top), 1, 1, ...P(a0, -0.35), 1, 0, ox, 0, oz);
+    W.ttri(...P(b0 + sl, -0.35), 0, 0, ...P(b0, top), 1, 1, ...P(b0, -0.35), 1, 0, ox, 0, oz);
   }
   // wing walls retaining the cutting: nearly parallel to the track, tops on the retained ground,
   // ending where the cutting gets shallow (omitted entirely in shallow cuttings)
@@ -662,17 +671,17 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
   }
 }
 
-/** Gallery length behind a portal: until the terrain over the tunnel rises `rel` above the track (1..6 units). */
+/** Gallery length behind a portal: until the terrain over the tunnel rises `rel` above the track (1..3 units). */
 function galleryLength(ctx: ChunkCtx, e: NEdge, sb: number, out: number, rel: number): number {
   const w = ctx.game.world;
   const g = w.net.geo(e);
-  for (let d = 0.5; d <= 6; d += 0.5) {
+  for (let d = 0.5; d <= 3; d += 0.5) {
     const s = sb - out * d;
     if (s < 0 || s > e.len) return Math.max(1, d - 0.5);
     const p = sampleAt(g, s);
     if (w.heightAt(p.x, p.z) > p.y + rel + 0.1) return Math.max(1, d);
   }
-  return 6;
+  return 3;
 }
 
 /** Samples along the tunnel from the portal inwards, ordered by increasing s (for sweeps). */

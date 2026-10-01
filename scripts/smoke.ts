@@ -6,6 +6,7 @@ import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { sitePop } from '../src/game/ai';
 import { CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
+import { roadDepotReaches } from '../src/game/roadvehicle';
 import {
   fails, check, fmt, connectStations, connectDouble, depotBehind, busStopSites, roadDepotNear, checkReservations, checkNaN,
   placeStationPair, addBusStop, newRailEdges, build, free, railOpts, roadOpts, Train, RoadVehicle,
@@ -137,7 +138,18 @@ let levelCrossing = -1;
           return -1;
         };
         const s1 = stopAt(-1), s2 = stopAt(1);
-        const dep = roadDepotNear(g, p.x - nx * 8, p.z - nz * 8, 0);
+        const roadEdges = [...net.edges.values()].filter((q) => q.kind === 'road' && q.owner === 0 && pr.tracks.length && Math.hypot((q.bez.x0 + q.bez.x3) / 2 - p.x, (q.bez.z0 + q.bez.z3) / 2 - p.z) < L + 2).map((q) => q.id);
+        let dep = roadDepotNear(g, p.x - nx * (L - 3), p.z - nz * (L - 3), 0, roadEdges);
+        // fallback: at a dead end of the crossing road, facing it
+        for (const sg of [-1, 1]) {
+          if (dep > 0) break;
+          const ex = p.x + nx * (L + 2.4) * sg, ez = p.z + nz * (L + 2.4) * sg;
+          const plan = g.depots.plan('road', ex, ez, Math.atan2(-nx * sg, -nz * sg), 0);
+          if (plan.ok) { const id = g.depots.nextId; if (!g.depots.commit('road', plan, 0)) dep = id; }
+          else console.log(`    depot at road end: ${plan.error}`);
+        }
+        // the depot must reach both stops
+        if (dep > 0 && s1 > 0 && s2 > 0 && !(roadDepotReaches(g, g.depots.get(dep)!, s1) && roadDepotReaches(g, g.depots.get(dep)!, s2))) { console.log('    depot does not reach the stops'); g.depots.remove(dep); dep = -1; }
         if (s1 > 0 && s2 > 0 && dep > 0) {
           const bl = g.lines.create('road', 0);
           bl.stops = [s1, s2];

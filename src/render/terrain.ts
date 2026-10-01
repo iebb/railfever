@@ -598,9 +598,9 @@ float rfBump = 0.0;
   vec3 dirt   = rf_srgb(vec3(0.43, 0.36, 0.26));
   vec3 soil   = rf_srgb(vec3(0.38, 0.35, 0.23));
   vec3 young  = rf_srgb(vec3(0.39, 0.45, 0.21));
-  vec3 scree  = rf_srgb(vec3(0.50, 0.45, 0.38));
-  vec3 rockA  = rf_srgb(vec3(0.43, 0.39, 0.34));
-  vec3 rockB  = rf_srgb(vec3(0.60, 0.55, 0.47));
+  vec3 scree  = rf_srgb(vec3(0.56, 0.51, 0.43));
+  vec3 rockA  = rf_srgb(vec3(0.54, 0.50, 0.44));
+  vec3 rockB  = rf_srgb(vec3(0.63, 0.58, 0.50));
   vec3 sand   = rf_srgb(vec3(0.79, 0.73, 0.55));
   vec3 wetS   = rf_srgb(vec3(0.50, 0.45, 0.35));
   vec3 mud    = rf_srgb(vec3(0.30, 0.29, 0.22));
@@ -628,11 +628,12 @@ float rfBump = 0.0;
   vec3 worksCol = mix(young, soil, clamp(0.3 + 0.45 * wSlope + (n3 - 0.5) * 0.4, 0.0, 1.0)) * (0.9 + 0.2 * n4);
   col = mix(col, worksCol, wk);
   // exposed soil on steep grass
-  float dirtAmt = smoothstep(0.1, 0.2, slope + sn) * 0.4;
+  float dirtAmt = smoothstep(0.12, 0.24, slope + sn) * 0.3;
   col = mix(col, dirt * (0.88 + 0.2 * n3 + 0.1 * n2), dirtAmt);
   // scree and rock on steep slopes: warm grey-brown, crisp ledges and cracks (triplanar, so cliff
   // faces are not smeared vertically)
-  float rockAmt = smoothstep(0.2, 0.32, slope + sn * 1.5);
+  // soft transition starting around 40 degrees: moderately steep grass stays green
+  float rockAmt = smoothstep(0.25, 0.42, slope + sn * 0.8);
   float rockBump = 0.0;
   if (rockAmt > 0.001) {
     vec3 an = abs(normalize(vWNormal));
@@ -640,11 +641,13 @@ float rfBump = 0.0;
     float f1 = 1.0 - smoothstep(0.2, 0.55, fw * 0.6), f2 = 1.0 - smoothstep(0.2, 0.55, fw * 2.3);
     float r1 = rf_tri(vWPos * 0.6 + 3.7, an);
     float r2 = f2 > 0.0 ? rf_tri(vWPos * 2.3 + 9.1, an) : 0.5;
-    float c1 = pow(1.0 - abs(2.0 * r1 - 1.0), 6.0) * f1, c2 = pow(1.0 - abs(2.0 * r2 - 1.0), 8.0) * f2;
+    // cracks and ledges: a subtle darkening, only for close-ups (camera within ~15 units)
+    float closeUp = 1.0 - smoothstep(10.0, 15.0, length(vViewPosition));
+    float c1 = pow(1.0 - abs(2.0 * r1 - 1.0), 6.0) * f1 * closeUp, c2 = pow(1.0 - abs(2.0 * r2 - 1.0), 8.0) * f2 * closeUp;
     vec3 rock = mix(rockA, rockB, smoothstep(0.25, 0.75, n2 * 0.45 + mix(0.5, r1, f1) * 0.55));
-    rock *= (1.0 - c1 * 0.38 - c2 * 0.3) * (0.9 + 0.2 * mix(0.5, r2, f2));
-    vec3 scr = scree * (0.88 + 0.24 * n4) * (1.0 - c2 * 0.15);
-    col = mix(col, mix(scr, rock, smoothstep(0.24, 0.4, slope + sn)), rockAmt);
+    rock *= (1.0 - c1 * 0.1 - c2 * 0.06) * (0.95 + 0.1 * mix(0.5, r2, f2));
+    vec3 scr = scree * (0.92 + 0.16 * n4) * (1.0 - c2 * 0.05);
+    col = mix(col, mix(scr, rock, smoothstep(0.3, 0.48, slope + sn)), rockAmt);
     rockBump = (mix(0.5, r1, f1) * 0.03 + mix(0.5, r2, f2) * 0.012 - (c1 * 0.02 + c2 * 0.008)) * rockAmt;
   }
   // beaches, wet sand, sea bed
