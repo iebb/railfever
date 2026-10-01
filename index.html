@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Railfever</title>
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%23e8a33d'/%3E%3Cpath d='M7 3v18M17 3v18M4 6h16M4 10h16M4 14h16M4 18h16' stroke='%231b2430' stroke-width='1.8'/%3E%3C/svg%3E" />
+    <style>
+      html, body { margin: 0; height: 100%; background: #0f141b; overflow: hidden; }
+      #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 40%, #1d2a38, #0b0f14); color: #e9eef3; font: 600 15px system-ui, sans-serif; z-index: 100000; transition: opacity .4s; }
+      #loading.hidden { opacity: 0; pointer-events: none; }
+      #loading .lbrand { font: 800 44px system-ui, sans-serif; letter-spacing: 6px; margin-bottom: 18px; }
+      #loading .lbrand span { color: #e8a33d; }
+      #loading .spin { width: 34px; height: 34px; border: 3px solid rgba(255,255,255,.15); border-top-color: #e8a33d; border-radius: 50%; animation: sp 0.8s linear infinite; margin-bottom: 14px; }
+      @keyframes sp { to { transform: rotate(360deg); } }
+    </style>
+  </head>
+  <body>
+    <div id="loading"><div class="lbrand">RAIL<span>FEVER</span></div><div class="spin"></div><div class="ltext">Generating world…</div></div>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
