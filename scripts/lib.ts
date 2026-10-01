@@ -4,10 +4,11 @@ import { findSnap, planEdge, commitProposal, BuildOptions, Snap, Proposal } from
 import { toggleSignal } from '../src/game/build-ops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
-import { Train, CROSS_BASE } from '../src/game/train';
+import { Train, CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import {
   findStationSite, stationEnds, CorridorSearch, alignCorridor, chainProfile, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotOnLine, buildRoadDepot, findRailPair,
+  routeConflict,
 } from '../src/game/ai';
 
 export const fails: string[] = [];
@@ -59,7 +60,11 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
   const from: OPoint = { x: a0.x + fA.x * LEAD, z: a0.z + fA.z * LEAD, tx: fA.x, tz: fA.z };
   const to: OPoint = { x: b0.x + fB.x * LEAD, z: b0.z + fB.z * LEAD, tx: -fB.x, tz: -fB.z };
   const t0 = performance.now();
-  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner });
+  const avoid = [
+    { x0: a0.x - fA.x * 4, z0: a0.z - fA.z * 4, x1: from.x - fA.x * 4, z1: from.z - fA.z * 4, r: 4 },
+    { x0: b0.x - fB.x * 4, z0: b0.z - fB.z * 4, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
+  ];
+  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
   const path = cs.run();
   if (!path) { log(`  corridor: none (expanded ${cs.expanded})`); return fail; }
   const al = alignCorridor(path, from, to);
@@ -213,7 +218,11 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
   const LEAD = 22;
   const from: OPoint = { x: cA.x + fA.x * LEAD, z: cA.z + fA.z * LEAD, tx: fA.x, tz: fA.z };
   const to: OPoint = { x: cB.x + fB.x * LEAD, z: cB.z + fB.z * LEAD, tx: -fB.x, tz: -fB.z };
-  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner });
+  const avoid = [
+    { x0: cA.x - fA.x * ra.length, z0: cA.z - fA.z * ra.length, x1: from.x - fA.x * 4, z1: from.z - fA.z * 4, r: 4 },
+    { x0: cB.x - fB.x * rb.length, z0: cB.z - fB.z * rb.length, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
+  ];
+  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
   const path = cs.run();
   if (!path) { log('  double: no corridor'); return fail; }
   const al = alignCorridor(path, from, to);
@@ -222,9 +231,32 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
   const prof = chainProfile(g, [{ x: cA.x, z: cA.z, tx: fA.x, tz: fA.z }, ...way], 2, ra.y, rb.y, 'rail', exclude);
   if (!prof) { log('  double: profile infeasible'); return fail; }
   const e0 = net.nextEdge;
+  log(`  double: first new edge #${e0}, profile crossings ${prof.crossings.map((c) => c.mode + '#' + c.edge).join(',')}`);
+  if (routeConflict(g, prof, 'rail', 2, exclude)) { log('  double: route conflicts with other edges or itself'); return fail; }
   const res = buildChain(g, frontsA[0], way, railOpts(owner, 2), frontsB[0], prof, (s) => log('   ' + s));
   log(`  double chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels}`);
   if (!res.ok) return fail;
+  {
+    // how far does each platform get (no signals yet)?
+    for (const eid of ra.edges) {
+      const e = net.edges.get(eid)!;
+      for (const dir of [1, -1]) {
+        const seen = new Set<number>(); let frontier = [{ e, dir }]; let reachedB = false, steps = 0, lastNode = -1;
+        while (frontier.length && steps++ < 400) {
+          const nx: { e: typeof e; dir: number }[] = [];
+          for (const f of frontier) for (const c of net.nextRail(f.e, f.dir)) {
+            if (seen.has(c.edge.id * 2 + (c.dir > 0 ? 1 : 0))) continue;
+            seen.add(c.edge.id * 2 + (c.dir > 0 ? 1 : 0));
+            if (c.edge.station === B.id) reachedB = true;
+            lastNode = c.node.id;
+            nx.push({ e: c.edge, dir: c.dir });
+          }
+          frontier = nx;
+        }
+        if (seen.size > 2) log(`  double: from platform ${eid} dir ${dir}: ${seen.size} edge-dirs, reached B ${reachedB}, last node ${lastNode}`);
+      }
+    }
+  }
   // which main track is on the right when travelling A->B ("out")?
   const edges = newRailEdges(g, e0, owner);
   const right = (x: number, z: number, px: number, pz: number, tx: number, tz: number) => (x - px) * -tz + (z - pz) * tx > 0;
@@ -237,21 +269,20 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
     return r0 ? { out: pts[0], in: pts[1] } : { out: pts[1], in: pts[0] };
   };
   let crossovers = 0;
-  // crossover near A: "in" -> "out" moving towards B; near B: "out" -> "in" moving towards A
-  for (const [c, f, fromKey, toKey] of [[from, fA, 'in', 'out'], [to, { x: -to.tx, z: -to.tz }, 'out', 'in']] as const) {
-    for (const d of [6, 9, 12, 16]) {
-      const x1 = c.x + f.x * d, z1 = c.z + f.z * d, x2 = c.x + f.x * (d + 9), z2 = c.z + f.z * (d + 9);
-      // direction of travel A->B at both points
-      const t1 = tracksAt(x1, z1, fA.x * (fromKey === 'in' ? 1 : 1) * (c === from ? 1 : -1) * (c === from ? 1 : -1), fA.z), t2 = tracksAt(x2, z2, fA.x, fA.z);
-      void t1; void t2;
-      // classify with the local direction of travel A->B
-      const dirAB = c === from ? { x: f.x, z: f.z } : { x: -f.x, z: -f.z };
+  // crossovers on the straight leads (single edges per track): near A "in" -> "out" moving towards B,
+  // near B "out" -> "in" moving towards A
+  for (const [c, f, fromKey, toKey] of [[cA, fA, 'in', 'out'], [cB, fB, 'out', 'in']] as const) {
+    let made = false;
+    for (const [d1, d2] of [[9, 19], [10, 20], [8, 17]]) {
+      const x1 = c.x + f.x * d1, z1 = c.z + f.z * d1, x2 = c.x + f.x * d2, z2 = c.z + f.z * d2;
+      const dirAB = c === cA ? { x: f.x, z: f.z } : { x: -f.x, z: -f.z };
       const a1 = tracksAt(x1, z1, dirAB.x, dirAB.z), a2 = tracksAt(x2, z2, dirAB.x, dirAB.z);
       if (!a1 || !a2) continue;
       const s1 = findSnap(g, 'rail', a1[fromKey].x, a1[fromKey].z, 0.3), s2 = findSnap(g, 'rail', a2[toKey].x, a2[toKey].z, 0.3);
       if (s1.kind !== 'edge' || s2.kind !== 'edge') continue;
-      if (build(g, s1, s2, railOpts(owner), 'crossover')) { crossovers++; break; }
+      if (build(g, s1, s2, railOpts(owner), 'crossover')) { crossovers++; made = true; break; }
     }
+    if (!made) log('  double: crossover failed');
   }
   // one-way signals at 1/3 and 2/3 of the line on both tracks
   let signals = 0;
@@ -261,20 +292,31 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
     const j = Math.min(prof.x.length - 1, i + 2);
     const tx = prof.x[j] - x, tz = prof.z[j] - z, tl = Math.hypot(tx, tz) || 1;
     const tr = tracksAt(x, z, tx / tl, tz / tl);
-    if (!tr) continue;
+    if (!tr) { log(`  double: no parallel tracks at ${fmt(x)},${fmt(z)}`); continue; }
     for (const key of ['out', 'in'] as const) {
       const p = tr[key];
-      if (toggleSignal(g, p.x, p.z, owner)) continue;
-      const n = net.nearestNode(p.x, p.z, 0.5, 'rail', (nn) => nn.signal > 0);
-      if (!n) continue;
-      // edge towards B (out) or towards A (in) leaves the node on this side
-      const towards = key === 'out' ? B : A;
+      const err = toggleSignal(g, p.x, p.z, owner);
+      if (err) { log(`  double: signal failed: ${err}`); continue; }
+      const n = net.nearestNode(p.x, p.z, 1.0, 'rail', (nn) => nn.signal > 0 && nn.edges.length === 2);
+      if (!n) { log(`  double: signal node not found at ${fmt(p.x)},${fmt(p.z)}`); continue; }
+      // the edge towards B (out) or towards A (in): the one passing closer to a point further along the route
+      const k = Math.max(0, Math.min(prof.x.length - 1, i + (key === 'out' ? 5 : -5)));
       let best = n.edges[0], bd = Infinity;
-      for (const eid of n.edges) { const e = net.edges.get(eid)!; const o = net.nodes.get(e.a === n.id ? e.b : e.a)!; const dd = Math.hypot(o.x - towards.x, o.z - towards.z); if (dd < bd) { bd = dd; best = eid; } }
+      for (const eid of n.edges) {
+        const ne = net.nearestEdge(prof.x[k], prof.z[k], 3, 'rail', (q) => q.id === eid);
+        const dd = ne ? ne.d : Infinity;
+        if (dd < bd) { bd = dd; best = eid; }
+      }
       n.signal = net.sideAt(net.edges.get(best)!, n.id) > 0 ? 2 : 3;
       signals++;
     }
   }
   g.onNetworkChanged();
+  // every platform must reach the other station
+  for (const [st, o] of [[A, B], [B, A]] as [Station, Station][]) for (const eid of st.rail!.edges) {
+    const e = net.edges.get(eid)!;
+    const ok = [1, -1].some((dir) => !!findRailRoute(g, railNext(g, e, dir, owner), o.id, owner, -1));
+    if (!ok) log(`  double: no route from ${st.name} platform ${eid} to ${o.name}`);
+  }
   return { ok: true, signals, crossovers, len: res.built };
 }

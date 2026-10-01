@@ -73,36 +73,51 @@ function importSave(ui: UI) {
 
 const SETTING_LABELS: Record<string, [string, string?]> = {
   shadows: ['Shadows'],
-  ao: ['Ambient occlusion', 'Soft contact shadows (costly)'],
+  ao: ['Ambient occlusion', 'Soft contact shadows'],
   clouds: ['Cloud shadows'],
   dayNight: ['Day / night cycle'],
   labels: ['Town & station labels'],
+  debug: ['Performance overlay (F3)', 'Frame times, draw calls, resolution'],
 };
+const ORDER = ['shadows', 'ao', 'clouds', 'dayNight', 'labels'];
 
 export function openSettings(ui: UI) {
   const r = ui.renderer;
   const s = r.settings as unknown as Record<string, unknown>;
-  const win = ui.wm.open('settings', 'Settings', { width: 380, icon: 'settings', color: '#eef2f7' });
+  const win = ui.wm.open('settings', 'Settings', { width: 390, icon: 'settings', color: '#eef2f7' });
   const apply = () => r.applySettings();
-  add(win.body, section('Graphics'));
-  for (const [key, val] of Object.entries(s)) {
-    if (typeof val !== 'boolean') continue;
-    const [label, hint] = SETTING_LABELS[key] ?? [key.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase())];
-    add(win.body, toggle(label, val, (v) => { s[key] = v; apply(); }, hint));
-  }
+  const humanize = (k: string) => k.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
+  const flag = (key: string) => {
+    const [label, hint] = SETTING_LABELS[key] ?? [humanize(key)];
+    return toggle(label, !!s[key], (v) => { s[key] = v; apply(); }, hint);
+  };
+  win.body.append(section('Graphics'));
+  const bools = Object.keys(s).filter((k) => typeof s[k] === 'boolean' && k !== 'debug');
+  for (const key of [...ORDER.filter((k) => bools.includes(k)), ...bools.filter((k) => !ORDER.includes(k))]) win.body.append(flag(key));
   if ('shadowQuality' in s) {
     const q = h('select', { class: 'select', 'aria-label': 'Shadow quality' }, ['high', 'low'].map((v) => h('option', { value: v, selected: s.shadowQuality === v }, v[0].toUpperCase() + v.slice(1))));
     q.addEventListener('change', () => { s.shadowQuality = q.value; apply(); });
-    add(win.body, field('Shadow quality', q));
+    win.body.append(field('Shadow quality', q));
+  }
+  if ('resolution' in s) {
+    const opts: [string, string][] = [['auto', 'Auto (holds ~60 fps)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']];
+    const cur = String(s.resolution);
+    const sel = h('select', { class: 'select', 'aria-label': 'Resolution' }, opts.map(([v, l]) => h('option', { value: v, selected: v === cur }, l)));
+    sel.addEventListener('change', () => { s.resolution = sel.value === 'auto' ? 'auto' : Number(sel.value); apply(); });
+    win.body.append(field('Resolution', sel, 'Render scale on top of the pixel ratio'));
   }
   if ('pixelRatio' in s) {
-    const sc = h('select', { class: 'select', 'aria-label': 'Render resolution' }, [0.5, 0.75, 1, 1.25, 1.5, 2].map((v) => h('option', { value: String(v), selected: Math.abs(Number(s.pixelRatio) - v) < 0.01 }, `${v * 100}%`)));
+    const vals = [1, 1.25, 1.5, 2];
+    const cur = Number(s.pixelRatio);
+    if (!vals.some((v) => Math.abs(v - cur) < 0.01)) vals.push(cur);
+    const sc = h('select', { class: 'select', 'aria-label': 'Max pixel ratio' }, vals.sort((a, b) => a - b).map((v) => h('option', { value: String(v), selected: Math.abs(cur - v) < 0.01 }, `${v}×`)));
     sc.addEventListener('change', () => { s.pixelRatio = Number(sc.value); apply(); });
-    add(win.body, field('Resolution', sc));
+    win.body.append(field('Max pixel ratio', sc, `Display: ${(window.devicePixelRatio || 1).toFixed(2)}×`));
   }
+  if ('debug' in s) win.body.append(flag('debug'));
   const g = ui.game;
   const grid = () => (r.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid;
-  add(win.body, 
+  win.body.append(
     section('Interface'),
     toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
     toggle('Sound effects', ui.soundOn, (v) => { ui.soundOn = v; ui.savePrefs(); }),

@@ -380,13 +380,13 @@ export class TerrainView {
         }
       }
     }
-    // earthworks: graded ground beside edges (cut/fill slopes reach ~6 units out)
-    const ER = 6;
+    // earthworks: graded ground beside edges (the visible band is kept narrow)
+    const ER = 3.5;
     for (const e of net.edgesNear(x0 - ER - 1, z0 - ER - 1, x1 + ER + 1, z1 + ER + 1)) {
       const g = net.geo(e);
       // town streets: gentler, mostly grassed verges
       const town = e.kind === 'road' && e.owner < 0;
-      const er = town ? 3 : ER, wk = town ? 0.45 : 1;
+      const er = town ? 2 : ER, wk = town ? 0.4 : 1;
       const core = net.halfWidth(e) + 0.3, outer = core + er;
       let last = -1e9;
       for (let i = 0; i < g.n; i++) {
@@ -541,7 +541,8 @@ export function raycastTerrain(w: World, o: V3, d: V3, maxH: number, out: V3, ma
 // ------------------------------------------------------------------------------------ materials
 
 function createTerrainMaterial(U: TerrainUniforms): THREE.MeshStandardMaterial {
-  const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0 });
+  // the sky environment adds a blue cast to steep, sun-averted slopes: keep it modest on the ground
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, envMapIntensity: 0.55 });
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, U);
     sh.vertexShader = sh.vertexShader
@@ -563,7 +564,9 @@ vMacro = vec2(rf_fbm(vWPos.xz * 0.006 + 3.1), rf_fbm(vWPos.xz * 0.03 + 11.7));`)
 uniform float uGrid; uniform vec4 uHiRect; uniform vec3 uHiColor; uniform float uHiOn;
 uniform vec4 uCircle; uniform vec3 uCircleColor; uniform float uSnow; uniform float uTime;
 varying vec3 vWPos; varying vec3 vWNormal; varying vec3 vAux; varying vec2 vMacro;
-${NOISE_GLSL}`)
+${NOISE_GLSL}
+// value noise projected on the three axis planes, weighted by the normal
+float rf_tri(vec3 q, vec3 w) { return rf_vnoise(q.zy) * w.x + rf_vnoise(q.xz) * w.y + rf_vnoise(q.xy) * w.z; }`)
       .replace('#include <map_fragment>', `
 vec3 rfGlow = vec3(0.0);
 float rfRough = 0.95;
@@ -592,10 +595,12 @@ float rfBump = 0.0;
   vec3 dryG   = rf_srgb(vec3(0.57, 0.55, 0.31));
   vec3 alpine = rf_srgb(vec3(0.46, 0.48, 0.31));
   vec3 forest = rf_srgb(vec3(0.23, 0.25, 0.13));
-  vec3 dirt   = rf_srgb(vec3(0.47, 0.38, 0.27));
-  vec3 scree  = rf_srgb(vec3(0.53, 0.50, 0.45));
-  vec3 rockA  = rf_srgb(vec3(0.42, 0.41, 0.39));
-  vec3 rockB  = rf_srgb(vec3(0.59, 0.57, 0.53));
+  vec3 dirt   = rf_srgb(vec3(0.43, 0.36, 0.26));
+  vec3 soil   = rf_srgb(vec3(0.38, 0.35, 0.23));
+  vec3 young  = rf_srgb(vec3(0.39, 0.45, 0.21));
+  vec3 scree  = rf_srgb(vec3(0.50, 0.45, 0.38));
+  vec3 rockA  = rf_srgb(vec3(0.43, 0.39, 0.34));
+  vec3 rockB  = rf_srgb(vec3(0.60, 0.55, 0.47));
   vec3 sand   = rf_srgb(vec3(0.79, 0.73, 0.55));
   vec3 wetS   = rf_srgb(vec3(0.50, 0.45, 0.35));
   vec3 mud    = rf_srgb(vec3(0.30, 0.29, 0.22));
@@ -613,19 +618,35 @@ float rfBump = 0.0;
   // forest floor under tree clusters
   float fo = smoothstep(0.12, 0.8, vAux.x + (n3 - 0.5) * 0.2);
   col = mix(col, forest * (0.85 + 0.25 * n4 + 0.15 * n2), fo * 0.85);
-  // ridges catch light, hollows collect shade and moisture
-  col *= 1.0 + clamp(vAux.z, -1.0, 1.0) * 0.1;
-  // exposed soil: steep grass naturally, fresh cuttings and embankments next to tracks and roads
-  float sn = (n2 - 0.5) * 0.08 + (m1 - 0.5) * 0.06;
+  // ridges catch light, hollows collect shade (not on earthworks: embankments would glow)
   float works = clamp(vAux.y, 0.0, 1.0);
-  float dirtAmt = smoothstep(0.1, 0.2, slope + sn) * 0.45;
-  dirtAmt = max(dirtAmt, works * smoothstep(0.035, 0.11, slope + sn * 0.5) * 0.85);
-  col = mix(col, dirt * (0.88 + 0.22 * n3 + 0.1 * n2), dirtAmt);
-  // scree and rock on steep slopes (low-frequency breakup only: no streaks)
+  col *= 1.0 + clamp(vAux.z, -1.0, 1.0) * 0.05 * (1.0 - works);
+  // graded ground beside tracks and roads: young grass and disturbed soil, mostly on the cut/fill slopes
+  float sn = (n2 - 0.5) * 0.08 + (m1 - 0.5) * 0.06;
+  float wSlope = smoothstep(0.04, 0.15, slope + sn * 0.5);
+  float wk = works * works * (0.22 + 0.33 * wSlope);
+  vec3 worksCol = mix(young, soil, clamp(0.3 + 0.45 * wSlope + (n3 - 0.5) * 0.4, 0.0, 1.0)) * (0.9 + 0.2 * n4);
+  col = mix(col, worksCol, wk);
+  // exposed soil on steep grass
+  float dirtAmt = smoothstep(0.1, 0.2, slope + sn) * 0.4;
+  col = mix(col, dirt * (0.88 + 0.2 * n3 + 0.1 * n2), dirtAmt);
+  // scree and rock on steep slopes: warm grey-brown, crisp ledges and cracks (triplanar, so cliff
+  // faces are not smeared vertically)
   float rockAmt = smoothstep(0.2, 0.32, slope + sn * 1.5);
-  vec3 rock = mix(rockA, rockB, smoothstep(0.25, 0.75, n2 * 0.6 + n3 * 0.4));
-  rock *= 0.86 + 0.28 * n4 * (0.6 + 0.4 * n5);
-  col = mix(col, mix(scree * (0.9 + 0.2 * n4), rock, smoothstep(0.24, 0.4, slope + sn)), rockAmt);
+  float rockBump = 0.0;
+  if (rockAmt > 0.001) {
+    vec3 an = abs(normalize(vWNormal));
+    an /= an.x + an.y + an.z;
+    float f1 = 1.0 - smoothstep(0.2, 0.55, fw * 0.6), f2 = 1.0 - smoothstep(0.2, 0.55, fw * 2.3);
+    float r1 = rf_tri(vWPos * 0.6 + 3.7, an);
+    float r2 = f2 > 0.0 ? rf_tri(vWPos * 2.3 + 9.1, an) : 0.5;
+    float c1 = pow(1.0 - abs(2.0 * r1 - 1.0), 6.0) * f1, c2 = pow(1.0 - abs(2.0 * r2 - 1.0), 8.0) * f2;
+    vec3 rock = mix(rockA, rockB, smoothstep(0.25, 0.75, n2 * 0.45 + mix(0.5, r1, f1) * 0.55));
+    rock *= (1.0 - c1 * 0.38 - c2 * 0.3) * (0.9 + 0.2 * mix(0.5, r2, f2));
+    vec3 scr = scree * (0.88 + 0.24 * n4) * (1.0 - c2 * 0.15);
+    col = mix(col, mix(scr, rock, smoothstep(0.24, 0.4, slope + sn)), rockAmt);
+    rockBump = (mix(0.5, r1, f1) * 0.03 + mix(0.5, r2, f2) * 0.012 - (c1 * 0.02 + c2 * 0.008)) * rockAmt;
+  }
   // beaches, wet sand, sea bed
   float beach = (1.0 - smoothstep(0.08, 0.3, h + (n2 - 0.5) * 0.15)) * (1.0 - smoothstep(0.12, 0.3, slope));
   col = mix(col, sand * (0.93 + 0.12 * n4), beach);
@@ -637,7 +658,7 @@ float rfBump = 0.0;
   col = mix(col, snow * (0.96 + 0.05 * n4), snowAmt);
   rfRough = mix(mix(0.95, 0.6, snowAmt), 0.5, wet);
   // micro relief for close-ups (rock and soil rougher than grass)
-  rfBump = detail * 0.01 * (1.0 + rockAmt * 2.5 + dirtAmt) * (1.0 - snowAmt * 0.6);
+  rfBump = (detail * 0.01 * (1.0 + dirtAmt) * (1.0 - rockAmt) + rockBump) * (1.0 - snowAmt * 0.6);
 
   if (uHiOn > 0.5) {
     vec2 dd = min(p - uHiRect.xy, uHiRect.zw - p);
@@ -762,12 +783,13 @@ function createWaterMaterial(heightTex: THREE.Texture, size: number): THREE.Shad
         col = mix(col, refl, clamp(fres, 0.0, 0.85));
         float spec = pow(max(dot(R, uSunDir), 0.0), 240.0) * 4.0 + pow(max(dot(R, uSunDir), 0.0), 24.0) * 0.12;
         col += uSunColor * spec * step(0.0, uSunDir.y);
-        float shore = 1.0 - smoothstep(0.0, 0.035, depth);
-        float foamN = rf_vnoise(p * 6.0 + vec2(uTime * 0.6, -uTime * 0.45));
-        float foam = shore * smoothstep(0.35, 0.75, foamN + shore * 0.4);
-        col = mix(col, vec3(0.85, 0.9, 0.92) * max(uLight, 0.15), foam * 0.7);
+        float shore = 1.0 - smoothstep(0.0, 0.02, depth);
+        float foamVis = 1.0 - smoothstep(0.15, 0.6, fw * 6.0);
+        float foamN = foamVis > 0.0 ? rf_vnoise(p * 6.0 + vec2(uTime * 0.6, -uTime * 0.45)) : 0.0;
+        float foam = shore * mix(0.12, smoothstep(0.45, 0.8, foamN + shore * 0.25), foamVis);
+        col = mix(col, vec3(0.8, 0.84, 0.86) * max(uLight, 0.15), foam * 0.55);
         float alpha = mix(0.55, 0.95, smoothstep(0.0, 0.4, depth));
-        alpha = max(alpha, foam * 0.9);
+        alpha = max(alpha, foam * 0.75);
         gl_FragColor = vec4(col, alpha);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>

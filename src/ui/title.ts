@@ -38,6 +38,7 @@ export function showTitle(o: TitleOpts) {
   ui.titleOpen = true;
   ui.tools?.setTool('inspect');
   const root = h('div', { class: 'title', role: 'dialog', 'aria-label': 'Railfever' });
+  const row = h('div', { class: 'title-row' });
   const main = h('div', { class: 'title-main' });
   let card: HTMLElement | null = null;
   const close = (resume = true) => {
@@ -52,7 +53,7 @@ export function showTitle(o: TitleOpts) {
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== 'Escape') return;
     e.stopPropagation();
-    if (card) { card.remove(); card = null; } else if (g) close();
+    if (card) { card.remove(); card = null; root.classList.remove('card-open'); } else if (g) close();
   };
   window.addEventListener('keydown', onKey, true);
   const btn = (ic: string, label: string, note: string, fn: () => void, primary = false) =>
@@ -68,7 +69,8 @@ export function showTitle(o: TitleOpts) {
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
     h('div', { class: 'title-foot' }, 'Runs entirely in your browser — no internet needed.'),
   );
-  root.appendChild(main);
+  row.appendChild(main);
+  root.appendChild(row);
   ui.root.appendChild(root);
 
   function openCard() {
@@ -96,7 +98,7 @@ export function showTitle(o: TitleOpts) {
           h('div', { class: 'ai-chips' }, st.ai ? Array.from({ length: st.ai }, (_, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[(i + 1) % COMPANY_COLORS.length]}` }, h('i'), AI_NAMES[i % AI_NAMES.length])) : h('span', { class: 'muted' }, 'Sandbox — no rivals')))),
         field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', title: 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
-          h('button', { class: 'btn ghost', onclick: () => { c.remove(); card = null; if (o.newGame && g) close(); } }, 'Cancel'),
+          h('button', { class: 'btn ghost', onclick: () => { c.remove(); card = null; root.classList.remove('card-open'); if (o.newGame && g) close(); } }, 'Cancel'),
           h('button', { class: 'btn primary lg', onclick: () => {
             close(false);
             const nt = Math.min(st.towns, Math.round((st.size * st.size) / 3000));
@@ -105,7 +107,9 @@ export function showTitle(o: TitleOpts) {
       );
     };
     render();
-    root.appendChild(c);
+    row.appendChild(c);
+    root.classList.add('card-open');
+    (c as HTMLElement & { scrollIntoView?: (o?: object) => void }).scrollIntoView?.({ block: 'nearest' });
   }
   if (o.newGame) openCard();
 }

@@ -14,6 +14,7 @@ import { ChunkCtx, SignalLamp, Boom, XLight, chunkIndexOf, hexToInt } from './bu
 import { buildRailEdge, buildRailNode } from './build-rail';
 import { buildRoadEdge, buildRoadNode, buildBusStops, buildCrossing } from './build-road';
 import { buildStation, buildDepot } from './build-stations';
+import { portalKeepouts, inKeepout, Keepout } from './build-structures';
 import { buildBuilding, FacadeBuilder } from './build-buildings';
 import { createTreeGeometries, createImpostorGeometry, makeTreeMeshes, makeImpostorMesh, impostorData, treeVariant, TreeInstance } from './trees';
 
@@ -239,9 +240,16 @@ export class ObjectsView {
       if (!b || !mine(b.x, b.z)) continue;
       try { buildBuilding(w, b, ctx.w, ctx.d, ctx.fac); } catch (err) { console.warn('objects: building failed', b.id, err); }
     }
+    // no trees on tunnel portals, their wing walls or galleries
+    const keep: Keepout[] = [];
+    for (const id of net.grid.query(x0 - 8, z0 - 8, x1 + 8, z1 + 8)) {
+      const e = net.edges.get(id);
+      if (e && e.sections.some((q) => q.type === 'tunnel')) portalKeepouts(ctx, e, keep);
+    }
     for (const id of w.treeGrid.query(x0, z0, x1, z1)) {
       const t = w.trees[id];
       if (!t || !mine(t.x, t.z)) continue;
+      if (keep.length && keep.some((k) => inKeepout(k, t.x, t.z))) continue;
       const y = w.heightAt(t.x, t.z);
       if (y < WATER_Y + 0.05) continue;
       const h = ((Math.floor(t.x * 97) * 31 + Math.floor(t.z * 89)) & 1023) / 1024;

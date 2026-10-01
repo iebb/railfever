@@ -67,6 +67,14 @@ function continuesAt(ctx: ChunkCtx, e: NEdge, nodeId: number, type: 'bridge' | '
   return false;
 }
 
+/** Lowest terrain under a footprint centred at p (half extents across/along the edge). */
+function groundUnder(ctx: ChunkCtx, p: Smp, ha: number, hl: number, off = 0): number {
+  const w = ctx.game.world;
+  let gy = w.heightAt(p.x + p.lx * off, p.z + p.lz * off);
+  for (const a of [-ha, ha]) for (const l of [-hl, hl]) gy = Math.min(gy, w.heightAt(p.x + p.lx * (off + a) + p.tx * l, p.z + p.lz * (off + a) + p.tz * l));
+  return gy;
+}
+
 // ------------------------------------------------------------------------------ bridges
 
 export type BridgeStyle = 'girder' | 'truss' | 'viaduct' | 'arch';
@@ -223,7 +231,7 @@ function pier(ctx: ChunkCtx, e: NEdge, s: number, D: Dims, depth: number, wl: nu
     if (!inChunk(ctx, p.x, p.z)) return sp;
     const W = ctx.w;
     W.cast = 1;
-    const base = gy - 0.4;
+    const base = Math.min(gy, groundUnder(ctx, p, D.pierW / 2 + 0.05, 0.12 * scale, (wr - wl) / 2)) - 0.4;
     const h = yb - 0.08 - base;
     const taper = Math.min(0.08, h * 0.008);
     // keep caps of parallel decks flush: centre the column under this deck's own width
@@ -345,7 +353,7 @@ function viaduct(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, sup: number[],
   for (let i = 1; i < sup.length - 1; i++) {
     const p = sampleAt(g, sup[i]);
     if (!inChunk(ctx, p.x, p.z)) continue;
-    const gy = w.heightAt(p.x, p.z) - 0.4;
+    const gy = groundUnder(ctx, p, (wl + wr) / 2 + 0.05, PW / 2 + 0.04, (wr - wl) / 2) - 0.4;
     const top = yDeck(p);
     W.use(WC.STONE, STONE);
     const off = (wr - wl) / 2;
@@ -427,9 +435,9 @@ function arches(ctx: ChunkCtx, e: NEdge, sup: number[], D: Dims, wl: number, wr:
   for (let i = 1; i < sup.length - 1; i++) {
     const p = sampleAt(g, sup[i]);
     if (!inChunk(ctx, p.x, p.z)) continue;
-    const gy = w.heightAt(p.x, p.z) - 0.4;
+    const gy = groundUnder(ctx, p, bw / 2 + 0.06, 0.25, off) - 0.4;
     W.use(WC.CONCRETE, CONCRETE_DARK);
-    W.tbox(p.x + p.lx * off, gy, p.z + p.lz * off, bw + 0.12, 0.65, 0.5, p.tx, p.tz, WSCALE.CONCRETE);
+    W.tbox(p.x + p.lx * off, gy, p.z + p.lz * off, bw + 0.12, Math.max(0.65, w.heightAt(p.x, p.z) - gy + 0.25), 0.5, p.tx, p.tz, WSCALE.CONCRETE);
     W.use(WC.CONCRETE, CONCRETE);
     W.tbox(p.x + p.lx * off, gy, p.z + p.lz * off, bw * 0.8, deckB(p) - gy, 0.2, p.tx, p.tz, WSCALE.CONCRETE);
   }
@@ -491,65 +499,106 @@ export function buildPortals(ctx: ChunkCtx, e: NEdge) {
   }
 }
 
-function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[], sb: number) {
-  const w = ctx.game.world;
-  const net = w.net;
-  const W = ctx.w;
-  W.cast = 1;
+/** Opening dimensions of a portal for an edge. */
+function portalDims(e: NEdge) {
   const rail = e.kind === 'rail';
   const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
   const ow = rail ? 0.3 : rt.half + rt.sidewalk * 0.5 + 0.08;
   const oh = rail ? 0.78 : 0.66;
+  return { ow, oh };
+}
+
+/** Oriented keep-out box around a portal (facade, wing walls, gallery) where no trees are drawn. */
+export interface Keepout { x: number; z: number; ox: number; oz: number; lx: number; lz: number; f0: number; f1: number; l0: number; l1: number }
+
+export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
+  const net = ctx.game.world.net;
+  for (const sec of e.sections) {
+    if (sec.type !== 'tunnel') continue;
+    for (const [s, o] of [[sec.s0, -1], [sec.s1, 1]] as [number, number][]) {
+      const atEnd = o < 0 ? s <= 0.05 : s >= e.len - 0.05;
+      if (atEnd && continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel')) continue;
+      const p = sampleAt(net.geo(e), s);
+      const { ow, oh } = portalDims(e);
+      const gl = galleryLength(ctx, e, s, o, oh + 0.16);
+      out.push({ x: p.x, z: p.z, ox: p.tx * o, oz: p.tz * o, lx: p.lx, lz: p.lz, f0: -(gl + 1.0), f1: 2.3, l0: -(ow + 1.9), l1: ow + 1.9 });
+    }
+  }
+}
+
+export function inKeepout(k: Keepout, x: number, z: number): boolean {
+  const dx = x - k.x, dz = z - k.z;
+  const f = dx * k.ox + dz * k.oz, l = dx * k.lx + dz * k.lz;
+  return f >= k.f0 && f <= k.f1 && l >= k.l0 && l <= k.l1;
+}
+
+function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[], sb: number) {
+  const w = ctx.game.world;
+  const W = ctx.w;
+  W.cast = 1;
+  const rail = e.kind === 'rail';
+  const { ow, oh } = portalDims(e);
   const archH = ow * 0.75;
   const ys = oh - archH; // springing height (relative to the profile)
-  const Hf = oh + 0.4;
+  const Hf = oh + 0.4;   // tallest facade
   const lo = Math.min(...offs) - ow - 0.5, hi = Math.max(...offs) + ow + 0.5;
   const ox = p.tx * out, oz = p.tz * out; // outward
   const lx = p.lx, lz = p.lz;
   const y = p.y;
   const modern = !rail || (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified;
   const cell = modern ? WC.CONCRETE : WC.STONE, sc = modern ? WSCALE.CONCRETE : WSCALE.STONE;
-  const tone = modern ? CONCRETE : STONE;
+  const tone = modern ? CONCRETE : STONE, dark = modern ? CONCRETE_DARK : STONE_DARK;
   const at = (l: number, f: number): [number, number] => [p.x + lx * l + ox * f, p.z + lz * l + oz * f];
   const T = 0.2, ff = 0.06, fb = ff - T;
   const yb = y - 0.35;
   const ops = offs.slice().sort((a, b) => a - b).map((c) => [c - ow, c + ow] as [number, number]);
-  // --- facade front face with arched openings (comb triangulation)
-  W.use(cell, tone);
-  const frontQuad = (l0: number, l1: number, y0a: number, y1a: number, y0b: number, y1b: number) => {
-    const [ax, az] = at(l0, ff), [bx, bz] = at(l1, ff);
-    W.twall(ax, az, bx, bz, y0a, y1a, y0b, y1b, ox, oz, sc, l0);
+  const archY = (l: number) => {
+    for (const [a, b] of ops) if (l >= a - 1e-6 && l <= b + 1e-6) { const c = (a + b) / 2, r = (b - a) / 2; return y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l - c) / r) ** 2)); }
+    return yb;
   };
-  let cur = lo;
-  for (const [a, b] of ops) {
-    frontQuad(cur, a, yb, y + Hf, yb, y + Hf);
-    const c = (a + b) / 2, r = (b - a) / 2;
-    const K = 10;
-    for (let k = 0; k < K; k++) {
-      const t0 = k / K, t1 = (k + 1) / K;
-      const l0 = a + (b - a) * t0, l1 = a + (b - a) * t1;
-      const archY = (l: number) => y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l - c) / r) ** 2));
-      frontQuad(l0, l1, archY(l0), y + Hf, archY(l1), y + Hf);
-    }
-    cur = b;
+  // facade top follows the hillside behind it (never floating above it), but always frames the arches
+  const opDist = (l: number) => { let d = Infinity; for (const [a, b] of ops) d = Math.min(d, l < a ? a - l : l > b ? l - b : 0); return d; };
+  const behind = (l: number) => { const [ax, az] = at(l, fb - 0.15), [bx, bz] = at(l, fb - 0.6); return Math.max(w.heightAt(ax, az), w.heightAt(bx, bz)); };
+  const topAt = (l: number) => {
+    const k = Math.min(1, Math.max(0, (opDist(l) - 0.08) / 0.4));
+    const minTop = y + oh + 0.14 - (oh - 0.2) * k * k * (3 - 2 * k);
+    return Math.min(y + Hf, Math.max(behind(l) + 0.06, minTop));
+  };
+  // lateral breakpoints: regular columns plus the opening edges
+  const cols: number[] = [];
+  for (let l = lo; l < hi - 1e-6; l += 0.1) cols.push(l);
+  cols.push(hi);
+  for (const [a, b] of ops) cols.push(a, b);
+  cols.sort((u, v) => u - v);
+  const L: number[] = [];
+  for (const l of cols) if (!L.length || l - L[L.length - 1] > 1e-4) L.push(l);
+  const TOP = L.map(topAt);
+  for (let i = 0; i < L.length - 1; i++) {
+    const l0 = L[i], l1 = L[i + 1], m = (l0 + l1) / 2;
+    const inside = ops.some(([a, b]) => m > a && m < b);
+    const b0 = inside ? archY(l0) : yb, b1 = inside ? archY(l1) : yb;
+    const t0 = TOP[i], t1 = TOP[i + 1];
+    const [fx0, fz0] = at(l0, ff), [fx1, fz1] = at(l1, ff), [bx0, bz0] = at(l0, fb), [bx1, bz1] = at(l1, fb);
+    W.use(cell, tone);
+    W.twall(fx0, fz0, fx1, fz1, b0, t0, b1, t1, ox, oz, sc, l0);
+    W.twall(bx0, bz0, bx1, bz1, b0, t0, b1, t1, -ox, -oz, sc, l0);
+    W.use(cell, dark);
+    W.ttri(fx0, t0, fz0, 0, 0, fx1, t1, fz1, (l1 - l0) / sc, 0, bx1, t1, bz1, (l1 - l0) / sc, T / sc, 0, 1, 0);
+    W.ttri(fx0, t0, fz0, 0, 0, bx1, t1, bz1, (l1 - l0) / sc, T / sc, bx0, t0, bz0, 0, T / sc, 0, 1, 0);
   }
-  frontQuad(cur, hi, yb, y + Hf, yb, y + Hf);
-  // ends of the facade and the coping
+  // facade ends
+  W.use(cell, tone);
   {
     const [ax, az] = at(lo, ff), [bx, bz] = at(lo, fb), [cx, cz] = at(hi, ff), [dx, dz] = at(hi, fb);
-    W.twall(ax, az, bx, bz, yb, y + Hf, yb, y + Hf, -lx, -lz, sc);
-    W.twall(cx, cz, dx, dz, yb, y + Hf, yb, y + Hf, lx, lz, sc);
-    const [mx, mz] = at((lo + hi) / 2, ff - T / 2 + 0.02);
-    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
-    W.tbox(mx, y + Hf, mz, hi - lo + 0.1, 0.06, T + 0.1, ox, oz, sc, true);
+    W.twall(ax, az, bx, bz, yb, TOP[0], yb, TOP[0], -lx, -lz, sc);
+    W.twall(cx, cz, dx, dz, yb, TOP[TOP.length - 1], yb, TOP[TOP.length - 1], lx, lz, sc);
   }
   // --- opening reveals (jambs and arch soffit) and the dark gallery behind
   const gl = galleryLength(ctx, e, sb, out, oh + 0.16);
-  // the facade back plane sits at fb: start the gallery there (shift the run start by T - ff)
   const run = tunnelRun(e, ctx, sb - out * (T - ff), out, gl);
   for (const [a, b] of ops) {
     const c = (a + b) / 2, r = (b - a) / 2;
-    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
+    W.use(cell, dark);
     const [a0x, a0z] = at(a, ff), [a1x, a1z] = at(a, fb), [b0x, b0z] = at(b, ff), [b1x, b1z] = at(b, fb);
     W.twall(a0x, a0z, a1x, a1z, y - 0.05, y + ys, y - 0.05, y + ys, lx, lz, sc);
     W.twall(b0x, b0z, b1x, b1z, y - 0.05, y + ys, y - 0.05, y + ys, -lx, -lz, sc);
@@ -573,37 +622,44 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
   // gallery shell (cut-and-cover) behind the facade, until the hillside covers it
   {
     const a0 = ops[0][0] - 0.12, b0 = ops[ops.length - 1][1] + 0.12;
-    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
+    W.use(cell, dark);
     sweep(W, run, [[a0, -0.35, 0], [a0, oh + 0.16, (oh + 0.51) / sc], [b0, oh + 0.16, (oh + 0.51 + b0 - a0) / sc], [b0, -0.35, (2 * oh + 1.02 + b0 - a0) / sc]], sc);
   }
-  // wing walls splayed outwards along the cutting, tops following the terrain
+  // wing walls retaining the cutting: nearly parallel to the track, tops on the retained ground,
+  // ending where the cutting gets shallow (omitted entirely in shallow cuttings)
+  const T2 = 0.15;
   for (const sd of [-1, 1]) {
-    const l0 = sd < 0 ? lo : hi;
-    const [sx, sz] = at(l0, ff - 0.02);
-    const ang = 0.5;
+    const lEdge = sd < 0 ? lo : hi;
+    const [sx, sz] = at(lEdge - sd * T2, ff);
+    const ang = 0.22;
     const dx = ox * Math.cos(ang) + lx * sd * Math.sin(ang), dz = oz * Math.cos(ang) + lz * sd * Math.sin(ang);
-    const nx = -dz * sd, nz = dx * sd; // outward (away from the track)
+    let nx = -dz * sd, nz = dx * sd; // away from the track
     const nl = Math.hypot(nx, nz) || 1;
-    const WL = 1.8, K = 7;
-    let px = sx, pz = sz, ph = y + Hf;
-    W.use(cell, tone);
-    for (let k = 1; k <= K; k++) {
-      const t = (WL * k) / K;
+    nx /= nl; nz /= nl;
+    const pts: { x: number; z: number; t: number }[] = [];
+    for (let k = 0; k <= 8; k++) {
+      const t = k * 0.25;
       const qx = sx + dx * t, qz = sz + dz * t;
-      const terr = w.heightAt(qx + (nx / nl) * 0.2, qz + (nz / nl) * 0.2);
-      const qh = Math.max(y + 0.15, Math.min(y + Hf, terr + 0.08));
-      const T2 = 0.09;
-      const pxo = px + (nx / nl) * T2, pzo = pz + (nz / nl) * T2, qxo = qx + (nx / nl) * T2, qzo = qz + (nz / nl) * T2;
-      // inner face (towards the track), outer face, top
-      W.twall(px, pz, qx, qz, yb, ph, yb, qh, -nx / nl, -nz / nl, sc, (k - 1) * WL / K);
-      W.twall(pxo, pzo, qxo, qzo, yb, ph, yb, qh, nx / nl, nz / nl, sc);
-      W.ttri(px, ph, pz, 0, 0, qx, qh, qz, 0.5, 0, qxo, qh, qzo, 0.5, 0.1, 0, 1, 0);
-      W.ttri(px, ph, pz, 0, 0, qxo, qh, qzo, 0.5, 0.1, pxo, ph, pzo, 0, 0.1, 0, 1, 0);
-      if (k === K) W.twall(qx, qz, qxo, qzo, yb, qh, yb, qh, dx, dz, sc);
-      px = qx; pz = qz; ph = qh;
+      const terr = Math.max(w.heightAt(qx + nx * (T2 + 0.15), qz + nz * (T2 + 0.15)), w.heightAt(qx + nx * (T2 + 0.5), qz + nz * (T2 + 0.5)));
+      const top = Math.min(y + Hf, terr + 0.04);
+      if (top < y + 0.3) break;
+      pts.push({ x: qx, z: qz, t: top });
     }
+    if (pts.length < 2) continue;
+    for (let k = 0; k < pts.length - 1; k++) {
+      const A = pts[k], B = pts[k + 1];
+      const aox = A.x + nx * T2, aoz = A.z + nz * T2, box2 = B.x + nx * T2, boz = B.z + nz * T2;
+      W.use(cell, tone);
+      W.twall(A.x, A.z, B.x, B.z, yb, A.t, yb, B.t, -nx, -nz, sc, k * 0.25);
+      W.twall(aox, aoz, box2, boz, yb, A.t, yb, B.t, nx, nz, sc, k * 0.25);
+      W.use(cell, dark);
+      W.ttri(A.x, A.t, A.z, 0, 0, B.x, B.t, B.z, 0.25 / sc, 0, box2, B.t, boz, 0.25 / sc, T2 / sc, 0, 1, 0);
+      W.ttri(A.x, A.t, A.z, 0, 0, box2, B.t, boz, 0.25 / sc, T2 / sc, aox, A.t, aoz, 0, T2 / sc, 0, 1, 0);
+    }
+    const E = pts[pts.length - 1];
+    W.use(cell, tone);
+    W.twall(E.x, E.z, E.x + nx * T2, E.z + nz * T2, yb, E.t, yb, E.t, dx, dz, sc);
   }
-  void net;
 }
 
 /** Gallery length behind a portal: until the terrain over the tunnel rises `rel` above the track (1..6 units). */

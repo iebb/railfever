@@ -36,6 +36,20 @@ export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string;
   'line-edit': { icon: 'lines', key: '', cat: 'lines', color: 'var(--accent)' },
 };
 
+/** One-line descriptions for the compact tool card (the long help sits behind '?'). */
+const TOOL_SHORT: Partial<Record<ToolId, string>> = {
+  rail: 'Click to start, click to build — continues from the new end.',
+  road: 'Click to start, click to build — continues from the new end.',
+  station: 'Click to place — lines up with nearby track ends.',
+  busstop: 'Click on a road to place a stop.',
+  'depot-rail': 'Click near a free track end to attach the depot.',
+  'depot-road': 'Click next to a road — the depot connects itself.',
+  signal: 'Click a track to add a signal, a signal to cycle it.',
+  bulldoze: 'Click to remove, drag to clear an area.',
+  terraform: 'Hold the button to reshape the ground.',
+  'line-edit': 'Click stations to add them as stops.',
+};
+
 const TOOL_LABEL: Partial<Record<ToolId, string>> = { rail: 'Track', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop' };
 
 /** Key hints per tool: [keys, action]. */
@@ -65,6 +79,9 @@ export class Hud {
   private dock: HTMLDivElement;
   private trayEl: HTMLDivElement;
   private card: HTMLDivElement;
+  private wrap: HTMLDivElement;
+  /** long help of the tool card expanded */
+  helpOpen = false;
   private catBtns = new Map<string, HTMLButtonElement>();
   private drawer: HTMLDivElement | null = null;
   openCat: string | null = null;
@@ -116,10 +133,14 @@ export class Hud {
       this.dock.appendChild(b);
     });
     this.trayEl = h('div', { class: 'tray chrome' });
-    this.card = h('div', { class: 'toolcard glass' });
+    this.card = h('div', { class: 'toolcard glass', role: 'region', 'aria-label': 'Tool options' });
     this.trayEl.style.display = 'none';
     this.card.style.display = 'none';
-    R.appendChild(h('div', { class: 'dockwrap' }, this.card, this.trayEl, this.dock));
+    this.wrap = h('div', { class: 'dockwrap' }, this.trayEl, this.dock);
+    R.appendChild(this.wrap);
+    // the options card lives at the bottom right, clear of the build area and the minimap
+    R.appendChild(this.card);
+    window.addEventListener('resize', () => this.placeCard());
   }
 
   setGame(g: Game) {
@@ -254,7 +275,34 @@ export class Hud {
     this.renderCard();
   }
 
+  /** Keep the tool card above the dock and tray (bottom right; full width on phones). */
+  private placeCard() {
+    if (this.card.style.display === 'none') return;
+    const H = window.innerHeight;
+    let top = this.dock.getBoundingClientRect().top;
+    if (this.trayEl.style.display !== 'none') {
+      // lift above the tray only where they would collide (narrow screens)
+      const tr = this.trayEl.getBoundingClientRect(), cr = this.card.getBoundingClientRect();
+      if (tr.right > cr.left - 8 && tr.left < cr.right + 8) top = Math.min(top, tr.top);
+    }
+    if (top > 0 && top < H) this.card.style.bottom = Math.round(H - top + 8) + 'px';
+  }
+
+  /** Screen areas the cursor tooltip should not cover. */
+  avoidRects(): DOMRect[] {
+    const out: DOMRect[] = [];
+    if (this.card.style.display !== 'none') out.push(this.card.getBoundingClientRect());
+    const mm = this.ui.minimap.el;
+    if (mm.isConnected !== false) out.push(mm.getBoundingClientRect());
+    return out;
+  }
+
   private renderTray() {
+    this.renderTrayContent();
+    this.placeCard();
+  }
+
+  private renderTrayContent() {
     const tr = this.trayEl;
     const c = CATS.find((x) => x.id === this.openCat);
     if (!c || (!c.actions && (!c.tools || (c.tools.length < 2 && c.id !== 'terrain')))) { tr.style.display = 'none'; return; }
@@ -287,7 +335,7 @@ export class Hud {
     return [T.tool, T.railType, T.roadType, T.tracks, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
-  /** Contextual options card of the active tool. */
+  /** Compact options card of the active tool: header, one-line description (long help behind '?'), options. */
   private renderCard() {
     const T = this.ui.tools;
     const t = T.tool;
@@ -304,20 +352,20 @@ export class Hud {
     if (t === 'rail' || t === 'road') {
       if (t === 'rail') {
         opts.push(opt('Track', seg([['standard', 'Standard', `${TRACK_TYPES.standard.speed} km/h`], ['highspeed', 'High-speed', `${TRACK_TYPES.highspeed.speed} km/h · electrified`]], T.railType, (v) => { T.railType = v; redo(); })));
-        opts.push(opt('Parallel', seg([[1, '1'], [2, '2'], [3, '3'], [4, '4']], T.tracks, (v) => { T.tracks = v; redo(); })));
+        opts.push(opt('Tracks', seg([[1, '1'], [2, '2'], [3, '3'], [4, '4']], T.tracks, (v) => { T.tracks = v; redo(); })));
       } else {
         opts.push(opt('Road', seg([['street', 'Town street', `${ROAD_TYPES.street.speed} km/h · sidewalks`], ['road', 'Country road', `${ROAD_TYPES.road.speed} km/h`]], T.roadType, (v) => { T.roadType = v; redo(); })));
       }
       opts.push(opt('Height', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: raised ends make bridges, lowered ends cuttings and tunnels ( [ / ] or PgUp / PgDn )')));
-      opts.push(opt('Crossings', seg([['auto', 'Auto'], ['over', 'Over'], ['under', 'Under'], ['level', 'Level']], T.crossing, (v) => { T.crossing = v; redo(); })));
+      opts.push(opt('Cross', seg([['auto', 'Auto'], ['over', 'Over'], ['under', 'Under'], ['level', 'Level']], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'station') {
       opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(8, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
       opts.push(opt('Tracks', stepper(String(T.stationTracks), () => { T.stationTracks = Math.max(1, T.stationTracks - 1); redo(); }, () => { T.stationTracks = Math.min(6, T.stationTracks + 1); redo(); })));
-      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left (Shift+R)', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
+      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left (Shift+R)', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
       opts.push(toggle('Align to track', T.autoAlign, (v) => { T.autoAlign = v; redo(); }));
     } else if (t === 'depot-rail' || t === 'depot-road') {
-      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
+      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
     } else if (t === 'terraform') {
       opts.push(opt('Mode', seg([['raise', 'Raise'], ['lower', 'Lower'], ['level', 'Level']], T.terraMode, (v) => { T.terraMode = v; redo(); this.renderTray(); })));
       const rng = h('input', { type: 'range', min: '1', max: '14', value: String(T.brushRadius), class: 'range', 'aria-label': 'Brush radius' }) as HTMLInputElement;
@@ -330,12 +378,16 @@ export class Hud {
       opts.push(h('button', { class: 'btn sm primary', onclick: () => T.setTool('inspect') }, icon('check', 14), 'Done'));
     }
     const keys = KEYS[t] ?? [];
+    const help = this.helpOpen
+      ? h('div', { class: 'tc-help' }, h('p', null, TOOL_INFO[t].hint), keys.length ? h('div', { class: 'tc-keys' }, keys.map(([ks, what]) => h('span', null, ks.map((k) => kbd(k)), what))) : null)
+      : h('div', { class: 'tc-desc', title: TOOL_INFO[t].hint }, TOOL_SHORT[t] ?? TOOL_INFO[t].hint);
     add(card,
       h('div', { class: 'tc-head' }, h('span', { class: 'tc-dot' }), h('span', { class: 'tc-title' }, TOOL_INFO[t].name),
+        h('button', { class: 'ibtn sm' + (this.helpOpen ? ' on' : ''), title: this.helpOpen ? 'Hide help' : 'Help & keys', 'aria-label': 'Help', 'aria-expanded': this.helpOpen ? 'true' : 'false', onclick: () => { this.helpOpen = !this.helpOpen; this.renderCard(); } }, icon('help', 16)),
         h('button', { class: 'ibtn sm', title: 'Close tool (Esc)', 'aria-label': 'Close tool', onclick: () => T.setTool('inspect') }, icon('close', 16))),
-      h('div', { class: 'tc-desc' }, TOOL_INFO[t].hint),
+      help,
       opts.length ? h('div', { class: 'tc-opts' }, opts) : null,
-      keys.length ? h('div', { class: 'tc-keys' }, keys.map(([ks, what]) => h('span', null, ks.map((k) => kbd(k)), what))) : null,
     );
+    this.placeCard();
   }
 }

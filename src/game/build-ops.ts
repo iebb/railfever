@@ -171,8 +171,9 @@ export class Depots {
 /** Place or cycle a signal on a rail edge near (x,z). */
 export function toggleSignal(g: Game, x: number, z: number, owner: number): string | null {
   const net = g.world.net;
-  // existing signal node?
-  const n = net.nearestNode(x, z, 0.8, 'rail', (nn) => nn.edges.length === 2);
+  // existing signal node? (only on the track under the cursor, not on a parallel neighbour 0.45 away)
+  const under = net.nearestEdge(x, z, 1.0, 'rail');
+  const n = net.nearestNode(x, z, 0.8, 'rail', (nn) => nn.edges.length === 2 && (!under || nn.edges.includes(under.edge.id) || Math.hypot(nn.x - x, nn.z - z) < 0.2));
   if (n && n.signal) {
     if (n.owner !== owner) return 'Not your track';
     n.signal = (n.signal + 1) % 4;

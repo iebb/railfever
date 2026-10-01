@@ -1060,10 +1060,15 @@ export class Tools {
     if (!this.tipShown) return;
     const W = window.innerWidth, H = window.innerHeight;
     const w = t.offsetWidth, h = t.offsetHeight;
-    let x = this.client.x + 18, y = this.client.y + 16;
-    if (x + w > W - 6) x = this.client.x - w - 14;
-    if (y + h > H - 6) y = this.client.y - h - 12;
-    t.style.transform = `translate3d(${Math.max(4, x)}px, ${Math.max(4, y)}px, 0)`;
+    const cx = this.client.x, cy = this.client.y;
+    // try the four corners around the cursor; avoid the tool card and the minimap
+    const avoid = this.ui.hud?.avoidRects() ?? [];
+    const cands: [number, number][] = [[cx + 18, cy + 16], [cx - w - 14, cy + 16], [cx + 18, cy - h - 12], [cx - w - 14, cy - h - 12]];
+    const fits = (x: number, y: number) => x >= 4 && y >= 4 && x + w <= W - 4 && y + h <= H - 4;
+    const free = (x: number, y: number) => avoid.every((r) => x + w < r.left || x > r.right || y + h < r.top || y > r.bottom);
+    const pos = cands.find(([x, y]) => fits(x, y) && free(x, y)) ?? cands.find(([x, y]) => fits(x, y)) ?? cands[0];
+    const x = Math.max(4, Math.min(W - w - 4, pos[0])), y = Math.max(4, Math.min(H - h - 4, pos[1]));
+    t.style.transform = `translate3d(${x}px, ${y}px, 0)`;
   }
 }
 

@@ -79,6 +79,8 @@ export interface CorridorOpts {
   buildingCost?: number;
   /** straight lead (world units) kept along the end tangents */
   lead?: number;
+  /** segments the corridor must keep away from (e.g. the station leads), with clearance r */
+  avoid?: { x0: number; z0: number; x1: number; z1: number; r: number }[];
 }
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -109,6 +111,7 @@ export class CorridorSearch {
   private goalDirs: Set<number>;
   private forbid: { x: number; z: number; a: number; w: number; d: number }[] = [];
   private lead: number;
+  private startV = -1;
   expanded = 0;
   state: 'running' | 'done' | 'failed' = 'running';
   path: P2[] | null = null;
@@ -127,6 +130,7 @@ export class CorridorSearch {
     for (const dp of g.depots.map.values()) this.forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5 });
     this.lead = opts.lead ?? 10;
     const s0 = this.vertex(from.x + from.tx * this.lead, from.z + from.tz * this.lead);
+    this.startV = s0;
     this.goal = this.vertex(to.x - to.tx * this.lead, to.z - to.tz * this.lead);
     // arrival headings within ~50 degrees of the goal tangent
     this.goalDirs = new Set();
@@ -169,6 +173,11 @@ export class CorridorSearch {
     if (water * 2 > hn) f |= 2;
     if (!w.inside(cx, cz, 5)) f |= 16;
     for (const fb of this.forbid) if (distToRect(cx, cz, fb.x, fb.z, fb.a, fb.w, fb.d) <= 0) { f |= 16; break; }
+    for (const a of this.opts.avoid ?? []) {
+      const dx = a.x1 - a.x0, dz = a.z1 - a.z0, l2 = dx * dx + dz * dz || 1;
+      const t = Math.max(0, Math.min(1, ((cx - a.x0) * dx + (cz - a.z0) * dz) / l2));
+      if (Math.hypot(a.x0 + dx * t - cx, a.z0 + dz * t - cz) < a.r) { f |= 16; break; }
+    }
     this.info[v] = f;
     return f;
   }
@@ -200,7 +209,7 @@ export class CorridorSearch {
         const ns = (v * 8 + di) * 4 + (dt ? 0 : Math.min(3, run + 1));
         if (this.closed[ns]) continue;
         const f = this.probe(v);
-        if (f & 16 && v !== this.goal) continue;
+        if (f & 16 && v !== this.goal && u !== this.startV) continue;
         const d = (di & 1 ? Math.SQRT2 : 1) * C;
         let c = d;
         const dh = Math.abs(this.hgt[v] - hu);
@@ -468,12 +477,13 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
   }
   const crossings: ChainProfile['crossings'] = [];
   if (cr.length) {
-    const clr = RAIL.clearance + 0.06;
+    const clr = RAIL.clearance + 0.15;
     for (const c of cr) {
       const yn = y[c.i];
       const mode: 'level' | 'over' | 'under' = !c.tunnel && Math.abs(yn - c.yo) < 0.35 && c.levelOk ? 'level' : yn >= c.yo ? 'over' : 'under';
       crossings.push({ x: c.x, z: c.z, mode, edge: c.edge });
-      for (let k = Math.max(0, c.i - 1); k <= Math.min(n - 1, c.i + 1); k++) {
+      // a window around the crossing, so segment ends close to it already have the clearance
+      for (let k = Math.max(0, c.i - 3); k <= Math.min(n - 1, c.i + 3); k++) {
         if (mode === 'over') lo[k] = Math.max(lo[k], c.yo + clr);
         else if (mode === 'under') hi[k] = Math.min(hi[k], c.yo - clr);
         else if (k === c.i) { lo[k] = Math.max(lo[k], c.yo - 0.05); hi[k] = Math.min(hi[k], c.yo + 0.05); }
@@ -493,6 +503,11 @@ export function routeConflict(g: Game, prof: ChainProfile, kind: NetKind, tracks
   const net = g.world.net;
   const hw = (kind === 'rail' ? 0.32 : ROAD_TYPES.road.half) + (tracks - 1) * RAIL.spacing * 0.5;
   const n = prof.x.length;
+  // the route must not come back close to itself
+  for (let i = 0; i < n; i += 3) for (let j = i + 12; j < n; j += 3) {
+    if (prof.s[j] - prof.s[i] < 12) continue;
+    if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return true;
+  }
   for (let i = 0; i < n; i += 2) {
     const x = prof.x[i], z = prof.z[i];
     // the ends attach to stations/streets
@@ -589,7 +604,11 @@ function buildSegment(g: Game, start: Snap, end: Snap, opts: BuildOptions, endY:
     }
   }
   res.error = last ? last.errors.join(', ') : 'Cannot build';
-  log?.(`segment failed: ${res.error}`);
+  if (last && log) {
+    const net = g.world.net;
+    const sn = start.kind === 'node' ? net.nodes.get(start.node!) : undefined;
+    log(`segment failed: ${res.error} (start y ${sn?.y.toFixed(2)}, end y ${endY?.toFixed(2)}, crossings ${last.crossings.map((c) => { const e = net.edges.get(c.edge)!; return `${c.mode}@${c.sNew.toFixed(1)}/${last!.tracks[c.track].len.toFixed(1)} ${e.kind}${e.owner} #${e.id} y${net.heightAtS(e, c.sOld).toFixed(2)} ${net.sectionAt(e, c.sOld)}`; }).join(', ')})`);
+  }
   return null;
 }
 
@@ -1211,7 +1230,11 @@ export class AIController {
     const frontA = { x: pr.a.x + fa.x * PLATFORM / 2, z: pr.a.z + fa.z * PLATFORM / 2 }, frontB = { x: pr.b.x + fb.x * PLATFORM / 2, z: pr.b.z + fb.z * PLATFORM / 2 };
     const from: OPoint = { x: frontA.x + fa.x * LEAD, z: frontA.z + fa.z * LEAD, tx: fa.x, tz: fa.z };
     const to: OPoint = { x: frontB.x + fb.x * LEAD, z: frontB.z + fb.z * LEAD, tx: -fb.x, tz: -fb.z };
-    const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner });
+    const avoid = [
+      { x0: frontA.x - fa.x * PLATFORM, z0: frontA.z - fa.z * PLATFORM, x1: from.x - fa.x * 4, z1: from.z - fa.z * 4, r: 4 },
+      { x0: frontB.x - fb.x * PLATFORM, z0: frontB.z - fb.z * PLATFORM, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
+    ];
+    const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
     while (cs.step(3000) === 'running') yield;
     if (!cs.path) return fail('no corridor');
     const al = alignCorridor(cs.path, from, to);
