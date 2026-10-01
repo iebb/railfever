@@ -4,14 +4,15 @@ import { Towns } from './towns';
 import { Stations } from './stations';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
-import { Economy, COSTS } from './economy';
+import { Depots } from './build-ops';
+import { Economy, Company, COMPANY_COLORS } from './economy';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
-import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR } from './constants';
+import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, TRACK_TYPES, ROAD_TYPES } from './constants';
 import { RNG } from './rng';
 import { MODELS } from './vehicle-types';
 import type { Vehicle } from './vehicle';
 import type { Station } from './stations';
-import { clearGeomCaches } from './geom';
+import { AIController, AI_NAMES } from './ai';
 
 export interface NewGameOptions {
   size: number;
@@ -20,12 +21,16 @@ export interface NewGameOptions {
   hilliness: Hilliness;
   water: WaterAmount;
   startYear: number;
+  /** number of AI competitors (0..3) */
+  aiCompanies?: number;
+  playerName?: string;
 }
 
-export type NewsKind = 'info' | 'good' | 'bad' | 'vehicle';
+export type NewsKind = 'info' | 'good' | 'bad' | 'vehicle' | 'ai';
 export interface News { day: number; text: string; kind: NewsKind; x?: number; z?: number }
 
 export const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+export const PLAYER = 0;
 const GEN_RATE = 0.0068;
 const MAX_STEP = 0.05;
 
@@ -33,9 +38,15 @@ export class Game {
   world: World;
   towns: Towns;
   stations: Stations;
+  depots: Depots;
   lines: Lines;
   vehicles: Vehicles;
-  economy = new Economy();
+  companies: Company[] = [];
+  /** pseudo company for town-owned infrastructure (never shown) */
+  private townCompany: Company = { id: -1, name: 'Towns', color: '#888888', ai: false, economy: new Economy() };
+  ais: AIController[] = [];
+  /** AI companies only build while enabled (their vehicles keep running) */
+  aiEnabled = true;
   options: NewGameOptions;
   day = 0;
   dayFrac = 0;
@@ -51,31 +62,48 @@ export class Game {
     income: [] as ((amount: number, v: Vehicle, st: Station) => void)[],
     network: [] as (() => void)[],
   };
+  networkVersion = 0;
   private networkDirty = false;
+  private lostSince = new Map<number, number>();
 
   constructor(opts: NewGameOptions, world?: World) {
     this.options = opts;
     this.world = world ?? new World(opts.size);
     this.rng = new RNG(opts.seed * 101 + 7);
-    this.towns = new Towns(this.world);
+    this.towns = new Towns(this);
     this.stations = new Stations(this);
+    this.depots = new Depots(this);
     this.lines = new Lines(this);
     this.vehicles = new Vehicles(this);
+    this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
   }
 
   static create(opts: NewGameOptions): Game {
-    clearGeomCaches();
     const g = new Game(opts);
     generateHeights(g.world, { seed: opts.seed, hilliness: opts.hilliness, water: opts.water });
     g.towns.generate(opts.towns, opts.seed);
     generateTrees(g.world, opts.seed);
-    // everything is freshly built: mark all chunks dirty
     g.world.dirtyObj.clear();
     g.world.dirtyTerrain.clear();
+    const n = Math.max(0, Math.min(3, opts.aiCompanies ?? 0));
+    for (let i = 0; i < n; i++) g.addAICompany();
     g.vehicles.manageAmbient();
     g.postNews(`Welcome to Railfever! Connect the towns of this region with rail and bus lines. Press F1 for a quick guide.`, 'info');
     return g;
   }
+
+  addAICompany(): Company {
+    const id = this.companies.length;
+    const co: Company = { id, name: AI_NAMES[(id - 1) % AI_NAMES.length], color: COMPANY_COLORS[id % COMPANY_COLORS.length], ai: true, economy: new Economy() };
+    this.companies.push(co);
+    this.ais.push(new AIController(this, id));
+    return co;
+  }
+
+  company(id: number): Company { return this.companies[id] ?? this.townCompany; }
+  get player(): Company { return this.companies[PLAYER]; }
+  /** Player economy (shortcut for the UI) */
+  get economy(): Economy { return this.companies[PLAYER].economy; }
 
   // ------------------------------------------------------------ calendar
   get year() { return this.options.startYear + Math.floor(this.day / (DAYS_PER_MONTH * MONTHS_PER_YEAR)); }
@@ -90,33 +118,36 @@ export class Game {
     if (this.news.length > 100) this.news.shift();
     for (const l of this.listeners.news) l(n);
   }
+
   onIncome(amount: number, v: Vehicle, st: Station) {
     for (const l of this.listeners.income) l(amount, v, st);
-    if (!this.firstArrival.has(st.id) && v.kind === 'train') {
+    if (v.owner === PLAYER && !this.firstArrival.has(st.id) && v.kind === 'train') {
       this.firstArrival.add(st.id);
       this.postNews(`Citizens celebrate! The first train arrives at ${st.name}.`, 'good', st.x, st.z);
     }
   }
-  isTileBusy(t: number) { return this.vehicles.isTileBusy(t); }
-  networkVersion = 0;
+
   onNetworkChanged() { this.networkDirty = true; this.networkVersion++; }
 
   // ------------------------------------------------------------ simulation
   update(dtReal: number) {
     if (this.paused) return;
     let dt = Math.min(dtReal, 0.25) * this.speed;
-    if (this.networkDirty) {
-      this.networkDirty = false;
-      for (const v of this.vehicles.all()) if (v.state === 'running' || v.state === 'waiting' || v.state === 'noroute') v.onLineChanged();
-      for (const a of this.vehicles.ambient) a.route = [];
-      this.vehicles.pruneAmbient();
-      for (const l of this.listeners.network) l();
-    }
+    this.flushNetworkChanges();
     while (dt > 1e-6) {
       const step = Math.min(MAX_STEP, dt);
       this.tick(step);
       dt -= step;
     }
+  }
+
+  /** Apply pending network changes to vehicles (normally done at the start of update). */
+  flushNetworkChanges() {
+    if (!this.networkDirty) return;
+    this.networkDirty = false;
+    this.vehicles.onNetworkChanged();
+    for (const v of this.vehicles.all()) if (v.state === 'running' || v.state === 'waiting' || v.state === 'noroute') v.onLineChanged();
+    for (const l of this.listeners.network) l();
   }
 
   private tick(dt: number) {
@@ -132,20 +163,19 @@ export class Game {
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
       }
     }
+    this.flushNetworkChanges();
   }
-
-  private lostSince = new Map<number, number>();
 
   private checkLost() {
     for (const v of this.vehicles.map.values()) {
-      if (v.state !== 'noroute') { this.lostSince.delete(v.id); continue; }
+      if (v.owner !== PLAYER || v.state !== 'noroute') { this.lostSince.delete(v.id); continue; }
       const since = this.lostSince.get(v.id);
       if (since === undefined) this.lostSince.set(v.id, this.day);
       else if (since >= 0 && this.day - since > 20) {
         this.lostSince.set(v.id, -1);
         const p = { x: 0, y: 0, z: 0 };
         v.worldPos(p);
-        this.postNews(`${v.name} is lost: ${v.status.toLowerCase()}. Check the line's track or roads.`, 'bad', Math.floor(p.x), Math.floor(p.z));
+        this.postNews(`${v.name} is lost: ${v.status.toLowerCase()}. Check the line's track or roads.`, 'bad', p.x, p.z);
       }
     }
   }
@@ -165,7 +195,7 @@ export class Game {
       for (const [d, hop] of table) {
         const ds = this.stations.get(d);
         if (!ds) continue;
-        const wgt = (ds.catchPop + 25) / (1 + hop.cost / 140);
+        const wgt = (ds.catchPop + 25) / (1 + hop.cost / 600);
         ws.push([d, wgt]);
         W += wgt;
       }
@@ -183,7 +213,8 @@ export class Game {
       st.genMonth += given;
       const town = this.towns.list[st.townId];
       if (town) town.passGenMonth += given;
-      this.stations.trimWaiting(st, 2500 + st.tiles.length * 150);
+      const cap = 600 + (st.rail ? st.rail.tracks * st.rail.length * 12 : 0) + st.stops.length * 150;
+      this.stations.trimWaiting(st, cap);
     }
     // station ratings
     for (const st of this.stations.map.values()) {
@@ -196,45 +227,52 @@ export class Game {
       st.rating += (target - st.rating) * 0.04;
       st.rating = Math.max(0, Math.min(1, st.rating));
     }
-    // town growth
+    // town growth (towns grow faster when served by frequent public transport)
     for (const town of this.towns.list) {
       if (this.day < town.nextGrowthDay) continue;
       let served = 0;
       for (const st of this.stations.map.values()) {
         if (this.day - st.lastPickup > 30 || !this.lines.stationServed(st.id)) continue;
-        if (Math.hypot(st.x - town.x, st.z - town.z) <= town.radius + 4) served++;
+        if (Math.hypot(st.x - town.x, st.z - town.z) <= town.radius + 10) served++;
       }
       town.served = served;
-      const base = served === 0 ? 70 : served === 1 ? 28 : served === 2 ? 18 : 12;
+      const base = served === 0 ? 60 : served === 1 ? 26 : served === 2 ? 17 : 11;
       town.nextGrowthDay = this.day + Math.round(base * (0.7 + this.rng.next() * 0.6));
       const steps = 1 + Math.floor(town.pop / 2500) + (served > 0 ? 1 : 0);
-      for (let i = 0; i < steps; i++) this.towns.growStep(town, this.rng, this.day);
       const before = town.pop;
+      for (let i = 0; i < steps; i++) this.towns.growStep(town, this.rng, this.day);
       this.towns.recomputePop(town);
       if (Math.floor(before / 1000) < Math.floor(town.pop / 1000) && town.pop >= 2000) {
         this.postNews(`${town.name} is booming: population passes ${Math.floor(town.pop / 1000) * 1000}!`, 'good', town.x, town.z);
       }
     }
+    if (this.aiEnabled) for (const ai of this.ais) ai.daily();
+  }
+
+  /** Yearly maintenance cost of a company's infrastructure. */
+  maintenanceOf(owner: number): number {
+    let c = 0;
+    for (const e of this.world.net.edges.values()) {
+      if (e.owner !== owner) continue;
+      const per = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).maintPerUnit : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).maintPerUnit;
+      c += e.len * per;
+      for (const s of e.sections) c += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
+    }
+    for (const st of this.stations.map.values()) {
+      if (st.owner !== owner) continue;
+      if (st.rail) c += 20000 + st.rail.tracks * st.rail.length * 500;
+      c += st.stops.length * 3000;
+    }
+    for (const d of this.depots.map.values()) if (d.owner === owner) c += d.kind === 'rail' ? 12000 : 6000;
+    return c;
   }
 
   private onNewMonth() {
-    // the month that just ended
     const pd = this.day - 1;
     const y = this.options.startYear + Math.floor(pd / (DAYS_PER_MONTH * MONTHS_PER_YEAR)), m = Math.floor(pd / DAYS_PER_MONTH) % MONTHS_PER_YEAR;
-    // infrastructure maintenance
-    const w = this.world;
-    let rail = 0, road = 0, stn = 0, span = 0;
-    const n = w.size * w.size;
-    for (let t = 0; t < n; t++) {
-      if (w.rail[t]) rail += w.pieceCount(t);
-      if (w.road[t] && w.roadOwner[t] === 2) road++;
-      if (w.station[t] >= 0) stn++;
-    }
-    for (const s of w.structures.values()) span += s.span;
-    const maint = (rail * COSTS.maintRailPerTile + road * COSTS.maintRoadPerTile + stn * COSTS.maintStationPerTile + span * COSTS.maintStructurePerTile) / 12;
-    this.economy.spend(maint, 'maintenance', true);
+    for (const co of this.companies) co.economy.spend(this.maintenanceOf(co.id) / 12, 'maintenance', true);
     this.vehicles.monthly();
-    this.economy.endMonth(y, m);
+    for (const co of this.companies) co.economy.endMonth(y, m);
     for (const st of this.stations.map.values()) {
       st.genLast = st.genMonth; st.genMonth = 0;
       st.pickupLast = st.pickupMonth; st.pickupMonth = 0;
@@ -243,11 +281,11 @@ export class Game {
     for (const t of this.towns.list) {
       t.passGenLast = t.passGenMonth; t.passGenMonth = 0;
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
-      this.towns.compactRoads(t);
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
     this.stations.recomputeCatchment();
     if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');
+    if (this.aiEnabled) for (const ai of this.ais) ai.monthly();
   }
 
   private onNewYear() {
@@ -256,7 +294,7 @@ export class Game {
       l.incomeLast = l.incomeYear; l.costLast = l.costYear;
       l.incomeYear = 0; l.costYear = 0;
     }
-    this.economy.endYear(this.year - 1);
+    for (const co of this.companies) co.economy.endYear(this.year - 1);
     for (const m of MODELS) {
       if (m.intro === this.year) this.postNews(`New vehicle available: ${m.name} (${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''})`, 'vehicle');
     }

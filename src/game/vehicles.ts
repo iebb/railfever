@@ -1,142 +1,244 @@
 // Vehicle manager: ownership, reservations, spatial hash, purchases and ambient traffic.
 import type { Game } from './game';
 import { Vehicle } from './vehicle';
-import { Train } from './train';
-import { RoadVehicle } from './roadvehicle';
+import { Train, CROSS_BASE } from './train';
+import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
+import type { NEdge } from './network';
+import { closestOnPolyline } from './geom';
+
+const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0) : -(s.node + 1));
 
 export class Vehicles {
   map = new Map<number, Vehicle>();
   nextId = 1;
   ambient: RoadVehicle[] = [];
   nextAmbientId = 1_000_000;
-  readonly tileCount: number;
-  private resv: Int32Array;
-  private structRes = new Map<number, number>();
+  private res = new Map<number, number>();
+  /** level crossings currently closed for road traffic */
+  crossingClosed = new Set<number>();
   roadHash = new Map<number, RoadVehicle[]>();
   private rng = new RNG(4242);
   ambientEnabled = true;
+  private ambientTimer = 0;
 
   constructor(private game: Game) {
-    const s = game.world.size;
-    this.tileCount = s * s;
-    this.resv = new Int32Array(this.tileCount);
+    const net = game.world.net;
+    net.onSplit.push((old, e1, e2, s) => this.onSplit(old, e1, e2, s));
+    net.onRemove.push((e) => this.onRemove(e));
   }
 
   get(id: number) { return this.map.get(id); }
   all() { return [...this.map.values()]; }
   trains(): Train[] { return [...this.map.values()].filter((v): v is Train => v.kind === 'train'); }
   roads(): RoadVehicle[] { return [...this.map.values()].filter((v): v is RoadVehicle => v.kind === 'road'); }
+  ofOwner(owner: number) { return [...this.map.values()].filter((v) => v.owner === owner); }
 
   // ---------------------------------------------------------------- reservations
-  getRes(r: number): number {
-    if (r < this.tileCount) return this.resv[r];
-    return this.structRes.get(r) ?? 0;
-  }
-  setRes(r: number, id: number) {
-    if (r < this.tileCount) this.resv[r] = id;
-    else this.structRes.set(r, id);
-  }
-  releaseRes(r: number, id: number) {
-    if (r < this.tileCount) { if (this.resv[r] === id) this.resv[r] = 0; }
-    else if (this.structRes.get(r) === id) this.structRes.delete(r);
-  }
-  roadsOn(t: number): RoadVehicle[] { return this.roadHash.get(t) ?? []; }
-  roadBusy(t: number): boolean { return (this.roadHash.get(t)?.length ?? 0) > 0; }
+  getRes(r: number): number { return this.res.get(r) ?? 0; }
+  setRes(r: number, id: number) { this.res.set(r, id); }
+  releaseRes(r: number, id: number) { if (this.res.get(r) === id) this.res.delete(r); }
+  crossingReservedBy(cid: number) { return this.getRes(CROSS_BASE + cid); }
 
-  /** Busy with a train or a company vehicle (ambient traffic does not block construction). */
-  isTileBusy(t: number): boolean {
-    if (this.resv[t] !== 0) return true;
-    const list = this.roadHash.get(t);
-    if (list) for (const v of list) if (!v.ambient) return true;
-    // a train still partly inside a depot
-    for (const v of this.map.values()) if (v.kind === 'train' && (v as Train).segs.some((s) => s.sid === -2 && s.t === t)) return true;
-    return false;
-  }
-
-  /** Remove ambient cars standing on tiles that lost their road. */
-  pruneAmbient() {
-    const w = this.game.world;
-    this.ambient = this.ambient.filter((a) => {
-      if (!a.seg) return false;
-      if (a.seg.sid === -1 && !w.road[a.seg.t]) return false;
-      if (a.seg.sid >= 0 && !w.structures.has(a.seg.sid)) return false;
-      if (a.prev && a.prev.sid >= 0 && !w.structures.has(a.prev.sid)) a.prev = null;
-      a.route = [];
-      return true;
-    });
-  }
-  isStructureBusy(sid: number): boolean {
-    if (this.structRes.has(this.tileCount + sid)) return true;
+  /** Physically occupied by a train or a company vehicle (ambient traffic never blocks construction). */
+  isEdgeBusy(eid: number): boolean {
     for (const v of this.map.values()) {
-      if (v.kind !== 'road') continue;
-      const r = v as RoadVehicle;
-      if (r.seg?.sid === sid || r.prev?.sid === sid || r.route.some((s) => s.sid === sid)) return true;
+      if (v instanceof Train) { if (v.occupiedEdges().includes(eid)) return true; }
+      else if (v instanceof RoadVehicle) { if (v.seg && v.occupiedEdges().includes(eid)) return true; }
     }
     return false;
   }
 
-  // ---------------------------------------------------------------- road following
+  // ---------------------------------------------------------------- network changes
+  private onSplit(old: NEdge, e1: NEdge, e2: NEdge, s: number) {
+    for (const v of this.map.values()) if (v instanceof Train) v.onEdgeSplit(old, e1, e2, s);
+    const fixRoad = (v: RoadVehicle): boolean => {
+      if (!v.seg) return true;
+      const net = this.game.world.net;
+      const remapConn = (c: RSeg) => {
+        if (c.kind !== 'conn') return;
+        if (c.e === old.id) c.e = c.dir > 0 ? e1.id : e2.id;
+        if (c.from === old.id) c.from = c.fromDir > 0 ? e2.id : e1.id;
+      };
+      remapConn(v.seg);
+      for (const t of v.trail) remapConn(t);
+      if (v.seg.kind === 'lane' && v.seg.e === old.id) {
+        const p = { x: 0, y: 0, z: 0 };
+        v.pointBehind(0, p);
+        let best: { seg: RSeg; pos: number; d: number } | null = null;
+        for (const e of [e1, e2]) {
+          if (!net.edges.has(e.id)) continue;
+          const seg = makeLaneSeg(this.game, e, v.seg.dir);
+          const c = seg.curve;
+          const r = closestOnPolyline(p.x, p.z, c.pts, 3, c.cum.length);
+          const pos = c.cum[r.i] + (c.cum[Math.min(c.cum.length - 1, r.i + 1)] - c.cum[r.i]) * r.f;
+          if (!best || r.d < best.d) best = { seg, pos, d: r.d };
+        }
+        if (!best || best.d > 0.6) return false;
+        v.seg = best.seg;
+        v.pos = best.pos;
+        v.trail = [];
+      }
+      if (v.ahead.some((a) => a.e === old.id || a.from === old.id)) {
+        const k = v.ahead.findIndex((a) => a.e === old.id || a.from === old.id);
+        v.ahead.length = k;
+        v.route = [];
+      }
+      v.trail = v.trail.filter((t) => t.e !== old.id);
+      return true;
+    };
+    for (const v of this.map.values()) if (v instanceof RoadVehicle && !fixRoad(v)) v.returnToDepot('Returned to depot');
+    this.ambient = this.ambient.filter((a) => fixRoad(a));
+  }
+
+  private onRemove(e: NEdge) {
+    for (const v of this.map.values()) {
+      if (v instanceof Train) v.onEdgeRemoved(e);
+      else if (v instanceof RoadVehicle && v.seg && v.occupiedEdges().includes(e.id)) v.returnToDepot('Returned to depot (road removed)');
+    }
+    this.ambient = this.ambient.filter((a) => !a.seg || !a.occupiedEdges().includes(e.id));
+  }
+
+  /** After construction: refresh geometry, drop stale look-ahead. */
+  onNetworkChanged() {
+    for (const v of this.map.values()) {
+      if (v instanceof Train) v.refreshGeometry();
+      else if (v instanceof RoadVehicle && !v.onNetworkChanged()) v.returnToDepot('Returned to depot (road removed)');
+    }
+    this.ambient = this.ambient.filter((a) => a.onNetworkChanged());
+  }
+
+  // ---------------------------------------------------------------- road spatial hash
   private rebuildHash() {
     this.roadHash.clear();
+    const put = (k: number, v: RoadVehicle) => {
+      let a = this.roadHash.get(k);
+      if (!a) { a = []; this.roadHash.set(k, a); }
+      if (!a.includes(v)) a.push(v);
+    };
     const add = (v: RoadVehicle) => {
       if (!v.seg) return;
-      const t = v.seg.t;
-      let a = this.roadHash.get(t);
-      if (!a) { a = []; this.roadHash.set(t, a); }
-      a.push(v);
-      if (v.prev && v.prev.t !== t && v.pos < v.length) {
-        let b = this.roadHash.get(v.prev.t);
-        if (!b) { b = []; this.roadHash.set(v.prev.t, b); }
-        b.push(v);
+      put(segKey(v.seg), v);
+      let rem = v.length - v.pos;
+      for (const t of v.trail) {
+        if (rem <= 0) break;
+        put(segKey(t), v);
+        rem -= t.len;
       }
     };
-    for (const v of this.map.values()) if (v.kind === 'road') add(v as RoadVehicle);
+    for (const v of this.map.values()) if (v instanceof RoadVehicle) add(v);
     for (const v of this.ambient) add(v);
   }
 
-  private tmpA = { x: 0, y: 0, z: 0 };
-  private tmpB = { x: 0, y: 0, z: 0 };
-  private tmpD = { x: 0, y: 0, z: 0 };
-  private tmpE = { x: 0, y: 0, z: 0 };
+  private tA = { x: 0, y: 0, z: 0 };
+  private tB = { x: 0, y: 0, z: 0 };
+  private tD = { x: 0, y: 0, z: 0 };
+  private tE = { x: 0, y: 0, z: 0 };
 
   /** Distance to the rear of the nearest vehicle ahead in the same lane, or Infinity. */
   gapAhead(v: RoadVehicle, look: number): number {
     if (!v.seg) return Infinity;
-    const p = this.tmpA, d = this.tmpD;
+    const p = this.tA, d = this.tD;
     v.pointBehind(0, p, d);
-    const tiles = [v.seg.t];
-    for (let i = 0; i < Math.min(3, v.route.length); i++) if (!tiles.includes(v.route[i].t)) tiles.push(v.route[i].t);
+    const dl = Math.hypot(d.x, d.z) || 1;
+    const dx = d.x / dl, dz = d.z / dl;
+    const keys = [segKey(v.seg)];
+    for (let i = 0; i < Math.min(3, v.ahead.length); i++) keys.push(segKey(v.ahead[i]));
     let best = Infinity;
-    const q = this.tmpB, qd = this.tmpE;
-    for (const t of tiles) {
-      const list = this.roadHash.get(t);
+    const q = this.tB, qd = this.tE;
+    const seen = new Set<RoadVehicle>();
+    for (const k of keys) {
+      const list = this.roadHash.get(k);
       if (!list) continue;
       for (const o of list) {
-        if (o === v || !o.seg) continue;
-        o.pointBehind(o.length, q, qd); // rear of other vehicle
+        if (o === v || !o.seg || seen.has(o)) continue;
+        seen.add(o);
+        o.pointBehind(o.length, q, qd);
         const rx = q.x - p.x, rz = q.z - p.z;
-        const along = rx * d.x + rz * d.z;
+        const along = rx * dx + rz * dz;
         if (along <= -0.05 || along > look) continue;
-        const lat = Math.abs(rx * d.z - rz * d.x);
-        if (lat > 0.085) continue;
-        if (qd.x * d.x + qd.z * d.z < 0.2) continue;
+        const lat = Math.abs(rx * dz - rz * dx);
+        if (lat > 0.11) continue;
+        const ql = Math.hypot(qd.x, qd.z) || 1;
+        if ((qd.x * dx + qd.z * dz) / ql < 0.2) continue;
         if (along < best) best = along;
       }
     }
     return best;
   }
 
+  /** May v enter connector c (no conflicting vehicle inside the junction)? */
+  junctionFree(v: RoadVehicle, c: RSeg): boolean {
+    const list = this.roadHash.get(-(c.node + 1));
+    if (!list) return true;
+    for (const o of list) {
+      if (o === v) continue;
+      const oc = o.seg && o.seg.kind === 'conn' && o.seg.node === c.node ? o.seg
+        : o.trail[0] && o.trail[0].kind === 'conn' && o.trail[0].node === c.node ? o.trail[0] : null;
+      if (!oc) continue;
+      if (oc.from === c.from && oc.fromDir === c.fromDir) continue;
+      if (connsConflict(c, oc)) return false;
+    }
+    return true;
+  }
+
+  /** Any road vehicle on edge eid within r of (x,z)? */
+  roadBusyNear(eid: number, x: number, z: number, r: number): boolean {
+    const a = this.tA, b = this.tB;
+    for (const k of [eid * 2, eid * 2 + 1]) {
+      const list = this.roadHash.get(k);
+      if (!list) continue;
+      for (const v of list) {
+        v.pointBehind(0, a);
+        v.pointBehind(v.length, b);
+        const dx = b.x - a.x, dz = b.z - a.z;
+        const l2 = dx * dx + dz * dz;
+        let f = l2 > 1e-9 ? ((x - a.x) * dx + (z - a.z) * dz) / l2 : 0;
+        f = Math.max(0, Math.min(1, f));
+        if (Math.hypot(a.x + dx * f - x, a.z + dz * f - z) < r) return true;
+      }
+    }
+    return false;
+  }
+
+  private updateCrossings() {
+    this.crossingClosed.clear();
+    const net = this.game.world.net;
+    if (!net.crossings.size) return;
+    for (const v of this.map.values()) {
+      if (!(v instanceof Train) || !v.segs.length) continue;
+      const warn = 6 + v.speed * 10;
+      const tail = v.tailInfo();
+      let off = -v.headPos;
+      for (let i = v.headSeg - 1; i >= tail.seg; i--) off -= v.segs[i].len;
+      for (let i = tail.seg; i < v.segs.length; i++) {
+        const s = v.segs[i];
+        if (off > warn) break;
+        for (const r of s.res) {
+          if (r < CROSS_BASE) continue;
+          const c = net.crossings.get(r - CROSS_BASE);
+          if (!c || c.kind !== 'level') continue;
+          const sp = s.dir > 0 ? c.s1 : s.len - c.s1;
+          const dist = off + sp;
+          if (dist > -(v.length + 0.6) && dist < warn) this.crossingClosed.add(c.id);
+        }
+        off += s.len;
+      }
+    }
+  }
+
   // ---------------------------------------------------------------- update
   update(dt: number) {
     this.rebuildHash();
+    this.updateCrossings();
     for (const v of this.map.values()) v.update(dt);
     if (this.ambientEnabled) {
       for (const a of this.ambient) a.update(dt);
       this.ambient = this.ambient.filter((a) => a.state !== 'stopped' && a.seg);
-    }
-    // keep the spatial index current for queries made between ticks (construction checks)
+      this.ambientTimer -= dt;
+      if (this.ambientTimer <= 0) { this.ambientTimer = 8; this.manageAmbient(); }
+    } else if (this.ambient.length) this.ambient = [];
     this.rebuildHash();
   }
 
@@ -144,28 +246,36 @@ export class Vehicles {
   manageAmbient() {
     if (!this.ambientEnabled) { this.ambient = []; return; }
     const g = this.game;
-    const w = g.world;
-    const byTown = new Map<number, number>();
+    const count = new Map<number, number>();
+    const p = { x: 0, y: 0, z: 0 };
     for (const a of this.ambient) {
-      const t = a.seg ? a.seg.t : -1;
-      const town = t >= 0 ? w.townOf[t] : -1;
-      byTown.set(town, (byTown.get(town) ?? 0) + 1);
+      a.worldPos(p);
+      const t = g.towns.nearest(p.x, p.z);
+      if (t) count.set(t.id, (count.get(t.id) ?? 0) + 1);
     }
-    let budget = 260 - this.ambient.length;
+    let budget = 320 - this.ambient.length;
     for (const town of g.towns.list) {
-      const want = Math.min(28, Math.floor(town.pop / 140));
-      let have = byTown.get(town.id) ?? 0;
+      if (budget <= 0) break;
+      const want = Math.min(32, Math.floor(town.pop / 110));
+      let have = count.get(town.id) ?? 0;
+      if (have >= want) continue;
+      const streets = g.towns.streets(town, 0);
+      if (!streets.length) continue;
       let tries = 0;
-      while (have < want && budget > 0 && tries++ < 20) {
-        if (!town.roads.length) break;
-        const t = town.roads[this.rng.int(town.roads.length)];
-        const m = w.road[t];
-        if (!m || w.station[t] >= 0 || this.roadBusy(t)) continue;
-        const edges: number[] = [];
-        for (let e = 0; e < 4; e++) if (m & (1 << e)) edges.push(e);
-        const e = edges[this.rng.int(edges.length)];
+      while (have < want && budget > 0 && tries++ < 12) {
+        const e = streets[this.rng.int(streets.length)];
+        if (e.len < 1.2) continue;
+        const dir = this.rng.next() < 0.5 ? 1 : -1;
+        const seg = makeLaneSeg(g, e, dir);
+        if (seg.len < 0.8) continue;
+        const pos = 0.3 + this.rng.next() * (seg.len - 0.6);
+        const q = { x: 0, y: 0, z: 0 };
+        const c = seg.curve;
+        const idx = Math.min(c.cum.length - 1, Math.max(0, Math.round((pos / seg.len) * (c.cum.length - 1))));
+        q.x = c.pts[idx * 3]; q.z = c.pts[idx * 3 + 2];
+        if (this.roadBusyNear(e.id, q.x, q.z, 1.2)) continue;
         const v = new RoadVehicle(g, this.nextAmbientId++, null, -1, true, this.rng.int(1e9));
-        v.placeAt(t, e);
+        v.placeAt(seg, pos);
         this.ambient.push(v);
         have++; budget--;
       }
@@ -175,13 +285,14 @@ export class Vehicles {
   // ---------------------------------------------------------------- purchase
   buyTrain(depotId: number, cars: VehicleModel[], lineId: number | null): Train | string {
     const g = this.game;
-    const dp = g.world.depots.get(depotId);
+    const dp = g.depots.get(depotId);
     if (!dp || dp.kind !== 'rail') return 'Invalid depot';
     if (!cars.length || cars[0].kind !== 'loco') return 'A train needs a locomotive';
     const cost = cars.reduce((s, c) => s + c.cost, 0);
-    if (!g.economy.spend(cost, 'vehicles')) return 'Not enough money';
+    if (!g.company(dp.owner).economy.spend(cost, 'vehicles')) return 'Not enough money';
     const t = new Train(g, this.nextId++, cars, depotId);
-    t.name = 'Train ' + t.id;
+    t.owner = dp.owner;
+    t.name = (dp.owner === 0 ? 'Train ' : g.company(dp.owner).name.split(' ')[0] + ' Train ') + t.id;
     this.map.set(t.id, t);
     if (lineId != null) t.setLine(lineId);
     return t;
@@ -189,22 +300,24 @@ export class Vehicles {
 
   buyRoad(depotId: number, model: VehicleModel, lineId: number | null): RoadVehicle | string {
     const g = this.game;
-    const dp = g.world.depots.get(depotId);
+    const dp = g.depots.get(depotId);
     if (!dp || dp.kind !== 'road') return 'Invalid depot';
-    if (!g.economy.spend(model.cost, 'vehicles')) return 'Not enough money';
+    if (!g.company(dp.owner).economy.spend(model.cost, 'vehicles')) return 'Not enough money';
     const v = new RoadVehicle(g, this.nextId++, model, depotId, false);
-    v.name = 'Bus ' + v.id;
+    v.owner = dp.owner;
+    v.name = (dp.owner === 0 ? 'Bus ' : g.company(dp.owner).name.split(' ')[0] + ' Bus ') + v.id;
     this.map.set(v.id, v);
     if (lineId != null) v.setLine(lineId);
     return v;
   }
 
+  resaleValue(v: Vehicle) { return v.value * Math.max(0.1, 0.75 - v.age * 0.06); }
+
   sell(id: number) {
     const v = this.map.get(id);
     if (!v) return;
     const g = this.game;
-    const resale = v.value * Math.max(0.1, 0.75 - v.age * 0.06);
-    g.economy.earn(resale, 'vehicles');
+    g.company(v.owner).economy.earn(this.resaleValue(v), 'vehicles');
     v.destroy();
     v.dumpCargo();
     const l = v.line;
@@ -213,18 +326,15 @@ export class Vehicles {
     g.lines.rebuild();
   }
 
-  resaleValue(v: Vehicle) { return v.value * Math.max(0.1, 0.75 - v.age * 0.06); }
-
   monthly() {
     const g = this.game;
     for (const v of this.map.values()) {
       const c = v.runningCost / 12;
-      g.economy.spend(c, 'running', true);
+      g.company(v.owner).economy.spend(c, 'running', true);
       v.profitYear -= c;
       const l = v.line;
       if (l) l.costYear += c;
     }
-    this.manageAmbient();
   }
 
   yearly() {
@@ -234,7 +344,6 @@ export class Vehicles {
   clearAll() {
     this.map.clear();
     this.ambient = [];
-    this.resv.fill(0);
-    this.structRes.clear();
+    this.res.clear();
   }
 }

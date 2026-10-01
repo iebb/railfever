@@ -94,6 +94,16 @@ export class Economy {
   get netWorth() { return this.money - this.loan; }
 }
 
+export interface Company {
+  id: number;
+  name: string;
+  color: string;
+  ai: boolean;
+  economy: Economy;
+}
+
+export const COMPANY_COLORS = ['#e8a33d', '#3d8be8', '#d6453d', '#47b36b'];
+
 export function fmtMoney(x: number): string {
   const neg = x < 0;
   x = Math.abs(x);

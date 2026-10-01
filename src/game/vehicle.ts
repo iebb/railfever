@@ -18,6 +18,7 @@ export function fare(dist: number, days: number, count: number): number {
 
 export abstract class Vehicle {
   readonly id: number;
+  owner = 0;
   abstract readonly kind: 'train' | 'road';
   name = '';
   lineId: number | null = null;
@@ -106,7 +107,7 @@ export abstract class Vehicle {
       this.cargo.delete(k);
     }
     if (income > 0) {
-      g.economy.earn(income, 'income');
+      g.company(this.owner).economy.earn(income, 'income');
       this.profitYear += income;
       this.incomeYear += income;
       if (line) { line.incomeYear += income; }

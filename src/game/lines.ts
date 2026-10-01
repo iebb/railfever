@@ -1,9 +1,10 @@
 // Lines (ordered stop lists) and passenger routing across the line network.
 import type { Game } from './game';
-import type { Transport } from './world';
+import type { NetKind as Transport } from './constants';
 
 export interface Line {
   id: number;
+  owner: number;
   name: string;
   color: string;
   kind: Transport;
@@ -29,11 +30,11 @@ export class Lines {
   get(id: number) { return this.map.get(id); }
   all() { return [...this.map.values()]; }
 
-  create(kind: Transport): Line {
+  create(kind: Transport, owner = 0): Line {
     const id = this.nextId++;
-    const n = [...this.map.values()].filter((l) => l.kind === kind).length + 1;
+    const n = [...this.map.values()].filter((l) => l.kind === kind && l.owner === owner).length + 1;
     const line: Line = {
-      id, name: (kind === 'rail' ? 'Rail line ' : 'Bus line ') + n, color: LINE_COLORS[(id - 1) % LINE_COLORS.length], kind,
+      id, owner, name: (kind === 'rail' ? 'Rail line ' : 'Bus line ') + n, color: LINE_COLORS[(id - 1) % LINE_COLORS.length], kind,
       stops: [], vehicles: [], passMonth: 0, passLast: 0, incomeYear: 0, incomeLast: 0, costYear: 0, costLast: 0,
     };
     this.map.set(id, line);

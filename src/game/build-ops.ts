@@ -1,336 +1,290 @@
-// Construction operations other than routes: stations, stops, depots, signals,
-// demolition and terraforming.
+// Depots, signals, demolition and terraforming.
 import type { Game } from './game';
-import { World, SLOPE_FLAT } from './world';
-import { DX, DZ, OPP, CORNER_DX, CORNER_DZ } from './constants';
-import { cornerLocked } from './terraform';
-import { COSTS } from './economy';
-import type { Station } from './stations';
-import { clearStructureCache } from './geom';
+import { NetKind, RAIL } from './constants';
+import { bezLine } from './geom';
+import { NEdge } from './network';
+import { distToRect, World } from './world';
+import { rectsOverlap } from './towns';
+import { applyEarthworks, recomputeLocks, brush } from './terraform';
+import { planEdge, commitProposal, findSnap } from './construction';
 
-export interface StationPlan {
-  ok: boolean;
-  error?: string;
-  x0: number; z0: number; x1: number; z1: number;
-  axis: number;
-  level: number;
-  cost: number;
-  corners: Map<number, number>;
-  join: Station | null;
+export interface Depot {
+  id: number;
+  kind: NetKind;
+  x: number; z: number; y: number;
+  angle: number;
+  owner: number;
+  /** exit node (connects to the network) and the stub edge inside the building */
+  node: number;
+  edge: number;
 }
 
-/** axis 0: tracks run north-south; axis 1: east-west. Rectangle centred on (x,z). */
-export function planRailStation(game: Game, x: number, z: number, axis: number, length: number, tracks: number): StationPlan {
-  const w = game.world;
-  const wx = axis === 0 ? tracks : length, wz = axis === 0 ? length : tracks;
-  const x0 = x - Math.floor((wx - 1) / 2), z0 = z - Math.floor((wz - 1) / 2);
-  const x1 = x0 + wx - 1, z1 = z0 + wz - 1;
-  const plan: StationPlan = { ok: true, x0, z0, x1, z1, axis, level: 0, cost: 0, corners: new Map(), join: null };
-  const failp = (e: string) => { plan.ok = false; plan.error = plan.error ?? e; };
-  if (x0 < 1 || z0 < 1 || x1 >= w.size - 1 || z1 >= w.size - 1) { failp('Too close to the map edge'); return plan; }
-  const piece = axis === 0 ? 0 : 1;
-  const levels = new Set<number>();
-  let trees = 0;
-  for (let zz = z0; zz <= z1; zz++) for (let xx = x0; xx <= x1; xx++) {
-    const t = w.idx(xx, zz);
-    if (w.building[t] >= 0) failp('Buildings in the way');
-    if (w.depot[t] >= 0) failp('Depot in the way');
-    if (w.span[t] >= 0) failp('Bridge or tunnel in the way');
-    if (w.station[t] >= 0) failp('Station already here');
-    if (w.road[t]) failp('Road in the way');
-    if (w.rail[t] && w.rail[t] !== 1 << piece) failp('Track in the way');
-    for (let c = 0; c < 4; c++) levels.add(w.corner(xx, zz, c));
-    trees += w.trees[t] & 15;
-  }
-  // choose the cheapest feasible level
-  const s1 = w.size + 1;
-  let bestL = NaN, bestCost = Infinity, bestMap: Map<number, number> | null = null;
-  for (const L of levels) {
-    if (L <= 0) continue;
-    let cost = 0, ok = true;
-    const map = new Map<number, number>();
-    for (let cz = z0; cz <= z1 + 1 && ok; cz++) for (let cx = x0; cx <= x1 + 1; cx++) {
-      const h = w.cornerH(cx, cz);
-      if (h === L) continue;
-      if (cornerLocked(w, cx, cz)) { ok = false; break; }
-      cost += Math.abs(h - L);
-      map.set(cz * s1 + cx, L);
+export function depotSize(kind: NetKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : { w: 1.8, d: 1.6 }; }
+
+export interface DepotPlan { ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number }
+
+export class Depots {
+  map = new Map<number, Depot>();
+  nextId = 1;
+  constructor(private game: Game) {}
+
+  get(id: number) { return this.map.get(id); }
+  all() { return [...this.map.values()]; }
+
+  near(x: number, z: number, r: number): Depot[] {
+    const out: Depot[] = [];
+    for (const d of this.map.values()) {
+      const sz = depotSize(d.kind);
+      if (distToRect(x, z, d.x, d.z, d.angle, sz.w / 2, sz.d / 2) <= r) out.push(d);
     }
-    if (ok && cost < bestCost) { bestCost = cost; bestL = L; bestMap = map; }
+    return out;
   }
-  if (!bestMap) failp('Cannot level the ground here');
-  else { plan.level = bestL; plan.corners = bestMap; }
-  plan.cost = (wx * wz) * COSTS.stationTile + (isFinite(bestCost) ? bestCost : 0) * COSTS.terraform + trees * COSTS.tree;
-  plan.join = game.stations.findNear(x0, z0, x1, z1, 1);
-  return plan;
-}
 
-export function commitRailStation(game: Game, plan: StationPlan): string | null {
-  const w = game.world;
-  if (!plan.ok) return plan.error ?? 'Cannot build';
-  if (!game.economy.canAfford(plan.cost)) return 'Not enough money';
-  for (let zz = plan.z0; zz <= plan.z1; zz++) for (let xx = plan.x0; xx <= plan.x1; xx++) if (game.isTileBusy(w.idx(xx, zz))) return 'Vehicle in the way';
-  game.economy.spend(plan.cost, 'construction');
-  const s1 = w.size + 1;
-  for (const [ci, l] of plan.corners) w.setCorner(ci % s1, (ci / s1) | 0, l);
-  const st = plan.join ?? game.stations.create(Math.round((plan.x0 + plan.x1) / 2), Math.round((plan.z0 + plan.z1) / 2));
-  const piece = plan.axis === 0 ? 0 : 1;
-  for (let zz = plan.z0; zz <= plan.z1; zz++) for (let xx = plan.x0; xx <= plan.x1; xx++) {
-    const t = w.idx(xx, zz);
-    w.rail[t] = 1 << piece;
-    w.signal[t] = 0;
-    w.trees[t] = 0;
-    game.stations.addTile(st, t, 1);
-  }
-  game.onNetworkChanged();
-  game.lines.rebuild();
-  return null;
-}
-
-export interface SimplePlan { ok: boolean; error?: string; cost: number; join?: Station | null; dir?: number; level?: number }
-
-export function planBusStop(game: Game, x: number, z: number): SimplePlan {
-  const w = game.world;
-  if (!w.inBounds(x, z)) return { ok: false, error: 'Out of bounds', cost: 0 };
-  const t = w.idx(x, z);
-  const m = w.road[t];
-  if (w.station[t] >= 0) return { ok: false, error: 'Already a station', cost: 0 };
-  if (!(m === 0b0101 || m === 0b1010)) return { ok: false, error: 'Needs a straight road', cost: 0 };
-  if (w.rail[t]) return { ok: false, error: 'Cannot build on a level crossing', cost: 0 };
-  if (w.headAt(t, 0) >= 0 || w.headAt(t, 1) >= 0 || w.headAt(t, 2) >= 0 || w.headAt(t, 3) >= 0) return { ok: false, error: 'Cannot build on a bridge head', cost: 0 };
-  return { ok: true, cost: COSTS.busStop, join: game.stations.findNear(x, z, x, z, 2) };
-}
-
-export function commitBusStop(game: Game, x: number, z: number): string | null {
-  const p = planBusStop(game, x, z);
-  if (!p.ok) return p.error!;
-  if (!game.economy.spend(p.cost, 'construction')) return 'Not enough money';
-  const st = p.join ?? game.stations.create(x, z);
-  game.stations.addTile(st, game.world.idx(x, z), 2);
-  game.onNetworkChanged();
-  game.lines.rebuild();
-  return null;
-}
-
-/** Find a depot orientation that connects to adjacent rail/road. */
-export function autoDepotDir(game: Game, kind: 'rail' | 'road', x: number, z: number, fallback: number): number {
-  const w = game.world;
-  for (let d = 0; d < 4; d++) {
-    const nx = x + DX[d], nz = z + DZ[d];
-    if (!w.inBounds(nx, nz)) continue;
-    const n = w.idx(nx, nz);
-    if (kind === 'rail' && w.railEdges(n) & (1 << OPP[d])) return d;
-    if (kind === 'road' && w.road[n] & (1 << OPP[d])) return d;
-  }
-  for (let d = 0; d < 4; d++) {
-    const nx = x + DX[d], nz = z + DZ[d];
-    if (!w.inBounds(nx, nz)) continue;
-    const n = w.idx(nx, nz);
-    if (kind === 'road' && w.road[n] && w.station[n] < 0 && !w.rail[n]) return d;
-  }
-  return fallback;
-}
-
-export function planDepot(game: Game, kind: 'rail' | 'road', x: number, z: number, dir: number): SimplePlan {
-  const w = game.world;
-  if (!w.inBounds(x, z) || x < 1 || z < 1 || x >= w.size - 1 || z >= w.size - 1) return { ok: false, error: 'Out of bounds', cost: 0 };
-  const t = w.idx(x, z);
-  if (!w.isEmpty(t) || w.span[t] >= 0) return { ok: false, error: 'Tile is not free', cost: 0 };
-  const c = w.corners(x, z);
-  const mx = Math.max(...c);
-  if (mx <= 0) return { ok: false, error: 'Cannot build on water', cost: 0 };
-  let level = mx;
-  // prefer the level of the edge facing the connection
-  const nx = x + DX[dir], nz = z + DZ[dir];
-  const el = w.edgeLevel(x, z, dir);
-  if (!isNaN(el) && el > 0) level = el;
-  let terra = 0;
-  for (let k = 0; k < 4; k++) {
-    if (c[k] === level) continue;
-    if (cornerLocked(w, x + CORNER_DX[k], z + CORNER_DZ[k])) return { ok: false, error: 'Ground cannot be levelled', cost: 0 };
-    terra += Math.abs(c[k] - level);
-  }
-  void nx; void nz;
-  const cost = (kind === 'rail' ? COSTS.depotRail : COSTS.depotRoad) + terra * COSTS.terraform + (w.trees[t] & 15) * COSTS.tree;
-  return { ok: true, cost, dir, level };
-}
-
-export function commitDepot(game: Game, kind: 'rail' | 'road', x: number, z: number, dir: number): string | null {
-  const w = game.world;
-  const p = planDepot(game, kind, x, z, dir);
-  if (!p.ok) return p.error!;
-  if (!game.economy.spend(p.cost, 'construction')) return 'Not enough money';
-  for (let k = 0; k < 4; k++) w.setCorner(x + CORNER_DX[k], z + CORNER_DZ[k], p.level!);
-  const t = w.idx(x, z);
-  const id = w.nextDepotId++;
-  w.depots.set(id, { id, kind, x, z, dir });
-  w.depot[t] = id;
-  w.trees[t] = 0;
-  w.markTile(x, z);
-  // connect road depots to the adjacent road automatically
-  if (kind === 'road') {
-    const nx = x + DX[dir], nz = z + DZ[dir];
-    if (w.inBounds(nx, nz)) {
-      const n = w.idx(nx, nz);
-      if (w.road[n] && !(w.road[n] & (1 << OPP[dir])) && w.station[n] < 0 && !w.rail[n] &&
-        World.shapeSupports(w.corners(nx, nz), w.road[n] | (1 << OPP[dir]))) {
-        w.road[n] |= 1 << OPP[dir];
-        w.markTile(nx, nz);
+  /** Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. */
+  plan(kind: NetKind, x: number, z: number, angle: number, owner: number): DepotPlan {
+    const g = this.game;
+    const w = g.world;
+    const net = w.net;
+    const sz = depotSize(kind);
+    let snapNode = -1;
+    // snap to a free rail end: depot exit coincides with it, facing along its direction
+    if (kind === 'rail') {
+      const n = net.nearestNode(x, z, sz.d / 2 + 2.5, 'rail', (nn) => nn.edges.length === 1);
+      if (n) {
+        const e = net.edges.get(n.edges[0])!;
+        const ld = net.leaveDir(e, n.id); // direction from node into the track
+        angle = Math.atan2(ld.x, ld.z); // depot faces the track
+        x = n.x - ld.x * (sz.d / 2 + 0.05);
+        z = n.z - ld.z * (sz.d / 2 + 0.05);
+        snapNode = n.id;
       }
     }
+    const fx = Math.sin(angle), fz = Math.cos(angle);
+    const exitX = x + fx * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3)), exitZ = z + fz * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3));
+    const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : 60000 };
+    const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
+    if (!w.inside(x, z, 4)) failp('Too close to the map edge');
+    let mx = -Infinity, mn = Infinity;
+    for (const [a, b] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [0, 0]]) {
+      const rx = fz, rz = -fx;
+      const h = w.heightAt(x + rx * sz.w * a + fx * sz.d * b, z + rz * sz.w * a + fz * sz.d * b);
+      mx = Math.max(mx, h); mn = Math.min(mn, h);
+    }
+    plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : mx;
+    if (mn < 0.2) failp('Cannot build on water');
+    if (mx - mn > 1.5) failp('Ground is too steep');
+    const rect = { x, z, angle, w: sz.w, d: sz.d };
+    const R = Math.hypot(sz.w, sz.d) / 2 + 1;
+    for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) failp('Buildings in the way'); }
+    for (const e of net.edgesNear(x - R, z - R, x + R, z + R)) {
+      const geo = net.geo(e);
+      const hw = net.halfWidth(e);
+      for (let i = 0; i < geo.n; i++) if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2) < hw - 0.1) { failp('Track or road in the way'); break; }
+    }
+    if (g.stations.footprintsNear(x, z, R).length) failp('Station in the way');
+    for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
+    plan.cost += Math.round((mx - mn) * 20000);
+    return plan;
   }
-  game.onNetworkChanged();
+
+  commit(kind: NetKind, plan: DepotPlan, owner: number): string | null {
+    const g = this.game;
+    const w = g.world;
+    const net = w.net;
+    if (!plan.ok) return plan.error ?? 'Cannot build';
+    if (!g.company(owner).economy.spend(plan.cost, 'construction')) return 'Not enough money';
+    const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
+    const sz = depotSize(kind);
+    const inX = plan.x - fx * (sz.d / 2 - 0.4), inZ = plan.z - fz * (sz.d / 2 - 0.4);
+    const inner = net.addNode(kind, inX, plan.y, inZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
+    const exit = plan.snapNode >= 0 ? net.nodes.get(plan.snapNode)! : net.addNode(kind, plan.exitX, plan.y, plan.exitZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
+    const len = Math.hypot(exit.x - inX, exit.z - inZ);
+    const prof = new Float32Array(Math.max(2, Math.ceil(len) + 1)).fill(plan.y);
+    prof[prof.length - 1] = exit.y;
+    const id = this.nextId++;
+    const e = net.addEdge(kind, inner.id, exit.id, bezLine(inX, inZ, exit.x, exit.z), prof, [], kind === 'rail' ? 'standard' : 'road', owner, { depot: id });
+    const dp: Depot = { id, kind, x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, owner, node: exit.id, edge: e.id };
+    this.map.set(id, dp);
+    // flatten the ground under the building
+    for (let zz = Math.floor(plan.z - 4); zz <= Math.ceil(plan.z + 4); zz++) for (let xx = Math.floor(plan.x - 4); xx <= Math.ceil(plan.x + 4); xx++) {
+      if (xx < 1 || zz < 1 || xx >= w.size || zz >= w.size) continue;
+      const d = distToRect(xx, zz, plan.x, plan.z, plan.angle, sz.w / 2 + 0.3, sz.d / 2 + 0.3);
+      const k = w.vi(xx, zz);
+      if (w.lock[k] & 2) continue;
+      const wgt = d <= 0 ? 1 : Math.max(0, 1 - d / 2);
+      if (wgt > 0) w.setVertex(xx, zz, w.h[k] + (plan.y - 0.08 - w.h[k]) * wgt);
+    }
+    applyEarthworks(w, [e]);
+    w.removeTreesNear(plan.x, plan.z, Math.hypot(sz.w, sz.d) / 2 + 0.5);
+    w.markObjArea(plan.x - 4, plan.z - 4, plan.x + 4, plan.z + 4);
+    // road depots connect themselves to the nearest road
+    if (kind === 'road') {
+      const ne = net.nearestEdge(exit.x, exit.z, 4, 'road', (ed) => ed.depot < 0);
+      if (ne) {
+        const to = findSnap(g, 'road', exit.x + 0, exit.z + 0, 0.01);
+        void to;
+        const target = ne.s < 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.a } : ne.s > ne.edge.len - 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.b } : null;
+        const p = { x: 0, y: 0, z: 0 };
+        w.net.pointAt(ne.edge, ne.s, p);
+        const end = target ? { ...target, x: w.net.nodes.get(target.node)!.x, z: w.net.nodes.get(target.node)!.z, y: w.net.nodes.get(target.node)!.y } : { kind: 'edge' as const, x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
+        if (Math.hypot(end.x - exit.x, end.z - exit.z) > 0.3) {
+          const prop = planEdge(g, { kind: 'node', x: exit.x, z: exit.z, y: exit.y, node: exit.id }, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+          if (prop.ok) commitProposal(g, prop);
+        }
+      }
+    }
+    g.onNetworkChanged();
+    return null;
+  }
+
+  remove(id: number): string | null {
+    const g = this.game;
+    const dp = this.map.get(id);
+    if (!dp) return null;
+    if (g.vehicles.all().some((v) => (v as any).depotId === id && !(v as any).onMap)) return 'Vehicles are in the depot';
+    if (g.vehicles.isEdgeBusy(dp.edge)) return 'Vehicle in the way';
+    g.world.net.removeEdge(dp.edge);
+    this.map.delete(id);
+    g.world.markObjArea(dp.x - 4, dp.z - 4, dp.x + 4, dp.z + 4);
+    g.onNetworkChanged();
+    return null;
+  }
+}
+
+// ------------------------------------------------------------------ signals
+
+/** Place or cycle a signal on a rail edge near (x,z). */
+export function toggleSignal(g: Game, x: number, z: number, owner: number): string | null {
+  const net = g.world.net;
+  // existing signal node?
+  const n = net.nearestNode(x, z, 0.8, 'rail', (nn) => nn.edges.length === 2);
+  if (n && n.signal) {
+    n.signal = (n.signal + 1) % 4;
+    net.version++;
+    g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2);
+    g.onNetworkChanged();
+    return null;
+  }
+  const ne = net.nearestEdge(x, z, 1.0, 'rail');
+  if (!ne) return 'Click on a track';
+  const e = ne.edge;
+  if (e.station >= 0 || e.depot >= 0) return 'Cannot place signals in stations or depots';
+  if (e.owner !== owner) return 'Not your track';
+  let node = n && Math.hypot(n.x - x, n.z - z) < 0.8 ? n : null;
+  if (!node) {
+    if (ne.s < 1 || ne.s > e.len - 1) {
+      const end = net.nodes.get(ne.s < 1 ? e.a : e.b)!;
+      if (end.edges.length !== 2) return 'Signals need plain track (not at a switch)';
+      node = end;
+    } else {
+      if (g.vehicles.isEdgeBusy(e.id)) return 'Train in the way';
+      const r = net.splitEdge(e.id, ne.s);
+      if (!r) return 'Cannot place here';
+      node = r.node;
+    }
+  }
+  if (!g.company(owner).economy.spend(9000, 'construction')) return 'Not enough money';
+  // default: one-way in the direction from the click towards the edge's end
+  node.signal = 1;
+  net.version++;
+  g.world.markObjArea(node.x - 2, node.z - 2, node.x + 2, node.z + 2);
+  g.onNetworkChanged();
   return null;
 }
 
-export function toggleSignal(game: Game, x: number, z: number): string | null {
-  const w = game.world;
-  if (!w.inBounds(x, z)) return 'Out of bounds';
-  const t = w.idx(x, z);
-  if (!w.rail[t]) return 'No track here';
-  if (w.station[t] >= 0) return 'Cannot place signals in stations';
-  if (w.pieceCount(t) !== 1) return 'Signals need plain track (no junctions)';
-  const cur = w.signal[t];
-  const next = (cur + 1) % 4;
-  if (cur === 0 && !game.economy.spend(COSTS.signal, 'construction')) return 'Not enough money';
-  w.signal[t] = next;
-  w.markTile(x, z);
-  game.onNetworkChanged();
-  return null;
-}
-
-export function removeSignal(game: Game, x: number, z: number) {
-  const w = game.world;
-  const t = w.idx(x, z);
-  if (w.signal[t]) { w.signal[t] = 0; w.markTile(x, z); game.onNetworkChanged(); }
-}
-
-function removeStructure(game: Game, sid: number): boolean {
-  const w = game.world;
-  const s = w.structures.get(sid);
-  if (!s) return true;
-  if (game.vehicles.isStructureBusy(sid)) return false;
-  const ta = w.idx(s.ax, s.az), tb = w.idx(s.bx, s.bz);
-  w.heads.delete(ta * 4 + s.dir);
-  w.heads.delete(tb * 4 + OPP[s.dir]);
-  for (let k = 1; k <= s.span; k++) {
-    const qx = s.ax + DX[s.dir] * k, qz = s.az + DZ[s.dir] * k;
-    w.span[w.idx(qx, qz)] = -1;
-    w.markTile(qx, qz);
-  }
-  w.structures.delete(sid);
-  clearStructureCache(sid);
-  w.markTile(s.ax, s.az); w.markTile(s.bx, s.bz);
-  return true;
-}
+// ------------------------------------------------------------------ demolition
 
 export interface BulldozeResult { cost: number; error: string | null; changed: number }
 
-/** Estimate or perform demolition of a rectangle. */
-export function bulldoze(game: Game, x0: number, z0: number, x1: number, z1: number, dryRun: boolean): BulldozeResult {
-  const w = game.world;
+/** Remove objects at a point (radius) or in a rectangle. */
+export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number, owner: number, dryRun: boolean): BulldozeResult {
+  const w = g.world;
+  const net = w.net;
   if (x0 > x1) [x0, x1] = [x1, x0];
   if (z0 > z1) [z0, z1] = [z1, z0];
-  let cost = 0, changed = 0;
-  let error: string | null = null;
-  const touchedTowns = new Set<number>();
-  for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
-    if (!w.inBounds(x, z)) continue;
-    const t = w.idx(x, z);
-    let c = 0;
-    if (w.rail[t]) c += COSTS.removeRail * w.pieceCount(t);
-    if (w.road[t] && !(w.station[t] >= 0 && w.stationKind[t] === 2)) c += COSTS.removeRoad;
-    if (w.station[t] >= 0) c += COSTS.removeRail;
-    if (w.depot[t] >= 0) c += COSTS.removeRail * 2;
-    const b = w.building[t];
-    if (b >= 0) c += (w.buildings[b]!.pop + 5) * COSTS.removeBuildingPerPop;
-    if (w.trees[t] & 15) c += (w.trees[t] & 15) * COSTS.tree;
-    if (c === 0 && ![0, 1, 2, 3].some((e) => w.headAt(t, e) >= 0)) continue;
-    if (game.isTileBusy(t)) { error = 'Vehicle in the way'; continue; }
-    if (w.depot[t] >= 0) {
-      const id = w.depot[t];
-      if (game.vehicles.all().some((v) => (v as any).depotId === id && !(v as any).onMap)) { error = 'Vehicles are in the depot'; continue; }
-    }
-    if (dryRun) { cost += c; changed++; continue; }
-    // structures
-    let blocked = false;
-    for (let e = 0; e < 4; e++) {
-      const sid = w.headAt(t, e);
-      if (sid >= 0 && !removeStructure(game, sid)) { error = 'Vehicle on bridge or tunnel'; blocked = true; }
-    }
-    if (blocked) continue;
-    cost += c;
-    changed++;
-    if (w.station[t] >= 0) {
-      const kind = w.stationKind[t];
-      game.stations.removeTile(t);
-      if (kind === 1) { w.rail[t] = 0; w.signal[t] = 0; }
+  const point = x1 - x0 < 0.01 && z1 - z0 < 0.01;
+  const res: BulldozeResult = { cost: 0, error: null, changed: 0 };
+  const inArea = (x: number, z: number, pad: number) => x >= x0 - pad && x <= x1 + pad && z >= z0 - pad && z <= z1 + pad;
+  // stations
+  for (const st of g.stations.all()) {
+    const hit = g.stations.footprints(st).some((f) => point ? distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1 : inArea(f.x, f.z, 0)) ||
+      st.stops.some((p) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
+    if (!hit) continue;
+    if (st.owner !== owner) { res.error = 'Owned by another company'; continue; }
+    res.cost += 20000; res.changed++;
+    if (dryRun) continue;
+    if (st.rail && (point ? g.stations.footprints(st).some((f) => distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1) : true)) {
+      const err = g.stations.removeStation(st.id);
+      if (err) res.error = err;
     } else {
-      if (w.rail[t]) { w.rail[t] = 0; w.signal[t] = 0; }
-      if (w.road[t]) {
-        // detach neighbours' edges pointing here
-        for (let d = 0; d < 4; d++) {
-          if (!(w.road[t] & (1 << d))) continue;
-          const n = w.neighbour(t, d);
-          if (n < 0 || !(w.road[n] & (1 << OPP[d])) || w.headAt(t, d) >= 0) continue;
-          w.road[n] &= ~(1 << OPP[d]);
-          if (w.road[n] === 0) { w.roadOwner[n] = 0; w.townOf[n] = -1; }
-          w.markTile(w.tx(n), w.tz(n));
-        }
-        w.road[t] = 0;
-        w.roadOwner[t] = 0;
+      for (let i = st.stops.length - 1; i >= 0; i--) {
+        const p = st.stops[i];
+        if (point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0)) g.stations.removeStop(st, i);
       }
     }
-    if (w.depot[t] >= 0) { w.depots.delete(w.depot[t]); w.depot[t] = -1; }
-    if (b >= 0) {
-      const bb = w.buildings[b]!;
-      const town = game.towns.list[bb.townId];
-      if (town) { town.buildings.delete(b); touchedTowns.add(town.id); }
-      w.removeBuilding(b);
+  }
+  // depots
+  for (const dp of g.depots.all()) {
+    const sz = depotSize(dp.kind);
+    const hit = point ? distToRect(x0, z0, dp.x, dp.z, dp.angle, sz.w / 2, sz.d / 2) < 0.1 : inArea(dp.x, dp.z, 0);
+    if (!hit) continue;
+    if (dp.owner !== owner) { res.error = 'Owned by another company'; continue; }
+    res.cost += 15000; res.changed++;
+    if (!dryRun) { const err = g.depots.remove(dp.id); if (err) res.error = err; }
+  }
+  // edges
+  const edges = point ? (() => { const ne = net.nearestEdge(x0, z0, 0.9); return ne ? [ne.edge] : []; })()
+    : net.edgesNear(x0, z0, x1, z1).filter((e) => { const geo = net.geo(e); for (let i = 0; i < geo.n; i++) if (inArea(geo.pts[i * 3], geo.pts[i * 3 + 2], 0)) return true; return false; });
+  const removed: NEdge[] = [];
+  for (const e of edges) {
+    if (e.station >= 0 || e.depot >= 0) continue;
+    if (e.owner >= 0 && e.owner !== owner) { res.error = 'Owned by another company'; continue; }
+    if (g.vehicles.isEdgeBusy(e.id)) { res.error = 'Vehicle in the way'; continue; }
+    res.cost += (e.kind === 'rail' ? 400 : 250) * e.len; res.changed++;
+    if (!dryRun) removed.push(e);
+  }
+  // buildings (point only, or all in area)
+  const blds = point ? w.buildingsNear(x0, z0, 4).filter((b) => distToRect(x0, z0, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.05)
+    : [...w.buildings.values()].filter((b) => inArea(b.x, b.z, 0));
+  for (const b of blds) {
+    res.cost += 6000 + b.pop * 2500; res.changed++;
+    if (!dryRun) g.towns.demolishBuilding(b.id);
+  }
+  // trees in area
+  if (!point) {
+    let n = 0;
+    for (const id of w.treeGrid.query(x0, z0, x1, z1)) { const t = w.trees[id]; if (t && inArea(t.x, t.z, 0)) n++; }
+    res.cost += n * 250;
+    if (n) res.changed++;
+    if (!dryRun && n) {
+      for (const id of w.treeGrid.query(x0, z0, x1, z1)) {
+        const t = w.trees[id];
+        if (t && inArea(t.x, t.z, 0)) { w.trees[id] = null; w.freeTrees.push(id); w.treeGrid.remove(id); w.markObj(t.x, t.z); }
+      }
     }
-    w.trees[t] = 0;
-    if (w.road[t] === 0 && w.building[t] < 0) w.townOf[t] = -1;
-    w.markTile(x, z);
   }
-  if (!dryRun) {
-    if (cost > 0) game.economy.spend(cost, 'construction', true);
-    for (const id of touchedTowns) game.towns.recomputePop(game.towns.list[id]);
-    if (changed) game.onNetworkChanged();
+  if (!dryRun && removed.length) {
+    let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
+    for (const e of removed) {
+      const b = net.grid.box(e.id);
+      if (b) { bx0 = Math.min(bx0, b[0]); bz0 = Math.min(bz0, b[1]); bx1 = Math.max(bx1, b[2]); bz1 = Math.max(bz1, b[3]); }
+      net.removeEdge(e.id);
+    }
+    recomputeLocks(w, bx0, bz0, bx1, bz1);
+    g.onNetworkChanged();
   }
-  return { cost, error, changed };
+  if (!dryRun && res.cost > 0) g.company(owner).economy.spend(res.cost, 'construction', true);
+  return res;
 }
 
-export function terraformCorner(game: Game, cx: number, cz: number, delta: number, dryRun = false): { ok: boolean; error?: string; cost: number } {
-  const w = game.world;
-  if (cx < 1 || cz < 1 || cx >= w.size || cz >= w.size) return { ok: false, error: 'Cannot modify map edge', cost: 0 };
-  if (cornerLocked(w, cx, cz)) return { ok: false, error: 'Construction in the way', cost: 0 };
-  const h = w.cornerH(cx, cz) + delta;
-  if (h < -3 || h > 60) return { ok: false, error: 'Height limit reached', cost: 0 };
-  const cost = COSTS.terraform;
-  if (dryRun) return { ok: true, cost };
-  if (!game.economy.spend(cost, 'construction')) return { ok: false, error: 'Not enough money', cost };
-  w.setCorner(cx, cz, h);
-  return { ok: true, cost };
+export function terraformBrush(g: Game, x: number, z: number, radius: number, mode: 'raise' | 'lower' | 'level', level: number, owner: number): { cost: number; error?: string } {
+  const vol = brush(g.world, x, z, radius, mode, 0.25, level, true);
+  const cost = Math.round(vol * 1500);
+  if (cost <= 0) return { cost: 0 };
+  if (!g.company(owner).economy.spend(cost, 'construction')) return { cost, error: 'Not enough money' };
+  brush(g.world, x, z, radius, mode, 0.25, level, false);
+  return { cost };
 }
 
-export function levelArea(game: Game, cx0: number, cz0: number, cx1: number, cz1: number, level: number, dryRun = false): { cost: number; skipped: number; error?: string } {
-  const w = game.world;
-  if (cx0 > cx1) [cx0, cx1] = [cx1, cx0];
-  if (cz0 > cz1) [cz0, cz1] = [cz1, cz0];
-  let cost = 0, skipped = 0;
-  const changes: [number, number][] = [];
-  for (let cz = Math.max(1, cz0); cz <= Math.min(w.size - 1, cz1); cz++) for (let cx = Math.max(1, cx0); cx <= Math.min(w.size - 1, cx1); cx++) {
-    const h = w.cornerH(cx, cz);
-    if (h === level) continue;
-    if (cornerLocked(w, cx, cz)) { skipped++; continue; }
-    cost += Math.abs(h - level) * COSTS.terraform;
-    changes.push([cx, cz]);
-  }
-  if (dryRun) return { cost, skipped };
-  if (!game.economy.canAfford(cost)) return { cost, skipped, error: 'Not enough money' };
-  game.economy.spend(cost, 'construction');
-  for (const [cx, cz] of changes) w.setCorner(cx, cz, level);
-  return { cost, skipped };
-}
-
-export function isFlat(w: World, x: number, z: number) { return w.slope(x, z) === SLOPE_FLAT; }
+export function isWorld(w: World) { return !!w; }
+export { RAIL };

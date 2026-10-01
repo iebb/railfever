@@ -1,108 +1,83 @@
-// Procedural terrain generation.
+// Procedural terrain (continuous heights, 1 unit = 10 m) and vegetation.
 import { World } from './world';
 import { RNG, Simplex2 } from './rng';
+import { WATER_Y } from './constants';
 
 export type Hilliness = 'flat' | 'hilly' | 'mountainous';
 export type WaterAmount = 'low' | 'medium' | 'high';
 
-export interface TerrainOptions {
-  seed: number;
-  hilliness: Hilliness;
-  water: WaterAmount;
-}
+export interface TerrainOptions { seed: number; hilliness: Hilliness; water: WaterAmount }
 
-/** Fill the world's corner heights. */
 export function generateHeights(world: World, opt: TerrainOptions) {
   const s = world.size;
   const s1 = s + 1;
-  const noise = new Simplex2(opt.seed);
-  const noise2 = new Simplex2(opt.seed * 7 + 13);
-  const noise3 = new Simplex2(opt.seed * 31 + 5);
-  const amp = opt.hilliness === 'flat' ? { base: 3.5, mtn: 5 } : opt.hilliness === 'hilly' ? { base: 6.5, mtn: 18 } : { base: 9, mtn: 38 };
-  const seaBias = opt.water === 'low' ? 4.5 : opt.water === 'medium' ? 2.6 : 0.8;
-  const contF = 1 / Math.max(80, s * 0.55);
-  const baseF = 1 / 42;
-  const mtnF = 1 / 70;
-
-  const H = new Float32Array(s1 * s1);
-  const mask = new Float32Array(s1 * s1);
+  const n1 = new Simplex2(opt.seed);
+  const n2 = new Simplex2(opt.seed * 7 + 13);
+  const n3 = new Simplex2(opt.seed * 31 + 5);
+  const n4 = new Simplex2(opt.seed * 53 + 17);
+  const amp = opt.hilliness === 'flat' ? { hill: 2.5, mtn: 4, base: 2 } : opt.hilliness === 'hilly' ? { hill: 6, mtn: 16, base: 3.5 } : { hill: 9, mtn: 36, base: 5 };
+  const seaBias = opt.water === 'low' ? 5 : opt.water === 'medium' ? 3 : 1.2;
+  const contF = 1 / Math.max(220, s * 0.6);
+  const hillF = 1 / 75;
+  const mtnF = 1 / 140;
   for (let z = 0; z <= s; z++) {
     for (let x = 0; x <= s; x++) {
-      const cont = noise.fbm(x * contF + 11.3, z * contF - 7.1, 3);
-      const base = noise2.fbm(x * baseF, z * baseF, 5, 2.0, 0.5);
-      const m = smooth(0.05, 0.55, noise3.fbm(x * mtnF * 0.6 + 40, z * mtnF * 0.6 - 30, 2));
-      const ridge = noise3.ridged(x * mtnF, z * mtnF, 5);
-      // slight lowering towards map edges so coasts appear at the borders sometimes
+      const cont = n1.fbm(x * contF + 11.3, z * contF - 7.1, 3);
+      const hills = n2.fbm(x * hillF, z * hillF, 5, 2.0, 0.5);
+      const mask = smooth(0.05, 0.55, n3.fbm(x * mtnF * 0.55 + 40, z * mtnF * 0.55 - 30, 2));
+      const ridge = n3.ridged(x * mtnF, z * mtnF, 5);
+      const detail = n4.fbm(x / 18, z / 18, 3) * 0.6;
       const ex = Math.min(x, s - x) / s, ez = Math.min(z, s - z) / s;
-      const edge = smooth(0.0, 0.12, Math.min(ex, ez));
-      let h = seaBias + cont * 7 + base * amp.base + ridge * m * amp.mtn - (1 - edge) * 3;
-      // terraces on lowland make flat building land more common
-      if (h > 0.5 && h < 8) h = h * 0.75 + Math.round(h) * 0.25;
-      H[z * s1 + x] = h;
-      mask[z * s1 + x] = m;
+      const edge = smooth(0, 0.1, Math.min(ex, ez));
+      let h = seaBias + cont * amp.base * 2.2 + hills * amp.hill + ridge * mask * amp.mtn + detail - (1 - edge) * 4;
+      // gentle valley floors: compress low land a bit
+      if (h > 0 && h < 4) h = h * 0.85;
+      world.h[z * s1 + x] = h;
     }
   }
-  const L = world.hgt;
-  for (let i = 0; i < L.length; i++) {
-    let v = Math.round(H[i]);
-    if (v < -3) v = -3;
-    if (v > 60) v = 60;
-    L[i] = v;
-  }
-  // Lipschitz constraint: neighbouring corners may differ by at most 1 (2-3 in mountains)
-  const maxd = new Uint8Array(s1 * s1);
-  for (let i = 0; i < maxd.length; i++) maxd[i] = 1 + Math.floor(mask[i] * (opt.hilliness === 'mountainous' ? 3.6 : opt.hilliness === 'hilly' ? 2.2 : 0));
-  clampSlopes(L, s1, maxd);
-}
-
-export function clampSlopes(L: Int16Array, s1: number, maxd: Uint8Array | number) {
-  const md = (i: number) => (typeof maxd === 'number' ? maxd : maxd[i]);
-  for (let iter = 0; iter < 6; iter++) {
-    let changed = false;
+  // limit extreme slopes (keeps cliffs plausible)
+  const maxStep = opt.hilliness === 'mountainous' ? 3.2 : opt.hilliness === 'hilly' ? 1.8 : 0.8;
+  for (let it = 0; it < 3; it++) {
     for (let pass = 0; pass < 2; pass++) {
-      const fwd = pass === 0;
-      for (let zz = 0; zz < s1; zz++) {
-        const z = fwd ? zz : s1 - 1 - zz;
-        for (let xx = 0; xx < s1; xx++) {
-          const x = fwd ? xx : s1 - 1 - xx;
+      for (let zz = 0; zz <= s; zz++) {
+        const z = pass ? s - zz : zz;
+        for (let xx = 0; xx <= s; xx++) {
+          const x = pass ? s - xx : xx;
           const i = z * s1 + x;
-          let m = L[i];
-          const d = md(i);
-          if (x > 0) m = Math.min(m, L[i - 1] + d);
-          if (x < s1 - 1) m = Math.min(m, L[i + 1] + d);
-          if (z > 0) m = Math.min(m, L[i - s1] + d);
-          if (z < s1 - 1) m = Math.min(m, L[i + s1] + d);
-          if (m < L[i]) { L[i] = m; changed = true; }
+          let m = world.h[i];
+          if (x > 0) m = Math.min(m, world.h[i - 1] + maxStep);
+          if (x < s) m = Math.min(m, world.h[i + 1] + maxStep);
+          if (z > 0) m = Math.min(m, world.h[i - s1] + maxStep);
+          if (z < s) m = Math.min(m, world.h[i + s1] + maxStep);
+          world.h[i] = m;
         }
       }
     }
-    if (!changed) break;
   }
+  world.heightsVersion++;
 }
 
-/** Place forests and scattered trees. */
+/** Scatter trees in forests and some solitary ones. */
 export function generateTrees(world: World, seed: number) {
   const s = world.size;
   const rng = new RNG(seed * 3 + 1);
   const noise = new Simplex2(seed * 17 + 3);
-  for (let z = 0; z < s; z++) {
-    for (let x = 0; x < s; x++) {
-      const t = world.idx(x, z);
-      if (!world.isEmpty(t) || world.townOf[t] >= 0) continue;
-      const mn = world.tileMin(x, z);
-      if (mn <= 0) continue;
-      const f = noise.fbm(x / 28, z / 28, 4) + 0.15 * noise.noise(x / 6, z / 6);
-      const hgt = world.tileMax(x, z);
-      let count = 0;
-      if (f > 0.12) count = 1 + Math.min(3, Math.floor((f - 0.12) * 12 + rng.next() * 1.5));
-      else if (rng.chance(0.035)) count = 1;
-      if (count > 0) {
-        // conifers at altitude, deciduous lower, mixed between
-        const alt = hgt / 25;
-        const conifer = rng.next() < 0.25 + alt * 1.2 + noise.noise(x / 40 + 100, z / 40) * 0.3;
-        const type = conifer ? 1 : 0;
-        world.trees[t] = Math.min(4, count) | (type << 4);
-      }
+  const cell = 1.6;
+  for (let gz = 0; gz < s; gz += cell) {
+    for (let gx = 0; gx < s; gx += cell) {
+      const f = noise.fbm(gx / 55, gz / 55, 4) + 0.18 * noise.noise(gx / 9, gz / 9);
+      let p = 0;
+      if (f > 0.1) p = Math.min(0.95, (f - 0.1) * 3.2);
+      else p = 0.02;
+      if (rng.next() > p) continue;
+      const x = gx + rng.next() * cell, z = gz + rng.next() * cell;
+      const h = world.heightAt(x, z);
+      if (h < WATER_Y + 0.3) continue;
+      const slope = world.slopeAt(x, z);
+      if (slope > 1.2) continue;
+      const alt = h / 25;
+      const conifer = rng.next() < 0.25 + alt * 1.1 + noise.noise(x / 60 + 100, z / 60) * 0.3;
+      world.addTree({ x, z, s: 0.75 + rng.next() * 0.65, type: conifer ? 1 : 0, tint: rng.next() });
     }
   }
 }
