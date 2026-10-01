@@ -35,6 +35,9 @@ export function clear(el: HTMLElement) { while (el.firstChild) el.removeChild(el
 
 export function fmtInt(n: number) { return Math.round(n).toLocaleString('en-US'); }
 
+/** Escape text for innerHTML. */
+export function esc(s: string) { return s.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!); }
+
 export function bar(frac: number, color?: string): HTMLElement {
   const f = Math.max(0, Math.min(1, frac));
   const col = color ?? (f > 0.66 ? '#4cd964' : f > 0.4 ? '#ffcc00' : '#ff5e3a');
@@ -62,6 +65,7 @@ export const ICONS: Record<string, string> = {
   play: '<path d="M7 4l13 8-13 8z" fill="currentColor"/>',
   ff: '<path d="M3 5l9 7-9 7zM12 5l9 7-9 7z" fill="currentColor"/>',
   news: '<path d="M4 4h13v16H6a2 2 0 01-2-2zM17 8h3v10a2 2 0 01-2 2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M7 8h7M7 12h7M7 16h5" stroke="currentColor" stroke-width="1.8"/>',
+  company: '<path d="M4 21V9l6-4v4l6-4v16z" fill="currentColor"/><path d="M18 21V3h3v18z" fill="currentColor"/>',
   help: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 9a3 3 0 115 2c-1 .7-2 1.3-2 3M12 17v1" stroke="currentColor" stroke-width="2" fill="none"/>',
 };
 

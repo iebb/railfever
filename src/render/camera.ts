@@ -1,18 +1,22 @@
-// RTS-style camera: pan, orbit, zoom-to-cursor, follow.
+// RTS-style camera: pan, orbit, zoom-to-cursor, follow. 1 unit = 10 m.
 import * as THREE from 'three';
-import type { World } from '../game/world';
+import { World, pointInRect } from '../game/world';
+import { WATER_Y } from '../game/constants';
+import { FLOOR_H } from '../game/towns';
 
 export class CameraController {
-  target = new THREE.Vector3(32, 0, 32);
-  distance = 28;
+  target = new THREE.Vector3(128, 0, 128);
+  distance = 60;
   yaw = Math.PI * 0.25;
-  pitch = 0.85;
-  private cur = { tx: 32, ty: 0, tz: 32, d: 28, yaw: Math.PI * 0.25, pitch: 0.85 };
+  pitch = 0.8;
+  private cur = { tx: 128, ty: 0, tz: 128, d: 60, yaw: Math.PI * 0.25, pitch: 0.8 };
   keys = new Set<string>();
   follow: (() => THREE.Vector3 | null) | null = null;
-  private drag: { mode: 'pan' | 'rotate'; x: number; y: number; ground: THREE.Vector3 | null } | null = null;
-  minDist = 3;
-  maxDist = 150;
+  private drag: { mode: 'pan' | 'rotate'; x: number; y: number } | null = null;
+  minDist = 1.5;
+  maxDist = 700;
+  minPitch = 0.1;
+  maxPitch = 1.5;
   enabled = true;
   /** Whether a single finger drag should pan (set by the UI: only in inspect mode). */
   singleTouchPan: () => boolean = () => true;
@@ -22,13 +26,14 @@ export class CameraController {
   constructor(
     public camera: THREE.PerspectiveCamera,
     private dom: HTMLElement,
-    public world: World,
+    public world: World | null,
     private pickGround: (cx: number, cy: number) => THREE.Vector3 | null,
   ) {
     dom.addEventListener('wheel', this.onWheel, { passive: false });
     dom.addEventListener('pointerdown', this.onDown);
     window.addEventListener('pointermove', this.onMove);
     window.addEventListener('pointerup', this.onUp);
+    window.addEventListener('pointercancel', this.onUp);
     window.addEventListener('keydown', this.onKey);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', () => this.keys.clear());
@@ -37,13 +42,13 @@ export class CameraController {
   }
 
   private touchState() {
-    const pts = [...this.touches.values()];
-    const [a, b] = pts;
+    const [a, b] = [...this.touches.values()];
     return { d: Math.hypot(b.x - a.x, b.y - a.y), a: Math.atan2(b.y - a.y, b.x - a.x), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 };
   }
 
+  /** Pan by a screen-space delta (pixels). */
   private panBy(dx: number, dy: number) {
-    const s = (this.distance * 2 * Math.tan((this.camera.fov * Math.PI) / 360)) / this.dom.clientHeight;
+    const s = (this.distance * 2 * Math.tan((this.camera.fov * Math.PI) / 360)) / Math.max(1, this.dom.clientHeight);
     const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
     const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
     const pk = 1 / Math.max(0.35, Math.sin(this.pitch));
@@ -55,21 +60,27 @@ export class CameraController {
 
   setWorld(w: World) {
     this.world = w;
+    this.maxDist = Math.max(250, Math.min(750, w.size * 0.95));
+    this.follow = null;
     this.target.set(w.size / 2, 0, w.size / 2);
-    this.cur.tx = this.target.x; this.cur.tz = this.target.z;
+    this.distance = Math.min(this.maxDist, 90);
+    const c = this.cur;
+    c.tx = this.target.x; c.tz = this.target.z; c.ty = Math.max(w.heightAt(c.tx, c.tz), WATER_Y);
+    c.d = this.distance;
   }
 
   jumpTo(x: number, z: number, dist?: number) {
     this.follow = null;
     this.target.x = x; this.target.z = z;
-    if (dist) this.distance = dist;
+    if (dist) this.distance = Math.max(this.minDist, Math.min(this.maxDist, dist));
+    this.clampTarget();
   }
 
   private onWheel = (e: WheelEvent) => {
     if (!this.enabled) return;
     e.preventDefault();
-    const delta = e.deltaMode === 1 ? e.deltaY * 30 : e.deltaY;
-    const factor = Math.exp(delta * (e.ctrlKey ? 0.01 : 0.0012));
+    const delta = e.deltaMode === 1 ? e.deltaY * 30 : e.deltaMode === 2 ? e.deltaY * 300 : e.deltaY;
+    const factor = Math.exp(Math.max(-1, Math.min(1, delta * (e.ctrlKey ? 0.01 : 0.0014))));
     const nd = Math.max(this.minDist, Math.min(this.maxDist, this.distance * factor));
     // zoom towards the cursor
     if (!this.follow) {
@@ -78,6 +89,7 @@ export class CameraController {
         const k = 1 - nd / this.distance;
         this.target.x += (g.x - this.target.x) * k;
         this.target.z += (g.z - this.target.z) * k;
+        this.clampTarget();
       }
     }
     this.distance = nd;
@@ -88,14 +100,14 @@ export class CameraController {
     if (e.pointerType === 'touch') {
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (this.touches.size === 2) { this.gesture = this.touchState(); this.drag = null; }
-      else if (this.touches.size === 1 && this.singleTouchPan()) this.drag = { mode: 'pan', x: e.clientX, y: e.clientY, ground: null };
+      else if (this.touches.size === 1 && this.singleTouchPan()) this.drag = { mode: 'pan', x: e.clientX, y: e.clientY };
       return;
     }
     const rotate = e.button === 1 || (e.button === 2 && (e.shiftKey || e.altKey)) || (e.button === 0 && e.altKey);
     const pan = e.button === 2 && !rotate;
     if (!rotate && !pan) return;
     e.preventDefault();
-    this.drag = { mode: rotate ? 'rotate' : 'pan', x: e.clientX, y: e.clientY, ground: pan ? this.pickGround(e.clientX, e.clientY) : null };
+    this.drag = { mode: rotate ? 'rotate' : 'pan', x: e.clientX, y: e.clientY };
     if (pan) this.follow = null;
   };
 
@@ -116,16 +128,8 @@ export class CameraController {
     this.drag.x = e.clientX; this.drag.y = e.clientY;
     if (this.drag.mode === 'rotate') {
       this.yaw -= dx * 0.006;
-      this.pitch = Math.max(0.22, Math.min(1.45, this.pitch + dy * 0.005));
-    } else {
-      const s = (this.distance * 2 * Math.tan((this.camera.fov * Math.PI) / 360)) / this.dom.clientHeight;
-      const fx = -Math.sin(this.yaw), fz = -Math.cos(this.yaw);
-      const rx = Math.cos(this.yaw), rz = -Math.sin(this.yaw);
-      const pk = 1 / Math.max(0.35, Math.sin(this.pitch));
-      this.target.x -= (rx * dx - fx * dy * pk) * s;
-      this.target.z -= (rz * dx - fz * dy * pk) * s;
-      this.clampTarget();
-    }
+      this.pitch = Math.max(this.minPitch, Math.min(this.maxPitch, this.pitch + dy * 0.005));
+    } else this.panBy(dx, dy);
   };
 
   private onUp = (e?: PointerEvent) => {
@@ -139,14 +143,21 @@ export class CameraController {
   private onKey = (e: KeyboardEvent) => {
     const tag = (e.target as HTMLElement)?.tagName;
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (e.ctrlKey || e.metaKey) return;
     this.keys.add(e.key.toLowerCase());
   };
   private onKeyUp = (e: KeyboardEvent) => { this.keys.delete(e.key.toLowerCase()); };
 
   private clampTarget() {
-    const s = this.world.size;
-    this.target.x = Math.max(-2, Math.min(s + 2, this.target.x));
-    this.target.z = Math.max(-2, Math.min(s + 2, this.target.z));
+    const s = this.world ? this.world.size : 1e6;
+    this.target.x = Math.max(0, Math.min(s, this.target.x));
+    this.target.z = Math.max(0, Math.min(s, this.target.z));
+  }
+
+  /** Visible ground (terrain or water surface) height. */
+  private ground(x: number, z: number) {
+    const w = this.world!;
+    return Math.max(w.heightAt(x, z), WATER_Y);
   }
 
   update(dt: number) {
@@ -168,39 +179,43 @@ export class CameraController {
       }
       if (k.has('q')) this.yaw += dt * 1.6;
       if (k.has('e')) this.yaw -= dt * 1.6;
-      if (k.has('r')) this.pitch = Math.min(1.45, this.pitch + dt);
-      if (k.has('f')) this.pitch = Math.max(0.22, this.pitch - dt);
+      if (k.has('r')) this.pitch = Math.min(this.maxPitch, this.pitch + dt);
+      if (k.has('f')) this.pitch = Math.max(this.minPitch, this.pitch - dt);
       if (k.has('=') || k.has('+')) this.distance = Math.max(this.minDist, this.distance * (1 - dt * 1.5));
       if (k.has('-')) this.distance = Math.min(this.maxDist, this.distance * (1 + dt * 1.5));
     }
+    const cam = this.camera;
+    if (!this.world) { cam.position.set(this.target.x, 50, this.target.z + 50); cam.lookAt(this.target); return; }
     if (this.follow) {
       const p = this.follow();
-      if (p) { this.target.x = p.x; this.target.z = p.z; } else this.follow = null;
+      if (p) { this.target.x = p.x; this.target.z = p.z; this.clampTarget(); } else this.follow = null;
     }
-    const ground = this.world.heightAt(this.target.x, this.target.z);
-    this.target.y = Math.max(ground, 0.05);
+    this.target.y = this.ground(this.target.x, this.target.z);
     // smoothing
     const a = 1 - Math.exp(-dt * (this.follow ? 8 : 14));
     const c = this.cur;
     c.tx += (this.target.x - c.tx) * a;
-    c.ty += (this.target.y - c.ty) * (1 - Math.exp(-dt * 5));
+    c.ty += (this.target.y - c.ty) * (1 - Math.exp(-dt * 6));
     c.tz += (this.target.z - c.tz) * a;
     c.d += (this.distance - c.d) * a;
     c.yaw += (this.yaw - c.yaw) * a;
     c.pitch += (this.pitch - c.pitch) * a;
     const cp = Math.cos(c.pitch), spt = Math.sin(c.pitch);
-    const cam = this.camera;
     cam.position.set(c.tx + Math.sin(c.yaw) * cp * c.d, c.ty + spt * c.d, c.tz + Math.cos(c.yaw) * cp * c.d);
-    let minY = this.world.heightAt(cam.position.x, cam.position.z) + 0.4;
-    // keep the camera above buildings
-    const w = this.world;
-    const bx = Math.floor(cam.position.x), bz = Math.floor(cam.position.z);
-    for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
-      if (!w.inBounds(bx + dx, bz + dz)) continue;
-      const b = w.building[w.idx(bx + dx, bz + dz)];
-      if (b < 0) continue;
-      const bb = w.buildings[b];
-      if (bb) minY = Math.max(minY, w.tileMax(bb.x, bb.z) * 0.2 + bb.floors * 0.105 + 0.45);
+    // keep the camera above the ground and buildings
+    const clear = 0.08 + c.d * 0.02;
+    let minY = this.ground(cam.position.x, cam.position.z) + clear;
+    for (const b of this.world.buildingsNear(cam.position.x, cam.position.z, 3)) {
+      if (!pointInRect(cam.position.x, cam.position.z, b.x, b.z, b.angle, b.w / 2 + 0.2, b.d / 2 + 0.2)) continue;
+      minY = Math.max(minY, b.y + b.floors * FLOOR_H + 0.35 + Math.min(b.w, b.d) * 0.35 + 0.15);
+    }
+    // keep the line of sight to the focus above the terrain
+    for (let i = 1; i <= 8; i++) {
+      const f = i / 9;
+      const x = c.tx + (cam.position.x - c.tx) * f, z = c.tz + (cam.position.z - c.tz) * f;
+      const need = this.ground(x, z) + clear * f;
+      const y = c.ty + (cam.position.y - c.ty) * f;
+      if (y < need) minY = Math.max(minY, c.ty + (need - c.ty) / f);
     }
     if (cam.position.y < minY) cam.position.y = minY;
     cam.lookAt(c.tx, c.ty, c.tz);

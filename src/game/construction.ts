@@ -85,7 +85,8 @@ export function curveSpeed(radius: number): number {
 
 // ------------------------------------------------------------------------------------ snapping
 
-/** Parallel siblings of a rail end node: other free ends side by side with the same direction. */
+/** Parallel siblings of a rail end node: other free ends side by side with the same direction
+ *  (standard spacing on plain track, wider spacing at station throats). */
 export function nodeGroup(g: Game, nodeId: number): number[] {
   const net = g.world.net;
   const n = net.nodes.get(nodeId);
@@ -94,15 +95,13 @@ export function nodeGroup(g: Game, nodeId: number): number[] {
   if (free === 0) return [nodeId];
   const rx = -n.dz, rz = n.dx;
   const members: { id: number; off: number }[] = [{ id: n.id, off: 0 }];
-  for (const id of net.nodeGrid.query(n.x - 2.5, n.z - 2.5, n.x + 2.5, n.z + 2.5)) {
+  for (const id of net.nodeGrid.query(n.x - 6, n.z - 6, n.x + 6, n.z + 6)) {
     if (id === n.id) continue;
     const m = net.nodes.get(id)!;
     if (m.kind !== 'rail' || Math.abs(m.dx * n.dx + m.dz * n.dz) < 0.995) continue;
     const dx = m.x - n.x, dz = m.z - n.z;
     const along = dx * n.dx + dz * n.dz, lat = dx * rx + dz * rz;
-    if (Math.abs(along) > 0.2) continue;
-    const k = Math.round(lat / RAIL.spacing);
-    if (k === 0 || Math.abs(lat - k * RAIL.spacing) > 0.08) continue;
+    if (Math.abs(along) > 0.2 || Math.abs(lat) < 0.3) continue;
     // the sibling's free side must point the same way
     const fs = freeSide(g, m) * Math.sign(m.dx * n.dx + m.dz * n.dz);
     if (fs !== free) continue;
@@ -110,13 +109,22 @@ export function nodeGroup(g: Game, nodeId: number): number[] {
   }
   members.sort((a, b) => a.off - b.off);
   const idx = members.findIndex((m) => m.id === n.id);
+  const gapOk = (a: number, b: number) => { const d = members[b].off - members[a].off; return d > RAIL.spacing - 0.08 && d < 1.3; };
   let lo = idx, hi = idx;
-  while (lo > 0 && Math.abs(members[lo].off - members[lo - 1].off - RAIL.spacing) < 0.08) lo--;
-  while (hi < members.length - 1 && Math.abs(members[hi + 1].off - members[hi].off - RAIL.spacing) < 0.08) hi++;
+  while (lo > 0 && gapOk(lo - 1, lo)) lo--;
+  while (hi < members.length - 1 && gapOk(hi, hi + 1)) hi++;
   const out = members.slice(lo, hi + 1).map((m) => m.id);
   // order left->right relative to the direction the new track will leave in
   if (free < 0) out.reverse();
   return out;
+}
+
+/** N contiguous members of a group around one of its nodes. */
+function groupWindow(group: number[], nodeId: number, N: number): number[] {
+  if (group.length <= N) return group;
+  const idx = Math.max(0, group.indexOf(nodeId));
+  const lo = Math.max(0, Math.min(group.length - N, idx - Math.floor((N - 1) / 2)));
+  return group.slice(lo, lo + N);
 }
 
 /** Free side of a rail node: +1/-1 if all edges are on the other side, 0 if both sides used. */
@@ -292,12 +300,12 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const kind = opts.kind;
   // number of parallel tracks: a snapped group dictates it
   let N = kind === 'rail' ? Math.max(1, Math.min(4, opts.tracks)) : 1;
-  const sg = start.kind === 'node' && kind === 'rail' ? start.group ?? [start.node!] : null;
-  const egRaw = end.kind === 'node' && kind === 'rail' ? end.group ?? [end.node!] : null;
-  const eg = egRaw ? [...egRaw].reverse() : null;
-  if (sg && sg.length > 1) N = sg.length;
-  else if (sg && N > 1) N = 1;
-  if (start.kind === 'edge' || end.kind === 'edge') { if (N > 1) N = 1; }
+  if (start.kind === 'edge' || end.kind === 'edge') N = 1;
+  const sgFull = start.kind === 'node' && kind === 'rail' ? start.group ?? [start.node!] : null;
+  if (sgFull) N = Math.min(N, sgFull.length);
+  const sg = sgFull ? groupWindow(sgFull, start.node!, N) : null;
+  const egFull = end.kind === 'node' && kind === 'rail' ? [...(end.group ?? [end.node!])].reverse() : null;
+  const eg = egFull ? groupWindow(egFull, end.node!, N) : null;
   if (N > 1 && end.kind !== 'free' && !(eg && eg.length === N)) fail(`Connect ${N} parallel tracks to ${N} track ends`);
   // group centres
   const centre = (sn: Snap, grp: number[] | null): Snap => {
@@ -323,21 +331,48 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   prop.stats.speed = kind === 'rail' ? Math.min((TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(minR)) : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).speed;
   if (minR < minRadiusOf(opts)) fail(kind === 'rail' ? `Curve too tight (radius ${Math.round(minR * 10)} m, min ${minRadiusOf(opts) * 10} m)` : 'Curve too tight');
 
-  // per-track curves
-  const offsets: number[] = [];
-  for (let i = 0; i < N; i++) offsets.push((i - (N - 1) / 2) * RAIL.spacing);
+  // per-track curves: standard spacing, or the spacing of a snapped group (e.g. a station throat)
+  // when the segment is too short to converge within the minimum radius
   const ctab = arcTable(centreBez);
   const L = ctab.len;
   prop.stats.len = L * N;
-  for (let i = 0; i < N; i++) {
-    const bez = N === 1 ? centreBez : bezOffset(centreBez, offsets[i]);
-    // snap the ends exactly onto group nodes
-    if (sg && sg.length === N && N > 1) { const n = net.nodes.get(sg[i])!; bez.x1 += n.x - bez.x0; bez.z1 += n.z - bez.z0; bez.x0 = n.x; bez.z0 = n.z; }
-    if (eg && eg.length === N && N > 1) { const n = net.nodes.get(eg[i])!; bez.x2 += n.x - bez.x3; bez.z2 += n.z - bez.z3; bez.x3 = n.x; bez.z3 = n.z; }
-    const st: Snap = sg && sg.length === N && N > 1 ? { kind: 'node', x: bez.x0, z: bez.z0, y: 0, node: sg[i] } : N === 1 ? start : { kind: 'free', x: bez.x0, z: bez.z0, y: 0 };
-    const en: Snap = eg && eg.length === N && N > 1 ? { kind: 'node', x: bez.x3, z: bez.z3, y: 0, node: eg[i] } : N === 1 ? end : { kind: 'free', x: bez.x3, z: bez.z3, y: 0 };
-    prop.tracks.push({ bez, len: arcTable(bez).len, prof: new Float32Array(0), sections: [], start: st, end: en });
+  const std: number[] = [];
+  for (let i = 0; i < N; i++) std.push((i - (N - 1) / 2) * RAIL.spacing);
+  const groupOffs = (grp: number[] | null, cx: number, cz: number, tx: number, tz: number): number[] | null => {
+    if (!grp || grp.length !== N || N < 2) return null;
+    return grp.map((id) => { const n = net.nodes.get(id)!; return (n.x - cx) * -tz + (n.z - cz) * tx; });
+  };
+  const candidates = [std];
+  const so = groupOffs(sg, fa.x, fa.z, fa.tx, fa.tz), eo = groupOffs(eg, fb.x, fb.z, fb.tx, fb.tz);
+  if (so) candidates.push(so);
+  if (eo) candidates.push(eo);
+  const makeTracks = (offs: number[]): TrackPlan[] => {
+    const out: TrackPlan[] = [];
+    for (let i = 0; i < N; i++) {
+      const bez = N === 1 ? centreBez : bezOffset(centreBez, offs[i]);
+      // snap the ends exactly onto group nodes
+      if (sg && sg.length === N && N > 1) { const n = net.nodes.get(sg[i])!; bez.x1 += n.x - bez.x0; bez.z1 += n.z - bez.z0; bez.x0 = n.x; bez.z0 = n.z; }
+      if (eg && eg.length === N && N > 1) { const n = net.nodes.get(eg[i])!; bez.x2 += n.x - bez.x3; bez.z2 += n.z - bez.z3; bez.x3 = n.x; bez.z3 = n.z; }
+      const st: Snap = sg && sg.length === N && N > 1 ? { kind: 'node', x: bez.x0, z: bez.z0, y: 0, node: sg[i] } : N === 1 ? start : { kind: 'free', x: bez.x0, z: bez.z0, y: 0 };
+      const en: Snap = eg && eg.length === N && N > 1 ? { kind: 'node', x: bez.x3, z: bez.z3, y: 0, node: eg[i] } : N === 1 ? end : { kind: 'free', x: bez.x3, z: bez.z3, y: 0 };
+      out.push({ bez, len: arcTable(bez).len, prof: new Float32Array(0), sections: [], start: st, end: en });
+    }
+    return out;
+  };
+  let offsets = std, bestR = -1;
+  for (const offs of candidates) {
+    const tr = makeTracks(offs);
+    let r = minR;
+    if (N > 1) for (const tp of tr) r = Math.min(r, bezMinRadius(tp.bez, 48));
+    if (r > bestR) { prop.tracks = tr; offsets = offs; bestR = r; }
+    if (r >= minRadiusOf(opts)) break;
   }
+  if (N > 1 && bestR < minR) {
+    prop.stats.minRadius = bestR;
+    prop.stats.speed = Math.min(prop.stats.speed, curveSpeed(bestR));
+    if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Curve too tight (radius ${Math.round(bestR * 10)} m, min ${minRadiusOf(opts) * 10} m)`);
+  }
+  const spread = N > 1 ? Math.max(Math.abs(offsets[0]), Math.abs(offsets[N - 1])) : 0;
 
   // ---- sample centreline
   const M = Math.max(2, Math.ceil(L / PSTEP) + 1);
@@ -368,10 +403,11 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     desired.push(sum / cnt);
   }
   const cons: Constraint[] = [];
-  const startY = fa.y ?? (start.kind === 'free' ? terr[0] + opts.heightOffset : null);
+  // the height offset applies to the end being placed; a free start sits on the ground
+  const startY = fa.y ?? terr[0];
   const endY = fb.y ?? (end.kind === 'free' ? terr[M - 1] + opts.heightOffset : null);
   if (fa.y !== null) cons.push({ i: 0, kind: 'eq', v: fa.y });
-  else { desired[0] = startY!; if (opts.heightOffset) cons.push({ i: 0, kind: 'eq', v: startY! }); }
+  else desired[0] = startY;
   if (fb.y !== null) cons.push({ i: M - 1, kind: 'eq', v: fb.y });
   else { desired[M - 1] = endY!; if (opts.heightOffset) cons.push({ i: M - 1, kind: 'eq', v: endY! }); }
   for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push({ i, kind: 'ge', v: WATER_Y + WATER_DECK });
@@ -386,7 +422,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     if (sn.kind === 'node') { const n = net.nodes.get(sn.node!); if (n) { for (const e of n.edges) exclude.add(e); nearEnds.push({ x: n.x, z: n.z }); } }
     if (sn.kind === 'edge') { exclude.add(sn.edge!); nearEnds.push({ x: sn.x, z: sn.z }); }
   }
-  const hwNew = halfWidthOf(opts) + (N - 1) * RAIL.spacing * 0.5;
+  const hwNew = halfWidthOf(opts) + spread;
   const crossings: CrossingPlan[] = [];
   prop.tracks.forEach((tp, ti) => {
     const tab = arcTable(tp.bez);

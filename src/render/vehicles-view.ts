@@ -1,27 +1,141 @@
-// Renders vehicles and smoke.
+// Renders trains, buses and ambient town traffic (instanced per model), steam smoke and night lights.
 import * as THREE from 'three';
 import type { Game } from '../game/game';
-import { Train } from '../game/train';
-import { RoadVehicle } from '../game/roadvehicle';
+import type { Train } from '../game/train';
+import type { RoadVehicle, RSeg } from '../game/roadvehicle';
 import { Materials } from './materials';
-import { getModel, getCarModel, ModelGeo } from './vehicle-models';
-import { createSmokeTexture } from './textures';
-import { ROAD_TOP } from '../game/constants';
+import { getModel, getCarModel, bogieModel, ModelGeo } from './vehicle-models';
+import { applyClouds } from './clouds';
+import { RAIL } from '../game/constants';
 
-const RAIL_Y = 0.084;
-const GAP = 0.04;
+/** Rail head above the edge profile (same as build-rail's RAIL_TOP_Y); road vehicles sit on the profile. */
+export const RAIL_Y = RAIL.railTop - RAIL.bedHeight;
+export const ROAD_Y = 0.002;
+/** Gap between train cars (matches train.ts). */
+export const CAR_GAP = 0.1;
 
-interface CarObj { group: THREE.Group; model: ModelGeo }
-interface VObj { sig: string; cars: CarObj[] }
+export interface V3 { x: number; y: number; z: number }
 
-const vA = new THREE.Vector3(), vB = new THREE.Vector3(), vC = new THREE.Vector3();
-const tmpA = { x: 0, y: 0, z: 0 }, tmpB = { x: 0, y: 0, z: 0 }, tmpC = { x: 0, y: 0, z: 0 };
+/** Column-major 4x4 transform with +z along unit vector f (x stays horizontal) at position p. */
+export function writeBasis(out: Float32Array | number[], o: number, px: number, py: number, pz: number, fx: number, fy: number, fz: number) {
+  let xx = fz, xz = -fx;
+  const xl = Math.hypot(xx, xz);
+  if (xl < 1e-6) { xx = 1; xz = 0; } else { xx /= xl; xz /= xl; }
+  // y = f × x
+  const yx = fy * xz, yy = fz * xx - fx * xz, yz = -fy * xx;
+  out[o] = xx; out[o + 1] = 0; out[o + 2] = xz; out[o + 3] = 0;
+  out[o + 4] = yx; out[o + 5] = yy; out[o + 6] = yz; out[o + 7] = 0;
+  out[o + 8] = fx; out[o + 9] = fy; out[o + 10] = fz; out[o + 11] = 0;
+  out[o + 12] = px; out[o + 13] = py; out[o + 14] = pz; out[o + 15] = 1;
+}
+
+export interface CarPose {
+  /** body centre (on the rail head) and unit nose direction */
+  x: number; y: number; z: number; fx: number; fy: number; fz: number;
+  /** bogie pivots (front/rear in travel direction) and their track tangents */
+  a: V3; da: V3; b: V3; db: V3;
+  /** edge ids under the bogies (-1: virtual track inside a depot) */
+  ea: number; eb: number;
+  hidden: boolean;
+}
+
+const tA = { x: 0, y: 0, z: 0 }, tB = { x: 0, y: 0, z: 0 }, tE = { x: 0, y: 0, z: 0 };
+
+/** Pose of every car of a train: each car rests on two bogie points on the track (follows curves and grades). */
+export function trainCarPoses(t: Train, out: CarPose[]): number {
+  let off = 0, n = 0;
+  for (let i = 0; i < t.cars.length; i++) {
+    const L = t.cars[i].length;
+    const p = out[n] ?? (out[n] = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1, a: { x: 0, y: 0, z: 0 }, da: { x: 0, y: 0, z: 0 }, b: { x: 0, y: 0, z: 0 }, db: { x: 0, y: 0, z: 0 }, ea: -1, eb: -1, hidden: false });
+    const ra = t.pointBehind(off + 0.18 * L, p.a, p.da);
+    const rb = t.pointBehind(off + 0.82 * L, p.b, p.db);
+    const rf = t.pointBehind(off, tE);
+    const rr = t.pointBehind(off + L, tE);
+    off += L + CAR_GAP;
+    if (!ra || !rb) continue;
+    p.ea = ra.seg.e; p.eb = rb.seg.e;
+    p.hidden = !!rf && !!rr && t.hiddenAt(rf.seg, rf.sp) && t.hiddenAt(rr.seg, rr.sp);
+    let fx = p.a.x - p.b.x, fy = p.a.y - p.b.y, fz = p.a.z - p.b.z;
+    let l = Math.hypot(fx, fy, fz);
+    if (l < 1e-6) { fx = p.da.x; fy = p.da.y; fz = p.da.z; l = Math.hypot(fx, fy, fz) || 1; }
+    const sg = t.reversed ? -1 : 1;
+    p.fx = (fx / l) * sg; p.fy = (fy / l) * sg; p.fz = (fz / l) * sg;
+    p.x = (p.a.x + p.b.x) / 2; p.y = (p.a.y + p.b.y) / 2 + RAIL_Y; p.z = (p.a.z + p.b.z) / 2;
+    n++;
+  }
+  return n;
+}
+
+/** Segment and position d units behind the front of a road vehicle. */
+function roadBehind(v: RoadVehicle, d: number): { seg: RSeg; pos: number } | null {
+  if (!v.seg) return null;
+  let s = v.seg, p = v.pos, k = 0;
+  while (d > p && k < v.trail.length) { d -= p; s = v.trail[k++]; p = s.len; }
+  return { seg: s, pos: Math.max(0, p - d) };
+}
+
+class Batch {
+  body: THREE.InstancedMesh;
+  glass: THREE.InstancedMesh | null;
+  ids: number[] = [];
+  n = 0;
+  constructor(public geo: THREE.BufferGeometry, public glassGeo: THREE.BufferGeometry | null, private mat: THREE.Material, private glassMat: THREE.Material, private parent: THREE.Group, public cap = 32, public tinted = false) {
+    this.body = this.make(geo, mat, true);
+    this.glass = glassGeo ? this.make(glassGeo, glassMat, false) : null;
+  }
+  private make(g: THREE.BufferGeometry, m: THREE.Material, shadow: boolean) {
+    const im = new THREE.InstancedMesh(g, m, this.cap);
+    im.count = 0;
+    im.frustumCulled = false;
+    im.castShadow = shadow;
+    im.receiveShadow = true;
+    if (this.tinted) im.setColorAt(0, new THREE.Color(1, 1, 1));
+    this.parent.add(im);
+    return im;
+  }
+  private grow() {
+    const old = [this.body, this.glass];
+    this.cap *= 2;
+    const nb = this.make(this.geo, this.mat, true);
+    nb.instanceMatrix.array.set(this.body.instanceMatrix.array);
+    if (this.tinted && this.body.instanceColor && nb.instanceColor) nb.instanceColor.array.set(this.body.instanceColor.array);
+    const ng = this.glass ? this.make(this.glassGeo!, this.glassMat, false) : null;
+    if (ng && this.glass) ng.instanceMatrix.array.set(this.glass.instanceMatrix.array);
+    for (const o of old) if (o) { this.parent.remove(o); o.dispose(); }
+    this.body = nb; this.glass = ng;
+  }
+  /** Reserve the next instance slot; returns the matrix offset. */
+  push(id: number): number {
+    if (this.n >= this.cap) this.grow();
+    this.ids[this.n] = id;
+    return this.n++ * 16;
+  }
+  get mat16() { return this.body.instanceMatrix.array as Float32Array; }
+  finish() {
+    const n = this.n;
+    this.body.count = n;
+    this.body.instanceMatrix.needsUpdate = true;
+    this.body.boundingSphere = null;
+    if (this.tinted && this.body.instanceColor) this.body.instanceColor.needsUpdate = true;
+    if (this.glass) {
+      this.glass.count = n;
+      (this.glass.instanceMatrix.array as Float32Array).set((this.body.instanceMatrix.array as Float32Array).subarray(0, n * 16));
+      this.glass.instanceMatrix.needsUpdate = true;
+      this.glass.boundingSphere = null;
+    }
+    this.n = 0;
+  }
+  dispose() {
+    for (const o of [this.body, this.glass]) if (o) { this.parent.remove(o); o.dispose(); }
+  }
+}
 
 class Smoke {
-  max = 1500;
+  max = 3000;
   pos: Float32Array; vel: Float32Array; life: Float32Array; size: Float32Array; alpha: Float32Array;
   geo: THREE.BufferGeometry;
   points: THREE.Points;
+  mat: THREE.ShaderMaterial;
   count = 0;
   constructor() {
     this.pos = new Float32Array(this.max * 3);
@@ -33,15 +147,18 @@ class Smoke {
     this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aSize', new THREE.BufferAttribute(this.size, 1).setUsage(THREE.DynamicDrawUsage));
     this.geo.setAttribute('aAlpha', new THREE.BufferAttribute(this.alpha, 1).setUsage(THREE.DynamicDrawUsage));
-    const mat = new THREE.ShaderMaterial({
-      uniforms: { uTex: { value: createSmokeTexture() }, uScale: { value: 600 * Math.min(window.devicePixelRatio, 2) }, uLight: { value: 1 } },
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: { uScale: { value: 800 }, uLight: { value: 1 } },
       transparent: true, depthWrite: false,
       vertexShader: `attribute float aSize; attribute float aAlpha; varying float vA; uniform float uScale;
-        void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv; gl_PointSize = aSize * uScale / -mv.z; vA = aAlpha; }`,
-      fragmentShader: `uniform sampler2D uTex; uniform float uLight; varying float vA;
-        void main(){ vec4 t = texture2D(uTex, gl_PointCoord); gl_FragColor = vec4(vec3(0.82, 0.82, 0.84) * uLight, t.a * vA); }`,
+        void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv;
+          gl_PointSize = clamp(aSize * uScale / max(-mv.z, 0.01), 1.0, 600.0); vA = aAlpha; }`,
+      fragmentShader: `uniform float uLight; varying float vA;
+        void main(){ vec2 c = gl_PointCoord - 0.5; float r = length(c) * 2.0; float a = smoothstep(1.0, 0.2, r);
+          if (a <= 0.003) discard;
+          gl_FragColor = vec4(vec3(0.8, 0.8, 0.82) * (0.25 + 0.75 * uLight), a * vA * 0.75); }`,
     });
-    this.points = new THREE.Points(this.geo, mat);
+    this.points = new THREE.Points(this.geo, this.mat);
     this.points.frustumCulled = false;
     this.points.renderOrder = 5;
   }
@@ -49,23 +166,26 @@ class Smoke {
     if (this.count >= this.max) return;
     const i = this.count++;
     this.pos[i * 3] = x; this.pos[i * 3 + 1] = y; this.pos[i * 3 + 2] = z;
-    this.vel[i * 3] = vx + (Math.random() - 0.5) * 0.05;
-    this.vel[i * 3 + 1] = 0.28 + Math.random() * 0.12;
-    this.vel[i * 3 + 2] = vz + (Math.random() - 0.5) * 0.05;
+    this.vel[i * 3] = vx + (Math.random() - 0.5) * 0.06;
+    this.vel[i * 3 + 1] = 0.35 + Math.random() * 0.15;
+    this.vel[i * 3 + 2] = vz + (Math.random() - 0.5) * 0.06;
     this.life[i] = 0;
+    this.size[i] = 0.1;
+    this.alpha[i] = 0;
   }
   update(dt: number) {
     let j = 0;
+    const LIFE = 3.2;
     for (let i = 0; i < this.count; i++) {
       const l = this.life[i] + dt;
-      if (l > 2.6) continue;
+      if (l > LIFE) continue;
       this.life[j] = l;
       for (let k = 0; k < 3; k++) this.pos[j * 3 + k] = this.pos[i * 3 + k] + this.vel[i * 3 + k] * dt;
-      this.vel[j * 3] = this.vel[i * 3] * (1 - dt * 1.5) + 0.03 * dt;
-      this.vel[j * 3 + 1] = this.vel[i * 3 + 1] * (1 - dt * 0.6);
-      this.vel[j * 3 + 2] = this.vel[i * 3 + 2] * (1 - dt * 1.5) + 0.02 * dt;
-      this.size[j] = 0.1 + l * 0.26;
-      this.alpha[j] = Math.min(1, l * 5) * (1 - l / 2.6) * 0.7;
+      this.vel[j * 3] = this.vel[i * 3] * (1 - dt * 1.2) + 0.04 * dt;
+      this.vel[j * 3 + 1] = this.vel[i * 3 + 1] * (1 - dt * 0.5);
+      this.vel[j * 3 + 2] = this.vel[i * 3 + 2] * (1 - dt * 1.2) + 0.025 * dt;
+      this.size[j] = 0.12 + l * 0.38;
+      this.alpha[j] = Math.min(1, l * 4) * (1 - l / LIFE);
       j++;
     }
     this.count = j;
@@ -76,191 +196,221 @@ class Smoke {
   }
 }
 
+/** Head/tail light glows (additive points, a minimum on-screen size keeps them visible from afar). */
+class Lights {
+  max = 6000;
+  pos = new Float32Array(this.max * 3);
+  col = new Float32Array(this.max * 3);
+  n = 0;
+  geo = new THREE.BufferGeometry();
+  mat: THREE.ShaderMaterial;
+  points: THREE.Points;
+  constructor() {
+    this.geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3).setUsage(THREE.DynamicDrawUsage));
+    this.geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3).setUsage(THREE.DynamicDrawUsage));
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: { uScale: { value: 800 }, uNight: { value: 0 } },
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false,
+      vertexShader: `attribute vec3 color; varying vec3 vC; uniform float uScale;
+        void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv;
+          gl_PointSize = clamp(0.09 * uScale / max(-mv.z, 0.01), 3.0, 48.0); vC = color; }`,
+      fragmentShader: `uniform float uNight; varying vec3 vC;
+        void main(){ float r = length(gl_PointCoord - 0.5) * 2.0; float a = pow(max(1.0 - r, 0.0), 2.2);
+          gl_FragColor = vec4(vC * a * uNight * 1.6, 1.0); }`,
+    });
+    this.points = new THREE.Points(this.geo, this.mat);
+    this.points.frustumCulled = false;
+    this.points.renderOrder = 6;
+  }
+  add(x: number, y: number, z: number, r: number, g: number, b: number) {
+    if (this.n >= this.max) return;
+    const i = this.n++ * 3;
+    this.pos[i] = x; this.pos[i + 1] = y; this.pos[i + 2] = z;
+    this.col[i] = r; this.col[i + 1] = g; this.col[i + 2] = b;
+  }
+  finish(night: number) {
+    this.points.visible = night > 0.02 && this.n > 0;
+    this.mat.uniforms.uNight.value = night;
+    this.geo.setDrawRange(0, this.n);
+    (this.geo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
+    (this.geo.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true;
+    this.n = 0;
+  }
+}
+
 export class VehiclesView {
   group = new THREE.Group();
-  private objs = new Map<number, VObj>();
-  private ambBody: THREE.InstancedMesh[] = [];
-  private ambGlass: THREE.InstancedMesh[] = [];
+  /** body material: vertex colours, ambient cars tint their paint (aPaint) with the instance colour */
+  paintMat: THREE.MeshStandardMaterial;
+  private batches = new Map<string, Batch>();
+  private bogies: Batch;
   smoke = new Smoke();
+  lights = new Lights();
   private emitAcc = new Map<number, number>();
-  private hlPos = new Float32Array(1200 * 3);
-  private hlCount = 0;
-  private headlights: THREE.Points;
+  private poses: CarPose[] = [];
+  private col = new THREE.Color();
 
   constructor(private mats: Materials) {
-    for (let s = 0; s < 3; s++) {
-      const m = getCarModel(s);
-      const b = new THREE.InstancedMesh(m.body, mats.body, 400);
-      const g = new THREE.InstancedMesh(m.glass, mats.glass, 400);
-      b.count = 0; g.count = 0;
-      b.castShadow = true;
-      b.frustumCulled = false; g.frustumCulled = false;
-      this.ambBody.push(b); this.ambGlass.push(g);
-      this.group.add(b, g);
-    }
-    this.group.add(this.smoke.points);
-    const hg = new THREE.BufferGeometry();
-    hg.setAttribute('position', new THREE.BufferAttribute(this.hlPos, 3).setUsage(THREE.DynamicDrawUsage));
-    this.headlights = new THREE.Points(hg, mats.headlight);
-    this.headlights.frustumCulled = false;
-    this.headlights.renderOrder = 6;
-    this.group.add(this.headlights);
+    this.paintMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.3 });
+    this.paintMat.onBeforeCompile = (sh) => {
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aPaint;')
+        .replace('#include <color_vertex>', `
+#if defined( USE_COLOR ) || defined( USE_INSTANCING_COLOR )
+  vColor = vec3( 1.0 );
+#endif
+#ifdef USE_COLOR
+  vColor *= color;
+#endif
+#ifdef USE_INSTANCING_COLOR
+  vColor.xyz *= mix(vec3(1.0), instanceColor.xyz, aPaint);
+#endif`);
+    };
+    this.paintMat.customProgramCacheKey = () => 'rf-vehicle-paint';
+    applyClouds(this.paintMat);
+    this.bogies = new Batch(bogieModel(), null, this.paintMat, mats.glass, this.group, 128);
+    this.group.add(this.smoke.points, this.lights.points);
   }
 
-  private addHeadlight(a: THREE.Vector3, b: THREE.Vector3, ahead: number, y: number) {
-    if (this.hlCount >= 1200) return;
-    const dx = a.x - b.x, dz = a.z - b.z;
-    const l = Math.hypot(dx, dz) || 1;
-    const i = this.hlCount++ * 3;
-    this.hlPos[i] = a.x + (dx / l) * ahead; this.hlPos[i + 1] = a.y + y; this.hlPos[i + 2] = a.z + (dz / l) * ahead;
-  }
-
-  private makeCar(model: ModelGeo, vid: number): CarObj {
-    const g = new THREE.Group();
-    const b = new THREE.Mesh(model.body, this.mats.body);
-    const gl = new THREE.Mesh(model.glass, this.mats.glass);
-    b.castShadow = true;
-    b.userData.vehicleId = vid; gl.userData.vehicleId = vid;
-    g.add(b, gl);
-    this.group.add(g);
-    return { group: g, model };
-  }
-
-  private ensure(v: Train | RoadVehicle): VObj {
-    const sig = v instanceof Train ? v.cars.map((c) => c.id).join(',') : (v.model ? v.model.id : 'amb');
-    let o = this.objs.get(v.id);
-    if (o && o.sig === sig) return o;
-    if (o) for (const c of o.cars) this.group.remove(c.group);
-    const cars: CarObj[] = [];
-    if (v instanceof Train) for (const c of v.cars) cars.push(this.makeCar(getModel(c.style, c.color, c.length), v.id));
-    else if (v.model) cars.push(this.makeCar(getModel(v.model.style, v.model.color, v.model.length), v.id));
-    o = { sig, cars };
-    this.objs.set(v.id, o);
-    return o;
+  private batch(key: string, m: ModelGeo, tinted = false): Batch {
+    let b = this.batches.get(key);
+    if (!b) { b = new Batch(m.body, m.glass, this.paintMat, this.mats.glass, this.group, 32, tinted); this.batches.set(key, b); }
+    return b;
   }
 
   update(game: Game, dt: number, light: number, pointScale = 1200) {
-    const seen = new Set<number>();
-    this.hlCount = 0;
-    const night = this.mats.headlight.visible;
-    for (const v of game.vehicles.map.values()) {
-      seen.add(v.id);
-      if (v instanceof Train) this.updateTrain(v, dt);
-      else if (v instanceof RoadVehicle) this.updateRoad(v);
-    }
-    for (const [id, o] of this.objs) {
-      if (!seen.has(id)) { for (const c of o.cars) this.group.remove(c.group); this.objs.delete(id); }
-    }
-    this.updateAmbient(game, night);
-    if (night) {
-      this.headlights.geometry.setDrawRange(0, this.hlCount);
-      (this.headlights.geometry.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-    }
-    this.headlights.visible = night;
+    const night = this.mats.uniforms.uNight.value;
+    for (const t of game.vehicles.trains()) this.updateTrain(t, dt, night);
+    for (const v of game.vehicles.roads()) this.updateRoad(v, night);
+    for (const v of game.vehicles.ambient) this.updateRoad(v, night);
+    for (const b of this.batches.values()) b.finish();
+    this.bogies.finish();
+    this.lights.mat.uniforms.uScale.value = pointScale;
+    this.lights.finish(night);
     this.smoke.update(dt);
-    (this.smoke.points.material as THREE.ShaderMaterial).uniforms.uLight.value = light;
-    (this.smoke.points.material as THREE.ShaderMaterial).uniforms.uScale.value = pointScale;
+    this.smoke.mat.uniforms.uLight.value = light;
+    this.smoke.mat.uniforms.uScale.value = pointScale;
+    for (const id of this.emitAcc.keys()) if (!game.vehicles.get(id)) this.emitAcc.delete(id);
   }
 
-  private updateTrain(t: Train, dt: number) {
-    const o = this.ensure(t);
-    if (!t.onMap) { for (const c of o.cars) c.group.visible = false; return; }
-    let off = 0;
-    for (let i = 0; i < t.cars.length; i++) {
-      const car = o.cars[i];
-      const L = t.cars[i].length;
-      const mid = t.pointBehind(off + L / 2, tmpC);
-      t.pointBehind(off + L * 0.18, tmpA);
-      t.pointBehind(off + L * 0.82, tmpB);
-      off += L + GAP;
-      let hidden = false;
-      if (mid) {
-        const s = mid.seg;
-        if (s.hidden === 1 && mid.sp < s.len - 0.32) hidden = true;
-        if (s.hidden === 2 && mid.sp > 0.22 && mid.sp < s.len - 0.22) hidden = true;
+  private updateTrain(t: Train, dt: number, night: number) {
+    if (!t.onMap) return;
+    const n = trainCarPoses(t, this.poses);
+    let lastVisible = -1;
+    for (let i = 0; i < n; i++) {
+      const p = this.poses[i];
+      if (p.hidden) continue;
+      const cm = t.cars[i];
+      const m = getModel(cm.style, cm.color, cm.length);
+      const b = this.batch('m:' + cm.style + ':' + cm.color + ':' + cm.length, m);
+      const o = b.push(t.id);
+      writeBasis(b.mat16, o, p.x, p.y, p.z, p.fx, p.fy, p.fz);
+      for (const bz of m.bogies) {
+        const front = (bz > 0) !== t.reversed;
+        const q = front ? p.a : p.b, d = front ? p.da : p.db;
+        const ob = this.bogies.push(t.id);
+        writeBasis(this.bogies.mat16, ob, q.x, q.y + RAIL_Y, q.z, d.x, d.y, d.z);
       }
-      car.group.visible = !hidden;
-      if (hidden) continue;
-      vA.set(tmpA.x, tmpA.y + RAIL_Y, tmpA.z);
-      vB.set(tmpB.x, tmpB.y + RAIL_Y, tmpB.z);
-      car.group.position.copy(vA).add(vB).multiplyScalar(0.5);
-      car.group.lookAt(t.reversed ? vB : vA);
-      if (i === 0 && this.mats.headlight.visible) { if (t.reversed) this.addHeadlight(vB, vA, 0.08, 0.1); else this.addHeadlight(vA, vB, 0.08, 0.1); }
-      if (car.model.chimney && (t.state === 'running' || t.state === 'waiting' || t.state === 'loading')) {
-        const acc = (this.emitAcc.get(t.id) ?? 0) + dt * (6 + t.speed * 12);
-        let n = Math.floor(acc);
-        this.emitAcc.set(t.id, acc - n);
-        if (n > 0) {
-          car.group.updateMatrixWorld();
-          vC.copy(car.model.chimney).applyMatrix4(car.group.matrixWorld);
-          const dx = (vA.x - vB.x), dz = (vA.z - vB.z);
-          const l = Math.hypot(dx, dz) || 1;
-          while (n-- > 0) this.smoke.emit(vC.x, vC.y, vC.z, (-dx / l) * t.speed * 0.3 * (t.reversed ? -1 : 1), (-dz / l) * t.speed * 0.3 * (t.reversed ? -1 : 1));
-        }
+      if (m.chimney && (t.state === 'running' || t.state === 'waiting' || t.state === 'loading')) this.emitSmoke(t.id, b, o, m.chimney, t.speed, p, dt, t.reversed);
+      if (i === 0 && night > 0.02) {
+        // head lights at the leading end (travel direction)
+        const s = t.reversed ? -1 : 1;
+        this.carLight(p, m.length / 2 * s + 0.01 * s, 0.24, 0.085, 1, 0.95, 0.8);
       }
+      lastVisible = i;
+    }
+    if (night > 0.02 && lastVisible === n - 1 && n > 0) {
+      const p = this.poses[n - 1];
+      const s = t.reversed ? -1 : 1;
+      this.carLight(p, -(t.cars[n - 1].length / 2) * s - 0.01 * s, 0.16, 0.09, 1, 0.08, 0.05);
     }
   }
 
-  private updateRoad(v: RoadVehicle) {
-    const o = this.ensure(v);
-    const car = o.cars[0];
-    if (!car) return;
-    if (!v.seg) { car.group.visible = false; return; }
+  /** Two lights at local z (along the nose direction), height y, lateral ±x. */
+  private carLight(p: CarPose, z: number, y: number, x: number, r: number, g: number, b: number) {
+    let rx = p.fz, rz = -p.fx;
+    const l = Math.hypot(rx, rz) || 1; rx /= l; rz /= l;
+    for (const sx of [-x, x]) this.lights.add(p.x + p.fx * z + rx * sx, p.y + y + p.fy * z, p.z + p.fz * z + rz * sx, r, g, b);
+  }
+
+  private emitSmoke(id: number, b: Batch, o: number, chimney: THREE.Vector3, speed: number, p: CarPose, dt: number, reversed: boolean) {
+    const acc = (this.emitAcc.get(id) ?? 0) + dt * (5 + speed * 40);
+    let k = Math.floor(acc);
+    this.emitAcc.set(id, acc - k);
+    if (k <= 0) return;
+    const e = b.mat16;
+    const cx = chimney.x, cy = chimney.y, cz = chimney.z;
+    const x = e[o] * cx + e[o + 4] * cy + e[o + 8] * cz + e[o + 12];
+    const y = e[o + 1] * cx + e[o + 5] * cy + e[o + 9] * cz + e[o + 13];
+    const z = e[o + 2] * cx + e[o + 6] * cy + e[o + 10] * cz + e[o + 14];
+    const s = reversed ? 1 : -1; // smoke trails behind the direction of travel
+    while (k-- > 0) this.smoke.emit(x, y, z, p.fx * speed * 0.35 * s, p.fz * speed * 0.35 * s);
+  }
+
+  private updateRoad(v: RoadVehicle, night: number) {
+    if (!v.seg) return;
     const L = v.length;
-    const s = v.pointBehind(L * 0.12, tmpA);
-    v.pointBehind(L * 0.88, tmpB);
-    let hidden = false;
-    if (s && s.hidden === 1 && v.pos < s.len * 0.45 && s === v.seg) hidden = true;
-    if (s && s.hidden === 2 && v.pos > 0.2 && v.pos < s.len - 0.2) hidden = true;
-    car.group.visible = !hidden;
-    if (hidden) return;
-    vA.set(tmpA.x, tmpA.y + ROAD_TOP, tmpA.z);
-    vB.set(tmpB.x, tmpB.y + ROAD_TOP, tmpB.z);
-    car.group.position.copy(vA).add(vB).multiplyScalar(0.5);
-    car.group.lookAt(vA);
-    if (this.mats.headlight.visible) this.addHeadlight(vA, vB, L * 0.12, 0.05);
-  }
-
-  private dummy = new THREE.Object3D();
-  private col = new THREE.Color();
-  private updateAmbient(game: Game, night: boolean) {
-    const counts = [0, 0, 0];
-    const d = this.dummy;
-    for (const v of game.vehicles.ambient) {
-      if (!v.seg) continue;
-      const st = v.carStyle;
-      const i = counts[st];
-      if (i >= 400) continue;
-      const L = v.length;
-      const s = v.pointBehind(L * 0.15, tmpA);
-      v.pointBehind(L * 0.85, tmpB);
-      if (s && s.hidden === 2 && v.pos > 0.2 && v.pos < s.len - 0.2) continue;
-      vA.set(tmpA.x, tmpA.y + ROAD_TOP, tmpA.z);
-      vB.set(tmpB.x, tmpB.y + ROAD_TOP, tmpB.z);
-      d.position.copy(vA).add(vB).multiplyScalar(0.5);
-      d.lookAt(vA);
-      d.updateMatrix();
-      if (night) this.addHeadlight(vA, vB, L * 0.15, 0.045);
-      this.ambBody[st].setMatrixAt(i, d.matrix);
-      this.ambGlass[st].setMatrixAt(i, d.matrix);
-      this.col.setHex(v.color);
-      this.ambBody[st].setColorAt(i, this.col);
-      counts[st]++;
+    const f = roadBehind(v, 0), r = roadBehind(v, L);
+    if (!f || !r) return;
+    if (v.hiddenAt(f.seg, f.pos) && v.hiddenAt(r.seg, r.pos)) return;
+    v.pointBehind(0, tA);
+    v.pointBehind(L, tB);
+    let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
+    const l = Math.hypot(fx, fy, fz);
+    if (l < 1e-6) return;
+    fx /= l; fy /= l; fz /= l;
+    const px = (tA.x + tB.x) / 2, py = (tA.y + tB.y) / 2 + ROAD_Y, pz = (tA.z + tB.z) / 2;
+    let m: ModelGeo, b: Batch;
+    if (v.model) {
+      m = getModel(v.model.style, v.model.color, v.model.length);
+      b = this.batch('m:' + v.model.style + ':' + v.model.color + ':' + v.model.length, m);
+    } else {
+      const st = Math.max(0, Math.min(3, v.style | 0));
+      m = getCarModel(st);
+      b = this.batch('car:' + st, m, true);
     }
-    for (let s = 0; s < 3; s++) {
-      this.ambBody[s].count = counts[s];
-      this.ambGlass[s].count = counts[s];
-      this.ambBody[s].instanceMatrix.needsUpdate = true;
-      this.ambGlass[s].instanceMatrix.needsUpdate = true;
-      if (this.ambBody[s].instanceColor) this.ambBody[s].instanceColor!.needsUpdate = true;
+    const o = b.push(v.ambient ? -1 : v.id);
+    writeBasis(b.mat16, o, px, py, pz, fx, fy, fz);
+    if (b.tinted && b.body.instanceColor) {
+      this.col.setHex(v.tint & 0xffffff);
+      // keep paint colours plausible: desaturate and limit brightness a little
+      const hsl = { h: 0, s: 0, l: 0 };
+      this.col.getHSL(hsl);
+      this.col.setHSL(hsl.h, hsl.s * 0.75, 0.2 + hsl.l * 0.6);
+      b.body.setColorAt(o / 16, this.col);
+    }
+    if (night > 0.02) {
+      for (const [lx, ly, lz] of m.front) this.lights.add(px + fz * lx + fx * lz, py + ly + fy * lz, pz - fx * lx + fz * lz, 1, 0.95, 0.8);
+      for (const [lx, ly, lz] of m.rear) this.lights.add(px + fz * lx + fx * lz, py + ly + fy * lz, pz - fx * lx + fz * lz, 0.9, 0.06, 0.04);
     }
   }
 
+  /** Vehicle id under the ray (ambient traffic is not pickable). */
   pick(ray: THREE.Raycaster): number | null {
     const targets: THREE.Object3D[] = [];
-    for (const o of this.objs.values()) for (const c of o.cars) if (c.group.visible) targets.push(c.group);
-    const hits = ray.intersectObjects(targets, true);
-    for (const h of hits) if (h.object.userData.vehicleId != null) return h.object.userData.vehicleId as number;
+    const owner = new Map<THREE.Object3D, Batch>();
+    for (const [key, b] of this.batches) {
+      if (key.startsWith('car:') || b.body.count === 0) continue;
+      targets.push(b.body);
+      owner.set(b.body, b);
+    }
+    if (this.bogies.body.count) { targets.push(this.bogies.body); owner.set(this.bogies.body, this.bogies); }
+    const hits = ray.intersectObjects(targets, false);
+    for (const h of hits) {
+      const b = owner.get(h.object);
+      if (!b || h.instanceId == null) continue;
+      const id = b.ids[h.instanceId];
+      if (id != null && id >= 0) return id;
+    }
     return null;
   }
+
+  dispose() {
+    for (const b of this.batches.values()) b.dispose();
+    this.batches.clear();
+    this.bogies.dispose();
+    this.smoke.geo.dispose();
+    this.lights.geo.dispose();
+  }
 }
+

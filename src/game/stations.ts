@@ -182,7 +182,7 @@ export class Stations {
     const footprint: Rect = { x, z, angle, w: layout.width, d: length };
     const bw = Math.min(length * 0.4, 5), bd = 1.5;
     const boff = layout.width / 2 + bd / 2 + 0.15;
-    const building: Rect = { x: x - rx * boff, z: z - rz * boff, angle: angle + Math.PI / 2, w: bd, d: bw };
+    const building: Rect = { x: x - rx * boff, z: z - rz * boff, angle: angle + Math.PI / 2, w: bw, d: bd };
     const plan: StationPlan = { ok: true, x, z, y: 0, angle, length, tracks, layout, footprint, building, demolish: [], cost: 0, join: null };
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
     // terrain level: average over the footprint

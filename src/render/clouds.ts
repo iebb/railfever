@@ -1,4 +1,4 @@
-// Drifting cloud shadows: attenuates direct sunlight using a world-space noise field.
+// Drifting cloud shadows: attenuates direct sunlight using a world-space noise field (~1 km clouds).
 import * as THREE from 'three';
 import { NOISE_GLSL } from './shaders';
 
@@ -32,7 +32,7 @@ varying vec3 vRfCloudPos;
 ${needsNoise && !sh.fragmentShader.includes('rf_fbm') ? NOISE_GLSL : ''}`)
       .replace('#include <lights_fragment_end>', `#include <lights_fragment_end>
 {
-  float rfCl = smoothstep(0.5, 0.7, rf_fbm(vRfCloudPos.xz * 0.016 + uCloudOffset));
+  float rfCl = smoothstep(0.5, 0.7, rf_fbm(vRfCloudPos.xz * 0.0085 + uCloudOffset));
   float rfK = 1.0 - rfCl * uCloudStrength;
   reflectedLight.directDiffuse *= rfK;
   reflectedLight.directSpecular *= rfK;

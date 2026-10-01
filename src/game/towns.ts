@@ -207,7 +207,7 @@ export class Towns {
     const core = 6 + Math.sqrt(P) * 0.18;
     if (P > 2600 && d < core * 0.55) return r < 0.35 ? BT_TOWER : r < 0.8 ? BT_OFFICE : BT_APARTMENT;
     if (P > 1100 && d < core) return r < 0.5 ? BT_APARTMENT : r < 0.65 && P > 1800 ? BT_OFFICE : r < 0.85 ? BT_SHOP : BT_TOWNHOUSE;
-    if (P > 350 && d < core * 1.35) return r < 0.4 ? BT_TOWNHOUSE : r < 0.65 ? BT_SHOP : r < 0.78 && P > 700 ? BT_APARTMENT : BT_HOUSE_L;
+    if (P > 220 && d < core * 1.35) return r < 0.4 ? BT_TOWNHOUSE : r < 0.65 ? BT_SHOP : r < 0.78 && P > 700 ? BT_APARTMENT : BT_HOUSE_L;
     return r < 0.55 ? BT_HOUSE_S : BT_HOUSE_L;
   }
 
@@ -248,10 +248,12 @@ export class Towns {
     return mx;
   }
 
-  private placeBuilding(town: Town, type: number, x: number, z: number, angle: number, w: number, d: number, y: number, rng: RNG, day: number): Building {
+  private placeBuilding(town: Town, type: number, x: number, z: number, angle: number, w: number, d: number, y: number, rng: RNG, day: number, maxPop = Infinity): Building {
     const bt = BUILDING_TYPES[type];
-    const floors = bt.floors[0] + rng.int(bt.floors[1] - bt.floors[0] + 1);
     const ppf = bt.popPerFloor[0] + rng.next() * (bt.popPerFloor[1] - bt.popPerFloor[0]);
+    let floors = bt.floors[0] + rng.int(bt.floors[1] - bt.floors[0] + 1);
+    const perFloor = (ppf * (w * d)) / 1.2;
+    if (perFloor > 0 && floors * perFloor > maxPop) floors = Math.max(bt.floors[0], Math.floor(maxPop / perFloor));
     this.world.removeTreesNear(x, z, Math.hypot(w, d) / 2 + 0.4);
     const b = this.world.addBuilding({ townId: town.id, x, z, angle, w, d, type, floors, pop: Math.round(floors * ppf * (w * d) / 1.2), seed: rng.int(1 << 30), y, built: day });
     town.buildings.add(b.id);
@@ -280,7 +282,7 @@ export class Towns {
     const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.street;
     const off = rt.half + rt.sidewalk + bt.setback + d / 2;
     const bx = p.x + nx * off, bz = p.z + nz * off;
-    if (Math.hypot(bx - town.x, bz - town.z) > this.maxRadius(town) + 4) return false;
+    if (Math.hypot(bx - town.x, bz - town.z) > this.growthRadius(town) + 4) return false;
     // facade faces the street: forward = -normal
     const angle = Math.atan2(-nx, -nz);
     const y = this.canPlace(bx, bz, angle, w, d);
@@ -290,35 +292,24 @@ export class Towns {
   }
 
   maxRadius(town: Town) { return 10 + Math.sqrt(Math.max(100, town.pop)) * 0.6; }
+  /** Radius within which new lots and streets may appear (compact core, or the existing built-up area). */
+  growthRadius(town: Town) { return Math.max(this.maxRadius(town) * 1.15, town.radius - 2.5); }
 
   /** One growth step: building, upgrade or street extension. */
   growStep(town: Town, rng: RNG, day: number): boolean {
     const w = this.world;
     const net = w.net;
+    // pace growth in the running game (generation grows freely): about 0.5 % of the population per
+    // step, independent of how many steps the game schedules for big towns
+    if (day > 0 && town.buildings.size > 0 && town.pop > 0) {
+      const avg = town.pop / town.buildings.size;
+      const gain = (0.005 * town.pop) / (1 + Math.floor(town.pop / 2500));
+      if (rng.next() > gain / Math.max(1, avg)) return false;
+    }
     const streets = this.streets(town);
     if (!streets.length) return false;
     // upgrade a building near the centre now and then
-    if (town.buildings.size > 20 && rng.chance(0.15)) {
-      const ids = [...town.buildings];
-      for (let k = 0; k < 4; k++) {
-        const b = w.buildings.get(ids[rng.int(ids.length)]);
-        if (!b || b.type === BT_CHURCH) continue;
-        const nt = this.chooseType(town, b.x, b.z, rng);
-        if (BUILDING_TYPES[nt].rank <= BUILDING_TYPES[b.type].rank) continue;
-        const bt = BUILDING_TYPES[nt];
-        const nw = Math.min(bt.w[1], Math.max(bt.w[0], b.w * 1.3)), nd = Math.min(bt.d[1], Math.max(bt.d[0], b.d * 1.3));
-        // keep the facade line, grow backwards
-        const fx = Math.sin(b.angle), fz = Math.cos(b.angle);
-        const cx = b.x - fx * (nd - b.d) / 2, cz = b.z - fz * (nd - b.d) / 2;
-        const y = this.canPlace(cx, cz, b.angle, nw, nd, b.id);
-        if (y === null) continue;
-        town.buildings.delete(b.id);
-        town.pop -= b.pop;
-        w.removeBuilding(b.id);
-        this.placeBuilding(town, nt, cx, cz, b.angle, nw, nd, y, rng, day);
-        return true;
-      }
-    }
+    if (town.buildings.size > 20 && rng.chance(0.15) && this.upgrade(town, rng, day)) return true;
     // church once established
     if (!town.hasChurch && town.pop > 500) {
       const near = streets.filter((e) => { const n = net.nodes.get(e.a)!; return Math.hypot(n.x - town.x, n.z - town.z) < 12; });
@@ -336,13 +327,46 @@ export class Towns {
       while (i < streets.length - 1 && r > weights[i]) { r -= weights[i]; i++; }
       if (this.tryLot(town, streets[i], rng, day)) return true;
     }
-    // extend the street network
-    return this.extendStreets(town, streets, rng);
+    // inner lots taken: try anywhere along the streets
+    for (let attempt = 0; attempt < 5; attempt++) if (this.tryLot(town, streets[rng.int(streets.length)], rng, day)) return true;
+    // extend the street network; if that fails too, densify
+    return this.extendStreets(town, streets, rng) || (town.buildings.size > 8 && this.upgrade(town, rng, day));
+  }
+
+  /** Replace a building by a higher-ranked one (bigger footprint if there is room, else taller). */
+  private upgrade(town: Town, rng: RNG, day: number): boolean {
+    const w = this.world;
+    const ids = [...town.buildings];
+    for (let k = 0; k < 4; k++) {
+      const b = w.buildings.get(ids[rng.int(ids.length)]);
+      if (!b || b.type === BT_CHURCH) continue;
+      const nt = this.chooseType(town, b.x, b.z, rng);
+      if (BUILDING_TYPES[nt].rank <= BUILDING_TYPES[b.type].rank) continue;
+      const bt = BUILDING_TYPES[nt];
+      // densify gradually: the new building may house at most 2.5x the old one
+      const maxPop = b.pop * 2.5 + 20;
+      if (bt.floors[0] * bt.popPerFloor[0] * (b.w * b.d) / 1.2 > maxPop) continue;
+      const nw = Math.min(bt.w[1], Math.max(bt.w[0], b.w * 1.3)), nd = Math.min(bt.d[1], Math.max(bt.d[0], b.d * 1.3));
+      // keep the facade line, grow backwards
+      const fx = Math.sin(b.angle), fz = Math.cos(b.angle);
+      const cx = b.x - fx * (nd - b.d) / 2, cz = b.z - fz * (nd - b.d) / 2;
+      let y = this.canPlace(cx, cz, b.angle, nw, nd, b.id);
+      let ux = cx, uz = cz, uw = nw, ud = nd;
+      // no room to grow: rebuild taller on the same footprint (only if it suits the new type)
+      if (y === null && b.w * b.d >= 0.6 * bt.w[0] * bt.d[0]) { y = this.canPlace(b.x, b.z, b.angle, b.w, b.d, b.id); ux = b.x; uz = b.z; uw = b.w; ud = b.d; }
+      if (y === null) continue;
+      town.buildings.delete(b.id);
+      town.pop -= b.pop;
+      w.removeBuilding(b.id);
+      this.placeBuilding(town, nt, ux, uz, b.angle, uw, ud, y, rng, day, maxPop);
+      return true;
+    }
+    return false;
   }
 
   private extendStreets(town: Town, streets: NEdge[], rng: RNG): boolean {
     const net = this.world.net;
-    const maxR = this.maxRadius(town);
+    const maxR = this.growthRadius(town);
     for (let attempt = 0; attempt < 6; attempt++) {
       const e = streets[rng.int(streets.length)];
       if (rng.chance(0.45)) {
@@ -350,7 +374,7 @@ export class Towns {
         for (const nid of [e.a, e.b]) {
           const n = net.nodes.get(nid)!;
           if (n.edges.length !== 1) continue;
-          if (Math.hypot(n.x - town.x, n.z - town.z) > maxR) continue;
+          if (Math.hypot(n.x - town.x, n.z - town.z) > maxR + 6) continue;
           const d = net.leaveDir(e, nid);
           const ang = Math.atan2(-d.x, -d.z) + (rng.next() - 0.5) * 0.4;
           const len = 6 + rng.next() * 3;

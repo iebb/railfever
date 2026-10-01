@@ -1,6 +1,6 @@
 // Shared materials with custom shader tweaks.
 import * as THREE from 'three';
-import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture } from './textures';
+import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture, createBallastTexture, createRoadTexture } from './textures';
 import { NOISE_GLSL } from './shaders';
 
 export class Materials {
@@ -19,6 +19,12 @@ export class Materials {
   ghost: THREE.MeshBasicMaterial;
   glow: THREE.PointsMaterial;
   headlight: THREE.PointsMaterial;
+  /** ballast bed top with sleepers (uv: see createBallastTexture) */
+  ballast: THREE.MeshStandardMaterial;
+  /** asphalt carriageways with markings (uv: see createRoadTexture) */
+  road: THREE.MeshStandardMaterial;
+  /** materials added by the static renderer that should also get cloud shadows etc. */
+  extra: THREE.Material[];
 
   constructor() {
     const U = this.uniforms;
@@ -70,7 +76,7 @@ diffuseColor *= rfTex;`)
         .replace('#include <begin_vertex>', `#include <begin_vertex>
 #ifdef USE_INSTANCING
   float ph = instanceMatrix[3].x * 0.7 + instanceMatrix[3].z * 1.3;
-  float sw = (sin(uTime * 1.4 + ph) + 0.5 * sin(uTime * 2.3 + ph * 1.7)) * 0.012 * max(position.y - 0.05, 0.0) * 5.0;
+  float sw = (sin(uTime * 1.4 + ph) + 0.5 * sin(uTime * 2.3 + ph * 1.7)) * 0.012 * max(position.y - 0.3, 0.0);
   transformed.x += sw;
   transformed.z += sw * 0.6;
 #endif`);
@@ -84,6 +90,10 @@ diffuseColor *= rfTex;`)
     const glowTex = createGlowTexture();
     this.glow = new THREE.PointsMaterial({ map: glowTex, color: 0xffd9a0, size: 0.85, sizeAttenuation: true, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
     this.headlight = new THREE.PointsMaterial({ map: glowTex, color: 0xfff2d0, size: 0.3, sizeAttenuation: true, transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending, toneMapped: false });
+    // ground decals sit slightly above graded terrain: pull them forward in depth
+    this.ballast = new THREE.MeshStandardMaterial({ vertexColors: true, map: createBallastTexture(), roughness: 0.96, metalness: 0, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 });
+    this.road = new THREE.MeshStandardMaterial({ vertexColors: true, map: createRoadTexture(), roughness: 0.9, metalness: 0, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 });
+    this.extra = [this.ballast, this.road];
   }
 
   update(time: number, night: number) {

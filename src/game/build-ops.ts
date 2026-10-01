@@ -6,7 +6,7 @@ import { NEdge } from './network';
 import { distToRect, World } from './world';
 import { rectsOverlap } from './towns';
 import { applyEarthworks, recomputeLocks, brush } from './terraform';
-import { planEdge, commitProposal, findSnap } from './construction';
+import { planEdge, commitProposal, nodeGroup } from './construction';
 
 export interface Depot {
   id: number;
@@ -21,7 +21,7 @@ export interface Depot {
 
 export function depotSize(kind: NetKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : { w: 1.8, d: 1.6 }; }
 
-export interface DepotPlan { ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number }
+export interface DepotPlan { ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number; demolish: number[] }
 
 export class Depots {
   map = new Map<number, Depot>();
@@ -61,7 +61,7 @@ export class Depots {
     }
     const fx = Math.sin(angle), fz = Math.cos(angle);
     const exitX = x + fx * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3)), exitZ = z + fz * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3));
-    const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : 60000 };
+    const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : 60000, demolish: [] };
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
     if (!w.inside(x, z, 4)) failp('Too close to the map edge');
     let mx = -Infinity, mn = Infinity;
@@ -72,16 +72,19 @@ export class Depots {
     }
     plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : mx;
     if (mn < 0.2) failp('Cannot build on water');
-    if (mx - mn > 1.5) failp('Ground is too steep');
+    // a depot on a track end takes the track's height and is levelled on commit
+    if (snapNode >= 0 ? Math.max(mx - plan.y, plan.y - mn) > 2.5 : mx - mn > 1.5) failp('Ground is too steep');
     const rect = { x, z, angle, w: sz.w, d: sz.d };
     const R = Math.hypot(sz.w, sz.d) / 2 + 1;
-    for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) failp('Buildings in the way'); }
+    for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) { plan.demolish.push(id); plan.cost += 6000 + b.pop * 2500; } }
+    const siblings = new Set(snapNode >= 0 ? nodeGroup(g, snapNode) : []);
     for (const e of net.edgesNear(x - R, z - R, x + R, z + R)) {
+      if (snapNode >= 0 && (siblings.has(e.a) || siblings.has(e.b))) continue; // the track the depot attaches to and its parallel siblings
       const geo = net.geo(e);
       const hw = net.halfWidth(e);
       for (let i = 0; i < geo.n; i++) if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2) < hw - 0.1) { failp('Track or road in the way'); break; }
     }
-    if (g.stations.footprintsNear(x, z, R).length) failp('Station in the way');
+    for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
     for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
     plan.cost += Math.round((mx - mn) * 20000);
     return plan;
@@ -93,6 +96,7 @@ export class Depots {
     const net = w.net;
     if (!plan.ok) return plan.error ?? 'Cannot build';
     if (!g.company(owner).economy.spend(plan.cost, 'construction')) return 'Not enough money';
+    for (const id of plan.demolish) g.towns.demolishBuilding(id);
     const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
     const sz = depotSize(kind);
     const inX = plan.x - fx * (sz.d / 2 - 0.4), inZ = plan.z - fz * (sz.d / 2 - 0.4);
@@ -121,15 +125,13 @@ export class Depots {
     if (kind === 'road') {
       const ne = net.nearestEdge(exit.x, exit.z, 4, 'road', (ed) => ed.depot < 0);
       if (ne) {
-        const to = findSnap(g, 'road', exit.x + 0, exit.z + 0, 0.01);
-        void to;
         const target = ne.s < 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.a } : ne.s > ne.edge.len - 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.b } : null;
         const p = { x: 0, y: 0, z: 0 };
         w.net.pointAt(ne.edge, ne.s, p);
         const end = target ? { ...target, x: w.net.nodes.get(target.node)!.x, z: w.net.nodes.get(target.node)!.z, y: w.net.nodes.get(target.node)!.y } : { kind: 'edge' as const, x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
         if (Math.hypot(end.x - exit.x, end.z - exit.z) > 0.3) {
           const prop = planEdge(g, { kind: 'node', x: exit.x, z: exit.z, y: exit.y, node: exit.id }, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
-          if (prop.ok) commitProposal(g, prop);
+          if (prop.ok && !prop.demolish.length) commitProposal(g, prop); // never demolish buildings silently
         }
       }
     }
@@ -159,6 +161,7 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
   // existing signal node?
   const n = net.nearestNode(x, z, 0.8, 'rail', (nn) => nn.edges.length === 2);
   if (n && n.signal) {
+    if (n.owner !== owner) return 'Not your track';
     n.signal = (n.signal + 1) % 4;
     net.version++;
     g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2);

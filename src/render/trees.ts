@@ -1,4 +1,4 @@
-// Tree models (instanced).
+// Tree models (instanced). Sizes in world units (1 = 10 m): deciduous ~1.6 tall, conifers ~1.9 at scale 1.
 import * as THREE from 'three';
 import { GeoBuilder } from './geo';
 import { hash2 } from '../game/rng';
@@ -11,31 +11,40 @@ function addThree(gb: GeoBuilder, geo: THREE.BufferGeometry, m: THREE.Matrix4, c
   if (jitter > 0) {
     for (let i = 0; i < p.count; i++) {
       const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
-      const k = hash2(Math.round(x * 1000), Math.round(z * 1000) + Math.round(y * 1000) * 7, seed) - 0.5;
-      p.setXYZ(i, x * (1 + k * jitter), y + k * jitter * 0.05, z * (1 + k * jitter));
+      const k = hash2(Math.round(x * 300), Math.round(z * 300) + Math.round(y * 300) * 7, seed) - 0.5;
+      p.setXYZ(i, x * (1 + k * jitter), y + k * jitter * 0.25, z * (1 + k * jitter));
     }
   }
   g.computeVertexNormals();
   const n = g.getAttribute('normal');
   gb.color(color);
   const base = gb.vertexCount;
-  for (let i = 0; i < p.count; i++) gb.vertex(p.getX(i), p.getY(i), p.getZ(i), n.getX(i), n.getY(i), n.getZ(i));
+  for (let i = 0; i < p.count; i++) {
+    // soften normals towards "up/out" so crowns shade like foliage, not facets
+    const nx = n.getX(i), ny = n.getY(i), nz = n.getZ(i);
+    const ox = p.getX(i), oz = p.getZ(i);
+    const ol = Math.hypot(ox, oz) || 1;
+    const sx = nx * 0.6 + (ox / ol) * 0.4, sy = ny * 0.6 + 0.4, sz = nz * 0.6 + (oz / ol) * 0.4;
+    const sl = Math.hypot(sx, sy, sz) || 1;
+    gb.vertex(p.getX(i), p.getY(i), p.getZ(i), sx / sl, sy / sl, sz / sl);
+  }
   for (let i = 0; i < p.count; i++) gb.idx.push(base + i);
 }
 
 export function createTreeGeometries(): THREE.BufferGeometry[] {
-  // deciduous
+  const T = (x: number, y: number, z: number) => new THREE.Matrix4().makeTranslation(x, y, z);
+  // deciduous: trunk + three jittered blobs
   const d = new GeoBuilder();
-  addThree(d, new THREE.CylinderGeometry(0.012, 0.02, 0.12, 6), new THREE.Matrix4().makeTranslation(0, 0.06, 0), 0x5a4330);
-  addThree(d, new THREE.IcosahedronGeometry(0.11, 1), new THREE.Matrix4().makeTranslation(0, 0.19, 0), 0x6f9a45, 0.25, 3);
-  addThree(d, new THREE.IcosahedronGeometry(0.075, 1), new THREE.Matrix4().makeTranslation(0.05, 0.26, 0.02), 0x7aa64c, 0.25, 4);
-  addThree(d, new THREE.IcosahedronGeometry(0.07, 1), new THREE.Matrix4().makeTranslation(-0.05, 0.15, -0.03), 0x648f3e, 0.25, 5);
-  // conifer
+  addThree(d, new THREE.CylinderGeometry(0.05, 0.09, 0.7, 5, 1, true), T(0, 0.35, 0), 0x5a4330);
+  addThree(d, new THREE.IcosahedronGeometry(0.55, 0), T(0, 0.98, 0), 0x6f9a45, 0.28, 3);
+  addThree(d, new THREE.IcosahedronGeometry(0.4, 0), T(0.24, 1.28, 0.1), 0x7aa64c, 0.28, 4);
+  addThree(d, new THREE.IcosahedronGeometry(0.36, 0), T(-0.24, 0.8, -0.14), 0x648f3e, 0.28, 5);
+  // conifer: trunk + stacked cones
   const c = new GeoBuilder();
-  addThree(c, new THREE.CylinderGeometry(0.01, 0.016, 0.08, 5), new THREE.Matrix4().makeTranslation(0, 0.04, 0), 0x4a3828);
-  addThree(c, new THREE.ConeGeometry(0.1, 0.16, 7), new THREE.Matrix4().makeTranslation(0, 0.13, 0), 0x2f5a35);
-  addThree(c, new THREE.ConeGeometry(0.08, 0.14, 7), new THREE.Matrix4().makeTranslation(0, 0.21, 0), 0x356540);
-  addThree(c, new THREE.ConeGeometry(0.055, 0.12, 7), new THREE.Matrix4().makeTranslation(0, 0.29, 0), 0x3b6e46);
+  addThree(c, new THREE.CylinderGeometry(0.04, 0.07, 0.45, 5, 1, true), T(0, 0.22, 0), 0x4a3828);
+  addThree(c, new THREE.ConeGeometry(0.5, 0.8, 7, 1, true), T(0, 0.75, 0), 0x2f5a35);
+  addThree(c, new THREE.ConeGeometry(0.38, 0.7, 7, 1, true), T(0, 1.18, 0), 0x356540);
+  addThree(c, new THREE.ConeGeometry(0.25, 0.6, 7, 1, true), T(0, 1.58, 0), 0x3b6e46);
   return [d.build(), c.build()];
 }
 

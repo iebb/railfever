@@ -100,7 +100,18 @@ function door(c: Ctx, x: number, y: number, w: number, h: number, col: string) {
 
 export interface Atlases { color: THREE.CanvasTexture; emissive: THREE.CanvasTexture }
 
+/** True when a DOM (canvas) is available; headless (node) builds get placeholder textures. */
+export const HAS_DOM = typeof document !== 'undefined';
+
+/** 1x1 placeholder texture for headless runs. */
+export function placeholderTexture(r = 200, g = 200, b = 200): THREE.DataTexture {
+  const t = new THREE.DataTexture(new Uint8Array([r, g, b, 255]), 1, 1);
+  t.needsUpdate = true;
+  return t;
+}
+
 export function createFacadeAtlas(): Atlases {
+  if (!HAS_DOM) return { color: placeholderTexture() as unknown as THREE.CanvasTexture, emissive: placeholderTexture(0, 0, 0) as unknown as THREE.CanvasTexture };
   const size = CELL * ATLAS_CELLS;
   const cv = document.createElement('canvas'); cv.width = cv.height = size;
   const ev = document.createElement('canvas'); ev.width = ev.height = size;
@@ -199,6 +210,7 @@ export function createFacadeAtlas(): Atlases {
 
 /** Soft round sprite for particles. */
 export function createSmokeTexture(): THREE.CanvasTexture {
+  if (!HAS_DOM) return placeholderTexture(255, 255, 255) as unknown as THREE.CanvasTexture;
   const cv = document.createElement('canvas'); cv.width = cv.height = 64;
   const c = cv.getContext('2d')!;
   const g = c.createRadialGradient(32, 32, 2, 32, 32, 30);
@@ -213,6 +225,7 @@ export function createSmokeTexture(): THREE.CanvasTexture {
 
 /** Soft glow sprite for lamps and headlights. */
 export function createGlowTexture(): THREE.CanvasTexture {
+  if (!HAS_DOM) return placeholderTexture(255, 255, 255) as unknown as THREE.CanvasTexture;
   const cv = document.createElement('canvas'); cv.width = cv.height = 64;
   const c = cv.getContext('2d')!;
   const g = c.createRadialGradient(32, 32, 0, 32, 32, 32);
@@ -224,4 +237,105 @@ export function createGlowTexture(): THREE.CanvasTexture {
   const t = new THREE.CanvasTexture(cv);
   t.colorSpace = THREE.SRGBColorSpace;
   return t;
+}
+
+function finishStrip(cv: HTMLCanvasElement): THREE.CanvasTexture {
+  const t = new THREE.CanvasTexture(cv);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = THREE.ClampToEdgeWrapping;
+  t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 8;
+  t.generateMipmaps = true;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  return t;
+}
+
+/** World length (units) covered by one texture repeat along strip textures (ballast, roads). */
+export const STRIP_PERIOD = 0.96;
+/** Sleepers per texture repeat. */
+export const SLEEPERS_PER_PERIOD = 16;
+
+/**
+ * Ballast bed top with sleepers. u: [0, 0.5] wooden sleepers, [0.5, 1] concrete sleepers; each half spans
+ * the bed top across (left edge to right edge). v: one repeat = STRIP_PERIOD units along the track.
+ */
+export function createBallastTexture(): THREE.Texture {
+  if (!HAS_DOM) return placeholderTexture(120, 110, 98);
+  const W = 256, H = 1024;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d')!;
+  const r = rng(77);
+  for (let half = 0; half < 2; half++) {
+    const x0 = half * 128;
+    noiseFill(c, x0, 0, 128, H, '#7a746a', 0.28, 41 + half);
+    // individual stones
+    for (let i = 0; i < 2600; i++) {
+      const v = 70 + Math.floor(r() * 90);
+      c.fillStyle = `rgb(${v + 8},${v + 4},${v - 4})`;
+      c.fillRect(x0 + r() * 128, r() * H, 1.5 + r() * 2.5, 1.5 + r() * 2.5);
+    }
+    const per = H / SLEEPERS_PER_PERIOD;
+    for (let k = 0; k < SLEEPERS_PER_PERIOD; k++) {
+      const y = k * per + per * 0.3;
+      const sh = per * 0.42;
+      const sx = x0 + 128 * 0.11, sw = 128 * 0.78;
+      // shadow under the sleeper edges
+      c.fillStyle = 'rgba(0,0,0,0.35)';
+      c.fillRect(sx - 1, y - 2, sw + 2, sh + 5);
+      if (half === 0) {
+        const g = 60 + Math.floor(r() * 22);
+        c.fillStyle = `rgb(${g + 26},${g + 10},${g - 6})`;
+        c.fillRect(sx, y, sw, sh);
+        c.fillStyle = 'rgba(0,0,0,0.18)';
+        for (let j = 0; j < 3; j++) c.fillRect(sx, y + 3 + j * (sh / 3), sw, 1);
+      } else {
+        c.fillStyle = '#a7a39b';
+        c.fillRect(sx, y, sw, sh);
+        c.fillStyle = 'rgba(255,255,255,0.12)';
+        c.fillRect(sx, y, sw, 3);
+        c.fillStyle = '#8f8b84';
+        c.fillRect(sx + sw * 0.42, y + 2, sw * 0.16, sh - 4);
+      }
+      // rail fastenings under both rails
+      c.fillStyle = '#2b2b2b';
+      for (const u of [0.267, 0.733]) c.fillRect(x0 + 128 * u - 7, y + 2, 14, sh - 4);
+    }
+  }
+  return finishStrip(cv);
+}
+
+/**
+ * Road surfaces. u: [0, 0.5] country road (solid edge lines, dashed centre), [0.5, 1] town street
+ * (dashed centre, gutters); each half spans the carriageway across. v: one repeat = STRIP_PERIOD units.
+ */
+export function createRoadTexture(): THREE.Texture {
+  if (!HAS_DOM) return placeholderTexture(84, 86, 90);
+  const W = 512, H = 256;
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const c = cv.getContext('2d')!;
+  const r = rng(91);
+  for (let half = 0; half < 2; half++) {
+    const x0 = half * 256;
+    noiseFill(c, x0, 0, 256, H, half === 0 ? '#57595d' : '#505256', 0.16, 51 + half);
+    for (let i = 0; i < 900; i++) {
+      const v = 60 + Math.floor(r() * 50);
+      c.fillStyle = `rgba(${v},${v},${v + 3},0.55)`;
+      c.fillRect(x0 + r() * 256, r() * H, 1 + r() * 2, 1 + r() * 2);
+    }
+    // worn wheel tracks
+    c.fillStyle = 'rgba(0,0,0,0.07)';
+    for (const u of [0.18, 0.34, 0.66, 0.82]) c.fillRect(x0 + 256 * u - 9, 0, 18, H);
+    c.fillStyle = '#ecebe4';
+    if (half === 0) {
+      c.fillRect(x0 + 9, 0, 4, H);
+      c.fillRect(x0 + 256 - 13, 0, 4, H);
+      c.fillRect(x0 + 126, 0, 4, H / 3);
+    } else {
+      c.fillRect(x0 + 126, 0, 4, H / 4);
+      c.fillStyle = 'rgba(0,0,0,0.25)';
+      c.fillRect(x0, 0, 7, H);
+      c.fillRect(x0 + 249, 0, 7, H);
+    }
+  }
+  return finishStrip(cv);
 }
