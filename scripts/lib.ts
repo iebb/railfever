@@ -233,32 +233,10 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
   const prof = chainProfile(g, [{ x: cA.x, z: cA.z, tx: fA.x, tz: fA.z }, ...way], 2, ra.y, rb.y, 'rail', exclude);
   if (!prof) { log('  double: profile infeasible'); return fail; }
   const e0 = net.nextEdge;
-  log(`  double: first new edge #${e0}, profile crossings ${prof.crossings.map((c) => c.mode + '#' + c.edge).join(',')}`);
   if (routeConflict(g, prof, 'rail', 2, exclude)) { log('  double: route conflicts with other edges or itself'); return fail; }
   const res = buildChain(g, frontsA[0], way, railOpts(owner, 2), frontsB[0], prof, (s) => log('   ' + s));
   log(`  double chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels}`);
   if (!res.ok) return fail;
-  {
-    // how far does each platform get (no signals yet)?
-    for (const eid of ra.edges) {
-      const e = net.edges.get(eid)!;
-      for (const dir of [1, -1]) {
-        const seen = new Set<number>(); let frontier = [{ e, dir }]; let reachedB = false, steps = 0, lastNode = -1;
-        while (frontier.length && steps++ < 400) {
-          const nx: { e: typeof e; dir: number }[] = [];
-          for (const f of frontier) for (const c of net.nextRail(f.e, f.dir)) {
-            if (seen.has(c.edge.id * 2 + (c.dir > 0 ? 1 : 0))) continue;
-            seen.add(c.edge.id * 2 + (c.dir > 0 ? 1 : 0));
-            if (c.edge.station === B.id) reachedB = true;
-            lastNode = c.node.id;
-            nx.push({ e: c.edge, dir: c.dir });
-          }
-          frontier = nx;
-        }
-        if (seen.size > 2) log(`  double: from platform ${eid} dir ${dir}: ${seen.size} edge-dirs, reached B ${reachedB}, last node ${lastNode}`);
-      }
-    }
-  }
   // which main track is on the right when travelling A->B ("out")?
   const edges = newRailEdges(g, e0, owner);
   const right = (x: number, z: number, px: number, pz: number, tx: number, tz: number) => (x - px) * -tz + (z - pz) * tx > 0;

@@ -29,7 +29,7 @@ export class SpatialGrid {
       const a = this.cells.get(k);
       if (!a) continue;
       const i = a.indexOf(id);
-      if (i >= 0) { a[i] = a[a.length - 1]; a.pop(); }
+      if (i >= 0) a.splice(i, 1); // keep insertion order (deterministic queries, also after save/load)
       if (!a.length) this.cells.delete(k);
     }
   }

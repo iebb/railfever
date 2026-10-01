@@ -680,10 +680,14 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
         net.touchEdge(oe);
         recomputeLocks(w, c.x - wdt - 1, c.z - wdt - 1, c.x + wdt + 1, c.z + wdt + 1);
       } else if (c.mode === 'level' || c.mode === 'diamond') {
-        const rail = ne.kind === 'rail' ? ne : oe, road = ne.kind === 'rail' ? oe : ne;
-        const sRail = rail === ne ? c.sNew : old.s, sRoad = road === ne ? c.sNew : old.s;
+        // the new edge may have been split by a junction of this proposal: locate the part at sNew
+        const nl = locate(ne.id, c.sNew);
+        const nE = net.edges.get(nl.id);
+        if (!nE) continue;
+        const rail = nE.kind === 'rail' ? nE : oe, road = nE.kind === 'rail' ? oe : nE;
+        const sRail = rail === nE ? nl.s : old.s, sRoad = road === nE ? nl.s : old.s;
         net.crossings.set(net.nextCrossing, { id: net.nextCrossing++, kind: c.mode, e1: rail.id, s1: sRail, e2: road.id, s2: sRoad, x: c.x, z: c.z });
-        net.markEdge(ne);
+        net.markEdge(nE);
       } else if (c.mode === 'junction') {
         const sNew = locate(ne.id, c.sNew);
         const r1 = net.splitEdge(old.id, old.s);

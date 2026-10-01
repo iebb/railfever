@@ -280,7 +280,7 @@ export function deserialize(d: any): Game {
         t.pending = pending;
       } else if (vd.segs.length) {
         t.segs = []; t.pending = []; t.speed = 0; t.state = 'depot'; t.status = 'Returned to depot';
-      }
+      } else { t.headSeg = vd.headSeg ?? 0; t.headPos = vd.headPos ?? 0; }
       v = t;
     } else v = makeRoad(vd);
     V.map.set(v.id, v);
