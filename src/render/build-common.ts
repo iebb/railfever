@@ -3,20 +3,25 @@ import type { Game } from '../game/game';
 import type { Network, NEdge, NNode, EdgeGeo } from '../game/network';
 import { OBJ_CHUNK } from '../game/world';
 import { GeoBuilder } from './geo';
+import type { WB } from './build-mesh';
+import type { FacadeBuilder } from './build-buildings';
+import type { TreeInstance } from './trees';
 
-/** One render chunk being built: bounds plus the builders/collectors objects add into. */
+/**
+ * One object chunk being built: bounds plus the builders/collectors objects add into.
+ * `w`: world material, ground pieces (cast = 0) and tall structures (cast = 1);
+ * `d`: small detail (rails, masts, lamps, furniture) hidden at a distance, never casting;
+ * `fac`: facade-atlas walls.
+ */
 export interface ChunkCtx {
   game: Game;
   ci: number;
   /** chunks per side */
   n: number;
   x0: number; z0: number; x1: number; z1: number;
-  matte: GeoBuilder;
-  metal: GeoBuilder;
-  /** textured ballast top (uv) */
-  ballast: GeoBuilder;
-  /** textured road carriageway (uv) */
-  road: GeoBuilder;
+  w: WB;
+  d: WB;
+  fac: FacadeBuilder;
   /** night light glow points (x,y,z triples) */
   lights: number[];
   /** signal lamps whose colour follows the reservation of `edge` */
@@ -25,6 +30,7 @@ export interface ChunkCtx {
   booms: Boom[];
   /** level crossing warning lights */
   xLights: XLight[];
+  trees: TreeInstance[];
 }
 
 export interface SignalLamp { x: number; y: number; z: number; edge: number }
@@ -195,19 +201,15 @@ export function sweep(gb: GeoBuilder, run: Smp[], prof: PP[], vScale = 1, yOff =
   }
 }
 
-/** Upward-facing triangle (winding fixed so the normal points up). */
-export function upTri(gb: GeoBuilder, ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number) {
-  const ny = (bz - az) * (cx - ax) - (bx - ax) * (cz - az);
-  if (ny >= 0) gb.triangle(ax, ay, az, bx, by, bz, cx, cy, cz);
-  else gb.triangle(ax, ay, az, cx, cy, cz, bx, by, bz);
+/** Upward-facing triangle (winding fixed so the normal points up), planar uvs at scale sc. */
+export function upTri(gb: WB, ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, sc = 1) {
+  gb.ptri(ax, ay, az, bx, by, bz, cx, cy, cz, sc);
 }
 
-/** Vertical quad wall between bottom points a and b facing (nx,nz) (winding fixed). */
-export function wallQuad(gb: GeoBuilder, ax: number, az: number, bx: number, bz: number, y0a: number, y1a: number, y0b: number, y1b: number, nx: number, nz: number) {
-  // quad(a, b, b', a') has normal cross(b-a, up) = (-(bz-az), 0, bx-ax); flip the order if that faces away
-  const cx = -(bz - az), cz = bx - ax;
-  if (cx * nx + cz * nz > 0) gb.quad(ax, y0a, az, bx, y0b, bz, bx, y1b, bz, ax, y1a, az);
-  else gb.quad(bx, y0b, bz, ax, y0a, az, ax, y1a, az, bx, y1b, bz);
+/** Vertical quad wall between bottom points a and b facing (nx,nz) (winding fixed), world uvs. */
+export function wallQuad(gb: WB, ax: number, az: number, bx: number, bz: number, y0a: number, y1a: number, y0b: number, y1b: number, nx: number, nz: number, sc = 1) {
+  const l = Math.hypot(nx, nz) || 1;
+  gb.twall(ax, az, bx, bz, y0a, y1a, y0b, y1b, nx / l, nz / l, sc);
 }
 
 /** Node helpers. */

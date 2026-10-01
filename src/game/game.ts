@@ -146,7 +146,8 @@ export class Game {
     if (!this.networkDirty) return;
     this.networkDirty = false;
     this.vehicles.onNetworkChanged();
-    for (const v of this.vehicles.all()) if (v.state === 'running' || v.state === 'waiting' || v.state === 'noroute') v.onLineChanged();
+    // lost vehicles re-plan at once, the others are staggered over the next ticks (no hitch)
+    this.vehicles.replanAfterNetworkChange();
     for (const l of this.listeners.network) l();
   }
 
@@ -232,7 +233,7 @@ export class Game {
       if (this.day < town.nextGrowthDay) continue;
       let served = 0;
       for (const st of this.stations.map.values()) {
-        if (this.day - st.lastPickup > 30 || !this.lines.stationServed(st.id)) continue;
+        if (this.day - st.lastPickup > 90 || !this.lines.stationServed(st.id)) continue; // v2 time scale: a train every ~2 months still serves a town
         if (Math.hypot(st.x - town.x, st.z - town.z) <= town.radius + 10) served++;
       }
       town.served = served;

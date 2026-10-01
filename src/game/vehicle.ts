@@ -7,13 +7,20 @@ export interface CargoGroup { alight: number; dest: number; count: number; from:
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
-export const FARE_PER_TILE = 14;
+/** Fare per world unit (10 m) of straight-line distance, before the speed factor. */
+export const FARE_PER_TILE = 7.5;
 
+/**
+ * Income for `count` passengers carried `dist` units (straight line) in `days`. Short hops (< 30 m)
+ * pay nothing extra, long journeys a tapered rate; fast journeys pay up to 1.45x, slow ones down to 0.35x.
+ */
 export function fare(dist: number, days: number, count: number): number {
-  if (dist < 1) return 0;
-  const speed = dist / Math.max(0.4, days); // tiles per day
+  const d = dist - 3;
+  if (d <= 0) return 0;
+  const eff = d <= 250 ? d : 250 + (d - 250) * 0.5;
+  const speed = dist / Math.max(0.4, days); // units per day
   const factor = Math.max(0.35, Math.min(1.45, 0.35 + speed / 9));
-  return count * dist * FARE_PER_TILE * factor;
+  return count * eff * FARE_PER_TILE * factor;
 }
 
 export abstract class Vehicle {

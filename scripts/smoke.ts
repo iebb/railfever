@@ -2,8 +2,9 @@
 // npx esbuild scripts/smoke.ts --bundle --platform=node --format=esm --outfile=$S/smoke.mjs && node $S/smoke.mjs
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { sitePop } from '../src/game/ai';
 import {
-  fails, check, fmt, connectStations, depotBehind, busStopSites, roadDepotNear, checkReservations, checkNaN, pickTownPair, placeStation,
+  fails, check, fmt, connectStations, depotBehind, busStopSites, roadDepotNear, checkReservations, checkNaN, placeStationPair, addBusStop,
   Train, RoadVehicle,
 } from './lib';
 
@@ -15,13 +16,11 @@ const pop0 = g.towns.list.map((t) => t.pop);
 const bld0 = g.world.buildings.size, edges0 = g.world.net.edges.size;
 
 // ------------------------------------------------------------------ rail line
-const pair = pickTownPair(g, 60, 150)!;
-const [TA, TB] = pair;
+const pair = placeStationPair(g, 60, 150, 0)!;
+check(pair, 'station pair placed');
+const { A, B, TA, TB } = pair;
 console.log(`rail: ${TA.name} (${TA.pop}) <-> ${TB.name} (${TB.pop}), ${fmt(Math.hypot(TA.x - TB.x, TA.z - TB.z))} units`);
-const A = placeStation(g, TA, TB)!;
-const B = placeStation(g, TB, TA, 0, 2, 16, { prefY: A.rail!.y, tolY: Math.hypot(TA.x - TB.x, TA.z - TB.z) * 0.012 })!;
-check(A && B, 'stations placed');
-console.log(`  stations ${A?.name} @${fmt(A.x)},${fmt(A.z)} y=${fmt(A.rail!.y, 2)}  ${B?.name} @${fmt(B.x)},${fmt(B.z)} y=${fmt(B.rail!.y, 2)}`);
+console.log(`  stations ${A.name} @${fmt(A.x)},${fmt(A.z)} y=${fmt(A.rail!.y, 2)} catch ${fmt(sitePop(g, A.x, A.z, 16), 0)}  ${B.name} @${fmt(B.x)},${fmt(B.z)} y=${fmt(B.rail!.y, 2)} catch ${fmt(sitePop(g, B.x, B.z, 16), 0)}`);
 const con = connectStations(g, A, B, 0, 1);
 const popBuilt = g.towns.list.reduce((a, t) => a + t.pop, 0);
 const popB = g.towns.list.map((t) => t.pop);
@@ -43,11 +42,9 @@ check(sites.length === 2, 'bus stop sites found');
 let bus: RoadVehicle | null = null;
 let busLineId = -1;
 if (sites.length === 2) {
-  const s0 = g.stations.nextId;
-  const e1 = g.stations.commitBusStop(sites[0][0], sites[0][1], 0);
-  const s1 = g.stations.nextId;
-  const e2 = g.stations.commitBusStop(sites[1][0], sites[1][1], 0);
-  check(!e1 && !e2, `bus stops built ${e1 ?? ''} ${e2 ?? ''}`);
+  const s0 = addBusStop(g, sites[0][0], sites[0][1], 0);
+  const s1 = addBusStop(g, sites[1][0], sites[1][1], 0);
+  check(s0 > 0 && s1 > 0 && s0 !== s1, `bus stops built ${s0} ${s1}`);
   const bdep = roadDepotNear(g, sites[0][0], sites[0][1], 0);
   check(bdep > 0, 'road depot built');
   const bl = g.lines.create('road', 0);
@@ -60,6 +57,7 @@ if (sites.length === 2) {
 }
 
 // ------------------------------------------------------------------ simulate
+const popSim = g.towns.list.map((t) => t.pop);
 let leftDepot = false, arrivals = { a: 0, b: 0 }, lastAt = -1, busArr = 0, lastBusState = '';
 let errors = 0, nanMsg: string | null = null;
 const T1 = performance.now();
@@ -102,7 +100,7 @@ for (const st of [A, B]) console.log(`  ${st.name}: catch ${fmt(st.catchPop, 0)}
 const growth = g.towns.list.map((t, i) => t.pop - pop0[i]);
 console.log(`towns: pop ${pop0.reduce((a, b) => a + b, 0)} (after construction ${popBuilt}) -> ${g.towns.list.reduce((a, t) => a + t.pop, 0)}, buildings ${bld0} -> ${g.world.buildings.size}, edges ${edges0} -> ${g.world.net.edges.size}`);
 check(growth.some((x) => x > 0), 'towns grew');
-console.log('  ' + g.towns.list.map((t, i) => `${t.name} ${popB[i]}->${t.pop} (served ${t.served})`).join(', '));
+console.log('  ' + g.towns.list.map((t, i) => `${t.name} ${popB[i]}/${popSim[i]}->${t.pop} (served ${t.served})`).join(', '));
 
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

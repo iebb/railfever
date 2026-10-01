@@ -8,6 +8,7 @@ import { depotSize } from '../game/build-ops';
 import { arcTable, tAtS, bezPoint } from '../game/geom';
 import { profAt } from '../game/network';
 import { ROAD_TYPES, WATER_Y, NetKind } from '../game/constants';
+import { FLOOR_H } from '../game/towns';
 
 export type MarkerKind = 'node' | 'edge' | 'free' | 'start' | 'signal' | 'point';
 export interface FootRect { x: number; z: number; angle: number; w: number; d: number; color: number; y?: number; lift?: number }
@@ -37,19 +38,28 @@ class Buf {
   }
 }
 
-/** BufferGeometry whose attributes grow on demand and are reused between updates. */
+/** BufferGeometry whose attributes are reused between updates. Growing swaps in a fresh geometry:
+ *  three.js does not re-upload new attributes attached to a geometry that was already disposed. */
 class DynGeo {
-  readonly geo = new THREE.BufferGeometry();
+  geo = new THREE.BufferGeometry();
+  /** meshes drawing this geometry (re-pointed when it is replaced) */
+  users: THREE.Mesh[] = [];
   private cap = 0;
-  constructor() { this.alloc(256); }
-  private alloc(n: number) {
+  constructor() { this.alloc(this.geo, 256); }
+  private alloc(geo: THREE.BufferGeometry, n: number) {
     this.cap = n;
-    this.geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
-    this.geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3), 3).setUsage(THREE.DynamicDrawUsage));
   }
   set(b: Buf) {
     const n = b.pos.length / 3;
-    if (n > this.cap) { this.geo.dispose(); this.alloc(Math.max(n, this.cap * 2)); }
+    if (n > this.cap) {
+      const old = this.geo;
+      this.geo = new THREE.BufferGeometry();
+      this.alloc(this.geo, Math.max(n, this.cap * 2));
+      for (const m of this.users) m.geometry = this.geo;
+      old.dispose();
+    }
     const pa = this.geo.getAttribute('position') as THREE.BufferAttribute, ca = this.geo.getAttribute('color') as THREE.BufferAttribute;
     (pa.array as Float32Array).set(b.pos);
     (ca.array as Float32Array).set(b.col);
@@ -83,6 +93,22 @@ function flatRect(b: Buf, x: number, z: number, a: number, w: number, d: number,
   b.quad(x - rx - fx, y, z - rz - fz, x + rx - fx, y, z + rz - fz, x + rx + fx, y, z + rz + fz, x - rx + fx, y, z - rz + fz, c);
 }
 
+/** Open box (top + 4 sides) over an oriented rectangle from y0 to y1. */
+function boxRect(b: Buf, x: number, z: number, a: number, w: number, d: number, y0: number, y1: number, c: THREE.Color) {
+  const fx = Math.sin(a) * d / 2, fz = Math.cos(a) * d / 2, rx = Math.cos(a) * w / 2, rz = -Math.sin(a) * w / 2;
+  const P = [[x - rx - fx, z - rz - fz], [x + rx - fx, z + rz - fz], [x + rx + fx, z + rz + fz], [x - rx + fx, z - rz + fz]];
+  b.quad(P[0][0], y1, P[0][1], P[1][0], y1, P[1][1], P[2][0], y1, P[2][1], P[3][0], y1, P[3][1], c);
+  for (let i = 0; i < 4; i++) {
+    const p = P[i], q = P[(i + 1) % 4];
+    b.quad(p[0], y0, p[1], q[0], y0, q[1], q[0], y1, q[1], p[0], y1, p[1], c);
+  }
+}
+
+/** Vertical quad from (ax,az) to (bx,bz) between heights y0 and y1. */
+function wall(b: Buf, ax: number, az: number, bx: number, bz: number, y0: number, y1: number, c: THREE.Color) {
+  b.quad(ax, y0, az, bx, y0, bz, bx, y1, bz, ax, y1, az, c);
+}
+
 function basic(opts: THREE.MeshBasicMaterialParameters) {
   return new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false, ...opts });
 }
@@ -96,7 +122,7 @@ class GhostMesh {
     this.mesh = new THREE.Mesh(this.dyn.geo, basic({ vertexColors: true, opacity, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -4 }));
     this.xray = new THREE.Mesh(this.dyn.geo, basic({ vertexColors: true, opacity: xrayOpacity, depthTest: false }));
     this.mesh.renderOrder = order; this.xray.renderOrder = order - 1;
-    for (const m of [this.mesh, this.xray]) { m.frustumCulled = false; m.visible = false; group.add(m); }
+    for (const m of [this.mesh, this.xray]) { m.frustumCulled = false; m.visible = false; group.add(m); this.dyn.users.push(m); }
   }
   set(b: Buf | null) {
     const vis = !!b && this.dyn.set(b);
@@ -112,6 +138,9 @@ export class Overlay {
   private foot: GhostMesh;
   private hover: GhostMesh;
   private rings: GhostMesh;
+  private demo: GhostMesh;
+  private disc: GhostMesh;
+  private demoKey = '';
   private markers = new Map<string, THREE.Mesh>();
   private markerGeo: Record<MarkerKind, THREE.BufferGeometry>;
   private crossPool: THREE.Mesh[] = [];
@@ -127,6 +156,8 @@ export class Overlay {
     this.foot = new GhostMesh(this.group, 0.5, 0.16, 29);
     this.hover = new GhostMesh(this.group, 0.55, 0.14, 27);
     this.rings = new GhostMesh(this.group, 0.75, 0.12, 25);
+    this.demo = new GhostMesh(this.group, 0.34, 0.1, 33);
+    this.disc = new GhostMesh(this.group, 0.3, 0.08, 24);
     const flat = (g: THREE.BufferGeometry) => g.rotateX(-Math.PI / 2);
     this.markerGeo = {
       node: flat(new THREE.RingGeometry(0.62, 1, 28)),
@@ -156,6 +187,8 @@ export class Overlay {
     this.setProposal(null);
     this.foot.set(null);
     this.setHoverEdge(null);
+    this.setDemolish(null);
+    this.disc.set(null);
     for (const m of this.markers.values()) m.visible = false;
   }
 
@@ -192,6 +225,8 @@ export class Overlay {
     const cBridge = new THREE.Color().setHex(ok ? C.okBridge : C.badBridge);
     const cTunnel = new THREE.Color().setHex(ok ? C.okTunnel : C.badTunnel);
     const cLine = new THREE.Color().setHex(ok ? 0x1d6b38 : 0x8a1f1f);
+    const cPier = new THREE.Color().setHex(ok ? 0x2f8fd0 : 0xd0603a);
+    const cPortal = new THREE.Color().setHex(ok ? 0xd2b8ff : 0xff9ad0);
     const pt = { x: 0, z: 0 };
     for (const tp of p.tracks) {
       const tab = arcTable(tp.bez);
@@ -209,6 +244,7 @@ export class Overlay {
       ribbon(b, pts, n, hw, 0.04, (i) => (types[i] === 1 ? cBridge : types[i] === 2 ? cTunnel : cGround));
       // centre line (rail) / lane divider (road) for readability
       ribbon(b, pts, n, road ? 0.025 : 0.04, 0.05, () => cLine);
+      this.structures(b, pts, types, n, step, hw, cPier, cPortal);
     }
     this.ghost.set(b);
     // crossing markers
@@ -220,6 +256,72 @@ export class Overlay {
       m.position.set(c.x, profAt(tp.prof, tp.len, c.sNew) + 0.08, c.z);
       m.visible = true;
     });
+  }
+
+  /** Bridge piers (every ~3 units down to the ground / water) and tunnel portal frames. */
+  private structures(b: Buf, pts: Float32Array, types: Uint8Array, n: number, step: number, hw: number, cPier: THREE.Color, cPortal: THREE.Color) {
+    const w = this.game.world;
+    const every = Math.max(1, Math.round(3 / step));
+    const tan = (i: number) => {
+      const a = Math.max(0, i - 1), c = Math.min(n - 1, i + 1);
+      const tx = pts[c * 3] - pts[a * 3], tz = pts[c * 3 + 2] - pts[a * 3 + 2];
+      const l = Math.hypot(tx, tz) || 1;
+      return [tx / l, tz / l];
+    };
+    let run = 0;
+    for (let i = 0; i < n; i++) {
+      const x = pts[i * 3], y = pts[i * 3 + 1], z = pts[i * 3 + 2];
+      if (types[i] === 1) {
+        if (run++ % every !== Math.floor(every / 2)) continue;
+        const gy = Math.max(w.heightAt(x, z), WATER_Y - 0.3);
+        if (y - gy < 0.35) continue;
+        const [tx, tz] = tan(i);
+        const r = 0.09;
+        wall(b, x - tz * r, z + tx * r, x + tz * r, z - tx * r, gy, y - 0.02, cPier);
+        wall(b, x - tx * r, z - tz * r, x + tx * r, z + tz * r, gy, y - 0.02, cPier);
+      } else run = 0;
+      // portal frame where a tunnel section starts or ends
+      const prev = i > 0 ? types[i - 1] : types[i], next = i < n - 1 ? types[i + 1] : types[i];
+      if (types[i] === 2 && (prev !== 2 || next !== 2)) {
+        const [tx, tz] = tan(i);
+        const rx = -tz * (hw + 0.12), rz = tx * (hw + 0.12);
+        const top = y + 0.62, t = 0.07;
+        wall(b, x - rx, z - rz, x - rx * 0.82, z - rz * 0.82, y, top, cPortal);
+        wall(b, x + rx * 0.82, z + rz * 0.82, x + rx, z + rz, y, top, cPortal);
+        wall(b, x - rx, z - rz, x + rx, z + rz, top - t, top, cPortal);
+      }
+    }
+  }
+
+  /** Buildings that would be demolished: translucent red boxes. */
+  setDemolish(ids: number[] | null) {
+    const key = ids && ids.length ? ids.join(',') : '';
+    if (key === this.demoKey) return;
+    this.demoKey = key;
+    if (!key) { this.demo.set(null); return; }
+    const b = this.buf.clear();
+    const c = col(0xff3b30).clone();
+    for (const id of ids!) {
+      const bd = this.game.world.buildings.get(id);
+      if (!bd) continue;
+      boxRect(b, bd.x, bd.z, bd.angle, bd.w + 0.06, bd.d + 0.06, bd.y - 0.05, bd.y + bd.floors * FLOOR_H + 0.25, c);
+    }
+    this.demo.set(b);
+  }
+
+  /** Flat translucent disc at height y (e.g. the target level of the terraform brush); null hides it. */
+  setDisc(d: { x: number; z: number; r: number; y: number; color?: number } | null) {
+    if (!d || d.r <= 0) { this.disc.set(null); return; }
+    const b = this.buf.clear();
+    const c = col(d.color ?? 0xffe066).clone();
+    const n = Math.max(24, Math.min(96, Math.ceil(d.r * 6)));
+    for (let i = 0; i < n; i++) {
+      const a0 = (i / n) * Math.PI * 2, a1 = ((i + 1) / n) * Math.PI * 2;
+      b.v(d.x, d.y, d.z, c);
+      b.v(d.x + Math.cos(a0) * d.r, d.y, d.z + Math.sin(a0) * d.r, c);
+      b.v(d.x + Math.cos(a1) * d.r, d.y, d.z + Math.sin(a1) * d.r, c);
+    }
+    this.disc.set(b);
   }
 
   private crossMat(mode: CrossingPlan['mode']) {
@@ -362,7 +464,7 @@ export class Overlay {
   linePathIds() { return [...this.linePaths.keys()]; }
 
   dispose() {
-    for (const g of [this.ghost, this.foot, this.hover, this.rings, ...this.linePaths.values()]) g.dispose();
+    for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, ...this.linePaths.values()]) g.dispose();
     for (const g of Object.values(this.markerGeo)) g.dispose();
     for (const m of this.markers.values()) (m.material as THREE.Material).dispose();
     for (const m of this.crossMats.values()) m.dispose();

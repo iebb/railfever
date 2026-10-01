@@ -205,7 +205,7 @@ export class CameraController {
     // keep the camera above the ground and buildings
     const clear = 0.08 + c.d * 0.02;
     let minY = this.ground(cam.position.x, cam.position.z) + clear;
-    for (const b of this.world.buildingsNear(cam.position.x, cam.position.z, 3)) {
+    if (cam.position.y - minY < 12) for (const b of this.world.buildingsNear(cam.position.x, cam.position.z, 3)) {
       if (!pointInRect(cam.position.x, cam.position.z, b.x, b.z, b.angle, b.w / 2 + 0.2, b.d / 2 + 0.2)) continue;
       minY = Math.max(minY, b.y + b.floors * FLOOR_H + 0.35 + Math.min(b.w, b.d) * 0.35 + 0.15);
     }
@@ -223,4 +223,6 @@ export class CameraController {
 
   get smoothDistance() { return this.cur.d; }
   get focus() { return new THREE.Vector3(this.cur.tx, this.cur.ty, this.cur.tz); }
+  /** Smoothed focus point written into `out` (no allocation). */
+  focusInto(out: THREE.Vector3) { return out.set(this.cur.tx, this.cur.ty, this.cur.tz); }
 }

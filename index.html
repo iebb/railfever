@@ -2,21 +2,25 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#0b0f15" />
     <title>Railfever</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%23e8a33d'/%3E%3Cpath d='M7 3v18M17 3v18M4 6h16M4 10h16M4 14h16M4 18h16' stroke='%231b2430' stroke-width='1.8'/%3E%3C/svg%3E" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='6' fill='%2310161f'/%3E%3Cpath d='M3 15h6c2 0 3-6 6-6h6' stroke='%23ffb020' stroke-width='2.4' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='6' cy='15' r='2.2' fill='%2310161f' stroke='%23ffb020' stroke-width='1.6'/%3E%3Ccircle cx='18' cy='9' r='2.2' fill='%2310161f' stroke='%23eef2f7' stroke-width='1.6'/%3E%3C/svg%3E" />
     <style>
-      html, body { margin: 0; height: 100%; background: #0f141b; overflow: hidden; }
-      #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; background: radial-gradient(circle at 50% 40%, #1d2a38, #0b0f14); color: #e9eef3; font: 600 15px system-ui, sans-serif; z-index: 100000; transition: opacity .4s; }
+      html, body { margin: 0; height: 100%; background: #0b0f15; overflow: hidden; }
+      #loading { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 22px; background: radial-gradient(ellipse at 50% 38%, #1a2433 0%, #0b0f15 70%); color: #eef2f7; font: 600 13px 'Barlow', system-ui, -apple-system, 'Segoe UI', sans-serif; letter-spacing: 0.08em; text-transform: uppercase; z-index: 100000; transition: opacity 0.45s ease; }
       #loading.hidden { opacity: 0; pointer-events: none; }
-      #loading .lbrand { font: 800 44px system-ui, sans-serif; letter-spacing: 6px; margin-bottom: 18px; }
-      #loading .lbrand span { color: #e8a33d; }
-      #loading .spin { width: 34px; height: 34px; border: 3px solid rgba(255,255,255,.15); border-top-color: #e8a33d; border-radius: 50%; animation: sp 0.8s linear infinite; margin-bottom: 14px; }
-      @keyframes sp { to { transform: rotate(360deg); } }
+      #loading .lbrand { font: 700 72px/0.9 'Barlow Condensed', 'Arial Narrow', system-ui, sans-serif; letter-spacing: 0.035em; text-transform: none; }
+      #loading .lbrand span { color: #ffb020; }
+      #loading .ltrack { position: relative; width: 240px; height: 4px; border-radius: 2px; background: rgba(255, 176, 32, 0.18); overflow: hidden; }
+      #loading .ltrack::after { content: ''; position: absolute; top: 0; bottom: 0; width: 34%; border-radius: 2px; background: #ffb020; box-shadow: 0 0 12px #ffb020; animation: lrun 1.1s cubic-bezier(.45,.05,.55,.95) infinite; }
+      #loading .ltext { color: #a4afbf; }
+      @keyframes lrun { from { left: -34%; } to { left: 100%; } }
+      @media (prefers-reduced-motion: reduce) { #loading .ltrack::after { animation: none; left: 33%; } }
     </style>
   </head>
   <body>
-    <div id="loading"><div class="lbrand">RAIL<span>FEVER</span></div><div class="spin"></div><div class="ltext">Generating world…</div></div>
+    <div id="loading" role="status" aria-live="polite"><div class="lbrand">RAIL<span>FEVER</span></div><div class="ltrack"></div><div class="ltext">Generating world…</div></div>
     <div id="app"></div>
     <script type="module" src="/src/main.ts"></script>
   </body>

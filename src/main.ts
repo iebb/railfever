@@ -3,7 +3,10 @@ import { Game, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
 import { saveToSlot, listSlots, loadFromSlot } from './game/save';
+import { loadFonts } from './ui/fonts';
+import { defaultTowns } from './ui/title';
 
+const fontsReady = loadFonts();
 const app = document.getElementById('app')!;
 const loading = document.getElementById('loading')!;
 const renderer = new Renderer(app);
@@ -22,8 +25,11 @@ function showLoading(text: string) {
 }
 function hideLoading() { loading.classList.add('hidden'); }
 
-/** Default number of towns for a map size (scaled with the area). */
-export function defaultTowns(size: number) { return Math.max(3, Math.round(10 * (size / 384) ** 2)); }
+/** Wait for the fonts (briefly) and for the loading screen to paint before blocking work. */
+function afterPaint(fn: () => void) {
+  const timeout = new Promise<void>((r) => setTimeout(r, 350));
+  Promise.race([fontsReady, timeout]).then(() => requestAnimationFrame(() => setTimeout(fn, 20)));
+}
 
 function setGame(g: Game) {
   game = g;
@@ -39,8 +45,7 @@ function setGame(g: Game) {
 
 function newGame(opts: NewGameOptions) {
   showLoading('Generating world…');
-  // let the loading screen paint before the (blocking) generation
-  setTimeout(() => {
+  afterPaint(() => {
     try {
       setGame(Game.create(opts));
     } catch (e) {
@@ -48,14 +53,14 @@ function newGame(opts: NewGameOptions) {
       ui.toast('World generation failed: ' + (e as Error).message, 'bad');
     }
     hideLoading();
-  }, 60);
+  });
 }
 
 // periodic autosave
 let autosaveTimer = 0;
 let saving = false;
 async function autosave() {
-  if (!game || saving) return;
+  if (!game || saving || ui.titleOpen) return;
   saving = true;
   try { await saveToSlot(game, 'autosave', 'Autosave'); } catch (e) { console.warn('autosave failed', e); }
   saving = false;
@@ -67,7 +72,14 @@ function loop(now: number) {
   last = now;
   if (game) {
     try {
+      const t0 = performance.now();
       game.update(dt);
+      renderer.simMs = performance.now() - t0;
+      if (ui.titleOpen) {
+        // slow cinematic orbit behind the title screen
+        const c = renderer.controls as unknown as { yaw?: number };
+        if (typeof c.yaw === 'number') c.yaw += dt * 0.03;
+      }
       renderer.frame(dt);
       ui.update(dt);
     } catch (e) { console.error(e); }
@@ -89,7 +101,7 @@ function boot() {
   const water = (wp === 'low' || wp === 'medium' || wp === 'high' ? wp : 'medium') as NewGameOptions['water'];
   const aiCompanies = Math.max(0, Math.min(3, Math.round(num('ai', 1))));
   showLoading('Generating world…');
-  setTimeout(() => {
+  afterPaint(() => {
     try {
       setGame(Game.create({ size, seed, towns, hilliness, water, startYear: num('year', 1950), aiCompanies }));
     } catch (e) {
@@ -100,25 +112,14 @@ function boot() {
     requestAnimationFrame(loop);
     if (params.has('nointro') || !game) return;
     const hasAuto = listSlots().some((s) => s.slot === 'autosave');
-    ui.openNewGame(true);
-    const win = ui.wm.get('newgame');
-    if (!win) return;
-    const btns = win.body.querySelector('.btns');
-    const play = document.createElement('button');
-    play.className = 'btn';
-    play.textContent = 'Play this map';
-    play.onclick = () => win.close();
-    btns?.prepend(play);
-    if (hasAuto) {
-      const cont = document.createElement('button');
-      cont.className = 'btn';
-      cont.textContent = 'Continue autosave';
-      cont.onclick = async () => {
-        try { const ag = await loadFromSlot('autosave'); win.close(); setGame(ag); } catch (e) { console.error(e); ui.toast('Could not load autosave', 'bad'); }
-      };
-      btns?.prepend(cont);
-    }
-  }, 30);
+    ui.showTitle({
+      onContinue: hasAuto ? async () => {
+        showLoading('Loading autosave…');
+        try { setGame(await loadFromSlot('autosave')); } catch (e) { console.error(e); ui.toast('Could not load the autosave', 'bad'); }
+        hideLoading();
+      } : undefined,
+    });
+  });
 }
 
 boot();

@@ -239,103 +239,256 @@ export function createGlowTexture(): THREE.CanvasTexture {
   return t;
 }
 
-function finishStrip(cv: HTMLCanvasElement): THREE.CanvasTexture {
-  const t = new THREE.CanvasTexture(cv);
-  t.colorSpace = THREE.SRGBColorSpace;
-  t.wrapS = THREE.ClampToEdgeWrapping;
-  t.wrapT = THREE.RepeatWrapping;
-  t.anisotropy = 8;
-  t.generateMipmaps = true;
-  t.minFilter = THREE.LinearMipmapLinearFilter;
-  return t;
-}
-
-/** World length (units) covered by one texture repeat along strip textures (ballast, roads). */
+/** World length (units) covered by one repeat of the road strip cells. */
 export const STRIP_PERIOD = 0.96;
-/** Sleepers per texture repeat. */
-export const SLEEPERS_PER_PERIOD = 16;
 
-/**
- * Ballast bed top with sleepers. u: [0, 0.5] wooden sleepers, [0.5, 1] concrete sleepers; each half spans
- * the bed top across (left edge to right edge). v: one repeat = STRIP_PERIOD units along the track.
- */
-export function createBallastTexture(): THREE.Texture {
-  if (!HAS_DOM) return placeholderTexture(120, 110, 98);
-  const W = 256, H = 1024;
-  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-  const c = cv.getContext('2d')!;
-  const r = rng(77);
-  for (let half = 0; half < 2; half++) {
-    const x0 = half * 128;
-    noiseFill(c, x0, 0, 128, H, '#7a746a', 0.28, 41 + half);
-    // individual stones
-    for (let i = 0; i < 2600; i++) {
-      const v = 70 + Math.floor(r() * 90);
-      c.fillStyle = `rgb(${v + 8},${v + 4},${v - 4})`;
-      c.fillRect(x0 + r() * 128, r() * H, 1.5 + r() * 2.5, 1.5 + r() * 2.5);
-    }
-    const per = H / SLEEPERS_PER_PERIOD;
-    for (let k = 0; k < SLEEPERS_PER_PERIOD; k++) {
-      const y = k * per + per * 0.3;
-      const sh = per * 0.42;
-      const sx = x0 + 128 * 0.11, sw = 128 * 0.78;
-      // shadow under the sleeper edges
-      c.fillStyle = 'rgba(0,0,0,0.35)';
-      c.fillRect(sx - 1, y - 2, sw + 2, sh + 5);
-      if (half === 0) {
-        const g = 60 + Math.floor(r() * 22);
-        c.fillStyle = `rgb(${g + 26},${g + 10},${g - 6})`;
-        c.fillRect(sx, y, sw, sh);
-        c.fillStyle = 'rgba(0,0,0,0.18)';
-        for (let j = 0; j < 3; j++) c.fillRect(sx, y + 3 + j * (sh / 3), sw, 1);
-      } else {
-        c.fillStyle = '#a7a39b';
-        c.fillRect(sx, y, sw, sh);
-        c.fillStyle = 'rgba(255,255,255,0.12)';
-        c.fillRect(sx, y, sw, 3);
-        c.fillStyle = '#8f8b84';
-        c.fillRect(sx + sw * 0.42, y + 2, sw * 0.16, sh - 4);
-      }
-      // rail fastenings under both rails
-      c.fillStyle = '#2b2b2b';
-      for (const u of [0.267, 0.733]) c.fillRect(x0 + 128 * u - 7, y + 2, 14, sh - 4);
-    }
+// ------------------------------------------------------------------------------ world atlas
+// One procedurally generated atlas (pure JS, so it also works headless) for all static world surfaces.
+// Cells are 4x4; each holds a tileable 256 px pattern with a wrapped 16 px gutter. Most patterns are
+// neutral in tone so vertex colours give the albedo; asphalt/ballast cells carry their own colours.
+
+/** World atlas cell indices (index = row * 4 + col). */
+export const WC = {
+  PLAIN: 0, BALLAST_WOOD: 1, BALLAST_CONC: 2, GRAVEL: 3,
+  ROAD_COUNTRY: 4, ROAD_STREET: 5, ASPHALT: 6, PAVING: 7,
+  PLATFORM: 8, CONCRETE: 9, STONE: 10, ROOF_TILES: 11,
+  ROOF_SLATE: 12, ROOF_FLAT: 13, METAL: 14, LAMP: 15,
+};
+/** World units per texture repeat for the 2D cells (strip cells are mapped explicitly). */
+export const WSCALE = {
+  GRAVEL: 0.5, ASPHALT: 1.2, PAVING: 0.4, PLATFORM: 1.0, CONCRETE: 1.0, STONE: 0.5,
+  ROOF_TILES: 0.36, ROOF_SLATE: 0.3, ROOF_FLAT: 1.0, PLAIN: 1.0,
+};
+/** Ballast cell: sleepers per repeat (one repeat = BALLAST_PERIOD units along the track). */
+export const BALLAST_PERIOD = 0.24;
+export const ATLAS = { cols: 4, content: 256, gutter: 16 };
+export const ATLAS_SIZE = ATLAS.cols * (ATLAS.content + 2 * ATLAS.gutter);
+/** Per-cell roughness / metalness used by the world material. */
+export const CELL_ROUGH = [0.9, 0.97, 0.95, 0.96, 0.9, 0.9, 0.9, 0.86, 0.85, 0.88, 0.9, 0.72, 0.62, 0.92, 0.42, 0.5];
+export const CELL_METAL = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05, 0, 0.72, 0];
+
+function h2(ix: number, iy: number, seed: number): number {
+  let h = (Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263) + Math.imul(seed | 0, 2246822519)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  h ^= h >>> 16;
+  return (h >>> 0) / 4294967296;
+}
+/** Tileable value noise; x,y in lattice units, lattice wraps at period p. */
+function vn(x: number, y: number, p: number, seed: number): number {
+  const ix = Math.floor(x), iy = Math.floor(y);
+  const fx = x - ix, fy = y - iy;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy);
+  const x0 = ((ix % p) + p) % p, y0 = ((iy % p) + p) % p, x1 = (x0 + 1) % p, y1 = (y0 + 1) % p;
+  const a = h2(x0, y0, seed), b = h2(x1, y0, seed), c = h2(x0, y1, seed), d = h2(x1, y1, seed);
+  return a + (b - a) * u + (c - a) * v + (a - b - c + d) * u * v;
+}
+/** Tileable fBm in [0,1]; (s,t) in [0,1) over the cell, base period p. */
+function fb(s: number, t: number, p: number, seed: number, oct = 3): number {
+  let sum = 0, amp = 0.5, norm = 0, per = p;
+  for (let o = 0; o < oct; o++) { sum += amp * vn(s * per, t * per, per, seed + o * 31); norm += amp; amp *= 0.5; per *= 2; }
+  return sum / norm;
+}
+/** Tileable Worley noise: returns [F1, F2-F1, cell id] for points jittered in a g x g grid. */
+function worley(s: number, t: number, g: number, seed: number, out: number[]) {
+  const x = s * g, y = t * g;
+  const ix = Math.floor(x), iy = Math.floor(y);
+  let f1 = 9, f2 = 9, id = 0;
+  for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) {
+    const cx = ix + dx, cy = iy + dy;
+    const wx = ((cx % g) + g) % g, wy = ((cy % g) + g) % g;
+    const px = cx + h2(wx, wy, seed), py = cy + h2(wx, wy, seed + 7);
+    const d = Math.hypot(px - x, py - y);
+    if (d < f1) { f2 = f1; f1 = d; id = wy * g + wx; } else if (d < f2) f2 = d;
   }
-  return finishStrip(cv);
+  out[0] = f1; out[1] = f2 - f1; out[2] = id;
 }
 
-/**
- * Road surfaces. u: [0, 0.5] country road (solid edge lines, dashed centre), [0.5, 1] town street
- * (dashed centre, gutters); each half spans the carriageway across. v: one repeat = STRIP_PERIOD units.
- */
-export function createRoadTexture(): THREE.Texture {
-  if (!HAS_DOM) return placeholderTexture(84, 86, 90);
-  const W = 512, H = 256;
-  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
-  const c = cv.getContext('2d')!;
-  const r = rng(91);
-  for (let half = 0; half < 2; half++) {
-    const x0 = half * 256;
-    noiseFill(c, x0, 0, 256, H, half === 0 ? '#57595d' : '#505256', 0.16, 51 + half);
-    for (let i = 0; i < 900; i++) {
-      const v = 60 + Math.floor(r() * 50);
-      c.fillStyle = `rgba(${v},${v},${v + 3},0.55)`;
-      c.fillRect(x0 + r() * 256, r() * H, 1 + r() * 2, 1 + r() * 2);
+type Painter = (s: number, t: number, o: number[]) => void;
+const clamp01 = (x: number) => (x < 0 ? 0 : x > 1 ? 1 : x);
+const smooth = (a: number, b: number, x: number) => { const k = clamp01((x - a) / (b - a)); return k * k * (3 - 2 * k); };
+const W3 = [0, 0, 0];
+
+function stones(s: number, t: number, g: number, seed: number, o: number[], base: [number, number, number], vary: number) {
+  worley(s, t, g, seed, W3);
+  const id = W3[2];
+  const k = 0.78 + vary * (h2(id, 3, seed) - 0.5) * 2 + 0.12 * (1 - Math.min(1, W3[0] * 1.6));
+  const edge = smooth(0.0, 0.12, W3[1]);
+  const shade = k * (0.68 + 0.32 * edge);
+  const tint = h2(id, 9, seed);
+  o[0] = base[0] * shade * (0.95 + tint * 0.1); o[1] = base[1] * shade; o[2] = base[2] * shade * (1.05 - tint * 0.1);
+}
+
+function asphalt(s: number, t: number, o: number[], tone: number, seed: number) {
+  const n = fb(s, t, 8, seed, 3);
+  const sp = h2(Math.floor(s * 256), Math.floor(t * 256), seed + 5);
+  let v = tone * (0.88 + 0.22 * n);
+  if (sp > 0.93) v *= 1.25; else if (sp < 0.05) v *= 0.8;
+  o[0] = v; o[1] = v * 1.01; o[2] = v * 1.04;
+}
+
+/** Ballast bed top: stones, 4 sleepers per repeat, rails painted in so the track reads at distance. */
+function ballast(concrete: boolean): Painter {
+  return (s, t, o) => {
+    stones(s, t, 44, concrete ? 61 : 62, o, [0.56, 0.53, 0.49], 0.13);
+    const tt = (t * 4) % 1;
+    const inSleeper = s > 0.11 && s < 0.89 && tt > 0.28 && tt < 0.7;
+    if (inSleeper) {
+      const n = fb(s, t, 16, 70, 2);
+      if (concrete) { const v = 0.66 + 0.08 * n - (Math.abs(s - 0.5) < 0.08 ? 0.05 : 0); o[0] = v; o[1] = v * 0.99; o[2] = v * 0.96; }
+      else { const v = 0.3 + 0.1 * n + 0.04 * Math.sin(t * 80); o[0] = v * 1.3; o[1] = v * 1.02; o[2] = v * 0.78; }
+      if (Math.abs(tt - 0.28) < 0.02 || Math.abs(tt - 0.7) < 0.02) { o[0] *= 0.7; o[1] *= 0.7; o[2] *= 0.7; }
+    } else if (s > 0.1 && s < 0.9 && (Math.abs(tt - 0.25) < 0.04 || Math.abs(tt - 0.73) < 0.04)) { o[0] *= 0.62; o[1] *= 0.62; o[2] *= 0.62; }
+    // rails: dark web/foot, bright polished head
+    for (const c of [0.267, 0.733]) {
+      const d = Math.abs(s - c);
+      if (d < 0.03) {
+        if (inSleeper && d < 0.03 && d > 0.018) { o[0] = 0.14; o[1] = 0.14; o[2] = 0.15; }
+        if (d <= 0.018) { const v = d < 0.009 ? 0.78 : 0.3; o[0] = v; o[1] = v * 0.97; o[2] = v * 0.93; }
+      }
     }
+  };
+}
+
+function roadStrip(country: boolean): Painter {
+  return (s, t, o) => {
+    asphalt(s, t, o, country ? 0.36 : 0.33, country ? 81 : 82);
     // worn wheel tracks
-    c.fillStyle = 'rgba(0,0,0,0.07)';
-    for (const u of [0.18, 0.34, 0.66, 0.82]) c.fillRect(x0 + 256 * u - 9, 0, 18, H);
-    c.fillStyle = '#ecebe4';
-    if (half === 0) {
-      c.fillRect(x0 + 9, 0, 4, H);
-      c.fillRect(x0 + 256 - 13, 0, 4, H);
-      c.fillRect(x0 + 126, 0, 4, H / 3);
+    for (const c of [0.2, 0.33, 0.67, 0.8]) if (Math.abs(s - c) < 0.05) { const k = 1 - 0.08 * (1 - Math.abs(s - c) / 0.05); o[0] *= k; o[1] *= k; o[2] *= k; }
+    let paint = false;
+    if (country) {
+      if ((s > 0.035 && s < 0.057) || (s > 0.943 && s < 0.965)) paint = true;
+      if (Math.abs(s - 0.5) < 0.011 && t < 0.34) paint = true;
     } else {
-      c.fillRect(x0 + 126, 0, 4, H / 4);
-      c.fillStyle = 'rgba(0,0,0,0.25)';
-      c.fillRect(x0, 0, 7, H);
-      c.fillRect(x0 + 249, 0, 7, H);
+      if (Math.abs(s - 0.5) < 0.01 && t < 0.25) paint = true;
+      if (s < 0.03 || s > 0.97) { o[0] *= 0.72; o[1] *= 0.72; o[2] *= 0.72; }
+    }
+    if (paint) { const v = 0.82 + 0.08 * fb(s, t, 32, 90, 2); o[0] = v; o[1] = v; o[2] = v * 0.97; }
+  };
+}
+
+function slabs(s: number, t: number, nx: number, ny: number, seed: number, o: number[], joint = 0.03, stagger = false) {
+  const row = Math.floor(t * ny);
+  const ss = stagger && row % 2 ? s + 0.5 / nx : s;
+  const ix = Math.floor(ss * nx), fx = ss * nx - ix, fy = t * ny - row;
+  const k = 0.85 + 0.14 * (h2(((ix % nx) + nx) % nx, row, seed) - 0.5) * 2;
+  let v = k * (0.9 + 0.12 * fb(s, t, 16, seed + 3, 2));
+  if (fx < joint || fx > 1 - joint || fy < joint || fy > 1 - joint) v *= 0.68;
+  o[0] = v; o[1] = v; o[2] = v;
+}
+
+const PAINTERS: Painter[] = [
+  (_s, _t, o) => { o[0] = 1; o[1] = 1; o[2] = 1; },
+  ballast(false),
+  ballast(true),
+  (s, t, o) => stones(s, t, 52, 63, o, [0.62, 0.58, 0.53], 0.16),
+  roadStrip(true),
+  roadStrip(false),
+  (s, t, o) => asphalt(s, t, o, 0.35, 83),
+  (s, t, o) => slabs(s, t, 6, 6, 84, o, 0.03),
+  (s, t, o) => { slabs(s, t, 4, 4, 85, o, 0.012); const sp = h2(Math.floor(s * 256), Math.floor(t * 256), 86); if (sp > 0.96) { o[0] *= 0.85; o[1] *= 0.85; o[2] *= 0.85; } },
+  // concrete: noise, formwork joints, tie holes, rain streaks
+  (s, t, o) => {
+    let v = 0.86 + 0.1 * (fb(s, t, 6, 87, 3) - 0.5) - 0.05 * fb(s * 0.25, t, 24, 88, 1);
+    const fx = (s * 2) % 1, fy = (t * 4) % 1;
+    if (fx < 0.008 || fy < 0.012) v *= 0.82;
+    const hx = (s * 8) % 1, hy = (t * 8) % 1;
+    if (Math.hypot(hx - 0.5, hy - 0.5) < 0.05 && Math.floor(t * 8) % 2 === 0) v *= 0.7;
+    o[0] = v; o[1] = v; o[2] = v * 0.98;
+  },
+  // stone masonry: 8 courses, 4 blocks each, random offsets
+  (s, t, o) => {
+    const row = Math.floor(t * 8), fy = t * 8 - row;
+    const off = h2(row, 1, 89) * 0.25;
+    const ss = (s + off) % 1;
+    const bi = Math.floor(ss * 4), fx = ss * 4 - bi;
+    const k = 0.84 + 0.18 * (h2(bi, row, 90) - 0.5) + 0.12 * (fb(s, t, 12, 91, 2) - 0.5);
+    let v = k;
+    const j = 0.045;
+    if (fy < j || fy > 1 - j || fx < j * 0.5 || fx > 1 - j * 0.5) v = 0.62;
+    else v *= 0.92 + 0.08 * Math.min(1, Math.min(fy, 1 - fy, fx * 2, (1 - fx) * 2) * 8);
+    o[0] = v * 1.02; o[1] = v; o[2] = v * 0.95;
+  },
+  // roof tiles: 12 courses (v up the slope), 16 tiles across, overlap shadow at the course bottom
+  (s, t, o) => {
+    const row = Math.floor(t * 12), fy = t * 12 - row;
+    const ss = (s + (row % 2) * 0.5 / 16) % 1;
+    const ti = Math.floor(ss * 16), fx = ss * 16 - ti;
+    let v = 0.82 + 0.14 * (h2(ti, row, 92) - 0.5) * 2;
+    v *= 0.62 + 0.38 * smooth(0, 0.14, fy) - 0.1 * fy;
+    v *= 0.88 + 0.12 * Math.sin(fx * Math.PI);
+    if (fx < 0.05) v *= 0.8;
+    o[0] = v; o[1] = v; o[2] = v;
+  },
+  // slate: 16 courses, 10 slates across, staggered
+  (s, t, o) => {
+    const row = Math.floor(t * 16), fy = t * 16 - row;
+    const ss = (s + (row % 2) * 0.05) % 1;
+    const ti = Math.floor(ss * 10), fx = ss * 10 - ti;
+    let v = 0.78 + 0.16 * (h2(ti, row, 93) - 0.5) * 2;
+    v *= 0.7 + 0.3 * smooth(0, 0.1, fy);
+    if (fx < 0.04) v *= 0.75;
+    v *= 0.94 + 0.08 * fb(s, t, 16, 94, 2);
+    o[0] = v; o[1] = v; o[2] = v;
+  },
+  // flat roof: gravel + bitumen seams
+  (s, t, o) => {
+    let v = 0.72 + 0.16 * (fb(s, t, 24, 95, 2) - 0.5) + (h2(Math.floor(s * 256), Math.floor(t * 256), 96) - 0.5) * 0.12;
+    if ((s * 3) % 1 < 0.01 || (t * 2) % 1 < 0.008) v *= 0.7;
+    o[0] = v; o[1] = v; o[2] = v;
+  },
+  (s, t, o) => { const v = 0.92 + 0.06 * fb(s, t, 4, 97, 2); o[0] = v; o[1] = v; o[2] = v; },
+  (_s, _t, o) => { o[0] = 1; o[1] = 1; o[2] = 1; },
+];
+
+let worldAtlasData: { data: Uint8Array; size: number } | null = null;
+
+/** Pixel data of the world atlas (RGBA, sRGB, row 0 = v 0). Cached. */
+export function worldAtlasPixels(): { data: Uint8Array; size: number } {
+  if (worldAtlasData) return worldAtlasData;
+  const { cols, content: C, gutter: G } = ATLAS;
+  const S = C + 2 * G, size = cols * S;
+  const data = new Uint8Array(size * size * 4);
+  const tile = new Float32Array(C * C * 3);
+  const o = [0, 0, 0];
+  const lut = new Uint8Array(4097);
+  for (let i = 0; i <= 4096; i++) lut[i] = Math.round(clamp01(i / 4096) * 255);
+  for (let ci = 0; ci < PAINTERS.length; ci++) {
+    const paint = PAINTERS[ci];
+    for (let y = 0; y < C; y++) for (let x = 0; x < C; x++) {
+      paint((x + 0.5) / C, (y + 0.5) / C, o);
+      const k = (y * C + x) * 3;
+      tile[k] = o[0]; tile[k + 1] = o[1]; tile[k + 2] = o[2];
+    }
+    const ox = (ci % cols) * S, oy = Math.floor(ci / cols) * S;
+    for (let y = -G; y < C + G; y++) {
+      const sy = ((y % C) + C) % C;
+      for (let x = -G; x < C + G; x++) {
+        const sx = ((x % C) + C) % C;
+        const k = (sy * C + sx) * 3;
+        const d = ((oy + G + y) * size + ox + G + x) * 4;
+        data[d] = lut[Math.round(clamp01(tile[k]) * 4096)];
+        data[d + 1] = lut[Math.round(clamp01(tile[k + 1]) * 4096)];
+        data[d + 2] = lut[Math.round(clamp01(tile[k + 2]) * 4096)];
+        data[d + 3] = 255;
+      }
     }
   }
-  return finishStrip(cv);
+  worldAtlasData = { data, size };
+  return worldAtlasData;
+}
+
+/** The world atlas as a mip-mapped sRGB texture. */
+export function createWorldAtlas(): THREE.DataTexture {
+  const { data, size } = worldAtlasPixels();
+  const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+  t.magFilter = THREE.LinearFilter;
+  t.minFilter = THREE.LinearMipmapLinearFilter;
+  t.generateMipmaps = true;
+  t.anisotropy = 8;
+  t.flipY = false;
+  t.userData = { cells: ATLAS.cols, pad: ATLAS.gutter / (ATLAS.content + 2 * ATLAS.gutter), content: ATLAS.content };
+  t.needsUpdate = true;
+  return t;
 }

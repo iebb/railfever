@@ -6,7 +6,7 @@ import { NEdge } from './network';
 import { distToRect, World } from './world';
 import { rectsOverlap } from './towns';
 import { applyEarthworks, recomputeLocks, brush } from './terraform';
-import { planEdge, commitProposal, nodeGroup } from './construction';
+import { planEdge, commitProposal, nodeGroup, Snap, Proposal } from './construction';
 
 export interface Depot {
   id: number;
@@ -87,7 +87,29 @@ export class Depots {
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
     for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
     plan.cost += Math.round((mx - mn) * 20000);
+    if (kind === 'road' && plan.ok) {
+      const link = this.roadLink(exitX, exitZ, plan.y, owner, -1);
+      if (link && !link.ok) failp('Cannot connect to the road');
+      else if (link) { for (const id of link.demolish) if (!plan.demolish.includes(id)) plan.demolish.push(id); plan.cost += link.cost; }
+      else if (!net.nearestEdge(exitX, exitZ, 4, 'road', (ed) => ed.depot < 0)) failp('No road nearby');
+    }
     return plan;
+  }
+
+  /** Street linking a road depot exit to the nearest road (null if none is needed or none is near). */
+  private roadLink(x: number, z: number, y: number, owner: number, exitNode: number): Proposal | null {
+    const g = this.game;
+    const net = g.world.net;
+    const ne = net.nearestEdge(x, z, 4, 'road', (ed) => ed.depot < 0);
+    if (!ne) return null;
+    const nodeEnd = ne.s < 0.8 ? ne.edge.a : ne.s > ne.edge.len - 0.8 ? ne.edge.b : -1;
+    const p = { x: 0, y: 0, z: 0 };
+    net.pointAt(ne.edge, ne.s, p);
+    const nn = nodeEnd >= 0 ? net.nodes.get(nodeEnd)! : null;
+    const end: Snap = nn ? { kind: 'node', x: nn.x, z: nn.z, y: nn.y, node: nn.id } : { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
+    if (Math.hypot(end.x - x, end.z - z) <= 0.3) return null;
+    const start: Snap = exitNode >= 0 ? { kind: 'node', x, z, y, node: exitNode } : { kind: 'free', x, z, y };
+    return planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
   }
 
   commit(kind: NetKind, plan: DepotPlan, owner: number): string | null {
@@ -121,19 +143,10 @@ export class Depots {
     applyEarthworks(w, [e]);
     w.removeTreesNear(plan.x, plan.z, Math.hypot(sz.w, sz.d) / 2 + 0.5);
     w.markObjArea(plan.x - 4, plan.z - 4, plan.x + 4, plan.z + 4);
-    // road depots connect themselves to the nearest road
+    // road depots connect themselves to the nearest road (planned, demolitions and cost included, in plan())
     if (kind === 'road') {
-      const ne = net.nearestEdge(exit.x, exit.z, 4, 'road', (ed) => ed.depot < 0);
-      if (ne) {
-        const target = ne.s < 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.a } : ne.s > ne.edge.len - 0.8 ? { kind: 'node' as const, x: 0, z: 0, y: 0, node: ne.edge.b } : null;
-        const p = { x: 0, y: 0, z: 0 };
-        w.net.pointAt(ne.edge, ne.s, p);
-        const end = target ? { ...target, x: w.net.nodes.get(target.node)!.x, z: w.net.nodes.get(target.node)!.z, y: w.net.nodes.get(target.node)!.y } : { kind: 'edge' as const, x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
-        if (Math.hypot(end.x - exit.x, end.z - exit.z) > 0.3) {
-          const prop = planEdge(g, { kind: 'node', x: exit.x, z: exit.z, y: exit.y, node: exit.id }, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
-          if (prop.ok && !prop.demolish.length) commitProposal(g, prop); // never demolish buildings silently
-        }
-      }
+      const link = this.roadLink(exit.x, exit.z, exit.y, owner, exit.id);
+      if (link && link.ok) commitProposal(g, link);
     }
     g.onNetworkChanged();
     return null;

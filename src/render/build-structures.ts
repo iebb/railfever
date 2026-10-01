@@ -1,52 +1,46 @@
-// Bridges (decks, parapets, piers, abutments) and tunnel portals.
-import { RAIL, ROAD_TYPES } from '../game/constants';
+// Bridges (girder, steel truss, stone viaduct, concrete arch; piers, abutments) and tunnel portals.
+import { RAIL, ROAD_TYPES, TRACK_TYPES } from '../game/constants';
 import type { NEdge } from '../game/network';
 import { closestOnPolyline } from '../game/geom';
-import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk, wallQuad } from './build-common';
+import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk } from './build-common';
+import { WB } from './build-mesh';
+import { WC, WSCALE } from './textures';
 
-const CONCRETE = 0xa7a39a;
-const CONCRETE_DARK = 0x8f8b83;
-const STONE = 0x9a9080;
+const CONCRETE = 0xc9c5bc;
+const CONCRETE_DARK = 0xaaa59c;
+const STONE = 0xc4b49c;
+const STONE_DARK = 0xa8987f;
 const DARK = 0x07080a;
 
-/** Is there a parallel edge of the same kind at ±RAIL.spacing (similar height) at arc length s? */
-export function parallelSides(ctx: ChunkCtx, e: NEdge, s: number, offs = RAIL.spacing): { left: boolean; right: boolean } {
+// ------------------------------------------------------------------------------ neighbours
+
+interface Nb { edge: NEdge; s: number; off: number }
+
+/** Parallel edges of the same kind at k * RAIL.spacing laterally (contiguous on each side), near the same height. */
+export function parallelGroup(ctx: ChunkCtx, e: NEdge, s: number, pred?: (f: NEdge, sf: number) => boolean): Nb[] {
+  const out: Nb[] = [];
+  if (e.kind !== 'rail') return out;
   const net = ctx.game.world.net;
   const p = sampleAt(net.geo(e), s);
-  const res = { left: false, right: false };
-  for (const side of [-1, 1]) {
-    const qx = p.x + p.lx * side * offs, qz = p.z + p.lz * side * offs;
-    const ne = net.nearestEdge(qx, qz, 0.14, e.kind, (f) => f.id !== e.id);
-    if (!ne) continue;
+  for (const side of [-1, 1]) for (let k = 1; k <= 3; k++) {
+    const off = side * k * RAIL.spacing;
+    const ne = net.nearestEdge(p.x + p.lx * off, p.z + p.lz * off, 0.14, 'rail', (f) => f.id !== e.id);
+    if (!ne) break;
     const q = sampleAt(net.geo(ne.edge), ne.s);
-    if (Math.abs(q.tx * p.tx + q.tz * p.tz) < 0.95 || Math.abs(q.y - p.y) > 0.3) continue;
-    if (side < 0) res.left = true; else res.right = true;
+    if (Math.abs(q.tx * p.tx + q.tz * p.tz) < 0.95 || Math.abs(q.y - p.y) > 0.3) break;
+    if (pred && !pred(ne.edge, ne.s)) break;
+    out.push({ edge: ne.edge, s: ne.s, off });
   }
-  return res;
+  return out;
 }
 
-/** Deck cross-section (left to right over the top): slab with parapets and a box girder below. */
-function deckProfile(wl: number, wr: number, pl: boolean, pr: boolean, top: number, depth: number, ph: number): PP[] {
-  const pt = top + ph;
-  const bot = top - depth, slab = top - 0.06;
-  const gl = Math.max(0.08, wl * 0.55), gr = Math.max(0.08, wr * 0.55);
-  const L: PP[] = [[-gl, bot], [-gl - 0.05, slab - 0.03], [-wl, slab]];
-  if (pl) L.push([-wl, pt], [-wl + 0.025, pt], [-wl + 0.025, top]); else L.push([-wl, top]);
-  if (pr) L.push([wr - 0.025, top], [wr - 0.025, pt], [wr, pt]); else L.push([wr, top]);
-  L.push([wr, slab], [gr + 0.05, slab - 0.03], [gr, bot], [-gl, bot]);
-  return L;
+/** Is there a parallel edge directly left/right (±spacing) at arc length s? */
+export function parallelSides(ctx: ChunkCtx, e: NEdge, s: number): { left: boolean; right: boolean } {
+  const g = parallelGroup(ctx, e, s);
+  return { left: g.some((n) => n.off < 0 && n.off > -RAIL.spacing * 1.5), right: g.some((n) => n.off > 0 && n.off < RAIL.spacing * 1.5) };
 }
 
-interface DeckDims { w: number; top: number; depth: number; ph: number; pierW: number; capW: number; spacing: number }
-
-function deckDims(e: NEdge): DeckDims {
-  if (e.kind === 'rail') return { w: 0.27, top: -0.05, depth: 0.26, ph: 0.11, pierW: 0.24, capW: 0.46, spacing: 4 };
-  const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
-  const W = rt.half + (rt.sidewalk > 0 ? rt.sidewalk : 0.06) + 0.04;
-  return { w: W, top: -0.005, depth: 0.24, ph: 0.1, pierW: Math.min(0.5, W * 0.7), capW: W * 1.5, spacing: 3.5 };
-}
-
-/** Does any other edge pass below the deck within its half width + margin of (x,z)? */
+/** Does any other edge pass below height yDeck within its half width + margin of (x,z)? */
 function blockedBelow(ctx: ChunkCtx, e: NEdge, x: number, z: number, yDeck: number, margin: number): boolean {
   const net = ctx.game.world.net;
   for (const f of net.edgesNear(x - 1.5, z - 1.5, x + 1.5, z + 1.5)) {
@@ -60,7 +54,7 @@ function blockedBelow(ctx: ChunkCtx, e: NEdge, x: number, z: number, yDeck: numb
   return false;
 }
 
-/** Whether the network continues on a bridge at an edge end (no abutment needed there). */
+/** Does the network continue on a bridge/tunnel at an edge end (then no abutment/portal there)? */
 function continuesAt(ctx: ChunkCtx, e: NEdge, nodeId: number, type: 'bridge' | 'tunnel'): boolean {
   const net = ctx.game.world.net;
   const node = net.nodes.get(nodeId);
@@ -73,51 +67,412 @@ function continuesAt(ctx: ChunkCtx, e: NEdge, nodeId: number, type: 'bridge' | '
   return false;
 }
 
-/** Deck, piers and abutments for the bridge section [s0,s1] of edge e (runs: chunk-local pieces of the section). */
+// ------------------------------------------------------------------------------ bridges
+
+export type BridgeStyle = 'girder' | 'truss' | 'viaduct' | 'arch';
+
+interface Dims { w: number; top: number; depth: number; ph: number; pierW: number; capW: number }
+
+function dims(e: NEdge): Dims {
+  if (e.kind === 'rail') return { w: 0.27, top: -0.05, depth: 0.26, ph: 0.11, pierW: 0.22, capW: 0.5 };
+  const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
+  const W = rt.half + (rt.sidewalk > 0 ? rt.sidewalk : 0.06) + 0.04;
+  return { w: W, top: -0.005, depth: 0.24, ph: 0.1, pierW: Math.min(0.5, W * 0.7), capW: W * 1.6 };
+}
+
+const styleCache = new Map<string, BridgeStyle>();
+const bridgeSigs = new Map<string, string>();
+
+function spanFor(style: BridgeStyle, e: NEdge): number {
+  return style === 'truss' ? 9 : style === 'viaduct' ? 2.4 : style === 'arch' ? 6 : e.kind === 'rail' ? 4 : 3.5;
+}
+
+/** Bridge style of a section, decided on the group leader so parallel tracks match. */
+export function bridgeStyle(ctx: ChunkCtx, e: NEdge, s0: number, s1: number): BridgeStyle {
+  const net = ctx.game.world.net;
+  const mid = (s0 + s1) / 2;
+  let le = e, ls0 = s0, ls1 = s1;
+  for (const nb of parallelGroup(ctx, e, mid, (f, sf) => net.sectionAt(f, sf) === 'bridge')) {
+    if (nb.edge.id >= le.id) continue;
+    const sec = nb.edge.sections.find((q) => q.type === 'bridge' && nb.s >= q.s0 - 0.01 && nb.s <= q.s1 + 0.01);
+    if (sec) { le = nb.edge; ls0 = sec.s0; ls1 = sec.s1; }
+  }
+  const key = le.id + ':' + le.version + ':' + ls0.toFixed(2) + ':' + net.version;
+  let st = styleCache.get(key);
+  if (st) return st;
+  st = computeStyle(ctx, le, ls0, ls1);
+  if (styleCache.size > 4000) styleCache.clear();
+  styleCache.set(key, st);
+  return st;
+}
+
+function computeStyle(ctx: ChunkCtx, e: NEdge, s0: number, s1: number): BridgeStyle {
+  const w = ctx.game.world;
+  const g = ctx.game.world.net.geo(e);
+  const D = dims(e);
+  const L = s1 - s0;
+  const hs: number[] = [];
+  let water = false;
+  for (let k = 1; k < 20; k++) {
+    const p = sampleAt(g, s0 + (L * k) / 20);
+    const gy = w.heightAt(p.x, p.z);
+    if (gy < 0) water = true;
+    if (k >= 3 && k <= 17) hs.push(p.y + D.top - D.depth - gy);
+  }
+  hs.sort((a, b) => a - b);
+  const med = hs.length ? hs[Math.floor(hs.length / 2)] : 0;
+  let st: BridgeStyle = 'girder';
+  if (e.kind === 'rail') {
+    if (water && L >= 9) st = 'truss';
+    else if (L >= 8 && med >= 2.0) st = (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified ? 'arch' : 'viaduct';
+  } else if (L >= 12 && med >= 2.4) st = 'arch';
+  if (st === 'viaduct' || st === 'arch') {
+    // arches need every pier: fall back to girders if any support would stand on another edge
+    const n = Math.max(1, Math.round(L / spanFor(st, e)));
+    for (let k = 1; k < n; k++) {
+      const p = sampleAt(g, s0 + (k * L) / n);
+      if (blockedBelow(ctx, e, p.x, p.z, p.y - 0.3, D.w + 0.15)) return 'girder';
+    }
+  }
+  return st;
+}
+
+/** Deck cross-section (left to right over the top): slab with parapets and a girder below. */
+function deckProfile(wl: number, wr: number, pl: boolean, pr: boolean, top: number, depth: number, ph: number, girder: boolean): PP[] {
+  const pt = top + ph;
+  const bot = top - depth, slab = top - 0.06;
+  const gl = Math.max(0.08, wl * 0.55), gr = Math.max(0.08, wr * 0.55);
+  const L: PP[] = girder ? [[-gl, bot], [-gl - 0.05, slab - 0.03], [-wl, slab]] : [[-wl, slab]];
+  if (pl) L.push([-wl, pt], [-wl + 0.025, pt], [-wl + 0.025, top]); else L.push([-wl, top]);
+  if (pr) L.push([wr - 0.025, top], [wr - 0.025, pt], [wr, pt]); else L.push([wr, top]);
+  L.push([wr, slab]);
+  if (girder) L.push([gr + 0.05, slab - 0.03], [gr, bot], [-gl, bot]); else L.push([-wl, slab]);
+  // u = lateral distance (concrete cell scale)
+  return L.map(([l, h]) => [l, h, (l + h) / WSCALE.CONCRETE]);
+}
+
+/** Deck, supports and abutments for the bridge section [s0,s1] of edge e (runs: chunk-local pieces). */
 export function buildBridge(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][]) {
   const net = ctx.game.world.net;
-  const w = ctx.game.world;
   const g = net.geo(e);
-  const D = deckDims(e);
-  const m = ctx.matte;
+  const D = dims(e);
+  const W = ctx.w;
+  const style = bridgeStyle(ctx, e, s0, s1);
+  const mid = sampleAt(g, (s0 + s1) / 2);
+  const ps = e.kind === 'rail' ? parallelSides(ctx, e, mid.s) : { left: false, right: false };
+  const half = RAIL.spacing / 2;
+  const wl = ps.left ? half : D.w, wr = ps.right ? half : D.w;
+  // deck
+  W.cast = 1;
   for (const run of runs) {
-    const mid = run[Math.floor(run.length / 2)];
-    const ps = e.kind === 'rail' ? parallelSides(ctx, e, mid.s) : { left: false, right: false };
-    const wl = ps.left ? RAIL.spacing / 2 + 0.012 : D.w, wr = ps.right ? RAIL.spacing / 2 + 0.012 : D.w;
-    m.color(CONCRETE);
-    sweep(m, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, D.depth, D.ph));
+    if (style === 'truss') {
+      W.use(WC.METAL, 0x4f5559);
+      sweep(W, run, deckProfile(wl, wr, false, false, D.top, 0.16, 0, false));
+    } else if (style === 'viaduct') {
+      W.use(WC.STONE, STONE);
+      sweep(W, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, 0.12, D.ph, false).map(([l, h]) => [l, h, (l + h) / WSCALE.STONE] as PP));
+    } else {
+      W.use(WC.CONCRETE, CONCRETE);
+      sweep(W, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, style === 'arch' ? 0.14 : D.depth, D.ph, style === 'girder'));
+    }
   }
-  // piers
   const L = s1 - s0;
-  const n = Math.max(1, Math.round(L / D.spacing));
-  for (let k = 1; k < n; k++) {
-    const p = sampleAt(g, s0 + (k * L) / n);
-    if (!inChunk(ctx, p.x, p.z)) continue;
-    const yb = p.y + D.top - D.depth + 0.02;
-    const gy = w.heightAt(p.x, p.z);
-    if (yb - gy < 0.4) continue;
-    if (blockedBelow(ctx, e, p.x, p.z, yb - 0.1, D.pierW / 2 + 0.1)) continue;
-    const base = gy - 0.4;
-    m.color(CONCRETE_DARK);
-    const taper = Math.min(0.06, (yb - base) * 0.006);
-    m.box(p.x, base, p.z, D.pierW + taper * 2, yb - 0.07 - base, 0.14 + taper, p.tx, p.tz);
-    m.color(CONCRETE);
-    m.box(p.x, yb - 0.08, p.z, D.capW, 0.08, 0.2, p.tx, p.tz, false);
+  const n = Math.max(1, Math.round(L / spanFor(style, e)));
+  const pierS: number[] = [];
+  for (let k = 1; k < n; k++) pierS.push(s0 + (k * L) / n);
+  let supports = [s0, ...pierS, s1];
+  if (style === 'girder' || style === 'truss') {
+    const depth = style === 'truss' ? 0.16 : D.depth;
+    supports = [s0];
+    for (const s of pierS) { const ps2 = pier(ctx, e, s, D, depth, wl, wr, style === 'truss' ? 1.6 : 1.0); if (ps2 !== null) supports.push(ps2); }
+    supports.push(s1);
+    if (style === 'truss') for (let i = 0; i < supports.length - 1; i++) truss(ctx, e, supports[i], supports[i + 1], D, ps);
+  } else if (style === 'viaduct') viaduct(ctx, e, s0, s1, supports, D, wl, wr, ps);
+  else arches(ctx, e, supports, D, wl, wr);
+  // a bridge spans several chunks: if its style or supports changed (e.g. a line was built underneath),
+  // make sure every chunk of it is rebuilt so the pieces stay consistent
+  const key = e.id + ':' + s0.toFixed(2);
+  const sig = style + ':' + supports.map((v) => v.toFixed(2)).join(',');
+  const prev = bridgeSigs.get(key);
+  if (prev !== sig) {
+    bridgeSigs.set(key, sig);
+    if (bridgeSigs.size > 20000) bridgeSigs.clear();
+    const b = net.grid.box(e.id);
+    if (prev !== undefined && b) ctx.game.world.markObjArea(b[0], b[1], b[2], b[3]);
   }
   // abutments where the bridge meets the ground
-  for (const [s, dir] of [[s0, -1], [s1, 1]] as [number, number][]) {
-    const atEnd = dir < 0 ? s <= 0.05 : s >= e.len - 0.05;
-    if (atEnd && continuesAt(ctx, e, dir < 0 ? e.a : e.b, 'bridge')) continue;
-    const p = sampleAt(g, s);
-    if (!inChunk(ctx, p.x, p.z)) continue;
-    const gy = Math.min(w.heightAt(p.x, p.z), p.y - 0.2);
-    const cx = p.x + p.tx * dir * 0.1, cz = p.z + p.tz * dir * 0.1;
-    m.color(STONE);
-    m.box(cx, gy - 0.5, cz, D.w * 2 + 0.12, p.y + D.top - (gy - 0.5), 0.36, p.tx, p.tz);
+  for (const [s, gd] of [[s0, -1], [s1, 1]] as [number, number][]) {
+    const atEnd = gd < 0 ? s <= 0.05 : s >= e.len - 0.05;
+    if (atEnd && continuesAt(ctx, e, gd < 0 ? e.a : e.b, 'bridge')) continue;
+    abutment(ctx, e, s, gd, D, wl, wr, style);
   }
 }
 
+/** Pier under the deck at s (shifted along the bridge if another edge passes below). Returns the used s or null. */
+function pier(ctx: ChunkCtx, e: NEdge, s: number, D: Dims, depth: number, wl: number, wr: number, scale: number): number | null {
+  const w = ctx.game.world;
+  const g = ctx.game.world.net.geo(e);
+  for (const dsh of [0, 0.5, -0.5, 1, -1, 1.5, -1.5]) {
+    const sp = s + dsh * scale;
+    if (sp <= 0.3 || sp >= e.len - 0.3) continue;
+    const p = sampleAt(g, sp);
+    const yb = p.y + D.top - depth + 0.02;
+    const gy = w.heightAt(p.x, p.z);
+    if (yb - gy < 0.4) return dsh === 0 ? null : null;
+    if (blockedBelow(ctx, e, p.x, p.z, yb - 0.1, D.pierW / 2 + 0.12)) continue;
+    if (!inChunk(ctx, p.x, p.z)) return sp;
+    const W = ctx.w;
+    W.cast = 1;
+    const base = gy - 0.4;
+    const h = yb - 0.08 - base;
+    const taper = Math.min(0.08, h * 0.008);
+    // keep caps of parallel decks flush: centre the column under this deck's own width
+    const off = (wr - wl) / 2;
+    const cx = p.x + p.lx * off, cz = p.z + p.lz * off;
+    W.use(WC.CONCRETE, CONCRETE_DARK);
+    W.tbox(cx, base, cz, D.pierW + taper * 2, h, 0.15 * scale + taper, p.tx, p.tz, WSCALE.CONCRETE);
+    W.use(WC.CONCRETE, CONCRETE);
+    W.tbox(cx, yb - 0.09, cz, Math.min(D.capW, wl + wr), 0.09, 0.22 * scale, p.tx, p.tz, WSCALE.CONCRETE, true);
+    if (gy < 0) { // footing at the waterline
+      W.use(WC.CONCRETE, CONCRETE_DARK);
+      W.tbox(cx, gy - 0.2, cz, D.pierW + 0.16, -gy + 0.2 + 0.08, 0.15 * scale + 0.16, p.tx, p.tz, WSCALE.CONCRETE);
+    }
+    return sp;
+  }
+  return null;
+}
+
+/** Steel through truss on the outer sides of one span [sa,sb]. */
+function truss(ctx: ChunkCtx, e: NEdge, sa: number, sb: number, D: Dims, ps: { left: boolean; right: boolean }) {
+  const g = ctx.game.world.net.geo(e);
+  const midp = sampleAt(g, (sa + sb) / 2);
+  if (!inChunk(ctx, midp.x, midp.z)) return;
+  const W = ctx.w;
+  W.cast = 1;
+  const col = [0x4b5d52, 0x7a4234, 0x5f676d][e.id % 3];
+  W.use(WC.METAL, col);
+  const m = Math.max(2, Math.round((sb - sa) / 1.0));
+  const TH = 0.84, r = 0.016;
+  const P = (i: number) => sampleAt(g, sa + ((sb - sa) * i) / m);
+  const pts = Array.from({ length: m + 1 }, (_, i) => P(i));
+  const sides: number[] = [];
+  if (!ps.left) sides.push(-1);
+  if (!ps.right) sides.push(1);
+  const y0 = D.top + 0.02;
+  for (const sd of sides) {
+    const off = sd * (D.w - 0.01);
+    const B = (i: number) => { const p = pts[i]; return [p.x + p.lx * off, p.y + y0, p.z + p.lz * off]; };
+    const T = (i: number) => { const p = pts[i]; return [p.x + p.lx * off, p.y + y0 + TH, p.z + p.lz * off]; };
+    for (let i = 0; i < m; i++) {
+      const b0 = B(i), b1 = B(i + 1);
+      W.tube(b0[0], b0[1], b0[2], b1[0], b1[1], b1[2], r * 1.3, 4);
+      if (i >= 1 && i < m - 1) { const t0 = T(i), t1 = T(i + 1); W.tube(t0[0], t0[1], t0[2], t1[0], t1[1], t1[2], r * 1.3, 4); }
+    }
+    // end posts
+    { const b = B(0), t = T(1); W.tube(b[0], b[1], b[2], t[0], t[1], t[2], r * 1.3, 4); }
+    { const b = B(m), t = T(m - 1); W.tube(b[0], b[1], b[2], t[0], t[1], t[2], r * 1.3, 4); }
+    for (let i = 1; i < m; i++) {
+      const b = B(i), t = T(i);
+      W.tube(b[0], b[1], b[2], t[0], t[1], t[2], r * 0.8, 4);
+      // Pratt diagonals sloping down towards the middle
+      const j = i < m / 2 ? i + 1 : i - 1;
+      if (j >= 1 && j <= m - 1 && i !== j) { const bj = B(j); W.tube(t[0], t[1], t[2], bj[0], bj[1], bj[2], r * 0.7, 4); }
+    }
+  }
+  // top bracing between both trusses of a single track
+  if (sides.length === 2) {
+    for (let i = 1; i < m; i++) {
+      const p = pts[i];
+      const yy = p.y + y0 + TH;
+      W.tube(p.x - p.lx * (D.w - 0.01), yy, p.z - p.lz * (D.w - 0.01), p.x + p.lx * (D.w - 0.01), yy, p.z + p.lz * (D.w - 0.01), r * 0.7, 4);
+    }
+  }
+}
+
+/** Stone arch viaduct: spandrel walls on the outer sides, barrel vault soffits and pier faces. */
+function viaduct(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, sup: number[], D: Dims, wl: number, wr: number, ps: { left: boolean; right: boolean }) {
+  const w = ctx.game.world;
+  const g = ctx.game.world.net.geo(e);
+  const W = ctx.w;
+  W.cast = 1;
+  const PW = 0.5; // pier thickness along the bridge
+  const crownT = 0.12; // stone above the crown
+  const yDeck = (p: Smp) => p.y + D.top - 0.12;
+  for (let i = 0; i < sup.length - 1; i++) {
+    const a = sup[i] + (i === 0 ? 0 : PW / 2), b = sup[i + 1] - (i === sup.length - 2 ? 0 : PW / 2);
+    const c = b - a;
+    const pm = sampleAt(g, (a + b) / 2);
+    if (!inChunk(ctx, pm.x, pm.z)) continue;
+    // rise limited by the ground under the span
+    let gmax = -1e9;
+    for (let k = 0; k <= 6; k++) { const p = sampleAt(g, a + (c * k) / 6); gmax = Math.max(gmax, w.heightAt(p.x, p.z)); }
+    const crown = yDeck(pm) - crownT;
+    const rise = Math.max(0.15, Math.min(c / 2, crown - gmax - 0.2));
+    const R = (rise * rise + (c / 2) * (c / 2)) / (2 * rise);
+    const yc = crown - R; // circle centre height (relative to the crown at the span middle)
+    const steps = Math.max(6, Math.round(c / 0.18));
+    const samp: { p: Smp; y: number }[] = [];
+    for (let k = 0; k <= steps; k++) {
+      const s = a + (c * k) / steps;
+      const p = sampleAt(g, s);
+      const dx = s - (a + c / 2);
+      const yy = yc + Math.sqrt(Math.max(0, R * R - dx * dx)) + (p.y - pm.y);
+      samp.push({ p, y: yy });
+    }
+    // soffit (facing down) across this deck's width
+    W.use(WC.STONE, STONE_DARK);
+    for (let k = 0; k < steps; k++) {
+      const A = samp[k], B = samp[k + 1];
+      const ax0 = A.p.x - A.p.lx * wl, az0 = A.p.z - A.p.lz * wl, ax1 = A.p.x + A.p.lx * wr, az1 = A.p.z + A.p.lz * wr;
+      const bx0 = B.p.x - B.p.lx * wl, bz0 = B.p.z - B.p.lz * wl, bx1 = B.p.x + B.p.lx * wr, bz1 = B.p.z + B.p.lz * wr;
+      const u0 = A.p.s / WSCALE.STONE, u1 = B.p.s / WSCALE.STONE;
+      const wx = 0, wy = -1, wz = 0;
+      W.ttri(ax0, A.y, az0, u0, 0, ax1, A.y, az1, u0, (wl + wr) / WSCALE.STONE, bx1, B.y, bz1, u1, (wl + wr) / WSCALE.STONE, wx, wy, wz);
+      W.ttri(ax0, A.y, az0, u0, 0, bx1, B.y, bz1, u1, (wl + wr) / WSCALE.STONE, bx0, B.y, bz0, u1, 0, wx, wy, wz);
+    }
+    // spandrel walls on the outer sides: from the deck slab down to the arch (and down the pier halves)
+    W.use(WC.STONE, STONE);
+    for (const [sd, wd, has] of [[-1, wl, !ps.left], [1, wr, !ps.right]] as [number, number, boolean][]) {
+      if (!has) continue;
+      for (let k = 0; k < steps; k++) {
+        const A = samp[k], B = samp[k + 1];
+        const ax = A.p.x + A.p.lx * sd * wd, az = A.p.z + A.p.lz * sd * wd, bx = B.p.x + B.p.lx * sd * wd, bz = B.p.z + B.p.lz * sd * wd;
+        W.twall(ax, az, bx, bz, A.y, yDeck(A.p) + 0.06, B.y, yDeck(B.p) + 0.06, A.p.lx * sd, A.p.lz * sd, WSCALE.STONE, A.p.s);
+      }
+    }
+  }
+  // piers: outer faces and the faces towards both arches, from the springing down to the ground
+  for (let i = 1; i < sup.length - 1; i++) {
+    const p = sampleAt(g, sup[i]);
+    if (!inChunk(ctx, p.x, p.z)) continue;
+    const gy = w.heightAt(p.x, p.z) - 0.4;
+    const top = yDeck(p);
+    W.use(WC.STONE, STONE);
+    const off = (wr - wl) / 2;
+    const cx = p.x + p.lx * off, cz = p.z + p.lz * off;
+    // a full-width block up to the deck; arch soffits/spandrels of the spans meet its faces
+    W.tbox(cx, gy, cz, wl + wr + (ps.left ? 0 : 0.03) + (ps.right ? 0 : 0.03), top + 0.05 - gy, PW, p.tx, p.tz, WSCALE.STONE, false, false);
+    // cutwater ledge
+    W.use(WC.STONE, STONE_DARK);
+    W.tbox(cx, gy, cz, wl + wr + 0.1, Math.min(top - gy, 0.6), PW + 0.08, p.tx, p.tz, WSCALE.STONE);
+  }
+  void s0; void s1;
+}
+
+/** Concrete open-spandrel arches: one rib per span springing from the pier footings, columns up to the deck. */
+function arches(ctx: ChunkCtx, e: NEdge, sup: number[], D: Dims, wl: number, wr: number) {
+  const w = ctx.game.world;
+  const g = ctx.game.world.net.geo(e);
+  const W = ctx.w;
+  W.cast = 1;
+  const bw = Math.min(wl + wr, D.w * 1.6) * 0.75; // rib width
+  const off = (wr - wl) / 2;
+  const deckB = (p: Smp) => p.y + D.top - 0.14;
+  for (let i = 0; i < sup.length - 1; i++) {
+    const a = sup[i], b = sup[i + 1], c = b - a;
+    const pa = sampleAt(g, a), pb = sampleAt(g, b), pm = sampleAt(g, (a + b) / 2);
+    const ya = w.heightAt(pa.x, pa.z) + 0.05, yb = w.heightAt(pb.x, pb.z) + 0.05;
+    const spring = Math.max(ya, yb, Math.min(pa.y, pb.y) - 6);
+    const crown = deckB(pm) - 0.04;
+    const rise = crown - spring;
+    const ribHere = inChunk(ctx, pm.x, pm.z);
+    if (rise < 0.8) {
+      // too low for an arch: plain column in the middle
+      if (ribHere) {
+        const gy = w.heightAt(pm.x, pm.z) - 0.3;
+        W.use(WC.CONCRETE, CONCRETE_DARK);
+        W.tbox(pm.x + pm.lx * off, gy, pm.z + pm.lz * off, D.pierW, deckB(pm) - gy, 0.16, pm.tx, pm.tz, WSCALE.CONCRETE);
+      }
+      continue;
+    }
+    const steps = Math.max(8, Math.round(c / 0.35));
+    const ribY = (k: number) => { const t = k / steps; return spring + rise * 4 * t * (1 - t); };
+    if (ribHere) {
+      // rib: box section swept along the parabola
+      W.use(WC.CONCRETE, CONCRETE);
+      const T = 0.16;
+      const pts: { p: Smp; y: number }[] = [];
+      for (let k = 0; k <= steps; k++) pts.push({ p: sampleAt(g, a + (c * k) / steps), y: ribY(k) });
+      for (const [l0, l1, h0, h1] of [[-bw / 2, bw / 2, T, T], [bw / 2, bw / 2, T, 0], [bw / 2, -bw / 2, 0, 0], [-bw / 2, -bw / 2, 0, T]] as [number, number, number, number][]) {
+        for (let k = 0; k < steps; k++) {
+          const A = pts[k], B = pts[k + 1];
+          const ax0 = A.p.x + A.p.lx * (off + l0), az0 = A.p.z + A.p.lz * (off + l0), ax1 = A.p.x + A.p.lx * (off + l1), az1 = A.p.z + A.p.lz * (off + l1);
+          const bx0 = B.p.x + B.p.lx * (off + l0), bz0 = B.p.z + B.p.lz * (off + l0), bx1 = B.p.x + B.p.lx * (off + l1), bz1 = B.p.z + B.p.lz * (off + l1);
+          // outward direction of this face
+          const mx = (A.p.lx * (l0 + l1) / 2) * (l0 === l1 ? 1 : 0), mz = (A.p.lz * (l0 + l1) / 2) * (l0 === l1 ? 1 : 0);
+          const my = l0 === l1 ? 0 : (h0 > 0 ? 1 : -1);
+          const u0 = A.p.s / WSCALE.CONCRETE, u1 = B.p.s / WSCALE.CONCRETE;
+          W.ttri(ax0, A.y + h0, az0, u0, 0, ax1, A.y + h1, az1, u0, 0.2, bx1, B.y + h1, bz1, u1, 0.2, mx, my, mz);
+          W.ttri(ax0, A.y + h0, az0, u0, 0, bx1, B.y + h1, bz1, u1, 0.2, bx0, B.y + h0, bz0, u1, 0, mx, my, mz);
+        }
+      }
+      // spandrel columns from the rib to the deck
+      const nc = Math.max(1, Math.round(c / 0.8));
+      W.use(WC.CONCRETE, CONCRETE_DARK);
+      for (let k = 1; k < nc; k++) {
+        const t = k / nc;
+        const kk = t * steps;
+        const y0 = ribY(kk) + 0.16;
+        const p = sampleAt(g, a + c * t);
+        const y1 = deckB(p);
+        if (y1 - y0 < 0.12) continue;
+        for (const sd of [-1, 1]) {
+          const lo = off + sd * bw * 0.3;
+          W.tbox(p.x + p.lx * lo, y0 - 0.02, p.z + p.lz * lo, 0.07, y1 - y0 + 0.02, 0.07, p.tx, p.tz, WSCALE.CONCRETE);
+        }
+      }
+    }
+  }
+  // main piers at the supports (footings the ribs spring from, and columns up to the deck)
+  for (let i = 1; i < sup.length - 1; i++) {
+    const p = sampleAt(g, sup[i]);
+    if (!inChunk(ctx, p.x, p.z)) continue;
+    const gy = w.heightAt(p.x, p.z) - 0.4;
+    W.use(WC.CONCRETE, CONCRETE_DARK);
+    W.tbox(p.x + p.lx * off, gy, p.z + p.lz * off, bw + 0.12, 0.65, 0.5, p.tx, p.tz, WSCALE.CONCRETE);
+    W.use(WC.CONCRETE, CONCRETE);
+    W.tbox(p.x + p.lx * off, gy, p.z + p.lz * off, bw * 0.8, deckB(p) - gy, 0.2, p.tx, p.tz, WSCALE.CONCRETE);
+  }
+}
+
+/**
+ * Abutment at a bridge end: a bearing block under the deck end and a back block reaching into the
+ * embankment just below the track formation (so the embankment, not concrete, shows beside the track).
+ */
+function abutment(ctx: ChunkCtx, e: NEdge, s: number, gd: number, D: Dims, wl: number, wr: number, style: BridgeStyle) {
+  const w = ctx.game.world;
+  const g = ctx.game.world.net.geo(e);
+  const p = sampleAt(g, s);
+  if (!inChunk(ctx, p.x, p.z)) return;
+  const W = ctx.w;
+  W.cast = 1;
+  const stone = style === 'viaduct';
+  const cell = stone ? WC.STONE : WC.CONCRETE, sc = stone ? WSCALE.STONE : WSCALE.CONCRETE;
+  const block = (a0: number, a1: number, l: number, r: number, top: number, tone: number) => {
+    const along = gd * (a0 + a1) / 2, off = (r - l) / 2;
+    const cx = p.x + p.tx * along + p.lx * off, cz = p.z + p.tz * along + p.lz * off;
+    let gy = top;
+    for (const t of [a0, a1]) for (const o of [-l, r]) gy = Math.min(gy, w.heightAt(p.x + p.tx * gd * t + p.lx * o, p.z + p.tz * gd * t + p.lz * o));
+    gy -= 0.5;
+    W.use(cell, tone);
+    W.tbox(cx, gy, cz, l + r, top - gy, a1 - a0, p.tx, p.tz, sc);
+  };
+  // bearing block: as wide as the deck, top just under the deck
+  block(-0.15, 0.22, wl, wr, p.y + D.top - 0.012, stone ? STONE : CONCRETE_DARK);
+  // back block into the embankment, hidden under the formation
+  const half = RAIL.spacing / 2;
+  const bw = e.kind === 'rail' ? 0.39 : D.w - 0.03;
+  const l = wl < D.w ? half : bw, r = wr < D.w ? half : bw;
+  block(0.22, 0.85, l, r, p.y + (e.kind === 'rail' ? -0.11 : -0.05), stone ? STONE_DARK : CONCRETE_DARK);
+}
+
 // ------------------------------------------------------------------------------ tunnels
+
+/** Inside a tunnel section of f or close to one of its ends. */
+function nearTunnel(f: NEdge, s: number): boolean {
+  for (const q of f.sections) if (q.type === 'tunnel' && s > q.s0 - 0.4 && s < q.s1 + 0.4) return true;
+  return false;
+}
 
 /** Portals at the ends of tunnel sections (one facade per group of parallel tracks). */
 export function buildPortals(ctx: ChunkCtx, e: NEdge) {
@@ -129,103 +484,149 @@ export function buildPortals(ctx: ChunkCtx, e: NEdge) {
       if (atEnd && continuesAt(ctx, e, out < 0 ? e.a : e.b, 'tunnel')) continue;
       const p = sampleAt(net.geo(e), s);
       if (!inChunk(ctx, p.x, p.z)) continue;
-      // parallel group: offsets of neighbouring tunnel tracks
-      const offs = [0];
-      let leader = true;
-      if (e.kind === 'rail') {
-        for (const side of [-1, 1]) for (let k = 1; k <= 3; k++) {
-          const qx = p.x + p.lx * side * k * RAIL.spacing, qz = p.z + p.lz * side * k * RAIL.spacing;
-          const ne = net.nearestEdge(qx, qz, 0.14, 'rail', (f) => f.id !== e.id);
-          if (!ne || !nearTunnel(ne.edge, ne.s)) break;
-          const q = sampleAt(net.geo(ne.edge), ne.s);
-          if (Math.abs(q.tx * p.tx + q.tz * p.tz) < 0.95 || Math.abs(q.y - p.y) > 0.3) break;
-          offs.push(side * k * RAIL.spacing);
-          if (ne.edge.id < e.id) leader = false;
-        }
-      }
-      if (!leader) continue;
-      buildPortal(ctx, e, p, out, offs);
+      const grp = parallelGroup(ctx, e, s, (f, sf) => nearTunnel(f, sf));
+      if (grp.some((nb) => nb.edge.id < e.id)) continue;
+      buildPortal(ctx, e, p, out, [0, ...grp.map((nb) => nb.off)], s);
     }
   }
 }
 
-/** Inside a tunnel section of f or close to one of its ends. */
-function nearTunnel(f: NEdge, s: number): boolean {
-  for (const q of f.sections) if (q.type === 'tunnel' && s > q.s0 - 0.4 && s < q.s1 + 0.4) return true;
-  return false;
-}
-
-function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[]) {
-  const m = ctx.matte;
+function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[], sb: number) {
+  const w = ctx.game.world;
+  const net = w.net;
+  const W = ctx.w;
+  W.cast = 1;
   const rail = e.kind === 'rail';
   const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
-  const ow = rail ? 0.29 : rt.half + rt.sidewalk * 0.5 + 0.06;
-  const oh = rail ? 0.76 : 0.64;
-  const Hf = oh + 0.42;
-  const lo = Math.min(...offs) - ow - 0.55, hi = Math.max(...offs) + ow + 0.55;
-  // frame: o = outward along the track, l = lateral (edge right)
-  const ox = p.tx * out, oz = p.tz * out;
+  const ow = rail ? 0.3 : rt.half + rt.sidewalk * 0.5 + 0.08;
+  const oh = rail ? 0.78 : 0.66;
+  const archH = ow * 0.75;
+  const ys = oh - archH; // springing height (relative to the profile)
+  const Hf = oh + 0.4;
+  const lo = Math.min(...offs) - ow - 0.5, hi = Math.max(...offs) + ow + 0.5;
+  const ox = p.tx * out, oz = p.tz * out; // outward
   const lx = p.lx, lz = p.lz;
   const y = p.y;
+  const modern = !rail || (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified;
+  const cell = modern ? WC.CONCRETE : WC.STONE, sc = modern ? WSCALE.CONCRETE : WSCALE.STONE;
+  const tone = modern ? CONCRETE : STONE;
   const at = (l: number, f: number): [number, number] => [p.x + lx * l + ox * f, p.z + lz * l + oz * f];
-  const T = 0.16; // facade thickness, front face at f = 0.04
-  const ff = 0.04, fb = ff - T;
+  const T = 0.2, ff = 0.06, fb = ff - T;
   const yb = y - 0.35;
-  // openings sorted
-  const ops = offs.slice().sort((a, b) => a - b).map((c) => [c - ow, c + ow]);
-  // facade pieces between openings (front face, back hidden in the hill)
-  const piece = (l0: number, l1: number, y0: number, y1: number) => {
-    if (l1 - l0 < 1e-3) return;
-    const [cx, cz] = at((l0 + l1) / 2, (ff + fb) / 2);
-    m.box(cx, y0, cz, l1 - l0, y1 - y0, T, ox, oz);
+  const ops = offs.slice().sort((a, b) => a - b).map((c) => [c - ow, c + ow] as [number, number]);
+  // --- facade front face with arched openings (comb triangulation)
+  W.use(cell, tone);
+  const frontQuad = (l0: number, l1: number, y0a: number, y1a: number, y0b: number, y1b: number) => {
+    const [ax, az] = at(l0, ff), [bx, bz] = at(l1, ff);
+    W.twall(ax, az, bx, bz, y0a, y1a, y0b, y1b, ox, oz, sc, l0);
   };
-  m.color(STONE);
   let cur = lo;
-  for (const [a, b] of ops) { piece(cur, a, yb, y + oh); cur = b; }
-  piece(cur, hi, yb, y + oh);
-  piece(lo, hi, y + oh, y + Hf);
-  // coping on top and a darker arch band over the openings
-  m.color(0x7d7468);
-  {
-    const [cx, cz] = at((lo + hi) / 2, ff - T / 2 + 0.02);
-    m.box(cx, y + Hf, cz, hi - lo + 0.08, 0.05, T + 0.06, ox, oz);
-  }
   for (const [a, b] of ops) {
-    const [cx, cz] = at((a + b) / 2, ff + 0.012);
-    m.box(cx, y + oh, cz, b - a + 0.1, 0.07, 0.03, ox, oz);
+    frontQuad(cur, a, yb, y + Hf, yb, y + Hf);
+    const c = (a + b) / 2, r = (b - a) / 2;
+    const K = 10;
+    for (let k = 0; k < K; k++) {
+      const t0 = k / K, t1 = (k + 1) / K;
+      const l0 = a + (b - a) * t0, l1 = a + (b - a) * t1;
+      const archY = (l: number) => y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l - c) / r) ** 2));
+      frontQuad(l0, l1, archY(l0), y + Hf, archY(l1), y + Hf);
+    }
+    cur = b;
   }
-  // dark gallery interior behind each opening (faces pointing inwards) and its concrete shell
-  const depth = 1.6;
-  for (const [a, b] of ops) {
-    const [ax, az] = at(a, fb), [bx, bz] = at(b, fb);
-    const [ax2, az2] = at(a, fb - depth), [bx2, bz2] = at(b, fb - depth);
-    m.color(DARK);
-    wallQuad(m, ax, az, ax2, az2, y - 0.1, y + oh, y - 0.1, y + oh, lx, lz);     // left wall faces right
-    wallQuad(m, bx, bz, bx2, bz2, y - 0.1, y + oh, y - 0.1, y + oh, -lx, -lz);   // right wall faces left
-    wallQuad(m, ax2, az2, bx2, bz2, y - 0.1, y + oh, y - 0.1, y + oh, ox, oz);   // end wall faces out
-    // ceiling (facing down) and floor (facing up)
-    m.quad(ax, y + oh, az, ax2, y + oh, az2, bx2, y + oh, bz2, bx, y + oh, bz);
-    fixDown(m);
-    m.quad(ax, y - 0.02, az, bx, y - 0.02, bz, bx2, y - 0.02, bz2, ax2, y - 0.02, az2);
-    fixUp(m);
-  }
-  m.color(CONCRETE_DARK);
+  frontQuad(cur, hi, yb, y + Hf, yb, y + Hf);
+  // ends of the facade and the coping
   {
-    const [cx, cz] = at((lo + hi) / 2, fb - depth / 2);
-    m.box(cx, yb, cz, ops[ops.length - 1][1] - ops[0][0] + 0.2, y + oh + 0.14 - yb, depth, ox, oz);
+    const [ax, az] = at(lo, ff), [bx, bz] = at(lo, fb), [cx, cz] = at(hi, ff), [dx, dz] = at(hi, fb);
+    W.twall(ax, az, bx, bz, yb, y + Hf, yb, y + Hf, -lx, -lz, sc);
+    W.twall(cx, cz, dx, dz, yb, y + Hf, yb, y + Hf, lx, lz, sc);
+    const [mx, mz] = at((lo + hi) / 2, ff - T / 2 + 0.02);
+    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
+    W.tbox(mx, y + Hf, mz, hi - lo + 0.1, 0.06, T + 0.1, ox, oz, sc, true);
   }
+  // --- opening reveals (jambs and arch soffit) and the dark gallery behind
+  const gl = galleryLength(ctx, e, sb, out, oh + 0.16);
+  // the facade back plane sits at fb: start the gallery there (shift the run start by T - ff)
+  const run = tunnelRun(e, ctx, sb - out * (T - ff), out, gl);
+  for (const [a, b] of ops) {
+    const c = (a + b) / 2, r = (b - a) / 2;
+    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
+    const [a0x, a0z] = at(a, ff), [a1x, a1z] = at(a, fb), [b0x, b0z] = at(b, ff), [b1x, b1z] = at(b, fb);
+    W.twall(a0x, a0z, a1x, a1z, y - 0.05, y + ys, y - 0.05, y + ys, lx, lz, sc);
+    W.twall(b0x, b0z, b1x, b1z, y - 0.05, y + ys, y - 0.05, y + ys, -lx, -lz, sc);
+    const K = 10;
+    for (let k = 0; k < K; k++) {
+      const l0 = a + (b - a) * (k / K), l1 = a + (b - a) * ((k + 1) / K);
+      const h0 = y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l0 - c) / r) ** 2)), h1 = y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l1 - c) / r) ** 2));
+      const [p0x, p0z] = at(l0, ff), [p1x, p1z] = at(l1, ff), [q0x, q0z] = at(l0, fb), [q1x, q1z] = at(l1, fb);
+      const mx = (c - (l0 + l1) / 2) * lx, mz = (c - (l0 + l1) / 2) * lz;
+      W.ttri(p0x, h0, p0z, 0, 0, p1x, h1, p1z, 0.2, 0, q1x, h1, q1z, 0.2, 0.2, mx, -1, mz);
+      W.ttri(p0x, h0, p0z, 0, 0, q1x, h1, q1z, 0.2, 0.2, q0x, h0, q0z, 0, 0.2, mx, -1, mz);
+    }
+    // dark interior along the tunnel curve: walls and ceiling facing inwards, floor facing up
+    W.use(WC.PLAIN, DARK);
+    sweep(W, run, [[b, -0.05], [b, oh], [a, oh], [a, -0.05]]);
+    sweep(W, run, [[a, -0.02], [b, -0.02]]);
+    const pe = out > 0 ? run[0] : run[run.length - 1];
+    const ex = pe.tx * out, ez = pe.tz * out;
+    W.twall(pe.x + pe.lx * a, pe.z + pe.lz * a, pe.x + pe.lx * b, pe.z + pe.lz * b, pe.y - 0.05, pe.y + oh, pe.y - 0.05, pe.y + oh, ex, ez);
+  }
+  // gallery shell (cut-and-cover) behind the facade, until the hillside covers it
+  {
+    const a0 = ops[0][0] - 0.12, b0 = ops[ops.length - 1][1] + 0.12;
+    W.use(cell, modern ? CONCRETE_DARK : STONE_DARK);
+    sweep(W, run, [[a0, -0.35, 0], [a0, oh + 0.16, (oh + 0.51) / sc], [b0, oh + 0.16, (oh + 0.51 + b0 - a0) / sc], [b0, -0.35, (2 * oh + 1.02 + b0 - a0) / sc]], sc);
+  }
+  // wing walls splayed outwards along the cutting, tops following the terrain
+  for (const sd of [-1, 1]) {
+    const l0 = sd < 0 ? lo : hi;
+    const [sx, sz] = at(l0, ff - 0.02);
+    const ang = 0.5;
+    const dx = ox * Math.cos(ang) + lx * sd * Math.sin(ang), dz = oz * Math.cos(ang) + lz * sd * Math.sin(ang);
+    const nx = -dz * sd, nz = dx * sd; // outward (away from the track)
+    const nl = Math.hypot(nx, nz) || 1;
+    const WL = 1.8, K = 7;
+    let px = sx, pz = sz, ph = y + Hf;
+    W.use(cell, tone);
+    for (let k = 1; k <= K; k++) {
+      const t = (WL * k) / K;
+      const qx = sx + dx * t, qz = sz + dz * t;
+      const terr = w.heightAt(qx + (nx / nl) * 0.2, qz + (nz / nl) * 0.2);
+      const qh = Math.max(y + 0.15, Math.min(y + Hf, terr + 0.08));
+      const T2 = 0.09;
+      const pxo = px + (nx / nl) * T2, pzo = pz + (nz / nl) * T2, qxo = qx + (nx / nl) * T2, qzo = qz + (nz / nl) * T2;
+      // inner face (towards the track), outer face, top
+      W.twall(px, pz, qx, qz, yb, ph, yb, qh, -nx / nl, -nz / nl, sc, (k - 1) * WL / K);
+      W.twall(pxo, pzo, qxo, qzo, yb, ph, yb, qh, nx / nl, nz / nl, sc);
+      W.ttri(px, ph, pz, 0, 0, qx, qh, qz, 0.5, 0, qxo, qh, qzo, 0.5, 0.1, 0, 1, 0);
+      W.ttri(px, ph, pz, 0, 0, qxo, qh, qzo, 0.5, 0.1, pxo, ph, pzo, 0, 0.1, 0, 1, 0);
+      if (k === K) W.twall(qx, qz, qxo, qzo, yb, qh, yb, qh, dx, dz, sc);
+      px = qx; pz = qz; ph = qh;
+    }
+  }
+  void net;
 }
 
-/** Make sure the last quad added faces down / up (flip winding if needed). */
-function fixDown(m: ChunkCtx['matte']) { fixLast(m, -1); }
-function fixUp(m: ChunkCtx['matte']) { fixLast(m, 1); }
-function fixLast(m: ChunkCtx['matte'], want: number) {
-  const n = m.nrm.length;
-  const ny = m.nrm[n - 2]; // normal y of the last vertex
-  if (ny * want >= 0) return;
-  const I = m.idx, k = I.length - 6;
-  // reverse both triangles
-  [I[k + 1], I[k + 2]] = [I[k + 2], I[k + 1]];
-  [I[k + 4], I[k + 5]] = [I[k + 5], I[k + 4]];
-  for (let i = n - 12; i < n; i += 3) { m.nrm[i] = -m.nrm[i]; m.nrm[i + 1] = -m.nrm[i + 1]; m.nrm[i + 2] = -m.nrm[i + 2]; }
+/** Gallery length behind a portal: until the terrain over the tunnel rises `rel` above the track (1..6 units). */
+function galleryLength(ctx: ChunkCtx, e: NEdge, sb: number, out: number, rel: number): number {
+  const w = ctx.game.world;
+  const g = w.net.geo(e);
+  for (let d = 0.5; d <= 6; d += 0.5) {
+    const s = sb - out * d;
+    if (s < 0 || s > e.len) return Math.max(1, d - 0.5);
+    const p = sampleAt(g, s);
+    if (w.heightAt(p.x, p.z) > p.y + rel + 0.1) return Math.max(1, d);
+  }
+  return 6;
 }
+
+/** Samples along the tunnel from the portal inwards, ordered by increasing s (for sweeps). */
+function tunnelRun(e: NEdge, ctx: ChunkCtx, sb: number, out: number, len: number): Smp[] {
+  const g = ctx.game.world.net.geo(e);
+  const n = Math.max(2, Math.ceil(len / 0.5) + 1);
+  const run: Smp[] = [];
+  for (let k = 0; k < n; k++) run.push(sampleAt(g, Math.max(0, Math.min(e.len, sb - out * (len * k) / (n - 1)))));
+  run.sort((a, b) => a.s - b.s);
+  return run;
+}
+
+export { WB };

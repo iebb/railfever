@@ -27,10 +27,36 @@ export interface RSeg {
   /** bus stop position along this lane */
   stopAt?: number;
   depot?: boolean;
+  /** local curve speed limits along a lane: [pos0, pos1, speed] (units/s) */
+  slow?: [number, number, number][];
+}
+
+/** Local curve speed limits along a lane curve (windowed radius), below `base` (units/s). */
+function slowZones(c: Curve3, base: number): [number, number, number][] {
+  const out: [number, number, number][] = [];
+  const p = c.pts, cum = c.cum, n = cum.length;
+  let j = 0, k = 0;
+  for (let i = 1; i < n - 1; i++) {
+    while (j < i - 1 && cum[i] - cum[j + 1] >= 0.4) j++;
+    if (k < i + 1) k = i + 1;
+    while (k < n - 1 && cum[k] - cum[i] < 0.4) k++;
+    const ax = p[i * 3] - p[j * 3], az = p[i * 3 + 2] - p[j * 3 + 2], bx = p[k * 3] - p[i * 3], bz = p[k * 3 + 2] - p[i * 3 + 2];
+    const la = Math.hypot(ax, az), lb = Math.hypot(bx, bz);
+    if (la < 1e-6 || lb < 1e-6) continue;
+    const ang = Math.abs(Math.atan2(ax * bz - az * bx, ax * bx + az * bz));
+    if (ang < 1e-4) continue;
+    const v = Math.max(8, curveSpeed((la + lb) / 2 / ang)) * KMH_TO_UPS;
+    if (v >= base) continue;
+    const a = cum[i] - 0.3, b = cum[i] + 0.3;
+    const last = out[out.length - 1];
+    if (last && a <= last[1]) { last[1] = b; last[2] = Math.min(last[2], v); } else out.push([a, b, v]);
+  }
+  return out;
 }
 
 const BRAKE = 0.3;
 const G = 0.981;
+const brakeTo = (dist: number) => Math.sqrt(2 * BRAKE * Math.max(0, dist));
 
 export function laneTrim(g: Game, e: NEdge): [number, number] {
   const net = g.world.net;
@@ -42,7 +68,8 @@ export function makeLaneSeg(g: Game, e: NEdge, dir: number): RSeg {
   const net = g.world.net;
   const curve = net.lane(e, dir);
   const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
-  let kmh = Math.min(rt.speed, curveSpeed(curve.minRadius));
+  // the lane's base limit is the road speed; tight bends only slow vehicles locally (slow zones)
+  let kmh = rt.speed;
   if (e.depot >= 0) kmh = Math.min(kmh, 15);
   const [s0, s1] = laneTrim(g, e);
   const map = (s: number) => (dir > 0 ? s - s0 : s1 - s);
@@ -55,7 +82,7 @@ export function makeLaneSeg(g: Game, e: NEdge, dir: number): RSeg {
   for (const c of net.crossings.values()) if (c.kind === 'level' && c.e2 === e.id) crossings.push({ id: c.id, pos: map(c.s2) });
   return {
     kind: 'lane', e: e.id, dir, node: -1, from: -1, fromDir: 0, curve, len: curve.len, limit: Math.max(8, kmh) * KMH_TO_UPS,
-    tunnels, crossings, depot: e.depot >= 0,
+    tunnels, crossings, depot: e.depot >= 0, slow: slowZones(curve, Math.max(8, kmh) * KMH_TO_UPS),
   };
 }
 
@@ -198,6 +225,8 @@ export class RoadVehicle extends Vehicle {
   tint = 0;
   cruise: number;
   grade = 0;
+  /** the look-ahead was dropped by a network change: re-plan before driving on */
+  needsReplan = false;
 
   constructor(game: Game, id: number, model: VehicleModel | null, depotId: number, ambient = false, seed = 1) {
     super(game, id);
@@ -366,6 +395,20 @@ export class RoadVehicle extends Vehicle {
     if (!this.seg) return true;
     const valid = (s: RSeg) => net.edges.has(s.e) && (s.kind === 'lane' || net.edges.has(s.from));
     if (!valid(this.seg)) return false;
+    // keep the plan if none of its lanes touch the changed part of the network
+    const dn = net.dirtyNodes, de = net.dirtyEdges;
+    const clean = (s: RSeg) => {
+      if (!valid(s)) return false;
+      const e = net.edges.get(s.e)!;
+      if (de.has(e.id) || dn.has(e.a) || dn.has(e.b)) return false;
+      if (s.kind === 'conn') { const f = net.edges.get(s.from)!; if (de.has(f.id) || dn.has(f.a) || dn.has(f.b)) return false; }
+      return true;
+    };
+    let intact = clean(this.seg);
+    for (let i = 0; intact && i < this.ahead.length; i++) intact = clean(this.ahead[i]);
+    for (let i = 0; intact && i < this.route.length; i++) intact = net.edges.has(this.route[i].edge);
+    if (intact) return true;
+    this.needsReplan = !this.ambient;
     if (this.seg.kind === 'conn') {
       const nxt = this.ahead[0];
       if (!nxt || !valid(nxt)) return false;
@@ -396,6 +439,7 @@ export class RoadVehicle extends Vehicle {
     if (!stub) return;
     if (g.vehicles.roadBusyNear(stub.id, stub.bez.x0, stub.bez.z0, this.length + 0.4)) { this.status = 'Waiting to leave depot'; return; }
     this.placeAt(makeLaneSeg(g, stub, 1), 0);
+    g.vehicles.noteOnRoad(this);
     this.speed = 0;
     if (!this.planRoute()) { this.seg = null; this.state = 'noroute'; }
   }
@@ -444,6 +488,7 @@ export class RoadVehicle extends Vehicle {
 
   private tmpA = { x: 0, y: 0, z: 0 };
   private tmpB = { x: 0, y: 0, z: 0 };
+  private gradeTimer = 0;
 
   private drive(dt: number) {
     if (!this.seg) return;
@@ -454,14 +499,17 @@ export class RoadVehicle extends Vehicle {
     const v = this.speed;
     const look = (v * v) / (2 * BRAKE) + 1.5;
     let vt = Math.min(this.cruise, seg.limit);
-    const brakeTo = (dist: number) => Math.sqrt(2 * BRAKE * Math.max(0, dist));
-    // walk the known path
+    // walk the known path (current segment, then the look-ahead)
     let d = -this.pos;
-    const segs = [seg, ...this.ahead];
+    const ahead = this.ahead;
     let endKnown = true;
-    for (let i = 0; i < segs.length; i++) {
-      const s = segs[i];
+    for (let i = 0; i <= ahead.length; i++) {
+      const s = i === 0 ? seg : ahead[i - 1];
       if (i > 0 && s.limit < vt) vt = Math.min(vt, Math.sqrt(s.limit * s.limit + 2 * BRAKE * Math.max(0, d)));
+      if (s.slow) for (const z of s.slow) {
+        if (d + z[1] < 0) continue;
+        vt = Math.min(vt, d + z[0] <= 0 ? z[2] : Math.sqrt(z[2] * z[2] + 2 * BRAKE * (d + z[0])));
+      }
       if (s.stopAt !== undefined && !this.ambient) {
         const dist = d + s.stopAt;
         if (dist >= -0.05) vt = Math.min(vt, brakeTo(dist) + 0.01);
@@ -490,11 +538,15 @@ export class RoadVehicle extends Vehicle {
     // car following
     const gap = V.gapAhead(this, look + 1);
     if (gap < Infinity) vt = Math.min(vt, gap < 0.18 ? 0 : brakeTo(gap - 0.18));
-    // physics
-    const A = this.tmpA, B = this.tmpB;
-    this.pointBehind(0, A);
-    this.pointBehind(this.length, B);
-    this.grade = this.length > 0.1 ? (A.y - B.y) / this.length : 0;
+    // physics (the gradient is sampled a few times per second)
+    this.gradeTimer -= dt;
+    if (this.gradeTimer <= 0) {
+      this.gradeTimer = 0.25;
+      const A = this.tmpA, B = this.tmpB;
+      this.pointBehind(0, A);
+      this.pointBehind(this.length, B);
+      this.grade = this.length > 0.1 ? (A.y - B.y) / this.length : 0;
+    }
     const P = this.model ? this.model.power : 80, M = this.model ? this.model.weight + this.load * 0.075 : 1.4;
     const tract = Math.min(1.6, P / (M * Math.max(3, v * 10)));
     const acc = (tract - 0.02) / 10 - G * this.grade;

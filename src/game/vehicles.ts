@@ -8,7 +8,12 @@ import { RNG } from './rng';
 import type { NEdge } from './network';
 import { closestOnPolyline } from './geom';
 
-const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0) : -(s.node + 1));
+/** Occupancy key: a lane (edge, direction) or one connector (from lane -> to lane) through a junction. */
+const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
+  : -1 - ((s.from * 2 + (s.fromDir > 0 ? 1 : 0)) * 4194304 + s.e * 2 + (s.dir > 0 ? 1 : 0)));
+
+/** Vehicles on one lane/connector with the start of the stretch they occupy (pooled, rebuilt per tick). */
+interface Occ { v: RoadVehicle[]; s: number[]; n: number }
 
 export class Vehicles {
   map = new Map<number, Vehicle>();
@@ -18,7 +23,11 @@ export class Vehicles {
   private res = new Map<number, number>();
   /** level crossings currently closed for road traffic */
   crossingClosed = new Set<number>();
-  roadHash = new Map<number, RoadVehicle[]>();
+  private occ = new Map<number, Occ>();
+  private occUsed: Occ[] = [];
+  /** vehicles inside a junction (on a connector) per node */
+  private nodeOcc = new Map<number, Occ>();
+  private nodeUsed: Occ[] = [];
   private rng = new RNG(4242);
   ambientEnabled = true;
   private ambientTimer = 0;
@@ -107,72 +116,102 @@ export class Vehicles {
       else if (v instanceof RoadVehicle && !v.onNetworkChanged()) v.returnToDepot('Returned to depot (road removed)');
     }
     this.ambient = this.ambient.filter((a) => a.onNetworkChanged());
+    const net = this.game.world.net;
+    net.dirtyNodes.clear();
+    net.dirtyEdges.clear();
+  }
+
+  private replanQueue: number[] = [];
+  /** After a network change: vehicles that lost their plan re-plan now, the others gradually (budget per tick). */
+  replanAfterNetworkChange() {
+    this.replanQueue.length = 0;
+    for (const v of this.map.values()) {
+      if (v.state !== 'running' && v.state !== 'waiting' && v.state !== 'noroute') continue;
+      if (v.state === 'noroute' || (v instanceof RoadVehicle && v.needsReplan)) { if (v instanceof RoadVehicle) v.needsReplan = false; v.onLineChanged(); }
+      else this.replanQueue.push(v.id);
+    }
+  }
+
+  private replanSome(n: number) {
+    while (n-- > 0 && this.replanQueue.length) {
+      const v = this.map.get(this.replanQueue.pop()!);
+      if (v && (v.state === 'running' || v.state === 'waiting' || v.state === 'noroute')) v.onLineChanged();
+    }
   }
 
   // ---------------------------------------------------------------- road spatial hash
-  private rebuildHash() {
-    this.roadHash.clear();
-    const put = (k: number, v: RoadVehicle) => {
-      let a = this.roadHash.get(k);
-      if (!a) { a = []; this.roadHash.set(k, a); }
-      if (!a.includes(v)) a.push(v);
-    };
-    const add = (v: RoadVehicle) => {
-      if (!v.seg) return;
-      put(segKey(v.seg), v);
-      let rem = v.length - v.pos;
-      for (const t of v.trail) {
-        if (rem <= 0) break;
-        put(segKey(t), v);
-        rem -= t.len;
-      }
-    };
-    for (const v of this.map.values()) if (v instanceof RoadVehicle) add(v);
-    for (const v of this.ambient) add(v);
+  private pushOcc(map: Map<number, Occ>, used: Occ[], k: number, v: RoadVehicle, start: number) {
+    let o = map.get(k);
+    if (!o) { o = { v: [], s: [], n: 0 }; map.set(k, o); }
+    if (o.n === 0) used.push(o);
+    o.v[o.n] = v; o.s[o.n] = start; o.n++;
+  }
+
+  private addOcc(v: RoadVehicle) {
+    const seg = v.seg;
+    if (!seg) return;
+    const L = v.length;
+    // start of the occupied stretch = rear of the body along the segment (negative: it extends further back)
+    this.pushOcc(this.occ, this.occUsed, segKey(seg), v, v.pos - L);
+    if (seg.kind === 'conn') this.pushOcc(this.nodeOcc, this.nodeUsed, seg.node, v, 0);
+    let rem = L - v.pos;
+    for (let i = 0; i < v.trail.length && rem > 0; i++) {
+      const t = v.trail[i];
+      this.pushOcc(this.occ, this.occUsed, segKey(t), v, t.len - rem);
+      if (i === 0 && t.kind === 'conn') this.pushOcc(this.nodeOcc, this.nodeUsed, t.node, v, 0);
+      rem -= t.len;
+    }
+  }
+
+  /** Register a vehicle that was just placed on the road (depot exit, spawn) for the rest of this tick. */
+  noteOnRoad(v: RoadVehicle) { this.addOcc(v); }
+
+  /** Rebuild the per-lane occupancy (once per tick). */
+  private rebuildOcc() {
+    for (const o of this.occUsed) o.n = 0;
+    for (const o of this.nodeUsed) o.n = 0;
+    this.occUsed.length = 0;
+    this.nodeUsed.length = 0;
+    if (this.occ.size > 20000) this.occ.clear();
+    for (const v of this.map.values()) if (v instanceof RoadVehicle) this.addOcc(v);
+    for (const v of this.ambient) this.addOcc(v);
   }
 
   private tA = { x: 0, y: 0, z: 0 };
   private tB = { x: 0, y: 0, z: 0 };
-  private tD = { x: 0, y: 0, z: 0 };
-  private tE = { x: 0, y: 0, z: 0 };
 
-  /** Distance to the rear of the nearest vehicle ahead in the same lane, or Infinity. */
+  /** Distance from v's front to the rear of the nearest vehicle ahead in the same lane, or Infinity. */
   gapAhead(v: RoadVehicle, look: number): number {
-    if (!v.seg) return Infinity;
-    const p = this.tA, d = this.tD;
-    v.pointBehind(0, p, d);
-    const dl = Math.hypot(d.x, d.z) || 1;
-    const dx = d.x / dl, dz = d.z / dl;
-    const keys = [segKey(v.seg)];
-    for (let i = 0; i < Math.min(3, v.ahead.length); i++) keys.push(segKey(v.ahead[i]));
+    const seg = v.seg;
+    if (!seg) return Infinity;
     let best = Infinity;
-    const q = this.tB, qd = this.tE;
-    const seen = new Set<RoadVehicle>();
-    for (const k of keys) {
-      const list = this.roadHash.get(k);
-      if (!list) continue;
-      for (const o of list) {
-        if (o === v || !o.seg || seen.has(o)) continue;
-        seen.add(o);
-        o.pointBehind(o.length, q, qd);
-        const rx = q.x - p.x, rz = q.z - p.z;
-        const along = rx * dx + rz * dz;
-        if (along <= -0.05 || along > look) continue;
-        const lat = Math.abs(rx * dz - rz * dx);
-        if (lat > 0.11) continue;
-        const ql = Math.hypot(qd.x, qd.z) || 1;
-        if ((qd.x * dx + qd.z * dz) / ql < 0.2) continue;
-        if (along < best) best = along;
-      }
+    let o = this.occ.get(segKey(seg));
+    if (o) for (let i = 0; i < o.n; i++) {
+      if (o.v[i] === v) continue;
+      const gap = o.s[i] - v.pos;
+      if (gap > -0.05 && gap < best) best = gap;
     }
-    return best;
+    let d = seg.len - v.pos;
+    const ahead = v.ahead;
+    for (let k = 0; k < ahead.length && k < 3 && d <= look; k++) {
+      const s = ahead[k];
+      o = this.occ.get(segKey(s));
+      if (o) for (let i = 0; i < o.n; i++) {
+        if (o.v[i] === v) continue;
+        const gap = d + o.s[i];
+        if (gap > -0.05 && gap < best) best = gap;
+      }
+      d += s.len;
+    }
+    return best <= look ? best : Infinity;
   }
 
   /** May v enter connector c (no conflicting vehicle inside the junction)? */
   junctionFree(v: RoadVehicle, c: RSeg): boolean {
-    const list = this.roadHash.get(-(c.node + 1));
+    const list = this.nodeOcc.get(c.node);
     if (!list) return true;
-    for (const o of list) {
+    for (let i = 0; i < list.n; i++) {
+      const o = list.v[i];
       if (o === v) continue;
       const oc = o.seg && o.seg.kind === 'conn' && o.seg.node === c.node ? o.seg
         : o.trail[0] && o.trail[0].kind === 'conn' && o.trail[0].node === c.node ? o.trail[0] : null;
@@ -186,10 +225,11 @@ export class Vehicles {
   /** Any road vehicle on edge eid within r of (x,z)? */
   roadBusyNear(eid: number, x: number, z: number, r: number): boolean {
     const a = this.tA, b = this.tB;
-    for (const k of [eid * 2, eid * 2 + 1]) {
-      const list = this.roadHash.get(k);
+    for (let k = eid * 2; k <= eid * 2 + 1; k++) {
+      const list = this.occ.get(k);
       if (!list) continue;
-      for (const v of list) {
+      for (let i = 0; i < list.n; i++) {
+        const v = list.v[i];
         v.pointBehind(0, a);
         v.pointBehind(v.length, b);
         const dx = b.x - a.x, dz = b.z - a.z;
@@ -230,16 +270,22 @@ export class Vehicles {
 
   // ---------------------------------------------------------------- update
   update(dt: number) {
-    this.rebuildHash();
+    if (this.replanQueue.length) this.replanSome(6);
+    this.rebuildOcc();
     this.updateCrossings();
     for (const v of this.map.values()) v.update(dt);
     if (this.ambientEnabled) {
-      for (const a of this.ambient) a.update(dt);
-      this.ambient = this.ambient.filter((a) => a.state !== 'stopped' && a.seg);
+      const amb = this.ambient;
+      let n = 0;
+      for (let i = 0; i < amb.length; i++) {
+        const a = amb[i];
+        a.update(dt);
+        if (a.state !== 'stopped' && a.seg) amb[n++] = a;
+      }
+      amb.length = n;
       this.ambientTimer -= dt;
       if (this.ambientTimer <= 0) { this.ambientTimer = 8; this.manageAmbient(); }
     } else if (this.ambient.length) this.ambient = [];
-    this.rebuildHash();
   }
 
   /** Keep the ambient traffic population in line with town sizes. */
@@ -277,6 +323,7 @@ export class Vehicles {
         const v = new RoadVehicle(g, this.nextAmbientId++, null, -1, true, this.rng.int(1e9));
         v.placeAt(seg, pos);
         this.ambient.push(v);
+        this.addOcc(v);
         have++; budget--;
       }
     }

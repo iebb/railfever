@@ -113,6 +113,9 @@ export class Network {
   grid = new SpatialGrid(8);
   nodeGrid = new SpatialGrid(8);
   version = 0;
+  /** edges and nodes touched since vehicles last processed a network change (see Vehicles.onNetworkChanged) */
+  dirtyEdges = new Set<number>();
+  dirtyNodes = new Set<number>();
   private geoCache = new Map<number, { v: number; g: EdgeGeo }>();
   private tables = new Map<number, { v: number; t: ReturnType<typeof arcTable> }>();
   private laneCache = new Map<string, { v: number; c: Curve3 }>();
@@ -187,6 +190,7 @@ export class Network {
   }
 
   markEdge(e: NEdge) {
+    this.dirtyEdges.add(e.id); this.dirtyNodes.add(e.a); this.dirtyNodes.add(e.b);
     const b = this.grid.box(e.id);
     if (b) this.world.markObjArea(b[0] - 2, b[1] - 2, b[2] + 2, b[3] + 2);
     // junction geometry of the end nodes depends on this edge

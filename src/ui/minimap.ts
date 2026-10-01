@@ -1,34 +1,56 @@
-// Minimap: terrain, network (Bezier strokes), towns, stations, vehicles and the camera view; click/drag to navigate.
+// Minimap card: terrain (pre-rendered offscreen), network & stations & town names (redrawn on network
+// changes), vehicles and the camera view (overlay); layer toggles; click / drag to move the camera.
 import * as THREE from 'three';
 import type { UI } from './ui';
-import { h } from './dom';
+import { h, icon } from './dom';
 import { WATER_Y } from '../game/constants';
+import { loadFonts } from './fonts';
 
 export class Minimap {
   el: HTMLDivElement;
+  private view: HTMLDivElement;
   private base: HTMLCanvasElement;
   private net: HTMLCanvasElement;
   private over: HTMLCanvasElement;
+  private terrain: HTMLCanvasElement | null = null;
   private baseTimer = 0;
   private overTimer = 0;
   private netTimer = 0;
   private netVer = -1;
   private heightsVer = -1;
   private size = 0;
+  private dpr = 1;
   visible = true;
+  layers = { network: true, vehicles: true, names: true };
+  private layerBtns: Record<string, HTMLButtonElement> = {};
   private dragging = false;
-  private readonly px = 210;
+  private readonly px = 216;
   private ray = new THREE.Raycaster();
   private ndc = new THREE.Vector2();
 
   constructor(private ui: UI) {
+    this.dpr = Math.min(2, window.devicePixelRatio || 1);
     this.base = h('canvas', { class: 'mm-base' });
     this.net = h('canvas', { class: 'mm-net' });
-    this.over = h('canvas', { class: 'mm-over' });
-    const toggle = h('button', { class: 'mm-toggle', title: 'Toggle minimap (M)', onclick: () => this.toggle() }, '▾');
-    this.el = h('div', { class: 'minimap' }, this.base, this.net, this.over, toggle);
-    for (const c of [this.base, this.net, this.over]) c.width = c.height = this.px;
+    this.over = h('canvas', { class: 'mm-over', 'aria-label': 'Minimap: click to move the camera' });
+    for (const c of [this.base, this.net, this.over]) c.width = c.height = Math.round(this.px * this.dpr);
+    this.view = h('div', { class: 'mm-view' }, this.base, this.net, this.over);
+    const layer = (key: keyof Minimap['layers'], ic: string, title: string) => {
+      const b = h('button', { class: 'ibtn sm mm-layer on', title, 'aria-label': title, 'aria-pressed': 'true', onclick: () => {
+        this.layers[key] = !this.layers[key];
+        b.classList.toggle('on', this.layers[key]);
+        b.setAttribute('aria-pressed', String(this.layers[key]));
+        this.netVer = -1; this.netTimer = 0; this.overTimer = 0;
+      } }, icon(ic, 15));
+      this.layerBtns[key] = b;
+      return b;
+    };
+    const collapse = h('button', { class: 'ibtn sm', title: 'Collapse (M)', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
+    this.el = h('div', { class: 'minimap glass' },
+      h('div', { class: 'mm-head' }, h('span', { class: 'mm-title' }, 'Map'), layer('network', 'rail', 'Network'), layer('vehicles', 'train', 'Vehicles'), layer('names', 'towns', 'Town names'), collapse),
+      this.view);
     ui.root.appendChild(this.el);
+    loadFonts().then(() => { this.netVer = -1; });
     const nav = (e: PointerEvent) => {
       if (!this.size) return;
       const r = this.over.getBoundingClientRect();
@@ -41,7 +63,7 @@ export class Minimap {
     window.addEventListener('pointerup', () => { this.dragging = false; });
     window.addEventListener('keydown', (e) => {
       const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || this.ui.titleOpen) return;
       if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) this.toggle();
     });
   }
@@ -49,12 +71,13 @@ export class Minimap {
   toggle() {
     this.visible = !this.visible;
     this.el.classList.toggle('collapsed', !this.visible);
+    if (this.visible) this.reset();
   }
 
-  reset() { this.baseTimer = 0; this.netTimer = 0; this.netVer = -1; this.heightsVer = -1; }
+  reset() { this.baseTimer = 0; this.netTimer = 0; this.netVer = -1; this.heightsVer = -1; this.terrain = null; }
 
-  /** Terrain colours from heights and water, trees and buildings. */
-  private drawBase() {
+  /** Terrain colours from heights and water with hill shading, trees and buildings (offscreen, once). */
+  private renderTerrain() {
     const g = this.ui.game;
     const w = g.world;
     const s = w.size;
@@ -72,14 +95,13 @@ export class Minimap {
       let r: number, gg: number, b: number;
       if (hh < WATER_Y) {
         const depth = Math.min(1, -hh / 3);
-        r = 52 - depth * 22; gg = 108 - depth * 40; b = 150 - depth * 30;
+        r = 38 - depth * 16; gg = 78 - depth * 26; b = 112 - depth * 24;
       } else {
         const f = Math.min(1, hh / maxH);
-        r = 108 + f * 70; gg = 150 + f * 14 - f * f * 50; b = 78 + f * 40;
-        if (f > 0.82) { r = 200 + f * 40; gg = 200 + f * 40; b = 206 + f * 40; }
-        // hill shading
-        const sx = w.heightAt(wx + k, wz) - hh;
-        const shade = Math.max(-26, Math.min(26, -sx * 14 / k));
+        r = 92 + f * 60; gg = 116 + f * 22 - f * f * 34; b = 74 + f * 34;
+        if (f > 0.82) { r = 190 + f * 40; gg = 192 + f * 40; b = 198 + f * 40; }
+        const sx = w.heightAt(wx + k, wz) - hh, sz = w.heightAt(wx, wz + k) - hh;
+        const shade = Math.max(-24, Math.min(24, (-sx - sz * 0.6) * 12 / k));
         r += shade; gg += shade; b += shade;
       }
       const i = (z * N + x) * 4;
@@ -92,81 +114,116 @@ export class Minimap {
       d[i] += (r - d[i]) * mix; d[i + 1] += (gg - d[i + 1]) * mix; d[i + 2] += (b - d[i + 2]) * mix;
     };
     const tmix = Math.min(0.5, 0.18 * k * k);
-    for (const t of w.trees) if (t) dot(t.x, t.z, 48, 92, 46, tmix);
-    for (const bd of w.buildings.values()) dot(bd.x, bd.z, 200, 118, 96, 0.85);
-    const tmp = document.createElement('canvas');
+    for (const t of w.trees) if (t) dot(t.x, t.z, 40, 74, 40, tmix);
+    for (const bd of w.buildings.values()) dot(bd.x, bd.z, 214, 196, 176, 0.8);
+    const tmp = this.terrain ?? document.createElement('canvas');
     tmp.width = tmp.height = N;
-    tmp.getContext('2d')!.putImageData(img, 0, 0);
-    const ctx = this.base.getContext('2d')!;
-    ctx.imageSmoothingEnabled = true;
-    ctx.clearRect(0, 0, this.px, this.px);
-    ctx.drawImage(tmp, 0, 0, this.px, this.px);
+    tmp.getContext('2d')?.putImageData(img, 0, 0);
+    this.terrain = tmp;
   }
 
-  /** Roads (grey) and rail (dark / company colour) drawn as Bezier strokes, plus stations. */
+  private drawBase() {
+    if (!this.terrain || this.heightsVer !== this.ui.game.world.heightsVersion) this.renderTerrain();
+    const ctx = this.base.getContext('2d');
+    if (!ctx || !this.terrain) return;
+    const P = this.base.width;
+    ctx.imageSmoothingEnabled = true;
+    ctx.clearRect(0, 0, P, P);
+    ctx.drawImage(this.terrain, 0, 0, P, P);
+  }
+
+  /** Roads (grey), rail (company colours), stations and town names. */
   private drawNetwork() {
     const g = this.ui.game;
     const net = g.world.net;
     this.netVer = g.networkVersion;
-    const k = this.px / g.world.size;
-    const ctx = this.net.getContext('2d')!;
-    ctx.clearRect(0, 0, this.px, this.px);
+    const P = this.net.width;
+    const k = P / g.world.size;
+    const ctx = this.net.getContext('2d');
+    if (!ctx) return;
+    ctx.clearRect(0, 0, P, P);
     ctx.lineCap = 'round';
-    const stroke = (kind: 'road' | 'rail', color: (owner: number) => string, width: number) => {
-      const groups = new Map<string, Path2D>();
-      for (const e of net.edges.values()) {
-        if (e.kind !== kind) continue;
-        const c = color(e.owner);
-        let p = groups.get(c);
-        if (!p) { p = new Path2D(); groups.set(c, p); }
-        const b = e.bez;
-        p.moveTo(b.x0 * k, b.z0 * k);
-        p.bezierCurveTo(b.x1 * k, b.z1 * k, b.x2 * k, b.z2 * k, b.x3 * k, b.z3 * k);
+    if (this.layers.network) {
+      const stroke = (kind: 'road' | 'rail', color: (owner: number) => string, width: number) => {
+        const groups = new Map<string, Path2D>();
+        for (const e of net.edges.values()) {
+          if (e.kind !== kind) continue;
+          const c = color(e.owner);
+          let p = groups.get(c);
+          if (!p) { p = new Path2D(); groups.set(c, p); }
+          const b = e.bez;
+          p.moveTo(b.x0 * k, b.z0 * k);
+          p.bezierCurveTo(b.x1 * k, b.z1 * k, b.x2 * k, b.z2 * k, b.x3 * k, b.z3 * k);
+        }
+        ctx.lineWidth = width;
+        for (const [c, p] of groups) { ctx.strokeStyle = c; ctx.stroke(p); }
+      };
+      stroke('road', (o) => (o < 0 ? 'rgba(210,214,220,0.55)' : 'rgba(255,170,110,0.75)'), Math.max(1, k * 0.9));
+      stroke('rail', (o) => g.company(o).color, Math.max(1.6, k * 1.2));
+      for (const st of g.stations.map.values()) {
+        const r = 2.6 * this.dpr;
+        ctx.fillStyle = '#10161f';
+        ctx.fillRect(st.x * k - r - 1, st.z * k - r - 1, 2 * r + 2, 2 * r + 2);
+        ctx.fillStyle = g.company(st.owner).color;
+        ctx.fillRect(st.x * k - r, st.z * k - r, 2 * r, 2 * r);
       }
-      ctx.lineWidth = width;
-      for (const [c, p] of groups) { ctx.strokeStyle = c; ctx.stroke(p); }
-    };
-    stroke('road', (o) => (o < 0 ? 'rgba(92,92,98,0.95)' : 'rgba(120,120,128,0.95)'), Math.max(1, k * 0.9));
-    stroke('rail', (o) => (o === 0 ? '#3a2a20' : g.company(o).color), Math.max(1.2, k * 1.1));
-    for (const st of g.stations.map.values()) {
-      ctx.fillStyle = g.company(st.owner).color;
-      ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.rect(st.x * k - 2.5, st.z * k - 2.5, 5, 5);
-      ctx.fill();
-      ctx.stroke();
+    }
+    if (this.layers.names) {
+      const fs = Math.round(10 * this.dpr);
+      ctx.font = `700 ${fs}px "Barlow Condensed", "Barlow", system-ui, sans-serif`;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.lineJoin = 'round';
+      const boxes: number[][] = [];
+      for (const t of [...g.towns.list].sort((a, b) => b.pop - a.pop)) {
+        const txt = t.name.toUpperCase();
+        const tw = ctx.measureText(txt).width;
+        const x = Math.max(tw / 2 + 2, Math.min(P - tw / 2 - 2, t.x * k)), y = Math.max(fs + 2, t.z * k - 3 * this.dpr);
+        const box = [x - tw / 2, y - fs, x + tw / 2, y];
+        if (boxes.some((b) => box[0] < b[2] && box[2] > b[0] && box[1] < b[3] && box[3] > b[1])) continue;
+        boxes.push(box);
+        ctx.lineWidth = 3 * this.dpr;
+        ctx.strokeStyle = 'rgba(10,14,20,0.8)';
+        ctx.strokeText(txt, x, y);
+        ctx.fillStyle = '#eef2f7';
+        ctx.fillText(txt, x, y);
+      }
     }
   }
 
   private drawOverlay() {
     const g = this.ui.game;
-    const ctx = this.over.getContext('2d')!;
-    const k = this.px / g.world.size;
-    ctx.clearRect(0, 0, this.px, this.px);
-    // vehicles
-    const p = { x: 0, y: 0, z: 0 };
-    for (const v of g.vehicles.map.values()) {
-      if (!v.worldPos(p)) continue;
-      ctx.fillStyle = v.kind === 'train' ? '#ffffff' : '#5ac8fa';
-      ctx.fillRect(p.x * k - 1.5, p.z * k - 1.5, 3, 3);
+    const ctx = this.over.getContext('2d');
+    if (!ctx) return;
+    const P = this.over.width;
+    const k = P / g.world.size;
+    ctx.clearRect(0, 0, P, P);
+    if (this.layers.vehicles) {
+      const p = { x: 0, y: 0, z: 0 };
+      const r = 1.6 * this.dpr;
+      for (const v of g.vehicles.map.values()) {
+        if (!v.worldPos(p)) continue;
+        ctx.fillStyle = v.kind === 'train' ? '#ffffff' : '#ffb27a';
+        ctx.fillRect(p.x * k - r, p.z * k - r, 2 * r, 2 * r);
+      }
     }
     // camera view: frustum corners on the ground plane
     const cam = this.ui.renderer.camera;
-    const pts: [number, number][] = [];
     const gy = this.ui.renderer.controls.focus?.y ?? 0;
+    ctx.beginPath();
+    let i = 0;
     for (const [nx, ny] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
       this.ray.setFromCamera(this.ndc.set(nx, ny), cam);
       const o = this.ray.ray.origin, dd = this.ray.ray.direction;
-      let t = dd.y < -1e-3 ? (o.y - gy) / -dd.y : 900;
-      t = Math.min(t, 900);
-      pts.push([(o.x + dd.x * t) * k, (o.z + dd.z * t) * k]);
+      const t = Math.min(dd.y < -1e-3 ? (o.y - gy) / -dd.y : 900, 900);
+      const x = (o.x + dd.x * t) * k, y = (o.z + dd.z * t) * k;
+      if (i++) ctx.lineTo(x, y); else ctx.moveTo(x, y);
     }
-    ctx.strokeStyle = 'rgba(255,255,255,0.9)';
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
     ctx.closePath();
+    ctx.fillStyle = 'rgba(255,176,32,0.1)';
+    ctx.fill();
+    ctx.strokeStyle = '#ffb020';
+    ctx.lineWidth = 1.5 * this.dpr;
     ctx.stroke();
   }
 
@@ -176,8 +233,13 @@ export class Minimap {
     this.baseTimer -= dt;
     this.netTimer -= dt;
     this.overTimer -= dt;
-    if (this.size !== w.size || (this.baseTimer <= 0 && this.heightsVer !== w.heightsVersion) || this.baseTimer < -20) { this.baseTimer = 4; this.drawBase(); }
+    const stale = this.baseTimer < -30;
+    if (this.size !== w.size || !this.terrain || stale || (this.baseTimer <= 0 && this.heightsVer !== w.heightsVersion)) {
+      if (stale || this.size !== w.size) this.terrain = null;
+      this.baseTimer = 4;
+      this.drawBase();
+    }
     if (this.netTimer <= 0 && this.netVer !== this.ui.game.networkVersion) { this.netTimer = 0.8; this.drawNetwork(); }
-    if (this.overTimer <= 0) { this.overTimer = 0.15; this.drawOverlay(); }
+    if (this.overTimer <= 0) { this.overTimer = 0.2; this.drawOverlay(); }
   }
 }

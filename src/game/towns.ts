@@ -168,6 +168,18 @@ export class Towns {
     if (!prop.ok) return false;
     if (prop.stats.bridges && prop.stats.len > 0 && prop.tracks.some((t) => t.sections.some((s) => s.type === 'bridge' && s.s1 - s.s0 > 6))) return false;
     if (prop.stats.tunnels) return false;
+    // no hairpin streets
+    if (prop.stats.minRadius < 3) return false;
+    // no piers: open water may only be bridged to reach existing streets
+    if (to.kind === 'free') {
+      const b = prop.tracks[0].bez;
+      for (let i = 0; i <= 12; i++) {
+        const t = i / 12, u = 1 - t;
+        const x = u * u * u * b.x0 + 3 * u * u * t * b.x1 + 3 * u * t * t * b.x2 + t * t * t * b.x3;
+        const z = u * u * u * b.z0 + 3 * u * u * t * b.z1 + 3 * u * t * t * b.z2 + t * t * t * b.z3;
+        if (g.world.heightAt(x, z) < WATER_Y + 0.15) return false;
+      }
+    }
     return commitProposal(g, prop) === null;
   }
 
@@ -293,7 +305,7 @@ export class Towns {
 
   maxRadius(town: Town) { return 10 + Math.sqrt(Math.max(100, town.pop)) * 0.6; }
   /** Radius within which new lots and streets may appear (compact core, or the existing built-up area). */
-  growthRadius(town: Town) { return Math.max(this.maxRadius(town) * 1.15, town.radius - 2.5); }
+  growthRadius(town: Town) { const m = this.maxRadius(town); return Math.max(m * 1.15, Math.min(town.radius - 2.5, m * 1.5)); }
 
   /** One growth step: building, upgrade or street extension. */
   growStep(town: Town, rng: RNG, day: number): boolean {

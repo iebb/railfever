@@ -1,6 +1,6 @@
-// Terrain chunks (1 vertex per world unit), map-edge skirts, water surface and exact ray picking.
+// Terrain chunks (1 vertex per world unit, distance LOD), map-edge skirts, water surface and exact ray picking.
 import * as THREE from 'three';
-import { World, TERRAIN_CHUNK } from '../game/world';
+import { World, TERRAIN_CHUNK, OBJ_CHUNK } from '../game/world';
 import { WATER_Y } from '../game/constants';
 import { NOISE_GLSL } from './shaders';
 import { GeoBuilder } from './geo';
@@ -16,25 +16,70 @@ export interface TerrainUniforms {
   uTime: { value: number };
 }
 
-/** Shared index buffers per chunk vertex dimensions (same split as World.heightAt). */
-const indexCache = new Map<string, THREE.BufferAttribute>();
-function chunkIndex(vw: number, vh: number): THREE.BufferAttribute {
-  const key = vw + 'x' + vh;
-  let a = indexCache.get(key);
-  if (a) return a;
-  const n = (vw - 1) * (vh - 1) * 6;
-  const idx = vw * vh > 65535 ? new Uint32Array(n) : new Uint16Array(n);
-  let k = 0;
-  for (let j = 0; j < vh - 1; j++) for (let i = 0; i < vw - 1; i++) {
-    const a0 = j * vw + i, b = a0 + 1, c = a0 + vw + 1, d = a0 + vw;
-    // (x,z),(x+1,z+1),(x+1,z) and (x,z),(x,z+1),(x+1,z+1): CCW seen from above
-    idx[k++] = a0; idx[k++] = c; idx[k++] = b;
-    idx[k++] = a0; idx[k++] = d; idx[k++] = c;
-  }
-  a = new THREE.BufferAttribute(idx, 1);
-  indexCache.set(key, a);
-  return a;
+/** Depth of the crack-hiding skirts hanging below every chunk border. */
+const SKIRT = 4;
+/** LOD steps (vertex spacing 1, 2, 4, 8 units). */
+const LODS = 4;
+/** Render chunk size (a multiple of the world's TERRAIN_CHUNK dirty-tracking size): few draw calls. */
+export const RENDER_CHUNK = 128;
+/**
+ * Pixels per world unit below which a chunk drops to the next coarser level. Conservative: coarse cells
+ * cannot follow 1-unit earthworks (cuttings would cover tracks), so they only start below ~4 px per unit.
+ */
+const LOD_PPU = [4, 2, 1];
+
+interface ChunkIndex {
+  index: THREE.BufferAttribute;
+  /** [start, count] of grid triangles per LOD, and of grid + skirt triangles per LOD */
+  grid: [number, number][];
+  full: [number, number][];
 }
+
+/** Shared index buffers per chunk vertex dimensions (same split as World.heightAt), all LODs in one buffer. */
+const indexCache = new Map<string, ChunkIndex>();
+function chunkIndex(vw: number, vh: number): ChunkIndex {
+  const key = vw + 'x' + vh;
+  const c = indexCache.get(key);
+  if (c) return c;
+  const nv = vw * vh;
+  const sb = nv; // skirt vertices: north row, south row, west column, east column
+  const idx: number[] = [];
+  const grid: [number, number][] = [], full: [number, number][] = [];
+  const v = (i: number, j: number) => j * vw + i;
+  for (let k = 0; k < LODS; k++) {
+    const st = 1 << k;
+    if ((vw - 1) % st || (vh - 1) % st) { grid.push(grid[k - 1]); full.push(full[k - 1]); continue; }
+    const start = idx.length;
+    for (let j = 0; j < vh - 1; j += st) for (let i = 0; i < vw - 1; i += st) {
+      const a = v(i, j), b = v(i + st, j), cc = v(i + st, j + st), d = v(i, j + st);
+      // (x,z),(x+1,z+1),(x+1,z) and (x,z),(x,z+1),(x+1,z+1): CCW seen from above
+      idx.push(a, cc, b, a, d, cc);
+    }
+    const gEnd = idx.length;
+    for (let i = 0; i < vw - 1; i += st) {
+      const p0 = v(i, 0), p1 = v(i + st, 0), b0 = sb + i, b1 = sb + i + st;
+      idx.push(p0, p1, b1, p0, b1, b0);
+      const q0 = v(i, vh - 1), q1 = v(i + st, vh - 1), c0 = sb + vw + i, c1 = sb + vw + i + st;
+      idx.push(q1, q0, c0, q1, c0, c1);
+    }
+    for (let j = 0; j < vh - 1; j += st) {
+      const p0 = v(0, j), p1 = v(0, j + st), b0 = sb + 2 * vw + j, b1 = sb + 2 * vw + j + st;
+      idx.push(p1, p0, b0, p1, b0, b1);
+      const q0 = v(vw - 1, j), q1 = v(vw - 1, j + st), c0 = sb + 2 * vw + vh + j, c1 = sb + 2 * vw + vh + j + st;
+      idx.push(q0, q1, c1, q0, c1, c0);
+    }
+    grid.push([start, gEnd - start]);
+    full.push([start, idx.length - start]);
+  }
+  const total = nv + 2 * (vw + vh);
+  const index = new THREE.BufferAttribute(total > 65535 ? new Uint32Array(idx) : new Uint16Array(idx), 1);
+  const ci = { index, grid, full };
+  indexCache.set(key, ci);
+  return ci;
+}
+
+interface ChunkInfo { x0: number; z0: number; x1: number; z1: number; minY: number; maxY: number; lod: number; range: number; ix: ChunkIndex }
+const NEIGH = [-1, 0, 1, 0, 0, -1, 0, 1];
 
 export class TerrainView {
   group = new THREE.Group();
@@ -49,13 +94,25 @@ export class TerrainView {
   base: THREE.Mesh;
   /** max milliseconds spent rebuilding dirty chunks per update */
   budgetMs = 6;
+  /** distance LOD (half/quarter resolution for far chunks) */
+  lodEnabled = true;
+  private info: ChunkInfo[] = [];
   private heightData: Uint16Array;
   private nc: number;
   private bottom = -6;
+  /** object chunks already seen dirty (their trees/edges feed the terrain attributes) */
+  private objSeen = new Set<number>();
+  private auxDirty = new Set<number>();
+  private geoDirty = new Set<number>();
+  private edgeH: Float32Array;
+  private camPos = new THREE.Vector3();
+  private saved = new THREE.Vector2();
+  /** minimum LOD used when the terrain casts shadows */
+  shadowLod = 1;
 
   constructor(public world: World) {
     const s = world.size;
-    this.nc = Math.ceil(s / TERRAIN_CHUNK);
+    this.nc = Math.ceil(s / RENDER_CHUNK);
     this.uniforms = {
       uGrid: { value: 0 },
       uHiRect: { value: new THREE.Vector4(0, 0, 0, 0) },
@@ -98,27 +155,106 @@ export class TerrainView {
 
     this.chunks = new Array(this.nc * this.nc).fill(null);
     for (let i = 0; i < this.nc * this.nc; i++) this.buildChunk(i);
+    this.edgeH = new Float32Array((s + 1) * 4);
+    this.edgesChanged();
     this.rebuildSkirt();
   }
 
   get chunkCount() { return this.nc; }
 
-  /** Rebuild dirty chunks (consumes world.dirtyTerrain) within the time budget. */
-  update() {
+  /**
+   * Rebuild dirty chunks (consumes world.dirtyTerrain) within the time budget, refresh the
+   * vegetation/earthwork attributes of chunks whose objects changed, and pick LODs for the camera.
+   */
+  update(camera?: THREE.Camera, pxScale = 0) {
     const w = this.world;
-    if (!w.dirtyTerrain.size) return;
     const t0 = performance.now();
-    let border = false;
-    for (const ci of [...w.dirtyTerrain]) {
-      w.dirtyTerrain.delete(ci);
-      if (ci < 0 || ci >= this.chunks.length) continue;
-      this.buildChunk(ci);
-      const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
-      this.fillHeights(cz * TERRAIN_CHUNK, Math.min(w.size, (cz + 1) * TERRAIN_CHUNK));
-      if (cx === 0 || cz === 0 || cx === this.nc - 1 || cz === this.nc - 1) border = true;
-      if (performance.now() - t0 > this.budgetMs) break;
+    if (w.dirtyTerrain.size) {
+      // world chunks (TERRAIN_CHUNK) map onto the larger render chunks
+      const wn = Math.ceil(w.size / TERRAIN_CHUNK), f = RENDER_CHUNK / TERRAIN_CHUNK;
+      for (const wc of w.dirtyTerrain) this.geoDirty.add(Math.floor(Math.floor(wc / wn) / f) * this.nc + Math.floor((wc % wn) / f));
+      w.dirtyTerrain.clear();
     }
-    if (border) this.rebuildSkirt();
+    if (this.geoDirty.size) {
+      let border = false;
+      for (const ci of [...this.geoDirty]) {
+        this.geoDirty.delete(ci);
+        if (ci < 0 || ci >= this.chunks.length) continue;
+        this.buildChunk(ci);
+        this.auxDirty.delete(ci);
+        const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
+        this.fillHeights(cz * RENDER_CHUNK, Math.min(w.size, (cz + 1) * RENDER_CHUNK));
+        if (cx === 0 || cz === 0 || cx === this.nc - 1 || cz === this.nc - 1) border = true;
+        if (performance.now() - t0 > this.budgetMs) break;
+      }
+      if (border && this.edgesChanged()) this.rebuildSkirt();
+    }
+    // object changes (trees cut, tracks built) alter forest floor and earthwork shading
+    if (w.dirtyObj.size || this.objSeen.size) {
+      const on = Math.ceil(w.size / OBJ_CHUNK);
+      for (const oc of w.dirtyObj) {
+        if (this.objSeen.has(oc)) continue;
+        this.objSeen.add(oc);
+        const ox = (oc % on) * OBJ_CHUNK, oz = Math.floor(oc / on) * OBJ_CHUNK;
+        const m = 6;
+        for (let cz = Math.max(0, Math.floor((oz - m) / RENDER_CHUNK)); cz <= Math.min(this.nc - 1, Math.floor((oz + OBJ_CHUNK + m) / RENDER_CHUNK)); cz++)
+          for (let cx = Math.max(0, Math.floor((ox - m) / RENDER_CHUNK)); cx <= Math.min(this.nc - 1, Math.floor((ox + OBJ_CHUNK + m) / RENDER_CHUNK)); cx++) this.auxDirty.add(cz * this.nc + cx);
+      }
+      for (const oc of this.objSeen) if (!w.dirtyObj.has(oc)) this.objSeen.delete(oc);
+    }
+    if (this.auxDirty.size) {
+      for (const ci of [...this.auxDirty]) {
+        this.auxDirty.delete(ci);
+        this.refreshAux(ci);
+        if (performance.now() - t0 > this.budgetMs) break;
+      }
+    }
+    if (camera && pxScale > 0) this.updateLod(camera, pxScale);
+  }
+
+  /** Per-chunk resolution from the projected size of a terrain cell. */
+  private updateLod(camera: THREE.Camera, pxScale: number) {
+    const c = this.camPos.copy(camera.position);
+    const n = this.nc;
+    for (let ci = 0; ci < this.info.length; ci++) {
+      const f = this.info[ci];
+      const dx = Math.max(f.x0 - c.x, 0, c.x - f.x1), dy = Math.max(f.minY - c.y, 0, c.y - f.maxY), dz = Math.max(f.z0 - c.z, 0, c.z - f.z1);
+      // pixels per world unit at the nearest point of the chunk
+      const ppu = pxScale / Math.max(1e-3, Math.hypot(dx, dy, dz));
+      let target = 0;
+      if (this.lodEnabled) while (target < LODS - 1 && ppu < LOD_PPU[target]) target++;
+      if (target === f.lod) continue;
+      // hysteresis around the boundary between adjacent levels avoids flicker
+      const edge = LOD_PPU[Math.min(target, f.lod)];
+      if (Math.abs(target - f.lod) > 1 || Math.abs(ppu / edge - 1) > 0.1 || !this.lodEnabled) f.lod = target;
+    }
+    for (let ci = 0; ci < this.info.length; ci++) {
+      const f = this.info[ci], m = this.chunks[ci];
+      if (!m) continue;
+      const cx = ci % n, cz = Math.floor(ci / n);
+      let skirt = f.lod > 0;
+      if (!skirt) for (let k = 0; k < 8; k += 2) {
+        const nx = cx + NEIGH[k], nz = cz + NEIGH[k + 1];
+        if (nx >= 0 && nz >= 0 && nx < n && nz < n && this.info[nz * n + nx].lod > 0) { skirt = true; break; }
+      }
+      const key = f.lod * 2 + (skirt ? 1 : 0);
+      if (key === f.range) continue;
+      f.range = key;
+      const r = skirt ? f.ix.full[f.lod] : f.ix.grid[f.lod];
+      m.geometry.setDrawRange(r[0], r[1]);
+    }
+  }
+
+  /** Did any height along the map border change since the skirt was built? */
+  private edgesChanged(): boolean {
+    const w = this.world, s = w.size, e = this.edgeH;
+    let changed = false;
+    for (let i = 0; i <= s; i++) {
+      const a = w.vh(i, 0), b = w.vh(i, s), c = w.vh(0, i), d = w.vh(s, i);
+      const k = i * 4;
+      if (e[k] !== a || e[k + 1] !== b || e[k + 2] !== c || e[k + 3] !== d) { changed = true; e[k] = a; e[k + 1] = b; e[k + 2] = c; e[k + 3] = d; }
+    }
+    return changed;
   }
 
   /** Copy vertex heights of rows z0..z1 into the height texture. */
@@ -131,57 +267,154 @@ export class TerrainView {
     this.heightTex.needsUpdate = true;
   }
 
+  private bounds(ci: number) {
+    const s = this.world.size;
+    const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
+    const x0 = cx * RENDER_CHUNK, z0 = cz * RENDER_CHUNK;
+    return { x0, z0, x1: Math.min(s, x0 + RENDER_CHUNK), z1: Math.min(s, z0 + RENDER_CHUNK) };
+  }
+
   buildChunk(ci: number) {
     const w = this.world;
-    const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
-    const x0 = cx * TERRAIN_CHUNK, z0 = cz * TERRAIN_CHUNK;
-    const x1 = Math.min(w.size, x0 + TERRAIN_CHUNK), z1 = Math.min(w.size, z0 + TERRAIN_CHUNK);
+    const { x0, z0, x1, z1 } = this.bounds(ci);
     const vw = x1 - x0 + 1, vh = z1 - z0 + 1;
-    const nv = vw * vh;
-    const pos = new Float32Array(nv * 3);
-    const nrm = new Float32Array(nv * 3);
-    const aux = new Float32Array(nv);
-    let k = 0;
+    const nv = vw * vh, total = nv + 2 * (vw + vh);
+    const pos = new Float32Array(total * 3);
+    const nrm = new Float32Array(total * 3);
+    let k = 0, minY = Infinity, maxY = -Infinity;
     for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
-      pos[k * 3] = x; pos[k * 3 + 1] = w.vh(x, z); pos[k * 3 + 2] = z;
+      const y = w.vh(x, z);
+      pos[k * 3] = x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = z;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
       const dx = (w.vh(x + 1, z) - w.vh(x - 1, z)) * 0.5;
       const dz = (w.vh(x, z + 1) - w.vh(x, z - 1)) * 0.5;
       const l = Math.hypot(dx, 1, dz);
       nrm[k * 3] = -dx / l; nrm[k * 3 + 1] = 1 / l; nrm[k * 3 + 2] = -dz / l;
       k++;
     }
-    this.forestDensity(x0, z0, x1, z1, vw, aux);
+    // skirt vertices below the border (copy normals so they shade like the surface)
+    const skirtOf = (src: number) => {
+      pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = pos[src * 3 + 1] - SKIRT; pos[k * 3 + 2] = pos[src * 3 + 2];
+      nrm[k * 3] = nrm[src * 3]; nrm[k * 3 + 1] = nrm[src * 3 + 1]; nrm[k * 3 + 2] = nrm[src * 3 + 2];
+      k++;
+    };
+    for (let i = 0; i < vw; i++) skirtOf(i);
+    for (let i = 0; i < vw; i++) skirtOf((vh - 1) * vw + i);
+    for (let j = 0; j < vh; j++) skirtOf(j * vw);
+    for (let j = 0; j < vh; j++) skirtOf(j * vw + vw - 1);
+    const aux = new Float32Array(total * 3);
+    this.computeAux(x0, z0, x1, z1, aux);
+    const ix = chunkIndex(vw, vh);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
     g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
-    g.setAttribute('aForest', new THREE.BufferAttribute(aux, 1));
-    g.setIndex(chunkIndex(vw, vh));
-    g.computeBoundingSphere();
+    g.setAttribute('aAux', new THREE.BufferAttribute(aux, 3));
+    g.setIndex(ix.index);
+    g.setDrawRange(ix.grid[0][0], ix.grid[0][1]);
+    g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, minY - SKIRT, z0), new THREE.Vector3(x1, maxY, z1));
+    g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+    this.info[ci] = { x0, z0, x1, z1, minY, maxY, lod: 0, range: 0, ix };
     let m = this.chunks[ci];
     if (m) { m.geometry.dispose(); m.geometry = g; }
     else {
       m = new THREE.Mesh(g, this.material);
       m.receiveShadow = true;
       m.castShadow = true;
+      m.matrixAutoUpdate = false;
+      // shadow casting only needs the silhouette: draw a coarser level (with skirts) in the shadow pass
+      const mesh = m, idx = ci;
+      mesh.onBeforeShadow = () => {
+        const f = this.info[idx];
+        const r = f.ix.full[Math.min(LODS - 1, Math.max(f.lod, this.shadowLod))];
+        const dr = mesh.geometry.drawRange;
+        this.saved.set(dr.start, dr.count);
+        mesh.geometry.setDrawRange(r[0], r[1]);
+      };
+      mesh.onAfterShadow = () => { mesh.geometry.setDrawRange(this.saved.x, this.saved.y); };
       this.chunks[ci] = m;
       this.group.add(m);
     }
   }
 
-  /** Per-vertex forest density (darker forest floor under tree clusters). */
-  private forestDensity(x0: number, z0: number, x1: number, z1: number, vw: number, out: Float32Array) {
-    const w = this.world;
-    const R = 1.8;
-    for (const id of w.treeGrid.query(x0 - R, z0 - R, x1 + R, z1 + R)) {
+  /** Recompute only the vegetation / earthwork / cavity attribute of a chunk. */
+  private refreshAux(ci: number) {
+    const m = this.chunks[ci];
+    if (!m) return;
+    const { x0, z0, x1, z1 } = this.bounds(ci);
+    const a = m.geometry.getAttribute('aAux') as THREE.BufferAttribute;
+    const arr = a.array as Float32Array;
+    arr.fill(0);
+    this.computeAux(x0, z0, x1, z1, arr);
+    a.needsUpdate = true;
+  }
+
+  /**
+   * Per-vertex attributes: x forest density (dark forest floor under tree clusters), y earthworks
+   * (cuttings/embankments next to network edges on the ground), z cavity (height above the local mean).
+   */
+  private computeAux(x0: number, z0: number, x1: number, z1: number, out: Float32Array) {
+    const w = this.world, net = w.net;
+    const vw = x1 - x0 + 1, vh = z1 - z0 + 1;
+    // cavity from a summed-area table over the chunk plus a margin
+    const R = 3, aw = vw + 2 * R, ah = vh + 2 * R, sw = aw + 1;
+    const sat = new Float64Array(sw * (ah + 1));
+    for (let j = 0; j < ah; j++) {
+      let row = 0;
+      for (let i = 0; i < aw; i++) { row += w.vh(x0 - R + i, z0 - R + j); sat[(j + 1) * sw + i + 1] = sat[j * sw + i + 1] + row; }
+    }
+    const D = 2 * R + 1, inv = 1 / (D * D);
+    for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
+      const sum = sat[(j + D) * sw + i + D] - sat[j * sw + i + D] - sat[(j + D) * sw + i] + sat[j * sw + i];
+      const c = w.vh(x0 + i, z0 + j) - sum * inv;
+      out[(j * vw + i) * 3 + 2] = Math.max(-1, Math.min(1, c * 0.7));
+    }
+    // forest floor
+    const TR = 1.8;
+    for (const id of w.treeGrid.query(x0 - TR, z0 - TR, x1 + TR, z1 + TR)) {
       const t = w.trees[id];
       if (!t) continue;
-      for (let z = Math.max(z0, Math.ceil(t.z - R)); z <= Math.min(z1, Math.floor(t.z + R)); z++) {
-        for (let x = Math.max(x0, Math.ceil(t.x - R)); x <= Math.min(x1, Math.floor(t.x + R)); x++) {
+      for (let z = Math.max(z0, Math.ceil(t.z - TR)); z <= Math.min(z1, Math.floor(t.z + TR)); z++) {
+        for (let x = Math.max(x0, Math.ceil(t.x - TR)); x <= Math.min(x1, Math.floor(t.x + TR)); x++) {
           const d = Math.hypot(x - t.x, z - t.z);
-          if (d < R) out[(z - z0) * vw + (x - x0)] += (1 - d / R) * 0.4 * t.s;
+          if (d < TR) out[((z - z0) * vw + (x - x0)) * 3] += (1 - d / TR) * 0.4 * t.s;
         }
       }
     }
+    // earthworks: graded ground beside edges (cut/fill slopes reach ~6 units out)
+    const ER = 6;
+    for (const e of net.edgesNear(x0 - ER - 1, z0 - ER - 1, x1 + ER + 1, z1 + ER + 1)) {
+      const g = net.geo(e);
+      // town streets: gentler, mostly grassed verges
+      const town = e.kind === 'road' && e.owner < 0;
+      const er = town ? 3 : ER, wk = town ? 0.45 : 1;
+      const core = net.halfWidth(e) + 0.3, outer = core + er;
+      let last = -1e9;
+      for (let i = 0; i < g.n; i++) {
+        const sp = g.cum[i];
+        if (i > 0 && i < g.n - 1 && sp - last < 0.6) continue;
+        last = sp;
+        if (net.sectionAt(e, sp) !== 'ground') continue;
+        const px = g.pts[i * 3], pz = g.pts[i * 3 + 2];
+        if (px < x0 - outer || px > x1 + outer || pz < z0 - outer || pz > z1 + outer) continue;
+        for (let z = Math.max(z0, Math.ceil(pz - outer)); z <= Math.min(z1, Math.floor(pz + outer)); z++) {
+          for (let x = Math.max(x0, Math.ceil(px - outer)); x <= Math.min(x1, Math.floor(px + outer)); x++) {
+            const d = Math.hypot(x - px, z - pz);
+            if (d >= outer) continue;
+            const f = (d <= core ? 1 : 1 - (d - core) / er) * wk;
+            const k = ((z - z0) * vw + (x - x0)) * 3 + 1;
+            if (f > out[k]) out[k] = f;
+          }
+        }
+      }
+    }
+    // skirts copy their border vertex
+    const nv = vw * vh;
+    let k = nv;
+    const cp = (src: number) => { out[k * 3] = out[src * 3]; out[k * 3 + 1] = out[src * 3 + 1]; out[k * 3 + 2] = out[src * 3 + 2]; k++; };
+    for (let i = 0; i < vw; i++) cp(i);
+    for (let i = 0; i < vw; i++) cp((vh - 1) * vw + i);
+    for (let j = 0; j < vh; j++) cp(j * vw);
+    for (let j = 0; j < vh; j++) cp(j * vw + vw - 1);
   }
 
   private rebuildSkirt() {
@@ -229,12 +462,11 @@ export class TerrainView {
     }
   }
 
-  /** Highest and lowest vertex height (for picking bounds). */
-  heightRange(): [number, number] {
-    const h = this.world.h;
-    let mn = Infinity, mx = -Infinity;
-    for (let i = 0; i < h.length; i++) { const v = h[i]; if (v < mn) mn = v; if (v > mx) mx = v; }
-    return [mn, mx];
+  /** Triangles currently submitted per pass (for stats). */
+  triangles(): number {
+    let n = 0;
+    for (const m of this.chunks) if (m) n += m.geometry.drawRange.count / 3;
+    return Math.round(n);
   }
 
   dispose() {
@@ -314,56 +546,99 @@ function createTerrainMaterial(U: TerrainUniforms): THREE.MeshStandardMaterial {
     Object.assign(sh.uniforms, U);
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', `#include <common>
-attribute float aForest;
+attribute vec3 aAux;
 varying vec3 vWPos;
 varying vec3 vWNormal;
-varying float vForest;`)
+varying vec3 vAux;
+varying vec2 vMacro;
+${NOISE_GLSL}`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
 vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
 vWNormal = normalize(mat3(modelMatrix) * objectNormal);
-vForest = aForest;`);
+vAux = aAux;
+// large-scale variation is smooth over a cell: evaluate per vertex
+vMacro = vec2(rf_fbm(vWPos.xz * 0.006 + 3.1), rf_fbm(vWPos.xz * 0.03 + 11.7));`);
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', `#include <common>
 uniform float uGrid; uniform vec4 uHiRect; uniform vec3 uHiColor; uniform float uHiOn;
 uniform vec4 uCircle; uniform vec3 uCircleColor; uniform float uSnow; uniform float uTime;
-varying vec3 vWPos; varying vec3 vWNormal; varying float vForest;
+varying vec3 vWPos; varying vec3 vWNormal; varying vec3 vAux; varying vec2 vMacro;
 ${NOISE_GLSL}`)
       .replace('#include <map_fragment>', `
 vec3 rfGlow = vec3(0.0);
+float rfRough = 0.95;
+float rfBump = 0.0;
 {
   vec2 p = vWPos.xz;
-  float fw = max(length(fwidth(p)), 1e-4);
-  float n0 = rf_fbm(p * 0.008 + 3.1);
-  float n1 = rf_fbm(p * 0.035);
-  float n2 = rf_vnoise(p * 0.25 + 5.3);
-  float n3 = rf_vnoise(p * 1.9 + 1.7) * (1.0 - smoothstep(0.25, 0.6, fw * 1.9));
-  float n4 = rf_vnoise(p * 8.3) * (1.0 - smoothstep(0.25, 0.6, fw * 8.3));
-  vec3 grassA = rf_srgb(vec3(0.31, 0.44, 0.17));
-  vec3 grassB = rf_srgb(vec3(0.43, 0.53, 0.22));
-  vec3 dry    = rf_srgb(vec3(0.58, 0.56, 0.32));
-  vec3 forest = rf_srgb(vec3(0.21, 0.27, 0.12));
-  vec3 dirt   = rf_srgb(vec3(0.46, 0.38, 0.28));
-  vec3 rockA  = rf_srgb(vec3(0.46, 0.44, 0.41));
-  vec3 rockB  = rf_srgb(vec3(0.60, 0.58, 0.54));
-  vec3 sand   = rf_srgb(vec3(0.80, 0.74, 0.56));
-  vec3 wetS   = rf_srgb(vec3(0.55, 0.50, 0.38));
-  vec3 mud    = rf_srgb(vec3(0.32, 0.31, 0.24));
-  vec3 snow   = rf_srgb(vec3(0.93, 0.95, 0.98));
-  vec3 col = mix(grassA, grassB, smoothstep(0.35, 0.65, n1));
-  col = mix(col, dry, smoothstep(0.55, 0.8, n0 + (n2 - 0.5) * 0.3) * 0.55);
-  col *= 0.9 + 0.16 * n2 + 0.08 * (n3 - 0.5) + 0.07 * (n4 - 0.5);
-  col = mix(col, forest * (0.85 + 0.3 * n3), clamp(vForest, 0.0, 1.0) * 0.8);
-  float slope = 1.0 - normalize(vWNormal).y;
-  col = mix(col, dirt * (0.9 + 0.2 * n3), smoothstep(0.06, 0.2, slope + (n2 - 0.5) * 0.06) * 0.55);
-  vec3 rock = mix(rockA, rockB, n3) * (0.8 + 0.3 * n4) * (0.92 + 0.1 * sin(vWPos.y * 6.0 + n2 * 4.0));
-  col = mix(col, rock, smoothstep(0.2, 0.36, slope + (n2 - 0.5) * 0.12));
   float h = vWPos.y;
-  float beach = (1.0 - smoothstep(0.05, 0.2, h + (n2 - 0.5) * 0.1)) * (1.0 - smoothstep(0.15, 0.4, slope));
-  col = mix(col, sand * (0.92 + 0.12 * n4), beach);
-  col = mix(col, wetS, (1.0 - smoothstep(-0.01, 0.04, h)) * 0.7);
-  col = mix(col, mud, 1.0 - smoothstep(-0.3, -0.05, h));
-  float sn = smoothstep(uSnow, uSnow + 3.0, h + (n1 - 0.5) * 6.0) * (1.0 - smoothstep(0.35, 0.6, slope));
-  col = mix(col, snow, sn);
+  float slope = 1.0 - normalize(vWNormal).y;
+  float fw = max(length(fwidth(p)), 1e-4);
+  float m0 = vMacro.x, m1 = vMacro.y;
+  // octaves fade out before they alias (keep >= ~5 px per cycle)
+  float n2 = rf_vnoise(p * 0.21 + 5.3);
+  float d3 = 1.0 - smoothstep(0.2, 0.5, fw * 1.13);
+  float d4 = 1.0 - smoothstep(0.2, 0.5, fw * 4.7);
+  float d5 = 1.0 - smoothstep(0.2, 0.5, fw * 19.0);
+  float d6 = 1.0 - smoothstep(0.2, 0.5, fw * 67.0);
+  float n3 = d3 > 0.0 ? rf_vnoise(p * 1.13 + 1.7) : 0.5;
+  float n4 = d4 > 0.0 ? rf_vnoise(p * 4.7 + 9.1) : 0.5;
+  float n5 = d5 > 0.0 ? rf_vnoise(p * 19.0 + 3.3) : 0.5;
+  float n6 = d6 > 0.0 ? rf_vnoise(p * 67.0) : 0.5;
+  n3 = mix(0.5, n3, d3); n4 = mix(0.5, n4, d4); n5 = mix(0.5, n5, d5); n6 = mix(0.5, n6, d6);
+  float detail = (n3 - 0.5) * 0.5 + (n4 - 0.5) * 0.35 + (n5 - 0.5) * 0.25 + (n6 - 0.5) * 0.2;
+
+  vec3 lush   = rf_srgb(vec3(0.29, 0.43, 0.16));
+  vec3 fresh  = rf_srgb(vec3(0.40, 0.52, 0.20));
+  vec3 dryG   = rf_srgb(vec3(0.57, 0.55, 0.31));
+  vec3 alpine = rf_srgb(vec3(0.46, 0.48, 0.31));
+  vec3 forest = rf_srgb(vec3(0.23, 0.25, 0.13));
+  vec3 dirt   = rf_srgb(vec3(0.47, 0.38, 0.27));
+  vec3 scree  = rf_srgb(vec3(0.53, 0.50, 0.45));
+  vec3 rockA  = rf_srgb(vec3(0.42, 0.41, 0.39));
+  vec3 rockB  = rf_srgb(vec3(0.59, 0.57, 0.53));
+  vec3 sand   = rf_srgb(vec3(0.79, 0.73, 0.55));
+  vec3 wetS   = rf_srgb(vec3(0.50, 0.45, 0.35));
+  vec3 mud    = rf_srgb(vec3(0.30, 0.29, 0.22));
+  vec3 snow   = rf_srgb(vec3(0.92, 0.94, 0.97));
+
+  // meadows: regional dry/lush variation, greener near water, alpine grass higher up
+  float moist = 1.0 - smoothstep(0.3, 2.5, h);
+  vec3 col = mix(fresh, lush, smoothstep(0.35, 0.7, m1));
+  col = mix(col, dryG, smoothstep(0.5, 0.78, m0 + (n2 - 0.5) * 0.25) * 0.6 * (1.0 - moist * 0.7));
+  col = mix(col, lush, moist * 0.3);
+  col = mix(col, alpine, smoothstep(uSnow * 0.45, uSnow * 0.85, h + (m1 - 0.5) * 4.0) * 0.8);
+  col *= 0.9 + 0.2 * n2;
+  col *= 1.0 + detail * 0.2;
+  col = mix(col, col * vec3(1.12, 1.06, 0.78), smoothstep(0.55, 0.85, n5) * d5 * 0.45);
+  // forest floor under tree clusters
+  float fo = smoothstep(0.12, 0.8, vAux.x + (n3 - 0.5) * 0.2);
+  col = mix(col, forest * (0.85 + 0.25 * n4 + 0.15 * n2), fo * 0.85);
+  // ridges catch light, hollows collect shade and moisture
+  col *= 1.0 + clamp(vAux.z, -1.0, 1.0) * 0.1;
+  // exposed soil: steep grass naturally, fresh cuttings and embankments next to tracks and roads
+  float sn = (n2 - 0.5) * 0.08 + (m1 - 0.5) * 0.06;
+  float works = clamp(vAux.y, 0.0, 1.0);
+  float dirtAmt = smoothstep(0.1, 0.2, slope + sn) * 0.45;
+  dirtAmt = max(dirtAmt, works * smoothstep(0.035, 0.11, slope + sn * 0.5) * 0.85);
+  col = mix(col, dirt * (0.88 + 0.22 * n3 + 0.1 * n2), dirtAmt);
+  // scree and rock on steep slopes (low-frequency breakup only: no streaks)
+  float rockAmt = smoothstep(0.2, 0.32, slope + sn * 1.5);
+  vec3 rock = mix(rockA, rockB, smoothstep(0.25, 0.75, n2 * 0.6 + n3 * 0.4));
+  rock *= 0.86 + 0.28 * n4 * (0.6 + 0.4 * n5);
+  col = mix(col, mix(scree * (0.9 + 0.2 * n4), rock, smoothstep(0.24, 0.4, slope + sn)), rockAmt);
+  // beaches, wet sand, sea bed
+  float beach = (1.0 - smoothstep(0.08, 0.3, h + (n2 - 0.5) * 0.15)) * (1.0 - smoothstep(0.12, 0.3, slope));
+  col = mix(col, sand * (0.93 + 0.12 * n4), beach);
+  float wet = 1.0 - smoothstep(-0.02, 0.05, h);
+  col = mix(col, wetS, wet * 0.75);
+  col = mix(col, mud, 1.0 - smoothstep(-0.4, -0.05, h));
+  // snow above the snow line, not on cliffs
+  float snowAmt = smoothstep(uSnow, uSnow + 2.5, h + (m1 - 0.5) * 5.0 + (n2 - 0.5)) * (1.0 - smoothstep(0.3, 0.5, slope));
+  col = mix(col, snow * (0.96 + 0.05 * n4), snowAmt);
+  rfRough = mix(mix(0.95, 0.6, snowAmt), 0.5, wet);
+  // micro relief for close-ups (rock and soil rougher than grass)
+  rfBump = detail * 0.01 * (1.0 + rockAmt * 2.5 + dirtAmt) * (1.0 - snowAmt * 0.6);
+
   if (uHiOn > 0.5) {
     vec2 dd = min(p - uHiRect.xy, uHiRect.zw - p);
     float md = min(dd.x, dd.y);
@@ -392,12 +667,25 @@ vec3 rfGlow = vec3(0.0);
     col = mix(col, vec3(0.0), minor * 0.22);
     col = mix(col, vec3(0.01), major * 0.4);
     col = mix(col, rf_srgb(vec3(0.98, 0.92, 0.62)), max(c1 * 0.35, c5 * 0.5));
+    rfGlow += rf_srgb(vec3(0.98, 0.92, 0.62)) * max(c1, c5) * 0.04;
   }
   diffuseColor.rgb = col;
 }`)
+      .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = rfRough;')
+      .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+{
+  // bump from the procedural micro relief (screen-space derivatives)
+  vec3 sx = dFdx(-vViewPosition), sy = dFdy(-vViewPosition);
+  vec2 dh = vec2(dFdx(rfBump), dFdy(rfBump));
+  vec3 r1 = cross(sy, normal), r2 = cross(normal, sx);
+  float det = dot(sx, r1) * faceDirection;
+  vec3 grad = sign(det) * (dh.x * r1 + dh.y * r2);
+  vec3 bn = abs(det) * normal - grad;
+  if (dot(bn, bn) > 1e-30) normal = normalize(bn);
+}`)
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += rfGlow;');
   };
-  mat.customProgramCacheKey = () => 'rf-terrain-v2';
+  mat.customProgramCacheKey = () => 'rf-terrain-v3';
   return mat;
 }
 
@@ -453,28 +741,31 @@ function createWaterMaterial(heightTex: THREE.Texture, size: number): THREE.Shad
         float depth = max(vWPos.y - th, 0.0);
         vec2 p = vWPos.xz;
         float fw = max(length(fwidth(p)), 1e-4);
+        // calmer water in the shallows
+        float calm = 0.45 + 0.55 * smoothstep(0.0, 0.6, depth);
         vec2 g = vec2(0.0);
         g += rfNoiseD(p * 0.18 + vec2(uTime * 0.02, uTime * 0.013)).yz * 0.18 * 0.5;
         g += rfNoiseD(p * 0.9 - vec2(uTime * 0.07, -uTime * 0.05)).yz * 0.9 * 0.06 * (1.0 - smoothstep(0.3, 0.7, fw * 0.9));
         g += rfNoiseD(p * 3.3 + vec2(-uTime * 0.21, uTime * 0.17)).yz * 3.3 * 0.012 * (1.0 - smoothstep(0.3, 0.7, fw * 3.3));
         g += rfNoiseD(p * 11.0 + vec2(uTime * 0.5, uTime * 0.37)).yz * 11.0 * 0.003 * (1.0 - smoothstep(0.3, 0.7, fw * 11.0));
+        g *= calm;
         vec3 N = normalize(vec3(-g.x, 1.0, -g.y));
         vec3 V = normalize(cameraPosition - vWPos);
-        float fres = 0.04 + 0.96 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
+        float fres = 0.03 + 0.97 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
         vec3 deep = vec3(0.010, 0.05, 0.085);
-        vec3 shallow = vec3(0.05, 0.24, 0.25);
+        vec3 shallow = vec3(0.06, 0.25, 0.25);
         vec3 col = mix(shallow, deep, smoothstep(0.0, 0.7, depth));
         float lit = 0.25 + 0.75 * max(uSunDir.y, 0.0);
-        col *= lit * uLight + 0.04;
+        col *= lit * uLight + 0.03;
         vec3 R = reflect(-V, N);
         vec3 refl = mix(uHorizon, uSkyColor, clamp(R.y * 1.8, 0.0, 1.0)) * uLight;
         col = mix(col, refl, clamp(fres, 0.0, 0.85));
-        float spec = pow(max(dot(R, uSunDir), 0.0), 220.0) * 3.5;
+        float spec = pow(max(dot(R, uSunDir), 0.0), 240.0) * 4.0 + pow(max(dot(R, uSunDir), 0.0), 24.0) * 0.12;
         col += uSunColor * spec * step(0.0, uSunDir.y);
         float shore = 1.0 - smoothstep(0.0, 0.035, depth);
         float foamN = rf_vnoise(p * 6.0 + vec2(uTime * 0.6, -uTime * 0.45));
         float foam = shore * smoothstep(0.35, 0.75, foamN + shore * 0.4);
-        col = mix(col, vec3(0.85, 0.9, 0.92) * uLight, foam * 0.7);
+        col = mix(col, vec3(0.85, 0.9, 0.92) * max(uLight, 0.15), foam * 0.7);
         float alpha = mix(0.55, 0.95, smoothstep(0.0, 0.4, depth));
         alpha = max(alpha, foam * 0.9);
         gl_FragColor = vec4(col, alpha);
