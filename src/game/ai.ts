@@ -694,9 +694,9 @@ export class AIController {
     if (hub && hub.rail) {
       const r = hub.rail;
       const pa = { ok: true, x: r.x, z: r.z, y: r.y, angle: r.angle, length: r.length, tracks: r.tracks, cost: 0 } as StationPlan;
-      const pb = yield* stationSiteGen(g, B, pa, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(pa, q, LEAD) });
+      const pb = yield* stationSiteGen(g, B, pa, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(pa, q, LEAD), quick: true });
       if (pb && Math.abs(pa.y - pb.y) <= grade * Math.hypot(pa.x - pb.x, pa.z - pb.z) * 1.15) pr = { a: pa, b: pb };
-    } else pr = yield* railPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22 });
+    } else pr = yield* railPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true });
     if (!pr) return fail('no station sites');
     const planning = this.state.phase;
     this.state.phase = `${planning}: route`;
@@ -1186,7 +1186,7 @@ export class AIController {
       let sid = -1, bd = Infinity;
       for (const st of g.stations.map.values()) if (st.owner === owner) for (const q of st.stops) { const d = Math.hypot(q.x - s.x, q.z - s.z); if (d < bd) { bd = d; sid = st.id; } }
       if (sid >= 0 && !ids.includes(sid)) ids.push(sid);
-      if (g.stations.nextId > before) { p.stations.push(before); this.linkTransfers(before); }
+      if (g.stations.nextId > before) { p.stations.push(before); yield; this.linkTransfers(before); }
       this.stats.busStops++;
       yield;
     }
@@ -1249,7 +1249,7 @@ export class AIController {
       if (g.stations.commitBusStop(s.x, s.z, owner)) return fail('stop site taken', 360);
       let sid = -1, bd = Infinity;
       for (const st of g.stations.map.values()) if (st.owner === owner) for (const q of st.stops) { const d = Math.hypot(q.x - s.x, q.z - s.z); if (d < bd) { bd = d; sid = st.id; } }
-      if (g.stations.nextId > before) { p.stations.push(before); this.linkTransfers(before); }
+      if (g.stations.nextId > before) { p.stations.push(before); yield; this.linkTransfers(before); }
       if (sid < 0 || ids.includes(sid)) return fail('stops not built', 360);
       ids.push(sid);
       this.stats.busStops++;

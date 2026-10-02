@@ -848,6 +848,8 @@ export interface SiteOpts {
   prefY?: number; tolY?: number;
   /** extra condition on a site (e.g. its leads line up with the other station's) */
   accept?: (p: StationPlan) => boolean;
+  /** a quicker search (AI): stop a few rings beyond the best site so far (unless a height is wanted) */
+  quick?: boolean;
 }
 
 /** Run a generator to completion (synchronous use of the incremental helpers). */
@@ -864,8 +866,9 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
   const front = o.front ?? 16, back = o.back ?? 9;
   let best: StationPlan | null = null, bestScore = Infinity;
   const maxR = o.maxR ?? town.radius + 14;
-  let n = 0;
+  let n = 0, bestR = Infinity;
   for (let r = 4; r <= maxR; r += 3) {
+    if (o.quick && o.prefY === undefined && r > bestR + 9) break;
     for (const da of [0, 0.25, -0.25, 0.5, -0.5, 0.8, -0.8, 1.2, -1.2]) {
       const pa = dirA + da;
       const x = town.x + Math.sin(pa) * r, z = town.z + Math.cos(pa) * r;
@@ -887,8 +890,8 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         // the caller's condition on the site first (planning the station is costly)
         if (o.accept && !o.accept({ x, z, angle: ang, length: o.length } as StationPlan)) continue;
         const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
-        // planning a station is the costly part (footprints, access road): one per step
-        n += 16;
+        // planning a station is the costly part (footprints, access road): two per step at most
+        n += 8;
         if (!plan.ok || plan.join) continue;
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
@@ -911,7 +914,7 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         const pop = g.stations.popInShapes(g.stations.planCatchShapes(plan)) + g.stations.popInShapes(railCatchShapes(x, z, ang, o.length).map((c) => ({ ...c, r: 15 })));
         let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 30 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
-        if (score < bestScore) { bestScore = score; best = plan; }
+        if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
       }
     }
   }
