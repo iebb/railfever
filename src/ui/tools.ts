@@ -6,7 +6,7 @@ import { PLAYER } from '../game/game';
 import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions, curveSpeed } from '../game/construction';
 import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable, electrify } from '../game/build-ops';
 import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING, SIGNAL_COST } from '../game/signals';
-import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan, planStationOnTrack, commitStationOnTrack, OnTrackPlan, planConnection, commitConnection, ConnectionPlan } from '../game/trackops';
+import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan, planStationOnTrack, commitStationOnTrack, OnTrackPlan, planConnection, commitConnection, ConnectionPlan, planRelevel, commitRelevel, RelevelPlan } from '../game/trackops';
 import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
@@ -19,7 +19,7 @@ import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
-import { planStation, StationLevel, catchRadius, catchShapes, catchColor, CATCH_COLOR, planCatchShapes, catchBonusOf, stationStyles, autoStationStyle, relevelApi, RelevelPlan, errorOf } from './gameapi';
+import { planStation, StationLevel, catchRadius, catchShapes, catchColor, CATCH_COLOR, planCatchShapes, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
 import { STATION_STYLES } from '../game/station-styles';
 import { servesKind } from './win-lines';
 import { accessState, policyText, requestAccessUI } from './win-access';
@@ -1217,10 +1217,9 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ re-level (lift / sink track in place)
+  /** Own track to lift / sink: the track under the cursor, or along it from the press point (stations on it go along). */
   private hoverRelevel(p: THREE.Vector3) {
     const g = this.game, net = g.world.net, ov = this.overlay;
-    const api = relevelApi();
-    if (!api) { this.tip({ title: 'Re-level', err: ['Not available in this version'] }, 'err'); return; }
     const ok = (e: NEdge) => e.owner === PLAYER && e.depot < 0;
     const cur = net.nearestEdge(p.x, p.z, 1.4, 'rail', ok);
     let chain: number[] = [];
@@ -1234,44 +1233,45 @@ export class Tools {
       this.rlv = null;
       ov.setProposal(null); ov.setHoverEdge(null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Not on depot tracks' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at your track, or drag along a stretch']] }, other ? 'err' : 'info');
+      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at your track, or drag along a stretch']] }, other ? 'err' : 'info');
       return;
     }
     const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}`;
     if (this.rlv?.key !== key) {
       let plan: RelevelPlan;
-      try { plan = api.plan(g, chain, this.relevelTo, PLAYER, { height: this.levelHeight, depth: this.levelDepth }); } catch (e) { plan = { ok: false, error: (e as Error).message, cost: 0 }; }
+      try { plan = planRelevel(g, chain, this.relevelTo, PLAYER, { height: this.levelHeight, depth: this.levelDepth }); }
+      catch (e) { plan = { ok: false, error: (e as Error).message, warnings: [], owner: PLAYER, level: this.relevelTo, cost: 0, edges: [], nodes: [], stations: [], crossings: [], ramps: [] }; }
       this.rlv = { key, chain, plan };
     }
     const pl = this.rlv.plan!;
-    const props = pl.proposals ?? (pl.proposal ? [pl.proposal] : []);
-    ov.setProposal(props.length ? { ...props[0], ok: pl.ok, cost: pl.cost, tracks: props.flatMap((q) => q.tracks), crossings: props.flatMap((q) => q.crossings), demolish: props.flatMap((q) => q.demolish) } : null);
+    ov.setProposal(relevelPreview(this.game, pl));
     ov.setHoverEdge(chain, pl.ok ? 0xffb020 : 0xff5a4a);
     let len = 0;
-    for (const id of chain) len += net.edges.get(id)?.len ?? 0;
-    const rows: [string, string][] = [['length', `<b>${fmtLen(pl.length ?? len)}</b> of track${chain.length > 1 ? ` · ${chain.length} sections` : ''}`]];
-    if (this.relevelTo !== 'ground') rows.push([this.relevelTo === 'elevated' ? 'bridge' : 'tunnel', this.relevelTo === 'elevated' ? `deck <b>${Math.round(this.levelHeight * 10)} m</b> up, ramps at both ends` : `<b>${Math.round(this.levelDepth * 10)} m</b> deep, portals at both ends`]);
-    if (pl.stations?.length) rows.push(['station', `${plural(pl.stations.length, 'station')} go${pl.stations.length === 1 ? 'es' : ''} with it`]);
-    const err = pl.ok ? [] : [pl.error ?? pl.errors?.[0] ?? 'Cannot re-level here'];
-    this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err, warn: [...(pl.warnings ?? []), ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? (d?.moved ? 'Release to rebuild' : 'Click to rebuild · drag along the line for more') : undefined }, pl.ok ? 'ok' : 'err');
+    for (const x of pl.edges.length ? pl.edges : chain.map((id) => ({ id }))) len += net.edges.get(x.id)?.len ?? 0;
+    const rows: [string, string][] = [['length', `<b>${fmtLen(len)}</b> of track${pl.edges.length > 1 ? ` · ${pl.edges.length} sections` : ''}`]];
+    if (this.relevelTo !== 'ground') rows.push([this.relevelTo === 'elevated' ? 'bridge' : 'tunnel', this.relevelTo === 'elevated' ? `deck <b>${Math.round(this.levelHeight * 10)} m</b> up` : `<b>${Math.round(this.levelDepth * 10)} m</b> deep`]);
+    if (pl.ramps.length) rows.push(['grade', `ramps ${pl.ramps.map((r) => fmtLen(r)).join(' · ')}`]);
+    if (pl.stations.length) rows.push(['station', `${pl.stations.map((s) => esc(g.stations.get(s.id)?.name ?? '?')).join(', ')} go${pl.stations.length === 1 ? 'es' : ''} with it`]);
+    if (pl.crossings.length) rows.push(['crossing', `${plural(pl.crossings.length, 'level crossing')} become${pl.crossings.length === 1 ? 's' : ''} grade-separated`]);
+    const err = pl.ok ? [] : [pl.error ?? 'Cannot re-level here'];
+    this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err, warn: [...pl.warnings], hint: pl.ok ? (d?.moved ? 'Release to rebuild' : 'Click to rebuild · drag along the line for more') : undefined }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
   }
 
   private commitRelevel() {
-    const g = this.game, api = relevelApi(), r = this.rlv;
+    const g = this.game, r = this.rlv;
     this.rlv = null;
     this.overlay.setProposal(null);
     this.overlay.setHoverEdge(null);
-    if (!api || !r?.plan) return;
-    if (!r.plan.ok) { this.ui.toast(r.plan.error ?? r.plan.errors?.[0] ?? 'Cannot re-level here', 'bad'); return; }
+    if (!r?.plan) return;
+    if (!r.plan.ok) { this.ui.toast(r.plan.error ?? 'Cannot re-level here', 'bad'); return; }
     const before = g.economy.money;
-    let res: unknown;
-    try { res = api.commit(g, r.plan); } catch (e) { res = (e as Error).message; }
-    const err = errorOf(res);
+    let err: string | null;
+    try { err = commitRelevel(g, r.plan); } catch (e) { err = (e as Error).message; }
     if (err === 'busy') { this.ui.toast('A train is on this stretch — try again in a moment', 'info'); return; }
     if (err) { this.ui.toast(err, 'bad'); return; }
     this.ui.floatCost(Math.max(0, before - g.economy.money), this.client.x, this.client.y);
     this.ui.sound('build-rail', this.ground ? { x: this.ground.x, z: this.ground.z, pitch: 0.9 } : {});
-    this.ui.toast(this.relevelTo === 'elevated' ? 'Track lifted onto a viaduct' : this.relevelTo === 'underground' ? 'Track sunk into a tunnel' : 'Track back on the ground', 'good');
+    this.ui.toast(r.plan.level === 'elevated' ? 'Track lifted onto a viaduct' : r.plan.level === 'underground' ? 'Track sunk into a tunnel' : 'Track back on the ground', 'good');
     this.moveDirty = true;
   }
 
@@ -2041,4 +2041,21 @@ export function typeLevelText(o: BuildOptions): string {
   if (o.level === 'elevated') return `${esc(name)} · elevated, <b>${Math.round((o.levelHeight ?? LINE_LEVEL.height.def) * 10)} m</b> up`;
   if (o.level === 'underground') return `${esc(name)} · underground, <b>${Math.round((o.levelDepth ?? LINE_LEVEL.depth.def) * 10)} m</b> deep`;
   return `${esc(name)}${tt.electrified ? ' · electrified' : ''}`;
+}
+
+/** Preview of a re-level plan as a proposal ghost: the stretch's edges with their new heights and structures. */
+function relevelPreview(g: { world: { net: { edges: Map<number, NEdge> } } }, pl: RelevelPlan): Proposal | null {
+  const net = g.world.net;
+  const tracks = pl.edges.map((x) => {
+    const e = net.edges.get(x.id);
+    if (!e) return null;
+    const snap = (t: 0 | 1): Snap => ({ kind: 'free', x: t ? e.bez.x3 : e.bez.x0, z: t ? e.bez.z3 : e.bez.z0, y: x.prof[t ? x.prof.length - 1 : 0] });
+    return { bez: e.bez, len: e.len, prof: x.prof, sections: x.sections, start: snap(0), end: snap(1) };
+  }).filter((t): t is NonNullable<typeof t> => !!t);
+  if (!tracks.length) return null;
+  const e0 = net.edges.get(pl.edges[0].id);
+  return {
+    ok: pl.ok, errors: pl.error ? [pl.error] : [], warnings: pl.warnings, opts: { kind: 'rail', type: e0?.type ?? 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: pl.owner },
+    tracks, crossings: [], demolish: [], trees: 0, cost: pl.cost, stats: { len: 0, maxGrade: 0, minRadius: Infinity, bridges: 0, tunnels: 0, speed: 0 },
+  };
 }

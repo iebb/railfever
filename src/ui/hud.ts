@@ -11,7 +11,7 @@ import { TRACK_TYPES, ROAD_TYPES, LINE_LEVEL, ELECTRIFY } from '../game/constant
 import { structureFactor } from '../game/construction';
 import { fmtDate, fmtHeight, newsDate, fmtPct, TYPE_META } from './format';
 import type { StationLevel } from './gameapi';
-import { stationStyles, catchBonusOf, relevelApi } from './gameapi';
+import { stationStyles, catchBonusOf } from './gameapi';
 import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
 import { audio } from '../audio/engine';
 
@@ -54,8 +54,8 @@ export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string;
   connect: { icon: 'connect', key: 'J', cat: 'rail', color: 'var(--rail)' },
 };
 
-/** Tools whose game API may still be missing (shown only when available). */
-const toolAvailable = (t: ToolId) => t !== 'relevel' || !!relevelApi();
+/** Tools whose game API may still be missing (shown only when available; all have landed). */
+const toolAvailable = (t: ToolId) => !!t;
 
 /** One-line descriptions for the compact tool card (the long help sits behind '?'). */
 const TOOL_SHORT: Partial<Record<ToolId, string>> = {

@@ -9,8 +9,6 @@ import { AIConfig, DEFAULT_AI_CONFIG, AI_PRESETS, normalizeAIConfig } from '../g
 import type { DemandView, DemandTown, DemandPair } from '../game/demand';
 import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, StationOpts, RailMode } from '../game/stations';
 import { CATCHMENT_RADIUS } from '../game/stations';
-import type { Proposal } from '../game/construction';
-import * as trackops from '../game/trackops';
 import { STATION_STYLES, stylesFor, defaultStationStyle } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
 
@@ -123,22 +121,6 @@ export function planCatchShapes(g: Game, plan: StationPlan): CatchShape[] {
     const base = CATCHMENT_RADIUS[c.mode];
     return Math.abs(c.r - base) < 1e-3 ? { ...c, r: base * (1 + bonus) } : c;
   });
-}
-
-/** Re-level plan (trackops planRelevel, UPDATE 9k): read defensively until its shape is settled. */
-export interface RelevelPlan {
-  ok: boolean; error?: string; errors?: string[]; warnings?: string[]; cost: number;
-  proposal?: Proposal | null; proposals?: Proposal[]; length?: number; stations?: number[];
-}
-export interface RelevelApi {
-  plan: (g: Game, edgeIds: number[], level: StationLevel, owner: number, opts?: { height?: number; depth?: number }) => RelevelPlan;
-  commit: (g: Game, plan: RelevelPlan) => unknown;
-}
-/** planRelevel / commitRelevel when the game has them, else null (the tool stays hidden). */
-export function relevelApi(): RelevelApi | null {
-  const plan = optional<RelevelApi['plan']>(trackops, 'planRelevel');
-  const commit = optional<RelevelApi['commit']>(trackops, 'commitRelevel');
-  return plan && commit ? { plan, commit } : null;
 }
 
 /** Error text of a commit result (null / '' = OK, a string, or an object with `error`). */

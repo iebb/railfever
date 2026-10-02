@@ -17,9 +17,9 @@ import { fmtPct, fmtMult, KIND_META } from './format';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
 import { demandView } from '../game/demand';
-import { getFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LINE_MODES, LineMode } from './lineid';
+import { getFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LineMode } from './lineid';
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
-import { servicesTab, patternSelect, stopDots, patBadge } from './win-services';
+import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns } from '../game/patterns';
 
 /** Does the station offer stops for this transport mode? */
@@ -162,27 +162,32 @@ export function openLine(ui: UI, id: number) {
   const g = ui.game;
   const line = g.lines.get(id);
   if (!line) return;
+  // a line merged into another as a service pattern: its id leads to that line
+  if (line.id !== id) { openLine(ui, line.id); return; }
   const meta0 = KIND_META[line.kind];
-  const win = ui.wm.open('line-' + id, line.name, { width: 430, icon: meta0.icon, color: line.color });
+  const win = ui.wm.open('line-' + id, line.name, { width: 460, icon: meta0.icon, color: line.color });
   let renaming = false;
   let palette = false;
   const render = () => {
     const l = g.lines.get(id);
-    if (!l) { win.close(); return; }
+    if (!l || l.id !== id) { win.close(); if (l) openLine(ui, l.id); return; }
     const mine = l.owner === PLAYER;
+    const operates = mine || g.lines.canOperate(l, PLAYER);
     const meta = KIND_META[l.kind];
-    ui.wm.setTabs(win, [['stops', 'Stops'], ['vehicles', 'Vehicles'], ['stats', 'Statistics']], render);
+    ui.wm.setTabs(win, [['stops', 'Stops'], ['services', 'Services'], ['vehicles', 'Vehicles'], ['stats', 'Statistics']], render);
     win.title.textContent = l.name;
-    win.sub.textContent = `${meta.label} line · ${g.company(l.owner).name}`;
+    const nOps = l.operators?.filter((o) => o !== l.owner).length ?? 0;
+    win.sub.textContent = `${MODE_META[lineMode(g, l)].label} line · ${g.company(l.owner).name}${nOps ? ` + ${nOps} partner${nOps > 1 ? 's' : ''}` : ''}`;
     (win.el.querySelector('.win-ic') as HTMLElement | null)?.style.setProperty('--c', l.color);
     clear(win.body);
-    const changed = () => { g.lines.rebuild(); for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged(); win.last = undefined; render(); };
+    const rerender = () => { win.last = undefined; render(); };
+    const changed = () => { g.lines.rebuild(); for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged(); ui.onLineEdited(l.id); rerender(); };
     const profit = l.incomeYear - l.costYear;
-    // header: colour swatch (palette), name (inline rename), auto-name badge
+    // header: line symbol (colour palette), name (inline rename), auto-name badge, owner; through service / services
     let nameEl: HTMLElement;
     if (renaming && mine) {
       const inp = h('input', { class: 'input', value: l.name, 'aria-label': 'Line name', style: 'flex:1' }) as HTMLInputElement;
-      const done = (ok: boolean) => { if (!renaming) return; renaming = false; if (ok && inp.value.trim() !== l.name) { renameLine(g, l, inp.value.trim()); ui.sound('toggle', { pitch: 1.1 }); } win.last = undefined; render(); };
+      const done = (ok: boolean) => { if (!renaming) return; renaming = false; if (ok && inp.value.trim() !== l.name) { renameLine(g, l, inp.value.trim()); ui.sound('toggle', { pitch: 1.1 }); } rerender(); };
       inp.placeholder = 'Empty = automatic name';
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(true); else if (e.key === 'Escape') { e.stopPropagation(); done(false); } });
       inp.addEventListener('blur', () => done(true));
@@ -192,11 +197,17 @@ export function openLine(ui: UI, id: number) {
       nameEl = h('b', { class: mine ? 'renamable' : '', 'data-tip': mine ? 'Rename' : undefined, onclick: () => { if (!mine) return; renaming = true; render(); } }, l.name);
     }
     const auto = isAutoName(l);
+    const route = routeInfo(g, l);
+    const nPat = l.patterns?.length ?? 0;
     add(win.body, h('div', { class: 'linehead' },
-      h('span', { class: 'swatch big', style: `background:${l.color}`, 'data-tip': mine ? 'Line colour' : undefined, role: mine ? 'button' : undefined, onclick: () => { if (!mine) return; palette = !palette; win.last = undefined; render(); } }),
+      h('button', { class: 'lsymbtn', 'data-tip': mine ? 'Line colour' : `Line ${l.name}`, 'aria-label': mine ? 'Line colour' : 'Line symbol', disabled: !mine, onclick: () => { if (!mine) return; palette = !palette; rerender(); } }, lineSymbol(g, l, 'lg')),
       nameEl,
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
+    if (route?.through || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
+      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Runs over several operators’ networks or track types' }, 'Through service') : null,
+      nPat > 1 ? h('span', { class: 'flag shared' }, `${nPat} services`) : null,
+      nOps ? h('span', { class: 'flag shared', 'data-tip': g.lines.operatorsOf(l).map((o) => g.company(o).name).join(' · ') }, `Shared · ${nOps + 1} operators`) : null));
     if (palette && mine) {
       add(win.body, h('div', { class: 'palette', role: 'radiogroup', 'aria-label': 'Line colour' },
         linePalette(l.kind).map((c) => h('button', { class: 'pal' + (!l.autoColor && c.toLowerCase() === l.color.toLowerCase() ? ' on' : ''), style: `--c:${c}`, 'aria-label': c, 'data-sfx': 'none', onclick: () => { setLineColor(g, l, c); palette = false; ui.sound('click', { pitch: 1.15 }); changed(); } })),
@@ -208,7 +219,12 @@ export function openLine(ui: UI, id: number) {
       tile(String(l.vehicles.length), meta.vehicles),
       tile(fmtInt(l.passLast), 'Pax last month'),
       tile(fmtMoney(profit), 'Profit this year', profit < 0 ? 'neg' : 'pos')));
+    const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
     if (win.tab === 'stops') {
+      add(win.body, congestionPanel(ui, l, rerender, () => { win.tab = 'vehicles'; rerender(); }), compatPanel(ui, l, rerender));
+      // a line inside another line's route becomes one of its services when editing ends (UPDATE 9k)
+      const sup = editing && l.stops.length >= 2 ? subsetOf(g, l) : null;
+      if (sup) add(win.body, h('div', { class: 'alert info' }, icon('info', 16), h('div', { class: 'alert-b' }, 'These stops lie on ', h('b', null, sup.name), ': when you finish, this line becomes one of its services (a short-turn or a service skipping stops).')));
       const broken = ui.lineBroken.get(id) ?? [];
       const list = h('div', { class: 'list stops' });
       l.stops.forEach((sid, i) => {
@@ -216,10 +232,12 @@ export function openLine(ui: UI, id: number) {
         let waiting = 0;
         if (st) for (const wg of st.waiting.values()) if (wg.line === l.id) waiting += wg.count;
         const noRoute = broken.some(([a]) => a === sid);
+        const b = l.kind === 'rail' ? badgeOn(g, l.id, sid) : null;
         list.appendChild(h('div', { class: 'row' },
-          h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)),
+          b ? badgeEl(b, 'sm') : h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)),
           ui.stationLink(sid),
           st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `Station of ${g.company(st.owner).name}: upkeep shared by usage at ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
+          stopDots(l, i),
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
@@ -239,31 +257,46 @@ export function openLine(ui: UI, id: number) {
         }), setting === 'auto' ? `Now: ${loop ? 'loop' : 'out and back'}` : undefined));
       }
       if (mine) {
-        const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
         add(win.body, h('div', { class: 'btns' },
-          h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); win.last = undefined; render(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
-          l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Signal the line\u2019s track by the rules (preview first)', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
+          h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
+          l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Signal the line’s track by the rules (preview first)', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
         if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'A line needs at least two stops.'));
       }
+      add(win.body, routePanel(ui, l));
+    } else if (win.tab === 'services') {
+      servicesTab(ui, l, win.body, rerender);
     } else if (win.tab === 'vehicles') {
+      add(win.body, congestionPanel(ui, l, rerender));
       const vl = h('div', { class: 'list' });
       for (const vid of l.vehicles) {
         const v = g.vehicles.get(vid);
         if (!v) continue;
-        vl.appendChild(h('div', { class: 'row link', onclick: () => ui.openVehicle(vid) }, h('span', null, v.name), h('span', { class: 'muted' }, v.status), h('span', { class: 'num' }, `${v.load}/${v.capacity}`)));
+        const ps = patternSelect(ui, l, v, rerender);
+        vl.appendChild(h('div', { class: 'row link', onclick: () => ui.openVehicle(vid) },
+          h('span', null, v.name),
+          v.owner !== PLAYER ? ui.ownerTag(v.owner) : null,
+          ps ? h('span', { onclick: (e: Event) => e.stopPropagation() }, ps) : null,
+          h('span', { class: 'muted' }, v.status),
+          h('span', { class: 'num' }, `${v.load}/${v.capacity}`)));
       }
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles on this line.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
-      if (mine) add(win.body, h('div', { class: 'btns' },
+      if (operates) add(win.body, h('div', { class: 'btns' },
         h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), `Add ${meta.vehicle}`),
-        l.vehicles.length ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
+        l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER) ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
+      add(win.body, sharedPanel(ui, l, rerender));
     } else {
       add(win.body,
         ui.kv('Income this year', fmtMoneyFull(l.incomeYear)),
         ui.kv('Running costs this year', fmtMoneyFull(l.costYear)),
         ui.kv('Profit last year', h('span', { class: l.incomeLast - l.costLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(l.incomeLast - l.costLast))),
-        ui.kv('Load factor', (() => { let cap = 0, load = 0; for (const vid of l.vehicles) { const v = g.vehicles.get(vid); if (v) { cap += v.capacity; load += v.load; } } return cap ? fmtPct(load / cap) : '—'; })()));
-      if (mine) add(win.body, h('div', { class: 'btns' }, h('button', { class: 'btn danger', onclick: () => { if (confirm(`Delete ${l.name}? Its vehicles will stop.`)) { g.lines.delete(l.id); win.close(); } } }, icon('trash', 16), 'Delete line')));
+        ui.kv('Load factor', (() => { let cap = 0, load = 0; for (const vid of l.vehicles) { const v = g.vehicles.get(vid); if (v) { cap += v.capacity; load += v.load; } } return cap ? fmtPct(load / cap) : '—'; })()),
+        faresPanel(ui, l));
+      const losing = l.incomeLast - l.costLast < 0 && profit < 0 && l.vehicles.length > 0;
+      if (mine && losing) add(win.body, h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Losing money'), h('div', null, 'Last year and this year so far. Faster or more frequent service, express services or a longer route can help; else decommission it.'))));
+      if (operates) add(win.body, h('div', { class: 'btns' },
+        h('button', { class: 'btn', 'data-tip': mine ? 'Sell your vehicles on it and delete the line (a partner takes a shared line over)' : 'Sell your vehicles on it and leave the line', onclick: () => decommission(ui, l, () => { if (g.lines.get(id)?.id === id) rerender(); else win.close(); }) }, icon('trash', 16), 'Decommission…'),
+        mine ? h('button', { class: 'btn danger', onclick: () => { if (confirm(`Delete ${l.name}? Its vehicles will stop.`)) { g.lines.delete(l.id); win.close(); } } }, icon('trash', 16), 'Delete line') : null));
     }
   };
   win.refresh = () => { if (!renaming) render(); };
@@ -278,9 +311,11 @@ function customColor(current: string | null, base: string, onPick: (c: string) =
   return h('label', { class: 'pal custom' + (current ? ' on' : ''), style: current ? `background:${current}` : undefined, 'data-tip': 'Custom colour' }, inp, current ? null : icon('plus', 14));
 }
 
+/** Buy another vehicle like the player's last one on the line. */
 function cloneLast(ui: UI, l: Line) {
   const g = ui.game;
-  const v = g.vehicles.get(l.vehicles[l.vehicles.length - 1]);
+  const own = l.vehicles.filter((id) => g.vehicles.get(id)?.owner === PLAYER);
+  const v = g.vehicles.get(own[own.length - 1]);
   if (!v) return;
   const dId = (v as Train | RoadVehicle).depotId;
   const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind, l);

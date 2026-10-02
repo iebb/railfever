@@ -819,3 +819,9 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .svh button.pk { border: 0; cursor: pointer; transition: filter var(--t-fast), transform var(--t-fast); }
 .svh button.pk:hover { filter: brightness(1.15); }
 .svh button.pk:active { transform: scale(0.95); }
+.lsymbtn { display: inline-flex; padding: 0; border: 0; background: none; border-radius: 8px; flex: none; transition: transform var(--t-fast); }
+.lsymbtn:not(:disabled):hover { transform: scale(1.06); }
+.lsymbtn:disabled { cursor: default; opacity: 1; }
+.lineflags { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 var(--sp-2); }
+.list.stops .row > .snum { flex: 0 0 auto !important; }
+.list .row > .pdots { margin-left: 2px; }
