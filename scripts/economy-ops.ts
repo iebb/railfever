@@ -16,9 +16,10 @@ import { serialize, deserialize } from '../src/game/save';
 import { Economy, CATEGORIES, operatingCosts } from '../src/game/economy';
 import {
   refTime, speedFactor, fareFor, walkTime, tripFactor, estimateLegFare, estimateLegTime, legacyFare, simNow, NO_TRANSFER_BONUS,
-  WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MIN,
+  WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MIN, fareCalibration,
 } from '../src/game/fares';
 import { estimateCostPerTrainKm, estimateVehicleYear, trackBasePerUnit, YEAR_S, KmCost } from '../src/game/opcosts';
+import { PASSENGER_RATE_SCALE } from '../src/game/constants';
 import {
   addPattern, setVehiclePattern, canonicalizeLines, linePatterns, patternStops, suggestExpress, patternHeadway,
   HOLD_MAX_S, PLATFORM_PASS_KMH, TRANSFER_PENALTY_S,
@@ -60,11 +61,29 @@ const syn = (id: string, o: Partial<VehicleModel>): VehicleModel => ({ id, name:
   check(Math.abs(f2 / f1 - Math.pow(100 / 370, 0.55)) < 0.01, 'fare ratio = (leg time ratio)^0.55');
   // demand elasticity and estimates
   check(tripFactor(100, 1000) === 2.5 && tripFactor(1e6, 100) === 0.3 && Math.abs(tripFactor(400, 400) - 1) < 1e-9, 'tripFactor (ref/time)^0.7 clamped 0.3..2.5');
-  check(Math.abs(estimateLegFare(500, 120, 200) - fareFor(500, estimateLegTime(500, 120, 200), 1)) < 1e-9 && estimateLegTime(500, 120, 200) > 100 + 5000 / (120 / 3.6), 'estimateLegFare = fareFor(estimateLegTime)');
+  const expected = fareFor(500, estimateLegTime(500, 120, 200), 1);
+  check(Math.abs(estimateLegFare(500, 120, 200, 1, 1.15, true, false) - expected * (1 + NO_TRANSFER_BONUS)) < 1e-9 && estimateLegTime(500, 120, 200) > 100 + 5000 / (120 / 3.6), 'boarding-based direct estimate includes the actual no-transfer bonus');
+  check(Math.abs(estimateLegFare(500, 120, 200, 8, 1.15, false, false) - expected * 8) < 1e-9, 'actual boarding estimates count people once, and omit the bonus on a transfer leg');
+  check(estimateLegFare(500, 120, 200) === estimateLegFare(500, 120, 200, 4, 1.15, true, false), 'project OD capture is bounded at four boardings per potential trip');
+  check(estimateLegFare(20, 25, 60) < estimateLegFare(20, 25, 60, 1, 1.15, true, false) * 1.25, 'nearby urban OD trips need little capture normalisation');
   const old = (d: number, days: number) => (d * d) / (d + 8) * 9.5 * (0.8 + 0.35 * Math.min(1, Math.max(0, (d / Math.max(0.4, days) - 2) / 8)));
-  const lr = [60, 150, 400].map((d) => legacyFare(d, d / 4, 1) / old(d, d / 4));
-  console.log(`  legacy fare() vs the v2.2 fare at 4 units/day: ${lr.map((x) => fmt(x, 2)).join(' / ')}`);
-  check(lr.every((x) => x > 0.6 && x < 1.6), 'legacy fare() wrapper stays near the old distance fares');
+  const lr = [60, 150, 400].map((d) => legacyFare(d, d / 4, 1) / fareCalibration(d) / old(d, d / 4));
+  console.log(`  legacy fare() vs v2.2 at 4 units/day, before fare compensation: ${lr.map((x) => fmt(x, 2)).join(' / ')}`);
+  check(lr.every((x) => x > 0.6 && x < 1.6), 'legacy wrapper preserves the old distance/time balance before fare compensation');
+}
+
+// Small calibrated queues must retain people across many destinations and keep transfer counts bounded.
+{
+  const h = flatGame(384), st = station(h, 60, 100, Math.PI / 2, 12, 2)!;
+  st.catchPop = 2000;
+  for (let dest = 0; dest < 200; dest++) h.stations.addWaiting(st, 0, dest, dest, 1, 0, 10, dest % 2);
+  h.stations.trimWaiting(st, 1000);
+  const groups = [...st.waiting.values()];
+  check(st.waitingTotal >= 30 && st.waitingTotal <= 100, 'a 2,000-person catchment has tens of waiting passengers, not hundreds');
+  check(groups.length === st.waitingTotal && groups.reduce((n, x) => n + x.count, 0) === st.waitingTotal, 'many single-person OD groups survive proportional trimming without rounding loss');
+  check(groups.every((x) => x.t === 10 && (x.transfers ?? 0) <= x.count), 'queue trimming retains waiting times and bounded transfer counts');
+  h.stations.trimWaiting(st, 0);
+  check(st.waitingTotal === 0 && st.waiting.size === 0, 'zero queue cap empties all groups');
 }
 
 // ------------------------------------------------------------------ 2. costs: HSR vs intercity per train-km
@@ -372,9 +391,14 @@ function hsrYear(n: number, every: number, distUnits: number): { income: number;
   const l = h.lines.create('rail', 0);
   l.stops = [P.id, Q.id];
   const trains = [h.vehicles.buyTrain(dp, hsr300, l.id)].filter((t): t is Train => t instanceof Train);
-  let last = h.day;
+  let last = h.day, accumulated = 0;
   const lineEdges = [...h.world.net.edges.values()].filter((e) => e.owner === 0 && e.kind === 'rail');
-  runDays(h, 360 * 2, () => { if (h.day !== last) { last = h.day; if (h.day % every === 0) { inject(h, P, Q, n); inject(h, Q, P, n); } } });
+  runDays(h, 360 * 2, () => { if (h.day !== last) { last = h.day; if (h.day % every === 0) {
+    // Synthetic economic demand uses the same calibration as generated demand; carry fractional people forward.
+    accumulated += n * PASSENGER_RATE_SCALE;
+    const count = Math.floor(accumulated); accumulated -= count;
+    inject(h, P, Q, count); inject(h, Q, P, count);
+  } } });
   const yr = h.economy.yearTotals[h.economy.yearTotals.length - 1].v;
   const track = lineEdges.reduce((s, e) => s + h.edgeMaintenance(e), 0);
   const vehicles = -(yr.running + yr.crew + yr.energy + yr.vehicleMaint);

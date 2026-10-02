@@ -8,12 +8,12 @@
 // compressed (DAY_SECONDS per game day), so waits and rides are real-time seconds even though a year passes in
 // 360 * DAY_SECONDS of them. `simNow(g)` is the continuous clock.
 import type { Game } from './game';
-import { DAY_SECONDS, UNIT_M } from './constants';
+import { DAY_SECONDS, UNIT_M, PASSENGER_FARE_SCALE, PASSENGER_LONG_FARE_SCALE, PASSENGER_FARE_BLEND, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE } from './constants';
 
 /** The alternative to public transport: walking (with a detour factor) and driving (detour, walk to the car, parking). */
 export const ALT = { walkKmh: 5, walkDetour: 1.2, carKmh: 60, carDetour: 1.3, carAccessS: 240 };
-/** Fare per unit of effective distance (calibrated so typical networks earn about what the distance-only fares paid). */
-export const FARE_RATE = 7.0;
+/** Short-leg fare per unit of effective distance in game money; baseFare blends to the long-leg compensation. */
+export const FARE_RATE = 7.0 * PASSENGER_FARE_SCALE;
 /** Effective distance d^2 / (d + SHORT_HOP): very short hops earn little. */
 export const SHORT_HOP = 10;
 /** Long trips: the rate tapers gently beyond TAPER_FROM units (the effective distance grows ~ sqrt beyond). */
@@ -62,8 +62,16 @@ export function effDist(d: number): number {
   return d <= TAPER_FROM ? e : e / Math.sqrt(1 + (d - TAPER_FROM) / TAPER_SCALE);
 }
 
+/**
+ * Compensation for realistic passenger counts. Saturated railways gain more from shorter queues/dwell than
+ * short bus hops; a single inverse-demand multiplier would inflate their income. Blend smoothly by distance.
+ */
+export function fareCalibration(d: number): number {
+  return PASSENGER_LONG_FARE_SCALE + (PASSENGER_FARE_SCALE - PASSENGER_LONG_FARE_SCALE) / (1 + (Math.max(0, d) / PASSENGER_FARE_BLEND) ** 2);
+}
+
 /** Base fare of one passenger for a leg of straight-line distance `d` units (before the speed factor). */
-export function baseFare(d: number): number { return FARE_RATE * effDist(d); }
+export function baseFare(d: number): number { return FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d); }
 
 /** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..2.6. */
 export function speedFactor(d: number, legSeconds: number): number {
@@ -104,9 +112,18 @@ export function estimateLegTime(distUnits: number, avgKmh: number, headwaySec: n
   return Math.max(0, headwaySec) / 2 + (Math.max(0, distUnits) * UNIT_M * detour) / Math.max(1, avgKmh / 3.6);
 }
 
-/** Expected fare of `count` passengers on such a leg (route evaluation, e.g. the AI's fareAt). Stable API. */
-export function estimateLegFare(distUnits: number, avgKmh: number, headwaySec: number, count = 1, detour = 1.15): number {
-  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count);
+/**
+ * Project revenue per calibrated OD trip (AI town demand already includes the rate scale). Generation in
+ * DemandModel.weights normalises the served local OD share to 60..100% of the catchment's rate; using raw OD
+ * counts alone understates intercity boardings. Approximate that capture from the same distance decay, bounded
+ * at 4x since the estimate lacks the actual catchments and other destinations. This adjusts forecast volume,
+ * never the fare a real passenger pays. Set `odDemand=false` when `count` is an actual number of boardings.
+ * Two-stop projects are direct rides and earn the actual no-transfer bonus. No second calendar rate scale.
+ */
+export function estimateLegFare(distUnits: number, avgKmh: number, headwaySec: number, count = 1, detour = 1.15, direct = true, odDemand = true): number {
+  const share = 1 / Math.pow(1 + (Math.max(0, distUnits) / LOCAL_DEMAND_DISTANCE) ** 2, LOCAL_DEMAND_EXP);
+  const capture = odDemand ? clamp((0.6 + 0.4 * Math.min(1, share / LOCAL_SERVED_SHARE)) / share, 1, 4) : 1;
+  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count * capture) * (direct ? 1 + NO_TRANSFER_BONUS : 1);
 }
 
 /**

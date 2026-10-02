@@ -2102,14 +2102,29 @@ export class Stations {
   }
 
   trimWaiting(st: Station, max: number) {
+    // The caller's legacy platform cap is a hard ceiling. People in the catchment and the size of the transfer
+    // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
+    // platforms alone must not invent thousands of waiting passengers.
+    const space = st.rail ? st.rail.tracks * st.rail.length * 0.75 : 0;
+    max = Math.max(0, Math.floor(Math.min(max, 300, 12 + st.catchPop * 0.035 + space + st.stops.length * 4)));
     if (st.waitingTotal <= max) return;
     const f = max / st.waitingTotal;
+    // Largest remainders retain exactly `max` people. Flooring every OD group independently can erase an entire
+    // small queue when the network offers many destinations, and particularly penalises transfer passengers.
+    const groups = [...st.waiting].map(([key, g]) => {
+      const scaled = g.count * f, count = Math.floor(scaled);
+      return { key, g, count, remainder: scaled - count, transfers: g.transfers ?? 0, oldCount: g.count };
+    });
+    let spare = max - groups.reduce((n, x) => n + x.count, 0);
+    groups.sort((a, b) => b.remainder - a.remainder);
+    for (const x of groups) if (spare > 0) { x.count++; spare--; }
     let tot = 0;
-    for (const [k, g] of st.waiting) {
-      g.count = Math.floor(g.count * f);
+    for (const x of groups) {
+      const g = x.g;
+      g.count = x.count;
       // transfers (passengers of the group who already changed) shrink with it
-      if (g.transfers) g.transfers = Math.min(g.count, Math.floor(g.transfers * f));
-      if (g.count <= 0) st.waiting.delete(k); else tot += g.count;
+      if (x.transfers) g.transfers = Math.min(g.count, Math.round(x.transfers * g.count / x.oldCount));
+      if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
   }

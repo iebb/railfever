@@ -5,6 +5,22 @@ export const UNIT_M = 10;
 export const DAY_SECONDS = 2.0;
 export const DAYS_PER_MONTH = 30;
 export const MONTHS_PER_YEAR = 12;
+/**
+ * Passenger calibration on the compressed calendar. Apply once to BOTH local and long-distance per-day/month
+ * demand (demand.ts), never to vehicle capacity or motion. A game year is only 720 physical seconds, so calendar
+ * totals and literal physical service-day rates must be reported separately (scripts/ridership.ts).
+ */
+export const PASSENGER_RATE_SCALE = 1 / 10;
+/**
+ * Fare compensation in game money (short / long legs). The old services were capacity constrained, so a 10x
+ * fare would overpay: fewer passengers also shorten dwell and waits. A smooth distance blend preserves the
+ * rail/bus income balance measured by scripts/economy.ts, while retaining the existing speed factor.
+ */
+export const PASSENGER_FARE_SCALE = 7, PASSENGER_LONG_FARE_SCALE = 1.95;
+/** Distance (units, 1 = 10 m) at which the short/long fare compensation is halfway blended. */
+export const PASSENGER_FARE_BLEND = 17;
+/** Shared local gravity/coverage parameters for demand and project revenue estimates. */
+export const LOCAL_DEMAND_DISTANCE = 40, LOCAL_DEMAND_EXP = 0.85, LOCAL_SERVED_SHARE = 0.15;
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 

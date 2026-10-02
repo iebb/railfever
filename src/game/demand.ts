@@ -14,7 +14,7 @@ import type { Hop } from './lines';
 import { tripFactor, refTime } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS } from './constants';
+import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 
 export interface Region {
@@ -37,15 +37,19 @@ export interface Region {
  */
 export interface StationDemand { dest: number[]; w: number[]; served: number }
 
-/** Passengers generated per catchment inhabitant per day, before the rating factor (0.2 + rating). */
-export const GEN_RATE = 0.0085;
+/**
+ * Passengers per catchment inhabitant per GAME day, before (0.2 + rating). The single calendar calibration is
+ * PASSENGER_RATE_SCALE: a 2-second game day cannot sustain the old queues between physically timed trains.
+ * Apply the same scale to LD_RATE, so local/long-distance shares and tripFactor elasticity keep their meaning.
+ */
+export const GEN_RATE = 0.0085 * PASSENGER_RATE_SCALE;
 /** Trips per inhabitant per month when covered by a station with a typical rating. */
 export const TRIPS_PER_MONTH = GEN_RATE * DAYS_PER_MONTH * (0.2 + 0.65);
 /** Towns from this size are split into a centre and outer districts. */
 export const DISTRICT_MIN_POP = 1500;
 
 /** Distance decay of local trips (the OD matrix): ~1 nearby, falling off strongly (∝ d^-1.7) between towns. */
-export const odDecay = (d: number) => 1 / Math.pow(1 + (d / 40) * (d / 40), 0.85);
+export const odDecay = (d: number) => 1 / Math.pow(1 + (d / LOCAL_DEMAND_DISTANCE) * (d / LOCAL_DEMAND_DISTANCE), LOCAL_DEMAND_EXP);
 /** Long-distance trips: between towns from LD_MIN units apart (fully from LD_FULL), decaying weakly (∝ d^-0.8). */
 export const LD_MIN = 60, LD_FULL = 130;
 export const ldDecay = (d: number) => {
@@ -54,7 +58,7 @@ export const ldDecay = (d: number) => {
   return t * t * (3 - 2 * t) * Math.pow(d / 100, -0.8);
 };
 /** Long-distance trips per inhabitant and month, per 1,000 attraction (jobs + 0.4 residents) at the far end, at 100 units. */
-export const LD_RATE = 0.012;
+export const LD_RATE = 0.012 * PASSENGER_RATE_SCALE;
 /** Trip factor of a typical service of the game (it leaves the demand as it was); fast direct services earn more. */
 export const TF_TYPICAL = 1.3;
 
@@ -376,7 +380,7 @@ export class DemandModel {
     }
     // local trips: the station's rate (60% of the full rate for a single destination, the full rate once it reaches
     // 15% of its local demand) times the mean trip factor, shared out by OD x trip factor; long-distance trips on top
-    const rate = local > 0 ? (0.6 + 0.4 * Math.min(1, local / 0.15)) * Math.max(0.6, Math.min(1.6, localF / local)) : 0;
+    const rate = local > 0 ? (0.6 + 0.4 * Math.min(1, local / LOCAL_SERVED_SHARE)) * Math.max(0.6, Math.min(1.6, localF / local)) : 0;
     const k = localF > 0 ? rate / localF : 0;
     const dest: number[] = [], w: number[] = [];
     let served = 0;
@@ -402,6 +406,9 @@ export class DemandModel {
   load(d: any) {
     if (!d || !Array.isArray(d.regions)) return false;
     this.regions = d.regions.map((r: Region) => ({ ...r }));
+    // Potential trips are derived rates, not historical counts: saves made before calibration must use today's
+    // rates immediately, just like the freshly computed long-distance matrix below.
+    for (const r of this.regions) r.produced = TRIPS_PER_MONTH * (r.pop + 0.3 * r.jobs);
     this.towns = new Map((d.towns ?? []).map((t: [number, number, number, number[]]) => [t[0], { core: t[1], sectors: t[2], ids: [...t[3]] }]));
     this.shares = new Map((d.shares ?? []).map((s: [number, [number, number][]]) => [s[0], s[1].map((x) => [x[0], x[1]] as [number, number])]));
     this.cursor = d.cursor ?? 0;

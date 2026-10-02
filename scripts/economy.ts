@@ -3,14 +3,27 @@
 // overheads, crew, energy, maintenance; track base upkeep + wear). Line maintenance below is the base upkeep of
 // the line's infrastructure (Game.edgeMaintenance / stationMaintenance); track wear is in the company totals.
 // npx esbuild scripts/economy.ts --bundle --platform=node --format=esm --outfile=$S/economy.mjs && node $S/economy.mjs [seed]
+// Seed 7 checks the pre-calibration incomes below. --json=/path/before.json saves another seed's exact results;
+// --baseline=/path/before.json checks each income stays within 25% of that baseline instead.
+import { readFileSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
 import { CATEGORIES } from '../src/game/economy';
 import type { Line } from '../src/game/lines';
-import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train } from './lib';
+import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train, check, fails } from './lib';
 
-const seed = Number(process.argv[2] ?? 7);
+const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
+const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
+// Measured before changing demand/fares: original rates, four years, final full year, no AI.
+const seed7Baseline = {
+  seed: 7, results: [
+    { name: 'rail Weyport-Ashwick (133 u track)', income: 1173514 },
+    { name: 'busy bus in Oldwood (2x Metro Articulated)', income: 164533 },
+    { name: 'short bus in Oldwood (1x City Liner)', income: 15475 },
+    { name: 'village rail Redwell(345)-Southley(237)', income: 806741 },
+  ],
+};
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
 g.economy.money = 1e9;
 
@@ -98,17 +111,48 @@ for (const [label, minD, maxD, n, model] of [['busy bus', 15, 24, 2, 'bus_c'], [
   }
 }
 // ---- simulate
+const months = new Map<number, number[]>(), loads = new Map<number, number[]>();
 for (let y = 0; y < YEARS; y++) {
-  for (let i = 0; i < 4 * 360 * 2; i++) g.update(0.25);
-  if (y === 0) continue; // first year is warm-up
+  // Measure a whole final year; a rail station may have zero visits in the last month alone.
+  for (const c of cases) { months.set(c.line.id, []); loads.set(c.line.id, []); }
+  let ticks = 0;
+  while (g.day < (y + 1) * 360) {
+    const day = g.day;
+    g.update(0.25);
+    if (g.day !== day && g.day % 30 === 0) for (const c of cases) months.get(c.line.id)!.push(c.line.passLast);
+    if (++ticks % 4 === 0) for (const c of cases) for (const id of c.line.vehicles) {
+      const v = g.vehicles.get(id);
+      if (v && v.capacity > 0 && ['running', 'loading', 'waiting'].includes(v.state)) loads.get(c.line.id)!.push(v.load / v.capacity);
+    }
+  }
 }
 console.log(`economy (seed ${seed}), last full year ${g.year - 1}; fares.ts / opcosts.ts`);
+const results: { name: string; income: number; boardings: number; load: number; net: number }[] = [];
 for (const c of cases) {
   const inc = c.line.incomeLast, run = c.line.costLast;
   const net = inc - run - c.maint;
-  const pax = c.line.passLast;
+  const mm = months.get(c.line.id)!, ll = loads.get(c.line.id)!;
+  const pax = mm.reduce((a, b) => a + b, 0), load = ll.reduce((a, b) => a + b, 0) / Math.max(1, ll.length);
+  results.push({ name: c.name, income: inc, boardings: pax, load, net });
   console.log('  vehicles: ' + c.line.vehicles.map((id) => { const v = g.vehicles.get(id)!; return v.state + ' ' + v.status + ' d=' + v.delivered; }).join(' | '));
-  console.log(`${c.name}, ${fmt(c.dist, 0)} u apart: income ${fmt(inc / 1e3, 0)}k, running ${fmt(run / 1e3, 0)}k, maintenance ${fmt(c.maint / 1e3, 0)}k -> net ${fmt(net / 1e3, 0)}k/yr; vehicles ${fmt(c.cost / 1e3, 0)}k -> payback ${net > 0 ? fmt(c.cost / net, 1) + ' yrs' : 'never'}; pax/month ${pax}`);
+  console.log(`${c.name}, ${fmt(c.dist, 0)} u apart: income ${fmt(inc / 1e3, 0)}k, running ${fmt(run / 1e3, 0)}k, maintenance ${fmt(c.maint / 1e3, 0)}k -> net ${fmt(net / 1e3, 0)}k/yr; vehicles ${fmt(c.cost / 1e3, 0)}k -> payback ${net > 0 ? fmt(c.cost / net, 1) + ' yrs' : 'never'}; boardings ${fmt(pax / 12, 1)}/month avg (${pax}/year), load ${fmt(load * 100, 1)}%`);
 }
 const yr = g.economy.yearTotals[g.economy.yearTotals.length - 1];
 console.log(`company ${yr.year}: ` + CATEGORIES.filter((k) => yr.v[k]).map((k) => `${k} ${fmt(yr.v[k] / 1e3, 0)}k`).join(', '));
+const baselinePath = flag('baseline');
+const baseline = baselinePath ? JSON.parse(readFileSync(baselinePath, 'utf8')) as typeof seed7Baseline : seed === 7 ? seed7Baseline : undefined;
+if (baseline) {
+  check(baseline.seed === seed, 'income baseline uses the same seed');
+  for (const r of results) {
+    const b = baseline.results.find((s) => s.name === r.name);
+    check(!!b, `baseline contains ${r.name}`);
+    if (b) {
+      const ratio = r.income / Math.max(1, b.income);
+      console.log(`  income before -> after ${r.name}: ${fmt(b.income / 1000)}k -> ${fmt(r.income / 1000)}k (${fmt((ratio - 1) * 100, 1)}%)`);
+      check(ratio >= 0.75 && ratio <= 1.25, `${r.name} income within 25% of baseline`);
+    }
+  }
+}
+const json = flag('json');
+if (json) writeFileSync(json, JSON.stringify({ seed, results }, null, 2) + '\n');
+process.exitCode = fails.length ? 1 : 0;
