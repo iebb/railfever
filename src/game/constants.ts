@@ -12,6 +12,8 @@ export const KMH_TO_UPS = 1 / 36;
 export const WATER_Y = 0;
 
 export type NetKind = 'rail' | 'road';
+/** Transport mode of a line (trams run on road edges that carry tram tracks). */
+export type LineKind = 'rail' | 'road' | 'tram';
 
 export interface TrackType {
   id: string;

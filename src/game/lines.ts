@@ -1,6 +1,6 @@
 // Lines (ordered stop lists) and passenger routing across the line network.
 import type { Game } from './game';
-import type { NetKind as Transport } from './constants';
+import type { LineKind as Transport } from './constants';
 
 export interface Line {
   id: number;

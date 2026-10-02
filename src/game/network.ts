@@ -35,6 +35,10 @@ export interface NEdge {
   owner: number;
   station: number;
   depot: number;
+  /** road edges only: embedded tram tracks (with overhead wire) */
+  tram?: boolean;
+  /** company owning the tram tracks (-1 / undefined = none) */
+  tramOwner?: number;
   version: number;
 }
 

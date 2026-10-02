@@ -135,7 +135,7 @@ export function openLine(ui: UI, id: number) {
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles on this line.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
       if (mine) add(win.body, h('div', { class: 'btns' },
-        h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), l.kind === 'rail' ? 'Add train' : 'Add bus'),
+        h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind === 'rail' ? 'rail' : 'road', null, l.id) }, icon('plus', 16), l.kind === 'rail' ? 'Add train' : l.kind === 'tram' ? 'Add tram' : 'Add bus'),
         l.vehicles.length ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
     } else {
       add(win.body, 
@@ -156,7 +156,7 @@ function cloneLast(ui: UI, l: Line) {
   const v = g.vehicles.get(l.vehicles[l.vehicles.length - 1]);
   if (!v) return;
   const dId = (v as Train | RoadVehicle).depotId;
-  const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind, l);
+  const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind === 'rail' ? 'rail' : 'road', l);
   if (dp == null) { ui.toast('No depot available', 'bad'); return; }
   const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.reversed ? [...v.cars].reverse() : [...v.cars], l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
   if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('purchase'); }

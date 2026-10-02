@@ -1,6 +1,6 @@
 // Vehicle catalogue.
 
-export type ModelKind = 'loco' | 'wagon' | 'bus';
+export type ModelKind = 'loco' | 'wagon' | 'bus' | 'tram';
 
 export interface VehicleModel {
   id: string;

@@ -103,6 +103,8 @@ export class Game {
   }
 
   company(id: number): Company { return this.companies[id] ?? this.townCompany; }
+  /** May company `user` run vehicles on infrastructure owned by `owner`? (public = -1 always) */
+  canUse(user: number, owner: number): boolean { return owner === user || owner < 0; }
   get player(): Company { return this.companies[PLAYER]; }
   /** Player economy (shortcut for the UI) */
   get economy(): Economy { return this.companies[PLAYER].economy; }
