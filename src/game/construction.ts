@@ -3,6 +3,7 @@ import type { Game } from './game';
 import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL } from './constants';
 import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
+  closestOnPolyline,
 } from './geom';
 import { NEdge, NNode, Section, profAt } from './network';
 import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
@@ -75,6 +76,8 @@ export interface Proposal {
     len: number; maxGrade: number; minRadius: number; bridges: number; tunnels: number; speed: number;
     /** rail: what sharing the formation saves (further tracks built together, or beside an existing track) */
     sharedSaving?: number;
+    /** retaining walls (units of length) where it runs close beside another formation at another height */
+    walls?: number;
     /** cost split: track (and road surface) on the ground, bridges / viaducts, tunnels, earthworks, the rest */
     costSplit?: { track: number; bridges: number; tunnels: number; earthworks: number; other: number };
   };
@@ -186,10 +189,27 @@ const TUNNEL_DEEP = 2.6, PORTAL_D = 1.2, TUNNEL_MIN = 8, TUNNEL_GAP = 10;
 /** A track joining a line runs alongside it this far from its switch (no parallel or formation clash with it). */
 const SWITCH_ZONE = 14;
 /**
- * Formations side by side share grid vertices: the height differences beyond which a new edge is refused there
- * (rail beside rail; a road above a railway, left in the air by its cutting; road beside road).
+ * Formations side by side share grid vertices: the height differences beyond which they need a retaining wall
+ * between them (rail beside rail; a road above a railway, left in the air by its cutting; road beside road). Town
+ * streets keep clear of such places; companies build (and pay for) the wall.
  */
 const CLASH = { rail: 0.3, roadAbove: 1.0, road: 1.2 };
+/** Town streets keep clear of any formation beside them at another height (they have other ways to go). */
+const CLASH_TOWN = { rail: 0.15, roadAbove: 0.35, road: 0.4 };
+/** Retaining wall cost per unit of length and unit of height (where a formation runs close beside another). */
+const RETAINING_WALL = 20000;
+
+/** Nearest point of an edge to (x, z): arc length and distance (a coarse pass over its samples, then refined). */
+function nearestOnEdge(net: Game['world']['net'], e: NEdge, x: number, z: number): { s: number; d: number } {
+  const g = net.geo(e), n = g.n, pts = g.pts;
+  const k = Math.max(1, Math.floor(n / 48));
+  let bi = 0, bd = Infinity;
+  for (let i = 0; i < n; i += k) { const d = (pts[i * 3] - x) ** 2 + (pts[i * 3 + 2] - z) ** 2; if (d < bd) { bd = d; bi = i; } }
+  const i0 = Math.max(0, bi - k), i1 = Math.min(n - 1, bi + k);
+  const c = closestOnPolyline(x, z, pts.subarray(i0 * 3, (i1 + 1) * 3), 3, i1 - i0 + 1);
+  const j = i0 + c.i;
+  return { s: g.cum[j] + (g.cum[Math.min(n - 1, j + 1)] - g.cum[j]) * c.f, d: c.d };
+}
 
 function maxGradeOf(o: BuildOptions) {
   return o.kind === 'rail' ? (TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).maxGrade : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).maxGrade;
@@ -785,7 +805,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
 
   // ---- obstacles along the corridor
   const demolish = new Set<number>();
-  let trees = 0;
+  let trees = 0, wallUnits = 0, wallArea = 0;
   const hw = halfWidthOf(opts);
   const crossWin = (ti: number, s: number) => crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < 2.5);
   prop.tracks.forEach((tp, ti) => {
@@ -844,18 +864,23 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       // must lie at about the same height there: else the terrain would bury a track or leave a road in the
       // air (a road below a railway may be draped over its bank). Not at the ends it joins, nor where it crosses.
       const R = hw + 2 * EARTHWORKS.corePad + 0.6;
-      if (sec === 'ground' && !nearEnd && !prop.errors.length && !crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < (R + 1.5) / Math.max(0.25, Math.sin(c.angle)))) {
+      if ((opts.town || i % 2 === 0) && sec === 'ground' && !nearEnd && !prop.errors.length && !crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < (R + 1.5) / Math.max(0.25, Math.sin(c.angle)))) {
         for (const e of net.edgesNear(p.x - R, p.z - R, p.x + R, p.z + R)) {
           if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
           const ehw = net.halfWidth(e), lim = hw + ehw + 2 * EARTHWORKS.corePad - 0.5;
-          const r = net.nearestEdge(p.x, p.z, lim, undefined, (q) => q.id === e.id);
-          if (!r || net.sectionAt(e, r.s) !== 'ground') continue;
+          const r = nearestOnEdge(net, e, p.x, p.z);
+          if (r.d > lim || net.sectionAt(e, r.s) !== 'ground') continue;
           const dy = net.heightAtS(e, r.s) - yy; // the other edge above (+) or below (-)
-          const clash = kind === 'rail' && e.kind === 'rail' ? Math.abs(dy) > CLASH.rail
-            : kind === 'rail' ? dy > CLASH.roadAbove // a road above the new railway would be left in the air
-            : e.kind === 'rail' ? dy < -CLASH.roadAbove // the new road above a railway
-            : Math.abs(dy) > CLASH.road;
-          if (clash) { fail(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
+          const C = opts.town ? CLASH_TOWN : CLASH;
+          const clash = kind === 'rail' && e.kind === 'rail' ? Math.abs(dy) > C.rail
+            : kind === 'rail' ? dy > C.roadAbove // a road above the new railway would be left in the air
+            : e.kind === 'rail' ? dy < -C.roadAbove // the new road above a railway
+            : Math.abs(dy) > C.road;
+          if (!clash) continue;
+          // towns keep their streets clear of it; a company builds a retaining wall between (and pays for it)
+          if (opts.town) { fail(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
+          wallUnits += 0.5; wallArea += 0.5 * Math.abs(dy);
+          break;
         }
       }
       if (sec === 'ground' && i % 2 === 0) trees += w.countTreesNear(p.x, p.z, hw + 0.4);
@@ -914,11 +939,13 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     for (const id of prop.demolish) { const b = w.buildings.get(id); if (b) cost += 6000 + b.pop * 2500; }
     cost += prop.trees * 250;
     for (const c of crossings) if (c.mode === 'level' || c.mode === 'diamond') cost += 15000;
+    cost += wallArea * RETAINING_WALL;
     split.other = cost - before;
     for (const k of Object.keys(split) as (keyof typeof split)[]) split[k] = Math.round(split[k]);
     prop.stats.costSplit = split;
   }
   prop.cost = Math.round(cost);
+  if (wallUnits > 0) prop.stats.walls = Math.round(wallUnits * 10) / 10;
   if (!opts.town && !g.company(opts.owner).economy.canAfford(prop.cost)) prop.warnings.push('Not enough money');
   // a free end in mid-air (9i): allowed for the player (to be continued), but worth a word
   for (const tp of prop.tracks) {

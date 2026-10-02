@@ -24,7 +24,7 @@ function plinths(g: Game, since = -1): { n: number; over: number; worst: number 
     for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1], [0, 0], [0, 1], [0, -1]]) mn = Math.min(mn, w.heightAt(b.x + rx * (b.w / 2) * sx + fx * (b.d / 2) * sz, b.z + rz * (b.w / 2) * sx + fz * (b.d / 2) * sz));
     const p = b.y - mn;
     n++;
-    if (p > 0.12) over++;
+    if (p > 0.125) over++; // (lots set into a slope get exactly the 0.12 plinth)
     worst = Math.max(worst, p);
   }
   return { n, over, worst };
@@ -52,7 +52,7 @@ for (const seed of seeds) {
   const be0 = g.towns.bridgeEnds().length, tb0 = townBridges(g), pl0 = plinths(g);
   console.log(`seed ${seed}: generated: pop ${pop0}, ${be0} town dead ends on a bridge; town street bridges ${tb0.n} (${tb0.len.toFixed(0)} units, ${tb0.atEnd} at a dead end); plinths > 1.2 m: ${pl0.over}/${pl0.n} (worst ${(pl0.worst * 10).toFixed(1)} m)`);
   check(be0 === 0, `seed ${seed}: no generated town street ends on a bridge (${be0})`);
-  check(pl0.over <= pl0.n * 0.05, `seed ${seed}: generated lots levelled: plinths over 1.2 m on at most 5 % of the buildings (${pl0.over}/${pl0.n})`);
+  check(pl0.over <= pl0.n * 0.05 && pl0.worst < 0.3, `seed ${seed}: generated lots levelled: plinths over 1.2 m on at most 5 % of the buildings, none over 3 m (${pl0.over}/${pl0.n}, worst ${(pl0.worst * 10).toFixed(1)} m)`);
   const day0 = g.day;
   g.speed = 8;
   const sites: Sites = new Map();
@@ -64,7 +64,7 @@ for (const seed of seeds) {
   check(be1.length === 0, `seed ${seed}: no town street ends on a bridge after ${YEARS} years (${be1.length})`);
   check(tb1.atEnd === 0, `seed ${seed}: town street bridges only inside streets (${tb1.atEnd})`);
   check(pop1 > pop0 * 1.1, `seed ${seed}: towns grew (${pop0} -> ${pop1})`);
-  check(pl1.over <= Math.max(3, pl1.n * 0.05), `seed ${seed}: new lots levelled: plinths over 1.2 m on at most 5 % (${pl1.over}/${pl1.n})`);
+  check(pl1.over <= Math.max(3, pl1.n * 0.05) && pl1.worst < 0.3, `seed ${seed}: new lots levelled: plinths over 1.2 m on at most 5 %, none over 3 m (${pl1.over}/${pl1.n}, worst ${(pl1.worst * 10).toFixed(1)} m)`);
   const fit = terrainFit(g, undefined, sites);
   console.log(`  terrain fit: ${fitLine(fit)}`);
   check(fit.covered === 0 && fit.floating <= fit.samples * 0.001, `seed ${seed}: the terrain fits the network after ${YEARS} years of growth (${fit.covered} covered, ${fit.floating} floating)`);

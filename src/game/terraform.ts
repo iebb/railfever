@@ -126,8 +126,10 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
     // it from a road (the road is draped over the terrain), never the other way round (not even a little:
     // a level crossing keeps the rail formation under the road)
     if (!rail && lock & LOCK.rail) continue;
-    // nor does a track raise another's formation, even a little (a crossover, a widened bank)
-    if (rail && lock & LOCK.rail && nv > cur && nv - cur <= 0.12) continue;
+    // nor does a track raise another's formation (a crossover, a widened bank, a track beside it at another
+    // height behind a retaining wall): where two rail formations share ground the lower one keeps it, so the
+    // terrain never buries a track (the higher one stands on its wall)
+    if (rail && lock & LOCK.rail && nv > cur) continue;
     if (lock & LOCK.formation && Math.abs(nv - cur) > 0.12) {
       if (!(rail && !(lock & LOCK.rail))) {
         const near = w.net.nearestEdge(x, z, a.dmin + 0.05, rail ? 'rail' : undefined, (q) => !own.has(q.id));
