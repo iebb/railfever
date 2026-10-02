@@ -1,6 +1,6 @@
 // Shared materials with custom shader tweaks.
 import * as THREE from 'three';
-import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture, createWorldAtlas, ATLAS, ATLAS_W, ATLAS_H, CELL_ROUGH, CELL_METAL, WC, FACADE_CELL0 } from './textures';
+import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture, createWorldAtlas, ATLAS, ATLAS_W, ATLAS_H, CELL_ROUGH, CELL_METAL, CELL_BUMP, WC, FACADE_CELL0 } from './textures';
 import { NOISE_GLSL } from './shaders';
 
 export class Materials {
@@ -125,6 +125,7 @@ diffuseColor *= rfTex;`)
       sh.uniforms.uLitRatio = U.uLitRatio;
       sh.uniforms.uCellRough = { value: CELL_ROUGH };
       sh.uniforms.uCellMetal = { value: CELL_METAL };
+      sh.uniforms.uCellBump = { value: CELL_BUMP };
       sh.uniforms.uFacMap = { value: atlas.color };
       sh.uniforms.uFacEm = { value: atlas.emissive };
       sh.uniforms.uFacEmissive = facEm;
@@ -137,8 +138,17 @@ vRfCell = aCell; vRfSeed = aSeed; vRfUv = uv;`);
       sh.fragmentShader = sh.fragmentShader
         .replace('#include <common>', `#include <common>
 uniform float uNight; uniform float uLitRatio; uniform float uCellRough[32]; uniform float uCellMetal[32];
+uniform float uCellBump[32];
 uniform sampler2D uFacMap; uniform sampler2D uFacEm; uniform vec3 uFacEmissive;
 varying float vRfCell; varying float vRfSeed; varying vec2 vRfUv;
+// relief from a height gradient (screen-space derivatives precomputed by the caller, uniform control flow)
+vec3 rfPerturb(vec3 sx, vec3 sy, vec3 n, vec2 dh) {
+  vec3 r1 = cross(sy, n);
+  vec3 r2 = cross(n, sx);
+  float det = dot(sx, r1);
+  vec3 m = abs(det) * n - sign(det) * (dh.x * r1 + dh.y * r2);
+  return dot(m, m) > 1e-24 ? normalize(m) : n;
+}
 ${NOISE_GLSL}`)
         .replace('#include <map_fragment>', `
 int rfCi = int(vRfCell + 0.5);
@@ -156,15 +166,29 @@ if (rfCi >= ${FACADE_CELL0}) {
   float rfH = rf_hash12(floor(vRfUv) + vec2(vRfSeed * 1.37, vRfSeed * 0.71));
   float rfWarm = rf_hash12(floor(vRfUv) * 1.7 + vRfSeed);
   rfEm = uFacEmissive * rfE.rgb * step(rfH, uLitRatio) * mix(vec3(1.0), vec3(0.75, 0.9, 1.25), step(0.8, rfWarm));
-  rfRough = 0.72; rfMetal = 0.05;
+  // glass (the window mask of the emissive atlas) is smooth and a little reflective
+  float rfGlass = smoothstep(0.3, 0.7, rfE.r);
+  rfRough = mix(0.72, 0.2, rfGlass); rfMetal = mix(0.05, 0.3, rfGlass);
 } else {
   vec2 rfCell = vec2(float(rfCi % ${A.cols}), float(rfCi / ${A.cols}));
   rfTex = textureGrad(map, rfCell * ${STRIDE} + ${PAD} + rfCuv * ${CONT}, rfGx * ${CONT}, rfGy * ${CONT});
   rfRough = uCellRough[rfCi]; rfMetal = uCellMetal[rfCi];
 }
-diffuseColor *= rfTex;`)
+diffuseColor *= rfTex;
+// relief height from the texture luminance; darker texels (joints, gaps) are also rougher
+float rfHt = dot(rfTex.rgb, vec3(0.299, 0.587, 0.114));
+float rfBumpK = rfCi >= ${FACADE_CELL0} ? 0.3 : uCellBump[rfCi];
+if (rfCi < ${FACADE_CELL0}) rfRough = clamp(rfRough * (0.88 + 0.24 * (1.0 - rfHt)), 0.04, 1.0);`)
         .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = rfRough;')
         .replace('#include <metalnessmap_fragment>', 'float metalnessFactor = rfMetal;')
+        .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+{
+  // fade the relief out where the texture is strongly minified (no sparkle in the distance)
+  float rfFade = clamp(1.5 - 6.0 * max(length(rfGx), length(rfGy)), 0.0, 1.0);
+  vec2 rfDh = vec2(dFdx(rfHt), dFdy(rfHt)) * (rfBumpK * rfFade);
+  vec3 rfSx = dFdx(-vViewPosition), rfSy = dFdy(-vViewPosition);
+  normal = rfPerturb(rfSx, rfSy, normal, rfDh);
+}`)
         .replace('#include <emissivemap_fragment>', `totalEmissiveRadiance = rfEm;
 if (rfCi == ${WC.LAMP}) totalEmissiveRadiance += diffuseColor.rgb * uNight * 2.6;`);
     };

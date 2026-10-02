@@ -2,7 +2,9 @@
 // catenary, buffer stops and signals. Bed = world layer (no shadows); rails and furniture = detail layer.
 import { RAIL, TRACK_TYPES } from '../game/constants';
 import type { NEdge, NNode } from '../game/network';
-import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, PP } from './build-common';
+import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, PP, EARTHWORK_TINT } from './build-common';
+import type { WB } from './build-mesh';
+import { hash2 } from '../game/rng';
 import { WC, WSCALE, BALLAST_PERIOD } from './textures';
 import { buildBridge, buildPortals, parallelSides } from './build-structures';
 
@@ -14,7 +16,8 @@ export const RAIL_HEAD_OFF = RAIL.gauge / 2 + 0.0075;
 export const WIRE_Y = RAIL_TOP_Y + 0.55;
 
 const BALLAST = 0xc4bdb2;
-const FORMATION = 0x9a9080;
+/** cess beside the ballast (gravel cell tinted to the terrain's earthwork soil, ≈ #6b5a45) */
+const CESS = 0xd9c2a3;
 const RAIL_SIDE = 0x6e5f52;
 const RAIL_HEAD = 0xd4d0c8;
 
@@ -38,11 +41,16 @@ export function trackRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
     sweep(W, run, [[T, top, 0], [0.235, -0.05, 0.16]], G, yo);
   } else {
     const B = RAIL.bedBottom;
-    sweep(W, run, [[-B, -0.05, 0], [-T, top, 0.28]], G, yo);
-    sweep(W, run, [[T, top, 0], [B, -0.05, 0.28]], G, yo);
-    W.use(WC.GRAVEL, FORMATION);
-    sweep(W, run, [[-0.4, -0.28, 0], [-0.38, -0.1, 0.36], [-B, -0.05, 0.55]], G, yo);
-    sweep(W, run, [[B, -0.05, 0], [0.38, -0.1, 0.19], [0.4, -0.28, 0.55]], G, yo);
+    // ballast shoulders with an irregular toe (spilled ballast), then the cess and the formation slope in
+    // the terrain's earthwork colours (no dark bands)
+    ballastShoulder(W, run, -1, T, top, B, yo);
+    ballastShoulder(W, run, 1, T, top, B, yo);
+    W.use(WC.GRAVEL, CESS);
+    sweep(W, run, [[-0.38, -0.1, 0], [-B, -0.05, 0.2]], G, yo);
+    sweep(W, run, [[B, -0.05, 0], [0.38, -0.1, 0.2]], G, yo);
+    W.use(WC.GRASS, EARTHWORK_TINT);
+    sweep(W, run, [[-0.4, -0.28, 0], [-0.38, -0.1, 0.25]], WSCALE.GRASS, yo);
+    sweep(W, run, [[0.38, -0.1, 0], [0.4, -0.28, 0.25]], WSCALE.GRASS, yo);
   }
   // rails (detail layer)
   const D = ctx.d;
@@ -53,6 +61,47 @@ export function trackRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
     sweep(D, run, [[c + 0.0075, H], [c + 0.011, top - 0.004]], 1, yo);
     D.use(WC.METAL, RAIL_HEAD);
     sweep(D, run, [[c - 0.0075, H], [c + 0.0075, H]], 1, yo);
+  }
+}
+
+/**
+ * One ballast shoulder (side sg = -1 left / +1 right) from the sleeper ends (lateral T, height top) down to
+ * the toe at B, densified to ~0.3 units with the toe pushed out by up to 0.035 (hashed on the world position,
+ * so runs that meet at a chunk border agree) and dipping slightly: an irregular, spilled edge.
+ */
+function ballastShoulder(W: WB, run: Smp[], sg: number, T: number, top: number, B: number, yo: number) {
+  const n = run.length;
+  if (n < 2) return;
+  const base = W.vertexCount;
+  let cnt = 0;
+  const emit = (x: number, y: number, z: number, lx: number, lz: number, s: number) => {
+    const j = hash2(Math.round(x * 8), Math.round(z * 8), 911);
+    const toe = B + 0.035 * j, dip = -0.05 - 0.012 * j;
+    const ax = x + lx * T * sg, az = z + lz * T * sg, bx = x + lx * toe * sg, bz = z + lz * toe * sg;
+    // face normal: up and outwards (as sweep's dl*up - dh*right)
+    const dl = toe - T, dh = dip - top, el = Math.hypot(dl, dh) || 1;
+    const nu = dl / el, nr = -dh / el * sg;
+    const nx = lx * nr, nz = lz * nr, nl = Math.hypot(nx, nu, nz) || 1;
+    const v = s / G;
+    if (sg > 0) { W.vertex(ax, y + top + yo, az, nx / nl, nu / nl, nz / nl, 0, v); W.vertex(bx, y + dip + yo, bz, nx / nl, nu / nl, nz / nl, 0.3, v); }
+    else { W.vertex(bx, y + dip + yo, bz, nx / nl, nu / nl, nz / nl, 0, v); W.vertex(ax, y + top + yo, az, nx / nl, nu / nl, nz / nl, 0.3, v); }
+    cnt++;
+  };
+  for (let i = 0; i < n - 1; i++) {
+    const A = run[i], C = run[i + 1];
+    const k = Math.max(1, Math.ceil(Math.abs(C.s - A.s) / 0.3));
+    for (let q = 0; q < k; q++) {
+      const t = q / k;
+      const lx = A.lx + (C.lx - A.lx) * t, lz = A.lz + (C.lz - A.lz) * t;
+      emit(A.x + (C.x - A.x) * t, A.y + (C.y - A.y) * t, A.z + (C.z - A.z) * t, lx, lz, A.s + (C.s - A.s) * t);
+    }
+  }
+  const L = run[n - 1];
+  emit(L.x, L.y, L.z, L.lx, L.lz, L.s);
+  // quads between consecutive samples: (a_i, b_i, b_i+1, a_i+1) as in sweep
+  for (let i = 0; i < cnt - 1; i++) {
+    const a = base + i * 2;
+    W.idx.push(a, a + 1, a + 3, a, a + 3, a + 2);
   }
 }
 

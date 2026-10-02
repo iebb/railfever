@@ -276,6 +276,12 @@ export const CELL_ROUGH = [0.9, 0.97, 0.95, 0.96, 0.9, 0.9, 0.9, 0.86, 0.85, 0.8
   0.95, 0.08, 0.8, 0.95, 0.78, ...new Array(11).fill(0.9)];
 export const CELL_METAL = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05, 0, 0.72, 0,
   0, 0.15, 0, 0, 0.1, ...new Array(11).fill(0)];
+/**
+ * Per-cell relief strength (32 slots): the world material bumps the surface from the texture's luminance
+ * (joints and gaps darker = lower) - stone, roof tiles, cobbles and ballast most, asphalt barely.
+ */
+export const CELL_BUMP = [0, 0.5, 0.4, 0.45, 0.12, 0.12, 0.12, 0.3, 0.25, 0.35, 0.7, 0.8,
+  0.6, 0.2, 0, 0, 0.3, 0, 0.6, 0.3, 0.3, ...new Array(11).fill(0)];
 
 function h2(ix: number, iy: number, seed: number): number {
   let h = (Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263) + Math.imul(seed | 0, 2246822519)) | 0;
