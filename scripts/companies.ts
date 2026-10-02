@@ -52,7 +52,7 @@ while (g.day < YEARS * 360) {
   try { g.update(0.25); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 6).join('\n')); if (errors > 3) break; }
 }
 console.log(`simulated ${YEARS} years in ${fmt((performance.now() - T1) / 1000, 1)} s (${fmt((performance.now() - T1) / (YEARS * 360), 2)} ms/day)`);
-interface Summary { label: string; id: number; projects: number; rail: number; bus: number; tram: number; vehicles: number; assets: number; built: number; value: number }
+interface Summary { label: string; id: number; projects: number; rail: number; bus: number; tram: number; vehicles: number; assets: number; built: number; value: number; urban: number }
 const sums: Summary[] = AIS.map((ai, i) => {
   const id = ai.companyId, e = g.company(id).economy;
   const lines = g.lines.all().filter((l) => l.owner === id);
@@ -60,6 +60,8 @@ const sums: Summary[] = AIS.map((ai, i) => {
   return {
     label: CONFIGS[i].label, id, projects: ai.state.projects, rail: lines.filter((l) => l.kind === 'rail').length, bus: lines.filter((l) => l.kind === 'road').length,
     tram: lines.filter((l) => l.kind === 'tram').length, vehicles: g.vehicles.all().filter((v) => v.owner === id).length,
+    // (urban railways: metro / light rail lines, all of whose stations are urban)
+    urban: lines.filter((l) => l.kind === 'rail' && l.stops.every((sid) => { const st = g.stations.get(sid); return !!st?.rail && st.rail.trackType !== undefined && ['metro', 'lightrail'].includes(st.rail.trackType); })).length,
     assets: g.companyAssets(id).total, built: spent('construction') + spent('vehicles'), value: g.companyValue(id),
   };
 });
@@ -74,7 +76,8 @@ check(passive.rail + passive.bus + passive.tram < aggressive.rail + aggressive.b
 check(aggressive.rail + aggressive.bus + aggressive.tram >= 2, 'aggressive company expands to several lines');
 check(railCo.rail >= 1, 'rail-focused company runs a railway');
 check(busCo.rail === 0 && (busCo.bus >= 1 || busTowns === 0), `bus-focused company runs buses and no railway (${busTowns} towns of 900+)`);
-check(tramCo.rail === 0 && (tramCo.tram >= 1 || tramTowns === 0), `tram-focused company runs trams (${tramTowns} towns of ${TramPlanner.minPop}+)`);
+// (a tram company may also run light rail, an urban railway; no main-line railway)
+check(tramCo.rail - tramCo.urban === 0 && (tramCo.tram >= 1 || tramTowns === 0), `tram-focused company runs trams, no main-line railway (${tramTowns} towns of ${TramPlanner.minPop}+)`);
 check(IDS.every((id) => !g.company(id).defunct), 'no buyouts while acquisitions are off');
 check(AIS.every((ai) => ai.state.phase !== 'consolidating' || g.company(ai.companyId).economy.loan > 0), 'sane AI states');
 for (const [i] of sums.entries()) check(aiTime[i].t / Math.max(1, aiTime[i].n) < 4, `${sums[i].label}: AI time per day < 4 ms`);
@@ -170,11 +173,15 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
         }
         const signals = [...g.world.net.nodes.values()].filter((n) => n.signal && n.owner === ai.companyId).length;
         const del0 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
+        const each0 = new Map(l.vehicles.map((id) => [id, g.vehicles.get(id)?.delivered ?? 0] as [number, number]));
         for (const d0 = g.day; g.day < d0 + 120;) g.update(0.25);
         const del1 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
         const lost = l.vehicles.map((id) => g.vehicles.get(id)).filter((v) => v && v.state === 'noroute');
         console.log(`  double track: ${done}; ${signals} signals on the company's track; ${l.vehicles.length} trains delivered ${del0} -> ${del1} in 120 days, ${lost.length} without route`);
-        check(lost.length === 0 && checkReservations(g).length === 0 && del1 > del0, 'trains keep running on the railway with a second track');
+        // (passengers delivered meanwhile: by the trains running all along, and by any put on since; a train sold or
+        // lengthened into a new one takes its own count along)
+        const gained = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0) - (each0.get(id) ?? 0), 0);
+        check(lost.length === 0 && checkReservations(g).length === 0 && gained > 0, `trains keep running on the railway with a second track (${gained} delivered)`);
       }
     }
   }
@@ -241,7 +248,8 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   g.lines.rename(pl2.id, '');
   check(pl2.autoName && pl2.name === 'R2', 'empty name returns to the automatic name');
   check(colorDistance(pl1.color, pl2.color) > 15 && pl1.color !== pb.color, 'distinct colours for the player lines');
-  check(LINE_PALETTES.rail.includes(pl1.color) && LINE_PALETTES.road.includes(pb.color), 'colours from the per-kind palettes');
+  // (UPDATE 9b: colours are unique across every company's lines: the per-kind palettes first, then further hues)
+  check([pl1, pb].every((x) => g.lines.all().filter((l) => l.color === x.color).length === 1) && (LINE_PALETTES.rail.includes(pl1.color) || /^#/.test(pl1.color)), 'colours unique across all lines (palettes first, then further hues)');
   g.lines.setColor(pl2.id, '#123456');
   check(pl2.color === '#123456' && !pl2.autoColor, 'setColor');
   g.lines.delete(pl1.id); g.lines.delete(pl2.id); g.lines.delete(pb.id);
@@ -249,6 +257,8 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
 
 // ------------------------------------------------------------------ 3. demand model
 {
+  // (the catchments the line edits above left to recompute are not the view's cost)
+  g.lines.flushCatchment();
   const t0 = performance.now();
   g.lines.version++;
   const dv = demandView(g);
@@ -304,7 +314,11 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     while (ai.busy) g.update(0.25);
     const al = g.lines.all().find((l) => l.owner === ai.companyId && l.stops.includes(pr.A.id) && l.stops.includes(pr.B.id));
     console.log(`  share: ${ai.log.slice(-3).join(' | ')}; agreement ${g.hasAccess(ai.companyId, PLAYER)}, line ${al?.name ?? '-'}`);
-    check(!!al && al.vehicles.length === 1 && g.hasAccess(ai.companyId, PLAYER), 'AI signed an access agreement and runs a line between the player stations');
+    // (UPDATE 9k: a company running services on a line owns one of its stations: a line of the AI's between two of
+    // the player's stations is refused; track access fees are covered by access.ts and through.ts)
+    // (the agreement it no longer needs is ended again: endUnusedAccess)
+    check(!al && ai.log.some((x) => /no station of ours on the line/.test(x)), 'the AI asked for track access but runs no line without a station of its own');
+    if (al) {
     const inc0 = total(g.economy, 'trackIncome'), d0 = ptr.delivered;
     runDays(150);
     const at = al ? g.vehicles.get(al.vehicles[0]) : undefined;
@@ -326,6 +340,7 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     check(!!al && !g.lines.get(al.id) && !g.depots.get(aiDepot), 'the AI closed its line and removed its depot');
     check(ptr.state !== 'noroute', 'the player train is not affected');
     g.setAllowAccess(PLAYER, true);
+    }
   }
 }
 

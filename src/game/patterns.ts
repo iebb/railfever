@@ -345,7 +345,10 @@ function slowest(vs: Vehicle[]): VehicleModel[] {
     const ms = a.cars ?? (a.model ? [a.model] : []);
     if (ms.length && v.maxSpeedKmh < bv) { bv = v.maxSpeedKmh; best = ms; }
   }
-  return best;
+  // (as the train is made up, not as it happens to face: a train turned at a terminus has its cars the other way
+  // round, and the timetable must not depend on which way it stands)
+  const lead = best.findIndex((m) => m.power > 0);
+  return lead > 0 && lead === best.length - 1 ? [...best].reverse() : best;
 }
 
 /**
@@ -364,7 +367,9 @@ export function lineTable(g: Game, l: Line): LineTable {
   // cached until what the timetable depends on changes (not on every routing rebuild): the stops (where they are,
   // their track type), the vehicles of each pattern (their speed) and the patterns' stops
   let key = '';
-  for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? Math.round(s.x) + ',' + Math.round(s.z) + (s.rail ? s.rail.trackType : '') : '') + ';'; }
+  // (exact positions: a station rebuilt longer moves its centre by less than a unit, and the timetable reads the
+  // exact distances; the town decides a road hop's speed cap)
+  for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? s.x + ',' + s.z + (s.rail ? s.rail.trackType : '') + '/' + s.townId : '') + ';'; }
   for (const [p, vs] of byPat) { key += '|' + p + ':'; for (const v of vs) key += v.id + '/' + v.maxSpeedKmh + '.'; }
   for (const p of l.patterns ?? []) { key += '|' + p.id + ':'; for (const x of servedFlags(l, p)) key += x ? '1' : '0'; }
   if (hit && hit.key === key) { hit.ver = g.lines.version; hit.stops = l.stops; hit.nv = l.vehicles.length; return hit; }

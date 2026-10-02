@@ -53,8 +53,29 @@ export function brakeSpeed(d: number): number {
 }
 /** Davis running resistance per kg: a0 (N/kg, bearings and rolling) + a1 (N/kg per m/s, flange and track). */
 export const DAVIS = { a0: 0.0075, a1: 0.0002 };
-/** Power reaching the wheels; rotating masses add to the inertia; passenger comfort caps acceleration (m/s^2). */
-const TRANSMISSION = 0.92, ROTATING = 1.06, ACCEL_MAX = 1.1;
+/** Power reaching the wheels; rotating masses add to the inertia. */
+const TRANSMISSION = 0.92, ROTATING = 1.06;
+/**
+ * Starting acceleration (m/s^2) a consist is designed for (traction equipment, passenger comfort): metro and
+ * light-rail sets 1.2, multiple units and loco-hauled trains 1.0 (adhesion permitting), high-speed sets 0.7.
+ */
+function accelCap(cars: VehicleModel[]): number {
+  if (!cars.length || !cars.every((c) => c.kind === 'emu')) return 1.0;
+  if (cars.some((c) => c.speed >= 200)) return 0.7;
+  return cars.every((c) => c.speed <= 110) ? 1.2 : 1.0;
+}
+
+/**
+ * Forces on a train at speed v (m/s) on level track (N): the most its traction can pull (power at the wheels,
+ * adhesion by Curtius-Kniffler, the design acceleration) and the Davis running resistance m (a0 + a1 v) + c v^2
+ * with its own aerodynamics.
+ */
+export function trainForces(t: Train, v: number): { traction: number; resistance: number } {
+  const ph = t.phys, m = t.mass * 1000;
+  const mu = 0.161 + 7.5 / (v * 3.6 + 44);
+  const traction = Math.min(mu * 9.81 * ph.driven * 1000, (t.power * 1000 * TRANSMISSION) / Math.max(2, v), m * ROTATING * ph.accel);
+  return { traction, resistance: m * (DAVIS.a0 + DAVIS.a1 * v) + ph.aero * v * v };
+}
 /** Share of a multiple unit's mass on driven axles. */
 const EMU_DRIVEN = 0.6;
 const GAP = 0.1;
@@ -154,19 +175,19 @@ export function blockEdges(g: Game, edgeId: number, fromNode: number): number[] 
  * Continuations after travelling edge e in direction dir (signals, track access, no depots). With `anyOwner`,
  * tracks the owner may not use are allowed too (a train caught on them when an agreement ends finds its way off).
  */
-export function railNext(g: Game, e: NEdge, dir: number, owner: number, anyOwner = false, rule: TrackRule | null = null): Cont[] {
+export function railNext(g: Game, e: NEdge, dir: number, owner: number, anyOwner = false, rule: TrackRule | null = null, ignoreSignals = false): Cont[] {
   const net = g.world.net;
   const out: Cont[] = [];
   for (const c of net.nextRail(e, dir)) {
     if (c.edge.depot >= 0 || (!anyOwner && !g.canUse(owner, c.edge.owner))) continue;
     if (rule && !ruleAllows(rule, c.edge)) continue;
-    if (net.signalFor(c.node, net.sideAt(c.edge, c.node.id)) < 0) continue;
+    if (!ignoreSignals && net.signalFor(c.node, net.sideAt(c.edge, c.node.id)) < 0) continue;
     out.push({ edge: c.edge, dir: c.dir });
   }
   return out;
 }
 
-function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false, rule: TrackRule | null = null): Cont[] {
+function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false, rule: TrackRule | null = null, ignoreSignals = false): Cont[] {
   const net = g.world.net;
   if (seg.e < 0) {
     const dp = g.depots.get(seg.depot!);
@@ -174,7 +195,7 @@ function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false, rule: Tra
     return stub ? [{ edge: stub, dir: 1 }] : [];
   }
   const e = net.edges.get(seg.e);
-  return e ? railNext(g, e, seg.dir, owner, anyOwner, rule) : [];
+  return e ? railNext(g, e, seg.dir, owner, anyOwner, rule, ignoreSignals) : [];
 }
 
 export class Heap {
@@ -229,7 +250,8 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     let c = e.len;
     const r = V.getRes(e.id);
     if (r && r !== selfId) c += 40;
-    if (e.station >= 0 && e.station !== target) c += 6;
+    // (passing a station: its through tracks rather than a platform track another train may want to stop at)
+    if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
     return c;
   };
@@ -323,9 +345,12 @@ export class Train extends Vehicle {
   get mass() { let w = 0; for (const m of this.cars) w += m.weight; return w + this.load * 0.075; }
 
   private physKey: unknown[] = [];
-  private physCache = { aero: 0, aux: 0, driven: 0 };
-  /** Consist physics: aerodynamic c (N per (m/s)^2: the leading nose plus the length), hotel load (kW), driven mass (t). */
-  get phys(): { aero: number; aux: number; driven: number } {
+  private physCache = { aero: 0, aux: 0, driven: 0, accel: 1 };
+  /**
+   * Consist physics: aerodynamic c (N per (m/s)^2: the leading nose plus the length), hotel load (kW), driven mass
+   * (t), design acceleration (m/s^2).
+   */
+  get phys(): { aero: number; aux: number; driven: number; accel: number } {
     const c0 = this.cars, n = c0.length, k = this.physKey;
     if (k[0] !== c0 || k[1] !== n || k[2] !== c0[0] || k[3] !== c0[n - 1]) {
       const key = [c0, n, c0[0], c0[n - 1]];
@@ -336,7 +361,7 @@ export class Train extends Vehicle {
         if (c.power > 0) driven += c.kind === 'emu' ? c.weight * EMU_DRIVEN : c.weight;
       }
       this.physKey = key;
-      this.physCache = { aero, aux, driven };
+      this.physCache = { aero, aux, driven, accel: accelCap(c0) };
     }
     return this.physCache;
   }
@@ -597,11 +622,14 @@ export class Train extends Vehicle {
     let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id, 60000, false, rule) : null;
     let rev: RouteResult | null = null;
     const canTurn = allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1;
+    // turning at a station (a terminus, or a short-turn pattern on double track): back off the platform past the
+    // one-way signal at its end (the station's crossovers lead onto the other track; signals beyond keep their way)
+    const turnAtPlatform = (ts: TSeg) => (g.world.net.edges.get(ts.e)?.station ?? -1) >= 0;
     if (canTurn) {
       const tail = this.tailInfo();
       const ts = this.segs[tail.seg];
       if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
-        const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, rule);
+        const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, rule, turnAtPlatform(ts));
         if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, false, rule);
       }
     }
@@ -612,7 +640,7 @@ export class Train extends Vehicle {
       if (!fwd && canTurn) {
         const ts = this.segs[this.tailInfo().seg];
         if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
-          const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true, rule);
+          const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true, rule, turnAtPlatform(ts));
           if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true, rule);
         }
       }
@@ -751,12 +779,12 @@ export class Train extends Vehicle {
       dEnd = this.distToEnd();
     }
     // target speed from the braking curve to the end of the reserved path and speed limits ahead
-    let vt = Math.min(vmax, brakeSpeed(dEnd - 0.05) + 0.02);
+    let vt = Math.min(vmax, brakeSpeed(dEnd - this.speed * dt));
     const look = brakeDist + 3;
     let d = -this.headPos;
     for (let i = this.headSeg; i < this.segs.length; i++) {
       const s = this.segs[i];
-      if (i > this.headSeg && s.limit < vt) vt = Math.min(vt, brakeSpeed(Math.max(0, d) + brakeDistance(s.limit)));
+      if (i > this.headSeg && s.limit < vt) vt = Math.min(vt, brakeSpeed(Math.max(0, d - this.speed * dt) + brakeDistance(s.limit)));
       if (s.e >= 0 && s.res.length > 1) {
         for (const r of s.res) {
           if (r < CROSS_BASE) continue;
@@ -782,25 +810,28 @@ export class Train extends Vehicle {
     this.pointBehind(Math.min(this.length, 8), B);
     const span = Math.max(0.5, Math.min(this.length, 8));
     this.grade = (A.y - B.y) / span;
-    const ph = this.phys, m = this.mass * 1000, mEff = m * ROTATING;
+    const m = this.mass * 1000, mEff = m * ROTATING;
     const v0 = this.speed * 10, vT = Math.max(0, vt) * 10;
-    const mu = 0.161 + 7.5 / (v0 * 3.6 + 44);
-    const fMax = Math.min(mu * 9.81 * ph.driven * 1000, (this.power * 1000 * TRANSMISSION) / Math.max(2, v0), mEff * ACCEL_MAX);
-    const fRes = m * (DAVIS.a0 + DAVIS.a1 * v0) + ph.aero * v0 * v0;
     const fGrade = m * 9.81 * this.grade;
+    const initial = trainForces(this, v0);
+    const accel = Math.max(-brakeRate(this.speed) * 10, Math.min((vT - v0) / dt, (initial.traction - initial.resistance - fGrade) / mEff));
+    const { traction: fMax, resistance: fRes } = trainForces(this, Math.max(0, v0 + accel * dt / 2));
     // the force at the wheels that brings the train to the target speed this step, within what it can do
     const need = (mEff * (vT - v0)) / dt + fRes + fGrade;
-    const F = vT >= v0 ? Math.min(need, fMax) : Math.max(need, -(mEff * brakeRate(this.speed) * 10 * 1.3 + Math.max(0, -fGrade)));
+    const fBrake = Math.max(0, mEff * brakeRate(this.speed) * 10 - fRes - fGrade);
+    const F = Math.min(fMax, Math.max(need, -fBrake));
     let v1 = v0 + ((F - fRes - fGrade) / mEff) * dt;
-    // a train too weak for the gradient creeps on (it never rolls back)
-    if (vT > v0 && v0 < 3 && v1 < v0 + 0.04 * dt) v1 = Math.min(vT, v0 + 0.04 * dt);
     if (vT >= v0 && v1 > vT) v1 = vT;
     this.speed = Math.max(0, v1) / 10;
     if (this.speed > vt && this.speed - vt < 0.002) this.speed = vt;
-    let mv = this.speed * dt;
-    if (mv >= dEnd) mv = dEnd;
+    let mv = (v0 / 10 + this.speed) * dt / 2;
+    // Finish the low-speed approach exactly at the reserved boundary (station or signal).
+    const finish = mv >= dEnd || (dEnd - mv < 0.02 && this.speed < 0.15);
+    if (finish) mv = dEnd;
     // energy at the wheels: traction work, braking work (regenerable), distance
-    if (F > 0) this.tractionJ += F * mv * 10; else this.regenJ -= F * mv * 10;
+    const wheelJ = finish ? -0.5 * mEff * v0 * v0 + (fRes + fGrade) * mv * 10 : F * mv * 10;
+    if (finish) this.speed = 0;
+    if (wheelJ > 0) this.tractionJ += wheelJ; else this.regenJ -= wheelJ;
     this.km += mv / 100;
     if (this.speed > 0.05) this.stuckTime = 0;
     else if (this.state === 'waiting') this.stuckTime += dt;
@@ -857,9 +888,11 @@ export function depotServes(g: Game, dp: Depot, a: number, b: number, cars?: Veh
   const rule = cars ? consistRule(cars) : null;
   for (const [x, y] of [[a, b], [b, a]]) {
     const r = findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule);
-    const last = r?.conts[r.conts.length - 1]?.edge;
-    if (!last) continue;
-    if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, last, d, dp.owner, false, rule), y, dp.owner, -1, 80000, false, rule))) return x;
+    const lc = r?.conts[r.conts.length - 1];
+    if (!lc) continue;
+    // on the way it came in, or turning back off the platform (past the one-way signal at its end, as trains do)
+    if (findRailRoute(g, railNext(g, lc.edge, lc.dir, dp.owner, false, rule), y, dp.owner, -1, 80000, false, rule)
+      || findRailRoute(g, railNext(g, lc.edge, -lc.dir, dp.owner, false, rule, lc.edge.station >= 0), y, dp.owner, -1, 80000, false, rule)) return x;
   }
   return -1;
 }

@@ -176,14 +176,17 @@ if (isMain) {
     check(Math.abs(est.equalUseShare - 2 / 3) < 1e-9 && est.multiplier === 2, 'estimateAccessShare');
   }
 
-  // ---- 3. the AI runs a train between the player's stations (needs access to the player's network)
+  // ---- 3. the AI runs a train between the player's stations (needs access to the player's network); its line
+  // stops at its own station E too (a company running services on a line owns one of its stations)
   const aiLine = g.lines.create('rail', ai);
-  aiLine.stops = [A, D];
+  aiLine.stops = [A, E, D, E];
   const at = g.vehicles.buyTrain(depAI, [loco, coach], aiLine.id) as Train;
   check(at instanceof Train, 'AI train bought');
-  run(20);
-  console.log(`  AI train without access: ${at.state} (${at.status})`);
-  check(at.state === 'noroute' || at.state === 'depot', 'AI train has no route without access to the player network');
+  // (without access it may serve its own station E, never the player's A and D nor their track)
+  const seenNoAccess = new Set<number>();
+  for (let k = 0; k < 80; k++) { g.update(0.25); if (at.atStation >= 0) seenNoAccess.add(at.atStation); if (pathEdges(at).some((id) => net.edges.get(id)?.owner === PLAYER)) seenNoAccess.add(-99); }
+  console.log(`  AI train without access: ${at.state} (${at.status}); served ${[...seenNoAccess].map((id) => g.stations.get(id)?.name ?? 'player track').join(', ') || 'nothing'}`);
+  check(!seenNoAccess.has(A) && !seenNoAccess.has(D) && !seenNoAccess.has(-99), 'AI train keeps off the player network without access');
   // the player is asked (policy 'ask'): a pending request, approved
   check(g.accessPolicy(PLAYER) === 'ask', 'the player is asked (policy ask)');
   check(g.requestAccess(ai, PLAYER, 'test') === 'pending' && g.requestAccess(ai, PLAYER) === 'pending', 'request pending (once)');
@@ -203,7 +206,7 @@ if (isMain) {
   // blocking ends the agreement (the AI line loses its stops at the player's stations, its train has no route)
   g.blockCompany(PLAYER, ai);
   check(g.isBlocked(PLAYER, ai) && !g.canUse(ai, PLAYER) && g.requestAccess(ai, PLAYER) === 'blocked', 'blocked: agreement ended, requests refused');
-  check(aiLine.stops.length === 0, 'AI line lost its stops at player stations');
+  check(!aiLine.stops.some((s) => g.stations.get(s)?.owner === PLAYER), `AI line lost its stops at player stations (${aiLine.stops.map((s) => g.stations.get(s)?.name).join(', ')})`);
   run(10);
   check(!pathEdges(at).some((id) => net.edges.get(id)?.owner === PLAYER) || at.state === 'noroute' || at.state === 'stopped', `blocked AI train keeps off the player network (${at.state}: ${at.status})`);
   g.unblockCompany(PLAYER, ai);
@@ -275,12 +278,12 @@ if (isMain) {
   g.setAccessPolicy(PLAYER, 'open');
   g.setAccessPolicy(ai, 'open');
   check(!g.hasAccess(ai, PLAYER) && g.canUse(ai, PLAYER) && g.lines.canAddStop(aiLine.id, A) === null, 'open: the AI may stop at the player stations without an agreement');
-  aiLine.stops = [A, D];
+  aiLine.stops = [A, E, D, E];
   g.lines.rebuild();
   for (const vid of aiLine.vehicles) g.vehicles.get(vid)?.onLineChanged();
   const n0 = g.requestsTo(PLAYER).length, d0 = at.delivered, f2 = { pEarned: total(P, 'trackIncome'), qPaid: total(Q, 'trackFees') };
   const visited = new Set<number>();
-  for (let k = 0; k < 600; k++) { g.update(0.25); if (at.atStation >= 0) visited.add(at.atStation); }
+  for (let k = 0; k < 1200; k++) { g.update(0.25); if (at.atStation >= 0) visited.add(at.atStation); }
   const ag = g.agreement(ai, PLAYER);
   console.log(`  open access: AI train served ${[...visited].map((id) => g.stations.get(id)?.name).join(', ')} (${at.status}); agreement ${!!ag} (paid ${fmt(ag?.paidTotal ?? 0, 0)}); player earned ${fmt(total(P, 'trackIncome') - f2.pEarned, 0)}`);
   check(g.requestsTo(PLAYER).length === n0 && !!ag, 'open: no request; an agreement made on first use');

@@ -10,11 +10,11 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import { WALK_LINE } from './stations';
-import type { Hop, Line } from './lines';
-import { tripFactor, refTime, transferWalkTime } from './fares';
+import type { Hop } from './lines';
+import { tripFactor, refTime } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS, UNIT_M } from './constants';
+import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 
 export interface Region {
@@ -56,9 +56,8 @@ export const ldDecay = (d: number) => {
 /** Long-distance trips per inhabitant and month, per 1,000 attraction (jobs + 0.4 residents) at the far end, at 100 units. */
 export const LD_RATE = 0.012;
 /** Trip factor of a typical service of the game (it leaves the demand as it was); fast direct services earn more. */
-export const TF_TYPICAL = 1.2;
-/** Dwell per stop (s) for the expected round trip of a line. */
-const DWELL_S = 25;
+export const TF_TYPICAL = 1.3;
+
 /** Trips within a region (across town): a share of its own attraction (many such trips are walked). */
 const INTRA = 0.35;
 /** Stations closer than this (units) share few trips within a region (people walk). */
@@ -287,46 +286,14 @@ export class DemandModel {
   }
 
   // ---------------------------------------------------------------- service quality (trip factor)
-  private service = new Map<number, { key: string; kmh: number; headway: number }>();
-
-  /** Average speed (km/h, stops included) and headway (s) of a line from its vehicles and stops. */
-  lineService(l: Line): { kmh: number; headway: number } {
-    const g = this.g;
-    const key = `${g.lines.version}:${l.vehicles.length}:${l.stops.length}`;
-    const c = this.service.get(l.id);
-    if (c && c.key === key) return c;
-    let vmax = Infinity;
-    for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) vmax = Math.min(vmax, v.maxSpeedKmh); }
-    if (!isFinite(vmax)) vmax = l.kind === 'rail' ? 100 : 50;
-    const cap = l.kind === 'rail' ? 320 : l.kind === 'tram' ? 70 : 80;
-    const kmh = Math.max(8, Math.min(vmax, cap) * (l.kind === 'rail' ? 0.6 : 0.5));
-    let len = 0;
-    for (let i = 0; i < l.stops.length; i++) {
-      const a = g.stations.get(l.stops[i]), b = g.stations.get(l.stops[(i + 1) % l.stops.length]);
-      if (a && b) len += Math.hypot(a.x - b.x, a.z - b.z) * 1.15;
-    }
-    const round = (len * UNIT_M) / (kmh / 3.6) + l.stops.length * DWELL_S;
-    const out = { key, kmh, headway: round / Math.max(1, l.vehicles.length) };
-    this.service.set(l.id, out);
-    return out;
-  }
-
   /**
    * Trip factor (fares.ts tripFactor, relative to a typical service: TF_TYPICAL) of travelling from st to d by the
-   * network: half the first line's headway waiting, riding the routed distance at its speed, and a transfer walk and
-   * wait where the trip changes lines, against the alternative (walking / driving) for the straight distance.
+   * network: the routed journey's expected time (Hop.cost, sim seconds: half the headway of the services worth
+   * taking, the rides, and the transfers with their penalty) against the alternative (walking / driving) for the
+   * straight distance. Fast, frequent, direct services: above 1; slow, sparse or roundabout ones: below.
    */
   serviceFactor(st: Station, d: Station, hop: Hop): number {
-    const g = this.g;
-    let line = g.lines.get(hop.line), h: Hop | undefined = hop, walks = 0;
-    // (a walk to a linked station first: the line taken from there)
-    for (let i = 0; i < 3 && h && h.line === WALK_LINE; i++) { walks++; h = g.lines.nextHop(h.alight, d.id); line = h ? g.lines.get(h.line) : undefined; }
-    if (!line || !h) return 1;
-    const sv = this.lineService(line);
-    const ride = (Math.max(1, hop.cost) * UNIT_M) / (sv.kmh / 3.6);
-    let t = sv.headway / 2 + ride + walks * transferWalkTime(20);
-    if (h.alight !== d.id) t += transferWalkTime(10) + sv.headway / 2;
-    return tripFactor(t, refTime(Math.hypot(d.x - st.x, d.z - st.z))) / TF_TYPICAL;
+    return tripFactor(Math.max(1, hop.cost), refTime(Math.hypot(d.x - st.x, d.z - st.z))) / TF_TYPICAL;
   }
 
   /** Which regions each station's catchment covers (after catchments change; game.ts / lines.ts call it). */
@@ -488,6 +455,8 @@ const viewCache = new WeakMap<Game, { key: string; view: DemandView }>();
 
 /** Demand by town, region, town pair and regional flow, for `company`'s view (served counts every company's lines). */
 export function demandView(g: Game, company = 0): DemandView {
+  // (catchments first: recomputing them bumps the model's version, which is part of the key)
+  g.lines.flushCatchment();
   const m = g.demand;
   const key = `${g.day}:${g.lines.version}:${m.version}:${company}`;
   const c = viewCache.get(g);

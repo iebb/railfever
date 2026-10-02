@@ -133,7 +133,22 @@ export class Lines {
   catchmentDirty = false;
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
-  constructor(private game: Game) {}
+  constructor(private game: Game) {
+    // stations rebuilt, moved or merged (longer platforms, another level, a stop combined): timetables and journey
+    // times read their positions, so the routing is worked out again (a saved game then loads to the same routing)
+    game.listeners?.network?.push(() => this.checkStations());
+  }
+
+  /** where the stations were when the routing was last worked out */
+  private stationSig = '';
+  private checkStations() {
+    let sig = '';
+    for (const st of this.game.stations.map.values()) sig += st.id + ':' + st.x + ',' + st.z + (st.rail ? st.rail.trackType : '') + ';';
+    if (sig === this.stationSig) return;
+    const first = !this.stationSig;
+    this.stationSig = sig;
+    if (!first && this.map.size) this.rebuild();
+  }
 
   /** lines merged into another as a service pattern (patterns.ts canonicalizeLines): old id -> line and pattern */
   redirect = new Map<number, { line: number; pattern: number }>();

@@ -189,26 +189,30 @@ if (want('centre')) {
   ai.state.cooldown = 1e9;
   const T = [...g.towns.list].sort((p, q) => q.pop - p.pop);
   const big = T[0];
-  const other = T.find((t) => t !== big && t.pop > 800 && Math.hypot(t.x - big.x, t.z - big.z) > 150 && Math.hypot(t.x - big.x, t.z - big.z) < 320);
+  // (the first of a few partner towns whose railway can be built: routes depend on the land between)
+  const others = T.filter((t) => t !== big && t.pop > 800 && Math.hypot(t.x - big.x, t.z - big.z) > 150 && Math.hypot(t.x - big.x, t.z - big.z) < 340).slice(0, 4);
   AIController.forceBuild = true;
-  if (!other || big.pop < AIController.centrePop) console.log(`  (no big town: ${big.name} ${big.pop})`);
-  else {
-    ai.startProject('rail', [big.id, other.id]);
+  let st: Station | undefined, other: Town | undefined;
+  if (big.pop < AIController.centrePop) console.log(`  (no big town: ${big.name} ${big.pop})`);
+  else for (const o of others) {
+    ai.startProject('rail', [big.id, o.id]);
     while (ai.busy) g.update(0.25);
-    const st = [...g.stations.map.values()].find((s) => s.townId === big.id && s.owner === ai.companyId && s.rail);
-    console.log(`  ${big.name} (${big.pop}) - ${other.name}: ${ai.log.slice(-2).join(' | ')}; station ${st?.name} ${st?.rail?.level} ${st ? fmt(Math.hypot(st.x - big.x, st.z - big.z), 0) + ' u from the centre' : ''}`);
-    check(!!st && st.rail?.level === 'underground' && Math.hypot(st.x - big.x, st.z - big.z) < big.radius * 0.4, 'a big town gets its main-line station underground in the centre');
-    const l = g.lines.all().find((x) => x.owner === ai.companyId && x.kind === 'rail');
-    if (l) {
-      const trains = l.vehicles.map((id) => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train);
-      const c = arrivals(trains);
-      runDays(g, 300, () => c.tick(g));
-      const n = [...c.n.entries()].filter(([k]) => k.endsWith(':' + st!.id)).reduce((x, [, v]) => x + v, 0);
-      console.log(`  300 days: ${n} arrivals at ${st!.name}; ${trains.map((t) => t.status).join(' | ')}`);
-      check(n >= 2, 'trains call at the underground station');
-    }
+    console.log(`  ${big.name} (${big.pop}) - ${o.name}: ${ai.log.slice(-2).join(' | ')}`);
+    st = [...g.stations.map.values()].find((s) => s.townId === big.id && s.owner === ai.companyId && s.rail);
+    if (st && g.lines.all().some((l) => l.owner === ai.companyId && l.stops.includes(st!.id))) { other = o; break; }
   }
   AIController.forceBuild = false;
+  console.log(`  station ${st?.name} ${st?.rail?.level} ${st ? fmt(Math.hypot(st.x - big.x, st.z - big.z), 0) + ' u from the centre' : ''}${other ? ', line to ' + other.name : ''}`);
+  check(!!st && st.rail?.level === 'underground' && Math.hypot(st.x - big.x, st.z - big.z) < big.radius * 0.4, 'a big town gets its main-line station underground in the centre');
+  const l = st ? g.lines.all().find((x) => x.owner === ai.companyId && x.kind === 'rail' && x.stops.includes(st!.id)) : undefined;
+  if (l && st) {
+    const trains = l.vehicles.map((id) => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train);
+    const c = arrivals(trains);
+    runDays(g, 360, () => c.tick(g));
+    const n = [...c.n.entries()].filter(([k]) => k.endsWith(':' + st!.id)).reduce((x, [, v]) => x + v, 0);
+    console.log(`  a year: ${n} arrivals at ${st.name}; ${trains.map((t) => t.status).join(' | ')}`);
+    check(n >= 2, 'trains call at the underground station');
+  }
 }
 
 // ------------------------------------------------------------------ 6. cross-city link
@@ -216,16 +220,17 @@ if (want('crosscity')) {
   console.log('cross-city link');
   const g = flatGame(1024, 1);
   const me = 1, Z = 512;
-  const X = fakeTown(g, 'Westholm', 200, Z, 1500), C = fakeTown(g, 'Grand City', 512, Z, 9000, 60), Y = fakeTown(g, 'Eastholm', 824, Z, 1500);
+  const X = fakeTown(g, 'Westholm', 120, Z, 1500), C = fakeTown(g, 'Grand City', 512, Z, 9000, 60), Y = fakeTown(g, 'Eastholm', 904, Z, 1500);
   // west line: Westholm - Grand City West (its east end free, towards the centre); east line likewise
-  const sX = station(g, 200, Z, me), s1 = station(g, 462, Z, me), s2 = station(g, 562, Z, me), sY = station(g, 824, Z, me);
+  // (the termini far enough apart for the tunnels to reach the platforms below the centre at a railway's grade)
+  const sX = station(g, 120, Z, me), s1 = station(g, 380, Z, me), s2 = station(g, 644, Z, me), sY = station(g, 904, Z, me);
   let ok = !!build(g, nodeSnap(g, ends(g, sX, true)[0], 'rail'), nodeSnap(g, ends(g, s1, false)[0], 'rail'), railOpts(me), 'west line');
   ok = !!build(g, nodeSnap(g, ends(g, s2, true)[0], 'rail'), nodeSnap(g, ends(g, sY, false)[0], 'rail'), railOpts(me), 'east line') && ok;
   for (const st of [sX, s1, s2, sY]) connectStationThroat(g, st.id, me);
   const l1 = g.lines.create('rail', me), l2 = g.lines.create('rail', me);
   l1.stops = [sX.id, s1.id]; l2.stops = [s2.id, sY.id];
   autoSignalLine(g, l1.id, me); autoSignalLine(g, l2.id, me);
-  const d1 = depotNear(g, me, 300, Z), d2 = depotNear(g, me, 720, Z);
+  const d1 = depotNear(g, me, 250, Z), d2 = depotNear(g, me, 780, Z);
   const tr = [g.vehicles.buyTrain(d1, [M('diesel_b'), M('coach_ic'), M('coach_ic')], l1.id), g.vehicles.buyTrain(d2, [M('diesel_b'), M('coach_ic'), M('coach_ic')], l2.id)].filter((t): t is Train => t instanceof Train);
   check(ok && tr.length === 2 && [sX, s1].every((s) => s.townId !== -1) && s1.townId === C.id && s2.townId === C.id, 'two lines ending at termini on either side of a big town');
   const ai = AI(g);
@@ -234,8 +239,10 @@ if (want('crosscity')) {
   check(!!pair, 'the AI sees the two termini a link could join');
   AIController.forceBuild = true;
   ai.state.cooldown = 1e9;
+  // (the flat test map starts with the AI switched off: its work units run only while it is on)
+  g.aiEnabled = true;
   ai.startProject('crosscity', [C.id]);
-  while (ai.busy) g.update(0.25);
+  for (let k = 0; ai.busy && k < 40000; k++) g.update(0.25);
   AIController.forceBuild = false;
   const centre = [...g.stations.map.values()].find((s) => s.townId === C.id && s.rail?.level === 'underground');
   const line = g.lines.get(l1.id);
@@ -245,9 +252,9 @@ if (want('crosscity')) {
   if (line && centre) {
     const trains = line.vehicles.map((id) => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train);
     const c = arrivals(trains);
-    runDays(g, 400, () => c.tick(g));
+    runDays(g, 720, () => c.tick(g));
     const at = (st: Station) => trains.reduce((n, t) => n + (c.n.get(`${t.id}:${st.id}`) ?? 0), 0);
-    console.log(`  400 days: arrivals ${[sX, s1, centre, s2, sY].map((s) => `${s.name} ${at(s)}`).join(', ')}; ${trains.map((t) => t.status).join(' | ')}`);
+    console.log(`  two years: arrivals ${[sX, s1, centre, s2, sY].map((s) => `${s.name} ${at(s)}`).join(', ')}; ${trains.map((t) => t.status).join(' | ')}`);
     check(at(centre) >= 2 && at(sX) >= 1 && at(sY) >= 1, 'trains run through the city tunnel end to end');
     check(checkReservations(g).length === 0, 'reservations consistent');
   }

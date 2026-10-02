@@ -6,7 +6,7 @@
 // npx esbuild scripts/through.ts --bundle --platform=node --format=esm --outfile=$S/through.mjs && node $S/through.mjs
 import { Game, PLAYER } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
-import { stationEnds, nodeSnap, buildDepotOnLine, depotAtEnd } from '../src/game/routing';
+import { stationEnds, nodeSnap, buildDepotOnLine, buildRailDepot, depotAtEnd } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
 import { lineCompatibility, lineOperators, lineCongestion, Train } from '../src/game/train';
@@ -14,7 +14,8 @@ import { outAndBack, colorDistance } from '../src/game/lines';
 import { serialize, deserialize } from '../src/game/save';
 import type { Station } from '../src/game/stations';
 import type { Economy, Category } from '../src/game/economy';
-import { fails, check, fmt, build, free, railOpts, checkReservations } from './lib';
+import { fails, check, fmt, build, free, railOpts, checkReservations, connectDouble } from './lib';
+import { addPattern, setVehiclePattern } from '../src/game/patterns';
 
 const total = (e: Economy, cat: Category) => e.yearTotals.reduce((s, y) => s + y.v[cat], 0) + e.thisYear[cat];
 const M = (id: string) => MODEL_BY_ID.get(id)!;
@@ -177,6 +178,33 @@ function counter(trains: Train[]) {
   const inc = [PLAYER, 1, 2].map((o) => total(g.company(o).economy, 'income'));
   console.log(`  a year: visits ${v.join('/')}, income ${inc.map((x) => fmt(x / 1000, 0) + 'k').join(' / ')}; congestion ${lineCongestion(g, line.id).level}`);
   check(v.every((x) => x >= 4) && checkReservations(g).length === 0, 'no gridlock: every operator\'s train keeps serving the line');
+}
+
+// ------------------------------------------------------------------ 3b. short-turn pattern on directional double track
+{
+  console.log('short turn on double track');
+  const g = flatGame(768, 1);
+  const Z = 384;
+  const S = [120, 320, 520].map((x) => station(g, x, Z, PLAYER, 'standard', 'ground', 12));
+  const d1 = connectDouble(g, S[0], S[1], PLAYER, () => {}), d2 = connectDouble(g, S[1], S[2], PLAYER, () => {});
+  console.log(`  double track: ${d1.ok && d2.ok ? 'ok' : 'failed'}, crossovers ${d1.crossovers}+${d2.crossovers}, signals ${d1.signals}+${d2.signals}`);
+  const line = g.lines.create('rail', PLAYER);
+  line.stops = outAndBack(S.map((x) => x.id));
+  // the short-turn pattern: A - B and back (its trains turn at the middle station)
+  const turn = addPattern(g, line.id, 'local', line.stops.map((sid) => sid !== S[2].id), 'Short turn');
+  // (the depot behind the first station: trains leave it into the platforms)
+  const dep = buildRailDepot(g, S[0], PLAYER, { x: 1, z: 0 });
+  const trains = [0, 1].map(() => g.vehicles.buyTrain(dep, [M('diesel_b'), M('coach_ic')], line.id)).filter((t): t is Train => t instanceof Train);
+  if (turn && trains[1]) setVehiclePattern(g, trains[1].id, turn.id);
+  check(d1.ok && d2.ok && !!turn && trains.length === 2, 'double track A - B - C, a line with a short-turn pattern, two trains');
+  const c = counter(trains);
+  let noroute = 0;
+  runDays(g, 360, () => { c.tick(); for (const t of trains) if (t.state === 'noroute') noroute++; });
+  const v = trains.map((t) => c.visits.get(t.id) ?? 0);
+  console.log(`  a year: visits all-stops ${v[0]}, short turn ${v[1]}; noroute ticks ${noroute}; ${trains.map((t) => t.status).join(' | ')}`);
+  check(v[1] >= 4 && noroute < 20, 'the short-turn train turns at the middle station (no noroute)');
+  check(v[0] >= 3, 'the all-stops train keeps running');
+  check(checkReservations(g).length === 0, 'reservations consistent');
 }
 
 // ------------------------------------------------------------------ 4. the AI builds urban rail in a big town

@@ -273,7 +273,17 @@ if (isMain && process.argv[2] !== 'metrics' && process.argv[2] !== 'pairs') {
     g.company(nc.id).economy.money = 1e8;
     const ai = g.aiOf(nc.id)!;
     check(g.canUse(nc.id, owner) && !g.hasAccess(nc.id, owner), 'open access: the newcomer may use the AI network without an agreement');
-    check(ai.startShare(owner, A.id, B.id), 'the newcomer starts trains on the AI railway');
+    // (a company running services on a line owns one of its stations, UPDATE 9k: the newcomer's line runs on from
+    // B to a station of its own, C, on its own track joined to B's free end)
+    ai.state.cooldown = 1e9;
+    const C = stationAt(g, 352, Z, Math.PI / 2, 1, 12, nc.id)!;
+    const ec = C ? stationEnds(g, C) : [];
+    const joined = !!C && !!build(g, nodeSnap(g, eb[0].front, 'rail'), nodeSnap(g, ec[0].back, 'rail'), railOpts(nc.id), 'newcomer track');
+    const dN = C ? buildRailDepot(g, C, nc.id, { x: -1, z: 0 }) : -1;
+    const nl = g.lines.create('rail', nc.id);
+    nl.stops = [C?.id ?? -1, B.id, A.id, B.id];
+    const nt = dN >= 0 ? g.vehicles.buyTrain(dN, [loco(), coach()], nl.id) : 'no depot';
+    check(joined && typeof nt !== 'string', `the newcomer runs a line from its own station onto the AI railway (${typeof nt === 'string' ? nt : 'train bought'})`);
     g.aiEnabled = true;
     let visits = 0, prev = '';
     const tr = () => g.vehicles.all().find((v) => v.owner === nc.id && v instanceof Train) as Train | undefined;
@@ -289,7 +299,7 @@ if (isMain && process.argv[2] !== 'metrics' && process.argv[2] !== 'pairs') {
     const ag = g.agreement(nc.id, owner);
     console.log(`  open access: newcomer ${ai.log.slice(-2).join(' | ')}; train ${tr()?.status}; agreement ${!!ag}, paid ${fmt(ag?.paidTotal ?? 0, 0)}; requests ${g.requestsBy(nc.id).length}`);
     check(!g.requestsBy(nc.id).length && !g.accessRequests.length, 'no access request was needed');
-    check(!!tr() && visits >= 2 && !!ag && (ag?.paidTotal ?? 0) > 0, 'the newcomer\'s train serves the AI stations and pays its share (agreement made on first use)');
+    check(!!tr() && visits >= 3 && !!ag && (ag?.paidTotal ?? 0) > 0, 'the newcomer\'s train serves the AI stations and pays its share (agreement made on first use)');
   }
 
   // ---- 3. loop lines: a ring railway (two stations, a loop at each end) and a circular bus line
