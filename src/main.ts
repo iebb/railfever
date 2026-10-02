@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { Game, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
-import { saveToSlot, listSlots, loadFromSlot, slotsReady } from './game/save';
+import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot } from './game/save';
 import { loadFonts } from './ui/fonts';
 import { defaultTowns, DEFAULT_MAP_SIZE } from './ui/title';
 import { aiConfigsFor, MAX_AI } from './ui/gameapi';
@@ -28,6 +28,7 @@ let game: Game | null = null;
 const AUTOSAVE_EVERY = 60;
 let autosaveTimer = 0;
 let saving = false;
+let autosaveNeedsBackup = false;
 /** the current world has been played (title closed, or started from "New game") */
 let played = false;
 
@@ -88,7 +89,10 @@ async function autosave(reason: string) {
   if (ui.titleOpen && !played) return;
   saving = true;
   ui.hud.showSave('saving');
-  try { await saveToSlot(game, 'autosave', 'Autosave'); ui.hud.showSave('saved'); } catch (e) { console.warn('autosave failed (' + reason + ')', e); ui.hud.showSave('error'); }
+  try {
+    if (autosaveNeedsBackup) { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
+    await saveToSlot(game, 'autosave', 'Autosave'); ui.hud.showSave('saved');
+  } catch (e) { console.warn('autosave failed (' + reason + ')', e); ui.hud.showSave('error'); }
   saving = false;
   autosaveTimer = 0;
 }
@@ -136,12 +140,18 @@ async function boot() {
   const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies);
   // the autosave (IndexedDB) becomes the current game unless ?new asks for a fresh map
   showLoading('Loading…');
-  await Promise.race([slotsReady, new Promise<void>((r) => setTimeout(r, 4000))]);
+  await slotsReady;
   const auto = params.has('new') ? undefined : listSlots().find((s) => s.slot === 'autosave');
   let resumed = false;
   if (auto) {
     showLoading('Loading your game…');
-    try { setGame(await loadFromSlot('autosave')); resumed = true; } catch (e) { console.error(e); ui.toast('Could not load the autosave — here is a new map', 'bad'); }
+    try { setGame(await loadFromSlot('autosave')); resumed = true; } catch (e) {
+      console.error(e);
+      autosaveNeedsBackup = true;
+      try { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
+      catch (backupError) { console.warn('Could not back up the failed autosave', backupError); }
+      ui.toast('Could not load the autosave — here is a new map', 'bad');
+    }
   }
   if (!game) {
     showLoading(genText(size));

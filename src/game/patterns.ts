@@ -690,9 +690,10 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
  * mode and shape) becomes a service pattern of it — short-turn or skipping stops — with its vehicles (they keep
  * their owner), its waiting passengers and its history; the surviving (longer, else older) line keeps its name,
  * colour and code. Lines that only share part of their route (X-A-B-Y and G-A-B-H) stay apart. `lineId`: only
- * merges involving that line. Returns what was merged (for news / the UI).
+ * merges involving that line. `sameOwnerOnly`: old-save upgrades must not silently create shared lines.
+ * Returns what was merged (for news / the UI).
  */
-export function canonicalizeLines(g: Game, lineId?: number): MergeNotice[] {
+export function canonicalizeLines(g: Game, lineId?: number, options: { sameOwnerOnly?: boolean } = {}): MergeNotice[] {
   const out: MergeNotice[] = [];
   for (let guard = 0; guard < 200; guard++) {
     let found: { a: Line; b: Line; dir: 1 | -1 } | null = null;
@@ -700,6 +701,7 @@ export function canonicalizeLines(g: Game, lineId?: number): MergeNotice[] {
     for (const a of ls) {
       for (const b of ls) {
         if (a === b) continue;
+        if (options.sameOwnerOnly && a.owner !== b.owner) continue;
         if (lineId !== undefined && a.id !== lineId && b.id !== lineId) continue;
         const d = mergeable(g, a, b);
         if (!d) continue;

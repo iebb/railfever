@@ -15,9 +15,11 @@ import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
 import { KMH_TO_UPS } from './constants';
 import type { Vehicle, CargoGroup } from './vehicle';
-import { putSave, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
+import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
+import type { StoredSave } from './storage';
 import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
+import { migrateElectricTrains } from './migrate';
 
 const VERSION = 2;
 
@@ -255,7 +257,7 @@ export function deserialize(d: any): Game {
   for (const l of d.lines as Line[]) g.lines.map.set(l.id, Lines.restore(l));
   g.lines.nextId = d.linesNextId;
   for (const [k, r] of (d.linesRedirect ?? []) as [number, { line: number; pattern: number }][]) g.lines.redirect.set(k, { line: r.line, pattern: r.pattern });
-  loadOps(g, d.ops);
+  try { loadOps(g, d.ops); } catch (e) { console.warn('Save load: loadOps failed', e); }
   g.firstArrival = new Set(d.firstArrival ?? []);
   g.news = (d.news ?? []).map((n: any) => ({ ...n }));
 
@@ -339,22 +341,34 @@ export function deserialize(d: any): Game {
   if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
+  if (!d.opsVersion) {
+    try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
+  }
   // older maps: town streets ending on a bridge are cut back to the ground (9i)
-  g.towns.tidyBridgeEnds();
+  try { g.towns.tidyBridgeEnds(); } catch (e) { console.warn('Save load: tidyBridgeEnds failed', e); }
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
-  g.lines.rebuild();
+  try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
   g.lines.catchmentDirty = !!d.catchmentDirty;
   // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
-  if (!d.opsVersion) canonicalizeLines(g);
+  if (!d.opsVersion) {
+    try { for (const n of canonicalizeLines(g, undefined, { sameOwnerOnly: true })) g.postNews(n.text, 'info'); }
+    catch (e) { console.warn('Save load: canonicalizeLines failed', e); }
+  }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
-  g.restoreAIs(d);
+  try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;
-  w.dirtyObj.clear(); w.dirtyTerrain.clear();
+  // Upgrades can remove old road ends or add wire: refresh saved paths before this game can be re-saved.
+  if (!d.opsVersion) {
+    try { g.flushNetworkChanges(); } catch (e) { console.warn('Save load: refresh upgraded paths failed', e); }
+  }
+  // Keep chunks dirtied by the old-save upgrades (in particular the new overhead wire).
+  if (d.opsVersion) w.dirtyObj.clear();
+  w.dirtyTerrain.clear();
   return g;
 }
 
@@ -401,12 +415,30 @@ export async function saveToSlot(g: Game, slot: string, name: string): Promise<v
   slotCache = [meta, ...slotCache.filter((s) => s.slot !== slot)].sort((a, b) => b.saved - a.saved);
 }
 
+async function backupRecord(rec: StoredSave, slot: string, name: string, once: boolean): Promise<void> {
+  const old = rec.meta as Partial<SlotInfo> | null;
+  const meta: SlotInfo = { slot, name, date: old?.date ?? '', saved: old?.saved ?? Date.now(), money: old?.money ?? 0 };
+  const backup: StoredSave = { slot, data: typeof rec.data === 'string' ? rec.data : rec.data.slice(), meta };
+  if (once) await putSaveOnce(backup);
+  else await putSave(backup);
+  await refreshSlots();
+}
+
+/** Copy the stored bytes, including saves that cannot be parsed or loaded. */
+export async function backupSlot(source: string, slot: string, name: string): Promise<void> {
+  await slotsReady;
+  const rec = await getSave(source);
+  if (rec) await backupRecord(rec, slot, name, false);
+}
+
 export async function loadFromSlot(slot: string): Promise<Game> {
   await slotsReady;
   const rec = await getSave(slot);
   if (!rec) throw new Error('Empty slot');
   const text = typeof rec.data === 'string' ? await gunzip(rec.data) : await gunzipBytes(rec.data);
-  return deserialize(JSON.parse(text));
+  const d = JSON.parse(text);
+  if (slot === 'autosave' && d && !d.opsVersion) await backupRecord(rec, 'autosave-v2.3', 'Autosave (v2.3 backup)', true);
+  return deserialize(d);
 }
 
 /** Known save slots, newest first (complete once `slotsReady` has resolved). */

@@ -41,6 +41,26 @@ export async function putSave(rec: StoredSave): Promise<void> {
   await tx(db, 'readwrite', (s) => s.put(rec));
 }
 
+/** Create a backup atomically; another tab or a later load must never replace the first copy. */
+export async function putSaveOnce(rec: StoredSave): Promise<boolean> {
+  const db = await openDb();
+  if (!db) {
+    if (memory.has(rec.slot)) return false;
+    memory.set(rec.slot, rec);
+    return true;
+  }
+  return new Promise((resolve, reject) => {
+    const t = db.transaction(STORE, 'readwrite');
+    const s = t.objectStore(STORE);
+    const req = s.get(rec.slot);
+    let inserted = false;
+    req.onsuccess = () => { if (req.result === undefined) { s.add(rec); inserted = true; } };
+    t.oncomplete = () => resolve(inserted);
+    t.onerror = () => reject(t.error ?? req.error);
+    t.onabort = () => reject(t.error ?? new Error('Storage transaction aborted'));
+  });
+}
+
 export async function getSave(slot: string): Promise<StoredSave | null> {
   const db = await openDb();
   if (!db) return memory.get(slot) ?? null;
