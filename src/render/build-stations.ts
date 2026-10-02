@@ -1,6 +1,6 @@
 // Rail stations (platforms with ramps, canopies, signage, station building, footbridge) and depots.
 import type { Station, RailPart } from '../game/stations';
-import { stationLayout } from '../game/stations';
+import { railWidth } from '../game/stations';
 import type { Depot } from '../game/build-ops';
 import { depotSize } from '../game/build-ops';
 import { ChunkCtx, Smp, RailPartX, StationEntrance, stationLevelOf, inChunk, stationFrame } from './build-common';
@@ -83,8 +83,21 @@ function platformsAndCanopies(ctx: ChunkCtx, r: RailPart, color: number) {
   for (const p of r.platforms) {
     const [cx, cz] = at(p.off, 0);
     platform(W, cx, cz, fx, fz, p.w, PL, y - 0.1, PY);
-    // white coping and yellow safety lines along both edges (thin raised strips on the flat part)
+    // white coping and yellow safety lines along both edges (thin raised strips on the flat part); a low
+    // fence where a through track (no stopping trains) runs next to the platform edge
+    const thr = r.throughOffsets ?? [];
     for (const s of [-1, 1]) {
+      const edgeOff = p.off + s * p.w / 2;
+      const nearT = [...r.trackOffsets, ...thr].reduce((best, o) => ((o - edgeOff) * s > 0 && Math.abs(o - edgeOff) < Math.abs(best - edgeOff) ? o : best), Infinity);
+      if (thr.includes(nearT) && Math.abs(nearT - edgeOff) < 0.45) {
+        const [gx, gz] = at(edgeOff - s * 0.03, 0);
+        D.use(WC.METAL, 0x6d757b);
+        D.box(gx, PY, gz, 0.008, 0.1, PL - 0.9, fx, fz);
+        for (let a = -(PL - 0.9) / 2; a <= (PL - 0.9) / 2 + 1e-6; a += 0.5) {
+          const [qx, qz] = at(edgeOff - s * 0.03, a);
+          D.box(qx, PY, qz, 0.014, 0.11, 0.014, fx, fz);
+        }
+      }
       const [ex, ez] = at(p.off + s * (p.w / 2 - 0.02), 0);
       W.use(WC.PLAIN, 0xeceae4, 0);
       W.box(ex, PY, ez, 0.04, 0.003, PL - 0.8, fx, fz);
@@ -438,8 +451,8 @@ function elevatedStation(ctx: ChunkCtx, st: Station, r: RailPartX, color: number
   const W = ctx.w, D = ctx.d;
   const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
   const L = r.length;
-  const lay = stationLayout(r.tracks);
-  const half = lay.width / 2 + 0.16;
+  const width = railWidth(r);
+  const half = width / 2 + 0.16;
   const at = (off: number, along: number): [number, number] => [r.x + rx * off + fx * along, r.z + rz * off + fz * along];
   const top = r.y - 0.05, bot = r.y - 0.25;
   const PY = r.y + PLATFORM_Y;
@@ -453,14 +466,14 @@ function elevatedStation(ctx: ChunkCtx, st: Station, r: RailPartX, color: number
       W.box(ex, bot + 0.05, ez, 0.008, 0.035, L + 0.1, fx, fz, false);
       boardText(D, ex + rx * sg * 0.004, (top + bot) / 2 + 0.03, ez + rz * sg * 0.004, rx * sg, rz * sg, Math.min(1.2, L * 0.12), 0.08, color);
       // parapet (higher where a platform runs along the edge)
-      const edgePlat = r.platforms.some((p) => Math.abs(p.off * sg + p.w / 2 - lay.width / 2) < 0.05 && p.off * sg > 0);
+      const edgePlat = r.platforms.some((p) => Math.abs(p.off * sg + p.w / 2 - width / 2) < 0.35 && p.off * sg > 0);
       const pt = edgePlat ? PY + 0.11 : top + 0.12;
       const [px, pz] = at(sg * (half - 0.02), 0);
       W.use(WC.CONCRETE, 0xc4c0b8, 1);
       W.tbox(px, top, pz, 0.04, pt - top, L + 0.1, fx, fz, WSCALE.CONCRETE, false, true);
       if (edgePlat) {
         // walkway between the platform edge and the parapet
-        const [wx, wz] = at(sg * (lay.width / 2 + 0.07), 0);
+        const [wx, wz] = at(sg * (width / 2 + 0.07), 0);
         W.use(WC.PLATFORM, 0xd2cec6, 0);
         W.tbox(wx, top, wz, 0.14, PY - top, L - 0.2, fx, fz, WSCALE.PLATFORM, false, true);
       }

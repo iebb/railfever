@@ -156,13 +156,24 @@ export function buildRailNode(ctx: ChunkCtx, node: NNode) {
   if (node.signal && node.edges.length === 2) buildSignals(ctx, node);
 }
 
+/**
+ * Signals at a node, one per direction a train may leave in (a red no-entry board where it may not).
+ * Path signals (junctions, station entries, starters): two-lens head with a white diamond plate;
+ * block signals (open line): one-lens head with a white plate with a black band; one-way signals passable
+ * from behind carry a small yellow plate; starters (leaving a platform) a route indicator above the head.
+ */
 function buildSignals(ctx: ChunkCtx, node: NNode) {
   const net = ctx.game.world.net;
+  const block = node.signalKind === 'block';
   for (const side of [1, -1]) {
     const sf = net.signalFor(node, side);
     if (!sf) continue;
-    let out: NEdge | null = null;
-    for (const id of node.edges) { const e = net.edges.get(id); if (e && net.sideAt(e, node.id) === side) out = e; }
+    let out: NEdge | null = null, other: NEdge | null = null;
+    for (const id of node.edges) {
+      const e = net.edges.get(id);
+      if (!e) continue;
+      if (net.sideAt(e, node.id) === side) out = e; else other = e;
+    }
     if (!out) continue;
     const d = net.leaveDir(out, node.id);
     // right-hand side of a train travelling along d
@@ -170,22 +181,56 @@ function buildSignals(ctx: ChunkCtx, node: NNode) {
     const x = node.x + rx * 0.3 - d.x * 0.05, z = node.z + rz * 0.3 - d.z * 0.05;
     const y = node.y + bedOffset(out);
     const D = ctx.d;
+    const fx = -d.x, fz = -d.z; // faces the train
     if (sf > 0) {
+      const starter = !block && !!other && other.station >= 0 && out.station < 0;
       D.use(WC.METAL, 0x5a6064);
-      D.cylinder(x, y - 0.1, z, 0.009, 0.62, 6);
+      D.cylinder(x, y - 0.1, z, 0.009, starter ? 0.72 : 0.62, 6);
+      const top = y + 0.52;
       D.use(WC.PLAIN, 0x1c1e20);
-      D.box(x, y + 0.42, z, 0.055, 0.13, 0.04, -d.x, -d.z, false);
-      // sun hood
-      D.box(x - d.x * 0.025, y + 0.53, z - d.z * 0.025, 0.05, 0.008, 0.03, -d.x, -d.z, false);
-      ctx.sigLamps.push({ x: x - d.x * 0.022, y: y + 0.5, z: z - d.z * 0.022, edge: out.id });
+      if (block) {
+        D.box(x, top - 0.08, z, 0.05, 0.08, 0.04, fx, fz, false);
+        D.box(x + fx * 0.02, top - 0.005, z + fz * 0.02, 0.046, 0.007, 0.03, fx, fz, false);
+        ctx.sigLamps.push({ x: x + fx * 0.022, y: top - 0.04, z: z + fz * 0.022, edge: out.id });
+        // white plate with a black band (automatic block signal)
+        D.use(WC.PLAIN, 0xf2f2ee);
+        D.box(x + fx * 0.012, top - 0.16, z + fz * 0.012, 0.05, 0.04, 0.004, fx, fz, false);
+        D.use(WC.PLAIN, 0x1c1e20);
+        D.box(x + fx * 0.015, top - 0.145, z + fz * 0.015, 0.052, 0.01, 0.003, fx, fz, false);
+      } else {
+        D.box(x, top - 0.13, z, 0.055, 0.13, 0.04, fx, fz, false);
+        D.box(x + fx * 0.02, top - 0.005, z + fz * 0.02, 0.05, 0.007, 0.03, fx, fz, false);
+        ctx.sigLamps.push({ x: x + fx * 0.022, y: top - 0.035, z: z + fz * 0.022, edge: out.id });
+        // dark second lens
+        D.use(WC.PLAIN, 0x3a3d40);
+        D.box(x + fx * 0.021, top - 0.1, z + fz * 0.021, 0.024, 0.024, 0.004, fx, fz, false);
+        // white diamond plate (path signal)
+        const px = x + fx * 0.012, pz = z + fz * 0.012, py = top - 0.2, h = 0.026;
+        const ux = -fz, uz = fx;
+        D.use(WC.PLAIN, 0xf4f4f0);
+        D.ttri(px - ux * h, py, pz - uz * h, 0, 0, px + ux * h, py, pz + uz * h, 0, 0, px, py + h, pz, 0, 0, fx, 0, fz);
+        D.ttri(px - ux * h, py, pz - uz * h, 0, 0, px, py - h, pz, 0, 0, px + ux * h, py, pz + uz * h, 0, 0, fx, 0, fz);
+        if (starter) {
+          // route indicator box above the head (station starter)
+          D.use(WC.PLAIN, 0x1c1e20);
+          D.box(x, top + 0.005, z, 0.06, 0.05, 0.035, fx, fz, false);
+          D.use(WC.LAMP, 0xf6f2e4);
+          D.box(x + fx * 0.018, top + 0.022, z + fz * 0.018, 0.026, 0.016, 0.004, fx, fz, false);
+        }
+      }
+      if (node.signalPass && node.signal >= 2) {
+        // passable from behind: small yellow plate on the back of the mast
+        D.use(WC.PLAIN, 0xe8c230);
+        D.box(x - fx * 0.012, y + 0.2, z - fz * 0.012, 0.03, 0.03, 0.004, fx, fz, false);
+      }
     } else {
       // no-entry board for the blocked direction
       D.use(WC.METAL, 0x9aa0a4);
       D.cylinder(x, y - 0.1, z, 0.006, 0.4, 5);
       D.use(WC.PLAIN, 0xc8322a);
-      D.box(x, y + 0.24, z, 0.08, 0.08, 0.008, -d.x, -d.z, false);
+      D.box(x, y + 0.24, z, 0.08, 0.08, 0.008, fx, fz, false);
       D.use(WC.PLAIN, 0xffffff);
-      D.box(x - d.x * 0.005, y + 0.275, z - d.z * 0.005, 0.06, 0.012, 0.004, -d.x, -d.z, false);
+      D.box(x + fx * 0.005, y + 0.275, z + fz * 0.005, 0.06, 0.012, 0.004, fx, fz, false);
     }
   }
 }

@@ -343,6 +343,8 @@ export class Overlay {
   private crossMats = new Map<string, THREE.MeshBasicMaterial>();
   private linePaths = new Map<number, ScreenRibbon>();
   private catch = new Map<string, { fill: GhostMesh; edge: ScreenRibbon }>();
+  private trackLayers: ScreenRibbon[] = [];
+  private segLayers = new Map<string, ScreenRibbon>();
   private hoverKey = '';
   private time = 0;
   private buf = new Buf();
@@ -393,6 +395,7 @@ export class Overlay {
     this.disc.set(null);
     this.sigs.set(null);
     this.setCatchments('hover', null);
+    this.setSegments('throat', null);
     for (const m of this.markers.values()) m.visible = false;
   }
 
@@ -580,6 +583,9 @@ export class Overlay {
     for (const p of pl.layout.platforms) flatRect(b, pl.x + rx * p.off, pl.z + rz * p.off, pl.angle, p.w, pl.length * 0.96, y + 0.1, cp);
     const ct = col(pl.ok ? 0x1d4f30 : 0x6e1d1d).clone();
     for (const o of pl.layout.trackOffsets) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.16, pl.length, y + 0.05, ct);
+    // through tracks (no platform) run the full length and a little beyond
+    const cth = col(pl.ok ? 0x4fc3ff : 0xff9a8a).clone();
+    for (const o of pl.layout.throughOffsets ?? []) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.2, pl.length + 1.2, y + 0.06, cth);
     // street-level access: the station building, or entrance pavilions / stair towers (red: no road beside it)
     const ce = col(pl.ok ? 0xf3e7c4 : 0xffb3a8).clone(), cno = col(0xff8a7a).clone();
     if (level === 'ground') { const bd = pl.building; flatRect(b, bd.x, bd.z, bd.angle, bd.w, bd.d, y + 0.3, ce); }
@@ -675,12 +681,12 @@ export class Overlay {
    * Planned signals: a post with an arrow head pointing the way trains may pass (two-way: a diamond); signals
    * already there are drawn grey.
    */
-  setSignalGhosts(spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean }[] | null) {
+  setSignalGhosts(spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color?: number }[] | null) {
     if (!spots || !spots.length) { this.sigs.set(null); return; }
     const b = this.buf.clear();
     for (const s of spots) {
       const l = Math.hypot(s.dx, s.dz) || 1, fx = s.dx / l, fz = s.dz / l, rx = fz, rz = -fx;
-      const c = col(s.existing ? 0x9aa5b4 : 0xffb020).clone();
+      const c = col(s.color ?? (s.existing ? 0x9aa5b4 : 0xffb020)).clone();
       const y = s.y + 0.35, k = 0.5;
       // post beside the track
       boxRect(b, s.x + rx * 0.55, s.z + rz * 0.55, Math.atan2(fx, fz), 0.12, 0.12, s.y, s.y + 0.9, c);
@@ -692,6 +698,36 @@ export class Overlay {
       }
     }
     this.sigs.set(b);
+  }
+
+  /**
+   * Coloured track layers in screen space (e.g. signal blocks by occupancy): each layer is a set of polylines
+   * (xyz) drawn with its colour and width (px), later layers on top. Null clears them.
+   */
+  setTrackLayers(layers: { pts: Float32Array[]; color: number; width: number }[] | null) {
+    const n = layers?.length ?? 0;
+    while (this.trackLayers.length < n) this.trackLayers.push(new ScreenRibbon(this.group, 46 + this.trackLayers.length));
+    this.trackLayers.forEach((r, i) => {
+      const L = layers?.[i];
+      if (!L || !L.pts.length) { r.set(null); return; }
+      r.style = { width: L.width, opacity: 0.95, casing: 1, caseAlpha: 0.6, chevrons: false };
+      r.set(L.pts.map((pts) => ({ pts, color: L.color })));
+    });
+  }
+
+  /** Straight guide segments (e.g. the throat connections of a station inserted into a line), keyed layers. */
+  setSegments(key: string, segs: { x0: number; z0: number; x1: number; z1: number }[] | null, color = 0xffd84a) {
+    let r = this.segLayers.get(key);
+    if (!segs || !segs.length) { r?.set(null); return; }
+    if (!r) { r = new ScreenRibbon(this.group, 53); r.style = { width: 3, opacity: 0.95, casing: 1, caseAlpha: 0.6, chevrons: false }; this.segLayers.set(key, r); }
+    const w = this.game.world;
+    const y = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y) + 0.4;
+    r.set(segs.map((q) => {
+      const n = Math.max(2, Math.ceil(Math.hypot(q.x1 - q.x0, q.z1 - q.z0) / 2) + 1);
+      const pts = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { const t = i / (n - 1), x = q.x0 + (q.x1 - q.x0) * t, z = q.z0 + (q.z1 - q.z0) * t; pts[i * 3] = x; pts[i * 3 + 1] = y(x, z); pts[i * 3 + 2] = z; }
+      return { pts, color };
+    }));
   }
 
   /** Dim the world under map views (0 = off). */
@@ -810,6 +846,7 @@ export class Overlay {
   dispose() {
     for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, this.arcs, this.shareRings, this.sigs, ...this.linePaths.values()]) g.dispose();
     for (const L of this.catch.values()) { L.fill.dispose(); L.edge.dispose(); }
+    for (const r of [...this.trackLayers, ...this.segLayers.values()]) r.dispose();
     for (const g of Object.values(this.markerGeo)) g.dispose();
     for (const m of this.markers.values()) (m.material as THREE.Material).dispose();
     for (const m of this.crossMats.values()) m.dispose();

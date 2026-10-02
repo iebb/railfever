@@ -20,6 +20,7 @@ import { demandView, stationDemand } from '../game/demand';
 import { townDemandShare } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
 import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, ENTRANCE_COST, planStationUpgrade, commitStationUpgrade } from '../game/stations';
+import { connectStationThroat } from '../game/trackops';
 import { field, seg } from './dom';
 import { servedColor, hexCss } from './mapmodes';
 
@@ -42,7 +43,7 @@ export function openStation(ui: UI, id: number) {
   const co = g.company(st.owner);
   const win = ui.wm.open('station-' + id, st.name, { width: 400, icon: st.rail ? 'station' : 'busstop', color: co.color });
   /** pending rebuild (platform length / tracks / level) of the station window's Build tab */
-  const up: { length: number; tracks: number; level: StationLevel } = { length: st.rail?.length ?? DEFAULT_PLATFORM_LENGTH, tracks: st.rail?.tracks ?? 2, level: st.rail?.level ?? 'ground' };
+  const up: { length: number; tracks: number; through: number; level: StationLevel } = { length: st.rail?.length ?? DEFAULT_PLATFORM_LENGTH, tracks: st.rail?.tracks ?? 2, through: st.rail?.through ?? 0, level: st.rail?.level ?? 'ground' };
   let upCache: { key: string; plan: UpgradePlan } | null = null;
   const render = () => {
     const s = g.stations.get(id);
@@ -57,7 +58,7 @@ export function openStation(ui: UI, id: number) {
     const rerender = () => { win.last = undefined; render(); };
     if (win.tab === 'overview') {
       const parts: string[] = [];
-      if (s.rail) parts.push(`${s.rail.tracks} track${s.rail.tracks > 1 ? 's' : ''} × ${Math.round(s.rail.length * 10)} m`);
+      if (s.rail) parts.push(`${s.rail.tracks} track${s.rail.tracks > 1 ? 's' : ''}${s.rail.through ? ` + ${s.rail.through} through` : ''} × ${Math.round(s.rail.length * 10)} m`);
       const tramN = s.stops.filter((p) => !!g.world.net.edges.get(p.edge)?.tram).length;
       if (s.stops.length - tramN) parts.push(`${s.stops.length - tramN} bus stop${s.stops.length - tramN > 1 ? 's' : ''}`);
       if (tramN) parts.push(`${tramN} tram stop${tramN > 1 ? 's' : ''}`);
@@ -124,8 +125,8 @@ export function openStation(ui: UI, id: number) {
       }
     } else {
       buildTab(ui, s, up, () => {
-        const key = `${up.length}|${up.tracks}|${up.level}|${g.networkVersion}|${g.economy.money > 0}`;
-        if (!upCache || upCache.key !== key) upCache = { key, plan: planStationUpgrade(g, s.id, { length: up.length, tracks: up.tracks, level: up.level }) };
+        const key = `${up.length}|${up.tracks}|${up.through}|${up.level}|${g.networkVersion}|${g.economy.money > 0}`;
+        if (!upCache || upCache.key !== key) upCache = { key, plan: planStationUpgrade(g, s.id, { length: up.length, tracks: up.tracks, through: up.through, level: up.level }) };
         return upCache.plan;
       }, rerender, win.body);
     }
@@ -223,16 +224,17 @@ export function startEntrance(ui: UI, stationId: number) {
 }
 
 /** Build tab: rebuild (platform length, tracks, level), entrances, move the station. */
-function buildTab(ui: UI, s: Station, up: { length: number; tracks: number; level: StationLevel }, plan: () => UpgradePlan, after: () => void, body: HTMLElement) {
+function buildTab(ui: UI, s: Station, up: { length: number; tracks: number; through: number; level: StationLevel }, plan: () => UpgradePlan, after: () => void, body: HTMLElement) {
   const g = ui.game;
   const r = s.rail;
   if (!r) { add(body, h('div', { class: 'pad' }, 'Bus and tram stops have nothing to rebuild. Move a stop by removing it and building a new one.')); return; }
-  const changed = up.length !== r.length || up.tracks !== r.tracks || up.level !== r.level;
+  const changed = up.length !== r.length || up.tracks !== r.tracks || up.through !== (r.through ?? 0) || up.level !== r.level;
   const pl = changed ? plan() : null;
   add(body,
     section('Rebuild', changed ? 'planned' : 'as built'),
     field('Platforms', stepper(`${Math.round(up.length * 10)} m`, () => { up.length = Math.max(4, up.length - 2); after(); }, () => { up.length = Math.min(40, up.length + 2); after(); }, 'Platform length')),
-    field('Tracks', stepper(String(up.tracks), () => { up.tracks = Math.max(1, up.tracks - 1); after(); }, () => { up.tracks = Math.min(6, up.tracks + 1); after(); })),
+    field('Tracks', stepper(String(up.tracks), () => { up.tracks = Math.max(1, up.tracks - 1); after(); }, () => { up.tracks = Math.min(6, up.tracks + 1); after(); }), 'With platforms'),
+    field('Through', stepper(String(up.through), () => { up.through = Math.max(0, up.through - 1); after(); }, () => { up.through = Math.min(2, up.through + 1); after(); }), 'Without platforms, for trains that do not stop'),
     field('Level', seg<StationLevel>([['ground', 'Ground'], ['elevated', 'Elevated'], ['underground', 'Underground']], up.level, (v) => { up.level = v; after(); })),
     pl ? h('div', { class: 'kv' }, h('span', { class: 'k' }, pl.ok ? 'Cost' : 'Not possible'), h('span', { class: 'v ' + (pl.ok ? '' : 'neg') }, pl.ok ? fmtMoney(pl.cost) : pl.error ?? 'Cannot rebuild')) : null,
     pl && pl.warnings.length ? h('div', { class: 'warn' }, icon('warning', 16), pl.warnings.join(' · ')) : null,
@@ -246,7 +248,7 @@ function buildTab(ui: UI, s: Station, up: { length: number; tracks: number; leve
         ui.toast(`${s.name} rebuilt`, 'good');
         after();
       } }, icon('upgrade', 16), pl && pl.ok ? `Rebuild for ${fmtMoney(pl.cost)}` : 'Rebuild'),
-      changed ? h('button', { class: 'btn ghost', onclick: () => { up.length = r.length; up.tracks = r.tracks; up.level = r.level; after(); } }, 'Reset') : null,
+      changed ? h('button', { class: 'btn ghost', onclick: () => { up.length = r.length; up.tracks = r.tracks; up.through = r.through ?? 0; up.level = r.level; after(); } }, 'Reset') : null,
       h('span', { class: 'spacer' }),
       h('button', { class: 'btn', 'data-tip': 'Place the station somewhere else; lines and passengers move with it', onclick: () => {
         const T = ui.tools;
@@ -258,6 +260,21 @@ function buildTab(ui: UI, s: Station, up: { length: number; tracks: number; leve
         T.refreshHover();
         ui.hud.onToolChange();
       } }, icon('move', 16), 'Move')));
+  // platform / through tracks left unconnected where other tracks of the station are connected
+  const net = g.world.net, own = new Set([...r.edges, ...(r.throughEdges ?? [])]);
+  const ends = g.stations.trackEnds(s, true);
+  const open = (nid: number) => (net.nodes.get(nid)?.edges.filter((id) => !own.has(id)).length ?? 0) === 0;
+  const loose = ends.reduce((a, t) => a + (open(t.front) ? 1 : 0) + (open(t.back) ? 1 : 0), 0);
+  const tied = ends.length * 2 - loose;
+  if (loose && tied) {
+    add(body, section('Track connections', `${loose} open track end${loose > 1 ? 's' : ''}`),
+      h('div', { class: 'btns' }, h('button', { class: 'btn', 'data-tip': 'Lay turnouts from the open platform and through tracks onto the connected ones', onclick: () => {
+        const res = connectStationThroat(g, s.id, PLAYER);
+        if (res.connected) { ui.sound('build-rail', { x: s.x, z: s.z }); ui.toast(`${res.connected} track${res.connected > 1 ? 's' : ''} connected${res.failed.length ? ` — ${res.failed[0]}` : ''}`, res.failed.length ? 'info' : 'good'); }
+        else ui.toast(res.failed[0] ?? 'Nothing to connect', 'bad');
+        after();
+      } }, icon('rail', 16), 'Connect station tracks')));
+  }
   if (r.level !== 'ground') {
     add(body, section('Entrances', String(r.entrances.length)),
       h('div', { class: 'list' }, r.entrances.map((e, i) => {
@@ -283,7 +300,7 @@ function accessRows(ui: UI, owner: number, upkeepYear: number, after: () => void
   const m = g.accessMultiplier(owner);
   return h('div', null,
     ui.kv('Owner', h('span', { class: 'inline' }, ui.ownerTag(owner), h('button', { class: 'ibtn sm', 'data-tip': 'Track access', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 15)))),
-    ui.kv('Track access', h('span', { class: 'inline' }, h('span', { class: st.kind === 'agreement' ? 'pos' : st.kind === 'blocked' || st.kind === 'closed' ? 'neg' : 'muted' }, st.kind === 'agreement' ? 'Agreement' : st.kind === 'pending' ? 'Request pending' : st.kind === 'blocked' ? 'Blocked' : st.kind === 'closed' ? 'Refused' : policyText(g, owner)),
+    ui.kv('Track access', h('span', { class: 'inline' }, h('span', { class: st.kind === 'agreement' ? 'pos' : st.kind === 'blocked' || st.kind === 'closed' ? 'neg' : 'muted' }, st.kind === 'agreement' ? (g.hasAccess(PLAYER, owner) ? 'Agreement' : 'Open network') : st.kind === 'pending' ? 'Request pending' : st.kind === 'blocked' ? 'Blocked' : st.kind === 'closed' ? 'Refused' : policyText(g, owner)),
       st.kind === 'agreement' ? null : accessControl(ui, owner, after))),
     ui.kv('Upkeep', h('span', { 'data-tip': `Shared by usage: the owner's traffic counts once, users' ${fmtMult(m)}; at 50/50 usage users pay ${fmtPct(equalUseShare(m))}` }, `${fmtMoney(upkeepYear)}/yr · users pay ${fmtMult(m)}`)),
     st.kind === 'agreement' ? h('div', { class: 'muted', style: 'margin-top:4px' }, st.text) : null);

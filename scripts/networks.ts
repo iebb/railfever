@@ -198,7 +198,7 @@ if (isMain && process.argv[2] === 'pairs') {
   const g = aiWorld(Number(process.argv[3] ?? 5), Number(process.argv[4] ?? 5), Number(process.argv[5] ?? 512));
   console.log(fmtM(networkMetrics(g)));
   for (const s2 of parallelPairs(g).slice(0, 15)) console.log('  ' + s2);
-  for (const ai of g.ais) console.log(`AI ${ai.companyId}: ` + ai.log.filter((x) => /railway|extended|share|trains on/.test(x)).slice(-10).join(' | '));
+  for (const ai of g.ais) console.log(`AI ${ai.companyId}: ` + ai.log.filter((x) => /railway|extended|share|trains on|station .* on |ring|loop|first train/.test(x)).slice(-12).join(' | '));
 }
 if (isMain && process.argv[2] === 'metrics') {
   const seeds = (process.argv[3] ?? '5,11,23').split(',').map(Number), years = Number(process.argv[4] ?? 4), size = Number(process.argv[5] ?? 512);

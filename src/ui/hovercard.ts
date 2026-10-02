@@ -16,7 +16,7 @@ export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; i
 /** One line on the player's access to another company's station. */
 function accessHint(g: Game, owner: number): string {
   const k = accessState(g, owner).kind;
-  return k === 'agreement' ? `Track access · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'You are blocked from this network' : k === 'closed' ? 'The owner refuses access' : 'No track access · click to request';
+  return k === 'agreement' ? `${g.hasAccess(PLAYER, owner) ? 'Track access' : 'Open network'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'You are blocked from this network' : k === 'closed' ? 'The owner refuses access' : 'No track access · click to request';
 }
 
 const stat = (ic: string, html: string) => `<span class="hc-stat">${svg(ic, 14)}<span>${html}</span></span>`;

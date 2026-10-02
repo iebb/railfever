@@ -171,12 +171,14 @@ export class Hud {
     this.accessBtn = h('button', { class: 'hbtn chrome', 'data-tip': 'Track access', 'data-key': 'K', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 19), this.accessBadge);
     this.mapBtns.lines = h('button', { class: 'hbtn chrome', 'data-tip': 'Lines map', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Lines map', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('lines') }, icon('map', 19));
     this.mapBtns.demand = h('button', { class: 'hbtn chrome', 'data-tip': 'Demand view', 'data-key': 'P', 'data-sfx': 'none', 'aria-label': 'Demand view', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('demand') }, icon('demand', 19));
+    this.mapBtns.signals = h('button', { class: 'hbtn chrome', 'data-tip': 'Signal blocks', 'data-sfx': 'none', 'aria-label': 'Signal blocks', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('signals') }, icon('signal', 19));
     this.mapBtns.catchment = h('button', { class: 'hbtn chrome', 'data-tip': 'Catchment areas', 'data-key': 'O', 'data-sfx': 'none', 'aria-label': 'Catchment areas', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('catchment') }, icon('catchment', 19));
     R.appendChild(h('div', { class: 'hud hud-tr' },
       this.fpsEl,
       this.mapBtns.lines,
       this.mapBtns.demand,
       this.mapBtns.catchment,
+      this.mapBtns.signals,
       this.vol,
       this.newsBtn,
       h('button', { class: 'hbtn chrome', 'data-tip': 'Companies', 'data-key': 'C', 'aria-label': 'Companies', onclick: () => ui.openCompetitors() }, icon('company', 19)),
@@ -454,7 +456,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Compact options card of the active tool: header, one-line description (long help behind '?'), options. */
@@ -490,8 +492,11 @@ export class Hud {
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'signal') {
       opts.push(opt('Mode', seg([['place', 'Place'], ['remove', 'Remove']], T.signalMode, (v) => { T.signalMode = v; redo(); })));
-      opts.push(opt('Type', seg([['oneway', 'One-way', 'Block signals for double track: trains pass in one direction'], ['twoway', 'Two-way', 'Trains pass both ways: single track with passing loops']], T.signalKind, (v) => { T.signalKind = v; redo(); })));
+      opts.push(opt('Type', seg([['oneway', 'One-way', 'Trains pass in one direction (double track)'], ['twoway', 'Two-way', 'Trains pass both ways: single track with passing loops']], T.signalKind, (v) => { T.signalKind = v; redo(); })));
+      opts.push(opt('Kind', seg([['block', 'Block', 'Spaces trains on open line'], ['path', 'Path', 'Guards junctions and station entries: a train passes only when its whole way to the next signal is free']], T.signalClass, (v) => { T.signalClass = v; redo(); })));
+      if (T.signalKind === 'oneway') opts.push(toggle('Passable from behind', T.signalPass, (v) => { T.signalPass = v; redo(); }, 'Trains may run the other way past it'));
       opts.push(opt('Spacing', seg<number>([[25, '250 m'], [50, '500 m'], [100, '1 km']], T.signalSpacing, (v) => { T.signalSpacing = v; redo(); })));
+      opts.push(h('button', { class: 'btn sm', 'data-tip': 'Signal all your railway by the rules (preview first)', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'));
     } else if (t === 'double') {
       opts.push(opt('Side', seg([['auto', 'Auto', 'Right, or left when the right is blocked'], ['right', 'Right'], ['left', 'Left']], T.doubleSide, (v) => { T.doubleSide = v; redo(); })));
       opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track, signals, crossovers before stations'));
@@ -505,9 +510,13 @@ export class Hud {
         const st = this.ui.game.stations.get(T.relocating);
         opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, icon('move', 13), `Moving ${st?.name ?? 'station'}`), h('button', { class: 'btn sm', onclick: () => T.setTool('inspect') }, 'Cancel'));
       }
-      opts.push(opt('Level', seg<StationLevel>([['ground', 'Ground'], ['elevated', 'Elevated', 'On a viaduct: little land used, costs extra'], ['underground', 'Underground', 'Below ground: only entrances on the surface, costs extra']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
+      const onLine = T.stationOnLine && T.relocating == null;
+      opts.push(opt('Level', seg<StationLevel>([['ground', onLine ? 'As the line' : 'Ground', onLine ? 'On the ground, on a bridge or in a tunnel like the line there' : undefined], ['elevated', 'Elevated', 'On a viaduct: little land used, costs extra'], ['underground', 'Underground', 'Below ground: only entrances on the surface, costs extra']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
       if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(STATION_HEIGHT.min, +(T.stationHeight - 0.3).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(STATION_HEIGHT.max, +(T.stationHeight + 0.3).toFixed(1)); redo(); }, 'Deck height above the highest ground beneath')));
       if (T.stationLevel === 'underground') opts.push(opt('Depth', stepper(`${Math.round(T.stationDepth * 10)} m`, () => { T.stationDepth = Math.max(STATION_DEPTH.min, +(T.stationDepth - 0.3).toFixed(1)); redo(); }, () => { T.stationDepth = Math.min(STATION_DEPTH.max, +(T.stationDepth + 0.3).toFixed(1)); redo(); }, 'Platform depth below the ground')));
+      if (T.relocating == null) opts.push(opt('Place', seg([['free', 'Anywhere', 'A new station, lined up with nearby track ends'], ['line', 'On a line', 'Cut the station into one of your tracks: trains keep running through it']], T.stationOnLine ? 'line' : 'free', (v) => { T.stationOnLine = v === 'line'; redo(); })));
+      opts.push(opt('Through', stepper(String(T.stationThrough), () => { T.stationThrough = Math.max(0, T.stationThrough - 1); redo(); }, () => { T.stationThrough = Math.min(2, T.stationThrough + 1); redo(); }, 'Tracks without platforms for trains that do not stop'),
+        T.stationThrough ? seg([['middle', 'Middle', 'Between side platforms'], ['outer', 'Outer', 'Outside the island platforms']], T.throughMode, (v) => { T.throughMode = v; redo(); }) : null));
       opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(4, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
       opts.push(opt('Tracks', stepper(String(T.stationTracks), () => { T.stationTracks = Math.max(1, T.stationTracks - 1); redo(); }, () => { T.stationTracks = Math.min(6, T.stationTracks + 1); redo(); })));
       opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));

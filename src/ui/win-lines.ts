@@ -3,7 +3,7 @@
 import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import type { LineKind } from '../game/constants';
-import { h, clear, fmtInt, tile, section, icon, toggle, add, seg } from './dom';
+import { h, clear, fmtInt, tile, section, icon, toggle, add, seg, field } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
@@ -56,7 +56,7 @@ export function openLines(ui: UI) {
     for (const l of lines) {
       const profit = l.incomeYear - l.costYear;
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => openLine(ui, l.id) },
-        h('td', { class: 'ellip' }, h('span', { class: 'linechip', style: `--c:${l.color}` }, icon(KIND_META[l.kind].icon, 13), l.name), l.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(l.owner).name}`) : null),
+        h('td', { class: 'ellip' }, h('span', { class: 'linechip', style: `--c:${l.color}` }, icon(KIND_META[l.kind].icon, 13), l.name, g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null), l.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(l.owner).name}`) : null),
         h('td', { class: 'r' }, String(l.stops.length)), h('td', { class: 'r' }, String(l.vehicles.length)), h('td', { class: 'r' }, fmtInt(l.passLast)),
         h('td', { class: 'r ' + (profit < 0 ? 'neg' : 'pos') }, fmtMoney(profit))));
     }
@@ -222,11 +222,21 @@ export function openLine(ui: UI, id: number) {
             h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
       });
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops yet.'));
-      add(win.body, section('Stops', l.stops.length >= 2 ? 'vehicles run in a loop' : ''), list);
+      const loop = g.lines.isLoop(l);
+      add(win.body, section('Stops', l.stops.length >= 2 ? (loop ? 'vehicles circle round the stops' : 'vehicles run out and back') : ''), list);
+      if (mine && l.stops.length >= 2) {
+        const setting = l.loop === undefined ? 'auto' : l.loop ? 'loop' : 'back';
+        add(win.body, field('Route', seg([['auto', 'Auto', 'Loop when the stops are three or more different stations'], ['loop', 'Loop', 'Vehicles keep circling one way round the stops'], ['back', 'Out and back', 'Vehicles turn at the first and last stop']], setting, (v) => {
+          g.lines.setLoop(l.id, v === 'auto' ? undefined : v === 'loop');
+          ui.sound('toggle', { pitch: v === 'back' ? 0.9 : 1.1 });
+          changed();
+        }), setting === 'auto' ? `Now: ${loop ? 'loop' : 'out and back'}` : undefined));
+      }
       if (mine) {
         const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
         add(win.body, h('div', { class: 'btns' },
-          h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); win.last = undefined; render(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map')));
+          h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); win.last = undefined; render(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
+          l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Signal the line\u2019s track by the rules (preview first)', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
         if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'A line needs at least two stops.'));
       }
     } else if (win.tab === 'vehicles') {

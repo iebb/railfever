@@ -5,11 +5,13 @@ import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions } from '../game/construction';
 import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable } from '../game/build-ops';
-import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING } from '../game/signals';
-import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan } from '../game/trackops';
+import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING, SIGNAL_COST } from '../game/signals';
+import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan, planStationOnTrack, commitStationOnTrack, OnTrackPlan } from '../game/trackops';
+import { openAutoSignal } from './win-signals';
+import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, CATCHMENT_RADIUS, ENTRANCE_SIZE, relocateStation } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, CATCHMENT_RADIUS, ENTRANCE_SIZE, relocateStation, ThroughMode } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL } from '../game/constants';
 import { CROSS_LABEL, MarkerKind } from '../render/overlay';
@@ -104,6 +106,14 @@ export class Tools {
   signalMode: 'place' | 'remove' = 'place';
   signalKind: 'oneway' | 'twoway' = 'oneway';
   signalSpacing = SIGNAL_SPACING;
+  /** block signals (open line) or path signals (junctions, station entries); one-way ones may be passable from behind */
+  signalClass: 'block' | 'path' = 'block';
+  signalPass = false;
+  /** station tool: through tracks without platforms (0-2) and where they go; insert into an existing line */
+  stationThrough = 0;
+  throughMode: ThroughMode = 'middle';
+  stationOnLine = false;
+  private onTrack: { key: string; plan: OnTrackPlan; edge: number } | null = null;
   private sigDrag: { edge: number; s0: number; dir: number; len: number } | null = null;
   /** double track tool: which side of the old track (auto tries right, then left) */
   doubleSide: 'auto' | 'right' | 'left' = 'auto';
@@ -605,6 +615,8 @@ export class Tools {
       case 'tram': this.hoverTram(); break;
       case 'tramstop': this.hoverStop(p, true); break;
       case 'station': {
+        if (this.stationOnLine && this.relocating == null) { this.hoverStationOnLine(p); break; }
+        ov.setSegments('throat', null);
         const pos = this.stationPlacement(p.x, p.z);
         const pl = this.planStation(pos.x, pos.z, pos.angle);
         this.stationPlan = pl;
@@ -617,7 +629,7 @@ export class Tools {
         const pop = g.stations.popInShapes(shapes);
         const lv = pl.level;
         const moving = this.relocating != null ? g.stations.get(this.relocating) : undefined;
-        const rows: [string, string][] = [['station', `${plural(pl.tracks, 'track')} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${CATCHMENT_RADIUS.rail * 10} m${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
+        const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${CATCHMENT_RADIUS.rail * 10} m${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
         if (lv === 'elevated') rows.push(['bridge', `Elevated · deck <b>${Math.round(pl.height * 10)} m</b> up · ${plural(pl.entrances.length, 'stair tower')}`]);
         if (lv === 'underground') rows.push(['tunnel', `Underground · <b>${Math.round(pl.depth * 10)} m</b> deep · ${plural(pl.entrances.length, 'entrance')}`]);
         if (pl.access) rows.push(['road', `Access street ${fmtLen(pl.access.stats.len)} · ${fmtMoney(pl.access.cost)} (included)`]);
@@ -718,7 +730,8 @@ export class Tools {
     if (!q.x) net.pointAt(e, ne.s, q);
     ov.setMarker('hover0', q, 'signal', err ? 0xff5a4a : 0xffb020);
     ov.setHoverEdge(e.id, err ? 0xff5a4a : 0xffb020);
-    this.tip(err ? { title: 'Signal', err: [err] } : { title: 'Two-way signal', cost: 9000, hint: 'Click again later to make it one-way' }, err ? 'err' : 'info');
+    const name = `${this.signalKind === 'oneway' ? 'One-way' : 'Two-way'} ${this.signalClass} signal`;
+    this.tip(err ? { title: 'Signal', err: [err] } : { title: name, cost: SIGNAL_COST, rows: this.signalKind === 'oneway' ? [['signal', `facing away from you${this.signalPass ? ' · passable from behind' : ''}`]] : [], hint: 'Click to place · drag along the track for a series' }, err ? 'err' : 'info');
   }
 
   private hoverInspect(p: THREE.Vector3) {
@@ -820,7 +833,7 @@ export class Tools {
       this.tip({ title: 'Remove signals', rows: [['length', `along ${fmtLen(sd.len)} of track`]], hint: 'Release to remove' }, 'err');
       return;
     }
-    const lay = signalsAlong(g, sd.edge, sd.dir, this.signalSpacing, PLAYER, Math.max(1, sd.len), { s0: sd.s0, kind: this.signalKind });
+    const lay = signalsAlong(g, sd.edge, sd.dir, this.signalSpacing, PLAYER, Math.max(1, sd.len), { s0: sd.s0, kind: this.signalKind, signalKind: this.signalClass, pass: this.signalKind === 'oneway' && this.signalPass });
     const ghosts = lay.spots.map((sp) => {
       const ee = net.edges.get(sp.edge)!, pp = { x: 0, y: 0, z: 0 }, dd = { x: 0, y: 0, z: 0 };
       net.pointAt(ee, sp.s, pp, dd);
@@ -831,7 +844,7 @@ export class Tools {
     const fresh = lay.spots.filter((sp) => !sp.signal).length;
     const STOP: Record<string, string> = { switch: 'stops at a switch', station: 'stops at a station', depot: 'stops at a depot', foreign: 'stops at another company\u2019s track', end: 'stops at the track end', loop: 'the loop is closed' };
     this.tip({
-      title: this.signalKind === 'oneway' ? 'One-way block signals' : 'Two-way signals', cost: lay.cost,
+      title: `${this.signalKind === 'oneway' ? 'One-way' : 'Two-way'} ${this.signalClass} signals`, cost: lay.cost,
       rows: [['signal', `<b>${lay.spots.length}</b> signal${lay.spots.length === 1 ? '' : 's'}${fresh < lay.spots.length ? ` (${fresh} new)` : ''} every ${fmtLen(this.signalSpacing)}`], ['length', `${fmtLen(lay.length)}${STOP[lay.stop] ? ' · ' + STOP[lay.stop] : ''}`]],
       err: lay.spots.length ? [] : ['No room for signals here'], warn: g.economy.canAfford(lay.cost) ? [] : ['Not enough money'], hint: 'Release to place',
     }, lay.spots.length ? 'ok' : 'err');
@@ -849,11 +862,11 @@ export class Tools {
       else this.ui.toast('No signals there', 'info');
       return;
     }
-    const r = autoSignals(g, sd.edge, sd.dir, this.signalSpacing, PLAYER, Math.max(1, sd.len), { s0: sd.s0, kind: this.signalKind });
+    const r = autoSignals(g, sd.edge, sd.dir, this.signalSpacing, PLAYER, Math.max(1, sd.len), { s0: sd.s0, kind: this.signalKind, signalKind: this.signalClass, pass: this.signalKind === 'oneway' && this.signalPass });
     if (r.placed) {
       if (r.cost > 0) this.ui.floatCost(r.cost, this.client.x, this.client.y);
       this.ui.sound('signal', at ? { x: at.x, z: at.z } : {});
-      this.ui.toast(`${plural(r.placed, this.signalKind === 'oneway' ? 'one-way signal' : 'two-way signal')} placed${r.error ? ` — ${r.error}` : ''}`, r.error ? 'info' : 'good');
+      this.ui.toast(`${plural(r.placed, `${this.signalKind === 'oneway' ? 'one-way' : 'two-way'} ${this.signalClass} signal`)} placed${r.error ? ` — ${r.error}` : ''}`, r.error ? 'info' : 'good');
     } else this.ui.toast(r.error ?? 'No room for signals here', 'bad');
   }
 
@@ -945,6 +958,62 @@ export class Tools {
     else if (f.signals && !this.finishTold) { this.finishTold = true; this.ui.toast(`Directional double track: one way per track, ${plural(f.signals, 'block signal')}`, 'good'); }
   }
 
+  // ------------------------------------------------------------------ stations inserted into a line
+  /** Preview of a through station cut into one of your tracks at the cursor (planStationOnTrack). */
+  private hoverStationOnLine(p: THREE.Vector3) {
+    const g = this.game, net = g.world.net, ov = this.overlay;
+    const ne = net.nearestEdge(p.x, p.z, 1.6, 'rail', (e) => e.station < 0 && e.depot < 0);
+    if (!ne || ne.edge.owner !== PLAYER) {
+      this.onTrack = null;
+      ov.setStationGhost(null); ov.setSegments('throat', null); ov.setCatchments('hover', null);
+      this.tip(ne ? { title: 'Station on the line', err: [`Track of ${g.company(ne.edge.owner).name}`] } : { title: 'Station on the line', rows: [['station', 'Point at one of your tracks: the station is cut into the line there']] }, ne ? 'err' : 'info');
+      return;
+    }
+    const s = Math.round(ne.s * 2) / 2;
+    const key = `${ne.edge.id}|${s}|${this.stationLen}|${this.stationTracks}|${this.stationThrough}|${this.throughMode}|${this.stationLevel}|${g.networkVersion}`;
+    if (this.onTrack?.key !== key) {
+      const plan = planStationOnTrack(g, ne.edge.id, s, { length: this.stationLen, tracks: this.stationTracks, through: this.stationThrough, throughMode: this.throughMode, level: this.stationLevel === 'ground' ? undefined : this.stationLevel }, PLAYER);
+      this.onTrack = { key, plan, edge: ne.edge.id };
+    }
+    const pl = this.onTrack.plan, st = pl.station;
+    ov.setStationGhost(st);
+    ov.setSegments('throat', pl.throat, pl.ok ? 0xffd84a : 0xff6b6b);
+    if (st) {
+      const shapes = g.stations.planCatchShapes(st);
+      ov.setCatchments('hover', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: pl.ok ? catchColor(c) : 0xff6b6b })));
+    } else ov.setCatchments('hover', null);
+    const rows: [string, string][] = [];
+    if (st) {
+      rows.push(['station', `${plural(st.tracks, 'platform track')}${st.through ? ` + ${st.through} through` : ''} × ${st.length * 10} m`]);
+      rows.push(['rail', `cuts the ${pl.mains.length > 1 ? 'double' : 'single'} track; ${plural(pl.throat.length, 'throat connection')}`]);
+      if (st.level !== 'ground') rows.push([st.level === 'elevated' ? 'bridge' : 'tunnel', st.level === 'elevated' ? 'elevated with the line' : 'underground with the line']);
+      rows.push(['people', `<b>${g.stations.popInShapes(g.stations.planCatchShapes(st)).toLocaleString('en-US')}</b> residents in reach`]);
+    }
+    this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click to build · trains keep running through it' : 'Straight, level track is needed for the platforms' }, pl.ok ? 'ok' : 'err');
+  }
+
+  private commitStationOnLine(e: PointerEvent) {
+    const g = this.game, ot = this.onTrack;
+    if (!ot || !ot.plan.ok) { this.ui.toast(ot?.plan.error ?? 'Point at one of your tracks', 'bad'); return; }
+    // lines running over the cut stretch (to offer signalling them afterwards)
+    const cut = new Set(ot.plan.mains.flatMap((m) => m.steps.map((x) => x.edge)));
+    const lines = g.lines.all().filter((l) => l.owner === PLAYER && l.kind === 'rail' && computeLinePath(g, l).edges.some((arr) => Array.from(arr).some((se) => cut.has(Math.abs(se) - 1))));
+    const before = g.economy.money;
+    const r = commitStationOnTrack(g, ot.plan);
+    this.onTrack = null;
+    if (r.error === 'busy') { this.ui.toast('A train is on this stretch — try again in a moment', 'info'); return; }
+    if (r.error) { this.ui.toast(r.error, 'bad'); return; }
+    this.overlay.setSegments('throat', null);
+    this.ui.floatCost(Math.max(0, before - g.economy.money), e.clientX, e.clientY);
+    const st = g.stations.get(r.station);
+    if (st) this.ui.sound('station', { x: st.x, z: st.z });
+    const line = lines[0];
+    this.ui.toastAction(`${st?.name ?? 'Station'} built into the line${line ? ` — ${line.name} can add the stop` : ''}`, 'good', 'Auto-signal', () => {
+      if (line) openAutoSignal(this.ui, { line: line.id });
+      else if (st?.rail) openAutoSignal(this.ui, { edges: trackAround(g, st.rail.edges.concat(st.rail.throughEdges), 300), label: `Track around ${st.name}` });
+    });
+  }
+
   // ------------------------------------------------------------------ station entrances
   private hoverEntrance(p: THREE.Vector3) {
     const g = this.game, ov = this.overlay;
@@ -990,7 +1059,7 @@ export class Tools {
   private planStation(x: number, z: number, angle: number): StationPlan {
     const lv = this.stationLevel;
     return planStation(this.game, x, z, angle, this.stationLen, this.stationTracks, PLAYER, lv === 'ground' ? undefined : { level: lv, height: this.stationHeight, depth: this.stationDepth },
-      this.relocating != null ? { ignoreStation: this.relocating } : undefined);
+      { through: this.stationThrough, throughMode: this.throughMode, ...(this.relocating != null ? { ignoreStation: this.relocating } : {}) });
   }
 
   private coveredPop(x: number, z: number, r: number): number {
@@ -1401,6 +1470,7 @@ export class Tools {
       }
       case 'station': {
         if (!p) return;
+        if (this.stationOnLine && this.relocating == null) { this.commitStationOnLine(e); return; }
         const pos = this.stationPlacement(p.x, p.z);
         const pl = this.planStation(pos.x, pos.z, pos.angle);
         this.stationPlan = null;
@@ -1475,9 +1545,21 @@ export class Tools {
       case 'signal': {
         if (!p) return;
         if (this.signalMode === 'remove') { this.removeSignalAt(p.x, p.z); break; }
-        const n = g.world.net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
+        const net = g.world.net;
+        const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
         if (n && n.owner !== PLAYER) { this.ui.toast(`Signal of ${g.company(n.owner).name}`, 'bad'); return; }
-        const err = toggleSignal(g, p.x, p.z, PLAYER);
+        let err: string | null;
+        if (n) err = toggleSignal(g, p.x, p.z, PLAYER); // an existing signal: cycle it
+        else {
+          // a new signal of the chosen type; one-way ones face away from the camera
+          const ne = net.nearestEdge(p.x, p.z, 1.0, 'rail');
+          if (!ne) { this.ui.toast('Click on a track', 'bad'); return; }
+          const q = { x: 0, y: 0, z: 0 }, t = { x: 0, y: 0, z: 0 };
+          net.pointAt(ne.edge, ne.s, q, t);
+          const cam = this.ui.renderer.camera.position;
+          const forward = (q.x - cam.x) * t.x + (q.z - cam.z) * t.z >= 0;
+          err = setSignal(g, ne.edge.id, ne.s, this.signalKind, forward, PLAYER, { signalKind: this.signalClass, pass: this.signalKind === 'oneway' && this.signalPass });
+        }
         if (err) this.ui.toast(err, 'bad');
         else this.ui.sound('signal', { x: p.x, z: p.z });
         break;
@@ -1543,6 +1625,25 @@ function accessOwnerOf(g: { companies: { id: number; name: string; defunct?: boo
   if (!m) return null;
   const co = g.companies.find((c) => !c.defunct && c.name === m[1]);
   return co && co.id !== PLAYER ? co.id : null;
+}
+
+/** Own rail edges reachable from some edges within a distance along the track (for signalling a stretch). */
+function trackAround(g: { world: { net: { edges: Map<number, NEdge>; nodes: Map<number, NNode> } } }, from: number[], reach: number): number[] {
+  const net = g.world.net;
+  const dist = new Map<number, number>(from.map((id) => [id, 0]));
+  const queue = [...from];
+  while (queue.length) {
+    const id = queue.shift()!;
+    const e = net.edges.get(id), d0 = dist.get(id)!;
+    if (!e || d0 > reach) continue;
+    for (const nid of [e.a, e.b]) for (const nx of net.nodes.get(nid)?.edges ?? []) {
+      const f = net.edges.get(nx);
+      if (!f || f.kind !== 'rail' || f.owner !== PLAYER || dist.has(nx)) continue;
+      dist.set(nx, d0 + e.len);
+      queue.push(nx);
+    }
+  }
+  return [...dist.keys()];
 }
 
 /** All parallel segments of a double-track plan as one proposal (for the ghost preview). */

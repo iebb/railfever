@@ -7,6 +7,8 @@ import { fails, check, free, railOpts, roadOpts } from './lib';
 
 const g = Game.create({ size: 256, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980, aiCompanies: 1, aiConfigs: [{ risk: 0.9 }] });
 g.aiEnabled = false;
+// company 1 shares its network on request here (open access, the default, needs none: see access.ts / networks.ts)
+g.setAccessPolicy(1, 'auto-approve');
 const w = g.world, net = w.net;
 for (let z = 0; z <= w.size; z++) for (let x = 0; x <= w.size; x++) w.h[w.vi(x, z)] = 3;
 w.heightsVersion++;

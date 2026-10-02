@@ -11,7 +11,7 @@ import { demandView, DemandView } from '../game/demand';
 import type { Arc, ShareRing } from '../render/overlay';
 import { fmtInt } from './dom';
 
-export type MapMode = 'none' | 'lines' | 'demand' | 'catchment';
+export type MapMode = 'none' | 'lines' | 'demand' | 'catchment' | 'signals';
 
 /** Red (unserved) → amber → green (served). */
 export function servedColor(f: number): number {
@@ -26,7 +26,10 @@ export const hexCss = (c: number) => '#' + c.toString(16).padStart(6, '0');
 
 /** Lines map: route width in px (normal / selected), spacing of lines sharing track, world dimming. */
 const ROUTE_W = 5, ROUTE_W_SEL = 8, LANE_STEP = 6.5;
-const DIM: Record<MapMode, number> = { none: 0, lines: 0.4, demand: 0.3, catchment: 0.16 };
+const DIM: Record<MapMode, number> = { none: 0, lines: 0.4, demand: 0.3, catchment: 0.16, signals: 0.34 };
+/** Signal blocks overlay: free, reserved (a train's path is set through it) and occupied blocks; path / block signals. */
+const BLOCK_COLOR = { free: 0x3f9a62, reserved: 0xffb020, occupied: 0xff5a5f };
+const SIG_COLOR = { path: 0xc084fc, block: 0x5ac8fa };
 
 export class MapModes {
   mode: MapMode = 'none';
@@ -48,6 +51,10 @@ export class MapModes {
   private shownSig = '';
   private demandT = 0;
   private catchSig = '';
+  /** signals overlay: block of every own rail edge (union of edges joined by nodes without a signal) */
+  private blocks: { ver: number; of: Map<number, number>; pts: Map<number, Float32Array> } | null = null;
+  private blockSig = '';
+  private blockT = 0;
   private listT = 0;
   private listSig = '';
   onChange: () => void = () => {};
@@ -77,6 +84,7 @@ export class MapModes {
     }
     if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.shares.clear(); }
     if (prev === 'catchment') { ov.setCatchments('map', null); this.catchSig = ''; }
+    if (prev === 'signals') { ov.setTrackLayers(null); ov.setSignalGhosts(null); this.blocks = null; this.blockSig = ''; }
     ov.setDim(DIM[m]);
     this.hoverLine = null;
     this.listSig = '';
@@ -92,6 +100,7 @@ export class MapModes {
     if (this.mode === 'lines') this.updateLines(dt);
     else if (this.mode === 'demand') this.updateDemand(dt);
     else if (this.mode === 'catchment') this.updateCatchment();
+    else if (this.mode === 'signals') this.updateSignals(dt);
   }
 
   // ------------------------------------------------------------------ lines map
@@ -114,7 +123,7 @@ export class MapModes {
     for (const id of [...this.paths.keys()]) if (!ids.has(id)) { ov.setLinePath(id, null); this.paths.delete(id); this.sigs.delete(id); this.styles.delete(id); this.tagPos.delete(id); this.lanesDirty = true; }
     // (re)compute routes whose stops / network changed, within a small time budget per frame
     for (const l of lines) {
-      const sig = l.stops.join(',') + '|' + g.networkVersion;
+      const sig = l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l);
       if (this.sigs.get(l.id) !== sig && !this.queue.includes(l.id)) this.queue.push(l.id);
     }
     const t0 = performance.now();
@@ -122,7 +131,7 @@ export class MapModes {
       const id = this.queue.shift()!;
       const l = g.lines.get(id);
       if (!l || !ids.has(id)) continue;
-      this.sigs.set(id, l.stops.join(',') + '|' + g.networkVersion);
+      this.sigs.set(id, l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l));
       const p = computeLinePath(g, l);
       this.paths.set(id, p);
       this.tagPos.set(id, midPoint(p.curves));
@@ -145,11 +154,12 @@ export class MapModes {
     const sel = this.selectedIds();
     for (const l of lines) {
       if (!this.paths.has(l.id)) continue;
-      const on = sel.has(l.id), dim = sel.size > 0 && !on;
-      const style = `${on}|${dim}`;
+      const on = sel.has(l.id), dim = sel.size > 0 && !on, loop = g.lines.isLoop(l);
+      const style = `${on}|${dim}|${loop}`;
       if (this.styles.get(l.id) === style) continue;
       this.styles.set(l.id, style);
-      ov.setLinePathStyle(l.id, { width: on ? ROUTE_W_SEL : ROUTE_W, opacity: dim ? 0.45 : 0.92, chevrons: on, order: on ? 5 : 0 });
+      // loops always show their running direction
+      ov.setLinePathStyle(l.id, { width: on ? ROUTE_W_SEL : ROUTE_W, opacity: dim ? 0.45 : 0.92, chevrons: on || loop, order: on ? 5 : 0 });
     }
     // line chips on station plates, name tags on the routes
     const lb = this.ui.renderer.labels;
@@ -166,7 +176,7 @@ export class MapModes {
 
   private renderLinesCard(lines: Line[]) {
     const g = this.ui.game;
-    const sig = this.showAll + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length).join(';') + '|' + this.queue.length;
+    const sig = this.showAll + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length;
     if (sig === this.listSig) return;
     this.listSig = sig;
     const c = this.card;
@@ -184,9 +194,86 @@ export class MapModes {
             onpointerenter: () => { this.hoverLine = l.id; },
             onpointerleave: () => { if (this.hoverLine === l.id) this.hoverLine = null; },
             onclick: () => this.ui.openLine(l.id),
-          }, h('i', { style: `background:${l.color}` }), icon(kindIcon(l.kind), 14), h('span', { class: 'mc-name' }, l.name), l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null)))
+          }, h('i', { style: `background:${l.color}` }), icon(kindIcon(l.kind), 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null)))
           : h('div', { class: 'mc-empty' }, 'No lines with two or more stops yet.'),
         this.queue.length ? h('div', { class: 'mc-note' }, `Tracing routes… ${this.queue.length}`) : null),
+    );
+  }
+
+  // ------------------------------------------------------------------ signal blocks
+  /** Your railway in signal blocks coloured by occupancy, with the signals (diamonds: path, arrows: block). */
+  private updateSignals(dt: number) {
+    this.blockT -= dt;
+    if (this.blockT > 0) return;
+    this.blockT = 0.25;
+    const g = this.ui.game, net = g.world.net, ov = this.ui.renderer.overlay;
+    if (!this.blocks || this.blocks.ver !== g.networkVersion) {
+      const parent = new Map<number, number>();
+      const find = (a: number): number => { let r = a; while ((parent.get(r) ?? r) !== r) r = parent.get(r)!; parent.set(a, r); return r; };
+      const pts = new Map<number, Float32Array>();
+      for (const e of net.edges.values()) {
+        if (e.kind !== 'rail' || e.owner !== PLAYER) continue;
+        parent.set(e.id, e.id);
+        const geo = net.geo(e), q = new Float32Array(geo.pts);
+        for (let i = 1; i < q.length; i += 3) q[i] += 0.3;
+        pts.set(e.id, q);
+      }
+      for (const n of net.nodes.values()) {
+        if (n.kind !== 'rail' || n.signal) continue;
+        const own = n.edges.filter((id) => parent.has(id));
+        for (let i = 1; i < own.length; i++) { const a = find(own[0]), b = find(own[i]); if (a !== b) parent.set(a, b); }
+      }
+      const of = new Map<number, number>();
+      for (const id of pts.keys()) of.set(id, find(id));
+      this.blocks = { ver: g.networkVersion, of, pts };
+      this.blockSig = '';
+      // the signals
+      const spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color: number }[] = [];
+      for (const n of net.nodes.values()) {
+        if (n.kind !== 'rail' || !n.signal || n.owner !== PLAYER) continue;
+        const f = n.signal === 3 ? -1 : 1;
+        spots.push({ x: n.x, y: n.y, z: n.z, dx: (n.dx || 1) * f, dz: n.dz * f, existing: false, twoWay: n.signal === 1, color: SIG_COLOR[n.signalKind === 'block' ? 'block' : 'path'] });
+      }
+      ov.setSignalGhosts(spots);
+    }
+    const B = this.blocks;
+    const occ = new Set<number>(), res = new Set<number>();
+    for (const v of g.vehicles.trains()) for (const id of v.occupiedEdges()) { const b = B.of.get(id); if (b !== undefined) occ.add(b); }
+    for (const [id, b] of B.of) if (!occ.has(b) && g.vehicles.getRes(id)) res.add(b);
+    const sig = [...occ].sort((a, b) => a - b).join(',') + '|' + [...res].sort((a, b) => a - b).join(',');
+    if (sig !== this.blockSig) {
+      this.blockSig = sig;
+      const layers = { free: [] as Float32Array[], reserved: [] as Float32Array[], occupied: [] as Float32Array[] };
+      for (const [id, b] of B.of) (occ.has(b) ? layers.occupied : res.has(b) ? layers.reserved : layers.free).push(B.pts.get(id)!);
+      ov.setTrackLayers([
+        { pts: layers.free, color: BLOCK_COLOR.free, width: 4 },
+        { pts: layers.reserved, color: BLOCK_COLOR.reserved, width: 6 },
+        { pts: layers.occupied, color: BLOCK_COLOR.occupied, width: 6 },
+      ]);
+    }
+    this.listT -= 0.25;
+    if (this.listT <= 0) { this.listT = 1; this.renderSignalsCard(occ.size, res.size, new Set(B.of.values()).size); }
+  }
+
+  private renderSignalsCard(occ: number, res: number, blocks: number) {
+    const g = this.ui.game;
+    let path = 0, block = 0;
+    for (const n of g.world.net.nodes.values()) if (n.kind === 'rail' && n.signal && n.owner === PLAYER) { if (n.signalKind === 'block') block++; else path++; }
+    const c = this.card;
+    clear(c);
+    const sw = (col: number, t: string, num: string) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { style: `background:${hexCss(col)}` }), h('span', { class: 'mc-name' }, t), h('span', { class: 'mc-num' }, num));
+    c.append(
+      h('div', { class: 'mc-head' }, icon('signal', 18), h('span', { class: 'mc-title' }, 'Signals'), h('span', { class: 'mc-sub' }, `${path + block}`),
+        h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close signals view', onclick: () => this.set('none') }, icon('close', 16))),
+      h('div', { class: 'mc-body' },
+        h('div', { class: 'mc-list' },
+          sw(BLOCK_COLOR.free, 'Free blocks', String(blocks - occ - res)),
+          sw(BLOCK_COLOR.reserved, 'Reserved (a train\u2019s path is set)', String(res)),
+          sw(BLOCK_COLOR.occupied, 'Occupied by a train', String(occ)),
+          sw(SIG_COLOR.path, 'Path signals ◆', String(path)),
+          sw(SIG_COLOR.block, 'Block signals ▲', String(block))),
+        h('div', { class: 'mc-note' }, 'A block runs from one signal to the next. Path signals guard junctions and station entries; block signals space trains on open line.'),
+        h('div', { class: 'btns' }, h('button', { class: 'btn sm', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'))),
     );
   }
 

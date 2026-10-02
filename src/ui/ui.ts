@@ -24,6 +24,8 @@ import * as info from './win-info';
 import * as lines from './win-lines';
 import * as company from './win-company';
 import * as access from './win-access';
+import * as signals from './win-signals';
+import type { AutoTarget } from './win-signals';
 import * as menu from './win-menu';
 import { showTitle, TitleOpts } from './title';
 
@@ -250,7 +252,7 @@ export class UI {
     for (const id of open) {
       const l = g.lines.get(id);
       if (!l) continue;
-      const sig = l.stops.join(',') + '|' + g.networkVersion + '|' + l.color;
+      const sig = l.stops.join(',') + '|' + g.networkVersion + '|' + l.color + '|' + g.lines.isLoop(l);
       marksSig += id + ':' + sig + ';';
       if (this.linePathSig.get(id) === sig) continue;
       this.linePathSig.set(id, sig);
@@ -313,6 +315,14 @@ export class UI {
     if (kind === 'bad') this.sound('error');
   }
 
+  /** A toast with an action button (e.g. "Auto-signal"); clicking the button runs it and closes the toast. */
+  toastAction(msg: string, kind: 'info' | 'good' | 'bad', label: string, fn: () => void) {
+    const el = h('div', { class: 'toast link ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg),
+      h('button', { class: 'btn sm toast-btn', onclick: (e: Event) => { e.stopPropagation(); el.remove(); fn(); } }, label));
+    this.pushToast(el, 9000);
+    if (kind === 'bad') this.sound('error');
+  }
+
   private pushToast(el: HTMLElement, ms: number) {
     this.toastBox.appendChild(el);
     setTimeout(() => el.classList.add('out'), ms);
@@ -351,7 +361,7 @@ export class UI {
 
   // ------------------------------------------------------------------ shared helpers
   kv(k: string, v: Node | string): HTMLElement { return h('div', { class: 'kv' }, h('span', { class: 'k' }, k), h('span', { class: 'v' }, v)); }
-  lineChip(l: Line): HTMLElement { return h('span', { class: 'chip', style: `--c:${l.color}`, onclick: () => this.openLine(l.id) }, icon(KIND_META[l.kind].icon, 13), l.name); }
+  lineChip(l: Line): HTMLElement { return h('span', { class: 'chip', style: `--c:${l.color}`, onclick: () => this.openLine(l.id) }, icon(KIND_META[l.kind].icon, 13), l.name, this.game.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null); }
   stationLink(id: number): HTMLElement {
     const st = this.game.stations.get(id);
     return h('a', { class: 'link', onclick: () => this.openStation(id) }, st ? st.name : '?');
@@ -425,6 +435,8 @@ export class UI {
   openFinances() { company.openFinances(this); }
   openCompetitors() { company.openCompetitors(this); }
   openTrackAccess() { access.openTrackAccess(this); }
+  /** Auto-signal a line, a stretch of track or (no argument) all of the player's railway, with a preview. */
+  openAutoSignal(target?: AutoTarget) { signals.openAutoSignal(this, target ?? { network: true }); }
   openNews() { this.hud.openNews(); }
   openMenu() { menu.openMenu(this); }
   openSaveLoad(mode: 'save' | 'load') { menu.openSaveLoad(this, mode); }

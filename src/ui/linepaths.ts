@@ -36,8 +36,18 @@ export function computeLinePath(g: Game, line: Line): LinePath {
   const res: LinePath = { curves: [], edges: [], broken: [] };
   const n = line.stops.length;
   if (n < 2) return res;
-  for (let i = 0; i < n; i++) {
-    const a = g.stations.get(line.stops[i]), bId = line.stops[(i + 1) % n];
+  // legs: round the ring for a loop line; out along the stops and back again otherwise
+  const legs: [number, number][] = [];
+  if (g.lines.isLoop(line)) for (let i = 0; i < n; i++) legs.push([line.stops[i], line.stops[(i + 1) % n]]);
+  else {
+    for (let i = 0; i + 1 < n; i++) legs.push([line.stops[i], line.stops[i + 1]]);
+    for (let i = n - 1; i > 0; i--) legs.push([line.stops[i], line.stops[i - 1]]);
+  }
+  const seen = new Set<string>();
+  for (const [aId, bId] of legs) {
+    if (seen.has(aId + '>' + bId)) continue;
+    seen.add(aId + '>' + bId);
+    const a = g.stations.get(aId);
     const b = g.stations.get(bId);
     if (!a || !b || a.id === b.id) continue;
     const pts: number[] = [], ids: number[] = [];

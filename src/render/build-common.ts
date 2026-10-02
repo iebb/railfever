@@ -6,7 +6,7 @@ import type { WB } from './build-mesh';
 import type { FacadeBuilder } from './build-buildings';
 import type { TreeInstance } from './trees';
 import type { RailPart } from '../game/stations';
-import { stationLayout } from '../game/stations';
+import { railWidth } from '../game/stations';
 
 /**
  * One object chunk being built: bounds plus the builders/collectors objects add into.
@@ -72,7 +72,7 @@ export function stationFrame(r: RailPart): StationFrame {
   const extAcross = Math.abs(brx * rx + brz * rz) * b.w + Math.abs(bfx * rx + bfz * rz) * b.d;
   const BL = Math.max(extAlong, extAcross), BD = Math.max(0.7, Math.min(extAlong, extAcross));
   const side = ((b.x - r.x) * rx + (b.z - r.z) * rz) >= 0 ? 1 : -1;
-  const width = stationLayout(r.tracks).width;
+  const width = railWidth(r);
   const along = (b.x - r.x) * fx + (b.z - r.z) * fz;
   const off = side * (width / 2 + BD / 2 + 0.15);
   const bx = r.x + rx * off + fx * along, bz = r.z + rz * off + fz * along;
@@ -101,7 +101,7 @@ export function stationEdgeLevels(game: Game): Map<number, StationLevel> {
   for (const st of game.stations.map.values()) {
     if (!st.rail) continue;
     const lv = stationLevelOf(st.rail);
-    if (lv !== 'ground') for (const id of st.rail.edges) out.set(id, lv);
+    if (lv !== 'ground') for (const id of [...st.rail.edges, ...(st.rail.throughEdges ?? [])]) out.set(id, lv);
   }
   return out;
 }

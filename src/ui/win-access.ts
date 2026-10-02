@@ -11,6 +11,7 @@ import { liveCompanies } from './gameapi';
 /** How an owner answers requests, in words (AI owners judge "ask" requests themselves, at once). */
 export function policyText(g: Game, owner: number): string {
   const p = g.accessPolicy(owner);
+  if (p === 'open') return 'Open network';
   if (p === 'auto-approve') return 'Grants access';
   if (p === 'auto-reject') return 'Refuses access';
   return g.company(owner).ai ? 'Decides on request' : 'Asks each time';
@@ -57,7 +58,9 @@ function endAgreement(ui: UI, user: number, owner: number, verb: string): boolea
 /** The player's access to `owner`'s network, in short. */
 export function accessState(g: Game, owner: number): { kind: 'agreement' | 'pending' | 'blocked' | 'closed' | 'none'; text: string } {
   const a = g.agreement(PLAYER, owner);
-  if (a) return { kind: 'agreement', text: `Agreement · upkeep shared ${fmtMult(g.accessMultiplier(owner))} · your share last month ${fmtPct(a.usageShareLastMonth)} · paid ${fmtMoney(a.paidLastMonth)}` };
+  if (a) return { kind: 'agreement', text: `${g.accessPolicy(owner) === 'open' ? 'Open network' : 'Agreement'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))} · your share last month ${fmtPct(a.usageShareLastMonth)} · paid ${fmtMoney(a.paidLastMonth)}` };
+  // an open network may be used without asking (the agreement for the fees starts with the first use)
+  if (g.canUse(PLAYER, owner)) return { kind: 'agreement', text: `Open network · upkeep shared ${fmtMult(g.accessMultiplier(owner))} when you use it` };
   const q = g.requestsBy(PLAYER).find((r) => r.owner === owner);
   if (q) return { kind: 'pending', text: `Request pending · ${Math.max(0, ACCESS_REQUEST_DAYS - (g.day - q.day))} days left` };
   if (g.isBlocked(owner, PLAYER)) return { kind: 'blocked', text: 'You are blocked from this network' };
@@ -69,7 +72,7 @@ export function accessState(g: Game, owner: number): { kind: 'agreement' | 'pend
 export function accessControl(ui: UI, owner: number, after: () => void): HTMLElement {
   const g = ui.game;
   const st = accessState(g, owner);
-  if (st.kind === 'agreement') return h('span', { class: 'pos' }, 'Agreement');
+  if (st.kind === 'agreement') return h('span', { class: 'pos' }, g.hasAccess(PLAYER, owner) ? 'Agreement' : 'Open');
   if (st.kind === 'pending') return h('button', { class: 'btn sm', 'data-tip': 'Withdraw the request', onclick: () => { g.cancelAccessRequest(PLAYER, owner); ui.sound('click'); after(); } }, 'Withdraw');
   if (st.kind === 'blocked' || st.kind === 'closed') return h('span', { class: 'muted' }, st.kind === 'blocked' ? 'Blocked' : 'Closed');
   return h('button', { class: 'btn sm', 'data-tip': `${policyText(g, owner)} · users share the upkeep ${fmtMult(g.accessMultiplier(owner))}`, onclick: () => { requestAccessUI(ui, owner); after(); } }, icon('key', 15), 'Request access');
@@ -98,7 +101,7 @@ export function openTrackAccess(ui: UI) {
 
     // ---- incoming requests
     add(win.body, section('Incoming requests', reqs.length ? String(reqs.length) : null));
-    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No requests waiting. Companies asking to run on your tracks appear here.' : `New requests are answered automatically (${policy === 'auto-approve' ? 'approved' : 'rejected'}).`));
+    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No requests waiting. Companies asking to run on your tracks appear here.' : policy === 'open' ? 'Your network is open: other companies may use it without asking (unless blocked) and share its upkeep.' : `New requests are answered automatically (${policy === 'auto-approve' ? 'approved' : 'rejected'}).`));
     for (const r of reqs) {
       const name = g.company(r.user).name;
       const left = Math.max(0, ACCESS_REQUEST_DAYS - (g.day - r.day));
@@ -114,11 +117,11 @@ export function openTrackAccess(ui: UI) {
 
     // ---- policy
     add(win.body, section('Your policy'),
-      field('Requests', seg<AccessPolicy>([['ask', 'Ask each time'], ['auto-approve', 'Auto-approve'], ['auto-reject', 'Auto-reject']], policy, (v) => {
+      field('Access', seg<AccessPolicy>([['open', 'Open', 'Anyone may use your network (except blocked companies)'], ['ask', 'Ask', 'Companies ask; you approve or reject each request'], ['auto-approve', 'Approve all', 'Requests are approved automatically'], ['auto-reject', 'Reject all', 'Nobody new may use your network']], policy, (v) => {
         g.setAccessPolicy(PLAYER, v);
         ui.sound('toggle', { pitch: v === 'auto-reject' ? 0.88 : 1.12 });
         rerender();
-      }), policy === 'auto-reject' ? 'Existing agreements continue — revoke them below.' : undefined),
+      }), policy === 'open' ? `Open — anyone may use your network and pays ${fmtMult(m)} of their usage share of the upkeep` : policy === 'auto-reject' ? 'Existing agreements continue — revoke them below.' : undefined),
       multSlider('Users pay', m, false, (v) => g.setAccessMultiplier(PLAYER, v), (v) => `${fmtMult(v)} · 50/50 usage → they pay ${fmtPct(equalUseShare(v))}`),
       h('div', { class: 'explain' },
         h('p', null, 'Users ', h('b', null, 'share the upkeep'), ' of what they use: every month each track, tram track and station that carried other companies’ traffic has its maintenance split by usage — the owner’s traffic counts once, each user’s counts × the owner’s multiplier.'),
@@ -184,7 +187,7 @@ export function openTrackAccess(ui: UI) {
     // ---- request access to others
     const candidates = others.filter((co) => !g.hasAccess(PLAYER, co.id));
     if (candidates.length) {
-      add(win.body, section('Request access to…'));
+      add(win.body, section('Other networks', 'open ones need no request'));
       for (const co of candidates) {
         const st = accessState(g, co.id);
         const hd = networkSummary(g, co.id);

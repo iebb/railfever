@@ -18,6 +18,7 @@ export function openMenu(ui: UI) {
     item('import', 'Import save from file…', () => importSave(ui)),
     item('company', 'Companies', () => { win.close(); ui.openCompetitors(); }),
     item('key', 'Track access', () => { win.close(); ui.openTrackAccess(); }),
+    item('signal', 'Auto-signal railway', () => { win.close(); ui.openAutoSignal(); }),
     item('settings', 'Settings', () => { win.close(); openSettings(ui); }),
     item('help', 'Help & controls', () => { win.close(); openHelp(ui); }),
     item('rail', 'Title screen', () => { win.close(); ui.showTitle({ resumed: {} }); }),
@@ -172,11 +173,14 @@ export function openHelp(ui: UI) {
       <li>Lines are named automatically from their stops and get their own colour — click the name or the swatch in a line window to change either (empty name = automatic again).</li>
       <li>The <b>Lines map</b> (<kbd>M</kbd>) shows every route in its colour; the <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (red = unserved, green = served) and how much of each town's travel your network can carry. <kbd>Esc</kbd> closes either.</li>
       <li>In <b>Companies</b> (<kbd>C</kbd>) you can add AI rivals (up to seven, each with a style: cautious, aggressive, rail baron, bus operator, tram builder…), change their settings, and buy them out — you take over their network, vehicles, cash and loan.</li>
-      <li><b>Track access</b>: sign an agreement (Companies → Track access, or in a foreign station's window) to run your trains and trams on another company's tracks and stop at its stations. Users share the upkeep of what they use: each month an item's maintenance is split by usage, the owner's traffic counting once and the user's × the owner's multiplier (0×–3×, default 2× — so at 50/50 usage the user pays 2/3). Set your own multiplier, or close your network, in Companies → Track access.</li>
+      <li><b>Track access</b>: networks are <b>open</b> by default — any company may run on another's tracks and stations without asking (unless blocked) and pays its usage share of the upkeep (× the owner's multiplier: at 2× and 50/50 usage the user pays 2/3). In Track access (<kbd>K</kbd>) you can switch to Ask, Approve all or Reject all, block companies, and see who uses what.</li>
     </ul>
     <h4>Tips</h4>
     <ul>
       <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>): click to place one, or drag along a track to place a series every 250 m – 1 km. Use one-way signals on double track; build passing loops on single track.</li>
+      <li><b>Auto-signal</b> (line window, Signals tool or the menu) signals a line or your whole railway by the rules: <b>path signals</b> before junctions and station entries (a train passes only when its whole way to the next signal is free), <b>block signals</b> along directional double track, signals at passing loops on single track. It shows a preview with the cost first. The <b>Signal blocks</b> view (top bar) colours each block free, reserved or occupied.</li>
+      <li>Stations can have <b>through tracks</b> without platforms (Through: 1–2, in the middle between side platforms or outside the islands) so non-stopping trains pass. Station tool → Place: <b>On a line</b> cuts a station into one of your existing tracks — trains keep running through it and lines can add the stop. Open track ends of a station can be connected in its Build tab.</li>
+      <li><b>Loop lines</b>: a line whose stops are three or more different stations circles round them one way (set Loop, Out and back or Auto in the line window); the lines map shows its direction.</li>
       <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
       <li>Stations can be built on the <b>ground</b>, <b>elevated</b> (little land, viaduct cost) or <b>underground</b> (entrances only, much dearer). Ground stations need a road at their forecourt — the station tool builds a short access street. In a station's <b>Build</b> tab you can lengthen platforms, add tracks, change the level, add entrances, move it, and link or merge nearby stations for transfers.</li>
       <li>Fares grow with the <b>distance</b> travelled (a little more for fast trips): intercity rail and long-distance buses earn well, very short hops earn little.</li>

@@ -283,6 +283,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .list .num { color: var(--text-2); font-weight: 600; }
 .ldots { display: inline-flex; gap: 3px; flex: none; }
 .ldots i { width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
+.loopic { display: inline-flex; margin-left: 4px; color: var(--text-2); vertical-align: -2px; }
 .walkchip { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 16px; padding: 0 3px; border-radius: 4px; background: var(--raised-2); color: var(--text-2); flex: none; }
 .list.stops .row > a { flex: 1; }
 .stopn { flex: 0 0 auto !important; width: 22px; height: 22px; border-radius: 50%; display: inline-flex !important; align-items: center; justify-content: center; font: 700 var(--fs-13)/1 var(--font-display); color: #0e131a; }
@@ -347,6 +348,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .flag.warn { background: rgba(255, 200, 87, 0.14); color: var(--warn); }
 .acc.req { margin: 4px 0; padding: 8px 10px; border-radius: var(--r); background: rgba(255, 200, 87, 0.06); border: 1px solid rgba(255, 200, 87, 0.25); }
 .toast-act { margin-left: auto; padding-left: 10px; color: var(--accent); font-weight: 700; white-space: nowrap; }
+.toast .toast-btn { margin-left: auto; flex: none; }
 .btn .cnt { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--warn); color: #0d1219; font: 700 var(--fs-11)/18px var(--font-display); text-align: center; }
 .acc .switch { flex: none; padding: 0; }
 .switch:has(.sw-in:disabled) { cursor: not-allowed; }
@@ -434,7 +436,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .hc-hint { margin-top: 6px; color: var(--text-3); font-size: var(--fs-11); font-weight: 500; letter-spacing: 0.01em; }
 
 /* ---------------------------------------------------------------- toasts, news, floats */
-.toasts { position: absolute; top: 64px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; align-items: center; z-index: 60; pointer-events: none; width: min(540px, calc(100vw - 20px)); }
+.toasts { position: absolute; top: 84px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; align-items: center; z-index: 60; pointer-events: none; width: min(540px, calc(100vw - 20px)); }
 .toast { display: flex; align-items: center; gap: 10px; max-width: 100%; padding: 10px 15px 10px 12px; border-radius: 12px; background: rgba(16, 22, 31, 0.93); border: 1px solid var(--hairline-2); box-shadow: var(--shadow-s); font-weight: 550; font-size: var(--fs-14); pointer-events: auto; animation: rise var(--t) var(--ease); transition: opacity 0.4s, transform 0.4s; }
 .toast .ic { color: var(--text-2); }
 .toast.bad { border-color: rgba(255, 107, 107, 0.5); color: #ffd2d2; }

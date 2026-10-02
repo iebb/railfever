@@ -191,6 +191,8 @@ export interface AIState {
   project?: Project | null;
   /** day of the last company acquisition */
   lastAcq?: number;
+  /** a corridor to continue: our station (the end of a line) and the town beyond it */
+  corridor?: [number, number];
 }
 
 /** Optional members of the tram planner used here (see ai-tram.ts). */
@@ -553,9 +555,19 @@ export class AIController {
         if (hub && hub.owner === this.companyId) score *= this.lineEndsAt(hub.id) ? 1.9 : 1.3;
         else if (hub) score *= this.foreignPathTo(hub) ? 1.7 : 1.4;
         // a town beyond (a corridor the line can continue along later)
-        else if (this.townBeyond(A, B) || this.townBeyond(B, A)) score *= 1.15;
+        else if (this.townBeyond(A, B) || this.townBeyond(B, A)) score *= 1.25;
         opts.push({ score: score * (railLines === 0 ? 1.3 : 1) * fw(focus.rail), kind: 'rail', towns: hubB ? [B.id, A.id] : [A.id, B.id], hub: hub?.id });
       }
+    }
+    // a corridor to continue (the town beyond the end of a line we just opened): a line through several towns
+    const cor = this.state.corridor;
+    if (cor && focus.rail > 0 && avail > 2_500_000) {
+      const st = g.stations.get(cor[0]), C = g.towns.list[cor[1]];
+      const B = st ? g.towns.list[st.townId] : undefined;
+      if (st && B && C && st.owner === this.companyId && this.hubFor(B, C) === st && !this.isFailed(this.pairKey(B.id, C.id))) {
+        const best = opts.filter((o) => o.kind === 'rail').reduce((m, o) => Math.max(m, o.score), 0);
+        opts.push({ score: Math.max(best * 1.2, 0.5 * fw(focus.rail)), kind: 'rail', towns: [B.id, C.id], hub: st.id });
+      } else this.state.corridor = undefined;
     }
     // trains on another company's railway (track access): much cheaper than building
     if (focus.rail > 0 && avail > 1_800_000) this.shareOptions(opts, own, D);
@@ -754,9 +766,11 @@ export class AIController {
               if (!best || d < best.d) best = { e, s: s2, d };
             }
           }
-          if (!best || best.d > town.radius + 8 || Math.hypot(a.x - town.x, a.z - town.z) < 40 || Math.hypot(b.x - town.x, b.z - town.z) < 40) continue;
-          const plan = T.planStationOnTrack(g, best.e.id, best.s, { length: aiPlatformLength(town.pop, Math.max(a.catchPop, b.catchPop), g.year), tracks: info.double ? 2 : 1 }, me);
-          if (!plan.ok) { (info.triedStops ??= []).push(town.id); continue; }
+          // (a station's catchment reaches 40 units: one at the edge of town serves much of it)
+          if (!best || best.d > town.radius + 25 || Math.hypot(a.x - town.x, a.z - town.z) < 40 || Math.hypot(b.x - town.x, b.z - town.z) < 40) continue;
+          // two platform tracks: on a single track the station is a passing loop too
+          const plan = T.planStationOnTrack(g, best.e.id, best.s, { length: aiPlatformLength(town.pop, Math.max(a.catchPop, b.catchPop), g.year), tracks: 2 }, me);
+          if (!plan.ok) { (info.triedStops ??= []).push(town.id); this.note(`no station site at ${town.name} on ${l.name}: ${plan.error ?? ''}`); continue; }
           if (plan.cost > this.available() * 0.3 || !this.borrowFor(plan.cost)) continue;
           const res = T.commitStationOnTrack(g, plan);
           if (res.error === 'busy') return false;
@@ -793,16 +807,23 @@ export class AIController {
     return false;
   }
 
-  /** A town (of some size) beyond B as seen from A: B roughly between them, so a line A–B can continue there. */
-  private townBeyond(A: Town, B: Town): boolean {
+  /**
+   * The town beyond B as seen from A (B roughly between them, so a line A–B can continue there): the biggest,
+   * straightest one 50–220 units on; null if none.
+   */
+  private townBeyond(A: Town, B: Town): Town | null {
     const ux = B.x - A.x, uz = B.z - A.z, ul = Math.hypot(ux, uz) || 1;
+    let best: Town | null = null, bs = 0;
     for (const C of this.game.towns.list) {
       if (C === A || C === B || C.pop < 300) continue;
       const vx = C.x - B.x, vz = C.z - B.z, vl = Math.hypot(vx, vz);
       if (vl < 50 || vl > 220) continue;
-      if ((ux * vx + uz * vz) / (ul * vl) > 0.7) return true;
+      const cos = (ux * vx + uz * vz) / (ul * vl);
+      if (cos <= 0.7) continue;
+      const sc = cos * Math.sqrt(C.pop) / (vl + 50);
+      if (sc > bs) { bs = sc; best = C; }
     }
-    return false;
+    return best;
   }
 
   /**
@@ -1007,12 +1028,15 @@ export class AIController {
     }
     // signals for the new or extended line (before its trains run)
     this.signalLine(line.id);
+    // (building may have cost more than planned: borrow for the trains; a line still without one gets its first
+    // train later, see manage, rather than the railway being lost)
+    this.borrowFor(trainCost * nTrains + 300_000);
     let bought = 0;
     for (let i = 0; i < nTrains; i++) {
       const t = g.vehicles.buyTrain(dep, cars, line.id);
       if (typeof t !== 'string') { bought++; this.stats.vehicles++; }
     }
-    if (!bought && !ext) return fail('could not buy a train', 360);
+    if (!bought) this.note(`no money for a train on ${line.name} yet`);
     if (!ext) {
       const info: LineInfo = early?.info ?? { kind: 'rail', towns: [A.id, B.id], depot: dep, maxVehicles: 2, opened: g.day };
       info.depot = dep;
@@ -1020,6 +1044,9 @@ export class AIController {
     }
     if (ext) p.line = line.id;
     this.stats.lines += ext ? 0 : 1; this.stats.railStations += hub ? 1 : 2;
+    // the corridor goes on: the town beyond B is the next extension (through B's free platform ends)
+    const next = hub && hub.owner !== owner ? null : this.townBeyond(A, B);
+    this.state.corridor = next ? [stB.id, next.id] : undefined;
     if (hub) this.stats.reused++;
     this.stats.spent += Math.max(0, spent0 - this.eco.money) + total - est;
     g.postNews(hub ? `${this.name} extends its railway from ${hub.name} to ${B.name} (${(len / 100).toFixed(1)} km).`
@@ -1664,6 +1691,18 @@ export class AIController {
         this.note(`closed ${l.name}`);
         continue;
       }
+      // a railway still without trains (money ran short when it opened): its first train
+      if (!vs.length && info.kind === 'rail' && info.shared === undefined && g.depots.get(info.depot)) {
+        const sts = l.stops.map((sid) => g.stations.get(sid)).filter((x): x is Station => !!x?.rail);
+        const platform = Math.min(...sts.map((x) => x.rail!.length), 99), span = sts.reduce((m, x) => Math.max(m, Math.hypot(x.x - sts[0].x, x.z - sts[0].z)), 0);
+        const cars = pickTrain(g.year, platform, span * 1.3, 2);
+        const cost = cars ? cars.reduce((a, c) => a + c.cost, 0) : Infinity;
+        if (cars && this.available() > cost + 300_000 && this.borrowFor(cost)) {
+          const t = g.vehicles.buyTrain(info.depot, cars, lid);
+          if (typeof t !== 'string') { this.stats.vehicles++; this.note(`first train on ${l.name}`); }
+        }
+        continue;
+      }
       // sell chronically unprofitable vehicles (keep one per line unless money is tight)
       for (const v of vs) {
         if (v.age < 2.5 || v.profitLast >= -0.25 * v.runningCost || v.profitYear > 0) continue;
@@ -2039,6 +2078,7 @@ export class AIController {
     const s = data?.state;
     if (!s) return;
     this.state = { phase: s.phase ?? 'idle', cooldown: s.cooldown ?? 10, projects: s.projects ?? 0 };
+    if (Array.isArray(s.corridor) && s.corridor.length === 2) this.state.corridor = [s.corridor[0], s.corridor[1]];
     if (typeof s.rng === 'number') this.rng.state = s.rng;
     if (Array.isArray(s.failed)) this.failed = new Map(s.failed);
     if (s.stats) this.stats = { ...this.stats, ...s.stats };
