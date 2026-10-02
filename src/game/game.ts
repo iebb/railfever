@@ -72,6 +72,8 @@ export const PLAYER = 0;
 export const MAX_AI_COMPANIES = 7;
 /** Infrastructure counts at this share of its replacement cost in a company's value. */
 const INFRA_DEPRECIATION = 0.6;
+/** Upkeep and value of elevated and underground stations relative to a ground station. */
+const STATION_LEVEL_FACTOR: Record<string, number> = { ground: 1, elevated: 3, underground: 6 };
 const BUYOUT_PREMIUM = 1.25;
 export { GEN_RATE };
 const MAX_STEP = 0.05;
@@ -452,8 +454,13 @@ export class Game {
     for (const s of e.sections) c += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
     return c;
   }
-  /** Yearly maintenance of a station (platforms and stops; the platform tracks count as edges). */
-  stationMaintenance(st: Station): number { return (st.rail ? 20000 + st.rail.tracks * st.rail.length * 500 : 0) + st.stops.length * 3000; }
+  /**
+   * Yearly maintenance of a station (platforms and stops; the platform tracks count as edges): an elevated
+   * station costs about 3x a ground one, an underground one about 6x.
+   */
+  stationMaintenance(st: Station): number {
+    return (st.rail ? (20000 + st.rail.tracks * st.rail.length * 500) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1) : 0) + st.stops.length * 3000;
+  }
 
   /**
    * Month end: users of other companies' items pay their usage share of each item's monthly maintenance to the
@@ -527,7 +534,8 @@ export class Game {
     }
     for (const st of this.stations.map.values()) {
       if (st.owner !== id) continue;
-      if (st.rail) a.stations += st.rail.tracks * st.rail.length * 9000 + 120000;
+      // what it cost to build (older saves: an estimate by size and level)
+      if (st.rail) a.stations += st.rail.cost ?? (st.rail.tracks * st.rail.length * 9000 + 120000) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1);
       a.stations += st.stops.length * 30000;
     }
     for (const d of this.depots.map.values()) if (d.owner === id) a.depots += d.kind === 'rail' ? 90000 : d.kind === 'road' ? 60000 : 120000;

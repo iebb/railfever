@@ -6,7 +6,8 @@ import type { NEdge } from './network';
 import { availableModels, VehicleModel } from './vehicle-types';
 import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize } from './build-ops';
 import { roadDepotReaches } from './roadvehicle';
-import { TRAM, BUSSTOP_RADIUS } from './constants';
+import { TRAM } from './constants';
+import { stopCatchShape } from './stations';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
 export interface TramProject {
@@ -227,9 +228,8 @@ export class TramPlanner {
       if (len > direct * 1.7 + 10) continue;
       const stops = tramStopSites(g, pts, owner);
       if (stops.length < 3) continue;
-      // people near the stops per unit of new track
-      let pop = 0;
-      for (const s of stops) for (const b of g.world.buildingsNear(s.x, s.z, BUSSTOP_RADIUS)) if (Math.hypot(b.x - s.x, b.z - s.z) <= BUSSTOP_RADIUS) pop += b.pop;
+      // people in the stops' catchment (each counted once) per unit of new track
+      const pop = g.stations.popInShapes(stops.map((s) => stopCatchShape(s.x, s.z, true)));
       out.push({ edges, len, pts, stops, score: pop / (40 + len) });
       yield;
     }

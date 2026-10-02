@@ -283,6 +283,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .list .num { color: var(--text-2); font-weight: 600; }
 .ldots { display: inline-flex; gap: 3px; flex: none; }
 .ldots i { width: 8px; height: 8px; border-radius: 2px; background: var(--c); }
+.walkchip { display: inline-flex; align-items: center; justify-content: center; min-width: 18px; height: 16px; padding: 0 3px; border-radius: 4px; background: var(--raised-2); color: var(--text-2); flex: none; }
 .list.stops .row > a { flex: 1; }
 .stopn { flex: 0 0 auto !important; width: 22px; height: 22px; border-radius: 50%; display: inline-flex !important; align-items: center; justify-content: center; font: 700 var(--fs-13)/1 var(--font-display); color: #0e131a; }
 .rowbtns { display: flex; gap: 2px; }
@@ -654,4 +655,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 }
 @media (prefers-reduced-motion: reduce) {
   #app *, #app *::before, #app *::after { animation: none !important; transition: none !important; }
+}
+
+/* Top bar: keep the centred clock clear of the action buttons on medium widths.
+   The map-view toggles stay available in the minimap header and via M / P / O. */
+@media (max-width: 1360px) {
+  .hud-tr .hbtn[data-key="M"], .hud-tr .hbtn[data-key="P"], .hud-tr .hbtn[data-key="O"] { display: none; }
+}
+@media (max-width: 880px) {
+  .hud-tc { top: 64px; }
 }

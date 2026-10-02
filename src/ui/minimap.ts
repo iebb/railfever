@@ -8,7 +8,7 @@ import { loadFonts } from './fonts';
 import type { MapMode } from './mapmodes';
 import { servedColor, hexCss } from './mapmodes';
 import { PLAYER } from '../game/game';
-import { catchShapes, CATCH_COLOR } from './gameapi';
+import { catchShapes, catchColor } from './gameapi';
 
 export class Minimap {
   el: HTMLDivElement;
@@ -271,8 +271,8 @@ export class Minimap {
     } else if (this.mode === 'catchment') {
       for (const st of g.stations.map.values()) {
         if (st.owner !== PLAYER) continue;
-        for (const c of catchShapes(g, st)) {
-          const col = hexCss(CATCH_COLOR[c.mode]);
+        for (const c of catchShapes(g, st, true)) {
+          const col = hexCss(catchColor(c));
           ctx.beginPath(); ctx.arc(c.x * k, c.z * k, Math.max(1.5 * this.dpr, c.r * k), 0, Math.PI * 2);
           ctx.globalAlpha = 0.22; ctx.fillStyle = col; ctx.fill();
           ctx.globalAlpha = 0.9; ctx.strokeStyle = col; ctx.lineWidth = this.dpr; ctx.stroke();

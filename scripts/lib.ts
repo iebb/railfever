@@ -176,7 +176,7 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
 export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log):
   { A: Station; B: Station; TA: Town; TB: Town; con: ReturnType<typeof connectStations> } | null {
   const skip = new Set<string>();
-  for (let attempt = 0; attempt < 5; attempt++) {
+  for (let attempt = 0; attempt < 10; attempt++) {
     const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip);
     if (!pr) return null;
     const e0 = g.world.net.nextEdge;

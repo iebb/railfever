@@ -406,9 +406,22 @@ export class Stations {
   /** Collision rectangles of station structures at street level (underground: only the entrances). */
   footprints(st: Station): Footprint[] { return this.structures(st); }
 
+  /** Cached station structure volumes (planning queries hit these per sample point). */
+  private structCache = new WeakMap<RailPart, { key: string; v: Volume[] }>();
+
   private structures(st: Station): Volume[] {
     const r = st.rail;
     if (!r) return [];
+    const b = r.building;
+    const key = `${this.game.world.heightsVersion}|${r.x}|${r.z}|${r.y}|${r.angle}|${r.length}|${r.tracks}|${r.level}|${b.x}|${b.z}|${b.w}|${b.d}|${(r.entrances ?? []).length}|${(r.piers ?? []).length}`;
+    const c = this.structCache.get(r);
+    if (c && c.key === key) return c.v;
+    const v = this.buildStructures(r);
+    this.structCache.set(r, { key, v });
+    return v;
+  }
+
+  private buildStructures(r: RailPart): Volume[] {
     const w = this.game.world;
     const lv = r.level ?? 'ground';
     const fp = { x: r.x, z: r.z, angle: r.angle, w: stationLayout(r.tracks).width, d: r.length };
@@ -427,7 +440,7 @@ export class Stations {
   private volumes(st: Station): Volume[] {
     const r = st.rail;
     if (!r) return [];
-    const out = this.structures(st);
+    const out = this.structures(st).slice();
     if ((r.level ?? 'ground') === 'underground') out.push({ x: r.x, z: r.z, angle: r.angle, w: stationLayout(r.tracks).width, d: r.length, y0: r.y - 0.4, y1: r.y + 1.1, part: 'platforms' });
     return out;
   }

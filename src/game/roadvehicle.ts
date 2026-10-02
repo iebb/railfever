@@ -169,16 +169,29 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
     NE.push(e.id); ND.push(d); NG.push(gc); NP.push(parent);
     heap.push(NE.length - 1, gc + heur(e, d));
   };
-  const nodeDeg = (e: NEdge, d: number) => net.nodes.get(d > 0 ? e.b : e.a)?.edges.length ?? 0;
-  /** continuations, filtered; a U-turn is cheap at a dead end (of the allowed network) */
-  const next = (e: NEdge, d: number) => {
-    const opts = roadNext(g, e, d);
-    if (!allow) return opts.map((c) => ({ ...c, pen: c.uturn ? (nodeDeg(e, d) <= 1 ? 2 : 40) : 0 }));
-    const ok = opts.filter((c) => c.uturn || allow(c.edge));
-    const dead = !ok.some((c) => !c.uturn);
-    return ok.map((c) => ({ ...c, pen: c.uturn ? (dead ? 2 : 40) : 0 }));
+  /**
+   * Push the continuations of lane (e, d) in roadNext's order (no allocations): the (allowed) edges at its end
+   * node, then the U-turn, which is cheap at a dead end (of the allowed network).
+   */
+  const expand = (e: NEdge, d: number, gc: number, parent: number) => {
+    const nodeId = d > 0 ? e.b : e.a;
+    const node = net.nodes.get(nodeId);
+    if (!node) return;
+    let open = false;
+    if (allow) for (const fid of node.edges) {
+      if (fid === e.id) continue;
+      const f = net.edges.get(fid);
+      if (f && f.depot < 0 && allow(f)) { open = true; break; }
+    }
+    for (const fid of node.edges) {
+      if (fid === e.id) continue;
+      const f = net.edges.get(fid);
+      if (!f || f.depot >= 0 || (allow && !allow(f))) continue;
+      push(f, f.a === nodeId ? 1 : -1, gc + cost(f), parent);
+    }
+    if (e.depot < 0) push(e, -d, gc + cost(e) + (allow ? (open ? 40 : 2) : node.edges.length <= 1 ? 2 : 40), parent);
   };
-  for (const c of next(edge, dir)) push(c.edge, c.dir, cost(c.edge) + c.pen, -1);
+  expand(edge, dir, 0, -1);
   let n = 0;
   while (heap.size) {
     const i = heap.pop();
@@ -191,7 +204,7 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
       return out.reverse();
     }
     if (++n > maxExpand) break;
-    for (const c of next(e, d)) push(c.edge, c.dir, NG[i] + cost(c.edge) + c.pen, i);
+    expand(e, d, NG[i], i);
   }
   return null;
 }

@@ -6,6 +6,8 @@
 // towns, regions, town pairs and the largest regional flows for the UI.
 import type { Game } from './game';
 import type { Station } from './stations';
+import { WALK_LINE } from './stations';
+import type { Hop } from './lines';
 import type { Building } from './world';
 import type { Town } from './towns';
 import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS } from './constants';
@@ -123,6 +125,43 @@ export class DemandModel {
     this.computeDecay();
     this.computeOD();
     this.version++;
+    // region ids changed: the stations' shares are worked out again
+    this.shares.clear();
+    if (g.lines) g.lines.catchmentDirty = true;
+  }
+
+  /**
+   * A town's district layout changed (it grew past a size step): its regions are made anew and aggregated; the
+   * other towns keep theirs (renumbered), so this costs one town instead of a full rebuild.
+   */
+  private relayout(t: Town) {
+    const g = this.g, old = this.regions, oldTowns = this.towns;
+    this.regions = [];
+    this.towns = new Map();
+    const remap = new Map<number, number>();
+    for (const tw of g.towns.list) {
+      const prev = oldTowns.get(tw.id);
+      const ids: number[] = [];
+      if (prev && tw.id !== t.id) {
+        for (const oid of prev.ids) { const id = this.regions.length; this.regions.push({ ...old[oid], id }); ids.push(id); remap.set(oid, id); }
+        this.towns.set(tw.id, { core: prev.core, sectors: prev.sectors, ids });
+        continue;
+      }
+      const lay = this.layoutOf(tw);
+      const add = (kind: Region['kind']) => { const id = this.regions.length; this.regions.push({ id, town: tw.id, kind, x: tw.x, z: tw.z, r: 0, pop: 0, jobs: 0, produced: 0, attracted: 0 }); ids.push(id); };
+      if (!lay.sectors) add('town'); else { add('centre'); for (let k = 0; k < lay.sectors; k++) add('district'); }
+      this.towns.set(tw.id, { core: lay.core, sectors: lay.sectors, ids });
+    }
+    for (const tw of g.towns.list) if (tw.id === t.id || !oldTowns.has(tw.id)) this.aggregateTown(tw);
+    // stations keep their shares of the other towns' regions; the town's own come with the next catchment update
+    for (const [sid, arr] of [...this.shares]) {
+      const kept = arr.filter(([r]) => remap.has(r)).map(([r, v]) => [remap.get(r)!, v] as [number, number]);
+      if (kept.length) this.shares.set(sid, kept); else this.shares.delete(sid);
+    }
+    if (g.lines) g.lines.catchmentDirty = true;
+    this.computeDecay();
+    this.computeOD();
+    this.version++;
   }
 
   /** Residents, jobs, centre and extent of a town's regions (from its buildings); returns their ids. */
@@ -166,7 +205,8 @@ export class DemandModel {
       const t = T[this.cursor % T.length];
       this.cursor = (this.cursor + 1) % T.length;
       const lay = this.towns.get(t.id), want = this.layoutOf(t);
-      if (!lay || want.sectors !== lay.sectors) { this.rebuild(); return; }
+      if (!lay) { this.rebuild(); return; }
+      if (want.sectors !== lay.sectors) { this.relayout(t); return; }
       lay.core = want.core;
       changed.push(...this.aggregateTown(t));
     }
@@ -342,6 +382,12 @@ export function demandView(g: Game, company = 0): DemandView {
   return view;
 }
 
+/** The line of the first leg actually ridden on the way to `dest` (walking transfers looked through). */
+function firstRide(g: Game, hop: Hop | undefined, dest: number): number {
+  for (let i = 0; hop && hop.line === WALK_LINE && i < 4; i++) hop = g.lines.nextHop(hop.alight, dest);
+  return hop ? hop.line : WALK_LINE;
+}
+
 function computeView(g: Game, company: number): DemandView {
   g.lines.flushCatchment();
   const m = g.demand;
@@ -360,9 +406,9 @@ function computeView(g: Game, company: number): DemandView {
     const from = cov.get(st.id)!;
     for (const [r, cr] of from) servedPop[r] += cr * R[r].pop;
     for (const [d, hop] of table) {
-      const to = cov.get(d);
-      if (!to || !to.length) continue;
-      const mine = g.lines.get(hop.line)?.owner === company;
+      const to = cov.get(d), ds = g.stations.get(d);
+      if (!to || !to.length || !ds || !stationActive(g, ds)) continue;
+      const mine = g.lines.get(firstRide(g, hop, d))?.owner === company;
       for (const [r, cr] of from) for (const [q, cq] of to) {
         reach[r * n + q] += cr * cq;
         if (mine) reachMine[r * n + q] += cr * cq;

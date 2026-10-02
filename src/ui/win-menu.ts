@@ -176,7 +176,9 @@ export function openHelp(ui: UI) {
     </ul>
     <h4>Tips</h4>
     <ul>
-      <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>). Use one-way signals on double track; build passing loops on single track.</li>
+      <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>): click to place one, or drag along a track to place a series every 250 m – 1 km. Use one-way signals on double track; build passing loops on single track.</li>
+      <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
+      <li>Stations can be built on the <b>ground</b>, <b>elevated</b> (little land, viaduct cost) or <b>underground</b> (entrances only, much dearer). Ground stations need a road at their forecourt — the station tool builds a short access street. In a station's <b>Build</b> tab you can lengthen platforms, add tracks, change the level, add entrances, move it, and link or merge nearby stations for transfers.</li>
       <li>Fares grow with the <b>distance</b> travelled (a little more for fast trips): intercity rail and long-distance buses earn well, very short hops earn little.</li>
       <li>Fast, frequent service raises station ratings — well-served towns grow faster.</li>
       <li>Double track runs one direction per track. Build single track and upgrade it later when traffic grows.</li>

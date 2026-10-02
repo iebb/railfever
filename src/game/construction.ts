@@ -669,11 +669,15 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
         if (opts.town) { fail('Buildings in the way'); continue; }
         demolish.add(b.id);
       }
-      // stations and depots
-      for (const st of g.stations.footprintsNear(p.x, p.z, hw + 0.2)) {
-        if (nearEnd) continue;
-        void st;
-        fail('Station in the way');
+      // stations: their structures where the new line runs at their height (it may pass under an elevated
+      // deck between the piers; underground stations only have their entrances at street level)
+      if (!nearEnd) for (const st of g.stations.footprintsNear(p.x, p.z, hw + 0.2)) {
+        for (const f of g.stations.footprints(st)) {
+          if (distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) > hw + 0.2) continue;
+          if (f.y0 !== undefined && f.y1 !== undefined && (yy + RAIL.clearance <= f.y0 || yy - 0.2 >= f.y1)) continue;
+          fail('Station in the way');
+          break;
+        }
       }
       for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd) { void dp; fail('Depot in the way'); } }
       // parallel conflicts with other edges

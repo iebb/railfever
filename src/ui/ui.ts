@@ -19,7 +19,7 @@ import { UiTips } from './tips';
 import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
 import { MapModes } from './mapmodes';
-import { catchShapes, CATCH_COLOR, stationLinks } from './gameapi';
+import { catchShapes, catchColor } from './gameapi';
 import * as info from './win-info';
 import * as lines from './win-lines';
 import * as company from './win-company';
@@ -389,8 +389,8 @@ export class UI {
     this.catchmentStation = id;
     const st = id >= 0 ? g.stations.get(id) : undefined;
     if (!st) { this.renderer.overlay.setCatchments('sel', null); return; }
-    const group = [st, ...stationLinks(g, st).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x)];
-    this.renderer.overlay.setCatchments('sel', group.flatMap((s) => catchShapes(g, s)).map((c) => ({ x: c.x, z: c.z, r: c.r, color: CATCH_COLOR[c.mode] })));
+    const group = g.stations.complex(st.id).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x);
+    this.renderer.overlay.setCatchments('sel', group.flatMap((s) => catchShapes(g, s, true)).map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
   }
 
   /** Open the info window for a picked object. */

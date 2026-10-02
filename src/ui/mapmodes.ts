@@ -6,7 +6,7 @@ import type { Line } from '../game/lines';
 import { PLAYER } from '../game/game';
 import { h, icon, clear, toggle } from './dom';
 import { computeLinePath, LinePath } from './linepaths';
-import { townDemandShare, catchShapes, catchRadius, CATCH_COLOR, CatchMode } from './gameapi';
+import { townDemandShare, catchShapes, catchRadius, catchColor, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
 import type { Arc, ShareRing } from '../render/overlay';
 import { fmtInt } from './dom';
@@ -198,8 +198,9 @@ export class MapModes {
     const sig = g.networkVersion + '|' + mine.length + '|' + Math.floor(g.day / 30);
     if (sig === this.catchSig) return;
     this.catchSig = sig;
-    const shapes = mine.flatMap((s) => catchShapes(g, s));
-    this.ui.renderer.overlay.setCatchments('map', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: CATCH_COLOR[c.mode] })));
+    const shapes = mine.flatMap((s) => catchShapes(g, s, true));
+    this.ui.renderer.overlay.setCatchments('map', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
+    const inactive = mine.filter((s) => s.rail && !s.roadAccess).length;
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);
     const pop = g.towns.list.reduce((a, t) => a + t.pop, 0);
     const towns = g.towns.list.filter((t) => !mine.some((s) => Math.hypot(s.x - t.x, s.z - t.z) < t.radius + 10));
@@ -214,7 +215,8 @@ export class MapModes {
         h('div', { class: 'mc-list' }, row('rail', 'Train stations', catchRadius('rail')), row('tram', 'Tram stops', catchRadius('tram')), row('bus', 'Bus stops', catchRadius('bus'))),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
-          towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null),
+          towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
+          inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access (grey)`)) : null),
         h('div', { class: 'mc-note' }, 'Passengers come from homes inside the circles: rail stations reach farthest, bus stops the least. Hover a station to see its own area.')),
     );
   }

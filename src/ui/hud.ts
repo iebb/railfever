@@ -10,6 +10,7 @@ import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES } from '../game/constants';
 import { fmtDate, fmtHeight, newsDate } from './format';
 import type { StationLevel } from './gameapi';
+import { STATION_HEIGHT, STATION_DEPTH } from '../game/stations';
 import { audio } from '../audio/engine';
 
 interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
@@ -17,7 +18,7 @@ interface Cat { id: string; label: string; icon: string; color: string; tip: str
 /** Tool categories of the dock. */
 const CATS: Cat[] = [
   { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
-  { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, signals, depot', keys: '2 4 5', tools: ['rail', 'signal', 'depot-rail'] },
+  { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, double track, signals, depot', keys: '2 4 5', tools: ['rail', 'double', 'signal', 'depot-rail'] },
   { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
   { id: 'tram', label: 'Tram', icon: 'tram', color: 'var(--tram)', tip: 'Tram: tracks, stops, depot', keys: '', tools: ['tram', 'tramstop', 'depot-tram'] },
   { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
@@ -41,6 +42,8 @@ export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string;
   bulldoze: { icon: 'bulldoze', key: '9', cat: 'demolish', color: 'var(--demolish)' },
   terraform: { icon: 'terraform', key: '0', cat: 'terrain', color: 'var(--terrain)' },
   'line-edit': { icon: 'lines', key: '', cat: 'lines', color: 'var(--accent)' },
+  double: { icon: 'parallel', key: '', cat: 'rail', color: 'var(--rail)' },
+  entrance: { icon: 'entrance', key: '', cat: 'stations', color: 'var(--station)' },
 };
 
 /** One-line descriptions for the compact tool card (the long help sits behind '?'). */
@@ -54,7 +57,9 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   tram: 'Lay tracks in roads: click one, or drag along streets.',
   tramstop: 'Click on a road with tram tracks.',
   'depot-tram': 'Click next to a road with tram tracks.',
-  signal: 'Click a track to add a signal, a signal to cycle it.',
+  signal: 'Click to add or cycle a signal · drag along a track to place block signals.',
+  double: 'Click or drag along one of your single tracks to double it.',
+  entrance: 'Click beside a road near the station.',
   bulldoze: 'Click to remove, drag to clear an area.',
   terraform: 'Hold the button to reshape the ground.',
   'line-edit': 'Click stations to add them as stops.',
@@ -62,9 +67,10 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
 
 /** Longer tray tooltips where the name alone does not explain the tool. */
 const TRAY_TIP: Partial<Record<ToolId, string>> = {
-  signal: 'Signals split track into blocks so several trains can run on a line. Two-way: trains pass in both directions (single track with passing loops). One-way: block signals for double track — trains only enter from the signal side.',
+  signal: 'Signals split track into blocks so several trains can run on a line. Two-way: trains pass in both directions (single track with passing loops). One-way: block signals for double track — trains only enter from the signal side. Drag along a track to place a series.',
+  double: 'Upgrade to double track: lay a second track beside one of yours, with switches at both ends.',
 };
-const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop' };
+const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', double: 'Double', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop', entrance: 'Entrance' };
 
 /** Key hints per tool: [keys, action]. */
 const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
@@ -77,7 +83,9 @@ const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   tram: [[['Click'], 'one road'], [['Drag'], 'along streets'], [['Esc'], 'cancel']],
   tramstop: [[['Click'], 'on tram tracks']],
   'depot-tram': [[['Click'], 'next to tram tracks'], [['R'], 'rotate']],
-  signal: [[['Click'], 'add / cycle signal']],
+  signal: [[['Click'], 'add / cycle signal'], [['Drag'], 'block signals along a track'], [['Right-click'], 'remove']],
+  double: [[['Click'], 'one track'], [['Drag'], 'along the line'], [['Esc'], 'cancel']],
+  entrance: [[['Click'], 'beside a road'], [['Esc'], 'done']],
   bulldoze: [[['Click'], 'remove'], [['Drag'], 'clear area']],
   terraform: [[['Hold'], 'apply brush']],
   'line-edit': [[['Click'], 'add station'], [['Esc'], 'done']],
@@ -446,7 +454,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Compact options card of the active tool: header, one-line description (long help behind '?'), options. */
@@ -480,15 +488,32 @@ export class Hud {
       opts.push(opt('Height', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: raised ends make bridges, lowered ends cuttings and tunnels ( [ / ] or PgUp / PgDn )')));
       opts.push(opt('Cross', seg([['auto', 'Auto'], ['over', 'Over'], ['under', 'Under'], ['level', 'Level']], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
+    } else if (t === 'signal') {
+      opts.push(opt('Mode', seg([['place', 'Place'], ['remove', 'Remove']], T.signalMode, (v) => { T.signalMode = v; redo(); })));
+      opts.push(opt('Type', seg([['oneway', 'One-way', 'Block signals for double track: trains pass in one direction'], ['twoway', 'Two-way', 'Trains pass both ways: single track with passing loops']], T.signalKind, (v) => { T.signalKind = v; redo(); })));
+      opts.push(opt('Spacing', seg<number>([[25, '250 m'], [50, '500 m'], [100, '1 km']], T.signalSpacing, (v) => { T.signalSpacing = v; redo(); })));
+    } else if (t === 'double') {
+      opts.push(opt('Side', seg([['auto', 'Auto', 'Right, or left when the right is blocked'], ['right', 'Right'], ['left', 'Left']], T.doubleSide, (v) => { T.doubleSide = v; redo(); })));
+      opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track, signals, crossovers before stations'));
+      if (T.directional) opts.push(opt('Run on', seg<string>([['right', 'Right'], ['left', 'Left']], T.rightHand ? 'right' : 'left', (v) => { T.rightHand = v === 'right'; redo(); })));
+    } else if (t === 'entrance') {
+      const st = T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation) : undefined;
+      opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, st?.name ?? '—'), h('span', { class: 'muted' }, st?.rail ? `${st.rail.entrances.length} entrance${st.rail.entrances.length === 1 ? '' : 's'}` : ''));
+      opts.push(h('button', { class: 'btn sm primary', onclick: () => { const id = T.entranceStation; T.setTool('inspect'); if (id != null) this.ui.openStation(id); } }, icon('check', 14), 'Done'));
     } else if (t === 'station') {
+      if (T.relocating != null) {
+        const st = this.ui.game.stations.get(T.relocating);
+        opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, icon('move', 13), `Moving ${st?.name ?? 'station'}`), h('button', { class: 'btn sm', onclick: () => T.setTool('inspect') }, 'Cancel'));
+      }
       opts.push(opt('Level', seg<StationLevel>([['ground', 'Ground'], ['elevated', 'Elevated', 'On a viaduct: little land used, costs extra'], ['underground', 'Underground', 'Below ground: only entrances on the surface, costs extra']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
-      if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(1.2, +(T.stationHeight - 0.4).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(4, +(T.stationHeight + 0.4).toFixed(1)); redo(); }, 'Deck height above the ground')));
-      if (T.stationLevel === 'underground') opts.push(opt('Depth', stepper(`${Math.round(T.stationDepth * 10)} m`, () => { T.stationDepth = Math.max(1.2, +(T.stationDepth - 0.4).toFixed(1)); redo(); }, () => { T.stationDepth = Math.min(5, +(T.stationDepth + 0.4).toFixed(1)); redo(); }, 'Platform depth below the ground')));
-      opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(8, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
+      if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(STATION_HEIGHT.min, +(T.stationHeight - 0.3).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(STATION_HEIGHT.max, +(T.stationHeight + 0.3).toFixed(1)); redo(); }, 'Deck height above the highest ground beneath')));
+      if (T.stationLevel === 'underground') opts.push(opt('Depth', stepper(`${Math.round(T.stationDepth * 10)} m`, () => { T.stationDepth = Math.max(STATION_DEPTH.min, +(T.stationDepth - 0.3).toFixed(1)); redo(); }, () => { T.stationDepth = Math.min(STATION_DEPTH.max, +(T.stationDepth + 0.3).toFixed(1)); redo(); }, 'Platform depth below the ground')));
+      opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(4, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
       opts.push(opt('Tracks', stepper(String(T.stationTracks), () => { T.stationTracks = Math.max(1, T.stationTracks - 1); redo(); }, () => { T.stationTracks = Math.min(6, T.stationTracks + 1); redo(); })));
       opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
       opts.push(toggle('Align to track', T.autoAlign, (v) => { T.autoAlign = v; redo(); }));
-    } else if (t === 'depot-rail' || t === 'depot-road') {
+    } else if (t === 'depot-rail' || t === 'depot-road' || t === 'depot-tram') {
+      if (T.relocatingDepot != null) opts.push(h('span', { class: 'chip', style: `--c:${TOOL_META[t].color}` }, icon('move', 13), 'Moving depot'), h('button', { class: 'btn sm', onclick: () => T.setTool('inspect') }, 'Cancel'));
       opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
     } else if (t === 'terraform') {
       opts.push(opt('Mode', seg([['raise', 'Raise'], ['lower', 'Lower'], ['level', 'Level']], T.terraMode, (v) => { T.terraMode = v; redo(); this.renderTray(); })));

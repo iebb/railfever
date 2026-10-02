@@ -7,8 +7,8 @@ import { LINE_PALETTES } from '../game/lines';
 import type { LineKind } from '../game/constants';
 import { AIConfig, DEFAULT_AI_CONFIG, AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import type { DemandView, DemandTown, DemandPair } from '../game/demand';
-import type { StationPlan, Station } from '../game/stations';
-import { STATION_RADIUS, BUSSTOP_RADIUS } from '../game/constants';
+import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, StationOpts } from '../game/stations';
+import { CATCHMENT_RADIUS } from '../game/stations';
 
 export type { AIConfig };
 export { AI_PRESETS };
@@ -70,44 +70,25 @@ export function aiConfigsFor(style: string, n: number): AIConfig[] {
 }
 
 // ------------------------------------------------------------------ stations: levels, catchment, transfers
-export type StationLevel = 'ground' | 'elevated' | 'underground';
+export type { StationLevel, CatchMode, CatchShape };
 export interface StationLevelOpts { level: StationLevel; height?: number; depth?: number }
 
-/** Plan a rail station on the ground, elevated (viaduct) or underground (passed through when supported). */
-export function planStation(g: Game, x: number, z: number, angle: number, length: number, tracks: number, owner: number, o?: StationLevelOpts): StationPlan {
-  const plan = g.stations.planRail as unknown as (...a: unknown[]) => StationPlan;
-  if (!o || o.level === 'ground') return plan.call(g.stations, x, z, angle, length, tracks, owner);
-  return plan.call(g.stations, x, z, angle, length, tracks, owner, { ...o, underground: o.level === 'underground' });
+/** Plan a rail station on the ground, elevated (viaduct) or underground (extra options: relocating etc.). */
+export function planStation(g: Game, x: number, z: number, angle: number, length: number, tracks: number, owner: number, o?: StationLevelOpts, extra?: StationOpts): StationPlan {
+  return g.stations.planRail(x, z, angle, length, tracks, owner, { ...(o ?? {}), ...(extra ?? {}) });
 }
-/** Level of a planned or built station part ('ground' when the game does not know levels). */
-export function levelOf(p: unknown): StationLevel {
-  const q = p as { level?: StationLevel; underground?: boolean } | null;
-  return q?.level ?? (q?.underground ? 'underground' : 'ground');
-}
+/** Level of a planned or built station part. */
+export function levelOf(p: { level?: StationLevel } | null | undefined): StationLevel { return p?.level ?? 'ground'; }
 
-export type CatchMode = 'rail' | 'tram' | 'bus';
-/** Catchment colours by mode (as --rail, --tram, --road). */
+/** Catchment colours by mode (as --rail, --tram, --road); inactive areas (no road access) are grey. */
 export const CATCH_COLOR: Record<CatchMode, number> = { rail: 0x5aa9ff, tram: 0xc084fc, bus: 0xff8a3d };
-export interface CatchShape { x: number; z: number; r: number; mode: CatchMode }
+export const CATCH_INACTIVE = 0x7a8494;
+export const catchColor = (c: CatchShape) => (c.active ? CATCH_COLOR[c.mode] : CATCH_INACTIVE);
 
-/** Catchment circles of a station (the game's per-mode shapes, or rail / stop radii). */
-export function catchShapes(g: Game, st: Station): CatchShape[] {
-  const f = (g.stations as unknown as { catchmentShapes?: (s: Station) => { x: number; z: number; r: number; mode: string }[] }).catchmentShapes;
-  if (f) return f.call(g.stations, st).map((c) => ({ x: c.x, z: c.z, r: c.r, mode: c.mode === 'rail' ? 'rail' : c.mode === 'tram' ? 'tram' : 'bus' }));
-  const out: CatchShape[] = [];
-  if (st.rail) out.push({ x: st.rail.x, z: st.rail.z, r: g.stations.catchmentRadius(st), mode: 'rail' });
-  for (const p of st.stops) out.push({ x: p.x, z: p.z, r: BUSSTOP_RADIUS, mode: g.world.net.edges.get(p.edge)?.tram ? 'tram' : 'bus' });
-  return out;
-}
-/** Catchment radius of a new station / stop of a mode (rail: by platform length). */
-export function catchRadius(mode: CatchMode, platformLen = 16): number {
-  const R = (globalThis as unknown as { __rfCatch?: Record<CatchMode, number> }).__rfCatch;
-  if (R) return R[mode];
-  return mode === 'rail' ? STATION_RADIUS + platformLen / 2 : mode === 'tram' ? Math.round(BUSSTOP_RADIUS * 1.4) : BUSSTOP_RADIUS;
-}
+/** Catchment circles of a station (all: also the inactive ones of a station without road access). */
+export function catchShapes(g: Game, st: Station, all = false): CatchShape[] { return g.stations.catchmentShapes(st, all); }
+/** Catchment radius of a mode. */
+export function catchRadius(mode: CatchMode): number { return CATCHMENT_RADIUS[mode]; }
 
-/** Stations linked with `st` for transfers (its transfer complex), when the game supports links. */
-export function stationLinks(_g: Game, st: Station): number[] {
-  const l = (st as unknown as { links?: number[] }).links;
-  return Array.isArray(l) ? l : [];
-}
+/** Stations linked with `st` for walking transfers. */
+export function stationLinks(_g: Game, st: Station): number[] { return st.links ?? []; }
