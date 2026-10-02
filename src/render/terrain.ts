@@ -85,6 +85,64 @@ function chunkIndex(vw: number, vh: number): ChunkIndex {
 interface ChunkInfo { x0: number; z0: number; x1: number; z1: number; minY: number; maxY: number; lod: number; range: number; ix: ChunkIndex }
 const NEIGH = [-1, 0, 1, 0, 0, -1, 0, 1];
 
+/**
+ * Far chunks merge in 2x2 groups drawn as one mesh: once all four are at LOD >= groupLod the group's own
+ * grid (vertex spacing of that LOD, identical vertices, so seams stay exact) replaces them - the whole-map
+ * view needs 9 terrain draws instead of 36. groupLod keeps a group at <= 129 x 129 vertices (LOD 1 for
+ * 128-unit chunks, LOD 2 for 256-unit chunks).
+ */
+const GROUP_GRID = 128;
+interface GroupInfo {
+  members: number[]; x0: number; z0: number; x1: number; z1: number;
+  mesh: THREE.Mesh | null; ix: ChunkIndex | null;
+  /** geometry / vegetation attributes out of date (a member was rebuilt / refreshed) */
+  stale: boolean; auxStale: boolean;
+  active: boolean; range: number; ok: boolean;
+}
+
+const quantY = (y: number) => Math.max(-32767, Math.min(32767, Math.round(y * YQ)));
+
+/**
+ * Compact vertices of a vw x vh grid with spacing `st` from (x0, z0): chunk-local integer x/z, height in 1/128
+ * units, 8-bit normals (from the 1-unit heightfield, so every LOD shades alike), then the skirt vertices.
+ * Returns [minY, maxY].
+ */
+function fillGrid(w: World, x0: number, z0: number, st: number, vw: number, vh: number, pos: Int16Array, nrm: Int8Array): [number, number] {
+  let k = 0, minY = Infinity, maxY = -Infinity;
+  for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
+    const x = x0 + i * st, z = z0 + j * st;
+    const y = w.vh(x, z);
+    pos[k * 3] = i * st; pos[k * 3 + 1] = quantY(y); pos[k * 3 + 2] = j * st;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    const dx = (w.vh(x + 1, z) - w.vh(x - 1, z)) * 0.5;
+    const dz = (w.vh(x, z + 1) - w.vh(x, z - 1)) * 0.5;
+    const l = 127 / Math.hypot(dx, 1, dz);
+    nrm[k * 4] = Math.round(-dx * l); nrm[k * 4 + 1] = Math.round(l); nrm[k * 4 + 2] = Math.round(-dz * l);
+    k++;
+  }
+  // skirt vertices below the border (copy normals so they shade like the surface)
+  const skirtOf = (src: number) => {
+    pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = Math.max(-32767, pos[src * 3 + 1] - SKIRT * YQ); pos[k * 3 + 2] = pos[src * 3 + 2];
+    nrm[k * 4] = nrm[src * 4]; nrm[k * 4 + 1] = nrm[src * 4 + 1]; nrm[k * 4 + 2] = nrm[src * 4 + 2];
+    k++;
+  };
+  for (let i = 0; i < vw; i++) skirtOf(i);
+  for (let i = 0; i < vw; i++) skirtOf((vh - 1) * vw + i);
+  for (let j = 0; j < vh; j++) skirtOf(j * vw);
+  for (let j = 0; j < vh; j++) skirtOf(j * vw + vw - 1);
+  return [minY, maxY];
+}
+
+/** Copy the attribute values of the border vertices to the skirt vertices that follow the grid. */
+function copySkirts(a: Int8Array | Float32Array, size: number, vw: number, vh: number) {
+  let k = vw * vh;
+  const cp = (src: number) => { for (let c = 0; c < size; c++) a[k * size + c] = a[src * size + c]; k++; };
+  for (let i = 0; i < vw; i++) cp(i);
+  for (let i = 0; i < vw; i++) cp((vh - 1) * vw + i);
+  for (let j = 0; j < vh; j++) cp(j * vw);
+  for (let j = 0; j < vh; j++) cp(j * vw + vw - 1);
+}
+
 export class TerrainView {
   group = new THREE.Group();
   material: THREE.MeshStandardMaterial;
@@ -119,11 +177,18 @@ export class TerrainView {
   private saved = new THREE.Vector2();
   /** minimum LOD used when the terrain casts shadows */
   shadowLod = 1;
+  /** 2x2 merged far-chunk meshes */
+  private groups: GroupInfo[] = [];
+  private ng = 0;
+  private readonly groupLod: number;
+  private readonly groupStep: number;
 
   constructor(public world: World) {
     const s = world.size;
     this.rc = renderChunkFor(s);
     this.nc = Math.ceil(s / this.rc);
+    this.groupLod = Math.max(1, Math.min(LODS - 1, Math.round(Math.log2((2 * this.rc) / GROUP_GRID))));
+    this.groupStep = 1 << this.groupLod;
     this.uniforms = {
       uGrid: { value: 0 },
       uHiRect: { value: new THREE.Vector4(0, 0, 0, 0) },
@@ -169,6 +234,17 @@ export class TerrainView {
 
     this.chunks = new Array(this.nc * this.nc).fill(null);
     for (let i = 0; i < this.nc * this.nc; i++) this.buildChunk(i);
+    this.ng = this.nc >= 2 ? Math.ceil(this.nc / 2) : 0;
+    for (let gz = 0; gz < this.ng; gz++) for (let gx = 0; gx < this.ng; gx++) {
+      const members: number[] = [];
+      for (let dz = 0; dz < 2; dz++) for (let dx = 0; dx < 2; dx++) {
+        const cx = gx * 2 + dx, cz = gz * 2 + dz;
+        if (cx < this.nc && cz < this.nc) members.push(cz * this.nc + cx);
+      }
+      const x0 = gx * 2 * this.rc, z0 = gz * 2 * this.rc, x1 = Math.min(s, x0 + 2 * this.rc), z1 = Math.min(s, z0 + 2 * this.rc);
+      const ok = members.length > 1 && (x1 - x0) % this.groupStep === 0 && (z1 - z0) % this.groupStep === 0;
+      this.groups.push({ members, x0, z0, x1, z1, mesh: null, ix: null, stale: true, auxStale: false, active: false, range: -1, ok });
+    }
     this.edgeH = new Float32Array((s + 1) * 4);
     this.edgesChanged();
     this.rebuildSkirt();
@@ -225,6 +301,8 @@ export class TerrainView {
         this.auxDirty.delete(ci);
         this.auxAt[ci] = now;
         this.refreshAux(ci);
+        const G = this.groupOf(ci);
+        if (G) G.auxStale = true;
         break;
       }
     }
@@ -247,6 +325,7 @@ export class TerrainView {
       const edge = LOD_PPU[Math.min(target, f.lod)];
       if (Math.abs(target - f.lod) > 1 || Math.abs(ppu / edge - 1) > 0.1 || !this.lodEnabled) f.lod = target;
     }
+    this.updateGroups();
     for (let ci = 0; ci < this.info.length; ci++) {
       const f = this.info[ci], m = this.chunks[ci];
       if (!m) continue;
@@ -262,6 +341,94 @@ export class TerrainView {
       const r = skirt ? f.ix.full[f.lod] : f.ix.grid[f.lod];
       m.geometry.setDrawRange(r[0], r[1]);
     }
+  }
+
+  private groupOf(ci: number): GroupInfo | null {
+    if (!this.ng) return null;
+    const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
+    return this.groups[(cz >> 1) * this.ng + (cx >> 1)] ?? null;
+  }
+
+  /** Swap 2x2 blocks of far chunks for their merged mesh (at most one group (re)built per frame). */
+  private updateGroups() {
+    let builds = 0;
+    for (const G of this.groups) {
+      let want = G.ok && this.lodEnabled, lod = LODS - 1;
+      if (want) for (const ci of G.members) {
+        const f = this.info[ci];
+        if (!f || !this.chunks[ci] || f.lod < this.groupLod) { want = false; break; }
+        if (f.lod < lod) lod = f.lod;
+      }
+      if (want && (G.stale || !G.mesh)) {
+        if (builds < 1) { this.buildGroup(G); builds++; } else want = false;
+      }
+      if (want && G.auxStale) this.groupAux(G);
+      if (want !== G.active) {
+        G.active = want;
+        if (G.mesh) G.mesh.visible = want;
+        for (const ci of G.members) { const m = this.chunks[ci]; if (m) m.visible = !want; }
+      }
+      if (want && G.mesh && G.ix && lod !== G.range) {
+        G.range = lod;
+        const r = G.ix.full[lod - this.groupLod];
+        G.mesh.geometry.setDrawRange(r[0], r[1]);
+      }
+    }
+  }
+
+  private buildGroup(G: GroupInfo) {
+    const { x0, z0, x1, z1 } = G;
+    const st = this.groupStep, vw = (x1 - x0) / st + 1, vh = (z1 - z0) / st + 1;
+    const total = vw * vh + 2 * (vw + vh);
+    const pos = new Int16Array(total * 3), nrm = new Int8Array(total * 4);
+    const [minY, maxY] = fillGrid(this.world, x0, z0, st, vw, vh, pos, nrm);
+    const ix = chunkIndex(vw, vh);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 4, true));
+    g.setAttribute('aAux', new THREE.BufferAttribute(new Int8Array(total * 4), 4, true));
+    g.setIndex(ix.index);
+    g.boundingBox = new THREE.Box3(new THREE.Vector3(0, minY - SKIRT, 0), new THREE.Vector3(x1 - x0, maxY, z1 - z0));
+    g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+    G.ix = ix;
+    G.range = -1;
+    G.stale = false;
+    if (G.mesh) { G.mesh.geometry.dispose(); G.mesh.geometry = g; }
+    else {
+      const m = new THREE.Mesh(g, this.material);
+      m.receiveShadow = true;
+      m.castShadow = true;
+      m.customDepthMaterial = this.depthMat;
+      m.position.set(x0, 0, z0);
+      m.matrixAutoUpdate = false;
+      m.updateMatrix();
+      m.visible = G.active;
+      G.mesh = m;
+      this.group.add(m);
+    }
+    this.groupAux(G);
+  }
+
+  /** Vegetation / earthwork / cavity attributes of a group: the member chunks' values at the group vertices. */
+  private groupAux(G: GroupInfo) {
+    G.auxStale = false;
+    if (!G.mesh) return;
+    const attr = G.mesh.geometry.getAttribute('aAux') as THREE.BufferAttribute, out = attr.array as Int8Array;
+    const st = this.groupStep, vw = (G.x1 - G.x0) / st + 1, vh = (G.z1 - G.z0) / st + 1, rc = this.rc, nc = this.nc;
+    let k = 0;
+    for (let j = 0; j < vh; j++) {
+      const z = G.z0 + j * st, cz = Math.min(nc - 1, Math.floor(z / rc));
+      for (let i = 0; i < vw; i++, k++) {
+        const x = G.x0 + i * st, cx = Math.min(nc - 1, Math.floor(x / rc));
+        const ci = cz * nc + cx, f = this.info[ci], m = this.chunks[ci];
+        if (!f || !m) continue;
+        const src = (m.geometry.getAttribute('aAux') as THREE.BufferAttribute).array as Int8Array;
+        const o = ((z - f.z0) * (f.x1 - f.x0 + 1) + (x - f.x0)) * 4;
+        out[k * 4] = src[o]; out[k * 4 + 1] = src[o + 1]; out[k * 4 + 2] = src[o + 2];
+      }
+    }
+    copySkirts(out, 4, vw, vh);
+    attr.needsUpdate = true;
   }
 
   /** Did any height along the map border change since the skirt was built? */
@@ -301,28 +468,9 @@ export class TerrainView {
     // compact vertices: chunk-local integer x/z, height in 1/128 units, 8-bit normals (14 bytes per vertex)
     const pos = new Int16Array(total * 3);
     const nrm = new Int8Array(total * 4);
-    const q = (y: number) => Math.max(-32767, Math.min(32767, Math.round(y * YQ)));
-    let k = 0, minY = Infinity, maxY = -Infinity;
-    for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
-      const y = w.vh(x, z);
-      pos[k * 3] = x - x0; pos[k * 3 + 1] = q(y); pos[k * 3 + 2] = z - z0;
-      if (y < minY) minY = y; if (y > maxY) maxY = y;
-      const dx = (w.vh(x + 1, z) - w.vh(x - 1, z)) * 0.5;
-      const dz = (w.vh(x, z + 1) - w.vh(x, z - 1)) * 0.5;
-      const l = 127 / Math.hypot(dx, 1, dz);
-      nrm[k * 4] = Math.round(-dx * l); nrm[k * 4 + 1] = Math.round(l); nrm[k * 4 + 2] = Math.round(-dz * l);
-      k++;
-    }
-    // skirt vertices below the border (copy normals so they shade like the surface)
-    const skirtOf = (src: number) => {
-      pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = Math.max(-32767, pos[src * 3 + 1] - SKIRT * YQ); pos[k * 3 + 2] = pos[src * 3 + 2];
-      nrm[k * 4] = nrm[src * 4]; nrm[k * 4 + 1] = nrm[src * 4 + 1]; nrm[k * 4 + 2] = nrm[src * 4 + 2];
-      k++;
-    };
-    for (let i = 0; i < vw; i++) skirtOf(i);
-    for (let i = 0; i < vw; i++) skirtOf((vh - 1) * vw + i);
-    for (let j = 0; j < vh; j++) skirtOf(j * vw);
-    for (let j = 0; j < vh; j++) skirtOf(j * vw + vw - 1);
+    const [minY, maxY] = fillGrid(w, x0, z0, 1, vw, vh, pos, nrm);
+    const G = this.groupOf(ci);
+    if (G) G.stale = true;
     const aux = new Int8Array(total * 4);
     this.packAux(x0, z0, x1, z1, aux, total);
     const ix = chunkIndex(vw, vh);
@@ -444,13 +592,7 @@ export class TerrainView {
       }
     }
     // skirts copy their border vertex
-    const nv = vw * vh;
-    let k = nv;
-    const cp = (src: number) => { out[k * 3] = out[src * 3]; out[k * 3 + 1] = out[src * 3 + 1]; out[k * 3 + 2] = out[src * 3 + 2]; k++; };
-    for (let i = 0; i < vw; i++) cp(i);
-    for (let i = 0; i < vw; i++) cp((vh - 1) * vw + i);
-    for (let j = 0; j < vh; j++) cp(j * vw);
-    for (let j = 0; j < vh; j++) cp(j * vw + vw - 1);
+    copySkirts(out, 3, vw, vh);
   }
 
   private rebuildSkirt() {
@@ -501,12 +643,14 @@ export class TerrainView {
   /** Triangles currently submitted per pass (for stats). */
   triangles(): number {
     let n = 0;
-    for (const m of this.chunks) if (m) n += m.geometry.drawRange.count / 3;
+    for (const m of this.chunks) if (m && m.visible) n += m.geometry.drawRange.count / 3;
+    for (const G of this.groups) if (G.active && G.mesh) n += G.mesh.geometry.drawRange.count / 3;
     return Math.round(n);
   }
 
   dispose() {
     for (const m of this.chunks) m?.geometry.dispose();
+    for (const G of this.groups) G.mesh?.geometry.dispose();
     this.skirt?.geometry.dispose();
     this.waterSides?.geometry.dispose();
     this.water.geometry.dispose();

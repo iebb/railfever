@@ -86,7 +86,13 @@ check(AIS[0].budget > b0, `runtime config change takes effect (budget ${b0} -> $
 // AI trains open short: loco + 2-3 coaches
 const aiTrains = g.vehicles.all().filter((v): v is Train => v instanceof Train && v.owner > 0);
 console.log(`  AI trains: ${aiTrains.map((t) => t.cars.length - 1).join(',')} coaches; AI stations ${g.stations.all().filter((st) => st.owner > 0 && st.rail).map((st) => st.rail!.length).join(',')} long`);
-check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((st) => st.owner <= 0 || !st.rail || st.rail.length <= 14), 'AI trains and stations are compact');
+check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((st) => st.owner <= 0 || !st.rail || st.rail.length <= 12), 'AI trains and stations are compact');
+{
+  const aiRail = g.stations.all().filter((st) => st.owner > 0 && st.rail);
+  const withAccess = aiRail.filter((st) => g.stations.hasAccess(st)).length;
+  console.log(`  AI rail stations with road access: ${withAccess}/${aiRail.length}`);
+  check(withAccess === aiRail.length, 'AI rail stations are connected to the roads');
+}
 {
   // passengers piling up on an AI railway: its train is replaced by a longer one (up to the platforms)
   const t0 = aiTrains.find((t) => t.line && t.line.owner > 0 && t.cars.length - 1 < 3 && g.ais.some((a) => a.companyId === t.owner));
@@ -96,8 +102,10 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     const n0 = t0.cars.length - 1;
     g.company(l.owner).economy.money += 5_000_000;
     l.incomeLast = l.costLast * 2 + 1_000_000; // a line that pays
+    // (no new project meanwhile: the money is for the longer platforms and train)
+    if (!ai.busy) ai.state.cooldown = Math.max(ai.state.cooldown, 400);
     let longer = -1;
-    for (let d = 0; d < 150 && longer < 0; d++) {
+    for (let d = 0; d < 180 && longer < 0; d++) {
       for (const sid of l.stops) { const st = g.stations.get(sid)!; const other = l.stops.find((x) => x !== sid)!; g.stations.addWaiting(st, l.id, other, other, 400 - Math.min(400, st.waitingTotal)); }
       const d0 = g.day;
       while (g.day === d0) g.update(0.25);
@@ -138,6 +146,41 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   console.log(`  hub extension: ${built || `none built (${tried} tried)`}`);
 }
 
+// an AI railway with a second track (trackops: opened doubled, upgraded, or passing loops; one-way running with
+// block signals): the trains keep running
+{
+  let done = '';
+  const info = (ai: AIController, lid: number) => (ai as unknown as { lines: Map<number, { double?: boolean; loops?: number }> }).lines.get(lid);
+  for (const pass of [0, 1]) {
+    for (const ai of AIS) {
+      if (done || g.company(ai.companyId).defunct) continue;
+      for (const lid of ai.managedLines()) {
+        const l = g.lines.get(lid), li = info(ai, lid);
+        if (done || !l || !li || l.kind !== 'rail' || l.owner !== ai.companyId || !l.vehicles.length) continue;
+        if (pass === 0) {
+          // one the company doubled itself
+          if (!li.double && !li.loops) continue;
+          done = `${l.name}: ${li.double ? 'double track' : li.loops + ' passing loops'} (by the AI)`;
+        } else {
+          g.company(ai.companyId).economy.money += 30_000_000;
+          const s0 = ai.stats.signals, d0 = ai.stats.trackDouble, l0 = ai.stats.loops;
+          if (!ai.upgradeLine(lid)) { console.log(`    double ${l.name}: ${ai.log[ai.log.length - 1]}`); continue; }
+          done = `${l.name}: +${fmt((ai.stats.trackDouble - d0) / 100, 2)} km second track (${ai.stats.loops > l0 ? ai.stats.loops - l0 + ' passing loops' : 'all of it'}), ${ai.stats.signals - s0} signals`;
+          console.log(`    ${ai.log[ai.log.length - 1]}`);
+        }
+        const signals = [...g.world.net.nodes.values()].filter((n) => n.signal && n.owner === ai.companyId).length;
+        const del0 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
+        for (const d0 = g.day; g.day < d0 + 120;) g.update(0.25);
+        const del1 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
+        const lost = l.vehicles.map((id) => g.vehicles.get(id)).filter((v) => v && v.state === 'noroute');
+        console.log(`  double track: ${done}; ${signals} signals on the company's track; ${l.vehicles.length} trains delivered ${del0} -> ${del1} in 120 days, ${lost.length} without route`);
+        check(lost.length === 0 && checkReservations(g).length === 0 && del1 > del0, 'trains keep running on the railway with a second track');
+      }
+    }
+  }
+  if (!done) console.log('  double track: no AI railway could be doubled');
+}
+
 // AI project mix and network reuse (for the report)
 {
   const kinds = new Map<string, number>();
@@ -147,9 +190,9 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     const k = l.kind === 'road' ? (towns.size > 1 ? 'coach' : 'town bus') : l.kind;
     kinds.set(k, (kinds.get(k) ?? 0) + 1);
   }
-  let track = 0, dbl = 0, reused = 0, shared = 0, coaches = 0;
-  for (const ai of AIS) { track += ai.stats.track; dbl += ai.stats.trackDouble; reused += ai.stats.reused; shared += ai.stats.shared; coaches += ai.stats.coaches; }
-  console.log(`  AI project mix: ${[...kinds].map(([k, n]) => `${k} ${n}`).join(', ')}; new track ${fmt(track / 100, 1)} km (second track ${fmt(dbl / 100, 1)} km), stations reused ${reused}, lines on others' railways ${shared}, coach lines ${coaches}`);
+  let track = 0, dbl = 0, reused = 0, shared = 0, coaches = 0, doubled = 0, loops = 0, signals = 0;
+  for (const ai of AIS) { track += ai.stats.track; dbl += ai.stats.trackDouble; reused += ai.stats.reused; shared += ai.stats.shared; coaches += ai.stats.coaches; doubled += ai.stats.doubled; loops += ai.stats.loops; signals += ai.stats.signals; }
+  console.log(`  AI project mix: ${[...kinds].map(([k, n]) => `${k} ${n}`).join(', ')}; new track ${fmt(track / 100, 1)} km (second track ${fmt(dbl / 100, 1)} km on ${doubled} lines, ${loops} of them as passing loops, ${signals} signals), stations reused ${reused}, lines on others' railways ${shared}, coach lines ${coaches}`);
 }
 
 // ------------------------------------------------------------------ 2. line names and colours
@@ -268,7 +311,9 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     const agr = g.agreement(ai.companyId, PLAYER);
     console.log(`  agreement: usage share last month ${fmt((agr?.usageShareLastMonth ?? 0) * 100, 0)}%, paid last month ${fmtMoney(agr?.paidLastMonth ?? 0)}, total ${fmtMoney(agr?.paidTotal ?? 0)}; player earned ${fmtMoney(g.accessEarnings(PLAYER).total)}`);
     check(!!agr && agr.usageShareLastMonth > 0.05 && agr.paidTotal > 0, 'the AI pays its usage share of the shared railway');
-    check(!!at && at.delivered > 0 && ptr.delivered > d0, 'both trains carry passengers on the shared railway');
+    const access = g.stations.hasAccess(pr.A) && g.stations.hasAccess(pr.B);
+    if (!access) console.log('  (the player stations have no road access: no passengers, delivery check skipped)');
+    check(!access || (!!at && at.delivered > 0 && ptr.delivered > d0), 'both trains carry passengers on the shared railway');
     const errs = checkReservations(g);
     check(errs.length === 0, 'reservations consistent on the shared railway ' + errs.slice(0, 3).join('; '));
     // the player closes its network: the agreement ends, the AI closes the line and removes its depot

@@ -7,6 +7,7 @@
 // don't change (town growth only rebuilds the quarter that changed).
 import * as THREE from 'three';
 import type { Game } from '../game/game';
+import type { Network } from '../game/network';
 import { OBJ_CHUNK, pointInRect } from '../game/world';
 import type { Building, World } from '../game/world';
 import { WATER_Y } from '../game/constants';
@@ -497,7 +498,7 @@ export class ObjectsView {
     }
     const bq: BQ[] = [];
     for (let q = 0; q < 4; q++) {
-      const sig = buildingsSig(quarters[q], terrainSig(w, quarters[q]));
+      const sig = buildingsSig(quarters[q], terrainSig(w, quarters[q]), net);
       const old = prev && prev.bq[q];
       if (old && old.sig === sig) {
         if (mode === 'world' || old.hasDetail) bq.push(old);
@@ -881,8 +882,11 @@ function terrainSig(w: World, list: Building[]): number {
   return h;
 }
 
-/** Signature of a set of buildings (everything their geometry depends on) and of the terrain under them. */
-function buildingsSig(list: Building[], terrain: number): number {
+/**
+ * Signature of a set of buildings (everything their geometry depends on) and of the terrain under them;
+ * parks and plazas also depend on the roads around them (their lawns / paving keep clear of them).
+ */
+function buildingsSig(list: Building[], terrain: number, net: Network): number {
   let h = terrain | 0;
   const mix = (v: number) => { h = Math.imul(h ^ (v | 0), 16777619); };
   mix(list.length);
@@ -890,6 +894,10 @@ function buildingsSig(list: Building[], terrain: number): number {
     mix(b.id); mix(b.type); mix(b.floors); mix(b.seed);
     mix(Math.round(b.x * 1024)); mix(Math.round(b.z * 1024)); mix(Math.round(b.angle * 65536));
     mix(Math.round(b.w * 1024)); mix(Math.round(b.d * 1024)); mix(Math.round(b.y * 1024));
+    if (b.type === 8 || b.type === 9) {
+      const R = Math.hypot(b.w, b.d) / 2 + 1.2;
+      for (const e of net.edgesNear(b.x - R, b.z - R, b.x + R, b.z + R)) { mix(e.id); mix(e.version); }
+    }
   }
   return h;
 }

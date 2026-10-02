@@ -327,6 +327,7 @@ export class VehiclesView {
   private game: Game | null = null;
   private tramInfo = new WeakMap<VehicleModel, TramInfo>();
   private colors = new Map<number | string, Float32Array>();
+  private tmpMain = new Float32Array(3);
 
   constructor(private mats: Materials) {
     this.paintMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.3 });
@@ -548,15 +549,17 @@ export class VehiclesView {
   }
 
   /**
-   * Coach livery: body in the model colour, operator colour on the stripes / swoosh / lower panels; when the
-   * two are too alike the body falls back to cream (or charcoal for very light operator colours).
+   * Coach livery in the operator's colour: stripes / swoosh / lower panels take the operator colour, the body
+   * a light neutral tinted by the model colour (so models still differ). When the operator colour is itself
+   * that light, the body turns charcoal to keep the contrast.
    */
   private coachLivery(b: Batch, o: number, m: VehicleModel, owner: number) {
-    let main = this.lin(m.color);
+    const mc = this.lin(m.color), cream = this.lin(0xf3efe6), main = this.tmpMain;
+    for (let i = 0; i < 3; i++) main[i] = mc[i] * 0.28 + cream[i] * 0.72;
     const acc = this.lin(this.game ? this.game.company(owner).color : '#e8a33d');
-    if (Math.abs(main[0] - acc[0]) + Math.abs(main[1] - acc[1]) + Math.abs(main[2] - acc[2]) < 0.3) {
-      main = this.lin(0.2126 * acc[0] + 0.7152 * acc[1] + 0.0722 * acc[2] > 0.45 ? 0x2e3438 : 0xf0ebdc);
-    }
+    // perceived lightness (CIE L*) of body and livery too close: charcoal body
+    const Ls = (c: Float32Array) => 116 * Math.cbrt(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) - 16;
+    if (Math.abs(Ls(main) - Ls(acc)) < 20) main.set(this.lin(0x2e3438));
     const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
     c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
     a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];

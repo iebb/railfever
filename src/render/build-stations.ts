@@ -393,29 +393,38 @@ function entrancePavilion(ctx: ChunkCtx, st: Station, en: StationEntrance, color
   darkRoom(W, en.x - fx * 0.01, en.z - fz * 0.01, fx, fz, BW - 0.04, BD - 0.04, yf, yf + H - 0.003);
   // the stairs inside, seen through the opening
   stairWell(W, D, en.x - fx * 0.05, yf, en.z - fz * 0.05, fx, fz, Math.min(0.4, OW - 0.06), BD - 0.24, 0.07);
-  // roundel on a post (classic) or a pylon (modern) beside the entrance
-  const [sx, sz] = P(BW / 2 + 0.17, BD / 2 + 0.08);
-  const gy = ctx.game.world.heightAt(sx, sz);
+  // paving from the door to the street (entrances stand beside the sidewalk; within the entrance footprint)
+  const pd = frontPaving(ctx, P(0, BD / 2), fx, fz, BW + 0.06, Math.min(yf - 0.004, hi + 0.02), 0.26);
+  // roundel on a post (classic) or a pylon (modern) at the front corner
+  const [sx, sz] = P(BW / 2 - 0.03, BD / 2 + Math.min(0.1, Math.max(0.05, pd - 0.05)));
+  const gy = Math.max(ctx.game.world.heightAt(sx, sz), pd > 0 ? Math.min(yf - 0.004, hi + 0.02) : -Infinity);
   if (modern) {
     W.use(WC.METAL, 0x3a4046, 1);
-    W.box(sx, gy - 0.03, sz, 0.045, 0.53, 0.03, fx, fz);
+    W.box(sx, gy - 0.03, sz, 0.04, 0.53, 0.03, fx, fz);
     roundel(ctx, sx, gy + 0.58, sz, fx, fz, 0.07, color);
   } else {
     D.use(WC.METAL, 0x2f3438);
     D.cylinder(sx, gy - 0.03, sz, 0.012, 0.47, 6);
     roundel(ctx, sx, gy + 0.5, sz, fx, fz, 0.07, color);
   }
-  // forecourt paving in front of the opening, unless the street is right there
-  const [qx, qz] = P(0, BD / 2 + 0.2);
-  const ne = net.nearestEdge(qx, qz, 2, 'road');
-  if (!ne || ne.d > net.halfWidth(ne.edge) + 0.22) {
-    const [fh, fl] = groundRange(ctx, qx, qz, fx, fz, BW + 0.3, 0.36);
-    const top = Math.min(yf - 0.004, fh + 0.02);
-    if (top > fl - 0.02) {
-      W.use(WC.PAVING, 0xd6d0c4, 0);
-      W.tbox(qx, fl - 0.05, qz, BW + 0.3, top - (fl - 0.05), 0.36, fx, fz, WSCALE.PAVING, false, true);
-    }
-  }
+}
+
+/**
+ * Paving from a door (front face centre `f`, facing (fx,fz)) out to the nearest street's paved edge, at most
+ * `maxD` deep, top at `top`. Returns the depth laid (0 when the sidewalk is right there).
+ */
+function frontPaving(ctx: ChunkCtx, f: [number, number], fx: number, fz: number, width: number, top: number, maxD: number): number {
+  const net = ctx.game.world.net;
+  const ne = net.nearestEdge(f[0] + fx * 0.02, f[1] + fz * 0.02, 2, 'road');
+  const depth = ne ? Math.min(maxD, ne.d - net.halfWidth(ne.edge) - 0.01) : maxD;
+  if (depth < 0.03) return 0;
+  const qx = f[0] + fx * depth / 2, qz = f[1] + fz * depth / 2;
+  const [, fl] = groundRange(ctx, qx, qz, fx, fz, width, depth);
+  if (top <= fl - 0.02) return 0;
+  const W = ctx.w;
+  W.use(WC.PAVING, 0xd6d0c4, 0);
+  W.tbox(qx, fl - 0.05, qz, width, top - (fl - 0.05), depth, fx, fz, WSCALE.PAVING, false, true);
+  return depth;
 }
 
 // ------------------------------------------------------------------------------ elevated stations
@@ -510,6 +519,7 @@ function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance
   W.box(en.x, g + HH - 0.04, en.z, HW + 0.012, 0.04, HD + 0.012, efx, efz, false);
   boardText(D, en.x + efx * (HD / 2 + 0.01), g + HH - 0.02, en.z + efz * (HD / 2 + 0.01), efx, efz, HW * 0.7, 0.03, color);
   roundel(ctx, en.x + efx * (HD / 2 + 0.03) + efz * (HW / 2 - 0.06), g + HH + 0.1, en.z + efz * (HD / 2 + 0.03) - efx * (HW / 2 - 0.06), efx, efz, 0.055, color);
+  frontPaving(ctx, [en.x + efx * HD / 2, en.z + efz * HD / 2], efx, efz, HW + 0.08, g - 0.004, 0.14);
   // where is the tower relative to the deck?
   const lat = (en.x - r.x) * rx + (en.z - r.z) * rz, al = (en.x - r.x) * fx + (en.z - r.z) * fz;
   const under = Math.abs(lat) < half + 0.12 && Math.abs(al) < r.length / 2 + 0.05;

@@ -7,6 +7,7 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Building } from './world';
+import type { Town } from './towns';
 import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 
@@ -78,6 +79,10 @@ export class DemandModel {
   shares = new Map<number, [number, number][]>();
   /** bumped when regions or station shares change */
   version = 0;
+  /** distance decay between regions, dec[r * n + q] (r == q: within the region) */
+  private dec = new Float32Array(0);
+  /** next town to refresh (a few per day, see daily) */
+  private cursor = 0;
   private cache = new Map<number, StationDemand>();
   private cacheKey = '';
 
@@ -96,58 +101,107 @@ export class DemandModel {
     return t.ids[1 + k];
   }
 
-  /** Regions from the towns as they are now, and the OD matrix (monthly). */
+  /** District layout of a town by its size. */
+  private layoutOf(t: Town): { sectors: number; core: number } {
+    const split = t.pop >= DISTRICT_MIN_POP;
+    return { sectors: !split ? 0 : t.pop < 3000 ? 3 : t.pop < 6000 ? 4 : 6, core: split ? Math.max(8, t.radius * 0.4) : 0 };
+  }
+
+  /** All regions from the towns as they are now, and the OD matrix (new games, and when a town's layout changes). */
   rebuild() {
     const g = this.g;
     this.regions = [];
     this.towns.clear();
     for (const t of g.towns.list) {
-      const split = t.pop >= DISTRICT_MIN_POP;
-      const sectors = !split ? 0 : t.pop < 3000 ? 3 : t.pop < 6000 ? 4 : 6;
+      const lay = this.layoutOf(t);
       const ids: number[] = [];
       const add = (kind: Region['kind']) => { const id = this.regions.length; this.regions.push({ id, town: t.id, kind, x: t.x, z: t.z, r: 0, pop: 0, jobs: 0, produced: 0, attracted: 0 }); ids.push(id); };
-      if (!split) add('town'); else { add('centre'); for (let k = 0; k < sectors; k++) add('district'); }
-      this.towns.set(t.id, { core: split ? Math.max(8, t.radius * 0.4) : 0, sectors, ids });
+      if (!lay.sectors) add('town'); else { add('centre'); for (let k = 0; k < lay.sectors; k++) add('district'); }
+      this.towns.set(t.id, { core: lay.core, sectors: lay.sectors, ids });
     }
-    const n = this.regions.length;
-    const acc = new Float64Array(n * 4); // sum w x, sum w z, sum w, sum w d^2
-    for (const b of g.world.buildings.values()) {
-      if (b.pop <= 0) continue;
-      const r = this.regionOf(b);
-      if (r < 0) continue;
-      const [res, jobs] = residentsJobs(b);
-      const R = this.regions[r];
-      R.pop += res; R.jobs += jobs;
-      acc[r * 4] += b.x * b.pop; acc[r * 4 + 1] += b.z * b.pop; acc[r * 4 + 2] += b.pop;
-    }
-    for (const R of this.regions) {
-      const w = acc[R.id * 4 + 2];
-      if (w > 0) { R.x = acc[R.id * 4] / w; R.z = acc[R.id * 4 + 1] / w; }
-    }
-    for (const b of g.world.buildings.values()) {
-      if (b.pop <= 0) continue;
-      const r = this.regionOf(b);
-      if (r < 0) continue;
-      const R = this.regions[r];
-      acc[r * 4 + 3] += b.pop * ((b.x - R.x) * (b.x - R.x) + (b.z - R.z) * (b.z - R.z));
-    }
-    for (const R of this.regions) {
-      const w = acc[R.id * 4 + 2];
-      R.r = w > 0 ? Math.sqrt(acc[R.id * 4 + 3] / w) * 1.5 + 4 : 6;
-      R.produced = TRIPS_PER_MONTH * (R.pop + 0.3 * R.jobs);
-      R.attracted = 0.4 * R.pop + R.jobs;
-    }
+    for (const t of g.towns.list) this.aggregateTown(t);
+    this.computeDecay();
     this.computeOD();
     this.version++;
   }
 
-  private computeOD() {
+  /** Residents, jobs, centre and extent of a town's regions (from its buildings); returns their ids. */
+  private aggregateTown(t: Town): number[] {
+    const lay = this.towns.get(t.id);
+    if (!lay) return [];
+    const acc = new Float64Array(lay.ids.length * 4); // sum w x, sum w z, sum w, sum w (x² + z²)
+    for (const id of lay.ids) { const R = this.regions[id]; R.pop = 0; R.jobs = 0; }
+    const base = lay.ids[0];
+    for (const bid of t.buildings) {
+      const b = this.g.world.buildings.get(bid);
+      if (!b || b.pop <= 0) continue;
+      const r = this.regionOf(b);
+      if (r < base || r >= base + lay.ids.length) continue;
+      const [res, jobs] = residentsJobs(b);
+      const R = this.regions[r], k = (r - base) * 4;
+      R.pop += res; R.jobs += jobs;
+      acc[k] += b.x * b.pop; acc[k + 1] += b.z * b.pop; acc[k + 2] += b.pop; acc[k + 3] += b.pop * (b.x * b.x + b.z * b.z);
+    }
+    for (const id of lay.ids) {
+      const R = this.regions[id], k = (id - base) * 4, w = acc[k + 2];
+      if (w > 0) { R.x = acc[k] / w; R.z = acc[k + 1] / w; } else { R.x = t.x; R.z = t.z; }
+      R.r = w > 0 ? Math.sqrt(Math.max(0, acc[k + 3] / w - R.x * R.x - R.z * R.z)) * 1.5 + 4 : 6;
+      R.produced = TRIPS_PER_MONTH * (R.pop + 0.3 * R.jobs);
+      R.attracted = 0.4 * R.pop + R.jobs;
+    }
+    return lay.ids;
+  }
+
+  /**
+   * Daily upkeep: a few towns' regions are refreshed (each town about every two weeks) and the OD matrix updated;
+   * a town that changes its district layout (grows past a threshold) rebuilds the model.
+   */
+  daily() {
+    const T = this.g.towns.list;
+    if (!T.length) return;
+    if (!this.regions.length || this.towns.size !== T.length) { this.rebuild(); return; }
+    const k = Math.max(1, Math.ceil(T.length / 15));
+    const changed: number[] = [];
+    for (let i = 0; i < k; i++) {
+      const t = T[this.cursor % T.length];
+      this.cursor = (this.cursor + 1) % T.length;
+      const lay = this.towns.get(t.id), want = this.layoutOf(t);
+      if (!lay || want.sectors !== lay.sectors) { this.rebuild(); return; }
+      lay.core = want.core;
+      changed.push(...this.aggregateTown(t));
+    }
+    this.updateDecay(changed);
+    this.computeOD();
+    this.version++;
+  }
+
+  /** Distance decay between all region centres (and within each region). */
+  private computeDecay() {
     const n = this.regions.length, R = this.regions;
-    this.od = new Float32Array(n * n);
+    this.dec = new Float32Array(n * n);
+    for (let r = 0; r < n; r++) {
+      this.dec[r * n + r] = odDecay(R[r].r);
+      for (let q = r + 1; q < n; q++) { const d = odDecay(Math.hypot(R[r].x - R[q].x, R[r].z - R[q].z)); this.dec[r * n + q] = d; this.dec[q * n + r] = d; }
+    }
+  }
+
+  private updateDecay(ids: number[]) {
+    const n = this.regions.length, R = this.regions;
+    if (this.dec.length !== n * n) { this.computeDecay(); return; }
+    for (const r of ids) {
+      this.dec[r * n + r] = odDecay(R[r].r);
+      for (let q = 0; q < n; q++) if (q !== r) { const d = odDecay(Math.hypot(R[r].x - R[q].x, R[r].z - R[q].z)); this.dec[r * n + q] = d; this.dec[q * n + r] = d; }
+    }
+  }
+
+  private computeOD() {
+    const n = this.regions.length, R = this.regions, dec = this.dec;
+    if (dec.length !== n * n) this.computeDecay();
+    if (this.od.length !== n * n) this.od = new Float32Array(n * n);
     for (let r = 0; r < n; r++) {
       let sum = 0;
       for (let q = 0; q < n; q++) {
-        const w = q === r ? R[r].attracted * odDecay(R[r].r) * INTRA : R[q].attracted * odDecay(Math.hypot(R[r].x - R[q].x, R[r].z - R[q].z));
+        const w = q === r ? R[r].attracted * this.dec[r * n + r] * INTRA : R[q].attracted * this.dec[r * n + q];
         this.od[r * n + q] = w;
         sum += w;
       }
@@ -157,46 +211,26 @@ export class DemandModel {
 
   /** Which regions each station's catchment covers (after catchments change; game.ts / lines.ts call it). */
   recomputeShares() {
-    const g = this.g;
+    const g = this.g, w = g.world;
     this.shares.clear();
-    const circles: { st: number; x: number; z: number; r: number }[] = [];
+    const seen = new Set<number>();
     for (const st of g.stations.map.values()) {
       if (!stationActive(g, st)) continue;
-      for (const c of catchmentCircles(g, st)) circles.push({ st: st.id, x: c.x, z: c.z, r: c.r });
-    }
-    if (circles.length) {
-      const C = 32, key = (cx: number, cz: number) => cx * 4096 + cz;
-      const cells = new Map<number, number[]>();
-      circles.forEach((c, i) => {
-        for (let cz = Math.floor((c.z - c.r) / C); cz <= Math.floor((c.z + c.r) / C); cz++) for (let cx = Math.floor((c.x - c.r) / C); cx <= Math.floor((c.x + c.r) / C); cx++) {
-          const k = key(cx, cz);
-          const a = cells.get(k);
-          if (a) a.push(i); else cells.set(k, [i]);
-        }
-      });
-      const acc = new Map<number, Map<number, number>>();
-      const seen: number[] = [];
-      for (const b of g.world.buildings.values()) {
-        if (b.pop <= 0) continue;
-        const idx = cells.get(key(Math.floor(b.x / C), Math.floor(b.z / C)));
-        if (!idx) continue;
-        const r = this.regionOf(b);
-        if (r < 0) continue;
-        seen.length = 0;
-        for (const i of idx) {
-          const c = circles[i];
-          if ((b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z) > c.r * c.r || seen.includes(c.st)) continue;
-          seen.push(c.st);
-          let m = acc.get(c.st);
-          if (!m) { m = new Map(); acc.set(c.st, m); }
-          m.set(r, (m.get(r) ?? 0) + b.pop);
+      const m = new Map<number, number>();
+      seen.clear();
+      for (const c of catchmentCircles(g, st)) {
+        for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
+          if (seen.has(id)) continue;
+          const b = w.buildings.get(id);
+          if (!b || b.pop <= 0 || (b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z) > c.r * c.r) continue;
+          seen.add(id);
+          const r = this.regionOf(b);
+          if (r >= 0) m.set(r, (m.get(r) ?? 0) + b.pop);
         }
       }
-      for (const [st, m] of acc) {
-        let tot = 0;
-        for (const v of m.values()) tot += v;
-        if (tot > 0) this.shares.set(st, [...m].sort((a, b) => a[0] - b[0]).map(([r, v]) => [r, v / tot]));
-      }
+      let tot = 0;
+      for (const v of m.values()) tot += v;
+      if (tot > 0) this.shares.set(st.id, [...m].sort((a, b) => a[0] - b[0]).map(([r, v]) => [r, v / tot]));
     }
     this.version++;
   }
@@ -239,6 +273,7 @@ export class DemandModel {
       regions: this.regions.map((r) => ({ ...r })),
       towns: [...this.towns].map(([t, v]) => [t, v.core, v.sectors, [...v.ids]]),
       shares: [...this.shares].map(([s, a]) => [s, a.map((x) => [...x])]),
+      cursor: this.cursor,
     };
   }
 
@@ -247,6 +282,8 @@ export class DemandModel {
     this.regions = d.regions.map((r: Region) => ({ ...r }));
     this.towns = new Map((d.towns ?? []).map((t: [number, number, number, number[]]) => [t[0], { core: t[1], sectors: t[2], ids: [...t[3]] }]));
     this.shares = new Map((d.shares ?? []).map((s: [number, [number, number][]]) => [s[0], s[1].map((x) => [x[0], x[1]] as [number, number])]));
+    this.cursor = d.cursor ?? 0;
+    this.computeDecay();
     this.computeOD();
     this.version++;
     return true;

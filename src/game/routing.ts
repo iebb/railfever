@@ -852,8 +852,10 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
   const front = o.front ?? 16, back = o.back ?? 9;
   let best: StationPlan | null = null, bestScore = Infinity;
   const maxR = o.maxR ?? town.radius + 14;
-  let n = 0;
+  let n = 0, bestR = Infinity;
   for (let r = 4; r <= maxR; r += 3) {
+    // sites further out only lose catchment: a few rings beyond the best one so far are enough
+    if (r > bestR + 9) break;
     for (const da of [0, 0.25, -0.25, 0.5, -0.5, 0.8, -0.8, 1.2, -1.2]) {
       const pa = dirA + da;
       const x = town.x + Math.sin(pa) * r, z = town.z + Math.cos(pa) * r;
@@ -861,7 +863,8 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
       // the platform axis should point at the target from where the station actually is
       const dirP = Math.atan2(toward.x - x, toward.z - z);
       for (const aa of [0, 0.15, -0.15, 0.35, -0.35]) {
-        if (++n % 12 === 0) yield;
+        // short steps: a pause after a few plans (quick rejections count little)
+        if ((n += 1) >= 16) { n = 0; yield; }
         const ang = dirA + aa;
         const off = Math.abs(Math.atan2(Math.sin(ang - dirP), Math.cos(ang - dirP)));
         if (off > 0.75) continue;
@@ -869,8 +872,13 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         // cheap rejections before the full plan: a street or track across the platform, a blocked throat
         let blocked = false;
         for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) if (g.world.net.nearestEdge(x + fx * o.length * t, z + fz * o.length * t, 1.1)) { blocked = true; break; }
-        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5)) continue;
+        // (half the station's width at least: platforms between the tracks)
+        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5 + 0.25 * (o.tracks - 1))) continue;
+        // the caller's condition on the site first (planning the station is costly)
+        if (o.accept && !o.accept({ x, z, angle: ang, length: o.length } as StationPlan)) continue;
         const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
+        // a site that can be built took long to plan (access road and all): a pause after each
+        n += plan.ok ? 16 : 3;
         if (!plan.ok || plan.join) continue;
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
@@ -889,7 +897,7 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         for (const b of g.world.buildingsNear(x, z, 30)) if (Math.hypot(b.x - x, b.z - z) < 30) pop += b.pop;
         let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 25 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
-        if (score < bestScore) { bestScore = score; best = plan; }
+        if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
       }
     }
   }

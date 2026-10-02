@@ -10,7 +10,7 @@ import { lampPost } from './build-road';
 export const BT_PARK = 8, BT_PLAZA = 9;
 
 /** Rect frame: local a across (right), b along the facing direction (front edge at +d/2). */
-class Frame {
+export class Frame {
   fx: number; fz: number; rx: number; rz: number; hw: number; hd: number;
   constructor(public cx: number, public cz: number, angle: number, w: number, d: number) {
     this.fx = Math.sin(angle); this.fz = Math.cos(angle); this.rx = this.fz; this.rz = -this.fx;
@@ -18,6 +18,41 @@ class Frame {
   }
   x(a: number, b: number) { return this.cx + this.rx * a + this.fx * b; }
   z(a: number, b: number) { return this.cz + this.rz * a + this.fz * b; }
+}
+
+/**
+ * The lot rect shrunk to keep clear of the paved width (plus a margin) of every nearby road or track:
+ * blocks of bent streets are not rectangles, so a road may cut into the lot rect. Each intruding sample
+ * moves the side that costs the least area.
+ */
+export function fitLot(ctx: ChunkCtx, b: Building): Frame {
+  const net = ctx.game.world.net;
+  const fx = Math.sin(b.angle), fz = Math.cos(b.angle), rx = fz, rz = -fx;
+  let l = -b.w / 2, r = b.w / 2, k = -b.d / 2, f = b.d / 2;
+  const R = Math.hypot(b.w, b.d) / 2 + 1.2;
+  for (const e of net.edgesNear(b.x - R, b.z - R, b.x + R, b.z + R)) {
+    const clear = net.halfWidth(e) + 0.06;
+    const g = net.geo(e);
+    for (let i = 0; i < g.n; i++) {
+      const dx = g.pts[i * 3] - b.x, dz = g.pts[i * 3 + 2] - b.z;
+      const a = dx * rx + dz * rz, c = dx * fx + dz * fz;
+      if (a < l - clear || a > r + clear || c < k - clear || c > f + clear) continue;
+      const W = r - l, D = f - k;
+      if (W < 0.8 || D < 0.8) break;
+      // area lost by moving each side just clear of this sample
+      const opts: [number, number][] = [
+        [(r - (a - clear)) * D, 0], [((a + clear) - l) * D, 1], [(f - (c - clear)) * W, 2], [((c + clear) - k) * W, 3],
+      ];
+      opts.sort((p, q) => p[0] - q[0]);
+      const side = opts.find(([loss]) => loss >= 0)?.[1];
+      if (side === 0) r = Math.max(l + 0.6, a - clear);
+      else if (side === 1) l = Math.min(r - 0.6, a + clear);
+      else if (side === 2) f = Math.max(k + 0.6, c - clear);
+      else if (side === 3) k = Math.min(f - 0.6, c + clear);
+    }
+  }
+  const ca = (l + r) / 2, cb = (k + f) / 2;
+  return new Frame(b.x + rx * ca + fx * cb, b.z + rz * ca + fz * cb, b.angle, r - l, f - k);
 }
 
 /** Upward surface over a local rectangle following the terrain (grid of `step`), planar world uvs. */
@@ -134,7 +169,7 @@ export function buildPark(ctx: ChunkCtx, b: Building) {
   const w = ctx.game.world;
   const W = ctx.w, D = ctx.d;
   const r = new RNG(b.seed);
-  const F = new Frame(b.x, b.z, b.angle, b.w, b.d);
+  const F = fitLot(ctx, b);
   const { hw, hd } = F;
   W.cast = 0;
   // lawn
@@ -228,10 +263,10 @@ export function buildPark(ctx: ChunkCtx, b: Building) {
     if (Math.abs(a) < hw - 0.15) disc(W, w, F, a, bb, 0.16, 0.1, null, 0.026, WSCALE.FLOWERS, 0.1, s + 3, 10);
   }
   // trees on the lawn, clear of paths, the feature and the edges
-  const area = b.w * b.d;
+  const area = 4 * hw * hd;
   const nTrees = Math.max(2, Math.min(14, Math.round(area * 0.7)));
   for (let k = 0, tries = 0; k < nTrees && tries < nTrees * 12; tries++) {
-    const a = (r.next() - 0.5) * (b.w - 0.5), bb = (r.next() - 0.5) * (b.d - 0.5);
+    const a = (r.next() - 0.5) * (2 * hw - 0.5), bb = (r.next() - 0.5) * (2 * hd - 0.5);
     if (Math.hypot(a - ca, bb - cb) < fr + 0.45) continue;
     if (paths.some((pth) => distToPath(pth, a, bb) < 0.32)) continue;
     const x = F.x(a, bb), z = F.z(a, bb);
@@ -279,7 +314,7 @@ export function buildPlaza(ctx: ChunkCtx, b: Building) {
   const w = ctx.game.world;
   const W = ctx.w, D = ctx.d;
   const r = new RNG(b.seed);
-  const F = new Frame(b.x, b.z, b.angle, b.w, b.d);
+  const F = fitLot(ctx, b);
   const { hw, hd } = F;
   // terrain under the square (sampled on a grid: the game's base height only looks at corners)
   let hmin = Infinity, hmax = -Infinity;
@@ -288,7 +323,7 @@ export function buildPlaza(ctx: ChunkCtx, b: Building) {
     hmin = Math.min(hmin, hgt); hmax = Math.max(hmax, hgt);
   }
   const level = hmax - hmin <= 0.3;
-  const cx = b.x, cz = b.z;
+  const cx = F.cx, cz = F.cz;
   const R = Math.max(0.22, Math.min(0.5, Math.min(hw, hd) * 0.32));
   // the centrepiece always stands on a level pad
   const padY = level ? hmax + 0.02 : Math.max(w.heightAt(cx, cz), ...[0, 1, 2, 3, 4, 5].map((k) => w.heightAt(cx + Math.cos(k) * (R + 0.2), cz + Math.sin(k) * (R + 0.2)))) + 0.03;
@@ -298,7 +333,7 @@ export function buildPlaza(ctx: ChunkCtx, b: Building) {
   if (level) {
     // raised square: stone sides, paved border, cobbled field
     W.use(WC.STONE, 0xbdb3a2, 1);
-    W.tbox(b.x, hmin - 0.08, b.z, b.w, y0 - hmin + 0.08, b.d, F.fx, F.fz, WSCALE.STONE, false, false);
+    W.tbox(F.cx, hmin - 0.08, F.cz, 2 * hw, y0 - hmin + 0.08, 2 * hd, F.fx, F.fz, WSCALE.STONE, false, false);
     W.cast = 0;
     const flat = (cell: number, color: number, a0: number, a1: number, b0: number, b1: number, yy: number, sc: number) => {
       W.use(cell, color, 0);
@@ -384,7 +419,7 @@ export function buildPlaza(ctx: ChunkCtx, b: Building) {
   }
   // planters with trees along the long sides, benches facing the centre, lamps at the corners
   const along = hw >= hd;
-  const n = Math.max(1, Math.round((along ? b.w : b.d) / 1.1));
+  const n = Math.max(1, Math.round((along ? 2 * hw : 2 * hd) / 1.1));
   for (let k = 0; k < n; k++) {
     const t = n === 1 ? 0 : -1 + (2 * k) / (n - 1);
     for (const s of [-1, 1]) {

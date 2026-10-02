@@ -39,20 +39,20 @@ export function buildAccessLayout(log = console.log): AccessLayout | null {
     if (err) { log(`station at ${x}: ${err}`); return -1; }
     return id;
   };
-  const A = station(60, 2, PLAYER), D = station(200, 2, PLAYER), E = station(130, 1, AI);
+  const A = station(60, 2, PLAYER), D = station(230, 2, PLAYER), E = station(130, 1, AI);
   if (A < 0 || D < 0 || E < 0) return null;
   const sA = g.stations.get(A)!, sD = g.stations.get(D)!, sE = g.stations.get(E)!;
   const eA = stationEnds(g, sA), eD = stationEnds(g, sD), eE = stationEnds(g, sE);
   const e0 = net.nextEdge;
-  // player throats: A's tracks merge on the way to J1 (x=100), D's from J2 (x=160)
+  // player throats: A's tracks merge on the way to J1 (x=100), D's from J2 (x=190)
   const edgeAt = (x: number) => { const s = findSnap(g, 'rail', x, Z, 0.8); return s.kind === 'edge' ? s : null; };
   if (!build(g, nodeSnap(g, eA[0].front, 'rail'), free(g, 100, Z), railOpts(PLAYER), 'A0-J1')) return null;
   const J1 = nodeAt(g, 'rail', 100, Z)!;
   const mA = edgeAt(82);
   if (!mA || !build(g, nodeSnap(g, eA[1].front, 'rail'), mA, railOpts(PLAYER), 'A1 merge')) return null;
-  if (!build(g, nodeSnap(g, eD[0].back, 'rail'), free(g, 160, Z), railOpts(PLAYER), 'D0-J2')) return null;
-  const J2 = nodeAt(g, 'rail', 160, Z)!;
-  const mD = edgeAt(178);
+  if (!build(g, nodeSnap(g, eD[0].back, 'rail'), free(g, 190, Z), railOpts(PLAYER), 'D0-J2')) return null;
+  const J2 = nodeAt(g, 'rail', 190, Z)!;
+  const mD = edgeAt(208);
   if (!mD || !build(g, nodeSnap(g, eD[1].back, 'rail'), mD, railOpts(PLAYER), 'D1 merge')) return null;
   const playerThroats = [...net.edges.keys()].filter((id) => id >= e0);
   // direct route over AI track through E (joining the player's junctions needs access while it is built)
@@ -68,14 +68,18 @@ export function buildAccessLayout(log = console.log): AccessLayout | null {
   const P1 = nodeAt(g, 'rail', 125, Z - 20)!, P2 = nodeAt(g, 'rail', 135, Z - 20)!;
   const bA = edgeAt(90);
   if (!bA || !build(g, nodeSnap(g, P1.id, 'rail'), bA, railOpts(PLAYER), 'detour west')) return null;
-  const bD = edgeAt(170);
+  const bD = edgeAt(200);
   if (!bD || !build(g, nodeSnap(g, P2.id, 'rail'), bD, railOpts(PLAYER), 'detour east')) return null;
   const north = (id: number) => { const e = net.edges.get(id); if (!e) return false; const q = { x: 0, y: 0, z: 0 }; net.pointAt(e, e.len / 2, q); return q.z < Z - 2; };
   const detour = [...net.edges.keys()].filter((id) => id >= t0 && north(id));
   // the player's depot behind A; the AI's on a siding off its track (built while it may use the player's junctions)
   const depA = buildRailDepot(g, sA, PLAYER, { x: 1, z: 0 });
-  const aiEdge = net.edges.get(direct[0])!;
-  const depAI = buildDepotOnLine(g, aiEdge.id, aiEdge.len / 2, AI);
+  let depAI = -1;
+  for (const id of direct) {
+    const e = net.edges.get(id);
+    if (!e || depAI >= 0) continue;
+    for (const f of [0.5, 0.35, 0.65]) { depAI = buildDepotOnLine(g, e.id, e.len * f, AI); if (depAI >= 0) break; }
+  }
   g.endAccess(AI, PLAYER);
   g.setAccessPolicy(PLAYER, 'ask');
   log(`layout: J1 ${J1.edges.length} edges, J2 ${J2.edges.length} edges, direct ${direct.map((id) => fmt(net.edges.get(id)?.len ?? 0)).join('+')}, detour ${detour.map((id) => fmt(net.edges.get(id)?.len ?? 0)).join('+')}, depots ${depA}/${depAI}, throats ${playerThroats.length}`);
@@ -142,8 +146,11 @@ if (isMain) {
     const e = net.edges.get(direct.find((id) => net.edges.get(id)!.len > 5)!)!;
     const C = g.edgeMaintenance(e) / 12, sE = g.stations.get(E)!, CS = g.stationMaintenance(sE) / 12;
     const bill = (use: () => void) => { const p0 = total(P, 'trackFees'), q0 = total(Q, 'trackIncome'); use(); g.billAccess(); return { paid: p0 - total(P, 'trackFees'), earned: total(Q, 'trackIncome') - q0 }; };
-    check(g.accessMultiplier(ai) === 2 && g.accessMultiplier(PLAYER) === 2, 'default multiplier 2');
+    check(g.accessMultiplier(ai) === 1 && g.accessMultiplier(PLAYER) === 2, 'default multipliers: AI 1x (permissive), player 2x');
     let r = bill(() => { g.recordTrackUse(ai, e, 10); g.recordTrackUse(PLAYER, e, 10); });
+    check(Math.abs(r.paid - C / 2) < 0.01, '50/50 usage at the AI default m = 1: the user pays half');
+    g.setAccessMultiplier(ai, 2);
+    r = bill(() => { g.recordTrackUse(ai, e, 10); g.recordTrackUse(PLAYER, e, 10); });
     console.log(`  split: edge maintenance ${fmt(C, 0)}/month, 50/50 at m=2: paid ${fmt(r.paid, 1)} (${fmt(r.paid / C * 100, 1)}%)`);
     check(Math.abs(r.paid - C * 2 / 3) < 0.01 && Math.abs(r.earned - r.paid) < 1e-6, '50/50 usage at m = 2: the user pays 2/3 of the maintenance');
     check(Math.abs(g.agreement(PLAYER, ai)!.usageShareLastMonth - 0.5) < 1e-9, 'usage share 50%');

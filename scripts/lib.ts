@@ -2,6 +2,7 @@
 import { Game } from '../src/game/game';
 import { findSnap, planEdge, commitProposal, BuildOptions, Snap, Proposal } from '../src/game/construction';
 import { toggleSignal } from '../src/game/build-ops';
+import { finishDoubleTrack } from '../src/game/trackops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { Train, CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
@@ -247,63 +248,10 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
   const res = buildChain(g, frontsA[0], way, railOpts(owner, 2), frontsB[0], prof, (s) => log('   ' + s));
   log(`  double chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels}`);
   if (!res.ok) return fail;
-  // which main track is on the right when travelling A->B ("out")?
-  const edges = newRailEdges(g, e0, owner);
-  const right = (x: number, z: number, px: number, pz: number, tx: number, tz: number) => (x - px) * -tz + (z - pz) * tx > 0;
-  // tracks near a point: the two parallel edges closest to it
-  const tracksAt = (x: number, z: number, tx: number, tz: number) => {
-    const near = edges.map((id) => ({ id, ne: net.nearestEdge(x, z, 1.5, 'rail', (e) => e.id === id) })).filter((q) => q.ne).sort((p, q) => p.ne!.d - q.ne!.d).slice(0, 2);
-    if (near.length < 2) return null;
-    const pts = near.map((q) => { const p = { x: 0, y: 0, z: 0 }; net.pointAt(q.ne!.edge, q.ne!.s, p); return { id: q.id, x: p.x, z: p.z }; });
-    const r0 = right(pts[0].x, pts[0].z, x, z, tx, tz);
-    return r0 ? { out: pts[0], in: pts[1] } : { out: pts[1], in: pts[0] };
-  };
-  let crossovers = 0;
-  // crossovers on the straight leads (single edges per track): near A "in" -> "out" moving towards B,
-  // near B "out" -> "in" moving towards A
-  for (const [c, f, fromKey, toKey] of [[cA, fA, 'in', 'out'], [cB, fB, 'out', 'in']] as const) {
-    let made = false;
-    for (const [d1, d2] of [[9, 19], [10, 20], [8, 17]]) {
-      const x1 = c.x + f.x * d1, z1 = c.z + f.z * d1, x2 = c.x + f.x * d2, z2 = c.z + f.z * d2;
-      const dirAB = c === cA ? { x: f.x, z: f.z } : { x: -f.x, z: -f.z };
-      const a1 = tracksAt(x1, z1, dirAB.x, dirAB.z), a2 = tracksAt(x2, z2, dirAB.x, dirAB.z);
-      if (!a1 || !a2) continue;
-      const s1 = findSnap(g, 'rail', a1[fromKey].x, a1[fromKey].z, 0.3), s2 = findSnap(g, 'rail', a2[toKey].x, a2[toKey].z, 0.3);
-      if (s1.kind !== 'edge' || s2.kind !== 'edge') continue;
-      if (build(g, s1, s2, railOpts(owner), 'crossover')) { crossovers++; made = true; break; }
-    }
-    if (!made) log('  double: crossover failed');
-  }
-  // one-way signals at 1/3 and 2/3 of the line on both tracks
-  let signals = 0;
-  for (const f of [0.33, 0.66]) {
-    const i = Math.floor(prof.x.length * f);
-    const x = prof.x[i], z = prof.z[i];
-    const j = Math.min(prof.x.length - 1, i + 2);
-    const tx = prof.x[j] - x, tz = prof.z[j] - z, tl = Math.hypot(tx, tz) || 1;
-    const tr = tracksAt(x, z, tx / tl, tz / tl);
-    if (!tr) { log(`  double: no parallel tracks at ${fmt(x)},${fmt(z)}`); continue; }
-    for (const key of ['out', 'in'] as const) {
-      const p = tr[key];
-      const err = toggleSignal(g, p.x, p.z, owner);
-      if (err) { log(`  double: signal failed: ${err}`); continue; }
-      const n = net.nearestNode(p.x, p.z, 1.0, 'rail', (nn) => nn.signal > 0 && nn.edges.length === 2);
-      if (!n) { log(`  double: signal node not found at ${fmt(p.x)},${fmt(p.z)}`); continue; }
-      // the edge towards B (out) or towards A (in): the one passing closer to a point further along the route
-      const k = Math.max(0, Math.min(prof.x.length - 1, i + (key === 'out' ? 5 : -5)));
-      let best = n.edges[0], bd = Infinity;
-      for (const eid of n.edges) {
-        const ne = net.nearestEdge(prof.x[k], prof.z[k], 3, 'rail', (q) => q.id === eid);
-        const dd = ne ? ne.d : Infinity;
-        if (dd < bd) { bd = dd; best = eid; }
-      }
-      n.signal = net.sideAt(net.edges.get(best)!, n.id) > 0 ? 2 : 3;
-      // keep the line usable: if the signal cuts a station off, it faces the wrong way
-      const routesOk = () => [[A, B], [B, A]].every(([st, o]) => st.rail!.edges.some((eid) => [1, -1].some((dir) => !!findRailRoute(g, railNext(g, net.edges.get(eid)!, dir, owner), o.id, owner, -1))));
-      if (!routesOk()) { n.signal = n.signal === 2 ? 3 : 2; if (!routesOk()) { n.signal = 0; continue; } }
-      signals++;
-    }
-  }
+  // directional running: crossover pairs before both stations and one-way block signals (trackops.ts)
+  const f = finishDoubleTrack(g, newRailEdges(g, e0, owner), owner);
+  if (f.error) log(`  double: ${f.error}`);
+  const crossovers = f.crossovers / 2, signals = f.signals;
   g.onNetworkChanged();
   // every platform must reach the other station (else the caller tries another pair)
   let routes = true;

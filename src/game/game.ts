@@ -134,6 +134,8 @@ export class Game {
   private assetCache = new Map<number, { key: string; a: CompanyAssets }>();
   /** the demand model came with the save (older saves: rebuilt once the world is loaded) */
   private demandSaved = false;
+  /** the monthly catchment recompute waits for the next frame */
+  private deferCatchment = false;
 
   constructor(opts: NewGameOptions, world?: World) {
     this.options = opts;
@@ -290,8 +292,9 @@ export class Game {
     if (this.accessRequests.some((q) => q.user === user && q.owner === owner)) return 'pending';
     const policy = this.accessPolicy(owner), ai = this.aiOf(owner);
     if (policy === 'auto-reject') return this.refused(user, owner);
-    // AI owners judge at once: cautious ones keep competitors off their tracks (more so when they 'ask')
-    if (ai) return ai.config.risk < (policy === 'ask' ? 0.6 : 0.25) && this.competes(user, owner) ? this.refused(user, owner) : this.grant(user, owner);
+    // AI owners answer at once: auto-approve (their default) grants everyone; set to 'ask', a cautious AI keeps
+    // competitors off its tracks
+    if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) ? this.refused(user, owner) : this.grant(user, owner);
     if (policy === 'auto-approve') return this.grant(user, owner);
     const q: AccessRequest = { id: this.nextRequestId++, user, owner, day: this.day };
     if (reason) q.reason = reason;
@@ -664,6 +667,7 @@ export class Game {
 
   // ------------------------------------------------------------ simulation
   update(dtReal: number) {
+    this.deferCatchment = false;
     this.lines.flushCatchment();
     if (this.paused) return;
     let dt = Math.min(dtReal, 0.25) * this.speed;
@@ -704,7 +708,7 @@ export class Game {
     // AI project work spread over the day (no frame takes a whole day's planning)
     if (this.aiEnabled) for (const ai of [...this.ais]) ai.work(f0, this.dayFrac + days);
     this.flushNetworkChanges();
-    this.lines.flushCatchment();
+    if (!this.deferCatchment) this.lines.flushCatchment();
   }
 
   private checkLost() {
@@ -724,6 +728,7 @@ export class Game {
   private onNewDay() {
     this.checkLost();
     this.meterTrams();
+    this.demand.daily();
     if (this.accessRequests.length) this.expireRequests();
     // passenger generation: a station's residents travel to the regions the network reaches, as the regional OD
     // demand says; a station reaching more of its demand generates more (60% of the full rate for a single
@@ -784,7 +789,11 @@ export class Game {
         this.postNews(`${town.name} is booming: population passes ${Math.floor(town.pop / 1000) * 1000}!`, 'good', town.x, town.z);
       }
     }
-    if (this.aiEnabled) for (const ai of [...this.ais]) ai.daily();
+    // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
+    if (this.aiEnabled) for (const ai of [...this.ais]) {
+      ai.daily();
+      if (this.day % DAYS_PER_MONTH === (ai.companyId * 7) % DAYS_PER_MONTH) ai.monthly();
+    }
   }
 
   /** Yearly maintenance cost of a company's infrastructure. */
@@ -816,12 +825,10 @@ export class Game {
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
-    this.demand.rebuild();
-    this.stations.recomputeCatchment();
-    this.demand.recomputeShares();
-    this.lines.catchmentDirty = false;
+    // catchments are shared out again at the start of the next frame (not on top of the month's other work)
+    this.lines.catchmentDirty = true;
+    this.deferCatchment = true;
     if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');
-    if (this.aiEnabled) for (const ai of [...this.ais]) ai.monthly();
   }
 
   private onNewYear() {

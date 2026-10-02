@@ -13,7 +13,7 @@ import { Overlay } from './overlay';
 import { Labels } from './labels';
 import { Materials } from './materials';
 import { CameraController } from './camera';
-import { applyClouds, cloudUniforms } from './clouds';
+import { applyClouds, cloudUniforms, shadowFadeUniforms } from './clouds';
 
 export type ResolutionMode = 'auto' | 1 | 0.75 | 0.5;
 
@@ -34,6 +34,8 @@ export interface GraphicsSettings {
 }
 
 const SETTINGS_VERSION = 2;
+/** Largest half-extent of the shadow box (units); wider views keep shadows around the focus and fade them out. */
+const SHADOW_MAX = 170;
 const WARM = new THREE.Color(0.95, 0.65, 0.45);
 const NIGHT_FOG = new THREE.Color(0.035, 0.05, 0.09);
 
@@ -144,6 +146,13 @@ export class Renderer {
   private sb = new Float64Array(6);
   private shadowTimer = 0;
   private shadowFrame = 0;
+  /** half-extent the view footprint would need (beyond SHADOW_MAX the box is clamped) */
+  private shadowNeed = 0;
+  /** distance fade of all shadows (1 = full), and whether the skipped shadow map is out of date */
+  private shadowFade = 1;
+  private shadowStale = false;
+  /** distance from the camera the shadow footprint reaches */
+  private shadowReach = 360;
   private lastCamM = new THREE.Matrix4();
   private v1 = new THREE.Vector3(); private v2 = new THREE.Vector3(); private v3 = new THREE.Vector3();
   private lx = new THREE.Vector3(); private ly = new THREE.Vector3();
@@ -440,6 +449,7 @@ export class Renderer {
     const ly = this.ly.crossVectors(L, lx);
     // footprint: corner rays of the view frustum down to the ground slab, limited to a shadow distance
     const maxD = Math.max(30, Math.min(360, dist * 2.2 + 20));
+    this.shadowReach = maxD;
     const gY = this.focusV.y - 2;
     const b = this.sb;
     b[0] = b[2] = b[4] = Infinity; b[1] = b[3] = b[5] = -Infinity;
@@ -454,9 +464,9 @@ export class Renderer {
     this.addLS(this.focusV);
     let half = Math.max(b[1] - b[0], b[3] - b[2]) / 2 + 1.5;
     let mx = (b[0] + b[1]) / 2, my = (b[2] + b[3]) / 2;
+    this.shadowNeed = half;
     // very wide views: shadows only around the focus (keeps texels useful and the caster count down)
-    const SMAX = 170;
-    if (half > SMAX) { half = SMAX; mx = this.focusV.dot(lx); my = this.focusV.dot(ly); }
+    if (half > SHADOW_MAX) { half = SHADOW_MAX; mx = this.focusV.dot(lx); my = this.focusV.dot(ly); }
     // quantise the extent (~9% steps) and snap the centre to texels
     const S = Math.pow(2, Math.ceil(Math.log2(Math.max(4, half)) * 8) / 8);
     const texel = (2 * S) / sh.mapSize.x;
@@ -540,9 +550,19 @@ export class Renderer {
       this.lastCamM.copy(cam.matrixWorld);
       this.shadowTimer -= dt;
       this.shadowFrame++;
+      // received shadows fade out with view distance before the footprint ends and towards the edge of a
+      // clamped box (no hard line or square); zoomed far out they fade away and the shadow pass is skipped
+      shadowFadeUniforms.uShadowDist.value.set(this.shadowReach * 0.72, this.shadowReach * 0.95);
+      shadowFadeUniforms.uShadowEdge.value = Math.max(0, Math.min(1, (this.shadowNeed / SHADOW_MAX - 1) * 4));
+      const fade = 1 - THREE.MathUtils.smoothstep(dist, 420, 820);
+      this.shadowFade += (fade - this.shadowFade) * Math.min(1, dt * 4);
+      if (Math.abs(this.shadowFade - fade) < 0.005) this.shadowFade = fade;
+      this.sun.shadow.intensity = this.shadowFade;
       // static view: moving vehicles need fresh shadows, at 30 Hz once they are small on screen
       const tick = !g.paused && (this.sun.shadow.camera.right < 40 || (this.shadowFrame & 1) === 0);
-      if (moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0) { sm.needsUpdate = true; this.shadowTimer = 0.5; }
+      const want = moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0;
+      if (this.shadowFade < 0.01) { if (want) this.shadowStale = true; }
+      else if (want || this.shadowStale) { sm.needsUpdate = true; this.shadowTimer = 0.5; this.shadowStale = false; }
     }
     // (castShadow stays constant: toggling it would switch every material's shader variant)
     this.sky.position.copy(cam.position);
