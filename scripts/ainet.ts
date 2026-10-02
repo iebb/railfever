@@ -356,32 +356,23 @@ export function scenarios() {
     console.log(`  after the grace period: ${left} stations, ${track} track edges of ours, retired ${stat(ai, 'netRetired')}`);
     check(left === 0 && track === 0, 'decommission: unused stations and track taken up');
   }
-  // 9. a town grown along a line: a station inserted
+  // 9. a district grown up beside a line between its stations: a station inserted there
   {
-    console.log('insert: a station where the line passes the town');
-    const { g, ai, me } = aiFlat(384, 10, 7);
-    const size = g.world.size;
-    let ok = false;
-    for (const T0 of [...g.towns.list].sort((a, b) => b.pop - a.pop).slice(0, 4)) {
-      if (ok) break;
-      const R = T0.radius + 55;
-      for (const [ang, dz] of [[Math.PI / 2, 0], [0, 0], [Math.PI / 2, 8], [0, 8], [Math.PI / 2, -8], [0, -8]] as [number, number][]) {
-        const ux = Math.sin(ang), uz = Math.cos(ang), px = T0.x - ux * R + uz * dz, pz = T0.z - uz * R - ux * dz, qx = T0.x + ux * R + uz * dz, qz = T0.z + uz * R - ux * dz;
-        if (Math.min(px, pz, qx, qz) < 20 || Math.max(px, pz, qx, qz) > size - 20) continue;
-        const P = station(g, px, pz, ang, 10, 1, me), Q = P && station(g, qx, qz, ang, 10, 1, me);
-        if (!P || !Q) { if (P) g.stations.removeStation(P.id); continue; }
-        if (!straightTrack(g, endNode(g, P, 0, true), endNode(g, Q, 0, false), me)) { g.stations.removeStation(P.id); g.stations.removeStation(Q.id); continue; }
-        const lid = lineWithTrain(g, me, [P, Q]);
-        runNetworkTask(ai, 'insert');
-        const l = g.lines.get(lid)!;
-        console.log(`  ${T0.name} (pop ${T0.pop}): ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
-        check(stat(ai, 'netInserted') === 1 && l.stops.length > 2, 'insert: a station on the line in the town');
-        check(routes(g, P, Q, me), 'insert: the line still runs end to end');
-        ok = true;
-        break;
-      }
-    }
-    if (!ok) console.log('  (no line through the town could be built: skipped)');
+    console.log('insert: a station where the line passes a new district');
+    const { g, ai, me } = aiFlat();
+    const P = station(g, 40, 128, Math.PI / 2, 10, 1, me)!, Q = station(g, 216, 128, Math.PI / 2, 10, 1, me)!;
+    build(g, nodeSnap(g, endNode(g, P, 0, true), 'rail'), nodeSnap(g, endNode(g, Q, 0, false), 'rail'), railOpts(me), 'line');
+    const lid = lineWithTrain(g, me, [P, Q]);
+    // a new district south of the line, halfway between the stations (64 houses, ~1600 residents)
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) g.world.addBuilding({ townId: -1, x: 116 + i * 3.2, z: 136 + j * 3.2, angle: 0, w: 1.2, d: 1.1, type: 1, floors: 2, pop: 25, seed: i * 8 + j, y: 3, built: 0 });
+    runNetworkTask(ai, 'insert');
+    const l = g.lines.get(lid)!;
+    console.log(`  ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
+    check(stat(ai, 'netInserted') === 1 && l.stops.length > 2, 'insert: a station on the line by the new district');
+    check(routes(g, P, Q, me), 'insert: the line still runs end to end');
+    // not twice: the district is covered now
+    runNetworkTask(ai, 'insert');
+    check(stat(ai, 'netInserted') === 1, 'insert: no second station for the same district');
   }
   // 10. bus stops of ours next to each other: one station
   {

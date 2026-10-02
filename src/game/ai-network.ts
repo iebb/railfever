@@ -33,6 +33,7 @@ import type { Proposal, BuildOptions, Snap } from './construction';
 import { railModeOf, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS } from './stations';
 import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
 import * as Trackops from './trackops';
+import * as StationsMod from './stations';
 import * as Patterns from './patterns';
 import { autoSignalLine } from './signals';
 import { findRailRoute, railNext, platformWaits } from './train';
@@ -64,7 +65,7 @@ interface NetOps {
   commitRelevel?: (g: Game, plan: PlanLike) => unknown;
   mergeStops?: (g: Game, a: number, b: number) => unknown;
 }
-const OPS = Trackops as unknown as NetOps;
+const OPS: NetOps = { ...(StationsMod as unknown as NetOps), ...(Trackops as unknown as NetOps) };
 interface PatternOps {
   canonicalizeLines?: (g: Game, lineId?: number) => { from: number; into: number; text: string }[];
   subsetOf?: (g: Game, l: Line) => Line | null;
@@ -1490,8 +1491,8 @@ class NetPlanner {
             for (const o of g.stations.footprintsNear(q.x, q.z, spacing)) if (o.rail && railModeOf(o.rail.trackType) === mode && Math.hypot(o.rail.x - q.x, o.rail.z - q.z) < spacing) { near = true; break; }
             if (near) continue;
             if (++k % 6 === 0) yield;
-            const town = g.towns.nearest(q.x, q.z);
-            if (!town || Math.hypot(town.x - q.x, town.z - q.z) > town.radius + R) continue;
+            // (open country: nothing to cover)
+            if (g.world.bgrid.query(q.x - R, q.z - R, q.x + R, q.z + R).length < 12) continue;
             const pop = this.uncovered(q.x, q.z, Math.atan2(dq.x, dq.z), platform, mode, cover);
             if (pop >= INSERT_POP[mode] * networkOptions.insertPop && (!best || pop > best.pop)) best = { e: e.id, s, pop, x: q.x, z: q.z, a, b };
           }
@@ -1757,12 +1758,11 @@ class NetPlanner {
           // ours both: one station (the one with more lines keeps its name)
           if (b.id < a.id) continue;
           const [into, from] = this.linesAt(b.id).length > this.linesAt(a.id).length ? [b, a] : [a, b];
-          // (stations.ts mergeStops when there: one stop of the two; else one station with both stops)
-          const sm = (g.stations as unknown as { mergeStops?: (x: number, y: number) => unknown }).mergeStops;
-          const err = errorOf(OPS.mergeStops ? OPS.mergeStops(g, into.id, from.id) : sm ? sm.call(g.stations, into.id, from.id) : g.stations.merge(into.id, from.id));
+          // (stations.ts mergeStops: one station, a stop beside another one taken away; else one station with both stops)
+          const err = errorOf(OPS.mergeStops ? OPS.mergeStops(g, into.id, from.id) : g.stations.merge(into.id, from.id));
           if (err) continue;
           // two stops on the same street a few metres apart: one is enough (its upkeep saved)
-          this.trimStops(into);
+          if (!OPS.mergeStops) this.trimStops(into);
           this.bump('netStopsMerged');
           this.note(`bus stops ${from.name} and ${into.name} combined`);
           yield;
