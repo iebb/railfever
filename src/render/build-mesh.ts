@@ -2,6 +2,7 @@
 // world-scaled texture helpers, and a fast geometry merger for super-chunks.
 import * as THREE from 'three';
 import { srgbToLinear } from './geo';
+import { cellAverages, FACADE_CELL0, WC } from './textures';
 
 const lin = new Map<number, [number, number, number]>();
 /** Hex colour (sRGB) -> linear RGB, cached. */
@@ -13,6 +14,23 @@ function linear(c: number): [number, number, number] {
     lin.set(c, v);
   }
   return v;
+}
+
+/** Growable index buffer (typed, reused across builds: no garbage from array growth). push takes 3 or 6 indices. */
+export class IndexBuf {
+  a = new Uint32Array(0);
+  length = 0;
+  /** discard pushes (builder switched off) */
+  off = false;
+  push(i0: number, i1: number, i2: number, i3?: number, i4?: number, i5?: number) {
+    if (this.off) return;
+    let n = this.length;
+    if (n + 6 > this.a.length) { const b = new Uint32Array(Math.max(4096, this.a.length * 2)); b.set(this.a.subarray(0, n)); this.a = b; }
+    const A = this.a;
+    A[n++] = i0; A[n++] = i1; A[n++] = i2;
+    if (i3 !== undefined) { A[n++] = i3; A[n++] = i4!; A[n++] = i5!; }
+    this.length = n;
+  }
 }
 
 /**
@@ -30,7 +48,7 @@ export class WB {
   cells = new Float32Array(0);
   casts = new Float32Array(0);
   seeds = new Float32Array(0);
-  idx: number[] = [];
+  idx = new IndexBuf();
   cell = 0;
   cast = 1;
   /** per-face random seed (facade window lighting) */
@@ -39,12 +57,16 @@ export class WB {
   private anyCast = false;
 
   /** Clear for reuse (keeps the allocated buffers). */
-  reset(): this {
+  reset(off = false): this {
     this.n = 0; this.idx.length = 0;
     this.cell = 0; this.cast = 1; this.seed = 0; this.anyCast = false;
     this.cr = this.cg = this.cb = 1;
+    this.off = off; this.idx.off = off;
     return this;
   }
+
+  /** Switched off: geometry is computed by the callers but nothing is stored (empty result). */
+  off = false;
 
   get vertexCount() { return this.n; }
   get empty() { return this.idx.length === 0; }
@@ -76,6 +98,7 @@ export class WB {
   }
 
   vertex(x: number, y: number, z: number, nx: number, ny: number, nz: number, u = 0, v = 0): number {
+    if (this.off) return 0;
     const i = this.n;
     if (i >= this.cap) this.grow(i + 1);
     const i3 = i * 3, i2 = i * 2;
@@ -177,19 +200,31 @@ export class WB {
     for (let i = 0; i < seg; i++) { const a = base + i * 2; this.idx.push(a, a + 3, a + 1, a, a + 2, a + 3); }
   }
 
-  /** Geometry with exact-size attribute copies (no bounding volumes unless asked). */
+  /**
+   * Geometry with exact-size, compact attribute copies (no bounding volumes unless asked): float
+   * positions and uvs, byte normals and (linear) colours, byte cell / cast flags, 16-bit seeds.
+   */
   build(bounds = false): THREE.BufferGeometry {
     const g = new THREE.BufferGeometry();
     const n = this.n;
-    const at = (a: Float32Array, k: number) => new THREE.BufferAttribute(a.slice(0, n * k), k);
-    g.setAttribute('position', at(this.pos, 3));
-    g.setAttribute('normal', at(this.nrm, 3));
-    g.setAttribute('color', at(this.col, 3));
-    g.setAttribute('uv', at(this.uvs, 2));
-    g.setAttribute('aCell', at(this.cells, 1));
-    g.setAttribute('aCast', at(this.casts, 1));
-    g.setAttribute('aSeed', at(this.seeds, 1));
-    g.setIndex(new THREE.BufferAttribute(n > 65535 ? new Uint32Array(this.idx) : new Uint16Array(this.idx), 1));
+    g.setAttribute('position', new THREE.BufferAttribute(this.pos.slice(0, n * 3), 3));
+    const nrm = new Int8Array(n * 3), col = new Uint8Array(n * 3);
+    const N = this.nrm, C = this.col;
+    for (let i = 0; i < n * 3; i++) {
+      nrm[i] = Math.round(N[i] * 127);
+      const c = C[i] * 255;
+      col[i] = c >= 255 ? 255 : c <= 0 ? 0 : Math.round(c);
+    }
+    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3, true));
+    g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
+    g.setAttribute('uv', new THREE.BufferAttribute(this.uvs.slice(0, n * 2), 2));
+    const cell = new Uint8Array(n), cast = new Uint8Array(n), seed = new Uint16Array(n);
+    for (let i = 0; i < n; i++) { cell[i] = this.cells[i]; cast[i] = this.casts[i]; seed[i] = this.seeds[i]; }
+    g.setAttribute('aCell', new THREE.BufferAttribute(cell, 1));
+    g.setAttribute('aCast', new THREE.BufferAttribute(cast, 1));
+    g.setAttribute('aSeed', new THREE.BufferAttribute(seed, 1));
+    const ix = this.idx.a.subarray(0, this.idx.length);
+    g.setIndex(new THREE.BufferAttribute(n > 65535 ? ix.slice() : new Uint16Array(ix), 1));
     if (bounds) { g.computeBoundingSphere(); g.computeBoundingBox(); }
     return g;
   }
@@ -242,7 +277,7 @@ export class WB {
     const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
     let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
     const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (l < 2e-6) return; // degenerate sliver (orientation would be arbitrary)
+    if (l < 2e-5) return; // degenerate sliver (invisible; its orientation would not survive float32 positions)
     nx /= l; ny /= l; nz /= l;
     if (nx * wx + ny * wy + nz * wz >= 0) {
       const a = this.vertex(ax, ay, az, nx, ny, nz, au, av), b = this.vertex(bx, by, bz, nx, ny, nz, bu, bv), c = this.vertex(cx, cy, cz, nx, ny, nz, cu, cv);
@@ -268,15 +303,16 @@ export function mergeGeos(geos: THREE.BufferGeometry[]): THREE.BufferGeometry | 
   for (const g of list) { nv += g.getAttribute('position').count; ni += g.index ? g.index.count : 0; }
   for (const name of Object.keys(list[0].attributes)) {
     const a0 = list[0].getAttribute(name) as THREE.BufferAttribute;
-    const arr = new Float32Array(nv * a0.itemSize);
+    const Ctor = a0.array.constructor as new (n: number) => THREE.TypedArray;
+    const arr = new Ctor(nv * a0.itemSize);
     let off = 0;
     for (const g of list) {
       const a = g.getAttribute(name) as THREE.BufferAttribute;
       if (!a) { off += g.getAttribute('position').count * a0.itemSize; continue; }
-      arr.set(a.array as Float32Array, off);
+      arr.set(a.array as ArrayLike<number>, off);
       off += a.array.length;
     }
-    out.setAttribute(name, new THREE.BufferAttribute(arr, a0.itemSize));
+    out.setAttribute(name, new THREE.BufferAttribute(arr, a0.itemSize, a0.normalized));
   }
   const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
   let io = 0, vo = 0;
@@ -300,4 +336,101 @@ export function mergeGeos(geos: THREE.BufferGeometry[]): THREE.BufferGeometry | 
   out.boundingBox = new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
   out.boundingSphere = out.boundingBox.getBoundingSphere(new THREE.Sphere());
   return out;
+}
+
+// ------------------------------------------------------------------------------ far LOD parts
+
+/** Compact far-LOD geometry: positions, byte normals, baked linear byte colours, night glow; 32-bit indices. */
+export interface FarPart { pos: Float32Array; nrm: Int8Array; col: Uint8Array; glow: Uint8Array; idx: Uint32Array; nv: number; ni: number }
+
+let remap = new Int32Array(0);
+
+/**
+ * Simplified compact copy of world-material geometries for distant views: drops tiny triangles and low
+ * vertical strips of ground pieces (kerbs, skirts, verges), bakes the cell's average colour into the
+ * vertex colour and marks lamp / facade vertices for night glow.
+ */
+export function farPart(geos: (THREE.BufferGeometry | null)[]): FarPart | null {
+  let NV = 0, NI = 0;
+  for (const g of geos) if (g && g.index) { NV += g.getAttribute('position').count; NI += g.index.count; }
+  if (!NI) return null;
+  const pos = new Float32Array(NV * 3), nrm = new Int8Array(NV * 3), col = new Uint8Array(NV * 3), glow = new Uint8Array(NV);
+  const idx = new Uint32Array(NI);
+  const avg = cellAverages();
+  let nv = 0, ni = 0;
+  for (const g of geos) {
+    if (!g || !g.index) continue;
+    const P = g.getAttribute('position').array as Float32Array;
+    const na = g.getAttribute('normal') as THREE.BufferAttribute, ca = g.getAttribute('color') as THREE.BufferAttribute;
+    const N = na.array as ArrayLike<number>, C = ca.array as ArrayLike<number>;
+    const nk = na.normalized ? 1 : 127, ck = ca.normalized ? 1 / 255 : 1;
+    const CE = g.getAttribute('aCell').array as ArrayLike<number>, CA = g.getAttribute('aCast').array as ArrayLike<number>;
+    const I = g.index.array;
+    const cnt = g.getAttribute('position').count;
+    if (remap.length < cnt) remap = new Int32Array(Math.max(cnt, remap.length * 2));
+    remap.fill(-1, 0, cnt);
+    for (let t = 0; t < I.length; t += 3) {
+      const a = I[t], b = I[t + 1], c = I[t + 2];
+      const ax = P[a * 3], ay = P[a * 3 + 1], az = P[a * 3 + 2];
+      const ux = P[b * 3] - ax, uy = P[b * 3 + 1] - ay, uz = P[b * 3 + 2] - az;
+      const vx = P[c * 3] - ax, vy = P[c * 3 + 1] - ay, vz = P[c * 3 + 2] - az;
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const l2 = nx * nx + ny * ny + nz * nz;
+      if (l2 < 9e-6) continue; // area < 0.0015
+      if (CA[a] < 0.5 && ny * ny < 0.12 * l2) {
+        const y0 = Math.min(ay, P[b * 3 + 1], P[c * 3 + 1]), y1 = Math.max(ay, P[b * 3 + 1], P[c * 3 + 1]);
+        if (y1 - y0 < 0.07) continue; // low vertical strip of a ground piece
+      }
+      for (const v of [a, b, c]) {
+        let m = remap[v];
+        if (m < 0) {
+          m = remap[v] = nv++;
+          pos[m * 3] = P[v * 3]; pos[m * 3 + 1] = P[v * 3 + 1]; pos[m * 3 + 2] = P[v * 3 + 2];
+          nrm[m * 3] = Math.round(N[v * 3] * nk); nrm[m * 3 + 1] = Math.round(N[v * 3 + 1] * nk); nrm[m * 3 + 2] = Math.round(N[v * 3 + 2] * nk);
+          const cell = Math.round(CE[v]);
+          const k = (cell < 64 ? cell : 0) * 3;
+          col[m * 3] = Math.min(255, Math.round(C[v * 3] * ck * avg[k] * 255));
+          col[m * 3 + 1] = Math.min(255, Math.round(C[v * 3 + 1] * ck * avg[k + 1] * 255));
+          col[m * 3 + 2] = Math.min(255, Math.round(C[v * 3 + 2] * ck * avg[k + 2] * 255));
+          glow[m] = cell === WC.LAMP ? 255 : cell >= FACADE_CELL0 ? 90 : 0;
+        }
+        idx[ni++] = m;
+      }
+    }
+  }
+  if (!ni) return null;
+  return { pos: pos.slice(0, nv * 3), nrm: nrm.slice(0, nv * 3), col: col.slice(0, nv * 3), glow: glow.slice(0, nv), idx: idx.slice(0, ni), nv, ni };
+}
+
+/** One geometry from far parts (bounds included). */
+export function concatFar(parts: (FarPart | null)[]): THREE.BufferGeometry | null {
+  let nv = 0, ni = 0;
+  for (const p of parts) if (p) { nv += p.nv; ni += p.ni; }
+  if (!ni) return null;
+  const pos = new Float32Array(nv * 3), nrm = new Int8Array(nv * 3), col = new Uint8Array(nv * 3), glow = new Uint8Array(nv);
+  const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
+  let vo = 0, io = 0;
+  for (const p of parts) {
+    if (!p) continue;
+    pos.set(p.pos, vo * 3); nrm.set(p.nrm, vo * 3); col.set(p.col, vo * 3); glow.set(p.glow, vo);
+    const I = p.idx;
+    for (let i = 0; i < I.length; i++) idx[io + i] = I[i] + vo;
+    vo += p.nv; io += p.ni;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3, true));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3, true));
+  g.setAttribute('aGlow', new THREE.BufferAttribute(glow, 1, true));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (let i = 0; i < pos.length; i += 3) {
+    const x = pos[i], y = pos[i + 1], z = pos[i + 2];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+  g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+  return g;
 }

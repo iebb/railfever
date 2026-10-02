@@ -7,6 +7,8 @@ import { WindowManager } from './windows';
 import { Tools, ToolId, Hit } from './tools';
 import { h, icon } from './dom';
 import type { Line } from '../game/lines';
+import type { LineKind } from '../game/constants';
+import { KIND_META } from './format';
 import type { Vehicle } from '../game/vehicle';
 import { Minimap } from './minimap';
 import { computeLinePath } from './linepaths';
@@ -16,13 +18,17 @@ import { audio, Sfx, PlayOpts } from '../audio/engine';
 import { UiTips } from './tips';
 import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
+import { MapModes } from './mapmodes';
+import { catchShapes, CATCH_COLOR, stationLinks } from './gameapi';
 import * as info from './win-info';
 import * as lines from './win-lines';
 import * as company from './win-company';
+import * as access from './win-access';
 import * as menu from './win-menu';
 import { showTitle, TitleOpts } from './title';
 
 export interface AppHooks {
+  /** extra: settings applied after creation (e.g. the AI activeness preset) */
   newGame(opts: NewGameOptions): void;
   setGame(g: Game): void;
 }
@@ -42,6 +48,7 @@ export class UI {
   tips: UiTips;
   hoverCard: HoverCard;
   checklist: Checklist;
+  mapModes: MapModes;
   private toastBox: HTMLDivElement;
   private floatLayer: HTMLDivElement;
   private floats: FloatText[] = [];
@@ -57,6 +64,9 @@ export class UI {
   lineBroken = new Map<number, [number, number][]>();
   following: number | null = null;
   titleOpen = false;
+  /** left column holding the checklist, the map view card and the minimap */
+  leftCol!: HTMLDivElement;
+  private lastDebug: boolean | null = null;
 
   constructor(public root: HTMLElement, public renderer: Renderer, public app: AppHooks) {
     this.loadPrefs();
@@ -67,6 +77,12 @@ export class UI {
     this.tips = new UiTips(root);
     this.hoverCard = new HoverCard(this);
     this.checklist = new Checklist(this);
+    this.mapModes = new MapModes(this);
+    this.mapModes.onChange = () => { this.linePathSig.clear(); this.marksSig = ''; this.hud.syncMapButtons(); this.checklist.setAutoCollapse(this.mapModes.mode !== 'none'); };
+    // left column: checklist, map view card and minimap flow top to bottom without overlapping
+    this.leftCol = h('div', { class: 'leftcol' });
+    root.appendChild(this.leftCol);
+    this.leftCol.append(this.checklist.el, this.mapModes.card, this.minimap.el);
     this.toastBox = h('div', { class: 'toasts', role: 'status', 'aria-live': 'polite' });
     root.appendChild(this.toastBox);
     this.floatLayer = h('div', { class: 'floats' });
@@ -121,6 +137,7 @@ export class UI {
     };
     this.minimap.reset();
     this.hoverCard.set(null);
+    this.mapModes.set('none');
     this.checklist.setGame();
     this.lastHl = undefined;
   }
@@ -143,9 +160,14 @@ export class UI {
     const T = this.tools;
     const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
     if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
-    if (k === 'Escape') { if (!T.cancel() && !this.wm.closeTop()) this.hud.closeNews(); return; }
+    if (k === 'Escape') {
+      if (T.cancel()) return;
+      if (this.mapModes.mode !== 'none') { this.mapModes.set('none'); return; }
+      if (!this.wm.closeTop()) this.hud.closeNews();
+      return;
+    }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
-    if ((k === 'r' || k === 'R') && ['station', 'depot-rail', 'depot-road'].includes(T.tool)) {
+    if ((k === 'r' || k === 'R') && ['station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
       T.rotate(e.shiftKey ? -1 : 1);
       this.hud.onToolChange();
       this.renderer.controls.keys.delete('r');
@@ -161,7 +183,11 @@ export class UI {
     else if (lk === 'v') this.openVehicles();
     else if (lk === 't') this.openTowns();
     else if (lk === 'c') this.openCompetitors();
+    else if (lk === 'k') this.openTrackAccess();
     else if (lk === 'n') this.hud.toggleNews();
+    else if (lk === 'm') this.mapModes.toggle('lines');
+    else if (lk === 'p') this.mapModes.toggle('demand');
+    else if (lk === 'o') this.mapModes.toggle('catchment');
     else if (k === 'F1') { e.preventDefault(); this.openHelp(); }
     else if (lk === 'g') { const u = (this.renderer.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid; if (u) u.value = u.value ? 0 : 1; }
   };
@@ -188,9 +214,12 @@ export class UI {
       this.incomeAcc.clear();
     }
     if (this.floats.length) this.updateFloats(dt);
+    const dbg = !!(this.renderer.settings as unknown as { debug?: boolean }).debug;
+    if (dbg !== this.lastDebug) { this.lastDebug = dbg; this.leftCol.classList.toggle('below-debug', dbg); }
     this.minimap.update(dt);
     this.hoverCard.update(dt);
     this.checklist.update(dt);
+    this.mapModes.update(dt);
     this.updateLinePaths();
     // follow a vehicle when the camera has no follow mode of its own
     if (this.following != null) {
@@ -215,7 +244,8 @@ export class UI {
     const ov = this.renderer.overlay;
     const open = new Set<number>();
     for (const win of this.wm.wins.values()) if (win.id.startsWith('line-')) open.add(Number(win.id.slice(5)));
-    for (const id of ov.linePathIds()) if (!open.has(id)) { ov.setLinePath(id, null); this.linePathSig.delete(id); }
+    const linesMap = this.mapModes.mode === 'lines';
+    if (!linesMap) for (const id of ov.linePathIds()) if (!open.has(id)) { ov.setLinePath(id, null); this.linePathSig.delete(id); }
     let marksSig = '';
     for (const id of open) {
       const l = g.lines.get(id);
@@ -225,7 +255,7 @@ export class UI {
       if (this.linePathSig.get(id) === sig) continue;
       this.linePathSig.set(id, sig);
       const lp = computeLinePath(g, l);
-      ov.setLinePath(id, lp.curves, l.color);
+      if (!linesMap) ov.setLinePath(id, lp.curves, l.color);
       this.lineBroken.set(id, lp.broken);
     }
     // stop numbers on the station labels of open lines
@@ -292,6 +322,15 @@ export class UI {
 
   private onNews(n: News) {
     this.hud.onNews(n);
+    // requests for access to the player's network: always shown, click to review
+    const request = n.text.includes('requests access to your tracks');
+    if (request) {
+      this.sound('notify');
+      const el = h('div', { class: 'toast news ai link' }, h('span', { class: 'news-date' }, newsDate(this.game, n)), h('span', null, n.text), h('b', { class: 'toast-act' }, 'Review'));
+      el.addEventListener('click', () => this.openTrackAccess());
+      this.pushToast(el, 9000);
+      return;
+    }
     if (n.kind === 'ai' && !this.game.aiEnabled) return;
     // news chimes are throttled (AI companies report often at high speed); bad news always sounds
     const now = performance.now();
@@ -312,7 +351,7 @@ export class UI {
 
   // ------------------------------------------------------------------ shared helpers
   kv(k: string, v: Node | string): HTMLElement { return h('div', { class: 'kv' }, h('span', { class: 'k' }, k), h('span', { class: 'v' }, v)); }
-  lineChip(l: Line): HTMLElement { return h('span', { class: 'chip', style: `--c:${l.color}`, onclick: () => this.openLine(l.id) }, l.name); }
+  lineChip(l: Line): HTMLElement { return h('span', { class: 'chip', style: `--c:${l.color}`, onclick: () => this.openLine(l.id) }, icon(KIND_META[l.kind].icon, 13), l.name); }
   stationLink(id: number): HTMLElement {
     const st = this.game.stations.get(id);
     return h('a', { class: 'link', onclick: () => this.openStation(id) }, st ? st.name : '?');
@@ -344,17 +383,14 @@ export class UI {
     }
   }
 
+  /** Show a station's catchment (with the stations of its transfer complex), or none (-1). */
   setCatchment(id: number) {
     const g = this.game;
     this.catchmentStation = id;
     const st = id >= 0 ? g.stations.get(id) : undefined;
-    const u = this.renderer.terrain.uniforms as unknown as { uCircle?: { value: THREE.Vector4 }; uCircleColor?: { value: THREE.Color } };
-    if (!st) { this.renderer.overlay.setRings(null); if (u.uCircle && this.tools.tool === 'inspect') u.uCircle.value.w = 0; return; }
-    const rings: { x: number; z: number; r: number }[] = [];
-    if (st.rail) rings.push({ x: st.rail.x, z: st.rail.z, r: g.stations.catchmentRadius(st) });
-    for (const p of st.stops) rings.push({ x: p.x, z: p.z, r: 14 });
-    this.renderer.overlay.setRings(rings, 0x3ccb7f);
-    if (u.uCircle && rings[0]) { u.uCircle.value.set(rings[0].x, rings[0].z, rings[0].r, 1); u.uCircleColor?.value.setHex(0x3ccb7f); }
+    if (!st) { this.renderer.overlay.setCatchments('sel', null); return; }
+    const group = [st, ...stationLinks(g, st).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x)];
+    this.renderer.overlay.setCatchments('sel', group.flatMap((s) => catchShapes(g, s)).map((c) => ({ x: c.x, z: c.z, r: c.r, color: CATCH_COLOR[c.mode] })));
   }
 
   /** Open the info window for a picked object. */
@@ -379,7 +415,7 @@ export class UI {
   openEdge(id: number) { info.openEdge(this, id); }
   openVehicle(id: number) { info.openVehicle(this, id); }
   openDepot(id: number) { info.openDepot(this, id); }
-  openPurchase(kind: 'rail' | 'road', depotId: number | null, lineId: number | null) { info.openPurchase(this, kind, depotId, lineId); }
+  openPurchase(kind: LineKind, depotId: number | null, lineId: number | null) { info.openPurchase(this, kind, depotId, lineId); }
   openLines() { lines.openLines(this); }
   openLine(id: number) { lines.openLine(this, id); }
   editLine(id: number) { lines.editLine(this, id); }
@@ -388,6 +424,7 @@ export class UI {
   openTowns() { lines.openTowns(this); }
   openFinances() { company.openFinances(this); }
   openCompetitors() { company.openCompetitors(this); }
+  openTrackAccess() { access.openTrackAccess(this); }
   openNews() { this.hud.openNews(); }
   openMenu() { menu.openMenu(this); }
   openSaveLoad(mode: 'save' | 'load') { menu.openSaveLoad(this, mode); }

@@ -254,6 +254,7 @@ export const WC = {
   PLATFORM: 8, CONCRETE: 9, STONE: 10, ROOF_TILES: 11,
   ROOF_SLATE: 12, ROOF_FLAT: 13, METAL: 14, LAMP: 15,
   GRASS: 16, WATER: 17, COBBLE: 18, FLOWERS: 19,
+  TRAMBED: 20,
 };
 /** First cell index of the facade atlas inside the world material (world cells are below it). */
 export const FACADE_CELL0 = 32;
@@ -263,16 +264,18 @@ export const WSCALE = {
   ROOF_TILES: 0.36, ROOF_SLATE: 0.3, ROOF_FLAT: 1.0, PLAIN: 1.0,
   GRASS: 0.8, WATER: 1.5, COBBLE: 0.4, FLOWERS: 0.5,
 };
+/** Tram track bed cell: u spans the bed across (TRAM_BED_HALF each side of the track centre), v repeats every TRAM_BED_PERIOD. */
+export const TRAM_BED_HALF = 0.12, TRAM_BED_PERIOD = 0.24;
 /** Ballast cell: sleepers per repeat (one repeat = BALLAST_PERIOD units along the track). */
 export const BALLAST_PERIOD = 0.24;
-export const ATLAS = { cols: 4, rows: 5, content: 256, gutter: 16 };
+export const ATLAS = { cols: 4, rows: 6, content: 256, gutter: 16 };
 export const ATLAS_W = ATLAS.cols * (ATLAS.content + 2 * ATLAS.gutter);
 export const ATLAS_H = ATLAS.rows * (ATLAS.content + 2 * ATLAS.gutter);
 /** Per-cell roughness / metalness used by the world material (32 slots). */
 export const CELL_ROUGH = [0.9, 0.97, 0.95, 0.96, 0.9, 0.9, 0.9, 0.86, 0.85, 0.88, 0.9, 0.72, 0.62, 0.92, 0.42, 0.5,
-  0.95, 0.08, 0.8, 0.95, ...new Array(12).fill(0.9)];
+  0.95, 0.08, 0.8, 0.95, 0.78, ...new Array(11).fill(0.9)];
 export const CELL_METAL = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05, 0, 0.72, 0,
-  0, 0.15, 0, 0, ...new Array(12).fill(0)];
+  0, 0.15, 0, 0, 0.1, ...new Array(11).fill(0)];
 
 function h2(ix: number, iy: number, seed: number): number {
   let h = (Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263) + Math.imul(seed | 0, 2246822519)) | 0;
@@ -484,6 +487,23 @@ const PAINTERS: Painter[] = [
       o[0] += (q[0] - o[0]) * k; o[1] += (q[1] - o[1]) * k; o[2] += (q[2] - o[2]) * k;
     }
   },
+  // tram track bed: setts with concrete edging and two flush grooved rails (gauge at u 0.2 / 0.8)
+  (s, t, o) => {
+    const row = Math.floor(t * 12), fy = t * 12 - row;
+    const ss = (s + (row % 2) * 0.05) % 1;
+    const ci = Math.floor(ss * 10), fx = ss * 10 - ci;
+    let v = 0.64 + 0.12 * (h2(ci, row, 111) - 0.5) * 2;
+    const e = Math.min(fx, 1 - fx, fy, 1 - fy);
+    v *= e < 0.07 ? 0.62 : 0.92 + 0.08 * Math.min(1, e * 6);
+    o[0] = v; o[1] = v * 0.98; o[2] = v * 0.95;
+    if (s < 0.04 || s > 0.96) { const c = 0.7 + 0.06 * fb(s, t, 8, 112, 2); o[0] = c; o[1] = c; o[2] = c * 0.98; }
+    for (const c of [0.2, 0.8]) {
+      const d = s - c, ad = Math.abs(d);
+      const inner = c < 0.5 ? d > 0 : d < 0; // the groove faces the track centre
+      if (ad < 0.012) { const hv = ad < 0.006 ? 0.78 : 0.5; o[0] = hv; o[1] = hv * 0.98; o[2] = hv * 0.95; }
+      else if (inner && ad < 0.03) { o[0] = 0.13; o[1] = 0.13; o[2] = 0.14; }
+    }
+  },
 ];
 
 let worldAtlasData: { data: Uint8Array; size: number; height: number } | null = null;
@@ -521,6 +541,37 @@ export function worldAtlasPixels(): { data: Uint8Array; size: number; height: nu
   }
   worldAtlasData = { data, size, height };
   return worldAtlasData;
+}
+
+/** Average colours (sRGB) of the facade atlas cells, walls and windows blended (far meshes). */
+const FACADE_AVG = [0xd9d3c9, 0xddd8cf, 0x8e5444, 0xcbc3b4, 0xc9c4bb, 0xa8aaa8, 0x3f5a70, 0xb3aa99, 0xd0c4b4, 0xcfcac0, 0x8a5242, 0xb9b0a0,
+  0x8a8f94, 0x9fa3a2, 0x4a5a68, 0xb6ab96, 0x3e6066, 0x7a5444, 0xa89c86, 0x9a5a42, 0x7d6d66, 0xd0c4b0, 0xf0ebe1, 0xbdbab3];
+let cellAvg: Float32Array | null = null;
+
+/** Average linear colour of every world material cell (world atlas cells, then facade cells from FACADE_CELL0). */
+export function cellAverages(): Float32Array {
+  if (cellAvg) return cellAvg;
+  const out = new Float32Array(64 * 3).fill(0.75);
+  const L = new Float32Array(256);
+  for (let i = 0; i < 256; i++) { const c = i / 255; L[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4); }
+  const { data, size } = worldAtlasPixels();
+  const { cols, rows, content: C, gutter: G } = ATLAS;
+  const S = C + 2 * G;
+  for (let ci = 0; ci < Math.min(PAINTERS.length, cols * rows); ci++) {
+    const ox = (ci % cols) * S + G, oy = Math.floor(ci / cols) * S + G;
+    let r = 0, g = 0, b = 0, n = 0;
+    for (let y = 0; y < C; y += 4) for (let x = 0; x < C; x += 4) {
+      const d = ((oy + y) * size + ox + x) * 4;
+      r += L[data[d]]; g += L[data[d + 1]]; b += L[data[d + 2]]; n++;
+    }
+    out[ci * 3] = r / n; out[ci * 3 + 1] = g / n; out[ci * 3 + 2] = b / n;
+  }
+  FACADE_AVG.forEach((h, i) => {
+    const k = (FACADE_CELL0 + i) * 3;
+    out[k] = L[(h >> 16) & 255]; out[k + 1] = L[(h >> 8) & 255]; out[k + 2] = L[h & 255];
+  });
+  cellAvg = out;
+  return out;
 }
 
 /** The world atlas as a mip-mapped sRGB texture. */

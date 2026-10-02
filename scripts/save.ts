@@ -26,7 +26,17 @@ if (sites.length === 2) {
   bl.stops = [s0, s1];
   for (let i = 0; i < 2; i++) g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id);
 }
+// company state: AI settings, a track access agreement, a renamed line, a bought (defunct) company
+g.ais[0].config = { ...g.ais[0].config, activeness: 1.4, risk: 0.7, focus: { rail: 2, road: 1, tram: 0.5 } };
+check(g.requestAccess(0, g.ais[1].companyId) === 'granted', 'access agreement signed');
+g.setAccessPolicy(0, 'ask');
+check(g.requestAccess(g.ais[0].companyId, 0, 'test') === 'pending', 'a pending request to the player (saved too)');
+g.lines.rename(line.id, 'Main Line');
 // run ~8 months, then save at a moment when no AI project is half-built (jobs are not persisted)
+while (g.day < 200 || g.ais.some((a) => a.busy)) g.update(0.25);
+g.economy.money += 80_000_000;
+const bought = g.ais[1].companyId;
+check(g.buyCompany(0, bought) === null, 'player buys an AI company');
 while (g.day < 240 || g.ais.some((a) => a.busy)) g.update(0.25);
 const t0 = performance.now();
 const data = serialize(g);
@@ -45,6 +55,11 @@ const sig = (x: Game) => ({
 });
 const s0 = sig(g), s0b = sig(g2);
 check(JSON.stringify(s0) === JSON.stringify(s0b), 'state identical right after loading');
+check(JSON.stringify(g2.ais.map((a) => a.config)) === JSON.stringify(g.ais.map((a) => a.config)), 'AI configs restored');
+check(JSON.stringify(g2.access) === JSON.stringify(g.access) && g2.accessMultiplier(0) === g.accessMultiplier(0), 'access agreements, fees and multipliers restored');
+check(JSON.stringify(g2.accessRequests) === JSON.stringify(g.accessRequests) && g2.accessPolicy(0) === g.accessPolicy(0), 'access requests and policies restored');
+check(!!g2.company(bought).defunct && g2.company(bought).boughtBy === 0 && !g2.ais.some((a) => a.companyId === bought), 'defunct company restored');
+check(g2.lines.get(line.id)?.name === 'Main Line' && g2.lines.all().every((l) => { const o = g.lines.get(l.id)!; return o.name === l.name && o.autoName === l.autoName && o.num === l.num && o.color === l.color; }), 'line names, numbers and colours restored');
 check(checkReservations(g2).length === 0, 'reservations rebuilt consistently');
 // a second round trip of the loaded game must give the same data
 const json2 = JSON.stringify(serialize(g2));

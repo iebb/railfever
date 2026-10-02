@@ -17,6 +17,8 @@ export interface VehicleModel {
   length: number;    // world units (1 = 10 m)
   style: string;
   color: number;
+  /** trams: articulated body sections (1 = single car) */
+  sections?: number;
 }
 
 export const MODELS: VehicleModel[] = [
@@ -36,6 +38,19 @@ export const MODELS: VehicleModel[] = [
   { id: 'bus_b', name: 'City Liner', kind: 'bus', intro: 1958, retire: 2010, speed: 75, capacity: 45, power: 150, weight: 10, cost: 145_000, running: 20_000, length: 1.2, style: 'bus', color: 0x2d7dd2 },
   { id: 'bus_c', name: 'Metro Articulated', kind: 'bus', intro: 1985, retire: 2060, speed: 80, capacity: 85, power: 220, weight: 16, cost: 270_000, running: 32_000, length: 1.8, style: 'bus_artic', color: 0x27ae60 },
   { id: 'bus_d', name: 'e-Liner', kind: 'bus', intro: 2008, retire: 2100, speed: 95, capacity: 62, power: 250, weight: 12, cost: 330_000, running: 21_000, length: 1.25, style: 'bus_modern', color: 0x16a085 },
+  // long-distance coaches (buses for intercity lines over the country roads): faster and more powerful,
+  // fewer seats than town buses, dearer to buy and run
+  { id: 'coach_a', name: 'Touring Coach', kind: 'bus', intro: 1930, retire: 1975, speed: 80, capacity: 35, power: 110, weight: 8, cost: 160_000, running: 24_000, length: 1.2, style: 'coach', color: 0x8e5a2b },
+  { id: 'coach_b', name: 'Highway Cruiser', kind: 'bus', intro: 1960, retire: 2005, speed: 100, capacity: 45, power: 210, weight: 12, cost: 240_000, running: 30_000, length: 1.25, style: 'coach', color: 0x3a6ea5 },
+  { id: 'coach_c', name: 'Express Liner', kind: 'bus', intro: 1990, retire: 2050, speed: 110, capacity: 50, power: 290, weight: 14, cost: 340_000, running: 35_000, length: 1.3, style: 'coach', color: 0xd35400 },
+  { id: 'coach_d', name: 'Skyline Express', kind: 'bus', intro: 2010, retire: 2100, speed: 120, capacity: 55, power: 340, weight: 15, cost: 430_000, running: 39_000, length: 1.4, style: 'coach', color: 0x6c3483 },
+
+  // trams: run on road edges with tram tracks (edge.tram), bought at tram depots; styles for the renderer
+  { id: 'tram_a', name: 'Electric Streetcar', kind: 'tram', intro: 1890, retire: 1955, speed: 40, capacity: 48, power: 60, weight: 14, cost: 130_000, running: 15_000, length: 1.6, style: 'tram_early', color: 0x9b2d20, sections: 1 },
+  { id: 'tram_b', name: 'PCC Streamliner', kind: 'tram', intro: 1936, retire: 1990, speed: 60, capacity: 75, power: 170, weight: 18, cost: 220_000, running: 22_000, length: 1.8, style: 'tram_pcc', color: 0xe0b33a, sections: 1 },
+  { id: 'tram_c', name: 'Articulated GT8', kind: 'tram', intro: 1958, retire: 2015, speed: 70, capacity: 135, power: 300, weight: 30, cost: 380_000, running: 30_000, length: 2.7, style: 'tram_artic', color: 0xf2e8d5, sections: 3 },
+  { id: 'tram_d', name: 'Low-floor LRV', kind: 'tram', intro: 1994, retire: 2100, speed: 75, capacity: 190, power: 420, weight: 38, cost: 580_000, running: 38_000, length: 3.0, style: 'tram_modern', color: 0x1f6fb2, sections: 5 },
+  { id: 'tram_e', name: 'CityLink XL', kind: 'tram', intro: 2012, retire: 2100, speed: 80, capacity: 250, power: 560, weight: 50, cost: 760_000, running: 46_000, length: 3.4, style: 'tram_modern', color: 0xc8102e, sections: 7 },
 ];
 
 export const MODEL_BY_ID = new Map(MODELS.map((m) => [m.id, m]));

@@ -11,6 +11,8 @@ interface Step { id: string; title: string; hint: string; action?: [string, () =
 export class Checklist {
   el: HTMLDivElement;
   private state = { hidden: false, collapsed: false };
+  /** collapsed to its header while a map view card is open (until the player expands it) */
+  private auto = false;
   private done = new Set<string>();
   private timer = 0;
   private sig = '';
@@ -34,6 +36,14 @@ export class Checklist {
   }
 
   get hidden() { return this.state.hidden; }
+
+  /** Collapse to the header while a map view card is open (restored when it closes). */
+  setAutoCollapse(on: boolean) {
+    if (on === this.auto) return;
+    this.auto = on;
+    this.sig = ''; this.timer = 0;
+  }
+  private get collapsed() { return this.state.collapsed || this.auto; }
 
   /** Show it again (e.g. from the settings). */
   reopen() { this.state.hidden = false; this.state.collapsed = false; this.save(); this.setGame(); }
@@ -93,8 +103,7 @@ export class Checklist {
     const n = steps.filter((s) => this.done.has(s.id)).length;
     if (n === steps.length && !this.finishedAt) this.finishedAt = performance.now();
     if (this.finishedAt && performance.now() - this.finishedAt > 8000) { this.state.hidden = true; this.save(); this.el.style.display = 'none'; return; }
-    this.el.classList.toggle('below-debug', !!(this.ui.renderer.settings as unknown as { debug?: boolean }).debug);
-    const sig = [...this.done].join(',') + '|' + this.state.collapsed;
+    const sig = [...this.done].join(',') + '|' + this.collapsed;
     if (sig === this.sig) return;
     const fresh = this.sig !== '';
     this.sig = sig;
@@ -105,7 +114,8 @@ export class Checklist {
   private render(steps: Step[], n: number) {
     const el = this.el;
     const all = n === steps.length;
-    el.classList.toggle('collapsed', this.state.collapsed);
+    const collapsed = this.collapsed;
+    el.classList.toggle('collapsed', collapsed);
     el.classList.toggle('done', all);
     const cur = steps.find((s) => !this.done.has(s.id));
     el.replaceChildren(
@@ -113,7 +123,10 @@ export class Checklist {
         icon(all ? 'check' : 'checklist', 18),
         h('span', { class: 'cl-title' }, all ? 'All set — enjoy!' : 'Getting started'),
         h('span', { class: 'cl-prog' }, `${n}/${steps.length}`),
-        h('button', { class: 'ibtn sm', 'data-tip': this.state.collapsed ? 'Expand' : 'Collapse', 'aria-label': this.state.collapsed ? 'Expand' : 'Collapse', onclick: () => { this.state.collapsed = !this.state.collapsed; this.save(); this.timer = 0; this.sig = ''; } }, icon(this.state.collapsed ? 'chevr' : 'chevd', 16)),
+        h('button', { class: 'ibtn sm', 'data-tip': collapsed ? 'Expand' : 'Collapse', 'aria-label': collapsed ? 'Expand' : 'Collapse', onclick: () => {
+          if (collapsed) { this.state.collapsed = false; this.auto = false; } else this.state.collapsed = true;
+          this.save(); this.timer = 0; this.sig = '';
+        } }, icon(collapsed ? 'chevr' : 'chevd', 16)),
         h('button', { class: 'ibtn sm', 'data-tip': 'Dismiss', 'aria-label': 'Dismiss checklist', onclick: () => this.dismiss() }, icon('close', 16))),
       h('div', { class: 'cl-bar' }, h('i', { style: `width:${Math.round((n / steps.length) * 100)}%` })),
       h('div', { class: 'cl-steps' }, steps.map((s) => {

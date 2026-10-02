@@ -53,19 +53,22 @@ function virtualDepotSeg(g: Game, dp: Depot, length: number): TSeg {
 
 export interface Cont { edge: NEdge; dir: number }
 
-/** Continuations after travelling edge e in direction dir (signals, ownership, no depots). */
-export function railNext(g: Game, e: NEdge, dir: number, owner: number): Cont[] {
+/**
+ * Continuations after travelling edge e in direction dir (signals, track access, no depots). With `anyOwner`,
+ * tracks the owner may not use are allowed too (a train caught on them when an agreement ends finds its way off).
+ */
+export function railNext(g: Game, e: NEdge, dir: number, owner: number, anyOwner = false): Cont[] {
   const net = g.world.net;
   const out: Cont[] = [];
   for (const c of net.nextRail(e, dir)) {
-    if (c.edge.depot >= 0 || c.edge.owner !== owner) continue;
+    if (c.edge.depot >= 0 || (!anyOwner && !g.canUse(owner, c.edge.owner))) continue;
     if (net.signalFor(c.node, net.sideAt(c.edge, c.node.id)) < 0) continue;
     out.push({ edge: c.edge, dir: c.dir });
   }
   return out;
 }
 
-function frontier(g: Game, seg: TSeg, owner: number): Cont[] {
+function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false): Cont[] {
   const net = g.world.net;
   if (seg.e < 0) {
     const dp = g.depots.get(seg.depot!);
@@ -73,7 +76,7 @@ function frontier(g: Game, seg: TSeg, owner: number): Cont[] {
     return stub ? [{ edge: stub, dir: 1 }] : [];
   }
   const e = net.edges.get(seg.e);
-  return e ? railNext(g, e, seg.dir, owner) : [];
+  return e ? railNext(g, e, seg.dir, owner, anyOwner) : [];
 }
 
 export class Heap {
@@ -106,8 +109,11 @@ export class Heap {
 
 export interface RouteResult { conts: Cont[]; cost: number }
 
-/** A* over (edge, direction) to any platform edge of the target station. */
-export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000): RouteResult | null {
+/**
+ * A* over (edge, direction) to any platform edge of the target station. With `exit`, tracks the owner may not
+ * use are allowed at a high cost (only to get off them).
+ */
+export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false): RouteResult | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.rail) return null;
@@ -126,6 +132,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     const r = V.getRes(e.id);
     if (r && r !== selfId) c += 40;
     if (e.station >= 0 && e.station !== target) c += 6;
+    if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
     return c;
   };
   const push = (e: NEdge, d: number, gc: number, parent: number) => {
@@ -149,7 +156,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
       return { conts, cost: NG[i] };
     }
     if (++n > maxExpand) break;
-    for (const c of railNext(g, e, d, owner)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
+    for (const c of railNext(g, e, d, owner, exit)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
   }
   return null;
 }
@@ -234,6 +241,17 @@ export class Train extends Vehicle {
     return false;
   }
 
+  /** Is the train standing on (or holding) track its owner may not use? */
+  private onForeignTrack(): boolean {
+    const g = this.game;
+    for (const s of this.segs) {
+      if (s.e < 0) continue;
+      const e = g.world.net.edges.get(s.e);
+      if (e && !g.canUse(this.owner, e.owner)) return true;
+    }
+    return false;
+  }
+
   /** Edges physically covered by the train body. */
   occupiedEdges(): number[] {
     if (!this.segs.length) return [];
@@ -283,7 +301,14 @@ export class Train extends Vehicle {
     if (tail.seg <= 0) return;
     const drop = this.segs.splice(0, tail.seg);
     this.headSeg -= tail.seg;
-    for (const s of drop) this.release(s, this.segs);
+    for (const s of drop) { this.release(s, this.segs); if (s.e >= 0) this.meterTrack(s); }
+  }
+
+  /** The whole train has passed a segment: metered for track access (users share the maintenance by usage). */
+  private meterTrack(s: TSeg) {
+    const g = this.game;
+    const e = g.world.net.edges.get(s.e);
+    if (e && e.owner >= 0) g.recordTrackUse(this.owner, e, s.len);
   }
 
   private releaseAhead() {
@@ -393,7 +418,7 @@ export class Train extends Vehicle {
     this.routeTarget = target.id;
     const last = this.segs[this.segs.length - 1];
     const fr = last ? frontier(g, last, this.owner) : [];
-    const fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id) : null;
+    let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id) : null;
     let rev: RouteResult | null = null;
     if (allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1) {
       const tail = this.tailInfo();
@@ -401,6 +426,18 @@ export class Train extends Vehicle {
       if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
         const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner);
         if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id);
+      }
+    }
+    if (!fwd && !rev && this.onForeignTrack()) {
+      // caught on tracks we may no longer use (an access agreement ended): find the way off them
+      const fx = last ? frontier(g, last, this.owner, true) : [];
+      fwd = fx.length ? findRailRoute(g, fx, target.id, this.owner, this.id, 60000, true) : null;
+      if (!fwd && allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1) {
+        const ts = this.segs[this.tailInfo().seg];
+        if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
+          const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true);
+          if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true);
+        }
       }
     }
     if (!fwd && !rev) {

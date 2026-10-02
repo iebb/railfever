@@ -1,50 +1,125 @@
-// Lines, line details (stops, vehicles, statistics), and the vehicle and town lists.
+// Lines (rail, bus, tram), line details (stops, vehicles, statistics) with inline rename and colour picker,
+// and the vehicle and town lists.
 import type { UI } from './ui';
 import { PLAYER } from '../game/game';
-import { h, clear, fmtInt, tile, section, icon, toggle, add } from './dom';
+import type { LineKind } from '../game/constants';
+import { h, clear, fmtInt, tile, section, icon, toggle, add, seg } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
-import { LINE_COLORS, Line } from '../game/lines';
+import type { Line } from '../game/lines';
+import type { Station } from '../game/stations';
+import type { Game } from '../game/game';
+import { availableModels } from '../game/vehicle-types';
 import { findDepot } from './win-info';
 import { chart } from './charts';
-import { fmtPct } from './format';
+import { fmtPct, fmtMult, KIND_META } from './format';
+import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
+import { requestAccessUI } from './win-access';
+import { demandView } from '../game/demand';
 
 let showAllLines = false;
 let showAllVehicles = false;
+let kindFilter: LineKind | 'all' = 'all';
+
+/** Does the station offer stops for this transport mode? */
+export function servesKind(g: Game, st: Station, kind: LineKind): boolean {
+  if (kind === 'rail') return !!st.rail;
+  if (kind === 'tram') return st.stops.some((p) => !!g.world.net.edges.get(p.edge)?.tram);
+  return st.stops.length > 0;
+}
 
 export function openLines(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('lines', 'Lines', { width: 500, icon: 'lines', color: 'var(--accent)' });
+  const win = ui.wm.open('lines', 'Lines', { width: 520, icon: 'lines', color: 'var(--accent)' });
   const render = () => {
     clear(win.body);
-    const lines = g.lines.all().filter((l) => showAllLines || l.owner === PLAYER);
     const mine = g.lines.all().filter((l) => l.owner === PLAYER);
+    const lines = g.lines.all().filter((l) => (showAllLines || l.owner === PLAYER) && (kindFilter === 'all' || l.kind === kindFilter));
     win.sub.textContent = `${mine.length} line${mine.length === 1 ? '' : 's'} · ${mine.reduce((s, l) => s + l.vehicles.length, 0)} vehicles`;
-    add(win.body, h('div', { class: 'btns', style: 'margin-top:0' },
-      h('button', { class: 'btn primary', onclick: () => newLine(ui, 'rail') }, icon('train', 16), 'New rail line'),
-      h('button', { class: 'btn primary', onclick: () => newLine(ui, 'road') }, icon('bus', 16), 'New bus line'),
-      h('span', { class: 'spacer' }),
-      toggle('All companies', showAllLines, (v) => { showAllLines = v; win.last = undefined; render(); })));
+    const trams = availableModels(g.year, 'tram').length > 0;
+    add(win.body,
+      h('div', { class: 'btns', style: 'margin-top:0' },
+        h('button', { class: 'btn primary', onclick: () => newLine(ui, 'rail') }, icon('train', 16), 'Rail line'),
+        h('button', { class: 'btn primary', onclick: () => newLine(ui, 'road') }, icon('bus', 16), 'Bus line'),
+        h('button', { class: 'btn primary', disabled: !trams, 'data-tip': trams ? undefined : 'No trams available yet in this era', onclick: () => newLine(ui, 'tram') }, icon('tram', 16), 'Tram line')),
+      h('div', { class: 'btns' },
+        seg([['all', 'All'], ['rail', 'Rail'], ['road', 'Bus'], ['tram', 'Tram']], kindFilter, (v) => { kindFilter = v; win.last = undefined; render(); }),
+        h('span', { class: 'spacer' }),
+        toggle('All companies', showAllLines, (v) => { showAllLines = v; win.last = undefined; render(); })));
+    const sugg = kindFilter === 'all' || kindFilter === 'road' ? intercitySuggestions(ui) : null;
     if (!lines.length) {
-      add(win.body, h('div', { class: 'pad' }, 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'));
+      add(win.body, h('div', { class: 'pad' }, mine.length ? 'No lines match the filter.' : 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'), sugg);
       return;
     }
     const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Line'), h('th', { class: 'r' }, 'Stops'), h('th', { class: 'r' }, 'Veh.'), h('th', { class: 'r' }, 'Pax/mo'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const l of lines) {
       const profit = l.incomeYear - l.costYear;
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => openLine(ui, l.id) },
-        h('td', { class: 'ellip' }, h('span', { class: 'swatch', style: `background:${l.color}` }), l.name, l.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(l.owner).name}`) : ''),
+        h('td', { class: 'ellip' }, h('span', { class: 'linechip', style: `--c:${l.color}` }, icon(KIND_META[l.kind].icon, 13), l.name), l.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(l.owner).name}`) : null),
         h('td', { class: 'r' }, String(l.stops.length)), h('td', { class: 'r' }, String(l.vehicles.length)), h('td', { class: 'r' }, fmtInt(l.passLast)),
         h('td', { class: 'r ' + (profit < 0 ? 'neg' : 'pos') }, fmtMoney(profit))));
     }
     win.body.appendChild(tbl);
+    if (sugg) win.body.appendChild(sugg);
   };
   win.refresh = render;
   render();
 }
 
-function newLine(ui: UI, kind: 'rail' | 'road') {
+// ------------------------------------------------------------------ intercity bus suggestions
+let suggCache: { key: string; rows: { a: number; b: number; dist: number; potential: number }[] } | null = null;
+
+/**
+ * Town pairs linked by roads (one road network component) without a bus line of the player, strongest demand
+ * first: candidates for long-distance coach lines.
+ */
+function intercitySuggestions(ui: UI): HTMLElement | null {
+  const g = ui.game;
+  const key = `${g.networkVersion}|${g.lines.version}|${Math.floor(g.day / 30)}`;
+  if (!suggCache || suggCache.key !== key) {
+    const net = g.world.net;
+    // road connectivity (union-find over road nodes)
+    const parent = new Map<number, number>();
+    const find = (a: number): number => { let r = a; while ((parent.get(r) ?? r) !== r) r = parent.get(r)!; parent.set(a, r); return r; };
+    for (const e of net.edges.values()) if (e.kind === 'road' && e.depot < 0) { const ra = find(e.a), rb = find(e.b); if (ra !== rb) parent.set(ra, rb); }
+    const comp = new Map<number, number>();
+    for (const t of g.towns.list) { const ne = net.nearestEdge(t.x, t.z, Math.max(6, t.radius * 0.5), 'road'); if (ne) comp.set(t.id, find(ne.edge.a)); }
+    // town pairs a player bus line already serves
+    const served = new Set<number>();
+    for (const l of g.lines.all()) {
+      if (l.owner !== PLAYER || l.kind !== 'road') continue;
+      const ts = [...new Set(l.stops.map((s) => g.stations.get(s)?.townId ?? -1).filter((t) => t >= 0))];
+      for (const a of ts) for (const b of ts) if (a < b) served.add(a * 4096 + b);
+    }
+    const rows: { a: number; b: number; dist: number; potential: number }[] = [];
+    for (const p of demandView(g, PLAYER).pairs) {
+      if (rows.length >= 3) break;
+      const a = Math.min(p.a, p.b), b = Math.max(p.a, p.b);
+      if (p.dist < 60 || p.dist > 700 || served.has(a * 4096 + b)) continue;
+      const ca = comp.get(a), cb = comp.get(b);
+      if (ca === undefined || ca !== cb) continue;
+      rows.push({ a, b, dist: p.dist, potential: p.potential });
+    }
+    suggCache = { key, rows };
+  }
+  if (!suggCache.rows.length) return null;
+  const name = (id: number) => g.towns.list[id]?.name ?? '?';
+  return h('div', null,
+    section('Intercity bus ideas', 'towns linked by road'),
+    h('div', { class: 'list' }, suggCache.rows.map((r) => h('div', { class: 'row' },
+      h('span', null, icon('bus', 14), ` ${name(r.a)} – ${name(r.b)}`),
+      h('span', { class: 'muted' }, `≈ ${((r.dist * 1.25) / 100).toFixed(1)} km by road · ${fmtInt(r.potential)} trips/mo`),
+      h('button', { class: 'btn sm', 'data-tip': 'Show both towns and pick the bus stop tool', onclick: () => {
+        const A = g.towns.list[r.a], B = g.towns.list[r.b];
+        if (A && B) ui.centerOn((A.x + B.x) / 2, (A.z + B.z) / 2, Math.max(60, r.dist * 0.9));
+        ui.tools.setTool('busstop');
+        ui.toast(`Place a bus stop in ${name(r.a)} and in ${name(r.b)}, then create a bus line — long routes suit coaches`, 'info');
+      } }, 'Plan')))),
+    h('div', { class: 'muted', style: 'margin-top:4px' }, 'Fares grow with distance: long bus routes between towns pay better than short hops in town.'));
+}
+
+function newLine(ui: UI, kind: LineKind) {
   const l = ui.game.lines.create(kind, PLAYER);
   openLine(ui, l.id);
   editLine(ui, l.id);
@@ -62,12 +137,15 @@ export function addStopToLine(ui: UI, lineId: number, stationId: number) {
   const l = g.lines.get(lineId);
   const st = g.stations.get(stationId);
   if (!l || !st || l.owner !== PLAYER) return;
-  if (st.owner !== PLAYER) { ui.toast(`${st.name} belongs to ${g.company(st.owner).name}`, 'bad'); return; }
-  if (l.kind === 'rail' && !g.stations.hasRail(st)) { ui.toast('This station has no train platforms', 'bad'); return; }
-  if (l.kind === 'road' && !g.stations.hasRoad(st)) { ui.toast('This station has no bus stop', 'bad'); return; }
+  if (!servesKind(g, st, l.kind)) {
+    ui.toast(l.kind === 'rail' ? 'This station has no train platforms' : l.kind === 'tram' ? 'This station has no tram stop' : 'This station has no bus stop', 'bad');
+    return;
+  }
+  // another company's station: needs an approved access agreement with its owner (asked for here)
+  if (!g.canUse(PLAYER, st.owner) && requestAccessUI(ui, st.owner) !== 'granted') return;
   if (l.stops[l.stops.length - 1] === stationId) { ui.toast('Already the last stop', 'info'); return; }
   l.stops.push(stationId);
-  ui.sound('click');
+  ui.sound('click', { pitch: 1 + Math.min(0.5, l.stops.length * 0.06) });
   g.lines.rebuild();
   for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
   ui.hud.onToolChange();
@@ -78,25 +156,50 @@ export function openLine(ui: UI, id: number) {
   const g = ui.game;
   const line = g.lines.get(id);
   if (!line) return;
-  const win = ui.wm.open('line-' + id, line.name, { width: 420, icon: line.kind === 'rail' ? 'train' : 'bus', color: line.color });
+  const meta0 = KIND_META[line.kind];
+  const win = ui.wm.open('line-' + id, line.name, { width: 430, icon: meta0.icon, color: line.color });
+  let renaming = false;
+  let palette = false;
   const render = () => {
     const l = g.lines.get(id);
     if (!l) { win.close(); return; }
     const mine = l.owner === PLAYER;
-    ui.wm.setTabs(win, [['stops', `Stops`], ['vehicles', `Vehicles`], ['stats', 'Statistics']], render);
+    const meta = KIND_META[l.kind];
+    ui.wm.setTabs(win, [['stops', 'Stops'], ['vehicles', 'Vehicles'], ['stats', 'Statistics']], render);
     win.title.textContent = l.name;
-    win.sub.textContent = `${l.kind === 'rail' ? 'Rail' : 'Bus'} line · ${g.company(l.owner).name}`;
+    win.sub.textContent = `${meta.label} line · ${g.company(l.owner).name}`;
     (win.el.querySelector('.win-ic') as HTMLElement | null)?.style.setProperty('--c', l.color);
     clear(win.body);
     const changed = () => { g.lines.rebuild(); for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged(); win.last = undefined; render(); };
     const profit = l.incomeYear - l.costYear;
+    // header: colour swatch (palette), name (inline rename), auto-name badge
+    let nameEl: HTMLElement;
+    if (renaming && mine) {
+      const inp = h('input', { class: 'input', value: l.name, 'aria-label': 'Line name', style: 'flex:1' }) as HTMLInputElement;
+      const done = (ok: boolean) => { if (!renaming) return; renaming = false; if (ok && inp.value.trim() !== l.name) { renameLine(g, l, inp.value.trim()); ui.sound('toggle', { pitch: 1.1 }); } win.last = undefined; render(); };
+      inp.placeholder = 'Empty = automatic name';
+      inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') done(true); else if (e.key === 'Escape') { e.stopPropagation(); done(false); } });
+      inp.addEventListener('blur', () => done(true));
+      nameEl = inp;
+      setTimeout(() => { inp.focus(); inp.select(); }, 0);
+    } else {
+      nameEl = h('b', { class: mine ? 'renamable' : '', 'data-tip': mine ? 'Rename' : undefined, onclick: () => { if (!mine) return; renaming = true; render(); } }, l.name);
+    }
+    const auto = isAutoName(l);
     add(win.body, h('div', { class: 'linehead' },
-      h('span', { class: 'swatch big', style: `background:${l.color}`, title: mine ? 'Change colour' : '', onclick: () => { if (!mine) return; l.color = LINE_COLORS[(LINE_COLORS.indexOf(l.color) + 1) % LINE_COLORS.length]; changed(); } }),
-      h('b', null, l.name),
-      mine ? h('button', { class: 'btn sm ghost', onclick: () => { const n = prompt('Rename line', l.name); if (n) { l.name = n.slice(0, 40); changed(); } } }, icon('edit', 14), 'Rename') : ui.ownerTag(l.owner)));
+      h('span', { class: 'swatch big', style: `background:${l.color}`, 'data-tip': mine ? 'Line colour' : undefined, role: mine ? 'button' : undefined, onclick: () => { if (!mine) return; palette = !palette; win.last = undefined; render(); } }),
+      nameEl,
+      auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
+      !mine ? ui.ownerTag(l.owner) : null));
+    if (palette && mine) {
+      add(win.body, h('div', { class: 'palette', role: 'radiogroup', 'aria-label': 'Line colour' },
+        linePalette(l.kind).map((c) => h('button', { class: 'pal' + (!l.autoColor && c.toLowerCase() === l.color.toLowerCase() ? ' on' : ''), style: `--c:${c}`, 'aria-label': c, 'data-sfx': 'none', onclick: () => { setLineColor(g, l, c); palette = false; ui.sound('click', { pitch: 1.15 }); changed(); } })),
+        customColor(l.autoColor || linePalette(l.kind).some((c) => c.toLowerCase() === l.color.toLowerCase()) ? null : l.color, l.color, (c) => { setLineColor(g, l, c); palette = false; ui.sound('click', { pitch: 1.15 }); changed(); }),
+        h('button', { class: 'pal auto' + (l.autoColor ? ' on' : ''), 'data-tip': 'Automatic colour', 'aria-label': 'Automatic colour', 'data-sfx': 'none', onclick: () => { setLineColor(g, l, null); palette = false; ui.sound('click'); changed(); } }, 'A')));
+    }
     add(win.body, h('div', { class: 'tiles' },
       tile(String(l.stops.length), 'Stops'),
-      tile(String(l.vehicles.length), 'Vehicles'),
+      tile(String(l.vehicles.length), meta.vehicles),
       tile(fmtInt(l.passLast), 'Pax last month'),
       tile(fmtMoney(profit), 'Profit this year', profit < 0 ? 'neg' : 'pos')));
     if (win.tab === 'stops') {
@@ -110,6 +213,7 @@ export function openLine(ui: UI, id: number) {
         list.appendChild(h('div', { class: 'row' },
           h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)),
           ui.stationLink(sid),
+          st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `Station of ${g.company(st.owner).name}: upkeep shared by usage at ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
@@ -135,10 +239,10 @@ export function openLine(ui: UI, id: number) {
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles on this line.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
       if (mine) add(win.body, h('div', { class: 'btns' },
-        h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind === 'rail' ? 'rail' : 'road', null, l.id) }, icon('plus', 16), l.kind === 'rail' ? 'Add train' : l.kind === 'tram' ? 'Add tram' : 'Add bus'),
+        h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), `Add ${meta.vehicle}`),
         l.vehicles.length ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
     } else {
-      add(win.body, 
+      add(win.body,
         ui.kv('Income this year', fmtMoneyFull(l.incomeYear)),
         ui.kv('Running costs this year', fmtMoneyFull(l.costYear)),
         ui.kv('Profit last year', h('span', { class: l.incomeLast - l.costLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(l.incomeLast - l.costLast))),
@@ -146,9 +250,16 @@ export function openLine(ui: UI, id: number) {
       if (mine) add(win.body, h('div', { class: 'btns' }, h('button', { class: 'btn danger', onclick: () => { if (confirm(`Delete ${l.name}? Its vehicles will stop.`)) { g.lines.delete(l.id); win.close(); } } }, icon('trash', 16), 'Delete line')));
     }
   };
-  win.refresh = render;
+  win.refresh = () => { if (!renaming) render(); };
   win.onClose = () => { if (ui.tools.tool === 'line-edit' && ui.tools.lineEditId === id) ui.tools.setTool('inspect'); };
   render();
+}
+
+/** Palette swatch opening the browser's colour picker; `current` = the custom colour in use (highlighted). */
+function customColor(current: string | null, base: string, onPick: (c: string) => void): HTMLElement {
+  const inp = h('input', { type: 'color', value: current ?? base, 'aria-label': 'Custom colour' }) as HTMLInputElement;
+  inp.addEventListener('change', () => onPick(inp.value));
+  return h('label', { class: 'pal custom' + (current ? ' on' : ''), style: current ? `background:${current}` : undefined, 'data-tip': 'Custom colour' }, inp, current ? null : icon('plus', 14));
 }
 
 function cloneLast(ui: UI, l: Line) {
@@ -156,7 +267,7 @@ function cloneLast(ui: UI, l: Line) {
   const v = g.vehicles.get(l.vehicles[l.vehicles.length - 1]);
   if (!v) return;
   const dId = (v as Train | RoadVehicle).depotId;
-  const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind === 'rail' ? 'rail' : 'road', l);
+  const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind, l);
   if (dp == null) { ui.toast('No depot available', 'bad'); return; }
   const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.reversed ? [...v.cars].reverse() : [...v.cars], l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
   if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('purchase'); }
@@ -165,21 +276,21 @@ function cloneLast(ui: UI, l: Line) {
 // ------------------------------------------------------------------ lists
 export function openVehicles(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('vehicles', 'Vehicles', { width: 560, icon: 'vehicles', color: 'var(--accent)' });
+  const win = ui.wm.open('vehicles', 'Vehicles', { width: 580, icon: 'vehicles', color: 'var(--accent)' });
   const render = () => {
     clear(win.body);
     const all = g.vehicles.all();
     const vs = all.filter((v) => showAllVehicles || v.owner === PLAYER).sort((a, b) => b.profitYear - a.profitYear);
     const mine = all.filter((v) => v.owner === PLAYER);
-    const trains = mine.filter((v) => v.kind === 'train').length;
-    win.sub.textContent = `${trains} train${trains === 1 ? '' : 's'} · ${mine.length - trains} bus${mine.length - trains === 1 ? '' : 'es'}`;
+    const count = (k: LineKind) => mine.filter((v) => (v.line?.kind ?? (v.kind === 'train' ? 'rail' : (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road')) === k).length;
+    win.sub.textContent = `${count('rail')} trains · ${count('road')} buses · ${count('tram')} trams`;
     add(win.body, h('div', { class: 'btns', style: 'margin-top:0' }, h('span', { class: 'spacer' }), toggle('All companies', showAllVehicles, (v) => { showAllVehicles = v; win.last = undefined; render(); })));
-    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, 'No vehicles yet. Build a depot, open it, and buy a train or bus.')); return; }
+    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, 'No vehicles yet. Build a depot, open it, and buy a train, bus or tram.')); return; }
     const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Vehicle'), h('th', null, 'Line'), h('th', null, 'Status'), h('th', { class: 'r' }, 'Load'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const v of vs.slice(0, 300)) {
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => ui.openVehicle(v.id) },
-        h('td', { class: 'ellip' }, v.owner !== PLAYER ? h('span', { class: 'swatch', style: `background:${g.company(v.owner).color}` }) : '', v.name),
-        h('td', { class: 'ellip' }, v.line ? h('span', null, h('span', { class: 'swatch', style: `background:${v.line.color}` }), v.line.name) : '—'),
+        h('td', { class: 'ellip' }, v.owner !== PLAYER ? h('span', { class: 'swatch', style: `background:${g.company(v.owner).color}` }) : null, v.name),
+        h('td', { class: 'ellip' }, v.line ? h('span', { class: 'linechip', style: `--c:${v.line.color}` }, v.line.name) : '—'),
         h('td', { class: 'ellip ' + (v.state === 'noroute' || v.state === 'stopped' ? 'neg' : 'muted') }, v.status),
         h('td', { class: 'r' }, `${v.load}/${v.capacity}`),
         h('td', { class: 'r ' + (v.profitYear < 0 ? 'neg' : 'pos') }, fmtMoney(v.profitYear))));

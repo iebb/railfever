@@ -51,6 +51,12 @@ export const ROAD_TYPES: Record<string, RoadType> = {
   road: { id: 'road', name: 'Country road', half: 0.34, sidewalk: 0, lanes: 2, speed: 90, maxGrade: 0.08, minRadius: 4, costPerUnit: 3000, maintPerUnit: 60 },
 };
 
+/**
+ * Tram tracks embedded in a road edge (with overhead wire): `edge.tram`, owned by `edge.tramOwner`.
+ * Costs per world unit of road; trams keep to the road's speed limit (max `speed` km/h on tracks).
+ */
+export const TRAM = { costPerUnit: 4500, maintPerUnit: 90, removePerUnit: 700, speed: 70 };
+
 export const RAIL = {
   gauge: 0.1435,
   spacing: 0.45,

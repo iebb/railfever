@@ -8,11 +8,15 @@ export class Materials {
     uTime: { value: 0 },
     uNight: { value: 0 },
     uLitRatio: { value: 0.55 },
+    /** camera distance where trees switch from full models to impostors (per instance, in the shaders) */
+    uTreeDist: { value: 125 },
   };
   matte: THREE.MeshStandardMaterial;
   metal: THREE.MeshStandardMaterial;
   facade: THREE.MeshStandardMaterial;
   tree: THREE.MeshStandardMaterial;
+  /** far tree impostors: drawn only beyond uTreeDist (near trees only within it) */
+  treeFar: THREE.MeshStandardMaterial;
   body: THREE.MeshStandardMaterial;
   glass: THREE.MeshStandardMaterial;
   lamp: THREE.MeshBasicMaterial;
@@ -26,6 +30,8 @@ export class Materials {
   world: THREE.MeshStandardMaterial;
   /** Shadow depth material for world meshes: faces with aCast = 0 (flat ground pieces) cast no shadow. */
   worldDepth: THREE.MeshDepthMaterial;
+  /** Far world regions: compact baked-colour copies of the static world (aGlow: night emission). */
+  worldFar: THREE.MeshStandardMaterial;
   /** materials added by the static renderer that should also get cloud shadows etc. */
   extra: THREE.Material[];
   /** night window emission of facade cells in the world material */
@@ -73,20 +79,30 @@ diffuseColor *= rfTex;`)
     };
     this.facade.customProgramCacheKey = () => 'rf-facade';
 
-    this.tree = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92, metalness: 0 });
-    this.tree.onBeforeCompile = (sh) => {
+    // trees: wind sway; near models and far impostors split by the instance's distance to the camera
+    const treeShader = (far: boolean) => (sh: THREE.WebGLProgramParametersWithUniforms) => {
       sh.uniforms.uTime = U.uTime;
+      sh.uniforms.uTreeDist = U.uTreeDist;
       sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nuniform float uTime;')
+        .replace('#include <common>', '#include <common>\nuniform float uTime; uniform float uTreeDist;')
         .replace('#include <begin_vertex>', `#include <begin_vertex>
 #ifdef USE_INSTANCING
   float ph = instanceMatrix[3].x * 0.7 + instanceMatrix[3].z * 1.3;
   float sw = (sin(uTime * 1.4 + ph) + 0.5 * sin(uTime * 2.3 + ph * 1.7)) * 0.012 * max(position.y - 0.3, 0.0);
   transformed.x += sw;
   transformed.z += sw * 0.6;
+#endif`)
+        .replace('#include <project_vertex>', `#include <project_vertex>
+#ifdef USE_INSTANCING
+  if (distance(cameraPosition, (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz) ${far ? '<' : '>'} uTreeDist) gl_Position = vec4(0.0, 0.0, -2.0, 1.0);
 #endif`);
     };
+    this.tree = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.92, metalness: 0 });
+    this.tree.onBeforeCompile = treeShader(false);
     this.tree.customProgramCacheKey = () => 'rf-tree';
+    this.treeFar = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95, metalness: 0 });
+    this.treeFar.onBeforeCompile = treeShader(true);
+    this.treeFar.customProgramCacheKey = () => 'rf-tree-far';
 
     this.body = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.45, metalness: 0.25 });
     this.glass = new THREE.MeshStandardMaterial({ color: 0x1b2730, roughness: 0.12, metalness: 0.6, emissive: new THREE.Color(1, 0.85, 0.55), emissiveIntensity: 0 });
@@ -160,7 +176,21 @@ if (rfCi == ${WC.LAMP}) totalEmissiveRadiance += diffuseColor.rgb * uNight * 2.6
         .replace('#include <project_vertex>', '#include <project_vertex>\nif (aCast < 0.5) gl_Position = vec4(0.0, 0.0, -2.0, 1.0);');
     };
     this.worldDepth.customProgramCacheKey = () => 'rf-world-depth';
-    this.extra = [this.world];
+    // far regions: plain vertex colours (cell colours baked in), windows and lamps glow at night
+    this.worldFar = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.9, metalness: 0, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 });
+    this.worldFar.onBeforeCompile = (sh) => {
+      sh.uniforms.uNight = U.uNight;
+      sh.uniforms.uLitRatio = U.uLitRatio;
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aGlow; varying float vRfGlow;')
+        .replace('#include <begin_vertex>', '#include <begin_vertex>\nvRfGlow = aGlow;');
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uNight; uniform float uLitRatio; varying float vRfGlow;')
+        .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
+totalEmissiveRadiance += vec3(1.0, 0.74, 0.42) * uNight * (vRfGlow > 0.9 ? 2.0 : vRfGlow * uLitRatio * 1.6);`);
+    };
+    this.worldFar.customProgramCacheKey = () => 'rf-world-far';
+    this.extra = [this.world, this.treeFar, this.worldFar];
   }
 
   update(time: number, night: number) {

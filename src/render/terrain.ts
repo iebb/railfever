@@ -18,15 +18,19 @@ export interface TerrainUniforms {
 
 /** Depth of the crack-hiding skirts hanging below every chunk border. */
 const SKIRT = 4;
-/** LOD steps (vertex spacing 1, 2, 4, 8 units). */
-const LODS = 4;
+/** LOD steps (vertex spacing 1, 2, 4, 8, 16 units). */
+const LODS = 5;
 /** Render chunk size (a multiple of the world's TERRAIN_CHUNK dirty-tracking size): few draw calls. */
 export const RENDER_CHUNK = 128;
+/** Larger chunks on big maps keep the whole-map view at <= 36 terrain draws. */
+export function renderChunkFor(size: number) { return size >= 1024 ? 256 : RENDER_CHUNK; }
+/** Heights are stored as 16-bit integers in 1/128 units (7.8 cm), positions relative to the chunk. */
+const YQ = 128;
 /**
  * Pixels per world unit below which a chunk drops to the next coarser level. Conservative: coarse cells
  * cannot follow 1-unit earthworks (cuttings would cover tracks), so they only start below ~4 px per unit.
  */
-const LOD_PPU = [4, 2, 1];
+const LOD_PPU = [4, 2, 1, 0.5];
 
 interface ChunkIndex {
   index: THREE.BufferAttribute;
@@ -99,11 +103,17 @@ export class TerrainView {
   private info: ChunkInfo[] = [];
   private heightData: Uint16Array;
   private nc: number;
+  /** render chunk size for this map */
+  readonly rc: number;
+  /** shadow pass: same integer vertex decoding as the terrain material */
+  private depthMat: THREE.MeshDepthMaterial;
+  private auxTmp: Float32Array | null = null;
   private bottom = -6;
   /** object chunks already seen dirty (their trees/edges feed the terrain attributes) */
   private objSeen = new Set<number>();
   private auxDirty = new Set<number>();
   private geoDirty = new Set<number>();
+  private auxAt: number[] = [];
   private edgeH: Float32Array;
   private camPos = new THREE.Vector3();
   private saved = new THREE.Vector2();
@@ -112,7 +122,8 @@ export class TerrainView {
 
   constructor(public world: World) {
     const s = world.size;
-    this.nc = Math.ceil(s / RENDER_CHUNK);
+    this.rc = renderChunkFor(s);
+    this.nc = Math.ceil(s / this.rc);
     this.uniforms = {
       uGrid: { value: 0 },
       uHiRect: { value: new THREE.Vector4(0, 0, 0, 0) },
@@ -124,6 +135,9 @@ export class TerrainView {
       uTime: { value: 0 },
     };
     this.material = createTerrainMaterial(this.uniforms);
+    this.depthMat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    this.depthMat.onBeforeCompile = (sh) => { sh.vertexShader = sh.vertexShader.replace('#include <begin_vertex>', DECODE); };
+    this.depthMat.customProgramCacheKey = () => 'rf-terrain-depth';
 
     let minH = 0;
     for (let i = 0; i < world.h.length; i++) if (world.h[i] < minH) minH = world.h[i];
@@ -171,7 +185,7 @@ export class TerrainView {
     const t0 = performance.now();
     if (w.dirtyTerrain.size) {
       // world chunks (TERRAIN_CHUNK) map onto the larger render chunks
-      const wn = Math.ceil(w.size / TERRAIN_CHUNK), f = RENDER_CHUNK / TERRAIN_CHUNK;
+      const wn = Math.ceil(w.size / TERRAIN_CHUNK), f = this.rc / TERRAIN_CHUNK;
       for (const wc of w.dirtyTerrain) this.geoDirty.add(Math.floor(Math.floor(wc / wn) / f) * this.nc + Math.floor((wc % wn) / f));
       w.dirtyTerrain.clear();
     }
@@ -183,7 +197,7 @@ export class TerrainView {
         this.buildChunk(ci);
         this.auxDirty.delete(ci);
         const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
-        this.fillHeights(cz * RENDER_CHUNK, Math.min(w.size, (cz + 1) * RENDER_CHUNK));
+        this.fillHeights(cz * this.rc, Math.min(w.size, (cz + 1) * this.rc));
         if (cx === 0 || cz === 0 || cx === this.nc - 1 || cz === this.nc - 1) border = true;
         if (performance.now() - t0 > this.budgetMs) break;
       }
@@ -197,16 +211,21 @@ export class TerrainView {
         this.objSeen.add(oc);
         const ox = (oc % on) * OBJ_CHUNK, oz = Math.floor(oc / on) * OBJ_CHUNK;
         const m = 6;
-        for (let cz = Math.max(0, Math.floor((oz - m) / RENDER_CHUNK)); cz <= Math.min(this.nc - 1, Math.floor((oz + OBJ_CHUNK + m) / RENDER_CHUNK)); cz++)
-          for (let cx = Math.max(0, Math.floor((ox - m) / RENDER_CHUNK)); cx <= Math.min(this.nc - 1, Math.floor((ox + OBJ_CHUNK + m) / RENDER_CHUNK)); cx++) this.auxDirty.add(cz * this.nc + cx);
+        const rc = this.rc;
+        for (let cz = Math.max(0, Math.floor((oz - m) / rc)); cz <= Math.min(this.nc - 1, Math.floor((oz + OBJ_CHUNK + m) / rc)); cz++)
+          for (let cx = Math.max(0, Math.floor((ox - m) / rc)); cx <= Math.min(this.nc - 1, Math.floor((ox + OBJ_CHUNK + m) / rc)); cx++) this.auxDirty.add(cz * this.nc + cx);
       }
       for (const oc of this.objSeen) if (!w.dirtyObj.has(oc)) this.objSeen.delete(oc);
     }
     if (this.auxDirty.size) {
-      for (const ci of [...this.auxDirty]) {
+      // cosmetic: at most one chunk per frame, and each chunk at most every 2 s (towns grow constantly)
+      const now = performance.now();
+      for (const ci of this.auxDirty) {
+        if (now - (this.auxAt[ci] ?? -1e9) < 2000) continue;
         this.auxDirty.delete(ci);
+        this.auxAt[ci] = now;
         this.refreshAux(ci);
-        if (performance.now() - t0 > this.budgetMs) break;
+        break;
       }
     }
     if (camera && pxScale > 0) this.updateLod(camera, pxScale);
@@ -270,8 +289,8 @@ export class TerrainView {
   private bounds(ci: number) {
     const s = this.world.size;
     const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
-    const x0 = cx * RENDER_CHUNK, z0 = cz * RENDER_CHUNK;
-    return { x0, z0, x1: Math.min(s, x0 + RENDER_CHUNK), z1: Math.min(s, z0 + RENDER_CHUNK) };
+    const x0 = cx * this.rc, z0 = cz * this.rc;
+    return { x0, z0, x1: Math.min(s, x0 + this.rc), z1: Math.min(s, z0 + this.rc) };
   }
 
   buildChunk(ci: number) {
@@ -279,39 +298,42 @@ export class TerrainView {
     const { x0, z0, x1, z1 } = this.bounds(ci);
     const vw = x1 - x0 + 1, vh = z1 - z0 + 1;
     const nv = vw * vh, total = nv + 2 * (vw + vh);
-    const pos = new Float32Array(total * 3);
-    const nrm = new Float32Array(total * 3);
+    // compact vertices: chunk-local integer x/z, height in 1/128 units, 8-bit normals (14 bytes per vertex)
+    const pos = new Int16Array(total * 3);
+    const nrm = new Int8Array(total * 4);
+    const q = (y: number) => Math.max(-32767, Math.min(32767, Math.round(y * YQ)));
     let k = 0, minY = Infinity, maxY = -Infinity;
     for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) {
       const y = w.vh(x, z);
-      pos[k * 3] = x; pos[k * 3 + 1] = y; pos[k * 3 + 2] = z;
+      pos[k * 3] = x - x0; pos[k * 3 + 1] = q(y); pos[k * 3 + 2] = z - z0;
       if (y < minY) minY = y; if (y > maxY) maxY = y;
       const dx = (w.vh(x + 1, z) - w.vh(x - 1, z)) * 0.5;
       const dz = (w.vh(x, z + 1) - w.vh(x, z - 1)) * 0.5;
-      const l = Math.hypot(dx, 1, dz);
-      nrm[k * 3] = -dx / l; nrm[k * 3 + 1] = 1 / l; nrm[k * 3 + 2] = -dz / l;
+      const l = 127 / Math.hypot(dx, 1, dz);
+      nrm[k * 4] = Math.round(-dx * l); nrm[k * 4 + 1] = Math.round(l); nrm[k * 4 + 2] = Math.round(-dz * l);
       k++;
     }
     // skirt vertices below the border (copy normals so they shade like the surface)
     const skirtOf = (src: number) => {
-      pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = pos[src * 3 + 1] - SKIRT; pos[k * 3 + 2] = pos[src * 3 + 2];
-      nrm[k * 3] = nrm[src * 3]; nrm[k * 3 + 1] = nrm[src * 3 + 1]; nrm[k * 3 + 2] = nrm[src * 3 + 2];
+      pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = Math.max(-32767, pos[src * 3 + 1] - SKIRT * YQ); pos[k * 3 + 2] = pos[src * 3 + 2];
+      nrm[k * 4] = nrm[src * 4]; nrm[k * 4 + 1] = nrm[src * 4 + 1]; nrm[k * 4 + 2] = nrm[src * 4 + 2];
       k++;
     };
     for (let i = 0; i < vw; i++) skirtOf(i);
     for (let i = 0; i < vw; i++) skirtOf((vh - 1) * vw + i);
     for (let j = 0; j < vh; j++) skirtOf(j * vw);
     for (let j = 0; j < vh; j++) skirtOf(j * vw + vw - 1);
-    const aux = new Float32Array(total * 3);
-    this.computeAux(x0, z0, x1, z1, aux);
+    const aux = new Int8Array(total * 4);
+    this.packAux(x0, z0, x1, z1, aux, total);
     const ix = chunkIndex(vw, vh);
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
-    g.setAttribute('aAux', new THREE.BufferAttribute(aux, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 4, true));
+    g.setAttribute('aAux', new THREE.BufferAttribute(aux, 4, true));
     g.setIndex(ix.index);
     g.setDrawRange(ix.grid[0][0], ix.grid[0][1]);
-    g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, minY - SKIRT, z0), new THREE.Vector3(x1, maxY, z1));
+    // bounds in decoded chunk-local units (three never reads the integer positions on the CPU)
+    g.boundingBox = new THREE.Box3(new THREE.Vector3(0, minY - SKIRT, 0), new THREE.Vector3(x1 - x0, maxY, z1 - z0));
     g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
     this.info[ci] = { x0, z0, x1, z1, minY, maxY, lod: 0, range: 0, ix };
     let m = this.chunks[ci];
@@ -320,7 +342,10 @@ export class TerrainView {
       m = new THREE.Mesh(g, this.material);
       m.receiveShadow = true;
       m.castShadow = true;
+      m.customDepthMaterial = this.depthMat;
+      m.position.set(x0, 0, z0);
       m.matrixAutoUpdate = false;
+      m.updateMatrix();
       // shadow casting only needs the silhouette: draw a coarser level (with skirts) in the shadow pass
       const mesh = m, idx = ci;
       mesh.onBeforeShadow = () => {
@@ -342,10 +367,21 @@ export class TerrainView {
     if (!m) return;
     const { x0, z0, x1, z1 } = this.bounds(ci);
     const a = m.geometry.getAttribute('aAux') as THREE.BufferAttribute;
-    const arr = a.array as Float32Array;
-    arr.fill(0);
-    this.computeAux(x0, z0, x1, z1, arr);
+    this.packAux(x0, z0, x1, z1, a.array as Int8Array, a.count);
     a.needsUpdate = true;
+  }
+
+  /** computeAux into a scratch buffer, then pack as normalised bytes (forest 0..1, works 0..1, cavity -1..1). */
+  private packAux(x0: number, z0: number, x1: number, z1: number, out: Int8Array, total: number) {
+    if (!this.auxTmp || this.auxTmp.length < total * 3) this.auxTmp = new Float32Array(total * 3);
+    const t = this.auxTmp;
+    t.fill(0, 0, total * 3);
+    this.computeAux(x0, z0, x1, z1, t);
+    for (let i = 0; i < total; i++) {
+      out[i * 4] = Math.round(Math.min(1, t[i * 3]) * 127);
+      out[i * 4 + 1] = Math.round(Math.min(1, t[i * 3 + 1]) * 127);
+      out[i * 4 + 2] = Math.round(Math.max(-1, Math.min(1, t[i * 3 + 2])) * 127);
+    }
   }
 
   /**
@@ -540,6 +576,9 @@ export function raycastTerrain(w: World, o: V3, d: V3, maxH: number, out: V3, ma
 
 // ------------------------------------------------------------------------------------ materials
 
+/** Vertex decode of the compact chunk positions (height stored in 1/128 units). */
+const DECODE = `vec3 transformed = vec3(position.x, position.y * ${(1 / YQ).toFixed(10)}, position.z);`;
+
 function createTerrainMaterial(U: TerrainUniforms): THREE.MeshStandardMaterial {
   // the sky environment adds a blue cast to steep, sun-averted slopes: keep it modest on the ground
   const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, envMapIntensity: 0.55 });
@@ -553,7 +592,7 @@ varying vec3 vWNormal;
 varying vec3 vAux;
 varying vec2 vMacro;
 ${NOISE_GLSL}`)
-      .replace('#include <begin_vertex>', `#include <begin_vertex>
+      .replace('#include <begin_vertex>', `${DECODE}
 vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
 vWNormal = normalize(mat3(modelMatrix) * objectNormal);
 vAux = aAux;
@@ -709,7 +748,7 @@ float rfBump = 0.0;
 }`)
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += rfGlow;');
   };
-  mat.customProgramCacheKey = () => 'rf-terrain-v3';
+  mat.customProgramCacheKey = () => 'rf-terrain-v4';
   return mat;
 }
 

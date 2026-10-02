@@ -5,6 +5,7 @@
 // street grid with a junction; crossing country roads meet at level junctions.
 import type { Game } from './game';
 import type { Town } from './towns';
+import type { NNode } from './network';
 import { WATER_Y, ROAD_TYPES } from './constants';
 import { planEdge, commitProposal, BuildOptions } from './construction';
 import { distToRect } from './world';
@@ -76,6 +77,7 @@ export function generateIntercityRoads(g: Game, o: { detour?: number; maxExtra?:
     if (graphDist(adj, p.a, p.b) <= detour * p.d) continue;
     if (attempt(p.a, p.b, p.d)) st.extra++;
   }
+  linkIsolated(g, st);
   st.ms = performance.now() - t0;
   return st;
 }
@@ -128,7 +130,12 @@ export function townExits(g: Game, T: Town, ux: number, uz: number): Exit[] {
       if (along < -2) continue;
       const dirs: [number, number][] = [];
       if (nd.edges.length === 1) { const ld = net.leaveDir(e, nid); dirs.push([-ld.x, -ld.z]); }
-      else for (const [ax, az] of axes) dirs.push([ax, az], [-ax, -az]);
+      else {
+        for (const [ax, az] of axes) dirs.push([ax, az], [-ax, -az]);
+        // warped layouts (organic, radial, hill, linear): straight out from the centre too
+        const rl = Math.hypot(rx, rz);
+        if (T.grid?.pts && rl > 1) dirs.push([rx / rl, rz / rl]);
+      }
       for (const [tx, tz] of dirs) {
         const facing = tx * ux + tz * uz;
         if (facing < (nd.edges.length === 1 ? 0.25 : 0.55)) continue;
@@ -199,7 +206,7 @@ function connect(g: Game, A: Town, B: Town, st: RoadGenStats, relaxed = false): 
   }
   combos.sort((p, q) => q[2] - p[2] || p[0] - q[0] || p[1] - q[1]);
   let why = combos.length ? '' : 'height difference too large';
-  for (const [i, j] of combos.slice(0, 3)) {
+  for (const [i, j] of combos.slice(0, 4)) {
     const xa = ea[i], xb = eb[j];
     const na = net.nodes.get(xa.node), nb = net.nodes.get(xb.node);
     if (!na || !nb) continue;
@@ -213,29 +220,173 @@ function connect(g: Game, A: Town, B: Town, st: RoadGenStats, relaxed = false): 
       st.log.push(`${A.name} - ${B.name}: ${p.stats.len.toFixed(0)} u (direct)`);
       return p.stats.len + centres;
     }
-    const from: OPoint = { x: xa.x, z: xa.z, tx: xa.tx, tz: xa.tz };
-    const to: OPoint = { x: xb.x, z: xb.z, tx: -xb.tx, tz: -xb.tz };
-    const ex = new Set<number>([...na.edges, ...nb.edges]);
-    const plan = runGen(routeGen(g, from, to, {
-      kind: 'road', owner: -1, tracks: 1, y0: na.y, y1: nb.y, avoid, exclude: ex, roadJunctions: true,
-      buildingCost: 8, lead: Math.min(8, gap / 4), slopeCost: 2.5, maxExpand: 120000, rmax: 80, rgood: 12, minR: 5, retries: 1,
-    }));
-    if (typeof plan === 'string') { why = plan; continue; }
-    const prof = plan.prof;
-    const L = prof.s[prof.s.length - 1];
-    if (L > gap * (relaxed ? 2.2 : 1.8) + 25) { why = 'detour too long'; continue; }
-    const runs = structureRuns(prof);
-    if (runs.water > (relaxed ? MAX_WATER_2 : MAX_WATER)) { why = `water crossing ${runs.water.toFixed(0)} u`; continue; }
-    if (runs.tunnel > (relaxed ? MAX_TUNNEL_2 : MAX_TUNNEL)) { why = `tunnel ${runs.tunnel.toFixed(0)} u`; continue; }
-    const e0 = net.nextEdge;
-    const r = buildChain(g, xa.node, plan.way.slice(1), ROAD_OPTS(), xb.node, prof);
-    if (!r.ok) { rollback(g, e0, prof); why = 'construction: ' + (r.error ?? '?'); continue; }
-    st.built++; st.edges += r.edges; st.length += r.built; st.bridges += r.bridges; st.tunnels += r.tunnels;
-    st.log.push(`${A.name} - ${B.name}: ${r.built.toFixed(0)} u, ${r.edges} edges, ${r.bridges} bridges, ${r.tunnels} tunnels`);
-    return r.built + centres;
+    const r = routeRoad(g, xa, { x: xb.x, z: xb.z, tx: -xb.tx, tz: -xb.tz }, xb.node, [A, B], relaxed, st, `${A.name} - ${B.name}`);
+    if (typeof r === 'string') { why = r; continue; }
+    return r + centres;
   }
   st.log.push(`${A.name} - ${B.name}: ${why}${relaxed ? ' (second pass)' : ''}`);
   return null;
+}
+
+type Avoid = { x0: number; z0: number; x1: number; z1: number; r: number };
+
+/**
+ * Keep-out circles around the towns a road must not pass through. On crowded maps towns share land, so
+ * a circle that would cover one of the road's ends is shrunk to leave it free.
+ */
+function avoidZones(g: Game, skip: Town[], ends: { x: number; z: number }[]): Avoid[] {
+  const out: Avoid[] = [];
+  for (const t of g.towns.list) {
+    if (skip.includes(t)) continue;
+    let r = t.radius + 4;
+    for (const p of ends) r = Math.min(r, Math.hypot(p.x - t.x, p.z - t.z) - 6);
+    if (r > 4) out.push({ x0: t.x, z0: t.z, x1: t.x, z1: t.z, r });
+  }
+  return out;
+}
+
+/**
+ * Route and build a country road from a town exit to an existing node, arriving there heading along
+ * `to`. Returns the length built, or why it failed (nothing is left behind then).
+ */
+function routeRoad(g: Game, xa: Exit, to: OPoint, goal: number, skip: Town[], relaxed: boolean, st: RoadGenStats, label: string): number | string {
+  const net = g.world.net;
+  const na = net.nodes.get(xa.node), nb = net.nodes.get(goal);
+  if (!na || !nb) return 'node gone';
+  const gap = Math.hypot(to.x - xa.x, to.z - xa.z);
+  const lead = Math.min(8, gap / 4);
+  const from: OPoint = { x: xa.x, z: xa.z, tx: xa.tx, tz: xa.tz };
+  const ends = [from, to, { x: from.x + from.tx * lead, z: from.z + from.tz * lead }, { x: to.x - to.tx * lead, z: to.z - to.tz * lead }];
+  const ex = new Set<number>([...na.edges, ...nb.edges]);
+  const plan = runGen(routeGen(g, from, to, {
+    kind: 'road', owner: -1, tracks: 1, y0: na.y, y1: nb.y, avoid: avoidZones(g, skip, ends), exclude: ex, roadJunctions: true,
+    buildingCost: 8, lead, slopeCost: 2.5, maxExpand: 120000, rmax: 80, rgood: 12, minR: 5, retries: 2,
+  }));
+  if (typeof plan === 'string') return plan;
+  const prof = plan.prof;
+  const L = prof.s[prof.s.length - 1];
+  if (L > gap * (relaxed ? 2.2 : 1.8) + 25) return 'detour too long';
+  const runs = structureRuns(prof);
+  if (runs.water > (relaxed ? MAX_WATER_2 : MAX_WATER)) return `water crossing ${runs.water.toFixed(0)} u`;
+  if (runs.tunnel > (relaxed ? MAX_TUNNEL_2 : MAX_TUNNEL)) return `tunnel ${runs.tunnel.toFixed(0)} u`;
+  const e0 = net.nextEdge;
+  const r = buildChain(g, xa.node, plan.way.slice(1), ROAD_OPTS(), goal, prof);
+  if (!r.ok) { rollback(g, e0, prof); return 'construction: ' + (r.error ?? '?'); }
+  st.built++; st.edges += r.edges; st.length += r.built; st.bridges += r.bridges; st.tunnels += r.tunnels;
+  st.log.push(`${label}: ${r.built.toFixed(0)} u, ${r.edges} edges, ${r.bridges} bridges, ${r.tunnels} tunnels`);
+  return r.built;
+}
+
+/** Connected components of the road network (node id -> component). */
+function roadComponents(g: Game): Map<number, number> {
+  const net = g.world.net;
+  const comp = new Map<number, number>();
+  let c = 0;
+  for (const n of net.nodes.values()) {
+    if (n.kind !== 'road' || comp.has(n.id)) continue;
+    const q = [n.id];
+    comp.set(n.id, c);
+    while (q.length) {
+      const id = q.pop()!;
+      for (const eid of net.nodes.get(id)!.edges) {
+        const e = net.edges.get(eid)!;
+        const o = e.a === id ? e.b : e.a;
+        if (!comp.has(o)) { comp.set(o, c); q.push(o); }
+      }
+    }
+    c++;
+  }
+  return comp;
+}
+
+/**
+ * Last pass: towns (and town districts of a dozen streets or more, e.g. across a river) still cut off
+ * from the network the most towns are on get a road to its nearest country road (a T junction) or
+ * street end, with the longer bridges and tunnels of the second pass.
+ */
+function linkIsolated(g: Game, st: RoadGenStats) {
+  const net = g.world.net, towns = g.towns.list;
+  const comp = roadComponents(g);
+  const centre = towns.map((t) => net.nearestNode(t.x, t.z, t.radius + 6, 'road', (n) => n.edges.length > 0));
+  const count = new Map<number, number>();
+  for (const n of centre) if (n) { const k = comp.get(n.id)!; count.set(k, (count.get(k) ?? 0) + 1); }
+  let main = -1, most = 0;
+  for (const [k, v] of count) if (v > most || (v === most && k < main)) { most = v; main = k; }
+  if (main < 0) return;
+  // the pieces: every town's centre component, and other components of its streets with >= 12 edges
+  const size = new Map<number, number>();
+  for (const e of net.edges.values()) {
+    if (e.kind !== 'road' || e.type !== 'street' || e.owner !== -1) continue;
+    const a = net.nodes.get(e.a)!;
+    const T = g.towns.owner(a.x, a.z);
+    if (!T) continue;
+    const k = T.id * 100000 + comp.get(e.a)!;
+    size.set(k, (size.get(k) ?? 0) + 1);
+  }
+  const pieces: { T: Town; c: number; n: number }[] = [];
+  towns.forEach((T, i) => { if (centre[i]) pieces.push({ T, c: comp.get(centre[i]!.id)!, n: Infinity }); });
+  for (const [k, n] of size) {
+    const T = towns.find((t) => t.id === Math.floor(k / 100000));
+    if (T && n >= 12) pieces.push({ T, c: k % 100000, n });
+  }
+  pieces.sort((p, q) => q.n - p.n || p.T.id - q.T.id || p.c - q.c);
+  const joined = new Set<number>([main]);
+  for (const p of pieces) {
+    if (joined.has(p.c)) continue;
+    if (linkPiece(g, p.T, comp, p.c, joined, st)) joined.add(p.c);
+  }
+}
+
+/** A road from a cut-off piece of a town to the nearest country road or street end of the joined network. */
+function linkPiece(g: Game, T: Town, comp: Map<number, number>, c: number, joined: Set<number>, st: RoadGenStats): boolean {
+  const w = g.world, net = w.net;
+  // the piece's middle
+  let mx = 0, mz = 0, mn = 0;
+  for (const n of net.nodes.values()) if (comp.get(n.id) === c && g.towns.owner(n.x, n.z) === T) { mx += n.x; mz += n.z; mn++; }
+  if (!mn) return false;
+  mx /= mn; mz /= mn;
+  const targets: { n: NNode; d: number }[] = [];
+  for (const n of net.nodes.values()) {
+    if (n.kind !== 'road' || !joined.has(comp.get(n.id) ?? -1) || n.edges.length > 2) continue;
+    const es = n.edges.map((id) => net.edges.get(id)!);
+    if (es.some((e) => e.owner !== -1 || e.station >= 0 || e.depot >= 0)) continue;
+    // middle nodes of country roads, or dead ends of streets
+    if (!(n.edges.length === 2 ? es.every((e) => e.type === 'road') : es[0].type === 'street')) continue;
+    const h = w.heightAt(n.x, n.z);
+    if (h < WATER_Y + 0.2 || Math.abs(n.y - h) > 0.4) continue;
+    const d = Math.hypot(n.x - mx, n.z - mz);
+    if (d > T.radius + 150) continue;
+    targets.push({ n, d });
+  }
+  targets.sort((p, q) => p.d - q.d || p.n.id - q.n.id);
+  const picked: typeof targets = [];
+  for (const t of targets) {
+    if (picked.length >= 4) break;
+    if (picked.some((p) => Math.hypot(p.n.x - t.n.x, p.n.z - t.n.z) < 20)) continue;
+    picked.push(t);
+  }
+  let why = picked.length ? '' : 'no road nearby', tries = 0;
+  for (const { n, d } of picked) {
+    const ux = (n.x - mx) / (d || 1), uz = (n.z - mz) / (d || 1);
+    const exits = townExits(g, T, ux, uz).filter((x) => comp.get(x.node) === c);
+    for (const xa of exits.slice(0, 2)) {
+      if (tries++ >= 6) break;
+      // arrive across a country road, or straight on into a street end
+      const ld = net.leaveDir(net.edges.get(n.edges[0])!, n.id);
+      let tx = ld.x, tz = ld.z;
+      if (n.edges.length === 2) {
+        tx = -ld.z; tz = ld.x;
+        if (tx * (n.x - xa.x) + tz * (n.z - xa.z) < 0) { tx = -tx; tz = -tz; }
+      } else if (tx * (n.x - xa.x) + tz * (n.z - xa.z) <= 0) continue;
+      const other = g.towns.owner(n.x, n.z);
+      const r = routeRoad(g, xa, { x: n.x, z: n.z, tx, tz }, n.id, other ? [T, other] : [T], true, st, `${T.name} - road network`);
+      if (typeof r === 'number') return true;
+      why = r;
+    }
+  }
+  st.failed++;
+  st.log.push(`${T.name} - road network: ${why} (last pass)`);
+  return false;
 }
 
 /** Remove the pieces of a failed road (not the split pieces of roads and streets it crossed). */

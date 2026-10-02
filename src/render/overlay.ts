@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import type { Game } from '../game/game';
 import type { Proposal, CrossingPlan } from '../game/construction';
 import type { StationPlan } from '../game/stations';
-import type { DepotPlan } from '../game/build-ops';
+import type { DepotPlan, DepotKind } from '../game/build-ops';
 import { depotSize } from '../game/build-ops';
 import { arcTable, tAtS, bezPoint } from '../game/geom';
 import { profAt } from '../game/network';
@@ -13,6 +13,17 @@ import { FLOOR_H } from '../game/towns';
 export type MarkerKind = 'node' | 'edge' | 'free' | 'start' | 'signal' | 'point';
 export interface FootRect { x: number; z: number; angle: number; w: number; d: number; color: number; y?: number; lift?: number }
 export interface Ring { x: number; z: number; r: number }
+/** Line route display (screen space): width in px, lateral offset in px (or per vertex: `lanes`, one array per
+ *  curve), opacity, animated direction chevrons, draw order among routes. */
+export interface LinePathOpts { width?: number; offset?: number; lanes?: ArrayLike<number>[]; lift?: number; opacity?: number; chevrons?: boolean; order?: number }
+/** Desire line between two points (screen space): width in px, colour, alpha, apex height (world units). */
+export interface Arc { ax: number; az: number; bx: number; bz: number; w: number; color: number; h: number; alpha?: number }
+/** Catchment circle: centre, radius, colour (fill and outline). */
+export interface CatchCircle { x: number; z: number; r: number; color: number }
+/** A polyline for screen-space ribbons: points (xyz), colour, alpha, width (px), lateral lane offset(s) (px). */
+export interface RibbonPoly { pts: ArrayLike<number>; color: number | string; alpha?: number; width?: number; lane?: number | ArrayLike<number> }
+/** Town ring for the demand view: radius, share (0..1) drawn as a progress arc, colour of the arc. */
+export interface ShareRing { x: number; z: number; r: number; frac: number; color: number }
 
 const C = {
   ok: 0x46e07a, okBridge: 0x4fc3ff, okTunnel: 0xb38cff,
@@ -71,7 +82,7 @@ class DynGeo {
 }
 
 /** Append a ribbon along a sampled 3D polyline (xyz triples). */
-function ribbon(b: Buf, pts: ArrayLike<number>, n: number, hw: number, lift: number, color: (i: number) => THREE.Color) {
+function ribbon(b: Buf, pts: ArrayLike<number>, n: number, hw: number, lift: number, color: (i: number) => THREE.Color, off = 0) {
   if (n < 2) return;
   let plx = 0, ply = 0, plz = 0, prx = 0, prz = 0, pc = new THREE.Color();
   for (let i = 0; i < n; i++) {
@@ -80,7 +91,7 @@ function ribbon(b: Buf, pts: ArrayLike<number>, n: number, hw: number, lift: num
     const l = Math.hypot(tx, tz) || 1;
     tx /= l; tz /= l;
     const rx = -tz * hw, rz = tx * hw;
-    const x = pts[i * 3], y = pts[i * 3 + 1] + lift, z = pts[i * 3 + 2];
+    const x = pts[i * 3] - tz * off, y = pts[i * 3 + 1] + lift, z = pts[i * 3 + 2] + tx * off;
     const ci = color(i).clone();
     if (i > 0) b.quad(plx - prx, ply, plz - prz, plx + prx, ply, plz + prz, x + rx, y, z + rz, x - rx, y, z - rz, pc, ci);
     plx = x; ply = y; plz = z; prx = rx; prz = rz; pc = ci;
@@ -132,6 +143,186 @@ class GhostMesh {
   dispose() { this.dyn.dispose(); (this.mesh.material as THREE.Material).dispose(); (this.xray.material as THREE.Material).dispose(); }
 }
 
+// ---------------------------------------------------------------- screen-space ribbons
+// Constant pixel width with a dark casing, drawn on top of the world (routes, desire lines). Each vertex carries
+// its centre point and tangent; the vertex shader offsets it sideways in screen space (lane + half width).
+const RIBBON_VS = `
+uniform vec2 uRes;
+uniform float uWidthMul;
+uniform float uCase;
+attribute vec3 aDir;
+attribute float aSide;
+attribute float aLane;
+attribute float aWidth;
+attribute float aDist;
+attribute vec4 aColor;
+varying vec4 vColor;
+varying float vAcross;
+varying float vDist;
+varying float vHalf;
+varying float vCore;
+void main() {
+  vec4 p0 = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  vec4 p1 = projectionMatrix * modelViewMatrix * vec4(position + aDir * 0.2, 1.0);
+  vec2 d = (p1.xy / p1.w - p0.xy / p0.w) * uRes;
+  float L = length(d);
+  d = L > 1e-6 ? d / L : vec2(1.0, 0.0);
+  vec2 n = vec2(-d.y, d.x);
+  float core = aWidth * uWidthMul * 0.5;
+  float hw = core + uCase;
+  p0.xy += n * ((aLane + aSide * hw) * 2.0 / uRes) * p0.w;
+  gl_Position = p0;
+  vColor = aColor; vAcross = aSide; vDist = aDist; vHalf = hw; vCore = core;
+}`;
+const RIBBON_FS = `
+uniform vec3 uCaseColor;
+uniform float uCaseAlpha;
+uniform float uOpacity;
+uniform float uChev;
+uniform float uTime;
+uniform float uPeriod;
+uniform float uPeriodPx;
+varying vec4 vColor;
+varying float vAcross;
+varying float vDist;
+varying float vHalf;
+varying float vCore;
+void main() {
+  float px = abs(vAcross) * vHalf;
+  float outer = 1.0 - smoothstep(vHalf - 1.0, vHalf, px);
+  float inner = 1.0 - smoothstep(vCore - 0.5, vCore + 0.5, px);
+  vec3 c = mix(uCaseColor, vColor.rgb, inner);
+  if (uChev > 0.0) {
+    float s = fract(vDist / uPeriod + px / uPeriodPx - uTime * 0.6);
+    float ch = smoothstep(0.0, 0.07, s) - smoothstep(0.2, 0.27, s);
+    c = mix(c, vec3(1.0), ch * inner * 0.55 * uChev);
+  }
+  float a = outer * mix(uCaseAlpha, 1.0, inner) * vColor.a * uOpacity;
+  if (a < 0.004) discard;
+  gl_FragColor = vec4(c, a);
+}`;
+
+/** Shared per-frame uniforms of all ribbon materials. */
+const RIB = { uRes: { value: new THREE.Vector2(1280, 800) }, uTime: { value: 0 } };
+const tmpV2 = new THREE.Vector2();
+const tmpV3 = new THREE.Vector3();
+
+class ScreenRibbon {
+  mesh: THREE.Mesh;
+  mat: THREE.ShaderMaterial;
+  /** centre of the drawn polylines (scales the chevron spacing with the camera distance) */
+  private center = new THREE.Vector3();
+  constructor(group: THREE.Group, order: number) {
+    this.mat = new THREE.ShaderMaterial({
+      uniforms: {
+        uRes: RIB.uRes, uTime: RIB.uTime, uWidthMul: { value: 1 }, uCase: { value: 1.5 },
+        uCaseColor: { value: new THREE.Color(0x0b0f14) }, uCaseAlpha: { value: 0.8 }, uOpacity: { value: 0.9 },
+        uChev: { value: 0 }, uPeriod: { value: 1 }, uPeriodPx: { value: 30 },
+      },
+      vertexShader: RIBBON_VS, fragmentShader: RIBBON_FS,
+      transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
+    });
+    this.mesh = new THREE.Mesh(new THREE.BufferGeometry(), this.mat);
+    this.mesh.frustumCulled = false;
+    this.mesh.renderOrder = order;
+    this.mesh.visible = false;
+    this.mesh.onBeforeRender = (r, _s, cam) => {
+      r.getSize(tmpV2);
+      if (tmpV2.x > 0 && tmpV2.y > 0) RIB.uRes.value.copy(tmpV2);
+      const pc = cam as THREE.PerspectiveCamera;
+      if (this.mat.uniforms.uChev.value > 0 && pc.isPerspectiveCamera) {
+        const d = Math.max(1, tmpV3.copy(this.center).distanceTo(pc.position));
+        const perPx = (2 * d * Math.tan((pc.fov * Math.PI) / 360)) / Math.max(1, RIB.uRes.value.y);
+        this.mat.uniforms.uPeriod.value = this.mat.uniforms.uPeriodPx.value * perPx;
+      }
+    };
+    group.add(this.mesh);
+  }
+
+  set style(o: { width?: number; opacity?: number; chevrons?: boolean; casing?: number; caseAlpha?: number; order?: number }) {
+    const u = this.mat.uniforms;
+    if (o.width !== undefined) u.uWidthMul.value = o.width;
+    if (o.opacity !== undefined) u.uOpacity.value = o.opacity;
+    if (o.chevrons !== undefined) u.uChev.value = o.chevrons ? 1 : 0;
+    if (o.casing !== undefined) u.uCase.value = o.casing;
+    if (o.caseAlpha !== undefined) u.uCaseAlpha.value = o.caseAlpha;
+    if (o.order !== undefined) this.mesh.renderOrder = o.order;
+  }
+
+  /** Rebuild from polylines (null or empty hides it). Width per polyline is multiplied by the style width. */
+  set(polys: RibbonPoly[] | null) {
+    let nv = 0, ni = 0;
+    if (polys) for (const p of polys) { const n = p.pts.length / 3; if (n >= 2) { nv += n * 2; ni += (n - 1) * 6; } }
+    const old = this.mesh.geometry;
+    if (!nv) { this.mesh.visible = false; return; }
+    const pos = new Float32Array(nv * 3), dir = new Float32Array(nv * 3), side = new Float32Array(nv), lane = new Float32Array(nv);
+    const wid = new Float32Array(nv), dist = new Float32Array(nv), colr = new Float32Array(nv * 4);
+    const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
+    const c = new THREE.Color();
+    let v = 0, k = 0, cx = 0, cy = 0, cz = 0, cn = 0;
+    for (const p of polys!) {
+      const P = p.pts, n = P.length / 3;
+      if (n < 2) continue;
+      c.set(p.color as THREE.ColorRepresentation);
+      const al = p.alpha ?? 1, w = p.width ?? 1, ln = p.lane ?? 0;
+      let acc = 0, tx = 1, ty = 0, tz = 0;
+      for (let i = 0; i < n; i++) {
+        // tangent from the nearest distinct neighbours (polylines may repeat points where edges meet)
+        let a = i, b = i;
+        while (a > 0 && Math.abs(P[a * 3] - P[i * 3]) + Math.abs(P[a * 3 + 2] - P[i * 3 + 2]) + Math.abs(P[a * 3 + 1] - P[i * 3 + 1]) < 1e-4) a--;
+        while (b < n - 1 && Math.abs(P[b * 3] - P[i * 3]) + Math.abs(P[b * 3 + 2] - P[i * 3 + 2]) + Math.abs(P[b * 3 + 1] - P[i * 3 + 1]) < 1e-4) b++;
+        const dx = P[b * 3] - P[a * 3], dy = P[b * 3 + 1] - P[a * 3 + 1], dz = P[b * 3 + 2] - P[a * 3 + 2];
+        const l = Math.hypot(dx, dy, dz);
+        if (l > 1e-6) { tx = dx / l; ty = dy / l; tz = dz / l; }
+        if (i > 0) acc += Math.hypot(P[i * 3] - P[i * 3 - 3], P[i * 3 + 1] - P[i * 3 - 2], P[i * 3 + 2] - P[i * 3 - 1]);
+        const li = typeof ln === 'number' ? ln : (ln[i] ?? 0);
+        for (let sd = -1; sd <= 1; sd += 2) {
+          pos[v * 3] = P[i * 3]; pos[v * 3 + 1] = P[i * 3 + 1]; pos[v * 3 + 2] = P[i * 3 + 2];
+          dir[v * 3] = tx; dir[v * 3 + 1] = ty; dir[v * 3 + 2] = tz;
+          side[v] = sd; lane[v] = li; wid[v] = w; dist[v] = acc;
+          colr[v * 4] = c.r; colr[v * 4 + 1] = c.g; colr[v * 4 + 2] = c.b; colr[v * 4 + 3] = al;
+          v++;
+        }
+        cx += P[i * 3]; cy += P[i * 3 + 1]; cz += P[i * 3 + 2]; cn++;
+        if (i > 0) {
+          const q = v - 4;
+          idx[k++] = q; idx[k++] = q + 1; idx[k++] = q + 2;
+          idx[k++] = q + 1; idx[k++] = q + 3; idx[k++] = q + 2;
+        }
+      }
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('aDir', new THREE.BufferAttribute(dir, 3));
+    g.setAttribute('aSide', new THREE.BufferAttribute(side, 1));
+    g.setAttribute('aLane', new THREE.BufferAttribute(lane, 1));
+    g.setAttribute('aWidth', new THREE.BufferAttribute(wid, 1));
+    g.setAttribute('aDist', new THREE.BufferAttribute(dist, 1));
+    g.setAttribute('aColor', new THREE.BufferAttribute(colr, 4));
+    g.setIndex(new THREE.BufferAttribute(idx, 1));
+    this.mesh.geometry = g;
+    old.dispose();
+    this.center.set(cx / cn, cy / cn, cz / cn);
+    this.mesh.visible = true;
+  }
+
+  dispose() { this.mesh.removeFromParent(); this.mesh.geometry.dispose(); this.mat.dispose(); }
+}
+
+/** Full-screen translucent layer (dims the world under map views); drawn after the world, before ribbons. */
+function dimLayer(): THREE.Mesh {
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), new THREE.ShaderMaterial({
+    uniforms: { uDim: { value: new THREE.Vector4(0.05, 0.07, 0.1, 0) } },
+    vertexShader: 'void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }',
+    fragmentShader: 'uniform vec4 uDim; void main() { gl_FragColor = uDim; }',
+    transparent: true, depthTest: false, depthWrite: false, fog: false, toneMapped: false,
+  }));
+  m.frustumCulled = false;
+  m.renderOrder = 45;
+  m.visible = false;
+  return m;
+}
+
 export class Overlay {
   group = new THREE.Group();
   private ghost: GhostMesh;
@@ -140,13 +331,17 @@ export class Overlay {
   private rings: GhostMesh;
   private demo: GhostMesh;
   private disc: GhostMesh;
+  private arcs: ScreenRibbon;
+  private shareRings: GhostMesh;
+  private dim = dimLayer();
   private demoKey = '';
   private markers = new Map<string, THREE.Mesh>();
   private markerGeo: Record<MarkerKind, THREE.BufferGeometry>;
   private crossPool: THREE.Mesh[] = [];
   private crossGeo = new THREE.RingGeometry(0.55, 1, 20).rotateX(-Math.PI / 2);
   private crossMats = new Map<string, THREE.MeshBasicMaterial>();
-  private linePaths = new Map<number, GhostMesh>();
+  private linePaths = new Map<number, ScreenRibbon>();
+  private catch = new Map<string, { fill: GhostMesh; edge: ScreenRibbon }>();
   private hoverKey = '';
   private time = 0;
   private buf = new Buf();
@@ -158,6 +353,10 @@ export class Overlay {
     this.rings = new GhostMesh(this.group, 0.75, 0.12, 25);
     this.demo = new GhostMesh(this.group, 0.34, 0.1, 33);
     this.disc = new GhostMesh(this.group, 0.3, 0.08, 24);
+    this.arcs = new ScreenRibbon(this.group, 52);
+    this.arcs.style = { casing: 1, caseAlpha: 0.55, opacity: 1 };
+    this.shareRings = new GhostMesh(this.group, 0.9, 0.3, 48);
+    this.group.add(this.dim);
     const flat = (g: THREE.BufferGeometry) => g.rotateX(-Math.PI / 2);
     this.markerGeo = {
       node: flat(new THREE.RingGeometry(0.62, 1, 28)),
@@ -172,6 +371,7 @@ export class Overlay {
   // ---------------------------------------------------------------- per frame
   update(dt: number, camera: THREE.Camera) {
     this.time += dt;
+    RIB.uTime.value = this.time;
     const cp = camera.position;
     const scale = (m: THREE.Object3D, k: number) => m.scale.setScalar(Math.max(0.12, Math.min(9, cp.distanceTo(m.position) * k)));
     for (const [slot, m] of this.markers) {
@@ -182,13 +382,14 @@ export class Overlay {
     for (const m of this.crossPool) if (m.visible) scale(m, 0.011);
   }
 
-  /** Hide all tool previews (line paths and catchment rings stay). */
+  /** Hide all tool previews (line paths, catchment rings and map layers stay). */
   clear() {
     this.setProposal(null);
     this.foot.set(null);
     this.setHoverEdge(null);
     this.setDemolish(null);
     this.disc.set(null);
+    this.setCatchments('hover', null);
     for (const m of this.markers.values()) m.visible = false;
   }
 
@@ -242,8 +443,9 @@ export class Overlay {
         for (const sec of tp.sections) if (s >= sec.s0 && s <= sec.s1) types[i] = sec.type === 'bridge' ? 1 : 2;
       }
       ribbon(b, pts, n, hw, 0.04, (i) => (types[i] === 1 ? cBridge : types[i] === 2 ? cTunnel : cGround));
-      // centre line (rail) / lane divider (road) for readability
-      ribbon(b, pts, n, road ? 0.025 : 0.04, 0.05, () => cLine);
+      // centre line (rail) / lane divider (road) for readability; embedded rails for tram roads
+      if (road && p.opts.tram) { ribbon(b, pts, n, 0.014, 0.05, () => cLine, 0.072); ribbon(b, pts, n, 0.014, 0.05, () => cLine, -0.072); }
+      else ribbon(b, pts, n, road ? 0.025 : 0.04, 0.05, () => cLine);
       this.structures(b, pts, types, n, step, hw, cPier, cPortal);
     }
     this.ghost.set(b);
@@ -364,19 +566,38 @@ export class Overlay {
     const b = this.buf.clear();
     const y = pl.y;
     const fr = pl.footprint;
-    const rx = Math.cos(pl.angle), rz = -Math.sin(pl.angle);
-    flatRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y + 0.02, col(pl.ok ? C.ok : C.bad).clone());
+    const ex = pl as StationPlan & { level?: string; underground?: boolean; entrances?: { x: number; z: number; angle: number }[] };
+    const level = ex.level ?? (ex.underground ? 'underground' : 'ground');
+    const rx = Math.cos(pl.angle), rz = -Math.sin(pl.angle), fx = Math.sin(pl.angle), fz = Math.cos(pl.angle);
+    const w = this.game.world;
+    const gy = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y);
+    const base = col(pl.ok ? C.ok : C.bad).clone();
+    if (level === 'underground') boxRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y - 0.6, y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+    else flatRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y + 0.02, base);
     const cp = col(pl.ok ? 0xd9f7e2 : 0xffd2cc).clone();
     for (const p of pl.layout.platforms) flatRect(b, pl.x + rx * p.off, pl.z + rz * p.off, pl.angle, p.w, pl.length * 0.96, y + 0.1, cp);
     const ct = col(pl.ok ? 0x1d4f30 : 0x6e1d1d).clone();
     for (const o of pl.layout.trackOffsets) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.16, pl.length, y + 0.05, ct);
-    const bd = pl.building;
-    flatRect(b, bd.x, bd.z, bd.angle, bd.w, bd.d, y + 0.3, col(pl.ok ? 0xf3e7c4 : 0xffb3a8).clone());
+    // street-level access: the station building, or entrance pavilions / stair towers of elevated and underground stations
+    const ents = ex.entrances?.length ? ex.entrances : level === 'ground' ? [] : [-1, 1].map((k) => ({ x: pl.x + fx * k * pl.length * 0.42 + rx * (fr.w / 2 + 0.7), z: pl.z + fz * k * pl.length * 0.42 + rz * (fr.w / 2 + 0.7), angle: pl.angle }));
+    const ce = col(pl.ok ? 0xf3e7c4 : 0xffb3a8).clone();
+    if (level === 'ground') { const bd = pl.building; flatRect(b, bd.x, bd.z, bd.angle, bd.w, bd.d, y + 0.3, ce); }
+    for (const e of ents) { const g0 = gy(e.x, e.z); boxRect(b, e.x, e.z, e.angle, 1.1, 1.1, g0, level === 'elevated' ? y + 0.7 : g0 + 0.6, ce); }
+    if (level === 'elevated') {
+      // viaduct piers every ~3 units under the deck
+      const n = Math.max(2, Math.round(pl.length / 3));
+      const cpier = col(pl.ok ? C.okBridge : C.badBridge).clone();
+      for (let i = 0; i <= n; i++) {
+        const t = (i / n - 0.5) * pl.length * 0.94;
+        const x = pl.x + fx * t, z = pl.z + fz * t;
+        boxRect(b, x, z, pl.angle, Math.max(0.6, fr.w * 0.5), 0.5, gy(x, z) - 0.2, y - 0.05, cpier);
+      }
+    }
     this.foot.set(b);
   }
 
   /** Ghost of a planned depot with an arrow showing the door / track direction. */
-  setDepotGhost(pl: DepotPlan | null, kind: NetKind = 'rail') {
+  setDepotGhost(pl: DepotPlan | null, kind: DepotKind = 'rail') {
     if (!pl) { this.foot.set(null); return; }
     const b = this.buf.clear();
     const sz = depotSize(kind);
@@ -432,43 +653,128 @@ export class Overlay {
     this.rings.set(b);
   }
 
+  // ---------------------------------------------------------------- demand view
+  /** Desire lines: raised arcs (height = h at the middle) with a constant screen width; drawn in the given order. */
+  setArcs(arcs: Arc[] | null) {
+    if (!arcs || !arcs.length) { this.arcs.set(null); return; }
+    const w = this.game.world;
+    const polys: RibbonPoly[] = [];
+    for (const a of arcs) {
+      const ya = Math.max(w.heightAt(a.ax, a.az), WATER_Y) + 1.2, yb = Math.max(w.heightAt(a.bx, a.bz), WATER_Y) + 1.2;
+      const d = Math.hypot(a.bx - a.ax, a.bz - a.az);
+      const n = Math.max(12, Math.min(48, Math.ceil(d / 5)));
+      const pts = new Float32Array((n + 1) * 3);
+      for (let i = 0; i <= n; i++) {
+        const t = i / n;
+        pts[i * 3] = a.ax + (a.bx - a.ax) * t;
+        pts[i * 3 + 1] = ya + (yb - ya) * t + 4 * a.h * t * (1 - t);
+        pts[i * 3 + 2] = a.az + (a.bz - a.az) * t;
+      }
+      polys.push({ pts, color: a.color, alpha: a.alpha ?? 0.9, width: a.w });
+    }
+    this.arcs.set(polys);
+  }
+
+  /** Dim the world under map views (0 = off). */
+  setDim(alpha: number) {
+    const u = (this.dim.material as THREE.ShaderMaterial).uniforms.uDim.value as THREE.Vector4;
+    u.w = alpha;
+    this.dim.visible = alpha > 0.001;
+  }
+
+  /** Terrain-draped town rings: a dim base ring with a progress arc (share transported). */
+  setShareRings(rings: ShareRing[] | null) {
+    if (!rings || !rings.length) { this.shareRings.set(null); return; }
+    const w = this.game.world;
+    const b = this.buf.clear();
+    const base = col(0x3a4452).clone();
+    for (const r of rings) {
+      const c = col(r.color).clone();
+      const n = Math.max(32, Math.min(200, Math.ceil(r.r * 3)));
+      const pts = new Float32Array((n + 1) * 3);
+      for (let i = 0; i <= n; i++) {
+        const a = -Math.PI / 2 + (i / n) * Math.PI * 2;
+        const x = r.x + Math.cos(a) * r.r, z = r.z + Math.sin(a) * r.r;
+        pts[i * 3] = x; pts[i * 3 + 1] = Math.max(w.heightAt(x, z), WATER_Y); pts[i * 3 + 2] = z;
+      }
+      const cut = Math.round(Math.max(0, Math.min(1, r.frac)) * n);
+      const hw = Math.max(0.18, r.r * 0.035);
+      ribbon(b, pts, n + 1, hw * 0.6, 0.18, () => base);
+      if (cut > 0) ribbon(b, pts.subarray(0, (cut + 1) * 3), cut + 1, hw, 0.22, () => c);
+    }
+    this.shareRings.set(b);
+  }
+
+  // ---------------------------------------------------------------- catchment areas
+  /**
+   * Catchment circles as soft terrain-draped fills with crisp outlines, in independent layers (`key`: e.g. the
+   * placement preview, the selected station, the map layer of all stations). Null or empty clears the layer.
+   */
+  setCatchments(key: string, circles: CatchCircle[] | null) {
+    let L = this.catch.get(key);
+    if (!circles || !circles.length) { if (L) { L.fill.set(null); L.edge.set(null); } return; }
+    if (!L) {
+      L = { fill: new GhostMesh(this.group, 0.15, 0.05, 23), edge: new ScreenRibbon(this.group, 49) };
+      L.edge.style = { width: 2, opacity: 0.9, casing: 1, caseAlpha: 0.45, chevrons: false };
+      this.catch.set(key, L);
+    }
+    const w = this.game.world;
+    const b = this.buf.clear();
+    const rings: RibbonPoly[] = [];
+    const RF = [0, 0.34, 0.62, 0.84, 1];
+    for (const c of circles) {
+      const color = col(c.color).clone();
+      const n = Math.max(24, Math.min(96, Math.ceil(c.r * 1.6)));
+      const yAt = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y) + 0.1;
+      const P = (ri: number, k: number): [number, number, number] => {
+        const a = (k / n) * Math.PI * 2, rr = RF[ri] * c.r;
+        const x = c.x + Math.cos(a) * rr, z = c.z + Math.sin(a) * rr;
+        return [x, yAt(x, z), z];
+      };
+      for (let ri = 0; ri < RF.length - 1; ri++) for (let k = 0; k < n; k++) {
+        const a0 = P(ri, k), a1 = P(ri, k + 1), b0 = P(ri + 1, k), b1 = P(ri + 1, k + 1);
+        b.quad(a0[0], a0[1], a0[2], a1[0], a1[1], a1[2], b1[0], b1[1], b1[2], b0[0], b0[1], b0[2], color);
+      }
+      const pts = new Float32Array((n + 1) * 3);
+      for (let k = 0; k <= n; k++) { const q = P(RF.length - 1, k); pts[k * 3] = q[0]; pts[k * 3 + 1] = q[1] + 0.05; pts[k * 3 + 2] = q[2]; }
+      rings.push({ pts, color: c.color });
+    }
+    L.fill.set(b);
+    L.edge.set(rings);
+  }
+
   // ---------------------------------------------------------------- line paths
-  /** Show a line's route as coloured polylines (xyz triples) lifted above the network; null removes it. */
-  setLinePath(id: number, curves: Float32Array[] | null, color = '#ffffff') {
+  /** Show a line's route (polylines, xyz) as a screen-space ribbon in its colour; null removes it. */
+  setLinePath(id: number, curves: Float32Array[] | null, color = '#ffffff', o: LinePathOpts = {}) {
     let m = this.linePaths.get(id);
     if (!curves || !curves.length) {
-      if (m) { this.group.remove(m.mesh, m.xray); m.dispose(); this.linePaths.delete(id); }
+      if (m) { m.dispose(); this.linePaths.delete(id); }
       return;
     }
-    if (!m) { m = new GhostMesh(this.group, 0.85, 0.22, 22); this.linePaths.set(id, m); }
-    const b = this.buf.clear();
-    const c = new THREE.Color(color);
-    const dark = c.clone().multiplyScalar(0.45);
-    for (const pts of curves) {
-      const n = pts.length / 3;
-      ribbon(b, pts, n, 0.075, 0.32, () => c);
-      // direction chevrons every ~5 units
-      let acc = 0;
-      for (let i = 1; i < n; i++) {
-        const dx = pts[i * 3] - pts[i * 3 - 3], dz = pts[i * 3 + 2] - pts[i * 3 - 1];
-        const l = Math.hypot(dx, dz);
-        acc += l;
-        if (acc < 5 || l < 1e-4) continue;
-        acc = 0;
-        const ux = dx / l, uz = dz / l, x = pts[i * 3], y = pts[i * 3 + 1] + 0.335, z = pts[i * 3 + 2];
-        b.v(x + ux * 0.16, y, z + uz * 0.16, dark); b.v(x - uz * 0.07 - ux * 0.06, y, z + ux * 0.07 - uz * 0.06, dark); b.v(x + uz * 0.07 - ux * 0.06, y, z - ux * 0.07 - uz * 0.06, dark);
-      }
-    }
-    m.set(b);
+    if (!m) { m = new ScreenRibbon(this.group, 50); this.linePaths.set(id, m); }
+    const lift = o.lift ?? 0.35;
+    m.set(curves.map((pts, i) => {
+      const q = new Float32Array(pts);
+      for (let k = 1; k < q.length; k += 3) q[k] += lift;
+      return { pts: q, color, lane: o.lanes?.[i] ?? o.offset ?? 0 };
+    }));
+    this.setLinePathStyle(id, o);
+  }
+  /** Change the width (px), opacity, chevrons or draw order of a shown route without rebuilding it. */
+  setLinePathStyle(id: number, o: LinePathOpts) {
+    const m = this.linePaths.get(id);
+    if (m) m.style = { width: o.width ?? 5, opacity: o.opacity ?? 0.9, chevrons: o.chevrons ?? true, order: 50 + (o.order ?? 0) };
   }
   linePathIds() { return [...this.linePaths.keys()]; }
 
   dispose() {
-    for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, ...this.linePaths.values()]) g.dispose();
+    for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, this.arcs, this.shareRings, ...this.linePaths.values()]) g.dispose();
+    for (const L of this.catch.values()) { L.fill.dispose(); L.edge.dispose(); }
     for (const g of Object.values(this.markerGeo)) g.dispose();
     for (const m of this.markers.values()) (m.material as THREE.Material).dispose();
     for (const m of this.crossMats.values()) m.dispose();
     this.crossGeo.dispose();
+    this.dim.geometry.dispose(); (this.dim.material as THREE.Material).dispose();
     this.group.clear();
   }
 }

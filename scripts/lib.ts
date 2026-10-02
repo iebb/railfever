@@ -9,7 +9,7 @@ import { RoadVehicle } from '../src/game/roadvehicle';
 import {
   findStationSite, stationEnds, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotNearLine, buildRoadDepot, findRailPair,
   routeGen, runGen, removeEdges,
-} from '../src/game/ai';
+} from '../src/game/routing';
 
 export const fails: string[] = [];
 export function check(cond: any, msg: string) { if (!cond) { fails.push(msg); console.log('  FAIL: ' + msg); } }
@@ -305,11 +305,12 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
     }
   }
   g.onNetworkChanged();
-  // every platform must reach the other station
+  // every platform must reach the other station (else the caller tries another pair)
+  let routes = true;
   for (const [st, o] of [[A, B], [B, A]] as [Station, Station][]) for (const eid of st.rail!.edges) {
     const e = net.edges.get(eid)!;
     const ok = [1, -1].some((dir) => !!findRailRoute(g, railNext(g, e, dir, owner), o.id, owner, -1));
-    if (!ok) log(`  double: no route from ${st.name} platform ${eid} to ${o.name}`);
+    if (!ok) { log(`  double: no route from ${st.name} platform ${eid} to ${o.name}`); routes = false; }
   }
-  return { ok: true, signals, crossovers, len: res.built };
+  return { ok: routes, signals, crossovers, len: res.built };
 }

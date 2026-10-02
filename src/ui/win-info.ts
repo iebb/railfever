@@ -9,12 +9,27 @@ import { RoadVehicle, roadDepotReaches } from '../game/roadvehicle';
 import type { Line } from '../game/lines';
 import { BUILDING_TYPES } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
-import { TRACK_TYPES, ROAD_TYPES } from '../game/constants';
+import { TRACK_TYPES, ROAD_TYPES, TRAM } from '../game/constants';
 import { curveSpeed } from '../game/construction';
-import { fmtLen, fmtPct } from './format';
+import { fmtLen, fmtPct, fmtMult, equalUseShare } from './format';
+import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
+import type { LineKind } from '../game/constants';
+import { KIND_META } from './format';
+import { demandView, stationDemand } from '../game/demand';
+import { townDemandShare, stationLinks } from './gameapi';
+import type { Station } from '../game/stations';
+import { servedColor, hexCss } from './mapmodes';
 
 const CAR_GAP = 0.1;
+
+/** Transport mode of a vehicle (trams are road vehicles with tram models). */
+export function vehicleKind(v: Vehicle): LineKind {
+  if (v.kind === 'train') return 'rail';
+  return (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road';
+}
+const depotTitle = (k: string) => (k === 'rail' ? 'Train depot' : k === 'tram' ? 'Tram depot' : 'Bus depot');
+const depotIcon = (k: string) => (k === 'rail' ? 'depot' : k === 'tram' ? 'tramdepot' : 'garage');
 const hex = (c: number) => '#' + c.toString(16).padStart(6, '0');
 
 // ------------------------------------------------------------------ station
@@ -37,7 +52,9 @@ export function openStation(ui: UI, id: number) {
     if (win.tab === 'overview') {
       const parts: string[] = [];
       if (s.rail) parts.push(`${s.rail.tracks} track${s.rail.tracks > 1 ? 's' : ''} × ${Math.round(s.rail.length * 10)} m`);
-      if (s.stops.length) parts.push(`${s.stops.length} bus stop${s.stops.length > 1 ? 's' : ''}`);
+      const tramN = s.stops.filter((p) => !!g.world.net.edges.get(p.edge)?.tram).length;
+      if (s.stops.length - tramN) parts.push(`${s.stops.length - tramN} bus stop${s.stops.length - tramN > 1 ? 's' : ''}`);
+      if (tramN) parts.push(`${tramN} tram stop${tramN > 1 ? 's' : ''}`);
       add(win.body, 
         h('div', { class: 'tiles' },
           tile(fmtPct(s.rating), 'Rating', s.rating < 0.4 ? 'neg' : '', bar(s.rating)),
@@ -45,20 +62,32 @@ export function openStation(ui: UI, id: number) {
           tile(fmtInt(s.catchPop), 'Catchment'),
           tile(String(lines.length), 'Lines')),
         ui.kv('Facilities', parts.join(' + ') || '—'),
+        mine && s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? h('div', { class: 'warn' }, icon('warning', 16),
+          h('span', null, 'No road access — this station won\u2019t attract passengers until its building is connected to a street. ',
+            h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => { ui.tools.roadType = 'street'; ui.tools.setTool('road'); ui.centerOn(s.x, s.z, 30); ui.toast('Build a street from the station building to the road network', 'info'); } }, icon('road', 15), 'Build access road'))) : null,
+        !mine && s.owner >= 0 ? accessRows(ui, s.owner, g.stationMaintenance(s), () => { win.last = undefined; render(); }) : null,
         ui.kv('New passengers', `${fmtInt(s.genLast)} last month`),
         ui.kv('Boarded · arrived', `${fmtInt(s.pickupLast)} · ${fmtInt(s.arrivedLast)}`),
         h('div', { class: 'btns' },
           h('button', { class: 'btn', onclick: () => ui.centerOn(s.x, s.z) }, icon('target', 16), 'Center'),
           h('button', { class: 'btn' + (ui.catchmentStation === id ? ' on' : ''), onclick: () => { ui.setCatchment(ui.catchmentStation === id ? -1 : id); win.last = undefined; render(); } }, icon('catchment', 16), 'Catchment'),
           mine ? h('button', { class: 'btn ghost', onclick: () => { const n = prompt('Rename station', s.name); if (n) { s.name = n.slice(0, 40); render(); } } }, icon('edit', 16), 'Rename') : null),
+        mine ? transferSection(ui, s, () => { win.last = undefined; render(); }) : null,
       );
     } else if (win.tab === 'waiting') {
       const byDest = new Map<number, number>();
       for (const wg of s.waiting.values()) byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count);
       const sorted = [...byDest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14);
-      add(win.body, section('Waiting by destination', `${fmtInt(s.waitingTotal)} total`));
+      const towns = stationDemand(g, s.id).slice(0, 6);
+      add(win.body, section('Waiting by destination town', `${fmtInt(s.waitingTotal)} total`));
       if (!sorted.length) add(win.body, h('div', { class: 'pad' }, 'Nobody is waiting here.'));
-      else add(win.body, h('div', { class: 'list' }, sorted.map(([d, c]) => h('div', { class: 'row' }, ui.stationLink(d), h('span', { class: 'num' }, fmtInt(c))))));
+      else {
+        add(win.body, h('div', { class: 'list' }, towns.map((e) => h('div', { class: 'row' },
+          h('span', null, g.towns.list[e.town]?.name ?? 'Elsewhere'),
+          h('span', { class: 'ldots' }, e.lines.slice(0, 5).map((x) => { const l = g.lines.get(x.line); return l ? h('i', { style: `--c:${l.color}`, 'data-tip': `${l.name}: ${fmtInt(x.count)}` }) : null; })),
+          h('span', { class: 'num' }, fmtInt(e.count))))));
+        add(win.body, section('By station'), h('div', { class: 'list' }, sorted.map(([d, c]) => h('div', { class: 'row' }, ui.stationLink(d), h('span', { class: 'num' }, fmtInt(c))))));
+      }
     } else {
       add(win.body, section('Lines serving this station'));
       if (lines.length) add(win.body, h('div', { class: 'chips' }, lines.map((l) => ui.lineChip(l))));
@@ -89,6 +118,7 @@ export function openTown(ui: UI, id: number) {
         tile(fmtPct(pct), 'Transported', '', bar(pct)),
         tile(growth, 'Growth', town.served ? 'pos' : '')),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
+      demandRows(ui, id),
       section('Buildings'),
       h('div', { class: 'list' }, [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => h('div', { class: 'row' }, h('span', null, BUILDING_TYPES[t]?.name ?? '?'), h('span', { class: 'num' }, String(c))))),
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => ui.centerOn(town.x, town.z) }, icon('target', 16), 'Center')),
@@ -96,6 +126,67 @@ export function openTown(ui: UI, id: number) {
   };
   win.refresh = render;
   render();
+}
+
+/** Trip demand of a town and its strongest connections (from the demand model). */
+function demandRows(ui: UI, id: number): HTMLElement | null {
+  const g = ui.game;
+  const d = demandView(g, PLAYER);
+  const t = d.towns.find((x) => x.id === id);
+  if (!t) return null;
+  const share = townDemandShare(d, t);
+  const pairs = d.pairs.filter((p) => p.a === id || p.b === id).slice(0, 4);
+  const demandOn = ui.mapModes.mode === 'demand';
+  return h('div', null,
+    ui.kv('Trip demand', h('span', null, `${fmtInt(t.potential)} / month · `, h('span', { style: `color:${hexCss(servedColor(share))}` }, `${fmtPct(share)} served`))),
+    ui.kv('Coverage', `${fmtPct(t.served)} of residents near a served station`),
+    section('Top destinations', h('button', { class: 'btn sm' + (demandOn ? ' on' : ''), onclick: () => ui.mapModes.toggle('demand') }, icon('demand', 15), 'Demand view')),
+    pairs.length ? h('div', { class: 'list' }, pairs.map((p) => {
+      const o = g.towns.list[p.a === id ? p.b : p.a];
+      return h('div', { class: 'row link', 'data-tip': `${fmtPct(p.served)} served · ${(p.dist / 100).toFixed(1)} km`, onclick: () => o && ui.openTown(o.id) },
+        h('span', null, o?.name ?? '?'), h('span', { class: 'ldots' }, h('i', { style: `--c:${hexCss(servedColor(p.served))}` })), h('span', { class: 'num' }, `${fmtInt(p.potential)} / mo`));
+    })) : h('div', { class: 'pad muted' }, 'No other towns nearby.'));
+}
+
+/** Transfer complex of one of the player's stations: linked stations (Unlink) and nearby ones (Merge / Link). */
+function transferSection(ui: UI, s: Station, after: () => void): HTMLElement | null {
+  const g = ui.game;
+  const api = g.stations as unknown as { canMerge?: (a: number, b: number) => string | null; merge?: (into: number, from: number) => string | null | void; link?: (a: number, b: number) => string | null | void; unlink?: (a: number, b: number) => void };
+  if (typeof api.canMerge !== 'function') return null;
+  const links = stationLinks(g, s).map((id) => g.stations.get(id)).filter((x): x is Station => !!x);
+  const near = g.stations.all().filter((o) => o.id !== s.id && o.owner === PLAYER && !links.includes(o) && Math.hypot(o.x - s.x, o.z - s.z) < 80)
+    .sort((a, b) => Math.hypot(a.x - s.x, a.z - s.z) - Math.hypot(b.x - s.x, b.z - s.z)).slice(0, 5);
+  const kindIcon = (o: Station) => (o.rail ? 'station' : o.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop');
+  const dist = (o: Station) => `${Math.round(Math.hypot(o.x - s.x, o.z - s.z) * 10)} m`;
+  const done = (err: string | null | void, ok: string) => { if (typeof err === 'string' && err) ui.toast(err, 'bad'); else { ui.toast(ok, 'good'); ui.sound('station', { x: s.x, z: s.z, pitch: 1.1 }); } after(); };
+  if (!links.length && !near.length) return null;
+  return h('div', null,
+    section('Transfer complex', links.length ? `${links.length + 1} stations` : null),
+    links.length ? h('div', { class: 'list' }, links.map((o) => h('div', { class: 'row' },
+      h('span', { class: 'inline' }, icon(kindIcon(o), 15), ui.stationLink(o.id)), h('span', { class: 'muted' }, dist(o)),
+      h('button', { class: 'btn sm', 'data-tip': 'Passengers no longer change here', onclick: () => { api.unlink?.(s.id, o.id); done(null, `${o.name} unlinked`); } }, 'Unlink')))) : null,
+    near.length ? h('div', { class: 'list' }, near.map((o) => {
+      const why = api.canMerge!(s.id, o.id);
+      const stop = !o.rail;
+      return h('div', { class: 'row' },
+        h('span', { class: 'inline' }, icon(kindIcon(o), 15), ui.stationLink(o.id)), h('span', { class: 'muted' }, dist(o)),
+        h('button', { class: 'btn sm', disabled: !!why, 'data-tip': why ?? (stop ? 'Make its stops part of this station' : 'Passengers may change between the two stations'), onclick: () => {
+          done(stop || !s.rail ? api.merge?.(s.rail ? s.id : o.id, s.rail ? o.id : s.id) : api.link?.(s.id, o.id), stop ? `${o.name} merged into ${s.name}` : `${o.name} linked for transfers`);
+        } }, stop || !s.rail ? 'Merge' : 'Link'));
+    })) : null);
+}
+
+/** Owner, access status (with "Request access") and how the upkeep would be shared, for another company's item. */
+function accessRows(ui: UI, owner: number, upkeepYear: number, after: () => void): HTMLElement {
+  const g = ui.game;
+  const st = accessState(g, owner);
+  const m = g.accessMultiplier(owner);
+  return h('div', null,
+    ui.kv('Owner', h('span', { class: 'inline' }, ui.ownerTag(owner), h('button', { class: 'ibtn sm', 'data-tip': 'Track access', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 15)))),
+    ui.kv('Track access', h('span', { class: 'inline' }, h('span', { class: st.kind === 'agreement' ? 'pos' : st.kind === 'blocked' || st.kind === 'closed' ? 'neg' : 'muted' }, st.kind === 'agreement' ? 'Agreement' : st.kind === 'pending' ? 'Request pending' : st.kind === 'blocked' ? 'Blocked' : st.kind === 'closed' ? 'Refused' : policyText(g, owner)),
+      st.kind === 'agreement' ? null : accessControl(ui, owner, after))),
+    ui.kv('Upkeep', h('span', { 'data-tip': `Shared by usage: the owner's traffic counts once, users' ${fmtMult(m)}; at 50/50 usage users pay ${fmtPct(equalUseShare(m))}` }, `${fmtMoney(upkeepYear)}/yr · users pay ${fmtMult(m)}`)),
+    st.kind === 'agreement' ? h('div', { class: 'muted', style: 'margin-top:4px' }, st.text) : null);
 }
 
 // ------------------------------------------------------------------ track / road info
@@ -126,7 +217,10 @@ export function openEdge(ui: UI, id: number) {
         tile(straight ? '—' : `${Math.round(geo.minRadius * 10)} m`, 'Min. radius'),
         tile(fmtPct(grade, 1), 'Max. grade')),
       sec ? ui.kv('Structures', sec) : null,
+      ed.tram ? ui.kv('Tram tracks', ed.tramOwner !== undefined && ed.tramOwner >= 0 ? g.company(ed.tramOwner).name : 'yes') : null,
       ed.station >= 0 ? ui.kv('Station', ui.stationLink(ed.station)) : null,
+      rail && ed.owner >= 0 && ed.owner !== PLAYER ? accessRows(ui, ed.owner, g.edgeMaintenance(ed), () => { win.last = undefined; render(); }) : null,
+      !rail && ed.tram && (ed.tramOwner ?? -1) >= 0 && ed.tramOwner !== PLAYER ? accessRows(ui, ed.tramOwner!, ed.len * TRAM.maintPerUnit, () => { win.last = undefined; render(); }) : null,
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => { const p = { x: 0, y: 0, z: 0 }; g.world.net.pointAt(ed, ed.len / 2, p); ui.centerOn(p.x, p.z); } }, icon('target', 16), 'Center')),
     );
   };
@@ -149,8 +243,8 @@ export function openVehicle(ui: UI, id: number) {
   const g = ui.game;
   const v = g.vehicles.get(id);
   if (!v) return;
-  const rail = v.kind === 'train';
-  const win = ui.wm.open('veh-' + id, v.name, { width: 380, icon: rail ? 'train' : 'bus', color: g.company(v.owner).color });
+  const vk = vehicleKind(v);
+  const win = ui.wm.open('veh-' + id, v.name, { width: 380, icon: KIND_META[vk].icon, color: g.company(v.owner).color });
   const render = () => {
     const v2 = g.vehicles.get(id);
     if (!v2) { win.close(); return; }
@@ -158,7 +252,7 @@ export function openVehicle(ui: UI, id: number) {
     win.sub.textContent = vehicleDesc(v2) + (v2 instanceof Train ? ` · ${Math.round(v2.length * 10)} m` : '');
     clear(win.body);
     const mine = v2.owner === PLAYER;
-    const kind = rail ? 'rail' : 'road';
+    const kind = vk;
     let lineEl: Node;
     if (mine) {
       const sel = h('select', { class: 'select', 'aria-label': 'Line' }, h('option', { value: '' }, '— no line —'),
@@ -208,7 +302,7 @@ function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: strin
     return { cars: [loco, ...Array<VehicleModel>(n).fill(w)], label: `${loco.name} + ${n}× ${w.name}` };
   }
   const rv = v as RoadVehicle;
-  const buses = availableModels(year, 'bus');
+  const buses = availableModels(year, rv.model?.kind === 'tram' ? 'tram' : 'bus');
   const best = buses[buses.length - 1];
   if (!rv.model || !best || best.id === rv.model.id || best.intro <= rv.model.intro) return null;
   return { cars: [best], label: best.name };
@@ -218,7 +312,7 @@ function upgradeVehicle(ui: UI, v: Vehicle) {
   const g = ui.game;
   const opt = upgradeOption(ui, v);
   if (!opt) return;
-  const kind = v.kind === 'train' ? 'rail' : 'road';
+  const kind = vehicleKind(v);
   const cur = (v as Train | RoadVehicle).depotId;
   const dId = g.depots.get(cur) ? cur : findDepot(ui, kind, v.line);
   if (dId == null) { ui.toast('No depot available for the replacement', 'bad'); return; }
@@ -238,8 +332,8 @@ export function openDepot(ui: UI, depotId: number) {
   const g = ui.game;
   const dp = g.depots.get(depotId);
   if (!dp) return;
-  if (dp.owner === PLAYER) { openPurchase(ui, dp.kind, depotId, null); return; }
-  const win = ui.wm.open('depot-' + depotId, dp.kind === 'rail' ? 'Train depot' : 'Bus depot', { width: 340, icon: dp.kind === 'rail' ? 'depot' : 'garage', color: g.company(dp.owner).color, sub: g.company(dp.owner).name });
+  if (dp.owner === PLAYER) { openPurchase(ui, dp.kind as LineKind, depotId, null); return; }
+  const win = ui.wm.open('depot-' + depotId, depotTitle(dp.kind), { width: 340, icon: depotIcon(dp.kind), color: g.company(dp.owner).color, sub: g.company(dp.owner).name });
   const here = g.vehicles.all().filter((v) => (v as Train | RoadVehicle).depotId === depotId);
   add(win.body, 
     h('div', { class: 'tiles' }, tile(String(here.length), 'Vehicles')),
@@ -248,13 +342,14 @@ export function openDepot(ui: UI, depotId: number) {
 }
 
 /** Purchase dialog / train composer. If depotId is null a suitable depot for the line is chosen. */
-export function openPurchase(ui: UI, kind: 'rail' | 'road', depotId: number | null, lineId: number | null) {
+export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lineId: number | null) {
   const g = ui.game;
   const year = g.year;
   const rail = kind === 'rail';
-  const win = ui.wm.open('buy-' + kind + '-' + (depotId ?? 'line'), rail ? 'Train composer' : 'Buy bus', { width: 470, icon: rail ? 'train' : 'bus', color: rail ? 'var(--rail)' : 'var(--road)', sub: depotId != null ? (rail ? 'Train depot' : 'Bus depot') : 'For a line' });
-  const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon'), buses = availableModels(year, 'bus');
-  const state = { loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: wagons[wagons.length - 1]?.id ?? '', count: 4, bus: buses[buses.length - 1]?.id ?? '', line: lineId };
+  const meta = KIND_META[kind];
+  const win = ui.wm.open('buy-' + kind + '-' + (depotId ?? 'line'), rail ? 'Train composer' : `Buy ${meta.vehicle}`, { width: 470, icon: meta.icon, color: meta.color, sub: depotId != null ? depotTitle(kind) : 'For a line' });
+  const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon'), buses = availableModels(year, kind === 'tram' ? 'tram' : 'bus');
+  const state = { loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: wagons[wagons.length - 1]?.id ?? '', count: 2, bus: buses[buses.length - 1]?.id ?? '', line: lineId };
   const render = () => {
     clear(win.body);
     const modelRow = (m: VehicleModel, selected: boolean, onSel: () => void) =>
@@ -275,8 +370,15 @@ export function openPurchase(ui: UI, kind: 'rail' | 'road', depotId: number | nu
         h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Locomotives'), stepper(String(state.locoN), () => { state.locoN = Math.max(1, state.locoN - 1); render(); }, () => { state.locoN = Math.min(2, state.locoN + 1); render(); })),
         h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Coaches'), stepper(String(state.count), () => { state.count = Math.max(1, state.count - 1); render(); }, () => { state.count = Math.min(14, state.count + 1); render(); }))));
     } else {
-      add(win.body, section('Model'));
-      for (const m of buses) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      // long-distance coaches (faster, more seats, for intercity lines on country roads) listed apart from city buses
+      const isCoach = (m: VehicleModel) => kind === 'road' && /coach/.test(m.style ?? '');
+      const city = buses.filter((m) => !isCoach(m)), coaches = buses.filter(isCoach);
+      add(win.body, section(coaches.length ? 'City buses' : 'Model'));
+      for (const m of city) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      if (coaches.length) {
+        add(win.body, section('Long-distance coaches', 'intercity lines'));
+        for (const m of coaches) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      }
     }
     const loco = MODEL_BY_ID.get(state.loco), wagon = MODEL_BY_ID.get(state.wagon), bus = MODEL_BY_ID.get(state.bus);
     const cars: VehicleModel[] = rail
@@ -296,7 +398,7 @@ export function openPurchase(ui: UI, kind: 'rail' | 'road', depotId: number | nu
     if (rail && line) {
       let minName = '';
       for (const sid of line.stops) { const st = g.stations.get(sid); if (st?.rail && st.rail.length < minP) { minP = st.rail.length; minName = st.name; } }
-      if (isFinite(minP) && len > minP) warn = `The train (${Math.round(len * 10)} m) is longer than the platforms at ${minName} (${Math.round(minP * 10)} m).`;
+      if (isFinite(minP) && len > minP) warn = `The train (${Math.round(len * 10)} m) is longer than the platforms at ${minName} (${Math.round(minP * 10)} m) — use fewer coaches.`;
     }
     // composition strip
     const strip = rail && cars.length ? h('div', { class: 'consist', title: 'Composition' }, cars.map((c) => h('span', { class: 'car' + (c.kind === 'loco' ? ' loco' : ''), style: `flex:${c.length};--c:${hex(c.color)}` }))) : null;
@@ -340,9 +442,9 @@ export function openPurchase(ui: UI, kind: 'rail' | 'road', depotId: number | nu
   render();
 }
 
-export function findDepot(ui: UI, kind: 'rail' | 'road', line: Line | null | undefined): number | null {
+export function findDepot(ui: UI, kind: LineKind, line: Line | null | undefined): number | null {
   const g = ui.game;
-  const depots = g.depots.all().filter((d) => d.kind === kind && d.owner === PLAYER);
+  const depots = g.depots.all().filter((d) => (d.kind as string) === kind && d.owner === PLAYER);
   if (!depots.length) return null;
   if (!line || !line.stops.length) return depots[0].id;
   const st = g.stations.get(line.stops[0]);

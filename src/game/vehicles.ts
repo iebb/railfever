@@ -345,14 +345,19 @@ export class Vehicles {
     return t;
   }
 
+  /** Buy a bus (at a road depot) or a tram (model.kind 'tram', at a tram depot). */
   buyRoad(depotId: number, model: VehicleModel, lineId: number | null): RoadVehicle | string {
     const g = this.game;
     const dp = g.depots.get(depotId);
-    if (!dp || dp.kind !== 'road') return 'Invalid depot';
+    const tram = model.kind === 'tram';
+    if (!dp || dp.kind !== (tram ? 'tram' : 'road')) return tram ? 'Trams are bought at a tram depot' : 'Invalid depot';
+    const line = lineId != null ? g.lines.get(lineId) : undefined;
+    if (line && line.kind !== (tram ? 'tram' : 'road')) return tram ? 'Not a tram line' : 'Not a bus line';
     if (!g.company(dp.owner).economy.spend(model.cost, 'vehicles')) return 'Not enough money';
     const v = new RoadVehicle(g, this.nextId++, model, depotId, false);
     v.owner = dp.owner;
-    v.name = (dp.owner === 0 ? 'Bus ' : g.company(dp.owner).name.split(' ')[0] + ' Bus ') + v.id;
+    const word = tram ? 'Tram ' : 'Bus ';
+    v.name = (dp.owner === 0 ? word : g.company(dp.owner).name.split(' ')[0] + ' ' + word) + v.id;
     this.map.set(v.id, v);
     if (lineId != null) v.setLine(lineId);
     return v;

@@ -5,6 +5,8 @@ import { OBJ_CHUNK } from '../game/world';
 import type { WB } from './build-mesh';
 import type { FacadeBuilder } from './build-buildings';
 import type { TreeInstance } from './trees';
+import type { RailPart } from '../game/stations';
+import { stationLayout } from '../game/stations';
 
 /**
  * One object chunk being built: bounds plus the builders/collectors objects add into.
@@ -30,6 +32,78 @@ export interface ChunkCtx {
   /** level crossing warning lights */
   xLights: XLight[];
   trees: TreeInstance[];
+  /** platform edges of underground / elevated stations (their tunnels / viaducts are the station's) */
+  stationEdges?: Map<number, StationLevel>;
+}
+
+/** Level of a rail station: on the ground, on a viaduct, or underground. */
+export type StationLevel = 'ground' | 'elevated' | 'underground';
+/** Station entrance on the surface (underground: pavilion with stairs; elevated: stair / lift tower). */
+export interface StationEntrance { x: number; z: number; angle: number }
+/** RailPart with the (optional) level fields of underground / elevated stations. */
+export type RailPartX = RailPart & {
+  level?: StationLevel; underground?: boolean; depth?: number; height?: number;
+  entrances?: StationEntrance[];
+  /** pier footprints chosen by the game (elevated), if any */
+  piers?: { x: number; z: number }[];
+};
+
+export function stationLevelOf(r: RailPart): StationLevel {
+  const x = r as RailPartX;
+  return x.level ?? (x.underground ? 'underground' : 'ground');
+}
+
+/** Ground station building (beside the tracks, entrance facing away) and the forecourt in front of it. */
+export interface StationFrame {
+  bx: number; bz: number;
+  /** entrance direction (away from the tracks) */
+  ex: number; ez: number;
+  /** building length (along the tracks) and depth */
+  BL: number; BD: number;
+  /** forecourt centre and size (across the entrance, outwards) */
+  cx: number; cz: number; cw: number; cd: number;
+}
+
+export function stationFrame(r: RailPart): StationFrame {
+  const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
+  const b = r.building;
+  const bfx = Math.sin(b.angle), bfz = Math.cos(b.angle), brx = bfz, brz = -bfx;
+  const extAlong = Math.abs(brx * fx + brz * fz) * b.w + Math.abs(bfx * fx + bfz * fz) * b.d;
+  const extAcross = Math.abs(brx * rx + brz * rz) * b.w + Math.abs(bfx * rx + bfz * rz) * b.d;
+  const BL = Math.max(extAlong, extAcross), BD = Math.max(0.7, Math.min(extAlong, extAcross));
+  const side = ((b.x - r.x) * rx + (b.z - r.z) * rz) >= 0 ? 1 : -1;
+  const width = stationLayout(r.tracks).width;
+  const along = (b.x - r.x) * fx + (b.z - r.z) * fz;
+  const off = side * (width / 2 + BD / 2 + 0.15);
+  const bx = r.x + rx * off + fx * along, bz = r.z + rz * off + fz * along;
+  const ex = rx * side, ez = rz * side;
+  const cd = 0.7;
+  return { bx, bz, ex, ez, BL, BD, cx: bx + ex * (BD / 2 + cd / 2), cz: bz + ez * (BD / 2 + cd / 2), cw: BL + 0.4, cd };
+}
+
+/** Is (x,z) on (or within `margin` of) the forecourt of a ground station? (access streets end there) */
+export function onStationForecourt(game: Game, x: number, z: number, margin: number): boolean {
+  for (const st of game.stations.map.values()) {
+    const r = st.rail;
+    if (!r || stationLevelOf(r) !== 'ground') continue;
+    if (Math.abs(r.x - x) > r.length + 6 || Math.abs(r.z - z) > r.length + 6) continue;
+    const f = stationFrame(r);
+    const dx = x - f.cx, dz = z - f.cz;
+    const a = dx * f.ez - dz * f.ex, b = dx * f.ex + dz * f.ez; // across, outwards
+    if (Math.abs(a) <= f.cw / 2 + margin && Math.abs(b) <= f.cd / 2 + margin) return true;
+  }
+  return false;
+}
+
+/** Platform edges of the game's underground and elevated stations. */
+export function stationEdgeLevels(game: Game): Map<number, StationLevel> {
+  const out = new Map<number, StationLevel>();
+  for (const st of game.stations.map.values()) {
+    if (!st.rail) continue;
+    const lv = stationLevelOf(st.rail);
+    if (lv !== 'ground') for (const id of st.rail.edges) out.set(id, lv);
+  }
+  return out;
 }
 
 export interface SignalLamp { x: number; y: number; z: number; edge: number }
@@ -128,9 +202,14 @@ export function edgeRuns(ctx: ChunkCtx, e: NEdge, sa: number, sb: number, mitreA
   if (sb - sa < 1e-4) return [];
   const idx = simplifiedIndices(g);
   const list: Smp[] = [];
-  list.push(sampleAt(g, sa));
-  for (const i of idx) { const s = g.cum[i]; if (s > sa + 0.02 && s < sb - 0.02) list.push(smpOf(g, i)); }
-  list.push(sampleAt(g, sb));
+  const first = sampleAt(g, sa), last = sampleAt(g, sb);
+  // a mitred end moves offset points along the track: keep inner samples clear of it (no folded strips)
+  const shift = (m: { x: number; z: number }, p: Smp) => Math.abs((m.x - p.lx) * p.tx + (m.z - p.lz) * p.tz);
+  const exA = 0.02 + (mitreA && sa <= 1e-6 ? 1.2 * shift(mitreA, first) : 0);
+  const exB = 0.02 + (mitreB && sb >= e.len - 1e-6 ? 1.2 * shift(mitreB, last) : 0);
+  list.push(first);
+  for (const i of idx) { const s = g.cum[i]; if (s > sa + exA && s < sb - exB) list.push(smpOf(g, i)); }
+  list.push(last);
   if (mitreA && sa <= 1e-6) { list[0].lx = mitreA.x; list[0].lz = mitreA.z; }
   if (mitreB && sb >= e.len - 1e-6) { const l = list[list.length - 1]; l.lx = mitreB.x; l.lz = mitreB.z; }
   const runs: Smp[][] = [];

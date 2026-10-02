@@ -64,7 +64,8 @@ export function buildRailEdge(ctx: ChunkCtx, e: NEdge) {
     if (part.type === 'tunnel') continue;
     const runs = edgeRuns(ctx, e, part.s0, part.s1, ma, mb);
     for (const run of runs) trackRun(ctx, e, run, part.type === 'bridge');
-    if (part.type === 'bridge') buildBridge(ctx, e, part.s0, part.s1, runs);
+    // elevated station platforms sit on the station's own viaduct
+    if (part.type === 'bridge' && ctx.stationEdges?.get(e.id) !== 'elevated') buildBridge(ctx, e, part.s0, part.s1, runs);
   }
   buildPortals(ctx, e);
   if ((TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified) buildCatenary(ctx, e);

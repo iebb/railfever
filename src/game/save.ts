@@ -4,6 +4,7 @@ import { World, Building, Tree } from './world';
 import type { NNode, NEdge, Crossing, Section } from './network';
 import type { Town } from './towns';
 import type { Station, WaitGroup } from './stations';
+import { restoreStation } from './stations';
 import type { Depot } from './build-ops';
 import { Lines, Line } from './lines';
 import { Economy, Company } from './economy';
@@ -93,7 +94,7 @@ function roadOf(v: RoadVehicle) {
     seg: v.seg ? rsegD(v.seg) : null, pos: v.pos, trail: v.trail.map(rsegD), ahead: v.ahead.map(rsegD),
     route: v.route.map((r) => [r.edge, r.dir]), speed: v.speed, loadTimer: v.loadTimer, retryTimer: v.retryTimer,
     junctionWait: v.junctionWait, stuck: v.stuck, ttl: v.ttl, rng: v.rng.state, style: v.style, tint: v.tint, cruise: v.cruise,
-    grade: v.grade, gradeTimer: v.gradeTimer,
+    grade: v.grade, gradeTimer: v.gradeTimer, retryWait: v.retryWait,
   };
 }
 
@@ -207,7 +208,8 @@ export function deserialize(d: any): Game {
     return town;
   });
   for (const s of d.stations as any[]) {
-    const st: Station = { ...s, rail: s.rail ? { ...s.rail, edges: [...s.rail.edges] } : null, stops: s.stops.map((p: any) => ({ ...p })), waiting: new Map() };
+    // station fields (levels, entrances, transfer links, road access) with defaults for older saves
+    const st: Station = restoreStation(s);
     st.waitingTotal = 0;
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count);
     g.stations.map.set(st.id, st);
@@ -249,7 +251,7 @@ export function deserialize(d: any): Game {
     restoreBase(r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
-    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0;
+    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2;
     const seg = rseg(vd.seg);
     if (seg) {
       r.seg = seg; r.pos = vd.pos;
@@ -302,7 +304,7 @@ export function deserialize(d: any): Game {
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.lines.rebuild();
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
-  g.lines.catchmentDirty = false;
+  g.lines.catchmentDirty = !!d.catchmentDirty;
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   g.restoreAIs(d);
   if (!d.ambient) V.manageAmbient();

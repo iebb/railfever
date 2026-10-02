@@ -4,7 +4,7 @@
 // npx esbuild scripts/smoke.ts --bundle --platform=node --format=esm --outfile=$S/smoke.mjs && node $S/smoke.mjs [seed]
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { sitePop, removeEdges } from '../src/game/ai';
+import { sitePop, removeEdges } from '../src/game/routing';
 import { CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
 import { roadDepotReaches } from '../src/game/roadvehicle';
 import {
@@ -246,7 +246,7 @@ check(dTrains.length === 2, 'two trains on the double track');
 
 // ------------------------------------------------------------------ 6. bus line in the biggest town
 const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
-const sites = busStopSites(g, big, 0, 12, 30);
+const sites = busStopSites(g, big, 0, 25, 60);
 let bus: RoadVehicle | null = null;
 if (sites.length === 2) {
   const s0 = addBusStop(g, sites[0][0], sites[0][1], 0), s1 = addBusStop(g, sites[1][0], sites[1][1], 0);
