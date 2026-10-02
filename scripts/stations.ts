@@ -271,7 +271,7 @@ let saveGame: Game | null = null;
   let err: string | null = 'busy';
   for (let i = 0; i < 8 * 120 && err === 'busy'; i++) { err = commitStationUpgrade(g, up); if (err === 'busy') g.update(0.25); }
   check(!err && A.rail!.tracks === 4 && Math.abs(A.rail!.length - 12) < 0.3 && A.rail!.edges.length === 4 && g.stations.get(A.id) === A, `rebuilt in place (${err ?? 'ok'}), same station`);
-  const r1 = runTrains(g, [t], 160);
+  const r1 = runTrains(g, [t], 240);
   const arrA = (r1.arrivals.get(t.id) ?? []).filter((s) => s === A.id).length;
   console.log(`  line before: ${(r0.arrivals.get(t.id) ?? []).length} stops / 120 days; after the rebuild: ${arrA} at ${A.name}, worst wait ${r1.worst.days} days`);
   check(arrA >= 2, 'the line keeps working through the rebuilt station');

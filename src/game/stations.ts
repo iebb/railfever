@@ -5,12 +5,12 @@ import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
-import { applyEarthworks } from './terraform';
+import { applyEarthworks, repairFormations } from './terraform';
 import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
-import { growThroat, throatFree } from './trackops';
+import { growThroat, throatFree, holdThroat, releaseHold } from './trackops';
 import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
@@ -1244,10 +1244,12 @@ export class Stations {
       // street level: pads under the entrances (and piers); trees under an elevated deck are cleared
       for (const f of this.footprints(st)) {
         if (f.part === 'deck') { w.removeTreesNear(f.x, f.z, Math.hypot(f.w, f.d) / 2 + 0.3); continue; }
-        if (f.part === 'entrance') this.padGround(f);
+        if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
         w.removeTreesNear(f.x, f.z, Math.hypot(f.w, f.d) / 2 + 0.4);
       }
     }
+    // the levelled site may have reshaped the ground under track and roads beside it: their formations again
+    this.repairSite(st);
     w.markObjArea(plan.x - L - 30, plan.z - L - 30, plan.x + L + 30, plan.z + L + 30);
     this.markStation(st);
   }
@@ -1270,6 +1272,13 @@ export class Stations {
       const wgt = d <= 0 ? 1 : Math.max(0, 1 - d / 1.2);
       if (wgt > 0) w.setVertex(x, z, w.h[k] + (target - w.h[k]) * wgt);
     }
+  }
+
+  /** Re-grade the formations of track and roads around a station site (after levelling or removing it). */
+  private repairSite(st: Station | { x: number; z: number; rail: { length: number; width?: number } | null }) {
+    const r = st.rail;
+    const R = (r ? r.length / 2 + (r.width ?? 2) : 4) + 8;
+    repairFormations(this.game.world, st.x - R, st.z - R, st.x + R, st.z + R);
   }
 
   private levelGround(plan: StationPlan) {
@@ -1299,10 +1308,12 @@ export class Stations {
     const st = this.map.get(id);
     if (!st) return null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) if (g.vehicles.isEdgeBusy(eid)) return 'Train in the station';
+    const site = st.rail ? { x: st.x, z: st.z, rail: { length: st.rail.length, width: railWidth(st.rail) } } : null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) g.world.net.removeEdge(eid);
     this.markStation(st);
     st.rail = null;
     this.deleteStation(id);
+    if (site) this.repairSite(site);
     g.onNetworkChanged();
     g.lines.rebuild();
     return null;
@@ -2274,7 +2285,20 @@ export class Stations {
     // new tracks get a turnout ladder at connected ends: the line track there must be free of trains (crossovers
     // in the ladder's way are laid again further out, where the track is free)
     const added = up.tracks + up.through - (r.tracks + (r.through ?? 0));
-    if (added > 0) for (const end of ['front', 'back'] as const) if (!throatFree(g, st.id, end, st.owner, added)) return 'busy';
+    if (added > 0) {
+      let free = true;
+      for (const end of ['front', 'back'] as const) if (!throatFree(g, st.id, end, st.owner, added)) free = false;
+      if (!free) {
+        // a possession: trains no longer enter the works area (held for up to 30 days) while those in it leave
+        if (!this.holds.has(st.id)) {
+          const edges = (['front', 'back'] as const).flatMap((end) => holdThroat(g, st.id, end, st.owner, added));
+          if (edges.length) this.holds.set(st.id, { edges, until: g.day + 30 });
+        }
+        return 'busy';
+      }
+    }
+    const hold = this.holds.get(st.id);
+    if (hold) { releaseHold(g, hold.edges); this.holds.delete(st.id); }
     const co = g.company(st.owner);
     if (!co.economy.canAfford(up.cost)) return 'Not enough money';
     co.economy.spend(up.cost - (up.plan.access?.cost ?? 0), 'construction');
@@ -2366,12 +2390,16 @@ export class Stations {
     return out.sort((p, q) => p.lat - q.lat).map((q) => q.ids);
   }
 
+  /** Station works waiting for a free throat: track held so no train enters (see commitUpgrade). Not saved. */
+  private holds = new Map<number, { edges: number[]; until: number }>();
+
   /**
    * Daily platform sampling for the capacity figures (game.ts, once a day): occupied platform tracks, trains
    * calling and passing (each train counted once per visit), as rolling means over about a month.
    */
   daily() {
     const g = this.game, V = g.vehicles, K = 1 / 30;
+    for (const [sid, h] of [...this.holds]) if (g.day >= h.until || !this.map.has(sid)) { releaseHold(g, h.edges); this.holds.delete(sid); }
     for (const st of this.map.values()) {
       if (!st.rail) continue;
       const groups = this.trackGroups(st);
@@ -2456,7 +2484,8 @@ export class Stations {
     r.cost = Math.round((r.cost ?? 0) * 0.7 + plan.cost);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     if (plan.level === 'ground') this.levelGround(plan);
-    else for (const f of this.footprints(st)) if (f.part === 'entrance') this.padGround(f);
+    else for (const f of this.footprints(st)) if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
+    this.repairSite(st);
     this.markStation(st);
     this.accessVersion = -1;
     g.lines.catchmentDirty = true;
