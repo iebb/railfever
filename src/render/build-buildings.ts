@@ -7,6 +7,7 @@ import { FLOOR_H, BUILDING_TYPES, BT_HOUSE_S, BT_HOUSE_L, BT_TOWNHOUSE, BT_SHOP,
 import { WB } from './build-mesh';
 import { FC, WC, WSCALE, FACADE_CELL0 } from './textures';
 import type { ChunkCtx } from './build-common';
+import { EARTHWORK_TINT } from './build-common';
 import { buildPark, buildPlaza, BT_PARK, BT_PLAZA } from './build-landuse';
 
 /** Width of one window bay on facades (units). */
@@ -317,6 +318,61 @@ function emitFar(w: World, b: Building, F: WB, parts: FarPart[]) {
   }
 }
 
+/**
+ * The base a building stands on, down to the lowest ground under it. Short: a dark stone base band. Tall (a
+ * sloping lot): a dressed-stone terrace wall with a coping round a lawn, wider on the downhill sides, and steps
+ * from the front door down to the ground - never a bare block.
+ */
+function plinth(w: World, b: Building, W: WB, base: number, lo: number) {
+  const fx = Math.sin(b.angle), fz = Math.cos(b.angle), rx = fz, rz = -fx;
+  const hw = b.w / 2, hd = b.d / 2;
+  const h = base + 0.04 - (lo + 0.06);
+  if (h <= 0.16) {
+    W.use(WC.STONE, 0x6f675e, 1);
+    W.tbox(b.x, lo, b.z, b.w + 0.03, base + 0.04 - lo, b.d + 0.03, fx, fz, WSCALE.STONE, false, false);
+    return;
+  }
+  // how far the ground falls away beside each side (front, back, right, left)
+  const drop = (ax: number, az: number) => base - w.heightAt(b.x + ax, b.z + az);
+  const dF = drop(fx * (hd + 0.3), fz * (hd + 0.3)), dB = drop(-fx * (hd + 0.3), -fz * (hd + 0.3));
+  const dR = drop(rx * (hw + 0.3), rz * (hw + 0.3)), dL = drop(-rx * (hw + 0.3), -rz * (hw + 0.3));
+  const ext = (d: number) => (d > 0.12 ? 0.2 : 0.03);
+  const eF = ext(dF), eB = ext(dB), eR = ext(dR), eL = ext(dL);
+  const TW = b.w + eR + eL, TD = b.d + eF + eB;
+  const tcx = b.x + rx * (eR - eL) / 2 + fx * (eF - eB) / 2, tcz = b.z + rz * (eR - eL) / 2 + fz * (eF - eB) / 2;
+  // terrace wall (dressed stone), lawn on top, coping round the edge
+  W.use(WC.STONE, 0xb3a894, 1);
+  W.tbox(tcx, lo, tcz, TW, base - lo, TD, fx, fz, WSCALE.STONE, false, false);
+  const P = (a: number, c: number): [number, number] => [tcx + rx * a + fx * c, tcz + rz * a + fz * c];
+  const gs = WSCALE.GRASS;
+  W.use(WC.GRASS, EARTHWORK_TINT, 0);
+  {
+    const p0 = P(-TW / 2, -TD / 2), p1 = P(TW / 2, -TD / 2), p2 = P(TW / 2, TD / 2), p3 = P(-TW / 2, TD / 2), yy = base + 0.002;
+    W.ttri(p0[0], yy, p0[1], p0[0] / gs, p0[1] / gs, p1[0], yy, p1[1], p1[0] / gs, p1[1] / gs, p2[0], yy, p2[1], p2[0] / gs, p2[1] / gs, 0, 1, 0);
+    W.ttri(p0[0], yy, p0[1], p0[0] / gs, p0[1] / gs, p2[0], yy, p2[1], p2[0] / gs, p2[1] / gs, p3[0], yy, p3[1], p3[0] / gs, p3[1] / gs, 0, 1, 0);
+  }
+  W.use(WC.STONE, 0x8d8475, 1);
+  for (const [a, c, ww, dd] of [[0, TD / 2 - 0.025, TW + 0.02, 0.05], [0, -TD / 2 + 0.025, TW + 0.02, 0.05], [TW / 2 - 0.025, 0, 0.05, TD], [-TW / 2 + 0.025, 0, 0.05, TD]] as [number, number, number, number][]) {
+    const [x, z] = P(a, c);
+    W.box(x, base - 0.01, z, ww, 0.04, dd, fx, fz);
+  }
+  // the building's own base band
+  W.use(WC.STONE, 0x6f675e, 1);
+  W.tbox(b.x, base - 0.01, b.z, b.w + 0.03, 0.05, b.d + 0.03, fx, fz, WSCALE.STONE, false, false);
+  // steps from the front door down to the ground in front
+  if (dF > 0.12) {
+    const n = Math.max(2, Math.min(8, Math.round(dF / 0.06)));
+    const run = Math.min(0.32, n * 0.05), dep = run / n;
+    const g = base - dF;
+    W.use(WC.STONE, 0xa39886, 1);
+    for (let k = 0; k < n; k++) {
+      const top = base - ((k + 1) * dF) / (n + 1);
+      const [x, z] = [b.x + fx * (hd + eF + (k + 0.5) * dep), b.z + fz * (hd + eF + (k + 0.5) * dep)];
+      W.tbox(x, g - 0.05, z, 0.24, top - (g - 0.05), dep, fx, fz, WSCALE.STONE, false, true);
+    }
+  }
+}
+
 function buildNear(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, parts?: FarPart[]) {
   const r = new RNG(b.seed);
   const fx = Math.sin(b.angle), fz = Math.cos(b.angle);
@@ -325,9 +381,8 @@ function buildNear(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, par
   const lo = lowestUnder(w, b.x, b.z, b.angle, b.w, b.d) - 0.06;
   const seed = b.seed;
   const cx = b.x, cz = b.z;
-  // plinth down to the lowest terrain
-  W.use(WC.STONE, 0xa59d90, 1);
-  W.tbox(cx, lo, cz, b.w + 0.03, base + 0.04 - lo, b.d + 0.03, fx, fz, WSCALE.STONE, false, false);
+  // the base: a dark stone band where the lot is nearly level, a terrace on a sloping lot
+  plinth(w, b, W, base, lo);
   const y = base + 0.04;
   const Wd = b.w, D = b.d;
   const slate = () => r.pick(ROOFS_SLATE);

@@ -4,6 +4,7 @@ import { ROAD_TYPES, RAIL, LANE_OFFSET } from '../game/constants';
 import type { Network, NEdge, NNode, Crossing } from '../game/network';
 import type { Station } from '../game/stations';
 import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP, onStationForecourt, EARTHWORK_TINT } from './build-common';
+import { buildRetainingWalls } from './build-walls';
 import type { WB } from './build-mesh';
 import { WC, WSCALE, STRIP_PERIOD, TRAM_BED_HALF, TRAM_BED_PERIOD } from './textures';
 import { distToRect } from '../game/world';
@@ -260,6 +261,7 @@ export function buildRoadEdge(ctx: ChunkCtx, e: NEdge) {
     }
   }
   buildPortals(ctx, e);
+  buildRetainingWalls(ctx, e);
 }
 
 /** Running-surface height of a ground-section road at arc length s / point (x,z): the drape, blended near structures. */

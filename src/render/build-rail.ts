@@ -7,6 +7,7 @@ import type { WB } from './build-mesh';
 import { hash2 } from '../game/rng';
 import { WC, WSCALE, BALLAST_PERIOD } from './textures';
 import { buildBridge, buildPortals, parallelSides } from './build-structures';
+import { buildRetainingWalls } from './build-walls';
 
 /** Height of the rail head above the edge profile (`prof` = top of ballast/sleepers). */
 export const RAIL_TOP_Y = RAIL.railTop - RAIL.bedHeight;
@@ -117,6 +118,7 @@ export function buildRailEdge(ctx: ChunkCtx, e: NEdge) {
     if (part.type === 'bridge' && ctx.stationEdges?.get(e.id) !== 'elevated') buildBridge(ctx, e, part.s0, part.s1, runs);
   }
   buildPortals(ctx, e);
+  buildRetainingWalls(ctx, e);
   if ((TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified) buildCatenary(ctx, e);
 }
 
