@@ -5,11 +5,11 @@ import { toggleSignal } from '../src/game/build-ops';
 import { finishDoubleTrack } from '../src/game/trackops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
-import { Train, CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
+import { Train, CROSS_BASE, findRailRoute, railNext, depotReaches } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import {
-  findStationSite, stationEnds, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotNearLine, buildRoadDepot, findRailPair,
-  routeGen, runGen, removeEdges,
+  findStationSite, stationEnds, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotNearLine, buildDepotOnLine, buildRoadDepot, findRailPair,
+  routeGen, runGen, removeEdges, sitePop,
 } from '../src/game/routing';
 
 export const fails: string[] = [];
@@ -87,12 +87,57 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
 
 /** Rail depot for a station: stub behind a free back end, else a siding off the line towards `toward`. */
 export function depotBehind(g: Game, st: Station, toward: Station, owner = 0): number {
-  const dir = { x: toward.x - st.x, z: toward.z - st.z };
-  const id = buildRailDepot(g, st, owner, dir);
-  if (id >= 0) return id;
-  // a siding off the company's line nearest the station
-  const ids = [...g.world.net.edges.values()].filter((e) => e.kind === 'rail' && e.owner === owner).map((e) => e.id);
-  return buildDepotNearLine(g, ids, st.x, st.z, owner);
+  const net = g.world.net;
+  // a depot trains can leave for a station of the line (they turn there for the other; a siding off a one-way
+  // track may face the wrong way, into a dead end)
+  const serves = (id: number) => { const dp = g.depots.get(id); return !!dp && (depotReaches(g, dp, st.id) || depotReaches(g, dp, toward.id)); };
+  const drop = (id: number) => {
+    const dp = g.depots.get(id);
+    if (!dp) return;
+    let node = dp.node;
+    g.depots.remove(id);
+    // and the dead-end track that led to it, back to the junction
+    const spur: number[] = [];
+    for (let k = 0; k < 20; k++) {
+      const n = net.nodes.get(node);
+      if (!n || n.edges.length !== 1) break;
+      const e = net.edges.get(n.edges[0])!;
+      if (e.station >= 0) break;
+      spur.push(e.id);
+      node = e.a === node ? e.b : e.a;
+      net.removeEdge(e.id);
+    }
+    void spur;
+  };
+  const id = buildRailDepot(g, st, owner, { x: toward.x - st.x, z: toward.z - st.z });
+  if (id >= 0 && serves(id)) return id;
+  if (id >= 0) drop(id);
+  // a siding off the line this station is on (not another network), nearest the station first
+  const seen = new Set<number>(), stack = [...(st.rail?.edges ?? [])];
+  while (stack.length && seen.size < 3000) {
+    const eid = stack.pop()!;
+    const e = net.edges.get(eid);
+    if (!e || seen.has(eid) || e.kind !== 'rail' || e.owner !== owner) continue;
+    seen.add(eid);
+    for (const nid of [e.a, e.b]) for (const x of net.nodes.get(nid)?.edges ?? []) if (!seen.has(x)) stack.push(x);
+  }
+  const cands: { id: number; s: number; d: number }[] = [];
+  const p = { x: 0, y: 0, z: 0 };
+  for (const eid of seen) {
+    const e = net.edges.get(eid)!;
+    if (e.station >= 0 || e.depot >= 0 || e.len < 8) continue;
+    for (let s = 3; s <= e.len - 3; s += 5) { if (net.sectionAt(e, s) !== 'ground') continue; net.pointAt(e, s, p); const d = Math.hypot(p.x - st.x, p.z - st.z); if (d <= 90) cands.push({ id: eid, s, d }); }
+  }
+  cands.sort((a, b) => a.d - b.d || a.id - b.id);
+  let tries = 0;
+  for (const c of cands) {
+    if (!net.edges.has(c.id)) continue;
+    const dep = buildDepotOnLine(g, c.id, c.s, owner);
+    if (dep >= 0 && serves(dep)) return dep;
+    if (dep >= 0) drop(dep);
+    if (++tries >= 24) break;
+  }
+  return -1;
 }
 
 /** Find two bus stop sites on streets of a town, `minD`..`maxD` apart. */
@@ -167,7 +212,10 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     const pb = g.stations.planRail(pr.b.x, pr.b.z, pr.b.angle, length, 2, owner);
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
-    return { A, B: g.stations.get(ib)!, TA, TB };
+    const B = g.stations.get(ib)!;
+    // both stations within reach of their towns' houses (a line between two fields carries nobody)
+    if (sitePop(g, A.x, A.z, 16) < 40 || sitePop(g, B.x, B.z, 16) < 40) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
+    return { A, B, TA, TB };
   }
   return null;
 }

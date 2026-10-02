@@ -183,6 +183,13 @@ const VIADUCT_H = 0.5, TUNNEL_COVER = 0.8;
  * closer than TUNNEL_GAP joined into one; anything else is a cutting.
  */
 const TUNNEL_DEEP = 2.6, PORTAL_D = 1.2, TUNNEL_MIN = 8, TUNNEL_GAP = 10;
+/** A track joining a line runs alongside it this far from its switch (no parallel or formation clash with it). */
+const SWITCH_ZONE = 14;
+/**
+ * Formations side by side share grid vertices: the height differences beyond which a new edge is refused there
+ * (rail beside rail; a road above a railway, left in the air by its cutting; road beside road).
+ */
+const CLASH = { rail: 0.3, roadAbove: 1.0, road: 1.2 };
 
 function maxGradeOf(o: BuildOptions) {
   return o.kind === 'rail' ? (TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).maxGrade : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).maxGrade;
@@ -591,7 +598,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   if (kind === 'rail') {
     for (let i = 0; i < M; i++) {
       const d = bezDeriv(centreBez, tAtS(ctab, sArr[i])), l = Math.hypot(d.x, d.z) || 1;
-      const h = formationBeside(g, xs[i], zs[i], d.x / l, d.z / l, 1.25 + spread);
+      const h = formationBeside(g, xs[i], zs[i], d.x / l, d.z / l, 0.32 * 2 + 2 * EARTHWORKS.corePad - 0.5 + spread);
       if (h !== null && (level === 'ground' || Math.abs(h - desired[i]) < 1)) desired[i] = h;
     }
   }
@@ -616,6 +623,13 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   for (const tp of prop.tracks) for (const sn of [tp.start, tp.end]) {
     if (sn.kind === 'node') { const n = net.nodes.get(sn.node!); if (n) { for (const e of n.edges) exclude.add(e); nearEnds.push({ x: n.x, z: n.z }); } }
     if (sn.kind === 'edge') { exclude.add(sn.edge!); nearEnds.push({ x: sn.x, z: sn.z }); }
+  }
+  // the line a new track joins, one edge on beyond the switch: a turnout's diverging track runs alongside it for
+  // a while (sidings, junctions, station throats)
+  const switchSet = new Set(exclude);
+  for (const id of exclude) {
+    const e = net.edges.get(id);
+    if (e) for (const nid of [e.a, e.b]) for (const x of net.nodes.get(nid)?.edges ?? []) switchSet.add(x);
   }
   const hwNew = halfWidthOf(opts) + spread;
   const crossings: CrossingPlan[] = [];
@@ -705,21 +719,29 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   if (level !== 'underground') {
     // tunnels with real cover: deep runs, out to their portals, joined over short open gaps, long enough
     const depth = (i: number) => terr[i] - y[i];
+    // crossings at grade (level crossings, diamonds, junctions) are in the open: no tunnel through them
+    const open = new Array<boolean>(M).fill(false);
+    for (const c of crossings) {
+      if (c.mode === 'over' || c.mode === 'under') continue;
+      const ci = idxOf(centreS(c.track, c.sNew));
+      for (let k = Math.max(0, ci - 2); k <= Math.min(M - 1, ci + 2); k++) open[k] = true;
+    }
+    const can = (i: number) => type[i] === 0 && !open[i];
     const tun: [number, number][] = [];
     for (let i = 0; i < M; i++) {
-      if (type[i] !== 0 || depth(i) < TUNNEL_DEEP) continue;
+      if (!can(i) || depth(i) < TUNNEL_DEEP) continue;
       let a = i, b = i;
-      while (b + 1 < M && type[b + 1] === 0 && depth(b + 1) >= TUNNEL_DEEP) b++;
+      while (b + 1 < M && can(b + 1) && depth(b + 1) >= TUNNEL_DEEP) b++;
       i = b;
-      while (a > 0 && type[a - 1] === 0 && depth(a - 1) >= PORTAL_D) a--;
-      while (b + 1 < M && type[b + 1] === 0 && depth(b + 1) >= PORTAL_D) b++;
+      while (a > 0 && can(a - 1) && depth(a - 1) >= PORTAL_D) a--;
+      while (b + 1 < M && can(b + 1) && depth(b + 1) >= PORTAL_D) b++;
       const last = tun[tun.length - 1];
-      if (last && (a - last[1] - 1) * PSTEP < TUNNEL_GAP && !type.slice(last[1] + 1, a).includes(1)) last[1] = b;
+      if (last && (a - last[1] - 1) * PSTEP < TUNNEL_GAP && !type.slice(last[1] + 1, a).includes(1) && !open.slice(last[1] + 1, a).includes(true)) last[1] = b;
       else tun.push([a, b]);
     }
     for (const [a, b] of tun) if ((b - a + 1) * PSTEP >= TUNNEL_MIN) for (let i = a; i <= b; i++) type[i] = 2;
     // leaving a tunnel or an underground station: the tunnel goes on to its portal
-    const onward = (i0: number, step: number) => { for (let i = i0; i >= 0 && i < M && type[i] !== 1 && depth(i) >= PORTAL_D; i += step) type[i] = 2; };
+    const onward = (i0: number, step: number) => { for (let i = i0; i >= 0 && i < M && type[i] !== 1 && !open[i] && depth(i) >= PORTAL_D; i += step) type[i] = 2; };
     if (depth(0) >= PORTAL_D) onward(0, 1);
     if (depth(M - 1) >= PORTAL_D) onward(M - 1, -1);
   }
@@ -804,9 +826,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       }
       for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd) { void dp; fail('Depot in the way'); } }
       // parallel conflicts with other edges
+      const nearSwitch = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < SWITCH_ZONE);
       if (!nearEnd && !crossWin(ti, s)) {
         for (const e of net.edgesNear(p.x - hw - 1, p.z - hw - 1, p.x + hw + 1, p.z + hw + 1)) {
-          if (exclude.has(e.id)) continue;
+          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
           const ge = net.geo(e);
           let best = Infinity, bi = 0;
           for (let j = 0; j < ge.n; j++) { const d = Math.hypot(ge.pts[j * 3] - p.x, ge.pts[j * 3 + 2] - p.z); if (d < best) { best = d; bi = j; } }
@@ -820,19 +843,18 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       // formations side by side share grid vertices (each reaches every grid cell its edge touches), so they
       // must lie at about the same height there: else the terrain would bury a track or leave a road in the
       // air (a road below a railway may be draped over its bank). Not at the ends it joins, nor where it crosses.
-      if (sec === 'ground' && !nearEnd && !prop.errors.length) {
-        const R = hw + 2 * EARTHWORKS.corePad + 0.6;
+      const R = hw + 2 * EARTHWORKS.corePad + 0.6;
+      if (sec === 'ground' && !nearEnd && !prop.errors.length && !crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < (R + 1.5) / Math.max(0.25, Math.sin(c.angle)))) {
         for (const e of net.edgesNear(p.x - R, p.z - R, p.x + R, p.z + R)) {
-          if (exclude.has(e.id)) continue;
+          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
           const ehw = net.halfWidth(e), lim = hw + ehw + 2 * EARTHWORKS.corePad - 0.5;
-          if (crossings.some((c) => c.track === ti && c.edge === e.id && Math.abs(c.sNew - s) < (lim + 1) / Math.max(0.25, Math.sin(c.angle)))) continue;
           const r = net.nearestEdge(p.x, p.z, lim, undefined, (q) => q.id === e.id);
           if (!r || net.sectionAt(e, r.s) !== 'ground') continue;
           const dy = net.heightAtS(e, r.s) - yy; // the other edge above (+) or below (-)
-          const clash = kind === 'rail' && e.kind === 'rail' ? Math.abs(dy) > 0.15
-            : kind === 'rail' ? dy > 0.35 // a road above the new railway would be left in the air
-            : e.kind === 'rail' ? dy < -0.35 // the new road above a railway
-            : Math.abs(dy) > 0.4;
+          const clash = kind === 'rail' && e.kind === 'rail' ? Math.abs(dy) > CLASH.rail
+            : kind === 'rail' ? dy > CLASH.roadAbove // a road above the new railway would be left in the air
+            : e.kind === 'rail' ? dy < -CLASH.roadAbove // the new road above a railway
+            : Math.abs(dy) > CLASH.road;
           if (clash) { fail(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
         }
       }

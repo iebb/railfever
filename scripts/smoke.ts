@@ -275,9 +275,31 @@ const icStops: number[] = [];
     return null;
   };
   const towns = [...g.towns.list].sort((a, b) => b.pop - a.pop);
+  // the length of the way by road between two points (Dijkstra over the road graph; Infinity if none)
+  const byRoad = (ax: number, az: number, bx: number, bz: number): number => {
+    const na = net.nearestNode(ax, az, 12, 'road'), nb = net.nearestNode(bx, bz, 12, 'road');
+    if (!na || !nb) return Infinity;
+    const dist = new Map<number, number>([[na.id, 0]]), q: [number, number][] = [[0, na.id]];
+    while (q.length) {
+      let bi = 0;
+      for (let i = 1; i < q.length; i++) if (q[i][0] < q[bi][0]) bi = i;
+      const [dd, n] = q.splice(bi, 1)[0];
+      if (n === nb.id) return dd;
+      if (dd > (dist.get(n) ?? Infinity)) continue;
+      for (const eid of net.nodes.get(n)?.edges ?? []) {
+        const e = net.edges.get(eid)!;
+        if (e.kind !== 'road') continue;
+        const m = e.a === n ? e.b : e.a, nd = dd + e.len;
+        if (nd < (dist.get(m) ?? Infinity)) { dist.set(m, nd); q.push([nd, m]); }
+      }
+    }
+    return Infinity;
+  };
   outer: for (const ta of towns) for (const tb of towns) {
     const d = Math.hypot(ta.x - tb.x, ta.z - tb.z);
     if (ta.id >= tb.id || d < 50 || d > 140) continue;
+    // neighbours by road (not the long way round a ridge)
+    if (byRoad(ta.x, ta.z, tb.x, tb.z) > d * 2.2) continue;
     const sa = stopIn(ta), sb = sa ? stopIn(tb) : null;
     if (!sa || !sb || sa.id < 0 || sb.id < 0 || sa.id === sb.id) continue;
     const dep = roadDepotNear(g, sa.x, sa.z, 0);

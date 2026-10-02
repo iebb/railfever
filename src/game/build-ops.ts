@@ -79,7 +79,9 @@ export class Depots {
       const h = w.heightAt(x + rx * sz.w * a + fx * sz.d * b, z + rz * sz.w * a + fz * sz.d * b);
       mx = Math.max(mx, h); mn = Math.min(mn, h);
     }
-    plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : mx;
+    // a rail depot on a track end takes the track's height; a road depot its door's (the street it opens onto
+    // starts there), within the ground under it
+    plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : kind === 'rail' ? mx : Math.max(mn, Math.min(mx, w.heightAt(exitX, exitZ)));
     if (mn < 0.2) failp('Cannot build on water');
     // a depot on a track end takes the track's height and is levelled on commit
     if (snapNode >= 0 ? Math.max(mx - plan.y, plan.y - mn) > 2.5 : mx - mn > 1.5) failp('Ground is too steep');
@@ -95,9 +97,9 @@ export class Depots {
       for (let i = 0; i < geo.n; i++) {
         const d = distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2);
         if (d < hw - 0.1) { failp('Track or road in the way'); break; }
-        // the depot's levelled pad and the other formation share grid vertices: only at about the same height
-        // (a rail formation beside it never; a road may be graded to the pad)
-        if (net.sectionAt(e, geo.cum[i]) === 'ground' && d < hw + EARTHWORKS.corePad + 0.6 && Math.abs(geo.pts[i * 3 + 1] - plan.y) > (e.kind === 'rail' ? 0.12 : 0.35)) { failp(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
+        // the depot's levelled pad and a track beside it share grid vertices: only at about the same height
+        // (roads are draped on the ground)
+        if (e.kind === 'rail' && net.sectionAt(e, geo.cum[i]) === 'ground' && d < hw + EARTHWORKS.corePad && Math.abs(geo.pts[i * 3 + 1] - plan.y) > 0.3) { failp('Too close to a track at another height'); break; }
       }
     }
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
@@ -126,7 +128,8 @@ export class Depots {
     const end: Snap = nn ? { kind: 'node', x: nn.x, z: nn.z, y: nn.y, node: nn.id } : { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
     if (Math.hypot(end.x - x, end.z - z) <= 0.3) return null;
     const start: Snap = exitNode >= 0 ? { kind: 'node', x, z, y, node: exitNode } : { kind: 'free', x, z, y };
-    return planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner, tram });
+    // (straight from the door: the same street whether planned from the plot or built from the depot's exit node)
+    return planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner, tram, straight: true });
   }
 
   commit(kind: DepotKind, plan: DepotPlan, owner: number): string | null {
@@ -167,8 +170,17 @@ export class Depots {
     w.markObjArea(plan.x - 4, plan.z - 4, plan.x + 4, plan.z + 4);
     // road / tram depots connect themselves to the nearest road / tram track (planned, demolitions and cost included, in plan())
     if (kind !== 'rail') {
-      const link = this.roadLink(exit.x, exit.z, exit.y, owner, exit.id, kind === 'tram');
+      const tram = kind === 'tram';
+      const link = this.roadLink(exit.x, exit.z, exit.y, owner, exit.id, tram);
       if (link && link.ok) commitProposal(g, link);
+      else if (!link) {
+        // the door opens right onto the road: join it there (at its end node, or splitting it)
+        const ne = net.nearestEdge(exit.x, exit.z, 0.5, 'road', (ed) => ed.id !== e.id && ed.depot < 0 && (!tram || tramUsable(g, ed, owner)));
+        if (ne) {
+          const at = ne.s < 0.3 ? net.nodes.get(ne.edge.a) : ne.s > ne.edge.len - 0.3 ? net.nodes.get(ne.edge.b) : net.splitEdge(ne.edge.id, ne.s)?.node;
+          if (at && at.id !== exit.id) { net.mergeNodes(at.id, exit.id); dp.node = at.id; }
+        }
+      }
     }
     g.onNetworkChanged();
     return null;
