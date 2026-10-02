@@ -16,7 +16,13 @@ import { canonicalizeLines } from '../src/game/patterns';
 import { backupSlot, deserialize, listSlots, loadFromSlot, serialize, slotsReady } from '../src/game/save';
 import { deleteSave, getSave, putSave, putSaveOnce } from '../src/game/storage';
 
-const directory = process.argv[2] ?? '/private/tmp/claude-501/-Users-ieb-Railfever/5a64dbd6-147f-4735-8024-85a73184933b/scratchpad/review/t23';
+// Fixtures are v2.2/v2.3 saves (*.json / *.json.gz, made with the old code); they are too large to keep in the
+// repo, so pass their directory as the first argument (default: scripts/fixtures/saves).
+const directory = process.argv[2] ?? 'scripts/fixtures/saves';
+if (!existsSync(directory)) {
+  console.log(`SKIPPED: fixture directory not found: ${directory} (pass a directory of v2.2/v2.3 saves as the first argument)`);
+  process.exit(0);
+}
 const upgradeText = 'Lines used by electric trains were electrified when this save was upgraded';
 const required = /^(s7y2005(?:-busy)?|aiw2000(?:-busy)?)\.json(?:\.gz)?$/;
 
