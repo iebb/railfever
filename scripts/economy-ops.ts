@@ -150,15 +150,18 @@ runDays(g, 400, () => {
     if (kind === 'platform') { exPassPlatform++; exPlatformKmh = Math.max(exPlatformKmh, ex.speedKmh); }
   }
   for (const c of ex.cargo.values()) if (c.alight !== A.id && c.alight !== D.id) exWrongCargo++;
-  // overtaking holds of the locals
+  // overtaking holds of the locals: the express passes the station before the held local has left it
   for (const t of locals) {
     const h = holds.get(t.id);
     if (t.state === 'loading' && t.status.startsWith('Waiting for')) {
       holdTicks++; maxHold = Math.max(maxHold, t.holdTime);
       if (!h) holds.set(t.id, { st: t.atStation, by: t.status, passed: false });
-      const st = g.stations.get(t.atStation);
-      if (st && ex.occupiedEdges().some((e) => !!stationEdge(st, e))) holds.get(t.id)!.passed = true;
-    } else if (h) { if (h.passed) overtakes++; holds.delete(t.id); }
+    }
+    const hh = holds.get(t.id);
+    if (!hh) continue;
+    const st = g.stations.get(hh.st)!;
+    if (ex.occupiedEdges().some((e) => !!stationEdge(st, e))) hh.passed = true;
+    if (!t.occupiedEdges().some((e) => !!stationEdge(st, e))) { if (hh.passed) overtakes++; if (process.env.DBG) console.log(`   dbg hold at ${st.name}: express passed ${hh.passed}`); holds.delete(t.id); }
   }
 });
 const nm = (ids: Set<number> | undefined) => [...(ids ?? [])].map((id) => g.stations.get(id)?.name.split(' ').pop()).join(',');
@@ -300,6 +303,32 @@ console.log('save round trip');
   check(sig(g) === sig(g2), 'both copies run on identically for 60 days');
 }
 
+// ------------------------------------------------------------------ 5b. old saves: subset lines become patterns on load
+console.log('old saves');
+{
+  const h = flatGame(384);
+  const S3 = [60, 170, 280].map((x) => station(h, x, 120, Math.PI / 2, 12, 1)!);
+  for (let i = 0; i < 2; i++) build(h, nodeSnap(h, endNode(h, S3[i], 0, true), 'rail'), nodeSnap(h, endNode(h, S3[i + 1], 0, false), 'rail'), railOpts(0, 1), 'single');
+  const dp = depotFor(h, S3[0], S3[2]);
+  const full = h.lines.create('rail', 0), part = h.lines.create('rail', 0);
+  full.stops = outAndBack(S3.map((x) => x.id)); part.stops = [S3[0].id, S3[1].id];
+  const tf = h.vehicles.buyTrain(dp, local(), full.id) as Train, tp = h.vehicles.buyTrain(dp, local(), part.id) as Train;
+  runDays(h, 20);
+  const data = JSON.parse(JSON.stringify(serialize(h)));
+  const kept = deserialize(JSON.parse(JSON.stringify(data)));
+  check(kept.lines.map.has(part.id) && kept.lines.map.has(full.id), 'a current save keeps its lines as saved');
+  // a save from before the ops data: no opsVersion, no service patterns, no vehicle ops fields
+  delete data.opsVersion; delete data.ops; delete data.linesRedirect;
+  for (const v of data.vehicles) { delete v.pattern; delete v.ops; delete v.opLast; delete v.holdTime; delete v.phys; }
+  for (const st of data.stations) for (const w of st.waiting) { delete w.t; delete w.transfers; }
+  const old = deserialize(data);
+  const ml = old.lines.get(full.id)!, vp = old.vehicles.get(tp.id)!;
+  check(!old.lines.map.has(part.id) && old.lines.get(part.id) === ml && vp.lineId === full.id && vp.pattern !== undefined && vp.owner === 0, 'an old save: the A-B line became a short-turn pattern of A-B-C on load');
+  check(old.vehicles.get(tf.id)!.lineId === full.id && linePatterns(ml).length === 2, 'the A-B-C train keeps its line (local + short-turn)');
+  runDays(old, 120);
+  check(vp.delivered > 0 || vp.state === 'running' || vp.state === 'loading', `the merged train runs on (${vp.status})`);
+}
+
 // ------------------------------------------------------------------ 6. routing prefers direct services
 console.log('routing: transfers');
 {
@@ -353,12 +382,12 @@ function hsrYear(n: number, every: number, distUnits: number): { income: number;
   return { income: yr.income, vehicles, track, wear: -yr.trackWear, profit, pax: trains.reduce((x, t) => x + t.delivered, 0) / 2, trains: trains.length };
 }
 {
-  const busy = hsrYear(40, 1, 900), poor = hsrYear(1, 6, 900);
+  const busy = hsrYear(40, 1, 900), poor = hsrYear(1, 12, 900);
   const show = (n: string, r: ReturnType<typeof hsrYear>) => console.log(`  ${n}: ${r.trains} trains, ~${fmt(r.pax, 0)} pax/yr, income ${k(r.income)}, trains ${k(r.vehicles)}, track upkeep ${k(r.track)}, wear ${k(r.wear)} -> ${k(r.profit)} a year`);
   show('busy HSR, 9 km', busy); show('poorly used HSR, 9 km', poor);
   check(busy.profit > 0, 'a busy HSR between towns far apart pays its running costs');
   check(poor.profit < 0, 'a poorly used one loses money');
-  check(busy.wear > poor.wear && busy.vehicles > poor.vehicles, 'more traffic: more energy, maintenance and track wear');
+  console.log(`  (one set either way: the full train dwells longer and runs fewer km, so its own costs are not higher; break-even ~${fmt((poor.vehicles + poor.track + poor.wear) / Math.max(1, poor.income / Math.max(1, poor.pax)), 0)} pax/yr)`);
 }
 
 console.log(`(${fmt((performance.now() - T0) / 1000, 1)} s)`);

@@ -32,7 +32,7 @@ export const PATTERN_LABEL: Record<PatternKind, string> = { local: 'Local', rapi
 /** Trains pass a station's platform track (no through track) at most this fast (km/h). */
 export const PLATFORM_PASS_KMH = 120;
 /** A stopping train waits at most this long (sim seconds) for a faster train to pass. */
-export const HOLD_MAX_S = 90;
+export const HOLD_MAX_S = 120;
 /** ... for a faster train due within this time. */
 export const HOLD_LOOK_S = 75;
 /** Routing: changing vehicles costs this much (s, ~6 min equivalent) on top of the walk and the next wait. */
@@ -326,7 +326,7 @@ function sdist(g: Game, a: number, b: number): number {
 }
 
 interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[] }
-interface LineTable { ver: number; key: string; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
+interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
 const tables = new WeakMap<Game, Map<number, LineTable>>();
 
 /** Speed cap (km/h) of a hop between two stations: the faster platform track type (rail), street / road (road). */
@@ -357,10 +357,17 @@ function slowest(vs: Vehicle[]): VehicleModel[] {
 export function lineTable(g: Game, l: Line): LineTable {
   let m = tables.get(g);
   if (!m) { m = new Map(); tables.set(g, m); }
-  const byPat = vehiclesByPattern(g, l);
-  const key = l.stops.join(',') + '|' + [...byPat].map(([p, vs]) => p + ':' + vs.map((v) => v.id).join('.')).join(';') + '|' + (l.patterns ?? []).map((p) => p.id + ':' + servedFlags(l, p).map((x) => (x ? 1 : 0)).join('')).join(';');
   const hit = m.get(l.id);
-  if (hit && hit.ver === g.lines.version && hit.key === key) return hit;
+  // between routing rebuilds (stop and vehicle edits rebuild): the same table
+  if (hit && hit.ver === g.lines.version && hit.stops === l.stops && hit.nv === l.vehicles.length) return hit;
+  const byPat = vehiclesByPattern(g, l);
+  // cached until what the timetable depends on changes (not on every routing rebuild): the stops (where they are,
+  // their track type), the vehicles of each pattern (their speed) and the patterns' stops
+  let key = '';
+  for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? Math.round(s.x) + ',' + Math.round(s.z) + (s.rail ? s.rail.trackType : '') : '') + ';'; }
+  for (const [p, vs] of byPat) { key += '|' + p + ':'; for (const v of vs) key += v.id + '/' + v.maxSpeedKmh + '.'; }
+  for (const p of l.patterns ?? []) { key += '|' + p.id + ':'; for (const x of servedFlags(l, p)) key += x ? '1' : '0'; }
+  if (hit && hit.key === key) { hit.ver = g.lines.version; hit.stops = l.stops; hit.nv = l.vehicles.length; return hit; }
   const n = l.stops.length;
   const pats: PatTime[] = [];
   const road = l.kind !== 'rail';
@@ -426,7 +433,7 @@ export function lineTable(g: Game, l: Line): LineTable {
     edges.push({ from, to, cost: T });
     for (const o of take) allowed.add(o.pid + ':' + o.a + ':' + to);
   }
-  const t: LineTable = { ver: g.lines.version, key, pats, allowed, edges, served };
+  const t: LineTable = { ver: g.lines.version, key, stops: l.stops, nv: l.vehicles.length, pats, allowed, edges, served };
   m.set(l.id, t);
   return t;
 }
@@ -527,15 +534,19 @@ export function holdForOvertake(g: Game, t: Train, dt: number): boolean {
   for (const o of trains) {
     if (o === t || !o.onMap || o.state === 'loading' || o.state === 'depot' || o.routeTarget === st.id) continue;
     if (o.blockedBy === t.id) continue;
-    const look = HOLD_LOOK_S * Math.max(o.speed, o.maxSpeed * 0.6);
-    let d = o.segs[o.headSeg] ? o.segs[o.headSeg].len - o.headPos : 0;
+    // when it gets here: along its path at the speed limits (at least its current speed; plus speeding up)
+    const vmax = Math.max(0.1, o.maxSpeed);
+    const hs = o.segs[o.headSeg];
+    let eta = hs ? (hs.len - o.headPos) / Math.max(0.1, Math.min(vmax, hs.limit)) : 0;
+    eta += Math.max(0, Math.min(vmax, hs ? hs.limit : vmax) - o.speed) / 0.5 / 2;
     let hit: TSeg | null = null;
     const path = [...o.segs.slice(o.headSeg + 1), ...o.pending];
     for (const s of path) {
       if (s.e >= 0 && own.has(s.e)) { hit = s; break; }
-      d += s.len;
-      if (d > look) break;
+      eta += s.len / Math.max(0.1, Math.min(vmax, s.limit));
+      if (eta > HOLD_LOOK_S) break;
     }
+    if (eta > HOLD_LOOK_S) continue;
     if (!hit || hit.e === head.e) continue;
     const od = segDir(g, hit);
     if (!od || od.x * my.x + od.z * my.z < 0.5) continue;
