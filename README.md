@@ -2,6 +2,8 @@
 
 A transport tycoon game in the spirit of Transport Fever and OpenTTD, built with WebGL (three.js) and TypeScript. It runs fully offline in the browser: no server and no network access.
 
+**Play it in your browser: https://iebb.github.io/railfever/** (or download `railfever.html` from there and open it from disk).
+
 You connect procedurally generated towns with railways and bus lines on a continuous, realistic-scale world (1 unit = 10 m). Tracks and roads are free-form curves, not tiles. Passengers choose destinations across your network, transfer between lines, and pay by distance and speed. Good service makes towns grow. Rival AI companies build their own networks.
 
 ## Running
