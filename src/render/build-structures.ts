@@ -11,6 +11,8 @@ const CONCRETE_DARK = 0xaaa59c;
 const STONE = 0xc4b49c;
 const STONE_DARK = 0xa8987f;
 const DARK = 0x07080a;
+const ABUTMENT_MAX_HEIGHT = 1.5;
+const ABUTMENT_FOUNDATION = 0.2;
 
 // ------------------------------------------------------------------------------ neighbours
 
@@ -224,17 +226,24 @@ export function buildBridge(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, run
   for (const [s, gd] of [[s0, -1], [s1, 1]] as [number, number][]) {
     const atEnd = gd < 0 ? s <= 0.05 : s >= e.len - 0.05;
     if (atEnd && continuesAt(ctx, e, gd < 0 ? e.a : e.b, 'bridge')) continue;
+    const p = sampleAt(g, s);
+    if (p.y + D.top - groundUnder(ctx, p, (wl + wr) / 2, 0.12, (wr - wl) / 2) > ABUTMENT_MAX_HEIGHT) {
+      // Section boundaries are not always the bank: support an exposed deck end with a column,
+      // and put the retaining wall farther back where the approach actually reaches the terrain.
+      const depth = style === 'viaduct' ? 0.12 : style === 'arch' ? 0.14 : style === 'girder' ? D.depth : 0.16;
+      pier(ctx, e, s, D, depth, wl, wr, 1, [s0, s1]);
+    }
     abutment(ctx, e, s, gd, D, wl, wr, style);
   }
 }
 
 /** Pier under the deck at s (shifted along the bridge if another edge passes below). Returns the used s or null. */
-function pier(ctx: ChunkCtx, e: NEdge, s: number, D: Dims, depth: number, wl: number, wr: number, scale: number): number | null {
+function pier(ctx: ChunkCtx, e: NEdge, s: number, D: Dims, depth: number, wl: number, wr: number, scale: number, endSpan?: [number, number]): number | null {
   const w = ctx.game.world;
   const g = ctx.game.world.net.geo(e);
   for (const dsh of [0, 0.5, -0.5, 1, -1, 1.5, -1.5]) {
     const sp = s + dsh * scale;
-    if (sp <= 0.3 || sp >= e.len - 0.3) continue;
+    if (endSpan ? sp < endSpan[0] || sp > endSpan[1] : sp <= 0.3 || sp >= e.len - 0.3) continue;
     const p = sampleAt(g, sp);
     const yb = p.y + D.top - depth + 0.02;
     const gy = w.heightAt(p.x, p.z);
@@ -492,35 +501,114 @@ function arches(ctx: ChunkCtx, e: NEdge, sup: number[], D: Dims, wl: number, wr:
   }
 }
 
-/**
- * Abutment at a bridge end: a bearing block under the deck end and a back block reaching into the
- * embankment just below the track formation (so the embankment, not concrete, shows beside the track).
- */
+/** Find the bank behind an exposed section end, following only the ground approach (including a joined edge). */
+function abutmentSite(ctx: ChunkCtx, e: NEdge, s: number, gd: number, D: Dims, wl: number, wr: number): { p: Smp; edge: NEdge } | null {
+  const w = ctx.game.world;
+  const net = w.net;
+  const end = sampleAt(net.geo(e), s);
+  const gap = (p: Smp) => p.y + D.top - groundUnder(ctx, p, (wl + wr) / 2, 0.12, (wr - wl) / 2);
+  const site = (f: NEdge, p: Smp, dir: number) => {
+    const align = dir * gd;
+    return { p: { ...p, tx: p.tx * align, tz: p.tz * align, lx: p.lx * align, lz: p.lz * align }, edge: f };
+  };
+  if (gap(end) <= ABUTMENT_MAX_HEIGHT) return site(e, end, gd);
+  let f = e, at = s, dir = gd, remaining = 4;
+  for (let hop = 0; hop < 3 && remaining > 0; hop++) {
+    const reach = Math.min(remaining, dir > 0 ? f.len - at : at);
+    const steps = Math.ceil(reach / 0.2);
+    for (let k = 1; k <= steps; k++) {
+      const p = sampleAt(net.geo(f), at + dir * reach * k / steps);
+      if (net.sectionAt(f, Math.max(0, Math.min(f.len, p.s + dir * 0.01))) !== 'ground') return null;
+      const bank = site(f, p, dir);
+      if (gap(bank.p) <= 0.6) return bank;
+    }
+    remaining -= reach;
+    const nodeId = dir > 0 ? f.b : f.a;
+    const node = net.nodes.get(nodeId);
+    let next: NEdge | undefined, best = 0.8;
+    for (const id of node?.edges ?? []) {
+      const q = net.edges.get(id);
+      if (!q || q.id === f.id || q.kind !== e.kind) continue;
+      const qs = q.a === nodeId ? 0.01 : q.len - 0.01;
+      if (net.sectionAt(q, qs) !== 'ground') continue;
+      const t = net.leaveDir(q, nodeId);
+      const dot = (t.x * end.tx + t.z * end.tz) * gd;
+      if (dot > best) { next = q; best = dot; }
+    }
+    if (!next) break; // a free end in mid-air has a pier, but no invented earthworks or floating wall
+    f = next; dir = f.a === nodeId ? 1 : -1; at = dir > 0 ? 0 : f.len;
+  }
+  return null;
+}
+
+/** Thin bank wall, bearing shelf, ballast backwall and splayed wings, founded on their own terrain samples. */
 function abutment(ctx: ChunkCtx, e: NEdge, s: number, gd: number, D: Dims, wl: number, wr: number, style: BridgeStyle) {
   const w = ctx.game.world;
-  const g = ctx.game.world.net.geo(e);
-  const p = sampleAt(g, s);
-  if (!inChunk(ctx, p.x, p.z)) return;
+  const end = sampleAt(w.net.geo(e), s);
+  // Own the whole assembly in the section end's chunk, even if the bank is across its boundary.
+  if (!inChunk(ctx, end.x, end.z)) return;
+  const bank = abutmentSite(ctx, e, s, gd, D, wl, wr);
+  if (!bank) return;
+  const { p } = bank;
+  const g = w.net.geo(bank.edge);
   const W = ctx.w;
   W.cast = 1;
-  const stone = style === 'viaduct';
+  const rt = e.kind === 'road' ? ROAD_TYPES[e.type] ?? ROAD_TYPES.road : null;
+  const stone = ctx.game.year < 1950 && !(rt && (rt.speed >= 80 || rt.lanes >= 4));
   const cell = stone ? WC.STONE : WC.CONCRETE, sc = stone ? WSCALE.STONE : WSCALE.CONCRETE;
-  const block = (a0: number, a1: number, l: number, r: number, top: number, tone: number) => {
-    const along = gd * (a0 + a1) / 2, off = (r - l) / 2;
-    const cx = p.x + p.tx * along + p.lx * off, cz = p.z + p.tz * along + p.lz * off;
-    let gy = top;
-    for (const t of [a0, a1]) for (const o of [-l, r]) gy = Math.min(gy, w.heightAt(p.x + p.tx * gd * t + p.lx * o, p.z + p.tz * gd * t + p.lz * o));
-    gy -= 0.5;
-    W.use(cell, tone);
-    W.tbox(cx, gy, cz, l + r, top - gy, a1 - a0, p.tx, p.tz, sc);
+  const depth = style === 'viaduct' ? 0.12 : style === 'arch' ? 0.14 : style === 'girder' ? D.depth : 0.16;
+  const deck = (x: number, z: number) => {
+    const c = closestOnPolyline(x, z, g.pts, 3, g.n);
+    return g.pts[c.i * 3 + 1] + (g.pts[Math.min(g.n - 1, c.i + 1) * 3 + 1] - g.pts[c.i * 3 + 1]) * c.f + D.top;
   };
-  // bearing block: as wide as the deck, top just under the deck
-  block(-0.15, 0.22, wl, wr, p.y + D.top - 0.012, stone ? STONE : CONCRETE_DARK);
-  // back block into the embankment, hidden under the formation
-  const half = RAIL.spacing / 2;
-  const bw = e.kind === 'rail' ? 0.39 : D.w - 0.03;
-  const l = wl < D.w ? half : bw, r = wr < D.w ? half : bw;
-  block(0.22, 0.85, l, r, p.y + (e.kind === 'rail' ? -0.11 : -0.05), stone ? STONE_DARK : CONCRETE_DARK);
+  const bearing = (deckY: number) => deckY - depth + 0.018;
+  // Each strip is sampled across both faces: a hillside must not turn the low corner's foundation
+  // into a deep solid block under the high corner. Buried panels are omitted, rather than inverted.
+  const strip = (a0: number, l0: number, a1: number, l1: number, thick: number,
+    topAt: (deckY: number, t: number, ground: number) => number, tone: number, bottomAt?: (deckY: number) => number) => {
+    const len = Math.hypot(a1 - a0, l1 - l0);
+    if (len < 0.01) return;
+    const nx = -(l1 - l0) / len, nz = (a1 - a0) / len;
+    const steps = Math.max(1, Math.ceil(len / 0.35));
+    const point = (t: number, side: number) => {
+      const a = a0 + (a1 - a0) * t + nx * side * thick / 2;
+      const l = l0 + (l1 - l0) * t + nz * side * thick / 2;
+      const x = p.x + p.tx * gd * a + p.lx * l, z = p.z + p.tz * gd * a + p.lz * l;
+      const gy = w.heightAt(x, z), deckY = deck(x, z);
+      const top = Math.min(deckY - 0.025, topAt(deckY, t, gy));
+      const bottom = Math.max(gy - ABUTMENT_FOUNDATION, bottomAt ? bottomAt(deckY) : -Infinity);
+      return { x, z, top, bottom };
+    };
+    const ox = p.tx * gd * nx + p.lx * nz, oz = p.tz * gd * nx + p.lz * nz;
+    const fx = p.tx * gd * (a1 - a0) / len + p.lx * (l1 - l0) / len;
+    const fz = p.tz * gd * (a1 - a0) / len + p.lz * (l1 - l0) / len;
+    W.use(cell, tone);
+    let open = false;
+    for (let k = 0; k < steps; k++) {
+      const A = point(k / steps, -1), B = point(k / steps, 1);
+      const C = point((k + 1) / steps, -1), E = point((k + 1) / steps, 1);
+      const visible = (v: typeof A) => v.top - v.bottom > 0.006 && v.top - v.bottom <= ABUTMENT_MAX_HEIGHT + ABUTMENT_FOUNDATION;
+      const here = [A, B, C, E].every(visible);
+      const face = (a: typeof A, b: typeof A, dx: number, dz: number) =>
+        W.twall(a.x, a.z, b.x, b.z, a.bottom, a.top, b.bottom, b.top, dx, dz, sc, k * len / steps);
+      if (!here) { open = false; continue; }
+      if (!open) face(A, B, -fx, -fz);
+      face(A, C, -ox, -oz); face(B, E, ox, oz);
+      W.ttri(A.x, A.top, A.z, A.x / sc, A.z / sc, B.x, B.top, B.z, B.x / sc, B.z / sc, E.x, E.top, E.z, E.x / sc, E.z / sc, 0, 1, 0);
+      W.ttri(A.x, A.top, A.z, A.x / sc, A.z / sc, E.x, E.top, E.z, E.x / sc, E.z / sc, C.x, C.top, C.z, C.x / sc, C.z / sc, 0, 1, 0);
+      const next = k + 1 < steps && [point((k + 2) / steps, -1), point((k + 2) / steps, 1)].every(visible);
+      if (!next) face(C, E, fx, fz);
+      open = next;
+    }
+  };
+  strip(0.07, -wl, 0.07, wr, 0.22, (dy) => bearing(dy) - 0.09, stone ? STONE : CONCRETE_DARK);
+  strip(0, -wl, 0, wr, 0.36, (dy) => bearing(dy), stone ? STONE_DARK : CONCRETE, (dy) => bearing(dy) - 0.1);
+  strip(0.2, -wl, 0.2, wr, 0.12, (dy) => dy - 0.035, stone ? STONE : CONCRETE_DARK, (dy) => bearing(dy) - 0.1);
+  for (const [side, width] of [[-1, wl], [1, wr]]) {
+    if (width < D.w - 0.01) continue; // no wing between parallel decks
+    strip(0.11, side * width, 1.25, side * (width + 0.42), 0.1,
+      (dy, t, gy) => Math.min(dy - 0.04, gy + 0.04 + (1 - t) * Math.min(1, Math.max(0, dy - gy))), stone ? STONE : CONCRETE_DARK);
+  }
 }
 
 // ------------------------------------------------------------------------------ tunnels
