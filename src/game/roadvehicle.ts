@@ -340,7 +340,10 @@ export class RoadVehicle extends Vehicle {
       if (!le) break;
       const opts = roadNext(g, le, last.dir);
       const fwd = opts.filter((o) => !o.uturn && o.edge.station < 0);
-      const pick = fwd.length ? fwd[this.rng.int(fwd.length)] : opts.find((o) => o.uturn);
+      // town traffic mostly stays on the streets; now and then a car heads out along a country road
+      const streets = fwd.filter((o) => o.edge.type === 'street');
+      const from = streets.length && streets.length < fwd.length && this.rng.next() < 0.85 ? streets : fwd;
+      const pick = from.length ? from[this.rng.int(from.length)] : opts.find((o) => o.uturn);
       if (!pick) break;
       if (!this.appendCont({ edge: pick.edge.id, dir: pick.dir })) break;
     }
@@ -488,7 +491,8 @@ export class RoadVehicle extends Vehicle {
 
   private tmpA = { x: 0, y: 0, z: 0 };
   private tmpB = { x: 0, y: 0, z: 0 };
-  private gradeTimer = 0;
+  /** time to the next gradient sample (saved, so a loaded game drives exactly alike) */
+  gradeTimer = 0;
 
   private drive(dt: number) {
     if (!this.seg) return;

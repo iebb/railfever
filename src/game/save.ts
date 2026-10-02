@@ -92,6 +92,7 @@ function roadOf(v: RoadVehicle) {
     seg: v.seg ? rsegD(v.seg) : null, pos: v.pos, trail: v.trail.map(rsegD), ahead: v.ahead.map(rsegD),
     route: v.route.map((r) => [r.edge, r.dir]), speed: v.speed, loadTimer: v.loadTimer, retryTimer: v.retryTimer,
     junctionWait: v.junctionWait, stuck: v.stuck, ttl: v.ttl, rng: v.rng.state, style: v.style, tint: v.tint, cruise: v.cruise,
+    grade: v.grade, gradeTimer: v.gradeTimer,
   };
 }
 
@@ -132,7 +133,8 @@ export function serialize(g: Game): any {
       crossings: [...net.crossings.values()],
       nextNode: net.nextNode, nextEdge: net.nextEdge, nextCrossing: net.nextCrossing,
     },
-    towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings] })),
+    // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
+    towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, waiting: [...s.waiting.values()] })),
     stationsNextId: g.stations.nextId,
     depots: [...g.depots.map.values()], depotsNextId: g.depots.nextId,
@@ -208,7 +210,12 @@ export function deserialize(d: any): Game {
     g.ais.push(ai);
   }
   // towns, stations, depots, lines
-  g.towns.list = (d.towns as any[]).map((t) => ({ ...t, buildings: new Set<number>(t.buildings) } as Town));
+  g.towns.list = (d.towns as any[]).map((t) => {
+    const { growth, ...rest } = t;
+    const town = { ...rest, buildings: new Set<number>(t.buildings) } as Town;
+    g.towns.restoreCache(town, growth);
+    return town;
+  });
   for (const s of d.stations as any[]) {
     const st: Station = { ...s, rail: s.rail ? { ...s.rail, edges: [...s.rail.edges] } : null, stops: s.stops.map((p: any) => ({ ...p })), waiting: new Map() };
     st.waitingTotal = 0;
@@ -226,7 +233,13 @@ export function deserialize(d: any): Game {
   // vehicles
   const V = g.vehicles;
   const tseg = (x: number[], t: Train): TSeg | null => {
-    if (x[0] < 0) { const dp = g.depots.get(t.depotId); return dp ? depotSeg(g, dp, x[2] ?? t.length + 0.3) : null; }
+    if (x[0] < 0) {
+      const dp = g.depots.get(t.depotId);
+      const sg = dp ? depotSeg(g, dp, x[2] ?? t.length + 0.3) : null;
+      // keep the saved length exactly (rebuilding the curve can differ in the last bit)
+      if (sg && typeof x[2] === 'number') sg.len = x[2];
+      return sg;
+    }
     const e = net.edges.get(x[0]);
     return e ? makeSeg(g, e, x[1]) : null;
   };
@@ -246,6 +259,7 @@ export function deserialize(d: any): Game {
     restoreBase(r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
+    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0;
     const seg = rseg(vd.seg);
     if (seg) {
       r.seg = seg; r.pos = vd.pos;

@@ -14,8 +14,8 @@ import { availableModels, VehicleModel } from './vehicle-types';
 import { fare } from './vehicle';
 import { endTangent } from './geom';
 import {
-  OPoint, P2, CorridorSearch, alignCorridor, chainProfile, chainGen, routeConflict, estimateChainCost, railPairGen, stationEnds,
-  buildRailDepot, buildDepotOnLine, buildRoadDepot, removeEdges, nodeSnap, nodeAt, depotAtEnd, depotFits,
+  OPoint, P2, ChainProfile, chainProfile, chainGen, routeConflict, routeGen, estimateChainCost, railPairGen, stationEnds,
+  buildRailDepot, buildDepotNearLine, roadDepotGen, removeEdges, nodeSnap, nodeAt, depotAtEnd, depotFits,
 } from './routing';
 
 export * from './routing';
@@ -85,7 +85,7 @@ export class AIController {
   state: AIState = { phase: 'idle', cooldown: 10, projects: 0 };
   stats: AIStats = { railStations: 0, busStops: 0, track: 0, road: 0, bridges: 0, tunnels: 0, lines: 0, vehicles: 0, failed: 0, spent: 0, sold: 0 };
   /** work units per game day */
-  budget = 4;
+  budget = 6;
   /** debugging: note work units slower than slowMs */
   static profile = false;
   static slowMs = 8;
@@ -127,7 +127,8 @@ export class AIController {
     const lens = tracks > 1 ? [18, 22, 26] : [5, 8, 11, 15, 20];
     for (const L of lens) {
       const x = back.x + bx * L, z = back.z + bz * L;
-      if (g.world.inside(x, z, 8) && depotFits(g, x, z, -bx, -bz, this.companyId, 30)) return true;
+      // single track can fall back to a siding off the line, so only the double-track stub needs level ground
+      if (g.world.inside(x, z, 8) && depotFits(g, x, z, -bx, -bz, this.companyId, 30, tracks > 1 ? plan.y : undefined)) return true;
     }
     return false;
   }
@@ -301,21 +302,14 @@ export class AIController {
       { x0: frontA.x - fa.x * PLATFORM, z0: frontA.z - fa.z * PLATFORM, x1: from.x - fa.x * 4, z1: from.z - fa.z * 4, r: 4 },
       { x0: frontB.x - fb.x * PLATFORM, z0: frontB.z - fb.z * PLATFORM, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
     ];
-    const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
-    while (cs.step(3000) === 'running') yield;
-    if (!cs.path) return fail('no corridor');
-    const al = alignCorridor(cs.path, from, to);
-    yield;
-    if (al.minR < 14) return fail('curves too tight');
-    const way = [...al.way, { x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }];
     const start: OPoint = { x: frontA.x, z: frontA.z, tx: fa.x, tz: fa.z };
-    let prof = chainProfile(g, [start, ...way], tracks, pr.a.y, pr.b.y, 'rail');
-    if (!prof) return fail('too steep');
-    yield;
-    const len = prof.s[prof.s.length - 1];
+    const plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, minR: 14 });
+    if (typeof plan === 'string') return fail(plan, plan.startsWith('route runs') ? 720 : 900);
+    const way = plan.way;
+    let prof: ChainProfile | null = plan.prof;
+    const len = plan.prof.s[plan.prof.s.length - 1];
     const dist = Math.hypot(pr.a.x - pr.b.x, pr.a.z - pr.b.z);
     if (len > dist * 1.55 + 25) return fail('detour too long');
-    if (routeConflict(g, prof, 'rail', tracks)) return fail('route runs along other tracks or roads', 720);
     yield;
     const cars = pickTrain(g.year, PLATFORM, len);
     if (!cars) return fail('no trains available');
@@ -389,16 +383,9 @@ export class AIController {
       const dir = { x: o.x - st.x, z: o.z - st.z };
       dep = tracks > 1 ? this.depotSwitch(st, dir) : buildRailDepot(g, st, owner, dir);
     }
-    if (dep < 0 && tracks === 1) {
-      // a siding off the main line near A
-      for (const d of [30, 45, 60]) {
-        const l = Math.hypot(stB.x - stA.x, stB.z - stA.z) || 1;
-        const x = stA.x + ((stB.x - stA.x) / l) * d, z = stA.z + ((stB.z - stA.z) / l) * d;
-        const ne = net.nearestEdge(x, z, 15, 'rail', (e) => e.owner === owner && e.station < 0 && e.depot < 0 && e.len > 8);
-        if (ne) dep = buildDepotOnLine(g, ne.edge.id, Math.min(ne.edge.len - 3, Math.max(3, ne.s)), owner);
-        if (dep >= 0) break;
-      }
-    }
+    // else a siding off the main line, near A or B
+    if (dep < 0 && tracks === 1) dep = buildDepotNearLine(g, [...p.edges], stA.x, stA.z, owner);
+    if (dep < 0 && tracks === 1) dep = buildDepotNearLine(g, [...p.edges], stB.x, stB.z, owner);
     this.track(d0);
     if (dep < 0) return fail('no depot site', 720);
     p.depots.push(dep);
@@ -435,7 +422,7 @@ export class AIController {
     const backC = { x: r.x + bx * r.length / 2, z: r.z + bz * r.length / 2 };
     for (const L of [12, 16, 20]) {
       const S = { x: backC.x + bx * L, z: backC.z + bz * L }, D = { x: S.x + bx * 6, z: S.z + bz * 6 };
-      if (!g.world.inside(D.x, D.z, 8) || !depotFits(g, D.x, D.z, -bx, -bz, owner, 30)) continue;
+      if (!g.world.inside(D.x, D.z, 8) || !depotFits(g, D.x, D.z, -bx, -bz, owner, 30, r.y)) continue;
       const n0 = net.nodes.get(ends[0]);
       if (!n0 || n0.edges.length !== 1) return buildRailDepot(g, st, owner, frontDir);
       const p1 = planEdge(g, nodeSnap(g, ends[0], 'rail'), { kind: 'free', x: S.x, z: S.z, y: 0 }, o(r.y - g.world.heightAt(S.x, S.z) || 1e-3));
@@ -466,8 +453,10 @@ export class AIController {
     if (!model) return fail('no buses available');
     // stop candidates on streets: middle of street edges, away from other companies' stops
     const cands: { x: number; z: number; d: number }[] = [];
+    let k = 0;
     for (const e of g.towns.streets(T, 0)) {
       if (e.len < 4) continue;
+      if (++k % 20 === 0) yield; // grid towns have many streets: spread the stop planning over days
       const q = { x: 0, y: 0, z: 0 };
       net.pointAt(e, e.len / 2, q);
       const bp = g.stations.planBusStop(q.x, q.z, owner);
@@ -498,11 +487,11 @@ export class AIController {
       if (sid >= 0 && !ids.includes(sid)) ids.push(sid);
       if (g.stations.nextId > before) p.stations.push(before);
       this.stats.busStops++;
+      yield;
     }
-    yield;
     if (ids.length < 2) return fail('stops not built');
     const d0 = net.nextEdge;
-    const dep = buildRoadDepot(g, stops[0].x, stops[0].z, owner);
+    const dep = yield* roadDepotGen(g, stops[0].x, stops[0].z, owner);
     this.track(d0);
     if (dep < 0) return fail('no depot site');
     p.depots.push(dep);
@@ -619,14 +608,13 @@ export class AIController {
     const gap = (to.x - from.x) * ux + (to.z - from.z) * uz;
     if (gap < 15) return fail('towns touch', 1e9);
     yield;
-    const cs = new CorridorSearch(g, from, to, { kind: 'road', owner, buildingCost: 3, lead: 6 });
-    while (cs.step(3000) === 'running') yield;
-    if (!cs.path) return fail('no corridor');
-    const al = alignCorridor(cs.path, from, to, 80, 12);
-    if (al.minR < 5) return fail('curves too tight');
-    let prof = chainProfile(g, al.way, 1, xa.prop.tracks[0].prof[xa.prop.tracks[0].prof.length - 1], xb.prop.tracks[0].prof[xb.prop.tracks[0].prof.length - 1], 'road');
-    if (!prof) return fail('too steep');
-    if (routeConflict(g, prof, 'road', 1)) return fail('route runs along other roads', 1500);
+    const plan = yield* routeGen(g, from, to, {
+      kind: 'road', owner, tracks: 1, y0: xa.prop.tracks[0].prof[xa.prop.tracks[0].prof.length - 1], y1: xb.prop.tracks[0].prof[xb.prop.tracks[0].prof.length - 1],
+      buildingCost: 3, lead: 6, rmax: 80, rgood: 12, minR: 5, roadJunctions: true,
+    });
+    if (typeof plan === 'string') return fail(plan, plan.startsWith('route runs') ? 1500 : 3000);
+    const al = { way: plan.way };
+    let prof: ChainProfile | null = plan.prof;
     if (prof.s[prof.s.length - 1] > gap * 2 + 20) return fail('detour too long');
     const est = estimateChainCost(prof, 1, 'road', 'road').cost * 1.2 + xa.prop.cost + xb.prop.cost + 50_000;
     if (est > this.available() * 0.4) return fail('too expensive', 720);
@@ -639,7 +627,7 @@ export class AIController {
     const nA = nodeAt(g, 'road', from.x, from.z), nB = nodeAt(g, 'road', to.x, to.z);
     if (!nA || !nB) return fail('could not join the towns');
     yield;
-    prof = chainProfile(g, al.way, 1, nA.y, nB.y, 'road');
+    prof = chainProfile(g, al.way, 1, nA.y, nB.y, 'road', new Set(), true);
     if (!prof) return fail('too steep');
     const chain = chainGen(g, nA.id, al.way.slice(1), o, nB.id, prof);
     let r = chain.next();

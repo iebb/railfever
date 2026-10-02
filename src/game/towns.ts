@@ -3,7 +3,7 @@ import type { Game } from './game';
 import { World, Building, distToRect, pointInRect } from './world';
 import { RNG, hash2 } from './rng';
 import { townName } from './names';
-import { ROAD_TYPES, WATER_Y } from './constants';
+import { ROAD_TYPES, WATER_Y, PSTEP } from './constants';
 import { planEdge, commitProposal, findSnap, BuildOptions } from './construction';
 import { NEdge, NNode } from './network';
 import { closestOnPolyline } from './geom';
@@ -26,11 +26,11 @@ export interface BuildingType {
 export const BUILDING_TYPES: BuildingType[] = [
   { name: 'Cottage', w: [0.8, 1.0], d: [0.7, 0.9], floors: [1, 2], popPerFloor: [1.5, 2.5], setback: 0.35, rank: 0 },
   { name: 'House', w: [1.0, 1.3], d: [0.9, 1.1], floors: [2, 2], popPerFloor: [2, 3], setback: 0.3, rank: 1 },
-  { name: 'Townhouse', w: [1.1, 1.5], d: [0.9, 1.2], floors: [3, 4], popPerFloor: [3, 4], setback: 0.08, rank: 2 },
-  { name: 'Shops', w: [1.4, 2.0], d: [1.1, 1.5], floors: [1, 3], popPerFloor: [4, 6], setback: 0.06, rank: 2 },
-  { name: 'Apartments', w: [1.8, 2.6], d: [1.4, 1.8], floors: [4, 7], popPerFloor: [8, 12], setback: 0.1, rank: 3 },
-  { name: 'Offices', w: [2.0, 2.8], d: [1.8, 2.4], floors: [6, 12], popPerFloor: [12, 18], setback: 0.08, rank: 4 },
-  { name: 'Tower', w: [2.2, 2.8], d: [2.2, 2.8], floors: [14, 30], popPerFloor: [14, 20], setback: 0.08, rank: 5 },
+  { name: 'Townhouse', w: [1.1, 1.5], d: [0.9, 1.2], floors: [3, 4], popPerFloor: [2.5, 3.5], setback: 0.08, rank: 2 },
+  { name: 'Shops', w: [1.4, 2.0], d: [1.1, 1.5], floors: [1, 3], popPerFloor: [3.5, 4.5], setback: 0.06, rank: 2 },
+  { name: 'Apartments', w: [1.8, 2.6], d: [1.4, 1.8], floors: [4, 7], popPerFloor: [3, 4.2], setback: 0.1, rank: 3 },
+  { name: 'Offices', w: [2.0, 2.8], d: [1.8, 2.4], floors: [6, 12], popPerFloor: [2.6, 3.6], setback: 0.08, rank: 4 },
+  { name: 'Tower', w: [2.2, 2.8], d: [2.2, 2.8], floors: [14, 30], popPerFloor: [3, 4.2], setback: 0.08, rank: 5 },
   { name: 'Church', w: [1.6, 1.6], d: [3.0, 3.0], floors: [1, 1], popPerFloor: [0, 0], setback: 0.4, rank: 9 },
   // land use: a whole block (rect = block interior), no floors, no inhabitants
   { name: 'Park', w: [4, 12], d: [4, 12], floors: [0, 0], popPerFloor: [0, 0], setback: 0, rank: 9 },
@@ -74,14 +74,15 @@ const TOWN_OPTS = (): BuildOptions => ({ kind: 'road', type: 'street', tracks: 1
 const latticeKey = (g: TownGrid, i: number, j: number, dir: number) => ((i + g.n) * (2 * g.n + 1) + (j + g.n)) * 2 + dir;
 
 /**
- * Street sides found full (no lot left) per town. Transient: edge ids are never reused, and the
- * running game forgets the set every couple of months (demolitions, terraforming free new lots).
+ * Street sides found full (no lot left) per town. Transient: edge ids are never reused; the set is
+ * forgotten when the town lost buildings (demolition frees lots) and every two years (terraforming).
  */
-const fullSides = new WeakMap<Town, { set: Set<number>; day: number }>();
+const fullSides = new WeakMap<Town, { set: Set<number>; day: number; n: number }>();
 const sideKey = (e: NEdge, side: number) => e.id * 2 + (side > 0 ? 1 : 0);
 function fullSet(town: Town, day: number): Set<number> {
   let f = fullSides.get(town);
-  if (!f || day - f.day > 60) { f = { set: new Set(), day }; fullSides.set(town, f); }
+  if (!f || day - f.day > 720 || town.buildings.size < f.n) { f = { set: new Set(), day, n: 0 }; fullSides.set(town, f); }
+  f.n = town.buildings.size;
   return f.set;
 }
 
@@ -105,6 +106,8 @@ export function rectsOverlap(a: { x: number; z: number; angle: number; w: number
 
 export class Towns {
   list: Town[] = [];
+  /** planned populations while the world is generated (towns claim land by their final size) */
+  private plan = new Map<Town, number>();
   constructor(public game: Game) {}
 
   get world(): World { return this.game.world; }
@@ -114,6 +117,25 @@ export class Towns {
     let best: Town | null = null, bd = Infinity;
     for (const t of this.list) {
       const d = Math.hypot(t.x - x, t.z - z) / (1 + Math.sqrt(t.pop) / 60);
+      if (d < bd) { bd = d; best = t; }
+    }
+    return best;
+  }
+
+  /** Growth cache of a town for saving (a loaded game then grows exactly like the original). */
+  cacheOf(town: Town): { full: number[]; day: number; n: number } | undefined {
+    const f = fullSides.get(town);
+    return f ? { full: [...f.set], day: f.day, n: f.n } : undefined;
+  }
+  restoreCache(town: Town, c: { full?: unknown; day?: unknown; n?: unknown } | undefined) {
+    if (c && Array.isArray(c.full)) fullSides.set(town, { set: new Set(c.full as number[]), day: Number(c.day) || 0, n: Number(c.n) || 0 });
+  }
+
+  /** The town whose land a point is: nearest centre, weighted by (planned) size. */
+  owner(x: number, z: number): Town | null {
+    let best: Town | null = null, bd = Infinity;
+    for (const t of this.list) {
+      const d = Math.hypot(t.x - x, t.z - z) / (1 + Math.sqrt(Math.max(t.pop, this.plan.get(t) ?? 0)) / 60);
       if (d < bd) { bd = d; best = t; }
     }
     return best;
@@ -181,6 +203,7 @@ export class Towns {
       }
     }
     w.heightsVersion++;
+    // all towns first, so each claims its land (see owner) before any of them is laid out
     sites.forEach((site, i) => {
       const isCity = i < Math.max(1, Math.round(count * cityFraction));
       const town: Town = {
@@ -189,13 +212,17 @@ export class Towns {
         passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, served: 0,
       };
       this.list.push(town);
-      const target = isCity ? 2200 + rng.int(2600) : 250 + rng.int(1100);
+      this.plan.set(town, isCity ? 2200 + rng.int(2600) : 250 + rng.int(1100));
+    });
+    for (const town of this.list) {
+      const target = this.plan.get(town)!;
       town.grid = this.makeGrid(town, rng, target);
       town.angle = town.grid.angle;
       this.layoutTown(town, target);
       let guard = 0, misses = 0;
-      while (town.pop < target && guard++ < 5000 && misses < 120) misses = this.growStep(town, rng, 0) ? 0 : misses + 1;
-    });
+      while (town.pop < target && guard++ < 5000 && misses < 120) misses = this.growStep(town, rng, 0, target) ? 0 : misses + 1;
+    }
+    this.plan.clear();
   }
 
   // ---------------------------------------------------------------- the street grid
@@ -252,7 +279,7 @@ export class Towns {
   }
 
   /** Planned grid extent (in blocks from the centre) for a population. */
-  plannedRing(pop: number): number { return Math.max(1, Math.min(9, Math.ceil(Math.sqrt(Math.max(1, pop) / 130) / 2))); }
+  plannedRing(pop: number): number { return Math.max(1, Math.min(9, Math.ceil(Math.sqrt(Math.max(1, pop) / 80) / 2))); }
 
   private latticeNode(g: TownGrid, i: number, j: number): NNode | null {
     if (Math.abs(i) > g.n || Math.abs(j) > g.n) return null;
@@ -274,8 +301,14 @@ export class Towns {
     return Math.abs(d.x * tx + d.z * tz) / (Math.hypot(d.x, d.z) || 1) > 0.9;
   }
 
+  /** All four sides built, or three built and the fourth impossible. */
   private cellClosed(g: TownGrid, i: number, j: number): boolean {
-    return this.latticeBuilt(g, i, j, 0) && this.latticeBuilt(g, i, j + 1, 0) && this.latticeBuilt(g, i, j, 1) && this.latticeBuilt(g, i + 1, j, 1);
+    let built = 0, dead = 0;
+    for (const [a, b, d] of this.cellSides(i, j)) {
+      if (this.latticeBuilt(g, a, b, d)) built++;
+      else if (g.failed.includes(latticeKey(g, a, b, d))) dead++;
+    }
+    return built === 4 || (built === 3 && dead === 1);
   }
 
   /** Park/plaza reserved for block (i, j), or -1. */
@@ -284,8 +317,14 @@ export class Towns {
     if (!g) return -1;
     if (g.plaza && i === 0 && j === 0) return BT_PLAZA;
     if (Math.abs(i + 0.5) < 1.6 && Math.abs(j + 0.5) < 1.6) return -1; // the core stays built-up
-    return hash2(i + 101, j + 101, town.id * 7 + 13) < 1 / 12 ? BT_PARK : -1;
+    if (hash2(i + 101, j + 101, town.id * 7 + 13) >= 1 / 12) return -1;
+    // a block that can never get three streets is left to ordinary frontage
+    let dead = 0;
+    for (const [a, b, d] of this.cellSides(i, j)) if (g.failed.includes(latticeKey(g, a, b, d))) dead++;
+    return dead <= 1 ? BT_PARK : -1;
   }
+
+  private cellSides(i: number, j: number): [number, number, number][] { return [[i, j, 0], [i, j + 1, 0], [i, j, 1], [i + 1, j, 1]]; }
 
   /** Build the street along lattice segment (i, j, dir); records failures. */
   private buildLattice(town: Town, i: number, j: number, dir: number, day = 0): boolean {
@@ -295,7 +334,18 @@ export class Towns {
     const k = latticeKey(g, i, j, dir);
     if (g.failed.includes(k)) return false;
     if (this.latticeBuilt(g, i, j, dir)) return true;
-    if (!this.tryStreet(this.latticePoint(g, i, j), this.latticePoint(g, i2, j2))) { g.failed.push(k); return false; }
+    // never into a neighbour's land (its grid has another angle)
+    const p = this.latticePoint(g, i, j), q = this.latticePoint(g, i2, j2);
+    if (this.owner((p.x + q.x) / 2, (p.z + q.z) / 2) !== town) return false;
+    const res = this.tryStreet(p, q);
+    if (res === 'busy') return false;
+    if (res === 'fail') {
+      g.failed.push(k);
+      // a reserved block that now has three streets and a dead fourth side becomes its park
+      if (dir === 0) { this.landUse(town, i, j - 1, day); this.landUse(town, i, j, day); }
+      else { this.landUse(town, i - 1, j, day); this.landUse(town, i, j, day); }
+      return false;
+    }
     // newly closed blocks may become parks or the plaza
     if (dir === 0) { this.landUse(town, i, j - 1, day); this.landUse(town, i, j, day); }
     else { this.landUse(town, i - 1, j, day); this.landUse(town, i, j, day); }
@@ -303,29 +353,29 @@ export class Towns {
   }
 
   /** A straight town street between two points; skipped when steep, over water, blocked or crossing rails. */
-  private tryStreet(p: { x: number; z: number }, q: { x: number; z: number }): boolean {
+  private tryStreet(p: { x: number; z: number }, q: { x: number; z: number }): 'ok' | 'fail' | 'busy' {
     const g = this.game, w = this.world, net = w.net;
-    if (!w.inside(p.x, p.z, 5) || !w.inside(q.x, q.z, 5)) return false;
-    const L = Math.hypot(q.x - p.x, q.z - p.z);
+    if (!w.inside(p.x, p.z, 5) || !w.inside(q.x, q.z, 5)) return 'fail';
     for (let k = 0; k <= 8; k++) {
       const x = p.x + ((q.x - p.x) * k) / 8, z = p.z + ((q.z - p.z) * k) / 8;
-      if (w.heightAt(x, z) < WATER_Y + 0.15) return false;
+      if (w.heightAt(x, z) < WATER_Y + 0.15) return 'fail';
     }
     const sa = findSnap(g, 'road', p.x, p.z, 0.9), sb = findSnap(g, 'road', q.x, q.z, 0.9);
-    if (sa.kind === 'node' && sb.kind === 'node' && sa.node === sb.node) return false;
+    if (sa.kind === 'node' && sb.kind === 'node' && sa.node === sb.node) return 'fail';
     const prop = planEdge(g, sa, sb, { ...TOWN_OPTS(), straight: true });
-    if (!prop.ok || prop.stats.bridges || prop.stats.tunnels || prop.stats.minRadius < 3) return false;
+    if (!prop.ok || prop.stats.bridges || prop.stats.tunnels || prop.stats.minRadius < 3) return 'fail';
     // never level-cross (or bridge) railways, never cut through company roads
-    for (const c of prop.crossings) { const e = net.edges.get(c.edge); if (!e || e.kind === 'rail' || e.owner >= 0) return false; }
-    // stay close to the ground (no big cuttings or embankments on hillsides)
+    for (const c of prop.crossings) { const e = net.edges.get(c.edge); if (!e || e.kind === 'rail' || e.owner >= 0) return 'fail'; }
+    // stay close to the ground (no big cuttings or embankments on hillsides); profile samples every PSTEP
     const tp = prop.tracks[0];
     for (let i = 0; i < tp.prof.length; i++) {
-      const f = Math.min(1, (i * 1) / Math.max(0.01, tp.len));
+      const f = Math.min(1, (i * PSTEP) / Math.max(0.01, tp.len));
       const x = tp.bez.x0 + (tp.bez.x3 - tp.bez.x0) * f, z = tp.bez.z0 + (tp.bez.z3 - tp.bez.z0) * f;
-      if (Math.abs(tp.prof[i] - w.heightAt(x, z)) > 1.0) return false;
+      if (Math.abs(tp.prof[i] - w.heightAt(x, z)) > 1.0) return 'fail';
     }
-    void L;
-    return commitProposal(g, prop) === null;
+    // traffic on a street that would be split is only a passing obstacle
+    const err = commitProposal(g, prop);
+    return err === null ? 'ok' : err === 'Vehicle in the way' ? 'busy' : 'fail';
   }
 
   /** Initial layout: two arterials through the centre, then the grid ring by ring. */
@@ -385,6 +435,9 @@ export class Towns {
       const a = has(i, j), b = has(i2, j2);
       if (!a && !b) continue;
       if (a && b && this.latticeBuilt(g, i, j, dir)) continue;
+      // not into a neighbour's land
+      const p = this.latticePoint(g, i, j), q = this.latticePoint(g, i2, j2);
+      if (this.owner((p.x + q.x) / 2, (p.z + q.z) / 2) !== town) continue;
       cands.push({ i, j, dir, score: (a && b ? 3 : 0) - ring * 1.5 + rng.next() * 1.5 });
     }
     cands.sort((p, q) => q.score - p.score);
@@ -431,6 +484,21 @@ export class Towns {
     town.buildings.add(b.id);
   }
 
+  /** Is a (country road) edge a straight piece along one of the grid's lattice lines? */
+  private onGrid(g: TownGrid, e: NEdge): boolean {
+    const b = e.bez;
+    const cx = b.x3 - b.x0, cz = b.z3 - b.z0, cl = Math.hypot(cx, cz);
+    if (cl < 2 || cl < e.len * 0.995) return false;
+    const sa = Math.sin(g.angle), ca = Math.cos(g.angle);
+    const du = Math.abs((cx * sa + cz * ca) / cl), dv = Math.abs((cx * ca - cz * sa) / cl);
+    if (Math.max(du, dv) < 0.985) return false;
+    // on a lattice line: the perpendicular coordinate matches one of the grid lines
+    const mx = (b.x0 + b.x3) / 2 - g.ox, mz = (b.z0 + b.z3) / 2 - g.oz;
+    const a = mx * sa + mz * ca, bb = mx * ca - mz * sa;
+    const lines = du > dv ? g.gv : g.gu, v = du > dv ? bb : a;
+    return lines.some((l) => Math.abs(l - v) < 0.6);
+  }
+
   /** Town street edges near the town. */
   streets(town: Town, extra = 6): NEdge[] {
     const R = town.radius + extra;
@@ -438,14 +506,19 @@ export class Towns {
       .filter((e) => e.kind === 'road' && e.owner === -1 && e.station < 0 && e.depot < 0);
   }
 
-  private chooseType(town: Town, x: number, z: number, rng: RNG): number {
+  /**
+   * Zoning by distance from the centre and (planned) population: an office/apartment core in cities,
+   * a ring of apartments, shops and townhouses, a high street of townhouses and shops, then houses.
+   * Fresh lots never get towers below 8000 inhabitants (those come from redevelopment).
+   */
+  private chooseType(town: Town, x: number, z: number, rng: RNG, P = town.pop, fresh = false): number {
     const d = Math.hypot(x - town.x, z - town.z);
-    const P = town.pop;
-    const r = rng.next();
-    const core = 6 + Math.sqrt(P) * 0.18;
-    if (P > 2600 && d < core * 0.55) return r < 0.35 ? BT_TOWER : r < 0.8 ? BT_OFFICE : BT_APARTMENT;
-    if (P > 1100 && d < core) return r < 0.5 ? BT_APARTMENT : r < 0.65 && P > 1800 ? BT_OFFICE : r < 0.85 ? BT_SHOP : BT_TOWNHOUSE;
-    if (P > 220 && d < core * 1.35) return r < 0.4 ? BT_TOWNHOUSE : r < 0.65 ? BT_SHOP : r < 0.78 && P > 700 ? BT_APARTMENT : BT_HOUSE_L;
+    const r = rng.next(), sq = Math.sqrt(Math.max(1, P));
+    if (P > 2600 && d < 2 + sq * 0.05) return r < 0.15 && (!fresh || P > 8000) ? BT_TOWER : r < 0.5 ? BT_OFFICE : r < 0.85 ? BT_APARTMENT : BT_SHOP;
+    if (P > 1100 && d < 2 + sq * 0.12) return r < 0.35 ? BT_APARTMENT : r < 0.45 && P > 1800 ? BT_OFFICE : r < 0.7 ? BT_SHOP : BT_TOWNHOUSE;
+    const f = Math.min(1, P / 1200);
+    if (P > 220 && d < 2 + sq * 0.19) return r < 0.45 * f ? BT_TOWNHOUSE : r < 0.65 * f ? BT_SHOP : r < 0.72 * f && P > 700 ? BT_APARTMENT : r < 0.8 ? BT_HOUSE_L : BT_HOUSE_S;
+    if (P > 600 && d < 2 + sq * 0.3) return r < 0.25 * f ? BT_TOWNHOUSE : r < 0.6 ? BT_HOUSE_L : BT_HOUSE_S;
     return r < 0.55 ? BT_HOUSE_S : BT_HOUSE_L;
   }
 
@@ -505,13 +578,9 @@ export class Towns {
    * Perimeter-block frontage: the next free lot on one side of a street, next to the existing row
    * (continuous rows in the centre, detached houses with gaps in the suburbs; block interiors stay open).
    */
-  private frontage(town: Town, e: NEdge, side: number, rng: RNG, day: number, typeOverride = -1): boolean {
+  private frontage(town: Town, e: NEdge, side: number, rng: RNG, day: number, typeOverride = -1, P = town.pop): boolean {
     const W = this.world, net = W.net;
     const geo = net.geo(e);
-    const ra = net.junctionRadius(e.a) + 0.3, rb = net.junctionRadius(e.b) + 0.3;
-    const s0 = Math.min(ra, e.len * 0.45), s1 = Math.max(e.len - rb, e.len * 0.55);
-    const full = fullSet(town, day);
-    if (s1 - s0 < 0.9) { if (typeOverride < 0) full.add(sideKey(e, side)); return false; }
     const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.street;
     const hw = rt.half + rt.sidewalk;
     const at = (s: number) => {
@@ -521,9 +590,29 @@ export class Towns {
       return { x: p.x, z: p.z, tx: d.x / l, tz: d.z / l };
     };
     // building type for this stretch
-    const mid = at((s0 + s1) / 2);
-    const type = typeOverride >= 0 ? typeOverride : this.chooseType(town, mid.x - mid.tz * side * 2, mid.z + mid.tx * side * 2, rng);
+    const mid = at(e.len / 2);
+    const type = typeOverride >= 0 ? typeOverride : this.chooseType(town, mid.x - mid.tz * side * 2, mid.z + mid.tx * side * 2, rng, P, true);
     const bt = BUILDING_TYPES[type];
+    // usable stretch: rows run through junctions where no street leaves on this side, and town
+    // rows (rank >= 2) close the corner where one does; detached houses keep clear of junctions
+    const endClear = (nodeId: number, s: number) => {
+      const n = net.nodes.get(nodeId);
+      if (!n || n.edges.length <= 1) return 0.3;
+      const p = at(s), nx = -p.tz * side, nz = p.tx * side;
+      let onSide = false;
+      for (const id of n.edges) {
+        if (id === e.id) continue;
+        const o = net.edges.get(id);
+        if (!o) continue;
+        const ld = net.leaveDir(o, nodeId), l = Math.hypot(ld.x, ld.z) || 1;
+        if ((ld.x * nx + ld.z * nz) / l > 0.3) onSide = true;
+      }
+      if (!onSide) return 0.3;
+      return bt.rank >= 2 && bt.rank < 9 ? hw + 0.1 : net.junctionRadius(nodeId) + 0.3;
+    };
+    const s0 = Math.min(endClear(e.a, 0), e.len * 0.45), s1 = Math.max(e.len - endClear(e.b, e.len), e.len * 0.55);
+    const full = fullSet(town, day);
+    if (s1 - s0 < 0.9) { if (typeOverride < 0) full.add(sideKey(e, side)); return false; }
     const wdt = bt.w[0] + rng.next() * (bt.w[1] - bt.w[0]);
     const dep = bt.d[0] + rng.next() * (bt.d[1] - bt.d[0]);
     const gap = bt.rank >= 2 ? 0.14 + rng.next() * 0.05 : 0.35 + rng.next() * 0.9;
@@ -583,7 +672,7 @@ export class Towns {
   growthRadius(town: Town) { const m = this.maxRadius(town); return Math.max(m * 1.15, Math.min(town.radius - 2.5, m * 1.5)); }
 
   /** One growth step: a frontage lot, a new grid segment at the edge, or densification. */
-  growStep(town: Town, rng: RNG, day: number): boolean {
+  growStep(town: Town, rng: RNG, day: number, plannedPop = town.pop): boolean {
     const net = this.world.net;
     // pace growth in the running game (generation grows freely): about 0.5 % of the population per
     // step, independent of how many steps the game schedules for big towns
@@ -594,10 +683,14 @@ export class Towns {
     }
     if (!town.grid) town.grid = this.makeGrid(town, rng, town.pop);
     const g = town.grid;
-    const streets = this.streets(town).filter((e) => e.type === 'street');
+    const streets = this.streets(town).filter((e) => {
+      if (e.type !== 'street' && !this.onGrid(g, e)) return false;
+      const geo = net.geo(e), k = Math.floor(geo.n / 2) * 3;
+      return this.owner(geo.pts[k], geo.pts[k + 2]) === town;
+    });
     if (!streets.length) return this.extendGrid(town, rng, day);
     // upgrade a building near the centre now and then
-    if (town.buildings.size > 20 && rng.chance(0.15) && this.upgrade(town, rng, day)) return true;
+    if (town.buildings.size > 20 && rng.chance(0.15) && this.upgrade(town, rng, day, plannedPop)) return true;
     // church once established
     if (!town.hasChurch && town.pop > 500) {
       const near = streets.filter((e) => { const n = net.nodes.get(e.a)!; return Math.hypot(n.x - town.x, n.z - town.z) < 14; });
@@ -615,20 +708,23 @@ export class Towns {
       for (const side of [1, -1]) if (!full.has(sideKey(e, side))) cands.push({ e, side, d: d + rng.next() * 7 });
     }
     cands.sort((a, b) => a.d - b.d);
-    for (const c of cands.slice(0, 6)) if (this.frontage(town, c.e, c.side, rng, day)) return true;
+    // full sides are remembered, so this scan is short once the set is warm; the grid only
+    // grows when every side has been tried
+    for (const c of cands.slice(0, 60)) if (this.frontage(town, c.e, c.side, rng, day, -1, plannedPop)) return true;
+    if (cands.length > 60) return false;
     // new blocks at the edge (their streets bring new lots); if that fails too, densify
     if (this.extendGrid(town, rng, day)) return true;
-    return town.buildings.size > 8 && this.upgrade(town, rng, day);
+    return town.buildings.size > 8 && this.upgrade(town, rng, day, plannedPop);
   }
 
   /** Replace a building by a higher-ranked one (bigger footprint if there is room, else taller). */
-  private upgrade(town: Town, rng: RNG, day: number): boolean {
+  private upgrade(town: Town, rng: RNG, day: number, P = town.pop): boolean {
     const w = this.world;
     const ids = [...town.buildings];
     for (let k = 0; k < 4; k++) {
       const b = w.buildings.get(ids[rng.int(ids.length)]);
       if (!b || BUILDING_TYPES[b.type].rank >= 9) continue;
-      const nt = this.chooseType(town, b.x, b.z, rng);
+      const nt = this.chooseType(town, b.x, b.z, rng, P);
       if (BUILDING_TYPES[nt].rank <= BUILDING_TYPES[b.type].rank) continue;
       const bt = BUILDING_TYPES[nt];
       // densify gradually: the new building may house at most 2.5x the old one

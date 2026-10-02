@@ -142,9 +142,19 @@ export function buildPark(ctx: ChunkCtx, b: Building) {
   terrainPatch(W, w, F, -hw, hw, -hd, hd, 0.012, WSCALE.GRASS);
   // feature in the middle: pond, playground or a small rondel with a statue
   const big = Math.min(hw, hd) >= 1.15;
-  const kind = big ? (r.chance(0.5) ? 'pond' : 'play') : r.chance(0.5) ? 'rondel' : 'play';
+  let kind = big ? (r.chance(0.5) ? 'pond' : 'play') : r.chance(0.5) ? 'rondel' : 'play';
   const ca = (r.next() - 0.5) * hw * 0.3, cb = (r.next() - 0.5) * hd * 0.3 - hd * 0.1;
-  const fr = Math.min(hw, hd) * (kind === 'pond' ? 0.42 : 0.3);
+  let fr = Math.min(hw, hd) * (kind === 'pond' ? 0.42 : 0.3);
+  // ponds only on near-level ground (water level = highest ground under the rim)
+  let pondTop = -Infinity, pondLow = Infinity;
+  if (kind === 'pond') {
+    for (let k = 0; k < 12; k++) {
+      const t = (k / 12) * Math.PI * 2;
+      const hgt = w.heightAt(F.x(ca + Math.cos(t) * fr * 1.15, cb + Math.sin(t) * fr), F.z(ca + Math.cos(t) * fr * 1.15, cb + Math.sin(t) * fr));
+      pondTop = Math.max(pondTop, hgt); pondLow = Math.min(pondLow, hgt);
+    }
+    if (pondTop - pondLow > 0.18) { kind = 'rondel'; fr = Math.min(hw, hd) * 0.3; }
+  }
   // paths: from the front entrance to the feature, then on to one or two other edges
   const paths: [number, number][][] = [];
   const entry: [number, number] = [(r.next() - 0.5) * hw * 0.6, hd];
@@ -168,7 +178,7 @@ export function buildPark(ctx: ChunkCtx, b: Building) {
   const fx = F.x(ca, cb), fz = F.z(ca, cb), fy = w.heightAt(fx, fz);
   if (kind === 'pond') {
     // flat water inside a stone rim
-    const yw = fy + 0.03;
+    const yw = Math.max(fy, pondTop) + 0.03;
     const rim = ring(W, w, F, ca, cb, fr, fr * 0.8, 0.045, yw + 0.012, 0.12, b.seed % 7, 18);
     W.use(WC.WATER, 0xffffff, 0);
     disc(W, w, F, ca, cb, fr - 0.04, fr * 0.8 - 0.04, yw, 0, WSCALE.WATER, 0.12, b.seed % 7, 18);
@@ -176,7 +186,7 @@ export function buildPark(ctx: ChunkCtx, b: Building) {
     W.use(WC.CONCRETE, 0xc4bdb0, 1);
     for (let k = 0; k < rim.length; k++) {
       const p = rim[k], q = rim[(k + 1) % rim.length];
-      wallQuad(W, p[0], p[2], q[0], q[2], w.heightAt(p[0], p[2]) - 0.02, p[1], w.heightAt(q[0], q[2]) - 0.02, q[1], (p[0] + q[0]) / 2 - fx, (p[2] + q[2]) / 2 - fz);
+      wallQuad(W, p[0], p[2], q[0], q[2], Math.min(w.heightAt(p[0], p[2]), p[1]) - 0.02, p[1], Math.min(w.heightAt(q[0], q[2]), q[1]) - 0.02, q[1], (p[0] + q[0]) / 2 - fx, (p[2] + q[2]) / 2 - fz);
     }
   } else if (kind === 'play') {
     W.use(WC.GRAVEL, 0xf0dfb0, 0);

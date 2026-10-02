@@ -20,7 +20,8 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 
 **World**
 - Continuous terrain at real scale (maps of 2.5–7.7 km) with hills, mountains, lakes and coasts, forests and snowy peaks.
-- Towns with organic, curved street networks and rotated building lots. They grow from cottages to apartments, offices and towers, and grow faster when stations serve them.
+- Towns laid out on street grids aligned with the terrain: arterials first, then blocks growing outward ring by ring, with continuous frontage around the blocks, a central plaza, parks, street trees and zebra crossings. They densify from cottages to apartments, offices and towers, and grow faster when stations serve them.
+- Country roads connect all towns from the start (a spanning tree plus shortcuts), routed over the terrain with viaducts, river bridges and the occasional tunnel.
 - Town traffic with junction priority, queueing and level-crossing safety.
 - Rendering: sky, fitted sun shadows, ambient occlusion, cloud shadows, animated water with shore foam, moonlit nights, distance LOD for terrain, details, trees and vehicles, and dynamic resolution that holds the frame rate.
 
@@ -48,8 +49,11 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Lines are ordered stop lists, drawn on the map. Routing across the whole network includes **transfers**.
 - Fares depend on distance and speed. The economy covers running costs, maintenance, a loan with interest, and finance and company reports with charts.
 
+**Sound**
+- Procedural sound effects (WebAudio, no audio files): soft interface sounds, construction clanks and rollers, demolition, cash chimes, positional trains (steam chuffs, diesel rumble, electric hum, rail-joint clatter, horns and whistles), level-crossing bells, station chimes, and ambience that follows the camera (birds, wind, town hum, surf, crickets at night). Volume sliders per group and a mute button in the top bar.
+
 **Interface**
-- A redesigned interface set in Barlow and Barlow Condensed: a top bar with your company and date, a tool dock with categories, compact tool cards with live cost, grade, radius and speed previews, and windows for stations, towns, vehicles, lines, finances, companies and news.
+- A redesigned interface set in Inter and Barlow Condensed, with a getting-started checklist, hover cards in the world and rising income text: a top bar with your company and date, a tool dock with categories, compact tool cards with live cost, grade, radius and speed previews, and windows for stations, towns, vehicles, lines, finances, companies and news.
 - Title screen and new-game setup, minimap with layers, settings for shadows, ambient occlusion, resolution, day/night, transparency and the F3 performance overlay.
 
 ## Controls

@@ -1,5 +1,5 @@
 // Procedural terrain (continuous heights, 1 unit = 10 m) and vegetation.
-import { World } from './world';
+import { World, pointInRect } from './world';
 import { RNG, Simplex2 } from './rng';
 import { WATER_Y } from './constants';
 
@@ -75,6 +75,14 @@ export function generateTrees(world: World, seed: number) {
       if (h < WATER_Y + 0.3) continue;
       const slope = world.slopeAt(x, z);
       if (slope > 1.2) continue;
+      // keep roads, railways and building lots clear; town gardens only get the odd tree
+      if (world.net.nearestEdge(x, z, 1.0)) continue;
+      let blocked = false, near = 0;
+      for (const b of world.buildingsNear(x, z, 4)) {
+        if (pointInRect(x, z, b.x, b.z, b.angle, b.w / 2 + 0.35, b.d / 2 + 0.35)) { blocked = true; break; }
+        near++;
+      }
+      if (blocked || (near > 1 && rng.next() > 0.25)) continue;
       const alt = h / 25;
       const conifer = rng.next() < 0.25 + alt * 1.1 + noise.noise(x / 60 + 100, z / 60) * 0.3;
       world.addTree({ x, z, s: 0.75 + rng.next() * 0.65, type: conifer ? 1 : 0, tint: rng.next() });

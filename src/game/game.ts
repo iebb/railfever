@@ -7,6 +7,7 @@ import { Vehicles } from './vehicles';
 import { Depots } from './build-ops';
 import { Economy, Company, COMPANY_COLORS } from './economy';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
+import { generateIntercityRoads } from './roads';
 import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, TRACK_TYPES, ROAD_TYPES } from './constants';
 import { RNG } from './rng';
 import { MODELS } from './vehicle-types';
@@ -82,6 +83,7 @@ export class Game {
     const g = new Game(opts);
     generateHeights(g.world, { seed: opts.seed, hilliness: opts.hilliness, water: opts.water });
     g.towns.generate(opts.towns, opts.seed);
+    generateIntercityRoads(g);
     generateTrees(g.world, opts.seed);
     g.world.dirtyObj.clear();
     g.world.dirtyTerrain.clear();

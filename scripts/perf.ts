@@ -4,7 +4,7 @@
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { findSnap } from '../src/game/construction';
-import { fmt, connectStations, depotBehind, placeStationPair, addBusStop, roadDepotNear, build, roadOpts, free, Train } from './lib';
+import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, build, roadOpts, free, Train } from './lib';
 
 const FRAMES = Number(process.argv[2] ?? 3000);
 const T0 = performance.now();
@@ -38,15 +38,35 @@ for (const town of g.towns.list) {
     for (let k = 0; k < 5; k++) if (typeof g.vehicles.buyRoad(dep, MODEL_BY_ID.get('bus_c')!, l.id) !== 'string') buses++;
   }
 }
+// ---- intercity bus lines over the generated country roads, 3 buses each
+let icLines = 0;
+{
+  const centreStop = (t: (typeof g.towns.list)[number]) => {
+    const st = [...g.stations.map.values()].filter((s) => s.owner === 0 && s.stops.length && Math.hypot(s.x - t.x, s.z - t.z) < t.radius);
+    st.sort((a, b) => Math.hypot(a.x - t.x, a.z - t.z) - Math.hypot(b.x - t.x, b.z - t.z));
+    return st[0];
+  };
+  const T = g.towns.list;
+  for (let i = 0; i < T.length && icLines < 6; i++) for (let j = i + 1; j < T.length && icLines < 6; j++) {
+    const d = Math.hypot(T[i].x - T[j].x, T[i].z - T[j].z);
+    if (d < 60 || d > 130) continue;
+    const a = centreStop(T[i]), b = centreStop(T[j]);
+    if (!a || !b) continue;
+    const dep = roadDepotNear(g, a.stops[0].x, a.stops[0].z, 0);
+    if (dep < 0) continue;
+    const l = g.lines.create('road', 0);
+    l.stops = [a.id, b.id];
+    icLines++;
+    for (let k = 0; k < 3; k++) if (typeof g.vehicles.buyRoad(dep, MODEL_BY_ID.get('bus_c')!, l.id) !== 'string') buses++;
+  }
+}
 // ---- rail lines between town pairs, 3 trains each
 let railLines = 0, trains = 0;
 const used = new Set<number>();
 for (let k = 0; k < 8; k++) {
-  const pr = placeStationPair(g, 70, 200, 0, used);
+  const pr = placeAndConnect(g, 70, 200, 0, used, 1, quiet);
   if (!pr) break;
   used.add(pr.TA.id); used.add(pr.TB.id);
-  const con = connectStations(g, pr.A, pr.B, 0, 1, quiet);
-  if (!con.ok) continue;
   const dep = depotBehind(g, pr.A, pr.B, 0);
   if (dep < 0) continue;
   const l = g.lines.create('rail', 0);
@@ -61,7 +81,7 @@ const setupMs = performance.now() - T0 - genMs;
 // warm up: let vehicles leave depots and ambient traffic spawn
 g.speed = 8;
 for (let i = 0; i < 600; i++) g.update(1 / 60);
-console.log(`512 map: gen ${fmt(genMs, 0)} ms, setup ${fmt(setupMs, 0)} ms; ${busLines} bus lines/${buses} buses, ${railLines} rail lines/${trains} trains, ambient ${g.vehicles.ambient.length}, edges ${g.world.net.edges.size}`);
+console.log(`512 map: gen ${fmt(genMs, 0)} ms, setup ${fmt(setupMs, 0)} ms; ${busLines} town + ${icLines} intercity bus lines/${buses} buses, ${railLines} rail lines/${trains} trains, ambient ${g.vehicles.ambient.length}, edges ${g.world.net.edges.size}`);
 
 // ---- instrument periodic jobs
 const jobs = new Map<string, { n: number; t: number; max: number }>();

@@ -8,6 +8,7 @@ import type { NNode, NEdge } from './network';
 import { NetKind, RAIL, TRACK_TYPES, ROAD_TYPES, WATER_Y, STATION_RADIUS } from './constants';
 import { planEdge, commitProposal, findSnap, freeSide, BuildOptions, Snap, Proposal } from './construction';
 import { recomputeLocks } from './terraform';
+import { depotSize } from './build-ops';
 import { distToRect } from './world';
 import { Heap } from './train';
 import { segIntersect, angleBetween } from './geom';
@@ -77,6 +78,8 @@ export interface CorridorOpts {
   lead?: number;
   /** segments the corridor must keep away from (e.g. the station leads), with clearance r */
   avoid?: { x0: number; z0: number; x1: number; z1: number; r: number }[];
+  /** weight of slopes (1 = default); higher follows the contours more closely */
+  slopeCost?: number;
 }
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -183,7 +186,7 @@ export class CorridorSearch {
     if (this.state !== 'running') return this.state;
     const n = this.n, C = this.C;
     const grade = this.opts.kind === 'rail' ? 0.03 : 0.07;
-    const bcost = this.opts.buildingCost ?? 1;
+    const bcost = this.opts.buildingCost ?? 1, sc = this.opts.slopeCost ?? 1;
     const maxExpand = this.opts.maxExpand ?? 250000;
     while (budget-- > 0) {
       if (!this.heap.size) { this.state = 'failed'; return this.state; }
@@ -209,7 +212,7 @@ export class CorridorSearch {
         const d = (di & 1 ? Math.SQRT2 : 1) * C;
         let c = d;
         const dh = Math.abs(this.hgt[v] - hu);
-        c += dh * 2 + Math.max(0, dh - grade * d) * 14;
+        c += (dh * 2 + Math.max(0, dh - grade * d) * 14) * sc;
         if (f & 2) c += d * 4.5;
         if (f & 4) c += 22 * bcost;
         if (f & 8) c += 9;
@@ -330,7 +333,7 @@ function rayLine(p: P2, d: P2, q: P2, e: P2): { u: number; w: number } | null {
  * allow, up to rmax); tight neighbouring corners are merged. Returns oriented waypoints: consecutive
  * points lie on one straight or one arc.
  */
-export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, rgood = 45): { way: OPoint[]; minR: number } {
+export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, rgood = 45): { way: OPoint[]; minR: number; minAt: P2 | null } {
   let V: P2[] = rdp(path, 1.2).map((p) => ({ ...p }));
   if (V.length < 4) {
     const L = Math.hypot(to.x - from.x, to.z - from.z) * 0.3;
@@ -364,7 +367,7 @@ export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, 
   }
   const f = cornerFit(V, rmax);
   const out: OPoint[] = [from];
-  let minR = Infinity;
+  let minR = Infinity, minAt: P2 | null = null;
   const pushPt = (x: number, z: number, tx: number, tz: number) => {
     const p = out[out.length - 1];
     if (Math.hypot(x - p.x, z - p.z) < 0.8) return;
@@ -380,7 +383,7 @@ export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, 
     const a = f.dir[i - 1];
     if (f.T[i] <= 1e-6) continue;
     const R = f.R[i];
-    minR = Math.min(minR, R);
+    if (R < minR) { minR = R; minAt = { x: V[i].x, z: V[i].z }; }
     const sx = V[i].x - a.x * f.T[i], sz = V[i].z - a.z * f.T[i];
     straightTo(sx, sz, a.x, a.z);
     const nx = -a.z * f.sgn[i], nz = a.x * f.sgn[i];
@@ -395,7 +398,7 @@ export function alignCorridor(path: P2[], from: OPoint, to: OPoint, rmax = 150, 
   }
   straightTo(to.x, to.z, to.tx, to.tz);
   if (out[out.length - 1].x !== to.x || out[out.length - 1].z !== to.z) { out.pop(); out.push(to); }
-  return { way: out, minR };
+  return { way: out, minR, minAt };
 }
 
 // ============================================================================ chained construction
@@ -410,8 +413,9 @@ export interface ChainProfile {
 /**
  * Sample a chain of oriented waypoints and compute a global grade-limited height profile that also
  * respects crossings with existing edges (level where possible, else over/under with clearance).
+ * Roads cross roads over/under unless `roadJunctions` (country roads meeting at level junctions).
  */
-export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set()): ChainProfile | null {
+export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }): ChainProfile | null {
   const xs: number[] = [], zs: number[] = [], ss: number[] = [], tr: number[] = [];
   let acc = 0;
   for (let i = 1; i < way.length; i++) {
@@ -430,7 +434,8 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
     }
   }
   const n = xs.length;
-  const win = 10;
+  // railways smooth the ground over ~20 units; roads hug it more closely
+  const win = kind === 'rail' ? 10 : 3;
   const desired: number[] = [], lo: number[] = [], hi: number[] = [];
   for (let i = 0; i < n; i++) {
     let sum = 0, cnt = 0;
@@ -448,7 +453,7 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
   const net = g.world.net;
   let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
   for (let i = 0; i < n; i++) { bx0 = Math.min(bx0, xs[i]); bx1 = Math.max(bx1, xs[i]); bz0 = Math.min(bz0, zs[i]); bz1 = Math.max(bz1, zs[i]); }
-  const cr: { i: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; edge: number }[] = [];
+  const cr: { i: number; sc: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; edge: number }[] = [];
   for (const e of net.edgesNear(bx0 - 1, bz0 - 1, bx1 + 1, bz1 + 1)) {
     if (exclude.has(e.id)) continue;
     const box = net.grid.box(e.id);
@@ -464,8 +469,8 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
         const ang = angleBetween(bx - ax, bz - az, ge.pts[j * 3 + 3] - ge.pts[j * 3], ge.pts[j * 3 + 5] - ge.pts[j * 3 + 2]);
         const sec = net.sectionAt(e, sOld);
         cr.push({
-          i: r[0] < 0.5 ? i : i + 1, x: ax + (bx - ax) * r[0], z: az + (bz - az) * r[0], yo: net.heightAtS(e, sOld),
-          levelOk: Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road'),
+          i: r[0] < 0.5 ? i : i + 1, sc: ss[i] + (ss[i + 1] - ss[i]) * r[0], x: ax + (bx - ax) * r[0], z: az + (bz - az) * r[0], yo: net.heightAtS(e, sOld),
+          levelOk: Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road' && !roadJunctions),
           tunnel: sec === 'tunnel', edge: e.id,
         });
       }
@@ -473,20 +478,37 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
   }
   const crossings: ChainProfile['crossings'] = [];
   if (cr.length) {
+    type Mode = 'level' | 'over' | 'under';
     const clr = RAIL.clearance + 0.15;
-    for (const c of cr) {
-      const yn = y[c.i];
-      const mode: 'level' | 'over' | 'under' = !c.tunnel && Math.abs(yn - c.yo) < 0.35 && c.levelOk ? 'level' : yn >= c.yo ? 'over' : 'under';
-      crossings.push({ x: c.x, z: c.z, mode, edge: c.edge });
-      // a window around the crossing, so segment ends close to it already have the clearance
-      for (let k = Math.max(0, c.i - 3); k <= Math.min(n - 1, c.i + 3); k++) {
-        if (mode === 'over') lo[k] = Math.max(lo[k], c.yo + clr);
-        else if (mode === 'under') hi[k] = Math.min(hi[k], c.yo - clr);
-        else if (k === c.i) { lo[k] = Math.max(lo[k], c.yo - 0.05); hi[k] = Math.min(hi[k], c.yo + 0.05); }
-      }
+    const solve = (modes: Mode[]) => {
+      const lo2 = lo.slice(), hi2 = hi.slice();
+      cr.forEach((c, j) => {
+        // a window around the crossing, so segment ends close to it already have the clearance (or,
+        // for level crossings, a height from which the crossing height is reachable within the grade)
+        for (let k = Math.max(0, c.i - 3); k <= Math.min(n - 1, c.i + 3); k++) {
+          if (modes[j] === 'over') lo2[k] = Math.max(lo2[k], c.yo + clr);
+          else if (modes[j] === 'under') hi2[k] = Math.min(hi2[k], c.yo - clr);
+          else { const slack = grade * 0.9 * Math.abs(ss[k] - c.sc) + 0.004; lo2[k] = Math.max(lo2[k], c.yo - slack); hi2[k] = Math.min(hi2[k], c.yo + slack); }
+        }
+      });
+      return solveHeights(desired, step, lo2, hi2, grade);
+    };
+    // the natural mode at each crossing: level when close in height, else over or under
+    const base: Mode[] = cr.map((c) => (!c.tunnel && Math.abs(y![c.i] - c.yo) < 0.35 && c.levelOk ? 'level' : y![c.i] >= c.yo ? 'over' : 'under'));
+    let modes = base;
+    let sol = solve(base);
+    if (!sol && cr.length <= 6) {
+      // other combinations, fewest changes first
+      const alts = cr.map((c, j) => (['level', 'over', 'under'] as Mode[]).filter((m) => m !== base[j] && (m !== 'level' || (c.levelOk && !c.tunnel))));
+      const combos: Mode[][] = [[]];
+      cr.forEach((_, j) => { const next: Mode[][] = []; for (const cb of combos) for (const m of [base[j], ...alts[j]]) next.push([...cb, m]); combos.splice(0, combos.length, ...next); });
+      const changes = (cb: Mode[]) => cb.reduce((a, m, j) => a + (m !== base[j] ? 1 : 0), 0);
+      combos.sort((a, b) => changes(a) - changes(b));
+      for (const cb of combos.slice(1, 250)) { const r = solve(cb); if (r) { sol = r; modes = cb; break; } }
     }
-    y = solveHeights(desired, step, lo, hi, grade);
-    if (!y) return null;
+    if (!sol) { if (diag) diag.crossings = cr.map((c) => ({ x: c.x, z: c.z })); return null; }
+    y = sol;
+    cr.forEach((c, j) => crossings.push({ x: c.x, z: c.z, mode: modes[j], edge: c.edge }));
   }
   return { s: ss, x: xs, z: zs, y, terr: tr, crossings };
 }
@@ -496,13 +518,18 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
  * Mirrors the planner's parallel-conflict rule so failures are found before anything is built.
  */
 export function routeConflict(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set()): boolean {
+  return routeConflictAt(g, prof, kind, tracks, exclude) !== null;
+}
+
+/** Where the profiled route conflicts (see routeConflict), or null. */
+export function routeConflictAt(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set()): P2 | null {
   const net = g.world.net;
   const hw = (kind === 'rail' ? 0.32 : ROAD_TYPES.road.half) + (tracks - 1) * RAIL.spacing * 0.5;
   const n = prof.x.length;
   // the route must not come back close to itself
   for (let i = 0; i < n; i += 3) for (let j = i + 12; j < n; j += 3) {
     if (prof.s[j] - prof.s[i] < 12) continue;
-    if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return true;
+    if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return { x: prof.x[j], z: prof.z[j] };
   }
   for (let i = 0; i < n; i += 2) {
     const x = prof.x[i], z = prof.z[i];
@@ -517,10 +544,73 @@ export function routeConflict(g: Game, prof: ChainProfile, kind: NetKind, tracks
       const ge = net.geo(e);
       let best = Infinity, bi = 0;
       for (let j = 0; j < ge.n; j++) { const d = (ge.pts[j * 3] - x) ** 2 + (ge.pts[j * 3 + 2] - z) ** 2; if (d < best) { best = d; bi = j; } }
-      if (Math.sqrt(best) < need && Math.abs(ge.pts[bi * 3 + 1] - prof.y[i]) < RAIL.clearance) return true;
+      if (Math.sqrt(best) < need && Math.abs(ge.pts[bi * 3 + 1] - prof.y[i]) < RAIL.clearance) return { x, z };
     }
   }
-  return false;
+  return null;
+}
+
+export interface RouteOpts {
+  kind: NetKind; owner: number; tracks: number;
+  /** heights at the start and the end of the profiled route */
+  y0: number; y1: number;
+  /** oriented points before / after the corridor (e.g. station fronts), part of the profile; `post` also of the way */
+  pre?: OPoint[]; post?: OPoint[];
+  avoid?: CorridorOpts['avoid'];
+  buildingCost?: number; lead?: number; slopeCost?: number; maxExpand?: number;
+  rmax?: number; rgood?: number; minR?: number;
+  exclude?: Set<number>; roadJunctions?: boolean;
+  /** corridor searches after the first, each keeping away from where the previous route failed */
+  retries?: number;
+}
+export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; expanded: number }
+
+/**
+ * Plan a buildable route between two oriented points: corridor search, alignment, height profile and
+ * conflict check. When the profile is infeasible at crossings with existing edges, or the route runs
+ * along other edges, the corridor is searched again keeping away from those spots. Returns the plan or
+ * the reason it failed.
+ */
+export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budget = 2000): Generator<void, RoutePlan | string> {
+  const extra: { x0: number; z0: number; x1: number; z1: number; r: number }[] = [];
+  const nearEnds = (p: P2, r = 8) => Math.hypot(p.x - from.x, p.z - from.z) < r || Math.hypot(p.x - to.x, p.z - to.z) < r;
+  let why = '';
+  for (let attempt = 0; attempt <= (o.retries ?? 2); attempt++) {
+    // the straight leads must not overlap when the ends are close
+    const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
+    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand });
+    while (cs.step(budget) === 'running') yield;
+    if (!cs.path) return why || 'no corridor';
+    const al = alignCorridor(cs.path, from, to, o.rmax, o.rgood);
+    if (al.minR < (o.minR ?? 0)) {
+      // a tight corner usually means a jog around an obstacle: search again keeping away from it
+      why = 'curves too tight';
+      if (!al.minAt || nearEnds(al.minAt, 6)) return why;
+      extra.push({ x0: al.minAt.x, z0: al.minAt.z, x1: al.minAt.x, z1: al.minAt.z, r: 5 });
+      continue;
+    }
+    yield;
+    const way = [...al.way, ...(o.post ?? [])];
+    const diag = { crossings: [] as P2[] };
+    const prof = chainProfile(g, [...(o.pre ?? []), ...way], o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag);
+    if (!prof) {
+      why = 'too steep';
+      const add = diag.crossings.filter((p) => !nearEnds(p));
+      if (!add.length) return why;
+      for (const p of add) extra.push({ x0: p.x, z0: p.z, x1: p.x, z1: p.z, r: 5 });
+      continue;
+    }
+    yield;
+    const hit = routeConflictAt(g, prof, o.kind, o.tracks, o.exclude);
+    if (hit) {
+      why = 'route runs along other tracks or roads';
+      if (nearEnds(hit, 3)) return why;
+      extra.push({ x0: hit.x, z0: hit.z, x1: hit.x, z1: hit.z, r: nearEnds(hit) ? 2.5 : 4 });
+      continue;
+    }
+    return { way, prof, minR: al.minR, expanded: cs.expanded };
+  }
+  return why;
 }
 
 /** Rough construction cost of a profiled chain (track, structures, earthworks). */
@@ -669,6 +759,23 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     if (!m) return false;
     return step(m, false, false) && step(q, false, false);
   };
+  /**
+   * A segment end on (or right next to) a crossing would sit on the crossed edge: end it a little
+   * earlier, moving back along the planned route (so curves keep their radius).
+   */
+  const clearOfCrossings = (q: P2, from: P2): P2 => {
+    if (!prof || !prof.crossings.length) return q;
+    const near = (p: P2) => prof!.crossings.some((c) => Math.hypot(c.x - p.x, c.z - p.z) < 1.8);
+    if (!near(q)) return q;
+    let k = 0, bd = Infinity;
+    for (let i = 0; i < prof.x.length; i++) { const d = (prof.x[i] - q.x) ** 2 + (prof.z[i] - q.z) ** 2; if (d < bd) { bd = d; k = i; } }
+    for (let i = k - 1; i > 0; i--) {
+      const p = { x: prof.x[i], z: prof.z[i] };
+      if (Math.hypot(p.x - from.x, p.z - from.z) < 3) break;
+      if (prof.s[k] - prof.s[i] >= 2.2 && !near(p)) return p;
+    }
+    return q;
+  };
   const yEnd = prof ? prof.y[prof.y.length - 1] : 0;
   for (let i = 0; i < way.length; i++) {
     const n = net.nodes.get(cur);
@@ -698,7 +805,7 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     }
     pts.push({ p: wp, goal: isGoal });
     for (const q of pts) {
-      if (!step(q.p, q.goal, true)) return res;
+      if (!step(q.goal ? q.p : clearOfCrossings(q.p, net.nodes.get(cur) ?? q.p), q.goal, true)) return res;
       yield;
     }
   }
@@ -727,6 +834,8 @@ export interface SiteOpts {
   tracks: number; length: number; owner: number; front?: number; back?: number; maxR?: number;
   /** preferred platform height (e.g. the other station's) and tolerated deviation */
   prefY?: number; tolY?: number;
+  /** extra condition on a site (e.g. its leads line up with the other station's) */
+  accept?: (p: StationPlan) => boolean;
 }
 
 /** Run a generator to completion (synchronous use of the incremental helpers). */
@@ -749,18 +858,36 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
       const pa = dirA + da;
       const x = town.x + Math.sin(pa) * r, z = town.z + Math.cos(pa) * r;
       if (!g.world.inside(x, z, 8)) continue;
+      // the platform axis should point at the target from where the station actually is
+      const dirP = Math.atan2(toward.x - x, toward.z - z);
       for (const aa of [0, 0.15, -0.15, 0.35, -0.35]) {
-        if (++n % 30 === 0) yield;
+        if (++n % 12 === 0) yield;
         const ang = dirA + aa;
+        const off = Math.abs(Math.atan2(Math.sin(ang - dirP), Math.cos(ang - dirP)));
+        if (off > 0.75) continue;
+        const fx = Math.sin(ang), fz = Math.cos(ang);
+        // cheap rejections before the full plan: a street or track across the platform, a blocked throat
+        let blocked = false;
+        for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) if (g.world.net.nearestEdge(x + fx * o.length * t, z + fz * o.length * t, 1.1)) { blocked = true; break; }
+        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5)) continue;
         const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
         if (!plan.ok || plan.join) continue;
-        const fx = Math.sin(ang), fz = Math.cos(ang);
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
+        if (o.accept && !o.accept(plan)) continue;
         const backFree = corridorFree(g, x, z, -fx, -fz, o.length / 2 + 0.5, o.length / 2 + back, 0.6);
+        // beyond the lead the line should not have to run alongside a road or track
+        let alongside = 0;
+        for (let t = o.length / 2 + front; t <= o.length / 2 + front + 14; t += 2) {
+          const ne = g.world.net.nearestEdge(x + fx * t, z + fz * t, 3);
+          if (!ne) continue;
+          const d = { x: 0, y: 0, z: 0 }, q = { x: 0, y: 0, z: 0 };
+          g.world.net.pointAt(ne.edge, ne.s, q, d);
+          if (Math.abs(d.x * fx + d.z * fz) / (Math.hypot(d.x, d.z) || 1) > 0.8) alongside++;
+        }
         let pop = 0;
         for (const b of g.world.buildingsNear(x, z, 30)) if (Math.hypot(b.x - x, b.z - z) < 30) pop += b.pop;
-        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 25 + Math.abs(aa) * 20 + (backFree ? 0 : 40) + r * 0.3;
+        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 25 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
         if (score < bestScore) { bestScore = score; best = plan; }
       }
@@ -787,21 +914,53 @@ export function findRailPair(g: Game, A: Town, B: Town, o: SiteOpts, detour = 1.
 
 export function* railPairGen(g: Game, A: Town, B: Town, o: SiteOpts, detour = 1.15): Generator<void, { a: StationPlan; b: StationPlan } | null> {
   const grade = TRACK_TYPES.standard.maxGrade * 0.8;
-  const pa = yield* stationSiteGen(g, A, B, o);
-  if (!pa) return null;
-  const feasible = (p: StationPlan, q: StationPlan) => Math.abs(p.y - q.y) <= grade * Math.hypot(p.x - q.x, p.z - q.z) * detour;
-  const pb = yield* stationSiteGen(g, B, A, o);
-  if (pb && feasible(pa, pb)) return { a: pa, b: pb };
-  // try height-matched sites on either side, but keep a useful catchment
+  const lead = (o.front ?? 16) - 2;
+  const heights = (p: StationPlan, q: StationPlan) => Math.abs(p.y - q.y) <= grade * Math.hypot(p.x - q.x, p.z - q.z) * detour;
   const minPop = (t: Town) => Math.min(t.pop * 0.3, 400);
   const d = Math.hypot(A.x - B.x, A.z - B.z);
-  const pb2 = yield* stationSiteGen(g, B, A, { ...o, prefY: pa.y, tolY: grade * d * 0.9 });
-  if (pb2 && feasible(pa, pb2) && sitePop(g, pb2.x, pb2.z, o.length) >= minPop(B)) return { a: pa, b: pb2 };
-  if (pb) {
-    const pa2 = yield* stationSiteGen(g, A, B, { ...o, prefY: pb.y, tolY: grade * d * 0.9 });
-    if (pa2 && feasible(pa2, pb) && sitePop(g, pa2.x, pa2.z, o.length) >= minPop(A)) return { a: pa2, b: pb };
+  const aligned = (p: StationPlan, q: StationPlan) => { const a = Math.atan2(q.x - p.x, q.z - p.z) - p.angle, off = Math.abs(Math.atan2(Math.sin(a), Math.cos(a))); return Math.min(off, Math.PI - off) <= 0.3; };
+  // B's platforms face A's station so that the two leads line up; then A's are aligned with B's
+  const pa = yield* stationSiteGen(g, A, B, o);
+  if (pa) {
+    const pb = yield* stationSiteGen(g, B, pa, { ...o, accept: (q) => leadsMeet(pa, q, lead) });
+    if (pb) {
+      if (!aligned(pa, pb)) {
+        const pa2 = yield* stationSiteGen(g, A, pb, { ...o, accept: (q) => leadsMeet(q, pb, lead) });
+        if (pa2 && heights(pa2, pb)) return { a: pa2, b: pb };
+      }
+      if (heights(pa, pb)) return { a: pa, b: pb };
+      // height-matched sites on either side, keeping a useful catchment
+      const pb2 = yield* stationSiteGen(g, B, pa, { ...o, prefY: pa.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(pa, q, lead) });
+      if (pb2 && heights(pa, pb2) && sitePop(g, pb2.x, pb2.z, o.length) >= minPop(B)) return { a: pa, b: pb2 };
+      const pa3 = yield* stationSiteGen(g, A, pb, { ...o, prefY: pb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, pb, lead) });
+      if (pa3 && heights(pa3, pb) && sitePop(g, pa3.x, pa3.z, o.length) >= minPop(A)) return { a: pa3, b: pb };
+    }
   }
+  // the other way round: B's best site first, then an A site whose lead meets it
+  const qb = yield* stationSiteGen(g, B, A, o);
+  if (!qb) return null;
+  const qa = yield* stationSiteGen(g, A, qb, { ...o, accept: (q) => leadsMeet(q, qb, lead) });
+  if (qa && heights(qa, qb)) return { a: qa, b: qb };
+  const qa2 = yield* stationSiteGen(g, A, qb, { ...o, prefY: qb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, qb, lead) });
+  if (qa2 && heights(qa2, qb) && sitePop(g, qa2.x, qa2.z, o.length) >= minPop(A)) return { a: qa2, b: qb };
   return null;
+}
+
+/**
+ * Can the leads of two stations (straight for `lead` units beyond the platforms, facing each other) be
+ * joined by curves of railway radius? The far lead end must lie ahead of each lead, with room for an
+ * S-curve across their lateral offset.
+ */
+export function leadsMeet(p: StationPlan, q: StationPlan, lead: number): boolean {
+  const axis = (s: StationPlan, o: P2) => { const fx = Math.sin(s.angle), fz = Math.cos(s.angle), sg = fx * (o.x - s.x) + fz * (o.z - s.z) >= 0 ? 1 : -1; return { x: fx * sg, z: fz * sg }; };
+  const fa = axis(p, q), fb = axis(q, p);
+  const ea = { x: p.x + fa.x * (p.length / 2 + lead), z: p.z + fa.z * (p.length / 2 + lead) };
+  const eb = { x: q.x + fb.x * (q.length / 2 + lead), z: q.z + fb.z * (q.length / 2 + lead) };
+  const dx = eb.x - ea.x, dz = eb.z - ea.z;
+  const da = dx * fa.x + dz * fa.z, db = -(dx * fb.x + dz * fb.z);
+  if (da < 8 || db < 8) return false;
+  const R = 15, h = Math.abs(dx * -fa.z + dz * fa.x);
+  return Math.min(da, db) >= Math.min(2 * R, Math.sqrt(Math.max(0, 4 * R * h - h * h))) + 4;
 }
 
 /** Track end nodes of a station: per track (in trackOffsets order) the node at the front (+axis) and back end. */
@@ -835,13 +994,24 @@ export function depotAtEnd(g: Game, nodeId: number, owner: number): number {
   return g.depots.commit('rail', plan, owner) ? -1 : id;
 }
 
-/** Would a rail depot fit with its door at (x,z) facing (fx,fz), demolishing only houses up to `maxPop`? */
-export function depotFits(g: Game, x: number, z: number, fx: number, fz: number, owner: number, maxPop = 0): boolean {
+/**
+ * Would a rail depot fit with its door at (x,z) facing (fx,fz), demolishing only houses up to `maxPop`?
+ * With `y` (the height of the track end it will sit on) the ground must also suit that height.
+ */
+export function depotFits(g: Game, x: number, z: number, fx: number, fz: number, owner: number, maxPop = 0, y?: number): boolean {
   const cx = x - fx * 2.15, cz = z - fz * 2.15;
   if (g.world.net.nearestNode(cx, cz, 4.7, 'rail', (nn) => nn.edges.length === 1)) return false;
   const p = g.depots.plan('rail', cx, cz, Math.atan2(fx, fz), owner);
   const dem = p.demolish ?? [];
-  return p.ok && dem.length <= (maxPop ? 2 : 0) && dem.every((id) => (g.world.buildings.get(id)?.pop ?? 0) <= maxPop);
+  if (!p.ok || dem.length > (maxPop ? 2 : 0) || !dem.every((id) => (g.world.buildings.get(id)?.pop ?? 0) <= maxPop)) return false;
+  if (y === undefined) return true;
+  // same rule as a depot snapped to a track end (Depots.plan): ground within 2.5 of the track height
+  const sz = depotSize('rail'), rx = fz, rz = -fx;
+  for (const [a, b] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [0, 0]]) {
+    const h = g.world.heightAt(cx + rx * sz.w * a + fx * sz.d * b, cz + rz * sz.w * a + fz * sz.d * b);
+    if (Math.abs(h - y) > 2.4) return false;
+  }
+  return true;
 }
 
 /**
@@ -868,7 +1038,7 @@ export function buildRailDepot(g: Game, st: Station, owner: number, frontDir?: P
     if (n.edges.length !== 1) continue;
     for (const L of [5, 8, 11, 15, 20, 26]) {
       const sx = n.x + c.bx * L, sz = n.z + c.bz * L;
-      if (!g.world.inside(sx, sz, 6) || !depotFits(g, sx, sz, -c.bx, -c.bz, owner, maxPop)) continue;
+      if (!g.world.inside(sx, sz, 6) || !depotFits(g, sx, sz, -c.bx, -c.bz, owner, maxPop, r.y)) continue;
       const p = planEdge(g, nodeSnap(g, c.node, 'rail'), { kind: 'free', x: sx, z: sz, y: 0 }, o({ heightOffset: r.y - g.world.heightAt(sx, sz) || 1e-3 }));
       if (!p.ok || p.demolish.length > 3 || !g.company(owner).economy.canAfford(p.cost + 120000)) continue;
       if (commitProposal(g, p)) continue;
@@ -894,7 +1064,7 @@ export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: numb
     // diverge over 12 units to 2.2 units off the line, then a 6-unit straight siding
     const ex = p.x + tx * 12 - tz * 2.2 * side, ez = p.z + tz * 12 + tx * 2.2 * side;
     const fx = p.x + tx * 18 - tz * 2.2 * side, fz = p.z + tz * 18 + tx * 2.2 * side;
-    if (!depotFits(g, fx, fz, -tx, -tz, owner, 30)) continue;
+    if (!depotFits(g, fx, fz, -tx, -tz, owner, 30, net.heightAtS(e, s))) continue;
     const start = findSnap(g, 'rail', p.x, p.z, 0.3);
     if (start.kind !== 'edge' || start.edge !== edgeId) continue;
     const o: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner };
@@ -917,17 +1087,52 @@ export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: numb
   return -1;
 }
 
+/** Depot on a siding off one of a line's edges (on the ground), the stretches nearest (x,z) first. */
+export function buildDepotNearLine(g: Game, edges: number[], x: number, z: number, owner: number, maxDist = 90): number {
+  const net = g.world.net;
+  const cands: { id: number; s: number; d: number }[] = [];
+  const p = { x: 0, y: 0, z: 0 };
+  for (const id of edges) {
+    const e = net.edges.get(id);
+    if (!e || e.kind !== 'rail' || e.owner !== owner || e.station >= 0 || e.depot >= 0 || e.len < 8) continue;
+    for (let s = 3; s <= e.len - 3; s += 5) {
+      if (net.sectionAt(e, s) !== 'ground') continue;
+      net.pointAt(e, s, p);
+      const d = Math.hypot(p.x - x, p.z - z);
+      if (d <= maxDist) cands.push({ id, s, d });
+    }
+  }
+  cands.sort((a, b) => a.d - b.d || a.id - b.id);
+  let tries = 0;
+  for (const c of cands) {
+    if (!net.edges.has(c.id)) continue;
+    const dep = buildDepotOnLine(g, c.id, c.s, owner);
+    if (dep >= 0) return dep;
+    if (++tries >= 12) break;
+  }
+  return -1;
+}
+
 /** Road depot beside a street near (x,z), connected to it. Prefers sites that demolish nothing. */
 export function buildRoadDepot(g: Game, x: number, z: number, owner: number, maxR = 26, pred?: (e: NEdge) => boolean): number {
+  return runGen(roadDepotGen(g, x, z, owner, maxR, pred));
+}
+
+/** Incremental road depot search (yields every few candidate sites). */
+export function* roadDepotGen(g: Game, x: number, z: number, owner: number, maxR = 26, pred?: (e: NEdge) => boolean): Generator<void, number> {
   const net = g.world.net;
+  let n = 0;
   for (const maxPop of [0, 30]) {
     for (let r = 2.5; r < maxR; r += 1.5) {
       for (let k = 0; k < 12; k++) {
         const a = ((k + (r % 2) * 0.5) / 12) * Math.PI * 2;
         const px = x + Math.sin(a) * r, pz = z + Math.cos(a) * r;
+        // a lot that is built on cannot take a depot without demolition: skip it cheaply first
+        if (!maxPop && g.world.buildingsNear(px, pz, 2.2).some((b) => distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 1.3)) continue;
         const ne = net.nearestEdge(px, pz, 3.6, 'road', (e) => e.depot < 0 && e.station < 0);
         if (ne && pred && !pred(ne.edge)) continue;
         if (!ne || ne.d < 2.1 || net.sectionAt(ne.edge, ne.s) !== 'ground') continue;
+        if (++n % 6 === 0) yield;
         const q = { x: 0, y: 0, z: 0 };
         net.pointAt(ne.edge, ne.s, q);
         const plan = g.depots.plan('road', px, pz, Math.atan2(q.x - px, q.z - pz), owner);

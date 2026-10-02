@@ -55,7 +55,15 @@ for (let i = 0; i < g.ais.length; i++) {
   check(earning.length >= 1, `${co.name} has a working line earning money`);
   check(vehicles.length >= 1, `${co.name} has vehicles`);
   check(aiTime[i].t / Math.max(1, aiTime[i].n) < 5, `${co.name} AI time per day < 5 ms`);
+  check(aiTime[i].max < 30, `${co.name} AI work per day stays sliced (max ${fmt(aiTime[i].max, 1)} ms)`);
 }
+// grid towns and country roads: the companies still find sites (railways at the town edges, stops on the grid)
+const aiRail = g.ais.filter((ai) => g.stations.all().some((s) => s.owner === ai.companyId && s.rail)).length;
+const aiBus = g.ais.filter((ai) => g.lines.all().some((l) => l.owner === ai.companyId && l.kind === 'road')).length;
+console.log(`
+companies with a railway: ${aiRail}/${g.ais.length}, with a bus service: ${aiBus}/${g.ais.length}; country roads ${[...g.world.net.edges.values()].filter((e) => e.kind === 'road' && e.type === 'road' && e.owner === -1).length} edges`);
+check(aiRail >= 1, 'an AI company built a railway');
+check(aiBus >= 1, 'an AI company runs buses');
 check(errors === 0, 'no exceptions or AI errors');
 check(!nan, 'no NaN positions ' + (nan ?? ''));
 const res = checkReservations(g);

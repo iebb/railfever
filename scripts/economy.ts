@@ -4,7 +4,7 @@ import { Game } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
 import { TRACK_TYPES, ROAD_TYPES } from '../src/game/constants';
 import type { Line } from '../src/game/lines';
-import { fmt, connectStations, depotBehind, placeStationPair, addBusStop, roadDepotNear, Train } from './lib';
+import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train } from './lib';
 
 const seed = Number(process.argv[2] ?? 7);
 const YEARS = 4;
@@ -38,8 +38,8 @@ const newEdges = (before: Set<number>) => new Set([...g.world.net.edges.keys()].
 // ---- intercity rail, 1 train
 {
   const before = new Set(g.world.net.edges.keys());
-  const pr = placeStationPair(g, 80, 160, 0)!;
-  const con = connectStations(g, pr.A, pr.B, 0, 1, () => {});
+  const pr = placeAndConnect(g, 80, 160, 0, new Set(), 1, () => {})!;
+  const con = pr.con;
   const dep = depotBehind(g, pr.A, pr.B, 0);
   const line = g.lines.create('rail', 0);
   line.stops = [pr.A.id, pr.B.id];
@@ -87,9 +87,9 @@ for (const [label, minD, maxD, n, model] of [['busy bus', 15, 24, 2, 'bus_c'], [
   const small = [...g.towns.list].sort((a, b) => a.pop - b.pop);
   const before = new Set(g.world.net.edges.keys());
   const ex = new Set(g.towns.list.filter((t) => !small.slice(0, 5).includes(t)).map((t) => t.id));
-  const pr = placeStationPair(g, 60, 200, 0, ex);
+  const pr = placeAndConnect(g, 60, 200, 0, ex, 1, () => {});
   if (pr) {
-    const con = connectStations(g, pr.A, pr.B, 0, 1, () => {});
+    const con = pr.con;
     const dep = depotBehind(g, pr.A, pr.B, 0);
     const line = g.lines.create('rail', 0);
     line.stops = [pr.A.id, pr.B.id];

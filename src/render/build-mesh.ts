@@ -219,6 +219,9 @@ export class WB {
 
   /** Vertical wall quad from bottom points a..b (heights per end) facing (nx,nz), world-scaled uvs. */
   twall(ax: number, az: number, bx: number, bz: number, y0a: number, y1a: number, y0b: number, y1b: number, nx: number, nz: number, sc = 1, u0 = 0) {
+    if (y1a < y0a) y1a = y0a;
+    if (y1b < y0b) y1b = y0b;
+    if (y1a - y0a + y1b - y0b < 1e-5) return;
     const len = Math.hypot(bx - ax, bz - az);
     const cx = -(bz - az), cz = bx - ax;
     const ua = u0 / sc, ub = (u0 + len) / sc;
@@ -238,7 +241,8 @@ export class WB {
     cx: number, cy: number, cz: number, cu: number, cv: number, wx: number, wy: number, wz: number) {
     const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
     let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-    const l = Math.sqrt(nx * nx + ny * ny + nz * nz) || 1;
+    const l = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (l < 2e-6) return; // degenerate sliver (orientation would be arbitrary)
     nx /= l; ny /= l; nz /= l;
     if (nx * wx + ny * wy + nz * wz >= 0) {
       const a = this.vertex(ax, ay, az, nx, ny, nz, au, av), b = this.vertex(bx, by, bz, nx, ny, nz, bu, bv), c = this.vertex(cx, cy, cz, nx, ny, nz, cu, cv);

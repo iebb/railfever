@@ -365,25 +365,48 @@ export class Stations {
 
   catchmentRadius(st: Station) { return st.rail ? STATION_RADIUS + st.rail.length / 2 : BUSSTOP_RADIUS; }
 
+  /**
+   * Catchment population of every station: each building's people are shared among the stations
+   * covering it (served ones first), weighted by rating. Building-major over a coarse grid of the
+   * catchment circles, which is much cheaper than querying the building grid per station.
+   */
   recomputeCatchment() {
     const w = this.game.world;
-    const cover = new Map<number, Station[]>();
+    const circles: { st: Station; x: number; z: number; r: number }[] = [];
     for (const st of this.map.values()) {
       st.catchPop = 0;
-      for (const b of this.catchmentBuildings(st)) {
-        let arr = cover.get(b);
-        if (!arr) { arr = []; cover.set(b, arr); }
-        arr.push(st);
-      }
+      if (st.rail) circles.push({ st, x: st.rail.x, z: st.rail.z, r: STATION_RADIUS + st.rail.length / 2 });
+      for (const p of st.stops) circles.push({ st, x: p.x, z: p.z, r: BUSSTOP_RADIUS });
     }
-    for (const [bid, arr] of cover) {
-      const b = w.buildings.get(bid);
-      if (!b) continue;
-      const act = arr.filter((s) => this.game.lines.stationServed(s.id));
-      const list = act.length ? act : arr;
+    if (!circles.length) return;
+    const C = 32, key = (cx: number, cz: number) => cx * 4096 + cz;
+    const cells = new Map<number, number[]>();
+    circles.forEach((c, i) => {
+      for (let cz = Math.floor((c.z - c.r) / C); cz <= Math.floor((c.z + c.r) / C); cz++) for (let cx = Math.floor((c.x - c.r) / C); cx <= Math.floor((c.x + c.r) / C); cx++) {
+        const k = key(cx, cz);
+        const a = cells.get(k);
+        if (a) a.push(i); else cells.set(k, [i]);
+      }
+    });
+    const served = new Map<number, boolean>();
+    const isServed = (s: Station) => { let v = served.get(s.id); if (v === undefined) { v = this.game.lines.stationServed(s.id); served.set(s.id, v); } return v; };
+    const list: Station[] = [], act: Station[] = [];
+    for (const b of w.buildings.values()) {
+      if (b.pop <= 0) continue;
+      const idx = cells.get(key(Math.floor(b.x / C), Math.floor(b.z / C)));
+      if (!idx) continue;
+      list.length = 0; act.length = 0;
+      for (const i of idx) {
+        const c = circles[i];
+        if ((b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z) > c.r * c.r || list.includes(c.st)) continue;
+        list.push(c.st);
+        if (isServed(c.st)) act.push(c.st);
+      }
+      if (!list.length) continue;
+      const use = act.length ? act : list;
       let sum = 0;
-      for (const s of list) sum += s.rating + 0.05;
-      for (const s of list) s.catchPop += (b.pop * (s.rating + 0.05)) / sum;
+      for (const s of use) sum += s.rating + 0.05;
+      for (const s of use) s.catchPop += (b.pop * (s.rating + 0.05)) / sum;
     }
   }
 

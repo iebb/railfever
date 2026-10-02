@@ -7,8 +7,8 @@ import type { Station } from '../src/game/stations';
 import { Train, CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import {
-  findStationSite, stationEnds, CorridorSearch, alignCorridor, chainProfile, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotOnLine, buildRoadDepot, findRailPair,
-  routeConflict,
+  findStationSite, stationEnds, buildChain, nodeSnap, OPoint, SiteOpts, buildRailDepot, buildDepotNearLine, buildRoadDepot, findRailPair,
+  routeGen, runGen, removeEdges,
 } from '../src/game/ai';
 
 export const fails: string[] = [];
@@ -64,14 +64,14 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
     { x0: a0.x - fA.x * 4, z0: a0.z - fA.z * 4, x1: from.x - fA.x * 4, z1: from.z - fA.z * 4, r: 4 },
     { x0: b0.x - fB.x * 4, z0: b0.z - fB.z * 4, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
   ];
-  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
-  const path = cs.run();
-  if (!path) { log(`  corridor: none (expanded ${cs.expanded})`); return fail; }
-  const al = alignCorridor(path, from, to);
-  const way = [...al.way, { x: b0.x, z: b0.z, tx: -fB.x, tz: -fB.z }];
   const exclude = new Set<number>([...a0.edges, ...b0.edges]);
-  const prof = chainProfile(g, [{ x: a0.x, z: a0.z, tx: fA.x, tz: fA.z }, ...way], tracks, ra.y, rb.y, 'rail', exclude);
-  log(`  corridor: ${path.length} pts, expanded ${cs.expanded}, ${fmt(performance.now() - t0)} ms; ${way.length} waypoints, min radius ${fmt(al.minR)}${prof ? ', crossings ' + prof.crossings.map((c) => c.mode).join('/') : ', PROFILE INFEASIBLE'}`);
+  const plan = runGen(routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: ra.y, y1: rb.y, pre: [{ x: a0.x, z: a0.z, tx: fA.x, tz: fA.z }], post: [{ x: b0.x, z: b0.z, tx: -fB.x, tz: -fB.z }], avoid, exclude }));
+  if (typeof plan === 'string') { log(`  route: ${plan}`); return fail; }
+  const { way, prof } = plan;
+  const dist = Math.hypot(A.x - B.x, A.z - B.z);
+  if (prof.s[prof.s.length - 1] > dist * 1.6 + 30) { log(`  route: detour too long (${fmt(prof.s[prof.s.length - 1])} for ${fmt(dist)})`); return fail; }
+  log(`  corridor: expanded ${plan.expanded}, ${fmt(performance.now() - t0)} ms; ${way.length} waypoints, min radius ${fmt(plan.minR)}, crossings ${prof.crossings.map((c) => c.mode).join('/') || 'none'}`);
+  const al = { minR: plan.minR };
   const res = buildChain(g, a0.id, way, railOpts(owner, tracks), b0.id, prof, (s) => log('   ' + s));
   log(`  chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels} cost=${Math.round(res.cost)}`);
   for (const n of res.notes ?? []) log('   ' + n);
@@ -87,17 +87,11 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
 /** Rail depot for a station: stub behind a free back end, else a siding off the line towards `toward`. */
 export function depotBehind(g: Game, st: Station, toward: Station, owner = 0): number {
   const dir = { x: toward.x - st.x, z: toward.z - st.z };
-  let id = buildRailDepot(g, st, owner, dir);
+  const id = buildRailDepot(g, st, owner, dir);
   if (id >= 0) return id;
-  const l = Math.hypot(dir.x, dir.z) || 1;
-  for (const d of [30, 40, 50, 60]) {
-    const x = st.x + (dir.x / l) * (st.rail!.length / 2 + d), z = st.z + (dir.z / l) * (st.rail!.length / 2 + d);
-    const ne = g.world.net.nearestEdge(x, z, 12, 'rail', (e) => e.owner === owner && e.station < 0 && e.depot < 0 && e.len > 8);
-    if (!ne) continue;
-    id = buildDepotOnLine(g, ne.edge.id, Math.min(ne.edge.len - 3, Math.max(3, ne.s)), owner);
-    if (id >= 0) return id;
-  }
-  return -1;
+  // a siding off the company's line nearest the station
+  const ids = [...g.world.net.edges.values()].filter((e) => e.kind === 'rail' && e.owner === owner).map((e) => e.id);
+  return buildDepotNearLine(g, ids, st.x, st.z, owner);
 }
 
 /** Find two bus stop sites on streets of a town, `minD`..`maxD` apart. */
@@ -159,10 +153,11 @@ export function townPairs(g: Game, minD: number, maxD: number, exclude: Set<numb
   return out.sort((x, y) => y.s - x.s).map((x) => x.p);
 }
 
-/** Place a pair of 2-track stations for a rail link (feasible heights, good catchment). */
-export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16): { A: Station; B: Station; TA: Town; TB: Town } | null {
+/** Place a pair of 2-track stations for a rail link (feasible heights, good catchment, free leads). */
+export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16, skipPairs: Set<string> = new Set()): { A: Station; B: Station; TA: Town; TB: Town } | null {
   for (const [TA, TB] of townPairs(g, minD, maxD, exclude)) {
-    const pr = findRailPair(g, TA, TB, { tracks: 2, length, owner });
+    if (skipPairs.has(TA.id + ':' + TB.id)) continue;
+    const pr = findRailPair(g, TA, TB, { tracks: 2, length, owner, front: 22 });
     if (!pr) continue;
     const ia = g.stations.nextId;
     if (g.stations.commitRail(pr.a, owner)) continue;
@@ -172,6 +167,24 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
     return { A, B: g.stations.get(ib)!, TA, TB };
+  }
+  return null;
+}
+
+/** A connected rail link: station pairs are tried until one connects (failed attempts are removed again). */
+export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log):
+  { A: Station; B: Station; TA: Town; TB: Town; con: ReturnType<typeof connectStations> } | null {
+  const skip = new Set<string>();
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip);
+    if (!pr) return null;
+    const e0 = g.world.net.nextEdge;
+    const con = connectStations(g, pr.A, pr.B, owner, tracks, log);
+    if (con.ok) return { ...pr, con };
+    log(`  ${pr.TA.name} - ${pr.TB.name} did not connect, trying another pair`);
+    skip.add(pr.TA.id + ':' + pr.TB.id);
+    removeEdges(g, newRailEdges(g, e0, owner), owner);
+    g.stations.removeStation(pr.A.id); g.stations.removeStation(pr.B.id);
   }
   return null;
 }
@@ -224,16 +237,13 @@ export function connectDouble(g: Game, A: Station, B: Station, owner = 0, log = 
     { x0: cA.x - fA.x * ra.length, z0: cA.z - fA.z * ra.length, x1: from.x - fA.x * 4, z1: from.z - fA.z * 4, r: 4 },
     { x0: cB.x - fB.x * rb.length, z0: cB.z - fB.z * rb.length, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
   ];
-  const cs = new CorridorSearch(g, from, to, { kind: 'rail', owner, avoid });
-  const path = cs.run();
-  if (!path) { log('  double: no corridor'); return fail; }
-  const al = alignCorridor(path, from, to);
-  const way = [...al.way, { x: cB.x, z: cB.z, tx: -fB.x, tz: -fB.z }];
   const exclude = new Set<number>([...ra.edges, ...rb.edges]);
-  const prof = chainProfile(g, [{ x: cA.x, z: cA.z, tx: fA.x, tz: fA.z }, ...way], 2, ra.y, rb.y, 'rail', exclude);
-  if (!prof) { log('  double: profile infeasible'); return fail; }
+  const plan = runGen(routeGen(g, from, to, { kind: 'rail', owner, tracks: 2, y0: ra.y, y1: rb.y, pre: [{ x: cA.x, z: cA.z, tx: fA.x, tz: fA.z }], post: [{ x: cB.x, z: cB.z, tx: -fB.x, tz: -fB.z }], avoid, exclude }));
+  if (typeof plan === 'string') { log(`  double: ${plan}`); return fail; }
+  const { way, prof } = plan;
+  const dist = Math.hypot(A.x - B.x, A.z - B.z);
+  if (prof.s[prof.s.length - 1] > dist * 1.6 + 30) { log(`  double: detour too long (${fmt(prof.s[prof.s.length - 1])} for ${fmt(dist)})`); return fail; }
   const e0 = net.nextEdge;
-  if (routeConflict(g, prof, 'rail', 2, exclude)) { log('  double: route conflicts with other edges or itself'); return fail; }
   const res = buildChain(g, frontsA[0], way, railOpts(owner, 2), frontsB[0], prof, (s) => log('   ' + s));
   log(`  double chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels}`);
   if (!res.ok) return fail;

@@ -4,12 +4,12 @@
 // npx esbuild scripts/smoke.ts --bundle --platform=node --format=esm --outfile=$S/smoke.mjs && node $S/smoke.mjs [seed]
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { sitePop } from '../src/game/ai';
+import { sitePop, removeEdges } from '../src/game/ai';
 import { CROSS_BASE, findRailRoute, railNext } from '../src/game/train';
 import { roadDepotReaches } from '../src/game/roadvehicle';
 import {
-  fails, check, fmt, connectStations, connectDouble, depotBehind, busStopSites, roadDepotNear, checkReservations, checkNaN,
-  placeStationPair, addBusStop, newRailEdges, build, free, railOpts, roadOpts, Train, RoadVehicle,
+  fails, check, fmt, connectDouble, depotBehind, busStopSites, roadDepotNear, checkReservations, checkNaN,
+  placeStationPair, placeAndConnect, addBusStop, newRailEdges, build, free, railOpts, roadOpts, Train, RoadVehicle,
 } from './lib';
 
 const seed = Number(process.argv[2] ?? 7);
@@ -21,13 +21,12 @@ const net = g.world.net;
 const loco = MODEL_BY_ID.get('diesel_b')!, coach = MODEL_BY_ID.get('coach_ic')!;
 
 // ------------------------------------------------------------------ 1. single-track line between two towns
-const pair = placeStationPair(g, 60, 150, 0)!;
-check(pair, 'station pair placed');
-const { A, B, TA, TB } = pair;
+const e0 = net.nextEdge;
+const pair = placeAndConnect(g, 60, 150, 0)!;
+check(pair, 'station pair placed and connected');
+const { A, B, TA, TB, con } = pair;
 console.log(`rail: ${TA.name} (${TA.pop}) <-> ${TB.name} (${TB.pop}), ${fmt(Math.hypot(TA.x - TB.x, TA.z - TB.z))} units`);
 console.log(`  stations ${A.name} y=${fmt(A.rail!.y, 2)} catch ${fmt(sitePop(g, A.x, A.z, 16), 0)}, ${B.name} y=${fmt(B.rail!.y, 2)} catch ${fmt(sitePop(g, B.x, B.z, 16), 0)}`);
-const e0 = net.nextEdge;
-const con = connectStations(g, A, B, 0, 1);
 check(con.ok, 'main line connected');
 const mainEdges = newRailEdges(g, e0);
 const depot = depotBehind(g, A, B, 0);
@@ -64,8 +63,9 @@ const eDbl = net.nextEdge;
     if (!pr2) break;
     used.add(pr2.TA.id); used.add(pr2.TB.id);
     console.log(`double track: ${pr2.TA.name} <-> ${pr2.TB.name}`);
+    const eTry = net.nextEdge;
     dbl = connectDouble(g, pr2.A, pr2.B, 0);
-    if (!dbl.ok) { g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id); continue; }
+    if (!dbl.ok) { removeEdges(g, newRailEdges(g, eTry), 0); g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id); continue; }
     console.log(`  crossovers ${dbl.crossovers}, signals ${dbl.signals}`);
     const dep2 = depotBehind(g, pr2.A, pr2.B, 0);
     if (dbl.ok && dep2 > 0) {
@@ -89,7 +89,7 @@ let levelCrossing = -1;
   for (const id of lineEdges) {
     const e = net.edges.get(id);
     if (!e) continue;
-    for (let s0 = 3; s0 < e.len - 3; s0 += 6) {
+    for (let s0 = 3; s0 < e.len - 3; s0 += 2) {
       if (e.sections.some((q) => s0 > q.s0 - 3 && s0 < q.s1 + 3)) continue;
       const p = { x: 0, y: 0, z: 0 };
       net.pointAt(e, s0, p);
@@ -98,7 +98,8 @@ let levelCrossing = -1;
   }
   console.log(`  crossing candidates: ${cands.length} points on ${lineEdges.length} line edges`);
   for (const mode of ['level', 'over', 'under'] as const) {
-    for (const cand of cands) {
+    // the test road crosses at right angles, or rotated by about 25 degrees either way
+    candLoop: for (const cand of cands) for (const rot of [0, 0.45, -0.45]) {
       const e = net.edges.get(cand.e);
       if (!e) continue;
       const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
@@ -107,19 +108,24 @@ let levelCrossing = -1;
       // level crossings need the railway at ground level and flat approaches
       const l0 = Math.hypot(d.x, d.z) || 1;
       const rel = p.y - g.world.heightAt(p.x, p.z);
-      if (mode === 'level' && (rel < -0.3 || rel > 0.7)) continue;
+      if (mode === 'level' && (rel < -0.3 || rel > 0.7)) { if (process.argv.includes('-v') && rot === 0) console.log(`    level cand: rail ${fmt(rel, 2)} above ground`); continue; }
       void l0;
-      const l = Math.hypot(d.x, d.z) || 1, nx = -d.z / l, nz = d.x / l;
+      const l = Math.hypot(d.x, d.z) || 1, nx0 = -d.z / l, nz0 = d.x / l;
+      const nx = nx0 * Math.cos(rot) - nz0 * Math.sin(rot), nz = nx0 * Math.sin(rot) + nz0 * Math.cos(rot);
       // approach length: long enough for the road grade on hillsides (level crossings)
       let L = 11;
       if (mode === 'level') {
-        L = [10, 14, 18].find((k) => [-1, 1].every((sg) => Math.abs(g.world.heightAt(p.x + nx * k * sg, p.z + nz * k * sg) - (p.y - 0.04)) <= 0.065 * k)) ?? -1;
-        if (L < 0) continue;
+        L = [10, 14, 18, 22, 26].find((k) => [-1, 1].every((sg) => Math.abs(g.world.heightAt(p.x + nx * k * sg, p.z + nz * k * sg) - (p.y - 0.04)) <= 0.065 * k)) ?? -1;
+        if (L < 0) { if (process.argv.includes('-v')) console.log(`    level cand: approaches too steep (rot ${rot})`); continue; }
       }
+      // the test road must not touch other roads (country roads, streets) near the line
+      const clear = (L: number) => {
+        for (let k = 0; k <= 2 * L; k++) { const x = p.x + nx * (k - L), z = p.z + nz * (k - L); if (net.nearestEdge(x, z, 1.6, undefined, (q) => !lineEdges.includes(q.id))) return false; }
+        return true;
+      };
+      if (mode !== 'level') L = [11, 9, 14].find(clear) ?? -1;
+      if (L < 0 || !clear(L)) { if (process.argv.includes('-v')) console.log(`    ${mode} cand blocked`); continue; }
       const a = { x: p.x - nx * L, z: p.z - nz * L }, b = { x: p.x + nx * L, z: p.z + nz * L };
-      let blocked = false;
-      for (let k = 0; k <= 2 * L && !blocked; k++) { const x = a.x + (b.x - a.x) * k / (2 * L), z = a.z + (b.z - a.z) * k / (2 * L); if (net.nearestEdge(x, z, 2, undefined, (q) => !lineEdges.includes(q.id))) blocked = true; }
-      if (blocked) { if (process.argv.includes('-v')) console.log(`    ${mode} cand blocked`); continue; }
       const pr = build(g, free(g, a.x, a.z), free(g, b.x, b.z), roadOpts(0, 'road', { crossing: mode }), mode + ' crossing');
       if (!pr || !pr.crossings.length) { if (pr) console.log('  (no crossing detected)'); continue; }
       crossEdges[mode] = e.id;
@@ -158,7 +164,67 @@ let levelCrossing = -1;
         }
         console.log(`    level crossing id ${levelCrossing}, bus stops ${s1},${s2}, depot ${dep}`);
       }
-      break;
+      break candLoop;
+    }
+  }
+  // no free flat stretch on the lines: use a level crossing the line got where it crossed a country road
+  if (levelCrossing < 0) {
+    const lc = [...net.crossings.values()].find((c) => c.kind === 'level' && (lineEdges.includes(c.e1) || lineEdges.includes(c.e2)));
+    const roadId = lc ? (lineEdges.includes(lc.e1) ? lc.e2 : lc.e1) : -1;
+    const road = net.edges.get(roadId);
+    if (lc && road) {
+      levelCrossing = lc.id;
+      const s0 = lineEdges.includes(lc.e1) ? lc.s2 : lc.s1;
+      const q0 = { x: 0, y: 0, z: 0 }, t0 = { x: 0, y: 0, z: 0 };
+      net.pointAt(road, s0, q0, t0);
+      const tl = Math.hypot(t0.x, t0.z) || 1;
+      // stops on the road a few units either side of the tracks (the road may continue on other edges)
+      const stopOn = (dir: number) => {
+        for (const k of [4, 6, 3, 8, 10]) {
+          const x = lc.x + (t0.x / tl) * k * dir, z = lc.z + (t0.z / tl) * k * dir;
+          if (g.stations.planBusStop(x, z, 0).ok) return { id: addBusStop(g, x, z, 0), x, z };
+        }
+        return null;
+      };
+      const st1 = stopOn(-1), st2 = stopOn(1);
+      let dep = st1 ? roadDepotNear(g, st1.x, st1.z, 0) : -1;
+      if (dep > 0 && st1 && st2 && !(roadDepotReaches(g, g.depots.get(dep)!, st1.id) && roadDepotReaches(g, g.depots.get(dep)!, st2.id))) { g.depots.remove(dep); dep = -1; }
+      if (st1 && st2 && st1.id > 0 && st2.id > 0 && st1.id !== st2.id && dep > 0) {
+        const bl = g.lines.create('road', 0);
+        bl.stops = [st1.id, st2.id];
+        const v = g.vehicles.buyRoad(dep, MODEL_BY_ID.get('bus_b')!, bl.id);
+        if (v instanceof RoadVehicle) crossBus = v;
+      }
+      console.log(`  level crossing of the line with a country road at ${fmt(lc.x)},${fmt(lc.z)}: id ${lc.id}, bus stops ${st1?.id},${st2?.id}, depot ${dep}`);
+    }
+  }
+  // over/under passes need no trains: if the lines have no free stretch, cross a test spur in open country
+  for (const mode of ['over', 'under'] as const) {
+    if (crossEdges[mode] !== undefined) continue;
+    const size = g.world.size, n = Math.floor((size - 48) / 6);
+    for (let k = 0; k < n * n; k++) {
+      const x = 24 + ((k * 37) % n) * 6, z = 24 + Math.floor(k / n) * 6;
+      // nothing near the spur (rail along x) and the test road (along z)
+      let busy = false;
+      for (let t = -20; t <= 20 && !busy; t += 1) {
+        if (net.nearestEdge(x + t, z, 2) || (Math.abs(t) <= 13 && net.nearestEdge(x, z + t, 2))) busy = true;
+        if (g.world.buildingsNear(x + t, z, 1.5).length || (Math.abs(t) <= 13 && g.world.buildingsNear(x, z + t, 1.5).length)) busy = true;
+      }
+      if (busy) continue;
+      let mn = Infinity, mx = -Infinity;
+      for (let dz = -12; dz <= 12; dz += 4) for (let dx = -15; dx <= 15; dx += 5) { const h = g.world.heightAt(x + dx, z + dz); mn = Math.min(mn, h); mx = Math.max(mx, h); }
+      if (mn < 0.3 || mx - mn > 6) continue;
+      // an underpass needs the railway up on a bridge: the spur rises to a raised middle node
+      let spur: ReturnType<typeof build> = null;
+      if (mode === 'over') spur = build(g, free(g, x - 15, z), free(g, x + 15, z), railOpts(0, 1), 'test spur');
+      else {
+        const h1 = build(g, free(g, x - 18, z), free(g, x + 1, z), railOpts(0, 1, { heightOffset: 1.5 }), 'test spur (up)');
+        const mid = h1 ? net.nearestNode(x + 1, z, 0.2, 'rail') : null;
+        spur = mid ? build(g, { kind: 'node', x: mid.x, z: mid.z, y: mid.y, node: mid.id }, free(g, x + 20, z), railOpts(0, 1), 'test spur (down)') : null;
+      }
+      if (!spur) continue;
+      const pr = build(g, free(g, x, z - 12), free(g, x, z + 12), roadOpts(0, 'road', { crossing: mode }), mode + ' crossing (spur)');
+      if (pr && pr.crossings.length) { crossEdges[mode] = spur.tracks.length ? (net.nearestEdge(x, z, 1, 'rail')?.edge.id ?? -1) : -1; console.log(`  ${mode} crossing on a test spur at ${fmt(x)},${fmt(z)}: modes ${pr.crossings.map((c) => c.mode).join(',')}, road bridges ${pr.stats.bridges}`); break; }
     }
   }
   check(levelCrossing > 0, 'level crossing built');
@@ -195,12 +261,43 @@ if (sites.length === 2) {
 }
 check(bus, 'town bus bought');
 
+// ------------------------------------------------------------------ 7. intercity bus over the country roads
+// a stop in each of two neighbouring towns joined by the generated roads; the bus must drive between them
+let icBus: RoadVehicle | null = null;
+const icStops: number[] = [];
+{
+  const roadEdges = [...net.edges.values()].filter((e) => e.kind === 'road' && e.type === 'road' && e.owner === -1);
+  check(roadEdges.length > 0, `country roads generated (${roadEdges.length} edges, ${fmt(roadEdges.reduce((a, e) => a + e.len, 0), 0)} u)`);
+  const stopIn = (t: typeof big) => {
+    const cands = g.towns.streets(t, 0).filter((e) => e.type === 'street' && e.len > 4).map((e) => { const p = { x: 0, y: 0, z: 0 }; net.pointAt(e, e.len / 2, p); return p; })
+      .sort((a, b) => Math.hypot(a.x - t.x, a.z - t.z) - Math.hypot(b.x - t.x, b.z - t.z));
+    for (const p of cands.slice(0, 30)) if (g.stations.planBusStop(p.x, p.z, 0).ok) return { id: addBusStop(g, p.x, p.z, 0), x: p.x, z: p.z };
+    return null;
+  };
+  const towns = [...g.towns.list].sort((a, b) => b.pop - a.pop);
+  outer: for (const ta of towns) for (const tb of towns) {
+    const d = Math.hypot(ta.x - tb.x, ta.z - tb.z);
+    if (ta.id >= tb.id || d < 50 || d > 140) continue;
+    const sa = stopIn(ta), sb = sa ? stopIn(tb) : null;
+    if (!sa || !sb || sa.id < 0 || sb.id < 0 || sa.id === sb.id) continue;
+    const dep = roadDepotNear(g, sa.x, sa.z, 0);
+    if (dep < 0 || !roadDepotReaches(g, g.depots.get(dep)!, sb.id)) { if (dep > 0) g.depots.remove(dep); continue; }
+    const l = g.lines.create('road', 0);
+    l.stops = [sa.id, sb.id];
+    const b = g.vehicles.buyRoad(dep, MODEL_BY_ID.get('bus_c')!, l.id);
+    if (b instanceof RoadVehicle) { icBus = b; icStops.push(sa.id, sb.id); console.log(`  intercity bus ${ta.name} - ${tb.name} (${fmt(d, 0)} u apart)`); break outer; }
+  }
+}
+check(icBus, 'intercity bus bought');
+
 // ------------------------------------------------------------------ simulate
 const popSim = g.towns.list.map((t) => t.pop);
 const bld0 = g.world.buildings.size, edges0 = net.edges.size;
 const arrivals = new Map<number, Map<number, number>>();
 const lastAt = new Map<number, number>();
 let busArr = 0, lastBus = '', crossBusArr = 0, lastCrossBus = '';
+const icVisits = new Map<number, number>();
+let icLast = '', icOnRoad = 0, icTicks = 0;
 let closedTicks = 0, waitedAtCrossing = 0, unsafe = 0, signalWaits = 0;
 let errors = 0, nanMsg: string | null = null;
 const T1 = performance.now();
@@ -222,6 +319,12 @@ while (g.day < startDay + days) {
   }
   if (bus) { if (bus.state === 'loading' && lastBus !== 'loading') busArr++; lastBus = bus.state; }
   if (crossBus) { if (crossBus.state === 'loading' && lastCrossBus !== 'loading') crossBusArr++; lastCrossBus = crossBus.state; }
+  if (icBus) {
+    const icb: RoadVehicle = icBus;
+    if (icb.state === 'loading' && icLast !== 'loading') { const st = icb.line?.stops[icb.stopIndex] ?? -1; icVisits.set(st, (icVisits.get(st) ?? 0) + 1); }
+    icLast = icb.state;
+    if (icb.seg && icb.state === 'running') { icTicks++; if (net.edges.get(icb.seg.e)?.type === 'road') icOnRoad++; }
+  }
   if (cr) {
     const closed = g.vehicles.crossingClosed.has(cr.id);
     if (closed) closedTicks++;
@@ -239,6 +342,7 @@ while (g.day < startDay + days) {
   if (g.day % 120 === 0 && g.day !== lastLog) {
     lastLog = g.day;
     console.log(`  ${g.dateString()}: train ${train.state} "${train.status}" | double ${dTrains.map((t) => t.state).join('/')} | buses ${busArr}/${crossBusArr} stops | crossing closed ${closedTicks} ticks, waits ${waitedAtCrossing} | money ${fmt(g.economy.money / 1e6, 2)}M`);
+    if (icBus && process.argv.includes('-v')) { const ib: RoadVehicle = icBus; ib.worldPos(pv); console.log(`    intercity bus ${ib.state} "${ib.status}" at ${fmt(pv.x)},${fmt(pv.z)} speed ${fmt(ib.speedKmh, 0)} km/h, stuck ${fmt(ib.stuck, 1)}`); }
   }
 }
 const simMs = performance.now() - T1;
@@ -252,6 +356,12 @@ check(train.delivered > 0, `train delivered passengers (${train.delivered})`);
 check(line.incomeYear + line.incomeLast > 0, 'rail line income > 0');
 check(busArr >= 4 && (bus?.delivered ?? 0) > 0, `town bus served its stops (${busArr} stops, ${bus?.delivered} delivered)`);
 check(crossBusArr >= 4, `bus across the level crossing kept running (${crossBusArr} stops)`);
+if (icBus) {
+  const ib: RoadVehicle = icBus;
+  check(icStops.every((s) => (icVisits.get(s) ?? 0) >= 2), `intercity bus served both towns (${icStops.map((s) => icVisits.get(s) ?? 0).join('/')} stops, ${ib.delivered} delivered)`);
+  check(icOnRoad > 0, `intercity bus drove on the country roads (${fmt((100 * icOnRoad) / Math.max(1, icTicks), 0)}% of its running time)`);
+  console.log(`  intercity bus: ${icStops.map((s) => icVisits.get(s) ?? 0).join('/')} stops, ${ib.delivered} delivered, ${fmt((100 * icOnRoad) / Math.max(1, icTicks), 0)}% of its running time on country roads`);
+}
 check(closedTicks > 0, `level crossing closed for trains (${closedTicks} ticks)`);
 check(waitedAtCrossing > 0, `road vehicles waited at the closed crossing (${waitedAtCrossing} vehicle-ticks)`);
 check(unsafe === 0, `no road vehicle on the crossing while a train passes (${unsafe})`);
