@@ -118,7 +118,7 @@ function roadOf(v: RoadVehicle) {
     seg: v.seg ? rsegD(v.seg) : null, pos: v.pos, trail: v.trail.map(rsegD), ahead: v.ahead.map(rsegD),
     route: v.route.map((r) => [r.edge, r.dir]), speed: v.speed, loadTimer: v.loadTimer, retryTimer: v.retryTimer,
     junctionWait: v.junctionWait, stuck: v.stuck, ttl: v.ttl, rng: v.rng.state, style: v.style, tint: v.tint, cruise: v.cruise,
-    grade: v.grade, gradeTimer: v.gradeTimer, retryWait: v.retryWait,
+    grade: v.grade, gradeTimer: v.gradeTimer, retryWait: v.retryWait, needsReplan: v.needsReplan,
   };
 }
 
@@ -158,7 +158,10 @@ export function serialize(g: Game): any {
       edges: [...net.edges.values()].map((e) => ({ ...e, prof: f32enc(e.prof) })),
       crossings: [...net.crossings.values()],
       nextNode: net.nextNode, nextEdge: net.nextEdge, nextCrossing: net.nextCrossing,
+      // changes the vehicles have not taken in yet (flushed at the start of the next update)
+      dirtyNodes: [...net.dirtyNodes], dirtyEdges: [...net.dirtyEdges],
     },
+    networkDirty: !!(g as any).networkDirty,
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, waiting: [...s.waiting.values()] })),
@@ -173,6 +176,8 @@ export function serialize(g: Game): any {
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
+    // vehicles still to re-plan after the last network change (a few per tick), and lost-vehicle news timers
+    replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };
@@ -221,6 +226,8 @@ export function deserialize(d: any): Game {
   }
   for (const c of d.net.crossings as Crossing[]) net.crossings.set(c.id, { ...c });
   net.nextNode = d.net.nextNode; net.nextEdge = d.net.nextEdge; net.nextCrossing = d.net.nextCrossing;
+  for (const id of (d.net.dirtyNodes ?? []) as number[]) net.dirtyNodes.add(id);
+  for (const id of (d.net.dirtyEdges ?? []) as number[]) net.dirtyEdges.add(id);
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
 
   const g = new Game({ ...d.options }, w);
@@ -281,7 +288,7 @@ export function deserialize(d: any): Game {
     restoreBase(r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
-    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2;
+    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2; r.needsReplan = !!vd.needsReplan;
     const seg = rseg(vd.seg);
     if (seg) {
       r.seg = seg; r.pos = vd.pos;
@@ -329,6 +336,8 @@ export function deserialize(d: any): Game {
   const VA = V as any;
   if (typeof d.vrng === 'number' && VA.rng) VA.rng.state = d.vrng;
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
+  if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
+  if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
   // older maps: town streets ending on a bridge are cut back to the ground (9i)
   g.towns.tidyBridgeEnds();
@@ -343,6 +352,8 @@ export function deserialize(d: any): Game {
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   g.restoreAIs(d);
   if (!d.ambient) V.manageAmbient();
+  // network changes made just before saving reach the vehicles at the next update, as they would have
+  if (d.networkDirty) (g as any).networkDirty = true;
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
   return g;
 }
