@@ -22,7 +22,8 @@ import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy } from './economy';
 import { availableModels, VehicleModel, MODEL_BY_ID } from './vehicle-types';
-import { estimateLegFare, estimateLegTime } from './fares';
+import { estimateLegFare, estimateLegTime, tripFactor, refTime } from './fares';
+import { TRIPS_PER_MONTH, TF_TYPICAL } from './demand';
 import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
@@ -1498,12 +1499,22 @@ export class AIController {
         if (T.pop < 2500 || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
         if ((urbanIn.get(T.id) ?? 0) >= (T.pop >= 6000 ? 3 : 1)) continue;
         const mode: 'metro' | 'lightrail' = T.pop >= 6000 ? 'metro' : 'lightrail';
-        const outlay = mode === 'metro' ? 9_000_000 + T.radius * 120_000 : 3_500_000 + T.radius * 50_000;
+        const platform = mode === 'metro' ? 12 : 7, unit = this.urbanUnit(mode, platform);
+        if (!unit) continue;
+        const fleet = 3 * unit.cost * (unit.length * 2 + 0.3 <= platform ? 2 : 1);
+        const outlay = (mode === 'metro' ? 9_000_000 + T.radius * 120_000 : 3_500_000 + T.radius * 50_000) + fleet;
         if (avail < outlay * 1.1) continue;
-        const trips = D.local(T.id);
+        // Urban service normalises the served local OD share to the catchment's generation rate (weights in
+        // demand.ts). Raw district-to-district trips omit same-district rides and understate those boardings.
+        // TRIPS_PER_MONTH already has the calendar scale; the fare below takes boardings, without OD capture.
+        const kmh = mode === 'metro' ? 36 : 27, headway = 140;
+        const time = estimateLegTime(25, kmh, headway);
+        const trips = T.pop * TRIPS_PER_MONTH * clamp(tripFactor(time, refTime(25)) / TF_TYPICAL, 0.6, 1.6);
+        // Assume the core stations reach two thirds of residents; count the town's population once.
+        const revenue = trips * 0.65 * 12 * estimateLegFare(25, kmh, headway, 1, 1.15, true, false);
         // a city line also feeds the company's other lines (and the town grows round it): a strategic bonus
         // on top of its own (modest) return, for companies with the money for it
-        const score = roi(trips * 0.5 * 12 * fareAt(25, mode === 'metro' ? 60 : 45, 140), 4 * 90_000 + T.radius * 2 * 400 * 2, outlay) + 0.35;
+        const score = roi(revenue, 4 * 90_000 + T.radius * 2 * 400 * 2, outlay) + 0.35;
         opts.push({ score: score * 1.2 * wUrban, kind: mode, towns: [T.id] });
       }
     }
@@ -2094,8 +2105,9 @@ export class AIController {
     if (hs && !hsUnit) return fail('no high-speed trains yet', 1800);
     const PLATFORM = hs ? Math.max(12, Math.ceil(hsUnit!.length + 1)) : aiPlatformLength(A.pop, B.pop, g.year), ST = 2, tracks = 1;
     const grade = (TRACK_TYPES[type] ?? TRACK_TYPES.standard).maxGrade * 0.8;
-    // (wide curves for high speed, and only high-speed track counts as running alongside)
-    const curve = hs ? { minR: (TRACK_TYPES.highspeed?.minRadius ?? 30) * 1.35, rmax: 500, rgood: 160, trackClass: 'highspeed' as const, cell: Math.max(12, Math.ceil(g.world.size / 48)) } : { minR: 14 };
+    // The technical minimum can limit an HSR below conventional speeds: keep its wide-curve target.
+    // Only high-speed track counts as running alongside.
+    const curve = hs ? { minR: Math.max(160, (TRACK_TYPES.highspeed?.minRadius ?? 30) * 1.35), rmax: 500, rgood: 160, trackClass: 'highspeed' as const, cell: Math.max(12, Math.ceil(g.world.size / 48)) } : { minR: 14 };
     let pr: { a: StationPlan; b: StationPlan } | null = null;
     const asPlan = (st: Station) => { const r = st.rail!; return { ok: true, x: r.x, z: r.z, y: r.y, angle: r.angle, length: r.length, tracks: r.tracks, cost: 0 } as StationPlan; };
     const reach = (a: StationPlan, b: StationPlan) => Math.abs(a.y - b.y) <= grade * Math.hypot(a.x - b.x, a.z - b.z) * 1.15;
@@ -3219,8 +3231,9 @@ export class AIController {
     if (plans.length < 4) return fail('no station sites');
     const unit = this.urbanUnit(mode, PL);
     if (!unit) return fail('no vehicles');
+    const consist = unit.length * 2 + 0.3 <= PL ? [unit, unit] : [unit];
     const trackCost = L * 2 * (TRACK_TYPES[mode]?.costPerUnit ?? 9000) * (level === 'underground' ? 7 : level === 'elevated' ? 4 : 1.5);
-    const total = plans.reduce((a, q) => a + q.cost, 0) + trackCost + 500_000 + unit.cost * 3;
+    const total = plans.reduce((a, q) => a + q.cost, 0) + trackCost + 500_000 + consist.reduce((a, m) => a + m.cost, 0) * 3;
     if (total > this.available() || !this.borrowFor(total)) return fail('too expensive', 720);
     this.state.phase = `building a ${what} in ${T.name}`;
     p.built = true;
@@ -3299,7 +3312,6 @@ export class AIController {
     p.line = line.id;
     this.signalLine(line.id);
     yield;
-    const consist = unit.length * 2 + 0.3 <= PL ? [unit, unit] : [unit];
     let bought = 0;
     for (let i = 0; i < 3; i++) { const t = g.vehicles.buyTrain(dep, consist, line.id); if (typeof t !== 'string') { bought++; this.stats.vehicles++; } yield; }
     if (!bought) this.note(`no money for ${what} trains in ${T.name} yet`);
