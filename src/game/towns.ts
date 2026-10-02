@@ -262,23 +262,7 @@ export class Towns {
     if (!b) return;
     const town = this.list[b.townId];
     this.world.removeBuilding(id);
-    this.relockNear(b.x, b.z, Math.hypot(b.w, b.d) / 2 + 1);
     if (town) { town.buildings.delete(id); this.recomputePop(town); if (b.type === BT_CHURCH) town.hasChurch = false; }
-  }
-
-  /**
-   * Restore the ground locks of the buildings near a removed one (World.removeBuilding clears the lock bit over
-   * the removed building's whole margin, which neighbours share).
-   */
-  relockNear(x: number, z: number, r: number) {
-    const W = this.world;
-    for (const b of W.buildingsNear(x, z, r + 1)) {
-      const R = Math.hypot(b.w, b.d) / 2 + 0.5;
-      for (let zz = Math.floor(b.z - R); zz <= Math.ceil(b.z + R); zz++) for (let xx = Math.floor(b.x - R); xx <= Math.ceil(b.x + R); xx++) {
-        if (xx < 0 || zz < 0 || xx > W.size || zz > W.size) continue;
-        if (pointInRect(xx, zz, b.x, b.z, b.angle, b.w / 2 + 0.6, b.d / 2 + 0.6)) W.lock[W.vi(xx, zz)] |= LOCK.building;
-      }
-    }
   }
 
   profileOf(town: Town): ProfileSpec { return GROWTH_PROFILES[town.profile ?? 'balanced'] ?? GROWTH_PROFILES.balanced; }
@@ -1682,7 +1666,6 @@ export class Towns {
       town.buildings.delete(b.id);
       town.pop -= b.pop;
       w.removeBuilding(b.id);
-      this.relockNear(b.x, b.z, Math.hypot(b.w, b.d) / 2 + 1);
       const yl = this.prepareLot(ux, uz, b.angle, uw, ud);
       if (yl === null) {
         // the bigger lot cannot be levelled: the old building stays

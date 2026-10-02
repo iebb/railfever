@@ -28,7 +28,7 @@ export class World {
   readonly size: number;
   /** vertex heights, (size+1)^2 */
   readonly h: Float32Array;
-  /** vertex locks: bit 1 network formation, bit 2 building */
+  /** vertex locks: bit 1 network formation, bit 2 building, bit 4 rail formation */
   readonly lock: Uint8Array;
   net: Network;
   buildings = new Map<number, Building>();
@@ -126,11 +126,14 @@ export class World {
   }
   private setBuildingLocks(b: Building, on: boolean) {
     const r = Math.hypot(b.w, b.d) / 2 + 0.5;
+    // Pad for rounded vertex bounds and rotated neighbours' margins (the spatial grid indexes footprints).
+    const nearby = on ? [] : this.buildingsNear(b.x, b.z, r + 2);
     for (let z = Math.floor(b.z - r); z <= Math.ceil(b.z + r); z++) for (let x = Math.floor(b.x - r); x <= Math.ceil(b.x + r); x++) {
       if (x < 0 || z < 0 || x > this.size || z > this.size) continue;
       if (!pointInRect(x, z, b.x, b.z, b.angle, b.w / 2 + 0.6, b.d / 2 + 0.6)) continue;
       const i = this.vi(x, z);
-      if (on) this.lock[i] |= 2; else this.lock[i] &= ~2;
+      if (on || nearby.some((other) => pointInRect(x, z, other.x, other.z, other.angle, other.w / 2 + 0.6, other.d / 2 + 0.6))) this.lock[i] |= 2;
+      else this.lock[i] &= ~2;
     }
   }
   /** Buildings whose footprint (expanded by margin) contains or touches the point. */
