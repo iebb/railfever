@@ -19,6 +19,7 @@ import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } f
 import type { StoredSave } from './storage';
 import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
+import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 
 const VERSION = 2;
@@ -151,6 +152,7 @@ export function serialize(g: Game): any {
     options: g.options, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    aiNetwork: saveNetwork(g),
     world: {
       size: w.size, h: f32enc(w.h), lock: b64(w.lock), trees: f32enc(trees),
       buildings: [...w.buildings.values()], nextBuildingId: w.nextBuildingId,
@@ -359,6 +361,7 @@ export function deserialize(d: any): Game {
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  try { loadNetwork(g, d.aiNetwork); } catch (e) { console.warn('Save load: loadNetwork failed', e); }
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

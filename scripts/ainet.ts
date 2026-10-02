@@ -7,11 +7,15 @@
 //   ais: AI companies (default 3; 'v23' = the v2.3 test world: 5 at 512, 7 above); --off: without ai-network
 import { Game } from '../src/game/game';
 import type { NEdge } from '../src/game/network';
-import { railModeOf } from '../src/game/stations';
-import { networkProfile, networkOptions, midLineCrossovers, subsetLinePairs, networkPlanner, runNetworkTask, routeBetween } from '../src/game/ai-network';
+import { railModeOf, planStationUpgrade, commitStationUpgrade } from '../src/game/stations';
+import { networkProfile, networkOptions, NETWORK_WORK_UNITS, networkDaily, saveNetwork, loadNetwork, midLineCrossovers, subsetLinePairs, networkPlanner, runNetworkTask, routeBetween } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
 import type { Station } from '../src/game/stations';
-import { planConnection, commitConnection, finishDoubleTrack } from '../src/game/trackops';
+import type { Town } from '../src/game/towns';
+import { emptyRecord } from '../src/game/economy';
+import { serialize, deserialize } from '../src/game/save';
+import { planConnection, commitConnection, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
+import { depotReaches } from '../src/game/train';
 import { nodeSnap } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { aiWorld, sidingEdges } from './networks';
@@ -22,7 +26,7 @@ export interface AINetMetrics {
   /** towns with own main-line stations, towns with 2+ of one company's, the closest such pair (units) */
   railTowns: number; multiTowns: number; multiList: string[];
   /** main-line stations (2+ companies' within 30 units and not linked: separate stations) */
-  stations: number; separate: number;
+  stations: number; railParts: number; separate: number;
   /** platform tracks: histogram, stations with more than 2, through tracks, still asking for more room */
   platforms: Map<number, number>; big: number; through: number; needRoom: number;
   /** connected pieces of own track per company (more lines than pieces: a network) */
@@ -62,6 +66,8 @@ export function aiNetMetrics(g: Game): AINetMetrics {
   }
   // stations
   const main = [...g.stations.map.values()].filter((st) => st.rail && st.owner > 0 && railModeOf(st.rail.trackType) === 'mainline');
+  const complex = (st: Station) => Math.min(...g.stations.complex(st.id));
+  const stations = new Set(main.map(complex)).size;
   const platforms = new Map<number, number>();
   let big = 0, through = 0, needRoom = 0;
   for (const st of main) {
@@ -77,7 +83,7 @@ export function aiNetMetrics(g: Game): AINetMetrics {
   const railTowns = new Set(main.filter((s) => s.townId >= 0).map((s) => s.townId)).size;
   const multiList: string[] = [];
   for (const [k, sts] of byTown) {
-    if (sts.length < 2) continue;
+    if (new Set(sts.map(complex)).size < 2) continue;
     let gap = Infinity;
     for (let i = 0; i < sts.length; i++) for (let j = i + 1; j < sts.length; j++) gap = Math.min(gap, Math.hypot(sts[i].x - sts[j].x, sts[i].z - sts[j].z));
     const T = g.towns.list[Number(k.split(':')[1])];
@@ -131,11 +137,11 @@ export function aiNetMetrics(g: Game): AINetMetrics {
       if (net.sectionAt(e, s) === 'bridge') stubsOnBridge++;
     }
   }
-  return { railTowns, multiTowns: multiList.length, multiList, stations: main.length, separate, platforms, big, through, needRoom, pieces: pieces.join(', '), unconnectedPar, parallel, stubs, stubsOnBridge };
+  return { railTowns, multiTowns: multiList.length, multiList, stations, railParts: main.length, separate, platforms, big, through, needRoom, pieces: pieces.join(', '), unconnectedPar, parallel, stubs, stubsOnBridge };
 }
 
 export const fmtNet = (m: AINetMetrics) => `rail towns ${m.railTowns}, towns with 2+ stations of one company ${m.multiTowns}${m.multiList.length ? ' [' + m.multiList.join('; ') + ']' : ''}, separate stations within 30 u ${m.separate}; `
-  + `${m.stations} stations, platform tracks ${[...m.platforms].sort((a, b) => a[0] - b[0]).map(([t, n]) => `${t}:${n}`).join(' ')}, >2 platforms ${m.big}, with through tracks ${m.through}, still short of platforms ${m.needRoom}; `
+  + `${m.stations} station complexes (${m.railParts} rail parts), platform tracks ${[...m.platforms].sort((a, b) => a[0] - b[0]).map(([t, n]) => `${t}:${n}`).join(' ')}, >2 platforms ${m.big}, with through tracks ${m.through}, still short of platforms ${m.needRoom}; `
   + `pieces ${m.pieces}; side by side ${fmt(m.parallel, 0)} u (unconnected ${fmt(m.unconnectedPar, 0)} u); dead ends ${m.stubs} (on a bridge ${m.stubsOnBridge})`;
 
 /** A world with `nai` rail-minded AI companies (as aiWorld's), run for `years`. */
@@ -149,6 +155,19 @@ export function netWorld(seed: number, years: number, size = 512, nai = 3, step?
 }
 
 const NET_KEYS = ['netDecommissioned', 'netRetired', 'netInserted', 'netInterchanges', 'netLinesMerged', 'netRestyled', 'netConsolidated', 'netStopsMerged', 'netThrough', 'netRelevelled', 'netCrossovers', 'netGraded', 'netDemolished', 'netJoined'] as const;
+
+/** Station upgrades can legitimately reserve track for works rather than for a train. */
+function netReservations(g: Game): string[] {
+  const holds = (g.stations as unknown as { holds?: Map<number, { edges: number[]; until: number }> }).holds;
+  const held = new Set<number>();
+  for (const [sid, h] of holds ?? []) if (g.stations.get(sid)?.rail && h.until > g.day) for (const id of h.edges) held.add(id);
+  return checkReservations(g).filter((e) => {
+    const m = /^reservation (\d+) by missing train (\d+)$/.exec(e);
+    if (!m || Number(m[2]) !== WORKS_HOLD) return true;
+    const id = Number(m[1]);
+    return !held.has(id) || !g.world.net.edges.has(id) || g.vehicles.isEdgeBusy(id);
+  });
+}
 
 // ------------------------------------------------------------------------------------------- scenarios
 // Small built situations, each task run once on its own (node ainet.mjs scenarios).
@@ -178,6 +197,19 @@ function lineWithTrain(g: Game, me: number, stops: Station[]): number {
   const dep = depotFor(g, stops[stops.length - 1], stops[0], me);
   if (dep >= 0) g.vehicles.buyTrain(dep, loco(), l.id);
   return l.id;
+}
+
+/** Synthetic towns keep these fixtures independent of terrain and generated street layouts. */
+function fixtureTown(g: Game, x: number, z: number, pop = 6000, radius = 60): Town {
+  const t: Town = { id: g.towns.list.length, name: 'Test town', x, z, angle: 0, pop, radius, buildings: new Set(),
+    nextGrowthDay: 1e9, hasChurch: false, passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, served: 0 };
+  g.towns.list.push(t);
+  return t;
+}
+
+function fixtureResidents(g: Game, t: Town, x: number, z: number, pop: number): void {
+  const b = g.world.addBuilding({ townId: t.id, x, z, angle: 0, w: 1.2, d: 1.1, type: 1, floors: 2, pop, seed: t.buildings.size, y: 3, built: 0 });
+  t.buildings.add(b.id);
 }
 
 /** Lay a straight own track from a node to another (pieces of ~10 units, each over / under / level as it fits). */
@@ -237,21 +269,34 @@ export function scenarios() {
   // 2. a terminus whose free end faces another line's track: a junction, the line runs through
   {
     console.log('connect: terminus joined to the line beside it');
-    const { g, ai, me } = aiFlat();
-    const V = station(g, 60, 40, 0, 10, 1, me)!, W = station(g, 60, 216, 0, 10, 1, me)!;
-    build(g, nodeSnap(g, endNode(g, V, 0, true), 'rail'), nodeSnap(g, endNode(g, W, 0, false), 'rail'), railOpts(me), 'line V-W');
-    const T = station(g, 108, 140, Math.PI / 2, 10, 1, me)!, U = station(g, 215, 140, Math.PI / 2, 10, 1, me)!;
-    build(g, nodeSnap(g, endNode(g, T, 0, true), 'rail'), nodeSnap(g, endNode(g, U, 0, false), 'rail'), railOpts(me), 'line T-U');
-    const la = lineWithTrain(g, me, [T, U]);
-    lineWithTrain(g, me, [V, W]);
-    networkOptions.throughTrips = 0;
-    runNetworkTask(ai, 'connect');
-    networkOptions.throughTrips = 25;
-    const l = g.lines.get(la)!;
-    const dest = l.stops.find((s) => s === V.id || s === W.id);
-    console.log(`  ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
-    check(stat(ai, 'netThrough') === 1 && dest !== undefined, 'connect: the terminus line runs through to the other line');
-    check(dest !== undefined && routes(g, T, g.stations.get(dest)!, me), 'connect: trains find the way through the junction both ways');
+    for (const [doubled, depotAtTerminus] of [[false, false], [true, false], [false, true]]) {
+      const { g, ai, me } = aiFlat(), kind = depotAtTerminus ? 'depot lead' : doubled ? 'double' : 'single';
+      const tracks = doubled ? 2 : 1;
+      const V = station(g, 60, 40, 0, 10, tracks, me)!, W = station(g, 60, 216, 0, 10, tracks, me)!;
+      const e0 = g.world.net.nextEdge;
+      build(g, nodeSnap(g, endNode(g, V, 0, true), 'rail'), nodeSnap(g, endNode(g, W, 0, false), 'rail'), railOpts(me, tracks), 'line V-W');
+      if (doubled) finishDoubleTrack(g, newTrack(g, e0, me), me);
+      const T = station(g, 108, 140, Math.PI / 2, 10, 1, me)!, U = station(g, 215, 140, Math.PI / 2, 10, 1, me)!;
+      build(g, nodeSnap(g, endNode(g, T, 0, true), 'rail'), nodeSnap(g, endNode(g, U, 0, false), 'rail'), railOpts(me), 'line T-U');
+      const la = lineWithTrain(g, me, depotAtTerminus ? [U, T] : [T, U]);
+      const home = g.vehicles.get(g.lines.get(la)!.vehicles[0]) as unknown as { depotId: number };
+      lineWithTrain(g, me, [V, W]);
+      const threshold = networkOptions.throughTrips;
+      networkOptions.throughTrips = 0;
+      runNetworkTask(ai, 'connect');
+      networkOptions.throughTrips = threshold;
+      const l = g.lines.get(la)!;
+      const dest = l.stops.find((s) => s === V.id || s === W.id);
+      console.log(`  ${kind}: ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
+      if (depotAtTerminus) {
+        check(stat(ai, 'netThrough') === 0 && routes(g, T, U, me), 'connect: a depot physically blocking the only buffer end defers construction');
+      } else {
+        check(stat(ai, 'netThrough') === 1 && dest !== undefined, `connect (${kind}): the terminus line runs through to the other line`);
+        check(dest !== undefined && routes(g, T, g.stations.get(dest)!, me), `connect (${kind}): trains find the way through the junction both ways`);
+      }
+      check(midLineCrossovers(g, me).length === 0, `connect (${kind}): crossovers belong only at the stations and junction`);
+      if (depotAtTerminus) check(!!home && !!g.depots.get(home.depotId) && depotReaches(g, g.depots.get(home.depotId)!, U.id), 'connect: the depot behind the old terminus still serves the line');
+    }
   }
   // 3. interchange where two lines cross in open country
   {
@@ -262,9 +307,10 @@ export function scenarios() {
     const B1 = station(g, 140, 20, 0, 10, 1, me)!, B2 = station(g, 140, 226, 0, 10, 1, me)!;
     build(g, nodeSnap(g, endNode(g, B1, 0, true), 'rail'), nodeSnap(g, endNode(g, B2, 0, false), 'rail'), railOpts(me), 'line B');
     const la = lineWithTrain(g, me, [A1, A2]), lb = lineWithTrain(g, me, [B1, B2]);
+    const threshold = networkOptions.interchangeTrips;
     networkOptions.interchangeTrips = 0;
     runNetworkTask(ai, 'interchange');
-    networkOptions.interchangeTrips = 45;
+    networkOptions.interchangeTrips = threshold;
     const LA = g.lines.get(la)!, LB = g.lines.get(lb)!;
     console.log(`  ${LA.name}: ${LA.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${LB.name}: ${LB.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
     const newA = LA.stops.find((s) => s !== A1.id && s !== A2.id), newB = LB.stops.find((s) => s !== B1.id && s !== B2.id);
@@ -371,6 +417,7 @@ export function scenarios() {
     check(stat(ai, 'netInserted') === 1 && l.stops.length > 2, 'insert: a station on the line by the new district');
     check(routes(g, P, Q, me), 'insert: the line still runs end to end');
     // not twice: the district is covered now
+    g.day += 181;
     runNetworkTask(ai, 'insert');
     check(stat(ai, 'netInserted') === 1, 'insert: no second station for the same district');
   }
@@ -390,14 +437,133 @@ export function scenarios() {
       const after = [...g.stations.map.values()].filter((s) => s.owner === me).length;
       console.log(`  stop stations ${before} -> ${after}; line ${l.stops.length} stops`);
       check(after === before - 1 && l.stops.length === 2, 'stops: the two adjacent stops are one station');
-    } else console.log('  (no stop sites: skipped)');
+    } else check(false, 'stops: fixture has two adjacent and two distant stop sites');
+  }
+  // 11. two own termini in one town: the second line moves into the first station
+  {
+    console.log('consolidate: two termini within 40 units in one town');
+    const { g, ai, me } = aiFlat();
+    const T = fixtureTown(g, 118, 124);
+    const A = station(g, 108, 110, Math.PI / 2, 10, 1, me, { style: 'none' })!;
+    const B = station(g, 128, 138, Math.PI / 2, 10, 1, me, { style: 'none' })!;
+    const P = station(g, 226, 110, Math.PI / 2, 10, 1, me)!, Q = station(g, 226, 138, Math.PI / 2, 10, 1, me)!;
+    A.townId = B.townId = T.id; P.townId = Q.townId = -1;
+    check(straightTrack(g, endNode(g, A, 0, true), endNode(g, P, 0, false), me), 'consolidate: segmented A-P approach built');
+    check(straightTrack(g, endNode(g, B, 0, true), endNode(g, Q, 0, false), me), 'consolidate: segmented B-Q approach built');
+    const la = lineWithTrain(g, me, [A, P]), lb = lineWithTrain(g, me, [B, Q]);
+    runNetworkTask(ai, 'consolidate');
+    const left = [A, B].filter((s) => g.stations.get(s.id));
+    console.log(`  town termini 2 -> ${left.length}; ${ai.log.slice(-2).join(' | ')}`);
+    check(stat(ai, 'netConsolidated') === 1 && left.length === 1, 'consolidate: one town station remains');
+    const H = left[0];
+    check(!!H && g.lines.get(la)?.stops.includes(H.id) && g.lines.get(lb)?.stops.includes(H.id)
+      && routes(g, H, P, me) && routes(g, H, Q, me), 'consolidate: both lines use it and still run both ways');
+    runNetworkTask(ai, 'consolidate');
+    check(stat(ai, 'netConsolidated') === 1, 'consolidate: no repeat merge');
+  }
+  // 12. a town-centre railway splitting the town is lifted, only when profitable
+  {
+    console.log('relevel: a town on both sides of a ground station');
+    const { g, ai, me } = aiFlat();
+    const T = fixtureTown(g, 128, 128);
+    const A = station(g, 30, 128, Math.PI / 2, 10, 1, me)!, H = station(g, 128, 128, Math.PI / 2, 10, 1, me, { style: 'none' })!, B = station(g, 226, 128, Math.PI / 2, 10, 1, me)!;
+    H.townId = T.id; A.townId = B.townId = -1;
+    build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, H, 0, false), 'rail'), railOpts(me), 'A-H');
+    build(g, nodeSnap(g, endNode(g, H, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'H-B');
+    const lid = lineWithTrain(g, me, [A, H, B]); // depot beyond B, clear of the town-centre ramps
+    g.lines.get(lid)!.stops = [A.id, H.id, B.id, H.id];
+    g.lines.rebuild();
+    fixtureResidents(g, T, 128, 112, 2400); fixtureResidents(g, T, 128, 144, 2400);
+    const eco = g.company(me).economy, v = emptyRecord();
+    v.income = -1_000_000; eco.yearTotals.push({ year: g.year - 1, v });
+    runNetworkTask(ai, 'relevel');
+    check(H.rail?.level === 'ground' && stat(ai, 'netRelevelled') === 0, 'relevel: losses defer the expensive viaduct');
+    v.income = 5_000_000;
+    runNetworkTask(ai, 'relevel');
+    console.log(`  ${H.name}: ${H.rail?.level}; ${ai.log.slice(-1).join('')}`);
+    check(H.rail?.level === 'elevated' && stat(ai, 'netRelevelled') === 1, 'relevel: profitable company lifts the station');
+    check(routes(g, A, B, me), 'relevel: trains still find both directions across the town');
+    runNetworkTask(ai, 'relevel');
+    check(stat(ai, 'netRelevelled') === 1, 'relevel: the elevated station is left alone');
+  }
+  // 13. a building is justified by extra catchment, never just by the company's cash or town population
+  {
+    console.log('building-by-value: newly covered residents pay for the building');
+    const { g, ai, me } = aiFlat();
+    const T = fixtureTown(g, 128, 128);
+    const H = station(g, 128, 128, Math.PI / 2, 10, 1, me, { style: 'none' })!, B = station(g, 226, 128, Math.PI / 2, 10, 1, me)!;
+    build(g, nodeSnap(g, endNode(g, H, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'H-B');
+    lineWithTrain(g, me, [H, B]);
+    fixtureResidents(g, T, 128, 150, 4000); // already within the halt's catchment
+    fixtureResidents(g, T, 128, 171, 1); // extra catchment too small to pay back
+    runNetworkTask(ai, 'capacity');
+    check(H.rail?.style === 'none' && stat(ai, 'netRestyled') === 0, 'building: a rich company keeps a halt when extra catchment does not pay');
+    const radius = g.stations.catchmentRadius(H);
+    g.day += 361;
+    fixtureResidents(g, T, 132, 171, 300);
+    const money = g.company(me).economy.money;
+    runNetworkTask(ai, 'capacity');
+    console.log(`  ${H.name}: ${H.rail?.style}; ${ai.log.slice(-1).join('')}`);
+    check(H.rail?.style !== 'none' && stat(ai, 'netRestyled') === 1 && g.stations.catchmentRadius(H) > radius
+      && g.company(me).economy.money < money, 'building: the valuable extra catchment earns a paid-for building');
+    runNetworkTask(ai, 'capacity');
+    check(stat(ai, 'netRestyled') === 1, 'building: cooldown prevents repeated spending');
   }
   networkOptions.enabled = true;
 }
 
+/** The persisted planner fields are exact; retirement deadlines survive real JSON saves. */
+function stateChecks() {
+  const { g, ai, me } = aiFlat();
+  const A = station(g, 40, 128, Math.PI / 2, 10, 1, me, { style: 'none' })!;
+  runNetworkTask(ai, 'capacity'); runNetworkTask(ai, 'decommission');
+  g.day = 120;
+  const upgrade = planStationUpgrade(g, A.id, { tracks: 2 });
+  check(upgrade.ok && !commitStationUpgrade(g, upgrade), 'save: station upgrade fixture commits');
+  runNetworkTask(ai, 'capacity');
+  networkOptions.enabled = true;
+  networkDaily(ai);
+  const timers = saveNetwork(g);
+  timers.companies[0][1].demand = { day: 119, nt: 2, P: [0, 1 / 3, Math.PI, 0] };
+  loadNetwork(g, timers);
+  const state = saveNetwork(g), data = JSON.parse(JSON.stringify(serialize(g))), loaded = deserialize(data);
+  check(state.companies[0][1].next.length === 12 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
+    && state.companies[0][1].retire.length > 0, 'save: schedules, cooldowns, station changes and removal grace are populated');
+  check(state.companies[0][1].sizes[0][1].day === 120, 'save: station growth cooldown retains the day of the actual change');
+  check(JSON.stringify(state) === JSON.stringify(saveNetwork(loaded)), 'save: planner fields round-trip exactly through JSON');
+  check(JSON.stringify(state) === JSON.stringify(saveNetwork(g)), 'save: serializing does not mutate the planner');
+  for (const w of [g, loaded]) {
+    w.day = 359; runNetworkTask(w.ais[0], 'decommission');
+    check(!!w.stations.get(A.id), 'save: unused station kept before its original grace deadline');
+    w.day = 360; runNetworkTask(w.ais[0], 'decommission');
+    check(!w.stations.get(A.id), 'save: unused station removed at its original grace deadline');
+  }
+  check(JSON.stringify(saveNetwork(g)) === JSON.stringify(saveNetwork(loaded)), 'save: timer changes after loading stay identical');
+  data.aiNetwork = undefined;
+  const old = deserialize(data);
+  check(saveNetwork(old).companies.length === 0, 'save: old save without planner data loads lazily');
+  networkDaily(old.ais[0]);
+  check(saveNetwork(old).companies[0][1].next.every(([, day]) => day > old.day), 'save: old save gets company-staggered initial deadlines');
+  // The same inputs under radically different clocks perform exactly the same counted work.
+  const snapshots: string[] = [], units: number[] = [], realPerformance = globalThis.performance;
+  try {
+    for (const increment of [0.001, 100]) {
+      const w = deserialize(data);
+      loadNetwork(w, state);
+      const start = networkProfile.steps;
+      let ticks = 0;
+      Object.defineProperty(globalThis, 'performance', { configurable: true, value: { now: () => ticks++ * increment } });
+      for (let day = 121; day <= 200; day++) { w.day = day; networkDaily(w.ais[0]); }
+      snapshots.push(JSON.stringify(serialize(w))); units.push(networkProfile.steps - start);
+    }
+  } finally { Object.defineProperty(globalThis, 'performance', { configurable: true, value: realPerformance }); }
+  check(units[0] > 0 && units[0] === units[1] && snapshots[0] === snapshots[1], 'determinism: fast and slow clocks produce identical work, saved worlds and deadlines');
+  check(networkProfile.maxSteps <= NETWORK_WORK_UNITS, 'determinism: every daily call respects the fixed work allowance');
+}
+
 const isMain = process.argv[1]?.includes('ainet');
-if (isMain && process.argv[2] === 'scenarios') {
-  scenarios();
+if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
+  if (process.argv[2] === 'state') stateChecks(); else scenarios();
   console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
   process.exitCode = fails.length ? 1 : 0;
 } else if (isMain) {
@@ -409,24 +575,41 @@ if (isMain && process.argv[2] === 'scenarios') {
   console.log(`ai-network ${off ? 'OFF' : 'on'}: seeds ${seeds.join(',')}, ${years} years, map ${size}, ${nai || 'v2.3 test world'} AIs`);
   for (const seed of seeds) {
     const t0 = performance.now();
-    const p0 = { ...networkProfile };
-    let errors = 0, minMoney = Infinity;
+    Object.assign(networkProfile, { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, tasks: {}, decisions: {} });
+    let errors = 0, minMoney = Infinity, overLoan = false, insolvent = false, lastDay = -1;
     const warn = console.warn;
     console.warn = (...a: unknown[]) => { errors++; warn('WARN', ...a); };
-    const g = nai ? netWorld(seed, years, size, nai, (gg) => { if (gg.day % 30 === 0) for (const ai of gg.ais) minMoney = Math.min(minMoney, gg.company(ai.companyId).economy.money); }) : aiWorld(seed, years, size);
+    const g = nai ? netWorld(seed, years, size, nai, (gg) => {
+      if (lastDay === gg.day) return;
+      lastDay = gg.day;
+      for (const ai of gg.ais) {
+        const e = gg.company(ai.companyId).economy;
+        minMoney = Math.min(minMoney, e.money);
+        overLoan ||= e.loan > e.maxLoan;
+        insolvent ||= e.money + Math.max(0, e.maxLoan - e.loan) < 0;
+      }
+      if (process.argv.includes('--progress') && gg.day % 360 === 0) console.log(`  seed ${seed}: year ${gg.day / 360}/${years}`);
+    }) : aiWorld(seed, years, size);
     console.warn = warn;
     const m = aiNetMetrics(g);
     const st = g.ais.map((ai) => ai.stats as unknown as Record<string, number>);
     const sum = (k: string) => st.reduce((a, x) => a + (x[k] ?? 0), 0);
     const mid = midLineCrossovers(g).filter((c) => c.owner > 0);
     const subs = subsetLinePairs(g);
-    const calls = networkProfile.calls - p0.calls, ms = networkProfile.ms - p0.ms;
+    const { calls, ms } = networkProfile;
     console.log(`seed ${seed}, ${years} years (${fmt((performance.now() - t0) / 1000, 0)} s): ${fmtNet(m)}`);
     console.log(`  stations per rail town ${fmt(m.stations / Math.max(1, m.railTowns), 2)}; mid-line crossovers ${mid.length}; subset/superset line pairs ${subs.length}`);
     console.log(`  AI: stations grown ${sum('grown')}, merged ${sum('merged')}, joined at a town's station ${sum('joinedStations')}, single tracks paired ${sum('paired')}, junctions ${sum('connections')}, stub track taken up ${fmt(sum('stubs'), 0)} u, lines ${sum('lines')}, rail stations ${sum('railStations')}`);
     console.log(`  network: ${NET_KEYS.map((k) => `${k.slice(3)} ${sum(k)}`).join(', ')}`);
+    console.log(`  opportunities: ${Object.entries(networkProfile.decisions).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'}`);
     console.log(`  money: ${g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return `${g.company(ai.companyId).code} ${fmt(e.money / 1e6, 1)}M (loan ${fmt(e.loan / 1e6, 1)}/${fmt(e.maxLoan / 1e6, 0)}M)`; }).join(', ')}${isFinite(minMoney) ? `; lowest cash ${fmt(minMoney / 1e6, 1)}M` : ''}`);
-    console.log(`  network work: ${calls} calls, avg ${fmt(ms / Math.max(1, calls), 3)} ms, max ${fmt(networkProfile.max, 1)} ms, ${networkProfile.slow} over 15 ms; per company max ${g.ais.map((ai) => fmt(networkPlanner(ai)?.prof.max ?? 0, 1)).join('/')} ms; steps by task ${Object.entries(networkProfile.tasks).map(([k, v]) => `${k} ${v.steps}x max ${fmt(v.max, 1)}`).join(', ')}`);
+    console.log(`  network work: ${calls} calls, ${networkProfile.steps} units (max ${networkProfile.maxSteps}/${NETWORK_WORK_UNITS} per call), avg ${fmt(ms / Math.max(1, calls), 3)} ms, max ${fmt(networkProfile.max, 1)} ms, ${networkProfile.slow} over 15 ms; per company max ${g.ais.map((ai) => fmt(networkPlanner(ai)?.prof.max ?? 0, 1)).join('/')} ms; steps by task ${Object.entries(networkProfile.tasks).map(([k, v]) => `${k} ${v.steps}x max ${fmt(v.max, 1)}`).join(', ')}`);
+    if (process.argv.includes('--json')) console.log('METRICS ' + JSON.stringify({ seed, off, stations: m.stations, railParts: m.railParts, railTowns: m.railTowns,
+      stationsPerTown: m.stations / Math.max(1, m.railTowns), multiTowns: m.multiTowns, midCrossovers: mid.length, subsets: subs.length,
+      paired: sum('paired'), connections: sum('connections'), through: sum('netThrough'), inserted: sum('netInserted'), interchanges: sum('netInterchanges'),
+      consolidated: sum('netConsolidated'), restyled: sum('netRestyled'), relevelled: sum('netRelevelled'), decommissioned: sum('netDecommissioned'),
+      minMoney, overLoan, insolvent, money: g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return { company: ai.companyId, cash: e.money, loan: e.loan, maxLoan: e.maxLoan }; }),
+      calls, units: networkProfile.steps, maxUnits: networkProfile.maxSteps, avgMs: ms / Math.max(1, calls), maxMs: networkProfile.max }));
     for (const ai of g.ais) {
       const notes = ai.log.filter((x) => /rebuilt|merged|joined|paired|junction|stub|station|closed|took up|interchange|combined|moved|lifted|crossovers|runs through|catchment/.test(x)).slice(-5);
       if (notes.length) console.log(`  ${g.company(ai.companyId).code}: ${notes.join(' | ')}`);
@@ -437,9 +620,10 @@ if (isMain && process.argv[2] === 'scenarios') {
     check(mid.length === 0, `seed ${seed}: no crossovers on plain line between stations (${mid.length})`);
     check(subs.length === 0, `seed ${seed}: no subset / superset lines (${subs.length})`);
     check(errors === 0, `seed ${seed}: no AI errors (${errors})`);
-    check(!off ? networkProfile.max < 30 : true, `seed ${seed}: network work stays sliced (max ${fmt(networkProfile.max, 1)} ms)`);
-    check(g.ais.every((ai) => { const e = g.company(ai.companyId).economy; return e.money > -2_000_000 || e.loan < e.maxLoan * 0.98; }), `seed ${seed}: AI money healthy`);
-    const errs = checkReservations(g);
+    // Wall time under contention is reported, never used as a simulation rule or a correctness assertion.
+    check(networkProfile.maxSteps <= NETWORK_WORK_UNITS, `seed ${seed}: network work stays within the deterministic allowance`);
+    check(!overLoan && !insolvent && g.companies.every((c) => !c.ai || !c.defunct), `seed ${seed}: no bankrupt company or loan beyond its limit`);
+    const errs = netReservations(g);
     check(errs.length === 0, `seed ${seed}: reservations consistent ${errs.slice(0, 2).join('; ')}`);
   }
   console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
