@@ -8,6 +8,7 @@ import type { TreeInstance } from './trees';
 import type { RailPart } from '../game/stations';
 import type { Drape } from './build-drape';
 import { railWidth } from '../game/stations';
+import { styleOf } from '../game/station-styles';
 
 /**
  * One object chunk being built: bounds plus the builders/collectors objects add into.
@@ -87,16 +88,82 @@ export function stationFrame(r: RailPart): StationFrame {
   return { bx, bz, ex, ez, BL, BD, cx: bx + ex * (BD / 2 + cd / 2), cz: bz + ez * (BD / 2 + cd / 2), cw: BL + 0.4, cd };
 }
 
-/** Is (x,z) on (or within `margin` of) the forecourt of a ground station? (access streets end there) */
+/**
+ * Pose of a station's passenger building: centre, front direction (towards its forecourt / the street), length
+ * along the front and depth. Side buildings, ramp pads and terminal head buildings alike (RailPart.building);
+ * without a forecourt the front faces away from the tracks.
+ */
+export interface BuildingPose { bx: number; bz: number; ex: number; ez: number; BL: number; BD: number }
+
+export function buildingPose(r: RailPart): BuildingPose {
+  const b = r.building;
+  let ex: number, ez: number;
+  if (r.forecourt && Math.hypot(r.forecourt.x - b.x, r.forecourt.z - b.z) > 1e-3) { ex = r.forecourt.x - b.x; ez = r.forecourt.z - b.z; }
+  else {
+    const rx = Math.cos(r.angle), rz = -Math.sin(r.angle);
+    const side = ((b.x - r.x) * rx + (b.z - r.z) * rz) >= 0 ? 1 : -1;
+    ex = rx * side; ez = rz * side;
+  }
+  const l = Math.hypot(ex, ez) || 1;
+  ex /= l; ez /= l;
+  // which of the rect's dimensions is its depth (along the front direction)?
+  const along = Math.abs(Math.sin(b.angle) * ex + Math.cos(b.angle) * ez);
+  return along >= 0.7071 ? { bx: b.x, bz: b.z, ex, ez, BL: b.w, BD: b.d } : { bx: b.x, bz: b.z, ex, ez, BL: b.d, BD: b.w };
+}
+
+/** A paved forecourt: centre, outward direction, width across and depth outwards. */
+export interface ForecourtRect { cx: number; cz: number; ex: number; ez: number; cw: number; cd: number }
+
+/**
+ * The paved forecourts of a station: from the building's front face out past the point where the access street
+ * ends (RailPart.forecourt; a concourse station has one on each side). Older ground stations without a
+ * forecourt point keep the stationFrame one.
+ */
+export function forecourtRects(r: RailPart): ForecourtRect[] {
+  const lv = stationLevelOf(r);
+  if (!r.forecourt) {
+    if (lv !== 'ground') return [];
+    const f = stationFrame(r);
+    return [{ cx: f.cx, cz: f.cz, ex: f.ex, ez: f.ez, cw: f.cw, cd: f.cd }];
+  }
+  const out: ForecourtRect[] = [];
+  const add = (fc: { x: number; z: number }, faceX: number, faceZ: number, width: number) => {
+    let ex = fc.x - faceX, ez = fc.z - faceZ;
+    const d = Math.hypot(ex, ez);
+    if (d < 0.05) return;
+    ex /= d; ez /= d;
+    const cd = d + 0.2;
+    out.push({ cx: faceX + ex * cd / 2, cz: faceZ + ez * cd / 2, ex, ez, cw: width, cd });
+  };
+  const sty = styleOf(r.style), b = r.building;
+  if (sty.placement === 'over') {
+    // pavilions on both sides of the tracks: their outer faces are the rect's ends across
+    const rx = Math.cos(r.angle), rz = -Math.sin(r.angle);
+    for (const fc of [r.forecourt, r.forecourt2]) {
+      if (!fc) continue;
+      const sd = ((fc.x - b.x) * rx + (fc.z - b.z) * rz) >= 0 ? 1 : -1;
+      // the concourse rect: w along the tracks, d across them (both pavilions)
+      add(fc, b.x + rx * sd * b.d / 2, b.z + rz * sd * b.d / 2, b.w + 0.3);
+    }
+    return out;
+  }
+  const p = buildingPose(r);
+  const width = sty.placement === 'none' ? 0.6 : p.BL + 0.4;
+  add(r.forecourt, p.bx + p.ex * p.BD / 2, p.bz + p.ez * p.BD / 2, width);
+  return out;
+}
+
+/** Is (x,z) on (or within `margin` of) a station forecourt? (access streets end there, no turning head) */
 export function onStationForecourt(game: Game, x: number, z: number, margin: number): boolean {
   for (const st of game.stations.map.values()) {
     const r = st.rail;
-    if (!r || stationLevelOf(r) !== 'ground') continue;
-    if (Math.abs(r.x - x) > r.length + 6 || Math.abs(r.z - z) > r.length + 6) continue;
-    const f = stationFrame(r);
-    const dx = x - f.cx, dz = z - f.cz;
-    const a = dx * f.ez - dz * f.ex, b = dx * f.ex + dz * f.ez; // across, outwards
-    if (Math.abs(a) <= f.cw / 2 + margin && Math.abs(b) <= f.cd / 2 + margin) return true;
+    if (!r) continue;
+    if (Math.abs(r.x - x) > r.length + 30 || Math.abs(r.z - z) > r.length + 30) continue;
+    for (const f of forecourtRects(r)) {
+      const dx = x - f.cx, dz = z - f.cz;
+      const a = dx * f.ez - dz * f.ex, b = dx * f.ex + dz * f.ez; // across, outwards
+      if (Math.abs(a) <= f.cw / 2 + margin && Math.abs(b) <= f.cd / 2 + margin) return true;
+    }
   }
   return false;
 }
