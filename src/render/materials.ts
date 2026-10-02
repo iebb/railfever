@@ -1,6 +1,6 @@
 // Shared materials with custom shader tweaks.
 import * as THREE from 'three';
-import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture, createWorldAtlas, ATLAS, ATLAS_SIZE, CELL_ROUGH, CELL_METAL, WC } from './textures';
+import { createFacadeAtlas, ATLAS_CELLS, createGlowTexture, createWorldAtlas, ATLAS, ATLAS_W, ATLAS_H, CELL_ROUGH, CELL_METAL, WC, FACADE_CELL0 } from './textures';
 import { NOISE_GLSL } from './shaders';
 
 export class Materials {
@@ -98,9 +98,10 @@ diffuseColor *= rfTex;`)
     // static world: one material for all static surfaces. Cells 0..15 = procedural world atlas (map),
     // cells >= 16 = facade atlas (uFacMap/uFacEm, lit windows at night); ground pieces sit slightly above
     // graded terrain, so pull them forward in depth.
-    const S = ATLAS_SIZE, A = ATLAS;
+    const A = ATLAS, SC = A.content + 2 * A.gutter;
     const f = (x: number) => x.toFixed(6);
-    const STRIDE = f((A.content + 2 * A.gutter) / S), PAD = f(A.gutter / S), CONT = f(A.content / S);
+    const v2 = (x: number, y: number) => `vec2(${f(x)}, ${f(y)})`;
+    const STRIDE = v2(SC / ATLAS_W, SC / ATLAS_H), PAD = v2(A.gutter / ATLAS_W, A.gutter / ATLAS_H), CONT = v2(A.content / ATLAS_W, A.content / ATLAS_H);
     this.world = new THREE.MeshStandardMaterial({ vertexColors: true, map: createWorldAtlas(), roughness: 0.9, metalness: 0, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 });
     const facEm = this.facEmissive;
     this.world.onBeforeCompile = (sh) => {
@@ -119,7 +120,7 @@ varying float vRfCell; varying float vRfSeed; varying vec2 vRfUv;`)
 vRfCell = aCell; vRfSeed = aSeed; vRfUv = uv;`);
       sh.fragmentShader = sh.fragmentShader
         .replace('#include <common>', `#include <common>
-uniform float uNight; uniform float uLitRatio; uniform float uCellRough[16]; uniform float uCellMetal[16];
+uniform float uNight; uniform float uLitRatio; uniform float uCellRough[32]; uniform float uCellMetal[32];
 uniform sampler2D uFacMap; uniform sampler2D uFacEm; uniform vec3 uFacEmissive;
 varying float vRfCell; varying float vRfSeed; varying vec2 vRfUv;
 ${NOISE_GLSL}`)
@@ -130,8 +131,8 @@ vec2 rfCuv = fract(vRfUv);
 vec3 rfEm = vec3(0.0);
 vec4 rfTex;
 float rfRough, rfMetal;
-if (rfCi >= 16) {
-  int rfF = rfCi - 16;
+if (rfCi >= ${FACADE_CELL0}) {
+  int rfF = rfCi - ${FACADE_CELL0};
   vec2 rfFc = vec2(float(rfF % ${ATLAS_CELLS}), float(rfF / ${ATLAS_CELLS}));
   vec2 rfFuv = vec2((rfFc.x + rfCuv.x) / ${ATLAS_CELLS.toFixed(1)}, 1.0 - (rfFc.y + 1.0 - rfCuv.y) / ${ATLAS_CELLS.toFixed(1)});
   rfTex = textureGrad(uFacMap, rfFuv, rfGx / ${ATLAS_CELLS.toFixed(1)}, rfGy / ${ATLAS_CELLS.toFixed(1)});

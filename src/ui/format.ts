@@ -29,3 +29,11 @@ export const fmtLen = (u: number) => (u >= 100 ? `${(u / 100).toFixed(2)} km` : 
 /** Height offset in world units as ±m. */
 export const fmtHeight = (h: number) => (h === 0 ? '±0 m' : `${h > 0 ? '+' : '−'}${Math.round(Math.abs(h) * 10)} m`);
 export const fmtPct = (f: number, digits = 0) => `${(f * 100).toFixed(digits)}%`;
+
+/** Compact money for floating text: $850, $1.2k, $45k, $1.25M. */
+export function fmtCompact(x: number): string {
+  const a = Math.abs(x), sgn = x < 0 ? '−' : '';
+  if (a >= 1e6) return `${sgn}$${(a / 1e6).toFixed(a >= 1e7 ? 1 : 2)}M`;
+  if (a >= 1e3) return `${sgn}$${(a / 1e3).toFixed(a >= 1e4 ? 0 : 1)}k`;
+  return `${sgn}$${Math.round(a)}`;
+}

@@ -2,7 +2,6 @@
 import type { Game } from '../game/game';
 import type { Network, NEdge, NNode, EdgeGeo } from '../game/network';
 import { OBJ_CHUNK } from '../game/world';
-import { GeoBuilder } from './geo';
 import type { WB } from './build-mesh';
 import type { FacadeBuilder } from './build-buildings';
 import type { TreeInstance } from './trees';
@@ -174,14 +173,14 @@ export type PP = [number, number, number?];
  * along a run of samples. Flat-shaded across the profile, smooth along the run.
  * uv: u from the profile point, v = s / vScale (when the builder has uvs).
  */
-export function sweep(gb: GeoBuilder, run: Smp[], prof: PP[], vScale = 1, yOff = 0) {
+export function sweep(gb: WB, run: Smp[], prof: PP[], vScale = 1, yOff = 0) {
   const n = run.length;
   if (n < 2 || prof.length < 2) return;
   for (let k = 0; k < prof.length - 1; k++) {
     const [la, ha, ua = 0] = prof[k];
     const [lb, hb, ub = 1] = prof[k + 1];
     const dl = lb - la, dh = hb - ha;
-    const el = Math.hypot(dl, dh) || 1;
+    const el = Math.sqrt(dl * dl + dh * dh) || 1;
     // face normal = dl*up - dh*right (see derivation in build notes)
     const nu = dl / el, nr = -dh / el;
     const base = gb.vertexCount;
@@ -189,7 +188,7 @@ export function sweep(gb: GeoBuilder, run: Smp[], prof: PP[], vScale = 1, yOff =
       const p = run[i];
       const v = p.s / vScale;
       const nx = p.lx * nr, nz = p.lz * nr;
-      const nl = Math.hypot(nx, nu, nz) || 1;
+      const nl = Math.sqrt(nx * nx + nu * nu + nz * nz) || 1;
       gb.vertex(p.x + p.lx * la, p.y + ha + yOff, p.z + p.lz * la, nx / nl, nu / nl, nz / nl, ua, v);
       gb.vertex(p.x + p.lx * lb, p.y + hb + yOff, p.z + p.lz * lb, nx / nl, nu / nl, nz / nl, ub, v);
     }

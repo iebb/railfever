@@ -30,6 +30,9 @@ export interface WinOpts {
 
 export class WindowManager {
   wins = new Map<string, Win>();
+  /** sound hooks (opening a new window / closing one) */
+  sfx = { open: () => {}, close: () => {} };
+  private silent = false;
   private z = 100;
   private cascade = 0;
   constructor(private root: HTMLElement) {
@@ -62,7 +65,7 @@ export class WindowManager {
     }
     const titleEl = h('span', { class: 'win-title' }, title);
     const subEl = h('span', { class: 'win-sub' }, opts.sub ?? '');
-    const closeBtn = h('button', { class: 'ibtn win-x', title: 'Close (Esc)', 'aria-label': 'Close' }, icon('close', 18));
+    const closeBtn = h('button', { class: 'ibtn win-x', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close' }, icon('close', 18));
     const ic = h('span', { class: 'win-ic' }, icon(opts.icon ?? 'info', 17));
     const header = h('div', { class: 'win-head' }, ic, h('div', { class: 'win-tt' }, titleEl, subEl), closeBtn);
     const tabsEl = h('div', { class: 'win-tabs', role: 'tablist' });
@@ -78,9 +81,19 @@ export class WindowManager {
     el.style.left = x + 'px';
     el.style.top = y + 'px';
     this.root.appendChild(el);
+    let closed = false;
     const win: Win = {
       id, el, body, title: titleEl, sub: subEl, tabsEl, tab: '', refresh: opts.refresh, onClose: opts.onClose,
-      close: () => { el.remove(); this.wins.delete(id); win.onClose?.(); },
+      close: () => {
+        if (closed) return;
+        closed = true;
+        if (this.wins.get(id) === win) this.wins.delete(id);
+        win.onClose?.();
+        if (!this.silent) this.sfx.close();
+        // fade / scale out, then remove
+        el.classList.add('closing');
+        setTimeout(() => el.remove(), 140);
+      },
     };
     this.setHead(win, opts);
     closeBtn.addEventListener('click', win.close);
@@ -100,6 +113,7 @@ export class WindowManager {
     });
     this.wins.set(id, win);
     this.focus(win);
+    if (!this.silent) this.sfx.open();
     return win;
   }
 
@@ -132,7 +146,11 @@ export class WindowManager {
     if (top) { top.close(); return true; }
     return false;
   }
-  closeAll() { for (const w of [...this.wins.values()]) w.close(); }
+  closeAll() {
+    this.silent = true;
+    for (const w of [...this.wins.values()]) w.close();
+    this.silent = false;
+  }
 
   /** Re-render windows with a refresh function; unchanged markup is not touched. */
   refreshAll() {

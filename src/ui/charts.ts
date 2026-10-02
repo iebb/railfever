@@ -11,7 +11,7 @@ export interface ChartOpts {
   fmt?: (v: number) => string;
 }
 
-const FONT = '600 10px "Barlow", system-ui, sans-serif';
+const FONT = '500 11px "Inter", system-ui, sans-serif';
 
 /** Render a chart into a new canvas (sized in CSS pixels, crisp on HiDPI). */
 export function chart(series: Series[], opts: ChartOpts = {}): HTMLCanvasElement {

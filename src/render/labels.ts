@@ -109,7 +109,7 @@ export class Labels {
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
       const y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
       const force = !!mk || isHl;
-      cands.push({ l, x: s.x, y, z: s.z, prio: isHl ? 1e9 : mk ? 1e8 : (served ? 2e4 : 1e4), maxDist: force ? 3000 : stMax, scale: isHl ? 1.12 : 0.95, force, d: 0, sx: 0, sy: 0, w: 0, h: 24 });
+      cands.push({ l, x: s.x, y, z: s.z, prio: isHl ? 1e9 : mk ? 1e8 : (served ? 2e4 : 1e4), maxDist: force ? 3000 : stMax, scale: isHl ? 1.1 : 1, force, d: 0, sx: 0, sy: 0, w: 0, h: 24 });
     }
     // ---- project & cull
     const v = this.v;
@@ -132,7 +132,8 @@ export class Labels {
     const keep = new Set<Label>();
     for (const c of cands) {
       if (keep.size >= this.maxVisible && !c.force) break;
-      const s = Math.max(0.72, Math.min(1.1, 0.78 + (40 / Math.max(1, c.d)) * 0.2)) * c.scale;
+      // never shrink below ~11 px text (smallest plate text is 12 px)
+      const s = Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2)) * c.scale;
       c.w = (c.l.text.length * (c.l.kind === 'town' ? 9 : 7.2) + (c.l.kind === 'stn' ? 56 : 12)) * s;
       c.h *= s;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;

@@ -1,14 +1,11 @@
-// Bundled typefaces (inlined by the single-file build): Barlow for UI text, Barlow Condensed for display.
-import barlow400 from '@fontsource/barlow/files/barlow-latin-400-normal.woff2';
-import barlow500 from '@fontsource/barlow/files/barlow-latin-500-normal.woff2';
-import barlow600 from '@fontsource/barlow/files/barlow-latin-600-normal.woff2';
+// Bundled typefaces (inlined by the single-file build): Inter (variable, 100–900) for UI text,
+// Barlow Condensed for display type (wordmark, titles, section headers, numerals, map labels).
+import inter from '@fontsource-variable/inter/files/inter-latin-wght-normal.woff2';
 import cond600 from '@fontsource/barlow-condensed/files/barlow-condensed-latin-600-normal.woff2';
 import cond700 from '@fontsource/barlow-condensed/files/barlow-condensed-latin-700-normal.woff2';
 
 const FACES: [string, string, string][] = [
-  ['Barlow', '400', barlow400],
-  ['Barlow', '500', barlow500],
-  ['Barlow', '600', barlow600],
+  ['Inter', '100 900', inter],
   ['Barlow Condensed', '600', cond600],
   ['Barlow Condensed', '700', cond700],
 ];

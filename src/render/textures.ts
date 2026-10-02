@@ -253,19 +253,26 @@ export const WC = {
   ROAD_COUNTRY: 4, ROAD_STREET: 5, ASPHALT: 6, PAVING: 7,
   PLATFORM: 8, CONCRETE: 9, STONE: 10, ROOF_TILES: 11,
   ROOF_SLATE: 12, ROOF_FLAT: 13, METAL: 14, LAMP: 15,
+  GRASS: 16, WATER: 17, COBBLE: 18, FLOWERS: 19,
 };
+/** First cell index of the facade atlas inside the world material (world cells are below it). */
+export const FACADE_CELL0 = 32;
 /** World units per texture repeat for the 2D cells (strip cells are mapped explicitly). */
 export const WSCALE = {
   GRAVEL: 0.5, ASPHALT: 1.2, PAVING: 0.4, PLATFORM: 1.0, CONCRETE: 1.0, STONE: 0.5,
   ROOF_TILES: 0.36, ROOF_SLATE: 0.3, ROOF_FLAT: 1.0, PLAIN: 1.0,
+  GRASS: 0.8, WATER: 1.5, COBBLE: 0.4, FLOWERS: 0.5,
 };
 /** Ballast cell: sleepers per repeat (one repeat = BALLAST_PERIOD units along the track). */
 export const BALLAST_PERIOD = 0.24;
-export const ATLAS = { cols: 4, content: 256, gutter: 16 };
-export const ATLAS_SIZE = ATLAS.cols * (ATLAS.content + 2 * ATLAS.gutter);
-/** Per-cell roughness / metalness used by the world material. */
-export const CELL_ROUGH = [0.9, 0.97, 0.95, 0.96, 0.9, 0.9, 0.9, 0.86, 0.85, 0.88, 0.9, 0.72, 0.62, 0.92, 0.42, 0.5];
-export const CELL_METAL = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05, 0, 0.72, 0];
+export const ATLAS = { cols: 4, rows: 5, content: 256, gutter: 16 };
+export const ATLAS_W = ATLAS.cols * (ATLAS.content + 2 * ATLAS.gutter);
+export const ATLAS_H = ATLAS.rows * (ATLAS.content + 2 * ATLAS.gutter);
+/** Per-cell roughness / metalness used by the world material (32 slots). */
+export const CELL_ROUGH = [0.9, 0.97, 0.95, 0.96, 0.9, 0.9, 0.9, 0.86, 0.85, 0.88, 0.9, 0.72, 0.62, 0.92, 0.42, 0.5,
+  0.95, 0.08, 0.8, 0.95, ...new Array(12).fill(0.9)];
+export const CELL_METAL = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.05, 0, 0.72, 0,
+  0, 0.15, 0, 0, ...new Array(12).fill(0)];
 
 function h2(ix: number, iy: number, seed: number): number {
   let h = (Math.imul(ix | 0, 374761393) + Math.imul(iy | 0, 668265263) + Math.imul(seed | 0, 2246822519)) | 0;
@@ -438,16 +445,55 @@ const PAINTERS: Painter[] = [
   },
   (s, t, o) => { const v = 0.92 + 0.06 * fb(s, t, 4, 97, 2); o[0] = v; o[1] = v; o[2] = v; },
   (_s, _t, o) => { o[0] = 1; o[1] = 1; o[2] = 1; },
+  // grass: two greens, blade speckle, faint mowing stripes
+  (s, t, o) => {
+    const n = fb(s, t, 8, 101, 3), m = fb(s, t, 32, 102, 2);
+    const sp = h2(Math.floor(s * 256), Math.floor(t * 256), 103);
+    let r = 0.36 + 0.1 * n, g = 0.52 + 0.1 * n + 0.04 * m, b = 0.2 + 0.05 * n;
+    const stripe = Math.floor(s * 2) % 2 ? 1.04 : 0.97;
+    r *= stripe; g *= stripe; b *= stripe;
+    if (sp > 0.94) { r *= 1.18; g *= 1.12; } else if (sp < 0.06) { r *= 0.75; g *= 0.8; b *= 0.75; }
+    o[0] = r; o[1] = g; o[2] = b;
+  },
+  // water: dark green-blue with soft ripples
+  (s, t, o) => {
+    const n = fb(s, t, 6, 104, 3), rp = Math.sin((s * 3 + fb(s, t, 4, 105, 2) * 1.2) * Math.PI * 8) * 0.5 + 0.5;
+    const v = 0.88 + 0.12 * n + 0.04 * rp;
+    o[0] = 0.15 * v; o[1] = 0.3 * v; o[2] = 0.33 * v;
+  },
+  // cobbles / setts: 16 staggered rows of small stones
+  (s, t, o) => {
+    const row = Math.floor(t * 16), fy = t * 16 - row;
+    const ss = (s + (row % 2) * 0.5 / 14) % 1;
+    const ci = Math.floor(ss * 14), fx = ss * 14 - ci;
+    let v = 0.78 + 0.16 * (h2(ci, row, 106) - 0.5) * 2 + 0.06 * (fb(s, t, 16, 107, 2) - 0.5);
+    const e = Math.min(fx, 1 - fx, fy, 1 - fy);
+    v *= e < 0.08 ? 0.55 : 0.9 + 0.1 * Math.min(1, e * 6);
+    o[0] = v * 1.02; o[1] = v; o[2] = v * 0.96;
+  },
+  // flower bed: dark soil with clusters of coloured blossoms
+  (s, t, o) => {
+    const n = fb(s, t, 10, 108, 2);
+    o[0] = 0.24 + 0.06 * n; o[1] = 0.32 + 0.08 * n; o[2] = 0.14 + 0.04 * n;
+    worley(s, t, 22, 109, W3);
+    if (W3[0] < 0.36) {
+      const c = Math.floor(h2(W3[2], 1, 110) * 5);
+      const P: [number, number, number][] = [[0.86, 0.2, 0.22], [0.95, 0.82, 0.25], [0.95, 0.94, 0.92], [0.62, 0.36, 0.78], [0.98, 0.55, 0.62]];
+      const k = Math.min(1, (1 - W3[0] / 0.36) * 1.6);
+      const q = P[c];
+      o[0] += (q[0] - o[0]) * k; o[1] += (q[1] - o[1]) * k; o[2] += (q[2] - o[2]) * k;
+    }
+  },
 ];
 
-let worldAtlasData: { data: Uint8Array; size: number } | null = null;
+let worldAtlasData: { data: Uint8Array; size: number; height: number } | null = null;
 
 /** Pixel data of the world atlas (RGBA, sRGB, row 0 = v 0). Cached. */
-export function worldAtlasPixels(): { data: Uint8Array; size: number } {
+export function worldAtlasPixels(): { data: Uint8Array; size: number; height: number } {
   if (worldAtlasData) return worldAtlasData;
   const { cols, content: C, gutter: G } = ATLAS;
-  const S = C + 2 * G, size = cols * S;
-  const data = new Uint8Array(size * size * 4);
+  const S = C + 2 * G, size = ATLAS_W, height = ATLAS_H;
+  const data = new Uint8Array(size * height * 4);
   const tile = new Float32Array(C * C * 3);
   const o = [0, 0, 0];
   const lut = new Uint8Array(4097);
@@ -473,14 +519,14 @@ export function worldAtlasPixels(): { data: Uint8Array; size: number } {
       }
     }
   }
-  worldAtlasData = { data, size };
+  worldAtlasData = { data, size, height };
   return worldAtlasData;
 }
 
 /** The world atlas as a mip-mapped sRGB texture. */
 export function createWorldAtlas(): THREE.DataTexture {
-  const { data, size } = worldAtlasPixels();
-  const t = new THREE.DataTexture(data, size, size, THREE.RGBAFormat, THREE.UnsignedByteType);
+  const { data, size, height } = worldAtlasPixels();
+  const t = new THREE.DataTexture(data, size, height, THREE.RGBAFormat, THREE.UnsignedByteType);
   t.colorSpace = THREE.SRGBColorSpace;
   t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
   t.magFilter = THREE.LinearFilter;
@@ -488,7 +534,7 @@ export function createWorldAtlas(): THREE.DataTexture {
   t.generateMipmaps = true;
   t.anisotropy = 8;
   t.flipY = false;
-  t.userData = { cells: ATLAS.cols, pad: ATLAS.gutter / (ATLAS.content + 2 * ATLAS.gutter), content: ATLAS.content };
+  t.userData = { cols: ATLAS.cols, rows: ATLAS.rows, gutter: ATLAS.gutter, content: ATLAS.content };
   t.needsUpdate = true;
   return t;
 }

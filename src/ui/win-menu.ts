@@ -4,6 +4,7 @@ import { h, clear, section, icon, toggle, field, add } from './dom';
 import { fmtMoney } from '../game/economy';
 import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
 import { fmtDate } from './format';
+import { audio, AudioSettings } from '../audio/engine';
 
 export function openMenu(ui: UI) {
   const win = ui.wm.open('menu', 'Menu', { width: 280, x: window.innerWidth - 300, y: 64, icon: 'menu', color: '#eef2f7' });
@@ -44,7 +45,7 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
             : h('button', { class: 'btn sm primary', onclick: async () => {
               try { const g = await loadFromSlot(s.slot); win.close(); ui.app.setGame(g); ui.toast('Game loaded', 'good'); } catch (e) { ui.toast('Load failed: ' + (e as Error).message, 'bad'); }
             } }, 'Load'),
-          h('button', { class: 'ibtn sm', title: 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
+          h('button', { class: 'ibtn sm', 'data-tip': 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
     }
   };
   render();
@@ -117,11 +118,25 @@ export function openSettings(ui: UI) {
   if ('debug' in s) win.body.append(flag('debug'));
   const g = ui.game;
   const grid = () => (r.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid;
+  // audio: volume sliders (0–100 %) and mute
+  const vol = (key: keyof Omit<AudioSettings, 'muted'>, label: string, hint?: string) => {
+    const rng = h('input', { type: 'range', min: '0', max: '100', value: String(Math.round(audio.settings[key] * 100)), class: 'range', 'aria-label': label }) as HTMLInputElement;
+    const val = h('span', { class: 'stp-v' }, `${rng.value}%`);
+    rng.addEventListener('input', () => { audio.settings[key] = Number(rng.value) / 100; val.textContent = `${rng.value}%`; ui.hud.syncVol(); });
+    rng.addEventListener('change', () => { audio.saveSettings(); ui.sound(key === 'ui' ? 'click' : key === 'world' ? 'build' : 'toggle'); });
+    return field(label, h('div', { class: 'inline', style: 'flex:1' }, rng, val), hint);
+  };
   win.body.append(
+    section('Audio'),
+    toggle('Mute all sound', audio.settings.muted, (v) => { audio.settings.muted = v; audio.saveSettings(); ui.hud.syncVol(); }),
+    vol('master', 'Master'),
+    vol('ui', 'Interface', 'Clicks, windows, notifications'),
+    vol('world', 'World', 'Construction, trains, stations'),
+    vol('ambient', 'Ambience', 'Wind, birds, town and traffic'),
     section('Interface'),
     toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
-    toggle('Sound effects', ui.soundOn, (v) => { ui.soundOn = v; ui.savePrefs(); }),
     toggle('Construction grid', (grid()?.value ?? 0) > 0, (v) => { const u = grid(); if (u) u.value = v ? 1 : 0; }, 'G'),
+    toggle('Show the getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
     section('Simulation'),
     toggle('Ambient town traffic', g.vehicles.ambientEnabled, (v) => { g.vehicles.ambientEnabled = v; g.vehicles.manageAmbient(); }),
     toggle('AI companies build', g.aiEnabled, (v) => { g.aiEnabled = v; }),

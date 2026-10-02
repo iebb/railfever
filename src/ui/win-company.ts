@@ -4,6 +4,7 @@ import { MONTH_NAMES, PLAYER } from '../game/game';
 import { h, clear, tile, section, icon, toggle, add } from './dom';
 import { fmtMoney, CATEGORIES, CATEGORY_LABEL, Economy, MonthRecord } from '../game/economy';
 import { chart } from './charts';
+import { cashPitch } from '../audio/engine';
 
 const monthSum = (m: MonthRecord) => CATEGORIES.reduce((a, k) => a + m.v[k], 0);
 
@@ -32,8 +33,8 @@ export function openFinances(ui: UI) {
       tile(fmtMoney(g.maintenanceOf(PLAYER)), 'Upkeep / yr')));
     if (win.tab === 'overview') {
       add(win.body, h('div', { class: 'btns', style: 'margin-top:0' },
-        h('button', { class: 'btn', onclick: () => { if (!e.borrow()) ui.toast('Maximum loan reached', 'bad'); win.last = undefined; render(); } }, icon('plus', 16), `Borrow ${fmtMoney(e.loanStep)}`),
-        h('button', { class: 'btn', onclick: () => { if (!e.repay()) ui.toast('Cannot repay', 'bad'); win.last = undefined; render(); } }, icon('minus', 16), `Repay ${fmtMoney(e.loanStep)}`),
+        h('button', { class: 'btn', onclick: () => { if (!e.borrow()) ui.toast('Maximum loan reached', 'bad'); else ui.sound('cash', { pitch: cashPitch(e.loanStep) }); win.last = undefined; render(); } }, icon('plus', 16), `Borrow ${fmtMoney(e.loanStep)}`),
+        h('button', { class: 'btn', onclick: () => { if (!e.repay()) ui.toast('Cannot repay', 'bad'); else ui.sound('click'); win.last = undefined; render(); } }, icon('minus', 16), `Repay ${fmtMoney(e.loanStep)}`),
         h('span', { class: 'muted' }, `max ${fmtMoney(e.maxLoan)} · ${(e.interestRate * 100).toFixed(1)}% interest`)));
       const months = e.months.slice(-3);
       const cols: { label: string; v: Record<string, number> }[] = [

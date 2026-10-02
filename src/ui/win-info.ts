@@ -12,6 +12,7 @@ import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES } from '../game/constants';
 import { curveSpeed } from '../game/construction';
 import { fmtLen, fmtPct } from './format';
+import { cashPitch } from '../audio/engine';
 
 const CAR_GAP = 0.1;
 const hex = (c: number) => '#' + c.toString(16).padStart(6, '0');
@@ -184,7 +185,7 @@ export function openVehicle(ui: UI, id: number) {
         h('button', { class: 'btn' + (ui.following === id ? ' on' : ''), onclick: () => { if (ui.following === id) ui.centerOn(...ui.posOf(v2)); else ui.follow(v2); win.last = undefined; render(); } }, icon('target', 16), ui.following === id ? 'Following' : 'Follow'),
         v2.line ? h('button', { class: 'btn', onclick: () => ui.openLine(v2.lineId!) }, icon('lines', 16), 'Line') : null,
         mine && upgradeOption(ui, v2) ? h('button', { class: 'btn', title: upgradeOption(ui, v2)!.label, onclick: () => upgradeVehicle(ui, v2) }, icon('up', 16), 'Upgrade') : null,
-        mine ? h('button', { class: 'btn danger', onclick: () => { if (confirm(`Sell ${v2.name} for ${fmtMoney(g.vehicles.resaleValue(v2))}?`)) { g.vehicles.sell(v2.id); win.close(); } } }, icon('tag', 16), 'Sell') : null,
+        mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
     );
   };
@@ -330,7 +331,7 @@ export function openPurchase(ui: UI, kind: 'rail' | 'road', depotId: number | nu
       const r = rail ? g.vehicles.buyTrain(dId, cars, state.line) : g.vehicles.buyRoad(dId, cars[0], state.line);
       if (typeof r === 'string') { ui.toast(r, 'bad'); return; }
       ui.toast(`${r.name} purchased`, 'good');
-      ui.sound('build');
+      ui.sound('purchase');
       if (!state.line) ui.toast('Tip: assign the vehicle to a line so it starts working.', 'info');
       render();
     };

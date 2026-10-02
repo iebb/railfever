@@ -36,7 +36,7 @@ export class Minimap {
     for (const c of [this.base, this.net, this.over]) c.width = c.height = Math.round(this.px * this.dpr);
     this.view = h('div', { class: 'mm-view' }, this.base, this.net, this.over);
     const layer = (key: keyof Minimap['layers'], ic: string, title: string) => {
-      const b = h('button', { class: 'ibtn sm mm-layer on', title, 'aria-label': title, 'aria-pressed': 'true', onclick: () => {
+      const b = h('button', { class: 'ibtn sm mm-layer on', 'data-tip': title, 'aria-label': title, 'aria-pressed': 'true', onclick: () => {
         this.layers[key] = !this.layers[key];
         b.classList.toggle('on', this.layers[key]);
         b.setAttribute('aria-pressed', String(this.layers[key]));
@@ -45,7 +45,7 @@ export class Minimap {
       this.layerBtns[key] = b;
       return b;
     };
-    const collapse = h('button', { class: 'ibtn sm', title: 'Collapse (M)', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
+    const collapse = h('button', { class: 'ibtn sm', 'data-tip': 'Collapse map', 'data-key': 'M', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
     this.el = h('div', { class: 'minimap glass' },
       h('div', { class: 'mm-head' }, h('span', { class: 'mm-title' }, 'Map'), layer('network', 'rail', 'Network'), layer('vehicles', 'train', 'Vehicles'), layer('names', 'towns', 'Town names'), collapse),
       this.view);
@@ -169,8 +169,8 @@ export class Minimap {
       }
     }
     if (this.layers.names) {
-      const fs = Math.round(10 * this.dpr);
-      ctx.font = `700 ${fs}px "Barlow Condensed", "Barlow", system-ui, sans-serif`;
+      const fs = Math.round(11.5 * this.dpr);
+      ctx.font = `700 ${fs}px "Barlow Condensed", "Inter", system-ui, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'bottom';
       ctx.lineJoin = 'round';

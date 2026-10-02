@@ -117,6 +117,8 @@ export class Tools {
   private brush = { timer: 0, level: 0, cost: 0, err: false };
   private wheelAcc = 0;
   hoverStation: number | null = null;
+  private vehPickAt = 0;
+  private hoverVeh: number | null = null;
 
   constructor(private ui: UI) {
     this.tooltip = document.createElement('div');
@@ -162,6 +164,8 @@ export class Tools {
     this.depotPlan = null;
     this.hoverStation = null;
     this.parallel = null;
+    this.hoverVeh = null;
+    this.ui.hoverCard?.set(null);
     this.clearVisuals();
     const u = this.terr;
     if (u.uGrid) u.uGrid.value = CONSTRUCTION.includes(t) && t !== 'signal' ? 1 : 0;
@@ -299,7 +303,7 @@ export class Tools {
         break;
       }
       case 'terraform':
-        if (this.brush.cost > 0) { this.ui.floatCost(this.brush.cost, e.clientX, e.clientY); this.ui.sound('build'); }
+        if (this.brush.cost > 0) { this.ui.floatCost(this.brush.cost, e.clientX, e.clientY); this.ui.sound('build', this.ground ? { x: this.ground.x, z: this.ground.z, pitch: 0.8 } : {}); }
         this.brush.cost = 0;
         this.overlay.setDisc(null);
         break;
@@ -494,6 +498,7 @@ export class Tools {
     if (!p) {
       if (!this.building) this.clearVisuals();
       ov.setMarker('hover0', null);
+      this.ui.hoverCard?.set(null);
       this.hideTip();
       return;
     }
@@ -623,10 +628,30 @@ export class Tools {
 
   private hoverInspect(p: THREE.Vector3) {
     const g = this.game, ov = this.overlay;
+    const card = this.ui.hoverCard;
+    // vehicles under the cursor (throttled raycast; retried next frame while throttled)
+    if (this.tool === 'inspect') {
+      const now = performance.now();
+      if (now - this.vehPickAt > 100) { this.vehPickAt = now; this.hoverVeh = this.ui.renderer.pickVehicle(this.client.x, this.client.y); }
+      else this.moveDirty = true;
+      if (this.hoverVeh != null && g.vehicles.get(this.hoverVeh)) {
+        ov.setHoverEdge(null);
+        ov.setFootprints(null);
+        this.hoverStation = null;
+        card.set({ kind: 'vehicle', id: this.hoverVeh });
+        this.hideTip();
+        return;
+      }
+    }
     const hit = this.hitAt(p.x, p.z);
     ov.setHoverEdge(null);
     ov.setFootprints(null);
     this.hoverStation = null;
+    // stations, depots and towns get the in-world hover card; tracks keep the cursor tooltip
+    if (this.tool === 'inspect' && hit && hit.kind !== 'edge') {
+      const t = hit.kind === 'building' ? { kind: 'town' as const, id: g.world.buildings.get(hit.id)?.townId ?? -1 } : { kind: hit.kind, id: hit.id };
+      if (t.id >= 0) card.set(t); else card.set(null);
+    } else card.set(null);
     if (!hit) { this.hideTip(); return; }
     const own = (o: number): [string, string][] => (o === PLAYER ? [] : [['company', o < 0 ? 'Town' : esc(g.company(o).name)]]);
     if (hit.kind === 'station') {
@@ -640,7 +665,7 @@ export class Tools {
         const okKind = l && (l.kind === 'rail' ? !!st.rail : st.stops.length > 0);
         const err = st.owner !== PLAYER ? 'Station of another company' : !okKind ? (l?.kind === 'rail' ? 'No train platforms' : 'No bus stop') : '';
         this.tip(err ? { title: esc(st.name), err: [err] } : { title: esc(st.name), ok: [`Add to ${l?.name ?? 'line'}`] }, err ? 'err' : 'ok');
-      } else this.tip({ title: esc(st.name), rows: [...own(st.owner), ['people', `<b>${st.waitingTotal}</b> waiting`], ['star', `Rating <b>${(st.rating * 100).toFixed(0)}%</b>`]] }, 'info');
+      } else this.hideTip();
       return;
     }
     if (this.tool === 'line-edit') { this.hideTip(); return; }
@@ -648,7 +673,7 @@ export class Tools {
       const dp = g.depots.get(hit.id)!;
       const sz = depotSize(dp.kind);
       ov.setFootprints([{ x: dp.x, z: dp.z, angle: dp.angle, w: sz.w, d: sz.d, color: 0xffb020, y: dp.y, lift: 0.1 }]);
-      this.tip({ title: dp.kind === 'rail' ? 'Train depot' : 'Bus depot', rows: own(dp.owner), hint: dp.owner === PLAYER ? 'Click to buy vehicles' : undefined }, 'info');
+      this.hideTip();
     } else if (hit.kind === 'edge') {
       const e = g.world.net.edges.get(hit.id)!;
       ov.setHoverEdge(e.id, 0xffb020);
@@ -657,10 +682,9 @@ export class Tools {
     } else if (hit.kind === 'building') {
       const b = g.world.buildings.get(hit.id)!;
       ov.setFootprints([{ x: b.x, z: b.z, angle: b.angle, w: b.w, d: b.d, color: 0xffb020, lift: 0.08 }]);
-      this.tip({ title: esc(g.towns.list[b.townId]?.name ?? 'Building'), rows: [['people', `<b>${b.pop}</b> residents`]] }, 'info');
+      this.tip({ title: esc(g.towns.list[b.townId]?.name ?? 'Building'), rows: [['people', `<b>${b.pop}</b> residents in this building`]] }, 'info');
     } else if (hit.kind === 'town') {
-      const t = g.towns.list[hit.id];
-      this.tip({ title: esc(t.name), rows: [['people', `<b>${t.pop.toLocaleString('en-US')}</b> residents`]] }, 'info');
+      this.hideTip();
     }
   }
 
@@ -827,8 +851,8 @@ export class Tools {
     const err = commitProposal(g, p);
     if (err) { this.ui.toast(err, 'bad'); return; }
     this.ui.floatCost(p.cost, this.client.x, this.client.y);
-    this.ui.sound('build');
     const end = this.hoverSnap!;
+    this.ui.sound(p.opts.kind === 'rail' ? 'build-rail' : 'build-road', { x: end.x, z: end.z });
     this.proposal = null;
     this.overlay.setProposal(null);
     this.overlay.setDemolish(null);
@@ -964,7 +988,7 @@ export class Tools {
     if (!r.prop.ok) { this.ui.toast(r.prop.errors[0] ?? 'Cannot build here', 'bad'); return; }
     if (r.err) { this.ui.toast(r.err, 'bad'); return; }
     this.ui.floatCost(r.prop.cost, this.client.x, this.client.y);
-    this.ui.sound('build');
+    this.ui.sound('build-rail', { x: this.ground.x, z: this.ground.z });
     this.parallel = null;
     this.planKey = '';
     this.moveDirty = true;
@@ -996,7 +1020,7 @@ export class Tools {
         this.stationPlan = null;
         const err = g.stations.commitRail(pl, PLAYER);
         if (err) this.ui.toast(err, 'bad');
-        else { this.ui.floatCost(pl.cost, e.clientX, e.clientY); this.ui.sound('build'); }
+        else { this.ui.floatCost(pl.cost, e.clientX, e.clientY); this.ui.sound('station', { x: pl.x, z: pl.z }); }
         break;
       }
       case 'busstop': {
@@ -1004,7 +1028,7 @@ export class Tools {
         const cost = g.stations.planBusStop(p.x, p.z, PLAYER).cost;
         const err = g.stations.commitBusStop(p.x, p.z, PLAYER);
         if (err) this.ui.toast(err, 'bad');
-        else { this.ui.floatCost(cost, e.clientX, e.clientY); this.ui.sound('build'); }
+        else { this.ui.floatCost(cost, e.clientX, e.clientY); this.ui.sound('station', { x: p.x, z: p.z, pitch: 1.15 }); }
         break;
       }
       case 'depot-rail':
@@ -1016,7 +1040,7 @@ export class Tools {
         if (!pl.ok) { this.ui.toast(pl.error ?? 'Cannot build', 'bad'); return; }
         const err = g.depots.commit(kind, pl, PLAYER);
         if (err) this.ui.toast(err, 'bad');
-        else { this.ui.floatCost(pl.cost, e.clientX, e.clientY); this.ui.sound('build'); }
+        else { this.ui.floatCost(pl.cost, e.clientX, e.clientY); this.ui.sound('depot', { x: pl.x, z: pl.z }); }
         break;
       }
       case 'signal': {
@@ -1025,7 +1049,7 @@ export class Tools {
         if (n && n.owner !== PLAYER) { this.ui.toast(`Signal of ${g.company(n.owner).name}`, 'bad'); return; }
         const err = toggleSignal(g, p.x, p.z, PLAYER);
         if (err) this.ui.toast(err, 'bad');
-        else this.ui.sound('click');
+        else this.ui.sound('signal', { x: p.x, z: p.z });
         break;
       }
     }
@@ -1036,7 +1060,7 @@ export class Tools {
     const g = this.game;
     const r = bulldoze(g, x0, z0, x1, z1, PLAYER, false);
     if (r.error) this.ui.toast(r.error, 'bad');
-    if (r.changed) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('demolish'); }
+    if (r.changed) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('demolish', { x: (x0 + x1) / 2, z: (z0 + z1) / 2 }); }
     this.overlay.setHoverEdge(null);
     this.hideTip();
   }

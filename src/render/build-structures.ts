@@ -77,7 +77,7 @@ function groundUnder(ctx: ChunkCtx, p: Smp, ha: number, hl: number, off = 0): nu
 
 // ------------------------------------------------------------------------------ bridges
 
-export type BridgeStyle = 'girder' | 'truss' | 'viaduct' | 'arch';
+export type BridgeStyle = 'girder' | 'truss' | 'viaduct' | 'arch' | 'tiedarch';
 
 interface Dims { w: number; top: number; depth: number; ph: number; pierW: number; capW: number }
 
@@ -92,7 +92,7 @@ const styleCache = new Map<string, BridgeStyle>();
 const bridgeSigs = new Map<string, string>();
 
 function spanFor(style: BridgeStyle, e: NEdge): number {
-  return style === 'truss' ? 9 : style === 'viaduct' ? 2.4 : style === 'arch' ? 6 : e.kind === 'rail' ? 4 : 3.5;
+  return style === 'truss' ? 9 : style === 'viaduct' ? 2.4 : style === 'arch' ? 6 : style === 'tiedarch' ? 12 : e.kind === 'rail' ? 4 : 3.5;
 }
 
 /** Bridge style of a section, decided on the group leader so parallel tracks match. */
@@ -133,7 +133,8 @@ function computeStyle(ctx: ChunkCtx, e: NEdge, s0: number, s1: number): BridgeSt
   if (e.kind === 'rail') {
     if (water && L >= 9) st = 'truss';
     else if (L >= 8 && med >= 2.0) st = (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified ? 'arch' : 'viaduct';
-  } else if (L >= 12 && med >= 2.4) st = 'arch';
+  } else if (water) st = L >= 10 ? 'tiedarch' : 'viaduct';
+  else if (L >= 12 && med >= 2.4) st = 'arch';
   if (st === 'viaduct' || st === 'arch') {
     // arches need every pier: fall back to girders if any support would stand on another edge
     const n = Math.max(1, Math.round(L / spanFor(st, e)));
@@ -179,6 +180,9 @@ export function buildBridge(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, run
     } else if (style === 'viaduct') {
       W.use(WC.STONE, STONE);
       sweep(W, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, 0.12, D.ph, false).map(([l, h]) => [l, h, (l + h) / WSCALE.STONE] as PP));
+    } else if (style === 'tiedarch') {
+      W.use(WC.CONCRETE, CONCRETE);
+      sweep(W, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, 0.16, D.ph * 0.8, false));
     } else {
       W.use(WC.CONCRETE, CONCRETE);
       sweep(W, run, deckProfile(wl, wr, !ps.left, !ps.right, D.top, style === 'arch' ? 0.14 : D.depth, D.ph, style === 'girder'));
@@ -189,12 +193,13 @@ export function buildBridge(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, run
   const pierS: number[] = [];
   for (let k = 1; k < n; k++) pierS.push(s0 + (k * L) / n);
   let supports = [s0, ...pierS, s1];
-  if (style === 'girder' || style === 'truss') {
-    const depth = style === 'truss' ? 0.16 : D.depth;
+  if (style === 'girder' || style === 'truss' || style === 'tiedarch') {
+    const depth = style === 'girder' ? D.depth : 0.16;
     supports = [s0];
-    for (const s of pierS) { const ps2 = pier(ctx, e, s, D, depth, wl, wr, style === 'truss' ? 1.6 : 1.0); if (ps2 !== null) supports.push(ps2); }
+    for (const s of pierS) { const ps2 = pier(ctx, e, s, D, depth, wl, wr, style === 'girder' ? 1.0 : 1.6); if (ps2 !== null) supports.push(ps2); }
     supports.push(s1);
     if (style === 'truss') for (let i = 0; i < supports.length - 1; i++) truss(ctx, e, supports[i], supports[i + 1], D, ps);
+    if (style === 'tiedarch') for (let i = 0; i < supports.length - 1; i++) tiedArch(ctx, e, supports[i], supports[i + 1], D, ps);
   } else if (style === 'viaduct') viaduct(ctx, e, s0, s1, supports, D, wl, wr, ps);
   else arches(ctx, e, supports, D, wl, wr);
   // a bridge spans several chunks: if its style or supports changed (e.g. a line was built underneath),
@@ -293,6 +298,43 @@ function truss(ctx: ChunkCtx, e: NEdge, sa: number, sb: number, D: Dims, ps: { l
       const p = pts[i];
       const yy = p.y + y0 + TH;
       W.tube(p.x - p.lx * (D.w - 0.01), yy, p.z - p.lz * (D.w - 0.01), p.x + p.lx * (D.w - 0.01), yy, p.z + p.lz * (D.w - 0.01), r * 0.7, 4);
+    }
+  }
+}
+
+/** Steel tied arch (bowstring) over one span: arch ribs on the outer sides, hangers, top bracing. */
+function tiedArch(ctx: ChunkCtx, e: NEdge, sa: number, sb: number, D: Dims, ps: { left: boolean; right: boolean }) {
+  const g = ctx.game.world.net.geo(e);
+  const mid = sampleAt(g, (sa + sb) / 2);
+  if (!inChunk(ctx, mid.x, mid.z)) return;
+  const W = ctx.w;
+  W.cast = 1;
+  W.use(WC.METAL, 0xd3d7da);
+  const span = sb - sa;
+  const rise = Math.max(1.0, Math.min(2.2, span * 0.18));
+  const K = Math.max(10, Math.round(span / 0.45));
+  const pts = Array.from({ length: K + 1 }, (_, k) => sampleAt(g, sa + (span * k) / K));
+  const y0 = D.top + 0.05;
+  const hy = (k: number) => { const t = k / K; return y0 + rise * 4 * t * (1 - t); };
+  const sides: number[] = [];
+  if (!ps.left) sides.push(-1);
+  if (!ps.right) sides.push(1);
+  for (const sd of sides) {
+    const off = sd * (D.w - 0.03);
+    const A = (k: number): [number, number, number] => { const p = pts[k]; return [p.x + p.lx * off, p.y + hy(k), p.z + p.lz * off]; };
+    for (let k = 0; k < K; k++) { const a = A(k), b = A(k + 1); W.tube(a[0], a[1], a[2], b[0], b[1], b[2], 0.045, 4); }
+    // hangers from the arch down to the deck edge
+    for (let k = 2; k < K - 1; k += 2) {
+      const a = A(k), p = pts[k];
+      W.tube(a[0], a[1], a[2], p.x + p.lx * off, p.y + y0, p.z + p.lz * off, 0.008, 3);
+    }
+  }
+  // wind bracing between the two arches where they are high enough above the road
+  if (sides.length === 2) {
+    for (let k = 2; k < K - 1; k += 2) {
+      if (hy(k) - y0 < 0.95) continue;
+      const p = pts[k], yy = p.y + hy(k);
+      W.tube(p.x - p.lx * (D.w - 0.03), yy, p.z - p.lz * (D.w - 0.03), p.x + p.lx * (D.w - 0.03), yy, p.z + p.lz * (D.w - 0.03), 0.02, 4);
     }
   }
 }

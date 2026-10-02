@@ -5,14 +5,14 @@ import type { World, Building } from '../game/world';
 import { RNG } from '../game/rng';
 import { FLOOR_H, BUILDING_TYPES, BT_HOUSE_S, BT_HOUSE_L, BT_TOWNHOUSE, BT_SHOP, BT_APARTMENT, BT_OFFICE, BT_TOWER, BT_CHURCH } from '../game/towns';
 import { WB } from './build-mesh';
-import { FC, WC, WSCALE } from './textures';
+import { FC, WC, WSCALE, FACADE_CELL0 } from './textures';
+import type { ChunkCtx } from './build-common';
+import { buildPark, buildPlaza, BT_PARK, BT_PLAZA } from './build-landuse';
 
 /** Width of one window bay on facades (units). */
 export const BAY = 0.32;
 export { FLOOR_H };
 
-/** Facade cells live in the world material after its 16 world-atlas cells. */
-export const FACADE_CELL0 = 16;
 
 /**
  * Builder for facade walls (world material): uv in (bay, floor) units, aCell = FACADE_CELL0 + facade
@@ -226,7 +226,12 @@ const ROOFS_TILE = [0xb5583a, 0xc0653f, 0xa04a30, 0x9a5236, 0x8b4a33, 0xb86b48];
 const ROOFS_SLATE = [0x5a6068, 0x4b525a, 0x64686c, 0x52565e];
 const AWNINGS = [0xb83b3b, 0x2f6e9e, 0x3c8c4e, 0xd09a2a, 0x6b4a8a];
 
-export function buildBuilding(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder) {
+export function buildBuilding(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, ctx?: ChunkCtx) {
+  // land use without a building (until the game exports BT_PARK / BT_PLAZA they are keyed off the numbers)
+  if (b.type === BT_PARK || b.type === BT_PLAZA) {
+    if (ctx) { if (b.type === BT_PARK) buildPark(ctx, b); else buildPlaza(ctx, b); }
+    return;
+  }
   const r = new RNG(b.seed);
   const fx = Math.sin(b.angle), fz = Math.cos(b.angle);
   const rx = fz, rz = -fx;

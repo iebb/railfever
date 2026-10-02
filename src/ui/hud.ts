@@ -8,18 +8,19 @@ import { h, icon, clear, seg, stepper, kbd, toggle, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES } from '../game/constants';
 import { fmtDate, fmtHeight, newsDate } from './format';
+import { audio } from '../audio/engine';
 
-interface Cat { id: string; label: string; icon: string; color: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
+interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
 
 /** Tool categories of the dock. */
 const CATS: Cat[] = [
-  { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tools: ['inspect'] },
-  { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tools: ['rail', 'signal', 'depot-rail'] },
-  { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tools: ['road', 'depot-road'] },
-  { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tools: ['station', 'busstop'] },
-  { id: 'lines', label: 'Lines', icon: 'lines', color: 'var(--accent)', actions: [['lines', 'Lines', 'lines', 'L'], ['vehicles', 'Vehicles', 'vehicles', 'V'], ['towns', 'Towns', 'towns', 'T']] },
-  { id: 'terrain', label: 'Terrain', icon: 'terraform', color: 'var(--terrain)', tools: ['terraform'] },
-  { id: 'demolish', label: 'Demolish', icon: 'bulldoze', color: 'var(--demolish)', tools: ['bulldoze'] },
+  { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
+  { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, signals, depot', keys: '2 4 5', tools: ['rail', 'signal', 'depot-rail'] },
+  { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
+  { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
+  { id: 'lines', label: 'Lines', icon: 'lines', color: 'var(--accent)', tip: 'Lines, vehicles & towns', keys: 'L V T', actions: [['lines', 'Lines', 'lines', 'L'], ['vehicles', 'Vehicles', 'vehicles', 'V'], ['towns', 'Towns', 'towns', 'T']] },
+  { id: 'terrain', label: 'Terrain', icon: 'terraform', color: 'var(--terrain)', tip: 'Terrain: raise, lower, level', keys: '0', tools: ['terraform'] },
+  { id: 'demolish', label: 'Demolish', icon: 'bulldoze', color: 'var(--demolish)', tip: 'Demolish', keys: '9', tools: ['bulldoze'] },
 ];
 
 export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string; color: string }> = {
@@ -83,6 +84,11 @@ export class Hud {
   /** long help of the tool card expanded */
   helpOpen = false;
   private catBtns = new Map<string, HTMLButtonElement>();
+  private vol: HTMLDivElement;
+  private volBtn: HTMLButtonElement;
+  private volRange: HTMLInputElement;
+  private prevTool: ToolId | undefined;
+  private trayHide = 0;
   private drawer: HTMLDivElement | null = null;
   openCat: string | null = null;
   private lastTool: Record<string, ToolId> = {};
@@ -99,15 +105,15 @@ export class Hud {
     this.plateName = h('span', { class: 'plate-name' });
     this.plateMoney = h('span', { class: 'plate-money' });
     this.plateDelta = h('span', { class: 'plate-delta' });
-    const plate = h('button', { class: 'plate chrome', title: 'Finances', onclick: () => ui.openFinances() },
+    const plate = h('button', { class: 'plate chrome', 'data-tip': 'Finances', 'aria-label': 'Finances', onclick: () => ui.openFinances() },
       this.plateChip, h('span', { class: 'plate-txt' }, this.plateName, this.plateMoney), this.plateDelta);
     R.appendChild(h('div', { class: 'hud hud-tl' }, plate));
     // clock & speed
     this.dateEl = h('span', { class: 'clock-date' });
-    const speeds: [string, number, string][] = [['pause', 0, 'Pause (Space)'], ['play', 1, 'Normal speed'], ['', 2, 'Fast 2×'], ['', 4, 'Faster 4×'], ['', 8, 'Fastest 8×']];
+    const speeds: [string, number, string][] = [['pause', 0, 'Pause'], ['play', 1, 'Normal speed'], ['', 2, 'Fast 2×'], ['', 4, 'Faster 4×'], ['', 8, 'Fastest 8×']];
     const sp = h('div', { class: 'speed', role: 'radiogroup', 'aria-label': 'Game speed' });
     for (const [ic, v, tip] of speeds) {
-      const b = h('button', { class: 'spd', title: tip, 'aria-label': tip, onclick: () => ui.setSpeed(v) }, ic ? icon(ic, 15) : `${v}×`);
+      const b = h('button', { class: 'spd', 'data-tip': tip, 'data-key': v === 0 ? 'Space' : undefined, 'data-sfx': 'none', 'aria-label': tip, onclick: () => ui.setSpeed(v) }, ic ? icon(ic, 15) : `${v}×`);
       this.spdBtns.push(b);
       sp.appendChild(b);
     }
@@ -116,19 +122,31 @@ export class Hud {
     this.fpsEl = h('span', { class: 'fps' });
     this.badge = h('span', { class: 'badge' });
     this.badge.style.display = 'none';
-    this.newsBtn = h('button', { class: 'hbtn chrome', title: 'News (N)', 'aria-label': 'News', onclick: () => this.toggleNews() }, icon('bell', 19), this.badge);
+    this.newsBtn = h('button', { class: 'hbtn chrome', 'data-tip': 'News', 'data-key': 'N', 'aria-label': 'News', onclick: () => this.toggleNews() }, icon('bell', 19), this.badge);
+    // volume: click mutes, hovering reveals the master volume slider
+    this.volBtn = h('button', { class: 'hbtn', 'data-tip': 'Mute', 'aria-label': 'Mute', 'data-sfx': 'none', onclick: () => this.toggleMute() }, icon('volume', 19));
+    this.volRange = h('input', { type: 'range', min: '0', max: '100', 'aria-label': 'Master volume' }) as HTMLInputElement;
+    this.volRange.addEventListener('input', () => {
+      audio.settings.master = Number(this.volRange.value) / 100;
+      if (audio.settings.muted && audio.settings.master > 0) audio.settings.muted = false;
+      this.syncVol();
+    });
+    this.volRange.addEventListener('change', () => { audio.saveSettings(); this.ui.sound('click'); });
+    this.vol = h('div', { class: 'vol chrome' }, this.volBtn, h('div', { class: 'vol-slider' }, this.volRange));
     R.appendChild(h('div', { class: 'hud hud-tr' },
       this.fpsEl,
+      this.vol,
       this.newsBtn,
-      h('button', { class: 'hbtn chrome', title: 'Companies (C)', 'aria-label': 'Companies', onclick: () => ui.openCompetitors() }, icon('company', 19)),
-      h('button', { class: 'hbtn chrome', title: 'Help (F1)', 'aria-label': 'Help', onclick: () => ui.openHelp() }, icon('help', 19)),
-      h('button', { class: 'hbtn chrome', title: 'Menu', 'aria-label': 'Menu', onclick: () => ui.openMenu() }, icon('menu', 19)),
+      h('button', { class: 'hbtn chrome', 'data-tip': 'Companies', 'data-key': 'C', 'aria-label': 'Companies', onclick: () => ui.openCompetitors() }, icon('company', 19)),
+      h('button', { class: 'hbtn chrome', 'data-tip': 'Help', 'data-key': 'F1', 'aria-label': 'Help', onclick: () => ui.openHelp() }, icon('help', 19)),
+      h('button', { class: 'hbtn chrome', 'data-tip': 'Menu', 'aria-label': 'Menu', onclick: () => ui.openMenu() }, icon('menu', 19)),
     ));
+    this.syncVol();
     // dock
     this.dock = h('div', { class: 'dock glass', role: 'toolbar', 'aria-label': 'Tools' });
     CATS.forEach((c, i) => {
       if (i === 4 || i === 1) this.dock.appendChild(h('span', { class: 'dock-sep' }));
-      const b = h('button', { class: 'cat', style: `--c:${c.color}`, title: c.label, onclick: () => this.pickCat(c) }, icon(c.icon, 24), h('span', { class: 'cat-l' }, c.label));
+      const b = h('button', { class: 'cat', style: `--c:${c.color}`, 'data-tip': c.tip, 'data-key': c.keys, 'data-sfx': 'none', 'aria-label': c.label, onclick: () => this.pickCat(c), onpointerenter: () => audio.play('hover') }, icon(c.icon, 24), h('span', { class: 'cat-l' }, c.label));
       this.catBtns.set(c.id, b);
       this.dock.appendChild(b);
     });
@@ -143,8 +161,31 @@ export class Hud {
     window.addEventListener('resize', () => this.placeCard());
   }
 
+  /** Volume button state from the audio settings. */
+  syncVol() {
+    const st = audio.settings;
+    const off = st.muted || st.master <= 0;
+    this.vol.classList.toggle('muted', off);
+    this.volBtn.replaceChildren(icon(off ? 'mute' : 'volume', 19));
+    this.volBtn.dataset.tip = off ? 'Unmute' : 'Mute';
+    this.volBtn.setAttribute('aria-label', off ? 'Unmute' : 'Mute');
+    this.volBtn.setAttribute('aria-pressed', off ? 'true' : 'false');
+    const v = String(Math.round(st.master * 100));
+    if (this.volRange.value !== v) this.volRange.value = v;
+  }
+
+  toggleMute() {
+    audio.settings.muted = !audio.settings.muted;
+    if (!audio.settings.muted && audio.settings.master <= 0) audio.settings.master = 0.6;
+    audio.saveSettings();
+    this.syncVol();
+    if (!audio.settings.muted) this.ui.sound('toggle', { pitch: 1.12 });
+  }
+
   setGame(g: Game) {
     this.unread = 0;
+    this.prevTool = undefined;
+    this.syncVol();
     this.badge.style.display = 'none';
     this.sMoney = this.sDate = this.sSpeed = this.sCard = '';
     this.deltaBase = NaN;
@@ -236,14 +277,14 @@ export class Hud {
       body.appendChild(row);
     }
     if (!g.news.length) body.appendChild(h('div', { class: 'pad' }, 'No news yet.'));
-    d.append(h('div', { class: 'drawer-head' }, icon('bell', 18), h('span', null, 'News'), h('button', { class: 'ibtn', title: 'Close', 'aria-label': 'Close', onclick: () => this.closeNews() }, icon('close', 18))), body);
+    d.append(h('div', { class: 'drawer-head' }, icon('bell', 18), h('span', null, 'News'), h('button', { class: 'ibtn', 'data-tip': 'Close', 'data-key': 'Esc', 'aria-label': 'Close', onclick: () => this.closeNews() }, icon('close', 18))), body);
   }
 
   // ------------------------------------------------------------------ dock
   private pickCat(c: Cat) {
     const T = this.ui.tools;
     if (!this.ui.game) return;
-    if (c.actions) { this.openCat = this.openCat === c.id ? null : c.id; if (T.tool !== 'inspect' && this.openCat) T.setTool('inspect'); this.onToolChange(); return; }
+    if (c.actions) { this.openCat = this.openCat === c.id ? null : c.id; this.ui.sound(this.openCat ? 'open' : 'close'); if (T.tool !== 'inspect' && this.openCat) T.setTool('inspect'); this.onToolChange(); return; }
     const tools = c.tools!;
     const cur = TOOL_META[T.tool].cat === c.id;
     if (tools.length === 1) {
@@ -261,6 +302,8 @@ export class Hud {
     const T = this.ui.tools;
     const t = T.tool;
     const meta = TOOL_META[t];
+    if (this.prevTool !== undefined && t !== this.prevTool) this.ui.sound(t === 'inspect' ? 'close' : 'tool');
+    this.prevTool = t;
     if (t !== 'inspect' && t !== 'line-edit') this.lastTool[meta.cat] = t;
     const cat = CATS.find((c) => c.id === meta.cat);
     if (t === 'inspect') { if (this.openCat !== 'lines') this.openCat = null; }
@@ -305,27 +348,36 @@ export class Hud {
   private renderTrayContent() {
     const tr = this.trayEl;
     const c = CATS.find((x) => x.id === this.openCat);
-    if (!c || (!c.actions && (!c.tools || (c.tools.length < 2 && c.id !== 'terrain')))) { tr.style.display = 'none'; return; }
+    clearTimeout(this.trayHide);
+    if (!c || (!c.actions && (!c.tools || (c.tools.length < 2 && c.id !== 'terrain')))) {
+      // fade out, then remove from the layout
+      if (tr.style.display !== 'none' && !tr.classList.contains('leaving')) {
+        tr.classList.add('leaving');
+        this.trayHide = window.setTimeout(() => { tr.style.display = 'none'; tr.classList.remove('leaving'); this.placeCard(); }, 130);
+      }
+      return;
+    }
     const T = this.ui.tools;
     clear(tr);
+    tr.classList.remove('leaving');
     tr.style.display = '';
     tr.style.setProperty('--c', c.color);
     if (c.actions) {
       for (const [id, label, ic, key] of c.actions) {
-        tr.appendChild(h('button', { class: 'toolb', onclick: () => this.ui.openList(id) }, icon(ic, 20), label, kbd(key)));
+        tr.appendChild(h('button', { class: 'toolb', 'data-tip': label, 'data-key': key, 'data-sfx': 'none', onclick: () => this.ui.openList(id) }, icon(ic, 20), label, kbd(key)));
       }
       return;
     }
     if (c.id === 'terrain') {
       for (const [m, label, ic] of [['raise', 'Raise', 'raise'], ['lower', 'Lower', 'lower'], ['level', 'Level', 'level']] as const) {
         const on = T.tool === 'terraform' && T.terraMode === m;
-        tr.appendChild(h('button', { class: 'toolb' + (on ? ' on' : ''), onclick: () => { T.terraMode = m; if (T.tool !== 'terraform') T.setTool('terraform'); else { T.refreshHover(); this.onToolChange(); } } }, icon(ic, 20), label));
+        tr.appendChild(h('button', { class: 'toolb' + (on ? ' on' : ''), 'data-tip': `${label} ground`, 'data-key': '0', 'data-sfx': T.tool === 'terraform' ? 'click' : 'none', onclick: () => { T.terraMode = m; if (T.tool !== 'terraform') T.setTool('terraform'); else { T.refreshHover(); this.onToolChange(); } } }, icon(ic, 20), label));
       }
       return;
     }
     for (const t of c.tools!) {
       const m = TOOL_META[t];
-      tr.appendChild(h('button', { class: 'toolb' + (T.tool === t ? ' on' : ''), title: TOOL_INFO[t].name, onclick: () => T.setTool(t) }, icon(m.icon, 20), TOOL_LABEL[t] ?? TOOL_INFO[t].name, m.key ? kbd(m.key) : null));
+      tr.appendChild(h('button', { class: 'toolb' + (T.tool === t ? ' on' : ''), 'data-tip': TOOL_INFO[t].name, 'data-key': m.key || undefined, 'data-sfx': 'none', 'aria-label': TOOL_INFO[t].name, onclick: () => T.setTool(t) }, icon(m.icon, 20), TOOL_LABEL[t] ?? TOOL_INFO[t].name, m.key ? kbd(m.key) : null));
     }
   }
 
@@ -362,10 +414,10 @@ export class Hud {
     } else if (t === 'station') {
       opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(8, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
       opts.push(opt('Tracks', stepper(String(T.stationTracks), () => { T.stationTracks = Math.max(1, T.stationTracks - 1); redo(); }, () => { T.stationTracks = Math.min(6, T.stationTracks + 1); redo(); })));
-      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left (Shift+R)', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
+      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('span', { class: 'stp-v' }, `${Math.round((T.stationAngle * 180) / Math.PI)}°`), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
       opts.push(toggle('Align to track', T.autoAlign, (v) => { T.autoAlign = v; redo(); }));
     } else if (t === 'depot-rail' || t === 'depot-road') {
-      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', title: 'Rotate left', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', title: 'Rotate right (R)', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
+      opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
     } else if (t === 'terraform') {
       opts.push(opt('Mode', seg([['raise', 'Raise'], ['lower', 'Lower'], ['level', 'Level']], T.terraMode, (v) => { T.terraMode = v; redo(); this.renderTray(); })));
       const rng = h('input', { type: 'range', min: '1', max: '14', value: String(T.brushRadius), class: 'range', 'aria-label': 'Brush radius' }) as HTMLInputElement;
@@ -383,8 +435,8 @@ export class Hud {
       : h('div', { class: 'tc-desc', title: TOOL_INFO[t].hint }, TOOL_SHORT[t] ?? TOOL_INFO[t].hint);
     add(card,
       h('div', { class: 'tc-head' }, h('span', { class: 'tc-dot' }), h('span', { class: 'tc-title' }, TOOL_INFO[t].name),
-        h('button', { class: 'ibtn sm' + (this.helpOpen ? ' on' : ''), title: this.helpOpen ? 'Hide help' : 'Help & keys', 'aria-label': 'Help', 'aria-expanded': this.helpOpen ? 'true' : 'false', onclick: () => { this.helpOpen = !this.helpOpen; this.renderCard(); } }, icon('help', 16)),
-        h('button', { class: 'ibtn sm', title: 'Close tool (Esc)', 'aria-label': 'Close tool', onclick: () => T.setTool('inspect') }, icon('close', 16))),
+        h('button', { class: 'ibtn sm' + (this.helpOpen ? ' on' : ''), 'data-tip': this.helpOpen ? 'Hide help' : 'Help & keys', 'aria-label': 'Help', 'aria-expanded': this.helpOpen ? 'true' : 'false', onclick: () => { this.helpOpen = !this.helpOpen; this.renderCard(); } }, icon('help', 16)),
+        h('button', { class: 'ibtn sm', 'data-tip': 'Close tool', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close tool', onclick: () => T.setTool('inspect') }, icon('close', 16))),
       help,
       opts.length ? h('div', { class: 'tc-opts' }, opts) : null,
     );

@@ -113,9 +113,9 @@ export function openLine(ui: UI, id: number) {
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
-            h('button', { class: 'ibtn sm', title: 'Move up', 'aria-label': 'Move up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
-            h('button', { class: 'ibtn sm', title: 'Move down', 'aria-label': 'Move down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
-            h('button', { class: 'ibtn sm', title: 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
+            h('button', { class: 'ibtn sm', 'data-tip': 'Move up', 'aria-label': 'Move up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
+            h('button', { class: 'ibtn sm', 'data-tip': 'Move down', 'aria-label': 'Move down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
+            h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
       });
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops yet.'));
       add(win.body, section('Stops', l.stops.length >= 2 ? 'vehicles run in a loop' : ''), list);
@@ -159,7 +159,7 @@ function cloneLast(ui: UI, l: Line) {
   const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind, l);
   if (dp == null) { ui.toast('No depot available', 'bad'); return; }
   const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.reversed ? [...v.cars].reverse() : [...v.cars], l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
-  if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('build'); }
+  if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('purchase'); }
 }
 
 // ------------------------------------------------------------------ lists

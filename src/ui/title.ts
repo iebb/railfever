@@ -96,7 +96,7 @@ export function showTitle(o: TitleOpts) {
         field('Competitors', h('div', { class: 'inline wrap' },
           stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(3, st.ai + 1); render(); }),
           h('div', { class: 'ai-chips' }, st.ai ? Array.from({ length: st.ai }, (_, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[(i + 1) % COMPANY_COLORS.length]}` }, h('i'), AI_NAMES[i % AI_NAMES.length])) : h('span', { class: 'muted' }, 'Sandbox — no rivals')))),
-        field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', title: 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
+        field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', 'data-tip': 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
           h('button', { class: 'btn ghost', onclick: () => { c.remove(); card = null; root.classList.remove('card-open'); if (o.newGame && g) close(); } }, 'Cancel'),
           h('button', { class: 'btn primary lg', onclick: () => {

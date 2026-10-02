@@ -6,13 +6,16 @@ import type { Renderer } from '../render/renderer';
 import { WindowManager } from './windows';
 import { Tools, ToolId, Hit } from './tools';
 import { h, icon } from './dom';
-import { fmtMoney } from '../game/economy';
 import type { Line } from '../game/lines';
 import type { Vehicle } from '../game/vehicle';
 import { Minimap } from './minimap';
 import { computeLinePath } from './linepaths';
 import { Hud } from './hud';
-import { newsDate } from './format';
+import { newsDate, fmtCompact } from './format';
+import { audio, Sfx, PlayOpts } from '../audio/engine';
+import { UiTips } from './tips';
+import { HoverCard } from './hovercard';
+import { Checklist } from './checklist';
 import * as info from './win-info';
 import * as lines from './win-lines';
 import * as company from './win-company';
@@ -36,17 +39,20 @@ export class UI {
   game!: Game;
   hud: Hud;
   minimap: Minimap;
+  tips: UiTips;
+  hoverCard: HoverCard;
+  checklist: Checklist;
   private toastBox: HTMLDivElement;
   private floatLayer: HTMLDivElement;
   private floats: FloatText[] = [];
   private refreshTimer = 0;
   private incomeAcc = new Map<number, number>();
   private incomeTimer = 0;
-  private audio: AudioContext | null = null;
-  soundOn = true;
+  /** time of the last sound (a generic click is skipped when an action already made a sound) */
+  private lastSfx = 0;
+  private lastNewsSfx = 0;
   reduceTransparency = false;
   catchmentStation = -1;
-  private lastCash = 0;
   private linePathSig = new Map<number, string>();
   lineBroken = new Map<number, [number, number][]>();
   following: number | null = null;
@@ -55,26 +61,41 @@ export class UI {
   constructor(public root: HTMLElement, public renderer: Renderer, public app: AppHooks) {
     this.loadPrefs();
     this.wm = new WindowManager(root);
+    this.wm.sfx = { open: () => this.sound('open'), close: () => this.sound('close') };
     this.hud = new Hud(this);
     this.minimap = new Minimap(this);
+    this.tips = new UiTips(root);
+    this.hoverCard = new HoverCard(this);
+    this.checklist = new Checklist(this);
     this.toastBox = h('div', { class: 'toasts', role: 'status', 'aria-live': 'polite' });
     root.appendChild(this.toastBox);
     this.floatLayer = h('div', { class: 'floats' });
     root.appendChild(this.floatLayer);
     window.addEventListener('keydown', this.onKey);
+    // generic UI sounds: clicks on controls and switch toggles (specific actions play their own sound)
+    root.addEventListener('click', (e) => {
+      const el = (e.target as HTMLElement | null)?.closest?.('button, .model, .row.link, tr.clickable, .chip, .swatch.big') as HTMLElement | null;
+      if (!el || (el as HTMLButtonElement).disabled) return;
+      const sfx = el.dataset?.sfx;
+      if (sfx === 'none' || performance.now() - this.lastSfx < 80) return;
+      this.sound((sfx as Sfx) || 'click');
+    });
+    root.addEventListener('change', (e) => {
+      const t = e.target as HTMLElement | null;
+      if (t?.classList?.contains('sw-in') && performance.now() - this.lastSfx > 80) this.sound('toggle', { pitch: (t as HTMLInputElement).checked ? 1.12 : 0.88 });
+    });
   }
 
   // ------------------------------------------------------------------ preferences
   private loadPrefs() {
     try {
       const p = JSON.parse(localStorage.getItem(UI_KEY) ?? '{}');
-      if (typeof p.sound === 'boolean') this.soundOn = p.sound;
       if (typeof p.solid === 'boolean') this.reduceTransparency = p.solid;
     } catch { /* ignore */ }
     this.root.classList.toggle('solid', this.reduceTransparency);
   }
   savePrefs() {
-    try { localStorage.setItem(UI_KEY, JSON.stringify({ sound: this.soundOn, solid: this.reduceTransparency })); } catch { /* ignore */ }
+    try { localStorage.setItem(UI_KEY, JSON.stringify({ solid: this.reduceTransparency })); } catch { /* ignore */ }
     this.root.classList.toggle('solid', this.reduceTransparency);
   }
 
@@ -99,6 +120,8 @@ export class UI {
       else this.openStation(id);
     };
     this.minimap.reset();
+    this.hoverCard.set(null);
+    this.checklist.setGame();
     this.lastHl = undefined;
   }
 
@@ -109,6 +132,7 @@ export class UI {
     if (!this.game) return;
     if (sp === 0) this.game.paused = !this.game.paused;
     else { this.game.paused = false; this.game.speed = sp; }
+    this.sound(sp === 0 ? 'pause' : 'speed', { pitch: sp === 0 ? (this.game.paused ? 0.8 : 1.2) : 0.85 + sp * 0.05 });
   }
 
   private onKey = (e: KeyboardEvent) => {
@@ -154,18 +178,19 @@ export class UI {
     this.incomeTimer -= dt;
     if (this.incomeTimer <= 0) {
       this.incomeTimer = 0.6;
+      // (the audio engine plays the positional income chime itself)
       for (const [sid, amt] of this.incomeAcc) {
         const st = g.stations.get(sid);
         if (!st || amt < 1) continue;
-        const y = (st.rail?.y ?? g.world.heightAt(st.x, st.z)) + 1.2;
-        this.addFloat(`+${fmtMoney(amt)}`, 'income', st.x, y, st.z);
+        const y = (st.rail?.y ?? g.world.heightAt(st.x, st.z)) + 1.4;
+        this.addFloat(`+${fmtCompact(amt)}`, 'income', st.x, y, st.z);
       }
-      const now = performance.now();
-      if (this.incomeAcc.size && now - this.lastCash > 2500) { this.lastCash = now; this.sound('cash'); }
       this.incomeAcc.clear();
     }
     if (this.floats.length) this.updateFloats(dt);
     this.minimap.update(dt);
+    this.hoverCard.update(dt);
+    this.checklist.update(dt);
     this.updateLinePaths();
     // follow a vehicle when the camera has no follow mode of its own
     if (this.following != null) {
@@ -226,7 +251,7 @@ export class UI {
 
   floatCost(cost: number, cx: number, cy: number) {
     if (cost <= 0) return;
-    this.addFloat(`−${fmtMoney(cost)}`, 'cost', 0, 0, 0, { x: cx, y: cy });
+    this.addFloat(`−${fmtCompact(cost).replace('−', '')}`, 'cost', 0, 0, 0, { x: cx, y: cy });
   }
 
   private v3 = new THREE.Vector3();
@@ -268,30 +293,21 @@ export class UI {
   private onNews(n: News) {
     this.hud.onNews(n);
     if (n.kind === 'ai' && !this.game.aiEnabled) return;
+    // news chimes are throttled (AI companies report often at high speed); bad news always sounds
+    const now = performance.now();
+    if (!this.titleOpen && (n.kind === 'bad' || now - this.lastNewsSfx > 2500)) {
+      this.lastNewsSfx = now;
+      this.sound(n.kind === 'good' ? 'news-good' : n.kind === 'bad' ? 'news-bad' : 'notify', n.kind === 'ai' ? { volume: 0.5 } : {});
+    }
     const el = h('div', { class: 'toast news ' + n.kind }, h('span', { class: 'news-date' }, newsDate(this.game, n)), h('span', null, n.text));
     if (n.x !== undefined) { el.classList.add('link'); el.addEventListener('click', () => this.centerOn(n.x!, n.z!)); }
     this.pushToast(el, 6000);
   }
 
-  sound(kind: 'build' | 'demolish' | 'click' | 'cash' | 'error') {
-    if (!this.soundOn) return;
-    try {
-      if (!this.audio) this.audio = new AudioContext();
-      const ac = this.audio;
-      const t0 = ac.currentTime;
-      const gain = ac.createGain();
-      gain.connect(ac.destination);
-      const osc = ac.createOscillator();
-      osc.connect(gain);
-      const env = (a: number, d: number, v: number) => { gain.gain.setValueAtTime(0, t0); gain.gain.linearRampToValueAtTime(v, t0 + a); gain.gain.exponentialRampToValueAtTime(0.0001, t0 + a + d); };
-      if (kind === 'cash') { osc.type = 'sine'; osc.frequency.setValueAtTime(1320, t0); osc.frequency.setValueAtTime(1760, t0 + 0.07); env(0.005, 0.25, 0.04); }
-      else if (kind === 'build') { osc.type = 'triangle'; osc.frequency.setValueAtTime(220, t0); osc.frequency.exponentialRampToValueAtTime(110, t0 + 0.15); env(0.005, 0.2, 0.12); }
-      else if (kind === 'demolish') { osc.type = 'sawtooth'; osc.frequency.setValueAtTime(120, t0); osc.frequency.exponentialRampToValueAtTime(40, t0 + 0.3); env(0.005, 0.35, 0.08); }
-      else if (kind === 'error') { osc.type = 'square'; osc.frequency.setValueAtTime(160, t0); env(0.005, 0.18, 0.04); }
-      else { osc.type = 'sine'; osc.frequency.setValueAtTime(880, t0); env(0.002, 0.06, 0.05); }
-      osc.start(t0);
-      osc.stop(t0 + 0.5);
-    } catch { /* audio unavailable */ }
+  /** Play a sound effect (world events pass x/z for positional sound). */
+  sound(kind: Sfx, opts?: PlayOpts) {
+    this.lastSfx = performance.now();
+    try { audio.play(kind, opts); } catch (e) { console.warn('sfx', kind, e); }
   }
 
   // ------------------------------------------------------------------ shared helpers

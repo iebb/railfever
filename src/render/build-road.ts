@@ -5,6 +5,7 @@ import type { Network, NEdge, NNode, Crossing } from '../game/network';
 import type { Station } from '../game/stations';
 import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP } from './build-common';
 import { WC, WSCALE, STRIP_PERIOD } from './textures';
+import { distToRect } from '../game/world';
 import { buildBridge, buildPortals } from './build-structures';
 import { RAIL_TOP_Y } from './build-rail';
 
@@ -77,9 +78,13 @@ function roadRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
     sweep(W, run, [[-h - 0.08, 0, 0], [-h, 0, 0.08]], 1);
     sweep(W, run, [[h, 0, 0], [h + 0.08, 0, 0.08]], 1);
   } else {
+    // gravel shoulder, then a grass verge sloping to the formation
     W.use(WC.GRAVEL, VERGE);
-    sweep(W, run, [[-h - 0.1, -0.04, 0], [-h, -0.002, 0.2]], 0.5);
-    sweep(W, run, [[h, -0.002, 0], [h + 0.1, -0.04, 0.2]], 0.5);
+    sweep(W, run, [[-h - 0.035, -0.012, 0], [-h, -0.002, 0.07]], 0.5);
+    sweep(W, run, [[h, -0.002, 0], [h + 0.035, -0.012, 0.07]], 0.5);
+    W.use(WC.GRASS, 0xe8ecd8);
+    sweep(W, run, [[-h - 0.1, -0.04, 0], [-h - 0.035, -0.012, 0.08]], WSCALE.GRASS);
+    sweep(W, run, [[h + 0.035, -0.012, 0], [h + 0.1, -0.04, 0.08]], WSCALE.GRASS);
     W.use(WC.GRAVEL, EARTH);
     sweep(W, run, [[-h - 0.12, low, 0], [-h - 0.1, -0.04, 0.4]], 0.5);
     sweep(W, run, [[h + 0.1, -0.04, 0], [h + 0.12, low, 0.4]], 0.5);
@@ -100,9 +105,96 @@ export function buildRoadEdge(ctx: ChunkCtx, e: NEdge) {
       const full = e.sections.find((q) => q.type === 'bridge' && q.s0 <= part.s0 + 1e-6 && q.s1 >= part.s1 - 1e-6);
       buildBridge(ctx, e, full ? Math.max(full.s0, part.s0) : part.s0, full ? Math.min(full.s1, part.s1) : part.s1, runs);
     }
-    if (part.type === 'ground' && roadType(e).sidewalk > 0 && e.depot < 0) streetLamps(ctx, e, part.s0, part.s1);
+    if (part.type === 'ground' && e.depot < 0) {
+      if (roadType(e).sidewalk > 0) { streetLamps(ctx, e, part.s0, part.s1); streetTrees(ctx, e, part.s0, part.s1); }
+      else roadFurniture(ctx, e, part.s0, part.s1);
+    }
   }
   buildPortals(ctx, e);
+}
+
+/** Positions (arc lengths) on edge e that street furniture must keep clear of: stops and level crossings. */
+function clearOf(ctx: ChunkCtx, e: NEdge): number[] {
+  const out: number[] = [];
+  for (const st of ctx.game.stations.map.values()) for (const p of st.stops) if (p.edge === e.id) out.push(p.s);
+  for (const c of ctx.game.world.net.crossings.values()) if (c.e2 === e.id) out.push(c.s2);
+  return out;
+}
+
+/** Street trees in the sidewalk near the kerb (staggered on both sides), clear of lamps, stops and buildings. */
+function streetTrees(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
+  const w = ctx.game.world;
+  const g = w.net.geo(e);
+  const rt = roadType(e);
+  const step = 1.4, lampStep = 2.8;
+  const keep = clearOf(ctx, e);
+  for (const side of [-1, 1]) {
+    const shift = side > 0 ? 0.5 : 0;
+    const k0 = Math.ceil((s0 + 0.75) / step - shift), k1 = Math.floor((s1 - 0.75) / step - shift);
+    for (let k = k0; k <= k1; k++) {
+      const s = (k + shift) * step;
+      // street lamps stand on alternating sides every lampStep
+      const lk = Math.round(s / lampStep);
+      if (Math.abs(s - lk * lampStep) < 0.45 && (((lk + e.id) & 1) ? 1 : -1) === side) continue;
+      if (keep.some((q) => Math.abs(q - s) < 0.9)) continue;
+      const h = ((e.id * 73856093) ^ (k * 19349663) ^ (side * 83492791)) >>> 0;
+      if ((h % 7) === 0) continue; // occasional gap
+      const p = sampleAt(g, s);
+      const off = side * (rt.half + 0.075);
+      const x = p.x + p.lx * off, z = p.z + p.lz * off;
+      if (!inChunk(ctx, x, z)) continue;
+      // room to the nearest building front decides the tree size (skip when there is none)
+      let room = 1;
+      for (const b of w.buildingsNear(x, z, 2)) {
+        if (b.type === 8) continue; // parks are fine next to trees
+        room = Math.min(room, distToRect(x, z, b.x, b.z, b.angle, b.w / 2, b.d / 2));
+      }
+      if (room < 0.16) continue;
+      const y = p.y + KERB_H;
+      const hv = (h % 1000) / 1000;
+      const size = Math.min(0.55, 0.3 + room * 0.7) * (0.85 + 0.15 * ((h >> 10) % 100) / 100);
+      ctx.trees.push({ type: hv < 0.7 ? 0 : 1, x, y: y - 0.005, z, s: size, rot: hv * 6.28, tint: ((h >> 4) % 100) / 100 });
+      ctx.d.use(WC.METAL, 0x2a2d2f);
+      ctx.d.box(x, y, z, 0.11, 0.004, 0.11, p.tx, p.tz);
+    }
+  }
+}
+
+/** Country roads: reflector posts on both verges and an occasional distance marker. */
+function roadFurniture(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
+  const g = ctx.game.world.net.geo(e);
+  const rt = roadType(e);
+  const D = ctx.d;
+  const keep = clearOf(ctx, e);
+  const step = 5;
+  for (let k = Math.ceil((s0 + 0.8) / step); k * step <= s1 - 0.8; k++) {
+    const s = k * step;
+    if (keep.some((q) => Math.abs(q - s) < 1.2)) continue;
+    const p = sampleAt(g, s);
+    for (const side of [-1, 1]) {
+      const off = side * (rt.half + 0.13);
+      const x = p.x + p.lx * off, z = p.z + p.lz * off;
+      if (!inChunk(ctx, x, z)) continue;
+      const y = p.y - 0.03;
+      D.use(WC.PLAIN, 0xf2f2ee, 0);
+      D.box(x, y, z, 0.014, 0.12, 0.014, p.tx, p.tz);
+      D.use(WC.PLAIN, 0x1d1d1d, 0);
+      D.box(x, y + 0.085, z, 0.0145, 0.022, 0.0145, p.tx, p.tz);
+      D.use(WC.PLAIN, side > 0 ? 0xd9601a : 0xeeeeee, 0);
+      D.box(x - p.lx * side * 0.0075, y + 0.092, z - p.lz * side * 0.0075, 0.006, 0.008, 0.002, -p.lx * side, -p.lz * side);
+    }
+    // distance marker every 6th post on the right-hand verge
+    if (((k + e.id) % 6) === 0) {
+      const off = rt.half + 0.2;
+      const x = p.x + p.lx * off, z = p.z + p.lz * off;
+      if (inChunk(ctx, x, z)) {
+        D.use(WC.METAL, 0x9aa0a4, 0);
+        D.box(x, p.y - 0.03, z, 0.01, 0.16, 0.01, p.tx, p.tz);
+        D.use(WC.PLAIN, 0xf4f4f0, 0);
+        D.box(x, p.y + 0.1, z, 0.06, 0.05, 0.006, -p.lx, -p.lz, true);
+      }
+    }
+  }
 }
 
 /** Lamp post with an arm and a night-emissive lamp head (detail layer) plus a glow point. */

@@ -5,7 +5,7 @@
 // (instanced per variant near the camera, one impostor mesh far away).
 import * as THREE from 'three';
 import type { Game } from '../game/game';
-import { OBJ_CHUNK } from '../game/world';
+import { OBJ_CHUNK, pointInRect } from '../game/world';
 import { WATER_Y } from '../game/constants';
 import { GeoBuilder } from './geo';
 import { Materials } from './materials';
@@ -86,6 +86,9 @@ export class ObjectsView {
   private lampGeo: THREE.BufferGeometry;
   private camPos = new THREE.Vector3();
   private hasCam = false;
+  /** builders reused for every chunk build (their buffers grow once) */
+  private wb = new WB();
+  private db = new WB();
   /** far-tree impostor regions (IR x IR super-chunks each) */
   private nr: number;
   private regions: { mesh: THREE.InstancedMesh | null; cap: number; dirty: boolean }[];
@@ -205,9 +208,9 @@ export class ObjectsView {
     const cx = ci % n, cz = Math.floor(ci / n);
     const x0 = cx * OBJ_CHUNK, z0 = cz * OBJ_CHUNK;
     const x1 = Math.min(w.size, x0 + OBJ_CHUNK), z1 = Math.min(w.size, z0 + OBJ_CHUNK);
-    const W = new WB();
+    const W = this.wb.reset(), Dt = this.db.reset();
     const ctx: ChunkCtx = {
-      game: g, ci, n, x0, z0, x1, z1, w: W, d: new WB(), fac: new FacadeBuilder(W),
+      game: g, ci, n, x0, z0, x1, z1, w: W, d: Dt, fac: new FacadeBuilder(W),
       lights: [], sigLamps: [], booms: [], xLights: [], trees: [],
     };
     const mine = (x: number, z: number) => chunkIndexOf(x, z, n) === ci;
@@ -238,7 +241,13 @@ export class ObjectsView {
     for (const id of w.bgrid.query(x0 - 0.5, z0 - 0.5, x1 + 0.5, z1 + 0.5)) {
       const b = w.buildings.get(id);
       if (!b || !mine(b.x, b.z)) continue;
-      try { buildBuilding(w, b, ctx.w, ctx.d, ctx.fac); } catch (err) { console.warn('objects: building failed', b.id, err); }
+      try { buildBuilding(w, b, ctx.w, ctx.d, ctx.fac, ctx); } catch (err) { console.warn('objects: building failed', b.id, err); }
+    }
+    // no world trees inside parks/plazas (they plant their own)
+    const lots: { x: number; z: number; a: number; hw: number; hd: number }[] = [];
+    for (const id of w.bgrid.query(x0 - 4, z0 - 4, x1 + 4, z1 + 4)) {
+      const b = w.buildings.get(id);
+      if (b && (b.type === 8 || b.type === 9)) lots.push({ x: b.x, z: b.z, a: b.angle, hw: b.w / 2 + 0.05, hd: b.d / 2 + 0.05 });
     }
     // no trees on tunnel portals, their wing walls or galleries
     const keep: Keepout[] = [];
@@ -250,6 +259,7 @@ export class ObjectsView {
       const t = w.trees[id];
       if (!t || !mine(t.x, t.z)) continue;
       if (keep.length && keep.some((k) => inKeepout(k, t.x, t.z))) continue;
+      if (lots.length && lots.some((l) => pointInRect(t.x, t.z, l.x, l.z, l.a, l.hw, l.hd))) continue;
       const y = w.heightAt(t.x, t.z);
       if (y < WATER_Y + 0.05) continue;
       const h = ((Math.floor(t.x * 97) * 31 + Math.floor(t.z * 89)) & 1023) / 1024;

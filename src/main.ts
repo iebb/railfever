@@ -1,12 +1,23 @@
 import './ui/style.css';
+import * as THREE from 'three';
 import { Game, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
 import { saveToSlot, listSlots, loadFromSlot } from './game/save';
 import { loadFonts } from './ui/fonts';
 import { defaultTowns } from './ui/title';
+import { audio } from './audio/engine';
 
 const fontsReady = loadFonts();
+audio.loadSettings();
+// browsers keep audio suspended until the first user gesture
+const unlockAudio = () => {
+  try { audio.unlock(); } catch (e) { console.warn('audio unlock failed', e); }
+  window.removeEventListener('pointerdown', unlockAudio, true);
+  window.removeEventListener('keydown', unlockAudio, true);
+};
+window.addEventListener('pointerdown', unlockAudio, true);
+window.addEventListener('keydown', unlockAudio, true);
 const app = document.getElementById('app')!;
 const loading = document.getElementById('loading')!;
 const renderer = new Renderer(app);
@@ -35,6 +46,7 @@ function setGame(g: Game) {
   game = g;
   renderer.setGame(g);
   ui.setGame(g);
+  try { audio.setGame(g); } catch (e) { console.warn('audio setGame failed', e); }
   // focus the camera on the biggest town
   const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
   if (big) renderer.controls.jumpTo(big.x, big.z, 40);
@@ -67,6 +79,7 @@ async function autosave() {
 }
 
 let last = performance.now();
+const focusV = new THREE.Vector3();
 function loop(now: number) {
   const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
   last = now;
@@ -83,6 +96,7 @@ function loop(now: number) {
       renderer.frame(dt);
       ui.update(dt);
     } catch (e) { console.error(e); }
+    try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
     autosaveTimer += dt;
     if (autosaveTimer > 180) { autosaveTimer = 0; autosave(); }
   }

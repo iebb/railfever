@@ -27,6 +27,8 @@ export interface BuildOptions {
   owner: number;
   /** towns build for free and never demolish */
   town?: boolean;
+  /** roads: straight segment with free ends (no tangent continuity at dead ends), e.g. grid streets */
+  straight?: boolean;
 }
 
 export interface CrossingPlan {
@@ -163,7 +165,7 @@ export function findSnap(g: Game, kind: NetKind, x: number, z: number, radius = 
 interface Frame { x: number; z: number; tx: number; tz: number; fixed: boolean; y: number | null }
 
 /** Start frame: position and outgoing tangent. */
-function startFrame(g: Game, sn: Snap, toward: V2, kind: NetKind): Frame {
+function startFrame(g: Game, sn: Snap, toward: V2, kind: NetKind, straight = false): Frame {
   const net = g.world.net;
   const cx = toward.x - sn.x, cz = toward.z - sn.z;
   const cl = Math.hypot(cx, cz) || 1;
@@ -174,7 +176,7 @@ function startFrame(g: Game, sn: Snap, toward: V2, kind: NetKind): Frame {
       if (side === 0 || n.edges.length === 0) side = cx * n.dx + cz * n.dz >= 0 ? 1 : -1;
       return { x: n.x, z: n.z, tx: n.dx * side, tz: n.dz * side, fixed: true, y: n.y };
     }
-    if (n.edges.length === 1) {
+    if (n.edges.length === 1 && !straight) {
       const e = net.edges.get(n.edges[0])!;
       const d = net.leaveDir(e, n.id);
       return { x: n.x, z: n.z, tx: -d.x, tz: -d.z, fixed: true, y: n.y };
@@ -196,7 +198,7 @@ function startFrame(g: Game, sn: Snap, toward: V2, kind: NetKind): Frame {
 }
 
 /** End frame: position and arriving tangent (direction of travel at the end). */
-function endFrame(g: Game, sn: Snap, from: V2, kind: NetKind): Frame {
+function endFrame(g: Game, sn: Snap, from: V2, kind: NetKind, straight = false): Frame {
   const net = g.world.net;
   const cx = sn.x - from.x, cz = sn.z - from.z;
   const cl = Math.hypot(cx, cz) || 1;
@@ -209,7 +211,7 @@ function endFrame(g: Game, sn: Snap, from: V2, kind: NetKind): Frame {
       if (free === 0) { const sg = cx * n.dx + cz * n.dz >= 0 ? 1 : -1; tx = n.dx * sg; tz = n.dz * sg; }
       return { x: n.x, z: n.z, tx, tz, fixed: true, y: n.y };
     }
-    if (n.edges.length === 1) {
+    if (n.edges.length === 1 && !straight) {
       const e = net.edges.get(n.edges[0])!;
       const d = net.leaveDir(e, n.id);
       return { x: n.x, z: n.z, tx: d.x, tz: d.z, fixed: true, y: n.y };
@@ -317,9 +319,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const cs = centre(start, sg), ce = centre(end, eg && eg.length === N ? eg : null);
   if (Math.hypot(ce.x - cs.x, ce.z - cs.z) < 1.0) { fail('Too short'); return prop; }
   if (start.kind === 'node' && end.kind === 'node' && start.node === end.node) { fail('Too short'); return prop; }
-  const fa = startFrame(g, cs.kind === 'node' && sg ? { ...start } : cs, ce, kind);
+  const straight = kind === 'road' && !!opts.straight;
+  const fa = startFrame(g, cs.kind === 'node' && sg ? { ...start } : cs, ce, kind, straight);
   if (sg && sg.length > 1) { fa.x = cs.x; fa.z = cs.z; }
-  const fb = endFrame(g, ce.kind === 'node' && eg && eg.length === N && N > 1 ? { ...end } : ce, { x: fa.x, z: fa.z }, kind);
+  const fb = endFrame(g, ce.kind === 'node' && eg && eg.length === N && N > 1 ? { ...end } : ce, { x: fa.x, z: fa.z }, kind, straight);
   if (eg && eg.length === N && N > 1) { fb.x = ce.x; fb.z = ce.z; }
   // the end must be ahead of the start tangent
   const chx = fb.x - fa.x, chz = fb.z - fa.z, chl = Math.hypot(chx, chz);
