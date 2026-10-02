@@ -4,9 +4,11 @@ import * as THREE from 'three';
 import type { Game } from '../game/game';
 import type { Train } from '../game/train';
 import type { RoadVehicle, RSeg } from '../game/roadvehicle';
+import { laneTrim } from '../game/roadvehicle';
+import { ROAD_DRAPE } from './terrain';
 import type { VehicleModel } from '../game/vehicle-types';
 import { Materials } from './materials';
-import { getModel, getCarModel, bogieModel, ModelGeo, getTramSection, tramSections, tramRoles, TramRole, TRAM_GAP, isRoadCoach, coachEra, getRoadCoach } from './vehicle-models';
+import { getModel, getCarModel, bogieModel, ModelGeo, getTramSection, tramSections, tramRoles, TramRole, TRAM_GAP, isRoadCoach, coachEra, getRoadCoach, getEmuCar, EMU_GAP, EmuRole, lrvStyle } from './vehicle-models';
 import { applyClouds } from './clouds';
 import { srgbToLinear } from './geo';
 import { RAIL } from '../game/constants';
@@ -49,17 +51,63 @@ export interface CarPose {
 const tA = { x: 0, y: 0, z: 0 }, tB = { x: 0, y: 0, z: 0 }, tE = { x: 0, y: 0, z: 0 };
 
 /**
- * Pose of every car of a train (out[i] for car i): each car rests on two bogie points on the track, so it
- * follows curves and grades. Cars that cannot be placed are marked hidden. Returns the number of cars.
+ * One rendered car of a train. Multiple units (EMU / metro / high-speed / light rail) are bought as whole units
+ * (one VehicleModel of `unitCars` cars); they render as their individual cars, close-coupled, cab cars facing
+ * out of the unit (end 1: towards the head, -1: towards the tail).
  */
-export function trainCarPoses(t: Train, out: CarPose[]): number {
+export interface CarSlot {
+  m: VehicleModel;
+  len: number;
+  /** gap to the next car */
+  gap: number;
+  /** multiple-unit car: geometry by style / role, oriented by `end` (not by the train's reversal) */
+  emu: boolean;
+  /** geometry (filled in by the view) */
+  geo?: ModelGeo;
+  end: number;
+  role: EmuRole | TramRole;
+  panto: boolean;
+  /** light rail: tram-section style on rails */
+  lrv: string | null;
+}
+
+/** Cars as rendered (units expanded); `out` is reused. */
+export function trainSlots(cars: VehicleModel[], out: CarSlot[] = []): CarSlot[] {
+  out.length = 0;
+  for (const c of cars) {
+    if (c.kind !== 'emu') { out.push({ m: c, len: c.length, gap: CAR_GAP, emu: false, end: 0, role: 'mid', panto: false, lrv: null }); continue; }
+    const lrv = lrvStyle(c.style);
+    const n = Math.max(1, Math.round(c.unitCars ?? c.sections ?? 1)), gap = lrv ? TRAM_GAP : EMU_GAP;
+    const len = (c.length - gap * (n - 1)) / n;
+    const hsr = c.style.startsWith('hsr');
+    for (let k = 0; k < n; k++) {
+      const end = n === 1 ? 0 : k === 0 ? 1 : k === n - 1 ? -1 : 0;
+      // pantographs: metro / commuter units on the motor cars (every other middle car, not the cab ends: 4 cars
+      // -> 1, 6 cars -> 2), two middle cars of a high-speed set, one per light-rail vehicle
+      const mid = k > 0 && k < n - 1;
+      const panto = lrv ? k === (n === 2 ? 0 : Math.floor(n / 2)) : hsr ? (k === 1 || k === n - 2) && mid : n <= 2 ? k === 0 : mid && k % 2 === 1;
+      let role: EmuRole | TramRole;
+      if (lrv) role = n === 1 ? 'single' : end !== 0 ? (panto ? 'cabp' : 'cab') : (panto ? 'midp' : 'mid');
+      else role = n === 1 ? 'single' : end !== 0 ? 'cab' : 'mid';
+      out.push({ m: c, len, gap: k < n - 1 ? gap : CAR_GAP, emu: true, end, role, panto, lrv });
+    }
+  }
+  return out;
+}
+
+/**
+ * Pose of every rendered car from two bogie points on the track (18 % / 82 % of the car), hidden where the
+ * train is hidden (tunnels, depots). Without `slots` one car per vehicle model (locomotive-hauled trains).
+ */
+export function trainCarPoses(t: Train, out: CarPose[], slots?: CarSlot[]): number {
   let off = 0;
-  const n = t.cars.length;
+  const n = slots ? slots.length : t.cars.length;
   // cars can only be hidden in tunnels or inside a depot
   let canHide = false;
   for (const s of t.segs) if (s.e < 0 || s.tunnels.length) { canHide = true; break; }
   for (let i = 0; i < n; i++) {
-    const L = t.cars[i].length;
+    const sl = slots ? slots[i] : null;
+    const L = sl ? sl.len : t.cars[i].length, gap = sl ? sl.gap : CAR_GAP;
     const p = out[i] ?? (out[i] = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1, a: { x: 0, y: 0, z: 0 }, da: { x: 0, y: 0, z: 0 }, b: { x: 0, y: 0, z: 0 }, db: { x: 0, y: 0, z: 0 }, ea: -1, eb: -1, hidden: false });
     const ra = t.pointBehind(off + 0.18 * L, p.a, p.da);
     const rb = t.pointBehind(off + 0.82 * L, p.b, p.db);
@@ -68,18 +116,51 @@ export function trainCarPoses(t: Train, out: CarPose[]): number {
       const rf = t.pointBehind(off, tE);
       if (rf && t.hiddenAt(rf.seg, rf.sp)) { const rr = t.pointBehind(off + L, tE); hidden = !!rr && t.hiddenAt(rr.seg, rr.sp); }
     }
-    off += L + CAR_GAP;
+    off += L + gap;
     if (!ra || !rb) { p.hidden = true; continue; }
     p.ea = ra.seg.e; p.eb = rb.seg.e;
     p.hidden = hidden;
     let fx = p.a.x - p.b.x, fy = p.a.y - p.b.y, fz = p.a.z - p.b.z;
     let l = Math.hypot(fx, fy, fz);
     if (l < 1e-6) { fx = p.da.x; fy = p.da.y; fz = p.da.z; l = Math.hypot(fx, fy, fz) || 1; }
-    const sg = t.reversed ? -1 : 1;
+    // locomotive-hauled cars keep their orientation when the train reverses; multiple-unit cabs face out
+    const sg = sl && sl.emu ? (sl.end < 0 ? -1 : 1) : t.reversed ? -1 : 1;
     p.fx = (fx / l) * sg; p.fy = (fy / l) * sg; p.fz = (fz / l) * sg;
     p.x = (p.a.x + p.b.x) / 2; p.y = (p.a.y + p.b.y) / 2 + RAIL_Y; p.z = (p.a.z + p.b.z) / 2;
   }
   return n;
+}
+
+/** Linear colour of vehicle glass (as the shared glass material). */
+const GLASS_LIN = [srgbToLinear(0x1b / 255), srgbToLinear(0x27 / 255), srgbToLinear(0x30 / 255)];
+
+/** Body and glass in one geometry (glass marked aPaint 3, untinted): one draw per vehicle batch. */
+function withGlass(body: THREE.BufferGeometry, glass: THREE.BufferGeometry | null): THREE.BufferGeometry {
+  if (!glass) return body;
+  const bp = body.getAttribute('position'), gp = glass.getAttribute('position');
+  const nb = bp.count, n = nb + gp.count;
+  const pos = new Float32Array(n * 3), nrm = new Float32Array(n * 3), col = new Float32Array(n * 3), paint = new Float32Array(n);
+  pos.set(bp.array as Float32Array, 0); pos.set(gp.array as Float32Array, nb * 3);
+  nrm.set(body.getAttribute('normal').array as Float32Array, 0); nrm.set(glass.getAttribute('normal').array as Float32Array, nb * 3);
+  const bc = body.getAttribute('color');
+  if (bc) col.set(bc.array as Float32Array, 0); else col.fill(1, 0, nb * 3);
+  for (let i = nb; i < n; i++) { col[i * 3] = GLASS_LIN[0]; col[i * 3 + 1] = GLASS_LIN[1]; col[i * 3 + 2] = GLASS_LIN[2]; }
+  const bpaint = body.getAttribute('aPaint');
+  if (bpaint) paint.set(bpaint.array as Float32Array, 0);
+  paint.fill(3, nb);
+  const bi = body.index!.array, gi = glass.index!.array;
+  const idx = n > 65535 ? new Uint32Array(bi.length + gi.length) : new Uint16Array(bi.length + gi.length);
+  idx.set(bi, 0);
+  for (let i = 0; i < gi.length; i++) idx[bi.length + i] = gi[i] + nb;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(nrm, 3));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('aPaint', new THREE.BufferAttribute(paint, 1));
+  g.setIndex(new THREE.BufferAttribute(idx, 1));
+  g.computeBoundingSphere();
+  g.computeBoundingBox();
+  return g;
 }
 
 /** Segment and position d units behind the front of a road vehicle. */
@@ -322,6 +403,10 @@ export class VehiclesView {
   private pxScale = 1200;
   private rb1 = { seg: null as RSeg | null, pos: 0 };
   private rb2 = { seg: null as RSeg | null, pos: 0 };
+  private rb3 = { seg: null as RSeg | null, pos: 0 };
+  /** per lane segment: [start, end] lane positions of bridge / tunnel sections (profile, not the drape) */
+  private profileRanges = new WeakMap<RSeg, Float32Array>();
+  private layouts = new WeakMap<Train, { cars: VehicleModel[]; slots: CarSlot[] }>();
   private tick = 0;
   private rpose = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1 };
   private game: Game | null = null;
@@ -332,8 +417,9 @@ export class VehiclesView {
   constructor(private mats: Materials) {
     this.paintMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.3 });
     this.paintMat.onBeforeCompile = (sh) => {
+      sh.uniforms.uRfNight = this.mats.uniforms.uNight;
       sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPaint;\nattribute vec3 aAccent;')
+        .replace('#include <common>', '#include <common>\nattribute float aPaint;\nattribute vec3 aAccent;\nvarying float vRfGlass;')
         .replace('#include <color_vertex>', `
 #if defined( USE_COLOR ) || defined( USE_INSTANCING_COLOR )
   vColor = vec3( 1.0 );
@@ -342,12 +428,19 @@ export class VehiclesView {
   vColor *= color;
 #endif
 #ifdef USE_INSTANCING_COLOR
-  // aPaint 1: main livery (instance colour), 2: accent (per-instance aAccent)
+  // aPaint 1: main livery (instance colour), 2: accent (per-instance aAccent), 3: glass (untinted)
   vec3 rfTint = aPaint > 1.5 ? aAccent : instanceColor.xyz;
-  vColor.xyz *= mix(vec3(1.0), rfTint, min(aPaint, 1.0));
-#endif`);
+  vColor.xyz *= mix(vec3(1.0), rfTint, aPaint > 2.5 ? 0.0 : min(aPaint, 1.0));
+#endif
+vRfGlass = step(2.5, aPaint);`);
+      // glass is part of the body draw: smooth, metallic-looking, lit from inside at night
+      sh.fragmentShader = sh.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform float uRfNight;\nvarying float vRfGlass;')
+        .replace('#include <roughnessmap_fragment>', '#include <roughnessmap_fragment>\nroughnessFactor = mix(roughnessFactor, 0.12, vRfGlass);')
+        .replace('#include <metalnessmap_fragment>', '#include <metalnessmap_fragment>\nmetalnessFactor = mix(metalnessFactor, 0.6, vRfGlass);')
+        .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += vec3(1.0, 0.85, 0.55) * uRfNight * 0.35 * vRfGlass;');
     };
-    this.paintMat.customProgramCacheKey = () => 'rf-vehicle-paint-2';
+    this.paintMat.customProgramCacheKey = () => 'rf-vehicle-paint-3';
     applyClouds(this.paintMat);
     this.bogies = {
       b2: new Batch(bogieModel('b2'), null, this.paintMat, mats.glass, this.group, 128),
@@ -370,8 +463,8 @@ export class VehiclesView {
     if (!p) {
       const tint = ambient || livery;
       p = {
-        hi: new Batch(m.body, m.glass, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, tint, true, livery),
-        lo: new Batch(m.lo.body, m.lo.glass, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, tint, !ambient, livery),
+        hi: new Batch(withGlass(m.body, m.glass), null, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, tint, true, livery),
+        lo: new Batch(withGlass(m.lo.body, m.lo.glass), null, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, tint, !ambient, livery),
         ambient,
       };
       this.batches.set(m, p);
@@ -430,7 +523,8 @@ export class VehiclesView {
       const len = t.length;
       if (!t.pointBehind(len / 2, tE) || !this.lod(tE.x, tE.y, tE.z, len)) { this.lastSpeed.set(t.id, t.speed); return; }
     }
-    const n = trainCarPoses(t, this.poses);
+    const slots = this.trainLayout(t);
+    const n = trainCarPoses(t, this.poses, slots);
     const prev = this.lastSpeed.get(t.id) ?? t.speed;
     this.lastSpeed.set(t.id, t.speed);
     const accel = dt > 0 ? (t.speed - prev) / dt : 0;
@@ -438,16 +532,17 @@ export class VehiclesView {
     for (let i = 0; i < n; i++) {
       const p = this.poses[i];
       if (p.hidden) continue;
-      const cm = t.cars[i];
-      const m = this.model(cm);
-      const lod = this.lod(p.x, p.y, p.z, cm.length);
+      const sl = slots[i], cm = sl.m;
+      const m = this.slotGeo(sl);
+      const lod = this.lod(p.x, p.y, p.z, sl.len);
       if (!lod) continue;
-      const bp = this.pair(m);
+      const bp = this.pair(m, false, sl.emu);
       const b = lod === 2 ? bp.hi : bp.lo;
       const o = b.push(t.id);
       writeBasis(b.mat16, o, p.x, p.y, p.z, p.fx, p.fy, p.fz);
+      if (sl.emu) this.unitLivery(b, o, cm, t.owner);
       if (lod === 2) for (const bz of m.bogies) {
-        const front = (bz > 0) !== t.reversed;
+        const front = (bz > 0) !== (sl.emu ? sl.end < 0 : t.reversed);
         const q = front ? p.a : p.b, d = front ? p.da : p.db;
         const bb = this.bogies[m.bogieKind];
         writeBasis(bb.mat16, bb.push(t.id), q.x, q.y + RAIL_Y, q.z, d.x, d.y, d.z);
@@ -456,11 +551,12 @@ export class VehiclesView {
       if (active && m.exhaust) this.emitExhaust(t.id, b.mat16, o, m.exhaust, t.speed, accel, dt);
     }
     if (night > 0.02 && n > 0) {
-      // white lamps on the leading face, red on the trailing face (cars keep their orientation when reversing)
-      const h = this.poses[0], hm = this.model(t.cars[0]);
-      if (!h.hidden) this.lamps(h, t.reversed ? hm.rear : hm.front, 1, 0.93, 0.78);
-      const r = this.poses[n - 1], rm = this.model(t.cars[n - 1]);
-      if (!r.hidden) this.lamps(r, t.reversed ? rm.front : rm.rear, 1, 0.06, 0.03);
+      // white lamps on the leading face, red on the trailing face (hauled cars keep their orientation when the
+      // train reverses; multiple-unit cab cars face out of the unit)
+      const hs = slots[0], h = this.poses[0], hm = this.slotGeo(hs);
+      if (!h.hidden) this.lamps(h, hs.emu ? hm.front : t.reversed ? hm.rear : hm.front, 1, 0.93, 0.78);
+      const rs = slots[n - 1], r = this.poses[n - 1], rm = this.slotGeo(rs);
+      if (!r.hidden) this.lamps(r, rs.emu ? (rs.end < 0 ? rm.front : rm.rear) : t.reversed ? rm.front : rm.rear, 1, 0.06, 0.03);
     }
   }
 
@@ -517,6 +613,8 @@ export class VehiclesView {
     if (v.hiddenAt(f.seg!, f.pos) && v.hiddenAt(r.seg!, r.pos)) return;
     v.pointBehind(0, tA);
     v.pointBehind(L, tB);
+    tA.y = this.surfaceY(f.seg!, f.pos, tA.x, tA.z, tA.y);
+    tB.y = this.surfaceY(r.seg!, r.pos, tB.x, tB.z, tB.y);
     let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
     const l = Math.hypot(fx, fy, fz);
     if (l < 1e-6) return;
@@ -548,6 +646,36 @@ export class VehiclesView {
     }
   }
 
+  /** Rendered cars of a train (units expanded), rebuilt when its vehicles or their order change. */
+  private trainLayout(t: Train): CarSlot[] {
+    let e = this.layouts.get(t);
+    if (e && e.cars.length === t.cars.length) {
+      let same = true;
+      for (let i = 0; i < t.cars.length; i++) if (e.cars[i] !== t.cars[i]) { same = false; break; }
+      if (same) return e.slots;
+    }
+    e = { cars: t.cars.slice(), slots: trainSlots(t.cars) };
+    this.layouts.set(t, e);
+    return e.slots;
+  }
+
+  private slotGeo(sl: CarSlot): ModelGeo {
+    if (!sl.geo) {
+      sl.geo = !sl.emu ? this.model(sl.m)
+        : sl.lrv ? getTramSection(sl.lrv, sl.role as TramRole, sl.len)
+        : getEmuCar(sl.m.style, sl.role as EmuRole, sl.len, sl.panto);
+    }
+    return sl.geo;
+  }
+
+  /** Multiple units: body in the model colour, bands / accents in the operator's colour. */
+  private unitLivery(b: Batch, o: number, m: VehicleModel, owner: number) {
+    const main = this.lin(m.color), acc = this.lin(this.game ? this.game.company(owner).color : '#e8a33d');
+    const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
+    c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
+    a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
+  }
+
   /**
    * Coach livery in the operator's colour: stripes / swoosh / lower panels take the operator colour, the body
    * a light neutral tinted by the model colour (so models still differ). When the operator colour is itself
@@ -563,6 +691,59 @@ export class VehiclesView {
     const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
     c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
     a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
+  }
+
+  /**
+   * Height of the road surface under a wheel: on ground sections roads are draped on the terrain (exact
+   * surface + ROAD_DRAPE), on bridge / tunnel sections they keep the edge profile; around section ends, level
+   * crossings and structures at the edge ends the drape blends into the profile over 1 unit (smoothstep) -
+   * the same rule as the static road drape (build-road blendPoints), so wheels sit on the drawn surface.
+   */
+  private surfaceY(seg: RSeg, pos: number, x: number, z: number, profileY: number): number {
+    const g = this.game;
+    if (!g || !g.world) return profileY;
+    const r = this.rangesOf(seg);
+    let k = 0;
+    for (let i = 0; i < r.length; i += 2) {
+      const d = pos < r[i] ? r[i] - pos : pos > r[i + 1] ? pos - r[i + 1] : 0;
+      if (d < 1) { const t = 1 - d, w = t * t * (3 - 2 * t); if (w > k) k = w; }
+    }
+    if (k >= 1) return profileY;
+    const drape = g.world.heightAt(x, z) + ROAD_DRAPE;
+    return k <= 0 ? drape : drape + (profileY - drape) * k;
+  }
+
+  /** Lane-position ranges on the profile (structures; single points for crossings / structure ends). */
+  private rangesOf(seg: RSeg): Float32Array {
+    let r = this.profileRanges.get(seg);
+    if (r) return r;
+    const g = this.game!, net = g.world.net, out: number[] = [];
+    if (seg.kind === 'lane') {
+      const e = net.edges.get(seg.e);
+      if (e) {
+        // lane position <-> edge arc length as for the lane's tunnel ranges (roadvehicle.makeLaneSeg)
+        const [s0, s1] = laneTrim(g, e);
+        const map = (s: number) => (seg.dir > 0 ? s - s0 : s1 - s);
+        const range = (a: number, b: number) => { const p = map(a), q = map(b); out.push(Math.min(p, q), Math.max(p, q)); };
+        for (const sec of e.sections) range(sec.s0, sec.s1);
+        for (const c of net.crossings.values()) if (c.kind === 'level' && c.e2 === e.id) range(c.s2, c.s2);
+        for (const [nid, sAt] of [[e.a, 0], [e.b, e.len]] as [number, number][]) {
+          const node = net.nodes.get(nid);
+          if (!node) continue;
+          for (const id of node.edges) {
+            const f = id === e.id ? null : net.edges.get(id);
+            if (f && net.sectionAt(f, f.a === nid ? 0.01 : f.len - 0.01) !== 'ground') { range(sAt, sAt); break; }
+          }
+        }
+      }
+    } else {
+      // junction connector: on the profile when an edge it joins is off the ground at the junction
+      const off = (eid: number, atStart: boolean) => { const e = net.edges.get(eid); return !!e && net.sectionAt(e, atStart ? 0.01 : e.len - 0.01) !== 'ground'; };
+      if (off(seg.e, seg.dir > 0) || off(seg.from, seg.fromDir < 0)) out.push(-1e9, 1e9);
+    }
+    r = new Float32Array(out);
+    this.profileRanges.set(seg, r);
+    return r;
   }
 
   /** Sections, their length and roles for a tram model (cached). */
@@ -603,6 +784,9 @@ export class VehiclesView {
       if (v.hiddenAt(f.seg!, f.pos) && v.hiddenAt(r.seg!, r.pos)) continue;
       v.pointBehind(off + t.sec * 0.15, tA);
       v.pointBehind(off + t.sec * 0.85, tB);
+      const q = this.rb3;
+      if (roadBehind(v, off + t.sec * 0.15, q)) tA.y = this.surfaceY(q.seg!, q.pos, tA.x, tA.z, tA.y);
+      if (roadBehind(v, off + t.sec * 0.85, q)) tB.y = this.surfaceY(q.seg!, q.pos, tB.x, tB.z, tB.y);
       let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
       const l = Math.hypot(fx, fy, fz);
       if (l < 1e-6) continue;

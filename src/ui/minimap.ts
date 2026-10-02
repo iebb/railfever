@@ -283,7 +283,7 @@ export class Minimap {
       ctx.lineJoin = 'round';
       ctx.lineWidth = 2 * this.dpr;
       for (const l of g.lines.map.values()) {
-        if (l.stops.length < 2 || (!this.ui.mapModes.showAll && l.owner !== PLAYER)) continue;
+        if (l.stops.length < 2 || !this.ui.mapModes.lineVisible(l)) continue;
         ctx.strokeStyle = l.color;
         ctx.beginPath();
         l.stops.forEach((sid, i) => { const st = g.stations.get(sid); if (!st) return; if (i) ctx.lineTo(st.x * k, st.z * k); else ctx.moveTo(st.x * k, st.z * k); });

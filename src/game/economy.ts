@@ -1,19 +1,32 @@
 // Company finances.
 
-export type Category = 'construction' | 'vehicles' | 'running' | 'maintenance' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition';
+/**
+ * Finance categories. Vehicle operating costs (opcosts.ts): 'running' = fixed overheads (older saves: all running
+ * costs), 'crew', 'energy', 'vehicleMaint'; infrastructure: 'maintenance' (base upkeep), 'trackWear' (wear by
+ * train passages).
+ */
+export type Category = 'construction' | 'vehicles' | 'running' | 'crew' | 'energy' | 'vehicleMaint' | 'maintenance' | 'trackWear' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition';
 /** Report order: income first, then the expenses. */
-export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'running', 'maintenance', 'trackFees', 'interest', 'acquisition'];
+export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees', 'interest', 'acquisition'];
 export const CATEGORY_LABEL: Record<Category, string> = {
   income: 'Passenger income',
   trackIncome: 'Track access income',
   construction: 'Construction',
   vehicles: 'Vehicle purchases',
-  running: 'Vehicle running costs',
+  crew: 'Crew wages',
+  energy: 'Energy & fuel',
+  vehicleMaint: 'Vehicle maintenance',
+  running: 'Vehicle overheads',
   maintenance: 'Infrastructure maintenance',
+  trackWear: 'Track wear',
   trackFees: 'Track access fees',
   interest: 'Loan interest',
   acquisition: 'Company acquisitions',
 };
+/** Operating costs (vehicles and infrastructure, access fees included): e.g. a "running & upkeep" chart line. */
+export const OPERATING_COSTS: Category[] = ['crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees'];
+/** Sum of the operating cost categories of a record (negative: costs). */
+export function operatingCosts(v: Record<Category, number>): number { let s = 0; for (const k of OPERATING_COSTS) s += v[k] ?? 0; return s; }
 
 export const COSTS = {
   rail: 12000,
@@ -42,7 +55,7 @@ export const COSTS = {
 export interface MonthRecord { year: number; month: number; v: Record<Category, number> }
 
 export function emptyRecord(): Record<Category, number> {
-  return { income: 0, construction: 0, vehicles: 0, running: 0, maintenance: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0 };
+  return { income: 0, construction: 0, vehicles: 0, running: 0, crew: 0, energy: 0, vehicleMaint: 0, maintenance: 0, trackWear: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0 };
 }
 /** Fill categories missing in an older record with 0. */
 function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Category, number> {
@@ -133,6 +146,8 @@ export interface Company {
   defunct?: boolean;
   /** id of the company that bought this one */
   boughtBy?: number;
+  /** one letter, unique among the companies (the X of JR-style station numbers XY01; see lines.ts) */
+  code?: string;
 }
 
 /** Company colours: the player first, then up to 7 AI companies (mutually distinct hues). */

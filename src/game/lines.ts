@@ -4,6 +4,9 @@ import type { LineKind as Transport } from './constants';
 import type { Station } from './stations';
 import { WALK_LINE } from './stations';
 import type { Town } from './towns';
+import type { ServicePattern } from './patterns';
+import { lineGraph, TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
+import { transferWalkTime } from './fares';
 
 export interface Line {
   id: number;
@@ -27,6 +30,21 @@ export interface Line {
    * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
    */
   loop?: boolean;
+  /** route letter (the Y of station numbers XY01), unique among the owner's lines; see Lines.lineCode */
+  code?: string;
+  /**
+   * shared lines: the owner is the lead operator; `operators` are the other companies that run vehicles on the
+   * line (each vehicle earns its own fares; track fees as usual). Who may join: `partners` (see Lines.partnerPolicy).
+   */
+  operators?: number[];
+  partners?: PartnerPolicy;
+  /** station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
+  numbers?: [number, number][];
+  /**
+   * service patterns (patterns.ts): locals, rapids, expresses and short-turns of the line, per stop whether they
+   * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
+   */
+  patterns?: ServicePattern[];
 }
 
 /**
@@ -36,11 +54,27 @@ export interface Line {
  */
 export interface Hop { line: number; alight: number; cost: number; lines?: number[] }
 
+/** Who may join a line as a further operator: anyone ('open'), companies the lead adds ('invite'), nobody. */
+export type PartnerPolicy = 'open' | 'invite' | 'closed';
+export const PARTNER_POLICIES: PartnerPolicy[] = ['open', 'invite', 'closed'];
+
 /** Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams. */
 export const LINE_PALETTES: Record<Transport, string[]> = {
   rail: ['#d7263d', '#1b6ec2', '#2a9d4b', '#7b2cbf', '#f08c00', '#00897b', '#c2185b', '#3949ab', '#8d6e00', '#5d4037', '#0097a7', '#6a1b9a'],
   road: ['#ff6f61', '#42a5f5', '#8bc34a', '#ffb300', '#ab47bc', '#26a69a', '#ff8a65', '#78909c', '#ec407a', '#9ccc65', '#5c6bc0', '#ffd54f'],
   tram: ['#e53935', '#00acc1', '#fb8c00', '#5e35b1', '#43a047', '#d81b60', '#1e88e5', '#795548', '#c0ca33', '#00897b'],
+};
+
+/** HSL -> '#rrggbb'. */
+function hsl(h: number, s: number, l: number): string {
+  const f = (n: number) => { const k = (n + h / 30) % 12, a = s * Math.min(l, 1 - l); const c = l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1)); return Math.round(c * 255).toString(16).padStart(2, '0'); };
+  return '#' + f(0) + f(8) + f(4);
+}
+/** Further candidate colours per mode (every 12° of hue at two lightness levels), after the palettes above. */
+const EXTRA: Record<Transport, string[]> = {
+  rail: [0.38, 0.5].flatMap((l) => Array.from({ length: 30 }, (_, i) => hsl(i * 12, 0.75, l))),
+  road: [0.62, 0.72].flatMap((l) => Array.from({ length: 30 }, (_, i) => hsl(i * 12 + 6, 0.7, l))),
+  tram: [0.45, 0.56].flatMap((l) => Array.from({ length: 30 }, (_, i) => hsl(i * 12 + 3, 0.85, l))),
 };
 /** All automatic colours (for cycling through them in the UI). */
 export const LINE_COLORS = [...new Set([...LINE_PALETTES.rail, ...LINE_PALETTES.road, ...LINE_PALETTES.tram])];
@@ -101,7 +135,10 @@ export class Lines {
   private autoText = new Map<number, string>();
   constructor(private game: Game) {}
 
-  get(id: number) { return this.map.get(id); }
+  /** lines merged into another as a service pattern (patterns.ts canonicalizeLines): old id -> line and pattern */
+  redirect = new Map<number, { line: number; pattern: number }>();
+  /** A line by id (the id of a line merged into another leads to that line). */
+  get(id: number) { const l = this.map.get(id); if (l) return l; const r = this.redirect.get(id); return r ? this.map.get(r.line) : undefined; }
   all() { return [...this.map.values()]; }
 
   create(kind: Transport, owner = 0): Line {
@@ -155,19 +192,116 @@ export class Lines {
   }
 
   /** The palette colour of this mode farthest from the colours of the owner's other lines. */
+  /**
+   * An automatic colour for a new line: of the mode's palette (then a wider range of hues), the one farthest
+   * (perceptually) from every other line's colour in the game, so no two lines look alike. `owner` is kept
+   * for callers; all companies' lines count.
+   */
   pickColor(kind: Transport, owner: number, except = -1): string {
+    void owner;
     const used: string[] = [];
-    for (const l of this.map.values()) if (l.owner === owner && l.id !== except) used.push(l.color);
-    const pal = LINE_PALETTES[kind] ?? LINE_PALETTES.rail;
+    for (const l of this.map.values()) if (l.id !== except) used.push(l.color);
+    const pal = [...(LINE_PALETTES[kind] ?? LINE_PALETTES.rail), ...(EXTRA[kind] ?? EXTRA.rail)];
     let best = pal[0], bs = -Infinity;
-    for (const c of pal) {
-      let d = Infinity, uses = 0;
-      for (const u of used) { const x = colorDistance(c, u); if (x < d) d = x; if (x < 1) uses++; }
-      // unused colours by distance to the used ones; once all are taken, the least used one
-      const score = uses ? -uses : d;
-      if (score > bs + 1e-9) { bs = score; best = c; }
+    for (let i = 0; i < pal.length; i++) {
+      let d = Infinity;
+      for (const u of used) { const x = colorDistance(pal[i], u); if (x < d) d = x; }
+      // the palette's own colours first while they are clearly distinct (delta E 25+)
+      const score = Math.min(d, 60) + (i < 12 && d >= 25 ? 100 : 0);
+      if (score > bs + 1e-9) { bs = score; best = pal[i]; }
     }
     return best;
+  }
+
+  // ---------------------------------------------------------------- route codes and station numbers (JR style)
+  /** The company letter (Company.code). */
+  companyCode(owner: number): string { return this.game.company(owner).code ?? '?'; }
+
+  /** The route letter of a line, given one if it has none yet (unique among its owner's lines). */
+  routeCode(l: Line): string {
+    if (l.code && !this.codeTaken(l.code, l.owner, l.id)) return l.code;
+    l.code = this.freeCode(l);
+    return l.code;
+  }
+  private codeTaken(code: string, owner: number, except: number): boolean {
+    for (const o of this.map.values()) if (o.id !== except && o.owner === owner && o.code === code) return true;
+    return false;
+  }
+  /** A free route letter: from the names of its first terminus (and the line name), else the first free one. */
+  private freeCode(l: Line): string {
+    const st = l.stops.length ? this.game.stations.get(l.stops[0]) : undefined;
+    const town = st ? this.game.towns.list[st.townId]?.name ?? st.name : '';
+    const letters = (town + ' ' + l.name.replace(/^(R|RE|Bus|Tram|M|LR)\s*\d+\s*/i, '')).toUpperCase().replace(/[^A-Z]/g, '');
+    for (const c of [...letters, ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ']) if (!this.codeTaken(c, l.owner, l.id)) return c;
+    for (let n = 2; n < 100; n++) for (const c of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') if (!this.codeTaken(c + n, l.owner, l.id)) return c + n;
+    return '?';
+  }
+
+  /** The line's symbol: company letter + route letter, e.g. 'AS' (unique in the game). */
+  lineCode(id: number): string {
+    const l = this.map.get(id);
+    return l ? this.companyCode(l.owner) + this.routeCode(l) : '';
+  }
+
+  /** Stations of a line in route order (out-and-back lines from one end to the other; else in stop order). */
+  routeStations(l: Line): number[] { return linearStops(l.stops) ?? [...new Set(l.stops)]; }
+
+  /** Numbers for the line's stations: kept where they have one, the next free numbers for new ones. */
+  private ensureNumbers(l: Line): Map<number, number> {
+    const route = this.routeStations(l), inRoute = new Set(route);
+    const m = new Map((l.numbers ?? []).filter(([sid]) => inRoute.has(sid)));
+    let next = 1;
+    for (const v of m.values()) next = Math.max(next, v + 1);
+    for (const sid of route) if (!m.has(sid)) m.set(sid, next++);
+    l.numbers = route.map((sid) => [sid, m.get(sid)!] as [number, number]);
+    return m;
+  }
+
+  /**
+   * A station's number on a line, JR style: the station owner's company letter, the route letter and the number,
+   * e.g. 'AS01' (through services: another company's stations on the route carry its letter). '' if not a stop.
+   */
+  stationCode(lineId: number, stationId: number): string {
+    const l = this.map.get(lineId), st = this.game.stations.get(stationId);
+    if (!l || !st || !l.stops.includes(stationId)) return '';
+    const n = this.ensureNumbers(l).get(stationId);
+    return n === undefined ? '' : this.companyCode(st.owner >= 0 ? st.owner : l.owner) + this.routeCode(l) + String(n).padStart(2, '0');
+  }
+
+  /** All numbers of a station (one per line stopping there; interchanges have several), with their lines. */
+  stationCodeEntries(stationId: number): { line: number; code: string }[] {
+    const out: { line: number; code: string }[] = [];
+    for (const l of this.map.values()) if (l.stops.includes(stationId)) { const c = this.stationCode(l.id, stationId); if (c) out.push({ line: l.id, code: c }); }
+    return out;
+  }
+  stationCodes(stationId: number): string[] { return [...new Set(this.stationCodeEntries(stationId).map((e) => e.code))]; }
+
+  /** Number the line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
+  renumber(lineId: number) {
+    const l = this.map.get(lineId);
+    if (!l) return;
+    l.numbers = this.routeStations(l).map((sid, i) => [sid, i + 1] as [number, number]);
+  }
+
+  /**
+   * Through service: line `lineId` continues the route of line `fromId` (another company's, say): it takes its
+   * route letter (where its owner has no other route with that letter) and its station numbers, and numbers its
+   * further stations on from there (A's stations AS01…AS07, then B's BS08…).
+   */
+  inheritRoute(lineId: number, fromId: number) {
+    const l = this.map.get(lineId), f = this.map.get(fromId);
+    if (!l || !f || l === f) return;
+    const code = this.routeCode(f);
+    if (!this.codeTaken(code, l.owner, l.id)) l.code = code;
+    const fm = this.ensureNumbers(f);
+    const route = this.routeStations(l);
+    let next = 1;
+    for (const v of fm.values()) next = Math.max(next, v + 1);
+    // the shared stations keep their numbers; the line's own ones continue (from the end of the shared part)
+    const shared = route.filter((sid) => fm.has(sid));
+    const own = route.filter((sid) => !fm.has(sid));
+    if (shared.length && route.indexOf(shared[0]) > 0) own.reverse();
+    l.numbers = [...shared.map((sid) => [sid, fm.get(sid)!] as [number, number]), ...own.map((sid) => [sid, next++] as [number, number])];
   }
 
   /** Express rail line: long (> 2 km between the ends) or run with fast trains. */
@@ -221,10 +355,12 @@ export class Lines {
   transfer(l: Line, owner: number) {
     if (l.owner === owner) return;
     l.owner = owner;
+    if (l.operators) l.operators = l.operators.filter((o) => o !== owner);
     l.num = this.freeNumber(l.kind, owner, l.id);
+    if (l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
     if (l.autoColor) {
       let clash = false;
-      for (const o of this.map.values()) if (o !== l && o.owner === owner && colorDistance(o.color, l.color) < 12) { clash = true; break; }
+      for (const o of this.map.values()) if (o !== l && colorDistance(o.color, l.color) < 12) { clash = true; break; }
       if (clash) l.color = this.pickColor(l.kind, owner, l.id);
     }
     if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
@@ -278,6 +414,70 @@ export class Lines {
     return [...this.map.values()].filter((l) => l.stops.includes(stationId));
   }
 
+  // ---------------------------------------------------------------- shared lines (several operators)
+  /** Who may join the line: its setting, else 'open' for AI lines and 'invite' for the player's. */
+  partnerPolicy(l: Line): PartnerPolicy { return l.partners ?? (this.game.company(l.owner).ai ? 'open' : 'invite'); }
+  setPartnerPolicy(id: number, p: PartnerPolicy) { const l = this.map.get(id); if (l && PARTNER_POLICIES.includes(p)) l.partners = p; }
+  /** The companies running vehicles on the line: the lead operator first. */
+  operatorsOf(l: Line): number[] { return [l.owner, ...(l.operators ?? []).filter((o) => o !== l.owner)]; }
+  /** Does `company` own a station the line stops at? */
+  ownsStationOn(l: Line, company: number): boolean {
+    for (const sid of l.stops) if (this.game.stations.get(sid)?.owner === company) return true;
+    return false;
+  }
+  /**
+   * May `company` put vehicles on the line? The lead operator, or one of its operators that owns at least one of
+   * the line's stations (a company running services on a line owns a station of it).
+   */
+  canOperate(l: Line, company: number): boolean { return company === l.owner || (!!l.operators?.includes(company) && this.ownsStationOn(l, company)); }
+  /**
+   * Why `company` may not put (more) vehicles on the line, or null: it must be the lead operator or an operator
+   * of it, and own at least one of the line's stations.
+   */
+  operateError(l: Line, company: number): string | null {
+    const g = this.game;
+    if (company !== l.owner && !l.operators?.includes(company)) return `${g.company(company).name} is not an operator of ${l.name}`;
+    if (l.stops.length && !this.ownsStationOn(l, company)) return `${g.company(company).name} owns no station of ${l.name}: a company running services on a line owns at least one of its stations`;
+    return null;
+  }
+  /**
+   * `company` joins the line as a further operator (its vehicles then run it too): on an open line, or one it
+   * was invited to (it needs the right to use the lead operator's network: open access, or an agreement).
+   * Null = OK, else why not.
+   */
+  join(id: number, company: number): string | null {
+    const l = this.map.get(id);
+    if (!l) return 'No such line';
+    if (company === l.owner) return null;
+    const g = this.game, co = g.companies[company];
+    if (!co || co.defunct) return 'No such company';
+    if (!this.ownsStationOn(l, company)) return `${co.name} owns no station of ${l.name}: a company running services on a line owns at least one of its stations`;
+    // (invited: in already)
+    if (l.operators?.includes(company)) return null;
+    if (this.partnerPolicy(l) !== 'open') return `${g.company(l.owner).name} runs ${l.name} alone`;
+    if (!g.canUse(company, l.owner)) return `No track access to ${g.company(l.owner).name}'s network`;
+    (l.operators ??= []).push(company);
+    return null;
+  }
+  /** The lead operator lets `company` run vehicles on the line (whatever the policy). */
+  invite(id: number, company: number) {
+    const l = this.map.get(id);
+    if (l && !this.canOperate(l, company)) (l.operators ??= []).push(company);
+  }
+  /** `company` stops running the line: its vehicles there go back to their depots (no line). */
+  leave(id: number, company: number) {
+    const l = this.map.get(id);
+    if (!l || company === l.owner || !l.operators?.includes(company)) return;
+    l.operators = l.operators.filter((o) => o !== company);
+    for (const vid of [...l.vehicles]) { const v = this.game.vehicles.get(vid); if (v && v.owner === company) v.setLine(null); }
+  }
+  /** Vehicles on the line by operator. */
+  vehiclesBy(l: Line): Map<number, number> {
+    const m = new Map<number, number>();
+    for (const vid of l.vehicles) { const v = this.game.vehicles.get(vid); if (v) m.set(v.owner, (m.get(v.owner) ?? 0) + 1); }
+    return m;
+  }
+
   /** Does the line run as a loop (explicit `loop`, else 3+ stops, each station once: not out and back)? */
   isLoop(l: Line): boolean { return l.loop ?? (l.stops.length >= 3 && new Set(l.stops).size === l.stops.length); }
 
@@ -300,53 +500,49 @@ export class Lines {
     this.servedStations.clear();
     this.version++;
     this.refreshNames();
+    for (const l of this.map.values()) if (l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
     // edges: from -> [{to, line, cost}]
+    // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
+    // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
     const edges = new Map<number, { to: number; line: number; cost: number }[]>();
-    const dist = (a: number, b: number) => {
-      const sa = stations.get(a), sb = stations.get(b);
-      if (!sa || !sb) return 1e9;
-      return Math.hypot(sa.x - sb.x, sa.z - sb.z);
-    };
     for (const l of this.map.values()) {
-      const n = l.stops.length;
-      if (n < 2 || l.vehicles.length === 0) continue;
-      for (const s of l.stops) this.servedStations.add(s);
-      for (let i = 0; i < n; i++) {
-        let acc = 0;
-        for (let k = 1; k < n; k++) {
-          const j = (i + k) % n;
-          const prev = (i + k - 1) % n;
-          acc += dist(l.stops[prev], l.stops[j]);
-          if (l.stops[j] === l.stops[i]) continue;
-          let arr = edges.get(l.stops[i]);
-          if (!arr) { arr = []; edges.set(l.stops[i], arr); }
-          arr.push({ to: l.stops[j], line: l.id, cost: acc + 6 });
-        }
+      if (l.stops.length < 2 || l.vehicles.length === 0) continue;
+      const lg = lineGraph(this.game, l);
+      for (const s of lg.served) this.servedStations.add(s);
+      for (const e of lg.edges) {
+        let arr = edges.get(e.from);
+        if (!arr) { arr = []; edges.set(e.from, arr); }
+        arr.push({ to: e.to, line: l.id, cost: e.cost });
       }
     }
-    // walking transfers between linked stations of a transfer complex (Stations.walkLinks)
+    // walking transfers between linked stations of a transfer complex (Stations.walkLinks): the walk's time
     for (const wl of stations.walkLinks()) {
       let arr = edges.get(wl.from);
       if (!arr) { arr = []; edges.set(wl.from, arr); }
-      arr.push({ to: wl.to, line: WALK_LINE, cost: wl.cost });
+      const sa = stations.get(wl.from), sb = stations.get(wl.to);
+      arr.push({ to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 });
     }
     for (const src of edges.keys()) {
       const table = new Map<number, Hop>();
       const best = new Map<number, number>([[src, 0]]);
       const first = new Map<number, { line: number; alight: number }>();
-      // did the best path ride a line? (stations reached on foot only are no destinations)
+      // did the best path ride a line? (stations reached on foot only are no destinations) Did it arrive on foot?
       const rode = new Map<number, boolean>([[src, false]]);
+      const walked = new Map<number, boolean>([[src, false]]);
       const open: [number, number][] = [[0, src]];
       while (open.length) {
         open.sort((a, b) => a[0] - b[0]);
         const [c, u] = open.shift()!;
         if (c > (best.get(u) ?? Infinity)) continue;
         for (const e of edges.get(u) ?? []) {
-          const nc = c + e.cost + (u === src ? 0 : 10);
+          // boarding again after a ride: a transfer (penalty, plus changing platforms unless they walked here)
+          const transfer = e.line !== WALK_LINE && rode.get(u) ? TRANSFER_PENALTY_S + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
+          const nc = c + e.cost + transfer;
           if (nc < (best.get(e.to) ?? Infinity)) {
             best.set(e.to, nc);
             first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
             rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
+            walked.set(e.to, e.line === WALK_LINE);
             open.push([nc, e.to]);
           }
         }
@@ -365,7 +561,7 @@ export class Lines {
         const leg = legs.get(f.alight);
         if (leg && leg.length > 1) {
           const own = leg.find((x) => x.line === f.line);
-          const lim = (own ? own.cost : Math.min(...leg.map((x) => x.cost))) * 1.15 + 5;
+          const lim = (own ? own.cost : Math.min(...leg.map((x) => x.cost))) * 1.15 + 10;
           const alt = leg.filter((x) => x.line !== f.line && x.cost <= lim).map((x) => x.line);
           if (alt.length) hop.lines = [f.line, ...alt];
         }
@@ -419,8 +615,10 @@ export class Lines {
     for (const w of old) {
       const hop = this.nextHop(st.id, w.dest);
       if (!hop) continue;
-      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count);
-      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n));
+      // (they keep when they started waiting and whether they changed vehicles)
+      const tr = (n: number) => (w.transfers ? (w.transfers * n) / Math.max(1, w.count) : 0);
+      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0);
+      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n)));
     }
   }
 
@@ -433,6 +631,9 @@ export class Lines {
     }
     if (typeof l.autoName !== 'boolean') l.autoName = false;
     if (typeof l.autoColor !== 'boolean') l.autoColor = false;
+    if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
+    if (Array.isArray(d.operators)) l.operators = [...d.operators];
+    if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));
     return l;
   }
 }

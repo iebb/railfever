@@ -6,6 +6,7 @@ import type { WB } from './build-mesh';
 import type { FacadeBuilder } from './build-buildings';
 import type { TreeInstance } from './trees';
 import type { RailPart } from '../game/stations';
+import type { Drape } from './build-drape';
 import { railWidth } from '../game/stations';
 
 /**
@@ -34,6 +35,8 @@ export interface ChunkCtx {
   trees: TreeInstance[];
   /** platform edges of underground / elevated stations (their tunnels / viaducts are the station's) */
   stationEdges?: Map<number, StationLevel>;
+  /** road pieces on ground sections are laid on the rendered terrain */
+  drape?: Drape;
 }
 
 /** Level of a rail station: on the ground, on a viaduct, or underground. */
@@ -52,6 +55,9 @@ export function stationLevelOf(r: RailPart): StationLevel {
   const x = r as RailPartX;
   return x.level ?? (x.underground ? 'underground' : 'ground');
 }
+
+/** Tint of the grass atlas cell matching the terrain's earthwork slopes (≈ #667834): fills, ramps, mounds. */
+export const EARTHWORK_TINT = 0xf9ceec;
 
 /** Ground station building (beside the tracks, entrance facing away) and the forecourt in front of it. */
 export interface StationFrame {

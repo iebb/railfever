@@ -2,7 +2,7 @@
 import { RAIL, ROAD_TYPES, TRACK_TYPES } from '../game/constants';
 import type { NEdge } from '../game/network';
 import { closestOnPolyline } from '../game/geom';
-import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk } from './build-common';
+import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk, EARTHWORK_TINT } from './build-common';
 import { WB } from './build-mesh';
 import { WC, WSCALE } from './textures';
 
@@ -543,21 +543,79 @@ export function buildPortals(ctx: ChunkCtx, e: NEdge) {
       if (!inChunk(ctx, p.x, p.z)) continue;
       const grp = parallelGroup(ctx, e, s, (f, sf) => nearTunnel(f, sf));
       if (grp.some((nb) => nb.edge.id < e.id)) continue;
-      buildPortal(ctx, e, p, out, [0, ...grp.map((nb) => nb.off)], s);
+      const offs = [0, ...grp.map((nb) => nb.off)];
+      const { sF, depth } = portalPlace(ctx, e, s, out, portalOpenings(e, offs));
+      buildPortal(ctx, e, sampleAt(net.geo(e), sF), out, offs, sF, depth);
     }
   }
 }
 
-/** Opening dimensions of a portal for an edge. */
-function portalDims(e: NEdge) {
-  const rail = e.kind === 'rail';
-  const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
-  const ow = rail ? 0.3 : rt.half + rt.sidewalk * 0.5 + 0.08;
-  const oh = rail ? 0.78 : 0.66;
-  return { ow, oh };
+/**
+ * Where the facade stands and how deep the opening stays clear behind it. The terrain is a grid: the cut
+ * face behind a tunnel boundary is a ramp about one unit long, so the facade goes to the toe of that ramp
+ * (on the graded approach) and the opening ends in a dark curtain where the ground rises inside.
+ */
+function portalPlace(ctx: ChunkCtx, e: NEdge, s: number, out: number, ops: Opening[]): { sF: number; depth: number } {
+  const w = ctx.game.world;
+  const g = w.net.geo(e);
+  const lat = [ops[0].c - ops[0].hw + 0.05, ...ops.map((o) => o.c), ops[ops.length - 1].c + ops[ops.length - 1].hw - 0.05];
+  const rise = (t: number) => {
+    const q = sampleAt(g, Math.max(0, Math.min(e.len, s + out * t)));
+    let m = -Infinity;
+    for (const l of lat) m = Math.max(m, w.heightAt(q.x + q.lx * l, q.z + q.lz * l) - q.y);
+    return m;
+  };
+  let toe = 0;
+  for (let t = 0; t <= 2 + 1e-6; t += 0.1) if (rise(t) <= 0.06) { toe = t; break; }
+  const tF = Math.min(toe + 0.32, out > 0 ? e.len - s : s);
+  // the dark interior stays shallow: deeper than this it would show above the ground behind the facade
+  let depth = 0.6;
+  for (let t = 0.26; t <= 0.6 + 1e-6; t += 0.04) if (rise(tF - t) > 0.06) { depth = t; break; }
+  return { sF: s + out * tF, depth };
 }
 
-/** Oriented keep-out box around a portal (facade, wing walls, gallery) where no trees are drawn. */
+/** One arched opening of a portal: centre offset, half width, springing height and rise above the profile. */
+interface Opening { c: number; hw: number; ys: number; rise: number }
+
+/**
+ * Openings of a portal for a group of parallel tracks (lateral offsets `offs`): one arch for one or two
+ * tracks (about 5 m / 9.5 m wide, springing at 4.5-5 m), twin arches with a central pier for wider groups.
+ */
+function portalOpenings(e: NEdge, offs: number[]): Opening[] {
+  if (e.kind !== 'rail') {
+    const rt = ROAD_TYPES[e.type] ?? ROAD_TYPES.road;
+    const hw = rt.half + rt.sidewalk * 0.5 + 0.08;
+    return [{ c: 0, hw, ys: 0.42, rise: Math.min(0.34, hw * 0.55) }];
+  }
+  const o = offs.slice().sort((a, b) => a - b);
+  const CW = 0.26; // track centre to the wall at springing height
+  const group = (list: number[]): Opening => {
+    const a = list[0] - CW, b = list[list.length - 1] + CW, hw = (b - a) / 2;
+    return { c: (a + b) / 2, hw, ys: list.length > 1 ? 0.5 : 0.45, rise: list.length > 1 ? hw * 0.82 : hw };
+  };
+  if (o.length <= 2) return [group(o)];
+  // twin arches with a central pier where the middle tracks are far enough apart, else one wide flat arch
+  const k = Math.ceil(o.length / 2);
+  if (o[k] - o[k - 1] >= 2 * CW + 0.14) return [group(o.slice(0, k)), group(o.slice(k))];
+  const one = group(o);
+  return [{ ...one, ys: 0.48, rise: Math.min(one.hw * 0.55, 0.62) }];
+}
+
+/** Height of an opening's soffit above the profile at lateral offset l (null outside it). */
+function soffit(op: Opening, l: number): number | null {
+  const u = (l - op.c) / op.hw;
+  if (u < -1 - 1e-6 || u > 1 + 1e-6) return null;
+  return op.ys + op.rise * Math.sqrt(Math.max(0, 1 - u * u));
+}
+
+/** Portal openings and outer extent (for keep-outs and covers). */
+function portalSpan(ctx: ChunkCtx, e: NEdge, s: number): { ops: Opening[]; lo: number; hi: number } {
+  const grp = parallelGroup(ctx, e, s, (f, sf) => nearTunnel(f, sf));
+  const ops = portalOpenings(e, [0, ...grp.map((nb) => nb.off)]);
+  return { ops, lo: ops[0].c - ops[0].hw - 0.45, hi: ops[ops.length - 1].c + ops[ops.length - 1].hw + 0.45 };
+}
+
+/** Oriented keep-out box around a portal (facade, wing walls, cover mound) where no trees are drawn. */
 export interface Keepout { x: number; z: number; ox: number; oz: number; lx: number; lz: number; f0: number; f1: number; l0: number; l1: number }
 
 export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
@@ -568,9 +626,9 @@ export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
       const atEnd = o < 0 ? s <= 0.05 : s >= e.len - 0.05;
       if (atEnd && (continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel') || buriedEnd(ctx, e, o < 0 ? e.a : e.b))) continue;
       const p = sampleAt(net.geo(e), s);
-      const { ow, oh } = portalDims(e);
-      const gl = galleryLength(ctx, e, s, o, oh + 0.1);
-      out.push({ x: p.x, z: p.z, ox: p.tx * o, oz: p.tz * o, lx: p.lx, lz: p.lz, f0: -(gl + 1.0), f1: 2.3, l0: -(ow + 1.9), l1: ow + 1.9 });
+      const { ops, lo, hi } = portalSpan(ctx, e, s);
+      const gl = uncoveredLength(ctx, e, s, o, ops);
+      out.push({ x: p.x, z: p.z, ox: p.tx * o, oz: p.tz * o, lx: p.lx, lz: p.lz, f0: -(gl + 0.9), f1: 2.3, l0: lo - 1.4, l1: hi + 1.4 });
     }
   }
 }
@@ -581,111 +639,223 @@ export function inKeepout(k: Keepout, x: number, z: number): boolean {
   return f >= k.f0 && f <= k.f1 && l >= k.l0 && l <= k.l1;
 }
 
-function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[], sb: number) {
+/** Lining top above the profile (crown plus lining thickness). */
+const liningTop = (ops: Opening[]) => Math.max(...ops.map((o) => o.ys + o.rise)) + 0.14;
+
+/**
+ * Length behind a portal (from its back face) where the ground does not yet cover the lining; 0 once the
+ * hillside (backfilled by the planner) reaches over it.
+ */
+function uncoveredLength(ctx: ChunkCtx, e: NEdge, sb: number, out: number, ops: Opening[]): number {
+  const w = ctx.game.world;
+  const g = w.net.geo(e);
+  const a = ops[0].c - ops[0].hw - 0.12, b = ops[ops.length - 1].c + ops[ops.length - 1].hw + 0.12;
+  const top = liningTop(ops);
+  let last = 0;
+  for (let d = 0.25; d <= 4; d += 0.25) {
+    const s = sb - out * (0.14 + d);
+    if (s < 0 || s > e.len) break;
+    const p = sampleAt(g, s);
+    let ground = Infinity;
+    for (const l of [a, (a + b) / 2, b]) ground = Math.min(ground, w.heightAt(p.x + p.lx * l, p.z + p.lz * l));
+    if (ground < p.y + top - 0.02) last = d;
+  }
+  return last;
+}
+
+/**
+ * Tunnel portal for a group of parallel tracks: a dressed-stone (or, on electrified lines and roads,
+ * concrete) facade with pilasters, plinth course and coping, voussoir rings with keystones round the
+ * arches, a dark arched lining fading into the hill, wing walls retaining the cutting, and a grassed cover
+ * only where the hill does not yet cover the lining.
+ */
+function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[], sb: number, clear: number) {
   const w = ctx.game.world;
   const W = ctx.w;
   W.cast = 1;
   const rail = e.kind === 'rail';
-  const { ow, oh } = portalDims(e);
-  const archH = ow * 0.75;
-  const ys = oh - archH; // springing height (relative to the profile)
-  const Hf = oh + 0.4;   // tallest facade
-  const lo = Math.min(...offs) - ow - 0.5, hi = Math.max(...offs) + ow + 0.5;
+  const ops = portalOpenings(e, offs);
+  const crown = Math.max(...ops.map((o) => o.ys + o.rise));
+  const Hf = crown + 0.55; // tallest facade
+  const lo = ops[0].c - ops[0].hw - 0.45, hi = ops[ops.length - 1].c + ops[ops.length - 1].hw + 0.45;
   const ox = p.tx * out, oz = p.tz * out; // outward
   const lx = p.lx, lz = p.lz;
   const y = p.y;
   const modern = !rail || (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified;
   const cell = modern ? WC.CONCRETE : WC.STONE, sc = modern ? WSCALE.CONCRETE : WSCALE.STONE;
   const tone = modern ? CONCRETE : STONE, dark = modern ? CONCRETE_DARK : STONE_DARK;
+  const light = modern ? 0xd6d2ca : 0xd2c4ad;
   const at = (l: number, f: number): [number, number] => [p.x + lx * l + ox * f, p.z + lz * l + oz * f];
-  const T = 0.2, ff = 0.06, fb = ff - T;
+  const P3 = (l: number, f: number, yy: number): [number, number, number] => [p.x + lx * l + ox * f, yy, p.z + lz * l + oz * f];
+  const T = 0.24, ff = 0.06, fb = ff - T;
   const yb = y - 0.35;
-  const ops = offs.slice().sort((a, b) => a - b).map((c) => [c - ow, c + ow] as [number, number]);
-  const archY = (l: number) => {
-    for (const [a, b] of ops) if (l >= a - 1e-6 && l <= b + 1e-6) { const c = (a + b) / 2, r = (b - a) / 2; return y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l - c) / r) ** 2)); }
-    return yb;
-  };
+  const soff = (l: number) => { for (const o of ops) { const h = soffit(o, l); if (h !== null) return y + h; } return null; };
   // facade top follows the hillside behind it (never floating above it), but always frames the arches
-  const opDist = (l: number) => { let d = Infinity; for (const [a, b] of ops) d = Math.min(d, l < a ? a - l : l > b ? l - b : 0); return d; };
+  const opDist = (l: number) => { let d = Infinity; for (const o of ops) d = Math.min(d, Math.max(0, Math.abs(l - o.c) - o.hw)); return d; };
   const behind = (l: number) => { const [ax, az] = at(l, fb - 0.15), [bx, bz] = at(l, fb - 0.6); return Math.max(w.heightAt(ax, az), w.heightAt(bx, bz)); };
   const topAt = (l: number) => {
-    const k = Math.min(1, Math.max(0, (opDist(l) - 0.08) / 0.4));
-    const minTop = y + oh + 0.14 - (oh - 0.2) * k * k * (3 - 2 * k);
+    const k = Math.min(1, Math.max(0, (opDist(l) - 0.1) / 0.45));
+    const minTop = y + crown + 0.2 - (crown - 0.15) * k * k * (3 - 2 * k);
     return Math.min(y + Hf, Math.max(behind(l) + 0.06, minTop));
   };
   // lateral breakpoints: regular columns plus the opening edges
   const cols: number[] = [];
-  for (let l = lo; l < hi - 1e-6; l += 0.1) cols.push(l);
+  for (let l = lo; l < hi - 1e-6; l += 0.08) cols.push(l);
   cols.push(hi);
-  for (const [a, b] of ops) cols.push(a, b);
+  for (const o of ops) cols.push(o.c - o.hw, o.c + o.hw);
   cols.sort((u, v) => u - v);
   const L: number[] = [];
   for (const l of cols) if (!L.length || l - L[L.length - 1] > 1e-4) L.push(l);
   const TOP = L.map(topAt);
   for (let i = 0; i < L.length - 1; i++) {
-    const l0 = L[i], l1 = L[i + 1], m = (l0 + l1) / 2;
-    const inside = ops.some(([a, b]) => m > a && m < b);
-    const b0 = inside ? archY(l0) : yb, b1 = inside ? archY(l1) : yb;
+    const l0 = L[i], l1 = L[i + 1];
+    const s0 = soff((l0 + l1) / 2) !== null;
+    const b0 = s0 ? soff(l0)! : yb, b1 = s0 ? soff(l1)! : yb;
     const t0 = TOP[i], t1 = TOP[i + 1];
     const [fx0, fz0] = at(l0, ff), [fx1, fz1] = at(l1, ff), [bx0, bz0] = at(l0, fb), [bx1, bz1] = at(l1, fb);
     W.use(cell, tone);
     W.twall(fx0, fz0, fx1, fz1, b0, t0, b1, t1, ox, oz, sc, l0);
     W.twall(bx0, bz0, bx1, bz1, b0, t0, b1, t1, -ox, -oz, sc, l0);
+    // coping: a cap over the facade top, overhanging the front
     W.use(cell, dark);
-    W.ttri(fx0, t0, fz0, 0, 0, fx1, t1, fz1, (l1 - l0) / sc, 0, bx1, t1, bz1, (l1 - l0) / sc, T / sc, 0, 1, 0);
-    W.ttri(fx0, t0, fz0, 0, 0, bx1, t1, bz1, (l1 - l0) / sc, T / sc, bx0, t0, bz0, 0, T / sc, 0, 1, 0);
+    const c0 = t0 + 0.04, c1 = t1 + 0.04;
+    const [gx0, gz0] = at(l0, ff + 0.03), [gx1, gz1] = at(l1, ff + 0.03);
+    W.twall(gx0, gz0, gx1, gz1, t0 - 0.015, c0, t1 - 0.015, c1, ox, oz, sc, l0);
+    W.ttri(gx0, c0, gz0, 0, 0, gx1, c1, gz1, (l1 - l0) / sc, 0, bx1, c1, bz1, (l1 - l0) / sc, T / sc, 0, 1, 0);
+    W.ttri(gx0, c0, gz0, 0, 0, bx1, c1, bz1, (l1 - l0) / sc, T / sc, bx0, c0, bz0, 0, T / sc, 0, 1, 0);
+    W.twall(bx0, bz0, bx1, bz1, t0, c0, t1, c1, -ox, -oz, sc, l0);
+    // plinth course along the foot (between the openings)
+    if (!s0) {
+      W.use(cell, dark);
+      const [px0, pz0] = at(l0, ff + 0.02), [px1, pz1] = at(l1, ff + 0.02);
+      W.twall(px0, pz0, px1, pz1, yb, y + 0.13, yb, y + 0.13, ox, oz, sc, l0);
+      W.ttri(px0, y + 0.13, pz0, 0, 0, px1, y + 0.13, pz1, 0.1, 0, fx1, y + 0.13, fz1, 0.1, 0.05, 0, 1, 0);
+      W.ttri(px0, y + 0.13, pz0, 0, 0, fx1, y + 0.13, fz1, 0.1, 0.05, fx0, y + 0.13, fz0, 0, 0.05, 0, 1, 0);
+    }
   }
-  // facade ends
+  // facade ends, pilasters (stone)
   W.use(cell, tone);
   {
     const [ax, az] = at(lo, ff), [bx, bz] = at(lo, fb), [cx, cz] = at(hi, ff), [dx, dz] = at(hi, fb);
     W.twall(ax, az, bx, bz, yb, TOP[0], yb, TOP[0], -lx, -lz, sc);
     W.twall(cx, cz, dx, dz, yb, TOP[TOP.length - 1], yb, TOP[TOP.length - 1], lx, lz, sc);
   }
-  // --- opening reveals (jambs and arch soffit) and the dark gallery behind
-  const gl = galleryLength(ctx, e, sb, out, oh + 0.1);
-  const run = tunnelRun(e, ctx, sb - out * (T - ff), out, gl);
-  for (const [a, b] of ops) {
-    const c = (a + b) / 2, r = (b - a) / 2;
-    W.use(cell, dark);
-    const [a0x, a0z] = at(a, ff), [a1x, a1z] = at(a, fb), [b0x, b0z] = at(b, ff), [b1x, b1z] = at(b, fb);
-    W.twall(a0x, a0z, a1x, a1z, y - 0.05, y + ys, y - 0.05, y + ys, lx, lz, sc);
-    W.twall(b0x, b0z, b1x, b1z, y - 0.05, y + ys, y - 0.05, y + ys, -lx, -lz, sc);
-    const K = 10;
-    for (let k = 0; k < K; k++) {
-      const l0 = a + (b - a) * (k / K), l1 = a + (b - a) * ((k + 1) / K);
-      const h0 = y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l0 - c) / r) ** 2)), h1 = y + ys + archH * Math.sqrt(Math.max(0, 1 - ((l1 - c) / r) ** 2));
-      const [p0x, p0z] = at(l0, ff), [p1x, p1z] = at(l1, ff), [q0x, q0z] = at(l0, fb), [q1x, q1z] = at(l1, fb);
-      const mx = (c - (l0 + l1) / 2) * lx, mz = (c - (l0 + l1) / 2) * lz;
-      W.ttri(p0x, h0, p0z, 0, 0, p1x, h1, p1z, 0.2, 0, q1x, h1, q1z, 0.2, 0.2, mx, -1, mz);
-      W.ttri(p0x, h0, p0z, 0, 0, q1x, h1, q1z, 0.2, 0.2, q0x, h0, q0z, 0, 0.2, mx, -1, mz);
+  if (!modern) {
+    for (const [a, b] of [[lo, lo + 0.16], [hi - 0.16, hi]]) {
+      const top = Math.min(topAt(a), topAt(b)) - 0.01;
+      W.use(cell, light);
+      W.tbox((at((a + b) / 2, ff)[0]), yb, (at((a + b) / 2, ff)[1]), b - a, top - yb, 0.05, ox, oz, sc, false, false);
     }
-    // dark interior along the tunnel curve: walls and ceiling facing inwards, floor facing up
-    W.use(WC.PLAIN, DARK);
-    sweep(W, run, [[b, -0.05], [b, oh], [a, oh], [a, -0.05]]);
-    sweep(W, run, [[a, 0.004], [b, 0.004]]);
-    const pe = out > 0 ? run[0] : run[run.length - 1];
-    const ex = pe.tx * out, ez = pe.tz * out;
-    W.twall(pe.x + pe.lx * a, pe.z + pe.lz * a, pe.x + pe.lx * b, pe.z + pe.lz * b, pe.y - 0.05, pe.y + oh, pe.y - 0.05, pe.y + oh, ex, ez);
   }
-  // cut-and-cover gallery behind the facade, earthed over like the hillside it re-creates
+  // voussoir rings with keystones round each arch, impost blocks at the springing
+  for (const o of ops) {
+    const K = 13, RW = 0.085;
+    for (let k = 0; k < K; k++) {
+      const th0 = Math.PI * (1 - k / K), th1 = Math.PI * (1 - (k + 1) / K);
+      const key = k === (K - 1) / 2;
+      const out1 = RW + (key ? 0.03 : 0), pr = key ? 0.04 : 0.022;
+      const ring = (th: number, ext: number): [number, number] => [o.c + Math.cos(th) * (o.hw + ext), y + o.ys + Math.sin(th) * (o.rise + ext)];
+      const [i0l, i0y] = ring(th0, 0), [i1l, i1y] = ring(th1, 0), [o0l, o0y] = ring(th0, out1), [o1l, o1y] = ring(th1, out1);
+      const tint = modern ? tone : (k & 1 ? light : tone);
+      W.use(cell, key && !modern ? light : tint);
+      const f1 = ff + pr;
+      // front face
+      W.ttri(...P3(i0l, f1, i0y), 0, 0, ...P3(i1l, f1, i1y), 0.1, 0, ...P3(o1l, f1, o1y), 0.1, 0.1, ox, 0, oz);
+      W.ttri(...P3(i0l, f1, i0y), 0, 0, ...P3(o1l, f1, o1y), 0.1, 0.1, ...P3(o0l, f1, o0y), 0, 0.1, ox, 0, oz);
+      // outer rim and soffit edge
+      const mo = ((o0l + o1l) / 2 - o.c), my = (o0y + o1y) / 2 - (y + o.ys);
+      W.ttri(...P3(o0l, ff, o0y), 0, 0, ...P3(o1l, ff, o1y), 0.1, 0, ...P3(o1l, f1, o1y), 0.1, 0.03, lx * mo, my, lz * mo);
+      W.ttri(...P3(o0l, ff, o0y), 0, 0, ...P3(o1l, f1, o1y), 0.1, 0.03, ...P3(o0l, f1, o0y), 0, 0.03, lx * mo, my, lz * mo);
+      W.use(cell, dark);
+      W.ttri(...P3(i0l, ff, i0y), 0, 0, ...P3(i1l, ff, i1y), 0.1, 0, ...P3(i1l, f1, i1y), 0.1, 0.03, -lx * mo, -my, -lz * mo);
+      W.ttri(...P3(i0l, ff, i0y), 0, 0, ...P3(i1l, f1, i1y), 0.1, 0.03, ...P3(i0l, f1, i0y), 0, 0.03, -lx * mo, -my, -lz * mo);
+    }
+    for (const sg of [-1, 1]) {
+      const l0 = o.c + sg * o.hw, l1 = l0 + sg * 0.11;
+      const [cx, cz] = at((l0 + l1) / 2, ff + 0.015);
+      W.use(cell, modern ? tone : light);
+      W.tbox(cx, y + o.ys - 0.05, cz, 0.11, 0.07, 0.03, ox, oz, sc, false, true);
+    }
+  }
+  // dark arched lining inside (as deep as the opening stays clear), fading into a dark curtain
+  const D0 = T - ff, D1 = Math.max(D0 + 0.08, clear);
+  const RINGS = Math.max(1, Math.round((D1 - D0) / 0.35));
+  const ringAt = (k: number) => sampleAt(w.net.geo(e), Math.max(0, Math.min(e.len, sb - out * (D0 + ((D1 - D0) * k) / RINGS))));
+  const shade = (f: number) => { const v = Math.round(46 * (1 - f) * (1 - f) + 10); return (v << 16) | (v << 8) | Math.round(v * 0.92); };
+  const Q = (S: Smp, l: number, h: number): [number, number, number] => [S.x + S.lx * l, S.y + h, S.z + S.lz * l];
+  for (const o of ops) {
+    const prof: [number, number][] = [[o.c - o.hw, -0.05], [o.c - o.hw, o.ys]];
+    for (let j = 1; j < 10; j++) { const th = Math.PI * (1 - j / 10); prof.push([o.c + Math.cos(th) * o.hw, o.ys + Math.sin(th) * o.rise]); }
+    prof.push([o.c + o.hw, o.ys], [o.c + o.hw, -0.05]);
+    for (let k = 0; k < RINGS; k++) {
+      const A = ringAt(k), B = ringAt(k + 1);
+      const fm = (k + 0.5) / RINGS * Math.min(1, (D1 - D0) / 1.6);
+      for (let j = 0; j < prof.length - 1; j++) {
+        const [l0, h0] = prof[j], [l1, h1] = prof[j + 1];
+        const nl = -(h1 - h0), nh = l1 - l0; // inward normal (towards the axis)
+        W.use(WC.PLAIN, shade(fm), 0);
+        W.ttri(...Q(A, l0, h0), 0, 0, ...Q(B, l0, h0), 0, 0, ...Q(B, l1, h1), 0, 0, A.lx * nl, nh, A.lz * nl);
+        W.ttri(...Q(A, l0, h0), 0, 0, ...Q(B, l1, h1), 0, 0, ...Q(A, l1, h1), 0, 0, A.lx * nl, nh, A.lz * nl);
+      }
+      W.use(WC.PLAIN, shade(fm), 0);
+      W.ttri(...Q(A, o.c - o.hw, 0.004), 0, 0, ...Q(B, o.c - o.hw, 0.004), 0, 0, ...Q(B, o.c + o.hw, 0.004), 0, 0, 0, 1, 0);
+      W.ttri(...Q(A, o.c - o.hw, 0.004), 0, 0, ...Q(B, o.c + o.hw, 0.004), 0, 0, ...Q(A, o.c + o.hw, 0.004), 0, 0, 0, 1, 0);
+    }
+    // curtain: an arch-shaped fan, dark at the rim and black in the middle (reads as depth)
+    const E = ringAt(RINGS);
+    const ex = E.tx * out, ez = E.tz * out;
+    const mid = Q(E, o.c, (o.ys + o.rise) * 0.45);
+    const rimC = shade(Math.min(1, (D1 - D0) / 1.6));
+    for (let j = 0; j < prof.length - 1; j++) {
+      const a = Q(E, prof[j][0], prof[j][1]), b = Q(E, prof[j + 1][0], prof[j + 1][1]);
+      const va = W.use(WC.PLAIN, rimC, 0);
+      void va;
+      const nx = ex, nz = ez;
+      const i0 = W.vertex(a[0], a[1], a[2], nx, 0, nz), i1 = W.vertex(b[0], b[1], b[2], nx, 0, nz);
+      W.color(0x050505);
+      const i2 = W.vertex(mid[0], mid[1], mid[2], nx, 0, nz);
+      // wind towards the opening (seen from outside)
+      const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = mid[0] - a[0], vy = mid[1] - a[1], vz = mid[2] - a[2];
+      const cx = uy * vz - uz * vy, cz = ux * vy - uy * vx;
+      if (cx * nx + cz * nz >= 0) W.idx.push(i0, i1, i2); else W.idx.push(i0, i2, i1);
+    }
+    // the bottom edge of the fan (floor line)
+    const fl = Q(E, o.c - o.hw, -0.05), fr = Q(E, o.c + o.hw, -0.05);
+    W.use(WC.PLAIN, rimC, 0);
+    const j0 = W.vertex(fl[0], fl[1], fl[2], ex, 0, ez), j1 = W.vertex(fr[0], fr[1], fr[2], ex, 0, ez);
+    W.color(0x050505);
+    const j2 = W.vertex(mid[0], mid[1], mid[2], ex, 0, ez);
+    {
+      const ux = fr[0] - fl[0], uy = fr[1] - fl[1], uz = fr[2] - fl[2], vx = mid[0] - fl[0], vy = mid[1] - fl[1], vz = mid[2] - fl[2];
+      const cx = uy * vz - uz * vy, cz = ux * vy - uy * vx;
+      if (cx * ex + cz * ez >= 0) W.idx.push(j0, j1, j2); else W.idx.push(j0, j2, j1);
+    }
+  }
+  // the portal block behind the facade, as deep as the interior (buried in the hillside, it closes the view into
+  // the opening from above): stone / concrete side walls like the facade, a grassed roof in the terrain's
+  // earthwork colour (where the hill does not cover it yet it reads as the portal's earth cover, not a box)
   {
-    const a0 = ops[0][0] - 0.1, b0 = ops[ops.length - 1][1] + 0.1, top = oh + 0.1, sl = top + 0.35;
-    W.use(WC.GRAVEL, 0x9a8f78);
-    sweep(W, run, [[a0 - sl, -0.35, 0], [a0, top, sl * 1.41 / 0.5]], 0.5);
-    sweep(W, run, [[b0, top, 0], [b0 + sl, -0.35, sl * 1.41 / 0.5]], 0.5);
-    W.use(WC.GRAVEL, 0x86905e);
-    sweep(W, run, [[a0, top, 0], [b0, top, (b0 - a0) / 0.5]], 0.5);
-    // close the mound's front ends beside the facade
-    const p0 = out > 0 ? run[run.length - 1] : run[0];
-    const P = (l: number, h: number): [number, number, number] => [p0.x + p0.lx * l, p0.y + h, p0.z + p0.lz * l];
-    W.use(WC.GRAVEL, 0x9a8f78);
-    W.ttri(...P(a0 - sl, -0.35), 0, 0, ...P(a0, top), 1, 1, ...P(a0, -0.35), 1, 0, ox, 0, oz);
-    W.ttri(...P(b0 + sl, -0.35), 0, 0, ...P(b0, top), 1, 1, ...P(b0, -0.35), 1, 0, ox, 0, oz);
+    const bl = lo + 0.08, br = hi - 0.08, dB = Math.max(D1 + 0.06, D0 + 0.1);
+    const B0 = sampleAt(w.net.geo(e), Math.max(0, Math.min(e.len, sb - out * D0)));
+    const B1 = sampleAt(w.net.geo(e), Math.max(0, Math.min(e.len, sb - out * dB)));
+    const roof = (S: Smp) => S.y + crown + 0.16;
+    const Q2 = (S: Smp, l: number, h: number): [number, number, number] => [S.x + S.lx * l, h, S.z + S.lz * l];
+    const gs = WSCALE.GRASS;
+    W.use(WC.GRASS, EARTHWORK_TINT, 1);
+    const r00 = Q2(B0, bl, roof(B0)), r01 = Q2(B0, br, roof(B0)), r10 = Q2(B1, bl, roof(B1)), r11 = Q2(B1, br, roof(B1));
+    W.ttri(...r00, r00[0] / gs, r00[2] / gs, ...r01, r01[0] / gs, r01[2] / gs, ...r11, r11[0] / gs, r11[2] / gs, 0, 1, 0);
+    W.ttri(...r00, r00[0] / gs, r00[2] / gs, ...r11, r11[0] / gs, r11[2] / gs, ...r10, r10[0] / gs, r10[2] / gs, 0, 1, 0);
+    W.use(cell, dark, 1);
+    for (const [l, sg] of [[bl, -1], [br, 1]] as [number, number][]) {
+      const a = Q2(B0, l, 0), b = Q2(B1, l, 0);
+      W.twall(a[0], a[2], b[0], b[2], B0.y - 0.35, roof(B0), B1.y - 0.35, roof(B1), B0.lx * sg, B0.lz * sg, sc);
+    }
+    // back of the block (seen only where the hill behind is low)
+    W.twall(r10[0], r10[2], r11[0], r11[2], B1.y - 0.35, roof(B1), B1.y - 0.35, roof(B1), -ox, -oz, sc);
   }
-  // wing walls retaining the cutting: nearly parallel to the track, tops on the retained ground,
-  // ending where the cutting gets shallow (omitted entirely in shallow cuttings)
-  const T2 = 0.15;
+  // wing walls retaining the cutting: nearly parallel to the track, tops on the retained ground with a
+  // coping, ending where the cutting gets shallow (omitted entirely in shallow cuttings)
+  const T2 = 0.16;
   for (const sd of [-1, 1]) {
     const lEdge = sd < 0 ? lo : hi;
     const [sx, sz] = at(lEdge - sd * T2, ff);
@@ -695,11 +865,11 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
     const nl = Math.hypot(nx, nz) || 1;
     nx /= nl; nz /= nl;
     const pts: { x: number; z: number; t: number }[] = [];
-    for (let k = 0; k <= 8; k++) {
+    for (let k = 0; k <= 10; k++) {
       const t = k * 0.25;
       const qx = sx + dx * t, qz = sz + dz * t;
       const terr = Math.max(w.heightAt(qx + nx * (T2 + 0.15), qz + nz * (T2 + 0.15)), w.heightAt(qx + nx * (T2 + 0.5), qz + nz * (T2 + 0.5)));
-      const top = Math.min(y + Hf, terr + 0.04);
+      const top = Math.min(y + Hf, terr + 0.05);
       if (top < y + 0.3) break;
       pts.push({ x: qx, z: qz, t: top });
     }
@@ -710,27 +880,20 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
       W.use(cell, tone);
       W.twall(A.x, A.z, B.x, B.z, yb, A.t, yb, B.t, -nx, -nz, sc, k * 0.25);
       W.twall(aox, aoz, box2, boz, yb, A.t, yb, B.t, nx, nz, sc, k * 0.25);
+      // coping
       W.use(cell, dark);
-      W.ttri(A.x, A.t, A.z, 0, 0, B.x, B.t, B.z, 0.25 / sc, 0, box2, B.t, boz, 0.25 / sc, T2 / sc, 0, 1, 0);
-      W.ttri(A.x, A.t, A.z, 0, 0, box2, B.t, boz, 0.25 / sc, T2 / sc, aox, A.t, aoz, 0, T2 / sc, 0, 1, 0);
+      const cA = A.t + 0.035, cB = B.t + 0.035;
+      const ix0 = A.x - nx * 0.025, iz0 = A.z - nz * 0.025, ix1 = B.x - nx * 0.025, iz1 = B.z - nz * 0.025;
+      const ex0 = aox + nx * 0.025, ez0 = aoz + nz * 0.025, ex1 = box2 + nx * 0.025, ez1 = boz + nz * 0.025;
+      W.twall(ix0, iz0, ix1, iz1, A.t - 0.01, cA, B.t - 0.01, cB, -nx, -nz, sc, k * 0.25);
+      W.twall(ex0, ez0, ex1, ez1, A.t - 0.01, cA, B.t - 0.01, cB, nx, nz, sc, k * 0.25);
+      W.ttri(ix0, cA, iz0, 0, 0, ix1, cB, iz1, 0.25 / sc, 0, ex1, cB, ez1, 0.25 / sc, T2 / sc, 0, 1, 0);
+      W.ttri(ix0, cA, iz0, 0, 0, ex1, cB, ez1, 0.25 / sc, T2 / sc, ex0, cA, ez0, 0, T2 / sc, 0, 1, 0);
     }
     const E = pts[pts.length - 1];
     W.use(cell, tone);
-    W.twall(E.x, E.z, E.x + nx * T2, E.z + nz * T2, yb, E.t, yb, E.t, dx, dz, sc);
+    W.twall(E.x - nx * 0.025, E.z - nz * 0.025, E.x + nx * (T2 + 0.025), E.z + nz * (T2 + 0.025), yb, E.t + 0.035, yb, E.t + 0.035, dx, dz, sc);
   }
-}
-
-/** Gallery length behind a portal: until the terrain over the tunnel rises `rel` above the track (1..3 units). */
-function galleryLength(ctx: ChunkCtx, e: NEdge, sb: number, out: number, rel: number): number {
-  const w = ctx.game.world;
-  const g = w.net.geo(e);
-  for (let d = 0.5; d <= 3; d += 0.5) {
-    const s = sb - out * d;
-    if (s < 0 || s > e.len) return Math.max(1, d - 0.5);
-    const p = sampleAt(g, s);
-    if (w.heightAt(p.x, p.z) > p.y + rel + 0.1) return Math.max(1, d);
-  }
-  return 3;
 }
 
 /** Samples along the tunnel from the portal inwards, ordered by increasing s (for sweeps). */

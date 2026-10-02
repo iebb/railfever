@@ -9,6 +9,7 @@ import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { addTramTracks } from '../src/game/build-ops';
 import { CATCHMENT_RADIUS, WALK_LINE, TRANSFER_RANGE, planStationUpgrade, commitStationUpgrade, relocateStation, stationLayout } from '../src/game/stations';
 import type { Station } from '../src/game/stations';
+import { styleOf } from '../src/game/station-styles';
 import { Train } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { roadOpts } from './lib';
@@ -29,7 +30,10 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const S = station(g, 128, 104, Math.PI / 2, 8, 2)!;
   check(S && S.roadAccess && g.stations.hasAccess(S), 'station beside a road has road access');
   const sh = g.stations.catchmentShapes(S);
-  check(sh.length === 3 && sh.every((c) => c.r === CATCHMENT_RADIUS.rail && c.mode === 'rail') && Math.abs(Math.max(...sh.map((c) => c.x)) - 132) < 0.01, 'rail: 3 circles of 400 m along the platforms (ends and centre)');
+  // (a station building draws people from further away: +20% for the classic one)
+  const RB = CATCHMENT_RADIUS.rail * (1 + styleOf(S.rail!.style).catchBonus);
+  check(S.rail!.style === 'classic' && Math.abs(RB - 48) < 1e-9, 'a classic station building widens the 400 m catchment by 20%');
+  check(sh.length === 3 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(Math.max(...sh.map((c) => c.x)) - 132) < 0.01, 'rail: 3 circles along the platforms (ends and centre)');
   const busId = g.stations.nextId;
   check(!g.stations.commitBusStop(50, 100, 0), 'bus stop built');
   const bus = g.stations.get(busId)!;
@@ -42,8 +46,8 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const rb = g.stations.catchmentShapes(bus)[0], rt = g.stations.catchmentShapes(tram)[0];
   console.log(`  radii: rail ${sh[0].r}, tram ${rt?.r} (${rt?.mode}), bus ${rb?.r} (${rb?.mode})`);
   check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, 'tram and bus radii, rail > tram > bus');
-  // measured from the platforms: a house 38 beyond a platform end is in, one 45 from every circle is out
-  const hin = house(g, 132 + 38, 104), hout = house(g, 128, 104 + 45), hside = house(g, 128, 104 + 39);
+  // measured from the platforms: a house 46 beyond a platform end is in, one 55 from every circle is out
+  const hin = house(g, 132 + 46, 104), hout = house(g, 128, 104 + 55), hside = house(g, 128, 104 + 47);
   const cb = new Set(g.stations.catchmentBuildings(S));
   check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'catchment measured from the platform area');
   // no road access: no catchment

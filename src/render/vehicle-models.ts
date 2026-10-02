@@ -1267,6 +1267,272 @@ export function getTramSection(style: string, role: TramRole, len: number): Mode
   return m;
 }
 
+// ------------------------------------------------------------------------------------ multiple units
+
+/** Cars of a multiple unit: cab end at +z ('cab'), middle car, or a single car with cabs at both ends. */
+export type EmuRole = 'cab' | 'mid' | 'single';
+/** Gap between the cars of one unit (close-coupled, with gangway bellows). */
+export const EMU_GAP = 0.05;
+
+type CabKind = 'flat3' | 'mask' | 'wrap' | 'round' | 'wedge' | 'duck' | 'long' | 'xlong';
+interface EmuSpec {
+  W: number; y0: number; yE: number; yT: number; flat: number;
+  doors: number; doorW: number;
+  /** unpainted stainless body: ribbed lower sides, livery only in the bands */
+  stainless: boolean;
+  /** operator-colour bands [y0, y1] along the body */
+  bands: [number, number][];
+  cab: CabKind;
+  /** nose length (units) of the cab car */
+  nose: number;
+  roof: number;
+  equip: 'vent' | 'ac' | 'smooth';
+  win: [number, number];
+  /** window pitch; continuous (flush) glazing when 0 */
+  pitch: number;
+  skirt: boolean;
+  hsr: boolean;
+}
+const hs = (cab: CabKind, nose: number, bands: [number, number][]): EmuSpec => ({
+  W: 0.3, y0: 0.075, yE: 0.36, yT: 0.405, flat: 0.5, doors: 1, doorW: 0.075, stainless: false, bands, cab, nose,
+  roof: 0xe9e9e6, equip: 'smooth', win: [0.245, 0.315], pitch: 0.13, skirt: true, hsr: true,
+});
+const EMU: Record<string, EmuSpec> = {
+  metro_steel: { W: 0.28, y0: 0.1, yE: 0.355, yT: 0.39, flat: 0.75, doors: 4, doorW: 0.13, stainless: false, bands: [[0.2, 0.222]], cab: 'flat3', nose: 0, roof: 0x6b6f73, equip: 'vent', win: [0.235, 0.33], pitch: 0.12, skirt: false, hsr: false },
+  metro_stainless: { W: 0.28, y0: 0.1, yE: 0.36, yT: 0.395, flat: 0.8, doors: 4, doorW: 0.13, stainless: true, bands: [[0.2, 0.226]], cab: 'mask', nose: 0, roof: 0x8d9296, equip: 'ac', win: [0.235, 0.335], pitch: 0.14, skirt: false, hsr: false },
+  metro_modern: { W: 0.285, y0: 0.095, yE: 0.365, yT: 0.4, flat: 0.8, doors: 4, doorW: 0.14, stainless: true, bands: [[0.338, 0.356], [0.116, 0.132]], cab: 'wrap', nose: 0.07, roof: 0xa9aeb3, equip: 'ac', win: [0.225, 0.33], pitch: 0, skirt: true, hsr: false },
+  emu_60s: { W: 0.285, y0: 0.11, yE: 0.36, yT: 0.405, flat: 0.6, doors: 4, doorW: 0.12, stainless: false, bands: [[0.205, 0.218]], cab: 'flat3', nose: 0, roof: 0x5d6064, equip: 'vent', win: [0.24, 0.33], pitch: 0.12, skirt: false, hsr: false },
+  emu_80s: { W: 0.29, y0: 0.105, yE: 0.365, yT: 0.405, flat: 0.75, doors: 4, doorW: 0.12, stainless: true, bands: [[0.198, 0.226]], cab: 'mask', nose: 0, roof: 0x8d9296, equip: 'ac', win: [0.235, 0.335], pitch: 0.15, skirt: false, hsr: false },
+  emu_modern: { W: 0.295, y0: 0.1, yE: 0.37, yT: 0.405, flat: 0.8, doors: 4, doorW: 0.13, stainless: true, bands: [[0.342, 0.36], [0.2, 0.222]], cab: 'wrap', nose: 0.09, roof: 0xa9aeb3, equip: 'ac', win: [0.225, 0.335], pitch: 0, skirt: true, hsr: false },
+  hsr_0: hs('round', 0.36, [[0.205, 0.238], [0.09, 0.104]]),
+  hsr_1: hs('wedge', 0.5, [[0.205, 0.232], [0.18, 0.19]]),
+  hsr_2: hs('duck', 0.66, [[0.2, 0.225], [0.17, 0.178]]),
+  hsr_3: hs('long', 0.8, [[0.212, 0.232]]),
+  hsr_4: hs('xlong', 1.0, [[0.19, 0.215]]),
+};
+
+/** Multiple-unit styles drawn as articulated light rail (tram sections on rails). */
+export function lrvStyle(style: string): string | null {
+  return style === 'lrv' ? 'tram_artic' : style === 'lrv_modern' ? 'tram_modern' : null;
+}
+
+/**
+ * Nose cross-section at t (0 = full body, 1 = tip) for the high-speed styles: width scale, height scale
+ * (about the floor) and floor lift.
+ */
+function noseShape(cab: CabKind, t: number): [number, number, number] {
+  const s = (a: number, b: number, x: number) => { const k = Math.min(1, Math.max(0, (x - a) / (b - a))); return k * k * (3 - 2 * k); };
+  switch (cab) {
+    case 'round': { const c = Math.sqrt(Math.max(0, 1 - Math.pow(t, 2.2))); return [0.38 + 0.62 * c, 0.42 + 0.58 * c, 0.035 * t]; }
+    case 'wedge': return [1 - 0.42 * t * t, 1 - 0.68 * t, 0.012 * t];
+    case 'duck': return [1 - 0.22 * t * t, 1 - 0.3 * s(0, 0.3, t) - 0.48 * s(0.38, 0.75, t), 0];
+    case 'long': return [1 - 0.55 * Math.pow(t, 1.5), 1 - 0.78 * Math.pow(t, 1.15) + 0.05 * Math.sin(Math.PI * Math.min(1, t * 1.8)), 0];
+    default: return [1 - 0.62 * Math.pow(t, 1.35), 1 - 0.84 * Math.pow(t, 1.05) + 0.04 * Math.sin(Math.PI * Math.min(1, t * 2.2)), 0];
+  }
+}
+
+/** One car of a multiple unit (cached per style, role, length and pantograph). */
+function emuCar(style: string, role: EmuRole, len: number, panto: boolean): ModelGeo {
+  const sp = EMU[style] ?? EMU.emu_80s;
+  const m = new MB(), gb = m.gb, gl = m.gl;
+  const hl = len / 2 - 0.006, W = sp.W, hw = W / 2;
+  const { y0, yE, yT } = sp;
+  const cabF = role !== 'mid', cabR = role === 'single';
+  const noseL = Math.min(sp.nose, len * 0.58);
+  const zf = cabF && noseL > 0 ? hl - noseL : hl, zr = cabR && noseL > 0 ? -hl + noseL : -hl;
+  const prof = roofProfile(hw, y0, yE, yT, sp.flat);
+  // ---- body shell (painted: model colour; stainless: bare metal, the model colour goes on bands and the cab)
+  if (sp.stainless) { m.paint(false); gb.color(0xc6cace); } else { m.paint(true); gb.color(0xffffff); }
+  prism(gb, zr, zf, prof, 0.6, false);
+  let front: [number, number, number][] = [], rear: [number, number, number][] = [];
+  const ends: [boolean, number][] = [[cabF, 1], [cabR, -1]];
+  for (const [isCab, dir] of ends) {
+    const zEnd = dir > 0 ? zf : zr, zTip = dir * hl;
+    if (isCab && noseL > 0 && sp.hsr) {
+      // lofted nose: sections from the body to a small cap at the tip
+      const N = 12;
+      let prev = prof, zp = zEnd;
+      for (let k = 1; k <= N; k++) {
+        const t = k / N, [sx, sy, lift] = noseShape(sp.cab, Math.min(t, 0.985));
+        const sec: P2[] = prof.map(([x, y]) => [x * sx, y0 + lift + (y - y0) * sy]);
+        const z = zEnd + dir * noseL * t;
+        if (dir > 0) loft(gb, prev, zp, sec, z, k === N ? 1 : 0); else loft(gb, sec, z, prev, zp, k === N ? -1 : 0);
+        prev = sec; zp = z;
+      }
+    } else if (isCab && noseL > 0) {
+      // short raked cab: slightly narrower and lower at the face
+      const sec = scaleP(prof, 0.93, y0, 0.965);
+      if (dir > 0) loft(gb, prof, zEnd, sec, zTip, 1); else loft(gb, sec, zTip, prof, zEnd, -1);
+    } else {
+      // flat end (gangway or flat cab)
+      const ring = prof;
+      let cx = 0, cy = 0;
+      for (const [x, y] of ring) { cx += x; cy += y; }
+      const c = gb.vertex(cx / ring.length, cy / ring.length, zEnd, 0, 0, dir);
+      const ids = ring.map(([x, y]) => gb.vertex(x, y, zEnd, 0, 0, dir));
+      for (let i = 0; i < ring.length; i++) {
+        if (dir > 0) gb.idx.push(c, ids[i], ids[(i + 1) % ring.length]);
+        else gb.idx.push(c, ids[(i + 1) % ring.length], ids[i]);
+      }
+    }
+  }
+  // ---- livery bands: the first in the operator's colour, further ones in the model colour
+  const bz0 = zr + 0.005, bz1 = zf - 0.005;
+  sp.bands.forEach(([a, b], i) => {
+    if (i === 0) m.accent(true); else m.paint(true);
+    gb.color(0xffffff);
+    gb.box(0, a, (bz0 + bz1) / 2, W + 0.004, b - a, bz1 - bz0);
+  });
+  m.paint(false);
+  // stainless: fine ribs along the lower body
+  if (sp.stainless) {
+    gb.color(0xb9bdc2);
+    for (let y = y0 + 0.02; y < (sp.bands[0]?.[0] ?? 0.19) - 0.008; y += 0.018) gb.box(0, y, (bz0 + bz1) / 2, W + 0.002, 0.004, bz1 - bz0 - 0.02);
+  }
+  // ---- doors and windows
+  const doorZ: number[] = [];
+  const d0 = zr + 0.16, d1 = zf - 0.16;
+  if (sp.doors === 1) { if (cabF) doorZ.push(zf - 0.12); if (!cabF || cabR) doorZ.push(zr + 0.12); }
+  else for (let i = 0; i < sp.doors; i++) doorZ.push(d0 + ((d1 - d0) * (i + 0.5)) / sp.doors);
+  gb.color(0x1b1d20);
+  for (const z of doorZ) for (const sx of [-1, 1]) gb.box(sx * (hw + 0.0015), y0 + 0.012, z, 0.003, sp.win[1] - y0 + 0.004, sp.doorW + 0.008);
+  gl.color(0xffffff);
+  for (const z of doorZ) for (const sx of [-1, 1]) {
+    // two door leaves, glazed above waist height
+    for (const k of [-1, 1]) {
+      const a = z + (k < 0 ? -sp.doorW / 2 + 0.004 : 0.004), b = z + (k < 0 ? -0.004 : sp.doorW / 2 - 0.004);
+      const x = sx * (hw + 0.0035), ya = sp.win[0] - 0.01, yb = sp.win[1] - 0.004;
+      if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
+    }
+  }
+  // window runs between the doors (flush glazing on a black band, or separate windows)
+  const runs: [number, number][] = [];
+  const edges = [zr + (cabR || sp.doors === 1 ? 0.07 : 0.04), ...doorZ.flatMap((z) => [z - sp.doorW / 2 - 0.025, z + sp.doorW / 2 + 0.025]).sort((a, b) => a - b), zf - (cabF ? (noseL > 0 ? 0.04 : 0.1) : 0.04)];
+  for (let i = 0; i + 1 < edges.length; i += 2) if (edges[i + 1] - edges[i] > 0.05) runs.push([edges[i], edges[i + 1]]);
+  const [wy0, wy1] = sp.win;
+  if (sp.pitch === 0) {
+    gb.color(0x14181b);
+    for (const [a, b] of runs) gb.box(0, wy0 - 0.006, (a + b) / 2, W + 0.002, wy1 - wy0 + 0.012, b - a);
+  }
+  for (const [a, b] of runs) windowBand(gl, a, b, wy0, wy1, hw + 0.002, sp.pitch === 0 ? Math.max(1, Math.round((b - a) / 0.3)) : Math.max(1, Math.round((b - a) / sp.pitch)), sp.pitch === 0 ? 0.006 : 0.018);
+  // ---- cab faces (non-HSR): windscreen, display, lamps; HSR: cockpit glass on the nose
+  for (const [isCab, dir] of ends) {
+    if (!isCab) {
+      // gangway bellows to the next car
+      gb.color(0x1d1d1d);
+      gb.box(0, y0 + 0.02, dir * (hl + EMU_GAP / 4), 0.16, yE - y0 - 0.05, EMU_GAP / 2 + 0.008);
+      continue;
+    }
+    const zFace = dir * hl;
+    const lamps: [number, number, number][] = [];
+    if (sp.hsr) {
+      // cockpit windows on the upper nose, lamps low on the nose sides
+      const N = 12, a = sp.cab === 'round' ? 0.38 : 0.2, b = sp.cab === 'round' ? 0.6 : 0.42;
+      gl.color(0xffffff);
+      const sec = (t: number) => { const [sx, sy, lift] = noseShape(sp.cab, t); return prof.map(([x, y]) => [x * sx * 1.012, y0 + lift + (y - y0) * sy + 0.002] as P2); };
+      const zAt = (t: number) => (dir > 0 ? zf : zr) + dir * noseL * t;
+      for (let k = 0; k < 3; k++) {
+        const t0 = a + ((b - a) * k) / 3, t1 = a + ((b - a) * (k + 1)) / 3;
+        const s0 = sec(t0), s1 = sec(t1), z0 = zAt(t0), z1 = zAt(t1);
+        // upper arc facets (roofProfile: indices 3 .. n-3 run over the crown)
+        for (let i = 3; i < s0.length - 3; i++) {
+          const p = s0[i], q = s0[i + 1], r2 = s1[i + 1], u = s1[i];
+          if (dir > 0) gl.quad(p[0], p[1], z0, q[0], q[1], z0, r2[0], r2[1], z1, u[0], u[1], z1);
+          else gl.quad(q[0], q[1], z0, p[0], p[1], z0, u[0], u[1], z1, r2[0], r2[1], z1);
+        }
+      }
+      void N;
+      const [sx, sy, lift] = noseShape(sp.cab, 0.78);
+      const ly = y0 + lift + 0.04 * sy + 0.03;
+      lamps.push([hw * sx * 0.55, ly, zAt(0.78)], [-hw * sx * 0.55, ly, zAt(0.78)]);
+      gb.color(0xfff6d8);
+      for (const [lx, lyy, lz] of lamps) gb.box(lx, lyy - 0.008, lz, 0.03, 0.016, 0.03);
+    } else {
+      const s = sp.cab === 'wrap' ? 0.93 : 1, fy = sp.cab === 'wrap' ? 0.965 : 1;
+      const fw = hw * s, ys = (y: number) => y0 + (y - y0) * fy;
+      const zz = zFace + dir * 0.0015;
+      const quadF = (x0: number, x1: number, ya: number, yb: number, g: GeoBuilder) => {
+        if (dir > 0) g.quad(x0, ya, zz, x1, ya, zz, x1, yb, zz, x0, yb, zz); else g.quad(x1, ya, zz, x0, ya, zz, x0, yb, zz, x1, yb, zz);
+      };
+      if (sp.cab === 'mask' || sp.cab === 'wrap') { gb.color(0x111417); quadF(-fw + 0.012, fw - 0.012, ys(wy0 - 0.03), ys(yE - 0.006), gb); }
+      if (sp.stainless) { m.paint(true); gb.color(0xffffff); quadF(-fw + 0.008, fw - 0.008, ys(y0 + 0.012), ys(wy0 - 0.034), gb); m.paint(false); }
+      gl.color(0xffffff);
+      if (sp.cab === 'flat3') {
+        // three-window front: driver, gangway door, second man
+        quadF(-fw + 0.015, -0.045, ys(wy0), ys(wy1), gl); quadF(-0.03, 0.03, ys(wy0 - 0.02), ys(wy1), gl); quadF(0.045, fw - 0.015, ys(wy0), ys(wy1), gl);
+        gb.color(0x1b1b1b); quadF(-0.032, 0.032, ys(y0 + 0.03), ys(wy1 + 0.004), gb);
+      } else quadF(-fw + 0.02, fw - 0.02, ys(wy0 - 0.015), ys(wy1 + 0.005), gl);
+      // destination display
+      gb.color(0x0d0d0d); quadF(-0.06, 0.06, ys(yE - 0.03), ys(yE - 0.008), gb);
+      gb.color(0xffb84d); quadF(-0.045, 0.045, ys(yE - 0.025), ys(yE - 0.013), gb);
+      // lamps, coupler, skirt
+      const ly = ys(y0 + 0.045);
+      lamps.push([fw - 0.035, ly, zFace + dir * 0.004], [-fw + 0.035, ly, zFace + dir * 0.004]);
+      gb.color(0xfff6d8);
+      for (const [lx] of lamps) gb.box(lx, ly - 0.01, zFace + dir * 0.0025, 0.032, 0.02, 0.003);
+      gb.color(0x222426);
+      gb.box(0, 0.07, zFace + dir * 0.014, 0.07, 0.03, 0.028);
+      if (sp.skirt) gb.box(0, 0.015, zFace - dir * 0.015, W * 0.86, 0.06, 0.03);
+    }
+    if (dir > 0) front = lamps; else rear = lamps;
+  }
+  if (role === 'cab') rear = [[0.08, y0 + 0.05, -hl - 0.01], [-0.08, y0 + 0.05, -hl - 0.01]];
+  // ---- roof equipment and pantograph
+  const rz0 = zr + 0.08, rz1 = zf - 0.08;
+  if (sp.equip === 'vent') {
+    gb.color(0x4e5155);
+    for (let z = rz0 + 0.05; z < rz1 - 0.05; z += 0.16) gb.box(0, yT - 0.004, z, 0.06, 0.016, 0.07);
+  } else if (sp.equip === 'ac') {
+    gb.color(0xc3c7cb);
+    for (const z of [rz0 + (rz1 - rz0) * 0.22, rz0 + (rz1 - rz0) * 0.78]) gb.box(0, yT - 0.006, z, 0.17, 0.026, 0.24);
+  } else {
+    gb.color(0xd0d3d6);
+    gb.box(0, yT - 0.003, (rz0 + rz1) / 2, 0.08, 0.008, Math.max(0.1, rz1 - rz0 - 0.2));
+  }
+  if (panto) {
+    const pz = role === 'cab' ? zr + 0.25 : zf - 0.25;
+    gb.color(0x3c3f42);
+    gb.box(0, yT - 0.006, pz, 0.2, 0.012, 0.22);
+    pantograph(gb, pz, yT + 0.004);
+    if (sp.hsr) { gb.color(0xd8dbde); gb.box(0, yT - 0.004, pz, 0.24, 0.03, 0.34); }
+  }
+  // ---- underframe and skirts
+  gb.color(0x232527);
+  gb.box(0, y0 - 0.045, (zr + zf) / 2, W * 0.72, 0.05, Math.max(0.1, (zf - zr) - 0.62));
+  if (sp.skirt) {
+    m.paint(true); gb.color(0xffffff);
+    for (const sx of [-1, 1]) gb.box(sx * (hw - 0.012), y0 - 0.055, (zr + zf) / 2, 0.012, 0.06, Math.max(0.1, zf - zr - 0.1));
+    m.paint(false);
+  }
+  const g = m.build();
+  // low detail: painted box (tapered nose), bands, roof, window strip, windscreen
+  const lb = new MB(), lg = lb.gb;
+  lb.paint(true); lg.color(0xffffff);
+  lg.box(0, y0, (zr + zf) / 2, W, yE - y0, zf - zr);
+  if (cabF && noseL > 0) { const [sx, sy] = noseShape(sp.cab, 0.85); taper(lg, zf, hl, y0, W, yE - y0, W * sx, (yE - y0) * sy); }
+  if (cabR && noseL > 0) { const [sx, sy] = noseShape(sp.cab, 0.85); taper(lg, -hl, zr, y0, W * sx, (yE - y0) * sy, W, yE - y0); }
+  lb.accent(true); lg.color(0xffffff);
+  for (const [a, b] of sp.bands) lg.box(0, a, (zr + zf) / 2, W + 0.004, b - a, zf - zr);
+  lb.paint(false);
+  lg.color(sp.roof);
+  lg.box(0, yE, (zr + zf) / 2, W * 0.86, yT - yE, zf - zr - 0.02);
+  if (panto) { lg.color(0x3c3f42); lg.box(0, yT, role === 'cab' ? zr + 0.25 : zf - 0.25, 0.16, 0.12, 0.03); }
+  windowBand(lb.gl, zr + 0.06, zf - 0.06, wy0, wy1, hw + 0.002, 1, 0);
+  if (cabF && noseL <= 0) endWindow(lb.gl, hl + 0.002, wy0, wy1, hw - 0.025);
+  return { ...g, lo: lb.build(), length: len, front, rear, bogies: [len * BOGIE_F, -len * BOGIE_F], bogieKind: 'b2' };
+}
+
+/** Geometry of one car of a multiple unit (cached). */
+export function getEmuCar(style: string, role: EmuRole, len: number, panto: boolean): ModelGeo {
+  const key = 'emu:' + style + ':' + role + ':' + len.toFixed(3) + (panto ? ':p' : '');
+  let m = cache.get(key);
+  if (!m) { m = emuCar(style, role, len, panto); cache.set(key, m); }
+  return m;
+}
+
+/** Is this a multiple-unit style with its own car models? */
+export function isEmuStyle(style: string): boolean { return style in EMU; }
+
 const cache = new Map<string, ModelGeo>();
 
 export function getModel(style: string, color: number, length: number): ModelGeo {

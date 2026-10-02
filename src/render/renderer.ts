@@ -1,10 +1,10 @@
 // Scene setup, lighting, sky, shadows, post-processing, dynamic resolution and frame orchestration (1 unit = 10 m).
 import * as THREE from 'three';
 import { Sky } from 'three/addons/objects/Sky.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
 import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
+import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
+import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import type { Game } from '../game/game';
 import { TerrainView, raycastTerrain } from './terrain';
 import { ObjectsView } from './objects';
@@ -38,6 +38,61 @@ const SETTINGS_VERSION = 2;
 const SHADOW_MAX = 170;
 const WARM = new THREE.Color(0.95, 0.65, 0.45);
 const NIGHT_FOG = new THREE.Color(0.035, 0.05, 0.09);
+
+/**
+ * Post-processing chain: the scene renders into one multisampled half-float target (its resolved depth feeds
+ * GTAO), AO is blended into a second target, the grade pass tone-maps (ACES), encodes sRGB and applies a
+ * subtle grade into an 8-bit target, and SMAA (FXAA when the GPU is short of time) anti-aliases to the screen.
+ */
+interface Post {
+  scene: THREE.WebGLRenderTarget;
+  ao: THREE.WebGLRenderTarget;
+  ldr: THREE.WebGLRenderTarget;
+  gtao: GTAOPass;
+  smaa: SMAAPass;
+  fxaa: FXAAPass;
+  grade: THREE.ShaderMaterial;
+  quad: FullScreenQuad;
+  w: number; h: number; samples: number;
+}
+
+const GRADE_VERT = /* glsl */ `
+varying vec2 vUv;
+void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+const GRADE_FRAG = /* glsl */ `
+uniform sampler2D tDiffuse;
+uniform float uExposure;
+uniform float uCurve;
+uniform float uSaturation;
+uniform vec3 uLift;
+uniform vec3 uGain;
+uniform float uVignette;
+varying vec2 vUv;
+// three.js ACES filmic fit
+vec3 rfRRT(vec3 v) { vec3 a = v * (v + 0.0245786) - 0.000090537; vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081; return a / b; }
+vec3 rfAces(vec3 c) {
+  const mat3 IN = mat3(vec3(0.59719, 0.07600, 0.02840), vec3(0.35458, 0.90834, 0.13383), vec3(0.04823, 0.01566, 0.83777));
+  const mat3 OUT = mat3(vec3(1.60475, -0.10208, -0.00327), vec3(-0.53108, 1.10813, -0.07276), vec3(-0.07367, -0.00605, 1.07602));
+  c *= uExposure / 0.6;
+  return clamp(OUT * rfRRT(IN * c), 0.0, 1.0);
+}
+vec3 rfSrgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+float rfHash(vec2 p) { vec3 p3 = fract(vec3(p.xyx) * 0.1031); p3 += dot(p3, p3.yzx + 33.33); return fract((p3.x + p3.y) * p3.z); }
+void main() {
+  vec3 c = rfSrgb(rfAces(texture2D(tDiffuse, vUv).rgb));
+  // grade in display space: cool shadows / warm highlights, gentle S-curve, a touch of saturation
+  float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c += uLift * (1.0 - l) * (1.0 - l);
+  c *= mix(vec3(1.0), uGain, l);
+  c = mix(c, c * c * (3.0 - 2.0 * c), uCurve);
+  l = dot(c, vec3(0.2126, 0.7152, 0.0722));
+  c = mix(vec3(l), c, uSaturation);
+  vec2 d = vUv - 0.5;
+  c *= 1.0 - uVignette * dot(d, d) * 2.0;
+  // dither the 8-bit target (no banding in skies and fog)
+  c += (rfHash(gl_FragCoord.xy) - 0.5) / 255.0;
+  gl_FragColor = vec4(clamp(c, 0.0, 1.0), 1.0);
+}`;
 
 /** GPU frame timing via EXT_disjoint_timer_query_webgl2 (null when unsupported). */
 class GpuTimer {
@@ -115,8 +170,7 @@ export class Renderer {
   lightDir = new THREE.Vector3();
   night = 0;
   light = 1;
-  private composer: EffectComposer | null = null;
-  private gtao: GTAOPass | null = null;
+  private post: Post | null = null;
   private gtaoRadius = 0;
   /** AO temporarily dropped by the automatic quality control */
   private aoSuspended = false;
@@ -143,6 +197,8 @@ export class Renderer {
   private appliedPR = 0;
   // shadows
   private shadowKey = new Float64Array(9);
+  private shadowKeyFar = new Float64Array(9);
+  private sunFar: THREE.DirectionalLight;
   private sb = new Float64Array(6);
   private shadowTimer = 0;
   private shadowFrame = 0;
@@ -164,7 +220,8 @@ export class Renderer {
   private stats = { calls: 0, tris: 0 };
 
   constructor(public container: HTMLElement) {
-    this.renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+    // anti-aliasing happens in the post chain (multisampled scene target + SMAA / FXAA)
+    this.renderer = new THREE.WebGLRenderer({ antialias: false, powerPreference: 'high-performance' });
     this.renderer.setPixelRatio(this.settings.pixelRatio);
     this.renderer.setSize(container.clientWidth, container.clientHeight);
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -208,6 +265,12 @@ export class Renderer {
     this.sun.shadow.normalBias = 0.02;
     this.sun.shadow.camera.matrixAutoUpdate = true;
     this.scene.add(this.sun, this.sun.target);
+    // far shadow cascade: casts only (no light of its own); added after the sun so it is shadow light 1
+    this.sunFar = new THREE.DirectionalLight(0xffffff, 0);
+    this.sunFar.castShadow = true;
+    this.sunFar.shadow.mapSize.set(2048, 2048);
+    this.sunFar.shadow.camera.matrixAutoUpdate = true;
+    this.scene.add(this.sunFar, this.sunFar.target);
     this.hemi = new THREE.HemisphereLight(0xbdd7ff, 0x5a5440, 0.9);
     this.scene.add(this.hemi);
     this.scene.fog = new THREE.Fog(0xc9d8e8, 200, 900);
@@ -243,10 +306,11 @@ export class Renderer {
     this.worldGroup.add(this.terrain.group, this.objects.group, this.vehicles.group, this.overlay.group);
     this.labels.clear();
     this.controls.setWorld(game.world);
-    // snow line relative to the highest terrain
+    // snow only where believable: on mountainous maps, the highest summits (top ~1.5 % of the land, and
+    // above 72 % of the peak height); never on hilly or flat maps
     this.heightVer = -1;
     const [, maxH] = this.terrainRange();
-    this.terrain.uniforms.uSnow.value = Math.max(16, maxH * 0.72);
+    this.terrain.uniforms.uSnow.value = game.options.hilliness === 'mountainous' ? Math.max(this.landPercentile(0.985), maxH * 0.72) : 1e5;
     this.shadowKey.fill(NaN);
   }
 
@@ -269,37 +333,80 @@ export class Renderer {
     this.renderer.setSize(w, h);
     this.camera.aspect = w / h;
     this.camera.updateProjectionMatrix();
-    if (this.composer) { this.composer.setPixelRatio(pr); this.composer.setSize(w, h); }
+    if (this.post) this.sizePost();
   }
 
-  private setupComposer() {
-    const w = Math.max(1, this.container.clientWidth), h = Math.max(1, this.container.clientHeight);
-    const pr = this.renderer.getPixelRatio();
-    const rt = new THREE.WebGLRenderTarget(w * pr, h * pr, { type: THREE.HalfFloatType, samples: 4, depthTexture: new THREE.DepthTexture(w * pr, h * pr) });
-    const composer = new EffectComposer(this.renderer, rt);
-    composer.addPass(new RenderPass(this.scene, this.camera));
-    const gtao = new GTAOPass(this.scene, this.camera, w, h);
-    // AO from the main pass depth (normals reconstructed from depth): no second geometry pass,
-    // computed at half resolution with few samples. The scene pass renders into the read buffer.
-    gtao.setGBuffer(composer.readBuffer.depthTexture!);
+  /** MSAA samples of the scene target: 4 at normal pixel densities, 2 on dense (high-DPI) buffers. */
+  private msaaSamples(): number {
+    const g = this.renderer.getContext();
+    const max = g instanceof WebGL2RenderingContext ? (g.getParameter(g.MAX_SAMPLES) as number) : 0;
+    return Math.min(max, this.renderer.getPixelRatio() > 1.6 ? 2 : 4);
+  }
+
+  private setupPost(): Post {
+    const size = this.renderer.getDrawingBufferSize(this.tmpV2), W = Math.max(1, size.x), H = Math.max(1, size.y);
+    const samples = this.msaaSamples();
+    const scene = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples, depthTexture: new THREE.DepthTexture(W, H) });
+    const ao = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, depthBuffer: false });
+    const ldr = new THREE.WebGLRenderTarget(W, H, { type: THREE.UnsignedByteType, depthBuffer: false });
+    const gtao = new GTAOPass(this.scene, this.camera, W, H);
+    // AO from the main pass depth (normals reconstructed from depth): no second geometry pass, half resolution
+    gtao.setGBuffer(scene.depthTexture!);
     (gtao as unknown as { normalRenderTarget: THREE.WebGLRenderTarget }).normalRenderTarget.setSize(1, 1);
     gtao.setSize = (sw: number, sh: number) => {
-      const W = Math.max(1, Math.round(sw * 0.5)), H = Math.max(1, Math.round(sh * 0.5));
-      gtao.width = W; gtao.height = H;
-      gtao.gtaoRenderTarget.setSize(W, H);
-      gtao.pdRenderTarget.setSize(W, H);
-      gtao.gtaoMaterial.uniforms.resolution.value.set(W, H);
-      gtao.pdMaterial.uniforms.resolution.value.set(W, H);
+      const w2 = Math.max(1, Math.round(sw * 0.5)), h2 = Math.max(1, Math.round(sh * 0.5));
+      gtao.width = w2; gtao.height = h2;
+      gtao.gtaoRenderTarget.setSize(w2, h2);
+      gtao.pdRenderTarget.setSize(w2, h2);
+      gtao.gtaoMaterial.uniforms.resolution.value.set(w2, h2);
+      gtao.pdMaterial.uniforms.resolution.value.set(w2, h2);
     };
-    gtao.updateGtaoMaterial({ radius: 0.4, distanceExponent: 1.5, thickness: 1.2, scale: 1.0, samples: 8, distanceFallOff: 1.0 });
-    gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 5, rings: 2, samples: 8 });
-    gtao.blendIntensity = 0.65;
-    composer.addPass(gtao);
-    composer.addPass(new OutputPass());
-    composer.setPixelRatio(pr);
-    composer.setSize(w, h);
-    this.composer = composer;
-    this.gtao = gtao;
+    // contact shadows only: small radius, gentle intensity, fast fall-off (no dark patches on hillsides)
+    gtao.updateGtaoMaterial({ radius: 0.2, distanceExponent: 2.0, thickness: 0.6, scale: 1.0, samples: 8, distanceFallOff: 0.6 });
+    gtao.updatePdMaterial({ lumaPhi: 10, depthPhi: 2, normalPhi: 3, radius: 4, rings: 2, samples: 8 });
+    gtao.blendIntensity = 0.55;
+    gtao.setSize(W, H);
+    const smaa = new SMAAPass();
+    smaa.setSize(W, H);
+    smaa.renderToScreen = true;
+    const fxaa = new FXAAPass();
+    fxaa.setSize(W, H);
+    fxaa.renderToScreen = true;
+    const grade = new THREE.ShaderMaterial({
+      uniforms: {
+        tDiffuse: { value: null },
+        uExposure: { value: 1 },
+        uCurve: { value: 0.16 },
+        uSaturation: { value: 1.06 },
+        uLift: { value: new THREE.Vector3(-0.004, 0.002, 0.014) },
+        uGain: { value: new THREE.Vector3(1.025, 1.0, 0.965) },
+        uVignette: { value: 0.12 },
+      },
+      vertexShader: GRADE_VERT, fragmentShader: GRADE_FRAG, depthTest: false, depthWrite: false, toneMapped: false,
+    });
+    this.post = { scene, ao, ldr, gtao, smaa, fxaa, grade, quad: new FullScreenQuad(grade), w: W, h: H, samples };
+    return this.post;
+  }
+
+  /** Follow the drawing-buffer size (and the MSAA sample count it calls for). */
+  private sizePost() {
+    const P = this.post!;
+    const size = this.renderer.getDrawingBufferSize(this.tmpV2), W = Math.max(1, size.x), H = Math.max(1, size.y);
+    const samples = this.msaaSamples();
+    if (samples !== P.samples) {
+      P.scene.dispose();
+      P.scene = new THREE.WebGLRenderTarget(W, H, { type: THREE.HalfFloatType, samples, depthTexture: new THREE.DepthTexture(W, H) });
+      P.samples = samples;
+      P.gtao.setGBuffer(P.scene.depthTexture!);
+    }
+    if (W === P.w && H === P.h) return;
+    P.w = W; P.h = H;
+    P.scene.setSize(W, H);
+    P.ao.setSize(W, H);
+    P.ldr.setSize(W, H);
+    P.gtao.setSize(W, H);
+    P.smaa.setSize(W, H);
+    P.fxaa.setSize(W, H);
   }
 
   loadSettings() {
@@ -321,16 +428,35 @@ export class Renderer {
     if (this.settings.resolution !== 'auto') this.resScale = 1;
     this.resize();
     this.sun.castShadow = this.settings.shadows;
+    // high quality: two cascades (sharp near the camera); low: one 1024 map
+    const cascades = this.settings.shadows && this.settings.shadowQuality !== 'low';
+    this.sunFar.castShadow = cascades;
+    this.sunFar.visible = cascades;
     const s = this.settings.shadowQuality === 'low' ? 1024 : 2048;
-    if (this.sun.shadow.mapSize.x !== s) {
-      this.sun.shadow.mapSize.set(s, s);
-      this.sun.shadow.map?.dispose();
-      (this.sun.shadow as unknown as { map: unknown }).map = null;
+    for (const l of [this.sun, this.sunFar]) {
+      if (l.shadow.mapSize.x === s) continue;
+      l.shadow.mapSize.set(s, s);
+      l.shadow.map?.dispose();
+      (l.shadow as unknown as { map: unknown }).map = null;
     }
     this.shadowKey.fill(NaN);
+    this.shadowKeyFar.fill(NaN);
     this.labels.visible = this.settings.labels;
     if (this.settings.ao) this.aoSuspended = false;
     this.updateDebugEl();
+  }
+
+  /** Height below which a fraction q of the land (above water) lies (histogram over the heightfield). */
+  private landPercentile(q: number): number {
+    const h = this.game.world.h;
+    let mx = 0;
+    for (let i = 0; i < h.length; i += 3) if (h[i] > mx) mx = h[i];
+    const B = 1024, hist = new Uint32Array(B), k = (B - 1) / Math.max(1e-3, mx);
+    let n = 0;
+    for (let i = 0; i < h.length; i += 3) { const y = h[i]; if (y <= 0) continue; hist[Math.min(B - 1, Math.floor(y * k))]++; n++; }
+    let acc = 0;
+    for (let b = 0; b < B; b++) { acc += hist[b]; if (acc >= q * n) return (b + 1) / k; }
+    return mx;
   }
 
   /** Lowest/highest terrain height (cached per heights version). */
@@ -398,8 +524,9 @@ export class Renderer {
     const moon = 1 - THREE.MathUtils.smoothstep(elev, -0.3, -0.06);
     if (elev > -0.06) {
       this.lightDir.copy(this.sunDir);
-      this.sun.color.setRGB(1, 0.94 - warm * 0.25, 0.86 - warm * 0.45);
-      this.sun.intensity = 3.1 * day;
+      // warm key light (warmer still at low sun)
+      this.sun.color.setRGB(1, 0.93 - warm * 0.25, 0.82 - warm * 0.42);
+      this.sun.intensity = 3.25 * day;
     } else {
       this.moonDir.set(-this.sunDir.x * 0.6, Math.max(0.25, -this.sunDir.y), -this.sunDir.z * 0.6 + 0.3).normalize();
       this.lightDir.copy(this.moonDir);
@@ -408,10 +535,11 @@ export class Renderer {
     }
     // sky light: neutral by day (less blue on shaded slopes), moonlit blue at night; the night stays
     // readable (moonlit grass ~0.3, rock ~0.27, asphalt ~0.1 in sRGB) while windows and lamps stand out
-    this.hemi.intensity = 0.9 + 0.1 * day;
-    this.hemi.color.setRGB(0.28 + 0.52 * day, 0.38 + 0.48 * day, 0.72 + 0.23 * day);
-    this.hemi.groundColor.setRGB(0.1 + 0.25 * day, 0.1 + 0.23 * day, 0.13 + 0.12 * day);
-    this.renderer.toneMappingExposure = 0.9 + 0.55 * this.night;
+    // cool sky fill from above, warm bounce from the ground
+    this.hemi.intensity = 0.9 + 0.05 * day;
+    this.hemi.color.setRGB(0.27 + 0.43 * day, 0.37 + 0.45 * day, 0.72 + 0.28 * day);
+    this.hemi.groundColor.setRGB(0.1 + 0.32 * day, 0.1 + 0.27 * day, 0.13 + 0.15 * day);
+    this.renderer.toneMappingExposure = 0.92 + 0.52 * this.night;
     const fog = this.scene.fog as THREE.Fog;
     const horizon = this.horizon.setRGB(0.72 * day + 0.04, 0.8 * day + 0.06, 0.9 * day + 0.12);
     horizon.lerp(WARM, warm * day * 0.35).lerp(NIGHT_FOG, this.night * 0.6);
@@ -436,35 +564,57 @@ export class Renderer {
   }
 
   /**
-   * Shadow frustum fitted to the visible ground near the camera, in light space; extents quantised and
-   * the centre snapped to whole shadow-map texels so static shadows don't shimmer. Biases scale with
-   * the texel size. Returns false when nothing changed (the shadow map can be reused).
+   * Shadow cascades fitted to the visible ground in light space: on high quality a near cascade (the view up
+   * to a distance-scaled split: sharp shadows close to the camera) and a far cascade (the whole footprint up
+   * to the shadow distance), blended by view distance in the shared lights chunk; on low quality one map.
+   * Extents are quantised and centres snapped to whole texels (no shimmer); biases scale with the texel size.
+   * Returns false when nothing changed (the shadow maps can be reused).
    */
   private updateShadow(dist: number): boolean {
-    const sh = this.sun.shadow, cam = this.camera;
+    const maxD = Math.max(30, Math.min(360, dist * 2.2 + 20));
+    this.shadowReach = maxD;
     const L = this.lightDir;
     const lx = this.lx.set(0, 1, 0).cross(L);
     if (lx.lengthSq() < 1e-8) lx.set(1, 0, 0);
     lx.normalize();
-    const ly = this.ly.crossVectors(L, lx);
-    // footprint: corner rays of the view frustum down to the ground slab, limited to a shadow distance
-    const maxD = Math.max(30, Math.min(360, dist * 2.2 + 20));
-    this.shadowReach = maxD;
+    this.ly.crossVectors(L, lx);
+    this.sunFar.position.copy(this.sun.position);
+    if (!this.sunFar.castShadow) {
+      shadowFadeUniforms.uCascade.value.set(1e5, 2e5);
+      this.terrain.exactShadowCamera = null;
+      return this.fitShadow(this.sun, this.shadowKey, maxD, true);
+    }
+    const split = Math.max(10, Math.min(110, dist * 0.9 + 6));
+    shadowFadeUniforms.uCascade.value.set(split * 0.78, split * 0.98);
+    // the near cascade gets exact (full resolution) terrain casters
+    this.terrain.exactShadowCamera = this.sun.shadow.camera;
+    const a = this.fitShadow(this.sun, this.shadowKey, split, false);
+    const b = this.fitShadow(this.sunFar, this.shadowKeyFar, maxD, true);
+    return a || b;
+  }
+
+  /** Fit one shadow camera to the view frustum up to `reach` (ground slab clipped), see updateShadow. */
+  private fitShadow(light: THREE.DirectionalLight, key: Float64Array, reach: number, outer: boolean): boolean {
+    const sh = light.shadow, cam = this.camera, L = this.lightDir, lx = this.lx, ly = this.ly;
     const gY = this.focusV.y - 2;
     const b = this.sb;
     b[0] = b[2] = b[4] = Infinity; b[1] = b[3] = b[5] = -Infinity;
     const o = cam.position;
-    for (let i = 0; i < 4; i++) {
-      const d = this.v1.set(i & 1 ? 1 : -1, i & 2 ? 1 : -1, 0.5).unproject(cam).sub(o).normalize();
-      let t = maxD;
-      if (d.y < -1e-4) t = Math.min(maxD, Math.max(0, (gY - o.y) / d.y));
+    // corner, edge-centre and centre rays (the inner cascade is bounded by a sphere: include its cap)
+    const rays = outer ? 4 : 9;
+    for (let i = 0; i < rays; i++) {
+      const sx = i < 4 ? (i & 1 ? 1 : -1) : i === 4 ? 0 : i === 5 ? 1 : i === 6 ? -1 : 0;
+      const sy = i < 4 ? (i & 2 ? 1 : -1) : i === 4 ? 0 : i < 7 ? 0 : i === 7 ? 1 : -1;
+      const d = this.v1.set(sx, sy, 0.5).unproject(cam).sub(o).normalize();
+      let t = reach;
+      if (d.y < -1e-4) t = Math.min(reach, Math.max(0, (gY - o.y) / d.y));
       this.addLS(this.v2.copy(o).addScaledVector(d, Math.min(t, cam.near * 2)));
       this.addLS(this.v2.copy(o).addScaledVector(d, t));
     }
-    this.addLS(this.focusV);
+    if (outer) this.addLS(this.focusV);
     let half = Math.max(b[1] - b[0], b[3] - b[2]) / 2 + 1.5;
     let mx = (b[0] + b[1]) / 2, my = (b[2] + b[3]) / 2;
-    this.shadowNeed = half;
+    if (outer) this.shadowNeed = half;
     // very wide views: shadows only around the focus (keeps texels useful and the caster count down)
     if (half > SHADOW_MAX) { half = SHADOW_MAX; mx = this.focusV.dot(lx); my = this.focusV.dot(ly); }
     // quantise the extent (~9% steps) and snap the centre to texels
@@ -473,7 +623,7 @@ export class Renderer {
     const cx = Math.round(mx / texel) * texel, cy = Math.round(my / texel) * texel;
     // depth: reach far towards the light for mountains and tall buildings casting into view
     const zc = Math.round((b[5] + 150) / 4) * 4, far = Math.ceil((zc - b[4] + 4) / 4) * 4;
-    const k = this.shadowKey;
+    const k = key;
     if (k[0] === S && k[1] === cx && k[2] === cy && k[3] === zc && k[4] === far && k[5] === L.x && k[6] === L.y && k[7] === L.z && k[8] === sh.mapSize.x) return false;
     k[0] = S; k[1] = cx; k[2] = cy; k[3] = zc; k[4] = far; k[5] = L.x; k[6] = L.y; k[7] = L.z; k[8] = sh.mapSize.x;
     const sc = sh.camera;
@@ -481,12 +631,12 @@ export class Renderer {
     sc.near = 1; sc.far = far;
     sc.updateProjectionMatrix();
     const center = this.v3.copy(lx).multiplyScalar(cx).addScaledVector(ly, cy).addScaledVector(L, zc - 150);
-    this.sun.target.position.copy(center);
-    this.sun.position.copy(center).addScaledVector(L, 150);
-    this.sun.target.updateMatrixWorld();
-    this.sun.updateMatrixWorld();
-    // receiver offset along the normal ~1.8 texels; small depth bias in normalised depth units
-    sh.normalBias = texel * 1.8;
+    light.target.position.copy(center);
+    light.position.copy(center).addScaledVector(L, 150);
+    light.target.updateMatrixWorld();
+    light.updateMatrixWorld();
+    // receiver offset along the normal ~1.6 texels; small depth bias in normalised depth units
+    sh.normalBias = texel * 1.6;
     sh.bias = -(texel * 0.6) / (far - 1);
     return true;
   }
@@ -558,6 +708,7 @@ export class Renderer {
       this.shadowFade += (fade - this.shadowFade) * Math.min(1, dt * 4);
       if (Math.abs(this.shadowFade - fade) < 0.005) this.shadowFade = fade;
       this.sun.shadow.intensity = this.shadowFade;
+      this.sunFar.shadow.intensity = this.shadowFade;
       // static view: moving vehicles need fresh shadows, at 30 Hz once they are small on screen
       const tick = !g.paused && (this.sun.shadow.camera.right < 40 || (this.shadowFrame & 1) === 0);
       const want = moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0;
@@ -568,16 +719,27 @@ export class Renderer {
     this.sky.position.copy(cam.position);
     const useAO = this.settings.ao && !this.aoSuspended;
     this.gpu?.begin();
+    const P = this.post ?? this.setupPost();
+    const rr = this.renderer;
+    rr.setRenderTarget(P.scene);
+    rr.render(this.scene, cam);
+    let src = P.scene;
     if (useAO) {
-      if (!this.composer) this.setupComposer();
-      // contact-scale AO only: a large radius smears dark blotches over hillsides
-      const r = Math.round(Math.max(0.1, Math.min(0.8, 0.08 + dist * 0.004)) * 50) / 50;
-      const gt = this.gtao!;
-      if (r !== this.gtaoRadius) { this.gtaoRadius = r; gt.updateGtaoMaterial({ radius: r }); }
-      const dtex = this.composer!.readBuffer.depthTexture;
-      if (dtex && gt.depthTexture !== dtex) gt.setGBuffer(dtex);
-      this.composer!.render(dt);
-    } else this.renderer.render(this.scene, cam);
+      // contact shadows only: the radius grows a little with distance but stays small (no dark blotches)
+      const rad = Math.round(Math.max(0.08, Math.min(0.3, 0.06 + dist * 0.0018)) * 50) / 50;
+      if (rad !== this.gtaoRadius) { this.gtaoRadius = rad; P.gtao.updateGtaoMaterial({ radius: rad }); }
+      P.gtao.render(rr, P.ao, P.scene, dt, false);
+      src = P.ao;
+    }
+    const gu = P.grade.uniforms;
+    gu.tDiffuse.value = src.texture;
+    gu.uExposure.value = rr.toneMappingExposure;
+    rr.setRenderTarget(P.ldr);
+    P.quad.render(rr);
+    // SMAA; the cheaper FXAA while dynamic resolution is cutting pixels or on low quality
+    if (this.resScale < 0.8 || this.settings.shadowQuality === 'low') P.fxaa.render(rr, P.ao, P.ldr, dt, false);
+    else P.smaa.render(rr, P.ao, P.ldr, dt, false);
+    rr.setRenderTarget(null);
     this.gpu?.end();
     this.stats.calls = info.render.calls;
     this.stats.tris = info.render.triangles;
@@ -650,7 +812,7 @@ export class Renderer {
       `cpu ${this.cpuMs.toFixed(1)} ms   sim ${this.simMs.toFixed(1)} ms   gpu ${this.gpu && this.gpu.samples ? this.gpu.ms.toFixed(1) + ' ms' : 'n/a'}\n` +
       `draw calls ${this.stats.calls}   tris ${k(this.stats.tris)}\n` +
       `geometries ${info.memory.geometries}   textures ${info.memory.textures}   programs ${info.programs?.length ?? 0}\n` +
-      `pixel ratio ${this.renderer.getPixelRatio().toFixed(2)} (${res})   AO ${this.settings.ao ? (this.aoSuspended ? 'auto-off' : 'on') : 'off'}\n` +
+      `pixel ratio ${this.renderer.getPixelRatio().toFixed(2)} (${res})   AO ${this.settings.ao ? (this.aoSuspended ? 'auto-off' : 'on') : 'off'}   AA ${this.resScale < 0.8 || this.settings.shadowQuality === 'low' ? 'FXAA' : 'SMAA'} + MSAA ${this.post ? this.post.samples : 0}x   shadows ${this.sunFar.castShadow ? '2 cascades' : this.sun.castShadow ? '1 map' : 'off'}\n` +
       `terrain tris ${k(this.terrain.triangles())}   vehicles ${this.vehicles.instances}\n` +
       `shadow ${this.settings.shadows ? `${this.sun.shadow.mapSize.x}² ±${sh.right.toFixed(0)}` : 'off'}   cam dist ${this.controls.smoothDistance.toFixed(1)}`;
   }

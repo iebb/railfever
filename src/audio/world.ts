@@ -38,7 +38,14 @@ export function nightOf(visualTime: number): number {
   return 1 - x * x * (3 - 2 * x);
 }
 
-type SlotKind = 'steam' | 'diesel' | 'hst' | 'electric' | 'tram' | 'bus' | 'coach' | 'car' | 'bell';
+/**
+ * Sound voices. Electric multiple units: 'resistor' (1960s resistor control: motor hum and gear whine), 'gto'
+ * (1980s GTO inverter: the carrier "sings" up a scale while starting), 'vvvf' (modern IGBT inverter: smooth
+ * rising whine), 'hsr' (high speed: wind roar and pantograph hiss rising steeply with speed).
+ */
+type SlotKind = 'steam' | 'diesel' | 'hst' | 'electric' | 'resistor' | 'gto' | 'vvvf' | 'hsr' | 'tram' | 'bus' | 'coach' | 'car' | 'bell';
+/** GTO inverter start-up: the carrier steps up a scale (F major, Hz) */
+const GTO_SCALE = [349, 392, 440, 466, 523, 587, 659, 698];
 
 /** Long-distance coach: a bus model with a 'coach' style (rail coaches are wagons). */
 function isCoach(r: RoadVehicle): boolean {
@@ -56,6 +63,10 @@ class Slot {
   whine: OscillatorNode | null = null; whineG: GainNode | null = null;
   squealG: GainNode | null = null;
   hiss: GainNode | null = null;
+  /** inverter carrier tone (gto / vvvf) */
+  car: OscillatorNode | null = null; carF: BiquadFilterNode | null = null; carG: GainNode | null = null;
+  /** high-speed wind roar */
+  wind: GainNode | null = null; windF: BiquadFilterNode | null = null;
   next = 0; nextJoint = 0; throttle = 0; lastSpeed = -1; seen = 0; dying = 0; gain = 0; d = 1e9; lastRamp = -1;
   x = 0; y = 0; z = 0; alt = 1;
   /** coaches: 0 in town .. 1 out on country roads (deeper, steadier engine and more tyre roar) */
@@ -97,6 +108,26 @@ class Slot {
       this.osc('sine', 100, this.eng, 0);
       this.osc('sine', kind === 'tram' ? 200 : 300, k.gain(0.25, this.eng), 0);
       this.addWhine(kind === 'tram' ? 220 : 160, 0);
+    } else if (kind === 'resistor') {
+      // traction motor hum (follows the speed) with its second harmonic, gear whine above it
+      this.eng = k.gain(0, this.body);
+      this.engF = k.filter({ type: 'lowpass', f: 700, q: 0.7 }, now, this.eng);
+      this.osc('triangle', 30, this.engF, 1);
+      this.osc('sine', 60, k.gain(0.35, this.engF), 2);
+      this.addWhine(300, 0);
+    } else if (kind === 'gto' || kind === 'vvvf' || kind === 'hsr') {
+      // inverter carrier (filtered square / saw) and the motors' magnetic whine
+      this.carG = k.gain(0, this.body);
+      this.carF = k.filter({ type: kind === 'gto' ? 'bandpass' : 'lowpass', f: 900, q: kind === 'gto' ? 2.5 : 0.8 }, now, this.carG);
+      this.car = this.osc(kind === 'gto' ? 'square' : 'sawtooth', 400, this.carF, 0);
+      this.addWhine(200, 0);
+      if (kind === 'hsr') {
+        this.wind = k.gain(0, this.body);
+        this.windF = k.filter({ type: 'bandpass', f: 500, q: 0.6 }, now, this.wind);
+        this.loopNoise(k.pink, this.windF);
+        this.hiss = k.gain(0, this.body);
+        this.loopNoise(k.white, k.filter({ type: 'highpass', f: 4200 }, now, this.hiss));
+      }
     }
     if (kind !== 'car' && kind !== 'bus' && kind !== 'coach') {
       // brake squeal, a little vibrato
@@ -293,6 +324,11 @@ export class WorldAudio {
   private trainKind(t: Train): SlotKind {
     const loco = t.cars.find((c) => c.power > 0) ?? t.cars[0];
     const st = loco?.style ?? 'diesel';
+    if (st.startsWith('hsr')) return 'hsr';
+    if (st === 'lrv' || st === 'lrv_modern') return 'tram';
+    if (st === 'metro_steel' || st === 'emu_60s') return 'resistor';
+    if (st === 'metro_stainless' || st === 'emu_80s') return 'gto';
+    if (st === 'metro_modern' || st === 'emu_modern') return 'vvvf';
     return st === 'steam' ? 'steam' : st === 'bullet' ? 'electric' : st === 'hst' ? 'hst' : 'diesel';
   }
 
@@ -409,6 +445,39 @@ export class WorldAudio {
         Slot.ramp(s.whineG.gain, 0.03 * T * clamp(vis / 0.3, 0, 1), now, 0.15);
       }
       if (s.rollF) Slot.ramp(s.rollF.frequency, 450 + 900 * clamp(vis / 3, 0, 1), now, 0.2);
+    } else if (s.kind === 'resistor' || s.kind === 'gto' || s.kind === 'vvvf' || s.kind === 'hsr') {
+      // speed as a fraction of the unit's top speed: motor and inverter tones follow it
+      const vmax = v.kind === 'train' ? (v as Train).maxSpeed : 1;
+      const u = clamp(speed / Math.max(1e-3, vmax), 0, 1);
+      const brake = accel < -0.004 && speed > 0.05;
+      if (s.kind === 'resistor') {
+        const f0 = (14 + 150 * u) * s.alt;
+        for (const [fp, r] of s.freqs) Slot.ramp(fp, f0 * r, now, 0.2);
+        if (s.eng) Slot.ramp(s.eng.gain, (0.035 + 0.12 * T) * clamp(u * 6, 0, 1), now, 0.15);
+        if (s.whine && s.whineG) { Slot.ramp(s.whine.frequency, (260 + 1300 * u) * s.alt, now, 0.2); Slot.ramp(s.whineG.gain, 0.012 * clamp(u * 4, 0, 1), now, 0.2); }
+      } else {
+        // carrier: GTO steps up the scale below ~1/3 of top speed, then glides up; IGBT rises smoothly
+        let fc: number, gc: number;
+        if (s.kind === 'gto') {
+          if (u < 0.32) { fc = GTO_SCALE[Math.min(7, Math.floor((u / 0.32) * 8))]; gc = 0.045; }
+          else { fc = 700 + 900 * ((u - 0.32) / 0.68); gc = 0.028 * (1.1 - u); }
+        } else { fc = (s.kind === 'hsr' ? 900 : 600) + 1500 * u; gc = 0.016; }
+        const drive = accel > 0.002 ? 1 : brake ? 0.65 : 0.12;
+        if (s.car && s.carF && s.carG) {
+          Slot.ramp(s.car.frequency, fc * s.alt, now, s.kind === 'gto' ? 0.02 : 0.15);
+          Slot.ramp(s.carF.frequency, fc * 1.3, now, 0.1);
+          Slot.ramp(s.carG.gain, gc * drive * clamp(u * 20, 0, 1), now, 0.12);
+        }
+        if (s.whine && s.whineG) {
+          Slot.ramp(s.whine.frequency, ((s.kind === 'hsr' ? 280 : 180) + (s.kind === 'hsr' ? 2200 : 1300) * u) * s.alt, now, 0.15);
+          Slot.ramp(s.whineG.gain, 0.022 * clamp(u * 5, 0, 1) * (0.35 + 0.65 * Math.max(T, brake ? 0.6 : 0)), now, 0.15);
+        }
+        if (s.kind === 'hsr') {
+          // wind roar and pantograph hiss rise steeply with speed
+          if (s.wind && s.windF) { Slot.ramp(s.wind.gain, 0.34 * Math.pow(u, 2.4), now, 0.2); Slot.ramp(s.windF.frequency, 320 + 950 * u, now, 0.2); }
+          if (s.hiss) Slot.ramp(s.hiss.gain, 0.075 * Math.pow(u, 3), now, 0.2);
+        }
+      }
     } else if (s.kind === 'electric') {
       if (s.eng) Slot.ramp(s.eng.gain, 0.04 + 0.05 * T, now, 0.2);
       if (s.whine && s.whineG) {
@@ -504,7 +573,9 @@ export class WorldAudio {
           // departure: whistle / horn
           if (!this.locoPos(t, p)) continue;
           const kind = this.trainKind(t);
-          this.oneShot(kind === 'steam' ? 'whistle' : kind === 'diesel' ? 'horn' : 'horn2', L, p.x, p.y + 0.4, p.z, 1, 2, 0.97 + Math.random() * 0.06);
+          if (kind === 'tram') this.oneShot('tbell', L, p.x, p.y + 0.3, p.z, 1, 2, 0.97 + Math.random() * 0.06);
+          else if (kind === 'resistor' || kind === 'gto' || kind === 'vvvf') this.oneShot('tchime', L, p.x, p.y + 0.3, p.z, 0.7, 1);
+          else this.oneShot(kind === 'steam' ? 'whistle' : kind === 'diesel' ? 'horn' : 'horn2', L, p.x, p.y + 0.4, p.z, kind === 'hsr' ? 0.6 : 1, 2, 0.97 + Math.random() * 0.06);
         } else if (v.state === 'loading' && t.atStation >= 0) {
           const st = g.stations.get(t.atStation);
           if (!st || (this.chimeAt.get(st.id) ?? -1e9) > now - 8) continue;

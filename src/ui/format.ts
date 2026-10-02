@@ -55,3 +55,9 @@ export const KIND_META: Record<LineKind, { label: string; icon: string; vehicle:
   road: { label: 'Bus', icon: 'bus', vehicle: 'bus', vehicles: 'buses', color: 'var(--road)' },
   tram: { label: 'Tram', icon: 'tram', vehicle: 'tram', vehicles: 'trams', color: 'var(--tram)' },
 };
+
+/** Short names and colours of the track types (type picker, route summaries). */
+export const TYPE_META: Record<string, { short: string; color: string }> = {
+  standard: { short: 'Standard', color: '#9aa5b4' }, electric: { short: 'Electric', color: '#5aa9ff' }, highspeed: { short: 'High-speed', color: '#ff5a5f' },
+  metro: { short: 'Metro', color: '#2ec4b6' }, lightrail: { short: 'Light rail', color: '#9bd16a' },
+};

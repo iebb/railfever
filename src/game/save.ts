@@ -16,6 +16,8 @@ import { MODEL_BY_ID } from './vehicle-types';
 import { KMH_TO_UPS } from './constants';
 import type { Vehicle, CargoGroup } from './vehicle';
 import { putSave, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
+import { saveOps, loadOps } from './opcosts';
+import { canonicalizeLines } from './patterns';
 
 const VERSION = 2;
 
@@ -59,8 +61,13 @@ function restoreCargo(v: Vehicle, list: CargoGroup[]) {
   for (const c of list) {
     const k = c.from + ':' + c.alight + ':' + c.dest;
     const o = v.cargo.get(k);
-    if (o) { o.day = (o.day * o.count + c.day * c.count) / Math.max(1, o.count + c.count); o.count += c.count; }
-    else v.cargo.set(k, { ...c });
+    if (o) {
+      const n = Math.max(1, o.count + c.count);
+      o.day = (o.day * o.count + c.day * c.count) / n;
+      if (o.t0 !== undefined || c.t0 !== undefined) o.t0 = ((o.t0 ?? c.t0!) * o.count + (c.t0 ?? o.t0!) * c.count) / n;
+      if (o.transfers || c.transfers) o.transfers = (o.transfers ?? 0) + (c.transfers ?? 0);
+      o.count += c.count;
+    } else v.cargo.set(k, { ...c });
   }
 }
 
@@ -69,13 +76,30 @@ function baseOf(v: Vehicle) {
     id: v.id, owner: v.owner, name: v.name, lineId: v.lineId, stopIndex: v.stopIndex, cargo: cargoOf(v), load: v.load,
     state: v.state, status: v.status, profitYear: v.profitYear, profitLast: v.profitLast, incomeYear: v.incomeYear,
     boughtDay: v.boughtDay, value: v.value, stateTime: v.stateTime, homeX: v.homeX, homeZ: v.homeZ, delivered: v.delivered,
+    // ops: service pattern, overtaking hold, odometer and last month's costs, train energy counters (opcosts.ts)
+    pattern: v.pattern ?? null, holdTime: v.holdTime, ops: [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt], opLast: v.opLast,
+    phys: physOf(v),
   };
+}
+/** Energy counters a train's physics keeps between the monthly charges (if it has them). */
+function physOf(v: Vehicle): number[] | null {
+  const p = v as unknown as { tractionJ?: number; regenJ?: number; auxJ?: number; km?: number; hours?: number };
+  return typeof p.tractionJ === 'number' ? [p.tractionJ, p.regenJ ?? 0, p.auxJ ?? 0, p.km ?? 0, p.hours ?? 0] : null;
 }
 function restoreBase(v: Vehicle, d: any) {
   v.owner = d.owner; v.name = d.name; v.lineId = d.lineId; v.stopIndex = d.stopIndex; restoreCargo(v, d.cargo ?? []);
   v.load = d.load; v.state = d.state; v.status = d.status; v.profitYear = d.profitYear; v.profitLast = d.profitLast;
   v.incomeYear = d.incomeYear; v.boughtDay = d.boughtDay; v.value = d.value; v.stateTime = d.stateTime ?? 0;
   v.homeX = d.homeX ?? v.homeX; v.homeZ = d.homeZ ?? v.homeZ; v.delivered = d.delivered ?? 0;
+  if (typeof d.pattern === 'number') v.pattern = d.pattern;
+  v.holdTime = d.holdTime ?? 0;
+  if (Array.isArray(d.ops)) [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt] = (d.ops as number[]).map((x) => Number(x) || 0);
+  else v.opMark = -1;
+  v.opLast = d.opLast ? { ...d.opLast } : null;
+  if (Array.isArray(d.phys)) {
+    const p = v as unknown as Record<string, number>;
+    ['tractionJ', 'regenJ', 'auxJ', 'km', 'hours'].forEach((k, i) => { p[k] = Number(d.phys[i]) || 0; });
+  }
 }
 
 function trainOf(t: Train) {
@@ -139,8 +163,12 @@ export function serialize(g: Game): any {
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, waiting: [...s.waiting.values()] })),
     stationsNextId: g.stations.nextId,
+    // the buildings of the last catchment share-out (the shares are worked out alike after loading)
+    catchMaxB: g.stations.catchMaxB,
     depots: [...g.depots.map.values()], depotsNextId: g.depots.nextId,
     lines: [...g.lines.map.values()], linesNextId: g.lines.nextId,
+    // ops: line ids merged into others as service patterns; this month's track wear; save format of the ops data
+    linesRedirect: [...g.lines.redirect], ops: saveOps(g), opsVersion: 1,
     vehicles: [...g.vehicles.map.values()].map((v) => (v instanceof Train ? trainOf(v) : roadOf(v as RoadVehicle))),
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
@@ -211,7 +239,7 @@ export function deserialize(d: any): Game {
     // station fields (levels, entrances, transfer links, road access) with defaults for older saves
     const st: Station = restoreStation(s);
     st.waitingTotal = 0;
-    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count);
+    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0);
     g.stations.map.set(st.id, st);
   }
   g.stations.nextId = d.stationsNextId;
@@ -219,6 +247,8 @@ export function deserialize(d: any): Game {
   g.depots.nextId = d.depotsNextId;
   for (const l of d.lines as Line[]) g.lines.map.set(l.id, Lines.restore(l));
   g.lines.nextId = d.linesNextId;
+  for (const [k, r] of (d.linesRedirect ?? []) as [number, { line: number; pattern: number }][]) g.lines.redirect.set(k, { line: r.line, pattern: r.pattern });
+  loadOps(g, d.ops);
   g.firstArrival = new Set(d.firstArrival ?? []);
   g.news = (d.news ?? []).map((n: any) => ({ ...n }));
 
@@ -300,11 +330,16 @@ export function deserialize(d: any): Game {
   if (typeof d.vrng === 'number' && VA.rng) VA.rng.state = d.vrng;
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
+  // older maps: town streets ending on a bridge are cut back to the ground (9i)
+  g.towns.tidyBridgeEnds();
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
+  g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
   g.lines.rebuild();
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
   g.lines.catchmentDirty = !!d.catchmentDirty;
+  // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
+  if (!d.opsVersion) canonicalizeLines(g);
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   g.restoreAIs(d);
   if (!d.ambient) V.manageAmbient();

@@ -1,16 +1,20 @@
 // Regional passenger demand. Towns are split into districts (a centre and outer sectors for towns of 1,500+,
 // one region for smaller towns); every region produces trips (from its residents) and attracts them (jobs and
-// residents), and an origin-destination matrix with distance decay and a long tail (intercity trips are a real
-// share) says where they go. Stations draw passengers from the regions in their catchment; passenger generation
-// (game.ts) sends them to the regions the network serves, in proportion to the OD demand. demandView() reports
-// towns, regions, town pairs and the largest regional flows for the UI.
+// residents). Two trip purposes (a gravity model): local trips with a strong distance decay (an origin-destination
+// matrix: most stay in town or go to the next one), and long-distance trips between towns far apart with a weak
+// decay, weighted by both ends' sizes (big towns far apart exchange many). Both are scaled by the trip factor of
+// the service (fares.ts tripFactor: expected door-to-door time against the alternative), so fast, frequent and
+// direct services unlock more trips. Stations draw passengers from the regions in their catchment; passenger
+// generation (game.ts) sends them to the regions the network serves, in proportion to that demand. demandView()
+// reports towns, regions, town pairs and the largest regional flows for the UI.
 import type { Game } from './game';
 import type { Station } from './stations';
 import { WALK_LINE } from './stations';
-import type { Hop } from './lines';
+import type { Hop, Line } from './lines';
+import { tripFactor, refTime, transferWalkTime } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS } from './constants';
+import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS, UNIT_M } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 
 export interface Region {
@@ -26,7 +30,11 @@ export interface Region {
   produced: number; attracted: number;
 }
 
-/** Destinations of a station's passengers: reachable stations, their OD weights, and the served share of its demand. */
+/**
+ * Destinations of a station's passengers: reachable stations and their weights (local and long-distance trips,
+ * scaled by the trip factor of the service there); `served` = their sum = the station's generation rate factor
+ * (1: a station reaching a fair share of its local demand by a typical service).
+ */
 export interface StationDemand { dest: number[]; w: number[]; served: number }
 
 /** Passengers generated per catchment inhabitant per day, before the rating factor (0.2 + rating). */
@@ -36,8 +44,21 @@ export const TRIPS_PER_MONTH = GEN_RATE * DAYS_PER_MONTH * (0.2 + 0.65);
 /** Towns from this size are split into a centre and outer districts. */
 export const DISTRICT_MIN_POP = 1500;
 
-/** Distance decay of the OD matrix: ~1 nearby, a long tail (∝ d^-1.2) for intercity trips. */
-export const odDecay = (d: number) => 1 / Math.pow(1 + (d / 45) * (d / 45), 0.6);
+/** Distance decay of local trips (the OD matrix): ~1 nearby, falling off strongly (∝ d^-1.7) between towns. */
+export const odDecay = (d: number) => 1 / Math.pow(1 + (d / 40) * (d / 40), 0.85);
+/** Long-distance trips: between towns from LD_MIN units apart (fully from LD_FULL), decaying weakly (∝ d^-0.8). */
+export const LD_MIN = 60, LD_FULL = 130;
+export const ldDecay = (d: number) => {
+  if (d <= LD_MIN) return 0;
+  const t = Math.min(1, (d - LD_MIN) / (LD_FULL - LD_MIN));
+  return t * t * (3 - 2 * t) * Math.pow(d / 100, -0.8);
+};
+/** Long-distance trips per inhabitant and month, per 1,000 attraction (jobs + 0.4 residents) at the far end, at 100 units. */
+export const LD_RATE = 0.012;
+/** Trip factor of a typical service of the game (it leaves the demand as it was); fast direct services earn more. */
+export const TF_TYPICAL = 1.2;
+/** Dwell per stop (s) for the expected round trip of a line. */
+const DWELL_S = 25;
 /** Trips within a region (across town): a share of its own attraction (many such trips are walked). */
 const INTRA = 0.35;
 /** Stations closer than this (units) share few trips within a region (people walk). */
@@ -75,8 +96,10 @@ export class DemandModel {
   regions: Region[] = [];
   /** per town: district layout (core radius, sector count) and its region ids (centre / the town first) */
   private towns = new Map<number, { core: number; sectors: number; ids: number[] }>();
-  /** od[r * n + q]: share of the trips produced in r that go to q (rows sum to 1; r -> r: across the region) */
+  /** od[r * n + q]: share of the local trips produced in r that go to q (rows sum to 1; r -> r: across the region) */
   od = new Float32Array(0);
+  /** ld[r * n + q]: long-distance trips per inhabitant of r and month to q (other towns far away; 0 within a town) */
+  ld = new Float32Array(0);
   /** per station: [region, share of its catchment population] */
   shares = new Map<number, [number, number][]>();
   /** bumped when regions or station shares change */
@@ -247,6 +270,63 @@ export class DemandModel {
       }
       if (sum > 0) for (let q = 0; q < n; q++) this.od[r * n + q] /= sum;
     }
+    // long-distance trips: gravity between regions of towns far apart (weak decay, by the far end's attraction)
+    if (this.ld.length !== n * n) this.ld = new Float32Array(n * n);
+    for (let r = 0; r < n; r++) for (let q = 0; q < n; q++) {
+      if (R[r].town === R[q].town) { this.ld[r * n + q] = 0; continue; }
+      const d = Math.hypot(R[r].x - R[q].x, R[r].z - R[q].z);
+      this.ld[r * n + q] = LD_RATE * (R[q].attracted / 1000) * ldDecay(d);
+    }
+  }
+
+  /** Potential trips per month from region r to region q (all modes): local (OD share of r's trips) plus long-distance. */
+  trips(r: number, q: number): number {
+    const n = this.regions.length, R = this.regions;
+    if (r < 0 || q < 0 || r >= n || q >= n) return 0;
+    return R[r].produced * this.od[r * n + q] + R[r].pop * (this.ld[r * n + q] ?? 0);
+  }
+
+  // ---------------------------------------------------------------- service quality (trip factor)
+  private service = new Map<number, { key: string; kmh: number; headway: number }>();
+
+  /** Average speed (km/h, stops included) and headway (s) of a line from its vehicles and stops. */
+  lineService(l: Line): { kmh: number; headway: number } {
+    const g = this.g;
+    const key = `${g.lines.version}:${l.vehicles.length}:${l.stops.length}`;
+    const c = this.service.get(l.id);
+    if (c && c.key === key) return c;
+    let vmax = Infinity;
+    for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) vmax = Math.min(vmax, v.maxSpeedKmh); }
+    if (!isFinite(vmax)) vmax = l.kind === 'rail' ? 100 : 50;
+    const cap = l.kind === 'rail' ? 320 : l.kind === 'tram' ? 70 : 80;
+    const kmh = Math.max(8, Math.min(vmax, cap) * (l.kind === 'rail' ? 0.6 : 0.5));
+    let len = 0;
+    for (let i = 0; i < l.stops.length; i++) {
+      const a = g.stations.get(l.stops[i]), b = g.stations.get(l.stops[(i + 1) % l.stops.length]);
+      if (a && b) len += Math.hypot(a.x - b.x, a.z - b.z) * 1.15;
+    }
+    const round = (len * UNIT_M) / (kmh / 3.6) + l.stops.length * DWELL_S;
+    const out = { key, kmh, headway: round / Math.max(1, l.vehicles.length) };
+    this.service.set(l.id, out);
+    return out;
+  }
+
+  /**
+   * Trip factor (fares.ts tripFactor, relative to a typical service: TF_TYPICAL) of travelling from st to d by the
+   * network: half the first line's headway waiting, riding the routed distance at its speed, and a transfer walk and
+   * wait where the trip changes lines, against the alternative (walking / driving) for the straight distance.
+   */
+  serviceFactor(st: Station, d: Station, hop: Hop): number {
+    const g = this.g;
+    let line = g.lines.get(hop.line), h: Hop | undefined = hop, walks = 0;
+    // (a walk to a linked station first: the line taken from there)
+    for (let i = 0; i < 3 && h && h.line === WALK_LINE; i++) { walks++; h = g.lines.nextHop(h.alight, d.id); line = h ? g.lines.get(h.line) : undefined; }
+    if (!line || !h) return 1;
+    const sv = this.lineService(line);
+    const ride = (Math.max(1, hop.cost) * UNIT_M) / (sv.kmh / 3.6);
+    let t = sv.headway / 2 + ride + walks * transferWalkTime(20);
+    if (h.alight !== d.id) t += transferWalkTime(10) + sv.headway / 2;
+    return tripFactor(t, refTime(Math.hypot(d.x - st.x, d.z - st.z))) / TF_TYPICAL;
   }
 
   /** Which regions each station's catchment covers (after catchments change; game.ts / lines.ts call it). */
@@ -254,9 +334,25 @@ export class DemandModel {
     const g = this.g, w = g.world;
     this.shares.clear();
     const seen = new Set<number>();
+    // strict catchment (stations.ts): each building's people are split among the stations whose circles hold it;
+    // a station draws on its shares only (nothing beyond its circles)
+    const exact = (g.stations as unknown as { buildingShares?: (st: Station) => { ids: number[]; w: number[] } }).buildingShares;
     for (const st of g.stations.map.values()) {
       if (!stationActive(g, st)) continue;
       const m = new Map<number, number>();
+      if (exact) {
+        const sh = exact.call(g.stations, st);
+        for (let i = 0; i < sh.ids.length; i++) {
+          const b = w.buildings.get(sh.ids[i]);
+          if (!b || b.pop <= 0) continue;
+          const r = this.regionOf(b);
+          if (r >= 0) m.set(r, (m.get(r) ?? 0) + b.pop * sh.w[i]);
+        }
+        let tot = 0;
+        for (const v of m.values()) tot += v;
+        if (tot > 0) this.shares.set(st.id, [...m].sort((a, b) => a[0] - b[0]).map(([r, v]) => [r, v / tot]));
+        continue;
+      }
       seen.clear();
       for (const c of catchmentCircles(g, st)) {
         for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
@@ -291,17 +387,36 @@ export class DemandModel {
     if (c) return c;
     const table = g.lines.routing.get(st.id), origin = this.shares.get(st.id);
     if (!table || !origin || !this.regions.length || !stationActive(g, st)) { this.cache.set(st.id, NO_DEMAND); return NO_DEMAND; }
-    const n = this.regions.length, od = this.od;
-    const dest: number[] = [], w: number[] = [];
-    let served = 0;
-    for (const d of table.keys()) {
+    const n = this.regions.length, od = this.od, ld = this.ld;
+    const parts: { d: number; x: number; y: number; f: number }[] = [];
+    let local = 0, localF = 0;
+    for (const [d, hop] of table) {
       const ds = g.stations.get(d);
       if (!ds || !stationActive(g, ds)) continue;
-      let x = 0;
+      // local trips (the OD share) and long-distance trips (relative to the local trip rate) to d's regions
+      let x = 0, y = 0;
       const walk = Math.min(1, Math.hypot(ds.x - st.x, ds.z - st.z) / WALK);
-      for (const [q, cov] of this.coverage(ds)) for (const [r, sr] of origin) if (r < n && q < n) x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
-      if (!(x > 0)) continue;
-      dest.push(d); w.push(x); served += x;
+      for (const [q, cov] of this.coverage(ds)) for (const [r, sr] of origin) {
+        if (r >= n || q >= n) continue;
+        x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
+        y += sr * (ld[r * n + q] ?? 0) * cov;
+      }
+      y /= TRIPS_PER_MONTH;
+      if (!(x > 0) && !(y > 0)) continue;
+      const f = this.serviceFactor(st, ds, hop);
+      parts.push({ d, x, y, f });
+      local += x; localF += x * f;
+    }
+    // local trips: the station's rate (60% of the full rate for a single destination, the full rate once it reaches
+    // 15% of its local demand) times the mean trip factor, shared out by OD x trip factor; long-distance trips on top
+    const rate = local > 0 ? (0.6 + 0.4 * Math.min(1, local / 0.15)) * Math.max(0.6, Math.min(1.6, localF / local)) : 0;
+    const k = localF > 0 ? rate / localF : 0;
+    const dest: number[] = [], w: number[] = [];
+    let served = 0;
+    for (const p of parts) {
+      const v = p.x * p.f * k + p.y * Math.max(0.3, Math.min(2, p.f));
+      if (!(v > 0)) continue;
+      dest.push(p.d); w.push(v); served += v;
     }
     const res: StationDemand = { dest, w, served };
     this.cache.set(st.id, res);
@@ -415,7 +530,7 @@ function computeView(g: Game, company: number): DemandView {
       }
     }
   }
-  const trips = (r: number, q: number) => R[r].produced * m.od[r * n + q];
+  const trips = (r: number, q: number) => m.trips(r, q);
   const regions: DemandRegion[] = R.map((r) => ({ ...r, served: r.pop > 0 ? Math.min(1, servedPop[r.id] / r.pop) : 0 }));
   // towns
   const towns: DemandTown[] = T.map((t) => ({

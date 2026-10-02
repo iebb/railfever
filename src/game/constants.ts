@@ -22,15 +22,38 @@ export interface TrackType {
   speed: number;
   maxGrade: number;
   minRadius: number;
+  /** per unit of track, overhead wire included on electrified track */
   costPerUnit: number;
   maintPerUnit: number;
+  /** overhead wire: electric traction needs it */
   electrified: boolean;
+  /** what the track is for (stations take their mode from their platform track) */
+  mode: 'mainline' | 'metro' | 'lightrail';
+  /** earthworks of its formation relative to heavy rail (light rail: narrower and lighter) */
+  formation: number;
 }
 
+/**
+ * Track types. `standard` is unelectrified; `electric` is the same main-line track with overhead wire (what
+ * `electrify` turns standard track into); `metro` is electrified urban rail (tighter curves, steeper grades,
+ * ~100 km/h), `lightrail` light electrified track (tight curves, steep grades, a light formation).
+ */
 export const TRACK_TYPES: Record<string, TrackType> = {
-  standard: { id: 'standard', name: 'Standard track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 7500, maintPerUnit: 300, electrified: false },
-  highspeed: { id: 'highspeed', name: 'High-speed track (electrified)', speed: 300, maxGrade: 0.03, minRadius: 30, costPerUnit: 14000, maintPerUnit: 600, electrified: true },
+  standard: { id: 'standard', name: 'Standard track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 7500, maintPerUnit: 300, electrified: false, mode: 'mainline', formation: 1 },
+  electric: { id: 'electric', name: 'Electrified track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 10000, maintPerUnit: 380, electrified: true, mode: 'mainline', formation: 1 },
+  highspeed: { id: 'highspeed', name: 'High-speed track (electrified)', speed: 400, maxGrade: 0.03, minRadius: 40, costPerUnit: 22000, maintPerUnit: 900, electrified: true, mode: 'mainline', formation: 1.1 },
+  metro: { id: 'metro', name: 'Metro track (electrified)', speed: 100, maxGrade: 0.045, minRadius: 8, costPerUnit: 9500, maintPerUnit: 400, electrified: true, mode: 'metro', formation: 0.9 },
+  lightrail: { id: 'lightrail', name: 'Light rail track (electrified)', speed: 80, maxGrade: 0.07, minRadius: 3, costPerUnit: 6500, maintPerUnit: 260, electrified: true, mode: 'lightrail', formation: 0.6 },
 };
+
+/** Overhead wire for existing track (`electrify`): standard -> electric, per unit of track. */
+export const ELECTRIFY = { costPerUnit: 2500, from: 'standard', to: 'electric' };
+
+/**
+ * Levels a line can be built at (BuildOptions.level): viaduct deck height above the ground beneath, and
+ * tunnel depth below the ground above (units, 1 = 10 m).
+ */
+export const LINE_LEVEL = { height: { min: 1.2, max: 1.8, def: 1.5 }, depth: { min: 1.5, max: 3, def: 2.2 } };
 
 export interface RoadType {
   id: string;

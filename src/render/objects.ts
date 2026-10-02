@@ -14,13 +14,14 @@ import { WATER_Y } from '../game/constants';
 import { GeoBuilder } from './geo';
 import { Materials } from './materials';
 import { WB, mergeGeos, farPart, concatFar, FarPart } from './build-mesh';
+import { Drape } from './build-drape';
 import { ChunkCtx, SignalLamp, Boom, XLight, chunkIndexOf, hexToInt, stationEdgeLevels } from './build-common';
 import { buildRailEdge, buildRailNode } from './build-rail';
 import { buildRoadEdge, buildRoadNode, buildBusStops, buildCrossing } from './build-road';
 import { buildStation, buildDepot } from './build-stations';
 import { portalKeepouts, inKeepout, Keepout } from './build-structures';
 import { buildBuilding, FacadeBuilder } from './build-buildings';
-import { createTreeGeometries, createImpostorGeometry, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance } from './trees';
+import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance } from './trees';
 
 /** Object chunks per super-chunk side. */
 const SC = 2;
@@ -86,8 +87,9 @@ interface Super {
   /** near tree instance data per variant, far impostor instance data */
   nearM: Float32Array[] | null;
   nearC: Float32Array[] | null;
-  farM: Float32Array | null;
-  farC: Float32Array | null;
+  /** far impostor instances per kind (broadleaf, conifer) */
+  farM: Float32Array[] | null;
+  farC: Float32Array[] | null;
   detail: THREE.Mesh | null;
   /** details of all its chunks are built (they are built when the camera comes near, dropped when it leaves) */
   detailBuilt: boolean;
@@ -123,7 +125,7 @@ export class ObjectsView {
   private outs: ChunkOut[];
   private supers: Super[];
   private treeGeos: THREE.BufferGeometry[];
-  private impGeo: THREE.BufferGeometry;
+  private impGeos: THREE.BufferGeometry[];
   private dynDirty = true;
   private lampMesh: THREE.InstancedMesh | null = null;
   private lampList: SignalLamp[] = [];
@@ -140,6 +142,9 @@ export class ObjectsView {
   private hasCam = false;
   /** super-chunks waiting for their details */
   private detailQueue = new Set<number>();
+  /** per chunk: hash of the terrain heights under it and a 2-unit margin (draped roads reach over the border) */
+  private tsig: Float64Array;
+  private hv = -1;
   /** camera frustum: near trees only for super-chunks in (or close to) the view */
   private frustum = new THREE.Frustum();
   private fm = new THREE.Matrix4();
@@ -158,7 +163,7 @@ export class ObjectsView {
   private regions: { near: (THREE.InstancedMesh | null)[]; ncap: number[]; dirty: boolean }[];
   /** impostor regions (IRF x IRF super-chunks): every tree of the region (the shader hides the near ones) */
   private nri: number;
-  private impRegions: { mesh: THREE.InstancedMesh | null; cap: number; dirty: boolean }[];
+  private impRegions: { mesh: (THREE.InstancedMesh | null)[]; cap: number[]; dirty: boolean }[];
   /** far world regions (RS x RS super-chunks) */
   private nl: number;
   private fregions: FarRegion[];
@@ -167,6 +172,7 @@ export class ObjectsView {
     this.n = Math.ceil(game.world.size / OBJ_CHUNK);
     this.ns = Math.ceil(this.n / SC);
     this.outs = Array.from({ length: this.n * this.n }, EMPTY_OUT);
+    this.tsig = new Float64Array(this.n * this.n).fill(-1);
     this.supers = Array.from({ length: this.ns * this.ns }, () => ({
       group: new THREE.Group(), meshes: [], treeSig: -1, treeBox: new THREE.Box3(), nearM: null, nearC: null, farM: null, farC: null, detail: null, detailBuilt: false,
       world: null, nA: 0, nB: 0, nC: 0, bldFar: null, box: new THREE.Box3(), empty: true, detailOn: true, nearOn: true,
@@ -176,11 +182,11 @@ export class ObjectsView {
     this.treeGeos = createTreeGeometries();
     this.regions = Array.from({ length: this.nr * this.nr }, () => ({ near: this.treeGeos.map(() => null), ncap: this.treeGeos.map(() => 0), dirty: true }));
     this.nri = Math.ceil(this.ns / IRF);
-    this.impRegions = Array.from({ length: this.nri * this.nri }, () => ({ mesh: null, cap: 0, dirty: true }));
+    this.impRegions = Array.from({ length: this.nri * this.nri }, () => ({ mesh: new Array(IMPOSTOR_KINDS).fill(null), cap: new Array(IMPOSTOR_KINDS).fill(0), dirty: true }));
     this.nl = Math.ceil(this.ns / RS);
     this.fregions = Array.from({ length: this.nl * this.nl }, () => ({ mesh: null, glow: null, dirty: true, far: false, box: new THREE.Box3() }));
     mats.uniforms.uTreeDist.value = TREE_DIST;
-    this.impGeo = createImpostorGeometry();
+    this.impGeos = createImpostorGeometries();
     // barrier boom: red/white bar along +x from the pivot, unit length
     const bg = new GeoBuilder();
     for (let i = 0; i < 6; i++) { bg.color(i % 2 ? 0xffffff : 0xd0302a); bg.box((i + 0.5) / 6, -0.009, 0, 1 / 6, 0.018, 0.016, 1, 0, false); }
@@ -197,12 +203,44 @@ export class ObjectsView {
     for (let i = 0; i < this.fregions.length; i++) this.buildFarRegion(i);
     this.dynDirty = true;
     this.game.world.dirtyObj.clear();
+    this.hv = this.game.world.heightsVersion;
+  }
+
+  /** Hash of the terrain heights of chunk ci and a 2-unit margin around it. */
+  private terrainHash(ci: number): number {
+    const w = this.game.world, S = w.size, s1 = S + 1, n = this.n;
+    const bits = new Uint32Array(w.h.buffer, w.h.byteOffset, w.h.length);
+    const cx = ci % n, cz = Math.floor(ci / n);
+    const x0 = Math.max(0, cx * OBJ_CHUNK - 2), x1 = Math.min(S, (cx + 1) * OBJ_CHUNK + 2);
+    const z0 = Math.max(0, cz * OBJ_CHUNK - 2), z1 = Math.min(S, (cz + 1) * OBJ_CHUNK + 2);
+    let h = 2166136261;
+    for (let z = z0; z <= z1; z++) for (let i = z * s1 + x0, e = z * s1 + x1; i <= e; i++) h = Math.imul(h ^ bits[i], 16777619);
+    return h >>> 0;
+  }
+
+  /** Terrain changed: neighbours of dirty chunks whose margin heights changed rebuild too (draped roads). */
+  private markTerrainNeighbours() {
+    const w = this.game.world, n = this.n;
+    if (w.heightsVersion === this.hv) return;
+    this.hv = w.heightsVersion;
+    for (const c of [...w.dirtyObj]) {
+      if (c < 0 || c >= this.outs.length) continue;
+      const cx = c % n, cz = Math.floor(c / n);
+      for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) {
+        const x = cx + dx, z = cz + dz;
+        if ((dx === 0 && dz === 0) || x < 0 || z < 0 || x >= n || z >= n) continue;
+        const nj = z * n + x;
+        if (w.dirtyObj.has(nj) || this.tsig[nj] < 0) continue;
+        if (this.terrainHash(nj) !== this.tsig[nj]) w.dirtyObj.add(nj);
+      }
+    }
   }
 
   /** Rebuild dirty chunks within a time budget (ms); their super-chunks are re-merged right away. */
   update(budgetMs = 6) {
     const w = this.game.world;
     const start = performance.now();
+    if (w.dirtyObj.size) this.markTerrainNeighbours();
     if (w.dirtyObj.size) {
       const supers = new Set<number>();
       for (const c of [...w.dirtyObj]) {
@@ -406,41 +444,43 @@ export class ObjectsView {
         mesh.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
       }
     }
-    // impostors: every tree of the region (static until the region's trees change)
+    // impostors: every tree of the region (static until the region's trees change), one mesh per kind
     for (let ri = 0; ri < this.impRegions.length; ri++) {
       const R = this.impRegions[ri];
       if (!R.dirty) continue;
       R.dirty = false;
       const rx = ri % this.nri, rz = Math.floor(ri / this.nri);
       const members: Super[] = [];
-      let total = 0;
       for (let sz = rz * IRF; sz < Math.min(this.ns, rz * IRF + IRF); sz++) for (let sx = rx * IRF; sx < Math.min(this.ns, rx * IRF + IRF); sx++) {
         const s = this.supers[sz * this.ns + sx];
-        if (!s.farM) continue;
-        members.push(s);
-        total += s.farM.length / 16;
+        if (s.farM) members.push(s);
       }
-      if (!total) { if (R.mesh) R.mesh.visible = false; continue; }
-      if (!R.mesh || R.cap < total) {
-        if (R.mesh) { this.group.remove(R.mesh); R.mesh.dispose(); }
-        R.cap = Math.ceil(total * 1.05) + 64;
-        R.mesh = makeImpostorMesh(this.impGeo, this.mats.treeFar, R.cap);
-        this.group.add(R.mesh);
+      for (let kd = 0; kd < IMPOSTOR_KINDS; kd++) {
+        let total = 0;
+        for (const s of members) total += s.farM![kd].length / 16;
+        if (!total) { if (R.mesh[kd]) R.mesh[kd]!.visible = false; continue; }
+        if (!R.mesh[kd] || R.cap[kd] < total) {
+          if (R.mesh[kd]) { this.group.remove(R.mesh[kd]!); R.mesh[kd]!.dispose(); }
+          R.cap[kd] = Math.ceil(total * 1.05) + 64;
+          R.mesh[kd] = makeImpostorMesh(this.impGeos[kd], this.mats.treeFar, R.cap[kd]);
+          this.group.add(R.mesh[kd]!);
+        }
+        const mesh = R.mesh[kd]!;
+        const ma = mesh.instanceMatrix.array as Float32Array, ca = mesh.instanceColor!.array as Float32Array;
+        let o = 0;
+        const box = new THREE.Box3();
+        for (const s of members) {
+          if (!s.farM![kd].length) continue;
+          ma.set(s.farM![kd], o * 16);
+          ca.set(s.farC![kd], o * 3);
+          o += s.farM![kd].length / 16;
+          box.union(s.treeBox);
+        }
+        mesh.count = o;
+        mesh.visible = true;
+        uploadInstances(mesh, o);
+        mesh.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
       }
-      const mesh = R.mesh;
-      const ma = mesh.instanceMatrix.array as Float32Array, ca = mesh.instanceColor!.array as Float32Array;
-      let o = 0;
-      const box = new THREE.Box3();
-      for (const s of members) {
-        ma.set(s.farM!, o * 16);
-        ca.set(s.farC!, o * 3);
-        o += s.farM!.length / 16;
-        box.union(s.treeBox);
-      }
-      mesh.count = o;
-      mesh.visible = true;
-      uploadInstances(mesh, o);
-      mesh.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
     }
   }
 
@@ -460,7 +500,7 @@ export class ObjectsView {
     const W = this.wb.reset(mode === 'detail'), Dt = this.db.reset(mode === 'world');
     const ctx: ChunkCtx = {
       game: g, ci, n, x0, z0, x1, z1, w: W, d: Dt, fac: new FacadeBuilder(W),
-      lights: [], sigLamps: [], booms: [], xLights: [], trees: [], stationEdges: stationEdgeLevels(g),
+      lights: [], sigLamps: [], booms: [], xLights: [], trees: [], stationEdges: stationEdgeLevels(g), drape: new Drape(w),
     };
     const mine = (x: number, z: number) => chunkIndexOf(x, z, n) === ci;
     const pad = 1;
@@ -532,6 +572,7 @@ export class ObjectsView {
       ctx.trees.push({ type: treeVariant(t.type, (h * 7.13) % 1), x: t.x, y: y - 0.03, z: t.z, s: t.s, rot: h * Math.PI * 2, tint: t.tint });
     }
     const kept = mode === 'detail' && prev;
+    if (!kept) this.tsig[ci] = this.terrainHash(ci);
     const world = kept ? prev.world : ctx.w.empty ? null : ctx.w.build();
     return {
       world, netFar: kept ? prev.netFar : farPart([world]),
@@ -636,7 +677,7 @@ export class ObjectsView {
         const trees = allTrees;
         const nd = nearTreeData(trees, this.treeGeos.length);
         s.nearM = nd.m; s.nearC = nd.c;
-        const fd = impostorData(trees);
+        const fd = impostorData(trees, this.treeGeos, this.impGeos);
         s.farM = fd.m; s.farC = fd.c;
         let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
         for (const t of trees) {
@@ -828,13 +869,13 @@ export class ObjectsView {
     for (const m of [this.lampMesh, this.boomMesh, this.xlMesh]) if (m) { this.group.remove(m); m.dispose(); }
     this.lampMesh = this.boomMesh = this.xlMesh = null;
     for (const R of this.regions) R.near.forEach((m, v) => { if (m) { this.group.remove(m); m.dispose(); R.near[v] = null; } });
-    for (const R of this.impRegions) if (R.mesh) { this.group.remove(R.mesh); R.mesh.dispose(); R.mesh = null; }
+    for (const R of this.impRegions) for (let kd = 0; kd < R.mesh.length; kd++) { const m = R.mesh[kd]; if (m) { this.group.remove(m); m.dispose(); R.mesh[kd] = null; } }
     for (const R of this.fregions) {
       if (R.mesh) { this.group.remove(R.mesh); R.mesh.geometry.dispose(); R.mesh = null; }
       if (R.glow) { this.group.remove(R.glow); R.glow.geometry.dispose(); R.glow = null; }
     }
     for (const geo of this.treeGeos) geo.dispose();
-    this.impGeo.dispose();
+    for (const g of this.impGeos) g.dispose();
     this.boomGeo.dispose();
     this.lampGeo.dispose();
   }

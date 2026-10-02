@@ -316,7 +316,8 @@ function lineTrack(g: Game, lineId: number): Set<number> {
     }
     for (const c of best?.conts ?? []) E.add(c.edge.id);
   }
-  // alternatives between nodes of the routes: passing loops, second tracks, crossovers, throat tracks
+  // alternatives between nodes of the routes: passing loops, second tracks, crossovers, throat tracks and turnout
+  // ladders (through further switches), up to 400 units
   const routeNodes = new Set<number>();
   for (const id of E) { const e = net.edges.get(id); if (e) { routeNodes.add(e.a); routeNodes.add(e.b); } }
   for (const nid of [...routeNodes]) {
@@ -324,16 +325,17 @@ function lineTrack(g: Game, lineId: number): Set<number> {
     if (!n || n.edges.length < 3) continue;
     for (const eid of n.edges) {
       if (E.has(eid)) continue;
-      const chain: number[] = [];
-      let cur = net.edges.get(eid), at = nid, len = 0;
-      while (cur && cur.kind === 'rail' && cur.depot < 0 && len < 400) {
-        chain.push(cur.id);
-        len += cur.len;
-        at = cur.a === at ? cur.b : cur.a;
-        if (routeNodes.has(at)) { for (const id of chain) E.add(id); break; }
+      const stack: { edge: number; from: number; len: number; path: number[] }[] = [{ edge: eid, from: nid, len: 0, path: [] }];
+      for (let guard = 0; stack.length && guard < 300; guard++) {
+        const c = stack.pop()!;
+        const e = net.edges.get(c.edge);
+        if (!e || e.kind !== 'rail' || e.depot >= 0 || c.path.includes(e.id)) continue;
+        const path = [...c.path, e.id], len = c.len + e.len;
+        const at = e.a === c.from ? e.b : e.a;
+        if (routeNodes.has(at)) { for (const id of path) E.add(id); continue; }
         const m = net.nodes.get(at);
-        if (!m || m.edges.length !== 2) break;
-        cur = net.edges.get(m.edges[0] === cur.id ? m.edges[1] : m.edges[0]);
+        if (!m || len > 400) continue;
+        for (const x of m.edges) if (x !== e.id && !E.has(x)) stack.push({ edge: x, from: at, len, path });
       }
     }
   }
@@ -418,13 +420,15 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
     }
     res.signals.push({ x: p.x, z: p.z, edge: edge.id, s, node, forward, kind, pass, role, action });
   };
-  // ---- station starters (platform and through tracks), facing the departure, passable from behind
+  // ---- station starters (platform and through tracks), facing the departure, passable from behind; a track
+  // made directional (a one-way signal at an end that trains may not pass from behind) keeps its signals
+  const oneWay = (nid: number) => { const n = net.nodes.get(nid); return !!n && n.signal >= 2 && !n.signalPass; };
   for (const sid of [...stations].sort((a, b) => a - b)) {
     const st = g.stations.get(sid);
     if (!st || !st.rail) continue;
     for (const t of g.stations.trackEnds(st, true)) for (const nid of [t.front, t.back]) {
       const n = net.nodes.get(nid);
-      if (!n || n.edges.length !== 2) continue;
+      if (!n || n.edges.length !== 2 || oneWay(t.front) || oneWay(t.back)) continue;
       const own = n.edges.map((id) => net.edges.get(id)!).find((e) => e.station === st.id || through.has(e.id));
       const other = n.edges.map((id) => net.edges.get(id)!).find((e) => e !== own);
       if (!own || !other || !E.has(other.id) || other.depot >= 0) continue;
@@ -435,7 +439,7 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
   for (const dp of g.depots.all()) {
     if (dp.kind !== 'rail' || dp.owner !== owner) continue;
     const stub = net.edges.get(dp.edge), n = net.nodes.get(dp.node);
-    if (!stub || !n || n.edges.length !== 2 || !n.edges.some((id) => E.has(id) && id !== stub.id)) continue;
+    if (!stub || !n || n.edges.length !== 2 || oneWay(n.id) || !n.edges.some((id) => E.has(id) && id !== stub.id)) continue;
     const other = net.edges.get(n.edges[0] === stub.id ? n.edges[1] : n.edges[0])!;
     if (other.station >= 0) continue;
     want(stub, n.id === stub.b ? stub.len : 0, n.id === stub.b, 'path', true, 'depot');
@@ -446,12 +450,19 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
   const twins = new Map<string, number>();
   for (const c of chains) twins.set(pairKey(c), (twins.get(pairKey(c)) ?? 0) + 1);
   for (const c of chains) {
-    // direction of existing one-way (non-passable) signals inside the chain
+    // direction of existing one-way (non-passable) signals inside the chain and at its ends (e.g. the starters of
+    // a directional line's stations)
     let fw = 0, bw = 0;
     for (let i = 0; i + 1 < c.steps.length; i++) {
       const st = c.steps[i], nid = st.dir > 0 ? st.edge.b : st.edge.a, n = net.nodes.get(nid)!;
       if (n.signal < 2 || n.signalPass) continue;
       if (signalAllows(g, st.edge, st.dir, nid)) fw++; else bw++;
+    }
+    {
+      const s0 = c.steps[0], s1 = c.steps[c.steps.length - 1];
+      const n0 = net.nodes.get(c.start), n1 = net.nodes.get(c.end);
+      if (n0 && n0.signal >= 2 && !n0.signalPass && n0.edges.length === 2) { if (net.signalFor(n0, leaveSide(s0.edge, s0.dir, c.start)) > 0) fw++; else bw++; }
+      if (n1 && n1.signal >= 2 && !n1.signalPass && n1.edges.length === 2 && c.end !== c.start) { if (signalAllows(g, s1.edge, s1.dir, c.end)) fw++; else bw++; }
     }
     if (fw && bw) { res.warnings.push('Track with one-way signals facing both ways left as it is'); continue; }
     if (fw || bw) {

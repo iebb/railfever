@@ -4,6 +4,7 @@ import { World, TERRAIN_CHUNK, OBJ_CHUNK } from '../game/world';
 import { WATER_Y } from '../game/constants';
 import { NOISE_GLSL } from './shaders';
 import { GeoBuilder } from './geo';
+import { detailTextures } from './terrain-tex';
 
 export interface TerrainUniforms {
   uGrid: { value: number };
@@ -17,7 +18,7 @@ export interface TerrainUniforms {
 }
 
 /** Depth of the crack-hiding skirts hanging below every chunk border. */
-const SKIRT = 4;
+const SKIRT = 6;
 /** LOD steps (vertex spacing 1, 2, 4, 8, 16 units). */
 const LODS = 5;
 /** Render chunk size (a multiple of the world's TERRAIN_CHUNK dirty-tracking size): few draw calls. */
@@ -82,7 +83,18 @@ function chunkIndex(vw: number, vh: number): ChunkIndex {
   return ci;
 }
 
-interface ChunkInfo { x0: number; z0: number; x1: number; z1: number; minY: number; maxY: number; lod: number; range: number; ix: ChunkIndex }
+interface ChunkInfo {
+  x0: number; z0: number; x1: number; z1: number; minY: number; maxY: number;
+  /** LOD wanted for the camera, and the one drawn (a coarse mesh may still wait to be built) */
+  lod: number; shown: number; range: number; ix: ChunkIndex;
+  /** full resolution (all LOD index ranges: the shadow pass draws a coarser one) */
+  geo0: THREE.BufferGeometry;
+  /** LOD >= 1: own vertices every 2^lod units, each lowered by the local LOD error (built lazily) */
+  coarse: (THREE.BufferGeometry | null)[];
+  drops: (Float32Array | null)[];
+  /** lowering of geo0's shadow-pass range (< 0: not computed yet) */
+  shadowDrop: number;
+}
 const NEIGH = [-1, 0, 1, 0, 0, -1, 0, 1];
 
 /**
@@ -94,13 +106,59 @@ const NEIGH = [-1, 0, 1, 0, 0, -1, 0, 1];
 const GROUP_GRID = 128;
 interface GroupInfo {
   members: number[]; x0: number; z0: number; x1: number; z1: number;
-  mesh: THREE.Mesh | null; ix: ChunkIndex | null;
-  /** geometry / vegetation attributes out of date (a member was rebuilt / refreshed) */
-  stale: boolean; auxStale: boolean;
-  active: boolean; range: number; ok: boolean;
+  mesh: THREE.Mesh | null;
+  /** merged geometry per absolute LOD (>= groupLod), lowered like the chunks' coarse levels, built lazily */
+  geos: (THREE.BufferGeometry | null)[];
+  /** vegetation attributes out of date (a member's were refreshed) */
+  auxStale: boolean;
+  active: boolean; level: number; ok: boolean;
 }
 
 const quantY = (y: number) => Math.max(-32767, Math.min(32767, Math.round(y * YQ)));
+
+/**
+ * Lift of draped road surfaces above the exact terrain (World.heightAt): road vehicles on ground sections ride
+ * on it, the static road drape uses it.
+ */
+export const ROAD_DRAPE = 0.02;
+
+/**
+ * Per-vertex lowering of a coarse grid (cw x ch cells of st units from (x0, z0)) so that no coarse triangle
+ * rises above the exact 1-unit surface: each vertex drops by the largest error (coarse - exact) of the coarse
+ * triangles around it, including the cells just outside the region, so neighbouring regions agree on shared
+ * borders. Anything lying on the exact surface (draped roads, rails, buildings) stays visible at every LOD,
+ * and coarse shadow casters cannot shadow the surface itself.
+ */
+function coarseDrops(w: World, x0: number, z0: number, cw: number, ch: number, st: number): Float32Array {
+  const CW = cw + 2, CH = ch + 2;
+  const errB = new Float32Array(CW * CH), errD = new Float32Array(CW * CH);
+  const inv = 1 / st;
+  for (let cj = 0; cj < CH; cj++) for (let ci = 0; ci < CW; ci++) {
+    const xa = x0 + (ci - 1) * st, za = z0 + (cj - 1) * st;
+    const ha = w.vh(xa, za), hb = w.vh(xa + st, za), hc = w.vh(xa + st, za + st), hd = w.vh(xa, za + st);
+    let eB = 0, eD = 0;
+    // same split as World.heightAt: triangles (a, c, b) for u >= v and (a, d, c) for v >= u
+    for (let j = 0; j <= st; j++) {
+      const v = j * inv;
+      for (let i = 0; i <= st; i++) {
+        const u = i * inv, h = w.vh(xa + i, za + j);
+        if (u >= v) { const e = ha + (hb - ha) * u + (hc - hb) * v - h; if (e > eB) eB = e; }
+        if (v >= u) { const e = ha + (hc - hd) * u + (hd - ha) * v - h; if (e > eD) eD = e; }
+      }
+    }
+    errB[cj * CW + ci] = eB; errD[cj * CW + ci] = eD;
+  }
+  // border vertices stay within the crack-hiding skirts of neighbouring regions; inside, any depth is fine
+  const vw = cw + 1, vh = ch + 1, drop = new Float32Array(vw * vh), cap = SKIRT - 0.5;
+  for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
+    // vertex (i, j) is corner a of cell (i, j) [both triangles], b of (i-1, j) [B], c of (i-1, j-1) [both], d of (i, j-1) [D]
+    const A = (j + 1) * CW + i + 1, Bc = (j + 1) * CW + i, Cc = j * CW + i, Dc = j * CW + i + 1;
+    const e = Math.max(errB[A], errD[A], errB[Bc], errB[Cc], errD[Cc], errD[Dc]);
+    const edge = i === 0 || j === 0 || i === vw - 1 || j === vh - 1;
+    drop[j * vw + i] = e > 0.004 ? Math.min(edge ? cap : 60, e + 0.01) : 0;
+  }
+  return drop;
+}
 
 /**
  * Compact vertices of a vw x vh grid with spacing `st` from (x0, z0): chunk-local integer x/z, height in 1/128
@@ -120,7 +178,13 @@ function fillGrid(w: World, x0: number, z0: number, st: number, vw: number, vh: 
     nrm[k * 4] = Math.round(-dx * l); nrm[k * 4 + 1] = Math.round(l); nrm[k * 4 + 2] = Math.round(-dz * l);
     k++;
   }
-  // skirt vertices below the border (copy normals so they shade like the surface)
+  addSkirts(pos, nrm, vw, vh);
+  return [minY, maxY];
+}
+
+/** Skirt vertices below the border of a vw x vh grid (copy normals so they shade like the surface). */
+function addSkirts(pos: Int16Array, nrm: Int8Array, vw: number, vh: number) {
+  let k = vw * vh;
   const skirtOf = (src: number) => {
     pos[k * 3] = pos[src * 3]; pos[k * 3 + 1] = Math.max(-32767, pos[src * 3 + 1] - SKIRT * YQ); pos[k * 3 + 2] = pos[src * 3 + 2];
     nrm[k * 4] = nrm[src * 4]; nrm[k * 4 + 1] = nrm[src * 4 + 1]; nrm[k * 4 + 2] = nrm[src * 4 + 2];
@@ -130,7 +194,6 @@ function fillGrid(w: World, x0: number, z0: number, st: number, vw: number, vh: 
   for (let i = 0; i < vw; i++) skirtOf((vh - 1) * vw + i);
   for (let j = 0; j < vh; j++) skirtOf(j * vw);
   for (let j = 0; j < vh; j++) skirtOf(j * vw + vw - 1);
-  return [minY, maxY];
 }
 
 /** Copy the attribute values of the border vertices to the skirt vertices that follow the grid. */
@@ -175,8 +238,11 @@ export class TerrainView {
   private edgeH: Float32Array;
   private camPos = new THREE.Vector3();
   private saved = new THREE.Vector2();
+  private shadowSwapped = false;
   /** minimum LOD used when the terrain casts shadows */
   shadowLod = 1;
+  /** shadow camera that gets exact full-resolution casters (the near cascade), set by the renderer */
+  exactShadowCamera: THREE.Camera | null = null;
   /** 2x2 merged far-chunk meshes */
   private groups: GroupInfo[] = [];
   private ng = 0;
@@ -243,7 +309,7 @@ export class TerrainView {
       }
       const x0 = gx * 2 * this.rc, z0 = gz * 2 * this.rc, x1 = Math.min(s, x0 + 2 * this.rc), z1 = Math.min(s, z0 + 2 * this.rc);
       const ok = members.length > 1 && (x1 - x0) % this.groupStep === 0 && (z1 - z0) % this.groupStep === 0;
-      this.groups.push({ members, x0, z0, x1, z1, mesh: null, ix: null, stale: true, auxStale: false, active: false, range: -1, ok });
+      this.groups.push({ members, x0, z0, x1, z1, mesh: null, geos: [], auxStale: false, active: false, level: -1, ok });
     }
     this.edgeH = new Float32Array((s + 1) * 4);
     this.edgesChanged();
@@ -326,21 +392,110 @@ export class TerrainView {
       if (Math.abs(target - f.lod) > 1 || Math.abs(ppu / edge - 1) > 0.1 || !this.lodEnabled) f.lod = target;
     }
     this.updateGroups();
+    // coarse meshes are built lazily within a small budget; until then a finer built level is drawn
+    const t0 = performance.now();
+    for (let ci = 0; ci < this.info.length; ci++) {
+      const f = this.info[ci];
+      if (f.shown === f.lod) continue;
+      let want = f.lod;
+      if (want > 0 && !f.coarse[want]) {
+        if (performance.now() - t0 < 3) this.buildCoarse(ci, want);
+        while (want > 0 && !f.coarse[want]) want--;
+      }
+      f.shown = want;
+    }
     for (let ci = 0; ci < this.info.length; ci++) {
       const f = this.info[ci], m = this.chunks[ci];
-      if (!m) continue;
-      const cx = ci % n, cz = Math.floor(ci / n);
-      let skirt = f.lod > 0;
-      if (!skirt) for (let k = 0; k < 8; k += 2) {
-        const nx = cx + NEIGH[k], nz = cz + NEIGH[k + 1];
-        if (nx >= 0 && nz >= 0 && nx < n && nz < n && this.info[nz * n + nx].lod > 0) { skirt = true; break; }
+      if (!m || !m.visible) continue;
+      if (f.shown > 0) {
+        const g = f.coarse[f.shown]!;
+        if (m.geometry !== g) { m.geometry = g; f.range = -1; }
+        continue;
       }
-      const key = f.lod * 2 + (skirt ? 1 : 0);
+      if (m.geometry !== f.geo0) { m.geometry = f.geo0; f.range = -1; }
+      // full resolution: skirts only when a neighbour is drawn coarser (cracks)
+      const cx = ci % n, cz = Math.floor(ci / n);
+      let skirt = false;
+      for (let k = 0; k < 8 && !skirt; k += 2) {
+        const nx = cx + NEIGH[k], nz = cz + NEIGH[k + 1];
+        if (nx >= 0 && nz >= 0 && nx < n && nz < n && this.shownLevel(nz * n + nx) > 0) skirt = true;
+      }
+      const key = skirt ? 1 : 0;
       if (key === f.range) continue;
       f.range = key;
-      const r = skirt ? f.ix.full[f.lod] : f.ix.grid[f.lod];
+      const r = skirt ? f.ix.full[0] : f.ix.grid[0];
       m.geometry.setDrawRange(r[0], r[1]);
     }
+  }
+
+  /** LOD drawn for a chunk (its group's level when merged). */
+  private shownLevel(ci: number): number {
+    const G = this.groupOf(ci);
+    return G && G.active ? G.level : this.info[ci].shown;
+  }
+
+  /** Lowering of a chunk's level-k grid (cached until the chunk is rebuilt). */
+  private chunkDrops(ci: number, k: number): Float32Array | null {
+    const f = this.info[ci], st = 1 << k;
+    if ((f.x1 - f.x0) % st || (f.z1 - f.z0) % st) return null;
+    return f.drops[k] ?? (f.drops[k] = coarseDrops(this.world, f.x0, f.z0, (f.x1 - f.x0) / st, (f.z1 - f.z0) / st, st));
+  }
+
+  private buildCoarse(ci: number, k: number) {
+    const f = this.info[ci], drop = this.chunkDrops(ci, k);
+    if (drop) f.coarse[k] = this.coarseGeometry(f.x0, f.z0, f.x1, f.z1, 1 << k, drop);
+  }
+
+  /**
+   * Coarse LOD geometry of a region (vertices every st units, lowered by `drop`), with skirts; normals and
+   * vegetation / earthwork attributes come from the full-resolution chunks.
+   */
+  private coarseGeometry(x0: number, z0: number, x1: number, z1: number, st: number, drop: Float32Array): THREE.BufferGeometry {
+    const w = this.world, vw = (x1 - x0) / st + 1, vh = (z1 - z0) / st + 1, total = vw * vh + 2 * (vw + vh);
+    const pos = new Int16Array(total * 3), nrm = new Int8Array(total * 4), aux = new Int8Array(total * 4);
+    let minY = Infinity, maxY = -Infinity;
+    for (let j = 0, k = 0; j < vh; j++) for (let i = 0; i < vw; i++, k++) {
+      const y = w.vh(x0 + i * st, z0 + j * st) - drop[k];
+      pos[k * 3] = i * st; pos[k * 3 + 1] = quantY(y); pos[k * 3 + 2] = j * st;
+      if (y < minY) minY = y; if (y > maxY) maxY = y;
+    }
+    this.copyFine(x0, z0, vw, vh, st, nrm, aux);
+    addSkirts(pos, nrm, vw, vh);
+    copySkirts(aux, 4, vw, vh);
+    const ix = chunkIndex(vw, vh);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 4, true));
+    g.setAttribute('aAux', new THREE.BufferAttribute(aux, 4, true));
+    g.setIndex(ix.index);
+    g.setDrawRange(ix.full[0][0], ix.full[0][1]);
+    g.boundingBox = new THREE.Box3(new THREE.Vector3(0, minY - SKIRT, 0), new THREE.Vector3(x1 - x0, maxY, z1 - z0));
+    g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
+    return g;
+  }
+
+  /** Normals (nrm) and / or vegetation attributes (aux) of grid vertices, copied from the full-resolution chunks. */
+  private copyFine(x0: number, z0: number, vw: number, vh: number, st: number, nrm: Int8Array | null, aux: Int8Array | null) {
+    const rc = this.rc, nc = this.nc;
+    for (let j = 0, k = 0; j < vh; j++) {
+      const z = z0 + j * st, cz = Math.min(nc - 1, Math.floor(z / rc));
+      for (let i = 0; i < vw; i++, k++) {
+        const x = x0 + i * st, cx = Math.min(nc - 1, Math.floor(x / rc));
+        const f = this.info[cz * nc + cx];
+        if (!f) continue;
+        const o = ((z - f.z0) * (f.x1 - f.x0 + 1) + (x - f.x0)) * 4;
+        if (nrm) { const src = (f.geo0.getAttribute('normal') as THREE.BufferAttribute).array as Int8Array; nrm[k * 4] = src[o]; nrm[k * 4 + 1] = src[o + 1]; nrm[k * 4 + 2] = src[o + 2]; }
+        if (aux) { const src = (f.geo0.getAttribute('aAux') as THREE.BufferAttribute).array as Int8Array; aux[k * 4] = src[o]; aux[k * 4 + 1] = src[o + 1]; aux[k * 4 + 2] = src[o + 2]; aux[k * 4 + 3] = src[o + 3]; }
+      }
+    }
+  }
+
+  /** Re-copy the vegetation attributes into a built coarse geometry. */
+  private refreshCoarseAux(g: THREE.BufferGeometry, x0: number, z0: number, x1: number, z1: number, st: number) {
+    const a = g.getAttribute('aAux') as THREE.BufferAttribute, vw = (x1 - x0) / st + 1, vh = (z1 - z0) / st + 1;
+    this.copyFine(x0, z0, vw, vh, st, null, a.array as Int8Array);
+    copySkirts(a.array as Int8Array, 4, vw, vh);
+    a.needsUpdate = true;
   }
 
   private groupOf(ci: number): GroupInfo | null {
@@ -349,7 +504,7 @@ export class TerrainView {
     return this.groups[(cz >> 1) * this.ng + (cx >> 1)] ?? null;
   }
 
-  /** Swap 2x2 blocks of far chunks for their merged mesh (at most one group (re)built per frame). */
+  /** Swap 2x2 blocks of far chunks for their merged mesh (at most one group level built per frame). */
   private updateGroups() {
     let builds = 0;
     for (const G of this.groups) {
@@ -359,76 +514,59 @@ export class TerrainView {
         if (!f || !this.chunks[ci] || f.lod < this.groupLod) { want = false; break; }
         if (f.lod < lod) lod = f.lod;
       }
-      if (want && (G.stale || !G.mesh)) {
-        if (builds < 1) { this.buildGroup(G); builds++; } else want = false;
+      if (want && !G.geos[lod]) {
+        if (builds < 1) { this.buildGroupLevel(G, lod); builds++; }
+        while (lod >= this.groupLod && !G.geos[lod]) lod--;
+        if (lod < this.groupLod) want = false;
       }
       if (want && G.auxStale) this.groupAux(G);
+      if (want && G.mesh && lod !== G.level) { G.level = lod; G.mesh.geometry = G.geos[lod]!; }
       if (want !== G.active) {
         G.active = want;
         if (G.mesh) G.mesh.visible = want;
         for (const ci of G.members) { const m = this.chunks[ci]; if (m) m.visible = !want; }
       }
-      if (want && G.mesh && G.ix && lod !== G.range) {
-        G.range = lod;
-        const r = G.ix.full[lod - this.groupLod];
-        G.mesh.geometry.setDrawRange(r[0], r[1]);
-      }
     }
   }
 
-  private buildGroup(G: GroupInfo) {
-    const { x0, z0, x1, z1 } = G;
-    const st = this.groupStep, vw = (x1 - x0) / st + 1, vh = (z1 - z0) / st + 1;
-    const total = vw * vh + 2 * (vw + vh);
-    const pos = new Int16Array(total * 3), nrm = new Int8Array(total * 4);
-    const [minY, maxY] = fillGrid(this.world, x0, z0, st, vw, vh, pos, nrm);
-    const ix = chunkIndex(vw, vh);
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    g.setAttribute('normal', new THREE.BufferAttribute(nrm, 4, true));
-    g.setAttribute('aAux', new THREE.BufferAttribute(new Int8Array(total * 4), 4, true));
-    g.setIndex(ix.index);
-    g.boundingBox = new THREE.Box3(new THREE.Vector3(0, minY - SKIRT, 0), new THREE.Vector3(x1 - x0, maxY, z1 - z0));
-    g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
-    G.ix = ix;
-    G.range = -1;
-    G.stale = false;
-    if (G.mesh) { G.mesh.geometry.dispose(); G.mesh.geometry = g; }
-    else {
+  /** Merged level-L geometry of a group: the members' level-L grids (same vertices and lowering) in one mesh. */
+  private buildGroupLevel(G: GroupInfo, L: number) {
+    const st = 1 << L;
+    if ((G.x1 - G.x0) % st || (G.z1 - G.z0) % st) return;
+    const drop = coarseDrops(this.world, G.x0, G.z0, (G.x1 - G.x0) / st, (G.z1 - G.z0) / st, st);
+    const g = this.coarseGeometry(G.x0, G.z0, G.x1, G.z1, st, drop);
+    G.geos[L] = g;
+    if (!G.mesh) {
       const m = new THREE.Mesh(g, this.material);
       m.receiveShadow = true;
       m.castShadow = true;
       m.customDepthMaterial = this.depthMat;
-      m.position.set(x0, 0, z0);
+      m.position.set(G.x0, 0, G.z0);
       m.matrixAutoUpdate = false;
       m.updateMatrix();
-      m.visible = G.active;
+      m.visible = false;
       G.mesh = m;
+      G.level = L;
       this.group.add(m);
     }
-    this.groupAux(G);
   }
 
-  /** Vegetation / earthwork / cavity attributes of a group: the member chunks' values at the group vertices. */
+  /** Vegetation / earthwork attributes of a group's built levels (copied from the members). */
   private groupAux(G: GroupInfo) {
     G.auxStale = false;
-    if (!G.mesh) return;
-    const attr = G.mesh.geometry.getAttribute('aAux') as THREE.BufferAttribute, out = attr.array as Int8Array;
-    const st = this.groupStep, vw = (G.x1 - G.x0) / st + 1, vh = (G.z1 - G.z0) / st + 1, rc = this.rc, nc = this.nc;
-    let k = 0;
-    for (let j = 0; j < vh; j++) {
-      const z = G.z0 + j * st, cz = Math.min(nc - 1, Math.floor(z / rc));
-      for (let i = 0; i < vw; i++, k++) {
-        const x = G.x0 + i * st, cx = Math.min(nc - 1, Math.floor(x / rc));
-        const ci = cz * nc + cx, f = this.info[ci], m = this.chunks[ci];
-        if (!f || !m) continue;
-        const src = (m.geometry.getAttribute('aAux') as THREE.BufferAttribute).array as Int8Array;
-        const o = ((z - f.z0) * (f.x1 - f.x0 + 1) + (x - f.x0)) * 4;
-        out[k * 4] = src[o]; out[k * 4 + 1] = src[o + 1]; out[k * 4 + 2] = src[o + 2];
-      }
+    for (let L = 0; L < G.geos.length; L++) { const g = G.geos[L]; if (g) this.refreshCoarseAux(g, G.x0, G.z0, G.x1, G.z1, 1 << L); }
+  }
+
+  /** Drop a group's merged levels (a member was rebuilt). */
+  private resetGroup(G: GroupInfo) {
+    if (G.active) {
+      G.active = false;
+      if (G.mesh) G.mesh.visible = false;
+      for (const ci of G.members) { const m = this.chunks[ci]; if (m) m.visible = true; }
     }
-    copySkirts(out, 4, vw, vh);
-    attr.needsUpdate = true;
+    for (const g of G.geos) g?.dispose();
+    G.geos = [];
+    G.level = -1;
   }
 
   /** Did any height along the map border change since the skirt was built? */
@@ -470,7 +608,7 @@ export class TerrainView {
     const nrm = new Int8Array(total * 4);
     const [minY, maxY] = fillGrid(w, x0, z0, 1, vw, vh, pos, nrm);
     const G = this.groupOf(ci);
-    if (G) G.stale = true;
+    if (G) this.resetGroup(G);
     const aux = new Int8Array(total * 4);
     this.packAux(x0, z0, x1, z1, aux, total);
     const ix = chunkIndex(vw, vh);
@@ -483,9 +621,11 @@ export class TerrainView {
     // bounds in decoded chunk-local units (three never reads the integer positions on the CPU)
     g.boundingBox = new THREE.Box3(new THREE.Vector3(0, minY - SKIRT, 0), new THREE.Vector3(x1 - x0, maxY, z1 - z0));
     g.boundingSphere = g.boundingBox.getBoundingSphere(new THREE.Sphere());
-    this.info[ci] = { x0, z0, x1, z1, minY, maxY, lod: 0, range: 0, ix };
+    const old = this.info[ci];
+    if (old) { old.geo0.dispose(); for (const c of old.coarse) c?.dispose(); }
+    this.info[ci] = { x0, z0, x1, z1, minY, maxY, lod: old ? old.lod : 0, shown: 0, range: 0, ix, geo0: g, coarse: [], drops: [], shadowDrop: -1 };
     let m = this.chunks[ci];
-    if (m) { m.geometry.dispose(); m.geometry = g; }
+    if (m) m.geometry = g;
     else {
       m = new THREE.Mesh(g, this.material);
       m.receiveShadow = true;
@@ -494,63 +634,116 @@ export class TerrainView {
       m.position.set(x0, 0, z0);
       m.matrixAutoUpdate = false;
       m.updateMatrix();
-      // shadow casting only needs the silhouette: draw a coarser level (with skirts) in the shadow pass
+      // shadow casting only needs the silhouette: a full-resolution chunk casts a coarser level (with skirts),
+      // lowered by that level's error so it cannot shadow the exact surface in hollows and cuttings
       const mesh = m, idx = ci;
-      mesh.onBeforeShadow = () => {
+      mesh.onBeforeShadow = (_r, _o, _c, shadowCamera) => {
         const f = this.info[idx];
-        const r = f.ix.full[Math.min(LODS - 1, Math.max(f.lod, this.shadowLod))];
+        this.shadowSwapped = false;
+        if (mesh.geometry !== f.geo0 || this.shadowLod <= 0 || (this.exactShadowCamera !== null && shadowCamera === this.exactShadowCamera)) return;
+        const lv = Math.min(LODS - 1, this.shadowLod);
+        if (f.shadowDrop < 0) { const d = this.chunkDrops(idx, lv); let mx = 0; if (d) for (let i = 0; i < d.length; i++) if (d[i] > mx) mx = d[i]; f.shadowDrop = d ? mx : 0; }
+        const r = f.ix.full[lv];
         const dr = mesh.geometry.drawRange;
         this.saved.set(dr.start, dr.count);
         mesh.geometry.setDrawRange(r[0], r[1]);
+        this.shadowSwapped = true;
+        const e = mesh.modelViewMatrix.elements, d = f.shadowDrop;
+        e[12] -= d * e[4]; e[13] -= d * e[5]; e[14] -= d * e[6];
       };
-      mesh.onAfterShadow = () => { mesh.geometry.setDrawRange(this.saved.x, this.saved.y); };
+      mesh.onAfterShadow = () => { if (this.shadowSwapped) mesh.geometry.setDrawRange(this.saved.x, this.saved.y); this.shadowSwapped = false; };
       this.chunks[ci] = m;
       this.group.add(m);
     }
   }
 
-  /** Recompute only the vegetation / earthwork / cavity attribute of a chunk. */
+  /** Recompute only the vegetation / earthwork / cavity / shore attribute of a chunk (and its coarse copies). */
   private refreshAux(ci: number) {
-    const m = this.chunks[ci];
-    if (!m) return;
-    const { x0, z0, x1, z1 } = this.bounds(ci);
-    const a = m.geometry.getAttribute('aAux') as THREE.BufferAttribute;
-    this.packAux(x0, z0, x1, z1, a.array as Int8Array, a.count);
+    const f = this.info[ci];
+    if (!f) return;
+    const a = f.geo0.getAttribute('aAux') as THREE.BufferAttribute;
+    this.packAux(f.x0, f.z0, f.x1, f.z1, a.array as Int8Array, a.count);
     a.needsUpdate = true;
+    for (let k = 1; k < f.coarse.length; k++) { const g = f.coarse[k]; if (g) this.refreshCoarseAux(g, f.x0, f.z0, f.x1, f.z1, 1 << k); }
   }
 
-  /** computeAux into a scratch buffer, then pack as normalised bytes (forest 0..1, works 0..1, cavity -1..1). */
+  /**
+   * computeAux into a scratch buffer, then pack as normalised bytes (forest 0..1, works 0..1, cavity -1..1,
+   * shore 0..1).
+   */
   private packAux(x0: number, z0: number, x1: number, z1: number, out: Int8Array, total: number) {
-    if (!this.auxTmp || this.auxTmp.length < total * 3) this.auxTmp = new Float32Array(total * 3);
+    if (!this.auxTmp || this.auxTmp.length < total * 4) this.auxTmp = new Float32Array(total * 4);
     const t = this.auxTmp;
-    t.fill(0, 0, total * 3);
+    t.fill(0, 0, total * 4);
     this.computeAux(x0, z0, x1, z1, t);
     for (let i = 0; i < total; i++) {
-      out[i * 4] = Math.round(Math.min(1, t[i * 3]) * 127);
-      out[i * 4 + 1] = Math.round(Math.min(1, t[i * 3 + 1]) * 127);
-      out[i * 4 + 2] = Math.round(Math.max(-1, Math.min(1, t[i * 3 + 2])) * 127);
+      out[i * 4] = Math.round(Math.min(1, t[i * 4]) * 127);
+      out[i * 4 + 1] = Math.round(Math.min(1, t[i * 4 + 1]) * 127);
+      out[i * 4 + 2] = Math.round(Math.max(-1, Math.min(1, t[i * 4 + 2])) * 127);
+      out[i * 4 + 3] = Math.round(Math.max(0, Math.min(1, t[i * 4 + 3])) * 127);
     }
   }
 
   /**
-   * Per-vertex attributes: x forest density (dark forest floor under tree clusters), y earthworks
-   * (cuttings/embankments next to network edges on the ground), z cavity (height above the local mean).
+   * Per-vertex attributes: x forest density (forest floor under tree clusters), y earthworks (cuttings and
+   * embankments next to network edges on the ground), z cavity (height above the local mean), w shore
+   * (1 at the water's edge fading to 0 about 4 units inland: beaches only next to water, not on low land).
    */
   private computeAux(x0: number, z0: number, x1: number, z1: number, out: Float32Array) {
     const w = this.world, net = w.net;
     const vw = x1 - x0 + 1, vh = z1 - z0 + 1;
-    // cavity from a summed-area table over the chunk plus a margin
-    const R = 3, aw = vw + 2 * R, ah = vh + 2 * R, sw = aw + 1;
+    // heights of the chunk plus a margin, read once (cavity and shore both use them)
+    const M = 5, gw = vw + 2 * M, gh = vh + 2 * M, hh = new Float32Array(gw * gh);
+    let anyWet = false;
+    for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+      const y = w.vh(x0 - M + i, z0 - M + j);
+      hh[j * gw + i] = y;
+      if (y < WATER_Y) anyWet = true;
+    }
+    // cavity from a summed-area table (radius 3)
+    const R = 3, aw = vw + 2 * R, ah = vh + 2 * R, sw = aw + 1, off = M - R;
     const sat = new Float64Array(sw * (ah + 1));
     for (let j = 0; j < ah; j++) {
       let row = 0;
-      for (let i = 0; i < aw; i++) { row += w.vh(x0 - R + i, z0 - R + j); sat[(j + 1) * sw + i + 1] = sat[j * sw + i + 1] + row; }
+      const src = (j + off) * gw + off;
+      for (let i = 0; i < aw; i++) { row += hh[src + i]; sat[(j + 1) * sw + i + 1] = sat[j * sw + i + 1] + row; }
     }
     const D = 2 * R + 1, inv = 1 / (D * D);
     for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
       const sum = sat[(j + D) * sw + i + D] - sat[j * sw + i + D] - sat[(j + D) * sw + i] + sat[j * sw + i];
-      const c = w.vh(x0 + i, z0 + j) - sum * inv;
-      out[(j * vw + i) * 3 + 2] = Math.max(-1, Math.min(1, c * 0.7));
+      const c = hh[(j + M) * gw + i + M] - sum * inv;
+      out[(j * vw + i) * 4 + 2] = Math.max(-1, Math.min(1, c * 0.7));
+    }
+    // shore: chamfer distance (1, sqrt 2) to the nearest vertex under water, over the chunk plus the margin
+    if (anyWet) {
+      const INF = 1e6, dist = new Float32Array(gw * gh), D2 = Math.SQRT2;
+      for (let k = 0; k < gw * gh; k++) dist[k] = hh[k] < WATER_Y ? 0 : INF;
+      for (let j = 0; j < gh; j++) for (let i = 0; i < gw; i++) {
+        const k = j * gw + i;
+        let d = dist[k];
+        if (i > 0) d = Math.min(d, dist[k - 1] + 1);
+        if (j > 0) {
+          d = Math.min(d, dist[k - gw] + 1);
+          if (i > 0) d = Math.min(d, dist[k - gw - 1] + D2);
+          if (i < gw - 1) d = Math.min(d, dist[k - gw + 1] + D2);
+        }
+        dist[k] = d;
+      }
+      for (let j = gh - 1; j >= 0; j--) for (let i = gw - 1; i >= 0; i--) {
+        const k = j * gw + i;
+        let d = dist[k];
+        if (i < gw - 1) d = Math.min(d, dist[k + 1] + 1);
+        if (j < gh - 1) {
+          d = Math.min(d, dist[k + gw] + 1);
+          if (i < gw - 1) d = Math.min(d, dist[k + gw + 1] + D2);
+          if (i > 0) d = Math.min(d, dist[k + gw - 1] + D2);
+        }
+        dist[k] = d;
+      }
+      for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
+        const d = dist[(j + M) * gw + i + M];
+        out[(j * vw + i) * 4 + 3] = Math.max(0, Math.min(1, 1 - (d - 0.5) / 3.5));
+      }
     }
     // forest floor
     const TR = 1.8;
@@ -560,7 +753,7 @@ export class TerrainView {
       for (let z = Math.max(z0, Math.ceil(t.z - TR)); z <= Math.min(z1, Math.floor(t.z + TR)); z++) {
         for (let x = Math.max(x0, Math.ceil(t.x - TR)); x <= Math.min(x1, Math.floor(t.x + TR)); x++) {
           const d = Math.hypot(x - t.x, z - t.z);
-          if (d < TR) out[((z - z0) * vw + (x - x0)) * 3] += (1 - d / TR) * 0.4 * t.s;
+          if (d < TR) out[((z - z0) * vw + (x - x0)) * 4] += (1 - d / TR) * 0.4 * t.s;
         }
       }
     }
@@ -585,14 +778,14 @@ export class TerrainView {
             const d = Math.hypot(x - px, z - pz);
             if (d >= outer) continue;
             const f = (d <= core ? 1 : 1 - (d - core) / er) * wk;
-            const k = ((z - z0) * vw + (x - x0)) * 3 + 1;
+            const k = ((z - z0) * vw + (x - x0)) * 4 + 1;
             if (f > out[k]) out[k] = f;
           }
         }
       }
     }
     // skirts copy their border vertex
-    copySkirts(out, 3, vw, vh);
+    copySkirts(out, 4, vw, vh);
   }
 
   private rebuildSkirt() {
@@ -649,8 +842,8 @@ export class TerrainView {
   }
 
   dispose() {
-    for (const m of this.chunks) m?.geometry.dispose();
-    for (const G of this.groups) G.mesh?.geometry.dispose();
+    for (const f of this.info) { if (!f) continue; f.geo0.dispose(); for (const c of f.coarse) c?.dispose(); }
+    for (const G of this.groups) for (const g of G.geos) g?.dispose();
     this.skirt?.geometry.dispose();
     this.waterSides?.geometry.dispose();
     this.water.geometry.dispose();
@@ -723,128 +916,200 @@ export function raycastTerrain(w: World, o: V3, d: V3, maxH: number, out: V3, ma
 /** Vertex decode of the compact chunk positions (height stored in 1/128 units). */
 const DECODE = `vec3 transformed = vec3(position.x, position.y * ${(1 / YQ).toFixed(10)}, position.z);`;
 
+/**
+ * Terrain shading: procedural detail texture layers (grass, dirt, scree, rock, sand; see terrain-tex.ts) at
+ * two world scales blended by view distance, combined by height so transitions follow clumps and stones;
+ * triplanar rock only on truly steep natural ground; earthworks as grass with soil patches; sand only next to
+ * water (aux.w) with a crisp wet band; per-pixel macro colour variation; whiteout-blended detail normals.
+ */
 function createTerrainMaterial(U: TerrainUniforms): THREE.MeshStandardMaterial {
   // the sky environment adds a blue cast to steep, sun-averted slopes: keep it modest on the ground
-  const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, envMapIntensity: 0.55 });
+  const mat = new THREE.MeshStandardMaterial({ roughness: 0.95, metalness: 0, envMapIntensity: 0.5 });
+  const det = detailTextures();
+  const extra = {
+    uDetA: { value: det.albedo },
+    uDetN: { value: det.normal },
+    uMacro: { value: det.macro },
+    uDetMean: { value: det.mean.map((m) => new THREE.Vector3(m[0], m[1], m[2])) },
+  };
   mat.onBeforeCompile = (sh) => {
-    Object.assign(sh.uniforms, U);
+    Object.assign(sh.uniforms, U, extra);
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', `#include <common>
-attribute vec3 aAux;
+attribute vec4 aAux;
 varying vec3 vWPos;
 varying vec3 vWNormal;
-varying vec3 vAux;
-varying vec2 vMacro;
-${NOISE_GLSL}`)
+varying vec4 vAux;`)
       .replace('#include <begin_vertex>', `${DECODE}
 vWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;
 vWNormal = normalize(mat3(modelMatrix) * objectNormal);
-vAux = aAux;
-// large-scale variation is smooth over a cell: evaluate per vertex
-vMacro = vec2(rf_fbm(vWPos.xz * 0.006 + 3.1), rf_fbm(vWPos.xz * 0.03 + 11.7));`);
+vAux = aAux;`);
     sh.fragmentShader = sh.fragmentShader
       .replace('#include <common>', `#include <common>
 uniform float uGrid; uniform vec4 uHiRect; uniform vec3 uHiColor; uniform float uHiOn;
 uniform vec4 uCircle; uniform vec3 uCircleColor; uniform float uSnow; uniform float uTime;
-varying vec3 vWPos; varying vec3 vWNormal; varying vec3 vAux; varying vec2 vMacro;
+uniform sampler2DArray uDetA;
+uniform sampler2DArray uDetN;
+uniform sampler2D uMacro;
+uniform vec3 uDetMean[5];
+varying vec3 vWPos; varying vec3 vWNormal; varying vec4 vAux;
 ${NOISE_GLSL}
-// value noise projected on the three axis planes, weighted by the normal
-float rf_tri(vec3 q, vec3 w) { return rf_vnoise(q.zy) * w.x + rf_vnoise(q.xz) * w.y + rf_vnoise(q.xy) * w.z; }`)
+// one detail layer: albedo (linear rgb) + height, tangent normal xy (-1..1) + cavity + roughness
+struct RfL { vec4 a; vec4 n; };
+// planar (top) projection at the mid scale, detail of the near scale multiplied in close to the camera
+// the near scale is rotated 37 degrees against the mid scale (no aligned repetition): its normals turn back
+const mat2 RF_NROT = mat2(0.7986, -0.6018, 0.6018, 0.7986);
+RfL rfPlanar(float l, vec2 uvM, vec2 gxM, vec2 gyM, vec2 uvN, vec2 gxN, vec2 gyN, float wN) {
+  RfL r;
+  r.a = textureGrad(uDetA, vec3(uvM, l), gxM, gyM);
+  r.n = textureGrad(uDetN, vec3(uvM, l), gxM, gyM);
+  r.n.xy = r.n.xy * 2.0 - 1.0;
+  if (wN > 0.003) {
+    vec4 a2 = textureGrad(uDetA, vec3(uvN, l), gxN, gyN);
+    vec4 n2 = textureGrad(uDetN, vec3(uvN, l), gxN, gyN);
+    r.a.rgb *= mix(vec3(1.0), a2.rgb / max(uDetMean[int(l)], vec3(1e-3)), wN * 0.6);
+    r.a.a = mix(r.a.a, a2.a, wN * 0.5);
+    r.n.xy += RF_NROT * (n2.xy * 2.0 - 1.0) * wN * 0.6;
+    r.n.z = mix(r.n.z, r.n.z * n2.z / 0.8, wN);
+    r.n.w = mix(r.n.w, n2.w, wN * 0.5);
+  }
+  return r;
+}
+// coverage t of layer b over a, following their heights (crisp but organic transitions)
+float rfHB(float ha, float hb, float t) {
+  float a = ha + (1.0 - t) * 1.5, b = hb + t * 1.5;
+  float m = max(a, b) - 0.2;
+  float wa = max(a - m, 0.0), wb = max(b - m, 0.0);
+  return wb / (wa + wb);
+}`)
       .replace('#include <map_fragment>', `
 vec3 rfGlow = vec3(0.0);
 float rfRough = 0.95;
-float rfBump = 0.0;
+vec3 rfNrm = normalize(vWNormal);
 {
   vec2 p = vWPos.xz;
   float h = vWPos.y;
-  float slope = 1.0 - normalize(vWNormal).y;
+  vec3 gN = normalize(vWNormal);
+  float slope = 1.0 - gN.y;
+  float vd = length(vViewPosition);
+  vec3 dpx = dFdx(vWPos), dpy = dFdy(vWPos);
   float fw = max(length(fwidth(p)), 1e-4);
-  float m0 = vMacro.x, m1 = vMacro.y;
-  // octaves fade out before they alias (keep >= ~5 px per cycle)
-  float n2 = rf_vnoise(p * 0.21 + 5.3);
-  float d3 = 1.0 - smoothstep(0.2, 0.5, fw * 1.13);
-  float d4 = 1.0 - smoothstep(0.2, 0.5, fw * 4.7);
-  float d5 = 1.0 - smoothstep(0.2, 0.5, fw * 19.0);
-  float d6 = 1.0 - smoothstep(0.2, 0.5, fw * 67.0);
-  float n3 = d3 > 0.0 ? rf_vnoise(p * 1.13 + 1.7) : 0.5;
-  float n4 = d4 > 0.0 ? rf_vnoise(p * 4.7 + 9.1) : 0.5;
-  float n5 = d5 > 0.0 ? rf_vnoise(p * 19.0 + 3.3) : 0.5;
-  float n6 = d6 > 0.0 ? rf_vnoise(p * 67.0) : 0.5;
-  n3 = mix(0.5, n3, d3); n4 = mix(0.5, n4, d4); n5 = mix(0.5, n5, d5); n6 = mix(0.5, n6, d6);
-  float detail = (n3 - 0.5) * 0.5 + (n4 - 0.5) * 0.35 + (n5 - 0.5) * 0.25 + (n6 - 0.5) * 0.2;
 
-  vec3 lush   = rf_srgb(vec3(0.29, 0.43, 0.16));
-  vec3 fresh  = rf_srgb(vec3(0.40, 0.52, 0.20));
-  vec3 dryG   = rf_srgb(vec3(0.57, 0.55, 0.31));
-  vec3 alpine = rf_srgb(vec3(0.46, 0.48, 0.31));
-  vec3 forest = rf_srgb(vec3(0.23, 0.25, 0.13));
-  vec3 dirt   = rf_srgb(vec3(0.43, 0.36, 0.26));
-  vec3 soil   = rf_srgb(vec3(0.38, 0.35, 0.23));
-  vec3 young  = rf_srgb(vec3(0.39, 0.45, 0.21));
-  vec3 scree  = rf_srgb(vec3(0.56, 0.51, 0.43));
-  vec3 rockA  = rf_srgb(vec3(0.54, 0.50, 0.44));
-  vec3 rockB  = rf_srgb(vec3(0.63, 0.58, 0.50));
-  vec3 sand   = rf_srgb(vec3(0.79, 0.73, 0.55));
-  vec3 wetS   = rf_srgb(vec3(0.50, 0.45, 0.35));
-  vec3 mud    = rf_srgb(vec3(0.30, 0.29, 0.22));
-  vec3 snow   = rf_srgb(vec3(0.92, 0.94, 0.97));
+  // macro variation per pixel (two scales): no per-vertex blotches at coarse LODs
+  vec4 M = texture2D(uMacro, p * 0.0019);
+  vec4 M2 = texture2D(uMacro, p * 0.0077 + vec2(0.41, 0.73));
+  float nb = M2.z - 0.5;
+  float works = clamp(vAux.y, 0.0, 1.0), forest = clamp(vAux.x, 0.0, 1.0), shore = clamp(vAux.w, 0.0, 1.0);
+  float above = h;
+  float moist = max(shore * 0.7, 1.0 - smoothstep(0.3, 2.5, h));
 
-  // meadows: regional dry/lush variation, greener near water, alpine grass higher up
-  float moist = 1.0 - smoothstep(0.3, 2.5, h);
-  vec3 col = mix(fresh, lush, smoothstep(0.35, 0.7, m1));
-  col = mix(col, dryG, smoothstep(0.5, 0.78, m0 + (n2 - 0.5) * 0.25) * 0.6 * (1.0 - moist * 0.7));
-  col = mix(col, lush, moist * 0.3);
-  col = mix(col, alpine, smoothstep(uSnow * 0.45, uSnow * 0.85, h + (m1 - 0.5) * 4.0) * 0.8);
-  col *= 0.9 + 0.2 * n2;
-  col *= 1.0 + detail * 0.2;
-  col = mix(col, col * vec3(1.12, 1.06, 0.78), smoothstep(0.55, 0.85, n5) * d5 * 0.45);
-  // forest floor under tree clusters
-  float fo = smoothstep(0.12, 0.8, vAux.x + (n3 - 0.5) * 0.2);
-  col = mix(col, forest * (0.85 + 0.25 * n4 + 0.15 * n2), fo * 0.85);
-  // ridges catch light, hollows collect shade (not on earthworks: embankments would glow)
-  float works = clamp(vAux.y, 0.0, 1.0);
-  col *= 1.0 + clamp(vAux.z, -1.0, 1.0) * 0.05 * (1.0 - works);
-  // graded ground beside tracks and roads: young grass and disturbed soil, mostly on the cut/fill slopes
-  float sn = (n2 - 0.5) * 0.08 + (m1 - 0.5) * 0.06;
-  float wSlope = smoothstep(0.04, 0.15, slope + sn * 0.5);
-  float wk = works * works * (0.22 + 0.33 * wSlope);
-  vec3 worksCol = mix(young, soil, clamp(0.3 + 0.45 * wSlope + (n3 - 0.5) * 0.4, 0.0, 1.0)) * (0.9 + 0.2 * n4);
-  col = mix(col, worksCol, wk);
-  // exposed soil on steep grass
-  float dirtAmt = smoothstep(0.12, 0.24, slope + sn) * 0.3;
-  col = mix(col, dirt * (0.88 + 0.2 * n3 + 0.1 * n2), dirtAmt);
-  // scree and rock on steep slopes: warm grey-brown, crisp ledges and cracks (triplanar, so cliff
-  // faces are not smeared vertically)
-  // soft transition starting around 40 degrees: moderately steep grass stays green
-  float rockAmt = smoothstep(0.25, 0.42, slope + sn * 0.8);
-  float rockBump = 0.0;
-  if (rockAmt > 0.001) {
-    vec3 an = abs(normalize(vWNormal));
-    an /= an.x + an.y + an.z;
-    float f1 = 1.0 - smoothstep(0.2, 0.55, fw * 0.6), f2 = 1.0 - smoothstep(0.2, 0.55, fw * 2.3);
-    float r1 = rf_tri(vWPos * 0.6 + 3.7, an);
-    float r2 = f2 > 0.0 ? rf_tri(vWPos * 2.3 + 9.1, an) : 0.5;
-    // cracks and ledges: a subtle darkening, only for close-ups (camera within ~15 units)
-    float closeUp = 1.0 - smoothstep(10.0, 15.0, length(vViewPosition));
-    float c1 = pow(1.0 - abs(2.0 * r1 - 1.0), 6.0) * f1 * closeUp, c2 = pow(1.0 - abs(2.0 * r2 - 1.0), 8.0) * f2 * closeUp;
-    vec3 rock = mix(rockA, rockB, smoothstep(0.25, 0.75, n2 * 0.45 + mix(0.5, r1, f1) * 0.55));
-    rock *= (1.0 - c1 * 0.1 - c2 * 0.06) * (0.95 + 0.1 * mix(0.5, r2, f2));
-    vec3 scr = scree * (0.92 + 0.16 * n4) * (1.0 - c2 * 0.05);
-    col = mix(col, mix(scr, rock, smoothstep(0.3, 0.48, slope + sn)), rockAmt);
-    rockBump = (mix(0.5, r1, f1) * 0.03 + mix(0.5, r2, f2) * 0.012 - (c1 * 0.02 + c2 * 0.008)) * rockAmt;
+  // two world scales: mid (5.3 units) everywhere, near (1.35 units) detail close to the camera
+  const float SM = 0.1887, SN = 0.7407, SR = 0.2778;
+  const mat2 RN = mat2(0.7986, 0.6018, -0.6018, 0.7986);
+  vec2 uvM = p * SM + vec2(0.37, 0.11), uvN = (RN * p) * SN + vec2(0.71, 0.23);
+  vec2 gxM = dpx.xz * SM, gyM = dpy.xz * SM, gxN = (RN * dpx.xz) * SN, gyN = (RN * dpy.xz) * SN;
+  float wN = 1.0 - smoothstep(10.0, 30.0, vd);
+  // far away the tiled detail fades into the layer's mean colour (no repetition patterns)
+  float farF = smoothstep(15.0, 85.0, vd) * 0.85;
+  // alpine zone: drier, yellower short grass, more scree and rock outcrops - never paler than the meadow
+  float alp = smoothstep(uSnow * 0.5, uSnow * 0.9, h + (M.x - 0.5) * 3.0);
+
+  // ---- layer weights
+  // rock only on truly steep natural ground (from ~48 degrees), never on earthworks; scree patches below it
+  float wRock = smoothstep(0.33 - 0.09 * alp, 0.47 - 0.09 * alp, slope + nb * 0.12) * (1.0 - works);
+  float wScree = smoothstep(0.27 - 0.12 * alp, 0.39 - 0.12 * alp, slope + nb * 0.16) * smoothstep(0.45 - 0.25 * alp, 0.7 - 0.25 * alp, M.z + nb * 0.5) * (1.0 - works);
+  // exposed soil on steep grass, soil patches on cut / fill slopes, forest floor under trees
+  float wDirt = smoothstep(0.18, 0.32, slope + nb * 0.25) * 0.4 * (1.0 - works);
+  wDirt = max(wDirt, works * (0.16 + 0.42 * smoothstep(0.05, 0.3, slope)) * smoothstep(0.3, 0.7, M2.x + nb * 0.7));
+  wDirt = max(wDirt, smoothstep(0.15, 0.75, forest) * 0.55);
+  // beaches: next to water, low and gentle only
+  float wSand = shore * (1.0 - smoothstep(0.25, 0.6, above + nb * 0.3)) * (1.0 - smoothstep(0.1, 0.22, slope));
+  wSand = max(wSand, (1.0 - smoothstep(-0.06, 0.0, above)) * 0.85);
+
+  // ---- grass base, tinted by region (lush / fresh / dry / alpine / young grass on earthworks)
+  RfL G = rfPlanar(0.0, uvM, gxM, gyM, uvN, gxN, gyN, wN);
+  vec3 tint = mix(vec3(1.42, 1.42, 1.6), vec3(0.85, 1.02, 1.05), smoothstep(0.35, 0.75, M.x));
+  tint = mix(tint, vec3(2.2, 1.45, 2.4), smoothstep(0.5, 0.82, M.y * 0.65 + M2.y * 0.35) * 0.55 * (1.0 - moist * 0.8));
+  tint *= mix(vec3(1.0), vec3(1.1, 0.92, 0.78), alp * 0.75);
+  tint = mix(tint, vec3(1.55, 1.48, 1.75), works * 0.5);
+  tint *= mix(1.0, 0.8, forest * 0.6) * (0.93 + 0.14 * M2.w);
+  vec3 col = mix(G.a.rgb, uDetMean[0], farF) * tint;
+  float hgt = G.a.a;
+  vec2 nT = G.n.xy * 0.45 * (1.0 - farF);
+  float cav = G.n.z, rough = G.n.w;
+  float t;
+  // ---- dirt / forest floor
+  if (wDirt > 0.01) {
+    RfL D = rfPlanar(1.0, uvM, gxM, gyM, uvN, gxN, gyN, wN);
+    t = rfHB(hgt, D.a.a, wDirt);
+    vec3 dt = mix(vec3(1.08, 1.04, 1.0), vec3(0.82, 0.92, 0.62), smoothstep(0.1, 0.6, forest)) * (0.92 + 0.16 * M2.w);
+    col = mix(col, mix(D.a.rgb, uDetMean[1], farF) * dt, t); hgt = mix(hgt, D.a.a, t); nT = mix(nT, D.n.xy * (1.0 - farF), t); cav = mix(cav, D.n.z, t); rough = mix(rough, D.n.w, t);
   }
-  // beaches, wet sand, sea bed
-  float beach = (1.0 - smoothstep(0.08, 0.3, h + (n2 - 0.5) * 0.15)) * (1.0 - smoothstep(0.12, 0.3, slope));
-  col = mix(col, sand * (0.93 + 0.12 * n4), beach);
-  float wet = 1.0 - smoothstep(-0.02, 0.05, h);
-  col = mix(col, wetS, wet * 0.75);
-  col = mix(col, mud, 1.0 - smoothstep(-0.4, -0.05, h));
+  // ---- scree
+  if (wScree > 0.01) {
+    RfL S = rfPlanar(2.0, uvM * 1.6, gxM * 1.6, gyM * 1.6, uvN * 1.6, gxN * 1.6, gyN * 1.6, wN);
+    t = rfHB(hgt, S.a.a, wScree);
+    col = mix(col, S.a.rgb * vec3(0.86, 0.83, 0.79), t); hgt = mix(hgt, S.a.a, t); nT = mix(nT, S.n.xy, t); cav = mix(cav, S.n.z, t); rough = mix(rough, S.n.w, t);
+  }
+  // planar detail normal over the geometric normal (whiteout)
+  vec2 nT2 = nT * 0.9;
+  float tz = sqrt(max(0.0, 1.0 - dot(nT2, nT2) * 0.25));
+  vec3 nW = normalize(vec3(gN.x + nT2.x, gN.y * tz, gN.z + nT2.y));
+  // ---- rock: triplanar (strata stay horizontal on cliff faces), darker warm grey-brown
+  if (wRock > 0.01) {
+    vec3 bw = pow(abs(gN), vec3(4.0));
+    bw /= bw.x + bw.y + bw.z;
+    vec3 sg = sign(gN);
+    vec2 uX = vec2(vWPos.z * sg.x, vWPos.y) * SR, uY = vec2(vWPos.x * sg.y, vWPos.z) * SR, uZ = vec2(-vWPos.x * sg.z, vWPos.y) * SR;
+    vec2 gxX = vec2(dpx.z * sg.x, dpx.y) * SR, gyX = vec2(dpy.z * sg.x, dpy.y) * SR;
+    vec2 gxY = vec2(dpx.x * sg.y, dpx.z) * SR, gyY = vec2(dpy.x * sg.y, dpy.z) * SR;
+    vec2 gxZ = vec2(-dpx.x * sg.z, dpx.y) * SR, gyZ = vec2(-dpy.x * sg.z, dpy.y) * SR;
+    vec4 rA = vec4(0.0), rNx = vec4(0.5, 0.5, 0.8, 0.8), rNy = rNx, rNz = rNx;
+    if (bw.x > 0.02) { rA += textureGrad(uDetA, vec3(uX, 3.0), gxX, gyX) * bw.x; rNx = textureGrad(uDetN, vec3(uX, 3.0), gxX, gyX); }
+    if (bw.y > 0.02) { rA += textureGrad(uDetA, vec3(uY, 3.0), gxY, gyY) * bw.y; rNy = textureGrad(uDetN, vec3(uY, 3.0), gxY, gyY); }
+    if (bw.z > 0.02) { rA += textureGrad(uDetA, vec3(uZ, 3.0), gxZ, gyZ) * bw.z; rNz = textureGrad(uDetN, vec3(uZ, 3.0), gxZ, gyZ); }
+    rA /= max(1e-3, (bw.x > 0.02 ? bw.x : 0.0) + (bw.y > 0.02 ? bw.y : 0.0) + (bw.z > 0.02 ? bw.z : 0.0));
+    // whiteout per projection (normal maps' x flipped with the mirrored uvs)
+    vec2 tx = (rNx.xy * 2.0 - 1.0) * 1.1, ty = (rNy.xy * 2.0 - 1.0) * 1.1, tzz = (rNz.xy * 2.0 - 1.0) * 1.1;
+    tx.x *= sg.x; ty.x *= sg.y; tzz.x *= -sg.z;
+    vec3 nX = vec3(tx + gN.zy, abs(gN.x)), nY = vec3(ty + gN.xz, abs(gN.y)), nZ = vec3(tzz + gN.xy, abs(gN.z));
+    vec3 nR = normalize(nX.zyx * vec3(sg.x, 1.0, 1.0) * bw.x + nY.xzy * vec3(1.0, sg.y, 1.0) * bw.y + nZ.xyz * vec3(1.0, 1.0, sg.z) * bw.z);
+    float rCav = rNx.z * bw.x + rNy.z * bw.y + rNz.z * bw.z, rRough = rNx.w * bw.x + rNy.w * bw.y + rNz.w * bw.z;
+    t = rfHB(hgt, rA.a, wRock);
+    col = mix(col, rA.rgb * vec3(0.78, 0.73, 0.66) * (0.9 + 0.2 * M2.w), t);
+    hgt = mix(hgt, rA.a, t); nW = normalize(mix(nW, nR, t)); cav = mix(cav, rCav, t); rough = mix(rough, rRough, t);
+  }
+  // ---- beaches, wet band at the waterline, sea bed
+  if (wSand > 0.01) {
+    RfL B = rfPlanar(4.0, uvM, gxM, gyM, uvN, gxN, gyN, wN);
+    t = rfHB(hgt, B.a.a, wSand);
+    col = mix(col, B.a.rgb * vec3(0.95, 0.94, 0.9), t); hgt = mix(hgt, B.a.a, t); cav = mix(cav, B.n.z, t); rough = mix(rough, B.n.w, t);
+    vec2 sb = B.n.xy * 0.6;
+    nW = normalize(mix(nW, normalize(vec3(gN.x + sb.x, gN.y, gN.z + sb.y)), t));
+  }
+  float wet = (1.0 - smoothstep(0.0, 0.06, above)) * smoothstep(0.15, 0.4, shore);
+  col *= mix(1.0, 0.6, wet);
+  rough = mix(rough, 0.32, wet);
+  col = mix(col, col * vec3(0.55, 0.6, 0.6), 1.0 - smoothstep(-0.5, -0.03, above));
+  // micro occlusion from the detail cavity, gentle ridge / hollow shading from the vertex cavity
+  col *= clamp(0.35 + 0.8 * cav, 0.55, 1.08);
+  col *= 1.0 + clamp(vAux.z, -1.0, 1.0) * 0.04 * (1.0 - works);
   // snow above the snow line, not on cliffs
-  float snowAmt = smoothstep(uSnow, uSnow + 2.5, h + (m1 - 0.5) * 5.0 + (n2 - 0.5)) * (1.0 - smoothstep(0.3, 0.5, slope));
-  col = mix(col, snow * (0.96 + 0.05 * n4), snowAmt);
-  rfRough = mix(mix(0.95, 0.6, snowAmt), 0.5, wet);
-  // micro relief for close-ups (rock and soil rougher than grass)
-  rfBump = (detail * 0.01 * (1.0 + dirtAmt) * (1.0 - rockAmt) + rockBump) * (1.0 - snowAmt * 0.6);
+  // snow above the snow line (mountainous maps only), crisp edge following the surface detail; on steeper
+  // slopes it keeps to the hollows and rock shows through on faces; albedo ~0.8 (sRGB) so it stays shaded
+  float snowAmt = smoothstep(uSnow - 0.1, uSnow + 0.25, h + (M.x - 0.5) * 2.5 + nb * 0.6 + (hgt - 0.5) * 0.6);
+  snowAmt *= 1.0 - smoothstep(0.24, 0.4, slope + (hgt - 0.5) * 0.25);
+  col = mix(col, vec3(0.6, 0.63, 0.68) * (0.93 + 0.1 * hgt), snowAmt);
+  nW = normalize(mix(nW, gN, snowAmt * 0.35));
+  rough = mix(rough, 0.72, snowAmt);
+  // crack-hiding skirts (vertical faces under chunk borders): shade as a small earth step, not a streak
+  vec3 fc = cross(dpx, dpy);
+  vec3 fN = dot(fc, fc) > 1e-24 ? normalize(fc) : gN;
+  float skirtF = (1.0 - smoothstep(0.2, 0.4, abs(fN.y))) * smoothstep(0.35, 0.6, gN.y);
+  col = mix(col, uDetMean[1] * 0.8, skirtF);
+  nW = normalize(mix(nW, fN, skirtF));
+  rfNrm = nW;
+  rfRough = rough;
 
   if (uHiOn > 0.5) {
     vec2 dd = min(p - uHiRect.xy, uHiRect.zw - p);
@@ -880,19 +1145,10 @@ float rfBump = 0.0;
 }`)
       .replace('#include <roughnessmap_fragment>', 'float roughnessFactor = rfRough;')
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
-{
-  // bump from the procedural micro relief (screen-space derivatives)
-  vec3 sx = dFdx(-vViewPosition), sy = dFdy(-vViewPosition);
-  vec2 dh = vec2(dFdx(rfBump), dFdy(rfBump));
-  vec3 r1 = cross(sy, normal), r2 = cross(normal, sx);
-  float det = dot(sx, r1) * faceDirection;
-  vec3 grad = sign(det) * (dh.x * r1 + dh.y * r2);
-  vec3 bn = abs(det) * normal - grad;
-  if (dot(bn, bn) > 1e-30) normal = normalize(bn);
-}`)
+normal = normalize((viewMatrix * vec4(rfNrm, 0.0)).xyz);`)
       .replace('#include <emissivemap_fragment>', '#include <emissivemap_fragment>\ntotalEmissiveRadiance += rfGlow;');
   };
-  mat.customProgramCacheKey = () => 'rf-terrain-v4';
+  mat.customProgramCacheKey = () => 'rf-terrain-v8';
   return mat;
 }
 
@@ -959,9 +1215,12 @@ function createWaterMaterial(heightTex: THREE.Texture, size: number): THREE.Shad
         vec3 N = normalize(vec3(-g.x, 1.0, -g.y));
         vec3 V = normalize(cameraPosition - vWPos);
         float fres = 0.03 + 0.97 * pow(1.0 - max(dot(N, V), 0.0), 5.0);
-        vec3 deep = vec3(0.010, 0.05, 0.085);
-        vec3 shallow = vec3(0.06, 0.25, 0.25);
-        vec3 col = mix(shallow, deep, smoothstep(0.0, 0.7, depth));
+        // depth-graded colour: red is absorbed first, so the shallows show the (sandy) bottom with a turquoise
+        // tint and deep water turns dark blue-green (depth in units of 10 m)
+        vec3 absorb = exp(-depth * vec3(6.0, 2.4, 1.5));
+        vec3 deep = vec3(0.008, 0.045, 0.075);
+        vec3 shallow = vec3(0.09, 0.33, 0.31);
+        vec3 col = mix(deep, shallow, absorb.g);
         float lit = 0.25 + 0.75 * max(uSunDir.y, 0.0);
         col *= lit * uLight + 0.03;
         vec3 R = reflect(-V, N);
@@ -969,13 +1228,18 @@ function createWaterMaterial(heightTex: THREE.Texture, size: number): THREE.Shad
         col = mix(col, refl, clamp(fres, 0.0, 0.85));
         float spec = pow(max(dot(R, uSunDir), 0.0), 240.0) * 4.0 + pow(max(dot(R, uSunDir), 0.0), 24.0) * 0.12;
         col += uSunColor * spec * step(0.0, uSunDir.y);
-        float shore = 1.0 - smoothstep(0.0, 0.02, depth);
+        // foam: a crisp line at the waterline, lapping in and out, and a fainter line just offshore
         float foamVis = 1.0 - smoothstep(0.15, 0.6, fw * 6.0);
-        float foamN = foamVis > 0.0 ? rf_vnoise(p * 6.0 + vec2(uTime * 0.6, -uTime * 0.45)) : 0.0;
-        float foam = shore * mix(0.12, smoothstep(0.45, 0.8, foamN + shore * 0.25), foamVis);
-        col = mix(col, vec3(0.8, 0.84, 0.86) * max(uLight, 0.15), foam * 0.55);
-        float alpha = mix(0.55, 0.95, smoothstep(0.0, 0.4, depth));
-        alpha = max(alpha, foam * 0.75);
+        float lap = 0.5 + 0.5 * sin(uTime * 0.9 + p.x * 0.6 + p.y * 0.45);
+        float fn = foamVis > 0.0 ? rf_vnoise(p * 7.0 + vec2(uTime * 0.5, -uTime * 0.4)) : 0.5;
+        float line = 1.0 - smoothstep(0.0, 0.03 + 0.025 * lap, depth);
+        float foam = line * smoothstep(0.3, 0.6, fn + line * 0.45);
+        float off = 1.0 - smoothstep(0.0, 0.012, abs(depth - (0.07 + 0.03 * lap)));
+        foam = max(foam, off * smoothstep(0.5, 0.75, fn) * 0.55 * foamVis);
+        foam *= mix(0.45, 1.0, foamVis);
+        col = mix(col, vec3(0.82, 0.86, 0.88) * max(uLight, 0.15), foam * 0.75);
+        float alpha = 1.0 - absorb.b * 0.72;
+        alpha = max(alpha, foam * 0.85);
         gl_FragColor = vec4(col, alpha);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>

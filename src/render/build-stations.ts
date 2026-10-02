@@ -10,7 +10,7 @@ import { FC, WC, WSCALE, TRAM_BED_HALF, TRAM_BED_PERIOD } from './textures';
 import { DAYS_PER_MONTH, MONTHS_PER_YEAR, WATER_Y } from '../game/constants';
 import { distToRect } from '../game/world';
 import { RAIL_TOP_Y } from './build-rail';
-import { lampPost } from './build-road';
+import { lampPost, drapeBox } from './build-road';
 
 /** Platform top above the station's track profile. */
 export const PLATFORM_Y = RAIL_TOP_Y + 0.08;
@@ -180,7 +180,8 @@ function stationBuilding(ctx: ChunkCtx, st: Station, r: RailPart, color: number)
   // forecourt in front of the entrance (slightly above street sidewalks: access streets end on it)
   const fl = lowestUnder(w, cx, cz, Math.atan2(ex, ez), cw, cd) - 0.04;
   W.use(WC.PAVING, 0xd8d2c6, 0);
-  W.tbox(cx, fl, cz, cw, base + 0.004 - fl, cd, ex, ez, WSCALE.PAVING);
+  if (ctx.drape) drapeBox(W, ctx.drape, cx, cz, cw, cd, ex, ez, -0.03, 0.022, WSCALE.PAVING);
+  else W.tbox(cx, fl, cz, cw, base + 0.004 - fl, cd, ex, ez, WSCALE.PAVING);
   // clock tower for big stations
   if (r.tracks >= 4) {
     const TH = Math.min(BL, BD) * 0.3 + 0.34; // clear of the hipped roof
@@ -436,7 +437,8 @@ function frontPaving(ctx: ChunkCtx, f: [number, number], fx: number, fz: number,
   if (top <= fl - 0.02) return 0;
   const W = ctx.w;
   W.use(WC.PAVING, 0xd6d0c4, 0);
-  W.tbox(qx, fl - 0.05, qz, width, top - (fl - 0.05), depth, fx, fz, WSCALE.PAVING, false, true);
+  if (ctx.drape) drapeBox(W, ctx.drape, qx, qz, width, depth, fx, fz, -0.03, 0.022, WSCALE.PAVING);
+  else W.tbox(qx, fl - 0.05, qz, width, top - (fl - 0.05), depth, fx, fz, WSCALE.PAVING, false, true);
   return depth;
 }
 
@@ -618,7 +620,8 @@ export function buildDepot(ctx: ChunkCtx, d: Depot, color: number) {
     W.box(d.x + fx * (sz.d / 2 + 0.006), y + H - 0.12, d.z + fz * (sz.d / 2 + 0.006), sz.w, 0.07, 0.012, fx, fz, false);
     // forecourt
     W.use(WC.CONCRETE, 0xb5b2aa, 0);
-    W.tbox(d.x + fx * (sz.d / 2 + 0.16), y - 0.06, d.z + fz * (sz.d / 2 + 0.16), sz.w, 0.048, 0.32, fx, fz, WSCALE.CONCRETE);
+    if (ctx.drape) drapeBox(W, ctx.drape, d.x + fx * (sz.d / 2 + 0.16), d.z + fz * (sz.d / 2 + 0.16), sz.w, 0.32, fx, fz, -0.03, -0.006, WSCALE.CONCRETE);
+    else W.tbox(d.x + fx * (sz.d / 2 + 0.16), y - 0.06, d.z + fz * (sz.d / 2 + 0.16), sz.w, 0.048, 0.32, fx, fz, WSCALE.CONCRETE);
   }
 }
 
@@ -669,8 +672,13 @@ function tramDepot(ctx: ChunkCtx, d: Depot, color: number, sz: { w: number; d: n
       const L = 0.58, yb = y - 0.008;
       const c = [[-TRAM_BED_HALF, 0.01], [TRAM_BED_HALF, 0.01], [TRAM_BED_HALF, L], [-TRAM_BED_HALF, L]].map(([l, f]) => P(o + l, f));
       const v = L / TRAM_BED_PERIOD;
-      W.ttri(c[0][0], yb, c[0][1], 0.01, 0, c[1][0], yb, c[1][1], 0.99, 0, c[2][0], yb, c[2][1], 0.99, v, 0, 1, 0);
-      W.ttri(c[0][0], yb, c[0][1], 0.01, 0, c[2][0], yb, c[2][1], 0.99, v, c[3][0], yb, c[3][1], 0.01, v, 0, 1, 0);
+      if (ctx.drape) {
+        const dv = (q: [number, number], u: number, vv: number) => ({ x: q[0], z: q[1], u, v: vv, h: -0.004, w: 0, py: 0 });
+        ctx.drape.quad(W, dv(c[0], 0.01, 0), dv(c[1], 0.99, 0), dv(c[2], 0.99, v), dv(c[3], 0.01, v));
+      } else {
+        W.ttri(c[0][0], yb, c[0][1], 0.01, 0, c[1][0], yb, c[1][1], 0.99, 0, c[2][0], yb, c[2][1], 0.99, v, 0, 1, 0);
+        W.ttri(c[0][0], yb, c[0][1], 0.01, 0, c[2][0], yb, c[2][1], 0.99, v, c[3][0], yb, c[3][1], 0.01, v, 0, 1, 0);
+      }
     }
   }
   gableWalls(W, d.x, y - 0.02 + H, d.z, sz.w, sz.d, 0.3, fx, fz, 0x9a5a42, true);
@@ -679,5 +687,6 @@ function tramDepot(ctx: ChunkCtx, d: Depot, color: number, sz: { w: number; d: n
   W.box(d.x, y + H + 0.24, d.z, 0.14, 0.1, sz.d * 0.75, fx, fz);
   // concrete apron in front of the doors (the real tracks and wires are the stub edge's)
   W.use(WC.CONCRETE, 0xb5b2aa, 0);
-  W.tbox(d.x + fx * (sz.d / 2 + 0.3), y - 0.06, d.z + fz * (sz.d / 2 + 0.3), sz.w, 0.048, 0.6, fx, fz, WSCALE.CONCRETE);
+  if (ctx.drape) drapeBox(W, ctx.drape, d.x + fx * (sz.d / 2 + 0.3), d.z + fz * (sz.d / 2 + 0.3), sz.w, 0.6, fx, fz, -0.03, -0.006, WSCALE.CONCRETE);
+  else W.tbox(d.x + fx * (sz.d / 2 + 0.3), y - 0.06, d.z + fz * (sz.d / 2 + 0.3), sz.w, 0.048, 0.6, fx, fz, WSCALE.CONCRETE);
 }

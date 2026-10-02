@@ -3,17 +3,23 @@
 import { ROAD_TYPES, RAIL, LANE_OFFSET } from '../game/constants';
 import type { Network, NEdge, NNode, Crossing } from '../game/network';
 import type { Station } from '../game/stations';
-import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP, onStationForecourt } from './build-common';
+import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP, onStationForecourt, EARTHWORK_TINT } from './build-common';
+import type { WB } from './build-mesh';
 import { WC, WSCALE, STRIP_PERIOD, TRAM_BED_HALF, TRAM_BED_PERIOD } from './textures';
 import { distToRect } from '../game/world';
 import { buildBridge, buildPortals } from './build-structures';
 import { RAIL_TOP_Y } from './build-rail';
+import { Drape, DSmp, DV, drapeSweep, drapeSkirt } from './build-drape';
 
 const PAVING = 0xd8d2c6;
 const KERB = 0xd6d2ca;
 const VERGE = 0x9a9476;
 const EARTH = 0x8f8170;
+/** tint of the grass cell matching the terrain's earthwork slopes (avg ≈ #667834): faces of road fills / ramps */
+const EARTHWORK = EARTHWORK_TINT;
 const KERB_H = 0.018;
+/** height of painted markings laid over a draped surface */
+const MARK_H = 0.004;
 const PS = WSCALE.PAVING;
 
 export function roadType(e: NEdge) { return ROAD_TYPES[e.type] ?? ROAD_TYPES.road; }
@@ -104,27 +110,162 @@ function roadRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
   }
 }
 
+// ------------------------------------------------------------------------------ draped roads
+
+/**
+ * A slab laid on the terrain: an oriented rectangle (centre, width across, depth along (fx,fz)) with its top
+ * h1 above the drape and edge faces down to h0.
+ */
+export function drapeBox(W: WB, D: Drape, cx: number, cz: number, w: number, d: number, fx: number, fz: number, h0: number, h1: number, sc = 1) {
+  const rx = fz, rz = -fx;
+  const P = (a: number, b: number): [number, number] => [cx + rx * a + fx * b, cz + rz * a + fz * b];
+  const c = [P(-w / 2, -d / 2), P(w / 2, -d / 2), P(w / 2, d / 2), P(-w / 2, d / 2)];
+  const v = (q: [number, number]): DV => ({ x: q[0], z: q[1], u: q[0] / sc, v: q[1] / sc, h: h1, w: 0, py: 0 });
+  D.quad(W, v(c[0]), v(c[1]), v(c[2]), v(c[3]));
+  const out: [number, number][] = [[-fx, -fz], [rx, rz], [fx, fz], [-rx, -rz]];
+  for (let i = 0; i < 4; i++) {
+    const a = c[i], b = c[(i + 1) % 4];
+    D.wall(W, a[0], a[1], b[0], b[1], h0, h1, out[i][0], out[i][1], sc);
+  }
+}
+
+/** Distance over which a draped road blends into the edge profile next to a structure / level crossing. */
+const BLEND = 1.0;
+
+/**
+ * Arc lengths on road edge e where the drape blends into the edge profile: ends of its bridge / tunnel
+ * sections, its ends where a structure starts on the next edge, and level crossings.
+ */
+export function blendPoints(ctx: ChunkCtx, e: NEdge): number[] {
+  const net = ctx.game.world.net;
+  const out: number[] = [];
+  for (const q of e.sections) { if (q.s0 > 1e-3) out.push(q.s0); if (q.s1 < e.len - 1e-3) out.push(q.s1); }
+  for (const [nid, s] of [[e.a, 0], [e.b, e.len]] as [number, number][]) {
+    const node = net.nodes.get(nid);
+    if (!node) continue;
+    for (const id of node.edges) {
+      if (id === e.id) continue;
+      const f = net.edges.get(id);
+      if (f && net.sectionAt(f, f.a === nid ? 0.01 : f.len - 0.01) !== 'ground') { out.push(s); break; }
+    }
+  }
+  for (const c of net.crossings.values()) if (c.kind === 'level' && c.e2 === e.id) out.push(c.s2);
+  return out;
+}
+
+function blendW(bl: number[], s: number): number {
+  let w = 0;
+  for (const q of bl) { const d = Math.abs(s - q); if (d < BLEND) { const t = 1 - d / BLEND; w = Math.max(w, t * t * (3 - 2 * t)); } }
+  return w;
+}
+
+/** Draped samples of a run: densified (at most 1 unit apart, 0.25 near blends), with profile height and blend weight. */
+function drapeRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bl: number[]): DSmp[] {
+  const g = ctx.game.world.net.geo(e);
+  const out: DSmp[] = [];
+  const add = (p: Smp) => out.push({ x: p.x, z: p.z, lx: p.lx, lz: p.lz, s: p.s, py: p.y, w: blendW(bl, p.s) });
+  // a mitred end lateral moves the offset points along the road: keep added samples clear of it (as edgeRuns)
+  const ex = (p: Smp) => { const sh = Math.abs(p.lx * p.tx + p.lz * p.tz); return sh > 1e-4 ? 0.02 + 1.2 * sh : 0; };
+  const exA = ex(run[0]), exB = ex(run[run.length - 1]);
+  for (let i = 0; i < run.length; i++) {
+    const a = run[i];
+    add(a);
+    if (i === run.length - 1) break;
+    const b = run[i + 1];
+    const lo = a.s + (i === 0 ? exA : 0), hi = b.s - (i === run.length - 2 ? exB : 0);
+    if (hi - lo < 1e-3) continue;
+    const near = bl.some((q) => q > lo - BLEND - 0.2 && q < hi + BLEND + 0.2);
+    const n = Math.ceil((hi - lo) / (near ? 0.25 : 1.0));
+    for (let k = lo > a.s ? 0 : 1; k <= (hi < b.s ? n : n - 1); k++) add(sampleAt(g, lo + ((hi - lo) * k) / n));
+  }
+  return out;
+}
+
+/** Height of a road's running surface at (x,z) on a draped sample (blend weight w towards profile height py). */
+function surfAt(D: Drape, x: number, z: number, w = 0, py = 0): number {
+  const g = D.ground(x, z);
+  return w > 0 ? g + (py - g) * w : g;
+}
+
+/** A road run on a ground section, laid on the terrain: carriageway, tram beds, sidewalks and kerbs. */
+function roadRunDraped(ctx: ChunkCtx, e: NEdge, run: DSmp[]) {
+  const D = ctx.drape!;
+  const rt = roadType(e);
+  const h = rt.half, sw = rt.sidewalk;
+  const street = sw > 0;
+  const W = ctx.w;
+  W.cast = 0;
+  const cell = street ? WC.ROAD_STREET : WC.ROAD_COUNTRY, tint = e.owner < 0 ? 0xf4f4f4 : 0xffffff;
+  if (e.tram) {
+    const L = LANE_OFFSET, B = TRAM_BED_HALF;
+    const u = (l: number) => 0.01 + (0.98 * (l + h)) / (2 * h);
+    for (const [a, b] of [[-h, -L - B], [-L + B, L - B], [L + B, h]]) {
+      W.use(cell, tint);
+      drapeSweep(W, D, run, [[a, 0, u(a)], [b, 0, u(b)]], STRIP_PERIOD);
+    }
+    W.use(WC.TRAMBED, 0xffffff);
+    for (const c of [-L, L]) drapeSweep(W, D, run, [[c - B, 0, 0.01], [c + B, 0, 0.99]], TRAM_BED_PERIOD);
+  } else {
+    W.use(cell, tint);
+    drapeSweep(W, D, run, [[-h, 0, 0.01], [h, 0, 0.99]], STRIP_PERIOD);
+  }
+  if (street) {
+    // sidewalks right up to the kerb line (one strip each: the kerb shows as its face)
+    const Wd = h + sw;
+    W.use(WC.PAVING, PAVING);
+    drapeSweep(W, D, run, [[-Wd, KERB_H, 0], [-h, KERB_H, sw / PS]], PS);
+    drapeSweep(W, D, run, [[h, KERB_H, 0], [Wd, KERB_H, sw / PS]], PS);
+    W.use(WC.CONCRETE, KERB);
+    drapeSweep(W, D, run, [[-h, KERB_H, 0], [-h, -0.002, 0.04]], 1);
+    drapeSweep(W, D, run, [[h, -0.002, 0], [h, KERB_H, 0.04]], 1);
+    // the sidewalks' outer edges step down into the ground (no skirts)
+    W.use(WC.GRASS, EARTHWORK);
+    drapeSweep(W, D, run, [[-Wd, -0.03, 0], [-Wd, KERB_H, 0.05]], 1);
+    drapeSweep(W, D, run, [[Wd, KERB_H, 0], [Wd, -0.03, 0.05]], 1);
+  }
+  // where the surface leaves the ground towards a structure or a level crossing: earth faces down to it
+  const edge = street ? h + sw : h + 0.04, top = street ? KERB_H : -0.003;
+  W.use(WC.GRASS, EARTHWORK);
+  for (let i = 0; i < run.length - 1; i++) {
+    const A = run[i], B = run[i + 1];
+    if (A.w <= 0 && B.w <= 0) continue;
+    for (const sg of [-1, 1]) {
+      drapeSkirt(W, D, A.x + A.lx * edge * sg, A.z + A.lz * edge * sg, B.x + B.lx * edge * sg, B.z + B.lz * edge * sg,
+        A.w, A.py, B.w, B.py, top, (A.lx + B.lx) / 2 * sg, (A.lz + B.lz) / 2 * sg);
+    }
+  }
+}
+
 export function buildRoadEdge(ctx: ChunkCtx, e: NEdge) {
   const net = ctx.game.world.net;
   const [sa, sb] = roadRange(net, e);
   const ma = nodeTrim(net, e.a) === 0 ? mitre(net, e, e.a) : null;
   const mb = nodeTrim(net, e.b) === 0 ? mitre(net, e, e.b) : null;
+  const bl = ctx.drape ? blendPoints(ctx, e) : [];
   for (const part of splitBySections(net, e, sa, sb)) {
     if (part.type === 'tunnel') continue;
     const runs = edgeRuns(ctx, e, part.s0, part.s1, ma, mb);
-    for (const run of runs) roadRun(ctx, e, run, part.type === 'bridge');
+    const druns = part.type === 'ground' && ctx.drape ? runs.map((run) => drapeRun(ctx, e, run, bl)) : null;
+    if (druns) for (const run of druns) roadRunDraped(ctx, e, run);
+    else for (const run of runs) roadRun(ctx, e, run, part.type === 'bridge');
     if (part.type === 'bridge') {
       // the deck spans the whole bridge section even where the road is trimmed at a junction
       const full = e.sections.find((q) => q.type === 'bridge' && q.s0 <= part.s0 + 1e-6 && q.s1 >= part.s1 - 1e-6);
       buildBridge(ctx, e, full ? Math.max(full.s0, part.s0) : part.s0, full ? Math.min(full.s1, part.s1) : part.s1, runs);
     }
-    if (e.tram) tramLine(ctx, e, part.s0, part.s1, runs, part.type === 'bridge');
+    if (e.tram) tramLine(ctx, e, part.s0, part.s1, runs, part.type === 'bridge', druns, bl);
     if (part.type === 'ground' && e.depot < 0) {
-      if (roadType(e).sidewalk > 0) { if (!e.tram) streetLamps(ctx, e, part.s0, part.s1); streetTrees(ctx, e, part.s0, part.s1); }
-      else roadFurniture(ctx, e, part.s0, part.s1);
+      if (roadType(e).sidewalk > 0) { if (!e.tram) streetLamps(ctx, e, part.s0, part.s1, bl); streetTrees(ctx, e, part.s0, part.s1, bl); }
+      else roadFurniture(ctx, e, part.s0, part.s1, bl);
     }
   }
   buildPortals(ctx, e);
+}
+
+/** Running-surface height of a ground-section road at arc length s / point (x,z): the drape, blended near structures. */
+function roadSurf(ctx: ChunkCtx, bl: number[], p: Smp, x: number, z: number): number {
+  if (!ctx.drape) return p.y;
+  return surfAt(ctx.drape, x, z, blendW(bl, p.s), p.y);
 }
 
 /** Contact wire height above the road surface. */
@@ -132,8 +273,9 @@ export const TRAM_WIRE_Y = 0.55;
 const POLE = 0x4c5358, CWIRE = 0x2b2e30;
 
 /** Overhead line along a tram edge: poles at both kerbs with a span wire (and lamps), one contact wire per lane. */
-function tramLine(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][], bridge: boolean) {
+function tramLine(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][], bridge: boolean, druns: DSmp[][] | null, bl: number[]) {
   const g = ctx.game.world.net.geo(e);
+  const surf = (p: Smp, x: number, z: number) => (druns ? roadSurf(ctx, bl, p, x, z) : p.y);
   const rt = roadType(e);
   const D = ctx.d;
   const step = 3.5;
@@ -147,15 +289,15 @@ function tramLine(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][]
     if (!inChunk(ctx, p.x, p.z)) continue;
     const near = keep.some((q) => Math.abs(q - s) < 0.5);
     const ax = p.x - p.lx * off, az = p.z - p.lz * off, bx = p.x + p.lx * off, bz = p.z + p.lz * off;
-    const y0 = p.y + base;
+    const y0 = Math.max(surf(p, ax, az), surf(p, bx, bz)) + base;
     D.use(WC.METAL, POLE);
-    for (const [x, z] of [[ax, az], [bx, bz]]) if (!near) D.cylinder(x, y0, z, 0.011, 0.72, 6);
+    for (const [x, z] of [[ax, az], [bx, bz]]) if (!near) { const yb = surf(p, x, z) + base; D.cylinder(x, yb, z, 0.011, y0 + 0.72 - yb, 6); }
     // span wire across the road, hangers down to the contact wires
     D.use(WC.METAL, CWIRE);
     D.tube(ax, y0 + 0.66, az, bx, y0 + 0.66, bz, 0.003, 3);
     for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
       const hx = p.x + p.lx * c, hz = p.z + p.lz * c;
-      D.tube(hx, y0 + 0.66, hz, hx, p.y + TRAM_WIRE_Y, hz, 0.002, 3);
+      D.tube(hx, y0 + 0.66, hz, hx, surf(p, hx, hz) + TRAM_WIRE_Y, hz, 0.002, 3);
     }
     // a street lamp on every other pole
     if (!near && (k & 1)) {
@@ -165,8 +307,19 @@ function tramLine(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][]
       ctx.lights.push(lx, y0 + 0.59, lz);
     }
   }
-  // contact wires along the lanes (chunk-local runs)
+  // contact wires along the lanes (chunk-local runs), at a constant height over the road surface
   D.use(WC.METAL, CWIRE);
+  if (druns && ctx.drape) {
+    const Dr = ctx.drape;
+    for (const run of druns) for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
+      for (let i = 0; i < run.length - 1; i++) {
+        const a = run[i], b = run[i + 1];
+        const ax = a.x + a.lx * c, az = a.z + a.lz * c, bx = b.x + b.lx * c, bz = b.z + b.lz * c;
+        D.tube(ax, surfAt(Dr, ax, az, a.w, a.py) + TRAM_WIRE_Y, az, bx, surfAt(Dr, bx, bz, b.w, b.py) + TRAM_WIRE_Y, bz, 0.0035, 3);
+      }
+    }
+    return;
+  }
   for (const run of runs) for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
     for (let i = 0; i < run.length - 1; i++) {
       const a = run[i], b = run[i + 1];
@@ -185,12 +338,31 @@ function laneEnd(c: { pts: Float32Array; cum: Float32Array }, atEnd: boolean) {
   return { x: p[i * 3], y: p[i * 3 + 1], z: p[i * 3 + 2], dx: dx / l, dz: dz / l };
 }
 
-/** Rails (raised steel strips) and contact wire along a polyline of points (x,y,z). */
-function tramRails(ctx: ChunkCtx, pts: number[]) {
+/**
+ * Rails (raised steel strips) and contact wire along a polyline of points (x,y,z); `drape`: on the
+ * terrain-laid road surface (the points' heights are ignored).
+ */
+function tramRails(ctx: ChunkCtx, pts: number[], drape?: Drape) {
   const D = ctx.d;
   const n = pts.length / 3;
   if (n < 2) return;
   const G2 = RAIL.gauge / 2 + 0.006;
+  if (drape) {
+    const dv = (x: number, z: number): DV => ({ x, z, u: 0, v: 0, h: 0.004, w: 0, py: 0 });
+    for (let i = 0; i < n - 1; i++) {
+      const ax = pts[i * 3], az = pts[i * 3 + 2], bx = pts[i * 3 + 3], bz = pts[i * 3 + 5];
+      const dx = bx - ax, dz = bz - az, l = Math.hypot(dx, dz) || 1;
+      const rx = -dz / l, rz = dx / l;
+      D.use(WC.METAL, 0x8f8a84);
+      for (const o of [-G2, G2]) {
+        drape.quad(D, dv(ax + rx * (o - 0.006), az + rz * (o - 0.006)), dv(ax + rx * (o + 0.006), az + rz * (o + 0.006)),
+          dv(bx + rx * (o + 0.006), bz + rz * (o + 0.006)), dv(bx + rx * (o - 0.006), bz + rz * (o - 0.006)));
+      }
+      D.use(WC.METAL, CWIRE);
+      D.tube(ax, drape.ground(ax, az) + TRAM_WIRE_Y, az, bx, drape.ground(bx, bz) + TRAM_WIRE_Y, bz, 0.0035, 3);
+    }
+    return;
+  }
   for (let i = 0; i < n - 1; i++) {
     const ax = pts[i * 3], ay = pts[i * 3 + 1], az = pts[i * 3 + 2], bx = pts[i * 3 + 3], by = pts[i * 3 + 4], bz = pts[i * 3 + 5];
     const dx = bx - ax, dz = bz - az, l = Math.hypot(dx, dz) || 1;
@@ -214,6 +386,7 @@ function tramJunction(ctx: ChunkCtx, node: NNode) {
   for (const id of node.edges) { const e = net.edges.get(id); if (e && e.kind === 'road' && e.tram) arms.push(e); }
   if (!arms.length) return;
   const R = nodeTrim(net, node.id);
+  const dr = nodeDrape(ctx, node);
   // lane stretches between the road strip end and the lane end (they run over the junction plate)
   for (const e of arms) {
     const atA = e.a === node.id;
@@ -229,7 +402,7 @@ function tramJunction(ctx: ChunkCtx, node: NNode) {
           const p = sampleAt(g, sLane + ((sStrip - sLane) * k) / 4);
           pts.push(p.x + p.lx * c, p.y, p.z + p.lz * c);
         }
-        tramRails(ctx, pts);
+        tramRails(ctx, pts, dr);
       }
     }
   }
@@ -257,7 +430,7 @@ function tramJunction(ctx: ChunkCtx, node: NNode) {
         pts.push(u * u * u * p0.x + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * p3.x, p0.y + (p3.y - p0.y) * t,
           u * u * u * p0.z + 3 * u * u * t * c1z + 3 * u * t * t * c2z + t * t * t * p3.z);
       }
-      tramRails(ctx, pts);
+      tramRails(ctx, pts, dr);
     }
   }
 }
@@ -271,7 +444,7 @@ function clearOf(ctx: ChunkCtx, e: NEdge): number[] {
 }
 
 /** Street trees in the sidewalk near the kerb (staggered on both sides), clear of lamps, stops and buildings. */
-function streetTrees(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
+function streetTrees(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, bl: number[] = []) {
   const w = ctx.game.world;
   const g = w.net.geo(e);
   const rt = roadType(e);
@@ -299,7 +472,7 @@ function streetTrees(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
         room = Math.min(room, distToRect(x, z, b.x, b.z, b.angle, b.w / 2, b.d / 2));
       }
       if (room < 0.16) continue;
-      const y = p.y + KERB_H;
+      const y = roadSurf(ctx, bl, p, x, z) + KERB_H;
       const hv = (h % 1000) / 1000;
       const size = Math.min(0.55, 0.3 + room * 0.7) * (0.85 + 0.15 * ((h >> 10) % 100) / 100);
       ctx.trees.push({ type: hv < 0.7 ? 0 : 1, x, y: y - 0.005, z, s: size, rot: hv * 6.28, tint: ((h >> 4) % 100) / 100 });
@@ -310,7 +483,7 @@ function streetTrees(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
 }
 
 /** Country roads: reflector posts on both verges and an occasional distance marker. */
-function roadFurniture(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
+function roadFurniture(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, bl: number[] = []) {
   const g = ctx.game.world.net.geo(e);
   const rt = roadType(e);
   const D = ctx.d;
@@ -324,7 +497,7 @@ function roadFurniture(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
       const off = side * (rt.half + 0.13);
       const x = p.x + p.lx * off, z = p.z + p.lz * off;
       if (!inChunk(ctx, x, z)) continue;
-      const y = p.y - 0.03;
+      const y = roadSurf(ctx, bl, p, x, z) - 0.03;
       D.use(WC.PLAIN, 0xf2f2ee, 0);
       D.box(x, y, z, 0.014, 0.12, 0.014, p.tx, p.tz);
       D.use(WC.PLAIN, 0x1d1d1d, 0);
@@ -337,10 +510,11 @@ function roadFurniture(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
       const off = rt.half + 0.2;
       const x = p.x + p.lx * off, z = p.z + p.lz * off;
       if (inChunk(ctx, x, z)) {
+        const yy = roadSurf(ctx, bl, p, x, z);
         D.use(WC.METAL, 0x9aa0a4, 0);
-        D.box(x, p.y - 0.03, z, 0.01, 0.16, 0.01, p.tx, p.tz);
+        D.box(x, yy - 0.03, z, 0.01, 0.16, 0.01, p.tx, p.tz);
         D.use(WC.PLAIN, 0xf4f4f0, 0);
-        D.box(x, p.y + 0.1, z, 0.06, 0.05, 0.006, -p.lx, -p.lz, true);
+        D.box(x, yy + 0.1, z, 0.06, 0.05, 0.006, -p.lx, -p.lz, true);
       }
     }
   }
@@ -358,7 +532,7 @@ export function lampPost(ctx: ChunkCtx, x: number, y: number, z: number, ax: num
   ctx.lights.push(hx, y + h - 0.04, hz);
 }
 
-function streetLamps(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
+function streetLamps(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, bl: number[] = []) {
   const net = ctx.game.world.net;
   const g = net.geo(e);
   const rt = roadType(e);
@@ -369,7 +543,8 @@ function streetLamps(ctx: ChunkCtx, e: NEdge, s0: number, s1: number) {
     if (!inChunk(ctx, p.x, p.z)) continue;
     const side = ((k + e.id) & 1) ? 1 : -1;
     const off = side * (rt.half + rt.sidewalk * 0.7);
-    lampPost(ctx, p.x + p.lx * off, p.y + KERB_H, p.z + p.lz * off, -p.lx * side, -p.lz * side);
+    const x = p.x + p.lx * off, z = p.z + p.lz * off;
+    lampPost(ctx, x, roadSurf(ctx, bl, p, x, z) + KERB_H, z, -p.lx * side, -p.lz * side);
   }
 }
 
@@ -391,6 +566,77 @@ function filletCtrl(ax: number, az: number, dax: number, daz: number, bx: number
 }
 
 const STOP_W = 0.035;
+
+/** The drape for a road node's plate, unless a structure or level crossing is close to it (then: profile). */
+function nodeDrape(ctx: ChunkCtx, node: NNode): Drape | undefined {
+  const D = ctx.drape;
+  if (!D) return undefined;
+  const net = ctx.game.world.net;
+  for (const id of node.edges) {
+    const e = net.edges.get(id);
+    if (!e) continue;
+    const s = e.a === node.id ? 0 : e.len;
+    for (const q of blendPoints(ctx, e)) if (Math.abs(q - s) < BLEND + 0.6) return undefined;
+  }
+  return D;
+}
+
+/** Flat surface piece of a road node: draped (offset h above the drape) or at the given heights (+h). */
+function nodeTri(W: WB, dr: Drape | undefined, ax: number, ay: number, az: number, bx: number, by: number, bz: number, cx: number, cy: number, cz: number, sc: number, h: number) {
+  if (!dr) { upTri(W, ax, ay + h, az, bx, by + h, bz, cx, cy + h, cz, sc); return; }
+  const v = (x: number, z: number): DV => ({ x, z, u: x / sc, v: z / sc, h, w: 0, py: 0 });
+  dr.tri(W, v(ax, az), v(bx, bz), v(cx, cz));
+}
+
+/** Flat convex polygon of a road node (x, y, z triples, either winding): draped (offset h) or at the given heights (+h). */
+function nodePoly(W: WB, dr: Drape | undefined, P: number[], sc: number, h: number) {
+  const n = P.length / 3;
+  if (n < 3) return;
+  if (!dr) {
+    for (let k = 1; k < n - 1; k++) upTri(W, P[0], P[1] + h, P[2], P[k * 3], P[k * 3 + 1] + h, P[k * 3 + 2], P[k * 3 + 3], P[k * 3 + 4] + h, P[k * 3 + 5], sc);
+    return;
+  }
+  dr.begin();
+  for (let k = 0; k < n; k++) dr.v(P[k * 3], P[k * 3 + 2], P[k * 3] / sc, P[k * 3 + 2] / sc, h);
+  dr.end(W);
+}
+
+/**
+ * The fan (c, B[i], B[i+1]) around a closed boundary B (x, y, z triples, star-shaped around c) laid as few
+ * convex polygons as possible.
+ */
+function convexFan(W: WB, dr: Drape | undefined, cx: number, cy: number, cz: number, B: number[], sc: number, h: number) {
+  const n = B.length / 3;
+  if (n < 2) return;
+  const X = (i: number) => B[(i % n) * 3], Y = (i: number) => B[(i % n) * 3 + 1], Z = (i: number) => B[(i % n) * 3 + 2];
+  const cr = (ax: number, az: number, bx: number, bz: number, qx: number, qz: number) => (bx - ax) * (qz - az) - (bz - az) * (qx - ax);
+  let sg = 0;
+  for (let i = 0; i < n && !sg; i++) { const c = cr(cx, cz, X(i), Z(i), X(i + 1), Z(i + 1)); if (Math.abs(c) > 1e-9) sg = c > 0 ? 1 : -1; }
+  if (!sg) return;
+  const ok = (ax: number, az: number, bx: number, bz: number, qx: number, qz: number) => cr(ax, az, bx, bz, qx, qz) * sg >= -1e-9;
+  const P: number[] = [];
+  let i = 0;
+  while (i < n) {
+    P.length = 0;
+    P.push(cx, cy, cz, X(i), Y(i), Z(i), X(i + 1), Y(i + 1), Z(i + 1));
+    let j = i + 1;
+    while (j < n && P.length < 28 * 3) {
+      const qx = X(j + 1), qz = Z(j + 1);
+      if (!ok(X(j - 1), Z(j - 1), X(j), Z(j), qx, qz) || !ok(X(j), Z(j), qx, qz, cx, cz) || !ok(qx, qz, cx, cz, X(i), Z(i))) break;
+      P.push(qx, Y(j + 1), qz);
+      j++;
+    }
+    nodePoly(W, dr, P, sc, h);
+    i = j;
+  }
+}
+
+/** Kerb or edge face of a road node piece: draped (h0..h1 above the drape) or between the given heights. */
+function nodeWall(W: WB, dr: Drape | undefined, ax: number, az: number, bx: number, bz: number, ya: number, yb: number, h0: number, h1: number, nx: number, nz: number, sc = 1) {
+  if (!dr) { wallQuad(W, ax, az, bx, bz, ya + h0, ya + h1, yb + h0, yb + h1, nx, nz, sc); return; }
+  const l = Math.hypot(nx, nz) || 1;
+  dr.wall(W, ax, az, bx, bz, h0, h1, nx / l, nz / l, sc);
+}
 
 export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
   const net = ctx.game.world.net;
@@ -414,6 +660,7 @@ export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
   const cy = node.y;
   const W = ctx.w;
   W.cast = 0;
+  const dr = nodeDrape(ctx, node);
   const bnd: number[] = []; // plate boundary (x,y,z), increasing angle
   const SEG = 6;
   const stopLines = arms.length >= 3;
@@ -422,21 +669,21 @@ export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
   const zone = (A: Arm, Z: number) => {
     const rx = -A.dz, rz = A.dx; // right of the outward arm direction
     const P = (l: number, d: number): [number, number] => [A.x + rx * l - A.dx * d, A.z + rz * l - A.dz * d];
-    const q = (l0: number, l1: number, d0: number, d1: number, white: boolean) => {
+    const q = (l0: number, l1: number, d0: number, d1: number, h: number) => {
       const [ax, az] = P(l0, d0), [bx, bz] = P(l1, d0), [cx, cz] = P(l1, d1), [dx, dz] = P(l0, d1);
-      if (white) W.use(WC.PLAIN, 0xe8e8e2); else W.use(WC.ASPHALT, 0xffffff);
-      upTri(W, ax, A.y, az, bx, A.y, bz, cx, A.y, cz, WSCALE.ASPHALT);
-      upTri(W, ax, A.y, az, cx, A.y, cz, dx, A.y, dz, WSCALE.ASPHALT);
+      nodePoly(W, dr, [ax, A.y, az, bx, A.y, bz, cx, A.y, cz, dx, A.y, dz], WSCALE.ASPHALT, h);
     };
-    // stop line across the incoming lane (left of the outward direction)
-    q(-A.w, 0, 0, STOP_W, true);
-    q(0, A.w, 0, STOP_W, false);
+    // the zone's asphalt, then the markings laid over it: stop line across the incoming lane (left of the
+    // outward direction) and the zebra stripes
+    W.use(WC.ASPHALT, 0xffffff);
+    q(-A.w, A.w, 0, Z, 0);
+    W.use(WC.PLAIN, 0xe8e8e2);
+    q(-A.w, 0, 0, STOP_W, MARK_H);
     if (Z > STOP_W + 1e-6) {
-      q(-A.w, A.w, STOP_W, STOP_W + 0.015, false);
       const n = Math.max(3, Math.round((2 * A.w) / 0.09));
-      for (let k = 0; k < 2 * n; k++) {
+      for (let k = 0; k < 2 * n; k += 2) {
         const l0 = -A.w + (2 * A.w * k) / (2 * n), l1 = -A.w + (2 * A.w * (k + 1)) / (2 * n);
-        q(l0, l1, STOP_W + 0.015, Z, k % 2 === 0);
+        q(l0, l1, STOP_W + 0.015, Z, MARK_H);
       }
     }
   };
@@ -460,9 +707,9 @@ export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
     // gap pieces between the end-zone inner corners and the outer corners (asphalt)
     if (stopLines) {
       W.use(WC.ASPHALT, 0xffffff);
-      upTri(W, rAx, A.y, rAz, oAx, A.y, oAz, qbez(oAx, cx, oBx, 1 / SEG), A.y + (B.y - A.y) / SEG, qbez(oAz, cz, oBz, 1 / SEG), WSCALE.ASPHALT);
+      nodeTri(W, dr, rAx, A.y, rAz, oAx, A.y, oAz, qbez(oAx, cx, oBx, 1 / SEG), A.y + (B.y - A.y) / SEG, qbez(oAz, cz, oBz, 1 / SEG), WSCALE.ASPHALT, 0);
       const iBx = B.x - B.dx * ZB + B.dz * B.w, iBz = B.z - B.dz * ZB - B.dx * B.w;
-      upTri(W, iBx, B.y, iBz, qbez(oAx, cx, oBx, (SEG - 1) / SEG), A.y + (B.y - A.y) * (SEG - 1) / SEG, qbez(oAz, cz, oBz, (SEG - 1) / SEG), oBx, B.y, oBz, WSCALE.ASPHALT);
+      nodeTri(W, dr, iBx, B.y, iBz, qbez(oAx, cx, oBx, (SEG - 1) / SEG), A.y + (B.y - A.y) * (SEG - 1) / SEG, qbez(oAz, cz, oBz, (SEG - 1) / SEG), oBx, B.y, oBz, WSCALE.ASPHALT, 0);
     }
     // sidewalk ring along the fillet
     const swA = A.sw, swB = B.sw;
@@ -478,22 +725,22 @@ export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
         const ox = qbez(pAx, ocx, pBx, t), oz = qbez(pAz, ocz, pBz, t);
         const ny = A.y + (B.y - A.y) * t;
         W.use(WC.PAVING, PAVING);
-        upTri(W, px, py + KERB_H, pz, qx, py + KERB_H, qz, ox, ny + KERB_H, oz, PS);
-        upTri(W, px, py + KERB_H, pz, ox, ny + KERB_H, oz, nx, ny + KERB_H, nz, PS);
+        nodePoly(W, dr, [px, py, pz, qx, py, qz, ox, ny, oz, nx, ny, nz], PS, KERB_H);
         W.use(WC.CONCRETE, KERB);
-        wallQuad(W, px, pz, nx, nz, py - 0.002, py + KERB_H, ny - 0.002, ny + KERB_H, node.x - (px + nx) / 2, node.z - (pz + nz) / 2);
-        W.use(WC.GRAVEL, EARTH);
-        wallQuad(W, qx, qz, ox, oz, py - 0.25, py + KERB_H, ny - 0.25, ny + KERB_H, (qx + ox) / 2 - node.x, (qz + oz) / 2 - node.z, 0.5);
+        nodeWall(W, dr, px, pz, nx, nz, py, ny, -0.002, KERB_H, node.x - (px + nx) / 2, node.z - (pz + nz) / 2);
+        if (dr) {
+          W.use(WC.GRASS, EARTHWORK);
+          nodeWall(W, dr, qx, qz, ox, oz, py, ny, -0.03, KERB_H, (qx + ox) / 2 - node.x, (qz + oz) / 2 - node.z);
+        } else {
+          W.use(WC.GRASS, EARTHWORK);
+          wallQuad(W, qx, qz, ox, oz, py - 0.25, py + KERB_H, ny - 0.25, ny + KERB_H, (qx + ox) / 2 - node.x, (qz + oz) / 2 - node.z, 0.5);
+        }
         px = nx; pz = nz; qx = ox; qz = oz; py = ny;
       }
     }
   }
   W.use(WC.ASPHALT, 0xffffff);
-  const n = bnd.length / 3;
-  for (let i = 0; i < n; i++) {
-    const j = (i + 1) % n;
-    upTri(W, node.x, cy, node.z, bnd[i * 3], bnd[i * 3 + 1], bnd[i * 3 + 2], bnd[j * 3], bnd[j * 3 + 1], bnd[j * 3 + 2], WSCALE.ASPHALT);
-  }
+  convexFan(W, dr, node.x, cy, node.z, bnd, WSCALE.ASPHALT, 0);
 }
 
 function deadEnd(ctx: ChunkCtx, node: NNode) {
@@ -501,7 +748,6 @@ function deadEnd(ctx: ChunkCtx, node: NNode) {
   const e = net.edges.get(node.edges[0]);
   if (!e || e.kind !== 'road' || e.depot >= 0) return;
   const rt = roadType(e);
-  if (rt.sidewalk <= 0) return;
   // access streets end on a station forecourt: no turning circle
   if (onStationForecourt(ctx.game, node.x, node.z, 0.35)) return;
   if (net.sectionAt(e, e.a === node.id ? 0 : e.len) !== 'ground') return;
@@ -510,25 +756,37 @@ function deadEnd(ctx: ChunkCtx, node: NNode) {
   const rx = -oz, rz = ox;
   const W = ctx.w;
   W.cast = 0;
-  const Wd = rt.half, S = rt.half + rt.sidewalk;
-  const SEG = 10;
+  const dr = nodeDrape(ctx, node);
+  // a rounded turning head: slightly wider than the street, kerbed (streets) or with gravel edges (roads)
+  const street = rt.sidewalk > 0;
+  const Wd = rt.half * (street ? 1.25 : 1.15), S = Wd + (street ? rt.sidewalk : 0.05);
+  const SEG = 12;
   const pt = (r: number, k: number): [number, number] => {
     const a = (k / SEG) * Math.PI;
     const c = Math.cos(a), s = Math.sin(a);
-    return [p.x + rx * r * c + ox * r * s, p.z + rz * r * c + oz * r * s];
+    // widen smoothly from the street's width at the sides into the head
+    const rr = r * (0.82 + 0.18 * s);
+    return [p.x + rx * rr * c + ox * rr * s, p.z + rz * rr * c + oz * rr * s];
   };
+  // the head (convex: one polygon), then the ring around it
+  W.use(WC.ASPHALT, 0xffffff);
+  const head: number[] = [];
+  for (let k = 0; k <= SEG; k++) { const [ax, az] = pt(Wd, k); head.push(ax, p.y, az); }
+  nodePoly(W, dr, head, WSCALE.ASPHALT, 0);
   for (let k = 0; k < SEG; k++) {
     const [ax, az] = pt(Wd, k), [bx, bz] = pt(Wd, k + 1);
-    W.use(WC.ASPHALT, 0xffffff);
-    upTri(W, p.x, p.y, p.z, ax, p.y, az, bx, p.y, bz, WSCALE.ASPHALT);
     const [cx, cz] = pt(S, k), [dx, dz] = pt(S, k + 1);
-    W.use(WC.PAVING, PAVING);
-    upTri(W, ax, p.y + KERB_H, az, cx, p.y + KERB_H, cz, dx, p.y + KERB_H, dz, PS);
-    upTri(W, ax, p.y + KERB_H, az, dx, p.y + KERB_H, dz, bx, p.y + KERB_H, bz, PS);
-    W.use(WC.CONCRETE, KERB);
-    wallQuad(W, ax, az, bx, bz, p.y - 0.002, p.y + KERB_H, p.y - 0.002, p.y + KERB_H, p.x - (ax + bx) / 2, p.z - (az + bz) / 2);
-    W.use(WC.GRAVEL, EARTH);
-    wallQuad(W, cx, cz, dx, dz, p.y - 0.25, p.y + KERB_H, p.y - 0.25, p.y + KERB_H, (cx + dx) / 2 - p.x, (cz + dz) / 2 - p.z, 0.5);
+    if (street) {
+      W.use(WC.PAVING, PAVING);
+      nodePoly(W, dr, [ax, p.y, az, cx, p.y, cz, dx, p.y, dz, bx, p.y, bz], PS, KERB_H);
+      W.use(WC.CONCRETE, KERB);
+      nodeWall(W, dr, ax, az, bx, bz, p.y, p.y, -0.002, KERB_H, p.x - (ax + bx) / 2, p.z - (az + bz) / 2);
+      if (dr) { W.use(WC.GRASS, EARTHWORK); nodeWall(W, dr, cx, cz, dx, dz, p.y, p.y, -0.03, KERB_H, (cx + dx) / 2 - p.x, (cz + dz) / 2 - p.z); }
+      else { W.use(WC.GRASS, EARTHWORK); wallQuad(W, cx, cz, dx, dz, p.y - 0.25, p.y + KERB_H, p.y - 0.25, p.y + KERB_H, (cx + dx) / 2 - p.x, (cz + dz) / 2 - p.z, 0.5); }
+    } else {
+      W.use(WC.GRAVEL, VERGE);
+      nodePoly(W, dr, [ax, p.y, az, cx, p.y, cz, dx, p.y, dz, bx, p.y, bz], 0.5, -0.003);
+    }
   }
 }
 
@@ -549,20 +807,25 @@ export function buildBusStops(ctx: ChunkCtx, st: Station, color: number) {
       const fx = p.lx * side, fz = p.lz * side; // away from the road
       const W = ctx.w, D = ctx.d;
       const tram = !!e.tram;
+      const dr = ctx.drape && net.sectionAt(e, stop.s) === 'ground' ? ctx.drape : undefined;
+      const surf = (qx: number, qz: number) => (dr ? dr.ground(qx, qz) : p.y);
       if (!street) {
         W.cast = 0;
         W.use(WC.PAVING, PAVING);
-        W.tbox(x - fx * 0.04, p.y - 0.06, z - fz * 0.04, tram ? 1.3 : 0.5, tram ? 0.1 : 0.075, 0.2, fx, fz, PS);
+        if (dr) drapeBox(W, dr, x - fx * 0.04, z - fz * 0.04, tram ? 1.3 : 0.5, 0.2, fx, fz, -0.03, tram ? 0.04 : 0.015, PS);
+        else W.tbox(x - fx * 0.04, p.y - 0.06, z - fz * 0.04, tram ? 1.3 : 0.5, tram ? 0.1 : 0.075, 0.2, fx, fz, PS);
       } else if (tram) {
         // raised boarding platform along the kerb with a yellow tactile edge
         const bx = p.x + p.lx * side * (rt.half + 0.07), bz = p.z + p.lz * side * (rt.half + 0.07);
         W.cast = 0;
         W.use(WC.PAVING, 0xcfcac0);
-        W.tbox(bx, p.y + KERB_H - 0.01, bz, 1.3, 0.035, 0.14, fx, fz, PS);
+        if (dr) drapeBox(W, dr, bx, bz, 1.3, 0.14, fx, fz, KERB_H - 0.01, KERB_H + 0.025, PS);
+        else W.tbox(bx, p.y + KERB_H - 0.01, bz, 1.3, 0.035, 0.14, fx, fz, PS);
         W.use(WC.PLAIN, 0xe3c02b);
-        W.box(bx - fx * 0.055, p.y + KERB_H + 0.025, bz - fz * 0.055, 1.24, 0.002, 0.02, fx, fz);
+        if (dr) drapeBox(W, dr, bx - fx * 0.055, bz - fz * 0.055, 1.24, 0.02, fx, fz, KERB_H + 0.025, KERB_H + 0.027, 1);
+        else W.box(bx - fx * 0.055, p.y + KERB_H + 0.025, bz - fz * 0.055, 1.24, 0.002, 0.02, fx, fz);
       }
-      const yb = street ? p.y + KERB_H + (tram ? 0.025 : 0) : p.y + (tram ? 0.04 : 0.015);
+      const yb = (street ? surf(x, z) + KERB_H + (tram ? 0.025 : 0) : surf(x, z) + (tram ? 0.04 : 0.015));
       // back wall (glass), roof, posts, bench
       D.use(WC.PLAIN, 0x8fb3c8);
       D.box(x + fx * 0.05, yb + 0.02, z + fz * 0.05, 0.34, 0.2, 0.01, fx, fz, false);

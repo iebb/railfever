@@ -7,6 +7,7 @@ import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
 import type { NEdge } from './network';
 import { closestOnPolyline } from './geom';
+import { chargeVehicles } from './opcosts';
 
 /** Occupancy key: a lane (edge, direction) or one connector (from lane -> to lane) through a junction. */
 const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
@@ -334,7 +335,14 @@ export class Vehicles {
     const g = this.game;
     const dp = g.depots.get(depotId);
     if (!dp || dp.kind !== 'rail') return 'Invalid depot';
-    if (!cars.length || cars[0].kind !== 'loco') return 'A train needs a locomotive';
+    // a locomotive hauling coaches, or one or more electric multiple units coupled together
+    const emu = cars.length > 0 && cars[0].kind === 'emu';
+    if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
+    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu')) return 'Multiple units only couple with multiple units';
+    // (companies: an operator of the line owning one of its stations, lines.operateError)
+    const tl = lineId != null ? g.lines.get(lineId) : undefined;
+    const opErr = tl ? g.lines.operateError(tl, dp.owner) : null;
+    if (opErr) return opErr;
     const cost = cars.reduce((s, c) => s + c.cost, 0);
     if (!g.company(dp.owner).economy.spend(cost, 'vehicles')) return 'Not enough money';
     const t = new Train(g, this.nextId++, cars, depotId);
@@ -353,6 +361,9 @@ export class Vehicles {
     if (!dp || dp.kind !== (tram ? 'tram' : 'road')) return tram ? 'Trams are bought at a tram depot' : 'Invalid depot';
     const line = lineId != null ? g.lines.get(lineId) : undefined;
     if (line && line.kind !== (tram ? 'tram' : 'road')) return tram ? 'Not a tram line' : 'Not a bus line';
+    // (companies: an operator of the line owning one of its stations, lines.operateError)
+    const opErr = line ? g.lines.operateError(line, dp.owner) : null;
+    if (opErr) return opErr;
     if (!g.company(dp.owner).economy.spend(model.cost, 'vehicles')) return 'Not enough money';
     const v = new RoadVehicle(g, this.nextId++, model, depotId, false);
     v.owner = dp.owner;
@@ -378,16 +389,8 @@ export class Vehicles {
     g.lines.rebuild();
   }
 
-  monthly() {
-    const g = this.game;
-    for (const v of this.map.values()) {
-      const c = v.runningCost / 12;
-      g.company(v.owner).economy.spend(c, 'running', true);
-      v.profitYear -= c;
-      const l = v.line;
-      if (l) l.costYear += c;
-    }
-  }
+  /** Month end: operating costs of every vehicle (overheads, crew, energy, maintenance; opcosts.ts). */
+  monthly() { chargeVehicles(this.game); }
 
   yearly() {
     for (const v of this.map.values()) { v.profitLast = v.profitYear; v.profitYear = 0; v.incomeYear = 0; }

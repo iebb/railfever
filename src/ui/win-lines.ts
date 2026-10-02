@@ -17,10 +17,10 @@ import { fmtPct, fmtMult, KIND_META } from './format';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
 import { demandView } from '../game/demand';
-
-let showAllLines = false;
-let showAllVehicles = false;
-let kindFilter: LineKind | 'all' = 'all';
+import { getFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LINE_MODES, LineMode } from './lineid';
+import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
+import { servicesTab, patternSelect, stopDots, patBadge } from './win-services';
+import { subsetOf, linePatterns } from '../game/patterns';
 
 /** Does the station offer stops for this transport mode? */
 export function servesKind(g: Game, st: Station, kind: LineKind): boolean {
@@ -31,11 +31,13 @@ export function servesKind(g: Game, st: Station, kind: LineKind): boolean {
 
 export function openLines(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('lines', 'Lines', { width: 520, icon: 'lines', color: 'var(--accent)' });
+  const win = ui.wm.open('lines', 'Lines', { width: 560, icon: 'lines', color: 'var(--accent)' });
+  const f = getFilter('lines');
   const render = () => {
     clear(win.body);
-    const mine = g.lines.all().filter((l) => l.owner === PLAYER);
-    const lines = g.lines.all().filter((l) => (showAllLines || l.owner === PLAYER) && (kindFilter === 'all' || l.kind === kindFilter));
+    const all = g.lines.all();
+    const mine = all.filter((l) => l.owner === PLAYER);
+    const lines = all.filter((l) => lineMatches(g, l, f));
     win.sub.textContent = `${mine.length} line${mine.length === 1 ? '' : 's'} · ${mine.reduce((s, l) => s + l.vehicles.length, 0)} vehicles`;
     const trams = availableModels(g.year, 'tram').length > 0;
     add(win.body,
@@ -43,20 +45,24 @@ export function openLines(ui: UI) {
         h('button', { class: 'btn primary', onclick: () => newLine(ui, 'rail') }, icon('train', 16), 'Rail line'),
         h('button', { class: 'btn primary', onclick: () => newLine(ui, 'road') }, icon('bus', 16), 'Bus line'),
         h('button', { class: 'btn primary', disabled: !trams, 'data-tip': trams ? undefined : 'No trams available yet in this era', onclick: () => newLine(ui, 'tram') }, icon('tram', 16), 'Tram line')),
-      h('div', { class: 'btns' },
-        seg([['all', 'All'], ['rail', 'Rail'], ['road', 'Bus'], ['tram', 'Tram']], kindFilter, (v) => { kindFilter = v; win.last = undefined; render(); }),
-        h('span', { class: 'spacer' }),
-        toggle('All companies', showAllLines, (v) => { showAllLines = v; win.last = undefined; render(); })));
-    const sugg = kindFilter === 'all' || kindFilter === 'road' ? intercitySuggestions(ui) : null;
+      filterBar(g, f, modeCounts(g, all, f), () => { win.last = undefined; render(); }));
+    const sugg = !f.hidden.includes('bus') || !f.hidden.includes('coach') ? intercitySuggestions(ui) : null;
     if (!lines.length) {
-      add(win.body, h('div', { class: 'pad' }, mine.length ? 'No lines match the filter.' : 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'), sugg);
+      add(win.body, h('div', { class: 'pad' }, all.some((l) => l.owner === PLAYER || f.company !== 'mine') ? 'No lines match the filter.' : 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'), sugg);
       return;
     }
     const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Line'), h('th', { class: 'r' }, 'Stops'), h('th', { class: 'r' }, 'Veh.'), h('th', { class: 'r' }, 'Pax/mo'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const l of lines) {
       const profit = l.incomeYear - l.costYear;
+      const cong = congestionOf(g, l.id);
+      const partner = l.owner !== PLAYER && g.lines.canOperate(l, PLAYER);
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => openLine(ui, l.id) },
-        h('td', { class: 'ellip' }, h('span', { class: 'linechip', style: `--c:${l.color}` }, icon(KIND_META[l.kind].icon, 13), l.name, g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null), l.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(l.owner).name}`) : null),
+        h('td', { class: 'ellip', style: 'max-width:260px' }, h('span', { class: 'inline', style: 'gap:6px' }, lineSymbol(g, l, 'sm'), icon(MODE_META[lineMode(g, l)].icon, 14),
+          h('span', { class: 'ltag-n' }, l.name),
+          g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null,
+          (l.patterns?.length ?? 0) > 1 ? h('span', { class: 'flag shared', 'data-tip': linePatterns(l).map((p) => p.name).join(' · ') }, `${l.patterns!.length} services`) : null,
+          cong && cong.level >= 2 ? h('span', { class: 'neg', 'data-tip': cong.level >= 3 ? 'Trains stuck' : 'Congested' }, icon('warning', 14)) : null,
+          l.owner !== PLAYER ? h('span', { class: 'muted' }, `${partner ? 'partner · ' : ''}${g.company(l.owner).name}`) : (l.operators?.length ? h('span', { class: 'flag shared' }, 'shared') : null))),
         h('td', { class: 'r' }, String(l.stops.length)), h('td', { class: 'r' }, String(l.vehicles.length)), h('td', { class: 'r' }, fmtInt(l.passLast)),
         h('td', { class: 'r ' + (profit < 0 ? 'neg' : 'pos') }, fmtMoney(profit))));
     }
@@ -286,21 +292,24 @@ function cloneLast(ui: UI, l: Line) {
 // ------------------------------------------------------------------ lists
 export function openVehicles(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('vehicles', 'Vehicles', { width: 580, icon: 'vehicles', color: 'var(--accent)' });
+  const win = ui.wm.open('vehicles', 'Vehicles', { width: 600, icon: 'vehicles', color: 'var(--accent)' });
+  const f = getFilter('vehicles');
   const render = () => {
     clear(win.body);
     const all = g.vehicles.all();
-    const vs = all.filter((v) => showAllVehicles || v.owner === PLAYER).sort((a, b) => b.profitYear - a.profitYear);
+    const vs = all.filter((v) => vehicleMatches(g, v, f)).sort((a, b) => b.profitYear - a.profitYear);
     const mine = all.filter((v) => v.owner === PLAYER);
     const count = (k: LineKind) => mine.filter((v) => (v.line?.kind ?? (v.kind === 'train' ? 'rail' : (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road')) === k).length;
     win.sub.textContent = `${count('rail')} trains · ${count('road')} buses · ${count('tram')} trams`;
-    add(win.body, h('div', { class: 'btns', style: 'margin-top:0' }, h('span', { class: 'spacer' }), toggle('All companies', showAllVehicles, (v) => { showAllVehicles = v; win.last = undefined; render(); })));
-    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, 'No vehicles yet. Build a depot, open it, and buy a train, bus or tram.')); return; }
+    const counts: Partial<Record<LineMode, number>> = {};
+    for (const v of all) if (vehicleMatches(g, v, { hidden: [], company: f.company })) { const m = vehicleMode(g, v); counts[m] = (counts[m] ?? 0) + 1; }
+    add(win.body, filterBar(g, f, counts, () => { win.last = undefined; render(); }));
+    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, mine.length ? 'No vehicles match the filter.' : 'No vehicles yet. Build a depot, open it, and buy a train, bus or tram.')); return; }
     const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Vehicle'), h('th', null, 'Line'), h('th', null, 'Status'), h('th', { class: 'r' }, 'Load'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const v of vs.slice(0, 300)) {
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => ui.openVehicle(v.id) },
         h('td', { class: 'ellip' }, v.owner !== PLAYER ? h('span', { class: 'swatch', style: `background:${g.company(v.owner).color}` }) : null, v.name),
-        h('td', { class: 'ellip' }, v.line ? h('span', { class: 'linechip', style: `--c:${v.line.color}` }, v.line.name) : '—'),
+        h('td', { class: 'ellip' }, v.line ? h('span', { class: 'inline', style: 'gap:6px' }, lineSymbol(g, v.line, 'sm'), h('span', { class: 'ltag-n' }, v.line.name)) : '—'),
         h('td', { class: 'ellip ' + (v.state === 'noroute' || v.state === 'stopped' ? 'neg' : 'muted') }, v.status),
         h('td', { class: 'r' }, `${v.load}/${v.capacity}`),
         h('td', { class: 'r ' + (v.profitYear < 0 ? 'neg' : 'pos') }, fmtMoney(v.profitYear))));

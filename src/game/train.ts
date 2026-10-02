@@ -5,8 +5,11 @@ import type { Depot } from './build-ops';
 import { Curve3, curvePoint, makeCurve, NEdge, NNode } from './network';
 import { KMH_TO_UPS, TRACK_TYPES } from './constants';
 import { curveSpeed } from './construction';
+import { HEAVY_RAIL_TRACKS, aeroOf, auxKwOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
+import { PLATFORM_PASS_KMH, holdForOvertake } from './patterns';
+import { trackPassage } from './opcosts';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
 export const CROSS_BASE = 50_000_000;
@@ -23,17 +26,47 @@ export interface TSeg {
   depot?: number;
 }
 
-/** Service braking (units/s^2 = 10 m/s^2). */
-export const TRAIN_BRAKE = 0.07;
+// ---------------------------------------------------------------- physics (UPDATE 9j)
+/**
+ * Service braking (units/s^2; 1 unit/s^2 = 10 m/s^2): 0.7 m/s^2 up to 160 km/h, easing to 0.5 m/s^2 from 300 km/h
+ * (high-speed trains brake gentler at speed: adhesion, brake heat).
+ */
+export const TRAIN_BRAKE = 0.07, TRAIN_BRAKE_HS = 0.05;
+const BV1 = 160 * KMH_TO_UPS, BV2 = 300 * KMH_TO_UPS, BK = (TRAIN_BRAKE - TRAIN_BRAKE_HS) / (BV2 - BV1), BC = TRAIN_BRAKE + BK * BV1;
+const BD1 = (BV1 * BV1) / (2 * TRAIN_BRAKE), BD2 = (BC * Math.log(TRAIN_BRAKE / TRAIN_BRAKE_HS) - (TRAIN_BRAKE - TRAIN_BRAKE_HS)) / (BK * BK);
+/** Service braking rate (units/s^2) at speed v (units/s). */
+export function brakeRate(v: number): number { return v <= BV1 ? TRAIN_BRAKE : v >= BV2 ? TRAIN_BRAKE_HS : BC - BK * v; }
+/** Distance (units) a train needs to stop from v (units/s) braking at brakeRate (400 km/h: ~11 km). */
+export function brakeDistance(v: number): number {
+  if (v <= BV1) return (v * v) / (2 * TRAIN_BRAKE);
+  if (v <= BV2) return BD1 + (BC * Math.log(TRAIN_BRAKE / (BC - BK * v)) - (TRAIN_BRAKE - (BC - BK * v))) / (BK * BK);
+  return BD1 + BD2 + (v * v - BV2 * BV2) / (2 * TRAIN_BRAKE_HS);
+}
+/** Highest speed (units/s) from which a train stops within d units (the inverse of brakeDistance). */
+export function brakeSpeed(d: number): number {
+  if (d <= 0) return 0;
+  if (d <= BD1) return Math.sqrt(2 * TRAIN_BRAKE * d);
+  if (d >= BD1 + BD2) return Math.sqrt(BV2 * BV2 + 2 * TRAIN_BRAKE_HS * (d - BD1 - BD2));
+  let lo = BV1, hi = BV2;
+  for (let i = 0; i < 24; i++) { const m = (lo + hi) / 2; if (brakeDistance(m) < d) lo = m; else hi = m; }
+  return (lo + hi) / 2;
+}
+/** Davis running resistance per kg: a0 (N/kg, bearings and rolling) + a1 (N/kg per m/s, flange and track). */
+export const DAVIS = { a0: 0.0075, a1: 0.0002 };
+/** Power reaching the wheels; rotating masses add to the inertia; passenger comfort caps acceleration (m/s^2). */
+const TRANSMISSION = 0.92, ROTATING = 1.06, ACCEL_MAX = 1.1;
+/** Share of a multiple unit's mass on driven axles. */
+const EMU_DRIVEN = 0.6;
 const GAP = 0.1;
-const G = 0.981;
 
 export function makeSeg(g: Game, e: NEdge, dir: number): TSeg {
   const net = g.world.net;
   const geo = net.geo(e);
   const tt = TRACK_TYPES[e.type] ?? TRACK_TYPES.standard;
-  let kmh = Math.min(tt.speed, curveSpeed(geo.minRadius));
+  let kmh = Math.min(tt.speed, curveSpeed(geo.minRadius, e.type));
   if (e.depot >= 0) kmh = Math.min(kmh, 25);
+  // (ops) a platform track is passed at reduced speed; non-stopping trains prefer the through tracks
+  if (e.station >= 0) kmh = Math.min(kmh, PLATFORM_PASS_KMH);
   const res = [e.id];
   for (const c of net.crossings.values()) if (c.e1 === e.id || c.e2 === e.id) res.push(CROSS_BASE + c.id);
   const tunnels: [number, number][] = [];
@@ -52,6 +85,34 @@ function virtualDepotSeg(g: Game, dp: Depot, length: number): TSeg {
 }
 
 export interface Cont { edge: NEdge; dir: number }
+
+// ---------------------------------------------------------------- track compatibility
+/**
+ * What a consist may run on: the track types every one of its vehicles allows (null: any), and whether one of
+ * them needs overhead wire (electric traction).
+ */
+export interface TrackRule { types: Set<string> | null; wire: boolean }
+
+/** The track rule of a consist (VehicleModel.tracks; heavy rail by default; electric traction needs wire). */
+export function consistRule(cars: VehicleModel[]): TrackRule {
+  let types: Set<string> | null = null, wire = false;
+  for (const m of cars) {
+    const allowed: string[] | null = m.tracks ?? (m.kind === 'loco' || m.kind === 'wagon' ? HEAVY_RAIL_TRACKS : null);
+    if (allowed) types = types ? new Set([...types].filter((t: string) => allowed.includes(t))) : new Set(allowed);
+    if (m.traction === 'electric') wire = true;
+  }
+  return { types, wire };
+}
+
+/** May a consist with this rule run on the edge? (depot tracks: always) */
+export function ruleAllows(rule: TrackRule | null | undefined, e: NEdge): boolean {
+  if (!rule || e.depot >= 0) return true;
+  if (rule.types && !rule.types.has(e.type)) return false;
+  return !rule.wire || !!TRACK_TYPES[e.type]?.electrified;
+}
+
+/** May every vehicle of the consist run on the edge (track type, overhead wire)? */
+export function trackAllows(cars: VehicleModel[], e: NEdge): boolean { return ruleAllows(consistRule(cars), e); }
 
 /** Block signals (`signalKind` 'block'; the default 'path' signals guard just a train's own path). */
 type SigNode = NNode & { signalKind?: 'block' | 'path' };
@@ -93,18 +154,19 @@ export function blockEdges(g: Game, edgeId: number, fromNode: number): number[] 
  * Continuations after travelling edge e in direction dir (signals, track access, no depots). With `anyOwner`,
  * tracks the owner may not use are allowed too (a train caught on them when an agreement ends finds its way off).
  */
-export function railNext(g: Game, e: NEdge, dir: number, owner: number, anyOwner = false): Cont[] {
+export function railNext(g: Game, e: NEdge, dir: number, owner: number, anyOwner = false, rule: TrackRule | null = null): Cont[] {
   const net = g.world.net;
   const out: Cont[] = [];
   for (const c of net.nextRail(e, dir)) {
     if (c.edge.depot >= 0 || (!anyOwner && !g.canUse(owner, c.edge.owner))) continue;
+    if (rule && !ruleAllows(rule, c.edge)) continue;
     if (net.signalFor(c.node, net.sideAt(c.edge, c.node.id)) < 0) continue;
     out.push({ edge: c.edge, dir: c.dir });
   }
   return out;
 }
 
-function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false): Cont[] {
+function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false, rule: TrackRule | null = null): Cont[] {
   const net = g.world.net;
   if (seg.e < 0) {
     const dp = g.depots.get(seg.depot!);
@@ -112,7 +174,7 @@ function frontier(g: Game, seg: TSeg, owner: number, anyOwner = false): Cont[] {
     return stub ? [{ edge: stub, dir: 1 }] : [];
   }
   const e = net.edges.get(seg.e);
-  return e ? railNext(g, e, seg.dir, owner, anyOwner) : [];
+  return e ? railNext(g, e, seg.dir, owner, anyOwner, rule) : [];
 }
 
 export class Heap {
@@ -149,7 +211,7 @@ export interface RouteResult { conts: Cont[]; cost: number }
  * A* over (edge, direction) to any platform edge of the target station. With `exit`, tracks the owner may not
  * use are allowed at a high cost (only to get off them).
  */
-export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false): RouteResult | null {
+export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null): RouteResult | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.rail) return null;
@@ -192,7 +254,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
       return { conts, cost: NG[i] };
     }
     if (++n > maxExpand) break;
-    for (const c of railNext(g, e, d, owner, exit)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
+    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
   }
   return null;
 }
@@ -216,8 +278,21 @@ export class Train extends Vehicle {
   reversed = false;
   blockedBy = 0;
   failCount = 0;
+  /** game seconds standing while waiting for a free path (since it last moved; congestion and deadlocks) */
+  stuckTime = 0;
   /** current gradient under the train (for UI) */
   grade = 0;
+  // energy accounting (physics, UPDATE 9j; opcosts.ts reads and resets them monthly)
+  /** traction energy delivered at the wheels (J) */
+  tractionJ = 0;
+  /** energy taken by the brakes (J): what regenerative braking could return (opcosts applies the share) */
+  regenJ = 0;
+  /** hotel / auxiliary energy (J): heating, air conditioning, lighting while in service */
+  auxJ = 0;
+  /** distance run (km) */
+  km = 0;
+  /** hours in service (on the map) */
+  hours = 0;
 
   constructor(game: Game, id: number, cars: VehicleModel[], depotId: number) {
     super(game, id);
@@ -226,6 +301,15 @@ export class Train extends Vehicle {
     this.value = cars.reduce((s, c) => s + c.cost, 0);
     const dp = game.depots.get(depotId);
     if (dp) { this.homeX = dp.x; this.homeZ = dp.z; this.owner = dp.owner; }
+  }
+
+  private ruleKey = '';
+  private ruleCache: TrackRule | null = null;
+  /** Track types and wire this train needs (from its vehicles; see consistRule). */
+  get rule(): TrackRule {
+    const key = this.cars.map((c) => c.id).sort().join(',');
+    if (key !== this.ruleKey || !this.ruleCache) { this.ruleKey = key; this.ruleCache = consistRule(this.cars); }
+    return this.ruleCache;
   }
 
   get length() { let l = 0; for (const c of this.cars) l += c.length + GAP; return l; }
@@ -237,6 +321,25 @@ export class Train extends Vehicle {
   get onMap() { return this.segs.length > 0; }
   get power() { let p = 0; for (const m of this.cars) p += m.power; return p; }
   get mass() { let w = 0; for (const m of this.cars) w += m.weight; return w + this.load * 0.075; }
+
+  private physKey: unknown[] = [];
+  private physCache = { aero: 0, aux: 0, driven: 0 };
+  /** Consist physics: aerodynamic c (N per (m/s)^2: the leading nose plus the length), hotel load (kW), driven mass (t). */
+  get phys(): { aero: number; aux: number; driven: number } {
+    const c0 = this.cars, n = c0.length, k = this.physKey;
+    if (k[0] !== c0 || k[1] !== n || k[2] !== c0[0] || k[3] !== c0[n - 1]) {
+      const key = [c0, n, c0[0], c0[n - 1]];
+      let aero = this.cars.length ? aeroOf(this.cars[0]).nose : 0, aux = 0, driven = 0;
+      for (const c of this.cars) {
+        aero += aeroOf(c).len * c.length;
+        aux += auxKwOf(c);
+        if (c.power > 0) driven += c.kind === 'emu' ? c.weight * EMU_DRIVEN : c.weight;
+      }
+      this.physKey = key;
+      this.physCache = { aero, aux, driven };
+    }
+    return this.physCache;
+  }
 
   // ---------------------------------------------------------------- geometry
   tailInfo(): { seg: number; pos: number } {
@@ -363,7 +466,8 @@ export class Train extends Vehicle {
   private meterTrack(s: TSeg) {
     const g = this.game;
     const e = g.world.net.edges.get(s.e);
-    if (e && e.owner >= 0) g.recordTrackUse(this.owner, e, s.len);
+    // (ops) wear of the passage for the owner's bill, metered for track access by that wear
+    if (e && e.owner >= 0) trackPassage(g, this, e, s.len);
   }
 
   private releaseAhead() {
@@ -464,6 +568,22 @@ export class Train extends Vehicle {
     return true;
   }
 
+  /**
+   * Break a deadlock this train is part of: drop what it reserved ahead and take another way to its target,
+   * turning back where it can (true if it found one).
+   */
+  breakDeadlock(): boolean {
+    if (!this.segs.length || this.state !== 'waiting' || this.headSeg !== this.segs.length - 1) return false;
+    this.pending = [];
+    const before = this.reversed;
+    this.forceTurn = true;
+    const ok = this.planRoute(true);
+    this.forceTurn = false;
+    if (ok) { this.state = 'waiting'; this.waitTime = 0; this.stuckTime = 0; }
+    return ok && this.reversed !== before;
+  }
+  private forceTurn = false;
+
   private planRoute(allowReverse: boolean): boolean {
     const g = this.game;
     const target = this.targetStation();
@@ -471,33 +591,37 @@ export class Train extends Vehicle {
     if (!target) { this.state = 'stopped'; this.status = 'No line assigned'; return false; }
     if (!target.rail) { this.state = 'noroute'; this.status = target.name + ' has no platforms'; return false; }
     this.routeTarget = target.id;
+    const rule = this.rule;
     const last = this.segs[this.segs.length - 1];
-    const fr = last ? frontier(g, last, this.owner) : [];
-    let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id) : null;
+    const fr = last ? frontier(g, last, this.owner, false, rule) : [];
+    let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id, 60000, false, rule) : null;
     let rev: RouteResult | null = null;
-    if (allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1) {
+    const canTurn = allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1;
+    if (canTurn) {
       const tail = this.tailInfo();
       const ts = this.segs[tail.seg];
       if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
-        const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner);
-        if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id);
+        const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, rule);
+        if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, false, rule);
       }
     }
     if (!fwd && !rev && this.onForeignTrack()) {
       // caught on tracks we may no longer use (an access agreement ended): find the way off them
-      const fx = last ? frontier(g, last, this.owner, true) : [];
-      fwd = fx.length ? findRailRoute(g, fx, target.id, this.owner, this.id, 60000, true) : null;
-      if (!fwd && allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1) {
+      const fx = last ? frontier(g, last, this.owner, true, rule) : [];
+      fwd = fx.length ? findRailRoute(g, fx, target.id, this.owner, this.id, 60000, true, rule) : null;
+      if (!fwd && canTurn) {
         const ts = this.segs[this.tailInfo().seg];
         if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
-          const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true);
-          if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true);
+          const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true, rule);
+          if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true, rule);
         }
       }
     }
     if (!fwd && !rev) {
       this.state = 'noroute';
-      this.status = 'No route to ' + target.name;
+      // a way there for other trains, not for this one: say why
+      const any = last && (rule.types || rule.wire) ? findRailRoute(g, frontier(g, last, this.owner), target.id, this.owner, this.id, 20000) : null;
+      this.status = any ? `No compatible route to ${target.name} (${rule.wire ? 'needs electrified ' : ''}${rule.types ? [...rule.types].join('/') : ''} track)` : 'No route to ' + target.name;
       if (++this.failCount >= 3 && this.line && this.line.stops.length > 1) { this.advanceStop(); this.failCount = 0; }
       return false;
     }
@@ -506,7 +630,7 @@ export class Train extends Vehicle {
     // a loop line keeps circulating: turning back only where the way ahead leads nowhere
     const loop = !!this.line && g.lines.isLoop(this.line);
     let route = fwd;
-    if (rev && (!fwd || (!loop && rev.cost + penalty < fwd.cost))) {
+    if (rev && (!fwd || this.forceTurn || (!loop && rev.cost + penalty < fwd.cost))) {
       if (this.reverseTrain()) route = rev;
     }
     if (!route) { this.state = 'noroute'; return false; }
@@ -581,6 +705,7 @@ export class Train extends Vehicle {
   // ---------------------------------------------------------------- update
   update(dt: number) {
     this.stateTime += dt;
+    if (this.segs.length) this.account(dt);
     switch (this.state) {
       case 'depot':
       case 'noroute':
@@ -597,7 +722,8 @@ export class Train extends Vehicle {
         return;
       case 'loading':
         this.loadTimer -= dt;
-        if (this.loadTimer <= 0) this.depart();
+        // (ops) a faster train about to pass: wait for it on this platform (bounded), then leave
+        if (this.loadTimer <= 0 && !holdForOvertake(this.game, this, dt)) this.depart();
         return;
     }
     this.move(dt);
@@ -606,22 +732,31 @@ export class Train extends Vehicle {
   private tmpA = { x: 0, y: 0, z: 0 };
   private tmpB = { x: 0, y: 0, z: 0 };
 
+  /** Physics accounting while in service (on the map): hotel energy and hours. */
+  private account(dt: number) {
+    this.auxJ += this.phys.aux * 1000 * dt;
+    this.hours += dt / 3600;
+  }
+
   private move(dt: number) {
     if (!this.segs.length) return;
     const g = this.game;
     let dEnd = this.distToEnd();
     const vmax = this.maxSpeed;
-    const brakeDist = (this.speed * this.speed) / (2 * TRAIN_BRAKE);
-    if (this.pending.length && dEnd < brakeDist + 6) {
-      if (this.tryExtend()) dEnd = this.distToEnd();
+    // the path is reserved at least a braking distance ahead (cab signalling; block by block), else the speed
+    // is held to what the reserved path allows
+    const brakeDist = brakeDistance(this.speed);
+    for (let k = 0; k < 16 && this.pending.length && dEnd < brakeDist + 6; k++) {
+      if (!this.tryExtend()) break;
+      dEnd = this.distToEnd();
     }
     // target speed from the braking curve to the end of the reserved path and speed limits ahead
-    let vt = Math.min(vmax, Math.sqrt(2 * TRAIN_BRAKE * Math.max(0, dEnd - 0.05)) + 0.02);
+    let vt = Math.min(vmax, brakeSpeed(dEnd - 0.05) + 0.02);
     const look = brakeDist + 3;
     let d = -this.headPos;
     for (let i = this.headSeg; i < this.segs.length; i++) {
       const s = this.segs[i];
-      if (i > this.headSeg && s.limit < vt) vt = Math.min(vt, Math.sqrt(s.limit * s.limit + 2 * TRAIN_BRAKE * Math.max(0, d)));
+      if (i > this.headSeg && s.limit < vt) vt = Math.min(vt, brakeSpeed(Math.max(0, d) + brakeDistance(s.limit)));
       if (s.e >= 0 && s.res.length > 1) {
         for (const r of s.res) {
           if (r < CROSS_BASE) continue;
@@ -630,7 +765,7 @@ export class Train extends Vehicle {
           const sp = s.dir > 0 ? c.s1 : s.len - c.s1;
           const dist = d + sp;
           if (dist < 0.2 || dist > look + 2) continue;
-          if (g.vehicles.roadBusyNear(c.e2, c.x, c.z, 0.55)) vt = Math.min(vt, Math.sqrt(2 * TRAIN_BRAKE * Math.max(0, dist - 0.7)));
+          if (g.vehicles.roadBusyNear(c.e2, c.x, c.z, 0.55)) vt = Math.min(vt, brakeSpeed(dist - 0.7));
         }
       }
       d += s.len;
@@ -639,25 +774,36 @@ export class Train extends Vehicle {
     // the whole train must respect the limits of the track it occupies
     const tail = this.tailInfo();
     for (let i = tail.seg; i <= this.headSeg; i++) vt = Math.min(vt, this.segs[i].limit);
-    // physics: tractive effort limited by power and adhesion, gradient and running resistance (SI, then /10)
+    // physics (SI): tractive effort limited by power, adhesion (Curtius-Kniffler) and comfort; Davis running
+    // resistance m (a0 + a1 v) + c v^2 with the train's own aerodynamics (nose and length, not mass); gradient;
+    // service braking (more on a falling gradient). Energy at the wheels is accounted.
     const A = this.tmpA, B = this.tmpB;
     this.pointBehind(0, A);
     this.pointBehind(Math.min(this.length, 8), B);
     const span = Math.max(0.5, Math.min(this.length, 8));
     this.grade = (A.y - B.y) / span;
-    const mass = this.mass;
-    let locoMass = 0;
-    for (const c of this.cars) if (c.power > 0) locoMass += c.weight;
-    const vms = this.speed * 10;
-    const adhesion = (0.28 * 9.81 * locoMass) / mass;
-    const tract = Math.min(adhesion, (this.power * 0.92) / (mass * Math.max(2, vms)));
-    const resist = 0.012 + 0.000035 * vms * vms;
-    const accel = (tract - resist) / 10 - G * this.grade;
-    if (this.speed < vt) this.speed = Math.max(0, Math.min(vt, this.speed + Math.max(accel, this.speed < 0.3 ? 0.004 : -0.05) * dt));
-    else this.speed = Math.max(vt, this.speed - TRAIN_BRAKE * 1.3 * dt);
+    const ph = this.phys, m = this.mass * 1000, mEff = m * ROTATING;
+    const v0 = this.speed * 10, vT = Math.max(0, vt) * 10;
+    const mu = 0.161 + 7.5 / (v0 * 3.6 + 44);
+    const fMax = Math.min(mu * 9.81 * ph.driven * 1000, (this.power * 1000 * TRANSMISSION) / Math.max(2, v0), mEff * ACCEL_MAX);
+    const fRes = m * (DAVIS.a0 + DAVIS.a1 * v0) + ph.aero * v0 * v0;
+    const fGrade = m * 9.81 * this.grade;
+    // the force at the wheels that brings the train to the target speed this step, within what it can do
+    const need = (mEff * (vT - v0)) / dt + fRes + fGrade;
+    const F = vT >= v0 ? Math.min(need, fMax) : Math.max(need, -(mEff * brakeRate(this.speed) * 10 * 1.3 + Math.max(0, -fGrade)));
+    let v1 = v0 + ((F - fRes - fGrade) / mEff) * dt;
+    // a train too weak for the gradient creeps on (it never rolls back)
+    if (vT > v0 && v0 < 3 && v1 < v0 + 0.04 * dt) v1 = Math.min(vT, v0 + 0.04 * dt);
+    if (vT >= v0 && v1 > vT) v1 = vT;
+    this.speed = Math.max(0, v1) / 10;
     if (this.speed > vt && this.speed - vt < 0.002) this.speed = vt;
     let mv = this.speed * dt;
     if (mv >= dEnd) mv = dEnd;
+    // energy at the wheels: traction work, braking work (regenerable), distance
+    if (F > 0) this.tractionJ += F * mv * 10; else this.regenJ -= F * mv * 10;
+    this.km += mv / 100;
+    if (this.speed > 0.05) this.stuckTime = 0;
+    else if (this.state === 'waiting') this.stuckTime += dt;
     this.headPos += mv;
     while (this.headPos > this.segs[this.headSeg].len && this.headSeg < this.segs.length - 1) {
       this.headPos -= this.segs[this.headSeg].len;
@@ -693,9 +839,202 @@ export class Train extends Vehicle {
   destroy() { this.releaseAll(); }
 }
 
-/** Can a train leaving this depot reach the station? */
-export function depotReaches(g: Game, dp: Depot, stationId: number): boolean {
+/** Can a train leaving this depot reach the station? (`cars`: such a train, by its track rule) */
+export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: VehicleModel[]): boolean {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return false;
-  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000);
+  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000, false, cars ? consistRule(cars) : null);
+}
+
+/**
+ * Can these vehicles run the line: from each stop to the next, some way their track rule allows? Null if
+ * so, else why not (for a warning before buying, and for the AI).
+ */
+export function lineCompatibility(g: Game, lineId: number, cars: VehicleModel[]): string | null {
+  const l = g.lines.get(lineId);
+  if (!l || l.kind !== 'rail' || l.stops.length < 2) return null;
+  const rule = consistRule(cars), net = g.world.net;
+  if (!rule.types && !rule.wire) return null;
+  for (let i = 0; i < l.stops.length; i++) {
+    const a = g.stations.get(l.stops[i]), b = g.stations.get(l.stops[(i + 1) % l.stops.length]);
+    if (!a?.rail || !b?.rail || a === b) continue;
+    let ok = false;
+    for (const eid of a.rail.edges) {
+      const e = net.edges.get(eid);
+      if (!e || !ruleAllows(rule, e)) continue;
+      if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, e, d, l.owner, false, rule), b.id, l.owner, -1, 40000, false, rule))) { ok = true; break; }
+    }
+    if (!ok) return `${cars[0]?.name ?? 'This train'} cannot run from ${a.name} to ${b.name}: the track there is not ${rule.wire ? 'electrified ' : ''}${rule.types ? [...rule.types].join(' / ') : ''} track`;
+  }
+  return null;
+}
+
+/**
+ * Who runs the track a line uses (through services across several companies' networks): per owner, the route
+ * length on its track between consecutive stops and the share of the whole, longest first.
+ */
+export function lineOperators(g: Game, lineId: number): { owner: number; distance: number; share: number }[] {
+  const l = g.lines.get(lineId);
+  if (!l || l.kind !== 'rail' || l.stops.length < 2) return [];
+  const net = g.world.net;
+  const v = l.vehicles.map((id) => g.vehicles.get(id)).find((x): x is Train => x instanceof Train);
+  const rule = v ? v.rule : null;
+  const by = new Map<number, number>();
+  for (let i = 0; i < l.stops.length; i++) {
+    const a = g.stations.get(l.stops[i]), b = g.stations.get(l.stops[(i + 1) % l.stops.length]);
+    if (!a?.rail || !b?.rail || a === b) continue;
+    let best: RouteResult | null = null;
+    for (const eid of a.rail.edges) {
+      const e = net.edges.get(eid);
+      if (!e) continue;
+      for (const d of [1, -1]) {
+        const r = findRailRoute(g, railNext(g, e, d, l.owner, false, rule), b.id, l.owner, -1, 40000, false, rule);
+        if (r && (!best || r.cost < best.cost)) best = r;
+      }
+    }
+    for (const c of best?.conts ?? []) by.set(c.edge.owner, (by.get(c.edge.owner) ?? 0) + c.edge.len);
+  }
+  const total = [...by.values()].reduce((x, y) => x + y, 0) || 1;
+  return [...by].map(([owner, distance]) => ({ owner, distance, share: distance / total })).sort((p, q) => q.distance - p.distance);
+}
+
+// ------------------------------------------------------------------------------------------- congestion
+export type CongestionFix = 'none' | 'signals' | 'platforms' | 'loops' | 'double' | 'fewer-trains';
+export interface LineCongestion {
+  /** 0 flowing, 1 some waiting, 2 congested, 3 stuck (a deadlock or trains not moving for long) */
+  level: 0 | 1 | 2 | 3;
+  /** trains of the line waiting for a free path a while (> 30 s), and how long the longest has waited */
+  waits: number; longestWait: number;
+  /** trains of the line in a circle of trains each waiting for the next */
+  deadlock: boolean;
+  /** where they wait: the reserved stretch each waiting train needs next (edge ids) */
+  blockedStretches: number[][];
+  edgeIds: number[];
+  /** stations the line's waiting trains are held before (waiting for a free platform there): trains per station */
+  platformWaits: { station: number; trains: number }[];
+  /** what would help: signals (none on the line yet), more platforms (most wait for one), passing loops / double
+   * track (single track), fewer trains */
+  suggestion: CongestionFix;
+}
+
+/** Trains held for a platform at a station (see platformWaits). */
+export interface PlatformWait {
+  station: number;
+  /** trains waiting a while (minWait) for a free path into the station they head for, and their ids */
+  trains: number; trainIds: number[];
+  /** seconds the longest of them has waited */
+  longestWait: number;
+}
+
+/** Is a waiting train held for a platform of the station it heads for (its blocked path runs into the station, or it waits within reach of it)? */
+export function waitsForPlatform(g: Game, t: Train): boolean {
+  if (t.state !== 'waiting' || t.routeTarget < 0) return false;
+  const net = g.world.net, target = t.routeTarget;
+  if (t.pending.slice(0, 12).some((x) => x.e >= 0 && net.edges.get(x.e)?.station === target)) return true;
+  const r = g.stations.get(target)?.rail;
+  if (!r) return false;
+  const p = { x: 0, y: 0, z: 0 };
+  t.worldPos(p);
+  return Math.hypot(p.x - r.x, p.z - r.z) <= r.length / 2 + 25;
+}
+
+/**
+ * Trains held for a platform, per station (all companies): trains waiting at least `minWait` seconds for a free
+ * path into the station they head for. Stations without such trains are left out.
+ */
+export function platformWaits(g: Game, minWait = 10): Map<number, PlatformWait> {
+  const out = new Map<number, PlatformWait>();
+  for (const t of g.vehicles.trains()) {
+    if (t.stuckTime < minWait || !waitsForPlatform(g, t)) continue;
+    let w = out.get(t.routeTarget);
+    if (!w) out.set(t.routeTarget, w = { station: t.routeTarget, trains: 0, trainIds: [], longestWait: 0 });
+    w.trains++;
+    w.trainIds.push(t.id);
+    w.longestWait = Math.max(w.longestWait, t.stuckTime);
+  }
+  return out;
+}
+
+/** Trains in circles of mutual waiting (each waits for the next one's reserved track): the circles. */
+export function deadlockCycles(g: Game, minWait = 20): Train[][] {
+  const by = new Map<number, Train>();
+  for (const t of g.vehicles.trains()) if (t.state === 'waiting' && t.blockedBy && t.stuckTime >= minWait) by.set(t.id, t);
+  const out: Train[][] = [], done = new Set<number>();
+  for (const t of by.values()) {
+    if (done.has(t.id)) continue;
+    const path: Train[] = [], seen = new Map<number, number>();
+    let cur: Train | undefined = t;
+    while (cur && !seen.has(cur.id) && !done.has(cur.id)) { seen.set(cur.id, path.length); path.push(cur); cur = by.get(cur.blockedBy); }
+    if (cur && seen.has(cur.id)) out.push(path.slice(seen.get(cur.id)));
+    for (const x of path) done.add(x.id);
+  }
+  return out;
+}
+
+/** Break each deadlock: the train that waited longest takes another way (turning back); true if any moved. */
+export function resolveDeadlocks(g: Game, minWait = 40): boolean {
+  let any = false;
+  for (const cyc of deadlockCycles(g, minWait)) {
+    const order = [...cyc].sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id);
+    for (const t of order) if (t.breakDeadlock()) { any = true; break; }
+  }
+  return any;
+}
+
+/** How congested a railway line is (all its operators' trains) and what would help. */
+export function lineCongestion(g: Game, lineId: number): LineCongestion {
+  const res: LineCongestion = { level: 0, waits: 0, longestWait: 0, deadlock: false, blockedStretches: [], edgeIds: [], platformWaits: [], suggestion: 'none' };
+  const l = g.lines.get(lineId);
+  if (!l || l.kind !== 'rail') return res;
+  const trains = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train);
+  const ids = new Set(trains.map((t) => t.id));
+  const edges = new Set<number>();
+  for (const t of trains) {
+    if (t.state !== 'waiting') continue;
+    res.longestWait = Math.max(res.longestWait, t.stuckTime);
+    if (t.stuckTime < 30) continue;
+    res.waits++;
+    if (waitsForPlatform(g, t)) {
+      const pw = res.platformWaits.find((q) => q.station === t.routeTarget);
+      if (pw) pw.trains++; else res.platformWaits.push({ station: t.routeTarget, trains: 1 });
+    }
+    const stretch = t.pending.slice(0, 12).map((x) => x.e).filter((e) => e >= 0);
+    res.blockedStretches.push(stretch);
+    for (const e of stretch) edges.add(e);
+  }
+  res.edgeIds = [...edges];
+  res.deadlock = deadlockCycles(g, 20).some((c) => c.some((t) => ids.has(t.id)));
+  res.level = res.deadlock || res.longestWait > 240 ? 3 : res.waits >= 2 || (res.waits >= 1 && res.longestWait > 90) ? 2 : res.waits ? 1 : 0;
+  if (res.level < 2) return res;
+  // what the waiting stretches lack: signals, a second track (loops first), else there are too many trains
+  const net = g.world.net;
+  let signals = 0, single = 0, n = 0;
+  for (const e of edges) {
+    const ed = net.edges.get(e);
+    if (!ed) continue;
+    n++;
+    if (net.nodes.get(ed.a)?.signal || net.nodes.get(ed.b)?.signal) signals++;
+    if (!twinTrack(g, ed)) single++;
+  }
+  const atPlatforms = res.platformWaits.reduce((a, q) => a + q.trains, 0);
+  res.suggestion = n && signals === 0 ? 'signals' : atPlatforms * 2 > res.waits ? 'platforms' : single > n / 2 ? (trains.length > 2 ? 'double' : 'loops') : 'fewer-trains';
+  return res;
+}
+
+/** Is there a second track beside this one (double track, a passing loop)? */
+function twinTrack(g: Game, e: NEdge): boolean {
+  const net = g.world.net, p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+  net.pointAt(e, e.len / 2, p, d);
+  const l = Math.hypot(d.x, d.z) || 1;
+  const tx = d.x / l, tz = d.z / l;
+  for (const o of net.edgesNear(p.x - 2, p.z - 2, p.x + 2, p.z + 2)) {
+    if (o.id === e.id || o.kind !== 'rail' || o.depot >= 0) continue;
+    const ne = net.nearestEdge(p.x, p.z, 1.6, 'rail', (x) => x.id === o.id);
+    if (!ne || ne.d < 0.2) continue;
+    const q = { x: 0, y: 0, z: 0 }, dd = { x: 0, y: 0, z: 0 };
+    net.pointAt(o, ne.s, q, dd);
+    const ol = Math.hypot(dd.x, dd.z) || 1;
+    if (Math.abs((dd.x * tx + dd.z * tz) / ol) > 0.95) return true;
+  }
+  return false;
 }

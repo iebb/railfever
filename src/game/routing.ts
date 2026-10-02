@@ -82,6 +82,9 @@ export interface CorridorOpts {
   slopeCost?: number;
   /** extra cost per unit of running alongside existing rail (any owner: 3–30 units off, similar heading) */
   parallel?: number;
+  /** which rail counts as running alongside: conventional track (default) or high-speed track (an HSR may run beside
+   * conventional rail, and conventional rail beside an HSR) */
+  trackClass?: TrackClass;
 }
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -240,7 +243,7 @@ export class CorridorSearch {
 
   /** Does existing rail run alongside a vertex at heading `di` (3–30 units off, within ~25°)? Cached per axis. */
   private alongside(v: number, di: number): boolean {
-    if (!this.par) { this.par = new Uint8Array(this.n * this.n * 4); this.field = railField(this.g); }
+    if (!this.par) { this.par = new Uint8Array(this.n * this.n * 4); this.field = railField(this.g, this.opts.trackClass); }
     const k = v * 4 + (di & 3);
     if (!this.par[k]) {
       const [dx, dz] = DIRS[di], l = Math.hypot(dx, dz);
@@ -275,19 +278,33 @@ export class CorridorSearch {
 
 // ------------------------------------------------------------------ existing rail alongside a route
 
+/**
+ * Track type for sidings, depot stubs and station connections off a line of `type`: the same (electric trains reach
+ * their depot under the wire), but ordinary electrified track off a high-speed line (slow movements; its curves fit).
+ */
+export function sidingType(type?: string): string {
+  if (!type || !TRACK_TYPES[type]) return 'standard';
+  return type === 'highspeed' ? 'electric' : type;
+}
+
 /** Rail track sampled about every 3 units (position and direction), hashed in 16-unit cells. */
 export interface RailField { cells: Map<number, number[]>; x: Float32Array; z: Float32Array; tx: Float32Array; tz: Float32Array }
 const FIELD_CELL = 16;
-const fieldCache = new WeakMap<Game, { v: number; f: RailField }>();
+/** Rail that counts for "running alongside": conventional track, or high-speed track (they do not exclude each other). */
+export type TrackClass = 'conventional' | 'highspeed';
+export const trackClassOf = (type: string): TrackClass => (type === 'highspeed' ? 'highspeed' : 'conventional');
+const fieldCache = new WeakMap<Game, Map<TrackClass, { v: number; f: RailField }>>();
 
-/** The rail field of the network as it is (rebuilt after network changes). */
-export function railField(g: Game): RailField {
-  const c = fieldCache.get(g);
+/** The rail field of the network as it is (rebuilt after network changes): conventional rail, or high-speed track only. */
+export function railField(g: Game, cls: TrackClass = 'conventional'): RailField {
+  let m = fieldCache.get(g);
+  if (!m) { m = new Map(); fieldCache.set(g, m); }
+  const c = m.get(cls);
   if (c && c.v === g.networkVersion) return c.f;
   const net = g.world.net;
   const X: number[] = [], Z: number[] = [], TX: number[] = [], TZ: number[] = [];
   for (const e of net.edges.values()) {
-    if (e.kind !== 'rail' || e.depot >= 0) continue;
+    if (e.kind !== 'rail' || e.depot >= 0 || trackClassOf(e.type) !== cls) continue;
     const geo = net.geo(e);
     let last = -Infinity;
     for (let i = 0; i < geo.n; i++) {
@@ -304,7 +321,7 @@ export function railField(g: Game): RailField {
     a.push(i);
   }
   const f: RailField = { cells, x: Float32Array.from(X), z: Float32Array.from(Z), tx: Float32Array.from(TX), tz: Float32Array.from(TZ) };
-  fieldCache.set(g, { v: g.networkVersion, f });
+  m.set(cls, { v: g.networkVersion, f });
   return f;
 }
 
@@ -329,8 +346,8 @@ export function parallelRailAt(f: RailField, x: number, z: number, tx: number, t
 }
 
 /** Share (0..1) of a profiled route (its first and last `skip` units left out) that runs alongside existing rail. */
-export function routeAlongside(g: Game, prof: ChainProfile, skip = 12): number {
-  const f = railField(g), n = prof.s.length, L = prof.s[n - 1] ?? 0;
+export function routeAlongside(g: Game, prof: ChainProfile, skip = 12, cls: TrackClass = 'conventional'): number {
+  const f = railField(g, cls), n = prof.s.length, L = prof.s[n - 1] ?? 0;
   let k = 0, hit = 0, last = -Infinity;
   for (let i = 1; i < n; i++) {
     if (prof.s[i] < skip || prof.s[i] > L - skip || prof.s[i] - last < 4) continue;
@@ -347,10 +364,10 @@ export function routeAlongside(g: Game, prof: ChainProfile, skip = 12): number {
  * Share (0..1) of the straight corridor between two points (their first and last `skip` units left out:
  * station areas) that runs alongside existing rail.
  */
-export function corridorOverlap(g: Game, ax: number, az: number, bx: number, bz: number, skip = 12): number {
+export function corridorOverlap(g: Game, ax: number, az: number, bx: number, bz: number, skip = 12, cls: TrackClass = 'conventional'): number {
   const L = Math.hypot(bx - ax, bz - az);
   if (L < skip * 2 + 5) return 0;
-  const f = railField(g), tx = (bx - ax) / L, tz = (bz - az) / L;
+  const f = railField(g, cls), tx = (bx - ax) / L, tz = (bz - az) / L;
   let n = 0, hit = 0;
   for (let s = skip; s <= L - skip; s += 5) { n++; if (parallelRailAt(f, ax + tx * s, az + tz * s, tx, tz)) hit++; }
   return n ? hit / n : 0;
@@ -674,8 +691,10 @@ export interface RouteOpts {
   exclude?: Set<number>; roadJunctions?: boolean;
   /** corridor searches after the first, each keeping away from where the previous route failed */
   retries?: number;
-  /** extra cost per unit alongside existing rail (see CorridorOpts.parallel) */
-  parallel?: number;
+  /** extra cost per unit alongside existing rail (see CorridorOpts.parallel), and which rail counts */
+  parallel?: number; trackClass?: TrackClass;
+  /** corridor grid spacing (default by map size; coarser: longer straights, wider curves) */
+  cell?: number;
 }
 export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; expanded: number }
 
@@ -692,7 +711,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
   for (let attempt = 0; attempt <= (o.retries ?? 2); attempt++) {
     // the straight leads must not overlap when the ends are close
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
-    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel });
+    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell });
     while (cs.step(budget) === 'running') yield;
     if (!cs.path) return why || 'no corridor';
     const al = alignCorridor(cs.path, from, to, o.rmax, o.rgood);
@@ -891,6 +910,8 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     return q;
   };
   const yEnd = prof ? prof.y[prof.y.length - 1] : 0;
+  // (wide-curve track: no stubs of a few units between waypoints, they would have to turn sharply)
+  const minLeg = opts.kind === 'rail' && (TRACK_TYPES[opts.type]?.minRadius ?? 0) >= 25 ? 4 : 1.2;
   for (let i = 0; i < way.length; i++) {
     const n = net.nodes.get(cur);
     if (!n) { res.error = 'Lost the chain'; return res; }
@@ -909,13 +930,13 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
       prof = np;
     }
     const L = Math.hypot(wp.x - a.x, wp.z - a.z);
-    if (L < 1.2 && !isGoal) continue;
+    if (L < minLeg && !isGoal) continue;
     const ux = (wp.x - a.x) / L, uz = (wp.z - a.z) / L;
     const straight = a.tx * ux + a.tz * uz > 0.9995 && wp.tx * ux + wp.tz * uz > 0.9995;
     const pts: { p: P2; goal: boolean }[] = [];
     if (!straight) {
       const j = biarcJunction(a, wp);
-      if (j && Math.hypot(j.x - a.x, j.z - a.z) > 1.2 && Math.hypot(wp.x - j.x, wp.z - j.z) > 1.2) pts.push({ p: j, goal: false });
+      if (j && Math.hypot(j.x - a.x, j.z - a.z) > minLeg && Math.hypot(wp.x - j.x, wp.z - j.z) > minLeg) pts.push({ p: j, goal: false });
     }
     pts.push({ p: wp, goal: isGoal });
     for (const q of pts) {
@@ -1156,7 +1177,9 @@ export function buildRailDepot(g: Game, st: Station, owner: number, frontDir?: P
     if (frontDir && sgn * (ax * frontDir.x + az * frontDir.z) > 0) continue; // keep the line's side free
     cands.push({ node: nid, bx: ax * sgn, bz: az * sgn });
   }
-  const o = (extra: Partial<BuildOptions> = {}): BuildOptions => ({ kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner, ...extra });
+  // (the stub is of the platforms' track type: electric trains reach their depot under the wire)
+  const type = sidingType(r.trackType);
+  const o = (extra: Partial<BuildOptions> = {}): BuildOptions => ({ kind: 'rail', type, tracks: 1, heightOffset: 0, crossing: 'auto', owner, ...extra });
   for (const maxPop of [0, 30]) for (const c of cands) {
     const n = net.nodes.get(c.node)!;
     if (n.edges.length !== 1) continue;
@@ -1191,7 +1214,9 @@ export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: numb
     if (!depotFits(g, fx, fz, -tx, -tz, owner, 30, net.heightAtS(e, s))) continue;
     const start = findSnap(g, 'rail', p.x, p.z, 0.3);
     if (start.kind !== 'edge' || start.edge !== edgeId) continue;
-    const o: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner };
+    // (the siding is of the line's track type: electric trains and multiple units reach their depot under the wire;
+    // off a high-speed line an ordinary electrified siding, whose curves fit)
+    const o: BuildOptions = { kind: 'rail', type: sidingType(e.type), tracks: 1, heightOffset: 0, crossing: 'auto', owner };
     const j = biarcJunction({ x: p.x, z: p.z, tx, tz }, { x: ex, z: ez, tx, tz });
     if (!j) continue;
     const p1 = planEdge(g, start, { kind: 'free', x: j.x, z: j.z, y: 0 }, o);

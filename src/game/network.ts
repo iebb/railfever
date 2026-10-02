@@ -274,7 +274,9 @@ export class Network {
   }
 
   sectionAt(e: NEdge, s: number): 'ground' | 'bridge' | 'tunnel' {
-    for (const sec of e.sections) if (s >= sec.s0 && s <= sec.s1) return sec.type;
+    // a structure planned to an end of the edge runs to that end (the planned and the built length differ
+    // by rounding)
+    for (const sec of e.sections) if ((s >= sec.s0 || sec.s0 < 0.02) && (s <= sec.s1 || sec.s1 > e.len - 0.02)) return sec.type;
     return 'ground';
   }
 
@@ -292,9 +294,10 @@ export class Network {
     const node = this.addNode(e.kind, p.x, y, p.z, e.kind === 'rail' ? d.x / dl : 0, e.kind === 'rail' ? d.z / dl : 0, e.owner);
     const prof1 = resampleProfile(e.prof, e.len, 0, s), prof2 = resampleProfile(e.prof, e.len, s, e.len);
     const sec1: Section[] = [], sec2: Section[] = [];
+    // (no slivers: a structure ending within 0.05 of the split stays on its own side)
     for (const sec of e.sections) {
-      if (sec.s0 < s) sec1.push({ s0: sec.s0, s1: Math.min(sec.s1, s), type: sec.type });
-      if (sec.s1 > s) sec2.push({ s0: Math.max(0, sec.s0 - s), s1: sec.s1 - s, type: sec.type });
+      if (sec.s0 < s - 0.05) sec1.push({ s0: sec.s0, s1: Math.min(sec.s1, s), type: sec.type });
+      if (sec.s1 > s + 0.05) sec2.push({ s0: Math.max(0, sec.s0 - s), s1: sec.s1 - s, type: sec.type });
     }
     const extra: Partial<NEdge> = { station: e.station, depot: e.depot };
     if (e.tram) { extra.tram = true; extra.tramOwner = e.tramOwner; }

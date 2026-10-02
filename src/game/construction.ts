@@ -1,11 +1,11 @@
 // Free-form construction planner for tracks and roads.
 import type { Game } from './game';
-import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM } from './constants';
+import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL } from './constants';
 import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
 } from './geom';
 import { NEdge, NNode, Section, profAt } from './network';
-import { applyEarthworks, recomputeLocks } from './terraform';
+import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
 
 export interface Snap {
@@ -31,6 +31,15 @@ export interface BuildOptions {
   straight?: boolean;
   /** roads: lay tram tracks (with overhead wire) in the new road, owned by `owner` */
   tram?: boolean;
+  /**
+   * Build level: 'elevated' = a continuous viaduct `levelHeight` above the ground beneath (LINE_LEVEL),
+   * 'underground' = a continuous tunnel `levelDepth` below the ground above; the profile follows the terrain
+   * at that offset within the grade limit, with ramps / portals where the line meets track at another
+   * level. Default 'ground'.
+   */
+  level?: 'ground' | 'elevated' | 'underground';
+  levelHeight?: number;
+  levelDepth?: number;
 }
 
 export interface CrossingPlan {
@@ -72,15 +81,26 @@ export interface Proposal {
 }
 
 /**
- * Structure cost per unit as a multiple of the ground track (or road) cost per unit: viaducts and bridges by
- * deck height above the ground or river bed (rail 5x low .. 8x from 50 m up; roads 3.5x .. 5x), tunnels by
- * depth below the surface (rail 9.5x shallow .. 13x from 80 m down; roads 7x .. 9.5x).
+ * Structure cost per unit as a multiple of the bare track (or road) cost per unit (UPDATE 9k: realistic ratios
+ * against ground track with its usual earthworks, about 1.25x bare track): viaducts and bridges by deck height
+ * above the ground or river bed (rail 4.5x low .. 6.3x from 50 m up = 3.6 .. 5x ground track; roads 3.5x ..
+ * 5x); tunnels by depth of the track below the surface: shallow cut-and-cover boxes (rail 5.2x down to 10 m ..
+ * 7.5x at 20 m = 4.2 .. 6x; roads 4x .. 6x) and bored tunnels deeper than 20 m (rail 8.5x .. 12x from 80 m =
+ * 6.8 .. 9.6x; roads 6.5x .. 9x).
  */
 export function structureFactor(kind: NetKind, type: 'bridge' | 'tunnel', h: number): number {
-  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 5 + 3 * k : 3.5 + 1.5 * k; }
-  const k = Math.min(6, Math.max(0, h - 1.9)) / 6;
-  return kind === 'rail' ? 9.5 + 3.5 * k : 7 + 2.5 * k;
+  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 4.5 + 1.8 * k : 3.5 + 1.5 * k; }
+  if (h < 2) { const k = Math.min(1, Math.max(0, h - 1)); return kind === 'rail' ? 5.2 + 2.3 * k : 4 + 2 * k; }
+  const k = Math.min(6, h - 2) / 6;
+  return kind === 'rail' ? 8.5 + 3.5 * k : 6.5 + 2.5 * k;
 }
+
+/**
+ * Yearly maintenance of structures per unit, as extra multiples of the track (road) type's maintPerUnit on top
+ * of the plain track: bridges and viaducts (bearings, deck, inspection) and tunnels (drainage, ventilation,
+ * lighting, lining). For edgeMaintenance / trackMaintenance (companies, ops).
+ */
+export const STRUCTURE_MAINT = { bridge: 4, tunnel: 6 };
 
 /**
  * Track cost shares where a track shares a graded formation, bridge or tunnel (further tracks built in the
@@ -140,9 +160,29 @@ function besideExisting(g: Game, prop: Proposal): Uint8Array[] {
   });
 }
 
-const BRIDGE_H = 1.1;   // >11 m above ground -> bridge
-const TUNNEL_D = 1.9;   // >19 m below ground -> tunnel
+const BRIDGE_H = 1.4;   // >14 m above ground -> bridge (banks first: structures are dear, 9k)
+/** town streets are banked up to 20 m before they bridge (towns grade their streets into the slopes, 9i) */
+const TOWN_BANK_H = 2.0;
+
+/**
+ * May a road cross track of this type at grade (a level crossing)? Conventional main-line track up to
+ * 160 km/h only: never high-speed, metro or light-rail reserved track.
+ */
+export function levelCrossingAllowed(trackType: string): boolean {
+  const tt = TRACK_TYPES[trackType] ?? TRACK_TYPES.standard;
+  return tt.mode === 'mainline' && tt.speed <= 160;
+}
 const WATER_DECK = 0.9;
+/** storey height of town buildings (towns.ts FLOOR_H; not imported: towns imports this module) */
+const FLOOR_H = 0.3;
+/** lines built elevated / underground: viaduct from 5 m above the ground, tunnel from 8 m of cover */
+const VIADUCT_H = 0.5, TUNNEL_COVER = 0.8;
+/**
+ * Tunnels through the ground (not built underground): only with real cover — the track at least TUNNEL_DEEP
+ * below the surface inside, portals where the cutting is PORTAL_D deep, at least TUNNEL_MIN long, and tunnels
+ * closer than TUNNEL_GAP joined into one; anything else is a cutting.
+ */
+const TUNNEL_DEEP = 2.6, PORTAL_D = 1.2, TUNNEL_MIN = 8, TUNNEL_GAP = 10;
 
 function maxGradeOf(o: BuildOptions) {
   return o.kind === 'rail' ? (TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).maxGrade : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).maxGrade;
@@ -156,10 +196,14 @@ function halfWidthOf(o: BuildOptions) {
   return rt.half + rt.sidewalk;
 }
 
-/** Speed limit (km/h) for a curve radius in world units. */
-export function curveSpeed(radius: number): number {
+/**
+ * Speed limit (km/h) in a curve of a radius in world units (R[m] = units x 10), with cant: v ~ 4.1 sqrt(R[m]) on
+ * conventional track, 4.3 sqrt(R[m]) on high-speed track (300 km/h needs R ~ 4.9 km, 400 km/h R ~ 8.7 km).
+ * Without a track type (roads): 4.3.
+ */
+export function curveSpeed(radius: number, trackType?: string): number {
   if (!isFinite(radius)) return 999;
-  return 4.3 * Math.sqrt(radius * 10);
+  return (trackType === undefined || trackType === 'highspeed' ? 4.3 : 4.1) * Math.sqrt(radius * 10);
 }
 
 // ------------------------------------------------------------------------------------ snapping
@@ -358,6 +402,8 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
     if (c.kind !== 'le') lo[c.i] = Math.max(lo[c.i], c.v);
     if (c.kind !== 'ge') hi[c.i] = Math.min(hi[c.i], c.v);
   }
+  // level crossings of tracks at slightly different heights meeting one sample: their middle height
+  for (let i = 0; i < n; i++) if (lo[i] > hi[i] && lo[i] - hi[i] < 0.06) lo[i] = hi[i] = (lo[i] + hi[i]) / 2;
   // Lipschitz envelopes
   for (let i = 1; i < n; i++) { hi[i] = Math.min(hi[i], hi[i - 1] + g * ds[i]); lo[i] = Math.max(lo[i], lo[i - 1] - g * ds[i]); }
   for (let i = n - 2; i >= 0; i--) { hi[i] = Math.min(hi[i], hi[i + 1] + g * ds[i + 1]); lo[i] = Math.max(lo[i], lo[i + 1] - g * ds[i + 1]); }
@@ -429,7 +475,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const centreBez = fitCurve(fa, fb);
   const minR = bezMinRadius(centreBez, 48);
   prop.stats.minRadius = minR;
-  prop.stats.speed = kind === 'rail' ? Math.min((TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(minR)) : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).speed;
+  prop.stats.speed = kind === 'rail' ? Math.min((TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(minR, opts.type)) : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).speed;
   if (minR < minRadiusOf(opts)) fail(kind === 'rail' ? `Curve too tight (radius ${Math.round(minR * 10)} m, min ${minRadiusOf(opts) * 10} m)` : 'Curve too tight');
 
   // per-track curves: standard spacing, or the spacing of a snapped group (e.g. a station throat)
@@ -470,7 +516,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   if (N > 1 && bestR < minR) {
     prop.stats.minRadius = bestR;
-    prop.stats.speed = Math.min(prop.stats.speed, curveSpeed(bestR));
+    prop.stats.speed = Math.min(prop.stats.speed, curveSpeed(bestR, kind === 'rail' ? opts.type : undefined));
     if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Curve too tight (radius ${Math.round(bestR * 10)} m, min ${minRadiusOf(opts) * 10} m)`);
   }
   const spread = N > 1 ? Math.max(Math.abs(offsets[0]), Math.abs(offsets[N - 1])) : 0;
@@ -503,23 +549,63 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     for (let j = Math.max(0, i - win); j <= Math.min(M - 1, i + win); j++) { sum += Math.max(terr[j], WATER_Y + 0.15); cnt++; }
     desired.push(sum / cnt);
   }
-  // rail beside an existing track: keep to that track's formation (a widened bank, cutting, bridge or tunnel)
+  // the build level: a viaduct levelHeight above the highest ground beneath, or a tunnel levelDepth below
+  // the lowest ground above (smoothed: level runs, not every bump); ramps and portals come from the
+  // grade limit where the line meets track at another level
+  const level = opts.level ?? 'ground';
+  let levelOff = 0;
+  if (level !== 'ground') {
+    const LV = LINE_LEVEL;
+    levelOff = level === 'elevated'
+      ? Math.max(LV.height.min, Math.min(LV.height.max, opts.levelHeight ?? LV.height.def))
+      : -Math.max(LV.depth.min, Math.min(LV.depth.max, opts.levelDepth ?? LV.depth.def));
+    const ext: number[] = [];
+    for (let i = 0; i < M; i++) {
+      let v = level === 'elevated' ? -Infinity : Infinity;
+      const r = level === 'elevated' ? 3 : 1;
+      for (let j = Math.max(0, i - r); j <= Math.min(M - 1, i + r); j++) v = level === 'elevated' ? Math.max(v, Math.max(terr[j], WATER_Y)) : Math.min(v, terr[j]);
+      ext.push(v + levelOff);
+    }
+    if (level === 'elevated') {
+      // the deck clears the buildings beneath, like an elevated station (raised over taller ones, up to
+      // 30 m above the ground; anything taller is in the way)
+      const hwF = halfWidthOf(opts) + spread + 0.1;
+      for (let i = 0; i < M; i++) {
+        let top = -Infinity;
+        for (const b of w.buildingsNear(xs[i], zs[i], hwF + 3)) {
+          if (b.floors <= 0 || distToRect(xs[i], zs[i], b.x, b.z, b.angle, b.w / 2, b.d / 2) > hwF) continue;
+          top = Math.max(top, b.y + b.floors * FLOOR_H + 0.95);
+        }
+        top = Math.min(top, Math.max(terr[i], WATER_Y) + 3);
+        for (let j = Math.max(0, i - 3); j <= Math.min(M - 1, i + 3); j++) ext[j] = Math.max(ext[j], top);
+      }
+    }
+    for (let i = 0; i < M; i++) {
+      let sum = 0, cnt = 0;
+      for (let j = Math.max(0, i - 4); j <= Math.min(M - 1, i + 4); j++) { sum += ext[j]; cnt++; }
+      desired[i] = sum / cnt;
+    }
+  }
+  // rail beside an existing track at this level: keep to its formation (a widened bank, cutting, viaduct or
+  // tunnel)
   if (kind === 'rail') {
     for (let i = 0; i < M; i++) {
       const d = bezDeriv(centreBez, tAtS(ctab, sArr[i])), l = Math.hypot(d.x, d.z) || 1;
       const h = formationBeside(g, xs[i], zs[i], d.x / l, d.z / l, 1.25 + spread);
-      if (h !== null) desired[i] = h;
+      if (h !== null && (level === 'ground' || Math.abs(h - desired[i]) < 1)) desired[i] = h;
     }
   }
   const cons: Constraint[] = [];
-  // the height offset applies to the end being placed; a free start sits on the ground
-  const startY = fa.y ?? terr[0];
-  const endY = fb.y ?? (end.kind === 'free' ? terr[M - 1] + opts.heightOffset : null);
+  // the height offset applies to the end being placed; a free start sits on the ground (or at the level)
+  const atLevel = (t: number) => (level === 'elevated' ? Math.max(t, WATER_Y) : t) + levelOff;
+  const startY = fa.y ?? atLevel(terr[0]);
+  const endY = fb.y ?? (end.kind === 'free' ? atLevel(terr[M - 1]) + opts.heightOffset : null);
   if (fa.y !== null) cons.push({ i: 0, kind: 'eq', v: fa.y });
   else desired[0] = startY;
   if (fb.y !== null) cons.push({ i: M - 1, kind: 'eq', v: fb.y });
   else { desired[M - 1] = endY!; if (opts.heightOffset) cons.push({ i: M - 1, kind: 'eq', v: endY! }); }
-  for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push({ i, kind: 'ge', v: WATER_Y + WATER_DECK });
+  // over water: a deck above it, or (underground) a tunnel below the bed
+  for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push(level === 'underground' ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
 
   let sol = solveProfile(desired, ds, cons, grade);
   if (!sol.ok) { fail('Too steep: make the route longer or change the height'); }
@@ -568,14 +654,21 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     let mode: CrossingPlan['mode'];
     // at grade (a diamond with switches) only across one's own or usable track, else over or under it
     const levelOk = c.angle > 0.4 && secOld === 'ground' && e.depot < 0 && e.station < 0
-      && !(kind === 'rail' && e.kind === 'rail' && e.owner >= 0 && e.owner !== opts.owner && !opts.town && !g.canUse(opts.owner, e.owner));
+      && !(kind === 'rail' && e.kind === 'rail' && e.owner >= 0 && e.owner !== opts.owner && !opts.town && !g.canUse(opts.owner, e.owner))
+      // roads cross railways at grade only on conventional track (no level crossings on high-speed, metro or
+      // light-rail reserved track)
+      && (kind === e.kind || levelCrossingAllowed(kind === 'rail' ? opts.type : e.type));
     const levelMode: CrossingPlan['mode'] = kind === 'rail' ? (e.kind === 'rail' ? 'diamond' : 'level') : e.kind === 'rail' ? 'level' : 'junction';
-    if (opts.crossing === 'level' && levelOk) mode = levelMode;
+    // lines built elevated / underground pass over / under everything at the surface (another viaduct or
+    // tunnel: by height)
+    if (level === 'underground') mode = secOld === 'tunnel' && yn >= yo ? 'over' : 'under';
+    else if (level === 'elevated') mode = secOld === 'bridge' && yn < yo ? 'under' : 'over';
+    else if (opts.crossing === 'level' && levelOk) mode = levelMode;
     else if (opts.crossing === 'over') mode = 'over';
     else if (opts.crossing === 'under') mode = 'under';
-    else if (Math.abs(yn - yo) < 0.35 && levelOk && !(opts.town && kind === 'road' && e.kind === 'rail')) mode = levelMode;
+    else if (Math.abs(yn - yo) < 0.35 && levelOk) mode = levelMode;
     else mode = yn >= yo ? 'over' : 'under';
-    if (secOld === 'tunnel') mode = yn >= yo ? 'over' : 'under';
+    if (secOld === 'tunnel' && level === 'ground') mode = yn >= yo ? 'over' : 'under';
     c.mode = mode;
     if (mode === 'over') cons.push({ i: ci, kind: 'ge', v: yo + RAIL.clearance });
     else if (mode === 'under') cons.push({ i: ci, kind: 'le', v: yo - RAIL.clearance });
@@ -598,15 +691,37 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     if (c.mode !== 'over') continue;
     const e = net.edges.get(c.edge)!;
     if (net.sectionAt(e, c.sOld) === 'tunnel') continue;
-    const wdt = (net.halfWidth(e) + 0.7) / Math.max(0.35, Math.sin(c.angle)) + 0.3;
+    // the bridge spans the other line's formation zone too (no cut or fill of one under the other's ramp)
+    const wdt = (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(c.angle)) + 0.3;
     const sc = centreS(c.track, c.sNew);
     for (let i = idxOf(sc - wdt); i <= idxOf(sc + wdt); i++) forcedBridge[i] = true;
   }
   for (let i = 0; i < M; i++) {
     const d = y[i] - terr[i];
-    if (forcedBridge[i] || terr[i] < WATER_Y + 0.05 || d > BRIDGE_H) type.push(1);
-    else if (d < -TUNNEL_D) type.push(2);
+    if (level === 'underground' && d < -TUNNEL_COVER) type.push(2);
+    else if (forcedBridge[i] || terr[i] < WATER_Y + 0.05 || d > (level === 'elevated' ? VIADUCT_H : opts.town && kind === 'road' && opts.type === 'street' ? TOWN_BANK_H : BRIDGE_H)) type.push(1);
     else type.push(0);
+  }
+  if (level !== 'underground') {
+    // tunnels with real cover: deep runs, out to their portals, joined over short open gaps, long enough
+    const depth = (i: number) => terr[i] - y[i];
+    const tun: [number, number][] = [];
+    for (let i = 0; i < M; i++) {
+      if (type[i] !== 0 || depth(i) < TUNNEL_DEEP) continue;
+      let a = i, b = i;
+      while (b + 1 < M && type[b + 1] === 0 && depth(b + 1) >= TUNNEL_DEEP) b++;
+      i = b;
+      while (a > 0 && type[a - 1] === 0 && depth(a - 1) >= PORTAL_D) a--;
+      while (b + 1 < M && type[b + 1] === 0 && depth(b + 1) >= PORTAL_D) b++;
+      const last = tun[tun.length - 1];
+      if (last && (a - last[1] - 1) * PSTEP < TUNNEL_GAP && !type.slice(last[1] + 1, a).includes(1)) last[1] = b;
+      else tun.push([a, b]);
+    }
+    for (const [a, b] of tun) if ((b - a + 1) * PSTEP >= TUNNEL_MIN) for (let i = a; i <= b; i++) type[i] = 2;
+    // leaving a tunnel or an underground station: the tunnel goes on to its portal
+    const onward = (i0: number, step: number) => { for (let i = i0; i >= 0 && i < M && type[i] !== 1 && depth(i) >= PORTAL_D; i += step) type[i] = 2; };
+    if (depth(0) >= PORTAL_D) onward(0, 1);
+    if (depth(M - 1) >= PORTAL_D) onward(M - 1, -1);
   }
   // clean-up: fill short ground gaps between bridges, drop very short structures
   const runs = () => {
@@ -616,9 +731,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     return r;
   };
   for (const r of runs()) if (r.t === 0 && r.a > 0 && r.b < M - 1 && (r.b - r.a + 1) * PSTEP < 4 && type[r.a - 1] === 1 && type[r.b + 1] === 1) for (let i = r.a; i <= r.b; i++) type[i] = 1;
+  // an underground line stays in its tunnel through short shallow stretches
+  if (level === 'underground') for (const r of runs()) if (r.t === 0 && r.a > 0 && r.b < M - 1 && (r.b - r.a + 1) * PSTEP < 6 && type[r.a - 1] === 2 && type[r.b + 1] === 2) for (let i = r.a; i <= r.b; i++) type[i] = 2;
   for (const r of runs()) {
     const len = (r.b - r.a + 1) * PSTEP;
-    if (r.t === 2 && len < 4) for (let i = r.a; i <= r.b; i++) type[i] = 0;
     if (r.t === 1 && len < 1.5) {
       let keep = false;
       for (let i = r.a; i <= r.b; i++) if (forcedBridge[i] || terr[i] < WATER_Y + 0.05) keep = true;
@@ -660,11 +776,18 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       let sec: Section['type'] | 'ground' = 'ground';
       for (const q of tp.sections) if (s >= q.s0 && s <= q.s1) sec = q.type;
       if (sec === 'tunnel') continue;
+      // no cutting below the water line (the hole would fill with water): bank it up, or tunnel
+      if (sec === 'ground' && yy - formationDepth({ kind } as NEdge) < DRY_MIN - 0.005 && w.heightAt(p.x, p.z) > yy - formationDepth({ kind } as NEdge) + 0.01) fail('Below the water line here: raise it or go into a tunnel');
       const nearEnd = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < 1.2);
-      // buildings
+      // buildings: on the formation; beside a railway also those standing where its cut or fill has to
+      // reshape the ground (the formation reaches every grid cell the track touches, buildings keep their
+      // ground: they go, rather than stand on plinths or bury the track)
+      const regrade = sec === 'ground' && Math.abs(yy - formationDepth({ kind } as NEdge) - w.heightAt(p.x, p.z)) > (kind === 'rail' ? 0.1 : 0.15);
       for (const b of w.buildingsNear(p.x, p.z, hw + 3)) {
         if (demolish.has(b.id)) continue;
-        if (distToRect(p.x, p.z, b.x, b.z, b.angle, b.w / 2, b.d / 2) > hw + 0.1) continue;
+        const db = distToRect(p.x, p.z, b.x, b.z, b.angle, b.w / 2, b.d / 2);
+        // (a railway regrading the ground takes every building whose ground shares grid cells with its formation)
+        if (db > hw + 0.1 && !(regrade && db < hw + EARTHWORKS.corePad + (kind === 'rail' ? 1.42 : 0.6))) continue;
         if (sec === 'bridge' && yy - (b.y + b.floors * 0.3 + 0.4) > 0.3) continue;
         if (opts.town) { fail('Buildings in the way'); continue; }
         demolish.add(b.id);
@@ -692,6 +815,25 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
             const dy = Math.abs(ge.pts[bi * 3 + 1] - yy);
             if (dy < RAIL.clearance) { fail(e.kind === 'rail' ? 'Too close to existing track' : 'Too close to existing road'); }
           }
+        }
+      }
+      // formations side by side share grid vertices (each reaches every grid cell its edge touches), so they
+      // must lie at about the same height there: else the terrain would bury a track or leave a road in the
+      // air (a road below a railway may be draped over its bank). Not at the ends it joins, nor where it crosses.
+      if (sec === 'ground' && !nearEnd && !prop.errors.length) {
+        const R = hw + 2 * EARTHWORKS.corePad + 0.6;
+        for (const e of net.edgesNear(p.x - R, p.z - R, p.x + R, p.z + R)) {
+          if (exclude.has(e.id)) continue;
+          const ehw = net.halfWidth(e), lim = hw + ehw + 2 * EARTHWORKS.corePad - 0.5;
+          if (crossings.some((c) => c.track === ti && c.edge === e.id && Math.abs(c.sNew - s) < (lim + 1) / Math.max(0.25, Math.sin(c.angle)))) continue;
+          const r = net.nearestEdge(p.x, p.z, lim, undefined, (q) => q.id === e.id);
+          if (!r || net.sectionAt(e, r.s) !== 'ground') continue;
+          const dy = net.heightAtS(e, r.s) - yy; // the other edge above (+) or below (-)
+          const clash = kind === 'rail' && e.kind === 'rail' ? Math.abs(dy) > 0.15
+            : kind === 'rail' ? dy > 0.35 // a road above the new railway would be left in the air
+            : e.kind === 'rail' ? dy < -0.35 // the new road above a railway
+            : Math.abs(dy) > 0.4;
+          if (clash) { fail(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
         }
       }
       if (sec === 'ground' && i % 2 === 0) trees += w.countTreesNear(p.x, p.z, hw + 0.4);
@@ -734,9 +876,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     // earthworks along the centre line: in full for the formation (unless it widens an existing one), a
     // share for every further track
     const N = prop.tracks.length, b0 = beside?.[0];
+    const fm = kind === 'rail' ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).formation : 1;
     for (let i = 0; i < M; i++) {
       if (type[i] !== 0) continue;
-      const v = Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2) * 900;
+      const v = Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2) * 900 * fm;
       const k = b0 ? Math.min(b0.length - 1, Math.floor((sArr[i] / L) * b0.length)) : 0;
       full += v * N;
       const ev = kind === 'rail' ? v * ((b0 && b0[k] ? S.earthworks : 1) + S.earthworks * (N - 1)) : v;
@@ -755,6 +898,11 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   prop.cost = Math.round(cost);
   if (!opts.town && !g.company(opts.owner).economy.canAfford(prop.cost)) prop.warnings.push('Not enough money');
+  // a free end in mid-air (9i): allowed for the player (to be continued), but worth a word
+  for (const tp of prop.tracks) {
+    const bAt = (s0: number) => tp.sections.some((q) => q.type === 'bridge' && q.s0 <= s0 + 0.05 && q.s1 >= s0 - 0.05);
+    if ((tp.start.kind === 'free' && bAt(0)) || (tp.end.kind === 'free' && bAt(tp.len))) { prop.warnings.push('The free end stands on a bridge: continue it to the ground'); break; }
+  }
   return prop;
 }
 
@@ -782,7 +930,9 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   if (co && !co.economy.canAfford(prop.cost)) return 'Not enough money';
   // vehicles on edges we must split?
   for (const tp of prop.tracks) for (const sn of [tp.start, tp.end]) if (sn.kind === 'edge' && g.vehicles.isEdgeBusy(sn.edge!)) return 'Vehicle in the way';
-  for (const c of prop.crossings) if ((c.mode === 'junction' || c.mode === 'under') && g.vehicles.isEdgeBusy(c.edge)) return 'Vehicle in the way';
+  // (a tunnel beneath a busy road or track does not disturb it)
+  const tunnelled = (c: CrossingPlan) => prop.tracks[c.track].sections.some((q) => q.type === 'tunnel' && c.sNew >= q.s0 - 0.5 && c.sNew <= q.s1 + 0.5);
+  for (const c of prop.crossings) if ((c.mode === 'junction' || (c.mode === 'under' && !tunnelled(c))) && g.vehicles.isEdgeBusy(c.edge)) return 'Vehicle in the way';
   if (co) co.economy.spend(prop.cost, 'construction');
   // demolition
   for (const id of prop.demolish) g.towns.demolishBuilding(id);
@@ -824,9 +974,18 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
       if (!oe || !ne) continue;
       if (c.mode === 'under') {
         if (net.sectionAt(oe, old.s) !== 'ground') continue;
+        // a tunnel passes beneath: nothing above needs a bridge
+        if (tunnelled(c)) continue;
         const hw = net.halfWidth(ne) + (prop.tracks.length - 1) * RAIL.spacing * 0.5;
-        const wdt = (hw + 0.8) / Math.max(0.35, Math.sin(c.angle)) + 0.3;
-        oe.sections.push({ s0: Math.max(0, old.s - wdt), s1: Math.min(oe.len, old.s + wdt), type: 'bridge' });
+        // the bridge spans the new line's formation and its cut slopes up to the old line's level
+        const tp = prop.tracks[c.track];
+        const dh = Math.max(0, net.heightAtS(oe, old.s) - profAt(tp.prof, tp.len, c.sNew));
+        const slope = ne.kind === 'rail' ? EARTHWORKS.slopeRail : EARTHWORKS.slopeRoad;
+        const wdt = Math.min(12, (hw + EARTHWORKS.corePad + dh / slope) / Math.max(0.35, Math.sin(c.angle)) + 0.3);
+        const sec = { s0: Math.max(0, old.s - wdt), s1: Math.min(oe.len, old.s + wdt), type: 'bridge' as const };
+        // merged with overlapping bridges
+        for (const q of oe.sections.filter((q) => q.type === 'bridge' && q.s0 <= sec.s1 && q.s1 >= sec.s0)) { sec.s0 = Math.min(sec.s0, q.s0); sec.s1 = Math.max(sec.s1, q.s1); }
+        oe.sections = [...oe.sections.filter((q) => !(q.type === 'bridge' && q.s0 <= sec.s1 && q.s1 >= sec.s0)), sec];
         oe.sections.sort((a, b) => a.s0 - b.s0);
         net.touchEdge(oe);
         recomputeLocks(w, c.x - wdt - 1, c.z - wdt - 1, c.x + wdt + 1, c.z + wdt + 1);
@@ -867,6 +1026,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
     for (let i = 0; i < geo.n; i += 2) if (net.sectionAt(e, geo.cum[i]) === 'ground') w.removeTreesNear(geo.pts[i * 3], geo.pts[i * 3 + 2], hw);
   }
   applyEarthworks(w, finalEdges);
+  coverTunnels(w, finalEdges);
   g.onNetworkChanged();
   return null;
 }

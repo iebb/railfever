@@ -1,11 +1,11 @@
 // Depots, signals, demolition and terraforming.
 import type { Game } from './game';
-import { NetKind, RAIL, TRAM, ROAD_TYPES } from './constants';
+import { NetKind, RAIL, TRAM, ROAD_TYPES, ELECTRIFY } from './constants';
 import { bezLine } from './geom';
 import { NEdge } from './network';
 import { distToRect, World } from './world';
 import { rectsOverlap } from './towns';
-import { applyEarthworks, recomputeLocks, brush } from './terraform';
+import { applyEarthworks, recomputeLocks, brush, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
 import { planEdge, commitProposal, nodeGroup, Snap, Proposal } from './construction';
 
 /** Depot kinds: rail, road (buses) and tram (on a road with tram tracks). */
@@ -87,11 +87,18 @@ export class Depots {
     const R = Math.hypot(sz.w, sz.d) / 2 + 1;
     for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) { plan.demolish.push(id); plan.cost += 6000 + b.pop * 2500; } }
     const siblings = new Set(snapNode >= 0 ? nodeGroup(g, snapNode) : []);
-    for (const e of net.edgesNear(x - R, z - R, x + R, z + R)) {
+    const R2 = R + EARTHWORKS.corePad + 1;
+    for (const e of net.edgesNear(x - R2, z - R2, x + R2, z + R2)) {
       if (snapNode >= 0 && (siblings.has(e.a) || siblings.has(e.b))) continue; // the track the depot attaches to and its parallel siblings
       const geo = net.geo(e);
       const hw = net.halfWidth(e);
-      for (let i = 0; i < geo.n; i++) if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2) < hw - 0.1) { failp('Track or road in the way'); break; }
+      for (let i = 0; i < geo.n; i++) {
+        const d = distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2);
+        if (d < hw - 0.1) { failp('Track or road in the way'); break; }
+        // the depot's levelled pad and the other formation share grid vertices: only at about the same height
+        // (a rail formation beside it never; a road may be graded to the pad)
+        if (net.sectionAt(e, geo.cum[i]) === 'ground' && d < hw + EARTHWORKS.corePad + 0.6 && Math.abs(geo.pts[i * 3 + 1] - plan.y) > (e.kind === 'rail' ? 0.12 : 0.35)) { failp(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
+      }
     }
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
     for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
@@ -148,9 +155,12 @@ export class Depots {
       if (xx < 1 || zz < 1 || xx >= w.size || zz >= w.size) continue;
       const d = distToRect(xx, zz, plan.x, plan.z, plan.angle, sz.w / 2 + 0.3, sz.d / 2 + 0.3);
       const k = w.vi(xx, zz);
-      if (w.lock[k] & 2) continue;
+      // never under buildings or into another formation's zone, never digging dry land below the water line
+      if (w.lock[k] & (LOCK.building | LOCK.formation)) continue;
       const wgt = d <= 0 ? 1 : Math.max(0, 1 - d / 2);
-      if (wgt > 0) w.setVertex(xx, zz, w.h[k] + (plan.y - 0.08 - w.h[k]) * wgt);
+      let v = w.h[k] + (plan.y - 0.08 - w.h[k]) * wgt;
+      if (v < w.h[k] && v < DRY_MIN) v = Math.min(w.h[k], DRY_MIN);
+      if (wgt > 0) w.setVertex(xx, zz, v);
     }
     applyEarthworks(w, [e]);
     w.removeTreesNear(plan.x, plan.z, Math.hypot(sz.w, sz.d) / 2 + 0.5);
@@ -172,6 +182,7 @@ export class Depots {
     if (g.vehicles.isEdgeBusy(dp.edge)) return 'Vehicle in the way';
     g.world.net.removeEdge(dp.edge);
     this.map.delete(id);
+    recomputeLocks(g.world, dp.x - 4, dp.z - 4, dp.x + 4, dp.z + 4);
     g.world.markObjArea(dp.x - 4, dp.z - 4, dp.x + 4, dp.z + 4);
     g.onNetworkChanged();
     return null;
@@ -350,6 +361,37 @@ export function addTramTracks(g: Game, edgeIds: number[], owner: number, dryRun 
   if (dryRun || !todo.length) return res;
   if (!g.company(owner).economy.spend(res.cost, 'construction')) return { cost: res.cost, changed: 0, error: 'Not enough money' };
   for (const e of todo) { e.tram = true; e.tramOwner = owner; net.touchEdge(e); }
+  g.onNetworkChanged();
+  return res;
+}
+
+export interface ElectrifyResult {
+  /** cost of the wire (spent unless a dry run or an error), edges electrified, units of track */
+  cost: number; changed: number; length: number;
+  error: string | null;
+}
+
+/**
+ * Overhead wire for standard track: standard -> electric (ELECTRIFY.costPerUnit per unit of track, platform
+ * tracks included). One's own track, or another company's that one may use (it stays theirs; the electrifying
+ * company pays). Electrified, metro, light-rail and high-speed track is left alone.
+ */
+export function electrify(g: Game, edgeIds: number[], owner: number, dryRun = false): ElectrifyResult {
+  const net = g.world.net;
+  const res: ElectrifyResult = { cost: 0, changed: 0, length: 0, error: null };
+  const todo: NEdge[] = [];
+  for (const id of new Set(edgeIds)) {
+    const e = net.edges.get(id);
+    if (!e || e.kind !== 'rail' || e.depot >= 0 || e.type !== ELECTRIFY.from) continue;
+    if (!g.canUse(owner, e.owner)) { res.error = 'Track of another company: needs track access'; continue; }
+    res.cost += ELECTRIFY.costPerUnit * e.len; res.length += e.len; res.changed++;
+    todo.push(e);
+  }
+  res.cost = Math.round(res.cost);
+  if (!todo.length) { res.error ??= 'No unelectrified track here'; return res; }
+  if (dryRun) return res;
+  if (!g.company(owner).economy.spend(res.cost, 'construction')) return { cost: res.cost, changed: 0, length: 0, error: 'Not enough money' };
+  for (const e of todo) { e.type = ELECTRIFY.to; net.touchEdge(e); }
   g.onNetworkChanged();
   return res;
 }

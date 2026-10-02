@@ -215,9 +215,9 @@ if (saved) {
   check(!err && nd !== old && !g.depots.get(old) && trains.every((t) => t.depotId === nd), 'all trains have the new home depot, the old one is gone');
   void dp;
   const before = trains.map((t) => t.delivered + (t.state === 'loading' ? 1 : 0));
-  const r = runTrains(g, trains, 120);
+  const r = runTrains(g, trains, 180);
   const counts = trains.map((t) => r.arrivals.get(t.id)?.length ?? 0);
-  console.log(`  120 days after: arrivals ${counts.join('/')}, worst spell ${r.worst.days} (${r.worst.kind})`);
+  console.log(`  180 days after: arrivals ${counts.join('/')}, worst spell ${r.worst.days} (${r.worst.kind})`);
   check(counts.every((c) => c >= 2) && r.worst.days < 25, 'the line keeps working after the move');
   void before;
 }

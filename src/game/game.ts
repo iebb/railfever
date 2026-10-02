@@ -17,6 +17,8 @@ import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
+import { resolveDeadlocks, lineCongestion } from './train';
+import { trackMaintenance, billTrackWear } from './opcosts';
 
 export interface NewGameOptions {
   size: number;
@@ -143,6 +145,8 @@ export class Game {
   networkVersion = 0;
   private networkDirty = false;
   private lostSince = new Map<number, number>();
+  /** day each congested player line was last reported */
+  private congestionTold = new Map<number, number>();
   private assetCache = new Map<number, { key: string; a: CompanyAssets }>();
   /** the demand model came with the save (older saves: rebuilt once the world is loaded) */
   private demandSaved = false;
@@ -160,6 +164,7 @@ export class Game {
     this.vehicles = new Vehicles(this);
     this.demand = new DemandModel(this);
     this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
+    this.companies[PLAYER].code = this.freeCompanyCode(this.companies[PLAYER].name);
     this.allowAccess[PLAYER] = true;
     this.accessPolicies[PLAYER] = DEFAULT_ACCESS_POLICY;
     this.accessMult[PLAYER] = DEFAULT_ACCESS_MULTIPLIER;
@@ -210,7 +215,7 @@ export class Game {
     const economy = new Economy();
     economy.money = cfg.startMoney;
     economy.loan = Math.min(cfg.startMoney, 5_000_000);
-    const co: Company = { id, name: nm, color: col, ai: true, economy };
+    const co: Company = { id, name: nm, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
     this.companies.push(co);
     this.allowAccess[id] = cfg.accessPolicy !== 'auto-reject';
     this.ais.push(new AIController(this, id, cfg));
@@ -219,6 +224,15 @@ export class Game {
   }
 
   company(id: number): Company { return this.companies[id] ?? this.townCompany; }
+
+  /** A company letter for JR-style station numbers: its initials first, then its other letters, then any free one. */
+  freeCompanyCode(name: string, except = -1): string {
+    const taken = new Set(this.companies.filter((c) => c.id !== except && c.code).map((c) => c.code!));
+    const words = name.toUpperCase().replace(/[^A-Z]+/g, ' ').trim().split(' ').filter(Boolean);
+    for (const c of [...words.map((w) => w[0]), ...words.join(''), ...'ABCDEFGHIJKLMNOPQRSTUVWXYZ']) if (!taken.has(c)) return c;
+    for (const a of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') for (const b of 'ABCDEFGHIJKLMNOPQRSTUVWXYZ') if (!taken.has(a + b)) return a + b;
+    return '?';
+  }
   get player(): Company { return this.companies[PLAYER]; }
   /** Player economy (shortcut for the UI) */
   get economy(): Economy { return this.companies[PLAYER].economy; }
@@ -497,10 +511,8 @@ export class Game {
 
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
-    const per = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).maintPerUnit : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).maintPerUnit;
-    let c = e.len * per;
-    for (const s of e.sections) c += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
-    return c;
+    // (ops) base upkeep by track type (high-speed ~3x standard); wear by train passages is billed on top monthly
+    return trackMaintenance(e);
   }
   /**
    * Yearly maintenance of a station (platforms and stops; the platform tracks count as edges): an elevated
@@ -515,6 +527,8 @@ export class Game {
    * owner. Weights: owner usage x 1, each user's usage x the owner's multiplier.
    */
   billAccess() {
+    // (ops) owners pay the month's track wear; on shared track it counts towards the cost users share
+    const wear = billTrackWear(this);
     for (const a of this.access) { a.usageShareLastMonth = 0; a.paidLastMonth = 0; }
     for (const k in this.accessEarned) this.accessEarned[k].lastMonth = 0;
     if (this.usage.size) {
@@ -528,7 +542,7 @@ export class Game {
         else {
           const e = net.edges.get(id);
           if (!e) continue;
-          if (kind === 1) { owner = e.tramOwner ?? -1; cost = (e.len * TRAM.maintPerUnit) / 12; } else { owner = e.owner; cost = this.edgeMaintenance(e) / 12; }
+          if (kind === 1) { owner = e.tramOwner ?? -1; cost = (e.len * TRAM.maintPerUnit) / 12; } else { owner = e.owner; cost = this.edgeMaintenance(e) / 12 + (wear.get(id) ?? 0); }
         }
         if (owner < 0 || !this.companies[owner] || this.companies[owner].defunct) continue;
         const uo = arr[owner] ?? 0;
@@ -664,6 +678,8 @@ export class Game {
       if (v.name.startsWith(tp)) v.name = bp + v.name.slice(tp.length);
     }
     for (const l of this.lines.map.values()) if (l.owner === target) this.lines.transfer(l, buyer);
+    // lines the target ran with others: the buyer runs them now
+    for (const l of this.lines.map.values()) if (l.operators?.includes(target)) l.operators = [...new Set(l.operators.map((o) => (o === target ? buyer : o)))].filter((o) => o !== l.owner);
     // agreements: the buyer steps into the target's place (no agreements with itself, no duplicates)
     const merged: AccessAgreement[] = [];
     for (const a of this.access) {
@@ -757,6 +773,8 @@ export class Game {
       this.day++;
       days++;
       this.onNewDay();
+      // trains in a circle of mutual waiting: one of them takes another way (every few days)
+      if (this.day % 3 === 0) resolveDeadlocks(this);
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
@@ -786,16 +804,17 @@ export class Game {
     this.checkLost();
     this.meterTrams();
     this.demand.daily();
+    this.stations.daily();
     if (this.accessRequests.length) this.expireRequests();
-    // passenger generation: a station's residents travel to the regions the network reaches, as the regional OD
-    // demand says; a station reaching more of its demand generates more (60% of the full rate for a single
-    // destination, the full rate once it reaches 15% of its OD demand)
+    // passenger generation: a station's residents travel to the regions the network reaches, as the regional
+    // demand says (local and long-distance trips, scaled by the trip factor of the service: demand.ts weights); its
+    // rate is their sum (a station reaching more of its demand, by better services, generates more)
     for (const st of this.stations.map.values()) {
       const table = this.lines.routing.get(st.id);
       if (!table || table.size === 0) continue;
       const dw = this.demand.weights(st);
       if (!(dw.served > 0)) continue;
-      st.genAccum += st.catchPop * GEN_RATE * (0.2 + st.rating) * (0.6 + 0.4 * Math.min(1, dw.served / 0.15));
+      st.genAccum += st.catchPop * GEN_RATE * (0.2 + st.rating) * dw.served;
       const n = Math.floor(st.genAccum);
       if (n <= 0) continue;
       st.genAccum -= n;
@@ -865,7 +884,20 @@ export class Game {
     return c;
   }
 
+  /** The player's congested railway lines: a news item with what would help (at most twice a year per line). */
+  private congestionNews() {
+    for (const l of this.lines.map.values()) {
+      if (l.owner !== PLAYER || l.kind !== 'rail' || l.vehicles.length < 2) continue;
+      const c = lineCongestion(this, l.id);
+      if (c.level < 2 || this.day - (this.congestionTold.get(l.id) ?? -1e9) < 180) continue;
+      this.congestionTold.set(l.id, this.day);
+      const fix = { signals: 'signals on the line', platforms: 'more platforms at the stations where trains wait', loops: 'passing loops on the single track', double: 'a second track', 'fewer-trains': 'fewer trains', none: '' }[c.suggestion];
+      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad');
+    }
+  }
+
   private onNewMonth() {
+    this.congestionNews();
     const pd = this.day - 1;
     const y = this.options.startYear + Math.floor(pd / (DAYS_PER_MONTH * MONTHS_PER_YEAR)), m = Math.floor(pd / DAYS_PER_MONTH) % MONTHS_PER_YEAR;
     for (const co of this.companies) if (!co.defunct) co.economy.spend(this.maintenanceOf(co.id) / 12, 'maintenance', true);
@@ -905,7 +937,7 @@ export class Game {
   saveCompanies() {
     return {
       companies: this.companies.map((c) => ({
-        id: c.id, name: c.name, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1,
+        id: c.id, name: c.name, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1, code: c.code ?? '',
         economy: JSON.parse(JSON.stringify(c.economy)),
       })),
       ais: this.ais.map((a) => a.toJSON()),
@@ -934,8 +966,11 @@ export class Game {
       const co: Company = { id: c.id, name: c.name, color: c.color, ai: !!c.ai, economy: Economy.fromJSON(c.economy) };
       if (c.defunct) co.defunct = true;
       if (typeof c.boughtBy === 'number' && c.boughtBy >= 0) co.boughtBy = c.boughtBy;
+      if (typeof c.code === 'string' && c.code) co.code = c.code;
       return co;
     });
+    // older saves: letters by name, in company order
+    for (const co of this.companies) if (!co.code) co.code = this.freeCompanyCode(co.name, co.id);
     this.allowAccess = {};
     for (const c of this.companies) this.allowAccess[c.id] = true;
     if (d.allowAccess) for (const [k, v] of Object.entries(d.allowAccess)) this.allowAccess[Number(k)] = !!v;

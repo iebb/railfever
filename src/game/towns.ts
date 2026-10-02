@@ -5,11 +5,11 @@ import type { Game } from './game';
 import { World, Building, distToRect, pointInRect } from './world';
 import { RNG, hash2 } from './rng';
 import { townName } from './names';
-import { ROAD_TYPES, WATER_Y, PSTEP } from './constants';
+import { ROAD_TYPES, WATER_Y, PSTEP, TRACK_TYPES } from './constants';
 import { planEdge, commitProposal, findSnap, BuildOptions, Proposal } from './construction';
 import { NEdge, NNode } from './network';
 import { closestOnPolyline } from './geom';
-import { recomputeLocks } from './terraform';
+import { recomputeLocks, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
 
 export const BT_HOUSE_S = 0, BT_HOUSE_L = 1, BT_TOWNHOUSE = 2, BT_SHOP = 3, BT_APARTMENT = 4,
   BT_OFFICE = 5, BT_TOWER = 6, BT_CHURCH = 7, BT_PARK = 8, BT_PLAZA = 9;
@@ -122,6 +122,11 @@ export interface Town {
 }
 
 const TOWN_OPTS = (): BuildOptions => ({ kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner: -1, town: true });
+/** Towns grade their streets into the slopes: cuttings and banks up to this deep / high (9i). */
+const TOWN_GRADE = 2;
+/** Building lots are levelled to within this (9e: no tall plinths); lots that cannot be stay gardens. */
+const PLINTH_MAX = 0.12, LOT_DIG = 0.25;
+const LOT_SAMPLES: [number, number][] = [[-1, -1], [0, -1], [1, -1], [-1, 0], [0, 0], [1, 0], [-1, 1], [0, 1], [1, 1]];
 
 const latticeKey = (g: TownGrid, i: number, j: number, dir: number) => ((i + g.n) * (2 * g.n + 1) + (j + g.n)) * 2 + dir;
 /** The lattice segment between two neighbouring points (i, j dir) */
@@ -257,7 +262,23 @@ export class Towns {
     if (!b) return;
     const town = this.list[b.townId];
     this.world.removeBuilding(id);
+    this.relockNear(b.x, b.z, Math.hypot(b.w, b.d) / 2 + 1);
     if (town) { town.buildings.delete(id); this.recomputePop(town); if (b.type === BT_CHURCH) town.hasChurch = false; }
+  }
+
+  /**
+   * Restore the ground locks of the buildings near a removed one (World.removeBuilding clears the lock bit over
+   * the removed building's whole margin, which neighbours share).
+   */
+  relockNear(x: number, z: number, r: number) {
+    const W = this.world;
+    for (const b of W.buildingsNear(x, z, r + 1)) {
+      const R = Math.hypot(b.w, b.d) / 2 + 0.5;
+      for (let zz = Math.floor(b.z - R); zz <= Math.ceil(b.z + R); zz++) for (let xx = Math.floor(b.x - R); xx <= Math.ceil(b.x + R); xx++) {
+        if (xx < 0 || zz < 0 || xx > W.size || zz > W.size) continue;
+        if (pointInRect(xx, zz, b.x, b.z, b.angle, b.w / 2 + 0.6, b.d / 2 + 0.6)) W.lock[W.vi(xx, zz)] |= LOCK.building;
+      }
+    }
   }
 
   profileOf(town: Town): ProfileSpec { return GROWTH_PROFILES[town.profile ?? 'balanced'] ?? GROWTH_PROFILES.balanced; }
@@ -318,8 +339,8 @@ export class Towns {
       if (!best) continue;
       sites.push(best);
     }
-    // sizes: a few cities (the largest ~3,000-4,500 people), market towns of 600-2,000 and villages of
-    // 150-500 (hill towns are towns); everything smaller on crowded maps
+    // sizes: a few cities (the largest ~4,000-6,000 people), market towns of 800-2,700 and villages of
+    // 200-675 (hill towns are towns); everything smaller on crowded maps
     const land = Math.max(0.55, Math.min(1, (s * s) / Math.max(1, count) / 24576));
     const nVillage = Math.round((sites.length - nCity) * 0.35);
     const tierOf = (i: number): 'city' | 'town' | 'village' => i < nCity ? 'city' : sites[i].hill ? 'town'
@@ -340,7 +361,8 @@ export class Towns {
         passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, served: 0,
       };
       this.list.push(town);
-      const size = tier === 'city' ? (i === 0 ? 3000 + rng.int(1500) : 2000 + rng.int(1800)) : tier === 'town' ? 600 + rng.int(1400) : 150 + rng.int(350);
+      // fewer but larger towns (9g): every tier 35 % larger than before
+      const size = 1.35 * (tier === 'city' ? (i === 0 ? 3000 + rng.int(1500) : 2000 + rng.int(1800)) : tier === 'town' ? 600 + rng.int(1400) : 150 + rng.int(350));
       this.plan.set(town, Math.max(120, Math.round(size * land)));
       town.claim = this.plan.get(town)!;
       // growth profile and layout from size and terrain
@@ -389,6 +411,7 @@ export class Towns {
       this.closeDeadEnds(town);
     }
     this.plan.clear();
+    this.tidyBridgeEnds();
   }
 
   /** Level the ground around a town centre towards the centre's height (full weight k0 within 0.35 R). */
@@ -919,6 +942,56 @@ export class Towns {
     }
   }
 
+  /** Town edges (streets and country roads, owner -1) with a dead end on a bridge, and which end. */
+  bridgeEnds(town?: Town): { e: NEdge; atStart: boolean }[] {
+    const net = this.world.net, out: { e: NEdge; atStart: boolean }[] = [];
+    const list = town ? this.streets(town, 8) : [...net.edges.values()].filter((e) => e.kind === 'road' && e.owner === -1 && e.station < 0 && e.depot < 0);
+    for (const e of list) for (const atStart of [true, false]) {
+      const node = net.nodes.get(atStart ? e.a : e.b);
+      if (!node || node.edges.length !== 1) continue;
+      if (e.sections.some((q) => q.type === 'bridge' && (atStart ? q.s0 <= 0.05 : q.s1 >= e.len - 0.05))) out.push({ e, atStart });
+    }
+    return out;
+  }
+
+  /**
+   * Town streets never end on a bridge (9i): a town dead end whose last stretch is a bridge is cut back to a
+   * unit of ground before the bridge, or removed when not much would be left. Runs after world generation, on
+   * loading old saves and now and then as towns grow (`town`: only its streets). Returns how many changed.
+   */
+  tidyBridgeEnds(town?: Town): number {
+    const g = this.game, w = this.world, net = w.net;
+    let changed = 0;
+    for (let pass = 0; pass < 4; pass++) {
+      let n = 0;
+      for (const { e: e0, atStart } of this.bridgeEnds(town)) {
+        const e = net.edges.get(e0.id);
+        if (!e || g.vehicles.isEdgeBusy(e.id)) continue;
+        const node = net.nodes.get(atStart ? e.a : e.b);
+        if (!node || node.edges.length !== 1) continue;
+        const br = e.sections.filter((q) => q.type === 'bridge' && (atStart ? q.s0 <= 0.05 : q.s1 >= e.len - 0.05));
+        if (!br.length) continue;
+        const cut = atStart ? Math.max(...br.map((q) => q.s1)) + 1 : Math.min(...br.map((q) => q.s0)) - 1;
+        const geo = net.geo(e);
+        let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+        for (let i = 0; i < geo.n; i++) { x0 = Math.min(x0, geo.pts[i * 3]); x1 = Math.max(x1, geo.pts[i * 3]); z0 = Math.min(z0, geo.pts[i * 3 + 2]); z1 = Math.max(z1, geo.pts[i * 3 + 2]); }
+        if (atStart ? cut > e.len - 1.5 : cut < 1.5) net.removeEdge(e.id);
+        else {
+          const r = net.splitEdge(e.id, cut);
+          if (!r) continue;
+          net.removeEdge(atStart ? r.e1.id : r.e2.id);
+        }
+        recomputeLocks(w, x0 - 3, z0 - 3, x1 + 3, z1 + 3);
+        w.markObjArea(x0 - 2, z0 - 2, x1 + 2, z1 + 2);
+        n++;
+      }
+      changed += n;
+      if (!n) break;
+    }
+    if (changed) g.onNetworkChanged();
+    return changed;
+  }
+
   /** Lattice segments that may still try alternatives in this growth step (generation: no limit). */
   private altBudget = Infinity;
 
@@ -1004,19 +1077,38 @@ export class Towns {
     if (sa.kind === 'node' && sb.kind === 'node' && sa.node === sb.node) return null;
     const prop = planEdge(g, sa, sb, { ...TOWN_OPTS(), straight: true });
     if (!prop.ok || prop.stats.tunnels || prop.stats.minRadius < 3) return null;
-    // a short bridge over a gully is fine (open water was ruled out above)
-    let bridged = 0;
-    for (const sec of prop.tracks[0].sections) if (sec.type === 'bridge') bridged += sec.s1 - sec.s0;
-    if (bridged > 4) return null;
-    // never level-cross (or bridge) railways, never cut through company roads
-    for (const c of prop.crossings) { const e = net.edges.get(c.edge); if (!e || e.kind === 'rail' || e.owner >= 0) return null; }
-    // stay close to the ground (no big cuttings or embankments on hillsides); profile samples every PSTEP
     const tp = prop.tracks[0];
+    // railways (9k): a level crossing (conventional track, see levelCrossingAllowed), a street bridge over the
+    // line, or beneath a railway bridge; never through company roads
+    let overRail = false;
+    for (const c of prop.crossings) {
+      const e = net.edges.get(c.edge);
+      if (!e) return null;
+      if (e.kind === 'rail') {
+        const sec = net.sectionAt(e, c.sOld);
+        if (c.mode === 'level') continue;
+        if (c.mode === 'over' && sec !== 'bridge') { overRail = true; continue; }
+        if (c.mode === 'under' && sec === 'bridge') continue;
+        return null;
+      }
+      if (e.owner >= 0) return null;
+    }
+    // bridges (9i): a short one over a gully (open water was ruled out above) or over a railway, only strictly
+    // inside the street — at least a unit of ground at both ends, never a street ending in mid-air
+    let bridged = 0;
+    for (const sec of tp.sections) {
+      if (sec.type !== 'bridge') continue;
+      bridged += sec.s1 - sec.s0;
+      if (sec.s0 < 1 || sec.s1 > tp.len - 1) return null;
+    }
+    if (bridged > (overRail ? 9 : 4)) return null;
+    // close to the ground: towns grade their streets into slopes (cuttings and banks of up to ~2, 9i) rather
+    // than bridge them; profile samples every PSTEP
     for (let i = 0; i < tp.prof.length; i++) {
       const f = Math.min(1, (i * PSTEP) / Math.max(0.01, tp.len));
       const x = tp.bez.x0 + (tp.bez.x3 - tp.bez.x0) * f, z = tp.bez.z0 + (tp.bez.z3 - tp.bez.z0) * f;
-      if (net.sectionAt({ sections: tp.sections } as NEdge, Math.min(i * PSTEP, tp.len)) !== 'ground') continue;
-      if (Math.abs(tp.prof[i] - w.heightAt(x, z)) > 1.0) return null;
+      if (net.sectionAt({ sections: tp.sections, len: tp.len } as NEdge, Math.min(i * PSTEP, tp.len)) !== 'ground') continue;
+      if (Math.abs(tp.prof[i] - w.heightAt(x, z)) > TOWN_GRADE) return null;
     }
     return prop;
   }
@@ -1253,7 +1345,8 @@ export class Towns {
       const tw = (P > 9000 ? 0.18 : P > 6000 ? 0.1 : 0) * tall, of = P > 4500 ? 0.25 * Math.min(1.3, tall) : 0;
       return r < tw && (!fresh || P > 7500) ? BT_TOWER : r < tw + of ? BT_OFFICE : r < 0.8 ? BT_APARTMENT : BT_SHOP;
     }
-    if (P > 1100 && d < 2 + sq * 0.19) return r < 0.42 ? BT_APARTMENT : r < 0.42 + 0.08 * Math.min(1, tall) && P > 4500 ? BT_OFFICE : r < 0.72 ? BT_SHOP : BT_TOWNHOUSE;
+    const ap = P > 3000 ? 0.5 : 0.42;
+    if (P > 1100 && d < 2 + sq * (P > 3000 ? 0.21 : 0.19)) return r < ap ? BT_APARTMENT : r < ap + 0.08 * Math.min(1, tall) && P > 4500 ? BT_OFFICE : r < 0.75 ? BT_SHOP : BT_TOWNHOUSE;
     const f = Math.min(1, P / 1200);
     if (P > 220 && d < 2 + sq * 0.27) return r < 0.45 * f ? BT_TOWNHOUSE : r < 0.65 * f ? BT_SHOP : r < 0.75 * f && P > 700 ? BT_APARTMENT : r < 0.82 ? BT_HOUSE_L : BT_HOUSE_S;
     if (P > 600 && d * prof.core / prof.sprawl < 2 + sq * 0.33) return r < 0.3 * f / prof.sprawl ? BT_TOWNHOUSE : r < 0.62 ? BT_HOUSE_L : BT_HOUSE_S;
@@ -1297,10 +1390,80 @@ export class Towns {
     return mx;
   }
 
+  /** Lowest and highest ground under a building rectangle (corners, edge middles and centre). */
+  private lotRange(x: number, z: number, angle: number, w: number, d: number): { min: number; max: number } {
+    const W = this.world, fx = Math.sin(angle), fz = Math.cos(angle), rx = fz, rz = -fx;
+    let mn = Infinity, mx = -Infinity;
+    for (const [sx, sz] of LOT_SAMPLES) {
+      const h = W.heightAt(x + rx * (w / 2) * sx + fx * (d / 2) * sz, z + rz * (w / 2) * sx + fz * (d / 2) * sz);
+      mn = Math.min(mn, h); mx = Math.max(mx, h);
+    }
+    return { min: mn, max: mx };
+  }
+
+  /**
+   * Level a building lot (9e): the ground under the footprint and half a unit around it goes to the lot height,
+   * blending back to the natural ground over a unit beyond; network formations, other buildings' ground and the
+   * shore keep theirs. Returns the base height for the building (the lot height, or the ground left higher under
+   * it where it could not be cut).
+   */
+  /** Span of the ground under the last lot prepared (before levelling): steep lots take low buildings. */
+  private lastLotSpan = 0;
+
+  /**
+   * Prepare a building lot (9e): level the ground under the footprint and half a unit around it to the street
+   * side's height, blending back to the natural ground over a unit beyond. Network formations (except a road's
+   * margin beside its carriageway and pavements: roads are draped on the terrain), other buildings' ground and
+   * the shore keep theirs. Returns the building's base height, or null (and the ground restored) when the lot
+   * is left steeper than PLINTH_MAX + LOT_DIG — such lots stay gardens.
+   */
+  private prepareLot(x: number, z: number, angle: number, w: number, d: number): number | null {
+    const W = this.world, S = W.size, R = Math.hypot(w, d) / 2 + 1.6, net = W.net;
+    const lot = this.lotRange(x, z, angle, w, d);
+    const fx = Math.sin(angle), fz = Math.cos(angle);
+    const y = Math.max(lot.min, Math.min(lot.max, W.heightAt(x + fx * d * 0.5, z + fz * d * 0.5)));
+    const free = (k: number, xx: number, zz: number): boolean => {
+      const L = W.lock[k];
+      if (L & (LOCK.rail | LOCK.building)) return false;
+      if (L & LOCK.formation) {
+        const ne = net.nearestEdge(xx, zz, 3);
+        if (ne && (ne.edge.kind === 'rail' || ne.d < net.halfWidth(ne.edge) + 0.3)) return false;
+      }
+      return true;
+    };
+    const undo: [number, number, number][] = [];
+    for (let zz = Math.max(1, Math.floor(z - R)); zz <= Math.min(S - 1, Math.ceil(z + R)); zz++) {
+      for (let xx = Math.max(1, Math.floor(x - R)); xx <= Math.min(S - 1, Math.ceil(x + R)); xx++) {
+        const dd = distToRect(xx, zz, x, z, angle, w / 2 + 0.5, d / 2 + 0.5);
+        if (dd > 1) continue;
+        const k = W.vi(xx, zz);
+        if (W.lock[k] && !free(k, xx, zz)) continue;
+        const f = 1 - dd, wgt = f * f * (3 - 2 * f), cur = W.h[k];
+        let v = cur + (y - 0.02 - cur) * wgt;
+        if (v < cur && v < DRY_MIN) v = Math.min(cur, DRY_MIN);
+        // the ground under a neighbour's walls (every grid cell it stands on) barely changes
+        if (Math.abs(v - cur) > 0.05 && W.buildingsNear(xx, zz, 1.5).some((b) => distToRect(xx, zz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 1.42)) v = cur + Math.max(-0.05, Math.min(0.05, v - cur));
+        if (Math.abs(v - cur) > 0.003) { undo.push([xx, zz, cur]); W.setVertex(xx, zz, v); }
+      }
+    }
+    const after = this.lotRange(x, z, angle, w, d);
+    // what could not be levelled: a low building set into the slope (plinth at most PLINTH_MAX, the uphill side
+    // dug in up to LOT_DIG); steeper, the lot stays a garden
+    if (after.max - after.min > PLINTH_MAX + LOT_DIG) {
+      for (let i = undo.length - 1; i >= 0; i--) W.setVertex(undo[i][0], undo[i][1], undo[i][2]);
+      return null;
+    }
+    this.lastLotSpan = Math.max(lot.max - lot.min, after.max - after.min > PLINTH_MAX ? 1 : 0);
+    return Math.min(after.max, after.min + PLINTH_MAX);
+  }
+
   private placeBuilding(town: Town, type: number, x: number, z: number, angle: number, w: number, d: number, y: number, rng: RNG, day: number, maxPop = Infinity, P = town.pop): Building {
     const bt = BUILDING_TYPES[type];
     const ppf = bt.popPerFloor[0] + rng.next() * (bt.popPerFloor[1] - bt.popPerFloor[0]);
     let floors = Math.min(bt.floors[0] + rng.int(bt.floors[1] - bt.floors[0] + 1), floorCap(P));
+    // a lot that was steep before levelling only takes a low building (9e)
+    if (this.lastLotSpan > 0.4) floors = Math.min(floors, Math.max(bt.floors[0], 2));
+    this.lastLotSpan = 0;
     const perFloor = (ppf * (w * d)) / 1.2;
     if (perFloor > 0 && floors * perFloor > maxPop) floors = Math.max(bt.floors[0], Math.floor(maxPop / perFloor));
     this.world.removeTreesNear(x, z, Math.hypot(w, d) / 2 + 0.4);
@@ -1353,8 +1516,9 @@ export class Towns {
     const s0 = Math.min(endClear(e.a, 0), e.len * 0.45), s1 = Math.max(e.len - endClear(e.b, e.len), e.len * 0.55);
     const full = fullSet(town, day);
     if (s1 - s0 < 0.9) { if (typeOverride < 0) full.add(sideKey(e, side)); return 0; }
-    // town rows are continuous; detached houses stand in gardens
-    const dims = () => ({ wdt: bt.w[0] + rng.next() * (bt.w[1] - bt.w[0]), dep: bt.d[0] + rng.next() * (bt.d[1] - bt.d[0]), gap: bt.rank >= 2 ? 0.14 + rng.next() * 0.05 : (0.55 + rng.next() * 1.0) * prof.gap });
+    // town rows are continuous; detached houses stand in gardens, larger towards the suburban fringe (9g)
+    const fringe = smoothstep(0.55, 1.05, Math.hypot(mid.x - town.x, mid.z - town.z) / this.maxRadius(town));
+    const dims = () => ({ wdt: bt.w[0] + rng.next() * (bt.w[1] - bt.w[0]), dep: bt.d[0] + rng.next() * (bt.d[1] - bt.d[0]), gap: bt.rank >= 2 ? 0.14 + rng.next() * 0.05 : (0.55 + rng.next() * 1.0) * prof.gap * (1 + 0.7 * fringe) });
     let { wdt, dep, gap } = dims();
     // occupied stretches on this side (buildings projected onto the street)
     const box = net.grid.box(e.id);
@@ -1393,13 +1557,14 @@ export class Towns {
           if (s - wdt / 2 < a - 1e-6 || s + wdt / 2 > b + 1e-6) break;
           const p = at(s);
           const nx = -p.tz * side, nz = p.tx * side;
-          const off = hw + bt.setback + dep / 2;
+          const off = hw + bt.setback * (bt.rank < 2 ? 1 + 0.8 * fringe : 1) + dep / 2;
           const bx = p.x + nx * off, bz = p.z + nz * off;
           // lots facing a park or the plaza stay open
           if (town.grid && this.inReserved(town, bx, bz)) { if (typeOverride < 0) full.add(sideKey(e, side)); return placed; }
           const angle = Math.atan2(-nx, -nz);
-          const y = this.canPlace(bx, bz, angle, wdt, dep);
-          if (y === null || this.blocksPlan(town, bx, bz, angle, wdt, dep)) continue;
+          if (this.canPlace(bx, bz, angle, wdt, dep) === null || this.blocksPlan(town, bx, bz, angle, wdt, dep)) continue;
+          const y = this.prepareLot(bx, bz, angle, wdt, dep);
+          if (y === null) continue;
           this.placeBuilding(town, type, bx, bz, angle, wdt, dep, y, rng, day, Infinity, P);
           placed++; ok = true;
           // the row continues from this building
@@ -1417,7 +1582,8 @@ export class Towns {
     return placed;
   }
 
-  maxRadius(town: Town) { return 10 + Math.sqrt(Math.max(100, town.pop)) * 0.6; }
+  /** Compact core radius by population (9g: larger towns with gardens and a suburban fringe reach further). */
+  maxRadius(town: Town) { return 11 + Math.sqrt(Math.max(100, town.pop)) * 0.68; }
   /** Radius within which new lots and streets may appear (compact core, or the existing built-up area). */
   growthRadius(town: Town) { const m = this.maxRadius(town); return Math.max(m * 1.15, Math.min(town.radius - 2.5, m * 1.5)); }
 
@@ -1457,7 +1623,7 @@ export class Towns {
     const streets = sc.list;
     if (!streets.length) return this.extendGrid(town, rng, day, plannedPop);
     // now and then: join streets that end inside the town to their neighbours
-    if (day > 0 && rng.chance(0.03)) this.closeDeadEnds(town, day);
+    if (day > 0 && rng.chance(0.03)) { this.closeDeadEnds(town, day); this.tidyBridgeEnds(town); }
     // upgrade a building near the centre now and then
     if (town.buildings.size > 20 && rng.chance(0.15) && this.upgrade(town, rng, day, plannedPop)) return true;
     // church once established
@@ -1516,7 +1682,16 @@ export class Towns {
       town.buildings.delete(b.id);
       town.pop -= b.pop;
       w.removeBuilding(b.id);
-      this.placeBuilding(town, nt, ux, uz, b.angle, uw, ud, y, rng, day, maxPop, P);
+      this.relockNear(b.x, b.z, Math.hypot(b.w, b.d) / 2 + 1);
+      const yl = this.prepareLot(ux, uz, b.angle, uw, ud);
+      if (yl === null) {
+        // the bigger lot cannot be levelled: the old building stays
+        const ob = w.addBuilding({ townId: b.townId, x: b.x, z: b.z, angle: b.angle, w: b.w, d: b.d, type: b.type, floors: b.floors, pop: b.pop, seed: b.seed, y: b.y, built: b.built });
+        town.buildings.add(ob.id);
+        town.pop += ob.pop;
+        continue;
+      }
+      this.placeBuilding(town, nt, ux, uz, b.angle, uw, ud, yl, rng, day, maxPop, P);
       return true;
     }
     return false;

@@ -1,9 +1,14 @@
-// In-world signage: town name plates and station plates (company colour, pictogram, waiting count,
-// stop marks of open lines). Priority-capped, decluttered, terrain-occluded; DOM writes only on change.
+// In-world signage: town name plates and station plates (company colour, pictogram, JR-style numbering badges,
+// waiting count, stop marks of open lines), one plate per transfer complex, station pins with their numbers in the
+// lines map's station display, and line name tags with their symbols. Priority-capped, decluttered,
+// terrain-occluded; DOM writes only on change.
 import * as THREE from 'three';
 import type { Game } from '../game/game';
 import { WATER_Y } from '../game/constants';
 import { svg } from '../ui/icons';
+
+/** A station number badge as the UI computes it (ui/lineid.ts Badge). */
+export interface LabelBadge { code: string; prefix: string; num: string; color: string }
 
 interface Label {
   el: HTMLDivElement;
@@ -13,7 +18,10 @@ interface Label {
   ico: HTMLSpanElement | null;
   mark: HTMLSpanElement | null;
   chips: HTMLSpanElement | null;
-  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string;
+  badges: HTMLSpanElement | null;
+  sym: HTMLSpanElement | null;
+  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string; symText: string;
+  badgeRef: LabelBadge[] | null; badgeMax: number; nBadges: number;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
 }
 
@@ -40,16 +48,30 @@ export class Labels {
   lineChips = new Map<number, string[]>();
   /** text replacing the population pill of towns (e.g. share transported in the demand view) */
   townInfo = new Map<number, string>();
-  /** line name tags on routes (lines map): line id -> anchor, text, colour, highlighted */
-  routeTags = new Map<number, { x: number; y: number; z: number; text: string; color: string; hl: boolean }>();
+  /** line name tags on routes (lines map): line id -> anchor, text, colour, highlighted, line symbol */
+  routeTags = new Map<number, { x: number; y: number; z: number; text: string; color: string; hl: boolean; code?: string }>();
   onClickTag: (lineId: number) => void = () => {};
   onHoverTag: (lineId: number | null) => void = () => {};
+  /** station numbering badges by station (set by the UI; JR style 'AS01'), or null */
+  badges: Map<number, LabelBadge[]> | null = null;
+  /** badges shown on a normal plate (the station display of the lines map shows more) */
+  badgeMax = 2;
+  /** transfer complexes: station id -> the complex's main station (one plate per complex), or null */
+  complexOf: Map<number, number> | null = null;
+  /** lines map station display: only these stations, drawn as pins with all their numbers; null = normal plates */
+  pinStations: Set<number> | null = null;
   private tags = new Map<number, Label>();
   private hl: number | null = null;
   private v = new THREE.Vector3();
   private cands: Cand[] = [];
   private placed: number[] = [];
   private wasVisible = true;
+  private keep = new Set<Label>();
+  // complexes: main -> parts, and the merged badges of a complex (rebuilt when the inputs change)
+  private complexRef: Map<number, number> | null = null;
+  private badgeRef: Map<number, LabelBadge[]> | null = null;
+  private parts = new Map<number, number[]>();
+  private merged = new Map<number, LabelBadge[]>();
 
   constructor(parent: HTMLElement) {
     this.container = document.createElement('div');
@@ -67,6 +89,8 @@ export class Labels {
     this.tags.clear();
     this.marks.clear();
     this.hl = null;
+    this.complexRef = null;
+    this.badgeRef = null;
   }
 
   private make(kind: 'town' | 'stn' | 'tag', onClick: () => void): Label {
@@ -74,19 +98,38 @@ export class Labels {
     el.className = 'lbl ' + kind;
     const name = document.createElement('span'); name.className = 'lbl-name';
     const sub = document.createElement('span'); sub.className = kind === 'town' ? 'lbl-pop' : 'lbl-wait';
-    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null, chips: HTMLSpanElement | null = null;
+    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null, chips: HTMLSpanElement | null = null, badges: HTMLSpanElement | null = null, sym: HTMLSpanElement | null = null;
     if (kind === 'stn') {
       ico = document.createElement('span'); ico.className = 'lbl-ico';
       mark = document.createElement('span'); mark.className = 'lbl-mark'; mark.style.display = 'none';
       chips = document.createElement('span'); chips.className = 'lbl-chips'; chips.style.display = 'none';
-      el.append(ico, mark, name, sub, chips);
-    } else if (kind === 'tag') el.append(name);
-    else el.append(name, sub);
+      badges = document.createElement('span'); badges.className = 'lbl-badges';
+      el.append(ico, badges, mark, name, sub, chips);
+    } else if (kind === 'tag') {
+      sym = document.createElement('span'); sym.className = 'lsym sm'; sym.style.display = 'none';
+      el.append(sym, name);
+    } else el.append(name, sub);
     el.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
     el.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
     el.style.display = 'none';
     this.container.appendChild(el);
-    return { el, kind, name, sub, ico, mark, chips, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeRef: null, badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+  }
+
+  /** Complex parts and merged badges, when the complexes or the badges changed. */
+  private refreshComplexes() {
+    if (this.complexRef === this.complexOf && this.badgeRef === this.badges) return;
+    this.complexRef = this.complexOf;
+    this.badgeRef = this.badges;
+    this.parts.clear();
+    this.merged.clear();
+    if (!this.complexOf) return;
+    for (const [id, main] of this.complexOf) { const a = this.parts.get(main); if (a) a.push(id); else this.parts.set(main, [id]); }
+    for (const [main, ids] of this.parts) {
+      const out: LabelBadge[] = [];
+      for (const id of [main, ...ids.filter((x) => x !== main)]) for (const b of this.badges?.get(id) ?? []) if (!out.some((o) => o.code === b.code)) out.push(b);
+      this.merged.set(main, out);
+    }
   }
 
   update(game: Game, camera: THREE.PerspectiveCamera, w: number, h: number, camDist: number) {
@@ -96,6 +139,8 @@ export class Labels {
     const cands = this.cands;
     cands.length = 0;
     const cp = camera.position;
+    this.refreshComplexes();
+    const pins = this.pinStations;
     // ---- towns
     const townMax = Math.max(180, camDist * 3.2);
     for (const t of game.towns.list) {
@@ -105,27 +150,37 @@ export class Labels {
       this.setText(l, t.name.toUpperCase(), info ?? t.pop.toLocaleString('en-US'), !info && t.served > 0);
       this.setCls(l, t.pop >= 3000 ? 'lbl town big' : 'lbl town');
       const y = Math.max(world.heightAt(t.x, t.z), WATER_Y) + 3 + Math.min(5, t.pop / 2500);
-      cands.push({ l, x: t.x, y, z: t.z, prio: 1e5 + t.pop, maxDist: townMax, scale: 1, force: false, d: 0, sx: 0, sy: 0, w: 0, h: 34 });
+      cands.push(this.cand(l, t.x, y, t.z, 1e5 + t.pop, townMax, 1, false, 34));
     }
-    // ---- stations
+    // ---- stations (one plate per transfer complex: its main station's, with everyone waiting there)
     const stMax = camDist < 170 ? Math.max(60, camDist * 2.6) : 0;
+    const pinMax = Math.max(400, camDist * 4);
     for (const s of game.stations.map.values()) {
       let l = this.stations.get(s.id);
       if (!l) { const id = s.id; l = this.make('stn', () => this.onClickStation(id)); this.stations.set(s.id, l); }
-      const served = game.lines.stationServed(s.id);
       const mk = this.marks.get(s.id);
       const isHl = this.hl === s.id;
-      this.setText(l, s.name, served ? String(s.waitingTotal) : '–', false);
+      const main = this.complexOf?.get(s.id);
+      const part = main !== undefined && main !== s.id;
+      // pins: only the stations of the lines shown; other plates of a complex only when marked / selected
+      if ((pins && !pins.has(s.id)) || (part && !mk && !isHl && !(pins && pins.has(s.id) && !pins.has(main!)))) continue;
+      const ids = !part && main !== undefined ? this.parts.get(s.id) : undefined;
+      let served = game.lines.stationServed(s.id), waiting = s.waitingTotal;
+      if (ids) for (const id of ids) { if (id === s.id) continue; const o = game.stations.get(id); if (!o) continue; waiting += o.waitingTotal; if (game.lines.stationServed(id)) served = true; }
+      this.setText(l, s.name, served ? String(waiting) : '–', false);
       this.setIcon(l, s.rail ? 'train' : s.stops.some((p) => game.world.net.edges.get(p.edge)?.tram) ? 'tram' : 'bus');
-      this.setMark(l, mk);
-      this.setChips(l, this.lineChips.get(s.id));
+      this.setMark(l, pins ? undefined : mk);
+      this.setChips(l, pins ? undefined : this.lineChips.get(s.id));
+      const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
+      this.setBadges(l, bl, pins ? 5 : this.badgeMax);
       const noRoad = !!s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false;
-      this.setCls(l, 'lbl stn' + (!served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad ? ' noroad' : ''));
+      this.setCls(l, 'lbl stn' + (pins ? ' pin' : '') + (l.nBadges ? ' badged' : '') + (!served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad && !pins ? ' noroad' : ''));
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
-      const y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
-      const force = !!mk || isHl;
-      cands.push({ l, x: s.x, y, z: s.z, prio: isHl ? 1e9 : mk ? 1e8 : (served ? 2e4 : 1e4), maxDist: force ? 3000 : stMax, scale: isHl ? 1.1 : 1, force, d: 0, sx: 0, sy: 0, w: 0, h: 24 });
+      const y = (s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8) - (pins ? 0.9 : 0);
+      const force = (!!mk && !pins) || isHl;
+      const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : (served ? 2e4 : 1e4);
+      cands.push(this.cand(l, s.x, y, s.z, prio, force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force, pins ? 40 : 24));
     }
     // ---- line name tags (lines map)
     for (const [id, t] of this.routeTags) {
@@ -137,9 +192,11 @@ export class Labels {
         this.tags.set(id, l);
       }
       if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
+      const code = t.code ?? '';
+      if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.style.display = code ? '' : 'none'; }
       this.setCls(l, t.hl ? 'lbl tag hl' : 'lbl tag');
       if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
-      cands.push({ l, x: t.x, y: t.y, z: t.z, prio: t.hl ? 5e8 : 9e4, maxDist: 5000, scale: 1, force: t.hl, d: 0, sx: 0, sy: 0, w: 0, h: 20 });
+      cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 5000, 1, t.hl, 20));
     }
     for (const [id, l] of this.tags) if (!this.routeTags.has(id)) { l.el.remove(); this.tags.delete(id); }
     // ---- project & cull
@@ -160,20 +217,23 @@ export class Labels {
     // ---- select: cap, declutter (screen rectangles), terrain occlusion
     const placed = this.placed;
     placed.length = 0;
-    const keep = new Set<Label>();
+    const keep = this.keep;
+    keep.clear();
+    const cap = pins ? Math.max(this.maxVisible, 90) : this.maxVisible;
     for (const c of cands) {
-      if (keep.size >= this.maxVisible && !c.force) break;
+      if (keep.size >= cap && !c.force) break;
       // never shrink below ~11 px text (smallest plate text is 12 px)
       const s = Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2)) * c.scale;
-      c.w = (c.l.kind === 'tag' ? Math.min(170, c.l.text.length * 6.6 + 16) : c.l.text.length * (c.l.kind === 'town' ? 9 : 7.2) + (c.l.kind === 'stn' ? 56 : 12)) * s;
+      const L = c.l;
+      c.w = (L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 0) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * 23 : 12)) * s;
       c.h *= s;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && c.l.kind !== 'tag' && this.occluded(game, camera, c.x, c.y, c.z)) continue;
+      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z)) continue;
       placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
-      keep.add(c.l);
+      keep.add(L);
       this.place(c, s, w, h);
     }
     for (const l of this.towns.values()) if (l.shown && !keep.has(l)) this.hide(l);
@@ -184,14 +244,25 @@ export class Labels {
     if (this.towns.size > game.towns.list.length) for (const [id, l] of this.towns) if (!game.towns.list[id]) { l.el.remove(); this.towns.delete(id); }
   }
 
+  /** A candidate record (pooled: the array keeps its objects between frames). */
+  private pool: Cand[] = [];
+  private poolN = 0;
+  private cand(l: Label, x: number, y: number, z: number, prio: number, maxDist: number, scale: number, force: boolean, hh: number): Cand {
+    if (this.cands.length === 0) this.poolN = 0;
+    let c = this.pool[this.poolN];
+    if (!c) { c = { l, x, y, z, prio, maxDist, scale, force, d: 0, sx: 0, sy: 0, w: 0, h: hh }; this.pool[this.poolN] = c; }
+    else { c.l = l; c.x = x; c.y = y; c.z = z; c.prio = prio; c.maxDist = maxDist; c.scale = scale; c.force = force; c.d = 0; c.sx = 0; c.sy = 0; c.w = 0; c.h = hh; }
+    this.poolN++;
+    return c;
+  }
+
   private setText(l: Label, text: string, sub: string, up: boolean) {
     if (l.text !== text) { l.text = text; l.name.textContent = text; }
-    const st = sub + (up ? '▲' : '');
-    if (l.subText !== st) {
-      l.subText = st;
-      if (up) { l.sub.textContent = sub + ' '; const u = document.createElement('span'); u.className = 'up'; u.textContent = '▲'; l.sub.appendChild(u); }
-      else l.sub.textContent = sub;
-    }
+    const st = up ? sub + '▲' : sub;
+    if (l.subText === st) return;
+    l.subText = st;
+    if (up) { l.sub.textContent = sub + ' '; const u = document.createElement('span'); u.className = 'up'; u.textContent = '▲'; l.sub.appendChild(u); }
+    else l.sub.textContent = sub;
   }
 
   private setIcon(l: Label, kind: string) {
@@ -218,6 +289,25 @@ export class Labels {
     l.chips.style.display = sig ? '' : 'none';
     l.chips.replaceChildren(...(colors ?? []).slice(0, 6).map((c) => { const i = document.createElement('i'); i.style.background = c; return i; }));
     if (colors && colors.length > 6) { const m = document.createElement('b'); m.textContent = `+${colors.length - 6}`; l.chips.appendChild(m); }
+  }
+
+  /** Numbering badges on a plate (at most `max`, then +n); DOM rebuilt only when the list or the cap changes. */
+  private setBadges(l: Label, list: LabelBadge[] | null, max: number) {
+    if (!l.badges || (l.badgeRef === list && l.badgeMax === max)) return;
+    l.badgeRef = list;
+    l.badgeMax = max;
+    const show = list ? list.slice(0, max) : [];
+    l.nBadges = show.length + (list && list.length > max ? 1 : 0);
+    l.badges.replaceChildren(...show.map((b) => {
+      const e = document.createElement('span');
+      e.className = 'snum sm';
+      e.style.setProperty('--c', b.color);
+      const i = document.createElement('i'); i.textContent = b.prefix;
+      const n = document.createElement('b'); n.textContent = b.num;
+      e.append(i, n);
+      return e;
+    }));
+    if (list && list.length > max) { const m = document.createElement('span'); m.className = 'snum-more'; m.textContent = `+${list.length - max}`; l.badges.appendChild(m); }
   }
 
   private hide(l: Label) { l.shown = false; l.el.style.display = 'none'; }

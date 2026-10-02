@@ -4,7 +4,8 @@ import * as THREE from 'three';
 import type { UI } from './ui';
 import type { Line } from '../game/lines';
 import { PLAYER } from '../game/game';
-import { h, icon, clear, toggle } from './dom';
+import { h, icon, clear, seg } from './dom';
+import { getFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
 import { townDemandShare, catchShapes, catchRadius, catchColor, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
@@ -30,11 +31,14 @@ const DIM: Record<MapMode, number> = { none: 0, lines: 0.4, demand: 0.3, catchme
 /** Signal blocks overlay: free, reserved (a train's path is set through it) and occupied blocks; path / block signals. */
 const BLOCK_COLOR = { free: 0x3f9a62, reserved: 0xffb020, occupied: 0xff5a5f };
 const SIG_COLOR = { path: 0xc084fc, block: 0x5ac8fa };
+const DISPLAY_KEY = 'railfever.linesmap';
 
 export class MapModes {
   mode: MapMode = 'none';
-  /** lines map: all companies or only the player's */
-  showAll = false;
+  /** lines map: mode / company filter (remembered), and the display: routes ('lines') or numbered stations ('stations') */
+  filter: LineFilter = getFilter('map');
+  filterVer = 0;
+  display: 'lines' | 'stations' = 'lines';
   /** line highlighted from the legend or its route tag */
   hoverLine: number | null = null;
   demand: DemandView | null = null;
@@ -43,12 +47,19 @@ export class MapModes {
   /** the card (lines legend / demand summary); placed in the left column by the UI */
   card: HTMLDivElement;
   private sigs = new Map<number, string>();
-  private styles = new Map<number, string>();
+  private styles = new Map<number, number>();
+  private vis: Line[] = [];
+  private visIds = new Set<number>();
+  private visT = 0; private visFv = -1; private visLv = -1; private visN = -1;
+  private pathT = 0; private pathNv = -1; private pathLv = -1; private pathFv = -1;
+  private selIds = new Set<number>();
+  private pins = new Set<number>();
+  private labelSig = '';
   private queue: number[] = [];
   private paths = new Map<number, LinePath>();
   private tagPos = new Map<number, { x: number; y: number; z: number }>();
   private lanesDirty = false;
-  private shownSig = '';
+  private shownSig = -1;
   private demandT = 0;
   private catchSig = '';
   /** signals overlay: block of every own rail edge (union of edges joined by nodes without a signal) */
@@ -66,6 +77,7 @@ export class MapModes {
     const lb = ui.renderer.labels;
     lb.onHoverTag = (id) => { if (this.mode === 'lines') this.hoverLine = id; };
     lb.onClickTag = (id) => this.ui.openLine(id);
+    try { const d = localStorage.getItem(DISPLAY_KEY); if (d === 'lines' || d === 'stations') this.display = d; } catch { /* ignore */ }
   }
 
   toggle(m: Exclude<MapMode, 'none'>) { this.set(this.mode === m ? 'none' : m); }
@@ -79,8 +91,10 @@ export class MapModes {
     // tear down the previous view
     if (prev === 'lines') {
       for (const id of this.paths.keys()) ov.setLinePath(id, null);
-      this.paths.clear(); this.sigs.clear(); this.styles.clear(); this.tagPos.clear(); this.queue = []; this.shownSig = '';
+      this.paths.clear(); this.sigs.clear(); this.styles.clear(); this.tagPos.clear(); this.queue = []; this.shownSig = -1; this.labelSig = '';
+      this.visT = 0; this.pathT = 0; this.visIds.clear();
       lb.lineChips.clear(); lb.routeTags.clear();
+      lb.pinStations = null;
     }
     if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.shares.clear(); }
     if (prev === 'catchment') { ov.setCatchments('map', null); this.catchSig = ''; }
@@ -104,12 +118,40 @@ export class MapModes {
   }
 
   // ------------------------------------------------------------------ lines map
-  private visibleLines(): Line[] {
-    return this.ui.game.lines.all().filter((l) => l.stops.length >= 2 && (this.showAll || l.owner === PLAYER)).sort((a, b) => a.id - b.id);
+  /** Lines shown (mode / company filter), refreshed twice a second or when the filter or the lines change. */
+  private visibleLines(dt: number): Line[] {
+    const g = this.ui.game;
+    this.visT -= dt;
+    if (this.visT <= 0 || this.visFv !== this.filterVer || this.visLv !== g.lines.version || this.visN !== g.lines.map.size) {
+      this.visT = 0.5; this.visFv = this.filterVer; this.visLv = g.lines.version; this.visN = g.lines.map.size;
+      this.vis = g.lines.all().filter((l) => l.stops.length >= 2 && lineMatches(g, l, this.filter)).sort((a, b) => a.id - b.id);
+      this.visIds.clear();
+      for (const l of this.vis) this.visIds.add(l.id);
+    }
+    return this.vis;
   }
+  /** Is a line shown by the lines map's filter (minimap)? */
+  lineVisible(l: Line): boolean { return this.mode === 'lines' ? this.visIds.has(l.id) : lineMatches(this.ui.game, l, this.filter); }
+
+  /** Switch the lines map between its line display and its station display (opening it if closed). */
+  toggleDisplay() {
+    if (this.mode !== 'lines') { this.display = 'stations'; this.saveDisplay(); this.set('lines'); return; }
+    this.setDisplay(this.display === 'lines' ? 'stations' : 'lines');
+  }
+  setDisplay(d: 'lines' | 'stations') {
+    if (d === this.display) return;
+    this.display = d;
+    this.saveDisplay();
+    this.styles.clear();
+    this.labelSig = '';
+    this.listSig = '';
+    this.ui.sound('toggle', { pitch: d === 'stations' ? 1.1 : 0.9 });
+  }
+  private saveDisplay() { try { localStorage.setItem(DISPLAY_KEY, this.display); } catch { /* ignore */ } }
 
   private selectedIds(): Set<number> {
-    const s = new Set<number>();
+    const s = this.selIds;
+    s.clear();
     for (const w of this.ui.wm.wins.values()) if (w.id.startsWith('line-')) s.add(Number(w.id.slice(5)));
     if (this.hoverLine != null) s.add(this.hoverLine);
     return s;
@@ -118,30 +160,38 @@ export class MapModes {
   private updateLines(dt: number) {
     const g = this.ui.game;
     const ov = this.ui.renderer.overlay;
-    const lines = this.visibleLines();
-    const ids = new Set(lines.map((l) => l.id));
-    for (const id of [...this.paths.keys()]) if (!ids.has(id)) { ov.setLinePath(id, null); this.paths.delete(id); this.sigs.delete(id); this.styles.delete(id); this.tagPos.delete(id); this.lanesDirty = true; }
-    // (re)compute routes whose stops / network changed, within a small time budget per frame
-    for (const l of lines) {
-      const sig = l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l);
-      if (this.sigs.get(l.id) !== sig && !this.queue.includes(l.id)) this.queue.push(l.id);
+    const lines = this.visibleLines(dt);
+    // routes: checked when the network or the lines changed, else a few times a second
+    this.pathT -= dt;
+    if (this.pathT <= 0 || this.pathNv !== g.networkVersion || this.pathLv !== g.lines.version || this.pathFv !== this.visFv) {
+      this.pathT = 0.4; this.pathNv = g.networkVersion; this.pathLv = g.lines.version; this.pathFv = this.visFv;
+      for (const id of [...this.paths.keys()]) if (!this.visIds.has(id)) { ov.setLinePath(id, null); this.paths.delete(id); this.sigs.delete(id); this.styles.delete(id); this.tagPos.delete(id); this.lanesDirty = true; }
+      for (const l of lines) {
+        const sig = l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l);
+        if (this.sigs.get(l.id) !== sig && !this.queue.includes(l.id)) this.queue.push(l.id);
+      }
     }
-    const t0 = performance.now();
-    while (this.queue.length && performance.now() - t0 < 4) {
-      const id = this.queue.shift()!;
-      const l = g.lines.get(id);
-      if (!l || !ids.has(id)) continue;
-      this.sigs.set(id, l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l));
-      const p = computeLinePath(g, l);
-      this.paths.set(id, p);
-      this.tagPos.set(id, midPoint(p.curves));
-      this.lanesDirty = true;
+    // (re)compute routes whose stops / network changed, within a small time budget per frame
+    if (this.queue.length) {
+      const t0 = performance.now();
+      while (this.queue.length && performance.now() - t0 < 4) {
+        const id = this.queue.shift()!;
+        const l = g.lines.get(id);
+        if (!l || !this.visIds.has(id)) continue;
+        this.sigs.set(id, l.stops.join(',') + '|' + g.networkVersion + '|' + g.lines.isLoop(l));
+        const p = computeLinePath(g, l);
+        this.paths.set(id, p);
+        this.tagPos.set(id, midPoint(p.curves));
+        this.lanesDirty = true;
+      }
     }
     // geometry: rebuilt when routes, the set of lines or a colour changed (lanes depend on all of them)
-    const shownSig = lines.map((l) => l.id + l.color).join(',');
+    let shownSig = 0;
+    for (const l of lines) shownSig = (shownSig * 31 + l.id * 7 + parseInt(l.color.slice(1), 16)) % 2147483647;
     if (this.lanesDirty || shownSig !== this.shownSig) {
       this.lanesDirty = false;
       this.shownSig = shownSig;
+      this.labelSig = '';
       const lanes = laneOffsets(lines.map((l) => [l.id, this.paths.get(l.id)] as const));
       for (const l of lines) {
         const p = this.paths.get(l.id);
@@ -150,25 +200,39 @@ export class MapModes {
         this.styles.delete(l.id);
       }
     }
-    // style: selected / hovered lines wider with chevrons and on top, the others dimmed while one is selected
+    // style: selected / hovered lines wider with chevrons and on top, the others dimmed while one is selected;
+    // the station display draws the routes thin and quiet under the station pins
     const sel = this.selectedIds();
+    const st = this.display === 'stations';
+    let selSig = st ? 1 : 0;
     for (const l of lines) {
       if (!this.paths.has(l.id)) continue;
       const on = sel.has(l.id), dim = sel.size > 0 && !on, loop = g.lines.isLoop(l);
-      const style = `${on}|${dim}|${loop}`;
-      if (this.styles.get(l.id) === style) continue;
-      this.styles.set(l.id, style);
+      if (on) selSig = (selSig * 31 + l.id) % 2147483647;
+      const code = (on ? 1 : 0) + (dim ? 2 : 0) + (loop ? 4 : 0) + (st ? 8 : 0);
+      if (this.styles.get(l.id) === code) continue;
+      this.styles.set(l.id, code);
       // loops always show their running direction
-      ov.setLinePathStyle(l.id, { width: on ? ROUTE_W_SEL : ROUTE_W, opacity: dim ? 0.45 : 0.92, chevrons: on || loop, order: on ? 5 : 0 });
+      ov.setLinePathStyle(l.id, { width: st ? (on ? 5 : 3) : on ? ROUTE_W_SEL : ROUTE_W, opacity: dim ? (st ? 0.3 : 0.45) : st ? 0.6 : 0.92, chevrons: on || (loop && !st), order: on ? 5 : 0 });
     }
-    // line chips on station plates, name tags on the routes
-    const lb = this.ui.renderer.labels;
-    lb.lineChips.clear();
-    for (const l of lines) for (const sid of new Set(l.stops)) { const a = lb.lineChips.get(sid); if (a) a.push(l.color); else lb.lineChips.set(sid, [l.color]); }
-    lb.routeTags.clear();
-    for (const l of lines) {
-      const t = this.tagPos.get(l.id);
-      if (t) lb.routeTags.set(l.id, { x: t.x, y: t.y + 0.6, z: t.z, text: l.name, color: l.color, hl: sel.has(l.id) });
+    // labels: line chips on station plates and name tags with the line symbol (line display), or station pins
+    // with their numbering badges (station display); rebuilt only when something they show changed
+    const lsig = `${shownSig}|${selSig}|${this.display}|${this.queue.length}|${g.lines.version}`;
+    if (lsig !== this.labelSig) {
+      this.labelSig = lsig;
+      const lb = this.ui.renderer.labels;
+      const pins = this.pins;
+      lb.lineChips.clear(); lb.routeTags.clear(); pins.clear();
+      for (const l of lines) for (const sid of l.stops) {
+        if (st) { pins.add(sid); continue; }
+        const a = lb.lineChips.get(sid);
+        if (!a) lb.lineChips.set(sid, [l.color]); else if (!a.includes(l.color)) a.push(l.color);
+      }
+      if (!st) for (const l of lines) {
+        const t = this.tagPos.get(l.id);
+        if (t) lb.routeTags.set(l.id, { x: t.x, y: t.y + 0.6, z: t.z, text: l.name, color: l.color, hl: sel.has(l.id), code: lineCodeOf(g, l) });
+      }
+      lb.pinStations = st ? pins : null;
     }
     this.listT -= dt;
     if (this.listT <= 0) { this.listT = 0.5; this.renderLinesCard(lines); }
@@ -176,17 +240,19 @@ export class MapModes {
 
   private renderLinesCard(lines: Line[]) {
     const g = this.ui.game;
-    const sig = this.showAll + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length;
+    const sig = this.filterVer + '|' + this.display + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length + '|' + g.lines.version;
     if (sig === this.listSig) return;
     this.listSig = sig;
     const c = this.card;
     clear(c);
-    const kindIcon = (k: string) => (k === 'rail' ? 'train' : k === 'tram' ? 'tram' : 'bus');
+    const all = g.lines.all().filter((l) => l.stops.length >= 2);
+    const numbered = this.display === 'stations' ? new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size : 0;
     c.append(
       h('div', { class: 'mc-head' }, icon('map', 18), h('span', { class: 'mc-title' }, 'Lines map'), h('span', { class: 'mc-sub' }, `${lines.length}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Close lines map', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        toggle('All companies', this.showAll, (v) => { this.showAll = v; this.listSig = ''; }),
+        h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Routes in their colours with line symbols (B)'], ['stations', 'Stations', 'Stations with their numbers, e.g. AS01 (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
+        filterBar(g, this.filter, modeCounts(g, all, this.filter), () => { this.filterVer++; this.listSig = ''; }, true),
         lines.length
           ? h('div', { class: 'mc-list' }, lines.map((l) => h('div', {
             class: 'mc-row' + (this.hoverLine === l.id ? ' on' : ''),
@@ -194,8 +260,9 @@ export class MapModes {
             onpointerenter: () => { this.hoverLine = l.id; },
             onpointerleave: () => { if (this.hoverLine === l.id) this.hoverLine = null; },
             onclick: () => this.ui.openLine(l.id),
-          }, h('i', { style: `background:${l.color}` }), icon(kindIcon(l.kind), 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null)))
-          : h('div', { class: 'mc-empty' }, 'No lines with two or more stops yet.'),
+          }, lineSymbol(g, l, 'sm'), icon(MODE_META[lineMode(g, l)].icon, 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null)))
+          : h('div', { class: 'mc-empty' }, all.length ? 'No lines match the filter.' : 'No lines with two or more stops yet.'),
+        this.display === 'stations' ? h('div', { class: 'mc-note' }, numbered ? `${numbered} numbered stations: company letter + line letter + number, e.g. AS01.` : 'Rail lines number their stations: company letter + line letter + number.') : null,
         this.queue.length ? h('div', { class: 'mc-note' }, `Tracing routes… ${this.queue.length}`) : null),
     );
   }

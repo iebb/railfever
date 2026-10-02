@@ -22,7 +22,7 @@ function ago(t: number): string {
 }
 
 /** Default number of towns for a map size (scaled with the area). */
-export function defaultTowns(size: number) { return Math.max(3, Math.min(48, Math.round(4.5 * (size / 384) ** 2))); }
+export function defaultTowns(size: number) { return Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2))); }
 /** Map size presets (world units; 1 unit = 10 m). */
 export const MAP_SIZES: [number, string, string][] = [[512, 'S', '5.1 km'], [768, 'M', '7.7 km'], [1024, 'L', '10.2 km'], [1536, 'XL', '15.4 km']];
 export const DEFAULT_MAP_SIZE = 768;

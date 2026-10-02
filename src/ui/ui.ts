@@ -20,6 +20,10 @@ import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
 import { MapModes } from './mapmodes';
 import { catchShapes, catchColor } from './gameapi';
+import { canonicalizeLines, MergeNotice } from '../game/patterns';
+import { allBadges } from './lineid';
+import { TOOL_META } from './hud';
+import { stationComplex } from '../game/stations';
 import * as info from './win-info';
 import * as lines from './win-lines';
 import * as company from './win-company';
@@ -162,6 +166,10 @@ export class UI {
     const T = this.tools;
     const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
     if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
+    // urban rail category, connect tracks; lines map display (lines / stations with their numbers)
+    if (k === 'u' || k === 'U') { T.setTool(TOOL_META[T.tool].cat === 'urban' ? 'inspect' : 'metro'); return; }
+    if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
+    if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === 'Escape') {
       if (T.cancel()) return;
       if (this.mapModes.mode !== 'none') { this.mapModes.set('none'); return; }
@@ -169,7 +177,7 @@ export class UI {
       return;
     }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
-    if ((k === 'r' || k === 'R') && ['station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
+    if ((k === 'r' || k === 'R') && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
       T.rotate(e.shiftKey ? -1 : 1);
       this.hud.onToolChange();
       this.renderer.controls.keys.delete('r');
@@ -223,6 +231,7 @@ export class UI {
     this.checklist.update(dt);
     this.mapModes.update(dt);
     this.updateLinePaths();
+    this.updateStationLabels(dt);
     // follow a vehicle when the camera has no follow mode of its own
     if (this.following != null) {
       const v = g.vehicles.get(this.following);
@@ -248,7 +257,7 @@ export class UI {
     for (const win of this.wm.wins.values()) if (win.id.startsWith('line-')) open.add(Number(win.id.slice(5)));
     const linesMap = this.mapModes.mode === 'lines';
     if (!linesMap) for (const id of ov.linePathIds()) if (!open.has(id)) { ov.setLinePath(id, null); this.linePathSig.delete(id); }
-    let marksSig = '';
+    let marksSig = g.lines.version + '|';
     for (const id of open) {
       const l = g.lines.get(id);
       if (!l) continue;
@@ -265,13 +274,57 @@ export class UI {
     this.marksSig = marksSig;
     const marks = this.renderer.labels.marks;
     marks.clear();
+    const badges = allBadges(g);
     for (const id of open) {
       const l = g.lines.get(id);
       if (!l) continue;
-      l.stops.forEach((sid, i) => { const prev = marks.get(sid); marks.set(sid, { color: l.color, text: (prev ? prev.text + ',' : '') + (i + 1) }); });
+      // numbered lines show the station numbers (AS03), others the stop order
+      l.stops.forEach((sid, i) => {
+        const prev = marks.get(sid);
+        const code = badges.get(sid)?.find((b) => b.line === l.id)?.code;
+        const t = code ?? String(i + 1);
+        if (prev?.text.split(',').includes(t)) return;
+        marks.set(sid, { color: l.color, text: (prev ? prev.text + ',' : '') + t });
+      });
     }
   }
   private marksSig = '';
+
+  // ------------------------------------------------------------------ station labels: numbering, complexes
+  private complexT = 0;
+  private complexSig = '';
+  /** Station labels: numbering badges (cached per line network) and one label per transfer complex (refreshed ~1/s). */
+  private updateStationLabels(dt: number) {
+    const g = this.game, lb = this.renderer.labels;
+    lb.badges = allBadges(g);
+    this.complexT -= dt;
+    if (this.complexT > 0) return;
+    this.complexT = 1;
+    let sig = '' + g.stations.map.size;
+    for (const st of g.stations.map.values()) if (st.links?.length) sig += ',' + st.id + ':' + st.links.join('.');
+    if (sig === this.complexSig && lb.complexOf) return;
+    this.complexSig = sig;
+    const of = new Map<number, number>();
+    for (const st of g.stations.map.values()) {
+      if (!st.links?.length || of.has(st.id)) continue;
+      const c = stationComplex(g, st.id);
+      if (c.parts.length > 1) for (const id of c.parts) of.set(id, c.main);
+    }
+    lb.complexOf = of;
+  }
+
+  /** After a line's stops were edited: a line that is a subset of another becomes one of its service patterns. */
+  onLineEdited(lineId: number) {
+    const g = this.game;
+    if (!g || (this.tools.tool === 'line-edit' && this.tools.lineEditId === lineId)) return;
+    let notes: MergeNotice[] = [];
+    try { notes = canonicalizeLines(g, lineId); } catch (e) { console.warn('canonicalizeLines', e); return; }
+    for (const n of notes) {
+      if (this.wm.get('line-' + n.from)) { this.wm.close('line-' + n.from); this.openLine(n.into); }
+      this.toastAction(n.text, 'info', 'Open', () => this.openLine(n.into));
+    }
+    if (notes.length) { this.sound('notify'); this.wm.get('lines')?.refresh?.(); }
+  }
 
   // ------------------------------------------------------------------ floats, toasts, sounds
   private addFloat(text: string, cls: string, x: number, y: number, z: number, client?: { x: number; y: number }) {

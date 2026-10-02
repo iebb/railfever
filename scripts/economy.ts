@@ -1,8 +1,11 @@
 // Economy balance check: yearly income/costs of typical lines (rail intercity, busy town bus, short/empty lines).
+// Fares and costs: fares.ts (distance x value of time: waiting + riding vs walking / driving), opcosts.ts (vehicle
+// overheads, crew, energy, maintenance; track base upkeep + wear). Line maintenance below is the base upkeep of
+// the line's infrastructure (Game.edgeMaintenance / stationMaintenance); track wear is in the company totals.
 // npx esbuild scripts/economy.ts --bundle --platform=node --format=esm --outfile=$S/economy.mjs && node $S/economy.mjs [seed]
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
-import { TRACK_TYPES, ROAD_TYPES } from '../src/game/constants';
+import { CATEGORIES } from '../src/game/economy';
 import type { Line } from '../src/game/lines';
 import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train } from './lib';
 
@@ -11,21 +14,16 @@ const YEARS = 4;
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
 g.economy.money = 1e9;
 
-/** Yearly maintenance of the infrastructure used by a line (edges owned by the player near its stations' routes). */
+/** Yearly base maintenance of the infrastructure used by a line (edges owned by the player near its stations' routes). */
 function lineMaintenance(edges: Set<number>, stations: number[], depots: number[]): number {
   let c = 0;
   for (const id of edges) {
     const e = g.world.net.edges.get(id);
-    if (!e) continue;
-    const per = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).maintPerUnit : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).maintPerUnit;
-    c += e.len * per;
-    for (const s of e.sections) c += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
+    if (e) c += g.edgeMaintenance(e);
   }
   for (const sid of stations) {
     const st = g.stations.get(sid);
-    if (!st) continue;
-    if (st.rail) c += 20000 + st.rail.tracks * st.rail.length * 500;
-    c += st.stops.length * 3000;
+    if (st) c += g.stationMaintenance(st);
   }
   for (const d of depots) { const dp = g.depots.get(d); if (dp) c += dp.kind === 'rail' ? 12000 : 6000; }
   return c;
@@ -104,7 +102,7 @@ for (let y = 0; y < YEARS; y++) {
   for (let i = 0; i < 4 * 360 * 2; i++) g.update(0.25);
   if (y === 0) continue; // first year is warm-up
 }
-console.log(`economy (seed ${seed}), last full year ${g.year - 1}; fare model in vehicle.ts`);
+console.log(`economy (seed ${seed}), last full year ${g.year - 1}; fares.ts / opcosts.ts`);
 for (const c of cases) {
   const inc = c.line.incomeLast, run = c.line.costLast;
   const net = inc - run - c.maint;
@@ -112,3 +110,5 @@ for (const c of cases) {
   console.log('  vehicles: ' + c.line.vehicles.map((id) => { const v = g.vehicles.get(id)!; return v.state + ' ' + v.status + ' d=' + v.delivered; }).join(' | '));
   console.log(`${c.name}, ${fmt(c.dist, 0)} u apart: income ${fmt(inc / 1e3, 0)}k, running ${fmt(run / 1e3, 0)}k, maintenance ${fmt(c.maint / 1e3, 0)}k -> net ${fmt(net / 1e3, 0)}k/yr; vehicles ${fmt(c.cost / 1e3, 0)}k -> payback ${net > 0 ? fmt(c.cost / net, 1) + ' yrs' : 'never'}; pax/month ${pax}`);
 }
+const yr = g.economy.yearTotals[g.economy.yearTotals.length - 1];
+console.log(`company ${yr.year}: ` + CATEGORIES.filter((k) => yr.v[k]).map((k) => `${k} ${fmt(yr.v[k] / 1e3, 0)}k`).join(', '));

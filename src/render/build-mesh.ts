@@ -55,6 +55,8 @@ export class WB {
   seed = 0;
   private cr = 1; private cg = 1; private cb = 1;
   private anyCast = false;
+  /** bumped whenever the vertex state (cell / colour) changes or the builder is reset (vertex sharing caches) */
+  stamp = 0;
 
   /** Clear for reuse (keeps the allocated buffers). */
   reset(off = false): this {
@@ -62,6 +64,7 @@ export class WB {
     this.cell = 0; this.cast = 1; this.seed = 0; this.anyCast = false;
     this.cr = this.cg = this.cb = 1;
     this.off = off; this.idx.off = off;
+    this.stamp++;
     return this;
   }
 
@@ -82,6 +85,7 @@ export class WB {
   }
 
   color(c: number | THREE.Color, mul = 1): this {
+    this.stamp++;
     if (typeof c === 'number') {
       if (mul === 1) { const v = linear(c); this.cr = v[0]; this.cg = v[1]; this.cb = v[2]; }
       else { this.cr = srgbToLinear((((c >> 16) & 255) / 255) * mul); this.cg = srgbToLinear((((c >> 8) & 255) / 255) * mul); this.cb = srgbToLinear(((c & 255) / 255) * mul); }
@@ -92,6 +96,7 @@ export class WB {
   /** Select atlas cell and colour (and optionally the shadow-cast flag) for the following faces. */
   use(cell: number, color: number, cast?: number): this {
     this.cell = cell;
+    this.stamp++;
     this.color(color);
     if (cast !== undefined) this.cast = cast;
     return this;
@@ -107,6 +112,23 @@ export class WB {
     N[i3] = nx; N[i3 + 1] = ny; N[i3 + 2] = nz;
     C[i3] = this.cr; C[i3 + 1] = this.cg; C[i3 + 2] = this.cb;
     this.uvs[i2] = u; this.uvs[i2 + 1] = v;
+    this.cells[i] = this.cell; this.casts[i] = this.cast; this.seeds[i] = this.seed;
+    if (this.cast) this.anyCast = true;
+    this.n = i + 1;
+    return i;
+  }
+
+  /** vertex() taking x y z nx ny nz u v from a scratch array (no number boxing in hot loops). */
+  vertexArr(a: Float64Array): number {
+    if (this.off) return 0;
+    const i = this.n;
+    if (i >= this.cap) this.grow(i + 1);
+    const i3 = i * 3, i2 = i * 2;
+    const P = this.pos, N = this.nrm, C = this.col;
+    P[i3] = a[0]; P[i3 + 1] = a[1]; P[i3 + 2] = a[2];
+    N[i3] = a[3]; N[i3 + 1] = a[4]; N[i3 + 2] = a[5];
+    C[i3] = this.cr; C[i3 + 1] = this.cg; C[i3 + 2] = this.cb;
+    this.uvs[i2] = a[6]; this.uvs[i2 + 1] = a[7];
     this.cells[i] = this.cell; this.casts[i] = this.cast; this.seeds[i] = this.seed;
     if (this.cast) this.anyCast = true;
     this.n = i + 1;
@@ -211,7 +233,8 @@ export class WB {
     const nrm = new Int8Array(n * 3), col = new Uint8Array(n * 3);
     const N = this.nrm, C = this.col;
     for (let i = 0; i < n * 3; i++) {
-      nrm[i] = Math.round(N[i] * 127);
+      const q = Math.round(N[i] * 127); // clamp: Int8Array wraps (an unnormalised -1.01 would become +1)
+      nrm[i] = q > 127 ? 127 : q < -127 ? -127 : q;
       const c = C[i] * 255;
       col[i] = c >= 255 ? 255 : c <= 0 ? 0 : Math.round(c);
     }
