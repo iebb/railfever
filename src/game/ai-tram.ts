@@ -8,6 +8,7 @@ import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize } from
 import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
+import { runGen } from './routing';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
 export interface TramProject {
@@ -162,6 +163,7 @@ export class TramPlanner {
     // ---- stops
     const ids: number[] = [];
     for (const s of route.stops) {
+      yield;
       const before = g.stations.nextId;
       if (g.stations.commitBusStop(s.x, s.z, owner)) continue;
       let sid = -1, bd = Infinity;
@@ -182,7 +184,7 @@ export class TramPlanner {
     p.line = line.id;
     line.stops = [...ids, ...ids.slice(1, -1).reverse()];
     let bought = 0;
-    for (let i = 0; i < nTrams; i++) if (typeof g.vehicles.buyRoad(dep, model, line.id) !== 'string') bought++;
+    for (let i = 0; i < nTrams; i++) { if (typeof g.vehicles.buyRoad(dep, model, line.id) !== 'string') bought++; yield; }
     if (!bought) return this.fail('could not buy trams');
     this.status = `opened trams in ${T.name}`;
     return true;
@@ -205,28 +207,33 @@ export class TramPlanner {
     const out: { edges: number[]; len: number; pts: { x: number; z: number; edge: number; s: number }[]; stops: { x: number; z: number }[]; score: number }[] = [];
     for (const a of [th, th + Math.PI / 2, th + Math.PI / 4, th - Math.PI / 4]) {
       const ux = Math.cos(a), uz = Math.sin(a);
-      const ends = [-1, 1].map((sg) => {
+      const ends: ({ x: number; y: number; z: number } | null)[] = [];
+      for (const sg of [-1, 1]) {
+        let end: { x: number; y: number; z: number } | null = null;
         // the street point nearest to the axis end (falling back towards the centre)
         for (let f = 1; f >= 0.45; f -= 0.1) {
           const x = mx + ux * sg * L * 0.5 * f, z = mz + uz * sg * L * 0.5 * f;
           const ne = net.nearestEdge(x, z, 6, 'road', (e) => e.depot < 0 && e.station < 0 && e.type === 'street');
-          if (ne) { const q = { x: 0, y: 0, z: 0 }; net.pointAt(ne.edge, ne.s, q); return q; }
+          yield;
+          if (ne) { end = { x: 0, y: 0, z: 0 }; net.pointAt(ne.edge, ne.s, end); break; }
         }
-        return null;
-      });
+        ends.push(end);
+      }
       yield;
       if (!ends[0] || !ends[1]) continue;
       const direct = Math.hypot(ends[1].x - ends[0].x, ends[1].z - ends[0].z);
       if (direct < 20) continue;
       const edges = roadPath(g, ends[0].x, ends[0].z, ends[1].x, ends[1].z, direct * 2.2);
+      yield;
       if (!edges || edges.length < 2) continue;
       // tracks of other companies on the way must be usable (access), company roads must be ours
       if (edges.some((id) => { const e = net.edges.get(id)!; return (e.tram && !tramUsable(g, e, owner)) || (e.owner >= 0 && !g.canUse(owner, e.owner)); })) continue;
       const pts = pathPoints(g, edges);
+      yield;
       if (pts.length < 2) continue;
       const len = pts.length - 1;
       if (len > direct * 1.7 + 10) continue;
-      const stops = tramStopSites(g, pts, owner);
+      const stops = yield* tramStopSitesGen(g, pts, owner);
       if (stops.length < 3) continue;
       // people in the stops' catchment (each counted once) per unit of new track
       const pop = g.stations.popInShapes(stops.map((s) => stopCatchShape(s.x, s.z, true)));
@@ -240,17 +247,17 @@ export class TramPlanner {
 /** A tram depot beside a tram route near one of its ends that reaches the route's first stop (-1: none). */
 export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number; s: number }[], stations: number[], owner: number): Generator<void, number> {
   const sz = depotSize('tram');
-  let n = 0;
   for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(pts.length - 2, 40); k += 2) {
     const i = fromEnd ? pts.length - 1 - k : k;
     const p = pts[i], q = pts[Math.min(pts.length - 1, i + 1)], o = pts[Math.max(0, i - 1)];
     const tx = q.x - o.x, tz = q.z - o.z, tl = Math.hypot(tx, tz) || 1;
     for (const side of [1, -1]) {
+      yield;
       const nx = (-tz / tl) * side, nz = (tx / tl) * side;
       const off = 0.5 + 0.9 + sz.d / 2;
       const x = p.x + nx * off, z = p.z + nz * off;
       const plan = g.depots.plan('tram', x, z, Math.atan2(-nx, -nz), owner);
-      if (++n % 4 === 0) yield;
+      yield;
       if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2) continue;
       const id = g.depots.nextId;
       if (g.depots.commit('tram', plan, owner)) continue;
@@ -287,6 +294,11 @@ export function pathPoints(g: Game, edges: number[]): { x: number; z: number; ed
 
 /** Stop sites about every 12 units along a path (on the path's own edges, not at junctions, ground only). */
 export function tramStopSites(g: Game, pts: { x: number; z: number; edge: number; s: number }[], owner: number): { x: number; z: number }[] {
+  return runGen(tramStopSitesGen(g, pts, owner));
+}
+
+/** The same stop search, with each candidate in its own AI work unit. */
+function* tramStopSitesGen(g: Game, pts: { x: number; z: number; edge: number; s: number }[], owner: number): Generator<void, { x: number; z: number }[]> {
   const out: { x: number; z: number }[] = [];
   const n = pts.length;
   const want: number[] = [];
@@ -298,6 +310,7 @@ export function tramStopSites(g: Game, pts: { x: number; z: number; edge: number
       if (i < 1 || i >= n - 1) continue;
       const p = pts[i];
       const bp = g.stations.planBusStop(p.x, p.z, owner);
+      yield;
       if (!bp.ok || bp.edge?.id !== p.edge) continue;
       if (out.some((o) => Math.hypot(o.x - p.x, o.z - p.z) < 6)) continue;
       out.push({ x: p.x, z: p.z });

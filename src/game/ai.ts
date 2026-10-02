@@ -5,18 +5,18 @@
 import type { Game, AccessPolicy } from './game';
 import type { Town } from './towns';
 import type { Station, StationPlan } from './stations';
-import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf } from './stations';
+import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf, railCatchShapes } from './stations';
 import { defaultStationStyle } from './station-styles';
-import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, DoublePlan } from './trackops';
+import { finishDoubleTrack, DoublePlan, DoubleEnd, DoubleResult, FinishOpts, Step } from './trackops';
 import { electrify } from './build-ops';
 import * as Signals from './signals';
 import * as Trackops from './trackops';
-import type { NEdge } from './network';
+import type { NEdge, Section } from './network';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
-import { WATER_Y, TRACK_TYPES, UNIT_M } from './constants';
+import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind } from './constants';
 import { distToRect } from './world';
-import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal } from './construction';
+import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor } from './construction';
 import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongestion } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
@@ -25,15 +25,790 @@ import { availableModels, VehicleModel, MODEL_BY_ID } from './vehicle-types';
 import { estimateLegFare, estimateLegTime } from './fares';
 import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
-import { endTangent } from './geom';
+import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
+import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
 import { networkDaily } from './ai-network';
 import {
-  OPoint, P2, ChainProfile, RoutePlan, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainGen, routeConflictGen, routeGen, estimateChainCost, railPairGen, stationEnds, corridorOverlap, routeAlongside,
-  buildRailDepot, buildDepotOnLine, roadDepotGen, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, stationSiteGen, leadsMeet,
+  OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, routeConflictGen, routeGen, estimateChainCost, stationEnds, corridorOverlap, routeAlongside,
+  buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
 } from './routing';
 
 export * from './routing';
+
+// Corridor expansions are independent of the slice size; keep terrain probes in short batches too.
+const AI_ROUTE_WORK = 100;
+
+/** AI variants of the routing jobs: identical choices, with pauses inside segment retries and site scoring. */
+function aiTerrRef(g: Game, x: number, z: number, tx: number, tz: number, tracks: number): number {
+  const w = g.world;
+  let h = w.heightAt(x, z);
+  if (tracks > 1) {
+    const o = ((tracks - 1) / 2) * RAIL.spacing;
+    h = Math.max(h, w.heightAt(x - tz * o, z + tx * o), w.heightAt(x + tz * o, z - tx * o));
+  }
+  return h;
+}
+
+function aiProfileAt(prof: ChainProfile, x: number, z: number): number {
+  let best = 0, bd = Infinity;
+  for (let i = 0; i < prof.x.length; i++) { const d = (prof.x[i] - x) ** 2 + (prof.z[i] - z) ** 2; if (d < bd) { bd = d; best = i; } }
+  return prof.y[best];
+}
+
+function* aiBuildSegment(g: Game, start: Snap, end: Snap, opts: BuildOptions, endY: number | null, res: ChainResult, log?: (s: string) => void): Generator<void, Proposal | null> {
+  const tries: Partial<BuildOptions>[] = [{}, { crossing: 'level' }, { crossing: 'over' }, { crossing: 'under' }];
+  let last: Proposal | null = null;
+  const cl = Math.hypot(end.x - start.x, end.z - start.z) || 1;
+  let firstErr = '';
+  for (const useH of endY !== null ? [true, false] : [false]) {
+    if (!useH && endY !== null && last) firstErr = last.errors.join(', ') + ` (crossings ${last.crossings.map((c) => c.mode).join('/')})`;
+    for (const t of tries) {
+      const o: BuildOptions = { ...opts, ...t };
+      if (useH && endY !== null && end.kind === 'free') {
+        const tr = aiTerrRef(g, end.x, end.z, (end.x - start.x) / cl, (end.z - start.z) / cl, start.group && start.group.length > 1 ? start.group.length : opts.tracks);
+        o.heightOffset = endY - tr;
+        if (Math.abs(o.heightOffset) < 1e-3) o.heightOffset = 1e-3;
+      } else o.heightOffset = 0;
+      const p = planEdge(g, start, end, o);
+      last = p;
+      yield;
+      if (!p.ok) continue;
+      if (p.warnings.includes('Not enough money')) { res.error = 'Not enough money'; return null; }
+      const err = commitProposal(g, p);
+      if (err) { res.error = err; return null; }
+      if (firstErr) (res.notes ??= []).push(`end height relaxed: ${firstErr}`);
+      res.cost += p.cost;
+      res.edges += p.tracks.length;
+      res.bridges += p.stats.bridges;
+      res.tunnels += p.stats.tunnels;
+      res.built += p.stats.len;
+      return p;
+    }
+  }
+  res.error = last ? last.errors.join(', ') : 'Cannot build';
+  if (last && log) {
+    const net = g.world.net;
+    const sn = start.kind === 'node' ? net.nodes.get(start.node!) : undefined;
+    log(`segment failed: ${res.error} (start y ${sn?.y.toFixed(2)}, end y ${endY?.toFixed(2)}, crossings ${last.crossings.map((c) => { const e = net.edges.get(c.edge)!; return `${c.mode}@${c.sNew.toFixed(1)}/${last!.tracks[c.track].len.toFixed(1)} ${e.kind}${e.owner} #${e.id} y${net.heightAtS(e, c.sOld).toFixed(2)} ${net.sectionAt(e, c.sOld)}`; }).join(', ')})`);
+  }
+  return null;
+}
+
+function aiGroupCentre(g: Game, nodeId: number, kind: NetKind, tracks: number): P2 {
+  const n = g.world.net.nodes.get(nodeId)!;
+  if (kind !== 'rail' || tracks < 2) return { x: n.x, z: n.z };
+  const grp = nodeSnap(g, nodeId, kind).group ?? [nodeId];
+  if (grp.length < 2) return { x: n.x, z: n.z };
+  const N = Math.min(tracks, grp.length);
+  const idx = Math.max(0, grp.indexOf(nodeId));
+  const lo = Math.max(0, Math.min(grp.length - N, idx - Math.floor((N - 1) / 2)));
+  let x = 0, z = 0;
+  for (const id of grp.slice(lo, lo + N)) { const m = g.world.net.nodes.get(id)!; x += m.x; z += m.z; }
+  return { x: x / N, z: z / N };
+}
+
+function* aiChainGen(g: Game, startNode: number, way: OPoint[], opts: BuildOptions, goalNode: number | null, prof: ChainProfile | null, log?: (s: string) => void): Generator<void, ChainResult> {
+  const net = g.world.net;
+  const res: ChainResult = { ok: false, cost: 0, endNode: startNode, edges: 0, bridges: 0, tunnels: 0, built: 0 };
+  let cur = startNode;
+  /** Build one arc from the current node to q (free point or the goal node); updates `cur`. */
+  const step = function* (q: P2, goal: boolean, allowSplit: boolean): Generator<void, boolean> {
+    const st = nodeSnap(g, cur, opts.kind);
+    const en: Snap = goal ? nodeSnap(g, goalNode!, opts.kind) : { kind: 'free', x: q.x, z: q.z, y: g.world.heightAt(q.x, q.z) };
+    const endY = goal || !prof ? null : aiProfileAt(prof, q.x, q.z);
+    const before = res.error;
+    const p = yield* aiBuildSegment(g, st, en, opts, endY, res, allowSplit && !goal ? undefined : log);
+    if (p) {
+      if (goal) { cur = goalNode!; return true; }
+      // the new end node (one member of the group for multi-track)
+      const tp = p.tracks[Math.floor((p.tracks.length - 1) / 2)];
+      const nn = nodeAt(g, opts.kind, tp.bez.x3, tp.bez.z3);
+      if (!nn) { res.error = 'End node missing'; return false; }
+      cur = nn.id;
+      return true;
+    }
+    if (!allowSplit || goal || res.error === 'Not enough money') return false;
+    // split the arc at its middle and try both halves
+    const c = aiGroupCentre(g, cur, opts.kind, opts.tracks);
+    const t = nodeTangent(g, cur, q);
+    const L = Math.hypot(q.x - c.x, q.z - c.z);
+    if (L < 4) return false;
+    const ux = (q.x - c.x) / L, uz = (q.z - c.z) / L;
+    const dp = t.tx * ux + t.tz * uz;
+    const tq = { tx: 2 * dp * ux - t.tx, tz: 2 * dp * uz - t.tz };
+    const m = biarcJunction({ x: c.x, z: c.z, ...t }, { x: q.x, z: q.z, ...tq });
+    res.error = before;
+    if (!m) return false;
+    return (yield* step(m, false, false)) && (yield* step(q, false, false));
+  };
+  /**
+   * A segment end on (or right next to) a crossing would sit on the crossed edge: end it a little
+   * earlier, moving back along the planned route (so curves keep their radius).
+   */
+  const clearOfCrossings = (q: P2, from: P2): P2 => {
+    if (!prof || !prof.crossings.length) return q;
+    const near = (p: P2) => prof!.crossings.some((c) => Math.hypot(c.x - p.x, c.z - p.z) < 1.8);
+    if (!near(q)) return q;
+    let k = 0, bd = Infinity;
+    for (let i = 0; i < prof.x.length; i++) { const d = (prof.x[i] - q.x) ** 2 + (prof.z[i] - q.z) ** 2; if (d < bd) { bd = d; k = i; } }
+    for (let i = k - 1; i > 0; i--) {
+      const p = { x: prof.x[i], z: prof.z[i] };
+      if (Math.hypot(p.x - from.x, p.z - from.z) < 3) break;
+      if (prof.s[k] - prof.s[i] >= 2.2 && !near(p)) return p;
+    }
+    return q;
+  };
+  const yEnd = prof ? prof.y[prof.y.length - 1] : 0;
+  // (wide-curve track: no stubs of a few units between waypoints, they would have to turn sharply)
+  const minLeg = opts.kind === 'rail' && (TRACK_TYPES[opts.type]?.minRadius ?? 0) >= 25 ? 4 : 1.2;
+  for (let i = 0; i < way.length; i++) {
+    const n = net.nodes.get(cur);
+    if (!n) { res.error = 'Lost the chain'; return res; }
+    const wp = way[i];
+    const isGoal = i === way.length - 1 && goalNode !== null;
+    const c = aiGroupCentre(g, cur, opts.kind, opts.tracks);
+    const t0 = nodeTangent(g, cur, wp);
+    const a: OPoint = { x: c.x, z: c.z, tx: t0.tx, tz: t0.tz };
+    // the last segment ended off the planned heights: re-plan the rest of the profile from here
+    if (prof && i > 0 && Math.abs(n.y - aiProfileAt(prof, c.x, c.z)) > 0.12) {
+      const ex = new Set<number>(n.edges);
+      if (goalNode !== null) for (const id of nodeSnap(g, goalNode, opts.kind).group ?? [goalNode]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
+      for (const id of nodeSnap(g, cur, opts.kind).group ?? [cur]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
+      yield;
+      const np = chainProfile(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex);
+      if (!np) { res.error = 'Too steep: the route left its planned heights'; log?.(`re-plan of heights failed at waypoint ${i}`); return res; }
+      prof = np;
+    }
+    const L = Math.hypot(wp.x - a.x, wp.z - a.z);
+    if (L < minLeg && !isGoal) continue;
+    const ux = (wp.x - a.x) / L, uz = (wp.z - a.z) / L;
+    const straight = a.tx * ux + a.tz * uz > 0.9995 && wp.tx * ux + wp.tz * uz > 0.9995;
+    const pts: { p: P2; goal: boolean }[] = [];
+    if (!straight) {
+      const j = biarcJunction(a, wp);
+      if (j && Math.hypot(j.x - a.x, j.z - a.z) > minLeg && Math.hypot(wp.x - j.x, wp.z - j.z) > minLeg) pts.push({ p: j, goal: false });
+    }
+    pts.push({ p: wp, goal: isGoal });
+    for (const q of pts) {
+      if (!(yield* step(q.goal ? q.p : clearOfCrossings(q.p, net.nodes.get(cur) ?? q.p), q.goal, true))) return res;
+      yield;
+    }
+  }
+  res.ok = true;
+  res.endNode = cur;
+  return res;
+}
+
+function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Generator<void, StationPlan | null> {
+  const dirA = Math.atan2(toward.x - town.x, toward.z - town.z);
+  const front = o.front ?? 16, back = o.back ?? 9;
+  let best: StationPlan | null = null, bestScore = Infinity;
+  const maxR = o.maxR ?? town.radius + 14;
+  let n = 0, bestR = Infinity;
+  for (let r = 4; r <= maxR; r += 3) {
+    if (o.quick && o.prefY === undefined && r > bestR + 9) break;
+    for (const da of [0, 0.25, -0.25, 0.5, -0.5, 0.8, -0.8, 1.2, -1.2]) {
+      const pa = dirA + da;
+      const x = town.x + Math.sin(pa) * r, z = town.z + Math.cos(pa) * r;
+      if (!g.world.inside(x, z, 8)) continue;
+      // the platform axis should point at the target from where the station actually is
+      const dirP = Math.atan2(toward.x - x, toward.z - z);
+      for (const aa of [0, 0.15, -0.15, 0.35, -0.35]) {
+        // short steps: a pause after a few plans (quick rejections count little)
+        if ((n += 1) >= 16) { n = 0; yield; }
+        const ang = dirA + aa;
+        const off = Math.abs(Math.atan2(Math.sin(ang - dirP), Math.cos(ang - dirP)));
+        if (off > 0.75) continue;
+        const fx = Math.sin(ang), fz = Math.cos(ang);
+        // cheap rejections before the full plan: a street or track across the platform, a blocked throat
+        let blocked = false;
+        for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) if (g.world.net.nearestEdge(x + fx * o.length * t, z + fz * o.length * t, 1.1)) { blocked = true; break; }
+        // (half the station's width at least: platforms between the tracks)
+        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5 + 0.25 * (o.tracks - 1))) continue;
+        // the caller's condition on the site first (planning the station is costly)
+        if (o.accept && !o.accept({ x, z, angle: ang, length: o.length } as StationPlan)) continue;
+        const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
+        // planning a station is the costly part (footprints, entrances, access road): one per step
+        n = 16;
+        if (!plan.ok || plan.join) continue;
+        const hw = plan.layout.width / 2;
+        if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
+        if (o.accept && !o.accept(plan)) continue;
+        const backFree = corridorFree(g, x, z, -fx, -fz, o.length / 2 + 0.5, o.length / 2 + back, 0.6);
+        // beyond the lead the line should not have to run alongside a road or track
+        let alongside = 0;
+        for (let t = o.length / 2 + front; t <= o.length / 2 + front + 14; t += 2) {
+          const ne = g.world.net.nearestEdge(x + fx * t, z + fz * t, 3);
+          if (!ne) continue;
+          const d = { x: 0, y: 0, z: 0 }, q = { x: 0, y: 0, z: 0 };
+          g.world.net.pointAt(ne.edge, ne.s, q, d);
+          if (Math.abs(d.x * fx + d.z * fz) / (Math.hypot(d.x, d.z) || 1) > 0.8) alongside++;
+        }
+        // (counting the catchment is costly too: a step of its own)
+        yield;
+        n = 0;
+        // people in the station's catchment (the access road comes with it), those within a short walk of the
+        // platforms counting double (central sites on the levelled town ground connect best)
+        const pop = g.stations.popInShapes(g.stations.planCatchShapes(plan)) + g.stations.popInShapes(railCatchShapes(x, z, ang, o.length).map((c) => ({ ...c, r: 15 })));
+        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 30 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
+        if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
+        if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
+        yield;
+      }
+    }
+  }
+  return best;
+}
+
+function* aiRailPairGen(g: Game, A: Town, B: Town, o: SiteOpts, detour = 1.15): Generator<void, { a: StationPlan; b: StationPlan } | null> {
+  const grade = TRACK_TYPES.standard.maxGrade * 0.8;
+  const lead = (o.front ?? 16) - 2;
+  const heights = (p: StationPlan, q: StationPlan) => Math.abs(p.y - q.y) <= grade * Math.hypot(p.x - q.x, p.z - q.z) * detour;
+  const minPop = (t: Town) => Math.min(t.pop * 0.3, 400);
+  const d = Math.hypot(A.x - B.x, A.z - B.z);
+  const aligned = (p: StationPlan, q: StationPlan) => { const a = Math.atan2(q.x - p.x, q.z - p.z) - p.angle, off = Math.abs(Math.atan2(Math.sin(a), Math.cos(a))); return Math.min(off, Math.PI - off) <= 0.3; };
+  // B's platforms face A's station so that the two leads line up; then A's are aligned with B's
+  const pa = yield* aiStationSiteGen(g, A, B, o);
+  if (pa) {
+    const pb = yield* aiStationSiteGen(g, B, pa, { ...o, accept: (q) => leadsMeet(pa, q, lead) });
+    if (pb) {
+      if (!aligned(pa, pb)) {
+        const pa2 = yield* aiStationSiteGen(g, A, pb, { ...o, accept: (q) => leadsMeet(q, pb, lead) });
+        if (pa2 && heights(pa2, pb)) return { a: pa2, b: pb };
+      }
+      if (heights(pa, pb)) return { a: pa, b: pb };
+      // height-matched sites on either side, keeping a useful catchment
+      const pb2 = yield* aiStationSiteGen(g, B, pa, { ...o, prefY: pa.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(pa, q, lead) });
+      if (pb2 && heights(pa, pb2) && sitePop(g, pb2.x, pb2.z, o.length, pb2.angle) >= minPop(B)) return { a: pa, b: pb2 };
+      const pa3 = yield* aiStationSiteGen(g, A, pb, { ...o, prefY: pb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, pb, lead) });
+      if (pa3 && heights(pa3, pb) && sitePop(g, pa3.x, pa3.z, o.length, pa3.angle) >= minPop(A)) return { a: pa3, b: pb };
+    }
+  }
+  // the other way round: B's best site first, then an A site whose lead meets it
+  const qb = yield* aiStationSiteGen(g, B, A, o);
+  if (!qb) return null;
+  const qa = yield* aiStationSiteGen(g, A, qb, { ...o, accept: (q) => leadsMeet(q, qb, lead) });
+  if (qa && heights(qa, qb)) return { a: qa, b: qb };
+  const qa2 = yield* aiStationSiteGen(g, A, qb, { ...o, prefY: qb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, qb, lead) });
+  if (qa2 && heights(qa2, qb) && sitePop(g, qa2.x, qa2.z, o.length, qa2.angle) >= minPop(A)) return { a: qa2, b: qb };
+  return null;
+}
+
+
+/** The double-track preview algorithm, sliced per turnout candidate and per planEdge call. */
+interface aiDoubleSample { u: number; x: number; z: number; y: number; tx: number; tz: number; edge: number; s: number }
+
+const aiDoubleRailOpts = (owner: number, extra: Partial<BuildOptions> = {}): BuildOptions => ({ kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner, ...extra });
+/** Track type of a chain of track (its first edge's; standard if unknown). */
+const aiDoubleLineType = (g: Game, steps: Step[]): string => (steps.length ? g.world.net.edges.get(steps[0].edge)?.type : undefined) ?? 'standard';
+
+/** Length of a turnout from one track to a parallel one at the standard spacing. */
+const aiDoubleTURNOUT = 8;
+/** Longest segment of a new parallel track (keeps it at the old track's heights). */
+const aiDoubleSEG = 8;
+
+// ------------------------------------------------------------------ track helpers
+
+/** Samples (about every 0.25-0.5 units) along a track: position, height, unit tangent in travel direction. */
+function aiDoubleSampleSteps(g: Game, steps: Step[]): aiDoubleSample[] {
+  const net = g.world.net;
+  const out: aiDoubleSample[] = [];
+  let u = 0;
+  for (const st of steps) {
+    const e = net.edges.get(st.edge);
+    if (!e) continue;
+    const geo = net.geo(e);
+    for (let k = 0; k < geo.n; k++) {
+      const i = st.dir > 0 ? k : geo.n - 1 - k;
+      if (out.length && k === 0) continue;
+      const x = geo.pts[i * 3], z = geo.pts[i * 3 + 2];
+      if (out.length) { const p = out[out.length - 1]; u += Math.hypot(x - p.x, z - p.z); }
+      out.push({ u, x, z, y: geo.pts[i * 3 + 1], tx: geo.tan[i * 2] * st.dir, tz: geo.tan[i * 2 + 1] * st.dir, edge: e.id, s: geo.cum[i] });
+    }
+  }
+  return out;
+}
+
+/** Interpolated sample at distance u along a sampled track. */
+function aiDoubleSampleAt(S: aiDoubleSample[], u: number): aiDoubleSample {
+  if (u <= S[0].u) return S[0];
+  if (u >= S[S.length - 1].u) return S[S.length - 1];
+  let lo = 0, hi = S.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (S[m].u <= u) lo = m; else hi = m; }
+  const a = S[lo], b = S[hi], f = (u - a.u) / Math.max(1e-9, b.u - a.u);
+  const tx = a.tx + (b.tx - a.tx) * f, tz = a.tz + (b.tz - a.tz) * f, tl = Math.hypot(tx, tz) || 1;
+  const same = a.edge === b.edge;
+  return { u, x: a.x + (b.x - a.x) * f, z: a.z + (b.z - a.z) * f, y: a.y + (b.y - a.y) * f, tx: tx / tl, tz: tz / tl, edge: same || f < 0.5 ? a.edge : b.edge, s: same ? a.s + (b.s - a.s) * f : f < 0.5 ? a.s : b.s };
+}
+
+/** Nearest sample of a track to a point (index and distance). */
+function aiDoubleNearestSample(S: aiDoubleSample[], x: number, z: number): { i: number; d: number } {
+  let bi = 0, bd = Infinity;
+  for (let i = 0; i < S.length; i++) { const d = (S[i].x - x) ** 2 + (S[i].z - z) ** 2; if (d < bd) { bd = d; bi = i; } }
+  return { i: bi, d: Math.sqrt(bd) };
+}
+
+/** Continue a track from edge e (travelled in direction d) through edges of `set`, the straightest way. */
+function aiDoubleExtend(g: Game, e: NEdge, d: number, set: Set<number>, exclude: Set<number>, visited: Set<number>): Step[] {
+  const net = g.world.net;
+  const out: Step[] = [];
+  let cur = e, cd = d;
+  for (let guard = 0; guard < 10000; guard++) {
+    const conts = net.nextRail(cur, cd).filter((c) => set.has(c.edge.id) && !exclude.has(c.edge.id) && !visited.has(c.edge.id));
+    if (!conts.length) break;
+    const geo = net.geo(cur), i = cd > 0 ? geo.n - 1 : 0, tx = geo.tan[i * 2] * cd, tz = geo.tan[i * 2 + 1] * cd;
+    let best = conts[0], bd = -Infinity;
+    for (const c of conts) {
+      const ld = net.leaveDir(c.edge, c.node.id), dot = ld.x * tx + ld.z * tz;
+      if (dot > bd) { bd = dot; best = c; }
+    }
+    out.push({ edge: best.edge.id, dir: best.dir });
+    visited.add(best.edge.id);
+    cur = best.edge; cd = best.dir;
+  }
+  return out;
+}
+
+/** The track through `seed` within `set` (both ways), in seed's +s direction. */
+function aiDoubleWalkTrack(g: Game, seed: NEdge, set: Set<number>, exclude: Set<number> = new Set()): Step[] {
+  const visited = new Set<number>([seed.id]);
+  const fwd = aiDoubleExtend(g, seed, 1, set, exclude, visited);
+  const bwd = aiDoubleExtend(g, seed, -1, set, exclude, visited);
+  return [...bwd.reverse().map((s) => ({ edge: s.edge, dir: -s.dir })), { edge: seed.id, dir: 1 }, ...fwd];
+}
+
+const aiDoubleStartNode = (g: Game, s: Step) => { const e = g.world.net.edges.get(s.edge)!; return s.dir > 0 ? e.a : e.b; };
+const aiDoubleEndNode = (g: Game, s: Step) => { const e = g.world.net.edges.get(s.edge)!; return s.dir > 0 ? e.b : e.a; };
+
+const aiDoubleNodeSnapOf = (g: Game, id: number): Snap => { const n = g.world.net.nodes.get(id)!; return { kind: 'node', x: n.x, z: n.z, y: n.y, node: n.id, group: [n.id] }; };
+
+interface aiDoubleSPt { x: number; z: number; y: number; tx: number; tz: number; edge?: number; s?: number; node?: number }
+
+/** Price of the two turnouts of a connection (plus its track). */
+const aiDoubleTURNOUT_COST = 15000;
+
+function aiDoubleConnectS(g: Game, owner: number, a: aiDoubleSPt, b: aiDoubleSPt, tracks: Set<number>, dry: boolean, type?: string): { error: string | null; cost: number } {
+  const net = g.world.net, w = g.world;
+  const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
+  if (L < 2) return { error: 'too short', cost: 0 };
+  // the track type of what it connects (plain track first): metro / light rail allow tighter turnouts
+  const typeAt = (q: aiDoubleSPt): string | undefined => {
+    if (q.edge !== undefined) return net.edges.get(q.edge)?.type;
+    const n = q.node !== undefined ? net.nodes.get(q.node) : undefined;
+    const es = (n?.edges ?? []).map((id) => net.edges.get(id)!).filter(Boolean);
+    return (es.find((e) => e.station < 0 && e.depot < 0) ?? es[0])?.type;
+  };
+  const ttype = type ?? typeAt(b) ?? typeAt(a) ?? 'standard';
+  const tt = TRACK_TYPES[ttype] ?? TRACK_TYPES.standard;
+  const sa = a.tx * dx + a.tz * dz >= 0 ? 1 : -1, sb = b.tx * dx + b.tz * dz >= 0 ? 1 : -1;
+  const bez = bezFromTangents(a.x, a.z, a.tx * sa, a.tz * sa, b.x, b.z, b.tx * sb, b.tz * sb, L * 0.38, L * 0.38);
+  if (bezMinRadius(bez, 32) < tt.minRadius) return { error: 'curve too tight', cost: 0 };
+  if (Math.abs(b.y - a.y) > tt.maxGrade * L + 0.02) return { error: 'too steep', cost: 0 };
+  const p = { x: 0, z: 0 }, p2 = { x: 0, z: 0 }, dq = { x: 0, y: 0, z: 0 }, pq = { x: 0, y: 0, z: 0 };
+  for (let i = 2; i <= 14; i++) {
+    bezPoint(bez, i / 16, p);
+    bezPoint(bez, (i + 0.5) / 16, p2);
+    const tl = Math.hypot(p2.x - p.x, p2.z - p.z) || 1, ctx = (p2.x - p.x) / tl, ctz = (p2.z - p.z) / tl;
+    for (const e of net.edgesNear(p.x - 1, p.z - 1, p.x + 1, p.z + 1)) {
+      if (tracks.has(e.id)) continue;
+      if (a.node !== undefined && (e.a === a.node || e.b === a.node)) continue;
+      if (b.node !== undefined && (e.a === b.node || e.b === b.node)) continue;
+      const ne = net.nearestEdge(p.x, p.z, net.halfWidth(e) + 0.36, undefined, (q) => q.id === e.id);
+      if (!ne) continue;
+      // a track running alongside may be as close as the usual track spacing
+      if (e.kind === 'rail') {
+        net.pointAt(e, ne.s, pq, dq);
+        const dl = Math.hypot(dq.x, dq.z) || 1;
+        if (Math.abs((dq.x * ctx + dq.z * ctz) / dl) > 0.97 && Math.hypot(pq.x - p.x, pq.z - p.z) >= RAIL.spacing - 0.06) continue;
+      }
+      if (Math.abs(net.heightAtS(e, ne.s) - (a.y + (b.y - a.y) * (i / 16))) < RAIL.clearance) return { error: e.kind === 'rail' ? 'other track in the way' : 'road in the way', cost: 0 };
+    }
+  }
+  for (const c of net.crossings.values()) if ((tracks.has(c.e1) || tracks.has(c.e2)) && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) return { error: 'level crossing in the way', cost: 0 };
+  // Nodes carry no section flag: inspect their incident parent rails too (station insertion lays node-to-node
+  // fans). Determine the sections and their price before a dry run returns, so preview and commit agree.
+  const secOf = (q: aiDoubleSPt): 'ground' | Section['type'] => {
+    if (q.edge !== undefined) { const e = net.edges.get(q.edge); return e ? net.sectionAt(e, q.s ?? 0) : 'ground'; }
+    const n = q.node !== undefined ? net.nodes.get(q.node) : undefined;
+    const es = (n?.edges ?? []).map((id) => net.edges.get(id)!).filter((e) => e?.kind === 'rail');
+    const at = (e: NEdge) => net.sectionAt(e, e.a === n!.id ? 0 : e.len);
+    const e = es.find((e) => tracks.has(e.id) && at(e) !== 'ground') ?? es.find((e) => tracks.has(e.id)) ?? es[0];
+    return e ? at(e) : 'ground';
+  };
+  const secA = secOf(a), secB = secOf(b);
+  const inherited = secA === secB ? secA : secA === 'ground' ? secB : secB === 'ground' ? secA : 'ground';
+  const tab = arcTable(bez), K = Math.max(1, Math.ceil(tab.len / 0.25));
+  const sections: Section[] = [];
+  let price = 2 * aiDoubleTURNOUT_COST;
+  for (let i = 0; i < K; i++) {
+    const s0 = tab.len * i / K, s1 = tab.len * (i + 1) / K, s = (s0 + s1) / 2;
+    bezPoint(bez, tAtS(tab, s), p);
+    const y = a.y + (b.y - a.y) * s / tab.len, terrain = w.heightAt(p.x, p.z), depth = terrain - y;
+    // Even a legacy ground parent cannot make a deep connecting piece an open cutting. Low land requires a
+    // bridge or a covered tunnel; a shallow formation below the water line cannot be built at this height.
+    const sec = inherited !== 'ground' ? inherited : depth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover ? 'tunnel' : y - terrain > 1.4 || terrain < DRY_MIN ? 'bridge' : 'ground';
+    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below the water line here: raise it or go into a tunnel', cost: 0 };
+    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill in the way of the bridge: use a tunnel', cost: 0 };
+    price += (s1 - s0) * tt.costPerUnit * (sec === 'ground' ? 1 : structureFactor('rail', sec, Math.abs(depth)));
+    if (sec === 'ground') continue;
+    const last = sections[sections.length - 1];
+    if (last && last.type === sec && Math.abs(last.s1 - s0) < 0.001) last.s1 = s1;
+    else sections.push({ s0, s1, type: sec });
+  }
+  const cost = Math.round(price);
+  if (dry) return { error: null, cost };
+  for (const q of [a, b]) if (q.edge !== undefined && g.vehicles.isEdgeBusy(q.edge)) return { error: 'train in the way', cost };
+  const eco = g.company(owner).economy;
+  if (!eco.canAfford(cost)) return { error: 'Not enough money', cost };
+  const nodeOf = (q: aiDoubleSPt): number | null => {
+    if (q.node !== undefined) return net.nodes.has(q.node) ? q.node : null;
+    const e = net.edges.get(q.edge!);
+    if (!e) return null;
+    if (q.s! < 0.3 || q.s! > e.len - 0.3) return q.s! < 0.3 ? e.a : e.b;
+    const r = net.splitEdge(e.id, q.s!);
+    return r ? r.node.id : null;
+  };
+  const na = nodeOf(a);
+  const nb = na === null ? null : nodeOf(b);
+  if (na === null || nb === null) return { error: 'cannot split the track', cost };
+  const A = net.nodes.get(na)!, B = net.nodes.get(nb)!;
+  const curve = { ...bez, x0: A.x, z0: A.z, x3: B.x, z3: B.z }, len = arcTable(curve).len;
+  const m = Math.max(2, Math.ceil(len / PSTEP) + 1);
+  const prof = new Float32Array(m);
+  for (let i = 0; i < m; i++) prof[i] = A.y + (B.y - A.y) * Math.min(i * PSTEP, len) / len;
+  const e = net.addEdge('rail', na, nb, curve, prof, sections.map((s) => ({ ...s, s0: s.s0 * len / tab.len, s1: s.s1 * len / tab.len })), ttype, owner);
+  applyEarthworks(w, [e]);
+  for (let i = 0; i <= 8; i++) {
+    const s = e.len * i / 8;
+    if (net.sectionAt(e, s) !== 'ground') continue;
+    bezPoint(curve, tAtS(net.table(e), s), p); w.removeTreesNear(p.x, p.z, 0.8);
+  }
+  eco.spend(cost, 'construction');
+  g.onNetworkChanged();
+  return { error: null, cost };
+}
+
+function aiDoubleChainOf(g: Game, edgeIds: number[], owner: number): { steps: Step[]; error?: string } {
+  const net = g.world.net;
+  const ids = [...new Set(edgeIds)].filter((id) => net.edges.has(id));
+  if (!ids.length) return { steps: [], error: 'No track selected' };
+  for (const id of ids) {
+    const e = net.edges.get(id)!;
+    if (e.kind !== 'rail') return { steps: [], error: 'Only railway track can be doubled' };
+    if (e.owner !== owner) return { steps: [], error: 'Not your track' };
+    if (e.station >= 0 || e.depot >= 0) return { steps: [], error: 'Platform and depot tracks cannot be doubled' };
+  }
+  const set = new Set(ids);
+  const steps = aiDoubleWalkTrack(g, net.edges.get(ids[0])!, set);
+  if (steps.length !== ids.length) return { steps: [], error: 'The selected track is not one continuous line' };
+  if (ids.length > 1) {
+    const iLast = steps.findIndex((s) => s.edge === ids[ids.length - 1]), iFirst = steps.findIndex((s) => s.edge === ids[0]);
+    if (iLast < iFirst) return { steps: steps.reverse().map((s) => ({ edge: s.edge, dir: -s.dir })) };
+  }
+  return { steps };
+}
+
+/** Distance from a point to a sampled track (projected onto the nearest sample segments). */
+function aiDoubleDistToTrack(S: aiDoubleSample[], x: number, z: number): number {
+  const i = aiDoubleNearestSample(S, x, z).i;
+  let d = Math.hypot(S[i].x - x, S[i].z - z);
+  for (const j of [i - 1, i]) {
+    if (j < 0 || j + 1 >= S.length) continue;
+    const a = S[j], b = S[j + 1], vx = b.x - a.x, vz = b.z - a.z, l2 = vx * vx + vz * vz;
+    if (l2 < 1e-12) continue;
+    const t = Math.max(0, Math.min(1, ((x - a.x) * vx + (z - a.z) * vz) / l2));
+    d = Math.min(d, Math.hypot(a.x + vx * t - x, a.z + vz * t - z));
+  }
+  return d;
+}
+
+/**
+ * Plan a second track beside a chain of single-track edges, `RAIL.spacing` to the given side (+1 right of the
+ * direction from the first listed edge to the last). Bridges and tunnels get parallel structures (the planner's
+ * shared-formation discount applies); at each end the new track either runs into a free platform end of a station
+ * there or joins the old track with a turnout (short of switches whose branches leave on that side). Nothing is
+ * built; errors say where along the line a piece cannot be built (try the other side).
+ */
+function* aiPlanDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner: number): Generator<void, DoublePlan> {
+  const net = g.world.net;
+  const plan: DoublePlan = { ok: true, errors: [], warnings: [], cost: 0, owner, side, steps: [], length: 0, points: [], start: { kind: 'turnout', u: 0, node: -1 }, end: { kind: 'turnout', u: 0, node: -1 }, proposals: [] };
+  const fail = (m: string) => { plan.ok = false; if (!plan.errors.includes(m)) plan.errors.push(m); return plan; };
+  const ch = aiDoubleChainOf(g, edgeIds, owner);
+  if (ch.error) return fail(ch.error);
+  plan.steps = ch.steps;
+  yield;
+  const S = aiDoubleSampleSteps(g, ch.steps);
+  yield;
+  const U = S[S.length - 1].u;
+  plan.length = U;
+  const sp = RAIL.spacing;
+  const nrm = (q: { tx: number; tz: number }) => ({ x: -q.tz * side, z: q.tx * side });
+  const m10 = (u: number) => Math.round(u * 10);
+  const chainSet = new Set(ch.steps.map((s) => s.edge));
+  // branches leaving on the new track's side (judged a few units along them, as turnouts join tangentially):
+  // near an end the new track stops short of them, elsewhere they are in the way
+  let uMin = 0, uMax = U;
+  const pt = { x: 0, y: 0, z: 0 };
+  for (let i = 0; i + 1 < ch.steps.length; i++) {
+    const nid = aiDoubleEndNode(g, ch.steps[i]);
+    const n = net.nodes.get(nid)!;
+    const q = S[aiDoubleNearestSample(S, n.x, n.z).i], nv = nrm(q);
+    for (const eid of n.edges) {
+      if (chainSet.has(eid)) continue;
+      const e = net.edges.get(eid)!;
+      const d = Math.min(e.len, 3);
+      net.pointAt(e, e.a === nid ? d : e.len - d, pt);
+      if ((pt.x - n.x) * nv.x + (pt.z - n.z) * nv.z <= 0.12) continue;
+      if (q.u < U * 0.4) uMin = Math.max(uMin, q.u + 1.5);
+      else if (q.u > U * 0.6) uMax = Math.min(uMax, q.u - 1.5);
+      else return fail(`A branch leaves the line on that side (${m10(q.u)} m along)`);
+    }
+  }
+  const offAt = (u: number) => { const q = aiDoubleSampleAt(S, u), nv = nrm(q); return { u, x: q.x + nv.x * sp, z: q.z + nv.z * sp, y: q.y, tx: q.tx, tz: q.tz }; };
+  const onMain = (u: number): aiDoubleSPt => { const q = aiDoubleSampleAt(S, u); return { x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, edge: q.edge, s: q.s }; };
+  const isSwitchNear = (u: number) => { const q = aiDoubleSampleAt(S, u); return [...net.nodeGrid.query(q.x - 1.5, q.z - 1.5, q.x + 1.5, q.z + 1.5)].some((id) => { const n = net.nodes.get(id); return !!n && n.kind === 'rail' && n.edges.length > 2 && Math.hypot(n.x - q.x, n.z - q.z) < 1.5; }); };
+  // the ends: into a free platform end beside the track's own, else a turnout
+  const endOf = function* (atStart: boolean): Generator<void, { end: DoubleEnd; inner: number; err?: string } | null> {
+    const limit = atStart ? uMin : U - uMax;
+    if (limit === 0) {
+      const nid = atStart ? aiDoubleStartNode(g, ch.steps[0]) : aiDoubleEndNode(g, ch.steps[ch.steps.length - 1]);
+      const n = net.nodes.get(nid)!;
+      const q = atStart ? S[0] : S[S.length - 1];
+      const nv = nrm(q);
+      const stEdge = n.edges.map((id) => net.edges.get(id)!).find((e) => e && e.station >= 0);
+      if (stEdge) {
+        const st = g.stations.get(stEdge.station);
+        let best = -1, bl = Infinity;
+        for (const t of st ? g.stations.trackEnds(st) : []) for (const cand of [t.front, t.back]) {
+          const m = net.nodes.get(cand);
+          if (!m || cand === nid || m.edges.length !== 1) continue;
+          const dx = m.x - n.x, dz = m.z - n.z, lat = dx * nv.x + dz * nv.z, along = dx * q.tx + dz * q.tz;
+          if (Math.abs(along) < 0.3 && lat > 0.3 && lat < 1.7 && lat < bl) { bl = lat; best = cand; }
+        }
+        if (best >= 0) {
+          const len = Math.max(7, Math.min(14, Math.sqrt(60 * Math.abs(bl - sp)) + 4));
+          const inner = atStart ? len : U - len;
+          const m = net.nodes.get(best)!, o = offAt(inner);
+          const r = aiDoubleConnectS(g, owner, { x: m.x, z: m.z, y: m.y, tx: q.tx, tz: q.tz, node: best }, o, chainSet, true);
+          yield;
+          if (!r.error) return { end: { kind: 'platform', u: atStart ? 0 : U, node: best }, inner };
+        }
+      }
+    }
+    let why = '';
+    for (const T of [aiDoubleTURNOUT, aiDoubleTURNOUT + 3, aiDoubleTURNOUT + 7]) for (let d = Math.max(2, limit + 0.5); d <= limit + 26; d += 1) {
+      const u = atStart ? d : U - d, u2 = atStart ? u + T : u - T;
+      if (u2 < 0 || u2 > U || (atStart ? u2 > U / 2 : u2 < U / 2)) break;
+      if (isSwitchNear(u)) continue;
+      const r = aiDoubleConnectS(g, owner, onMain(u), offAt(u2), chainSet, true);
+      yield;
+      if (!r.error) return { end: { kind: 'turnout', u, node: -1 }, inner: u2 };
+      why = r.error;
+    }
+    return { end: { kind: 'turnout', u: 0, node: -1 }, inner: NaN, err: why || 'no room' };
+  };
+  const a = yield* endOf(true), b = yield* endOf(false);
+  if (!a || isNaN(a.inner)) return fail(`No room for the turnout at the start (${a?.err ?? ''})`);
+  if (!b || isNaN(b.inner)) return fail(`No room for the turnout at the end (${b?.err ?? ''})`);
+  plan.start = a.end; plan.end = b.end;
+  const uS = a.inner, uE = b.inner;
+  if (uE - uS < 3) return fail('Too short to double');
+  // where the new track crosses other roads and tracks: no segment ends there
+  const cross: number[] = [];
+  for (let i = 0; i < S.length - 1; i += 2) {
+    if (i % 32 === 0) yield;
+    const p = S[i], q = S[Math.min(S.length - 1, i + 2)];
+    const np = nrm(p), nq = nrm(q);
+    const ax = p.x + np.x * sp, az = p.z + np.z * sp, bx = q.x + nq.x * sp, bz = q.z + nq.z * sp;
+    for (const e of net.edgesNear(Math.min(ax, bx) - 0.5, Math.min(az, bz) - 0.5, Math.max(ax, bx) + 0.5, Math.max(az, bz) + 0.5)) {
+      if (chainSet.has(e.id)) continue;
+      const ge = net.geo(e);
+      for (let j = 0; j < ge.n - 1; j++) {
+        const cx = ge.pts[j * 3], cz = ge.pts[j * 3 + 2], dx = ge.pts[j * 3 + 3], dz = ge.pts[j * 3 + 5];
+        const rx = bx - ax, rz = bz - az, sx = dx - cx, sz = dz - cz, den = rx * sz - rz * sx;
+        if (Math.abs(den) < 1e-12) continue;
+        const t = ((cx - ax) * sz - (cz - az) * sx) / den, v = ((cx - ax) * rz - (cz - az) * rx) / den;
+        if (t >= 0 && t <= 1 && v >= 0 && v <= 1) cross.push(p.u + (q.u - p.u) * t);
+      }
+    }
+  }
+  // (segment ends keep 4.5 units from crossings, so the track can meet a level crossing's height)
+  const CR = 4.5;
+  const blocked = (u: number) => cross.find((c) => Math.abs(c - u) < CR);
+  const us: number[] = [uS];
+  for (let guard = 0; guard < 2000; guard++) {
+    const u = us[us.length - 1];
+    if (u >= uE - 1e-6) break;
+    let nx = u + aiDoubleSEG >= uE - 3 ? uE : u + aiDoubleSEG;
+    const c = nx < uE ? blocked(nx) : undefined;
+    if (c !== undefined) nx = c - CR - u >= 2 ? c - CR : Math.min(uE, c + CR);
+    if (nx >= uE - 1.5) nx = uE;
+    us.push(nx);
+  }
+  // segment ends on the parallel line with its exact direction; every segment is laid node to node (the planner's
+  // curve between the two directions), split where that curve would stray from the parallel line
+  const pts = [offAt(us[0])];
+  const queue = us.slice(1);
+  const pb = { x: 0, z: 0 };
+  for (let guard = 0; queue.length && guard < 4000; guard++) {
+    yield;
+    const A = pts[pts.length - 1], B = offAt(queue[0]);
+    const bez = fitCurve({ x: A.x, z: A.z, tx: A.tx, tz: A.tz, fixed: true, y: null }, { x: B.x, z: B.z, tx: B.tx, tz: B.tz, fixed: true, y: null });
+    let dev = 0;
+    for (let i = 1; i < 8; i++) { bezPoint(bez, i / 8, pb); dev = Math.max(dev, Math.abs(aiDoubleDistToTrack(S, pb.x, pb.z) - sp)); }
+    if (dev > 0.03 && queue[0] - A.u > 1.5) { queue.unshift((A.u + queue[0]) / 2); continue; }
+    pts.push(B);
+    queue.shift();
+  }
+  plan.points = pts;
+  // plan every segment between temporary nodes (removed again)
+  const tmp = pts.map((p) => net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, owner));
+  // Reserve the same node IDs as the synchronous planner, but expose temporary nodes only during a planEdge
+  // call. Other jobs and save/load must never see the preview's unconnected nodes between work units.
+  const detach = () => { for (const n of tmp) { net.nodes.delete(n.id); net.nodeGrid.remove(n.id); } };
+  detach();
+  try {
+    for (let k = 0; k + 1 < pts.length; k++) {
+      let prop: Proposal;
+      try {
+        for (const n of tmp) { net.nodes.set(n.id, n); net.nodeGrid.insert(n.id, n.x, n.z, n.x, n.z); }
+        prop = planEdge(g, aiDoubleNodeSnapOf(g, tmp[k].id), aiDoubleNodeSnapOf(g, tmp[k + 1].id), aiDoubleRailOpts(owner, { type: aiDoubleLineType(g, plan.steps) }));
+      } finally { detach(); }
+      plan.proposals.push(prop);
+      if (!prop.ok) fail(`New track (${m10(pts[k].u)}-${m10(pts[k + 1].u)} m of ${m10(U)} m): ${prop.errors[0] ?? 'cannot build'}`);
+      yield;
+    }
+  } finally {
+    detach();
+    net.version += tmp.length; // the synchronous planner's removeNode calls advance the version once per node
+  }
+  const conn = (e: DoubleEnd, inner: number) => {
+    const o = offAt(inner);
+    if (e.kind === 'platform') { const m = net.nodes.get(e.node)!; return aiDoubleConnectS(g, owner, { x: m.x, z: m.z, y: m.y, tx: o.tx, tz: o.tz, node: e.node }, o, chainSet, true).cost; }
+    return aiDoubleConnectS(g, owner, onMain(e.u), o, chainSet, true).cost;
+  };
+  const startCost = conn(plan.start, uS);
+  yield;
+  const endCost = conn(plan.end, uE);
+  yield;
+  plan.cost = Math.round(plan.proposals.reduce((s, p) => s + p.cost, 0) + startCost + endCost);
+  if (!g.company(owner).economy.canAfford(plan.cost)) plan.warnings.push('Not enough money');
+  return plan;
+}
+
+
+/** Double-track construction with one preview or commit per unit and exact rollback accounting. */
+function aiDoubleTrackSplits(g: Game, lists: Step[][]): () => void {
+  const net = g.world.net;
+  const f = (old: NEdge, e1: NEdge, e2: NEdge) => {
+    for (const L of lists) {
+      const i = L.findIndex((s) => s.edge === old.id);
+      if (i < 0) continue;
+      const d = L[i].dir;
+      L.splice(i, 1, ...(d > 0 ? [{ edge: e1.id, dir: 1 }, { edge: e2.id, dir: 1 }] : [{ edge: e2.id, dir: -1 }, { edge: e1.id, dir: -1 }]));
+    }
+  };
+  net.onSplit.push(f);
+  return () => { net.onSplit = net.onSplit.filter((x) => x !== f); };
+}
+
+function aiDoubleRefund(g: Game, owner: number, before: number) {
+  const eco = g.company(owner).economy;
+  const spent = before - eco.money;
+  if (spent > 0) eco.spend(-spent, 'construction', true);
+}
+
+function* aiCommitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts: FinishOpts = {}, record: (edges: number[]) => void = () => {}): Generator<void, DoubleResult> {
+  const net = g.world.net;
+  const owner = plan.owner;
+  const res: DoubleResult = { error: null, cost: 0, edges: [], signals: 0, crossovers: 0 };
+  if (!plan.ok) { res.error = plan.errors[0] ?? 'Cannot build'; return res; }
+  const eco = g.company(owner).economy;
+  if (!eco.canAfford(plan.cost)) { res.error = 'Not enough money'; return res; }
+  for (const s of plan.steps) if (!net.edges.has(s.edge)) { res.error = 'The track changed, plan again'; return res; }
+  for (const e of [plan.start, plan.end]) if (e.kind === 'platform' && net.nodes.get(e.node)?.edges.length !== 1) { res.error = 'The track changed, plan again'; return res; }
+  let paid = 0;
+  const added = new Set<number>();
+  const split = (old: NEdge, e1: NEdge, e2: NEdge) => { if (added.delete(old.id)) { added.add(e1.id); added.add(e2.id); } };
+  net.onSplit.push(split);
+  let hideUnused = () => {};
+  let restoreUnused = () => {};
+  const main = plan.steps.map((s) => ({ ...s }));
+  const untrack = aiDoubleTrackSplits(g, [main]);
+  const created = () => [...added].filter((id) => net.edges.has(id) && !main.some((s) => s.edge === id)).sort((a, b) => a - b);
+  // Operating income and other companies' construction continue between units; track only this transaction.
+  const mutate = <T>(f: () => T, countCost = true): T => {
+    const e0 = net.nextEdge, before = eco.money;
+    restoreUnused();
+    try { return f(); } finally {
+      for (let id = e0; id < net.nextEdge; id++) if (net.edges.has(id)) added.add(id);
+      if (countCost) paid += before - eco.money;
+      hideUnused();
+      record(created());
+    }
+  };
+  const rollback = (why: string) => {
+    for (const id of created()) net.removeEdge(id);
+    aiDoubleRefund(g, owner, eco.money + paid);
+    g.onNetworkChanged();
+    res.error = why;
+    return res;
+  };
+  try {
+    const pts = plan.points;
+    const nodes = pts.map((p) => net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, owner).id);
+    const first = net.nodes.get(nodes[0])!;
+    const nodeRecords = nodes.map((id) => net.nodes.get(id)!);
+    hideUnused = () => { for (const n of nodeRecords) if (!n.edges.length) { net.nodes.delete(n.id); net.nodeGrid.remove(n.id); } };
+    restoreUnused = () => { for (const n of nodeRecords) if (!n.edges.length && !net.nodes.has(n.id)) { net.nodes.set(n.id, n); net.nodeGrid.insert(n.id, n.x, n.z, n.x, n.z); } };
+    const dropNodes = () => { restoreUnused(); for (const id of nodes) { const n = net.nodes.get(id); if (n && !n.edges.length) net.removeNode(id); } };
+    hideUnused();
+    for (let k = 0; k + 1 < pts.length; k++) {
+      let ok = false;
+      for (const extra of [{}, { crossing: 'level' as const }, { crossing: 'over' as const }, { crossing: 'under' as const }]) {
+        let prop: Proposal;
+        restoreUnused();
+        try { prop = planEdge(g, aiDoubleNodeSnapOf(g, nodes[k]), aiDoubleNodeSnapOf(g, nodes[k + 1]), aiDoubleRailOpts(owner, { type: aiDoubleLineType(g, plan.steps), ...extra })); }
+        finally { hideUnused(); }
+        yield;
+        if (!prop.ok) continue;
+        const error = mutate(() => commitProposal(g, prop));
+        yield;
+        if (error) continue;
+        ok = true;
+        break;
+      }
+      if (!ok) { const r = rollback(`New track could not be built at ${Math.round(pts[k].u * 10)} m (the ground or the network changed)`); dropNodes(); return r; }
+    }
+    const cur = nodes[nodes.length - 1];
+    const tracks = () => new Set<number>([...main.map((s) => s.edge), ...created()]);
+    const nodePt = (id: number, t: { tx: number; tz: number }): aiDoubleSPt => { const n = net.nodes.get(id)!; return { x: n.x, z: n.z, y: n.y, tx: t.tx, tz: t.tz, node: id }; };
+    const mainPt = (u: number): aiDoubleSPt => { const q = aiDoubleSampleAt(aiDoubleSampleSteps(g, main), u); return { x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, edge: q.edge, s: q.s }; };
+    const last = pts[pts.length - 1];
+    const r1 = mutate(() => plan.end.kind === 'platform' ? aiDoubleConnectS(g, owner, nodePt(cur, last), nodePt(plan.end.node, last), tracks(), false) : aiDoubleConnectS(g, owner, nodePt(cur, last), mainPt(plan.end.u), tracks(), false));
+    yield;
+    if (r1.error) { const r = rollback(`End connection: ${r1.error}`); dropNodes(); return r; }
+    const r2 = mutate(() => plan.start.kind === 'platform' ? aiDoubleConnectS(g, owner, nodePt(plan.start.node, pts[0]), nodePt(first.id, pts[0]), tracks(), false) : aiDoubleConnectS(g, owner, mainPt(plan.start.u), nodePt(first.id, pts[0]), tracks(), false));
+    yield;
+    if (r2.error) { const r = rollback(`Start connection: ${r2.error}`); dropNodes(); return r; }
+    res.edges = created();
+    res.cost = Math.round(paid);
+    g.onNetworkChanged();
+    if (finish) {
+      yield;
+      const f = mutate(() => finishDoubleTrack(g, [...main.map((s) => s.edge), ...res.edges], owner, opts), false);
+      res.signals = f.signals; res.crossovers = f.crossovers;
+      if (f.error) res.finishError = f.error;
+      res.cost += f.cost;
+    }
+    return res;
+  } finally {
+    hideUnused();
+    untrack();
+    net.onSplit = net.onSplit.filter((f) => f !== split);
+  }
+}
 
 export const AI_NAMES = [
   'Northern Star Rail', 'Blue Valley Transit', 'Crimson Express', 'Evergreen Lines', 'Violet Coast Railways',
@@ -265,8 +1040,8 @@ const BUS_MIN_POP = 1500;
 
 /**
  * An AI company. Plans one project at a time (a bus network or a tram line in a large town, an intercity
- * railway, trains on another company's railway, or a country road) as an incremental job; `daily()` runs a
- * number of work units (each well under a few milliseconds), `monthly()` manages loans, vehicles, track access
+ * railway, trains on another company's railway, or a country road) as an incremental job; `work()` spreads
+ * its work units over the day, `monthly()` manages loans, vehicles, track access
  * and acquisitions. Uses only the public construction API. `config` may be changed at any time.
  */
 export class AIController {
@@ -382,7 +1157,7 @@ export class AIController {
   private onError(e: unknown) {
     if (!this.errorLogged) { this.errorLogged = true; console.warn(`AI ${this.name}:`, e); }
     this.note('error: ' + String((e as Error)?.message ?? e));
-    try { if (this.project) this.abandon(this.project); } catch { /* ignore */ }
+    try { this.job?.return(undefined); if (this.project) this.abandon(this.project); } catch { /* ignore */ }
     this.project = null;
     this.job = null;
     this.state.phase = 'idle';
@@ -442,7 +1217,7 @@ export class AIController {
   /** The company was bought: stop and remove a half-built project. */
   dispose() {
     if (this.disposed) return;
-    try { if (this.project) this.abandon(this.project); } catch { /* ignore */ }
+    try { this.job?.return(undefined); if (this.project) this.abandon(this.project); } catch { /* ignore */ }
     this.project = null;
     this.job = null;
     this.disposed = true;
@@ -1333,15 +2108,15 @@ export class AIController {
       if (hubB && reach(pa, asPlan(hubB)) && leadsMeet(pa, asPlan(hubB), LEAD)) pr = { a: pa, b: asPlan(hubB) };
       else {
         hubB = null;
-        const pb = yield* stationSiteGen(g, B, pa, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(pa, q, LEAD), quick: true });
+        const pb = yield* aiStationSiteGen(g, B, pa, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(pa, q, LEAD), quick: true });
         if (pb && reach(pa, pb)) pr = { a: pa, b: pb };
       }
     } else if (hubB) {
       const pb = asPlan(hubB);
-      const pa = yield* stationSiteGen(g, A, pb, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(q, pb, LEAD), quick: true });
+      const pa = yield* aiStationSiteGen(g, A, pb, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(q, pb, LEAD), quick: true });
       if (pa && reach(pa, pb)) pr = { a: pa, b: pb };
     }
-    if (!pr && !hub) { hubB = null; pr = yield* railPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true }); }
+    if (!pr && !hub) { hubB = null; pr = yield* aiRailPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true }); }
     if (!pr) return fail('no station sites');
     // big towns: the new station in the city centre, underground (subway style), where it serves clearly more people
     // than the site found on the ground (its cost and the tunnel's are weighed with the rest below)
@@ -1384,13 +2159,13 @@ export class AIController {
         const W = this.mergePoint(J, frontA);
         if (!W) continue;
         yield;
-        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, retries: 2, parallel: 3 }, 500);
+        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, retries: 2, parallel: 3 }, AI_ROUTE_WORK);
         if (typeof pj !== 'string') { plan = pj; join = { S, J }; break; }
       }
       if (!join) this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`);
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
-    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, retries: 3, parallel: 3 }, 500);
+    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, retries: 3, parallel: 3 }, AI_ROUTE_WORK);
     // a high-speed line where the corridor search found none: straight on (viaducts and tunnels)
     if (hs && typeof plan === 'string') {
       const al = alignCorridor([{ x: from.x, z: from.z }, { x: to.x, z: to.z }], from, to, 500, 160);
@@ -1450,7 +2225,8 @@ export class AIController {
       const style = defaultStationStyle(g.year, ST, sp.level ?? 'ground', 'mainline', (sp === pr.a ? A : B).pop);
       const tt = { ...(hs ? { trackType: type } : {}), ...(sp.level && sp.level !== 'ground' ? { level: sp.level, depth: sp.depth || undefined } : {}) };
       let re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, { style, ...tt });
-      if (!re.ok) re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, tt);
+      yield;
+      if (!re.ok) { re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, tt); yield; }
       const id = g.stations.nextId;
       if (!re.ok || g.stations.commitRail(re, owner)) return fail('station site taken', 360);
       p.stations.push(id);
@@ -1487,7 +2263,7 @@ export class AIController {
     if (yield* routeConflictGen(g, prof, 'rail', tracks, exclude, 40)) return fail('route runs along other tracks or roads', 720);
     yield;
     const e0 = net.nextEdge;
-    const chain = chainGen(g, fAs[0], way, { kind: 'rail', type, tracks, heightOffset: 0, crossing: 'auto', owner }, join ? null : fBs[0], prof);
+    const chain = aiChainGen(g, fAs[0], way, { kind: 'rail', type, tracks, heightOffset: 0, crossing: 'auto', owner }, join ? null : fBs[0], prof);
     let r = chain.next();
     while (!r.done) { this.track(e0); yield; r = chain.next(); }
     this.track(e0);
@@ -1537,9 +2313,11 @@ export class AIController {
           const sn = findSnap(g, 'rail', n0.x + out.x * L, n0.z + out.z * L, 0.4);
           if (sn.kind !== 'edge') continue;
           const pj = planEdge(g, nodeSnap(g, ends[i], 'rail'), sn, { kind: 'rail', type: sidingType(type), tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+          yield;
           if (pj.ok && !commitProposal(g, pj)) break;
         }
         this.track(t0);
+        yield;
       }
       // platforms still loose at the line's end (wide high-speed curves need a longer throat): turnout ladders
       // onto the approach (stations API)
@@ -1548,6 +2326,7 @@ export class AIController {
         const t0 = net.nextEdge;
         if (throat && st.owner === owner) throat(g, st.id, owner);
         this.track(t0);
+        yield;
       }
     }
     yield;
@@ -1560,6 +2339,7 @@ export class AIController {
     for (const d of g.depots.map.values()) {
       if (d.owner !== owner || d.kind !== 'rail') continue;
       const f = depotServes(g, d, stA.id, stB.id);
+      yield;
       if (f >= 0) { dep = d.id; first = f; break; }
     }
     const ownDepot = dep < 0;
@@ -1571,7 +2351,7 @@ export class AIController {
       return false;
     };
     for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
-    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
     this.track(d0);
     if (dep < 0) return fail('no depot site that serves both stations', 720);
     if (ownDepot) p.depots.push(dep);
@@ -1613,6 +2393,7 @@ export class AIController {
     }
     // signals for the new or extended line (before its trains run)
     this.signalLine(line.id);
+    yield;
     // (building may have cost more than planned: borrow for the trains; a line still without one gets its first
     // train later, see manage, rather than the railway being lost)
     this.borrowFor(trainCost * nTrains + 300_000);
@@ -1620,6 +2401,7 @@ export class AIController {
     for (let i = 0; i < nTrains; i++) {
       const t = g.vehicles.buyTrain(dep, cars, line.id);
       if (typeof t !== 'string') { bought++; this.stats.vehicles++; }
+      yield;
     }
     if (!bought) this.note(`no money for a train on ${line.name} yet`);
     if (!ext) {
@@ -1708,6 +2490,7 @@ export class AIController {
       const to = findSnap(g, 'road', q.x, q.z, 0.6);
       if (to.kind !== 'free') {
         const pj = planEdge(g, from, to, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner: this.companyId });
+        yield;
         if (pj.ok && pj.demolish.length <= 1 && pj.cost < this.available() * 0.2 && !commitProposal(g, pj)) {
           g.stations.refreshAccess(true);
           if (g.stations.hasAccess(st)) { this.note(`access road for ${st.name}`); return; }
@@ -1720,6 +2503,7 @@ export class AIController {
       yield;
       if (!g.stations.get(st.id)) return;
       const plan = g.stations.planRail(r.x, r.z, r.angle, r.length, r.tracks, this.companyId, { buildingSide: side, ignoreStation: st.id });
+      yield;
       if (!plan.ok || !plan.roadAccess || plan.cost > this.available() * 0.3 || !this.borrowFor(plan.cost)) continue;
       if (!relocateStation(g, st.id, plan)) { this.note(`rebuilt ${st.name} facing a road`); return; }
     }
@@ -1731,6 +2515,7 @@ export class AIController {
     const cands: { id: number; s: number; d: number }[] = [];
     const p = { x: 0, y: 0, z: 0 };
     for (const id of edges) {
+      yield;
       const e = net.edges.get(id);
       if (!e || e.kind !== 'rail' || e.owner !== owner || e.station >= 0 || e.depot >= 0 || e.len < 8) continue;
       for (let s = 3; s <= e.len - 3; s += 5) {
@@ -1744,6 +2529,7 @@ export class AIController {
     let tries = 0;
     for (const c of cands) {
       if (!net.edges.has(c.id)) continue;
+      yield;
       const dep = buildDepotOnLine(g, c.id, c.s, owner);
       if (dep >= 0) return dep;
       if (++tries >= 12) break;
@@ -1753,7 +2539,7 @@ export class AIController {
   }
 
   /** Depot for a multi-track terminus: a switch behind the back ends feeding every platform track. */
-  private depotSwitch(st: Station, frontDir: P2): number {
+  private *depotSwitch(st: Station, frontDir: P2): Generator<void, number> {
     const g = this.game, net = g.world.net, owner = this.companyId;
     const r = st.rail!;
     const ax = Math.sin(r.angle), az = Math.cos(r.angle);
@@ -1763,20 +2549,31 @@ export class AIController {
     const type = sidingType(r.trackType);
     const o = (h: number): BuildOptions => ({ kind: 'rail', type, tracks: 1, heightOffset: h, crossing: 'auto', owner });
     const backC = { x: r.x + bx * r.length / 2, z: r.z + bz * r.length / 2 };
+    const e0 = net.nextEdge;
     for (const L of [12, 16, 20]) {
+      yield;
       const S = { x: backC.x + bx * L, z: backC.z + bz * L }, D = { x: S.x + bx * 6, z: S.z + bz * 6 };
       if (!g.world.inside(D.x, D.z, 8) || !depotFits(g, D.x, D.z, -bx, -bz, owner, 30, r.y)) continue;
       const n0 = net.nodes.get(ends[0]);
       if (!n0 || n0.edges.length !== 1) return buildRailDepot(g, st, owner, frontDir);
       const p1 = planEdge(g, nodeSnap(g, ends[0], 'rail'), { kind: 'free', x: S.x, z: S.z, y: 0 }, o(r.y - g.world.heightAt(S.x, S.z) || 1e-3));
+      yield;
       if (!p1.ok || commitProposal(g, p1)) continue;
+      this.track(e0);
+      yield;
       const sNode = nodeAt(g, 'rail', S.x, S.z);
       if (!sNode) return -1;
       const p2 = planEdge(g, nodeSnap(g, sNode.id, 'rail'), { kind: 'free', x: D.x, z: D.z, y: 0 }, o(r.y - g.world.heightAt(D.x, D.z) || 1e-3));
+      yield;
       if (!p2.ok || commitProposal(g, p2)) { removeEdges(g, [...sNode.edges], owner); continue; }
+      this.track(e0);
+      yield;
       for (let i = 1; i < ends.length; i++) {
         const p3 = planEdge(g, nodeSnap(g, ends[i], 'rail'), nodeSnap(g, sNode.id, 'rail'), o(0));
+        yield;
         if (p3.ok) commitProposal(g, p3);
+        this.track(e0);
+        yield;
       }
       const dNode = nodeAt(g, 'rail', D.x, D.z);
       const id = dNode ? depotAtEnd(g, dNode.id, owner) : -1;
@@ -1784,6 +2581,37 @@ export class AIController {
       return -1;
     }
     return buildRailDepot(g, st, owner, frontDir);
+  }
+
+  /** roadDepotGen's search order, with each site and its commit in separate AI work units. */
+  private *roadDepot(x: number, z: number): Generator<void, number> {
+    const g = this.game, net = g.world.net, owner = this.companyId;
+    for (const maxPop of [0, 30]) {
+      for (let r = 2.5; r < 26; r += 1.5) {
+        for (let k = 0; k < 12; k++) {
+          yield;
+          const a = ((k + (r % 2) * 0.5) / 12) * Math.PI * 2;
+          const px = x + Math.sin(a) * r, pz = z + Math.cos(a) * r;
+          if (!maxPop && g.world.buildingsNear(px, pz, 2.2).some((b) => distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 1.3)) continue;
+          const ne = net.nearestEdge(px, pz, 3.6, 'road', (e) => e.depot < 0 && e.station < 0);
+          if (!ne || ne.d < 2.1 || net.sectionAt(ne.edge, ne.s) !== 'ground') continue;
+          const q = { x: 0, y: 0, z: 0 };
+          net.pointAt(ne.edge, ne.s, q);
+          const plan = g.depots.plan('road', px, pz, Math.atan2(q.x - px, q.z - pz), owner);
+          yield;
+          if (!plan.ok || !this.eco.canAfford(plan.cost + 40000)) continue;
+          const dem = plan.demolish ?? [];
+          if (dem.length > (maxPop ? 1 : 0) || dem.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > maxPop)) continue;
+          const id = g.depots.nextId;
+          if (g.depots.commit('road', plan, owner)) continue;
+          const dp = g.depots.get(id);
+          const exit = dp ? net.nodes.get(dp.node) : undefined;
+          if (dp && exit && exit.edges.length >= 2) return id;
+          if (dp) g.depots.remove(id);
+        }
+      }
+    }
+    return -1;
   }
 
   // ---------------------------------------------------------------- trains on another company's railway
@@ -1874,7 +2702,7 @@ export class AIController {
           for (let s = 3; s <= e.len - 3; s += 4) { if (net.sectionAt(e, s) !== 'ground') continue; net.pointAt(e, s, q); const d = Math.hypot(q.x - st.x, q.z - st.z); if (d > 16) cands.push({ id: e.id, s, d }); }
         }
         cands.sort((a, b) => a.d - b.d || a.id - b.id);
-        for (const c of cands.slice(0, 16)) { if (!net.edges.has(c.id)) continue; dep = buildDepotOnLine(g, c.id, c.s, me); if (dep >= 0) break; }
+        for (const c of cands.slice(0, 16)) { if (!net.edges.has(c.id)) continue; yield; dep = buildDepotOnLine(g, c.id, c.s, me); this.track(e0); if (dep >= 0) break; }
         yield;
       }
     }
@@ -1967,10 +2795,9 @@ export class AIController {
     // stop candidates on streets: middle of street edges, away from other companies' stops; a stop that joins our
     // rail station in the town comes first (one transfer complex: passengers change between trains and buses)
     const cands: { x: number; z: number; d: number; rail?: boolean }[] = [];
-    let k = 0;
     for (const e of g.towns.streets(T, 0)) {
       if (e.len < 4) continue;
-      if (++k % 20 === 0) yield; // grid towns have many streets: spread the stop planning over days
+      yield; // one stop candidate per unit, including rejected sites
       const q = { x: 0, y: 0, z: 0 };
       net.pointAt(e, e.len / 2, q);
       const bp = g.stations.planBusStop(q.x, q.z, owner);
@@ -1999,8 +2826,10 @@ export class AIController {
     if (!this.borrowFor(cost)) return fail('no money');
     this.state.phase = `building buses in ${T.name}`;
     p.built = true;
+    yield;
     const ids: number[] = [];
     for (const s of stops) {
+      yield;
       const before = g.stations.nextId;
       if (g.stations.commitBusStop(s.x, s.z, owner)) continue;
       let sid = -1, bd = Infinity;
@@ -2012,7 +2841,7 @@ export class AIController {
     }
     if (ids.length < 2) return fail('stops not built');
     const d0 = net.nextEdge;
-    const dep = yield* roadDepotGen(g, stops[0].x, stops[0].z, owner);
+    const dep = yield* this.roadDepot(stops[0].x, stops[0].z);
     this.track(d0);
     if (dep < 0) return fail('no depot site');
     p.depots.push(dep);
@@ -2022,7 +2851,7 @@ export class AIController {
     if (ring && ids.length >= 4) { line.loop = true; this.stats.rings++; }
     p.line = line.id;
     const n = Math.min(3, ids.length);
-    for (let i = 0; i < n; i++) { const v = g.vehicles.buyRoad(dep, model, line.id); if (typeof v !== 'string') this.stats.vehicles++; }
+    for (let i = 0; i < n; i++) { const v = g.vehicles.buyRoad(dep, model, line.id); if (typeof v !== 'string') this.stats.vehicles++; yield; }
     this.lines.set(line.id, { kind: 'bus', towns: [T.id], depot: dep, maxVehicles: line.loop ? 6 : 5, opened: g.day });
     this.stats.lines++;
     g.postNews(`${this.name} starts a ${line.loop ? 'circular bus line' : 'bus service'} in ${T.name}.`, 'ai', T.x, T.z);
@@ -2103,6 +2932,7 @@ export class AIController {
         for (const aa of [0, 0.25, -0.25]) {
           const angle = Math.atan2(toward.x - x, toward.z - z) + aa;
           const pl = g.stations.planRail(x, z, angle, PL, 2, me, { level: 'underground', depth: 2.4 });
+          yield;
           if (!pl.ok || pl.join) continue;
           const pop = g.stations.popInShapes(g.stations.planCatchShapes(pl));
           if (pop > bestPop) { bestPop = pop; best = pl; }
@@ -2180,6 +3010,7 @@ export class AIController {
       const mx = na.x + (nb.x - na.x) * t + Math.cos(ang) * lat, mz = na.z + (nb.z - na.z) * t - Math.sin(ang) * lat;
       // (cut and cover under the streets where it can, deeper where it must)
       const pl = g.stations.planRail(mx, mz, ang, PL, 2, me, { level: 'underground', depth, trackType: type });
+      yield;
       if (!pl.ok || pl.join) continue;
       // the tunnels must reach the platforms within the grade from both termini
       const grade = TRACK_TYPES.standard.maxGrade * 0.85;
@@ -2213,7 +3044,7 @@ export class AIController {
       const prof = chainProfile(g, [{ x: n0.x, z: n0.z, tx: t0.tx, tz: t0.tz }, ...way], 1, n0.y, n1.y, 'rail', exclude);
       if (!prof) return 'too steep';
       const e0 = net.nextEdge;
-      const ch = chainGen(g, from, way, { kind: 'rail', type, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me }, to, prof);
+      const ch = aiChainGen(g, from, way, { kind: 'rail', type, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me }, to, prof);
       let r = ch.next();
       while (!r.done) { self.track(e0); yield; r = ch.next(); }
       self.track(e0);
@@ -2370,7 +3201,8 @@ export class AIController {
           for (const d of offs) {
             const t = target + d;
             if (got.length && t - tPrev < PL + 6) continue;
-            if (++tries % 2 === 0) yield;
+            tries++;
+            yield;
             pl = site(a, lat, t, lv, got[got.length - 1]);
             if (pl) { at = t; break; }
           }
@@ -2440,12 +3272,15 @@ export class AIController {
         if (!g.world.inside(fx, fz, 8)) continue;
         const t0 = net.nextEdge;
         const pr = planEdge(g, nodeSnap(g, outer[0], 'rail'), { kind: 'free', x: fx, z: fz, y: g.world.heightAt(fx, fz) }, { kind: 'rail', type: mode, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
+        yield;
         if (!pr.ok || commitProposal(g, pr)) continue;
         this.track(t0);
+        yield;
         const endNode = net.nearestNode(fx, fz, 0.1, 'rail', (x) => x.edges.length === 1);
         dep = endNode ? depotAtEnd(g, endNode.id, me) : -1;
         if (dep >= 0) { rampEdges = [...p.edges].filter((id) => id >= t0 && net.edges.get(id)?.depot === -1); depEnd = st; break; }
         removeEdges(g, [...p.edges].filter((id) => id >= t0), me);
+        yield;
       }
       yield;
     }
@@ -2457,19 +3292,21 @@ export class AIController {
     // directional running, crossovers before the ends
     const fin = finishDoubleTrack(g, doubleEdges, me);
     if (fin.error) this.note(`${what} ${T.name}: ${fin.error}`);
+    yield;
     // the line, its trains (two units coupled where the platforms take them)
     const line = g.lines.create('rail', me);
     line.stops = outAndBack(sts.map((x) => x.id));
     p.line = line.id;
     this.signalLine(line.id);
+    yield;
     const consist = unit.length * 2 + 0.3 <= PL ? [unit, unit] : [unit];
     let bought = 0;
-    for (let i = 0; i < 3; i++) { const t = g.vehicles.buyTrain(dep, consist, line.id); if (typeof t !== 'string') { bought++; this.stats.vehicles++; } }
+    for (let i = 0; i < 3; i++) { const t = g.vehicles.buyTrain(dep, consist, line.id); if (typeof t !== 'string') { bought++; this.stats.vehicles++; } yield; }
     if (!bought) this.note(`no money for ${what} trains in ${T.name} yet`);
     const info: LineInfo = { kind: 'rail', towns: [T.id], depot: dep, maxVehicles: Math.max(3, sts.length), opened: g.day, double: true, urban: mode };
     this.lines.set(line.id, info);
     this.stats.lines++; this.stats.urban++; this.stats.railStations += sts.length;
-    for (const st of sts) this.linkTransfers(st.id);
+    for (const st of sts) { this.linkTransfers(st.id); yield; }
     g.postNews(`${this.name} opens a ${what} line in ${T.name} (${sts.length} stations).`, 'ai', T.x, T.z);
     this.note(`opened ${what} ${line.name} in ${T.name}: ${sts.length} stations, ${fin.signals} signals`);
     this.canonical(line.id);
@@ -2503,15 +3340,19 @@ export class AIController {
         if (sn.kind !== 'edge') continue;
         const t0 = net.nextEdge;
         const pj = planEdge(g, nodeSnap(g, free[0], 'rail'), sn, { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
+        yield;
         if (!pj.ok || commitProposal(g, pj)) continue;
+        this.track(t0);
         yield;
         // the main line electrified (its track and stations; ours, or theirs at our cost)
         const edges = new Set<number>();
         for (let i = 0; i + 1 < path.length; i++) {
+          yield;
           const a = g.stations.get(path[i]), b = g.stations.get(path[i + 1]);
           if (!a?.rail || !b?.rail) continue;
           for (const eid of [...a.rail.edges, ...b.rail.edges]) edges.add(eid);
           for (const eid of a.rail.edges) {
+            yield;
             const e = net.edges.get(eid);
             if (!e) continue;
             const r = findRailRoute(g, railNext(g, e, 1, me), b.id, me, -1, 30000) ?? findRailRoute(g, railNext(g, e, -1, me), b.id, me, -1, 30000);
@@ -2550,10 +3391,10 @@ export class AIController {
   /** A stop for coaches in a town: at our rail station (a transfer hub) or on a central street. */
   private *coachStopGen(T: Town): Generator<void, { x: number; z: number } | null> {
     const g = this.game, owner = this.companyId, net = g.world.net;
-    let best: { x: number; z: number; d: number } | null = null, k = 0;
+    let best: { x: number; z: number; d: number } | null = null;
     for (const e of g.towns.streets(T, 2)) {
       if (e.len < 4) continue;
-      if (++k % 8 === 0) yield;
+      yield;
       const q = { x: 0, y: 0, z: 0 };
       net.pointAt(e, e.len / 2, q);
       const bp = g.stations.planBusStop(q.x, q.z, owner);
@@ -2581,8 +3422,10 @@ export class AIController {
     if (cost > this.available() || !this.borrowFor(cost)) return fail('no money', 360);
     this.state.phase = `building coaches ${A.name} - ${B.name}`;
     p.built = true;
+    yield;
     const ids: number[] = [];
     for (const s of [sa, sb]) {
+      yield;
       const before = g.stations.nextId;
       if (g.stations.commitBusStop(s.x, s.z, owner)) return fail('stop site taken', 360);
       let sid = -1, bd = Infinity;
@@ -2594,18 +3437,21 @@ export class AIController {
       yield;
     }
     const d0 = net.nextEdge;
-    const dep = yield* roadDepotGen(g, sa.x, sa.z, owner);
+    const dep = yield* this.roadDepot(sa.x, sa.z);
     this.track(d0);
     if (dep < 0) return fail('no depot site', 720);
     p.depots.push(dep);
     const dp = g.depots.get(dep)!;
-    if (!roadDepotReaches(g, dp, ids[0]) || !roadDepotReaches(g, dp, ids[1])) return fail('no road route', 720);
+    yield;
+    if (!roadDepotReaches(g, dp, ids[0])) return fail('no road route', 720);
+    yield;
+    if (!roadDepotReaches(g, dp, ids[1])) return fail('no road route', 720);
     yield;
     const line = g.lines.create('road', owner);
     line.stops = ids;
     p.line = line.id;
     let bought = 0;
-    for (let i = 0; i < 2; i++) { const v = g.vehicles.buyRoad(dep, model, line.id); if (typeof v !== 'string') { bought++; this.stats.vehicles++; } }
+    for (let i = 0; i < 2; i++) { const v = g.vehicles.buyRoad(dep, model, line.id); if (typeof v !== 'string') { bought++; this.stats.vehicles++; } yield; }
     if (!bought) return fail('could not buy coaches', 360);
     this.lines.set(line.id, { kind: 'bus', towns: [A.id, B.id], depot: dep, maxVehicles: 4, opened: g.day });
     this.stats.lines++; this.stats.coaches++;
@@ -2697,7 +3543,7 @@ export class AIController {
    * Where a country road can leave a town towards direction u: a dead-end street facing that way
    * (extended straight), else a side exit from the outermost street. Returns the join proposal.
    */
-  private townExit(T: Town, ux: number, uz: number): { prop: Proposal; x: number; z: number; tx: number; tz: number } | null {
+  private *townExit(T: Town, ux: number, uz: number): Generator<void, { prop: Proposal; x: number; z: number; tx: number; tz: number } | null> {
     const g = this.game, net = g.world.net;
     const so: BuildOptions = { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner: this.companyId };
     const cands: { sn: Snap; tx: number; tz: number; score: number }[] = [];
@@ -2727,9 +3573,11 @@ export class AIController {
     for (const q of pts.slice(0, 6)) { const sn = findSnap(g, 'road', q.x, q.z, 0.4); if (sn.kind !== 'free') cands.push({ sn, tx: ux, tz: uz, score: q.along - 1000 }); }
     cands.sort((p, q) => q.score - p.score);
     for (const c of cands.slice(0, 10)) {
+      yield;
       const x = c.sn.x + c.tx * 8, z = c.sn.z + c.tz * 8;
       if (!g.world.inside(x, z, 6) || g.world.heightAt(x, z) < WATER_Y + 0.2) continue;
       const pj = planEdge(g, c.sn, { kind: 'free', x, z, y: 0 }, so);
+      yield;
       if (pj.ok && pj.demolish.length <= 2 && pj.stats.minRadius >= 3) {
         const end = endTangent(pj.tracks[0].bez);
         return { prop: pj, x, z, tx: end.x, tz: end.z };
@@ -2748,7 +3596,7 @@ export class AIController {
     yield;
     const d = Math.hypot(B.x - A.x, B.z - A.z);
     const ux = (B.x - A.x) / d, uz = (B.z - A.z) / d;
-    const xa = this.townExit(A, ux, uz), xb = this.townExit(B, -ux, -uz);
+    const xa = yield* this.townExit(A, ux, uz), xb = yield* this.townExit(B, -ux, -uz);
     if (!xa || !xb) return fail('no way out of the towns');
     const from: OPoint = { x: xa.x, z: xa.z, tx: xa.tx, tz: xa.tz };
     const to: OPoint = { x: xb.x, z: xb.z, tx: -xb.tx, tz: -xb.tz };
@@ -2758,7 +3606,7 @@ export class AIController {
     const plan = yield* routeGen(g, from, to, {
       kind: 'road', owner, tracks: 1, y0: xa.prop.tracks[0].prof[xa.prop.tracks[0].prof.length - 1], y1: xb.prop.tracks[0].prof[xb.prop.tracks[0].prof.length - 1],
       buildingCost: 3, lead: 6, rmax: 80, rgood: 12, minR: 5, roadJunctions: true,
-    }, 500);
+    }, AI_ROUTE_WORK);
     if (typeof plan === 'string') return fail(plan, plan.startsWith('route runs') ? 1500 : 3000);
     const al = { way: plan.way };
     let prof: ChainProfile | null = plan.prof;
@@ -2777,7 +3625,7 @@ export class AIController {
     yield;
     prof = chainProfile(g, al.way, 1, nA.y, nB.y, 'road', new Set(), true);
     if (!prof) return fail('too steep');
-    const chain = chainGen(g, nA.id, al.way.slice(1), o, nB.id, prof);
+    const chain = aiChainGen(g, nA.id, al.way.slice(1), o, nB.id, prof);
     let r = chain.next();
     while (!r.done) { this.track(e0); yield; r = chain.next(); }
     this.track(e0);
@@ -3019,10 +3867,15 @@ export class AIController {
     // each stretch between stations (a line through a hub has several); the throats (platform tracks joining the
     // main line) stay as they are: the second track starts beyond them
     const chains = this.stretches(m.edges).map((c) => this.trimThroats(c)).sort((a, b) => b.length - a.length);
+    yield;
     let built = 0, full = true, newLen = 0, signals = 0, crossovers = 0, err = '', why = '', plans = 0, fullParts = 0;
-    const build = (pl: DoublePlan): boolean => {
-      if (this.available() < pl.cost * 1.2 + 500_000 || !this.borrowFor(pl.cost)) { err = 'not enough money'; return false; }
-      const res = commitDoubleTrack(g, pl);
+    const build = function* (self: AIController, pl: DoublePlan): Generator<void, boolean> {
+      if (self.available() < pl.cost * 1.2 + 500_000 || !self.borrowFor(pl.cost)) { err = 'not enough money'; return false; }
+      const res = yield* aiCommitDoubleTrack(g, pl, true, {}, (ids) => {
+        const p = self.project;
+        if (p) for (const id of ids) if (net.edges.get(id)?.owner === me && !p.edges.includes(id)) p.edges.push(id);
+      });
+      if (self.project?.kind === 'double') self.project.edges = [];
       if (res.error) { err = res.error; return false; }
       built++;
       newLen += res.edges.reduce((s2, id) => s2 + (net.edges.get(id)?.len ?? 0), 0);
@@ -3041,12 +3894,12 @@ export class AIController {
       const whole: DoublePlan[] = [];
       let whole1 = false;
       for (const side of [1, -1] as const) {
-        const pl = planDoubleTrack(g, chain, side, me);
+        const pl = yield* aiPlanDoubleTrack(g, chain, side, me);
         plans++;
-        // (planning and building are separate steps: each is a few milliseconds)
-        if (pl.ok) { yield; whole1 = build(pl); if (whole1 || err === 'not enough money') break; whole.push(unbuilt(pl)); }
-        else { why ||= pl.errors[0] ?? ''; whole.push(pl); }
         yield;
+        // Pause after every plan, including failures, and after every build before trying another stretch.
+        if (pl.ok) { whole1 = yield* build(this, pl); yield; if (whole1 || err === 'not enough money') break; whole.push(unbuilt(pl)); }
+        else { why ||= pl.errors[0] ?? ''; whole.push(pl); }
       }
       if (whole1) { fullParts++; continue; }
       full = false;
@@ -3061,11 +3914,13 @@ export class AIController {
           const run = queue.shift()!;
           let done = false, failed: DoublePlan | null = null;
           for (const side of order) {
-            const pl = planDoubleTrack(g, run, side, me);
+            const pl = yield* aiPlanDoubleTrack(g, run, side, me);
             plans++;
+            yield;
             if (pl.ok) {
+              done = yield* build(this, pl);
               yield;
-              if (build(pl)) { done = true; break; }
+              if (done) break;
               // built nothing: split where the new track could not be laid
               failed = unbuilt(pl);
               break;
