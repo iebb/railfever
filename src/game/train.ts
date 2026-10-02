@@ -513,6 +513,25 @@ export class Train extends Vehicle {
   onEdgeSplit(old: NEdge, e1: NEdge, e2: NEdge, s: number) {
     const g = this.game;
     const V = g.vehicles;
+    const reserved = this.segs.find((sg) => sg.e === old.id);
+    const net = g.world.net;
+    // Plain one-way track up to a signal that prevents an opposing train entering. Do not split the
+    // reservation of a junction or a platform exit (a train there may turn past its one-way starter).
+    const oneWay = (edge: NEdge, dir: number) => {
+      if (edge.station >= 0 || edge.depot >= 0) return false;
+      let e = edge, n = net.nodes.get(dir > 0 ? e.b : e.a)!;
+      for (let k = 0; k < 200; k++) {
+        if (n.edges.length !== 2) return false;
+        const next = net.edges.get(n.edges.find((id) => id !== e.id)!);
+        if (!next || next.kind !== 'rail' || next.station >= 0 || next.depot >= 0
+          || net.sideAt(next, n.id) !== -net.sideAt(e, n.id)) return false;
+        if (n.signal) return !n.signalPass && net.signalFor(n, net.sideAt(e, n.id)) < 0;
+        e = next;
+        n = net.nodes.get(e.a === n.id ? e.b : e.a)!;
+      }
+      return false;
+    };
+    const mayYield = reserved && oneWay(reserved.dir > 0 ? e2 : e1, reserved.dir);
     const fix = (list: TSeg[], isSegs: boolean) => {
       for (let i = 0; i < list.length; i++) {
         const sg = list[i];
@@ -532,6 +551,21 @@ export class Train extends Vehicle {
     };
     fix(this.segs, true);
     fix(this.pending, false);
+    if (mayYield && this.segs.length) {
+      // A long reserved edge split for construction need not keep every new piece locked. Keep enough track
+      // to brake safely, and queue the rest so a possession can hold free track beyond the stopping distance.
+      const horizon = brakeDistance(this.speed);
+      let d = this.segs[this.headSeg].len - this.headPos, i = this.headSeg + 1;
+      while (i < this.segs.length) {
+        const sg = this.segs[i], e = net.edges.get(sg.e);
+        const n = e && net.nodes.get(sg.dir > 0 ? e.a : e.b);
+        if (d >= horizon && (this.startsAtSignal(sg) || (e && n?.edges.length === 2 && oneWay(e, sg.dir)))) break;
+        d += this.segs[i++].len;
+      }
+      const drop = this.segs.splice(i);
+      this.pending.unshift(...drop);
+      for (const sg of drop) this.release(sg, this.segs);
+    }
     void s;
   }
 
