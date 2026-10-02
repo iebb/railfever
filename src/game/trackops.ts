@@ -3,8 +3,8 @@
 // stations and depots so every platform is reachable from both tracks), and moving a depot.
 import type { Game } from './game';
 import { RAIL, TRACK_TYPES, PSTEP, LINE_LEVEL } from './constants';
-import { bezFromTangents, bezMinRadius, bezPoint, endTangent } from './geom';
-import { applyEarthworks, repairFormations } from './terraform';
+import { bezFromTangents, bezMinRadius, bezPoint, endTangent, arcTable, tAtS } from './geom';
+import { applyEarthworks, repairFormations, DRY_MIN, TUNNEL_LINING } from './terraform';
 import type { NEdge, Section } from './network';
 import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions, structureFactor } from './construction';
 import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
@@ -174,13 +174,41 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     }
   }
   for (const c of net.crossings.values()) if ((tracks.has(c.e1) || tracks.has(c.e2)) && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) return { error: 'level crossing in the way', cost: 0 };
-  const cost = Math.round(L * tt.costPerUnit + 2 * TURNOUT_COST);
+  // Nodes carry no section flag: inspect their incident parent rails too (station insertion lays node-to-node
+  // fans). Determine the sections and their price before a dry run returns, so preview and commit agree.
+  const secOf = (q: SPt): 'ground' | Section['type'] => {
+    if (q.edge !== undefined) { const e = net.edges.get(q.edge); return e ? net.sectionAt(e, q.s ?? 0) : 'ground'; }
+    const n = q.node !== undefined ? net.nodes.get(q.node) : undefined;
+    const es = (n?.edges ?? []).map((id) => net.edges.get(id)!).filter((e) => e?.kind === 'rail');
+    const at = (e: NEdge) => net.sectionAt(e, e.a === n!.id ? 0 : e.len);
+    const e = es.find((e) => tracks.has(e.id) && at(e) !== 'ground') ?? es.find((e) => tracks.has(e.id)) ?? es[0];
+    return e ? at(e) : 'ground';
+  };
+  const secA = secOf(a), secB = secOf(b);
+  const inherited = secA === secB ? secA : secA === 'ground' ? secB : secB === 'ground' ? secA : 'ground';
+  const tab = arcTable(bez), K = Math.max(1, Math.ceil(tab.len / 0.25));
+  const sections: Section[] = [];
+  let price = 2 * TURNOUT_COST;
+  for (let i = 0; i < K; i++) {
+    const s0 = tab.len * i / K, s1 = tab.len * (i + 1) / K, s = (s0 + s1) / 2;
+    bezPoint(bez, tAtS(tab, s), p);
+    const y = a.y + (b.y - a.y) * s / tab.len, terrain = w.heightAt(p.x, p.z), depth = terrain - y;
+    // Even a legacy ground parent cannot make a deep connecting piece an open cutting. Low land requires a
+    // bridge or a covered tunnel; a shallow formation below the water line cannot be built at this height.
+    const sec = inherited !== 'ground' ? inherited : depth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover ? 'tunnel' : y - terrain > 1.4 || terrain < DRY_MIN ? 'bridge' : 'ground';
+    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below the water line here: raise it or go into a tunnel', cost: 0 };
+    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill in the way of the bridge: use a tunnel', cost: 0 };
+    price += (s1 - s0) * tt.costPerUnit * (sec === 'ground' ? 1 : structureFactor('rail', sec, Math.abs(depth)));
+    if (sec === 'ground') continue;
+    const last = sections[sections.length - 1];
+    if (last && last.type === sec && Math.abs(last.s1 - s0) < 0.001) last.s1 = s1;
+    else sections.push({ s0, s1, type: sec });
+  }
+  const cost = Math.round(price);
   if (dry) return { error: null, cost };
   for (const q of [a, b]) if (q.edge !== undefined && g.vehicles.isEdgeBusy(q.edge)) return { error: 'train in the way', cost };
   const eco = g.company(owner).economy;
   if (!eco.canAfford(cost)) return { error: 'Not enough money', cost };
-  const secOf = (q: SPt) => { if (q.edge === undefined) return 'ground'; const e = net.edges.get(q.edge); return e ? net.sectionAt(e, q.s ?? 0) : 'ground'; };
-  const sec = secOf(a) !== 'ground' ? secOf(a) : secOf(b);
   const nodeOf = (q: SPt): number | null => {
     if (q.node !== undefined) return net.nodes.has(q.node) ? q.node : null;
     const e = net.edges.get(q.edge!);
@@ -193,12 +221,17 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   const nb = na === null ? null : nodeOf(b);
   if (na === null || nb === null) return { error: 'cannot split the track', cost };
   const A = net.nodes.get(na)!, B = net.nodes.get(nb)!;
-  const len = Math.hypot(B.x - A.x, B.z - A.z);
-  const m = Math.max(2, Math.ceil(len) + 1);
+  const curve = { ...bez, x0: A.x, z0: A.z, x3: B.x, z3: B.z }, len = arcTable(curve).len;
+  const m = Math.max(2, Math.ceil(len / PSTEP) + 1);
   const prof = new Float32Array(m);
-  for (let i = 0; i < m; i++) prof[i] = A.y + (B.y - A.y) * Math.min(1, i / (m - 1));
-  const e = net.addEdge('rail', na, nb, { ...bez, x0: A.x, z0: A.z, x3: B.x, z3: B.z }, prof, sec === 'ground' ? [] : [{ s0: 0, s1: len + 1, type: sec }], ttype, owner);
-  if (sec === 'ground') { applyEarthworks(w, [e]); for (let i = 0; i <= 8; i++) { bezPoint(bez, i / 8, p); w.removeTreesNear(p.x, p.z, 0.8); } }
+  for (let i = 0; i < m; i++) prof[i] = A.y + (B.y - A.y) * Math.min(i * PSTEP, len) / len;
+  const e = net.addEdge('rail', na, nb, curve, prof, sections.map((s) => ({ ...s, s0: s.s0 * len / tab.len, s1: s.s1 * len / tab.len })), ttype, owner);
+  applyEarthworks(w, [e]);
+  for (let i = 0; i <= 8; i++) {
+    const s = e.len * i / 8;
+    if (net.sectionAt(e, s) !== 'ground') continue;
+    bezPoint(curve, tAtS(net.table(e), s), p); w.removeTreesNear(p.x, p.z, 0.8);
+  }
   eco.spend(cost, 'construction');
   g.onNetworkChanged();
   return { error: null, cost };

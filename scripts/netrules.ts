@@ -6,11 +6,13 @@ import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { mergeStops } from '../src/game/stations';
 import type { Station } from '../src/game/stations';
-import { finishDoubleTrack, planRelevel, commitRelevel, normaliseCrossovers, planConnection, commitConnection } from '../src/game/trackops';
+import { finishDoubleTrack, planRelevel, commitRelevel, normaliseCrossovers, planConnection, commitConnection, planStationOnTrack, commitStationOnTrack } from '../src/game/trackops';
 import { autoSignalLine, autoSignalNetwork } from '../src/game/signals';
 import { Train } from '../src/game/train';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { TRACK_TYPES } from '../src/game/constants';
+import { bezLine } from '../src/game/geom';
+import { DRY_MIN } from '../src/game/terraform';
 import { roadOpts, roadDepotNear } from './lib';
 import { flatGame, station, endNode, newTrack, loco, depotFor, runTrains, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
 
@@ -36,6 +38,53 @@ const legs = (g: Game) => [...g.world.net.edges.values()].filter((e) => {
   const a = g.world.net.nodes.get(e.a)!, b = g.world.net.nodes.get(e.b)!;
   return a.edges.length >= 3 && b.edges.length >= 3 && Math.abs(a.z - b.z) > 0.3;
 });
+
+// Inserting a station lays node-to-node S-curves at both throats. The parent structure must survive that
+// conversion, and the construction quote must price the same structures that the commit actually lays.
+{
+  console.log('connections inherit tunnel and bridge sections');
+  for (const type of ['tunnel', 'bridge'] as const) {
+    const g = flatGame(256), w = g.world, net = w.net, y = type === 'tunnel' ? -0.6 : 4.5;
+    const a = net.addNode('rail', 30, y, 128, 1, 0, 0), b = net.addNode('rail', 226, y, 128, 1, 0, 0);
+    const e = net.addEdge('rail', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(197).fill(y), [{ s0: 0, s1: 196, type }], 'standard', 0);
+    const plan = planStationOnTrack(g, e.id, e.len / 2, { length: 12, tracks: 2 }, 0);
+    check(plan.ok, `${type} station insertion planned (${plan.error ?? 'ok'})`);
+    if (!plan.ok) continue;
+    const before = w.h.slice(), money = g.economy.money;
+    const result = commitStationOnTrack(g, plan);
+    check(!result.error, `${type} station inserted (${result.error ?? 'ok'})`);
+    const fans = [...net.edges.values()].filter((q) => q.kind === 'rail' && q.station < 0 && q.len < 30);
+    check(fans.length === 4 && fans.every((q) => [0, q.len / 2, q.len].every((s) => net.sectionAt(q, s) === type)), `all four node-to-node throat pieces retain the parent ${type}`);
+    check(w.h.every((h, k) => Math.abs(h - before[k]) < 0.005), `${type} connections do not dig or fill the surface`);
+    check(Math.abs(money - g.economy.money - plan.cost) < 3, `${type} connection preview and commit costs agree`);
+  }
+}
+{
+  console.log('connecting pieces classify actual terrain depth');
+  const g = flatGame(192, 6.7), w = g.world, net = w.net;
+  const plain = (z: number, y: number) => {
+    const a = net.addNode('rail', 30, y, z, 1, 0, 0), b = net.addNode('rail', 162, y, z, 1, 0, 0);
+    return net.addEdge('rail', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(133).fill(y), [], 'standard', 0);
+  };
+  // A legacy ground label cannot override the real 37 m of cover over this short piece.
+  const a = plain(96, 3), b = plain(97, 3);
+  const plan = planConnection(g, a.id, 60, b.id, 72, 0);
+  const before = w.h.slice(), result = plan.ok ? commitConnection(g, plan, { signals: false }) : null;
+  const crossover = result?.edges.map((id) => net.edges.get(id)!).find((q) => Math.abs(net.nodes.get(q.a)!.z - net.nodes.get(q.b)!.z) > 0.5);
+  check(plan.ok && result && !result.error && crossover && net.sectionAt(crossover, crossover.len / 2) === 'tunnel', `37 m of cover produces a tunnel (${plan.error ?? result?.error ?? 'ok'})`);
+  check(w.h.every((h, k) => h === before[k]), 'depth-classified crossover leaves the hill intact');
+}
+{
+  const g = flatGame(192, 0.2), w = g.world, net = w.net;
+  const plain = (z: number) => {
+    const a = net.addNode('rail', 30, 0.1, z, 1, 0, 0), b = net.addNode('rail', 162, 0.1, z, 1, 0, 0);
+    return net.addEdge('rail', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(133).fill(0.1), [], 'standard', 0);
+  };
+  const a = plain(96), b = plain(97), before = w.h.slice(), count = net.edges.size, money = g.economy.money;
+  const plan = planConnection(g, a.id, 60, b.id, 72, 0);
+  check(!plan.ok && /water line/.test(plan.error ?? ''), `a shallow connection below DRY_MIN is refused (${plan.error ?? 'unexpected success'})`);
+  check(w.h.every((h, k) => h === before[k] && h >= DRY_MIN) && net.edges.size === count && g.economy.money === money, 'refused below-water connection changes no terrain, track or money');
+}
 
 // ------------------------------------------------------------------ 1. lifting a running line onto a viaduct
 {

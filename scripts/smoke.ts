@@ -183,8 +183,25 @@ let levelCrossing = -1;
       // stops on the road a few units either side of the tracks (the road may continue on other edges)
       const stopOn = (dir: number) => {
         for (const k of [4, 6, 3, 8, 10]) {
-          const x = lc.x + (t0.x / tl) * k * dir, z = lc.z + (t0.z / tl) * k * dir;
-          if (g.stations.planBusStop(x, z, 0).ok) return { id: addBusStop(g, x, z, 0), x, z };
+          let edge = road, s = s0, sign = dir, left = k;
+          for (let guard = 0; guard < 20; guard++) {
+            const available = sign > 0 ? edge.len - s : s;
+            if (left <= available) {
+              const p = { x: 0, y: 0, z: 0 };
+              net.pointAt(edge, s + sign * left, p);
+              if (g.stations.planBusStop(p.x, p.z, 0).ok) return { id: addBusStop(g, p.x, p.z, 0), x: p.x, z: p.z };
+              break;
+            }
+            left -= available;
+            const node = net.nodes.get(sign > 0 ? edge.b : edge.a)!;
+            const into = net.leaveDir(edge, node.id);
+            const next = node.edges.map((id) => net.edges.get(id)!).filter((e) => e.id !== edge.id && e.kind === 'road' && e.depot < 0).sort((a, b) => {
+              const da = net.leaveDir(a, node.id), db = net.leaveDir(b, node.id);
+              return (da.x - db.x) * into.x + (da.z - db.z) * into.z;
+            })[0];
+            if (!next) break;
+            edge = next; sign = edge.a === node.id ? 1 : -1; s = sign > 0 ? 0 : edge.len;
+          }
         }
         return null;
       };

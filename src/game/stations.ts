@@ -5,7 +5,7 @@ import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
-import { applyEarthworks, repairFormations } from './terraform';
+import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
 import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
@@ -634,7 +634,9 @@ export class Stations {
   private buildStructures(r: RailPart): Volume[] {
     const w = this.game.world;
     const lv = r.level ?? 'ground';
-    const fp = { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length };
+    // Platforms stop 50 cm inside each end node; buffers also sit inside it. Keep the throat outside this
+    // rectangle free for connecting track and short depot stubs (earthwork skirts are not structures).
+    const fp = { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: Math.max(0, r.length - 0.1) };
     if (lv === 'ground') {
       const sty = styleOf(r.style), out: Volume[] = [{ ...fp, y0: r.y - 0.3, y1: r.y + 1.0, part: 'platforms' }];
       if (sty.placement === 'over') {
@@ -762,9 +764,10 @@ export class Stations {
       sum += h; cnt++; mn = Math.min(mn, h); mx = Math.max(mx, h);
     }
     const demolish = new Set<number>();
-    // platforms, tracks and a station building (60k of the 120k; other styles add or save the difference, a building
-    // at street level above or below the platforms costs its own price), screen doors
+    // Platforms, tracks, access and screen doors. The passenger building is priced separately from the civil
+    // works, so the structure multiplier does not also multiply a street-level building's cost.
     const base = (tracks + through * 0.7) * length * 9000 + 120000 + (psd ? tracks * length * 2500 : 0);
+    const civil = base - BUILDING_BASE;
     const fixed = opts.fixedY;
     const ign = opts.ignoreStation;
     /** The passenger building's site by its style's placement, its base at height y0 (see the comments within). */
@@ -856,6 +859,7 @@ export class Stations {
     if (level === 'ground') {
       if (wet) failp('Cannot build on water');
       plan.y = fixed ?? Math.max(0.3, sum / cnt);
+      if (plan.y - 0.1 < DRY_MIN - 0.005) failp('Below the water line here: raise it or go underground');
       if (fixed === undefined ? mx - mn > 3 : Math.max(mx - fixed, fixed - mn) > 3.5) failp('Ground is too uneven');
       const err = this.rectConflict(footprint, plan.y - 0.3, plan.y + 1.0, demolish, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
       if (err) failp(err);
@@ -871,8 +875,9 @@ export class Stations {
       if (fixed !== undefined) { plan.y = fixed; plan.depth = mn - fixed; if (plan.depth < STATION_DEPTH.min - 0.4) failp('Too close to the surface for an underground station'); }
       const err = this.rectConflict(footprint, plan.y - 0.4, plan.y + 1.1, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
-      const k = (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min);
-      plan.cost = base * (5 + 3 * k);
+      const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
+      // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
+      plan.cost = civil * (4.5 + 1.5 * k);
     } else {
       // elevated: the deck clears the ground, buildings, roads and tracks beneath
       plan.height = Math.max(STATION_HEIGHT.min, Math.min(STATION_HEIGHT.max, opts.height ?? STATION_HEIGHT.def));
@@ -883,7 +888,7 @@ export class Stations {
         if (b && rectsOverlap(footprint, b, 0.1)) top = Math.max(top, b.y + b.floors * FLOOR_H + 0.95);
       }
       for (const e of w.net.edgesNear(x - R, z - R, x + R, z + R)) {
-        if (ign !== undefined && e.station === ign) continue;
+        if (opts.ignoreEdges?.has(e.id) || ign !== undefined && e.station === ign) continue;
         const geo = w.net.geo(e), hw = w.net.halfWidth(e);
         for (let i = 0; i < geo.n; i++) {
           if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, footprint.w / 2, footprint.d / 2) >= hw) continue;
@@ -897,11 +902,12 @@ export class Stations {
       plan.height = top - mx;
       const err = this.rectConflict(footprint, plan.y - 0.4, plan.y + 1.0, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
       if (err) failp(err === 'Building in the way' ? 'Tall building in the way' : err);
-      const pr = this.viaductPiers(footprint, layout.width, demolish, ign);
+      const pr = this.viaductPiers(footprint, layout.width, demolish, ign, opts.ignoreEdges);
       if (pr.error) failp(pr.error);
       plan.piers = pr.piers;
       const k = Math.min(1, Math.max(0, (plan.height - STATION_HEIGHT.min) / 1.8));
-      plan.cost = base * (3 + k);
+      // Deck, columns and elevated access, plus the towers below: roughly 3-4x a ground station.
+      plan.cost = civil * (3.4 + 0.5 * k);
     }
     if (level !== 'ground') {
       const want = length >= 20 ? 4 : length >= 13 ? 3 : 2;
@@ -963,6 +969,16 @@ export class Stations {
             break search;
           }
         }
+      }
+    }
+    if (level === 'ground') {
+      // A rail formation reaches all the grid cells under its ballast. Houses sharing those cells must be
+      // cleared when it is regraded, including outside the platform rectangle and along through tracks.
+      const reach = 0.32 + EARTHWORKS.corePad + 1.42;
+      for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
+        const px = x + rx * off + fx * s, pz = z + rz * off + fz * s;
+        if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
+        for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) demolish.add(b.id);
       }
     }
     plan.demolish = [...demolish];
@@ -1044,7 +1060,7 @@ export class Stations {
   }
 
   /** Viaduct columns under an elevated deck, rows every ~6 units, shifted to miss roads and tracks below. */
-  private viaductPiers(fp: Rect, width: number, demolish: Set<number>, ignore?: number): { piers: { x: number; z: number }[]; error?: string } {
+  private viaductPiers(fp: Rect, width: number, demolish: Set<number>, ignore?: number, ignoreEdges?: Set<number>): { piers: { x: number; z: number }[]; error?: string } {
     const w = this.game.world, net = w.net;
     const fx = Math.sin(fp.angle), fz = Math.cos(fp.angle), rx = fz, rz = -fx;
     const L = fp.d, rows = Math.max(2, Math.ceil((L - 0.8) / 6) + 1);
@@ -1052,7 +1068,7 @@ export class Stations {
     const piers: { x: number; z: number }[] = [];
     const clear = (px: number, pz: number) => {
       for (const e of net.edgesNear(px - 1.5, pz - 1.5, px + 1.5, pz + 1.5)) {
-        if (ignore !== undefined && e.station === ignore) continue;
+        if (ignoreEdges?.has(e.id) || ignore !== undefined && e.station === ignore) continue;
         const geo = net.geo(e), hw = net.halfWidth(e);
         for (let i = 0; i < geo.n; i++) if (Math.hypot(geo.pts[i * 3] - px, geo.pts[i * 3 + 2] - pz) < hw + 0.3) return false;
       }
@@ -1270,15 +1286,28 @@ export class Stations {
       if (w.lock[k]) continue;
       const d = distToRect(x, z, f.x, f.z, f.angle, f.w / 2 + 0.2, f.d / 2 + 0.2);
       const wgt = d <= 0 ? 1 : Math.max(0, 1 - d / 1.2);
-      if (wgt > 0) w.setVertex(x, z, w.h[k] + (target - w.h[k]) * wgt);
+      if (wgt > 0) {
+        const cur = w.h[k];
+        let v = cur + (target - cur) * wgt;
+        if (v < cur && v < DRY_MIN) v = Math.min(cur, DRY_MIN);
+        w.setVertex(x, z, v);
+      }
     }
   }
 
   /** Re-grade the formations of track and roads around a station site (after levelling or removing it). */
-  private repairSite(st: Station | { x: number; z: number; rail: { length: number; width?: number } | null }) {
+  private repairSite(st: { x: number; z: number; rail: { length: number; width?: number; building?: Rect; entrances?: Entrance[] } | null }) {
     const r = st.rail;
     const R = (r ? r.length / 2 + (r.width ?? 2) : 4) + 8;
-    repairFormations(this.game.world, st.x - R, st.z - R, st.x + R, st.z + R);
+    let x0 = st.x - R, z0 = st.z - R, x1 = st.x + R, z1 = st.z + R;
+    // An extra entrance may lie up to ENTRANCE_REACH away from the platforms.
+    const extend = (f: { x: number; z: number }, pad: number) => {
+      x0 = Math.min(x0, f.x - pad); z0 = Math.min(z0, f.z - pad);
+      x1 = Math.max(x1, f.x + pad); z1 = Math.max(z1, f.z + pad);
+    };
+    for (const f of r?.entrances ?? []) extend(f, 4);
+    if (r?.building) extend(r.building, Math.hypot(r.building.w, r.building.d) / 2 + 3);
+    repairFormations(this.game.world, x0, z0, x1, z1);
   }
 
   private levelGround(plan: StationPlan) {
@@ -1290,15 +1319,17 @@ export class Stations {
       let d = Infinity;
       for (const r of rects) d = Math.min(d, distToRect(x, z, r.x, r.z, r.angle, r.w / 2 + 0.3, r.d / 2 + 0.3));
       const k = w.vi(x, z);
-      if (w.lock[k] & 2) continue;
+      if (w.lock[k] & (LOCK.building | LOCK.formation)) continue;
       const cur = w.h[k];
       const target = plan.y - 0.1;
       const ext = Math.min(5, Math.abs(target - cur) * 1.6 + 0.6);
       if (d > ext) continue;
       const f = d / ext;
       const wgt = d <= 0 ? 1 : 1 - f * f * (3 - 2 * f);
-      w.setVertex(x, z, cur + (target - cur) * wgt);
-      if (d <= 0) w.lock[k] |= 1;
+      let v = cur + (target - cur) * wgt;
+      if (v < cur && v < DRY_MIN) v = Math.min(cur, DRY_MIN);
+      w.setVertex(x, z, v);
+      if (d <= 0) w.lock[k] |= LOCK.formation;
     }
   }
 
@@ -1308,7 +1339,7 @@ export class Stations {
     const st = this.map.get(id);
     if (!st) return null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) if (g.vehicles.isEdgeBusy(eid)) return 'Train in the station';
-    const site = st.rail ? { x: st.x, z: st.z, rail: { length: st.rail.length, width: railWidth(st.rail) } } : null;
+    const site = st.rail ? { x: st.x, z: st.z, rail: st.rail } : null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) g.world.net.removeEdge(eid);
     this.markStation(st);
     st.rail = null;
@@ -1359,6 +1390,7 @@ export class Stations {
     st.rail!.entrances.push(pl.entrance);
     const lv = st.rail!.level as 'underground' | 'elevated', sz = ENTRANCE_SIZE[lv];
     this.padGround({ x: pl.entrance.x, z: pl.entrance.z, angle: pl.entrance.angle, w: sz.w, d: sz.d });
+    this.repairSite(st);
     g.world.removeTreesNear(pl.entrance.x, pl.entrance.z, 1.2);
     g.world.markObjArea(pl.entrance.x - 3, pl.entrance.z - 3, pl.entrance.x + 3, pl.entrance.z + 3);
     this.accessVersion = -1;
@@ -2075,6 +2107,8 @@ export class Stations {
     let tot = 0;
     for (const [k, g] of st.waiting) {
       g.count = Math.floor(g.count * f);
+      // transfers (passengers of the group who already changed) shrink with it
+      if (g.transfers) g.transfers = Math.min(g.count, Math.floor(g.transfers * f));
       if (g.count <= 0) st.waiting.delete(k); else tot += g.count;
     }
     st.waitingTotal = tot;
@@ -2269,6 +2303,8 @@ export class Stations {
       r.style = up.plan.style; r.building = up.plan.style === 'none' ? r.building : up.plan.building;
       r.forecourt = up.plan.style === 'none' ? undefined : up.plan.forecourt ?? undefined; r.forecourt2 = up.plan.forecourt2 ?? undefined;
       if (up.plan.access && up.plan.access.ok) commitProposal(g, up.plan.access);
+      for (const f of this.footprints(st)) if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
+      this.repairSite(st);
       this.markStation(st);
       this.accessVersion = -1;
       g.lines.catchmentDirty = true;
@@ -2280,13 +2316,15 @@ export class Stations {
       if (c.edge >= 0) { const e = net.edges.get(c.edge); if (!e || c.s <= 0.05 || c.s >= e.len - 0.05) return 'The track changed, plan again'; }
       if (c.at >= 0 && !net.nodes.has(c.at)) return 'The track changed, plan again';
     }
-    for (const eid of [...r.edges, ...r.throughEdges, ...up.cuts.flatMap((c) => [...c.remove, c.edge])]) if (eid >= 0 && g.vehicles.isEdgeBusy(eid)) return 'busy';
+    const occupied = [...r.edges, ...r.throughEdges, ...up.cuts.flatMap((c) => [...c.remove, c.edge])].some((eid) => eid >= 0 && g.vehicles.isEdgeBusy(eid));
     // new tracks may need the crossovers at a connected end moved out: they must be free of trains too
     // new tracks get a turnout ladder at connected ends: the line track there must be free of trains (crossovers
     // in the ladder's way are laid again further out, where the track is free)
     const added = up.tracks + up.through - (r.tracks + (r.through ?? 0));
     if (added > 0) {
-      let free = true;
+      // Hold incoming trains while occupied platforms drain too: waiting for empty platforms before taking
+      // a possession lets the next train enter them, so a busy terminus can never begin its upgrade.
+      let free = !occupied;
       for (const end of ['front', 'back'] as const) if (!throatFree(g, st.id, end, st.owner, added)) free = false;
       if (!free) {
         // a possession: trains no longer enter the works area (held for up to 30 days) while those in it leave
@@ -2296,7 +2334,7 @@ export class Stations {
         }
         return 'busy';
       }
-    }
+    } else if (occupied) return 'busy';
     const hold = this.holds.get(st.id);
     if (hold) { releaseHold(g, hold.edges); this.holds.delete(st.id); }
     const co = g.company(st.owner);
@@ -2579,6 +2617,7 @@ export class Stations {
     for (const eid of [...old.edges, ...old.throughEdges]) net.removeEdge(eid);
     this.markStation(st);
     st.rail = null;
+    this.repairSite({ x: old.x, z: old.z, rail: old });
     this.buildRailPart(st, plan, st.owner);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     for (const o of plan.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);

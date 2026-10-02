@@ -16,11 +16,88 @@ import { roadOpts } from './lib';
 import { findSnap } from '../src/game/construction';
 import { flatGame, station, endNode, loco, depotFor, runTrains, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
 import { buildRoadDepot } from '../src/game/routing';
+import { applyEarthworks, DRY_MIN, EARTHWORKS, LOCK } from '../src/game/terraform';
+import { bezLine } from '../src/game/geom';
 
 const T0 = performance.now();
 const road = (g: Game, x0: number, z0: number, x1: number, z1: number) => build(g, free(g, x0, z0), free(g, x1, z1), roadOpts(0, 'road'), 'road');
 const house = (g: Game, x: number, z: number, floors = 2) => g.world.addBuilding({ townId: -1, x, z, angle: 0, w: 0.8, d: 0.8, type: 0, floors, pop: 10, seed: 1, y: g.world.heightAt(x, z), built: 0 });
 const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l = g.lines.create(kind, 0); l.stops = stops.map((s) => s.id); return l; };
+
+// Station earthworks must leave neighbouring formations and the shoreline intact, and clear houses whose
+// ground shares grid cells with a regraded platform track (including the preview and compensation).
+{
+  console.log('station earthworks regressions');
+  const g = flatGame(192, 3, (x) => 3 + (x - 100) * 0.045), w = g.world, net = w.net;
+  const a = net.addNode('rail', 97, 2.8, 70, 0, 1, 0), b = net.addNode('rail', 97, 2.8, 130, 0, 1, 0);
+  const e = net.addEdge('rail', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(61).fill(2.8), [], 'standard', 0);
+  applyEarthworks(w, [e]);
+  const protectedGround = new Map<number, number>();
+  for (let z = 85; z <= 115; z++) for (let x = 94; x <= 98; x++) {
+    const k = w.vi(x, z);
+    if (w.lock[k] & LOCK.formation) protectedGround.set(k, w.h[k]);
+  }
+  const setVertex = w.setVertex.bind(w);
+  let movedLocked = 0;
+  w.setVertex = (x, z, y) => {
+    const k = w.vi(x, z);
+    if (protectedGround.has(k) && w.lock[k] & LOCK.formation && Math.abs(w.h[k] - y) > 0.005) movedLocked++;
+    setVertex(x, z, y);
+  };
+  const S = station(g, 100, 100, 0, 12, 2, 0, { fixedY: 3.4, buildingSide: 1 });
+  w.setVertex = setVertex;
+  check(!!S && protectedGround.size > 0 && movedLocked === 0, `station levelling never writes into another track's locked formation (${movedLocked} writes)`);
+  check([...protectedGround].every(([k, h]) => Math.abs(w.h[k] - h) < 0.005), 'neighbouring formation heights stay exact');
+  if (S) {
+    check(!g.stations.removeStation(S.id), 'levelled station removed');
+    check(!(w.lock[w.vi(100, 100)] & LOCK.formation) && [...protectedGround.keys()].every((k) => w.lock[k] & LOCK.formation), 'removal releases the old site and repairs the remaining formation locks');
+    const p = { x: 0, y: 0, z: 0 };
+    let misfits = 0;
+    for (let s = 0; s <= e.len; s += 0.5) {
+      net.pointAt(e, s, p);
+      for (const off of [-net.halfWidth(e), 0, net.halfWidth(e)]) {
+        const gap = p.y - w.heightAt(p.x + off, p.z);
+        if (gap < 0.02 || gap > 0.35) misfits++;
+      }
+    }
+    check(misfits === 0, `remaining track fits the terrain after removal (${misfits} misfits)`);
+  }
+}
+{
+  const g = flatGame(192), w = g.world;
+  const opts = { fixedY: 4, buildingSide: 1 as const };
+  const before = g.stations.planRail(100, 100, Math.PI / 2, 12, 2, 0, opts);
+  const near = house(g, 100, 103), far = house(g, 100, 105);
+  const plan = g.stations.planRail(100, 100, Math.PI / 2, 12, 2, 0, opts);
+  const reach = 0.32 + EARTHWORKS.corePad + 1.42;
+  check(plan.ok && plan.demolish.includes(near.id) && !plan.demolish.includes(far.id), `regraded platform tracks clear houses within ${fmt(reach, 2)} of their axes`);
+  check(plan.cost - before.cost === 6000 + near.pop * 2500, 'formation-side house compensation is included once in the station quote');
+  check(!g.stations.commitRail(plan, 0) && !w.buildings.has(near.id) && w.buildings.has(far.id) && Math.abs(w.heightAt(far.x, far.z) - far.y) < 0.1, 'commit clears the formation-side house and keeps the distant house on its original ground');
+}
+{
+  const g = flatGame(192, 0.5, (x) => x <= 101 ? 0.5 : -0.6), w = g.world;
+  const before = w.h.slice();
+  const plan = g.stations.planRail(100, 100, 0, 8, 2, 0, { level: 'elevated', style: 'classic', buildingSide: 1 });
+  check(plan.ok && !g.stations.commitRail(plan, 0), `street-level building pad beside the shoreline (${plan.error ?? 'ok'})`);
+  check(w.h.every((h, k) => before[k] < DRY_MIN || h >= DRY_MIN - 1e-6), 'entrance and building pads never pull dry land below DRY_MIN');
+  check(w.h.every((h, k) => before[k] >= DRY_MIN || h >= before[k] - 1e-6), 'pads never deepen water');
+  const low = g.stations.planRail(60, 100, 0, 8, 2, 0, { fixedY: DRY_MIN + 0.02 });
+  const unchanged = w.h.slice();
+  check(!low.ok && /water line/.test(low.error ?? '') && !!g.stations.commitRail(low, 0), 'ground platform formations below the water line are refused');
+  check(w.h.every((h, k) => h === unchanged[k]), 'refused station leaves the shoreline untouched');
+}
+{
+  console.log('station cost ratios (entrances included)');
+  const g = flatGame(192);
+  for (const [length, tracks] of [[8, 2], [20, 4], [40, 8]]) {
+    const ground = g.stations.planRail(96, 96, Math.PI / 2, length, tracks, 0, { style: 'classic' });
+    const elevated = g.stations.planRail(96, 96, Math.PI / 2, length, tracks, 0, { level: 'elevated', style: 'classic' });
+    const underground = g.stations.planRail(96, 96, Math.PI / 2, length, tracks, 0, { level: 'underground', style: 'classic' });
+    const er = elevated.cost / ground.cost, ur = underground.cost / ground.cost;
+    console.log(`  ${tracks} tracks / ${length * 10} m: elevated ${fmt(er, 2)}x, underground ${fmt(ur, 2)}x`);
+    check(ground.ok && elevated.ok && underground.ok && er >= 3 && er <= 4 && ur >= 4 && ur <= 6, 'same-size classic stations: elevated 3-4x, underground 4-6x, entrances included');
+  }
+}
 
 // ------------------------------------------------------------------ 1. catchment radii per mode, road access
 {
@@ -95,8 +172,8 @@ let saveGame: Game | null = null;
   const ent = up.entrances.length * 90_000;
   console.log(`  plan: ok ${up.ok} ${up.error ?? ''}, y ${fmt(up.y, 2)} (depth ${fmt(up.depth, 1)}), ${up.entrances.length} entrances (access ${up.entrances.filter((e) => e.access).length}), cost ${fmt(up.cost / 1e6, 2)}M vs ground ${fmt(ground.cost / 1e6, 2)}M`);
   check(up.ok && up.level === 'underground' && up.entrances.length >= 2 && up.entrances.every((e) => e.access), 'planned with 2+ entrances beside the streets');
-  const ratio = (up.cost - ent) / ground.cost;
-  check(ratio >= 5 && ratio <= 8, `underground ${fmt(ratio, 1)}x a ground station of the same size (5-8x)`);
+  const ratio = up.cost / ground.cost;
+  check(ratio >= 4 && ratio <= 6 && up.cost > ent, `underground ${fmt(ratio, 2)}x a ground station of the same size, entrances included (4-6x)`);
   const uid = g.stations.nextId;
   check(!g.stations.commitRail(up, 0), 'built');
   const U = g.stations.get(uid)!;
@@ -143,8 +220,9 @@ let saveGame: Game | null = null;
   const ent = ep.entrances.length * 60_000;
   console.log(`  plan: ok ${ep.ok} ${ep.error ?? ''}, deck ${fmt(ep.y - 3, 2)} above ground, ${ep.piers.length} piers, ${ep.entrances.length} towers, demolish ${ep.demolish.length}, cost ${fmt(ep.cost / 1e6, 2)}M vs ground ${fmt(ground.cost / 1e6, 2)}M`);
   check(ep.ok && ep.y - 3 >= 1.2 && ep.piers.length >= 4 && !ep.demolish.includes(h.id), 'planned on a viaduct over the street and the house');
-  const ratio = (ep.cost - ent) / (2 * 8 * 9000 + 120000);
-  check(ratio >= 3 && ratio <= 4, `elevated ${fmt(ratio, 1)}x a ground station of the same size (3-4x)`);
+  const reference = flatGame(192).stations.planRail(96, 96, Math.PI / 2, 8, 2, 0);
+  const ratio = ep.cost / reference.cost;
+  check(reference.ok && ratio >= 3 && ratio <= 4 && ep.cost > ent, `elevated ${fmt(ratio, 2)}x a ground station of the same size, entrances included (3-4x)`);
   const pierOnRoad = ep.piers.some((p) => net.nearestEdge(p.x, p.z, 0.6, 'road'));
   check(!pierOnRoad, 'no pier on the street');
   const eid = g.stations.nextId;

@@ -12,6 +12,9 @@ import { finishDoubleTrack, planConnection, commitConnection, pairAsDoubleTrack,
 import { autoSignalNetwork } from '../src/game/signals';
 import { Train, findRailRoute, railNext } from '../src/game/train';
 import { roadOpts } from './lib';
+import { depotAtEnd } from '../src/game/routing';
+import { depotSize } from '../src/game/build-ops';
+import { rectsOverlap } from '../src/game/towns';
 import { flatGame, station, endNode, newTrack, loco, depotFor, runTrains, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
 
 const T0 = performance.now();
@@ -28,6 +31,35 @@ const lineOf = (g: Game, stops: Station[], owner = 0) => {
 const lonLat = (st: Station, x: number, z: number) => { const r = st.rail!; const fx = Math.sin(r.angle), fz = Math.cos(r.angle); return { lon: (x - r.x) * fx + (z - r.z) * fz, lat: (x - r.x) * fz - (z - r.z) * fx }; };
 /** Is every station track connected (track beyond) at the given end? */
 const connectedAt = (g: Game, st: Station, front: boolean) => g.stations.trackEnds(st, true).every((t) => (g.world.net.nodes.get(front ? t.front : t.back)?.edges.length ?? 0) >= 2);
+
+// A depot's door 50 m behind an end of the platforms must fit, including on rotated and wide stations.
+{
+  console.log('short depot stubs behind station ends');
+  for (const [angle, tracks, style] of [[0, 2, 'classic'], [PI2, 8, 'classic'], [0.6, 2, 'none']] as const) for (const front of [false, true]) {
+    const g = flatGame(192), net = g.world.net;
+    const S = station(g, 96, 96, angle, 12, tracks, 0, { style })!;
+    check(!!S, 'depot-stub station built');
+    if (!S) continue;
+    const n = net.nodes.get(endNode(g, S, 0, front))!, sign = front ? 1 : -1;
+    const dx = Math.sin(angle) * sign, dz = Math.cos(angle) * sign;
+    const sx = n.x + dx * 5, sz = n.z + dz * 5;
+    const dp = g.depots.plan('rail', sx + dx * 2.15, sz + dz * 2.15, angle + (front ? Math.PI : 0), 0);
+    const szD = depotSize('rail');
+    const rect = { x: dp.x, z: dp.z, angle: dp.angle, w: szD.w, d: szD.d };
+    const fps = g.stations.footprints(S);
+    check(dp.ok && !fps.some((f) => rectsOverlap(rect, f, 0.02)), `L=5 depot fits behind ${style}, ${tracks} tracks, ${front ? 'front' : 'back'} (${dp.error ?? 'ok'})`);
+    check(fps.filter((f) => f.part === 'platforms').every((f) => f.d <= S.rail!.length), 'platform footprint stops at the end nodes');
+    const stub = build(g, nodeSnap(g, n.id, 'rail'), free(g, sx, sz), railOpts(0, 1, { straight: true }), '50 m depot stub');
+    const end = net.nearestNode(sx, sz, 0.1, 'rail');
+    const id = stub && end ? depotAtEnd(g, end.id, 0) : -1;
+    check(id >= 0, 'short stub and depot commit successfully');
+    if (id >= 0) {
+      const depot = g.depots.get(id)!;
+      const doorGap = (depot.x - n.x) * dx + (depot.z - n.z) * dz - szD.d / 2;
+      check(doorGap >= 5, 'depot building stays clear of the station buffer stops');
+    }
+  }
+}
 
 // ------------------------------------------------------------------ 1. building styles
 {
