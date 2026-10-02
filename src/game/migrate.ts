@@ -2,12 +2,17 @@
 import type { Game } from './game';
 import { consistRule, findRailRoute, railNext, ruleAllows } from './train';
 import type { Cont, TrackRule } from './train';
+import type { RailPart } from './stations';
 
 /** Preserve old electric trains' routes by adding wire for free, without changing unrelated track. */
 export function migrateElectricTrains(g: Game): void {
   const net = g.world.net;
   const byCompany = new Map<number, Set<number>>();
   const lineRoutes = new Map<string, Set<number>>();
+  const stationTracks = new Map<number, RailPart>();
+  for (const st of g.stations.map.values()) if (st.rail) {
+    for (const id of [...st.rail.edges, ...(st.rail.throughEdges ?? [])]) stationTracks.set(id, st.rail);
+  }
   for (const t of g.vehicles.trains()) {
     const rule = consistRule(t.cars);
     if (!rule.wire) continue;
@@ -59,6 +64,16 @@ export function migrateElectricTrains(g: Game): void {
       // The stub may have an approach siding before joining the station-to-station routes.
       for (const target of l?.stops ?? []) if (route([{ edge: stub, dir: 1 }], target)) break;
     }
+    // Re-planning can choose another platform or through track. Wire the whole affected station, including
+    // stations passed without a stop, so its stored track type can also preserve wire through future rebuilds.
+    for (const id of [...edges]) {
+      const r = stationTracks.get(id);
+      if (!r || (r.trackType ?? 'standard') !== 'standard') continue;
+      for (const eid of [...r.edges, ...(r.throughEdges ?? [])]) {
+        const e = net.edges.get(eid);
+        if (e && ruleAllows(legacyRule, e) && g.canUse(t.owner, e.owner)) edges.add(eid);
+      }
+    }
     const companyEdges = byCompany.get(t.owner) ?? new Set<number>();
     for (const id of edges) {
       const e = net.edges.get(id);
@@ -68,6 +83,7 @@ export function migrateElectricTrains(g: Game): void {
   }
   // Collect first, then change track: companies sharing a route each receive one upgrade notice.
   const changed = new Set<number>();
+  const stations = new Set<RailPart>();
   for (const [owner, edges] of byCompany) {
     for (const id of edges) {
       if (changed.has(id)) continue;
@@ -75,8 +91,15 @@ export function migrateElectricTrains(g: Game): void {
       e.type = 'electric';
       net.touchEdge(e);
       changed.add(id);
+      const r = stationTracks.get(id);
+      if (r) stations.add(r);
     }
     g.postNews(`${g.company(owner).name}: Lines used by electric trains were electrified when this save was upgraded`, 'info');
+  }
+  // Station rebuilds use the stored track type, not the old edges. Do not relabel partially wired stations.
+  for (const r of stations) {
+    if ((r.trackType ?? 'standard') === 'standard' && r.edges.length
+      && [...r.edges, ...(r.throughEdges ?? [])].every((id) => net.edges.get(id)?.type === 'electric')) r.trackType = 'electric';
   }
   if (changed.size) g.onNetworkChanged();
 }
