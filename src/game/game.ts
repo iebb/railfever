@@ -6,6 +6,7 @@ import { Lines } from './lines';
 import { Vehicles } from './vehicles';
 import { Depots } from './build-ops';
 import { Economy, Company, COMPANY_COLORS } from './economy';
+import { Shares, SHARE_COUNT } from './shares';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
 import { generateIntercityRoads } from './roads';
 import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, TRACK_TYPES, ROAD_TYPES, TRAM } from './constants';
@@ -95,6 +96,8 @@ export class Game {
   /** regional passenger demand (districts, OD matrix, station catchment shares) */
   demand: DemandModel;
   companies: Company[] = [];
+  /** Corporate shareholders, dividends and subsidiary choices. */
+  shares = new Shares(this);
   /** pseudo company for town-owned infrastructure (never shown) */
   private townCompany: Company = { id: -1, name: 'Towns', color: '#888888', ai: false, economy: new Economy() };
   ais: AIController[] = [];
@@ -616,13 +619,18 @@ export class Game {
     return co.economy.money - co.economy.loan + this.companyAssets(id).total;
   }
 
-  /** Price to buy a company: its value plus two years of profit, with a premium; at least a floor. */
-  buyoutPrice(id: number): number {
+  /** Buyout/share valuation before purchase premiums: net assets plus two years of positive profit. */
+  acquisitionValue(id: number): number {
     const co = this.companies[id];
     if (!co || co.defunct) return 0;
     const value = this.companyValue(id) + Math.max(0, co.economy.lastYearProfit) * 2;
     const floor = 500_000 + this.companyAssets(id).total * 0.15;
-    return Math.round(Math.max(value * BUYOUT_PREMIUM, floor) / 1000) * 1000;
+    return Math.max(value, floor / BUYOUT_PREMIUM);
+  }
+
+  /** Price to buy a company: its valuation with a premium; at least the existing buyout floor. */
+  buyoutPrice(id: number): number {
+    return Math.round(this.acquisitionValue(id) * BUYOUT_PREMIUM / 1000) * 1000;
   }
 
   /** Why `buyer` cannot buy `target` now, or null. */
@@ -631,6 +639,9 @@ export class Game {
     if (!b || !t || b.defunct || t.defunct) return 'No such company';
     if (buyer === target) return 'A company cannot buy itself';
     if (target === PLAYER || !t.ai) return `${t.name} is not for sale`;
+    const shares = this.shares.canBuyout(buyer, target);
+    if (shares) return shares;
+    if (this.shares.shareCount(buyer, target) === SHARE_COUNT) return null; // already paid for control
     const price = this.buyoutPrice(target);
     if (b.economy.money < price) return `Not enough money (the price is $${Math.round(price).toLocaleString('en-US')})`;
     return null;
@@ -644,17 +655,31 @@ export class Game {
   buyCompany(buyer: number, target: number): string | null {
     const err = this.canBuy(buyer, target);
     if (err) return err;
-    const b = this.companies[buyer], t = this.companies[target];
+    if (this.shares.shareCount(buyer, target) === SHARE_COUNT) return this.mergeCompany(buyer, target);
     const price = this.buyoutPrice(target);
+    this.companies[buyer].economy.spend(price, 'acquisition');
+    this.shares.recordBuyout(buyer, target);
+    return this.mergeOwnedCompany(buyer, target, price);
+  }
+
+  /** Merge an already wholly owned company, including a subsidiary, without buying its stock again. */
+  mergeCompany(buyer: number, target: number): string | null {
+    return this.mergeOwnedCompany(buyer, target);
+  }
+
+  private mergeOwnedCompany(buyer: number, target: number, price?: number): string | null {
+    const err = this.shares.canMerge(buyer, target);
+    if (err) return err;
+    const b = this.companies[buyer], t = this.companies[target];
     // the target's AI stops (a half-built project is removed first)
     for (const ai of this.ais) if (ai.companyId === target) ai.dispose();
     this.ais = this.ais.filter((a) => a.companyId !== target);
-    // money: price, then the target's cash and loan
+    // The shares are already paid for; take over cash, loan and stakes in other companies.
     const be = b.economy, te = t.economy;
-    be.spend(price, 'acquisition', true);
     if (te.money >= 0) be.earn(te.money, 'acquisition'); else be.spend(-te.money, 'acquisition', true);
     be.loan += te.loan;
     te.money = 0; te.loan = 0;
+    this.shares.onMerge(buyer, target);
     // assets
     const w = this.world, net = w.net;
     for (const e of net.edges.values()) {
@@ -709,7 +734,9 @@ export class Game {
     this.lostSince.clear();
     this.lines.rebuild();
     this.onNetworkChanged();
-    this.postNews(`${b.name} buys ${t.name} for $${(price / 1e6).toFixed(2)}M and takes over its network.`, buyer === PLAYER ? 'good' : 'ai');
+    this.postNews(price !== undefined
+      ? `${b.name} buys ${t.name} for $${(price / 1e6).toFixed(2)}M and takes over its network.`
+      : `${b.name} merges ${t.name} and takes over its network.`, buyer === PLAYER ? 'good' : 'ai');
     return null;
   }
 
@@ -926,7 +953,16 @@ export class Game {
       l.incomeLast = l.incomeYear; l.costLast = l.costYear;
       l.incomeYear = 0; l.costYear = 0;
     }
-    for (const co of this.companies) if (!co.defunct) co.economy.endYear(this.year - 1);
+    this.shares.payDividends(this.year - 1);
+    for (const co of this.companies) if (!co.defunct) {
+      // Month end has already closed December. Attribute the distribution to that month and year.
+      const e = co.economy, december = e.months[e.months.length - 1];
+      if (december?.year === this.year - 1 && december.month === MONTHS_PER_YEAR - 1) {
+        december.v.dividends += e.current.dividends;
+        e.current.dividends = 0;
+      }
+      e.endYear(this.year - 1);
+    }
     for (const m of MODELS) {
       if (m.intro === this.year) this.postNews(`New vehicle available: ${m.name} (${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''})`, 'vehicle');
     }

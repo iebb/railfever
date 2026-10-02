@@ -152,6 +152,7 @@ export function serialize(g: Game): any {
     options: g.options, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     world: {
       size: w.size, h: f32enc(w.h), lock: b64(w.lock), trees: f32enc(trees),
@@ -239,6 +240,7 @@ export function deserialize(d: any): Game {
   g.aiEnabled = d.aiEnabled ?? true;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);
+  g.shares.load(d.shares);
   // towns, stations, depots, lines
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;

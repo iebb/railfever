@@ -5,9 +5,9 @@
  * costs), 'crew', 'energy', 'vehicleMaint'; infrastructure: 'maintenance' (base upkeep), 'trackWear' (wear by
  * train passages).
  */
-export type Category = 'construction' | 'vehicles' | 'running' | 'crew' | 'energy' | 'vehicleMaint' | 'maintenance' | 'trackWear' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition';
+export type Category = 'construction' | 'vehicles' | 'running' | 'crew' | 'energy' | 'vehicleMaint' | 'maintenance' | 'trackWear' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition' | 'investments' | 'divestments' | 'dividends';
 /** Report order: income first, then the expenses. */
-export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees', 'interest', 'acquisition'];
+export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees', 'interest', 'acquisition', 'investments', 'divestments', 'dividends'];
 export const CATEGORY_LABEL: Record<Category, string> = {
   income: 'Passenger income',
   trackIncome: 'Track access income',
@@ -22,7 +22,16 @@ export const CATEGORY_LABEL: Record<Category, string> = {
   trackFees: 'Track access fees',
   interest: 'Loan interest',
   acquisition: 'Company acquisitions',
+  investments: 'Share investments / funding',
+  divestments: 'Share divestments / repurchases',
+  dividends: 'Dividends received / paid',
 };
+/** Capital transfers and distributions are separate from the profit used for valuation and dividends. */
+export const NON_PROFIT_CATEGORIES: Category[] = ['acquisition', 'investments', 'divestments', 'dividends'];
+export const PROFIT_CATEGORIES = CATEGORIES.filter((k) => !NON_PROFIT_CATEGORIES.includes(k));
+export function profitOf(v: Partial<Record<Category, number>>): number {
+  return PROFIT_CATEGORIES.reduce((sum, k) => sum + (v[k] ?? 0), 0);
+}
 /** Operating costs (vehicles and infrastructure, access fees included): e.g. a "running & upkeep" chart line. */
 export const OPERATING_COSTS: Category[] = ['crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees'];
 /** Sum of the operating cost categories of a record (negative: costs). */
@@ -55,7 +64,7 @@ export const COSTS = {
 export interface MonthRecord { year: number; month: number; v: Record<Category, number> }
 
 export function emptyRecord(): Record<Category, number> {
-  return { income: 0, construction: 0, vehicles: 0, running: 0, crew: 0, energy: 0, vehicleMaint: 0, maintenance: 0, trackWear: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0 };
+  return { income: 0, construction: 0, vehicles: 0, running: 0, crew: 0, energy: 0, vehicleMaint: 0, maintenance: 0, trackWear: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0, investments: 0, divestments: 0, dividends: 0 };
 }
 /** Fill categories missing in an older record with 0. */
 function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Category, number> {
@@ -130,9 +139,7 @@ export class Economy {
   get lastYearProfit() {
     const y = this.yearTotals[this.yearTotals.length - 1];
     const v = y ? y.v : this.thisYear;
-    let s = 0;
-    for (const k of CATEGORIES) if (k !== 'acquisition') s += v[k];
-    return s;
+    return profitOf(v);
   }
 }
 

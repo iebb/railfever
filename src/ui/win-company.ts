@@ -1,21 +1,22 @@
-// Company windows: player finances; the companies overview with AI settings, buyouts, track access and history.
+// Company windows: finances, shareholders, investments, AI settings, track access and history.
 import type { UI } from './ui';
 import { MONTH_NAMES, PLAYER, DEFAULT_ACCESS_MULTIPLIER } from '../game/game';
 import type { Game } from '../game/game';
 import { h, clear, tile, section, icon, toggle, add, field, stepper, seg } from './dom';
 import { AI_NAMES, AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import { liveCompanies, aiCount, aiConfigOf, addAI, applyAIConfig, presetOf, MAX_AI, DEFAULT_AI } from './gameapi';
-import { fmtMoney, CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category, OPERATING_COSTS, operatingCosts } from '../game/economy';
+import { fmtMoney, fmtMoneyFull, NON_PROFIT_CATEGORIES, PROFIT_CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category, OPERATING_COSTS, operatingCosts } from '../game/economy';
+import { SHARE_COUNT, DIVIDEND_RATE } from '../game/shares';
 import { fmtLen, fmtMult, fmtPct, equalUseShare } from './format';
 import { multSlider } from './win-access';
 import type { AccessPolicy } from '../game/game';
 import { chart } from './charts';
 import { cashPitch } from '../audio/engine';
 
-/** Operating categories: acquisitions are capital spending and kept out of profit. */
-const OPERATING = CATEGORIES.filter((k) => k !== 'acquisition');
+/** Share funding, repurchases and distributions are shown separately from operating profit. */
+const OPERATING = PROFIT_CATEGORIES;
 /** Rows hidden while they are zero in every column. */
-const OPTIONAL = new Set<Category>(['trackIncome', 'trackFees', 'acquisition']);
+const OPTIONAL = new Set<Category>(['trackIncome', 'trackFees']);
 const valueOf = (v: Partial<Record<Category, number>>, k: Category) => typeof v[k] === 'number' && isFinite(v[k]!) ? v[k]! : 0;
 const recordSum = (v: Partial<Record<Category, number>>) => OPERATING.reduce((a, k) => a + valueOf(v, k), 0);
 const monthSum = (m: MonthRecord) => recordSum(m.v);
@@ -60,7 +61,7 @@ export function openFinances(ui: UI) {
       const tbl = h('table', { class: 'tbl fin' }, h('tr', null, h('th', null, ''), cols.map((c) => h('th', null, c.label))));
       for (const cat of OPERATING) if (!OPTIONAL.has(cat) || cols.some((c) => valueOf(c.v, cat))) tbl.appendChild(row(cat));
       tbl.appendChild(h('tr', { class: 'total' }, h('td', null, 'Profit'), cols.map((c) => { const s = recordSum(c.v); return h('td', { class: s < 0 ? 'neg' : 'pos' }, fmtMoney(s)); })));
-      if (cols.some((c) => valueOf(c.v, 'acquisition'))) tbl.appendChild(row('acquisition', 'after'));
+      for (const cat of NON_PROFIT_CATEGORIES) if (cols.some((c) => valueOf(c.v, cat))) tbl.appendChild(row(cat, 'after'));
       add(win.body, section('Income & expenses'), h('div', { class: 'finance-table' }, tbl),
         h('div', { class: 'muted finance-note' }, 'Overheads are fixed vehicle costs. Older records keep their combined running costs in the same row; new bills separate energy, crew and vehicle maintenance.'));
     } else {
@@ -112,6 +113,14 @@ function holdings(g: Game, id: number) {
   };
 }
 
+function ownershipLabel(g: Game, id: number): string {
+  const owners = g.shares.shareholders(id).map((h) => `${g.company(h.owner).name} ${h.shares * 10}%`);
+  const free = g.shares.freeFloat(id);
+  if (free) owners.push(`Free float ${free * 10}%`);
+  const parent = g.shares.subsidiaryOf(id);
+  return parent !== null ? `Subsidiary of ${g.company(parent).name} · ${owners.join(' · ')}` : owners.join(' · ');
+}
+
 export function openCompetitors(ui: UI) {
   const g = ui.game;
   const win = ui.wm.open('competitors', 'Companies', { width: 700, icon: 'company', color: 'var(--accent)' });
@@ -119,15 +128,15 @@ export function openCompetitors(ui: UI) {
   const overview = () => {
     const nAI = aiCount(g);
     const nReq = g.requestsTo(PLAYER).length;
-    const tbl = h('table', { class: 'tbl fin' }, h('tr', null, ['Company', 'Value', 'Cash', 'Profit (yr)', 'Vehicles', 'Stations', 'Lines', ''].map((t) => h('th', null, t))));
+    const tbl = h('table', { class: 'tbl fin companies-table' }, h('tr', null, ['Company', 'Ownership', 'Value', 'Cash', 'Profit (yr)', 'Vehicles', 'Stations', 'Lines', ''].map((t) => h('th', null, t))));
     for (const co of liveCompanies(g)) {
       const e = co.economy;
       const profit = e.lastYearProfit;
       const hd = holdings(g, co.id);
       const cfg = co.ai ? aiConfigOf(g, co.id) : null;
-      const why = co.ai ? g.canBuy(PLAYER, co.id) : null;
       tbl.appendChild(h('tr', null,
         h('td', { class: 'ellip' }, ui.ownerTag(co.id), co.id === PLAYER ? h('span', { class: 'muted' }, ' you') : cfg ? h('span', { class: 'muted' }, ' ' + (presetOf(cfg)?.name ?? 'Custom')) : null),
+        h('td', { class: 'company-ownership', title: ownershipLabel(g, co.id) }, ownershipLabel(g, co.id)),
         h('td', null, fmtMoney(g.companyValue(co.id))),
         h('td', { class: e.money < 0 ? 'neg' : '' }, fmtMoney(e.money)),
         h('td', { class: profit < 0 ? 'neg' : 'pos' }, fmtMoney(profit)),
@@ -136,16 +145,16 @@ export function openCompetitors(ui: UI) {
         h('td', null, String(hd.lines)),
         h('td', null, co.ai ? h('span', { class: 'rowbtns' },
           h('button', { class: 'ibtn sm', 'data-tip': 'AI settings', 'aria-label': `AI settings of ${co.name}`, onclick: () => openAIConfig(ui, co.id) }, icon('settings', 15)),
-          h('button', { class: 'ibtn sm', 'data-tip': why ? `Buy out — ${why}` : `Buy out for ${fmtMoney(g.buyoutPrice(co.id))}`, 'aria-label': `Buy out ${co.name}`, onclick: () => openBuyout(ui, co.id) }, icon('buyout', 15))) : null)));
+          h('button', { class: 'btn sm', 'aria-label': `Invest in ${co.name}`, onclick: () => openInvest(ui, co.id) }, 'Invest')) : null)));
     }
     const gone = g.companies.filter((c) => c.defunct);
-    add(win.body, tbl,
+    add(win.body, h('div', { class: 'companies-scroll' }, tbl),
       h('div', { class: 'btns' },
         toggle('AI construction', g.aiEnabled, (v) => { g.aiEnabled = v; ui.sound('toggle', { pitch: v ? 1.1 : 0.9 }); win.last = undefined; render(); }, 'AI vehicles keep running when off'),
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn', 'data-tip': 'Requests, policy, blocking and agreements', onclick: () => ui.openTrackAccess() }, icon('key', 16), 'Track access', nReq ? h('span', { class: 'cnt' }, String(nReq)) : null),
         h('button', { class: 'btn', disabled: nAI >= MAX_AI, 'data-tip': nAI >= MAX_AI ? `At most ${MAX_AI} AI companies` : 'Add a rival with its own style', onclick: () => openAIConfig(ui, null) }, icon('plus', 16), 'Add AI company')),
-      h('div', { class: 'muted', style: 'margin-top:6px' }, 'Value: cash − loan + depreciated network and vehicles; buyouts are priced from it. Profit: last full year, or this year so far.'),
+      h('div', { class: 'muted', style: 'margin-top:6px' }, 'Value: cash − loan + depreciated network and vehicles. Share prices also include two years of positive profit. Profit excludes share transfers and dividends. AI share trading is off.'),
       gone.length ? h('div', { class: 'muted', style: 'margin-top:4px' }, gone.map((c) => `${c.name} was bought by ${c.boughtBy != null ? g.company(c.boughtBy).name : 'a rival'}.`).join(' ')) : null);
   };
 
@@ -250,7 +259,7 @@ export function openAIConfig(ui: UI, id: number | null) {
         () => { st.cfg.startMoney = Math.max(1_000_000, st.cfg.startMoney - 1_000_000); render(); },
         () => { st.cfg.startMoney = Math.min(50_000_000, st.cfg.startMoney + 1_000_000); render(); }), `The first ${fmtMoney(5_000_000)} is a loan`),
       h('div', { class: 'btns right' },
-        co ? h('button', { class: 'btn ghost', onclick: () => openBuyout(ui, co.id) }, icon('buyout', 16), 'Buy out…') : null,
+        co ? h('button', { class: 'btn ghost', onclick: () => openInvest(ui, co.id) }, icon('money', 16), 'Invest…') : null,
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn ghost', onclick: () => win.close() }, 'Cancel'),
         co
@@ -279,27 +288,91 @@ function suggestName(g: Game): string {
   return AI_NAMES.find((n) => !used.has(n)) ?? `Rival Transport ${g.companies.length}`;
 }
 
-/** Buyout: price, what the company owns, affordability, confirmation. */
-export function openBuyout(ui: UI, id: number) {
+/** Investment: ten share steps, annual returns, and the owner's choice when all shares are held. */
+export function openInvest(ui: UI, id: number) {
   const g = ui.game;
   const co = g.company(id);
-  const win = ui.wm.open('buyout-' + id, `Buy ${co.name}`, { width: 440, icon: 'buyout', color: co.color, sub: 'Company acquisition' });
+  const win = ui.wm.open('invest-' + id, `Invest in ${co.name}`, { width: 480, icon: 'money', color: co.color, sub: 'Company shares', cls: 'company-invest-info' });
+  const refresh = () => {
+    win.last = undefined;
+    render();
+    ui.wm.get('competitors')?.refresh?.();
+    ui.wm.get('finances')?.refresh?.();
+    for (const c of g.companies) if (c.id !== id) ui.wm.get('invest-' + c.id)?.refresh?.();
+  };
+  const trade = (buy: boolean) => {
+    const quote = g.shares.quote(PLAYER, id);
+    const err = buy ? g.shares.invest(PLAYER, id) : g.shares.divest(PLAYER, id);
+    if (err) { ui.toast(err, 'bad'); ui.sound('error'); refresh(); return; }
+    ui.sound('cash', { pitch: cashPitch(buy ? quote.buyPrice : quote.sellPrice) });
+    ui.toast(`${co.name}: you own ${g.shares.shareCount(PLAYER, id) * 10}%`, 'good');
+    refresh();
+  };
   const render = () => {
     clear(win.body);
     if (co.defunct) { add(win.body, h('div', { class: 'pad' }, `${co.name} now belongs to ${co.boughtBy != null ? g.company(co.boughtBy).name : 'another company'}.`)); return; }
-    const price = g.buyoutPrice(id);
-    const why = g.canBuy(PLAYER, id);
+    const quote = g.shares.quote(PLAYER, id);
+    const held = g.shares.shareCount(PLAYER, id), free = g.shares.freeFloat(id);
+    const buyWhy = g.shares.canInvest(PLAYER, id), sellWhy = g.shares.canDivest(PLAYER, id);
+    const parent = g.shares.subsidiaryOf(id), kept = parent === PLAYER;
+    const owners = g.shares.shareholders(id);
+    const slots = owners.flatMap((holder) => Array.from({ length: holder.shares }, () =>
+      h('i', { style: { background: g.company(holder.owner).color }, title: `${g.company(holder.owner).name}: ${holder.shares * 10}%` })));
+    for (let i = 0; i < free; i++) slots.push(h('i', { class: 'share-free', title: 'Free float: 10%' }));
+    const dividendYear = g.shares.dividendYear(id);
     const te = co.economy;
     const a = g.companyAssets(id);
     const hd = holdings(g, id);
-    const money = g.economy.money;
     const asset = (label: string, what: string, v: number) => (v > 0 ? h('tr', null, h('td', null, label), h('td', { class: 'muted' }, what), h('td', null, fmtMoney(v))) : null);
     add(win.body,
+      section('Ownership', `Your stake ${held * 10}%`),
+      h('div', { class: 'share-stake-bar', role: 'img', 'aria-label': ownershipLabel(g, id) }, slots),
+      h('div', { class: 'share-owners' }, owners.map((holder) =>
+        h('span', null, h('i', { style: { background: g.company(holder.owner).color } }), `${g.company(holder.owner).name} ${holder.shares * 10}%`)),
+        free ? h('span', null, h('i', { class: 'share-free' }), `Free float ${free * 10}%`) : null),
+      parent !== null ? h('div', { class: 'share-note pos' }, `Subsidiary of ${g.company(parent).name}`) : null,
+      held === SHARE_COUNT ? h('div', { class: 'share-control' },
+        section(kept ? 'Your subsidiary' : 'You own 100%'),
+        h('div', { class: 'share-note' }, kept
+          ? 'It keeps its name, colour and AI operations, and pays you yearly dividends. You can merge it later.'
+          : 'Merge its network, vehicles, cash and loan into your company, or keep its name, colour and AI operations as a subsidiary.'),
+        h('div', { class: 'btns' },
+          h('button', { class: 'btn primary', disabled: !!g.shares.canMerge(PLAYER, id), 'data-sfx': 'none', onclick: () => {
+            if (!confirm(`Merge ${co.name} into ${g.player.name}? Its network, vehicles, cash and loan become yours.`)) return;
+            const err = g.mergeCompany(PLAYER, id);
+            if (err) { ui.toast(err, 'bad'); ui.sound('error'); refresh(); return; }
+            ui.sound('purchase');
+            ui.toast(`${co.name} is now part of ${g.player.name}`, 'good');
+            ui.wm.get('ai-config')?.close();
+            refresh();
+          } }, icon('buyout', 16), 'Merge'),
+          h('button', { class: 'btn', disabled: kept, onclick: () => {
+            const err = g.shares.keepAsSubsidiary(PLAYER, id);
+            if (err) { ui.toast(err, 'bad'); ui.sound('error'); refresh(); return; }
+            ui.sound('toggle');
+            ui.toast(`${co.name} will keep operating as your subsidiary`, 'good');
+            refresh();
+          } }, 'Keep as subsidiary'))) : null,
       h('div', { class: 'tiles' },
-        tile(fmtMoney(price), 'Price', why ? 'neg' : ''),
-        tile(fmtMoney(g.companyValue(id)), 'Company value'),
+        tile(fmtMoneyFull(quote.value), '10% share value'),
+        tile(fmtMoney(g.economy.money), 'Your cash', g.economy.money < 0 ? 'neg' : ''),
         tile(fmtMoney(te.lastYearProfit), 'Profit (yr)', te.lastYearProfit < 0 ? 'neg' : 'pos')),
-      section('You take over'),
+      section('Invest / divest', 'One share = 10%'),
+      h('div', { class: 'share-trades' },
+        h('div', { class: 'share-trade' },
+          h('button', { class: 'btn primary', disabled: !!buyWhy, 'data-sfx': 'none', 'data-tip': buyWhy ?? `Buy one share of ${co.name}`, onclick: () => trade(true) }, icon('plus', 16), `Buy 10% · ${fmtMoneyFull(quote.buyPrice)}`),
+          h('div', { class: 'share-note' }, `Premium +${Math.round(quote.premium * 100)}% (${fmtMoneyFull(quote.premiumAmount)})`),
+          buyWhy ? h('div', { class: 'share-note muted' }, buyWhy) : null),
+        h('div', { class: 'share-trade' },
+          h('button', { class: 'btn', disabled: !!sellWhy, 'data-sfx': 'none', 'data-tip': sellWhy ?? `Sell one share of ${co.name}`, onclick: () => trade(false) }, icon('minus', 16), `Sell 10% · ${fmtMoneyFull(quote.sellPrice)}`),
+          h('div', { class: 'share-note' }, `Fee −${Math.round(quote.fee * 100)}% (${fmtMoneyFull(quote.feeAmount)})`),
+          sellWhy ? h('div', { class: 'share-note muted' }, sellWhy) : null)),
+      h('div', { class: 'share-note muted' }, 'Share value uses net assets plus two years of positive profit, with a minimum valuation. The premium rises by 5 percentage points per share you hold. Purchases fund the company at base value; sales use its cash. Premiums and fees are transaction charges.'),
+      section('Dividends', dividendYear !== null ? String(dividendYear) : 'No full year yet'),
+      ui.kv('You received last year', h('span', { class: 'pos' }, fmtMoneyFull(g.shares.dividendLastYear(PLAYER, id)))),
+      ui.kv('Total paid to shareholders', fmtMoneyFull(g.shares.dividendsPaidLastYear(id))),
+      h('div', { class: 'share-note muted' }, `${Math.round(DIVIDEND_RATE * 100)}% of positive annual profit is paid pro rata, limited by available cash. The free float's portion stays in the company.`),
+      section('Company assets'),
       h('table', { class: 'tbl fin' },
         h('tr', null, h('th', null, 'Asset'), h('th', null, ''), h('th', null, 'Value')),
         asset('Track', fmtLen(hd.rail), a.track),
@@ -310,23 +383,11 @@ export function openBuyout(ui: UI, id: number) {
         asset('Vehicles', `${hd.vehicles} on ${hd.lines} line${hd.lines === 1 ? '' : 's'}`, a.vehicles),
         h('tr', null, h('td', null, 'Cash'), h('td', null, ''), h('td', { class: te.money < 0 ? 'neg' : 'pos' }, fmtMoney(te.money))),
         h('tr', null, h('td', null, 'Loan'), h('td', null, ''), h('td', { class: te.loan ? 'neg' : 'muted' }, te.loan ? '−' + fmtMoney(te.loan) : '–'))),
-      ui.kv('Your cash', h('span', { class: money >= price ? 'pos' : 'neg' }, fmtMoney(money))),
-      why ? h('div', { class: 'warn' }, icon('warning', 16), money < price ? `You need ${fmtMoney(price - money)} more — borrow in Finances or wait.` : why) : null,
-      h('div', { class: 'muted', style: 'margin-top:6px' }, 'Its lines and vehicles keep running under your name; its track access agreements pass to you.'),
-      h('div', { class: 'btns right' },
-        h('button', { class: 'btn ghost', onclick: () => win.close() }, 'Cancel'),
-        h('button', { class: 'btn primary', disabled: !!why, 'data-sfx': 'none', onclick: () => {
-          if (!confirm(`Buy ${co.name} for ${fmtMoney(price)}? You take over its network, vehicles, cash and loan.`)) return;
-          const err = g.buyCompany(PLAYER, id);
-          if (err) { ui.toast(err, 'bad'); ui.sound('error'); render(); return; }
-          ui.sound('cash', { pitch: cashPitch(price) });
-          ui.toast(`${co.name} is now part of ${g.player.name}`, 'good');
-          win.close();
-          ui.wm.get('ai-config')?.close();
-          ui.wm.get('competitors')?.refresh?.();
-        } }, icon('buyout', 16), `Buy for ${fmtMoney(price)}`)),
     );
   };
   win.refresh = render;
   render();
 }
+
+/** Existing acquisition entry points now open the share/merge panel. */
+export function openBuyout(ui: UI, id: number) { openInvest(ui, id); }
