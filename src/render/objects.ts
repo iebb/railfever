@@ -21,7 +21,7 @@ import { buildRoadEdge, buildRoadNode, buildBusStops, buildCrossing } from './bu
 import { buildStation, buildDepot } from './build-stations';
 import { portalKeepouts, inKeepout, Keepout } from './build-structures';
 import { buildBuilding, FacadeBuilder } from './build-buildings';
-import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance } from './trees';
+import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance, forestTreeInstances } from './trees';
 
 /** Object chunks per super-chunk side. */
 const SC = 2;
@@ -674,7 +674,7 @@ export class ObjectsView {
       this.regions[this.regionOf(si)].dirty = true;
       this.impRegions[this.impRegionOf(si)].dirty = true;
       if (cnt) {
-        const trees = allTrees;
+        const trees = forestTreeInstances(allTrees, this.game.world);
         const nd = nearTreeData(trees, this.treeGeos.length);
         s.nearM = nd.m; s.nearC = nd.c;
         const fd = impostorData(trees, this.treeGeos, this.impGeos);
