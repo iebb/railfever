@@ -83,13 +83,14 @@ const crossEdges: Record<string, number> = {};
 let crossBus: RoadVehicle | null = null;
 let levelCrossing = -1;
 {
-  // candidate points on the main line: on the ground, away from structures and the stations
+  // Sample all line edges densely, including short pieces left by turnouts and splits. Edge endpoints are
+  // often just joins on continuous ground track; structures and stations still need their own clearance.
   const cands: { e: number; s: number }[] = [];
   const lineEdges = [...mainEdges, ...dblEdges];
   for (const id of lineEdges) {
     const e = net.edges.get(id);
     if (!e) continue;
-    for (let s0 = 3; s0 < e.len - 3; s0 += 2) {
+    for (let s0 = 1; s0 < e.len - 1; s0 += 0.5) {
       if (e.sections.some((q) => s0 > q.s0 - 3 && s0 < q.s1 + 3)) continue;
       const p = { x: 0, y: 0, z: 0 };
       net.pointAt(e, s0, p);
@@ -106,25 +107,24 @@ let levelCrossing = -1;
       net.pointAt(e, cand.s, p, d);
       if ([...net.crossings.values()].some((c) => Math.hypot(c.x - p.x, c.z - p.z) < 14)) continue;
       // level crossings need the railway at ground level and flat approaches
-      const l0 = Math.hypot(d.x, d.z) || 1;
       const rel = p.y - g.world.heightAt(p.x, p.z);
       if (mode === 'level' && (rel < -0.3 || rel > 0.7)) { if (process.argv.includes('-v') && rot === 0) console.log(`    level cand: rail ${fmt(rel, 2)} above ground`); continue; }
-      void l0;
       const l = Math.hypot(d.x, d.z) || 1, nx0 = -d.z / l, nz0 = d.x / l;
       const nx = nx0 * Math.cos(rot) - nz0 * Math.sin(rot), nz = nx0 * Math.sin(rot) + nz0 * Math.cos(rot);
-      // approach length: long enough for the road grade on hillsides (level crossings)
-      let L = 11;
-      if (mode === 'level') {
-        L = [10, 14, 18, 22, 26].find((k) => [-1, 1].every((sg) => Math.abs(g.world.heightAt(p.x + nx * k * sg, p.z + nz * k * sg) - (p.y - 0.04)) <= 0.065 * k)) ?? -1;
-        if (L < 0) { if (process.argv.includes('-v')) console.log(`    level cand: approaches too steep (rot ${rot})`); continue; }
-      }
       // the test road must not touch other roads (country roads, streets) near the line
       const clear = (L: number) => {
+        if (![-1, 1].every((sg) => g.world.inside(p.x + nx * L * sg, p.z + nz * L * sg, 1))) return false;
         for (let k = 0; k <= 2 * L; k++) { const x = p.x + nx * (k - L), z = p.z + nz * (k - L); if (net.nearestEdge(x, z, 1.6, undefined, (q) => !lineEdges.includes(q.id))) return false; }
         return true;
       };
-      if (mode !== 'level') L = [11, 9, 14].find(clear) ?? -1;
-      if (L < 0 || !clear(L)) { if (process.argv.includes('-v')) console.log(`    ${mode} cand blocked`); continue; }
+      // Try more approach lengths before abandoning a site, keeping the same gentle grade limit on both sides.
+      // A flat length may be obstructed while another is clear, so check every feasible length up to 40 units.
+      const lengths = mode === 'level'
+        ? [10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32, 34, 36, 38, 40].filter((k) => [-1, 1].every((sg) => Math.abs(g.world.heightAt(p.x + nx * k * sg, p.z + nz * k * sg) - (p.y - 0.04)) <= 0.065 * k))
+        : [11, 9, 14];
+      if (!lengths.length) { if (process.argv.includes('-v')) console.log(`    level cand: approaches too steep (rot ${rot})`); continue; }
+      const L = lengths.find(clear) ?? -1;
+      if (L < 0) { if (process.argv.includes('-v')) console.log(`    ${mode} cand blocked`); continue; }
       const a = { x: p.x - nx * L, z: p.z - nz * L }, b = { x: p.x + nx * L, z: p.z + nz * L };
       const pr = build(g, free(g, a.x, a.z), free(g, b.x, b.z), roadOpts(0, 'road', { crossing: mode }), mode + ' crossing');
       if (!pr || !pr.crossings.length) { if (pr) console.log('  (no crossing detected)'); continue; }
