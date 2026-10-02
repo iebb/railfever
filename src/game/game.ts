@@ -56,9 +56,14 @@ export interface AccessAgreement {
 export const DEFAULT_ACCESS_MULTIPLIER = 2;
 export const MAX_ACCESS_MULTIPLIER = 3;
 
-/** How an owner answers access requests: ask (the player decides; AI owners judge each case), or always yes / no. */
-export type AccessPolicy = 'ask' | 'auto-approve' | 'auto-reject';
-export const ACCESS_POLICIES: AccessPolicy[] = ['ask', 'auto-approve', 'auto-reject'];
+/**
+ * How an owner shares its network: open (the default: every company not blocked may use it without asking; an
+ * agreement for the fees is made on first use), ask (requests wait for the player; AI owners judge each case),
+ * or answer every request yes / no.
+ */
+export type AccessPolicy = 'open' | 'ask' | 'auto-approve' | 'auto-reject';
+export const ACCESS_POLICIES: AccessPolicy[] = ['open', 'ask', 'auto-approve', 'auto-reject'];
+export const DEFAULT_ACCESS_POLICY: AccessPolicy = 'open';
 /** A request waiting for the owner's answer (expires after ACCESS_REQUEST_DAYS: rejected). */
 export interface AccessRequest { id: number; user: number; owner: number; day: number; reason?: string }
 export type AccessResult = 'granted' | 'pending' | 'rejected' | 'blocked';
@@ -109,6 +114,11 @@ export class Game {
   /** access fees earned (by owner id): last month and in total */
   accessEarned: Record<number, { lastMonth: number; total: number }> = {};
   private accessKeys = new Set<number>();
+  /** by owner id: 1 when its network is open (policy 'open'); blocked (owner * 4096 + user) keys (see refreshAccess) */
+  private openNet = new Uint8Array(0);
+  private blockedKeys = new Set<number>();
+  /** v2.2 saves: their default policies become open access when the AIs are restored */
+  private legacyAccess = false;
   /** weight of others' usage of a company's network (non-AI owners; AI owners keep it in their config) */
   private accessMult: Record<number, number> = {};
   /** usage this month: item key (rail edge id*4, tram tracks id*4+1, station id*4+2) -> amount by company id */
@@ -151,7 +161,7 @@ export class Game {
     this.demand = new DemandModel(this);
     this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
     this.allowAccess[PLAYER] = true;
-    this.accessPolicies[PLAYER] = 'ask';
+    this.accessPolicies[PLAYER] = DEFAULT_ACCESS_POLICY;
     this.accessMult[PLAYER] = DEFAULT_ACCESS_MULTIPLIER;
     // metered usage follows edges that are split
     this.world.net.onSplit.push((old, e1, e2) => {
@@ -175,6 +185,7 @@ export class Game {
     g.demand.rebuild();
     g.world.dirtyObj.clear();
     g.world.dirtyTerrain.clear();
+    g.refreshAccess();
     const n = Math.max(0, Math.min(MAX_AI_COMPANIES, Math.max(opts.aiCompanies ?? 0, opts.aiConfigs?.length ?? 0)));
     for (let i = 0; i < n; i++) g.addAICompany(opts.aiConfigs?.[i] ?? {});
     g.vehicles.manageAmbient();
@@ -203,6 +214,7 @@ export class Game {
     this.companies.push(co);
     this.allowAccess[id] = cfg.accessPolicy !== 'auto-reject';
     this.ais.push(new AIController(this, id, cfg));
+    this.refreshAccess();
     return co;
   }
 
@@ -214,7 +226,10 @@ export class Game {
 
   // ------------------------------------------------------------ track access
   /** May company `user` run vehicles on infrastructure owned by `owner`? (own, public = -1, or an access agreement) */
-  canUse(user: number, owner: number): boolean { return owner === user || owner < 0 || this.accessKeys.has(user * 4096 + owner); }
+  /** May `user` run vehicles on `owner`'s tracks and stop at its stations? (own, agreed, or open and not blocked) */
+  canUse(user: number, owner: number): boolean {
+    return owner === user || owner < 0 || this.accessKeys.has(user * 4096 + owner) || (this.openNet[owner] === 1 && user >= 0 && !this.blockedKeys.has(owner * 4096 + user));
+  }
   hasAccess(user: number, owner: number): boolean { return this.accessKeys.has(user * 4096 + owner); }
   agreement(user: number, owner: number): AccessAgreement | undefined { return this.access.find((a) => a.user === user && a.owner === owner); }
   /** Agreements of a company: networks it uses, and companies using its network. */
@@ -225,12 +240,34 @@ export class Game {
     this.accessKeys.clear();
     for (const a of this.access) this.accessKeys.add(a.user * 4096 + a.owner);
   }
+  /** Open networks and blocks for canUse (after policy changes; every frame too, as the UI edits AI configs). */
+  refreshAccess() {
+    const n = this.companies.length;
+    if (this.openNet.length !== n) this.openNet = new Uint8Array(n);
+    for (let i = 0; i < n; i++) this.openNet[i] = !this.companies[i].defunct && this.accessPolicy(i) === 'open' ? 1 : 0;
+    this.blockedKeys.clear();
+    for (const k in this.blocked) for (const u of this.blocked[k]) this.blockedKeys.add(Number(k) * 4096 + u);
+  }
+  /**
+   * First use of an open network: the agreement that books `user`'s usage-share fees to `owner` (no request;
+   * news only when the player is involved).
+   */
+  private openAccess(user: number, owner: number) {
+    if (user < 0 || owner < 0 || user === owner || this.accessKeys.has(user * 4096 + owner) || !this.canUse(user, owner)) return;
+    const u = this.companies[user], o = this.companies[owner];
+    if (!u || !o || u.defunct || o.defunct) return;
+    this.access.push({ user, owner, since: this.day, usageShareLastMonth: 0, paidLastMonth: 0, paidTotal: 0 });
+    this.accessKeys.add(user * 4096 + owner);
+    this.metered.add(owner);
+    if (owner === PLAYER) this.postNews(`${u.name} runs on your network (open access: it pays its share of the upkeep).`, 'info');
+    else if (user === PLAYER) this.postNews(`You run on ${o.name}'s network (open access: you pay your share of the upkeep).`, 'info');
+  }
 
   /** How `owner` answers access requests. */
   accessPolicy(owner: number): AccessPolicy {
     const ai = this.aiOf(owner);
     const p = ai ? ai.config.accessPolicy : this.accessPolicies[owner];
-    return p === 'ask' || p === 'auto-approve' || p === 'auto-reject' ? p : ai ? 'auto-approve' : 'ask';
+    return ACCESS_POLICIES.includes(p) ? p : DEFAULT_ACCESS_POLICY;
   }
   setAccessPolicy(owner: number, p: AccessPolicy) {
     if (!ACCESS_POLICIES.includes(p)) return;
@@ -238,8 +275,10 @@ export class Game {
     const ai = this.aiOf(owner);
     if (ai) ai.config = { ...ai.config, accessPolicy: p };
     this.allowAccess[owner] = p !== 'auto-reject';
+    this.refreshAccess();
     // a decision for the waiting requests
-    if (p !== 'ask') for (const r of this.accessRequests.filter((q) => q.owner === owner)) p === 'auto-approve' ? this.approveAccess(r.id) : this.rejectAccess(r.id);
+    if (p !== 'ask') for (const r of this.accessRequests.filter((q) => q.owner === owner)) p === 'auto-reject' ? this.rejectAccess(r.id) : this.approveAccess(r.id);
+    this.onNetworkChanged();
   }
   isBlocked(owner: number, user: number): boolean { return !!this.blocked[owner]?.includes(user); }
   /** Companies `owner` has blocked. */
@@ -249,12 +288,16 @@ export class Game {
     if (owner === user || owner < 0) return;
     const list = this.blocked[owner] ?? (this.blocked[owner] = []);
     if (!list.includes(user)) list.push(user);
+    this.refreshAccess();
     this.accessRequests = this.accessRequests.filter((q) => !(q.owner === owner && q.user === user));
     if (this.hasAccess(user, owner)) this.endAccess(user, owner);
+    else { this.lines.dropForeignStops(user, owner); this.onNetworkChanged(); }
   }
   unblockCompany(owner: number, user: number) {
     const list = this.blocked[owner];
     if (list) this.blocked[owner] = list.filter((x) => x !== user);
+    this.refreshAccess();
+    this.onNetworkChanged();
   }
   /** Requests waiting for `owner`'s answer (e.g. the player's inbox). */
   requestsTo(owner: number): AccessRequest[] { return this.accessRequests.filter((q) => q.owner === owner); }
@@ -294,6 +337,7 @@ export class Game {
     if (this.accessRequests.some((q) => q.user === user && q.owner === owner)) return 'pending';
     const policy = this.accessPolicy(owner), ai = this.aiOf(owner);
     if (policy === 'auto-reject') return this.refused(user, owner);
+    if (policy === 'open') return this.grant(user, owner);
     // AI owners answer at once: auto-approve (their default) grants everyone; set to 'ask', a cautious AI keeps
     // competitors off its tracks
     if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) ? this.refused(user, owner) : this.grant(user, owner);
@@ -372,7 +416,7 @@ export class Game {
 
   /** Open or close `owner`'s network: closing rejects all requests (policy auto-reject) and ends the agreements. */
   setAllowAccess(owner: number, allow: boolean) {
-    this.setAccessPolicy(owner, allow ? (this.aiOf(owner) ? 'auto-approve' : 'ask') : 'auto-reject');
+    this.setAccessPolicy(owner, allow ? 'open' : 'auto-reject');
     if (!allow) for (const a of [...this.access]) if (a.owner === owner) this.endAccess(a.user, a.owner);
   }
 
@@ -420,12 +464,16 @@ export class Game {
   /** Metering: a vehicle of `user` travelled `units` on a rail edge (or its tram tracks). Own usage counts too. */
   recordTrackUse(user: number, e: NEdge, units: number, tram = false) {
     const owner = tram ? e.tramOwner ?? -1 : e.owner;
-    if (owner < 0 || user < 0 || e.depot >= 0 || !this.metered.has(owner)) return;
+    if (owner < 0 || user < 0 || e.depot >= 0) return;
+    if (owner !== user && !this.accessKeys.has(user * 4096 + owner)) this.openAccess(user, owner);
+    if (!this.metered.has(owner)) return;
     this.addUsage(e.id * 4 + (tram ? 1 : 0), user, units);
   }
   /** Metering: a vehicle stops at a station (called when it serves the station). */
   recordStop(v: Vehicle, st: Station) {
-    if (st.owner < 0 || v.owner < 0 || !this.metered.has(st.owner)) return;
+    if (st.owner < 0 || v.owner < 0) return;
+    if (st.owner !== v.owner && !this.accessKeys.has(v.owner * 4096 + st.owner)) this.openAccess(v.owner, st.owner);
+    if (!this.metered.has(st.owner)) return;
     this.addUsage(st.id * 4 + 2, v.owner, 1);
   }
   private addUsage(key: number, user: number, x: number) {
@@ -676,6 +724,7 @@ export class Game {
   // ------------------------------------------------------------ simulation
   update(dtReal: number) {
     this.deferCatchment = false;
+    this.refreshAccess();
     this.lines.flushCatchment();
     if (this.paused) return;
     let dt = Math.min(dtReal, 0.25) * this.speed;
@@ -871,6 +920,8 @@ export class Game {
       nextAccessRequest: this.nextRequestId,
       accessPolicies: { ...this.accessPolicies },
       accessBlocked: JSON.parse(JSON.stringify(this.blocked)),
+      // 2: open access is the default policy (v2.3)
+      accessVersion: 2,
       // a catchment recompute still pending (e.g. saved right after a buyout) happens in the loaded game too
       catchmentDirty: this.lines.catchmentDirty,
       demand: this.demand.toJSON(),
@@ -904,12 +955,16 @@ export class Game {
     this.demandSaved = !!d.demand && this.demand.load(d.demand);
     this.accessRequests = ((d.accessRequests ?? []) as AccessRequest[]).map((q) => ({ ...q }));
     this.nextRequestId = d.nextAccessRequest ?? this.accessRequests.reduce((m, q) => Math.max(m, q.id + 1), 1);
+    // v2.2 saves: their default policies (the player's 'ask', the AIs' 'auto-approve') become open access
+    this.legacyAccess = (d.accessVersion ?? 1) < 2;
+    const migrate = (p: AccessPolicy): AccessPolicy => (this.legacyAccess && (p === 'ask' || p === 'auto-approve') ? 'open' : p);
     this.accessPolicies = {};
-    for (const c of this.companies) if (!c.ai) this.accessPolicies[c.id] = this.allowAccess[c.id] === false ? 'auto-reject' : 'ask';
-    if (d.accessPolicies) for (const [k, v] of Object.entries(d.accessPolicies)) if (ACCESS_POLICIES.includes(v as AccessPolicy)) this.accessPolicies[Number(k)] = v as AccessPolicy;
+    for (const c of this.companies) if (!c.ai) this.accessPolicies[c.id] = this.allowAccess[c.id] === false ? 'auto-reject' : DEFAULT_ACCESS_POLICY;
+    if (d.accessPolicies) for (const [k, v] of Object.entries(d.accessPolicies)) if (ACCESS_POLICIES.includes(v as AccessPolicy)) this.accessPolicies[Number(k)] = migrate(v as AccessPolicy);
     this.blocked = {};
     if (d.accessBlocked) for (const [k, v] of Object.entries(d.accessBlocked as Record<string, number[]>)) this.blocked[Number(k)] = [...v];
     this.ais = [];
+    this.refreshAccess();
   }
 
   /** Restore the AI controllers once stations, lines and vehicles exist (an interrupted project is cleaned up). */
@@ -921,7 +976,10 @@ export class Game {
       const data = ((d.ais ?? []) as any[]).find((a) => a && a.companyId === c.id);
       const ai = new AIController(this, c.id, data?.config);
       if (data) { try { ai.load(data); } catch (e) { console.warn('AI state could not be restored', e); } }
+      if (this.legacyAccess && ai.config.accessPolicy === 'auto-approve') ai.config = { ...ai.config, accessPolicy: 'open' };
       this.ais.push(ai);
     }
+    this.legacyAccess = false;
+    this.refreshAccess();
   }
 }

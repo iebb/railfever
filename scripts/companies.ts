@@ -292,6 +292,8 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     const ai = g.ais.find((a) => a.companyId === railCo.id)!;
     while (ai.busy) g.update(0.25);
     g.company(ai.companyId).economy.money += 6_000_000;
+    // the player asks to be asked here (open access, the default, needs no request: see access.ts / networks.ts)
+    g.setAccessPolicy(PLAYER, 'ask');
     check(ai.startShare(PLAYER, pr.A.id, pr.B.id), 'AI starts running trains on the player railway');
     // the player is asked (default policy) and approves
     const mine = () => g.requestsTo(PLAYER).find((q) => q.user === ai.companyId);

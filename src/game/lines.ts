@@ -22,6 +22,11 @@ export interface Line {
   autoName: boolean;
   /** the colour was picked automatically (until Lines.setColor) */
   autoColor: boolean;
+  /**
+   * a loop line: vehicles circulate one way round the stops (no turning back at a stop while the way ahead
+   * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
+   */
+  loop?: boolean;
 }
 
 /**
@@ -55,6 +60,24 @@ function lab(hex: string): [number, number, number] {
   labCache.set(hex, c);
   return c;
 }
+/**
+ * The stations of a line that runs out and back (stops A, B or A, B, C, B or A, B, C, D, C, B …), in order from
+ * one end to the other; null for other stop lists (rings, repeats).
+ */
+export function linearStops(stops: number[]): number[] | null {
+  const n = stops.length;
+  if (n < 2) return null;
+  if (n === 2) return stops[0] !== stops[1] ? [...stops] : null;
+  if (n % 2 !== 0) return null;
+  const k = n / 2;
+  for (let i = 1; i < k; i++) if (stops[k + i] !== stops[k - i]) return null;
+  const path = stops.slice(0, k + 1);
+  return new Set(path).size === path.length ? path : null;
+}
+
+/** The stops of a line running out and back along `path` (A, B, C -> A, B, C, B). */
+export function outAndBack(path: number[]): number[] { return path.length < 3 ? [...path] : [...path, ...path.slice(1, -1).reverse()]; }
+
 /** Perceptual distance between two colours (delta E; ~2.3 = just noticeable, > 25 clearly different). */
 export function colorDistance(a: string, b: string): number {
   const p = lab(a.toLowerCase()), q = lab(b.toLowerCase());
@@ -253,6 +276,17 @@ export class Lines {
 
   linesAt(stationId: number): Line[] {
     return [...this.map.values()].filter((l) => l.stops.includes(stationId));
+  }
+
+  /** Does the line run as a loop (explicit `loop`, else 3+ stops, each station once: not out and back)? */
+  isLoop(l: Line): boolean { return l.loop ?? (l.stops.length >= 3 && new Set(l.stops).size === l.stops.length); }
+
+  /** Make a line a loop (true), out and back (false), or decide by its stops (undefined). */
+  setLoop(id: number, loop: boolean | undefined) {
+    const l = this.map.get(id);
+    if (!l) return;
+    if (loop === undefined) delete l.loop; else l.loop = loop;
+    for (const vid of l.vehicles) this.game.vehicles.get(vid)?.onLineChanged();
   }
 
   nextHop(from: number, dest: number): Hop | undefined {

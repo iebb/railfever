@@ -30,6 +30,9 @@ export function buildAccessLayout(log = console.log): AccessLayout | null {
   g.economy.money = 1e8;
   const AI = 1;
   g.company(AI).economy.money = 1e8;
+  // networks shared on request here (the v2.2 defaults); open access (the default now) is tested at the end
+  g.setAccessPolicy(PLAYER, 'ask');
+  g.setAccessPolicy(AI, 'auto-approve');
   const net = g.world.net;
   const Z = 128;
   const station = (x: number, tracks: number, owner: number) => {
@@ -182,7 +185,7 @@ if (isMain) {
   console.log(`  AI train without access: ${at.state} (${at.status})`);
   check(at.state === 'noroute' || at.state === 'depot', 'AI train has no route without access to the player network');
   // the player is asked (policy 'ask'): a pending request, approved
-  check(g.accessPolicy(PLAYER) === 'ask', 'the player is asked by default');
+  check(g.accessPolicy(PLAYER) === 'ask', 'the player is asked (policy ask)');
   check(g.requestAccess(ai, PLAYER, 'test') === 'pending' && g.requestAccess(ai, PLAYER) === 'pending', 'request pending (once)');
   const rq = g.requestsTo(PLAYER);
   check(rq.length === 1 && rq[0].user === ai && !g.hasAccess(ai, PLAYER), 'pending request listed for the player, no access yet');
@@ -254,6 +257,37 @@ if (isMain) {
   check(sawDetour > 10 && pt.state !== 'noroute', 'player train re-routed over its own detour');
   errs = checkReservations(g);
   check(errs.length === 0, 'reservations consistent after re-routing ' + errs.slice(0, 3).join('; '));
+
+  // ---- 6. open access (the default): no requests; an agreement for the fees on first use
+  {
+    const h = Game.create({ size: 256, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 2 });
+    check(h.accessPolicy(PLAYER) === 'open' && h.accessPolicy(1) === 'open' && h.aiOf(1)!.config.accessPolicy === 'open', 'open access is every company\'s default');
+    check(h.canUse(2, 1) && h.canUse(PLAYER, 1) && h.canUse(1, PLAYER) && !h.hasAccess(2, 1), 'anyone may use an open network without an agreement');
+    check(h.requestAccess(PLAYER, 2) === 'granted' && h.hasAccess(PLAYER, 2), 'a request to an open network is granted at once');
+    h.blockCompany(1, 2);
+    check(!h.canUse(2, 1) && h.canUse(PLAYER, 1) && h.requestAccess(2, 1) === 'blocked', 'a blocked company may not');
+    h.unblockCompany(1, 2);
+    h.setAccessPolicy(1, 'ask');
+    check(!h.canUse(2, 1) && h.requestAccess(2, 1) === 'granted', 'switched to ask: requests again (an AI that asks grants a non-competitor)');
+    h.setAccessPolicy(1, 'open');
+  }
+  // in the layout: the AI runs its train between the player's stations again, without asking
+  g.setAccessPolicy(PLAYER, 'open');
+  g.setAccessPolicy(ai, 'open');
+  check(!g.hasAccess(ai, PLAYER) && g.canUse(ai, PLAYER) && g.lines.canAddStop(aiLine.id, A) === null, 'open: the AI may stop at the player stations without an agreement');
+  aiLine.stops = [A, D];
+  g.lines.rebuild();
+  for (const vid of aiLine.vehicles) g.vehicles.get(vid)?.onLineChanged();
+  const n0 = g.requestsTo(PLAYER).length, d0 = at.delivered, f2 = { pEarned: total(P, 'trackIncome'), qPaid: total(Q, 'trackFees') };
+  const visited = new Set<number>();
+  for (let k = 0; k < 600; k++) { g.update(0.25); if (at.atStation >= 0) visited.add(at.atStation); }
+  const ag = g.agreement(ai, PLAYER);
+  console.log(`  open access: AI train served ${[...visited].map((id) => g.stations.get(id)?.name).join(', ')} (${at.status}); agreement ${!!ag} (paid ${fmt(ag?.paidTotal ?? 0, 0)}); player earned ${fmt(total(P, 'trackIncome') - f2.pEarned, 0)}`);
+  check(g.requestsTo(PLAYER).length === n0 && !!ag, 'open: no request; an agreement made on first use');
+  check(visited.has(A) && visited.has(D) && total(P, 'trackIncome') > f2.pEarned && total(Q, 'trackFees') < f2.qPaid, 'open: the AI train serves the player stations and pays its share');
+  void d0;
+  errs = checkReservations(g);
+  check(errs.length === 0, 'reservations consistent ' + errs.slice(0, 3).join('; '));
   void direct; void findSnap;
   console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
   process.exitCode = fails.length ? 1 : 0;

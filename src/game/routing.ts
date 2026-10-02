@@ -80,6 +80,8 @@ export interface CorridorOpts {
   avoid?: { x0: number; z0: number; x1: number; z1: number; r: number }[];
   /** weight of slopes (1 = default); higher follows the contours more closely */
   slopeCost?: number;
+  /** extra cost per unit of running alongside existing rail (any owner: 3–30 units off, similar heading) */
+  parallel?: number;
 }
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -111,6 +113,9 @@ export class CorridorSearch {
   private forbid: { x: number; z: number; a: number; w: number; d: number; r: number }[] = [];
   private lead: number;
   private startV = -1;
+  /** per vertex and axis (heading mod 180°): 0 unknown, 1 clear, 2 existing rail alongside */
+  private par: Uint8Array | null = null;
+  private field: RailField | null = null;
   expanded = 0;
   state: 'running' | 'done' | 'failed' = 'running';
   path: P2[] | null = null;
@@ -220,6 +225,7 @@ export class CorridorSearch {
         if (f & 4) c += 22 * bcost;
         if (f & 8) c += 9;
         if (dt) c += C * 0.8;
+        if (this.opts.parallel && this.alongside(v, di)) c += d * this.opts.parallel;
         const nc = this.gcost[s] + c;
         if (nc >= this.gcost[ns]) continue;
         this.gcost[ns] = nc;
@@ -231,6 +237,17 @@ export class CorridorSearch {
   }
 
   run(): P2[] | null { while (this.step(20000) === 'running'); return this.path; }
+
+  /** Does existing rail run alongside a vertex at heading `di` (3–30 units off, within ~25°)? Cached per axis. */
+  private alongside(v: number, di: number): boolean {
+    if (!this.par) { this.par = new Uint8Array(this.n * this.n * 4); this.field = railField(this.g); }
+    const k = v * 4 + (di & 3);
+    if (!this.par[k]) {
+      const [dx, dz] = DIRS[di], l = Math.hypot(dx, dz);
+      this.par[k] = parallelRailAt(this.field!, (v % this.n) * this.C, Math.floor(v / this.n) * this.C, dx / l, dz / l) ? 2 : 1;
+    }
+    return this.par[k] === 2;
+  }
 
   private finish(s: number) {
     const verts: P2[] = [];
@@ -254,6 +271,89 @@ export class CorridorSearch {
     ];
     this.state = 'done';
   }
+}
+
+// ------------------------------------------------------------------ existing rail alongside a route
+
+/** Rail track sampled about every 3 units (position and direction), hashed in 16-unit cells. */
+export interface RailField { cells: Map<number, number[]>; x: Float32Array; z: Float32Array; tx: Float32Array; tz: Float32Array }
+const FIELD_CELL = 16;
+const fieldCache = new WeakMap<Game, { v: number; f: RailField }>();
+
+/** The rail field of the network as it is (rebuilt after network changes). */
+export function railField(g: Game): RailField {
+  const c = fieldCache.get(g);
+  if (c && c.v === g.networkVersion) return c.f;
+  const net = g.world.net;
+  const X: number[] = [], Z: number[] = [], TX: number[] = [], TZ: number[] = [];
+  for (const e of net.edges.values()) {
+    if (e.kind !== 'rail' || e.depot >= 0) continue;
+    const geo = net.geo(e);
+    let last = -Infinity;
+    for (let i = 0; i < geo.n; i++) {
+      if (geo.cum[i] - last < 3 && i < geo.n - 1) continue;
+      last = geo.cum[i];
+      X.push(geo.pts[i * 3]); Z.push(geo.pts[i * 3 + 2]); TX.push(geo.tan[i * 2]); TZ.push(geo.tan[i * 2 + 1]);
+    }
+  }
+  const cells = new Map<number, number[]>();
+  for (let i = 0; i < X.length; i++) {
+    const k = Math.floor(X[i] / FIELD_CELL) * 65536 + Math.floor(Z[i] / FIELD_CELL);
+    let a = cells.get(k);
+    if (!a) { a = []; cells.set(k, a); }
+    a.push(i);
+  }
+  const f: RailField = { cells, x: Float32Array.from(X), z: Float32Array.from(Z), tx: Float32Array.from(TX), tz: Float32Array.from(TZ) };
+  fieldCache.set(g, { v: g.networkVersion, f });
+  return f;
+}
+
+/**
+ * Is there rail running alongside the point (x,z) at heading (tx,tz): `minOff`–`maxOff` units to the side,
+ * within `maxAhead` along, heading within `cosMin` (cos 25° by default)?
+ */
+export function parallelRailAt(f: RailField, x: number, z: number, tx: number, tz: number, minOff = 3, maxOff = 30, cosMin = 0.906, maxAhead = 12): boolean {
+  const r = Math.max(maxOff, maxAhead);
+  const cx0 = Math.floor((x - r) / FIELD_CELL), cx1 = Math.floor((x + r) / FIELD_CELL), cz0 = Math.floor((z - r) / FIELD_CELL), cz1 = Math.floor((z + r) / FIELD_CELL);
+  for (let cx = cx0; cx <= cx1; cx++) for (let cz = cz0; cz <= cz1; cz++) {
+    const a = f.cells.get(cx * 65536 + cz);
+    if (!a) continue;
+    for (const i of a) {
+      const dx = f.x[i] - x, dz = f.z[i] - z;
+      const along = dx * tx + dz * tz, off = Math.abs(dx * tz - dz * tx);
+      if (off < minOff || off > maxOff || Math.abs(along) > maxAhead) continue;
+      if (Math.abs(f.tx[i] * tx + f.tz[i] * tz) >= cosMin) return true;
+    }
+  }
+  return false;
+}
+
+/** Share (0..1) of a profiled route (its first and last `skip` units left out) that runs alongside existing rail. */
+export function routeAlongside(g: Game, prof: ChainProfile, skip = 12): number {
+  const f = railField(g), n = prof.s.length, L = prof.s[n - 1] ?? 0;
+  let k = 0, hit = 0, last = -Infinity;
+  for (let i = 1; i < n; i++) {
+    if (prof.s[i] < skip || prof.s[i] > L - skip || prof.s[i] - last < 4) continue;
+    last = prof.s[i];
+    const dx = prof.x[i] - prof.x[i - 1], dz = prof.z[i] - prof.z[i - 1], l = Math.hypot(dx, dz);
+    if (l < 1e-6) continue;
+    k++;
+    if (parallelRailAt(f, prof.x[i], prof.z[i], dx / l, dz / l)) hit++;
+  }
+  return k ? hit / k : 0;
+}
+
+/**
+ * Share (0..1) of the straight corridor between two points (their first and last `skip` units left out:
+ * station areas) that runs alongside existing rail.
+ */
+export function corridorOverlap(g: Game, ax: number, az: number, bx: number, bz: number, skip = 12): number {
+  const L = Math.hypot(bx - ax, bz - az);
+  if (L < skip * 2 + 5) return 0;
+  const f = railField(g), tx = (bx - ax) / L, tz = (bz - az) / L;
+  let n = 0, hit = 0;
+  for (let s = skip; s <= L - skip; s += 5) { n++; if (parallelRailAt(f, ax + tx * s, az + tz * s, tx, tz)) hit++; }
+  return n ? hit / n : 0;
 }
 
 /** Resample a polyline at a fixed spacing. */
@@ -574,6 +674,8 @@ export interface RouteOpts {
   exclude?: Set<number>; roadJunctions?: boolean;
   /** corridor searches after the first, each keeping away from where the previous route failed */
   retries?: number;
+  /** extra cost per unit alongside existing rail (see CorridorOpts.parallel) */
+  parallel?: number;
 }
 export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; expanded: number }
 
@@ -590,7 +692,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
   for (let attempt = 0; attempt <= (o.retries ?? 2); attempt++) {
     // the straight leads must not overlap when the ends are close
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
-    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand });
+    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel });
     while (cs.step(budget) === 'running') yield;
     if (!cs.path) return why || 'no corridor';
     const al = alignCorridor(cs.path, from, to, o.rmax, o.rgood);

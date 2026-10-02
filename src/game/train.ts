@@ -2,7 +2,7 @@
 import { Vehicle } from './vehicle';
 import type { Game } from './game';
 import type { Depot } from './build-ops';
-import { Curve3, curvePoint, makeCurve, NEdge } from './network';
+import { Curve3, curvePoint, makeCurve, NEdge, NNode } from './network';
 import { KMH_TO_UPS, TRACK_TYPES } from './constants';
 import { curveSpeed } from './construction';
 import type { VehicleModel } from './vehicle-types';
@@ -52,6 +52,42 @@ function virtualDepotSeg(g: Game, dp: Depot, length: number): TSeg {
 }
 
 export interface Cont { edge: NEdge; dir: number }
+
+/** Block signals (`signalKind` 'block'; the default 'path' signals guard just a train's own path). */
+type SigNode = NNode & { signalKind?: 'block' | 'path' };
+const blockCache = new WeakMap<Game, { v: number; m: Map<number, number[]> }>();
+
+/**
+ * The block a block signal guards: the edges reached from `edgeId` (leaving node `fromNode`) without passing
+ * another signal (the edges between this signal and the next ones, junctions included). Capped (huge
+ * unsignalled networks: the train's own path decides, as at a path signal).
+ */
+export function blockEdges(g: Game, edgeId: number, fromNode: number): number[] {
+  let c = blockCache.get(g);
+  if (!c || c.v !== g.networkVersion) { c = { v: g.networkVersion, m: new Map() }; blockCache.set(g, c); }
+  const key = edgeId * 2 + (fromNode === g.world.net.edges.get(edgeId)?.a ? 0 : 1);
+  const hit = c.m.get(key);
+  if (hit) return hit;
+  const net = g.world.net;
+  const out: number[] = [];
+  const seen = new Set<number>([edgeId]);
+  const queue: [number, number][] = [[edgeId, fromNode]];
+  while (queue.length && out.length < 400) {
+    const [id, from] = queue.pop()!;
+    const e = net.edges.get(id);
+    if (!e) continue;
+    out.push(id);
+    for (const nid of [e.a, e.b]) {
+      if (nid === from && id === edgeId) continue;
+      const n = net.nodes.get(nid);
+      if (!n || n.signal) continue;
+      for (const f of n.edges) if (!seen.has(f)) { const fe = net.edges.get(f); if (fe && fe.kind === 'rail' && fe.depot < 0) { seen.add(f); queue.push([f, nid]); } }
+    }
+  }
+  const res = out.length >= 400 ? [] : out;
+  c.m.set(key, res);
+  return res;
+}
 
 /**
  * Continuations after travelling edge e in direction dir (signals, track access, no depots). With `anyOwner`,
@@ -273,9 +309,28 @@ export class Train extends Vehicle {
     return net.signalFor(node, net.sideAt(e, nodeId)) > 0;
   }
 
-  /** Reserve pending segments up to the next signal. */
+  /** At a block signal (the start of the next stretch): is every edge of its block free of other trains? */
+  private blockFree(): boolean {
+    const s = this.pending[0];
+    if (!s || s.e < 0) return true;
+    const net = this.game.world.net;
+    const e = net.edges.get(s.e);
+    if (!e) return true;
+    const nodeId = s.dir > 0 ? e.a : e.b;
+    const node = net.nodes.get(nodeId) as SigNode | undefined;
+    if (!node || !node.signal || node.signalKind !== 'block' || net.signalFor(node, net.sideAt(e, nodeId)) <= 0) return true;
+    const V = this.game.vehicles;
+    for (const id of blockEdges(this.game, e.id, nodeId)) {
+      const o = V.getRes(id);
+      if (o !== 0 && o !== this.id) { this.blockedBy = o; return false; }
+    }
+    return true;
+  }
+
+  /** Reserve pending segments up to the next signal (a block signal: once its whole block is free). */
   private tryExtend(): boolean {
     if (!this.pending.length) return false;
+    if (!this.blockFree()) return false;
     const V = this.game.vehicles;
     let j = this.pending.length;
     for (let k = 1; k < this.pending.length; k++) if (this.startsAtSignal(this.pending[k])) { j = k; break; }
@@ -448,8 +503,10 @@ export class Train extends Vehicle {
     }
     this.failCount = 0;
     const penalty = 10 + this.length * 2;
+    // a loop line keeps circulating: turning back only where the way ahead leads nowhere
+    const loop = !!this.line && g.lines.isLoop(this.line);
     let route = fwd;
-    if (rev && (!fwd || rev.cost + penalty < fwd.cost)) {
+    if (rev && (!fwd || (!loop && rev.cost + penalty < fwd.cost))) {
       if (this.reverseTrain()) route = rev;
     }
     if (!route) { this.state = 'noroute'; return false; }
@@ -469,7 +526,7 @@ export class Train extends Vehicle {
     const last = this.segs[this.segs.length - 1];
     if (target && !this.pending.length && last && last.e >= 0 && g.world.net.edges.get(last.e)?.station === target.id) {
       this.routeTarget = target.id;
-      if (this.state === 'noroute') { this.state = 'running'; this.status = 'Heading to ' + target.name; }
+      if (this.state === 'noroute' || this.state === 'stopped') { this.state = 'running'; this.status = 'Heading to ' + target.name; }
       return;
     }
     this.planRoute(this.speed < 0.01);

@@ -9,6 +9,8 @@ import type { NEdge } from './network';
 import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions } from './construction';
 import { setSignal, SIGNAL_SPACING } from './signals';
 import type { DepotPlan } from './build-ops';
+import { stationLayout, DEFAULT_PLATFORM_LENGTH } from './stations';
+import type { StationPlan, StationLevel, ThroughMode } from './stations';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
 export interface Step { edge: number; dir: number }
@@ -490,6 +492,8 @@ export interface FinishResult { signals: number; crossovers: number; cost: numbe
 /** What lies just beyond an end of a double stretch: the tracks merging, a station or a depot, or open line. */
 function beyond(g: Game, nodes: number[], outward: { x: number; z: number }, reach = 30): 'merge' | 'station' | 'depot' | 'open' {
   const net = g.world.net;
+  const through = new Set<number>();
+  for (const st of g.stations.all()) if (st.rail) for (const id of st.rail.throughEdges) through.add(id);
   const seen = new Map<number, number>();
   let kind: 'merge' | 'station' | 'depot' | 'open' = 'open';
   const queue: { n: number; d: number; from: number; root: number }[] = nodes.map((n, i) => ({ n, d: 0, from: -1, root: i }));
@@ -510,7 +514,7 @@ function beyond(g: Game, nodes: number[], outward: { x: number; z: number }, rea
       if (!e || e.kind !== 'rail') continue;
       const o = e.a === q.n ? e.b : e.a, on = net.nodes.get(o)!;
       if (q.d === 0 && (on.x - n.x) * outward.x + (on.z - n.z) * outward.z < 0) continue;
-      if (e.station >= 0) { kind = 'station'; continue; }
+      if (e.station >= 0 || through.has(e.id)) { kind = 'station'; continue; }
       if (e.depot >= 0) { if (kind === 'open') kind = 'depot'; continue; }
       if (q.d + e.len <= reach) queue.push({ n: o, d: q.d + e.len, from: eid, root: q.root });
     }
@@ -669,11 +673,13 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
       }
       const home = free(to, -sg * 0.5);
       if (isFinite(home) && (!want.length || Math.abs(home - want[want.length - 1]) > 4)) want.push(home);
-      for (const w of want) {
-        const q = sampleAt(S, w);
+      for (let wi = 0; wi < want.length; wi++) {
+        const q = sampleAt(S, want[wi]);
         const step = L.find((x) => x.edge === q.edge);
         if (!step) continue;
-        if (!setSignal(g, q.edge, q.s, 'oneway', step.dir * sg > 0, owner)) res.signals++;
+        // the last one guards the station / junction ahead (path signal), the others space the trains (block)
+        const kind = wi === want.length - 1 && wi > 0 ? 'path' : 'block';
+        if (!setSignal(g, q.edge, q.s, 'oneway', step.dir * sg > 0, owner, { signalKind: kind })) res.signals++;
         S = sampleSteps(g, L);
         if (ti === 0) SA = S;
       }
@@ -683,6 +689,317 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
   }
   res.cost = Math.round(money0 - eco.money);
   return res;
+}
+
+// ------------------------------------------------------------------ station throats and stations on existing lines
+
+/** The point `d` units out from `node` along the track leaving it on edge `e` (through plain nodes), or null. */
+function pointOut(g: Game, node: number, e: NEdge, d: number): SPt | null {
+  const net = g.world.net;
+  let cur = e, at = node, acc = 0;
+  const p = { x: 0, y: 0, z: 0 }, t = { x: 0, y: 0, z: 0 };
+  for (let guard = 0; guard < 40; guard++) {
+    const fromA = cur.a === at;
+    if (acc + cur.len >= d + 0.4) {
+      const s = fromA ? d - acc : cur.len - (d - acc);
+      net.pointAt(cur, s, p, t);
+      const l = Math.hypot(t.x, t.z) || 1;
+      return { x: p.x, z: p.z, y: p.y, tx: t.x / l, tz: t.z / l, edge: cur.id, s };
+    }
+    acc += cur.len;
+    at = fromA ? cur.b : cur.a;
+    const n = net.nodes.get(at);
+    if (!n || n.edges.length !== 2) return null;
+    const nx = net.edges.get(n.edges[0] === cur.id ? n.edges[1] : n.edges[0]);
+    if (!nx || nx.station >= 0 || nx.depot >= 0) return null;
+    cur = nx;
+  }
+  return null;
+}
+
+/**
+ * Turnouts for station tracks (platform or through) left unconnected at an end where other tracks of the station
+ * are connected: each joins the approach of the nearest connected track 8-18 units out (an S-curve), tracks further
+ * out chaining onto those just connected. Returns how many were connected, and why others could not be.
+ */
+export function connectStationThroat(g: Game, stationId: number, owner: number): { connected: number; failed: string[] } {
+  const net = g.world.net;
+  const st = g.stations.get(stationId);
+  const res = { connected: 0, failed: [] as string[] };
+  if (!st || !st.rail) return res;
+  const r = st.rail;
+  for (const end of ['front', 'back'] as const) {
+    const sg = end === 'front' ? 1 : -1, ax = Math.sin(r.angle) * sg, az = Math.cos(r.angle) * sg;
+    const own = new Set([...r.edges, ...r.throughEdges]);
+    const approach = (nid: number) => net.nodes.get(nid)?.edges.filter((id) => !own.has(id)) ?? [];
+    const ends = g.stations.trackEnds(st, true);
+    const conn = ends.map((t) => approach(t[end]).length > 0);
+    if (!conn.some(Boolean) || conn.every(Boolean)) continue;
+    for (let pass = 0; pass < ends.length; pass++) {
+      let changed = false;
+      for (let j = 0; j < ends.length; j++) {
+        if (conn[j] || !((j > 0 && conn[j - 1]) || (j + 1 < ends.length && conn[j + 1]))) continue;
+        const k = j > 0 && conn[j - 1] ? j - 1 : j + 1;
+        const nk = ends[k][end], appr = approach(nk);
+        const nj = net.nodes.get(ends[j][end])!;
+        let why = appr.length === 1 ? 'no room' : 'a switch right at the platform end';
+        if (appr.length === 1) {
+          const e = net.edges.get(appr[0])!;
+          for (const d of [8, 10, 12, 15, 18]) {
+            const q = pointOut(g, nk, e, d);
+            if (!q) break;
+            const tracks = new Set<number>([...own, ...ends.flatMap((t) => [...approach(t.front), ...approach(t.back)])]);
+            const c = connectS(g, owner, { x: nj.x, z: nj.z, y: nj.y, tx: ax, tz: az, node: nj.id }, q, tracks, false);
+            if (!c.error) { conn[j] = true; changed = true; res.connected++; break; }
+            why = c.error;
+          }
+        }
+        if (!conn[j]) res.failed.push(`${end} end of track ${j + 1}: ${why}`);
+      }
+      if (!changed) break;
+      res.failed = res.failed.filter((f) => !f.startsWith(end));
+    }
+    for (let j = 0; j < ends.length; j++) if (!conn[j]) res.failed.push(`${end} end of track ${j + 1}: not connected`);
+  }
+  res.failed = [...new Set(res.failed)];
+  return res;
+}
+
+export interface OnTrackOpts {
+  /** platform length (default DEFAULT_PLATFORM_LENGTH) */
+  length?: number;
+  /** platform tracks (default: 1 on single track, 2 on double track) */
+  tracks?: number;
+  /** through tracks without platforms (0-2) */
+  through?: number;
+  throughMode?: ThroughMode;
+  /** default: from the line there (ground, a bridge: elevated, a tunnel: underground) */
+  level?: StationLevel;
+}
+
+export interface OnTrackPlan {
+  ok: boolean;
+  error?: string;
+  warnings: string[];
+  cost: number;
+  owner: number;
+  /** the station (at the line's height, axis along the line) */
+  station: StationPlan | null;
+  /** the line's tracks through the site (1 or 2), in chain order, with their cut points (chain distances) */
+  mains: { steps: Step[]; cut: [number, number]; lat: number }[];
+  /** fans: per entry the line track (index into mains) and the station track it feeds (lateral order, platform and through tracks) */
+  feeds: number[];
+  feedTrack: number[];
+  /** throat connections (previews): from the cut points to the station track ends */
+  throat: { x0: number; z0: number; x1: number; z1: number }[];
+}
+
+/** Plain own track around an edge (both ways, up to `reach` each way): steps in the edge's +s direction and where it starts. */
+function plainAround(g: Game, e0: NEdge, owner: number, reach: number): { steps: Step[]; u0: number } {
+  const net = g.world.net;
+  const walk = (dir: number): Step[] => {
+    const out: Step[] = [];
+    let cur = e0, d = dir, acc = 0;
+    const seen = new Set<number>([e0.id]);
+    while (acc < reach) {
+      const nid = d > 0 ? cur.b : cur.a;
+      const n = net.nodes.get(nid);
+      if (!n || n.edges.length !== 2) break;
+      const nx = net.nextRail(cur, d);
+      if (nx.length !== 1) break;
+      const c = nx[0];
+      if (c.edge.owner !== owner || c.edge.station >= 0 || c.edge.depot >= 0 || seen.has(c.edge.id)) break;
+      seen.add(c.edge.id);
+      out.push({ edge: c.edge.id, dir: c.dir });
+      acc += c.edge.len;
+      cur = c.edge; d = c.dir;
+    }
+    return out;
+  };
+  const back = walk(-1), fwd = walk(1);
+  const steps = [...back.reverse().map((s) => ({ edge: s.edge, dir: -s.dir })), { edge: e0.id, dir: 1 }, ...fwd];
+  let u0 = 0;
+  for (const s of steps) { if (s.edge === e0.id) break; u0 += net.edges.get(s.edge)!.len; }
+  return { steps, u0 };
+}
+
+/**
+ * Plan inserting a through station into an existing single or double track at arc length `s` of edge `edgeId`:
+ * the platform (and through) tracks lie on the line's axis at its height, the line is cut on both sides and its
+ * tracks fan into the station tracks with smooth turnouts (on double track each line track feeds the station
+ * tracks on its side, so one-way running continues). The track must be straight and level for the platforms.
+ */
+export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrackOpts, owner: number): OnTrackPlan {
+  const net = g.world.net;
+  const plan: OnTrackPlan = { ok: true, warnings: [], cost: 0, owner, station: null, mains: [], feeds: [], feedTrack: [], throat: [] };
+  const fail = (m: string) => { plan.ok = false; plan.error = m; return plan; };
+  const e = net.edges.get(edgeId);
+  if (!e || e.kind !== 'rail') return fail('No track here');
+  if (e.owner !== owner) return fail('Not your track');
+  if (e.station >= 0 || e.depot >= 0) return fail('Already a station or depot track');
+  const L = Math.max(4, Math.min(40, o.length ?? DEFAULT_PLATFORM_LENGTH));
+  const reach = L / 2 + 30;
+  const A = plainAround(g, e, owner, reach);
+  const SA = sampleSteps(g, A.steps);
+  const uc = A.u0 + Math.max(0, Math.min(e.len, s));
+  const q = sampleAt(SA, uc);
+  // a second track alongside: double track
+  let B: { steps: Step[]; S: Sample[]; lat: number } | null = null;
+  for (const c of net.edgesNear(q.x - 1.5, q.z - 1.5, q.x + 1.5, q.z + 1.5)) {
+    if (c.kind !== 'rail' || A.steps.some((st) => st.edge === c.id) || c.owner !== owner || c.station >= 0 || c.depot >= 0) continue;
+    const ne = net.nearestEdge(q.x, q.z, 1.4, 'rail', (x) => x.id === c.id);
+    if (!ne || ne.d < 0.3) continue;
+    const pt = { x: 0, y: 0, z: 0 }, dr = { x: 0, y: 0, z: 0 };
+    net.pointAt(c, ne.s, pt, dr);
+    const dl = Math.hypot(dr.x, dr.z) || 1;
+    if (Math.abs((dr.x * q.tx + dr.z * q.tz) / dl) < 0.98 || Math.abs(pt.y - q.y) > 0.3) continue;
+    const pb = plainAround(g, c, owner, reach + 2);
+    let steps = pb.steps;
+    let S = sampleSteps(g, steps);
+    const m = S[nearestSample(S, pt.x, pt.z).i];
+    if (m.tx * q.tx + m.tz * q.tz < 0) { steps = steps.reverse().map((x) => ({ edge: x.edge, dir: -x.dir })); S = sampleSteps(g, steps); }
+    B = { steps, S, lat: 0 };
+    break;
+  }
+  // the station frame: forward along the line, right = (fz, -fx); centred between the tracks
+  const fx = q.tx, fz = q.tz, rx = fz, rz = -fx;
+  let cx = q.x, cz = q.z;
+  if (B) { const m = sampleAt(B.S, B.S[nearestSample(B.S, q.x, q.z).i].u); cx = (q.x + m.x) / 2; cz = (q.z + m.z) / 2; }
+  const latOf = (x: number, z: number) => (x - cx) * rx + (z - cz) * rz;
+  const yc = q.y;
+  const mainsS: Sample[][] = B ? [SA, B.S] : [SA];
+  const lats = mainsS.map((S) => { const m = S[nearestSample(S, cx, cz).i]; return latOf(m.x, m.z); });
+  // straight and level under the platforms
+  for (const S of mainsS) {
+    const c = S[nearestSample(S, cx, cz).i];
+    for (let d = -L / 2 - 0.5; d <= L / 2 + 0.5; d += 0.5) {
+      const p = sampleAt(S, c.u + d);
+      if (Math.abs(p.u - (c.u + d)) > 0.01) return fail(`Not enough plain track here (the station needs ${Math.round((L + 1) * 10)} m)`);
+      const lat = latOf(p.x, p.z) - latOf(c.x, c.z);
+      if (Math.abs(lat) > 0.15) return fail(`The line curves here: the platforms need ${Math.round(L * 10)} m of straight track`);
+      if (Math.abs(p.y - yc) > 0.15) return fail('The line climbs here: the platforms need level track');
+    }
+  }
+  const lv: StationLevel = o.level ?? (net.sectionAt(e, s) === 'tunnel' ? 'underground' : net.sectionAt(e, s) === 'bridge' ? 'elevated' : 'ground');
+  const P = Math.max(1, Math.min(8, o.tracks ?? (B ? 2 : 1))), T = Math.max(0, Math.min(2, o.through ?? 0));
+  const lay = stationLayout(P, T, o.throughMode ?? 'middle');
+  const all = [...lay.trackOffsets, ...lay.throughOffsets].sort((a, b) => a - b);
+  // feeds: each station track from the nearest line track; every line track feeds at least one
+  plan.feeds = all.map((off) => (lats.length > 1 && Math.abs(off - lats[1]) < Math.abs(off - lats[0]) ? 1 : 0));
+  plan.feedTrack = all.map((_, j) => j);
+  for (let m = 0; m < lats.length; m++) if (!plan.feeds.includes(m)) {
+    let bj = 0;
+    for (let j = 0; j < all.length; j++) if (Math.abs(all[j] - lats[m]) < Math.abs(all[bj] - lats[m])) bj = j;
+    plan.feeds.push(m);
+    plan.feedTrack.push(bj);
+  }
+  // throats: long enough for the widest fan
+  let throat = 6;
+  plan.feeds.forEach((m, j) => { throat = Math.max(throat, Math.min(18, Math.sqrt(60 * Math.abs(all[plan.feedTrack[j]] - lats[m])) + 3)); });
+  const ignore = new Set<number>();
+  for (let m = 0; m < mainsS.length; m++) {
+    const S = mainsS[m], c = S[nearestSample(S, cx, cz).i];
+    const cut: [number, number] = [c.u - L / 2 - throat, c.u + L / 2 + throat];
+    if (cut[0] < 0.5 || cut[1] > S[S.length - 1].u - 0.5) return fail(`Not enough plain track on both sides (the station and its throats need ${Math.round((L + 2 * throat) * 10)} m)`);
+    const steps = m === 0 ? A.steps : B!.steps;
+    plan.mains.push({ steps, cut, lat: lats[m] });
+    for (const q2 of S) if (q2.u > cut[0] - 1 && q2.u < cut[1] + 1) ignore.add(q2.edge);
+  }
+  // the station itself, at the line's height
+  const st = g.stations.planRail(cx, cz, Math.atan2(fx, fz), L, P, owner, { level: lv, fixedY: yc, through: T, throughMode: o.throughMode ?? 'middle', ignoreEdges: ignore });
+  plan.station = st;
+  if (!st.ok) return fail(st.error ?? 'Cannot build the station here');
+  plan.warnings.push(...st.warnings);
+  // the fans, checked now
+  let cost = st.cost;
+  const allowed = new Set<number>(ignore);
+  for (let j = 0; j < plan.feeds.length; j++) {
+    const m = plan.feeds[j], S = mainsS[m], off = all[plan.feedTrack[j]];
+    for (const end of [0, 1]) {
+      const cu = sampleAt(S, plan.mains[m].cut[end]);
+      const sx = cx + fx * (end ? L / 2 : -L / 2) + rx * off, sz = cz + fz * (end ? L / 2 : -L / 2) + rz * off;
+      const sp: SPt = { x: sx, z: sz, y: yc, tx: fx, tz: fz };
+      const cp: SPt = { x: cu.x, z: cu.z, y: cu.y, tx: cu.tx, tz: cu.tz, edge: cu.edge, s: cu.s };
+      const r = end ? connectS(g, owner, sp, cp, allowed, true) : connectS(g, owner, cp, sp, allowed, true);
+      if (r.error) return fail(`Cannot connect the station tracks to the line: ${r.error}`);
+      cost += r.cost;
+      plan.throat.push({ x0: cu.x, z0: cu.z, x1: sx, z1: sz });
+    }
+  }
+  // the old track between the cuts is taken up
+  for (const mn of plan.mains) cost += (mn.cut[1] - mn.cut[0]) * 400;
+  plan.cost = Math.round(cost);
+  if (!g.company(owner).economy.canAfford(plan.cost)) plan.warnings.push('Not enough money');
+  return plan;
+}
+
+/**
+ * Insert a planned station into its line: the line tracks are cut at the throats (only when no train stands on
+ * that stretch: 'busy'), the station is built and the fans laid. Trains and lines keep using the line (through the
+ * platform or through tracks); lines may then add the stop. Returns the new station's id, or the reason.
+ */
+export function commitStationOnTrack(g: Game, plan: OnTrackPlan): { error: string | null; station: number } {
+  const net = g.world.net;
+  const owner = plan.owner;
+  if (!plan.ok || !plan.station) return { error: plan.error ?? 'Cannot build', station: -1 };
+  for (const mn of plan.mains) for (const st of mn.steps) if (!net.edges.has(st.edge)) return { error: 'The track changed, plan again', station: -1 };
+  const eco = g.company(owner).economy;
+  if (!eco.canAfford(plan.cost)) return { error: 'Not enough money', station: -1 };
+  // the stretches between the cuts must be free of trains
+  const mains = plan.mains.map((m) => ({ ...m, steps: m.steps.map((x) => ({ ...x })) }));
+  for (const mn of mains) {
+    const S = sampleSteps(g, mn.steps);
+    for (const q of S) if (q.u > mn.cut[0] - 0.5 && q.u < mn.cut[1] + 0.5 && g.vehicles.isEdgeBusy(q.edge)) return { error: 'busy', station: -1 };
+  }
+  const untrack = trackSplits(g, mains.map((m) => m.steps));
+  const cuts: [number, number][] = [];
+  try {
+    for (const mn of mains) {
+      const ids: number[] = [];
+      for (const end of [1, 0]) {
+        const S = sampleSteps(g, mn.steps), q = sampleAt(S, mn.cut[end]);
+        const e = net.edges.get(q.edge)!;
+        let node: number;
+        if (q.s < 0.3 || q.s > e.len - 0.3) node = q.s < 0.3 ? e.a : e.b;
+        else { const r = net.splitEdge(e.id, q.s); if (!r) return { error: 'Cannot cut the track', station: -1 }; node = r.node.id; }
+        ids[end] = node;
+      }
+      // take up the old track between the cut nodes
+      const S = sampleSteps(g, mn.steps);
+      const inside = [...new Set(S.filter((q) => q.u > mn.cut[0] + 0.05 && q.u < mn.cut[1] - 0.05).map((q) => q.edge))];
+      let len = 0;
+      for (const id of inside) { const e = net.edges.get(id); if (e) { len += e.len; net.removeEdge(id); } }
+      eco.spend(len * 400, 'construction', true);
+      cuts.push([ids[0], ids[1]]);
+    }
+  } finally {
+    untrack();
+  }
+  const sid = g.stations.nextId;
+  const err = g.stations.commitRail(plan.station, owner);
+  if (err) return { error: err, station: -1 };
+  const st = g.stations.get(plan.station.join ? plan.station.join.id : sid)!;
+  const ends = g.stations.trackEnds(st, true);
+  const allowed = new Set<number>([...st.rail!.edges, ...st.rail!.throughEdges]);
+  for (const c of cuts) for (const nid of c) for (const id of net.nodes.get(nid)?.edges ?? []) allowed.add(id);
+  const f = { x: Math.sin(st.rail!.angle), z: Math.cos(st.rail!.angle) };
+  let firstErr: string | null = null;
+  const e0 = net.nextEdge;
+  for (let j = 0; j < plan.feeds.length; j++) {
+    const m = plan.feeds[j], t = ends[plan.feedTrack[j]];
+    if (!t) { firstErr = firstErr ?? 'Station track missing'; continue; }
+    for (const end of [0, 1]) {
+      const cn = net.nodes.get(cuts[m][end])!, sn = net.nodes.get(end ? t.front : t.back)!;
+      const cutPt: SPt = { x: cn.x, z: cn.z, y: cn.y, tx: cn.dx || f.x, tz: cn.dz || f.z, node: cn.id };
+      const stPt: SPt = { x: sn.x, z: sn.z, y: sn.y, tx: f.x, tz: f.z, node: sn.id };
+      for (let id = e0; id < net.nextEdge; id++) allowed.add(id);
+      const r = end ? connectS(g, owner, stPt, cutPt, allowed, false) : connectS(g, owner, cutPt, stPt, allowed, false);
+      if (r.error && !firstErr) firstErr = `Throat: ${r.error}`;
+    }
+  }
+  g.onNetworkChanged();
+  g.lines.rebuild();
+  return { error: firstErr, station: st.id };
 }
 
 // ------------------------------------------------------------------ depots

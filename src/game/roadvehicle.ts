@@ -146,7 +146,7 @@ export function roadNext(g: Game, e: NEdge, dir: number): { edge: NEdge; dir: nu
  * A* from the end of lane (edge, dir) to an edge carrying a stop of the target station. `allow` restricts
  * the edges (trams: tram tracks the owner may use); where nothing allowed continues, turning is cheap.
  */
-export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000, allow?: (e: NEdge) => boolean): RCont[] | null {
+export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000, allow?: (e: NEdge) => boolean, uturn = 40): RCont[] | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.stops.length) return null;
@@ -189,7 +189,7 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
       if (!f || f.depot >= 0 || (allow && !allow(f))) continue;
       push(f, f.a === nodeId ? 1 : -1, gc + cost(f), parent);
     }
-    if (e.depot < 0) push(e, -d, gc + cost(e) + (allow ? (open ? 40 : 2) : node.edges.length <= 1 ? 2 : 40), parent);
+    if (e.depot < 0) push(e, -d, gc + cost(e) + (allow ? (open ? uturn : 2) : node.edges.length <= 1 ? 2 : uturn), parent);
   };
   expand(edge, dir, 0, -1);
   let n = 0;
@@ -403,7 +403,9 @@ export class RoadVehicle extends Vehicle {
       return true;
     }
     const be = net.edges.get(base.e);
-    const r = be ? findRoadRoute(g, be, base.dir, target.id, 40000, this.routeFilter()) : null;
+    // a loop line circulates: U-turns only at dead ends
+    const line = this.line;
+    const r = be ? findRoadRoute(g, be, base.dir, target.id, 40000, this.routeFilter(), line && g.lines.isLoop(line) ? 600 : 40) : null;
     if (!r) {
       this.state = 'noroute';
       this.status = (this.isTram && !target.stops.some((p) => { const e = net.edges.get(p.edge); return e && tramUsable(g, e, this.owner); }) ? target.name + ' has no tram stop' : 'No route to ' + target.name);

@@ -4,6 +4,7 @@
 // leaving the node on side +1 / -1); a signal between nodes splits the edge there. See also toggleSignal (build-ops).
 import type { Game } from './game';
 import type { NEdge, NNode } from './network';
+import { findRailRoute, railNext, RouteResult } from './train';
 
 export type SignalKind = 'none' | 'twoway' | 'oneway';
 /** Price of a new signal (as toggleSignal); changing or removing one is free. */
@@ -39,6 +40,10 @@ export interface SignalRunOpts {
   s0?: number;
   /** 'oneway' (default) or 'twoway' */
   kind?: 'oneway' | 'twoway';
+  /** signal kind of the placed signals (default: a signal already at a spot keeps its kind, new ones are 'path') */
+  signalKind?: 'block' | 'path';
+  /** one-way signals passable from behind (default: as the signal already there, new ones not) */
+  pass?: boolean;
 }
 
 /** Side (+1/-1) on which a train travelling along `e` in direction `dir` leaves `node` (an end of e). */
@@ -67,7 +72,14 @@ export function signalAllows(g: Game, e: NEdge, dir: number, nodeId: number): bo
  * used (it must join exactly two tracks); elsewhere the edge is split. New signals cost SIGNAL_COST.
  * Null = OK, else the reason.
  */
-export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, forward: boolean, owner: number): string | null {
+export interface SignalOpts {
+  /** 'path' (default: junctions, station exits) or 'block' (open line) */
+  signalKind?: 'block' | 'path';
+  /** one-way signal passable by trains in the other direction (instead of making the track one-way) */
+  pass?: boolean;
+}
+
+export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, forward: boolean, owner: number, so: SignalOpts = {}): string | null {
   const net = g.world.net;
   const e = net.edges.get(edgeId);
   if (!e || e.kind !== 'rail') return 'No track here';
@@ -91,16 +103,19 @@ export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, 
     node = r.node;
     // the split node: trains in +s direction leave along the second half
     const value = kind === 'twoway' ? 1 : (forward ? r.e2.sa : r.e1.sb) > 0 ? 2 : 3;
-    return applySignal(g, node, value, owner);
+    return applySignal(g, node, value, owner, so);
   }
   const value = kind === 'none' ? 0 : kind === 'twoway' ? 1 : leaveSide(e, dir, node.id) > 0 ? 2 : 3;
-  return applySignal(g, node, value, owner);
+  return applySignal(g, node, value, owner, so);
 }
 
-function applySignal(g: Game, node: NNode, value: number, owner: number): string | null {
+function applySignal(g: Game, node: NNode, value: number, owner: number, so: SignalOpts = {}): string | null {
   const net = g.world.net;
-  if (node.signal === value) return null;
+  const sk = value ? so.signalKind ?? 'path' : undefined, pass = value >= 2 ? !!so.pass : undefined;
+  if (node.signal === value && (node.signalKind ?? 'path') === (sk ?? 'path') && !!node.signalPass === !!pass) return null;
   if (value && !node.signal && !g.company(owner).economy.spend(SIGNAL_COST, 'construction')) return 'Not enough money';
+  if (sk && sk !== 'path') node.signalKind = sk; else delete node.signalKind;
+  if (pass) node.signalPass = true; else delete node.signalPass;
   node.signal = value;
   net.version++;
   g.world.markObjArea(node.x - 2, node.z - 2, node.x + 2, node.z + 2);
@@ -195,7 +210,9 @@ export function autoSignals(g: Game, edgeId: number, dir: number, spacing: numbe
       const e = net.edges.get(id);
       if (!e) continue;
       const before = g.company(owner).economy.money;
-      const err = setSignal(g, id, Math.max(0, Math.min(e.len, s)), o.kind ?? 'oneway', sp.forward, owner);
+      const n0 = sp.node >= 0 ? net.nodes.get(sp.node) : undefined;
+      const so: SignalOpts = { signalKind: o.signalKind ?? n0?.signalKind ?? 'path', pass: o.pass ?? !!n0?.signalPass };
+      const err = setSignal(g, id, Math.max(0, Math.min(e.len, s)), o.kind ?? 'oneway', sp.forward, owner, so);
       if (err) { res.error = err; if (err === 'Not enough money') break; continue; }
       res.placed++;
       res.cost += Math.max(0, before - g.company(owner).economy.money);
@@ -230,4 +247,306 @@ export function clearSignalsAlong(g: Game, edgeId: number, dir: number, owner: n
   }
   if (removed) { net.version++; g.onNetworkChanged(); }
   return { removed };
+}
+
+// ------------------------------------------------------------------ automatic signalling
+//
+// Rules (with this game's path reservation: a train reserves its whole path up to the next signal facing it):
+// - directional double track (track already one-way): one-way block signals every `spacing`, and a path signal
+//   shortly before a junction / station entry at its end;
+// - every platform and through track end: a starter signal facing the departure, passable from behind (so
+//   arriving trains are never stopped at the platform edge);
+// - passing loops on single track: an exit signal at both ends of each loop track, facing out of the loop and
+//   passable from behind, so trains wait inside the loop for the single section ahead and the next loop;
+// - depots: an exit signal facing out of the depot;
+// - no signals inside single-track sections or in front of their junctions / station throats: a train must take
+//   a single section and a free track at its far end in one reservation, else opposing trains deadlock;
+// - never one-way-blocking signals on two-way track (all new non-block signals are passable from behind), so no
+//   line loses a route; idempotent: signals already in place (within 2 units) are kept or turned to the rule.
+
+/** A planned (or kept) signal of the automatic signalling. */
+export interface AutoSignal {
+  x: number; z: number;
+  /** where: edge and arc length (an end node when s is 0 or the edge length) */
+  edge: number; s: number;
+  /** existing node there (-1: the edge is split) */
+  node: number;
+  /** for trains travelling in the edge's +s direction */
+  forward: boolean;
+  kind: 'block' | 'path';
+  pass: boolean;
+  role: 'block' | 'approach' | 'starter' | 'loop' | 'depot';
+  action: 'add' | 'change' | 'keep';
+}
+
+export interface AutoSignalResult {
+  signals: AutoSignal[];
+  /** price of the new signals */
+  cost: number;
+  warnings: string[];
+  placed: number; changed: number;
+}
+
+export interface AutoSignalOpts {
+  /** block signal spacing on directional double track (default SIGNAL_SPACING) */
+  spacing?: number;
+  /** plan only (nothing changes) */
+  preview?: boolean;
+}
+
+/** Track a line uses: the best route between consecutive stops (from every platform, both ways) and the stops' station tracks. */
+function lineTrack(g: Game, lineId: number): Set<number> {
+  const net = g.world.net;
+  const E = new Set<number>();
+  const l = g.lines.get(lineId);
+  if (!l || l.kind !== 'rail') return E;
+  const stops = l.stops.map((id) => g.stations.get(id)).filter((st): st is NonNullable<typeof st> => !!st && !!st.rail);
+  for (const st of stops) for (const id of [...st.rail!.edges, ...st.rail!.throughEdges]) E.add(id);
+  for (let i = 0; i < stops.length && stops.length > 1; i++) {
+    const a = stops[i], b = stops[(i + 1) % stops.length];
+    if (a === b) continue;
+    let best: RouteResult | null = null;
+    for (const pid of a.rail!.edges) {
+      const pe = net.edges.get(pid);
+      if (!pe) continue;
+      for (const d of [1, -1]) {
+        const r = findRailRoute(g, railNext(g, pe, d, l.owner), b.id, l.owner, -1, 40000);
+        if (r && (!best || r.cost < best.cost)) best = r;
+      }
+    }
+    for (const c of best?.conts ?? []) E.add(c.edge.id);
+  }
+  // alternatives between nodes of the routes: passing loops, second tracks, crossovers, throat tracks
+  const routeNodes = new Set<number>();
+  for (const id of E) { const e = net.edges.get(id); if (e) { routeNodes.add(e.a); routeNodes.add(e.b); } }
+  for (const nid of [...routeNodes]) {
+    const n = net.nodes.get(nid);
+    if (!n || n.edges.length < 3) continue;
+    for (const eid of n.edges) {
+      if (E.has(eid)) continue;
+      const chain: number[] = [];
+      let cur = net.edges.get(eid), at = nid, len = 0;
+      while (cur && cur.kind === 'rail' && cur.depot < 0 && len < 400) {
+        chain.push(cur.id);
+        len += cur.len;
+        at = cur.a === at ? cur.b : cur.a;
+        if (routeNodes.has(at)) { for (const id of chain) E.add(id); break; }
+        const m = net.nodes.get(at);
+        if (!m || m.edges.length !== 2) break;
+        cur = net.edges.get(m.edges[0] === cur.id ? m.edges[1] : m.edges[0]);
+      }
+    }
+  }
+  return E;
+}
+
+interface Chain { steps: { edge: NEdge; dir: number }[]; cum: number[]; len: number; start: number; end: number }
+
+/** Maximal runs of plain track (no station / depot track) through two-edge nodes within E. */
+function chainsOf(g: Game, E: Set<number>, special: (e: NEdge) => boolean): Chain[] {
+  const net = g.world.net;
+  const seen = new Set<number>();
+  const out: Chain[] = [];
+  const ext = (e: NEdge, d: number): { edge: NEdge; dir: number }[] => {
+    const r: { edge: NEdge; dir: number }[] = [];
+    let cur = e, cd = d;
+    for (let guard = 0; guard < 5000; guard++) {
+      const nid = cd > 0 ? cur.b : cur.a;
+      const n = net.nodes.get(nid);
+      if (!n || n.edges.length !== 2) break;
+      const o = net.edges.get(n.edges[0] === cur.id ? n.edges[1] : n.edges[0]);
+      if (!o || !E.has(o.id) || special(o) || seen.has(o.id)) break;
+      seen.add(o.id);
+      const od = o.a === nid ? 1 : -1;
+      r.push({ edge: o, dir: od });
+      cur = o; cd = od;
+    }
+    return r;
+  };
+  for (const id of [...E].sort((a, b) => a - b)) {
+    const e = net.edges.get(id);
+    if (!e || e.kind !== 'rail' || special(e) || seen.has(id)) continue;
+    seen.add(id);
+    const back = ext(e, -1), fwd = ext(e, 1);
+    const steps = [...back.reverse().map((x) => ({ edge: x.edge, dir: -x.dir })), { edge: e, dir: 1 }, ...fwd];
+    const cum = [0];
+    for (const st of steps) cum.push(cum[cum.length - 1] + st.edge.len);
+    const first = steps[0], last = steps[steps.length - 1];
+    out.push({ steps, cum, len: cum[cum.length - 1], start: first.dir > 0 ? first.edge.a : first.edge.b, end: last.dir > 0 ? last.edge.b : last.edge.a });
+  }
+  return out;
+}
+
+/** Edge, arc length and travel flag at chain distance u, travelling along the chain (dir +1) or against it. */
+function chainAt(c: Chain, u: number, dir: number): { edge: NEdge; s: number; forward: boolean } {
+  let i = 0;
+  while (i < c.steps.length - 1 && c.cum[i + 1] <= u) i++;
+  const st = c.steps[i], d = Math.max(0, Math.min(st.edge.len, u - c.cum[i]));
+  return { edge: st.edge, s: st.dir > 0 ? d : st.edge.len - d, forward: st.dir * dir > 0 };
+}
+
+/** Plan the signals for a set of track (see the rules above). */
+function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number): AutoSignalResult {
+  const net = g.world.net;
+  const res: AutoSignalResult = { signals: [], cost: 0, warnings: [], placed: 0, changed: 0 };
+  const through = new Set<number>();
+  const stations = new Set<number>();
+  for (const id of E) { const e = net.edges.get(id); if (e && e.station >= 0) stations.add(e.station); }
+  for (const st of g.stations.all()) if (st.rail) for (const id of st.rail.throughEdges) { through.add(id); if (E.has(id)) stations.add(st.id); }
+  const special = (e: NEdge) => e.station >= 0 || e.depot >= 0 || through.has(e.id);
+  const deg = (nid: number) => net.nodes.get(nid)?.edges.length ?? 0;
+  const p = { x: 0, y: 0, z: 0 };
+  const want = (edge: NEdge, s: number, forward: boolean, kind: 'block' | 'path', pass: boolean, role: AutoSignal['role']) => {
+    if (edge.owner !== owner) { res.warnings.push(`Track of ${g.company(edge.owner).name} near ${Math.round(edge.bez.x0)},${Math.round(edge.bez.z0)} is left as it is`); return; }
+    const atEnd = s < 0.6 || s > edge.len - 0.6;
+    let node = atEnd ? (s < 0.6 ? edge.a : edge.b) : -1;
+    if (node >= 0) s = node === edge.a ? 0 : edge.len;
+    net.pointAt(edge, s, p);
+    // an existing signal close by (2 units along the track) is reused
+    if (node < 0) for (const nid of [edge.a, edge.b]) {
+      const n = net.nodes.get(nid)!;
+      if (n.signal && n.edges.length === 2 && Math.hypot(n.x - p.x, n.z - p.z) < 2) { node = nid; s = nid === edge.a ? 0 : edge.len; net.pointAt(edge, s, p); break; }
+    }
+    if (node >= 0 && deg(node) !== 2) return;
+    if (res.signals.some((q) => (node >= 0 && q.node === node) || (q.edge === edge.id && Math.abs(q.s - s) < 0.5))) return;
+    const n = node >= 0 ? net.nodes.get(node)! : null;
+    let action: AutoSignal['action'] = 'add';
+    if (n && n.signal) {
+      // compare with what the rule wants (direction, kind, passable)
+      const dirOk = n.signal >= 2 && net.signalFor(n, leaveSide(edge, forward ? 1 : -1, node)) > 0;
+      action = dirOk && (n.signalKind ?? 'path') === kind && !!n.signalPass === pass ? 'keep' : 'change';
+    }
+    res.signals.push({ x: p.x, z: p.z, edge: edge.id, s, node, forward, kind, pass, role, action });
+  };
+  // ---- station starters (platform and through tracks), facing the departure, passable from behind
+  for (const sid of [...stations].sort((a, b) => a - b)) {
+    const st = g.stations.get(sid);
+    if (!st || !st.rail) continue;
+    for (const t of g.stations.trackEnds(st, true)) for (const nid of [t.front, t.back]) {
+      const n = net.nodes.get(nid);
+      if (!n || n.edges.length !== 2) continue;
+      const own = n.edges.map((id) => net.edges.get(id)!).find((e) => e.station === st.id || through.has(e.id));
+      const other = n.edges.map((id) => net.edges.get(id)!).find((e) => e !== own);
+      if (!own || !other || !E.has(other.id) || other.depot >= 0) continue;
+      want(own, nid === own.b ? own.len : 0, nid === own.b, 'path', true, 'starter');
+    }
+  }
+  // ---- depot exits
+  for (const dp of g.depots.all()) {
+    if (dp.kind !== 'rail' || dp.owner !== owner) continue;
+    const stub = net.edges.get(dp.edge), n = net.nodes.get(dp.node);
+    if (!stub || !n || n.edges.length !== 2 || !n.edges.some((id) => E.has(id) && id !== stub.id)) continue;
+    const other = net.edges.get(n.edges[0] === stub.id ? n.edges[1] : n.edges[0])!;
+    if (other.station >= 0) continue;
+    want(stub, n.id === stub.b ? stub.len : 0, n.id === stub.b, 'path', true, 'depot');
+  }
+  // ---- plain track
+  const chains = chainsOf(g, E, special);
+  const pairKey = (c: Chain) => Math.min(c.start, c.end) + ':' + Math.max(c.start, c.end);
+  const twins = new Map<string, number>();
+  for (const c of chains) twins.set(pairKey(c), (twins.get(pairKey(c)) ?? 0) + 1);
+  for (const c of chains) {
+    // direction of existing one-way (non-passable) signals inside the chain
+    let fw = 0, bw = 0;
+    for (let i = 0; i + 1 < c.steps.length; i++) {
+      const st = c.steps[i], nid = st.dir > 0 ? st.edge.b : st.edge.a, n = net.nodes.get(nid)!;
+      if (n.signal < 2 || n.signalPass) continue;
+      if (signalAllows(g, st.edge, st.dir, nid)) fw++; else bw++;
+    }
+    if (fw && bw) { res.warnings.push('Track with one-way signals facing both ways left as it is'); continue; }
+    if (fw || bw) {
+      // directional: block signals every `spacing`, a path signal before a junction / station at its end
+      const D = fw ? 1 : -1;
+      const at = (u: number) => (D > 0 ? u : c.len - u);  // distance from the chain start in travel direction
+      const endNode = D > 0 ? c.end : c.start;
+      const junction = deg(endNode) > 2 || net.nodes.get(endNode)!.edges.some((id) => special(net.edges.get(id)!));
+      if (junction && c.len > 6) {
+        const q = chainAt(c, at(c.len - 2.5), D);
+        want(q.edge, q.s, q.forward, 'path', false, 'approach');
+      }
+      // the existing signals of the line become block signals; gaps longer than the spacing are filled
+      const have: number[] = [0];
+      for (let i = 0; i + 1 < c.steps.length; i++) {
+        const st = c.steps[i], nid = st.dir > 0 ? st.edge.b : st.edge.a, n = net.nodes.get(nid)!;
+        if (!n.signal) continue;
+        const u = at(c.cum[i + 1]);
+        have.push(u);
+        if (!(junction && Math.abs(u - (c.len - 2.5)) < 2)) want(st.edge, st.dir > 0 ? st.edge.len : 0, st.dir * D > 0, 'block', false, 'block');
+      }
+      have.push(junction ? c.len - 2.5 : c.len - 2);
+      have.sort((a, b) => a - b);
+      for (let k = 0; k + 1 < have.length; k++) {
+        const a = have[k], b = have[k + 1];
+        if (b - a <= spacing * 1.25) continue;
+        const n = Math.round((b - a) / spacing);
+        for (let j = 1; j < n; j++) {
+          const u = a + ((b - a) * j) / n;
+          if (u < 2 || u > c.len - 2) continue;
+          const q = chainAt(c, at(u), D);
+          want(q.edge, q.s, q.forward, 'block', false, 'block');
+        }
+      }
+      continue;
+    }
+    // two-way plain track: exit signals at both ends of passing-loop tracks
+    if ((twins.get(pairKey(c)) ?? 0) >= 2 && c.start !== c.end && deg(c.start) > 2 && deg(c.end) > 2 && c.len >= 6) {
+      const q0 = chainAt(c, 1.8, -1), q1 = chainAt(c, c.len - 1.8, 1);
+      want(q0.edge, q0.s, q0.forward, 'path', true, 'loop');
+      want(q1.edge, q1.s, q1.forward, 'path', true, 'loop');
+    }
+  }
+  for (const q of res.signals) {
+    if (q.action === 'add') { res.cost += SIGNAL_COST; res.placed++; }
+    else if (q.action === 'change') res.changed++;
+  }
+  res.warnings = [...new Set(res.warnings)];
+  return res;
+}
+
+/** Place the planned signals (edges split by earlier ones are followed). */
+function applyAutoSignals(g: Game, plan: AutoSignalResult, owner: number): AutoSignalResult {
+  const net = g.world.net;
+  if (!g.company(owner).economy.canAfford(plan.cost)) return { ...plan, warnings: [...plan.warnings, 'Not enough money'], placed: 0, changed: 0 };
+  const remap = new Map<number, { e1: number; e2: number; s: number }>();
+  const onSplit = (old: NEdge, e1: NEdge, e2: NEdge, s: number) => { remap.set(old.id, { e1: e1.id, e2: e2.id, s }); };
+  net.onSplit.push(onSplit);
+  let placed = 0, changed = 0;
+  const warnings = [...plan.warnings];
+  try {
+    for (const q of plan.signals) {
+      if (q.action === 'keep') continue;
+      let id = q.edge, s = q.s;
+      if (q.node >= 0) {
+        // at a node: the edge there that the signal was planned on (or its piece)
+        const n = net.nodes.get(q.node);
+        const e0 = n?.edges.map((x) => net.edges.get(x)!).find((e) => e.id === q.edge || (remap.has(q.edge) && (e.id === remap.get(q.edge)!.e1 || e.id === remap.get(q.edge)!.e2)));
+        if (!n || !e0) { warnings.push('A planned signal spot changed'); continue; }
+        id = e0.id; s = e0.a === q.node ? 0 : e0.len;
+      } else for (let guard = 0; guard < 64; guard++) { const r = remap.get(id); if (!r) break; if (s < r.s) id = r.e1; else { id = r.e2; s -= r.s; } }
+      const err = setSignal(g, id, s, 'oneway', q.forward, owner, { signalKind: q.kind, pass: q.pass });
+      if (err) { warnings.push(err); continue; }
+      if (q.action === 'add') placed++; else changed++;
+    }
+  } finally {
+    net.onSplit = net.onSplit.filter((f) => f !== onSplit);
+  }
+  return { ...plan, placed, changed, warnings: [...new Set(warnings)] };
+}
+
+/**
+ * Signal a line (its id) or a set of track (edge ids) by the rules above. With `preview` nothing changes: the
+ * result lists every signal the rules want (added, changed or kept) and what the new ones cost.
+ */
+export function autoSignalLine(g: Game, line: number | number[], owner: number, opts: AutoSignalOpts = {}): AutoSignalResult {
+  const E = Array.isArray(line) ? new Set(line) : lineTrack(g, line);
+  const plan = planAutoSignals(g, E, owner, Math.max(10, opts.spacing ?? SIGNAL_SPACING));
+  return opts.preview ? plan : applyAutoSignals(g, plan, owner);
+}
+
+/** Signal all of a company's railway (its track, stations and depots) by the same rules. */
+export function autoSignalNetwork(g: Game, owner: number, opts: AutoSignalOpts = {}): AutoSignalResult {
+  const E = new Set<number>();
+  for (const e of g.world.net.edges.values()) if (e.kind === 'rail' && e.owner === owner) E.add(e.id);
+  const plan = planAutoSignals(g, E, owner, Math.max(10, opts.spacing ?? SIGNAL_SPACING));
+  return opts.preview ? plan : applyAutoSignals(g, plan, owner);
 }

@@ -189,6 +189,9 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
   if (n && n.signal) {
     if (n.owner !== owner) return 'Not your track';
     n.signal = (n.signal + 1) % 4;
+    // cycled by hand: a plain signal (not passable from behind); removed: no kind left behind
+    delete n.signalPass;
+    if (!n.signal) delete n.signalKind;
     net.version++;
     g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2);
     g.onNetworkChanged();

@@ -16,6 +16,10 @@ export interface NNode {
   /** rail signal: 0 none, 1 two-way, 2 one-way (+dir), 3 one-way (-dir) */
   signal: number;
   owner: number;
+  /** signal kind: 'path' (default; guards junctions, station entries / exits) or 'block' (spaces trains on open line) */
+  signalKind?: 'block' | 'path';
+  /** one-way signal that trains in the other direction pass freely (instead of one-way track) */
+  signalPass?: boolean;
 }
 
 export interface Section { s0: number; s1: number; type: 'bridge' | 'tunnel' }
@@ -450,8 +454,9 @@ export class Network {
     const s = node.signal;
     if (!s) return 0;
     if (s === 1) return 1;
-    if (s === 2) return side > 0 ? 1 : -1;
-    return side < 0 ? 1 : -1;
+    const back = node.signalPass ? 0 : -1;
+    if (s === 2) return side > 0 ? 1 : back;
+    return side < 0 ? 1 : back;
   }
 
   clearCaches() { this.geoCache.clear(); this.laneCache.clear(); }

@@ -50,10 +50,16 @@ const T0 = performance.now();
   const gaps = sig.slice(1).map((n, i) => n.x - sig[i].x);
   check(gaps.every((d) => Math.abs(d - 50) < 0.6), `spacing 50 (${gaps.map((d) => fmt(d)).join(',')})`);
   check(sig.every((n) => n.signal === 2 || n.signal === 3), 'all one-way');
+  check(sig.every((n) => !n.signalKind && !n.signalPass), 'path signals by default');
   // trains may run eastwards only
   const west = [...net.edges.values()].sort((a, b) => Math.min(net.nodes.get(a.a)!.x, net.nodes.get(a.b)!.x) - Math.min(net.nodes.get(b.a)!.x, net.nodes.get(b.b)!.x));
   const eastDir = (ed: typeof e) => (net.nodes.get(ed.b)!.x > net.nodes.get(ed.a)!.x ? 1 : -1);
   check(reach(g, west[0], eastDir(west[0])).size === west.length && reach(g, west[west.length - 1], -eastDir(west[west.length - 1])).size === 1, 'one-way eastwards along the whole line');
+  const kinds = () => [...net.nodes.values()].filter((n) => n.signal).map((n) => n.signalKind ?? 'path');
+  const rb = autoSignals(g, west[0].id, eastDir(west[0]), 50, 0, Infinity, { signalKind: 'block' });
+  check(rb.placed === 4 && rb.cost === 0 && kinds().length === 4 && kinds().every((k) => k === 'block'), `turned to block signals for free (${rb.placed}, ${rb.cost})`);
+  autoSignals(g, west[0].id, eastDir(west[0]), 50, 0);
+  check(kinds().length === 4 && kinds().every((k) => k === 'block'), 'running the tool again without a kind keeps the block signals');
   const c = clearSignalsAlong(g, west[0].id, eastDir(west[0]), 0);
   check(c.removed === 4 && ![...net.nodes.values()].some((n) => n.signal), 'cleared');
   const r2 = autoSignals(g, west[1].id, eastDir(west[1]), 30, 0, 70, { s0: 5, kind: 'twoway' });
