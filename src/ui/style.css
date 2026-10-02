@@ -869,3 +869,11 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (min-width: 721px) {
   .station-info, .purchase-info, .vehicle-info, .finances-info, .help-info { max-height: min(520px, calc(100vh - 240px)); }
 }
+
+/* Construction advice stays readable beside the crossing controls and in the cursor preview. */
+.tc-warnings { display: grid; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--hairline); }
+.tc-warning { display: flex; align-items: flex-start; gap: 6px; padding: 7px 8px; border: 1px solid rgba(255, 200, 87, 0.35); border-radius: 8px; background: rgba(255, 200, 87, 0.13); color: var(--warn); font-size: var(--fs-12); line-height: 1.4; overflow-wrap: anywhere; }
+.tc-warning > .ic, .tooltip .tt-row > .ic, .tooltip .pill > .ic { flex: none; margin-top: 1px; }
+.tc-warning > span, .tooltip .tt-row > span { min-width: 0; overflow-wrap: anywhere; }
+.tooltip .tt-row, .tooltip .pill { align-items: flex-start; }
+.tooltip .pill { max-width: 100%; border-radius: 8px; white-space: normal; overflow-wrap: anywhere; }

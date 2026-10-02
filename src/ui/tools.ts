@@ -3,7 +3,7 @@
 import * as THREE from 'three';
 import type { UI } from './ui';
 import { PLAYER } from '../game/game';
-import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions, curveSpeed } from '../game/construction';
+import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions, curveSpeed, levelCrossingAllowed } from '../game/construction';
 import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable, electrify } from '../game/build-ops';
 import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING, SIGNAL_COST } from '../game/signals';
 import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan, planStationOnTrack, commitStationOnTrack, OnTrackPlan, planConnection, commitConnection, ConnectionPlan, planRelevel, commitRelevel, RelevelPlan } from '../game/trackops';
@@ -13,7 +13,7 @@ import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
 import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, CATCHMENT_RADIUS, ENTRANCE_SIZE, relocateStation, ThroughMode, railModeOf, catchModeOf } from '../game/stations';
 import { fmtMoney } from '../game/economy';
-import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL } from '../game/constants';
+import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
 import { CROSS_LABEL, MarkerKind } from '../render/overlay';
 import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
@@ -239,6 +239,12 @@ export class Tools {
   /** a station tool (main line or urban) */
   get stationTool() { return this.tool === 'station' || this.tool === 'metro-station'; }
   get building() { return this.railBuild || this.tool === 'road' || (this.tool === 'tram' && this.tramMode === 'build'); }
+
+  /** Construction advice shared by the preview and the options card; never changes build eligibility. */
+  get constructionWarnings(): string[] {
+    const p = this.parallel?.prop ?? this.proposal;
+    return this.building && p ? this.planWarnings(p) : [];
+  }
 
   buildOptions(): BuildOptions {
     const rail = this.railBuild;
@@ -1025,6 +1031,8 @@ export class Tools {
       ['parallel', `${pl.side > 0 ? 'Right' : 'Left'} side${this.dbl.flipped ? ' (the other side is blocked)' : ''}`],
       ['rail', `Ends: ${endText(pl.start)} · ${endText(pl.end)}`],
     ];
+    const walls = this.retainingWallRow(pl.proposals);
+    if (walls) rows.push(walls);
     if (this.directional) rows.push(['signal', `Directional: ${this.rightHand ? 'right' : 'left'}-hand running, block signals, crossovers before stations`]);
     this.tip({ title: 'Double track', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : pl.errors.slice(0, 3), warn: pl.warnings, hint: pl.ok ? (d?.moved ? 'Release to build' : 'Click to build · drag along the line for more') : 'Try the other side or a shorter stretch' }, pl.ok ? 'ok' : 'err');
   }
@@ -1173,10 +1181,13 @@ export class Tools {
     if (pl.ok) {
       rows.push(['length', `<b>${fmtLen(pl.length)}</b> connecting curve`]);
       const R = pl.minRadius;
-      rows.push(['radius', isFinite(R) && R < 5000 ? `radius <b>${Math.round(R * 10).toLocaleString('en-US')} m</b> · ${Math.round(Math.min((TRACK_TYPES[pl.proposal?.opts.type ?? 'standard'] ?? TRACK_TYPES.standard).speed, curveSpeed(R)))} km/h` : 'straight']);
+      const type = pl.proposal?.opts.type ?? g.world.net.edges.get(ea)?.type ?? 'standard';
+      rows.push(['radius', isFinite(R) && R < 5000 ? `radius <b>${Math.round(R * 10).toLocaleString('en-US')} m</b> · ${Math.round(Math.min((TRACK_TYPES[type] ?? TRACK_TYPES.standard).speed, curveSpeed(R, type)))} km/h` : 'straight']);
       rows.push(['rail', '2 turnouts · path signals where the line is signalled']);
       if (pl.proposal?.stats.bridges || pl.proposal?.stats.tunnels) rows.push(['bridge', `<span class="tt-hot">${pl.proposal.stats.bridges ? plural(pl.proposal.stats.bridges, 'bridge') : ''}${pl.proposal.stats.bridges && pl.proposal.stats.tunnels ? ' · ' : ''}${pl.proposal.stats.tunnels ? plural(pl.proposal.stats.tunnels, 'tunnel') : ''}</span>`]);
     }
+    const walls = pl.proposal ? this.retainingWallRow([pl.proposal]) : null;
+    if (walls) rows.push(walls);
     const warn = [...pl.warnings];
     if (pl.ok && pl.proposal?.demolish.length) warn.unshift(`Demolishes ${plural(pl.proposal.demolish.length, 'building')}`);
     this.tip({ title: 'Connect tracks', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot connect here'], warn, hint: pl.ok ? 'Click to build · Esc picks again' : 'Try another point, or click to search nearby' }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
@@ -1598,12 +1609,53 @@ export class Tools {
     this.tip(this.proposalTip(p, N), p.ok && g.economy.canAfford(p.cost) ? 'ok' : 'err');
   }
 
+  private planWarnings(p: Proposal): string[] {
+    const warnings: string[] = [];
+    const bridgeEnd = p.tracks.some((tp) => [tp.start, tp.end].some((sn, i) => {
+      const s = i === 0 ? 0 : tp.len;
+      return sn.kind === 'free' && tp.sections.some((q) => q.type === 'bridge' && q.s0 <= s + 0.05 && q.s1 >= s - 0.05);
+    }));
+    if (bridgeEnd) warnings.push(`End stands on a bridge — ${p.opts.kind === 'rail' ? 'trains' : 'vehicles'} can't continue. Extend to the ground.`);
+    if (p.opts.kind === 'road' && (!p.opts.level || p.opts.level === 'ground') && (p.opts.crossing === 'auto' || p.opts.crossing === 'level')) {
+      const net = this.game.world.net, types = new Set<string>();
+      for (const c of p.crossings) {
+        const e = net.edges.get(c.edge);
+        if (e?.kind === 'rail' && net.sectionAt(e, c.sOld) === 'ground' && !levelCrossingAllowed(e.type)) types.add(e.type);
+      }
+      for (const type of types) {
+        const name = (TRACK_TYPES[type] ?? TRACK_TYPES.standard).name.replace(/ \(electrified\)$/, '');
+        warnings.push(`${name} doesn't allow level crossings. Choose Overpass or Underpass crossing mode.`);
+      }
+    }
+    return warnings;
+  }
+
+  /** Walls are in the planner's "other" bill: remove its non-wall charges to retain the actual height-based cost. */
+  private retainingWallCost(p: Proposal): number | undefined {
+    if (p.stats.walls === undefined || !p.stats.costSplit) return undefined;
+    let other = p.trees * 250;
+    for (const id of p.demolish) { const b = this.game.world.buildings.get(id); if (b) other += 6000 + b.pop * 2500; }
+    for (const c of p.crossings) if (c.mode === 'level' || c.mode === 'diamond') other += 15000;
+    if (p.opts.tram && p.opts.kind === 'road') for (const tp of p.tracks) other += TRAM.costPerUnit * tp.len;
+    return Math.max(0, Math.round(p.stats.costSplit.other - other));
+  }
+
+  private retainingWallRow(proposals: Proposal[]): [string, string] | null {
+    const walls = proposals.filter((p) => p.stats.walls !== undefined);
+    if (!walls.length) return null;
+    const length = walls.reduce((sum, p) => sum + p.stats.walls!, 0);
+    const costs = walls.map((p) => this.retainingWallCost(p));
+    const cost = costs.every((c) => c !== undefined) ? fmtMoney(costs.reduce<number>((sum, c) => sum + c!, 0)) : 'included in total';
+    return ['terraform', `<span class="tt-hot">Retaining walls: <b>${fmtLen(length)}</b>, cost ${cost}</span>`];
+  }
+
   /** Tooltip card of a planned track / road. */
   private proposalTip(p: Proposal, N: number, title?: string): Tip {
     const st = p.stats;
     const rows: [string, string][] = [];
     rows.push(['length', `<b>${fmtLen(st.len / N)}</b>${N > 1 ? ` × ${N} tracks` : ''}`]);
-    rows.push(['speed', `<b>${Math.round(st.speed)}</b> km/h`]);
+    const speed = p.opts.kind === 'rail' ? Math.min((TRACK_TYPES[p.opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(st.minRadius, p.opts.type)) : st.speed;
+    rows.push(['speed', `<b>${Math.round(speed)}</b> km/h`]);
     if (p.opts.kind === 'rail') rows.push([p.opts.level === 'elevated' ? 'bridge' : p.opts.level === 'underground' ? 'tunnel' : 'rail', typeLevelText(p.opts)]);
     rows.push(['grade', `grade <b>${(st.maxGrade * 100).toFixed(1)}%</b>`]);
     rows.push(['radius', isFinite(st.minRadius) && st.minRadius < 5000 ? `radius <b>${Math.round(st.minRadius * 10).toLocaleString('en-US')} m</b>` : 'straight']);
@@ -1615,11 +1667,14 @@ export class Tools {
       if (bl > 0) rows.push(['bridge', `<span class="tt-hot">${plural(st.bridges, 'bridge')} · ${fmtLen(bl)}${cs?.bridges ? ` · ${fmtMoney(cs.bridges)}` : ''}</span>`]);
       if (tl > 0) rows.push(['tunnel', `<span class="tt-hot">${plural(st.tunnels, 'tunnel')} · ${fmtLen(tl)}${cs?.tunnels ? ` · ${fmtMoney(cs.tunnels)}` : ''}</span>`]);
     }
+    const walls = this.retainingWallRow([p]);
+    if (walls) rows.push(walls);
     if (st.costSplit) {
       const cs = st.costSplit, parts: string[] = [];
       if (cs.track) parts.push(`track ${fmtMoney(cs.track)}`);
       if (cs.earthworks) parts.push(`earthworks ${fmtMoney(cs.earthworks)}`);
-      if (cs.other) parts.push(`other ${fmtMoney(cs.other)}`);
+      const other = cs.other - (this.retainingWallCost(p) ?? 0);
+      if (other > 0) parts.push(`other ${fmtMoney(other)}`);
       if (parts.length > 1 || cs.bridges || cs.tunnels) rows.push(['coin', parts.join(' · ')]);
     }
     if (p.crossings.length) {
@@ -1630,7 +1685,7 @@ export class Tools {
     if (this.heightOffset && this.hoverSnap?.kind === 'free' && !title) rows.push(['height', `end ${fmtHeight(this.heightOffset)}`]);
     if (st.sharedSaving && st.sharedSaving > 0) rows.push(['coin', `<b>${fmtMoney(st.sharedSaving)}</b> saved: ${N > 1 ? 'the tracks share one formation' : 'it shares the formation of the track beside it'}`]);
     for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (upkeep shared ${fmtMult(this.game.accessMultiplier(fo))})`]); break; } }
-    const warn = [...p.warnings];
+    const warn = [...this.planWarnings(p), ...p.warnings.filter((w) => w !== 'The free end stands on a bridge: continue it to the ground')];
     if (p.demolish.length) warn.unshift(`Demolishes ${plural(p.demolish.length, 'building')}`);
     const who = accessOwnerOf(this.game, p.errors[0]);
     if (who !== null) return { title: `${esc(this.game.company(who).name)}'s network`, cost: p.cost, rows, warn, err: [`${p.errors[0]}`], hint: accessState(this.game, who).kind === 'none' ? 'Click to request track access' : undefined };

@@ -489,7 +489,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Station tools: a new platform track type (urban: platform length and level follow the type's defaults). */
@@ -565,7 +565,12 @@ export class Hud {
       }
       opts.push(opt('End', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: raised ends make bridges, lowered ends cuttings and tunnels ( [ / ] or PgUp / PgDn )')));
       // elevated / underground lines cross everything over / under by themselves
-      if (!T.railBuild || T.railLevel === 'ground') opts.push(opt('Cross', seg([['auto', 'Auto'], ['over', 'Over'], ['under', 'Under'], ['level', 'Level']], T.crossing, (v) => { T.crossing = v; redo(); })));
+      if (!T.railBuild || T.railLevel === 'ground') opts.push(opt('Cross', seg([
+        ['auto', 'Auto', 'Choose a permitted crossing for the terrain and track type'],
+        ['over', 'Overpass', 'Build above the line being crossed'],
+        ['under', 'Underpass', 'Build below the line being crossed'],
+        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and reserved light rail need an overpass or underpass'],
+      ], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'electrify') {
       opts.push(h('div', { class: 'tc-spec' }, icon('bolt', 14), h('span', null, 'Overhead wire ', h('b', null, `${fmtMoney(ELECTRIFY.costPerUnit * 100)}/km`), ' · standard → electrified track (160 km/h)')));
@@ -632,12 +637,14 @@ export class Hud {
     const help = this.helpOpen
       ? h('div', { class: 'tc-help' }, h('p', null, TOOL_INFO[t].hint), keys.length ? h('div', { class: 'tc-keys' }, keys.map(([ks, what]) => h('span', null, ks.map((k) => kbd(k)), what))) : null)
       : h('div', { class: 'tc-desc', title: TOOL_INFO[t].hint }, TOOL_SHORT[t] ?? TOOL_INFO[t].hint);
+    const warnings = T.constructionWarnings;
     add(card,
       h('div', { class: 'tc-head' }, h('span', { class: 'tc-dot' }), h('span', { class: 'tc-title' }, TOOL_INFO[t].name),
         h('button', { class: 'ibtn sm' + (this.helpOpen ? ' on' : ''), 'data-tip': this.helpOpen ? 'Hide help' : 'Help & keys', 'aria-label': 'Help', 'aria-expanded': this.helpOpen ? 'true' : 'false', onclick: () => { this.helpOpen = !this.helpOpen; this.renderCard(); } }, icon('help', 16)),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close tool', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close tool', onclick: () => T.setTool('inspect') }, icon('close', 16))),
       help,
       opts.length ? h('div', { class: 'tc-opts' }, opts) : null,
+      warnings.length ? h('div', { class: 'tc-warnings', role: 'status', 'aria-live': 'polite' }, warnings.map((w) => h('div', { class: 'tc-warning' }, icon('warning', 14), h('span', null, w)))) : null,
     );
     this.placeCard();
   }
