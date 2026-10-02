@@ -682,8 +682,14 @@ export class Train extends Vehicle {
     if (!fwd && !rev) {
       this.state = 'noroute';
       // a way there for other trains, not for this one: say why
-      const any = last && (rule.types || rule.wire) ? findRailRoute(g, frontier(g, last, this.owner), target.id, this.owner, this.id, 20000) : null;
-      this.status = any ? `No compatible route to ${target.name} (${rule.wire ? 'needs electrified ' : ''}${rule.types ? [...rule.types].join('/') : ''} track)` : 'No route to ' + target.name;
+      let any = last && (rule.types || rule.wire) ? findRailRoute(g, frontier(g, last, this.owner), target.id, this.owner, this.id, 20000) : null;
+      if (!any && canTurn && (rule.types || rule.wire)) {
+        const ts = this.segs[this.tailInfo().seg];
+        if (ts.e >= 0 && g.world.net.edges.has(ts.e)) {
+          any = findRailRoute(g, frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, null, turnAtPlatform(ts)), target.id, this.owner, this.id, 20000);
+        }
+      }
+      this.status = any ? `No compatible route to ${target.name} (${rule.wire ? 'needs electrified track' : `needs ${[...rule.types!].join('/')} track`})` : 'No route to ' + target.name;
       if (++this.failCount >= 3 && this.line && this.line.stops.length > 1) { this.advanceStop(); this.failCount = 0; }
       return false;
     }
@@ -855,6 +861,8 @@ export class Train extends Vehicle {
     const fBrake = Math.max(0, mEff * brakeRate(this.speed) * 10 - fRes - fGrade);
     const F = Math.min(fMax, Math.max(need, -fBrake));
     let v1 = v0 + ((F - fRes - fGrade) / mEff) * dt;
+    // A train too weak for the gradient creeps on, within the speed its reserved path allows.
+    if (this.power > 0 && vT > v0 && v0 < 3 && v1 < v0 + 0.04 * dt) v1 = Math.min(vT, v0 + 0.04 * dt);
     if (vT >= v0 && v1 > vT) v1 = vT;
     this.speed = Math.max(0, v1) / 10;
     if (this.speed > vt && this.speed - vt < 0.002) this.speed = vt;

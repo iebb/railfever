@@ -105,18 +105,18 @@ function loop(now: number) {
   const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
   last = now;
   if (game) {
+    const t0 = performance.now();
+    try { game.update(dt); } catch (e) { console.error(e); }
+    renderer.simMs = performance.now() - t0;
     try {
-      const t0 = performance.now();
-      game.update(dt);
-      renderer.simMs = performance.now() - t0;
       if (ui.titleOpen) {
         // slow cinematic orbit behind the title screen
         const c = renderer.controls as unknown as { yaw?: number };
         if (typeof c.yaw === 'number') c.yaw += dt * 0.03;
       }
       renderer.frame(dt);
-      ui.update(dt);
     } catch (e) { console.error(e); }
+    try { ui.update(dt); } catch (e) { console.error(e); }
     try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
     if (ui.titleOpen) { if (!played) autosaveTimer = 0; } else played = true;
     if (!game.paused) autosaveTimer += dt;

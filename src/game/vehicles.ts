@@ -30,6 +30,7 @@ export class Vehicles {
   private nodeOcc = new Map<number, Occ>();
   private nodeUsed: Occ[] = [];
   private rng = new RNG(4242);
+  private failedUpdates = new WeakSet<Vehicle>();
   ambientEnabled = true;
   private ambientTimer = 0;
 
@@ -270,17 +271,36 @@ export class Vehicles {
   }
 
   // ---------------------------------------------------------------- update
+  private updateVehicle(v: Vehicle, dt: number) {
+    if (v.state === 'stopped' && this.failedUpdates.has(v)) return;
+    try { v.update(dt); }
+    catch (e) {
+      if (!this.failedUpdates.has(v)) {
+        this.failedUpdates.add(v);
+        console.error(`Vehicle ${v.id} (${v.name || 'ambient traffic'}) update failed`, e);
+      }
+      // An interrupted reservation may not have reached the train's path yet. Release every key it owns.
+      for (const [r, id] of this.res) if (id === v.id) this.res.delete(r);
+      if (v instanceof Train) {
+        v.segs = []; v.pending = []; v.headSeg = 0; v.headPos = 0; v.speed = 0;
+        v.atStation = -1; v.routeTarget = -1; v.blockedBy = 0; v.waitTime = 0; v.stuckTime = 0;
+      } else if (v instanceof RoadVehicle) v.returnToDepot('Stopped in depot after an update error');
+      v.state = 'stopped';
+      v.status = 'Stopped in depot after an update error';
+    }
+  }
+
   update(dt: number) {
     if (this.replanQueue.length) this.replanSome(6);
     this.rebuildOcc();
     this.updateCrossings();
-    for (const v of this.map.values()) v.update(dt);
+    for (const v of this.map.values()) this.updateVehicle(v, dt);
     if (this.ambientEnabled) {
       const amb = this.ambient;
       let n = 0;
       for (let i = 0; i < amb.length; i++) {
         const a = amb[i];
-        a.update(dt);
+        this.updateVehicle(a, dt);
         if (a.state !== 'stopped' && a.seg) amb[n++] = a;
       }
       amb.length = n;

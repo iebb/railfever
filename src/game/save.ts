@@ -111,7 +111,7 @@ function trainOf(t: Train) {
     segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
     pending: t.pending.map((s) => [s.e, s.dir]), speed: t.speed, waitTime: t.waitTime, retryTimer: t.retryTimer,
     loadTimer: t.loadTimer, routeTarget: t.routeTarget, atStation: t.atStation, reversed: t.reversed, blockedBy: t.blockedBy,
-    failCount: t.failCount,
+    failCount: t.failCount, stuckTime: t.stuckTime, grade: t.grade,
   };
 }
 
@@ -315,6 +315,7 @@ export function deserialize(d: any): Game {
       t.speed = vd.speed; t.waitTime = vd.waitTime ?? 0; t.retryTimer = vd.retryTimer ?? 0; t.loadTimer = vd.loadTimer ?? 0;
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;
+      t.stuckTime = vd.stuckTime ?? 0; t.grade = vd.grade ?? 0;
       const segs: TSeg[] = [];
       let ok = true;
       for (const x of vd.segs as number[][]) { const s = tseg(x, t); if (!s) { ok = false; break; } segs.push(s); }
@@ -352,6 +353,11 @@ export function deserialize(d: any): Game {
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
   try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
+  // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
+  for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
+    const restored = g.stations.get(s.id)?.waiting.get(wg.line + ':' + wg.alight + ':' + wg.dest);
+    if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
+  }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
   g.lines.catchmentDirty = !!d.catchmentDirty;
   // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
