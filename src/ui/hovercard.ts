@@ -10,6 +10,7 @@ import type { Game } from '../game/game';
 import { fmtMoney } from '../game/economy';
 import type { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
+import { stationBadges, badgeHtml } from './lineid';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
 
@@ -34,6 +35,7 @@ export class HoverCard {
   private blocked = false;
   private avoidT = 0;
   private v = new THREE.Vector3();
+  private anchorPos = { x: 0, y: 0, z: 0 };
 
   constructor(private ui: UI) {
     this.el = document.createElement('div');
@@ -61,25 +63,30 @@ export class HoverCard {
   private anchor(t: HoverTarget): { x: number; y: number; z: number } | null {
     const g = this.ui.game;
     const w = g.world;
+    const p = this.anchorPos;
     if (t.kind === 'station') {
       const s = g.stations.get(t.id);
       if (!s) return null;
-      return s.rail ? { x: s.x, y: s.rail.y + 2.1, z: s.z } : { x: s.x, y: Math.max(w.heightAt(s.x, s.z), WATER_Y) + 2, z: s.z };
+      p.x = s.x; p.z = s.z; p.y = s.rail ? s.rail.y + 2.1 : Math.max(w.heightAt(s.x, s.z), WATER_Y) + 2;
+      return p;
     }
     if (t.kind === 'vehicle') {
       const v = g.vehicles.get(t.id);
       if (!v) return null;
-      const p = { x: 0, y: 0, z: 0 };
       if (!v.worldPos(p)) return null;
-      return { x: p.x, y: p.y + 0.9, z: p.z };
+      p.y += 0.9;
+      return p;
     }
     if (t.kind === 'depot') {
       const d = g.depots.get(t.id);
-      return d ? { x: d.x, y: d.y + 1.6, z: d.z } : null;
+      if (!d) return null;
+      p.x = d.x; p.y = d.y + 1.6; p.z = d.z;
+      return p;
     }
     const town = g.towns.list[t.id];
     if (!town) return null;
-    return { x: town.x, y: Math.max(w.heightAt(town.x, town.z), WATER_Y) + 6.5 + Math.min(5, town.pop / 2500), z: town.z };
+    p.x = town.x; p.z = town.z; p.y = Math.max(w.heightAt(town.x, town.z), WATER_Y) + 6.5 + Math.min(5, town.pop / 2500);
+    return p;
   }
 
   private content(t: HoverTarget): { html: string; color: string } | null {
@@ -90,10 +97,13 @@ export class HoverCard {
       const co = g.company(s.owner);
       const town = g.towns.list[s.townId];
       const lines = g.lines.linesAt(s.id).length;
+      let badges = '';
+      for (const b of stationBadges(g, s.id)) badges += badgeHtml(b, 'sm');
       return {
         color: co.color,
         html: `<div class="hc-title">${svg(s.rail ? 'station' : s.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}</div>` +
+          (badges ? `<div class="hc-badges" aria-label="Station numbers">${badges}</div>` : '') +
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}</div>` +
           `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access — no passengers</span>' : 'Click for details'}</div>`,
       };

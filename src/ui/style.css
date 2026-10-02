@@ -825,3 +825,47 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .lineflags { display: flex; flex-wrap: wrap; gap: 5px; margin: 0 0 var(--sp-2); }
 .list.stops .row > .snum { flex: 0 0 auto !important; }
 .list .row > .pdots { margin-left: 2px; }
+
+/* Station details: compact capacity, complex parts, merge choices and shared-stop bills. */
+.station-info .kv .v { flex-wrap: wrap; overflow-wrap: anywhere; }
+.station-info .kv .select { width: 100%; min-width: 0; }
+.station-info .station-lines .row { flex-wrap: wrap; }
+.station-info .station-lines .row > .snum { flex: none; }
+.station-info .station-lines .ltag { flex: 1; min-width: 100px; }
+.station-advice { font-size: var(--fs-12); line-height: 1.4; margin-top: 4px; }
+.merge-choice, .complex-part, .stopshare-company { padding: 7px 8px; border-radius: var(--r); overflow-wrap: anywhere; }
+.merge-choice:nth-child(odd), .complex-part:nth-child(odd) { background: var(--raised); }
+.merge-choice > .muted, .merge-choice > .neg, .complex-part > .muted { margin-top: 4px; font-size: var(--fs-12); line-height: 1.4; }
+.merge-choice .btns { margin-top: 6px; }
+.complex-part .snums { flex-wrap: wrap; }
+.station-restyle .field-c > .select { width: 100%; min-width: 0; }
+.station-restyle .section-r { max-width: 68%; white-space: normal; text-align: right; }
+.stopshare-company { padding-bottom: 8px; border-bottom: 1px solid var(--hairline); }
+.stopshare-company:last-child { border-bottom: 0; }
+.stopshare-company .kv { padding: 4px 0; border: 0; }
+.share-lines { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.share-lines .ltag { max-width: 100%; }
+
+/* Purchase summary keeps long shared-line and depot names inside the card. */
+.purchase-info .kv .k { flex: none; }
+.purchase-info .kv .v { flex: 1; max-width: 72%; flex-wrap: wrap; overflow-wrap: anywhere; }
+.purchase-info .kv .select { width: 100%; min-width: 0; }
+.purchase-info .consist .car.unit { border-left: 2px solid var(--surface-solid); border-right: 2px solid var(--surface-solid); }
+.purchase-info .model:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* Vehicle assignment controls wrap at the card's width, including service badges. */
+.vehicle-info .kv .v { flex: 1; max-width: 68%; flex-wrap: wrap; overflow-wrap: anywhere; }
+.vehicle-info .kv .select { width: 100%; min-width: 0; }
+.vehicle-service { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; }
+.vehicle-service .select { flex: 1; min-width: 0; width: 0; }
+
+/* Finance history keeps every category readable at 1024 × 768 and on bottom sheets. */
+.finance-table { max-width: 100%; overflow-x: auto; overscroll-behavior: contain; }
+.finances-info .tbl.fin td:first-child { min-width: 140px; white-space: normal; }
+.finance-note { font-size: var(--fs-12); line-height: 1.4; margin-top: 7px; }
+
+.hc-badges { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 5px 0 4px; }
+
+@media (min-width: 721px) {
+  .station-info, .purchase-info, .vehicle-info, .finances-info, .help-info { max-height: min(520px, calc(100vh - 240px)); }
+}

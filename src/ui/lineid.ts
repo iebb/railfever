@@ -6,7 +6,7 @@ import { PLAYER } from '../game/game';
 import type { Line } from '../game/lines';
 import type { Vehicle } from '../game/vehicle';
 import type { VehicleModel } from '../game/vehicle-types';
-import { h, icon } from './dom';
+import { h, icon, esc } from './dom';
 
 export type LineMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus' | 'coach';
 export const LINE_MODES: LineMode[] = ['rail', 'metro', 'lightrail', 'tram', 'bus', 'coach'];
@@ -98,11 +98,16 @@ export function badgeEl(b: Badge, size: '' | 'sm' | 'lg' = '', tip = true): HTML
   return h('span', { class: 'snum' + (size ? ' ' + size : ''), style: `--c:${b.color}`, 'data-tip': tip ? b.code : undefined, 'aria-label': b.code }, h('i', null, b.prefix), h('b', null, b.num));
 }
 
+/** Same badge for throttled HTML hover cards, without constructing throwaway DOM nodes. */
+export function badgeHtml(b: Badge, size: '' | 'sm' | 'lg' = ''): string {
+  return `<span class="snum${size ? ' ' + size : ''}" style="--c:${esc(b.color)}" aria-label="${esc(b.code)}"><i>${esc(b.prefix)}</i><b>${esc(b.num)}</b></span>`;
+}
+
 interface BadgeCache { ver: number; n: number; t: number; map: Map<number, Badge[]> }
 const badgeCaches = new WeakMap<Game, BadgeCache>();
 
 /**
- * Station numbering badges of every station (rail lines only, in line order), cached: rebuilt when the line
+ * Station numbering badges of every station (one per serving line, in line order), cached: rebuilt when the line
  * network changes, and every few seconds for colour changes. One map read per station afterwards.
  */
 export function allBadges(g: Game): Map<number, Badge[]> {
@@ -112,7 +117,7 @@ export function allBadges(g: Game): Map<number, Badge[]> {
   const map = new Map<number, Badge[]>();
   const L = g.lines as unknown as { stationCode?: (l: number, s: number) => string; routeCode?: (l: Line) => string };
   if (L.stationCode && L.routeCode) {
-    const lines = [...g.lines.map.values()].filter((l) => l.kind === 'rail' && l.stops.length >= 2).sort((a, b) => a.id - b.id);
+    const lines = [...g.lines.map.values()].filter((l) => l.stops.length > 0).sort((a, b) => a.id - b.id);
     for (const l of lines) {
       const route = L.routeCode.call(g.lines, l);
       for (const sid of new Set(l.stops)) {
@@ -121,7 +126,7 @@ export function allBadges(g: Game): Map<number, Badge[]> {
         const sp = splitCode(code, route);
         const arr = map.get(sid);
         const b: Badge = { code, prefix: sp.prefix, num: sp.num, color: l.color, line: l.id };
-        if (arr) { if (!arr.some((x) => x.code === code)) arr.push(b); } else map.set(sid, [b]);
+        if (arr) arr.push(b); else map.set(sid, [b]);
       }
     }
   }
@@ -131,7 +136,8 @@ export function allBadges(g: Game): Map<number, Badge[]> {
 }
 
 /** A station's numbering badges (empty when no numbered line stops there). */
-export function stationBadges(g: Game, stationId: number): Badge[] { return allBadges(g).get(stationId) ?? []; }
+const NO_BADGES: Badge[] = [];
+export function stationBadges(g: Game, stationId: number): Badge[] { return allBadges(g).get(stationId) ?? NO_BADGES; }
 
 /** The badge of one station on one line, if any. */
 export function badgeOn(g: Game, lineId: number, stationId: number): Badge | null {

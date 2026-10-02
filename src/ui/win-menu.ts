@@ -148,17 +148,17 @@ export function openSettings(ui: UI) {
 }
 
 export function openHelp(ui: UI) {
-  const win = ui.wm.open('help', 'How to play', { width: 520, icon: 'help', color: '#eef2f7' });
+  const win = ui.wm.open('help', 'How to play', { width: 520, icon: 'help', color: '#eef2f7', cls: 'help-info' });
   win.body.innerHTML = `
     <div class="help">
     <h4>Camera</h4>
-    <p><b>Right-drag</b> pan · <b>Middle-drag</b> or <kbd>Alt</kbd> + drag rotate &amp; tilt · <b>Wheel</b> zoom · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd> <kbd>E</kbd> rotate · <kbd>R</kbd> <kbd>F</kbd> tilt · <kbd>M</kbd> minimap. On touch: two fingers pan, pinch and rotate.</p>
+    <p><b>Right-drag</b> pan · <b>Middle-drag</b> or <kbd>Alt</kbd> + drag rotate &amp; tilt · <b>Wheel</b> zoom · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd> <kbd>E</kbd> rotate · <kbd>R</kbd> <kbd>F</kbd> tilt · <kbd>M</kbd> lines map. On touch: two fingers pan, pinch and rotate.</p>
     <h4>Building track and roads</h4>
     <ol>
       <li>Open <b>Rail</b> or <b>Road</b> in the dock (<kbd>2</kbd> / <kbd>6</kbd>). Click to set the start — on open ground, a track end, or onto a track to branch off.</li>
       <li>Move the mouse: the preview shows the curve, bridges (blue), tunnels (purple), crossings and buildings in the way (red). The card shows cost, length, grade, radius and speed.</li>
       <li>Click to build. Construction continues from the new end with a smooth curve; <b>right-click</b>, <kbd>Esc</kbd> or a long press ends it. You can also drag to build one section.</li>
-      <li>Options: standard or high-speed track, <b>1–4 parallel tracks</b>, road type, the <b>end height</b> (<kbd>[</kbd> <kbd>]</kbd>, ±5 m) for bridges and tunnels, and how to cross other lines. Hold <kbd>Shift</kbd> over a track to copy it as a parallel track.</li>
+      <li>Options: standard, electric or high-speed track (up to 400 km/h), <b>1–4 parallel tracks</b>, road type, the <b>end height</b> (<kbd>[</kbd> <kbd>]</kbd>, ±5 m) for bridges and tunnels, and how to cross other lines. Hold <kbd>Shift</kbd> over a track to copy it as a parallel track.</li>
     </ol>
     <h4>Getting started</h4>
     <ol>
@@ -168,12 +168,27 @@ export function openHelp(ui: UI) {
       <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
     </ol>
+    <h4>Urban rail &amp; network tools</h4>
+    <ul>
+      <li><b>Urban</b> (<kbd>U</kbd>) opens the metro and light-rail category. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban stations use the matching platform tracks and can have street entrances.</li>
+      <li><b>Connect tracks</b> (<kbd>J</kbd>, also Rail → Connect): click a point on the first track, then point at another track to preview a connecting curve, turnouts, signals and cost. Click to build; <kbd>Esc</kbd> or right-click lets you pick the first track again. Pick outside platform and depot tracks.</li>
+      <li><b>Re-level</b> (Urban → Re-level): choose <b>Lift</b>, <b>Sink</b> or <b>Ground</b>, set height or depth, then click a track or drag along your stretch. The preview shows the cost, ramps and stations that move with it. Lines and signals stay connected; bridges and tunnels cost much more than ground track.</li>
+      <li><b>Electrify</b> (Rail → Electrify): click standard track, or drag along a stretch, to add overhead wire, including platform tracks. The preview shows the cost. Electric locomotives and EMUs need wire and a compatible track type; electrifying standard track keeps its 160 km/h limit.</li>
+      <li>In the <b>train composer</b>, choose <b>Multiple units</b> to buy EMUs or light-rail units. Price and capacity are for a whole unit; the Units control couples complete sets. Check the track-type badges and compatibility warning before buying.</li>
+    </ul>
     <h4>Lines, demand and companies</h4>
     <ul>
-      <li>Lines are named automatically from their stops and get their own colour — click the name or the swatch in a line window to change either (empty name = automatic again).</li>
-      <li>The <b>Lines map</b> (<kbd>M</kbd>) shows every route in its colour; the <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (red = unserved, green = served) and how much of each town's travel your network can carry. <kbd>Esc</kbd> closes either.</li>
+      <li>Lines are named automatically from their stops and get their own colour and company/route symbol. Click the name or symbol in a line window to change the name or colour (empty name = automatic again). Station badges such as <b>AS01</b> identify a station on each line.</li>
+      <li>The <b>Lines map</b> (<kbd>M</kbd>) has <b>Lines / Stations</b> displays: coloured routes with line symbols, or station dots with numbering badges. Press <kbd>B</kbd> to switch (or open Stations when the map is closed). Filter by transport mode and company. The <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (red = unserved, green = served). <kbd>Esc</kbd> closes either.</li>
       <li>In <b>Companies</b> (<kbd>C</kbd>) you can add AI rivals (up to seven, each with a style: cautious, aggressive, rail baron, bus operator, tram builder…), change their settings, and buy them out — you take over their network, vehicles, cash and loan.</li>
       <li><b>Track access</b>: networks are <b>open</b> by default — any company may run on another's tracks and stations without asking (unless blocked) and pays its usage share of the upkeep (× the owner's multiplier: at 2× and 50/50 usage the user pays 2/3). In Track access (<kbd>K</kbd>) you can switch to Ask, Approve all or Reject all, block companies, and see who uses what.</li>
+      <li><b>Shared lines</b>: use a line’s Vehicles tab to invite partners or join an open line. Each company keeps its vehicles and fares; an operator must own a station on that line. Shared bus/tram stops show each company’s lines and estimated upkeep share in the station window.</li>
+    </ul>
+    <h4>Service patterns</h4>
+    <ul>
+      <li>Open a line’s <b>Services</b> tab to add <b>Local, Rapid, Express or Limited Express</b> patterns. Click each station’s dot to switch between stop and pass; a service skipping the end stations turns at its first and last stopping stations (<b>short-turn</b>).</li>
+      <li>Assign each vehicle a <b>Service pattern</b> in its window or the line’s Vehicles tab. Passengers board services that stop where they need to alight. Trains skipping a station use its through tracks where available, or pass more slowly on a platform track.</li>
+      <li>Routes contained within a longer route become service patterns of that line. Faster trips, shorter waits and direct journeys earn higher fares; compare each vehicle’s monthly energy, crew and maintenance with its income, and the operating-cost breakdown in Finances.</li>
     </ul>
     <h4>Tips</h4>
     <ul>
@@ -182,13 +197,14 @@ export function openHelp(ui: UI) {
       <li>Stations can have <b>through tracks</b> without platforms (Through: 1–2, in the middle between side platforms or outside the islands) so non-stopping trains pass. Station tool → Place: <b>On a line</b> cuts a station into one of your existing tracks — trains keep running through it and lines can add the stop. Open track ends of a station can be connected in its Build tab.</li>
       <li><b>Loop lines</b>: a line whose stops are three or more different stations circles round them one way (set Loop, Out and back or Auto in the line window); the lines map shows its direction.</li>
       <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
-      <li>Stations can be built on the <b>ground</b>, <b>elevated</b> (little land, viaduct cost) or <b>underground</b> (entrances only, much dearer). Ground stations need a road at their forecourt — the station tool builds a short access street. In a station's <b>Build</b> tab you can lengthen platforms, add tracks, change the level, add entrances, move it, and link or merge nearby stations for transfers.</li>
-      <li>Fares grow with the <b>distance</b> travelled (a little more for fast trips): intercity rail and long-distance buses earn well, very short hops earn little.</li>
+      <li>Stations can be <b>ground</b>, <b>elevated</b> or <b>underground</b>. Buildings are optional at every level; a building can widen the catchment. The station’s <b>Build</b> tab offers restyling, longer platforms, up to eight platform tracks, expansion side, entrances and relocation. Connected track changes level with the Re-level tool.</li>
+      <li>A station’s <b>Overview</b> shows platform occupancy and trains waiting, with an expansion recommendation and live cost. Nearby stations can be rebuilt as one station or joined into a walking-transfer complex; the merge panel explains which is possible and links to each complex part.</li>
+      <li>Fares grow with <b>distance</b> and the time saved against walking or driving, including the wait before boarding. Fast, frequent services and journeys without transfers earn more; high-speed trains also cost more energy and maintenance.</li>
       <li>Fast, frequent service raises station ratings — well-served towns grow faster.</li>
       <li>Double track runs one direction per track. Build single track and upgrade it later when traffic grows.</li>
       <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). With track access you can join their network with your own track and use their stations and stops.</li>
     </ul>
     <h4>Keys</h4>
-    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>G</kbd> grid · <kbd>Esc</kbd> cancel / close</p>
+    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>Esc</kbd> cancel / close</p>
     </div>`;
 }

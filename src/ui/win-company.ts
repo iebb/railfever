@@ -5,7 +5,7 @@ import type { Game } from '../game/game';
 import { h, clear, tile, section, icon, toggle, add, field, stepper, seg } from './dom';
 import { AI_NAMES, AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import { liveCompanies, aiCount, aiConfigOf, addAI, applyAIConfig, presetOf, MAX_AI, DEFAULT_AI } from './gameapi';
-import { fmtMoney, CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category } from '../game/economy';
+import { fmtMoney, CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category, OPERATING_COSTS, operatingCosts } from '../game/economy';
 import { fmtLen, fmtMult, fmtPct, equalUseShare } from './format';
 import { multSlider } from './win-access';
 import type { AccessPolicy } from '../game/game';
@@ -16,13 +16,20 @@ import { cashPitch } from '../audio/engine';
 const OPERATING = CATEGORIES.filter((k) => k !== 'acquisition');
 /** Rows hidden while they are zero in every column. */
 const OPTIONAL = new Set<Category>(['trackIncome', 'trackFees', 'acquisition']);
-const monthSum = (m: MonthRecord) => OPERATING.reduce((a, k) => a + m.v[k], 0);
+const valueOf = (v: Partial<Record<Category, number>>, k: Category) => typeof v[k] === 'number' && isFinite(v[k]!) ? v[k]! : 0;
+const recordSum = (v: Partial<Record<Category, number>>) => OPERATING.reduce((a, k) => a + valueOf(v, k), 0);
+const monthSum = (m: MonthRecord) => recordSum(m.v);
+const financeLabel = (k: Category) => k === 'running' ? 'Overheads / legacy running' : CATEGORY_LABEL[k];
+const COST_COLORS: Partial<Record<Category, string>> = {
+  energy: '#ffc857', crew: '#8fc3ff', vehicleMaint: '#c792ea', running: '#a4afbf',
+  maintenance: '#4ade80', trackWear: '#ff8c69', trackFees: '#2ec4b6',
+};
 
 function monthLabels(e: Economy, n: number) { return e.months.slice(-n).map((m) => MONTH_NAMES[m.month]); }
 
 export function openFinances(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('finances', 'Finances', { width: 580, icon: 'money', color: 'var(--pos)', sub: g.player.name });
+  const win = ui.wm.open('finances', 'Finances', { width: 580, icon: 'money', color: 'var(--pos)', sub: g.player.name, cls: 'finances-info' });
   const render = () => {
     const e = g.economy;
     ui.wm.setTabs(win, [['overview', 'Overview'], ['history', 'History']], render);
@@ -46,12 +53,16 @@ export function openFinances(ui: UI) {
       ];
       const ly = e.yearTotals[e.yearTotals.length - 1];
       if (ly) cols.push({ label: String(ly.year), v: ly.v });
-      const row = (cat: Category, cls = '') => h('tr', { class: cls }, h('td', null, CATEGORY_LABEL[cat]), cols.map((c) => h('td', { class: c.v[cat] < 0 ? 'neg' : c.v[cat] > 0 ? 'pos' : 'muted' }, c.v[cat] ? fmtMoney(c.v[cat]) : '–')));
+      const row = (cat: Category, cls = '') => h('tr', { class: cls }, h('td', null, financeLabel(cat)), cols.map((c) => {
+        const v = valueOf(c.v, cat);
+        return h('td', { class: v < 0 ? 'neg' : v > 0 ? 'pos' : 'muted' }, v ? fmtMoney(v) : '–');
+      }));
       const tbl = h('table', { class: 'tbl fin' }, h('tr', null, h('th', null, ''), cols.map((c) => h('th', null, c.label))));
-      for (const cat of OPERATING) if (!OPTIONAL.has(cat) || cols.some((c) => c.v[cat])) tbl.appendChild(row(cat));
-      tbl.appendChild(h('tr', { class: 'total' }, h('td', null, 'Profit'), cols.map((c) => { const s = OPERATING.reduce((a, k) => a + c.v[k], 0); return h('td', { class: s < 0 ? 'neg' : 'pos' }, fmtMoney(s)); })));
-      if (cols.some((c) => c.v.acquisition)) tbl.appendChild(row('acquisition', 'after'));
-      add(win.body, section('Income & expenses'), tbl);
+      for (const cat of OPERATING) if (!OPTIONAL.has(cat) || cols.some((c) => valueOf(c.v, cat))) tbl.appendChild(row(cat));
+      tbl.appendChild(h('tr', { class: 'total' }, h('td', null, 'Profit'), cols.map((c) => { const s = recordSum(c.v); return h('td', { class: s < 0 ? 'neg' : 'pos' }, fmtMoney(s)); })));
+      if (cols.some((c) => valueOf(c.v, 'acquisition'))) tbl.appendChild(row('acquisition', 'after'));
+      add(win.body, section('Income & expenses'), h('div', { class: 'finance-table' }, tbl),
+        h('div', { class: 'muted finance-note' }, 'Overheads are fixed vehicle costs. Older records keep their combined running costs in the same row; new bills separate energy, crew and vehicle maintenance.'));
     } else {
       const ms = e.months.slice(-24);
       add(win.body, section('Monthly profit & income', `${ms.length} months`));
@@ -59,21 +70,25 @@ export function openFinances(ui: UI) {
       else {
         add(win.body, chart([
           { values: ms.map(monthSum), color: '#4ade80', kind: 'bar', label: 'Profit' },
-          { values: ms.map((m) => m.v.income + m.v.trackIncome), color: '#8fc3ff', label: 'Income' },
-          { values: ms.map((m) => m.v.running + m.v.maintenance + m.v.trackFees), color: '#ffc857', label: 'Running & upkeep' },
+          { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
+          { values: ms.map((m) => operatingCosts(m.v)), color: '#ffc857', label: 'Operating costs' },
         ], { w: 548, h: 170, labels: monthLabels(e, 24) }),
-        h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'), h('span', { style: '--c:#ffc857' }, h('i'), 'Running, upkeep & fees')));
+        h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'), h('span', { style: '--c:#ffc857' }, h('i'), 'Vehicle costs, upkeep, wear & fees')),
+        section('Monthly operating cost breakdown'),
+        chart(OPERATING_COSTS.map((k) => ({ values: ms.map((m) => -valueOf(m.v, k)), color: COST_COLORS[k] ?? '#a4afbf', label: financeLabel(k) })), { w: 548, h: 170, labels: monthLabels(e, 24) }),
+        h('div', { class: 'legend' }, OPERATING_COSTS.map((k) => h('span', { style: `--c:${COST_COLORS[k] ?? '#a4afbf'}` }, h('i'), financeLabel(k)))),
+        h('div', { class: 'muted finance-note' }, 'Operating costs include energy, crew, vehicle maintenance, overheads, infrastructure upkeep, track wear and access fees. Purchases and construction stay in the finance table.'));
       }
       const years = e.yearTotals.slice(-8);
       if (years.length) {
         add(win.body, section('Yearly results'));
         const tbl = h('table', { class: 'tbl fin' }, h('tr', null, h('th', null, 'Year'), h('th', null, 'Income'), h('th', null, 'Costs'), h('th', null, 'Profit')));
         for (const y of [...years].reverse()) {
-          const p = OPERATING.reduce((a, k) => a + y.v[k], 0);
-          const inc = y.v.income + y.v.trackIncome;
+          const p = recordSum(y.v);
+          const inc = valueOf(y.v, 'income') + valueOf(y.v, 'trackIncome');
           tbl.appendChild(h('tr', null, h('td', null, String(y.year)), h('td', { class: 'pos' }, fmtMoney(inc)), h('td', { class: 'neg' }, fmtMoney(p - inc)), h('td', { class: p < 0 ? 'neg' : 'pos' }, fmtMoney(p))));
         }
-        add(win.body, tbl);
+        add(win.body, h('div', { class: 'finance-table' }, tbl));
       }
     }
   };
