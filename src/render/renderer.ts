@@ -269,6 +269,7 @@ export class Renderer {
     this.sunFar = new THREE.DirectionalLight(0xffffff, 0);
     this.sunFar.castShadow = true;
     this.sunFar.shadow.mapSize.set(2048, 2048);
+    this.sunFar.shadow.autoUpdate = false;
     this.sunFar.shadow.camera.matrixAutoUpdate = true;
     this.scene.add(this.sunFar, this.sunFar.target);
     this.hemi = new THREE.HemisphereLight(0xbdd7ff, 0x5a5440, 0.9);
@@ -312,6 +313,7 @@ export class Renderer {
     const [, maxH] = this.terrainRange();
     this.terrain.uniforms.uSnow.value = game.options.hilliness === 'mountainous' ? Math.max(this.landPercentile(0.985), maxH * 0.72) : 1e5;
     this.shadowKey.fill(NaN);
+    this.shadowKeyFar.fill(NaN);
   }
 
   // ------------------------------------------------------------------ resolution / settings
@@ -578,7 +580,6 @@ export class Renderer {
     if (lx.lengthSq() < 1e-8) lx.set(1, 0, 0);
     lx.normalize();
     this.ly.crossVectors(L, lx);
-    this.sunFar.position.copy(this.sun.position);
     if (!this.sunFar.castShadow) {
       shadowFadeUniforms.uCascade.value.set(1e5, 2e5);
       this.terrain.exactShadowCamera = null;
@@ -590,6 +591,7 @@ export class Renderer {
     this.terrain.exactShadowCamera = this.sun.shadow.camera;
     const a = this.fitShadow(this.sun, this.shadowKey, split, false);
     const b = this.fitShadow(this.sunFar, this.shadowKeyFar, maxD, true);
+    if (b) this.sunFar.shadow.needsUpdate = true;
     return a || b;
   }
 
@@ -624,7 +626,12 @@ export class Renderer {
     // depth: reach far towards the light for mountains and tall buildings casting into view
     const zc = Math.round((b[5] + 150) / 4) * 4, far = Math.ceil((zc - b[4] + 4) / 4) * 4;
     const k = key;
-    if (k[0] === S && k[1] === cx && k[2] === cy && k[3] === zc && k[4] === far && k[5] === L.x && k[6] === L.y && k[7] === L.z && k[8] === sh.mapSize.x) return false;
+    // The far map tolerates two texels of motion and ~0.1 degrees of sun drift. Compare against the
+    // last fitted view so small changes accumulate, and keep its light transform until it is refreshed.
+    const farCascade = light === this.sunFar;
+    const tolerance = farCascade ? texel * 2 : 0;
+    const sameSun = farCascade ? Math.hypot(k[5] - L.x, k[6] - L.y, k[7] - L.z) < 0.002 : k[5] === L.x && k[6] === L.y && k[7] === L.z;
+    if (k[0] === S && Math.abs(k[1] - cx) <= tolerance && Math.abs(k[2] - cy) <= tolerance && k[3] === zc && k[4] === far && sameSun && k[8] === sh.mapSize.x) return false;
     k[0] = S; k[1] = cx; k[2] = cy; k[3] = zc; k[4] = far; k[5] = L.x; k[6] = L.y; k[7] = L.z; k[8] = sh.mapSize.x;
     const sc = sh.camera;
     sc.left = -S; sc.right = S; sc.top = S; sc.bottom = -S;
@@ -678,8 +685,8 @@ export class Renderer {
     cam.far = fog.far * 1.05;
     cam.updateProjectionMatrix();
     cam.updateMatrixWorld();
-    const dirtyT = g.world.dirtyTerrain.size, dirtyO = g.world.dirtyObj.size;
-    this.terrain.update(cam, pointScale);
+    const dirtyO = g.world.dirtyObj.size;
+    const dirtyT = this.terrain.update(cam, pointScale);
     this.objects.update(6);
     this.updateLighting();
     this.mats.update(this.time, this.night);
@@ -696,6 +703,7 @@ export class Renderer {
     sm.needsUpdate = false;
     if (this.settings.shadows && this.sun.intensity > 0.01) {
       const moved = this.updateShadow(dist);
+      if (this.sunFar.castShadow && (dirtyT || dirtyO)) this.sunFar.shadow.needsUpdate = true;
       const camMoved = !this.lastCamM.equals(cam.matrixWorld);
       this.lastCamM.copy(cam.matrixWorld);
       this.shadowTimer -= dt;
@@ -710,10 +718,14 @@ export class Renderer {
       this.sun.shadow.intensity = this.shadowFade;
       this.sunFar.shadow.intensity = this.shadowFade;
       // static view: moving vehicles need fresh shadows, at 30 Hz once they are small on screen
-      const tick = !g.paused && (this.sun.shadow.camera.right < 40 || (this.shadowFrame & 1) === 0);
-      const want = moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0;
+      const outerShadow = this.sunFar.castShadow ? this.sunFar.shadow : this.sun.shadow;
+      const tick = !g.paused && (outerShadow.camera.right < 40 || (this.shadowFrame & 1) === 0);
+      const want = moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0 || (this.sunFar.castShadow && this.sunFar.shadow.needsUpdate);
       if (this.shadowFade < 0.01) { if (want) this.shadowStale = true; }
-      else if (want || this.shadowStale) { sm.needsUpdate = true; this.shadowTimer = 0.5; this.shadowStale = false; }
+      else if (want || this.shadowStale) {
+        if (this.shadowStale && this.sunFar.castShadow) this.sunFar.shadow.needsUpdate = true;
+        sm.needsUpdate = true; this.shadowTimer = 0.5; this.shadowStale = false;
+      }
     }
     // (castShadow stays constant: toggling it would switch every material's shader variant)
     this.sky.position.copy(cam.position);

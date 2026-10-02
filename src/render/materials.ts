@@ -146,8 +146,11 @@ vec3 rfPerturb(vec3 sx, vec3 sy, vec3 n, vec2 dh) {
   vec3 r1 = cross(sy, n);
   vec3 r2 = cross(n, sx);
   float det = dot(sx, r1);
-  vec3 m = abs(det) * n - sign(det) * (dh.x * r1 + dh.y * r2);
-  return dot(m, m) > 1e-24 ? normalize(m) : n;
+  if (abs(det) < 1e-12) return n;
+  vec3 gradient = sign(det) * (dh.x * r1 + dh.y * r2) / abs(det);
+  // bound the slope: high-contrast texels should never look like embossed geometry
+  gradient *= min(1.0, 0.12 / max(length(gradient), 1e-6));
+  return normalize(n - gradient);
 }
 ${NOISE_GLSL}`)
         .replace('#include <map_fragment>', `
@@ -185,14 +188,16 @@ if (rfCi < ${FACADE_CELL0}) rfRough = clamp(rfRough * (0.88 + 0.24 * (1.0 - rfHt
 {
   // fade the relief out where the texture is strongly minified (no sparkle in the distance)
   float rfFade = clamp(1.5 - 6.0 * max(length(rfGx), length(rfGy)), 0.0, 1.0);
-  vec2 rfDh = vec2(dFdx(rfHt), dFdy(rfHt)) * (rfBumpK * rfFade);
+  // height is in world units: a few millimetres, with still less relief in close-ups
+  float rfRelief = mix(0.0002, 0.0008, smoothstep(6.0, 30.0, length(vViewPosition)));
+  vec2 rfDh = vec2(dFdx(rfHt), dFdy(rfHt)) * (rfBumpK * rfRelief * rfFade);
   vec3 rfSx = dFdx(-vViewPosition), rfSy = dFdy(-vViewPosition);
   normal = rfPerturb(rfSx, rfSy, normal, rfDh);
 }`)
         .replace('#include <emissivemap_fragment>', `totalEmissiveRadiance = rfEm;
 if (rfCi == ${WC.LAMP}) totalEmissiveRadiance += diffuseColor.rgb * uNight * 2.6;`);
     };
-    this.world.customProgramCacheKey = () => 'rf-world';
+    this.world.customProgramCacheKey = () => 'rf-world-2';
     this.worldDepth = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
     this.worldDepth.onBeforeCompile = (sh) => {
       sh.vertexShader = sh.vertexShader

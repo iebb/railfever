@@ -28,9 +28,12 @@ const SHADOW_LINE = `directLight.color *= ( directLight.visible && receiveShadow
  */
 const CASCADED = `#if ( NUM_DIR_LIGHT_SHADOWS > 1 ) && ( UNROLLED_LOOP_INDEX == 0 )
 		float rfVd = length( vViewPosition );
-		float rfCk = smoothstep( uCascade.x, uCascade.y, rfVd );
+		vec3 rfNearCoord = vDirectionalShadowCoord[ 0 ].xyz / vDirectionalShadowCoord[ 0 ].w;
+		rfNearCoord.z += directionalLightShadow.shadowBias;
+		bool rfNearInside = all( greaterThanEqual( rfNearCoord, vec3( 0.0 ) ) ) && all( lessThanEqual( rfNearCoord, vec3( 1.0 ) ) );
+		float rfCk = rfNearInside ? smoothstep( uCascade.x, uCascade.y, rfVd ) : 1.0;
 		float rfS0 = rfCk < 1.0 ? getShadow( directionalShadowMap[ 0 ], directionalLightShadow.shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadow.shadowBias, directionalLightShadow.shadowRadius, vDirectionalShadowCoord[ 0 ] ) : 1.0;
-		float rfS1 = rfCk > 0.0 ? getShadow( directionalShadowMap[ 1 ], directionalLightShadows[ 1 ].shadowMapSize, directionalLightShadow.shadowIntensity, directionalLightShadows[ 1 ].shadowBias, directionalLightShadows[ 1 ].shadowRadius, vDirectionalShadowCoord[ 1 ] ) : 1.0;
+		float rfS1 = rfCk > 0.0 ? getShadow( directionalShadowMap[ 1 ], directionalLightShadows[ 1 ].shadowMapSize, directionalLightShadows[ 1 ].shadowIntensity, directionalLightShadows[ 1 ].shadowBias, directionalLightShadows[ 1 ].shadowRadius, vDirectionalShadowCoord[ 1 ] ) : 1.0;
 		directLight.color *= ( directLight.visible && receiveShadow ) ? mix( mix( rfS0, rfS1, rfCk ), 1.0, rfShadowFade( vDirectionalShadowCoord[ 1 ], rfVd ) ) : 1.0;
 		#else
 		directLight.color *= ( directLight.visible && receiveShadow ) ? mix( ${SHADOW_CALL}, 1.0, rfShadowFade( vDirectionalShadowCoord[ i ], length( vViewPosition ) ) ) : 1.0;
@@ -89,6 +92,6 @@ ${needsNoise && !sh.fragmentShader.includes('rf_fbm') ? NOISE_GLSL : ''}`)
   reflectedLight.directSpecular *= rfK;
 }`);
   };
-  mat.customProgramCacheKey = () => (prevKey ? prevKey() : '') + '|clouds3';
+  mat.customProgramCacheKey = () => (prevKey ? prevKey() : '') + '|clouds4';
   mat.needsUpdate = true;
 }

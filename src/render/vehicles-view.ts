@@ -179,7 +179,7 @@ class Batch {
   n = 0;
   /** per-instance accent colour (aPaint = 2), e.g. the operator's colour on trams */
   accentAttr: THREE.InstancedBufferAttribute | null = null;
-  constructor(public geo: THREE.BufferGeometry, public glassGeo: THREE.BufferGeometry | null, private mat: THREE.Material, private glassMat: THREE.Material, private parent: THREE.Group, public cap = 32, public tinted = false, private shadow = true, public accent = false) {
+  constructor(public geo: THREE.BufferGeometry, public glassGeo: THREE.BufferGeometry | null, private mat: THREE.Material, private glassMat: THREE.Material, private parent: THREE.Group, public cap = 32, public tinted = false, private shadow = true, public accent = false, private ownsGeo = false) {
     this.body = this.make(geo, mat, shadow);
     this.glass = glassGeo ? this.make(glassGeo, glassMat, false) : null;
     if (accent) this.setAccent(null);
@@ -258,6 +258,8 @@ class Batch {
   }
   dispose() {
     for (const o of [this.body, this.glass]) if (o) { this.parent.remove(o); o.dispose(); }
+    // Merged body/glass geometry belongs to this batch; cached models and bogies are shared.
+    if (this.ownsGeo) this.geo.dispose();
   }
 }
 
@@ -404,8 +406,9 @@ export class VehiclesView {
   private rb1 = { seg: null as RSeg | null, pos: 0 };
   private rb2 = { seg: null as RSeg | null, pos: 0 };
   private rb3 = { seg: null as RSeg | null, pos: 0 };
-  /** per lane segment: [start, end] lane positions of bridge / tunnel sections (profile, not the drape) */
-  private profileRanges = new WeakMap<RSeg, Float32Array>();
+  /** Stable lane / connector ids, invalidated by network edits and pruned when no longer used. */
+  private profileRanges = new Map<string, { ranges: Float32Array; used: number }>();
+  private profileVersion = -1;
   private layouts = new WeakMap<Train, { cars: VehicleModel[]; slots: CarSlot[] }>();
   private tick = 0;
   private rpose = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1 };
@@ -462,9 +465,10 @@ vRfGlass = step(2.5, aPaint);`);
     let p = this.batches.get(m);
     if (!p) {
       const tint = ambient || livery;
+      const hi = withGlass(m.body, m.glass), lo = withGlass(m.lo.body, m.lo.glass);
       p = {
-        hi: new Batch(withGlass(m.body, m.glass), null, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, tint, true, livery),
-        lo: new Batch(withGlass(m.lo.body, m.lo.glass), null, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, tint, !ambient, livery),
+        hi: new Batch(hi, null, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, tint, true, livery, hi !== m.body),
+        lo: new Batch(lo, null, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, tint, !ambient, livery, lo !== m.lo.body),
         ambient,
       };
       this.batches.set(m, p);
@@ -488,6 +492,10 @@ vRfGlass = step(2.5, aPaint);`);
 
   update(game: Game, dt: number, light: number, pointScale = 1200, camera?: THREE.Camera) {
     const night = this.mats.uniforms.uNight.value;
+    if (this.game !== game || this.profileVersion !== game.world.net.version) {
+      this.profileRanges.clear();
+      this.profileVersion = game.world.net.version;
+    }
     this.game = game;
     this.pxScale = pointScale;
     this.cull = !!camera;
@@ -514,6 +522,7 @@ vRfGlass = step(2.5, aPaint);`);
     if ((this.tick & 255) === 0) {
       for (const id of this.emitAcc.keys()) if (!game.vehicles.get(id)) this.emitAcc.delete(id);
       for (const id of this.lastSpeed.keys()) if (!game.vehicles.get(id)) this.lastSpeed.delete(id);
+      for (const [key, entry] of this.profileRanges) if (this.tick - entry.used >= 256) this.profileRanges.delete(key);
     }
   }
 
@@ -715,8 +724,9 @@ vRfGlass = step(2.5, aPaint);`);
 
   /** Lane-position ranges on the profile (structures; single points for crossings / structure ends). */
   private rangesOf(seg: RSeg): Float32Array {
-    let r = this.profileRanges.get(seg);
-    if (r) return r;
+    const key = seg.kind === 'lane' ? `lane:${seg.e}:${seg.dir}` : `conn:${seg.node}:${seg.from}:${seg.fromDir}:${seg.e}:${seg.dir}`;
+    const entry = this.profileRanges.get(key);
+    if (entry) { entry.used = this.tick; return entry.ranges; }
     const g = this.game!, net = g.world.net, out: number[] = [];
     if (seg.kind === 'lane') {
       const e = net.edges.get(seg.e);
@@ -741,8 +751,8 @@ vRfGlass = step(2.5, aPaint);`);
       const off = (eid: number, atStart: boolean) => { const e = net.edges.get(eid); return !!e && net.sectionAt(e, atStart ? 0.01 : e.len - 0.01) !== 'ground'; };
       if (off(seg.e, seg.dir > 0) || off(seg.from, seg.fromDir < 0)) out.push(-1e9, 1e9);
     }
-    r = new Float32Array(out);
-    this.profileRanges.set(seg, r);
+    const r = new Float32Array(out);
+    this.profileRanges.set(key, { ranges: r, used: this.tick });
     return r;
   }
 
@@ -838,5 +848,9 @@ vRfGlass = step(2.5, aPaint);`);
     this.bogies.b2.dispose(); this.bogies.b3.dispose();
     this.smoke.geo.dispose();
     this.lights.geo.dispose();
+    this.paintMat.dispose();
+    this.smoke.mat.dispose();
+    this.lights.mat.dispose();
+    this.profileRanges.clear();
   }
 }

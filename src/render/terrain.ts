@@ -5,6 +5,7 @@ import { WATER_Y } from '../game/constants';
 import { NOISE_GLSL } from './shaders';
 import { GeoBuilder } from './geo';
 import { detailTextures } from './terrain-tex';
+import { applyClouds } from './clouds';
 
 export interface TerrainUniforms {
   uGrid: { value: number };
@@ -294,7 +295,9 @@ export class TerrainView {
     const bg = new THREE.PlaneGeometry(s * 12, s * 12);
     bg.rotateX(-Math.PI / 2);
     bg.translate(s / 2, this.bottom, s / 2);
-    this.base = new THREE.Mesh(bg, new THREE.MeshStandardMaterial({ color: 0x5b6150, roughness: 1 }));
+    const baseMat = new THREE.MeshStandardMaterial({ color: 0x5b6150, roughness: 1 });
+    applyClouds(baseMat);
+    this.base = new THREE.Mesh(bg, baseMat);
     this.base.receiveShadow = true;
     this.group.add(this.base);
 
@@ -321,10 +324,12 @@ export class TerrainView {
   /**
    * Rebuild dirty chunks (consumes world.dirtyTerrain) within the time budget, refresh the
    * vegetation/earthwork attributes of chunks whose objects changed, and pick LODs for the camera.
+   * Returns whether terrain casters changed, including rebuilds queued by an earlier frame.
    */
   update(camera?: THREE.Camera, pxScale = 0) {
     const w = this.world;
     const t0 = performance.now();
+    let shadowChanged = false;
     if (w.dirtyTerrain.size) {
       // world chunks (TERRAIN_CHUNK) map onto the larger render chunks
       const wn = Math.ceil(w.size / TERRAIN_CHUNK), f = this.rc / TERRAIN_CHUNK;
@@ -337,6 +342,7 @@ export class TerrainView {
         this.geoDirty.delete(ci);
         if (ci < 0 || ci >= this.chunks.length) continue;
         this.buildChunk(ci);
+        shadowChanged = true;
         this.auxDirty.delete(ci);
         const cx = ci % this.nc, cz = Math.floor(ci / this.nc);
         this.fillHeights(cz * this.rc, Math.min(w.size, (cz + 1) * this.rc));
@@ -373,6 +379,7 @@ export class TerrainView {
       }
     }
     if (camera && pxScale > 0) this.updateLod(camera, pxScale);
+    return shadowChanged;
   }
 
   /** Per-chunk resolution from the projected size of a terrain cell. */
@@ -821,7 +828,9 @@ export class TerrainView {
     const g = gb.build();
     if (this.skirt) { this.skirt.geometry.dispose(); this.skirt.geometry = g; }
     else {
-      this.skirt = new THREE.Mesh(g, new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, side: THREE.DoubleSide }));
+      const skirtMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 1, side: THREE.DoubleSide });
+      applyClouds(skirtMat);
+      this.skirt = new THREE.Mesh(g, skirtMat);
       this.skirt.receiveShadow = true;
       this.group.add(this.skirt);
     }
@@ -851,6 +860,8 @@ export class TerrainView {
     this.heightTex.dispose();
     this.waterMat.dispose();
     this.material.dispose();
+    (this.base.material as THREE.Material).dispose();
+    if (this.skirt) (this.skirt.material as THREE.Material).dispose();
   }
 }
 
