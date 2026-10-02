@@ -67,6 +67,13 @@ function continuesAt(ctx: ChunkCtx, e: NEdge, nodeId: number, type: 'bridge' | '
   return false;
 }
 
+/** Dead end of an underground station platform: the track ends inside the station box, no portal. */
+function buriedEnd(ctx: ChunkCtx, e: NEdge, nodeId: number): boolean {
+  if (ctx.stationEdges?.get(e.id) !== 'underground') return false;
+  const node = ctx.game.world.net.nodes.get(nodeId);
+  return !node || node.edges.length <= 1;
+}
+
 /** Lowest terrain under a footprint centred at p (half extents across/along the edge). */
 function groundUnder(ctx: ChunkCtx, p: Smp, ha: number, hl: number, off = 0): number {
   const w = ctx.game.world;
@@ -528,10 +535,10 @@ function nearTunnel(f: NEdge, s: number): boolean {
 export function buildPortals(ctx: ChunkCtx, e: NEdge) {
   const net = ctx.game.world.net;
   for (const sec of e.sections) {
-    if (sec.type !== 'tunnel') continue;
+    if (sec.type !== 'tunnel' || sec.s1 - sec.s0 < 0.05) continue;
     for (const [s, out] of [[sec.s0, -1], [sec.s1, 1]] as [number, number][]) {
       const atEnd = out < 0 ? s <= 0.05 : s >= e.len - 0.05;
-      if (atEnd && continuesAt(ctx, e, out < 0 ? e.a : e.b, 'tunnel')) continue;
+      if (atEnd && (continuesAt(ctx, e, out < 0 ? e.a : e.b, 'tunnel') || buriedEnd(ctx, e, out < 0 ? e.a : e.b))) continue;
       const p = sampleAt(net.geo(e), s);
       if (!inChunk(ctx, p.x, p.z)) continue;
       const grp = parallelGroup(ctx, e, s, (f, sf) => nearTunnel(f, sf));
@@ -556,10 +563,10 @@ export interface Keepout { x: number; z: number; ox: number; oz: number; lx: num
 export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
   const net = ctx.game.world.net;
   for (const sec of e.sections) {
-    if (sec.type !== 'tunnel') continue;
+    if (sec.type !== 'tunnel' || sec.s1 - sec.s0 < 0.05) continue;
     for (const [s, o] of [[sec.s0, -1], [sec.s1, 1]] as [number, number][]) {
       const atEnd = o < 0 ? s <= 0.05 : s >= e.len - 0.05;
-      if (atEnd && continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel')) continue;
+      if (atEnd && (continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel') || buriedEnd(ctx, e, o < 0 ? e.a : e.b))) continue;
       const p = sampleAt(net.geo(e), s);
       const { ow, oh } = portalDims(e);
       const gl = galleryLength(ctx, e, s, o, oh + 0.1);

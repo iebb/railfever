@@ -1,10 +1,10 @@
 // Road geometry: carriageways with markings, kerbed sidewalks, junction plates with stop lines, lamps,
 // bus stops and level crossings. Surfaces = world layer (no shadows); furniture = detail layer.
-import { ROAD_TYPES, RAIL } from '../game/constants';
+import { ROAD_TYPES, RAIL, LANE_OFFSET } from '../game/constants';
 import type { Network, NEdge, NNode, Crossing } from '../game/network';
 import type { Station } from '../game/stations';
-import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP } from './build-common';
-import { WC, WSCALE, STRIP_PERIOD } from './textures';
+import { ChunkCtx, Smp, edgeRuns, splitBySections, sweep, sampleAt, inChunk, mitre, upTri, wallQuad, PP, onStationForecourt } from './build-common';
+import { WC, WSCALE, STRIP_PERIOD, TRAM_BED_HALF, TRAM_BED_PERIOD } from './textures';
 import { distToRect } from '../game/world';
 import { buildBridge, buildPortals } from './build-structures';
 import { RAIL_TOP_Y } from './build-rail';
@@ -59,8 +59,21 @@ function roadRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
   const street = sw > 0;
   const W = ctx.w;
   W.cast = 0;
-  W.use(street ? WC.ROAD_STREET : WC.ROAD_COUNTRY, e.owner < 0 ? 0xf4f4f4 : 0xffffff);
-  sweep(W, run, [[-h, 0, 0.01], [h, 0, 0.99]], STRIP_PERIOD);
+  const cell = street ? WC.ROAD_STREET : WC.ROAD_COUNTRY, tint = e.owner < 0 ? 0xf4f4f4 : 0xffffff;
+  if (e.tram) {
+    // tram tracks in both lanes: asphalt | bed | asphalt (centre) | bed | asphalt, all flush
+    const L = LANE_OFFSET, B = TRAM_BED_HALF;
+    const u = (l: number) => 0.01 + (0.98 * (l + h)) / (2 * h);
+    for (const [a, b] of [[-h, -L - B], [-L + B, L - B], [L + B, h]]) {
+      W.use(cell, tint);
+      sweep(W, run, [[a, 0, u(a)], [b, 0, u(b)]], STRIP_PERIOD);
+    }
+    W.use(WC.TRAMBED, 0xffffff);
+    for (const c of [-L, L]) sweep(W, run, [[c - B, 0, 0.01], [c + B, 0, 0.99]], TRAM_BED_PERIOD);
+  } else {
+    W.use(cell, tint);
+    sweep(W, run, [[-h, 0, 0.01], [h, 0, 0.99]], STRIP_PERIOD);
+  }
   const low = bridge ? -0.005 : -0.25;
   if (street) {
     const Wd = h + sw;
@@ -105,12 +118,148 @@ export function buildRoadEdge(ctx: ChunkCtx, e: NEdge) {
       const full = e.sections.find((q) => q.type === 'bridge' && q.s0 <= part.s0 + 1e-6 && q.s1 >= part.s1 - 1e-6);
       buildBridge(ctx, e, full ? Math.max(full.s0, part.s0) : part.s0, full ? Math.min(full.s1, part.s1) : part.s1, runs);
     }
+    if (e.tram) tramLine(ctx, e, part.s0, part.s1, runs, part.type === 'bridge');
     if (part.type === 'ground' && e.depot < 0) {
-      if (roadType(e).sidewalk > 0) { streetLamps(ctx, e, part.s0, part.s1); streetTrees(ctx, e, part.s0, part.s1); }
+      if (roadType(e).sidewalk > 0) { if (!e.tram) streetLamps(ctx, e, part.s0, part.s1); streetTrees(ctx, e, part.s0, part.s1); }
       else roadFurniture(ctx, e, part.s0, part.s1);
     }
   }
   buildPortals(ctx, e);
+}
+
+/** Contact wire height above the road surface. */
+export const TRAM_WIRE_Y = 0.55;
+const POLE = 0x4c5358, CWIRE = 0x2b2e30;
+
+/** Overhead line along a tram edge: poles at both kerbs with a span wire (and lamps), one contact wire per lane. */
+function tramLine(ctx: ChunkCtx, e: NEdge, s0: number, s1: number, runs: Smp[][], bridge: boolean) {
+  const g = ctx.game.world.net.geo(e);
+  const rt = roadType(e);
+  const D = ctx.d;
+  const step = 3.5;
+  const off = rt.sidewalk > 0 ? rt.half + rt.sidewalk * 0.45 : rt.half + (bridge ? 0.06 : 0.14);
+  const base = rt.sidewalk > 0 ? KERB_H : bridge ? 0 : -0.02;
+  const keep = clearOf(ctx, e);
+  // depot stubs: only the contact wires (they run on into the hall)
+  for (let k = Math.ceil((s0 + 0.4) / step); e.depot < 0 && k * step <= s1 - 0.4; k++) {
+    const s = k * step;
+    const p = sampleAt(g, s);
+    if (!inChunk(ctx, p.x, p.z)) continue;
+    const near = keep.some((q) => Math.abs(q - s) < 0.5);
+    const ax = p.x - p.lx * off, az = p.z - p.lz * off, bx = p.x + p.lx * off, bz = p.z + p.lz * off;
+    const y0 = p.y + base;
+    D.use(WC.METAL, POLE);
+    for (const [x, z] of [[ax, az], [bx, bz]]) if (!near) D.cylinder(x, y0, z, 0.011, 0.72, 6);
+    // span wire across the road, hangers down to the contact wires
+    D.use(WC.METAL, CWIRE);
+    D.tube(ax, y0 + 0.66, az, bx, y0 + 0.66, bz, 0.003, 3);
+    for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
+      const hx = p.x + p.lx * c, hz = p.z + p.lz * c;
+      D.tube(hx, y0 + 0.66, hz, hx, p.y + TRAM_WIRE_Y, hz, 0.002, 3);
+    }
+    // a street lamp on every other pole
+    if (!near && (k & 1)) {
+      D.use(WC.LAMP, 0xfff1c8);
+      const lx = bx - p.lx * 0.1, lz = bz - p.lz * 0.1;
+      D.box(lx, y0 + 0.6, lz, 0.06, 0.018, 0.03, -p.lx, -p.lz, true);
+      ctx.lights.push(lx, y0 + 0.59, lz);
+    }
+  }
+  // contact wires along the lanes (chunk-local runs)
+  D.use(WC.METAL, CWIRE);
+  for (const run of runs) for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
+    for (let i = 0; i < run.length - 1; i++) {
+      const a = run[i], b = run[i + 1];
+      D.tube(a.x + a.lx * c, a.y + TRAM_WIRE_Y, a.z + a.lz * c, b.x + b.lx * c, b.y + TRAM_WIRE_Y, b.z + b.lz * c, 0.0035, 3);
+    }
+  }
+}
+
+/** End of a lane curve (position and travel direction) at its start or end. */
+function laneEnd(c: { pts: Float32Array; cum: Float32Array }, atEnd: boolean) {
+  const p = c.pts, n = c.cum.length;
+  const i = atEnd ? n - 1 : 0, j = atEnd ? n - 2 : 1;
+  let dx = p[i * 3] - p[j * 3], dz = p[i * 3 + 2] - p[j * 3 + 2];
+  if (!atEnd) { dx = -dx; dz = -dz; }
+  const l = Math.hypot(dx, dz) || 1;
+  return { x: p[i * 3], y: p[i * 3 + 1], z: p[i * 3 + 2], dx: dx / l, dz: dz / l };
+}
+
+/** Rails (raised steel strips) and contact wire along a polyline of points (x,y,z). */
+function tramRails(ctx: ChunkCtx, pts: number[]) {
+  const D = ctx.d;
+  const n = pts.length / 3;
+  if (n < 2) return;
+  const G2 = RAIL.gauge / 2 + 0.006;
+  for (let i = 0; i < n - 1; i++) {
+    const ax = pts[i * 3], ay = pts[i * 3 + 1], az = pts[i * 3 + 2], bx = pts[i * 3 + 3], by = pts[i * 3 + 4], bz = pts[i * 3 + 5];
+    const dx = bx - ax, dz = bz - az, l = Math.hypot(dx, dz) || 1;
+    const rx = -dz / l, rz = dx / l;
+    D.use(WC.METAL, 0x8f8a84);
+    for (const o of [-G2, G2]) {
+      const x0 = ax + rx * (o - 0.006), z0 = az + rz * (o - 0.006), x1 = ax + rx * (o + 0.006), z1 = az + rz * (o + 0.006);
+      const x2 = bx + rx * (o + 0.006), z2 = bz + rz * (o + 0.006), x3 = bx + rx * (o - 0.006), z3 = bz + rz * (o - 0.006);
+      D.ttri(x0, ay + 0.004, z0, 0, 0, x1, ay + 0.004, z1, 0, 0, x2, by + 0.004, z2, 0, 0, 0, 1, 0);
+      D.ttri(x0, ay + 0.004, z0, 0, 0, x2, by + 0.004, z2, 0, 0, x3, by + 0.004, z3, 0, 0, 0, 1, 0);
+    }
+    D.use(WC.METAL, CWIRE);
+    D.tube(ax, ay + TRAM_WIRE_Y, az, bx, by + TRAM_WIRE_Y, bz, 0.0035, 3);
+  }
+}
+
+/** Tram tracks and wires across a junction: straight-through pairs, and turns for arms without one. */
+function tramJunction(ctx: ChunkCtx, node: NNode) {
+  const net = ctx.game.world.net;
+  const arms: NEdge[] = [];
+  for (const id of node.edges) { const e = net.edges.get(id); if (e && e.kind === 'road' && e.tram) arms.push(e); }
+  if (!arms.length) return;
+  const R = nodeTrim(net, node.id);
+  // lane stretches between the road strip end and the lane end (they run over the junction plate)
+  for (const e of arms) {
+    const atA = e.a === node.id;
+    const [sa, sb] = roadRange(net, e);
+    const jr = net.junctionRadius(node.id);
+    const sLane = atA ? Math.min(jr, e.len * 0.45) : Math.max(e.len - jr, e.len * 0.55);
+    const sStrip = atA ? sa : sb;
+    if (Math.abs(sStrip - sLane) > 0.02) {
+      const g = net.geo(e);
+      for (const c of [-LANE_OFFSET, LANE_OFFSET]) {
+        const pts: number[] = [];
+        for (let k = 0; k <= 4; k++) {
+          const p = sampleAt(g, sLane + ((sStrip - sLane) * k) / 4);
+          pts.push(p.x + p.lx * c, p.y, p.z + p.lz * c);
+        }
+        tramRails(ctx, pts);
+      }
+    }
+  }
+  if (arms.length < 2 || R <= 0) return;
+  const dirs = arms.map((e) => net.leaveDir(e, node.id));
+  const pairs: [number, number][] = [];
+  const straight = new Set<number>();
+  for (let i = 0; i < arms.length; i++) for (let j = i + 1; j < arms.length; j++) {
+    if (dirs[i].x * dirs[j].x + dirs[i].z * dirs[j].z < -0.85) { pairs.push([i, j]); straight.add(i); straight.add(j); }
+  }
+  for (let i = 0; i < arms.length; i++) if (!straight.has(i)) for (let j = 0; j < arms.length; j++) if (j !== i && !pairs.some(([a, b]) => (a === i && b === j) || (a === j && b === i))) pairs.push([i, j]);
+  for (const [i, j] of pairs) {
+    for (const [A, B] of [[arms[i], arms[j]], [arms[j], arms[i]]]) {
+      // arrive on A (towards the node), leave on B (away from it)
+      const inA = net.lane(A, A.b === node.id ? 1 : -1), outB = net.lane(B, B.a === node.id ? 1 : -1);
+      const p0 = laneEnd(inA, true), p3 = laneEnd(outB, false);
+      const dist = Math.hypot(p3.x - p0.x, p3.z - p0.z);
+      if (dist < 0.03) continue;
+      const dot = p0.dx * p3.dx + p0.dz * p3.dz;
+      const k = dot < -0.5 ? Math.max(0.36, dist * 0.9) : dist * 0.42;
+      const c1x = p0.x + p0.dx * k, c1z = p0.z + p0.dz * k, c2x = p3.x - p3.dx * k, c2z = p3.z - p3.dz * k;
+      const pts: number[] = [];
+      for (let q = 0; q <= 10; q++) {
+        const t = q / 10, u = 1 - t;
+        pts.push(u * u * u * p0.x + 3 * u * u * t * c1x + 3 * u * t * t * c2x + t * t * t * p3.x, p0.y + (p3.y - p0.y) * t,
+          u * u * u * p0.z + 3 * u * u * t * c1z + 3 * u * t * t * c2z + t * t * t * p3.z);
+      }
+      tramRails(ctx, pts);
+    }
+  }
 }
 
 /** Positions (arc lengths) on edge e that street furniture must keep clear of: stops and level crossings. */
@@ -245,6 +394,7 @@ const STOP_W = 0.035;
 
 export function buildRoadNode(ctx: ChunkCtx, node: NNode) {
   const net = ctx.game.world.net;
+  tramJunction(ctx, node);
   const R = nodeTrim(net, node.id);
   if (node.edges.length === 1) { deadEnd(ctx, node); return; }
   if (R <= 0) return;
@@ -352,6 +502,8 @@ function deadEnd(ctx: ChunkCtx, node: NNode) {
   if (!e || e.kind !== 'road' || e.depot >= 0) return;
   const rt = roadType(e);
   if (rt.sidewalk <= 0) return;
+  // access streets end on a station forecourt: no turning circle
+  if (onStationForecourt(ctx.game, node.x, node.z, 0.35)) return;
   if (net.sectionAt(e, e.a === node.id ? 0 : e.len) !== 'ground') return;
   const p = sampleAt(net.geo(e), e.a === node.id ? 0 : e.len);
   const ox = e.a === node.id ? -p.tx : p.tx, oz = e.a === node.id ? -p.tz : p.tz;
@@ -396,12 +548,21 @@ export function buildBusStops(ctx: ChunkCtx, st: Station, color: number) {
       const x = p.x + p.lx * off, z = p.z + p.lz * off;
       const fx = p.lx * side, fz = p.lz * side; // away from the road
       const W = ctx.w, D = ctx.d;
+      const tram = !!e.tram;
       if (!street) {
         W.cast = 0;
         W.use(WC.PAVING, PAVING);
-        W.tbox(x - fx * 0.04, p.y - 0.06, z - fz * 0.04, 0.5, 0.075, 0.2, fx, fz, PS);
+        W.tbox(x - fx * 0.04, p.y - 0.06, z - fz * 0.04, tram ? 1.3 : 0.5, tram ? 0.1 : 0.075, 0.2, fx, fz, PS);
+      } else if (tram) {
+        // raised boarding platform along the kerb with a yellow tactile edge
+        const bx = p.x + p.lx * side * (rt.half + 0.07), bz = p.z + p.lz * side * (rt.half + 0.07);
+        W.cast = 0;
+        W.use(WC.PAVING, 0xcfcac0);
+        W.tbox(bx, p.y + KERB_H - 0.01, bz, 1.3, 0.035, 0.14, fx, fz, PS);
+        W.use(WC.PLAIN, 0xe3c02b);
+        W.box(bx - fx * 0.055, p.y + KERB_H + 0.025, bz - fz * 0.055, 1.24, 0.002, 0.02, fx, fz);
       }
-      const yb = street ? p.y + KERB_H : p.y + 0.015;
+      const yb = street ? p.y + KERB_H + (tram ? 0.025 : 0) : p.y + (tram ? 0.04 : 0.015);
       // back wall (glass), roof, posts, bench
       D.use(WC.PLAIN, 0x8fb3c8);
       D.box(x + fx * 0.05, yb + 0.02, z + fz * 0.05, 0.34, 0.2, 0.01, fx, fz, false);
@@ -410,12 +571,23 @@ export function buildBusStops(ctx: ChunkCtx, st: Station, color: number) {
       for (const a of [-0.17, 0.17]) D.box(x + fz * a + fx * 0.05, yb, z - fx * a + fz * 0.05, 0.012, 0.235, 0.012, fx, fz);
       D.use(WC.PLAIN, 0x6b4f36);
       D.box(x + fx * 0.025, yb + 0.045, z + fz * 0.025, 0.24, 0.012, 0.04, fx, fz, false);
-      // sign pole with company colour
+      // sign pole with company colour (tram stops add a 'T' plate)
       const sx = x - fz * 0.27, sz = z + fx * 0.27;
       D.use(WC.METAL, 0x9aa0a6);
-      D.cylinder(sx, yb, sz, 0.006, 0.3, 5);
+      D.cylinder(sx, yb, sz, 0.006, tram ? 0.36 : 0.3, 5);
       D.use(WC.PLAIN, color);
       D.box(sx, yb + 0.24, sz, 0.008, 0.07, 0.07, fx, fz, false);
+      if (tram) {
+        // green plate facing along the road with a white 'T' on both faces
+        D.use(WC.PLAIN, 0x1f6b45);
+        D.box(sx, yb + 0.3, sz, 0.008, 0.06, 0.06, fx, fz, false);
+        D.use(WC.PLAIN, 0xffffff);
+        for (const o of [-0.0055, 0.0055]) {
+          const px = sx + fz * o, pz = sz - fx * o;
+          D.box(px, yb + 0.342, pz, 0.004, 0.01, 0.04, fx, fz, false);
+          D.box(px, yb + 0.309, pz, 0.004, 0.033, 0.01, fx, fz, false);
+        }
+      }
     }
   }
 }

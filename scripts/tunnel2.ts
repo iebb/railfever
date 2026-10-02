@@ -6,7 +6,7 @@ import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { bulldoze } from '../src/game/build-ops';
 import { fails, check, build, free, roadOpts, nodeNear, addBusStop, roadDepotNear } from './lib';
-import { nodeSnap } from '../src/game/ai';
+import { nodeSnap } from '../src/game/routing';
 
 const g = Game.create({ size: 160, seed: 2, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 });
 g.economy.money = 1e8;

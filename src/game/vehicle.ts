@@ -7,19 +7,19 @@ export interface CargoGroup { alight: number; dest: number; count: number; from:
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
-/** Fare per world unit (10 m) of straight-line distance, before the speed factor. */
-export const FARE_PER_TILE = 7.5;
+/** Fare per world unit (10 m) of straight-line distance travelled. */
+export const FARE_PER_TILE = 9.5;
 
 /**
- * Income for `count` passengers carried `dist` units (straight line) in `days`. Short hops (< 30 m)
- * pay nothing extra, long journeys a tapered rate; fast journeys pay up to 1.45x, slow ones down to 0.35x.
+ * Income for `count` passengers carried `dist` units (straight line between the stops) in `days`: in
+ * proportion to the distance (each leg of a journey pays its own); very short hops earn little (an effective
+ * distance of dist² / (dist + 8)); a mild comfort / speed factor from 0.8x (slow) to 1.15x (fast).
  */
 export function fare(dist: number, days: number, count: number): number {
-  const d = dist - 3;
-  if (d <= 0) return 0;
-  const eff = d <= 250 ? d : 250 + (d - 250) * 0.5;
+  if (!(dist > 1)) return 0;
+  const eff = (dist * dist) / (dist + 8);
   const speed = dist / Math.max(0.4, days); // units per day
-  const factor = Math.max(0.35, Math.min(1.45, 0.35 + speed / 9));
+  const factor = 0.8 + 0.35 * Math.min(1, Math.max(0, (speed - 2) / 8));
   return count * eff * FARE_PER_TILE * factor;
 }
 
@@ -95,6 +95,7 @@ export abstract class Vehicle {
     let moved = 0;
     let income = 0;
     const line = this.line;
+    g.recordStop(this, st);
     for (const [k, c] of this.cargo) {
       if (c.alight !== st.id) continue;
       const from = g.stations.get(c.from);
@@ -107,7 +108,7 @@ export abstract class Vehicle {
         if (town) town.passTransMonth += c.count;
       } else {
         const hop = g.lines.nextHop(st.id, c.dest);
-        if (hop) g.stations.addWaiting(st, hop.line, hop.alight, c.dest, c.count);
+        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n));
       }
       moved += c.count;
       this.load -= c.count;

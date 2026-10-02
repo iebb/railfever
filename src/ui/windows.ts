@@ -59,6 +59,7 @@ export class WindowManager {
       ex.last = undefined;
       ex.tabsEl.innerHTML = '';
       ex.tabsEl.style.display = 'none';
+      ex.tabsEl.dataset.sig = '';
       this.setHead(ex, opts);
       this.focus(ex);
       return ex;

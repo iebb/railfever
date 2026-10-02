@@ -6,7 +6,7 @@ import type { Train } from '../game/train';
 import type { RoadVehicle, RSeg } from '../game/roadvehicle';
 import type { VehicleModel } from '../game/vehicle-types';
 import { Materials } from './materials';
-import { getModel, getCarModel, bogieModel, ModelGeo } from './vehicle-models';
+import { getModel, getCarModel, bogieModel, ModelGeo, getTramSection, tramSections, tramRoles, TramRole, TRAM_GAP, isRoadCoach, coachEra, getRoadCoach } from './vehicle-models';
 import { applyClouds } from './clouds';
 import { srgbToLinear } from './geo';
 import { RAIL } from '../game/constants';
@@ -18,6 +18,8 @@ export const ROAD_Y = 0.002;
 export const CAR_GAP = 0.1;
 /** A vehicle uses its detailed model when its length covers at least this many pixels. */
 const HI_PX = 46;
+/** Below this many pixels a vehicle is not drawn at all (whole-map views of big maps). */
+const MIN_PX = 1.2;
 
 export interface V3 { x: number; y: number; z: number }
 
@@ -94,9 +96,19 @@ class Batch {
   glass: THREE.InstancedMesh | null;
   ids: number[] = [];
   n = 0;
-  constructor(public geo: THREE.BufferGeometry, public glassGeo: THREE.BufferGeometry | null, private mat: THREE.Material, private glassMat: THREE.Material, private parent: THREE.Group, public cap = 32, public tinted = false, private shadow = true) {
+  /** per-instance accent colour (aPaint = 2), e.g. the operator's colour on trams */
+  accentAttr: THREE.InstancedBufferAttribute | null = null;
+  constructor(public geo: THREE.BufferGeometry, public glassGeo: THREE.BufferGeometry | null, private mat: THREE.Material, private glassMat: THREE.Material, private parent: THREE.Group, public cap = 32, public tinted = false, private shadow = true, public accent = false) {
     this.body = this.make(geo, mat, shadow);
     this.glass = glassGeo ? this.make(glassGeo, glassMat, false) : null;
+    if (accent) this.setAccent(null);
+  }
+  private setAccent(old: Float32Array | null) {
+    const a = new THREE.InstancedBufferAttribute(new Float32Array(this.cap * 3).fill(1), 3);
+    a.setUsage(THREE.DynamicDrawUsage);
+    if (old) a.array.set(old.subarray(0, Math.min(old.length, a.array.length)));
+    this.geo.setAttribute('aAccent', a);
+    this.accentAttr = a;
   }
   private make(g: THREE.BufferGeometry, m: THREE.Material, shadow: boolean) {
     const im = new THREE.InstancedMesh(g, m, this.cap);
@@ -118,6 +130,7 @@ class Batch {
     const ng = this.glass ? this.make(this.glassGeo!, this.glassMat, false) : null;
     for (const o of old) if (o) { this.parent.remove(o); o.dispose(); }
     this.body = nb; this.glass = ng;
+    if (this.accent) this.setAccent(this.accentAttr ? (this.accentAttr.array as Float32Array) : null);
   }
   /** Reserve the next instance slot; returns the matrix offset. */
   push(id: number): number {
@@ -127,6 +140,7 @@ class Batch {
   }
   get mat16() { return this.body.instanceMatrix.array as Float32Array; }
   get col3() { return this.body.instanceColor!.array as Float32Array; }
+  get acc3() { return this.accentAttr!.array as Float32Array; }
   finish(): number {
     const n = this.n;
     this.body.count = n;
@@ -139,6 +153,11 @@ class Batch {
         this.body.instanceColor.clearUpdateRanges();
         this.body.instanceColor.addUpdateRange(0, n * 3);
         this.body.instanceColor.needsUpdate = true;
+      }
+      if (this.accentAttr) {
+        this.accentAttr.clearUpdateRanges();
+        this.accentAttr.addUpdateRange(0, n * 3);
+        this.accentAttr.needsUpdate = true;
       }
     }
     this.body.boundingSphere = null;
@@ -162,6 +181,7 @@ class Batch {
 }
 
 interface BatchPair { hi: Batch; lo: Batch; ambient: boolean }
+interface TramInfo { n: number; sec: number; roles: TramRole[]; style: string }
 
 const SMOKE_ATTRS = ['position', 'aSize', 'aAlpha', 'aTone'];
 
@@ -304,12 +324,16 @@ export class VehiclesView {
   private rb2 = { seg: null as RSeg | null, pos: 0 };
   private tick = 0;
   private rpose = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1 };
+  private game: Game | null = null;
+  private tramInfo = new WeakMap<VehicleModel, TramInfo>();
+  private colors = new Map<number | string, Float32Array>();
+  private tmpMain = new Float32Array(3);
 
   constructor(private mats: Materials) {
     this.paintMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.42, metalness: 0.3 });
     this.paintMat.onBeforeCompile = (sh) => {
       sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', '#include <common>\nattribute float aPaint;')
+        .replace('#include <common>', '#include <common>\nattribute float aPaint;\nattribute vec3 aAccent;')
         .replace('#include <color_vertex>', `
 #if defined( USE_COLOR ) || defined( USE_INSTANCING_COLOR )
   vColor = vec3( 1.0 );
@@ -318,10 +342,12 @@ export class VehiclesView {
   vColor *= color;
 #endif
 #ifdef USE_INSTANCING_COLOR
-  vColor.xyz *= mix(vec3(1.0), instanceColor.xyz, aPaint);
+  // aPaint 1: main livery (instance colour), 2: accent (per-instance aAccent)
+  vec3 rfTint = aPaint > 1.5 ? aAccent : instanceColor.xyz;
+  vColor.xyz *= mix(vec3(1.0), rfTint, min(aPaint, 1.0));
 #endif`);
     };
-    this.paintMat.customProgramCacheKey = () => 'rf-vehicle-paint';
+    this.paintMat.customProgramCacheKey = () => 'rf-vehicle-paint-2';
     applyClouds(this.paintMat);
     this.bogies = {
       b2: new Batch(bogieModel('b2'), null, this.paintMat, mats.glass, this.group, 128),
@@ -332,16 +358,20 @@ export class VehiclesView {
 
   private model(m: VehicleModel): ModelGeo {
     let g = this.models.get(m);
-    if (!g) { g = getModel(m.style, m.color, m.length); this.models.set(m, g); }
+    if (!g) {
+      g = isRoadCoach(m) ? getRoadCoach(coachEra(m.style, m.intro), m.length) : getModel(m.style, m.color, m.length);
+      this.models.set(m, g);
+    }
     return g;
   }
 
-  private pair(m: ModelGeo, ambient = false): BatchPair {
+  private pair(m: ModelGeo, ambient = false, livery = false): BatchPair {
     let p = this.batches.get(m);
     if (!p) {
+      const tint = ambient || livery;
       p = {
-        hi: new Batch(m.body, m.glass, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, ambient),
-        lo: new Batch(m.lo.body, m.lo.glass, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, ambient, !ambient),
+        hi: new Batch(m.body, m.glass, this.paintMat, this.mats.glass, this.group, ambient ? 64 : 16, tint, true, livery),
+        lo: new Batch(m.lo.body, m.lo.glass, this.paintMat, this.mats.glass, this.group, ambient ? 128 : 16, tint, !ambient, livery),
         ambient,
       };
       this.batches.set(m, p);
@@ -349,18 +379,23 @@ export class VehiclesView {
     return p;
   }
 
-  /** Visible (with a margin for shadows) and detailed enough for the high LOD? 0 culled, 1 lo, 2 hi. */
+  /**
+   * Visible (with a margin for shadows) and detailed enough for the high LOD? 0 culled (outside the view or
+   * under ~1 px), 1 lo, 2 hi.
+   */
   private lod(x: number, y: number, z: number, len: number): number {
     if (!this.cull) return 2;
     this.sphere.center.set(x, y, z);
     this.sphere.radius = len / 2 + 1.2;
     if (!this.frustum.intersectsSphere(this.sphere)) return 0;
     const d = Math.hypot(x - this.camPos.x, y - this.camPos.y, z - this.camPos.z);
-    return len * this.pxScale > HI_PX * d ? 2 : 1;
+    const px = len * this.pxScale;
+    return px > HI_PX * d ? 2 : px > MIN_PX * d ? 1 : 0;
   }
 
   update(game: Game, dt: number, light: number, pointScale = 1200, camera?: THREE.Camera) {
     const night = this.mats.uniforms.uNight.value;
+    this.game = game;
     this.pxScale = pointScale;
     this.cull = !!camera;
     if (camera) {
@@ -391,6 +426,10 @@ export class VehiclesView {
 
   private updateTrain(t: Train, dt: number, night: number) {
     if (!t.onMap) return;
+    if (this.cull) {
+      const len = t.length;
+      if (!t.pointBehind(len / 2, tE) || !this.lod(tE.x, tE.y, tE.z, len)) { this.lastSpeed.set(t.id, t.speed); return; }
+    }
     const n = trainCarPoses(t, this.poses);
     const prev = this.lastSpeed.get(t.id) ?? t.speed;
     this.lastSpeed.set(t.id, t.speed);
@@ -466,6 +505,12 @@ export class VehiclesView {
 
   private updateRoad(v: RoadVehicle, night: number) {
     if (!v.seg) return;
+    if (this.cull) {
+      const len = v.length;
+      v.pointBehind(len / 2, tE);
+      if (!this.lod(tE.x, tE.y, tE.z, len)) return;
+    }
+    if (v.model && v.model.kind === 'tram') { this.updateTram(v, v.model, night); return; }
     const L = v.length;
     const f = this.rb1, r = this.rb2;
     if (!roadBehind(v, 0, f) || !roadBehind(v, L, r)) return;
@@ -480,11 +525,13 @@ export class VehiclesView {
     const lod = this.lod(px, py, pz, L);
     if (!lod) return;
     const m = v.model ? this.model(v.model) : getCarModel(Math.max(0, Math.min(3, v.style | 0)));
-    const bp = this.pair(m, !v.model);
+    const coach = !!v.model && isRoadCoach(v.model);
+    const bp = this.pair(m, !v.model, coach);
     const b = lod === 2 ? bp.hi : bp.lo;
     const o = b.push(v.ambient ? -1 : v.id);
     writeBasis(b.mat16, o, px, py, pz, fx, fy, fz);
-    if (b.tinted) {
+    if (coach) this.coachLivery(b, o, v.model!, v.owner);
+    else if (b.tinted) {
       // plausible paint: desaturated, mid brightness (linear colour for the shader)
       const t = v.tint & 0xffffff;
       let cr = ((t >> 16) & 255) / 255, cg = ((t >> 8) & 255) / 255, cb = (t & 255) / 255;
@@ -498,6 +545,87 @@ export class VehiclesView {
       pose.x = px; pose.y = py; pose.z = pz; pose.fx = fx; pose.fy = fy; pose.fz = fz;
       this.lamps(pose, m.front, 1, 0.94, 0.8);
       this.lamps(pose, m.rear, 0.9, 0.05, 0.03);
+    }
+  }
+
+  /**
+   * Coach livery in the operator's colour: stripes / swoosh / lower panels take the operator colour, the body
+   * a light neutral tinted by the model colour (so models still differ). When the operator colour is itself
+   * that light, the body turns charcoal to keep the contrast.
+   */
+  private coachLivery(b: Batch, o: number, m: VehicleModel, owner: number) {
+    const mc = this.lin(m.color), cream = this.lin(0xf3efe6), main = this.tmpMain;
+    for (let i = 0; i < 3; i++) main[i] = mc[i] * 0.28 + cream[i] * 0.72;
+    const acc = this.lin(this.game ? this.game.company(owner).color : '#e8a33d');
+    // perceived lightness (CIE L*) of body and livery too close: charcoal body
+    const Ls = (c: Float32Array) => 116 * Math.cbrt(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) - 16;
+    if (Math.abs(Ls(main) - Ls(acc)) < 20) main.set(this.lin(0x2e3438));
+    const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
+    c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
+    a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
+  }
+
+  /** Sections, their length and roles for a tram model (cached). */
+  private tram(m: VehicleModel): TramInfo {
+    let t = this.tramInfo.get(m);
+    if (!t) {
+      const n = tramSections(m.style, m.length, (m as VehicleModel & { sections?: number }).sections);
+      t = { n, sec: Math.max(0.2, (m.length - TRAM_GAP * (n - 1)) / n), roles: tramRoles(m.style, n), style: m.style };
+      this.tramInfo.set(m, t);
+    }
+    return t;
+  }
+
+  /** Linear RGB of a colour (number or '#rrggbb'), cached. */
+  private lin(c: number | string): Float32Array {
+    let v = this.colors.get(c);
+    if (!v) {
+      const h = typeof c === 'number' ? c : parseInt(String(c).replace('#', ''), 16) || 0xcccccc;
+      v = new Float32Array([srgbToLinear(((h >> 16) & 255) / 255), srgbToLinear(((h >> 8) & 255) / 255), srgbToLinear((h & 255) / 255)]);
+      this.colors.set(c, v);
+    }
+    return v;
+  }
+
+  /**
+   * Articulated tram: every section rests on its own two points along the lane path (so the sections
+   * follow curves through junctions); the rear cab faces backwards; livery in the model colour with the
+   * operator's colour as accent.
+   */
+  private updateTram(v: RoadVehicle, m: VehicleModel, night: number) {
+    const t = this.tram(m);
+    const main = this.lin(m.color);
+    const acc = this.lin(this.game ? this.game.company(v.owner).color : '#e8a33d');
+    let off = 0;
+    for (let i = 0; i < t.n; i++, off += t.sec + TRAM_GAP) {
+      const f = this.rb1, r = this.rb2;
+      if (!roadBehind(v, off, f) || !roadBehind(v, off + t.sec, r)) continue;
+      if (v.hiddenAt(f.seg!, f.pos) && v.hiddenAt(r.seg!, r.pos)) continue;
+      v.pointBehind(off + t.sec * 0.15, tA);
+      v.pointBehind(off + t.sec * 0.85, tB);
+      let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
+      const l = Math.hypot(fx, fy, fz);
+      if (l < 1e-6) continue;
+      fx /= l; fy /= l; fz /= l;
+      const flip = t.n > 1 && i === t.n - 1;
+      if (flip) { fx = -fx; fy = -fy; fz = -fz; }
+      const px = (tA.x + tB.x) / 2, py = (tA.y + tB.y) / 2 + ROAD_Y, pz = (tA.z + tB.z) / 2;
+      const lod = this.lod(px, py, pz, t.sec);
+      if (!lod) continue;
+      const geo = getTramSection(t.style, t.roles[i], t.sec);
+      const bp = this.pair(geo, false, true);
+      const b = lod === 2 ? bp.hi : bp.lo;
+      const o = b.push(v.id);
+      writeBasis(b.mat16, o, px, py, pz, fx, fy, fz);
+      const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
+      c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
+      a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
+      if (night > 0.02) {
+        const pose = this.rpose;
+        pose.x = px; pose.y = py; pose.z = pz; pose.fx = fx; pose.fy = fy; pose.fz = fz;
+        if (i === 0) this.lamps(pose, geo.front, 1, 0.94, 0.8);
+        if (i === t.n - 1) this.lamps(pose, t.n === 1 ? geo.rear : geo.front, 0.9, 0.05, 0.03);
+      }
     }
   }
 

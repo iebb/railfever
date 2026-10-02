@@ -38,7 +38,13 @@ export function nightOf(visualTime: number): number {
   return 1 - x * x * (3 - 2 * x);
 }
 
-type SlotKind = 'steam' | 'diesel' | 'hst' | 'electric' | 'bus' | 'car' | 'bell';
+type SlotKind = 'steam' | 'diesel' | 'hst' | 'electric' | 'tram' | 'bus' | 'coach' | 'car' | 'bell';
+
+/** Long-distance coach: a bus model with a 'coach' style (rail coaches are wagons). */
+function isCoach(r: RoadVehicle): boolean {
+  const m = r.model;
+  return !!m && ((m.kind as string) === 'coach' || (m.kind === 'bus' && typeof m.style === 'string' && m.style.startsWith('coach')));
+}
 
 /** A continuous positional sound (one vehicle or crossing): sources -> body -> lowpass -> gain -> pan -> bus. */
 class Slot {
@@ -52,6 +58,8 @@ class Slot {
   hiss: GainNode | null = null;
   next = 0; nextJoint = 0; throttle = 0; lastSpeed = -1; seen = 0; dying = 0; gain = 0; d = 1e9; lastRamp = -1;
   x = 0; y = 0; z = 0; alt = 1;
+  /** coaches: 0 in town .. 1 out on country roads (deeper, steadier engine and more tyre roar) */
+  rural = 0; ruralAt = -1;
 
   constructor(public k: Kit, public key: number, public kind: SlotKind, dest: AudioNode, now: number) {
     const c = k.ctx;
@@ -71,25 +79,26 @@ class Slot {
     // rolling noise for every vehicle
     this.roll = k.gain(0, this.body);
     this.rollF = k.filter({ type: 'lowpass', f: 400, q: 0.6 }, now, this.roll);
-    this.loopNoise(kind === 'car' || kind === 'bus' ? k.brown : k.pink, this.rollF);
+    this.loopNoise(kind === 'car' || kind === 'bus' || kind === 'coach' ? k.brown : k.pink, this.rollF);
     if (kind === 'steam') {
       this.hiss = k.gain(0, this.body);
       this.loopNoise(k.white, k.filter({ type: 'highpass', f: 3800 }, now, this.hiss));
-    } else if (kind === 'diesel' || kind === 'hst' || kind === 'bus') {
+    } else if (kind === 'diesel' || kind === 'hst' || kind === 'bus' || kind === 'coach') {
       this.eng = k.gain(0, this.body);
       this.engF = k.filter({ type: 'lowpass', f: 300, q: 1.1 }, now, this.eng);
-      const f0 = kind === 'bus' ? 44 : 32;
+      // coach: bigger engine, lower firing frequency
+      const f0 = kind === 'bus' ? 44 : kind === 'coach' ? 34 : 32;
       this.osc('sawtooth', f0, this.engF, 1);
       this.osc('sawtooth', f0 * 1.008, this.engF, 1.008);
       this.osc('sine', f0 / 2, this.engF, 0.5);
       if (kind === 'hst') this.addWhine(2500, 0);
-    } else if (kind === 'electric') {
+    } else if (kind === 'electric' || kind === 'tram') {
       this.eng = k.gain(0, this.body);
       this.osc('sine', 100, this.eng, 0);
-      this.osc('sine', 300, k.gain(0.25, this.eng), 0);
-      this.addWhine(160, 0);
+      this.osc('sine', kind === 'tram' ? 200 : 300, k.gain(0.25, this.eng), 0);
+      this.addWhine(kind === 'tram' ? 220 : 160, 0);
     }
-    if (kind !== 'car' && kind !== 'bus') {
+    if (kind !== 'car' && kind !== 'bus' && kind !== 'coach') {
       // brake squeal, a little vibrato
       this.squealG = k.gain(0, this.body);
       const sq = this.osc('sine', 3100 + Math.random() * 600, this.squealG, 0);
@@ -138,7 +147,7 @@ class Slot {
   }
 }
 
-const TRAIN_SLOTS = 3, TRAFFIC_SLOTS = 2;
+const TRAIN_SLOTS = 3, TRAFFIC_SLOTS = 3;
 const JOINT = 2.5;          // rail joints every 25 m
 const DRIVER_CIRC = 0.534;  // steam driving wheel circumference (1.7 m wheels)
 const LOOKAHEAD = 0.14;
@@ -156,6 +165,8 @@ export class WorldAudio {
   slots = new Map<string, Slot>();
   private prevState = new Map<number, string>();
   private chimeAt = new Map<number, number>();
+  private segKind = new Map<number, string>();
+  private dingAt = new Map<number, number>();
   private income: { x: number; z: number; amount: number }[] = [];
   private lastCash = 0;
   private scanT = 0; private envT = 0; private purgeT = 0;
@@ -263,6 +274,7 @@ export class WorldAudio {
     if (this.purgeT <= 0) {
       this.purgeT = 5;
       for (const id of this.prevState.keys()) if (!g.vehicles.get(id)) this.prevState.delete(id);
+      for (const id of this.segKind.keys()) if (!g.vehicles.get(id)) { this.segKind.delete(id); this.dingAt.delete(id); }
     }
   }
 
@@ -298,8 +310,9 @@ export class WorldAudio {
         const r = v as RoadVehicle;
         if (!r.onMap) continue;
         r.worldPos(p);
-        const gain = distGain(distTo(L, p.x, p.y, p.z), 3, 40);
-        if (gain > 0.03) roads.push({ id: r.id, gain, kind: 'bus' });
+        const tram = r.model?.kind === 'tram', coach = !tram && isCoach(r);
+        const gain = distGain(distTo(L, p.x, p.y, p.z), tram ? 4 : coach ? 3.5 : 3, tram ? 60 : coach ? 50 : 40) * (tram ? 1.2 : coach ? 1.1 : 1);
+        if (gain > 0.03) roads.push({ id: r.id, gain, kind: tram ? 'tram' : coach ? 'coach' : 'bus' });
       }
     }
     if (L.camDist < 35) {
@@ -343,7 +356,8 @@ export class WorldAudio {
   private place(s: Slot, L: Listener, x: number, y: number, z: number, now: number, level: number) {
     s.x = x; s.y = y; s.z = z;
     s.d = distTo(L, x, y, z);
-    const g = distGain(s.d, s.kind === 'car' ? 2.5 : s.kind === 'bus' ? 3 : 6, s.kind === 'car' ? 30 : s.kind === 'bus' ? 40 : 150) * level;
+    const k = s.kind;
+    const g = distGain(s.d, k === 'car' ? 2.5 : k === 'bus' ? 3 : k === 'coach' ? 3.5 : k === 'tram' ? 4 : 6, k === 'car' ? 30 : k === 'bus' ? 40 : k === 'coach' ? 50 : k === 'tram' ? 60 : 150) * level;
     s.gain = g;
     Slot.ramp(s.out.gain, g, now, 0.06);
     Slot.ramp(s.pan.pan, panOf(L, x, y, z), now, 0.05);
@@ -367,16 +381,34 @@ export class WorldAudio {
     s.throttle += (thr - s.throttle) * Math.min(1, dt * 2.5);
     const T = s.throttle;
     const run = clamp(vis / 3, 0, 1);
-    if (ramp && s.roll && s.rollF) {
-      Slot.ramp(s.roll.gain, (s.kind === 'car' ? 0.3 : s.kind === 'bus' ? 0.25 : 0.4) * Math.pow(run, 0.8), now);
-      Slot.ramp(s.rollF.frequency, 250 + 650 * clamp(vis / 5, 0, 1), now, 0.2);
+    if (s.kind === 'coach') {
+      // out of town (no town within its radius + 4 units, checked twice a second) the coach cruises in top gear
+      if (now - s.ruralAt > 0.5) {
+        s.ruralAt = now;
+        let rural = 1;
+        for (const t of g.towns.list) if (Math.hypot(t.x - p.x, t.z - p.z) < t.radius + 4) { rural = 0; break; }
+        s.rural += (rural - s.rural) * 0.35;
+      }
     }
-    if (!ramp) { /* parameters unchanged this frame */ } else if (s.kind === 'diesel' || s.kind === 'hst' || s.kind === 'bus') {
-      const f0 = (s.kind === 'bus' ? 42 + 30 * T : s.kind === 'hst' ? 42 + 46 * T : 30 + 38 * T) * s.alt;
+    const R = s.rural;
+    if (ramp && s.roll && s.rollF) {
+      Slot.ramp(s.roll.gain, (s.kind === 'car' ? 0.3 : s.kind === 'bus' ? 0.25 : s.kind === 'coach' ? 0.27 + 0.1 * R : 0.4) * Math.pow(run, 0.8), now);
+      Slot.ramp(s.rollF.frequency, (s.kind === 'coach' ? 220 - 60 * R : 250) + 650 * clamp(vis / 5, 0, 1), now, 0.2);
+    }
+    if (!ramp) { /* parameters unchanged this frame */ } else if (s.kind === 'diesel' || s.kind === 'hst' || s.kind === 'bus' || s.kind === 'coach') {
+      // coach: like a bus but deeper, and deeper still (low revs, darker timbre) on country roads
+      const f0 = (s.kind === 'bus' ? 42 + 30 * T : s.kind === 'coach' ? (34 + 22 * T) * (1 - R) + (27 + 12 * T) * R : s.kind === 'hst' ? 42 + 46 * T : 30 + 38 * T) * s.alt;
       for (const [fp, r] of s.freqs) Slot.ramp(fp, f0 * r, now, 0.25);
-      if (s.engF) Slot.ramp(s.engF.frequency, 170 + 650 * T, now, 0.2);
-      if (s.eng) Slot.ramp(s.eng.gain, s.kind === 'bus' ? 0.07 + 0.1 * T : 0.14 + 0.22 * T, now, 0.15);
+      if (s.engF) Slot.ramp(s.engF.frequency, s.kind === 'coach' ? (150 + 520 * T) * (1 - R) + (115 + 330 * T) * R : 170 + 650 * T, now, 0.2);
+      if (s.eng) Slot.ramp(s.eng.gain, s.kind === 'bus' ? 0.07 + 0.1 * T : s.kind === 'coach' ? 0.085 + 0.1 * T + 0.02 * R : 0.14 + 0.22 * T, now, 0.15);
       if (s.whine && s.whineG) { Slot.ramp(s.whine.frequency, 2300 + 500 * T, now, 0.3); Slot.ramp(s.whineG.gain, 0.008 * T, now, 0.2); }
+    } else if (s.kind === 'tram') {
+      if (s.eng) Slot.ramp(s.eng.gain, 0.025 + 0.03 * T, now, 0.2);
+      if (s.whine && s.whineG) {
+        Slot.ramp(s.whine.frequency, (220 + 560 * clamp(vis / 2.5, 0, 1)) * s.alt, now, 0.15);
+        Slot.ramp(s.whineG.gain, 0.03 * T * clamp(vis / 0.3, 0, 1), now, 0.15);
+      }
+      if (s.rollF) Slot.ramp(s.rollF.frequency, 450 + 900 * clamp(vis / 3, 0, 1), now, 0.2);
     } else if (s.kind === 'electric') {
       if (s.eng) Slot.ramp(s.eng.gain, 0.04 + 0.05 * T, now, 0.2);
       if (s.whine && s.whineG) {
@@ -397,7 +429,16 @@ export class WorldAudio {
         }
       } else s.next = now;
     }
-    if (ramp && s.squealG) Slot.ramp(s.squealG.gain, accel < -0.015 && vis > 0.05 && vis < 1.6 ? Math.min(0.025, -accel * 0.5) : 0, now, 0.12);
+    if (ramp && s.squealG) {
+      let sq = accel < -0.015 && vis > 0.05 && vis < 1.6 ? Math.min(0.025, -accel * 0.5) : 0;
+      // trams: flange squeal through tight curves and junctions
+      if (s.kind === 'tram') {
+        const seg = (v as RoadVehicle).seg;
+        const R = seg ? seg.curve.minRadius : Infinity;
+        sq = Math.max(sq, vis > 0.06 && R < 3 ? 0.02 * clamp((3 - R) / 2, 0, 1) * clamp(vis / 0.6, 0.3, 1) : 0);
+      }
+      Slot.ramp(s.squealG.gain, sq, now, 0.12);
+    }
     // rail joints: "da-dum ... da-dum" (axles of a bogie, then the next bogie)
     if (v.kind === 'train' && vis > 0.15) {
       const per = JOINT / vis;
@@ -471,9 +512,29 @@ export class WorldAudio {
           const y = (st.rail?.y ?? g.world.heightAt(st.x, st.z)) + 0.8;
           this.oneShot('chime', L, st.x, y, st.z, 0.9, 2);
         }
-      } else if (v.state === 'loading' && !(v as RoadVehicle).ambient) {
-        v.worldPos(p);
-        this.oneShot('doors', L, p.x, p.y + 0.2, p.z, 0.8, 1);
+      } else if (!(v as RoadVehicle).ambient) {
+        const tram = (v as RoadVehicle).model?.kind === 'tram';
+        if (v.state === 'loading') {
+          v.worldPos(p);
+          if (tram) this.oneShot('tchime', L, p.x, p.y + 0.3, p.z, 0.8, 1);
+          this.oneShot('doors', L, p.x, p.y + 0.2, p.z, 0.8, 1);
+        } else if (tram && prev === 'loading' && v.state === 'running') {
+          v.worldPos(p);
+          this.oneShot('tbell', L, p.x, p.y + 0.3, p.z, 1, 2, 0.97 + Math.random() * 0.06);
+        }
+      }
+    }
+    // trams ring now and then when they enter a junction
+    for (const sl of this.slots.values()) {
+      if (sl.kind !== 'tram' || sl.dying) continue;
+      const tv = g.vehicles.get(sl.key) as RoadVehicle | undefined;
+      const k = tv?.seg?.kind ?? 'lane';
+      const was = this.segKind.get(sl.key);
+      this.segKind.set(sl.key, k);
+      if (tv && was === 'lane' && k === 'conn' && now - (this.dingAt.get(sl.key) ?? -1e9) > 10 && Math.random() < 0.3) {
+        this.dingAt.set(sl.key, now);
+        tv.worldPos(p);
+        this.oneShot('tding', L, p.x, p.y + 0.3, p.z, 0.9, 1);
       }
     }
     // income near the camera

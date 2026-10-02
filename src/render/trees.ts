@@ -138,6 +138,38 @@ export function makeTreeMeshes(list: TreeInstance[], geos: THREE.BufferGeometry[
   return out;
 }
 
+/** Near tree instance data per variant (matrices, colours), as written by makeTreeMeshes. */
+export function nearTreeData(list: TreeInstance[], variants: number): { m: Float32Array[]; c: Float32Array[] } {
+  const counts = new Array(variants).fill(0);
+  for (const t of list) counts[t.type < variants ? t.type : 0]++;
+  const m = counts.map((k) => new Float32Array(k * 16)), c = counts.map((k) => new Float32Array(k * 3));
+  const o = new Array(variants).fill(0);
+  for (const it of list) {
+    const v = it.type < variants ? it.type : 0, i = o[v]++;
+    q.setFromAxisAngle(up, it.rot);
+    pos.set(it.x, it.y, it.z);
+    scl.set(it.s, it.s * (0.9 + it.tint * 0.25), it.s);
+    m4.compose(pos, q, scl);
+    m4.toArray(m[v], i * 16);
+    const k = 0.82 + it.tint * 0.3;
+    // InstancedMesh colours are linear: same conversion as Color.setRGB in makeTreeMeshes
+    col.setRGB(k * (0.95 + it.tint * 0.1), k, k * (0.9 + (1 - it.tint) * 0.1));
+    c[v][i * 3] = col.r; c[v][i * 3 + 1] = col.g; c[v][i * 3 + 2] = col.b;
+  }
+  return { m, c };
+}
+
+/** Instanced near-tree mesh of one variant with a given capacity (instances are written by the caller). */
+export function makeTreeMesh(geo: THREE.BufferGeometry, mat: THREE.Material, capacity: number): THREE.InstancedMesh {
+  const im = new THREE.InstancedMesh(geo, mat, Math.max(1, capacity));
+  im.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(Math.max(1, capacity) * 3), 3);
+  im.count = 0;
+  im.castShadow = true;
+  im.receiveShadow = true;
+  im.matrixAutoUpdate = false;
+  return im;
+}
+
 /** Far impostor instance data (matrices, colours) for a list of trees. */
 export function impostorData(list: TreeInstance[]): { m: Float32Array; c: Float32Array } {
   const m = new Float32Array(list.length * 16), c = new Float32Array(list.length * 3);

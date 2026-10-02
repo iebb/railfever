@@ -373,6 +373,17 @@ export const RECIPES: Record<string, Recipe> = {
       tt += 0.09 + Math.random() * 0.08;
     }
   },
+  /** tram bell: "ding-ding" */
+  tbell(k, t, out, p, v) {
+    for (const dt of [0, 0.17]) bell(k, t + dt, 1250 * p, 0.055 * v, 0.6, out, [[1, 1, 1], [2.7, 0.35, 0.5], [5.2, 0.12, 0.3]]);
+  },
+  /** single tram bell strike (junctions) */
+  tding(k, t, out, p, v) { bell(k, t, 1250 * p, 0.045 * v, 0.55, out, [[1, 1, 1], [2.7, 0.35, 0.5], [5.2, 0.12, 0.3]]); },
+  /** tram door chime: soft falling two-tone */
+  tchime(k, t, out, p, v) {
+    k.tone(sine, 1174.7 * p, t, 0.32, 0.03 * v, out, 0.01);
+    k.tone(sine, 880 * p, t + 0.2, 0.5, 0.03 * v, out, 0.01);
+  },
   /** cricket chirp: 3 quick pulses */
   cricket(k, t, out, p, v) {
     for (let i = 0; i < 3; i++) k.tone(sine, 4300 * p, t + i * 0.032, 0.022, 0.018 * v, out, 0.004);
@@ -380,4 +391,4 @@ export const RECIPES: Record<string, Recipe> = {
 };
 
 /** World-sound recipes that are not offered through play(). */
-export const WORLD_ONLY = new Set(['chime', 'whistle', 'horn', 'horn2', 'xbell', 'doors', 'swish', 'bird', 'cricket']);
+export const WORLD_ONLY = new Set(['chime', 'whistle', 'horn', 'horn2', 'xbell', 'doors', 'swish', 'bird', 'cricket', 'tbell', 'tding', 'tchime']);

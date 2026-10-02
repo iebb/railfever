@@ -1,14 +1,19 @@
-// World generation scale test: Game.create time per phase, grid towns (streets, buildings, parks, plazas),
-// generated country roads (edges, length, structures, connectivity) and sim cost for map sizes 256..768.
+// World generation scale test: Game.create time per phase, towns (sizes, streets, buildings, parks, plazas,
+// spacing), generated country roads (edges, length, structures, connectivity) and sim cost for map sizes
+// 512..1536 with the default number of towns (title screen), plus a crowded 512 map; town street networks
+// connected to their centres.
 // npx esbuild scripts/scale.ts --bundle --platform=node --format=esm --outfile=$S/scale.mjs && node $S/scale.mjs [seed]
 import { Game } from '../src/game/game';
 import { generateHeights, generateTrees } from '../src/game/terrain-gen';
 import { generateIntercityRoads } from '../src/game/roads';
 import { BT_PARK, BT_PLAZA } from '../src/game/towns';
 import { fmt, fails, check } from './lib';
+import { townNetworks } from './townstats';
 
 const seed = Number(process.argv[2] ?? 5);
-for (const [size, towns] of [[256, 6], [384, 10], [512, 14], [768, 24]] as const) {
+// the title screen's map presets with their default number of towns, and a crowded 512 map
+const defaultTowns = (size: number) => Math.max(3, Math.min(48, Math.round(4.5 * (size / 384) ** 2)));
+for (const [size, towns] of [[512, defaultTowns(512)], [768, defaultTowns(768)], [1024, defaultTowns(1024)], [1536, defaultTowns(1536)], [512, 20]] as const) {
   // the phases of Game.create, timed separately
   const opts = { size, seed, towns, hilliness: 'hilly' as const, water: 'medium' as const, startYear: 1980 };
   const t0 = performance.now();
@@ -44,11 +49,22 @@ for (const [size, towns] of [[256, 6], [384, 10], [512, 14], [768, 24]] as const
   const sim = (performance.now() - t5) / 15;
   console.log(`${size}x${size}, ${towns} towns: Game.create ${fmt(ms, 0)} ms (heights ${fmt(t1 - t0, 0)}, towns ${fmt(t2 - t1, 0)}, roads ${fmt(t3 - t2, 0)}, trees ${fmt(t4 - t3, 0)}); ` +
     `pop ${g.towns.list.reduce((a, t) => a + t.pop, 0)}, ${g.world.buildings.size} buildings (${parks} parks, ${plazas} plazas)`);
+  const pops = g.towns.list.map((t) => t.pop).sort((a, b) => b - a);
+  let gaps = 0;
+  for (const t of g.towns.list) gaps += Math.min(...g.towns.list.filter((o) => o !== t).map((o) => Math.hypot(o.x - t.x, o.z - t.z) - t.radius - o.radius));
+  console.log(`  towns: largest ${pops[0]}, median ${pops[Math.floor(pops.length / 2)]}, smallest ${pops[pops.length - 1]} people; ` +
+    `open country to the nearest town ${fmt(gaps / g.towns.list.length / 100, 2)} km on average; tallest building ${Math.max(...[...g.world.buildings.values()].map((b) => b.floors))} storeys`);
   console.log(`  ${streets} street edges (${fmt(streetLen, 0)} u), ${roads} country road edges (${fmt(roadLen, 0)} u; ${rs.built} roads: ${rs.mst} tree + ${rs.extra} shortcuts, ${rs.failed} pairs skipped, ` +
     `${rs.bridges} bridge / ${rs.tunnels} tunnel sections), ${linked}/${towns} towns linked; ${g.world.trees.filter(Boolean).length} trees, ${g.vehicles.ambient.length} town cars; ${fmt(sim, 2)} ms per game day`);
-  check(ms < 2500 || size > 512, `${size} map generated in under 2.5 s (${fmt(ms, 0)} ms)`);
+  check(ms < (size <= 768 ? 2500 : size <= 1024 ? 4000 : 6000), `${size} map generated in time (${fmt(ms, 0)} ms)`);
   check(roads > 0, `${size} map has country roads`);
   check(linked >= towns - 1, `${size} map: towns linked by road (${linked}/${towns})`);
+  check(pops[0] <= 5000, `${size} map: no huge cities at the start (largest ${pops[0]})`);
+  const nets = townNetworks(g);
+  const worst = nets.reduce((a, n) => (n.pct < a.pct ? n : a), nets[0]);
+  console.log(`  town streets: worst connectivity ${fmt(worst.pct, 1)} % (${worst.town.name}), ${fmt(nets.reduce((a, n) => a + n.deadEnds, 0) / nets.length, 1)} dead ends per town`);
+  check(nets.every((n) => n.pct >= 98), `${size} map: every town's streets connected to its centre`);
+  check(Math.max(...[...g.world.buildings.values()].map((b) => b.floors)) <= 6, `${size} map: no high-rises at the start`);
 }
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

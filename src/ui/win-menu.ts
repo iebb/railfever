@@ -17,9 +17,10 @@ export function openMenu(ui: UI) {
     item('export', 'Export save to file', () => exportSave(ui)),
     item('import', 'Import save from file…', () => importSave(ui)),
     item('company', 'Companies', () => { win.close(); ui.openCompetitors(); }),
+    item('key', 'Track access', () => { win.close(); ui.openTrackAccess(); }),
     item('settings', 'Settings', () => { win.close(); openSettings(ui); }),
     item('help', 'Help & controls', () => { win.close(); openHelp(ui); }),
-    item('rail', 'Title screen', () => { win.close(); ui.showTitle({}); }),
+    item('rail', 'Title screen', () => { win.close(); ui.showTitle({ resumed: {} }); }),
   );
 }
 
@@ -36,6 +37,7 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
     }
     add(win.body, section('Saved games', String(slots.length)));
     if (!slots.length) add(win.body, h('div', { class: 'pad' }, 'No saved games yet.'));
+    slots.sort((a, b) => (a.slot === 'autosave' ? -1 : b.slot === 'autosave' ? 1 : b.saved - a.saved));
     for (const s of slots) {
       add(win.body, h('div', { class: 'slot' },
         h('div', { style: 'min-width:0' }, h('b', null, s.name), h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}`)),
@@ -47,6 +49,7 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
             } }, 'Load'),
           h('button', { class: 'ibtn sm', 'data-tip': 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
     }
+    add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
   };
   render();
 }
@@ -162,14 +165,26 @@ export function openHelp(ui: UI) {
       <li>Connect the stations with track and add a <b>train depot</b> (<kbd>5</kbd>) at a free track end.</li>
       <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>New rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
       <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
+      <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
     </ol>
+    <h4>Lines, demand and companies</h4>
+    <ul>
+      <li>Lines are named automatically from their stops and get their own colour — click the name or the swatch in a line window to change either (empty name = automatic again).</li>
+      <li>The <b>Lines map</b> (<kbd>M</kbd>) shows every route in its colour; the <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (red = unserved, green = served) and how much of each town's travel your network can carry. <kbd>Esc</kbd> closes either.</li>
+      <li>In <b>Companies</b> (<kbd>C</kbd>) you can add AI rivals (up to seven, each with a style: cautious, aggressive, rail baron, bus operator, tram builder…), change their settings, and buy them out — you take over their network, vehicles, cash and loan.</li>
+      <li><b>Track access</b>: sign an agreement (Companies → Track access, or in a foreign station's window) to run your trains and trams on another company's tracks and stop at its stations. Users share the upkeep of what they use: each month an item's maintenance is split by usage, the owner's traffic counting once and the user's × the owner's multiplier (0×–3×, default 2× — so at 50/50 usage the user pays 2/3). Set your own multiplier, or close your network, in Companies → Track access.</li>
+    </ul>
     <h4>Tips</h4>
     <ul>
-      <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>). Use one-way signals on double track; build passing loops on single track.</li>
+      <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>): click to place one, or drag along a track to place a series every 250 m – 1 km. Use one-way signals on double track; build passing loops on single track.</li>
+      <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
+      <li>Stations can be built on the <b>ground</b>, <b>elevated</b> (little land, viaduct cost) or <b>underground</b> (entrances only, much dearer). Ground stations need a road at their forecourt — the station tool builds a short access street. In a station's <b>Build</b> tab you can lengthen platforms, add tracks, change the level, add entrances, move it, and link or merge nearby stations for transfers.</li>
+      <li>Fares grow with the <b>distance</b> travelled (a little more for fast trips): intercity rail and long-distance buses earn well, very short hops earn little.</li>
       <li>Fast, frequent service raises station ratings — well-served towns grow faster.</li>
-      <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). You can inspect their property but not change it.</li>
+      <li>Double track runs one direction per track. Build single track and upgrade it later when traffic grows.</li>
+      <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). With track access you can join their network with your own track and use their stations and stops.</li>
     </ul>
     <h4>Keys</h4>
-    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>N</kbd> news · <kbd>Space</kbd> pause · <kbd>G</kbd> grid · <kbd>Esc</kbd> cancel / close</p>
+    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>G</kbd> grid · <kbd>Esc</kbd> cancel / close</p>
     </div>`;
 }

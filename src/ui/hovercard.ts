@@ -4,11 +4,20 @@ import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import { WATER_Y } from '../game/constants';
 import { esc, svg } from './dom';
+import { fmtMult } from './format';
+import { accessState } from './win-access';
+import type { Game } from '../game/game';
 import { fmtMoney } from '../game/economy';
 import type { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
+
+/** One line on the player's access to another company's station. */
+function accessHint(g: Game, owner: number): string {
+  const k = accessState(g, owner).kind;
+  return k === 'agreement' ? `Track access · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'You are blocked from this network' : k === 'closed' ? 'The owner refuses access' : 'No track access · click to request';
+}
 
 const stat = (ic: string, html: string) => `<span class="hc-stat">${svg(ic, 14)}<span>${html}</span></span>`;
 
@@ -20,6 +29,10 @@ export class HoverCard {
   private t = 0;
   private sx = NaN; private sy = NaN;
   private shown = false;
+  /** card size (measured when the content changes) and whether it currently overlaps a HUD card */
+  private cw = 0; private chh = 0;
+  private blocked = false;
+  private avoidT = 0;
   private v = new THREE.Vector3();
 
   constructor(private ui: UI) {
@@ -79,10 +92,10 @@ export class HoverCard {
       const lines = g.lines.linesAt(s.id).length;
       return {
         color: co.color,
-        html: `<div class="hc-title">${svg(s.rail ? 'station' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
+        html: `<div class="hc-title">${svg(s.rail ? 'station' : s.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}</div>` +
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}</div>` +
-          `<div class="hc-hint">Click for details</div>`,
+          `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access — no passengers</span>' : 'Click for details'}</div>`,
       };
     }
     if (t.kind === 'vehicle') {
@@ -138,11 +151,19 @@ export class HoverCard {
       this.t = 0.4;
       const c = this.content(t);
       if (!c) { this.set(null); return; }
-      if (c.html !== this.html) { this.html = c.html; this.el.innerHTML = c.html; }
+      if (c.html !== this.html) { this.html = c.html; this.el.innerHTML = c.html; this.cw = this.el.offsetWidth; this.chh = this.el.offsetHeight; }
       if (c.color !== this.color) { this.color = c.color; this.el.style.setProperty('--c', c.color); }
     }
     const W = this.ui.root.clientWidth, H = this.ui.root.clientHeight;
     const sx = (v.x * 0.5 + 0.5) * W, sy = (-v.y * 0.5 + 0.5) * H - 10;
+    // stay out from under the left column's cards and the tool card (checked a few times a second)
+    this.avoidT -= dt;
+    if (this.avoidT <= 0) {
+      this.avoidT = 0.12;
+      const x0 = sx - this.cw / 2, x1 = sx + this.cw / 2, y0 = sy - this.chh, y1 = sy;
+      this.blocked = this.ui.hud.avoidRects().some((r) => x0 < r.right && x1 > r.left && y0 < r.bottom && y1 > r.top);
+    }
+    if (this.blocked) { this.hide(); return; }
     if (Math.abs(sx - this.sx) > 0.5 || Math.abs(sy - this.sy) > 0.5) {
       this.sx = sx; this.sy = sy;
       this.el.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;

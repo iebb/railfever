@@ -12,6 +12,8 @@ export const KMH_TO_UPS = 1 / 36;
 export const WATER_Y = 0;
 
 export type NetKind = 'rail' | 'road';
+/** Transport mode of a line (trams run on road edges that carry tram tracks). */
+export type LineKind = 'rail' | 'road' | 'tram';
 
 export interface TrackType {
   id: string;
@@ -48,6 +50,12 @@ export const ROAD_TYPES: Record<string, RoadType> = {
   street: { id: 'street', name: 'Town street', half: 0.3, sidewalk: 0.2, lanes: 2, speed: 50, maxGrade: 0.1, minRadius: 1.5, costPerUnit: 3500, maintPerUnit: 80 },
   road: { id: 'road', name: 'Country road', half: 0.34, sidewalk: 0, lanes: 2, speed: 90, maxGrade: 0.08, minRadius: 4, costPerUnit: 3000, maintPerUnit: 60 },
 };
+
+/**
+ * Tram tracks embedded in a road edge (with overhead wire): `edge.tram`, owned by `edge.tramOwner`.
+ * Costs per world unit of road; trams keep to the road's speed limit (max `speed` km/h on tracks).
+ */
+export const TRAM = { costPerUnit: 4500, maintPerUnit: 90, removePerUnit: 700, speed: 70 };
 
 export const RAIL = {
   gauge: 0.1435,

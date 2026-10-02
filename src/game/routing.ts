@@ -3,9 +3,9 @@
 // construction with planEdge/commitProposal, station sites and depots.
 import type { Game } from './game';
 import type { Town } from './towns';
-import type { Station, StationPlan } from './stations';
+import { railCatchShapes, type Station, type StationPlan } from './stations';
 import type { NNode, NEdge } from './network';
-import { NetKind, RAIL, TRACK_TYPES, ROAD_TYPES, WATER_Y, STATION_RADIUS } from './constants';
+import { NetKind, RAIL, TRACK_TYPES, ROAD_TYPES, WATER_Y } from './constants';
 import { planEdge, commitProposal, findSnap, freeSide, BuildOptions, Snap, Proposal } from './construction';
 import { recomputeLocks } from './terraform';
 import { depotSize } from './build-ops';
@@ -108,7 +108,7 @@ export class CorridorSearch {
   private heap = new Heap();
   private goal: number;
   private goalDirs: Set<number>;
-  private forbid: { x: number; z: number; a: number; w: number; d: number }[] = [];
+  private forbid: { x: number; z: number; a: number; w: number; d: number; r: number }[] = [];
   private lead: number;
   private startV = -1;
   expanded = 0;
@@ -125,8 +125,8 @@ export class CorridorSearch {
     this.gcost = new Float32Array(N * 32).fill(Infinity);
     this.parent = new Int32Array(N * 32).fill(-1);
     this.closed = new Uint8Array(N * 32);
-    for (const st of g.stations.map.values()) for (const f of g.stations.footprints(st)) this.forbid.push({ x: f.x, z: f.z, a: f.angle, w: f.w / 2 + 1.5, d: f.d / 2 + 1.5 });
-    for (const dp of g.depots.map.values()) this.forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5 });
+    for (const st of g.stations.map.values()) for (const f of g.stations.footprints(st)) this.forbid.push({ x: f.x, z: f.z, a: f.angle, w: f.w / 2 + 1.5, d: f.d / 2 + 1.5, r: Math.hypot(f.w / 2 + 1.5, f.d / 2 + 1.5) });
+    for (const dp of g.depots.map.values()) this.forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5, r: Math.hypot(2.5, 3.5) });
     this.lead = opts.lead ?? 10;
     const s0 = this.vertex(from.x + from.tx * this.lead, from.z + from.tz * this.lead);
     this.startV = s0;
@@ -171,7 +171,10 @@ export class CorridorSearch {
     this.hgt[v] = hn ? hs / hn : 0;
     if (water * 2 > hn) f |= 2;
     if (!w.inside(cx, cz, 5)) f |= 16;
-    for (const fb of this.forbid) if (distToRect(cx, cz, fb.x, fb.z, fb.a, fb.w, fb.d) <= 0) { f |= 16; break; }
+    for (const fb of this.forbid) {
+      if (Math.abs(cx - fb.x) > fb.r || Math.abs(cz - fb.z) > fb.r) continue;
+      if (distToRect(cx, cz, fb.x, fb.z, fb.a, fb.w, fb.d) <= 0) { f |= 16; break; }
+    }
     for (const a of this.opts.avoid ?? []) {
       const dx = a.x1 - a.x0, dz = a.z1 - a.z0, l2 = dx * dx + dz * dz || 1;
       const t = Math.max(0, Math.min(1, ((cx - a.x0) * dx + (cz - a.z0) * dz) / l2));
@@ -523,15 +526,24 @@ export function routeConflict(g: Game, prof: ChainProfile, kind: NetKind, tracks
 
 /** Where the profiled route conflicts (see routeConflict), or null. */
 export function routeConflictAt(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set()): P2 | null {
+  return runGen(routeConflictGen(g, prof, kind, tracks, exclude));
+}
+
+/** routeConflictAt in steps: a pause every `step` samples along the route (0: none). */
+export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set(), step = 0): Generator<void, P2 | null> {
   const net = g.world.net;
   const hw = (kind === 'rail' ? 0.32 : ROAD_TYPES.road.half) + (tracks - 1) * RAIL.spacing * 0.5;
   const n = prof.x.length;
   // the route must not come back close to itself
-  for (let i = 0; i < n; i += 3) for (let j = i + 12; j < n; j += 3) {
-    if (prof.s[j] - prof.s[i] < 12) continue;
-    if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return { x: prof.x[j], z: prof.z[j] };
+  for (let i = 0; i < n; i += 3) {
+    if (step && i % (step * 3) === 0 && i) yield;
+    for (let j = i + 12; j < n; j += 3) {
+      if (prof.s[j] - prof.s[i] < 12) continue;
+      if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return { x: prof.x[j], z: prof.z[j] };
+    }
   }
   for (let i = 0; i < n; i += 2) {
+    if (step && i % (step * 2) === 0) yield;
     const x = prof.x[i], z = prof.z[i];
     // the ends attach to stations/streets
     if (prof.s[i] < 2 || prof.s[n - 1] - prof.s[i] < 2) continue;
@@ -836,6 +848,8 @@ export interface SiteOpts {
   prefY?: number; tolY?: number;
   /** extra condition on a site (e.g. its leads line up with the other station's) */
   accept?: (p: StationPlan) => boolean;
+  /** a quicker search (AI): stop a few rings beyond the best site so far (unless a height is wanted) */
+  quick?: boolean;
 }
 
 /** Run a generator to completion (synchronous use of the incremental helpers). */
@@ -852,8 +866,9 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
   const front = o.front ?? 16, back = o.back ?? 9;
   let best: StationPlan | null = null, bestScore = Infinity;
   const maxR = o.maxR ?? town.radius + 14;
-  let n = 0;
+  let n = 0, bestR = Infinity;
   for (let r = 4; r <= maxR; r += 3) {
+    if (o.quick && o.prefY === undefined && r > bestR + 9) break;
     for (const da of [0, 0.25, -0.25, 0.5, -0.5, 0.8, -0.8, 1.2, -1.2]) {
       const pa = dirA + da;
       const x = town.x + Math.sin(pa) * r, z = town.z + Math.cos(pa) * r;
@@ -861,7 +876,8 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
       // the platform axis should point at the target from where the station actually is
       const dirP = Math.atan2(toward.x - x, toward.z - z);
       for (const aa of [0, 0.15, -0.15, 0.35, -0.35]) {
-        if (++n % 12 === 0) yield;
+        // short steps: a pause after a few plans (quick rejections count little)
+        if ((n += 1) >= 16) { n = 0; yield; }
         const ang = dirA + aa;
         const off = Math.abs(Math.atan2(Math.sin(ang - dirP), Math.cos(ang - dirP)));
         if (off > 0.75) continue;
@@ -869,8 +885,13 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         // cheap rejections before the full plan: a street or track across the platform, a blocked throat
         let blocked = false;
         for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) if (g.world.net.nearestEdge(x + fx * o.length * t, z + fz * o.length * t, 1.1)) { blocked = true; break; }
-        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5)) continue;
+        // (half the station's width at least: platforms between the tracks)
+        if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5 + 0.25 * (o.tracks - 1))) continue;
+        // the caller's condition on the site first (planning the station is costly)
+        if (o.accept && !o.accept({ x, z, angle: ang, length: o.length } as StationPlan)) continue;
         const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
+        // planning a station is the costly part (footprints, access road): two per step at most
+        n += 8;
         if (!plan.ok || plan.join) continue;
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
@@ -885,23 +906,24 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
           g.world.net.pointAt(ne.edge, ne.s, q, d);
           if (Math.abs(d.x * fx + d.z * fz) / (Math.hypot(d.x, d.z) || 1) > 0.8) alongside++;
         }
-        let pop = 0;
-        for (const b of g.world.buildingsNear(x, z, 30)) if (Math.hypot(b.x - x, b.z - z) < 30) pop += b.pop;
-        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 25 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
+        // (counting the catchment is costly too: a step of its own)
+        yield;
+        n = 0;
+        // people in the station's catchment (the access road comes with it), those within a short walk of the
+        // platforms counting double (central sites on the levelled town ground connect best)
+        const pop = g.stations.popInShapes(g.stations.planCatchShapes(plan)) + g.stations.popInShapes(railCatchShapes(x, z, ang, o.length).map((c) => ({ ...c, r: 15 })));
+        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 30 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
-        if (score < bestScore) { bestScore = score; best = plan; }
+        if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
       }
     }
   }
   return best;
 }
 
-/** Population within a station's catchment if it were built at (x,z) with platform length L. */
-export function sitePop(g: Game, x: number, z: number, L: number): number {
-  const R = STATION_RADIUS + L / 2;
-  let pop = 0;
-  for (const b of g.world.buildingsNear(x, z, R)) if (Math.hypot(b.x - x, b.z - z) <= R) pop += b.pop;
-  return pop;
+/** Population within a ground station's catchment if it were built at (x,z) along `angle` with platform length L. */
+export function sitePop(g: Game, x: number, z: number, L: number, angle = 0): number {
+  return g.stations.popInShapes(railCatchShapes(x, z, angle, L));
 }
 
 /**
@@ -931,9 +953,9 @@ export function* railPairGen(g: Game, A: Town, B: Town, o: SiteOpts, detour = 1.
       if (heights(pa, pb)) return { a: pa, b: pb };
       // height-matched sites on either side, keeping a useful catchment
       const pb2 = yield* stationSiteGen(g, B, pa, { ...o, prefY: pa.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(pa, q, lead) });
-      if (pb2 && heights(pa, pb2) && sitePop(g, pb2.x, pb2.z, o.length) >= minPop(B)) return { a: pa, b: pb2 };
+      if (pb2 && heights(pa, pb2) && sitePop(g, pb2.x, pb2.z, o.length, pb2.angle) >= minPop(B)) return { a: pa, b: pb2 };
       const pa3 = yield* stationSiteGen(g, A, pb, { ...o, prefY: pb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, pb, lead) });
-      if (pa3 && heights(pa3, pb) && sitePop(g, pa3.x, pa3.z, o.length) >= minPop(A)) return { a: pa3, b: pb };
+      if (pa3 && heights(pa3, pb) && sitePop(g, pa3.x, pa3.z, o.length, pa3.angle) >= minPop(A)) return { a: pa3, b: pb };
     }
   }
   // the other way round: B's best site first, then an A site whose lead meets it
@@ -942,7 +964,7 @@ export function* railPairGen(g: Game, A: Town, B: Town, o: SiteOpts, detour = 1.
   const qa = yield* stationSiteGen(g, A, qb, { ...o, accept: (q) => leadsMeet(q, qb, lead) });
   if (qa && heights(qa, qb)) return { a: qa, b: qb };
   const qa2 = yield* stationSiteGen(g, A, qb, { ...o, prefY: qb.y, tolY: grade * d * 0.9, accept: (q) => leadsMeet(q, qb, lead) });
-  if (qa2 && heights(qa2, qb) && sitePop(g, qa2.x, qa2.z, o.length) >= minPop(A)) return { a: qa2, b: qb };
+  if (qa2 && heights(qa2, qb) && sitePop(g, qa2.x, qa2.z, o.length, qa2.angle) >= minPop(A)) return { a: qa2, b: qb };
   return null;
 }
 

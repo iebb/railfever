@@ -1,11 +1,14 @@
-// Fuzz test: random construction, bulldozing, signals, stations, depots, lines, vehicles, terraforming and
-// save/load round trips while simulating; checks network / vehicle invariants after every step.
+// Fuzz test: random construction, bulldozing, signals, stations, depots, lines, vehicles, terraforming,
+// tram tracks / tram depots / trams and save/load round trips while simulating; checks network / vehicle
+// invariants (incl. tram edges) after every step.
 // npx esbuild scripts/fuzz.ts --bundle --platform=node --format=esm --outfile=$S/fuzz.mjs && node $S/fuzz.mjs [seed] [steps]
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, findSnap, Snap } from '../src/game/construction';
-import { toggleSignal, bulldoze, terraformBrush } from '../src/game/build-ops';
+import { toggleSignal, bulldoze, terraformBrush, addTramTracks, removeTramTracks, roadPath, tramUsable } from '../src/game/build-ops';
+import { tramDepotGen, pathPoints } from '../src/game/ai-tram';
+import { runGen } from '../src/game/routing';
 import { availableModels } from '../src/game/vehicle-types';
-import { buildRailDepot, buildRoadDepot } from '../src/game/ai';
+import { buildRailDepot, buildRoadDepot } from '../src/game/routing';
 import { RNG } from '../src/game/rng';
 import { serialize, deserialize } from '../src/game/save';
 import { Train } from '../src/game/train';
@@ -34,6 +37,8 @@ function invariants(): string[] {
     if (e.prof.some((y) => !isFinite(y))) errs.push(`edge ${e.id} NaN profile`);
     if (e.station >= 0 && !g.stations.get(e.station)?.rail?.edges.includes(e.id)) errs.push(`edge ${e.id} claims station ${e.station}`);
     if (e.depot >= 0 && g.depots.get(e.depot)?.edge !== e.id) errs.push(`edge ${e.id} claims depot ${e.depot}`);
+    if (e.tram && (e.kind !== 'road' || e.tramOwner === undefined || e.tramOwner < 0 || e.tramOwner >= g.companies.length)) errs.push(`edge ${e.id} bad tram tracks (${e.kind}, owner ${e.tramOwner})`);
+    if (!e.tram && e.tramOwner !== undefined) errs.push(`edge ${e.id} tram owner without tracks`);
   }
   for (const c of net.crossings.values()) if (!net.edges.has(c.e1) || !net.edges.has(c.e2)) errs.push(`crossing ${c.id} references a missing edge`);
   for (const st of g.stations.map.values()) {
@@ -41,10 +46,14 @@ function invariants(): string[] {
     for (const p of st.stops) if (!net.edges.get(p.edge) || net.edges.get(p.edge)!.kind !== 'road') errs.push(`stop of station ${st.id} on missing road ${p.edge}`);
     if (st.waitingTotal < 0) errs.push(`station ${st.id} negative waiting`);
   }
-  for (const d of g.depots.map.values()) if (!net.edges.has(d.edge) || !net.nodes.has(d.node)) errs.push(`depot ${d.id} lost its track`);
+  for (const d of g.depots.map.values()) {
+    if (!net.edges.has(d.edge) || !net.nodes.has(d.node)) errs.push(`depot ${d.id} lost its track`);
+    else if ((d.kind === 'tram') !== !!net.edges.get(d.edge)!.tram) errs.push(`depot ${d.id} (${d.kind}) stub tram flag wrong`);
+  }
   for (const l of g.lines.map.values()) {
     for (const s of l.stops) if (!g.stations.get(s)) errs.push(`line ${l.id} stop ${s} missing`);
     for (const v of l.vehicles) if (g.vehicles.get(v)?.lineId !== l.id) errs.push(`line ${l.id} vehicle ${v} not on the line`);
+    for (const v of l.vehicles) { const rv = g.vehicles.get(v); if (rv instanceof RoadVehicle && (l.kind === 'tram') !== rv.isTram) errs.push(`line ${l.id} (${l.kind}) runs ${rv.name}`); }
   }
   for (const v of g.vehicles.map.values()) {
     if (v.lineId != null && !g.lines.get(v.lineId)?.vehicles.includes(v.id)) errs.push(`${v.name} line ${v.lineId} does not list it`);
@@ -53,6 +62,7 @@ function invariants(): string[] {
       for (const s of v.segs) if (s.e >= 0 && !net.edges.has(s.e)) errs.push(`${v.name} on missing edge ${s.e}`);
       if (v.segs.length && (v.headSeg < 0 || v.headSeg >= v.segs.length)) errs.push(`${v.name} bad headSeg`);
     } else if (v instanceof RoadVehicle && v.seg && !net.edges.has(v.seg.e)) errs.push(`${v.name} on missing road ${v.seg.e}`);
+    else if (v instanceof RoadVehicle && v.isTram && v.seg && v.seg.kind === 'lane' && !tramUsable(g, net.edges.get(v.seg.e)!, v.owner)) errs.push(`${v.name} off the tram tracks (edge ${v.seg.e})`);
   }
   for (const a of g.vehicles.ambient) if (a.seg && !net.edges.has(a.seg.e)) errs.push(`town car on missing road ${a.seg.e}`);
   errs.push(...checkReservations(g));
@@ -76,7 +86,7 @@ for (let step = 0; step < STEPS; step++) {
       const kind = r.chance(0.55) ? 'rail' : 'road';
       const a = near(town.x, town.z, town.radius + 15), b = near(a.x, a.z, 25);
       const sa: Snap = findSnap(g, kind, a.x, a.z, 1.5), sb: Snap = findSnap(g, kind, b.x, b.z, 1.5);
-      const p = planEdge(g, sa, sb, { kind, type: kind === 'rail' ? (r.chance(0.8) ? 'standard' : 'highspeed') : r.chance(0.5) ? 'road' : 'street', tracks: kind === 'rail' ? 1 + r.int(2) : 1, heightOffset: r.chance(0.2) ? (r.next() - 0.5) * 6 : 0, crossing: r.pick(['auto', 'auto', 'over', 'under', 'level'] as const), owner: 0 });
+      const p = planEdge(g, sa, sb, { kind, type: kind === 'rail' ? (r.chance(0.8) ? 'standard' : 'highspeed') : r.chance(0.5) ? 'road' : 'street', tracks: kind === 'rail' ? 1 + r.int(2) : 1, heightOffset: r.chance(0.2) ? (r.next() - 0.5) * 6 : 0, crossing: r.pick(['auto', 'auto', 'over', 'under', 'level'] as const), owner: 0, tram: kind === 'road' && r.chance(0.25) });
       if (p.ok && !commitProposal(g, p)) did('built ' + kind);
     } else if (k < 0.33) {
       op = 'station';
@@ -118,8 +128,8 @@ for (let step = 0; step < STEPS; step++) {
       if (!terraformBrush(g, a.x, a.z, 1 + r.next() * 3, r.pick(['raise', 'lower', 'level'] as const), g.world.heightAt(a.x, a.z), 0).error) did('terraform');
     } else if (k < 0.72) {
       op = 'line';
-      const kind = r.chance(0.5) ? 'rail' : 'road';
-      const sts = g.stations.all().filter((s) => (kind === 'rail' ? !!s.rail : s.stops.length > 0));
+      const kind = r.pick(['rail', 'road', 'tram'] as const);
+      const sts = g.stations.all().filter((s) => (kind === 'rail' ? !!s.rail : kind === 'tram' ? g.stations.tramStops(s, 0).length > 0 : s.stops.length > 0));
       if (sts.length >= 2) {
         const l = g.lines.all().find((x) => x.kind === kind && r.chance(0.6)) ?? g.lines.create(kind, 0);
         const s = sts[r.int(sts.length)];
@@ -134,11 +144,14 @@ for (let step = 0; step < STEPS; step++) {
       const deps = g.depots.all();
       if (deps.length) {
         const dp = deps[r.int(deps.length)];
-        const lines = g.lines.all().filter((l) => l.kind === (dp.kind === 'rail' ? 'rail' : 'road'));
+        const lines = g.lines.all().filter((l) => l.kind === dp.kind);
         const line = lines.length && r.chance(0.85) ? lines[r.int(lines.length)].id : null;
         if (dp.kind === 'rail') {
           const loco = r.pick(availableModels(g.year, 'loco')), wag = r.pick(availableModels(g.year, 'wagon'));
           if (typeof g.vehicles.buyTrain(dp.id, [loco, ...Array(1 + r.int(4)).fill(wag)], line) !== 'string') did('buy train');
+        } else if (dp.kind === 'tram') {
+          const trams = availableModels(g.year, 'tram');
+          if (trams.length && typeof g.vehicles.buyRoad(dp.id, r.pick(trams), line) !== 'string') did('buy tram');
         } else if (typeof g.vehicles.buyRoad(dp.id, r.pick(availableModels(g.year, 'bus')), line) !== 'string') did('buy bus');
       }
     } else if (k < 0.89) {
@@ -151,6 +164,36 @@ for (let step = 0; step < STEPS; step++) {
       else { const sts = g.stations.all(); if (sts.length && !g.stations.removeStation(sts[r.int(sts.length)].id)) did('remove station'); }
     } else if (k < 0.935) {
       op = 'save/load';
+      g = deserialize(JSON.parse(JSON.stringify(serialize(g))));
+      did('save/load');
+    } else if (k < 0.99) {
+      op = 'tram';
+      const kk = r.next();
+      if (kk < 0.5) {
+        // tracks along streets between two points of the town (sometimes a stop on them)
+        const streets = g.towns.streets(town, 0);
+        const ea = streets[r.int(Math.max(1, streets.length))], eb = streets[r.int(Math.max(1, streets.length))];
+        const a = { x: 0, y: 0, z: 0 }, b = { x: 0, y: 0, z: 0 };
+        if (ea && eb) { g.world.net.pointAt(ea, ea.len / 2, a); g.world.net.pointAt(eb, eb.len / 2, b); }
+        const path = ea && eb ? roadPath(g, a.x, a.z, b.x, b.z, 80) : null;
+        if (path && !addTramTracks(g, path, 0).error) did('tram tracks');
+        if (path && r.chance(0.6)) {
+          const pts = pathPoints(g, path);
+          const q = pts[r.int(pts.length)];
+          if (q && !g.stations.commitBusStop(q.x, q.z, 0)) did('tram stop');
+        }
+      } else if (kk < 0.7) {
+        const mine = [...g.world.net.edges.values()].filter((e) => e.tram && e.tramOwner === 0 && e.depot < 0);
+        if (mine.length && !removeTramTracks(g, [mine[r.int(mine.length)].id], 0).error) did('remove tram tracks');
+      } else {
+        const mine = [...g.world.net.edges.values()].filter((e) => e.tram && e.tramOwner === 0 && e.depot < 0);
+        if (mine.length) {
+          const pts = pathPoints(g, [mine[r.int(mine.length)].id]);
+          if (pts.length > 6 && runGen(tramDepotGen(g, pts, [], 0)) >= 0) did('tram depot');
+        }
+      }
+    } else if (k < 0.995) {
+      op = 'save/load (tram)';
       g = deserialize(JSON.parse(JSON.stringify(serialize(g))));
       did('save/load');
     }

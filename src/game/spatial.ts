@@ -34,19 +34,20 @@ export class SpatialGrid {
     }
   }
 
-  /** Unique ids whose box intersects the query box. */
+  /** Unique ids whose box intersects the query box (in the order of the first cell they appear in). */
   query(x0: number, z0: number, x1: number, z1: number): number[] {
     const out: number[] = [];
-    const seen = new Set<number>();
     const c = this.cell;
-    for (let cz = Math.floor(z0 / c); cz <= Math.floor(z1 / c); cz++) for (let cx = Math.floor(x0 / c); cx <= Math.floor(x1 / c); cx++) {
+    const qx0 = Math.floor(x0 / c), qz0 = Math.floor(z0 / c), qx1 = Math.floor(x1 / c), qz1 = Math.floor(z1 / c);
+    for (let cz = qz0; cz <= qz1; cz++) for (let cx = qx0; cx <= qx1; cx++) {
       const a = this.cells.get(this.key(cx, cz));
       if (!a) continue;
       for (const id of a) {
-        if (seen.has(id)) continue;
-        seen.add(id);
         const b = this.boxes.get(id)!;
-        if (b[0] <= x1 && b[2] >= x0 && b[1] <= z1 && b[3] >= z0) out.push(id);
+        if (b[0] > x1 || b[2] < x0 || b[1] > z1 || b[3] < z0) continue;
+        // an object spanning several cells is reported from the first of them inside the query (no set needed)
+        if (cx !== Math.max(Math.floor(b[0] / c), qx0) || cz !== Math.max(Math.floor(b[1] / c), qz0)) continue;
+        out.push(id);
       }
     }
     return out;

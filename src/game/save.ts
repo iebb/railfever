@@ -4,8 +4,9 @@ import { World, Building, Tree } from './world';
 import type { NNode, NEdge, Crossing, Section } from './network';
 import type { Town } from './towns';
 import type { Station, WaitGroup } from './stations';
+import { restoreStation } from './stations';
 import type { Depot } from './build-ops';
-import type { Line } from './lines';
+import { Lines, Line } from './lines';
 import { Economy, Company } from './economy';
 import { AIController } from './ai';
 import { Train, TSeg, makeSeg } from './train';
@@ -14,6 +15,7 @@ import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
 import { KMH_TO_UPS } from './constants';
 import type { Vehicle, CargoGroup } from './vehicle';
+import { putSave, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
 
 const VERSION = 2;
 
@@ -92,7 +94,7 @@ function roadOf(v: RoadVehicle) {
     seg: v.seg ? rsegD(v.seg) : null, pos: v.pos, trail: v.trail.map(rsegD), ahead: v.ahead.map(rsegD),
     route: v.route.map((r) => [r.edge, r.dir]), speed: v.speed, loadTimer: v.loadTimer, retryTimer: v.retryTimer,
     junctionWait: v.junctionWait, stuck: v.stuck, ttl: v.ttl, rng: v.rng.state, style: v.style, tint: v.tint, cruise: v.cruise,
-    grade: v.grade, gradeTimer: v.gradeTimer,
+    grade: v.grade, gradeTimer: v.gradeTimer, retryWait: v.retryWait,
   };
 }
 
@@ -121,8 +123,8 @@ export function serialize(g: Game): any {
   return {
     version: VERSION,
     options: g.options, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
-    companies: g.companies.map((c) => ({ id: c.id, name: c.name, color: c.color, ai: c.ai, economy: JSON.parse(JSON.stringify(c.economy)) })),
-    ais: g.ais.map((a) => a.toJSON()),
+    // companies (defunct flags, economies), AI states and configs, track access agreements and rates
+    ...g.saveCompanies(),
     world: {
       size: w.size, h: f32enc(w.h), lock: b64(w.lock), trees: f32enc(trees),
       buildings: [...w.buildings.values()], nextBuildingId: w.nextBuildingId,
@@ -196,19 +198,8 @@ export function deserialize(d: any): Game {
   const g = new Game({ ...d.options }, w);
   g.day = d.day; g.dayFrac = d.dayFrac; g.visualTime = d.visualTime; g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
-  // companies and AI
-  g.companies = (d.companies as any[]).map((c) => {
-    const eco = Object.assign(new Economy(), c.economy);
-    return { id: c.id, name: c.name, color: c.color, ai: c.ai, economy: eco } as Company;
-  });
-  g.ais = [];
-  for (const c of g.companies) {
-    if (!c.ai) continue;
-    const ai = new AIController(g, c.id);
-    const data = (d.ais as any[] ?? []).find((a) => a && a.companyId === c.id);
-    if (data) { try { ai.load(data); } catch (e) { console.warn('AI state could not be restored', e); } }
-    g.ais.push(ai);
-  }
+  // companies and access agreements (the AI controllers are restored at the end, once everything exists)
+  g.restoreCompanies(d);
   // towns, stations, depots, lines
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;
@@ -217,7 +208,8 @@ export function deserialize(d: any): Game {
     return town;
   });
   for (const s of d.stations as any[]) {
-    const st: Station = { ...s, rail: s.rail ? { ...s.rail, edges: [...s.rail.edges] } : null, stops: s.stops.map((p: any) => ({ ...p })), waiting: new Map() };
+    // station fields (levels, entrances, transfer links, road access) with defaults for older saves
+    const st: Station = restoreStation(s);
     st.waitingTotal = 0;
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count);
     g.stations.map.set(st.id, st);
@@ -225,7 +217,7 @@ export function deserialize(d: any): Game {
   g.stations.nextId = d.stationsNextId;
   for (const dp of d.depots as Depot[]) g.depots.map.set(dp.id, { ...dp });
   g.depots.nextId = d.depotsNextId;
-  for (const l of d.lines as Line[]) g.lines.map.set(l.id, { ...l, stops: [...l.stops], vehicles: [...l.vehicles] });
+  for (const l of d.lines as Line[]) g.lines.map.set(l.id, Lines.restore(l));
   g.lines.nextId = d.linesNextId;
   g.firstArrival = new Set(d.firstArrival ?? []);
   g.news = (d.news ?? []).map((n: any) => ({ ...n }));
@@ -259,7 +251,7 @@ export function deserialize(d: any): Game {
     restoreBase(r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
-    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0;
+    r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2;
     const seg = rseg(vd.seg);
     if (seg) {
       r.seg = seg; r.pos = vd.pos;
@@ -312,6 +304,9 @@ export function deserialize(d: any): Game {
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.lines.rebuild();
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
+  g.lines.catchmentDirty = !!d.catchmentDirty;
+  // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
+  g.restoreAIs(d);
   if (!d.ambient) V.manageAmbient();
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
   return g;
@@ -319,57 +314,61 @@ export function deserialize(d: any): Game {
 
 // ------------------------------------------------------------------------------ storage
 
-async function gzip(text: string): Promise<string> {
-  if (typeof CompressionStream === 'undefined') return 'raw:' + text;
+async function gzipBytes(text: string): Promise<Uint8Array | null> {
+  if (typeof CompressionStream === 'undefined') return null;
   const cs = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
-  const buf = new Uint8Array(await new Response(cs).arrayBuffer());
-  return 'gz:' + b64(buf);
+  return new Uint8Array(await new Response(cs).arrayBuffer());
+}
+async function gunzipBytes(u8: Uint8Array): Promise<string> {
+  const ds = new Blob([u8 as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return await new Response(ds).text();
+}
+/** Text form (exported files, legacy saves). */
+async function gzip(text: string): Promise<string> {
+  const u8 = await gzipBytes(text);
+  return u8 ? 'gz:' + b64(u8) : 'raw:' + text;
 }
 async function gunzip(data: string): Promise<string> {
   if (data.startsWith('raw:')) return data.slice(4);
   if (!data.startsWith('gz:')) return data;
-  const u8 = unb64(data.slice(3));
-  const ds = new Blob([u8 as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
-  return await new Response(ds).text();
+  return gunzipBytes(unb64(data.slice(3)));
 }
 
 export interface SlotInfo { slot: string; name: string; date: string; saved: number; money: number }
 
-const PREFIX = 'railfever.save.';
+let slotCache: SlotInfo[] = [];
+async function refreshSlots() {
+  const all = await listSaves();
+  slotCache = all.map((r) => r.meta as SlotInfo).filter((m) => !!m && typeof m === 'object' && typeof m.slot === 'string').sort((a, b) => b.saved - a.saved);
+}
+/** Resolves once the saved slots are known (IndexedDB is asynchronous; old localStorage saves are migrated). */
+export const slotsReady: Promise<void> = (async () => {
+  try { await migrateLegacy(); await refreshSlots(); } catch (e) { console.warn('save storage unavailable', e); }
+})();
 
+/** Save to IndexedDB (gzip-compressed binary). */
 export async function saveToSlot(g: Game, slot: string, name: string): Promise<void> {
-  const data = await gzip(JSON.stringify(serialize(g)));
+  const json = JSON.stringify(serialize(g));
+  const data = (await gzipBytes(json)) ?? json;
   const meta: SlotInfo = { slot, name, date: g.dateString(), saved: Date.now(), money: g.economy.money };
-  try {
-    localStorage.setItem(PREFIX + slot, data);
-  } catch (e) {
-    // quota: drop the autosave to make room and retry once
-    if (slot !== 'autosave' && localStorage.getItem(PREFIX + 'autosave')) { deleteSlot('autosave'); localStorage.setItem(PREFIX + slot, data); }
-    else throw e;
-  }
-  localStorage.setItem(PREFIX + slot + '.meta', JSON.stringify(meta));
+  await putSave({ slot, data, meta });
+  slotCache = [meta, ...slotCache.filter((s) => s.slot !== slot)].sort((a, b) => b.saved - a.saved);
 }
 
 export async function loadFromSlot(slot: string): Promise<Game> {
-  const data = localStorage.getItem(PREFIX + slot);
-  if (!data) throw new Error('Empty slot');
-  return deserialize(JSON.parse(await gunzip(data)));
+  await slotsReady;
+  const rec = await getSave(slot);
+  if (!rec) throw new Error('Empty slot');
+  const text = typeof rec.data === 'string' ? await gunzip(rec.data) : await gunzipBytes(rec.data);
+  return deserialize(JSON.parse(text));
 }
 
-export function listSlots(): SlotInfo[] {
-  const out: SlotInfo[] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const k = localStorage.key(i)!;
-    if (k.startsWith(PREFIX) && k.endsWith('.meta')) {
-      try { out.push(JSON.parse(localStorage.getItem(k)!)); } catch { /* ignore */ }
-    }
-  }
-  return out.sort((a, b) => b.saved - a.saved);
-}
+/** Known save slots, newest first (complete once `slotsReady` has resolved). */
+export function listSlots(): SlotInfo[] { return slotCache.slice(); }
 
 export function deleteSlot(slot: string) {
-  localStorage.removeItem(PREFIX + slot);
-  localStorage.removeItem(PREFIX + slot + '.meta');
+  slotCache = slotCache.filter((s) => s.slot !== slot);
+  deleteSave(slot).catch((e) => console.warn('delete failed', e));
 }
 
 export async function exportToFile(g: Game): Promise<Blob> {

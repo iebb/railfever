@@ -7,12 +7,13 @@ import { svg } from '../ui/icons';
 
 interface Label {
   el: HTMLDivElement;
-  kind: 'town' | 'stn';
+  kind: 'town' | 'stn' | 'tag';
   name: HTMLSpanElement;
   sub: HTMLSpanElement;
   ico: HTMLSpanElement | null;
   mark: HTMLSpanElement | null;
-  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string;
+  chips: HTMLSpanElement | null;
+  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
 }
 
@@ -35,6 +36,15 @@ export class Labels {
   marks = new Map<number, { color: string; text: string }>();
   /** maximum number of labels on screen */
   maxVisible = 60;
+  /** colours of the lines serving each station (shown as chips on the plates, e.g. in the lines map) */
+  lineChips = new Map<number, string[]>();
+  /** text replacing the population pill of towns (e.g. share transported in the demand view) */
+  townInfo = new Map<number, string>();
+  /** line name tags on routes (lines map): line id -> anchor, text, colour, highlighted */
+  routeTags = new Map<number, { x: number; y: number; z: number; text: string; color: string; hl: boolean }>();
+  onClickTag: (lineId: number) => void = () => {};
+  onHoverTag: (lineId: number | null) => void = () => {};
+  private tags = new Map<number, Label>();
   private hl: number | null = null;
   private v = new THREE.Vector3();
   private cands: Cand[] = [];
@@ -54,26 +64,29 @@ export class Labels {
     this.container.innerHTML = '';
     this.towns.clear();
     this.stations.clear();
+    this.tags.clear();
     this.marks.clear();
     this.hl = null;
   }
 
-  private make(kind: 'town' | 'stn', onClick: () => void): Label {
+  private make(kind: 'town' | 'stn' | 'tag', onClick: () => void): Label {
     const el = document.createElement('div');
     el.className = 'lbl ' + kind;
     const name = document.createElement('span'); name.className = 'lbl-name';
     const sub = document.createElement('span'); sub.className = kind === 'town' ? 'lbl-pop' : 'lbl-wait';
-    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null;
+    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null, chips: HTMLSpanElement | null = null;
     if (kind === 'stn') {
       ico = document.createElement('span'); ico.className = 'lbl-ico';
       mark = document.createElement('span'); mark.className = 'lbl-mark'; mark.style.display = 'none';
-      el.append(ico, mark, name, sub);
-    } else el.append(name, sub);
+      chips = document.createElement('span'); chips.className = 'lbl-chips'; chips.style.display = 'none';
+      el.append(ico, mark, name, sub, chips);
+    } else if (kind === 'tag') el.append(name);
+    else el.append(name, sub);
     el.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
     el.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
     el.style.display = 'none';
     this.container.appendChild(el);
-    return { el, kind, name, sub, ico, mark, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+    return { el, kind, name, sub, ico, mark, chips, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
   }
 
   update(game: Game, camera: THREE.PerspectiveCamera, w: number, h: number, camDist: number) {
@@ -88,7 +101,8 @@ export class Labels {
     for (const t of game.towns.list) {
       let l = this.towns.get(t.id);
       if (!l) { const id = t.id; l = this.make('town', () => this.onClickTown(id)); this.towns.set(t.id, l); }
-      this.setText(l, t.name.toUpperCase(), t.pop.toLocaleString('en-US'), t.served > 0);
+      const info = this.townInfo.get(t.id);
+      this.setText(l, t.name.toUpperCase(), info ?? t.pop.toLocaleString('en-US'), !info && t.served > 0);
       this.setCls(l, t.pop >= 3000 ? 'lbl town big' : 'lbl town');
       const y = Math.max(world.heightAt(t.x, t.z), WATER_Y) + 3 + Math.min(5, t.pop / 2500);
       cands.push({ l, x: t.x, y, z: t.z, prio: 1e5 + t.pop, maxDist: townMax, scale: 1, force: false, d: 0, sx: 0, sy: 0, w: 0, h: 34 });
@@ -102,15 +116,32 @@ export class Labels {
       const mk = this.marks.get(s.id);
       const isHl = this.hl === s.id;
       this.setText(l, s.name, served ? String(s.waitingTotal) : '–', false);
-      this.setIcon(l, s.rail ? 'train' : 'bus');
+      this.setIcon(l, s.rail ? 'train' : s.stops.some((p) => game.world.net.edges.get(p.edge)?.tram) ? 'tram' : 'bus');
       this.setMark(l, mk);
-      this.setCls(l, 'lbl stn' + (!served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : ''));
+      this.setChips(l, this.lineChips.get(s.id));
+      const noRoad = !!s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false;
+      this.setCls(l, 'lbl stn' + (!served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad ? ' noroad' : ''));
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
       const y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
       const force = !!mk || isHl;
       cands.push({ l, x: s.x, y, z: s.z, prio: isHl ? 1e9 : mk ? 1e8 : (served ? 2e4 : 1e4), maxDist: force ? 3000 : stMax, scale: isHl ? 1.1 : 1, force, d: 0, sx: 0, sy: 0, w: 0, h: 24 });
     }
+    // ---- line name tags (lines map)
+    for (const [id, t] of this.routeTags) {
+      let l = this.tags.get(id);
+      if (!l) {
+        l = this.make('tag', () => this.onClickTag(id));
+        l.el.addEventListener('pointerenter', () => this.onHoverTag(id));
+        l.el.addEventListener('pointerleave', () => this.onHoverTag(null));
+        this.tags.set(id, l);
+      }
+      if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
+      this.setCls(l, t.hl ? 'lbl tag hl' : 'lbl tag');
+      if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
+      cands.push({ l, x: t.x, y: t.y, z: t.z, prio: t.hl ? 5e8 : 9e4, maxDist: 5000, scale: 1, force: t.hl, d: 0, sx: 0, sy: 0, w: 0, h: 20 });
+    }
+    for (const [id, l] of this.tags) if (!this.routeTags.has(id)) { l.el.remove(); this.tags.delete(id); }
     // ---- project & cull
     const v = this.v;
     let n = 0;
@@ -134,19 +165,20 @@ export class Labels {
       if (keep.size >= this.maxVisible && !c.force) break;
       // never shrink below ~11 px text (smallest plate text is 12 px)
       const s = Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2)) * c.scale;
-      c.w = (c.l.text.length * (c.l.kind === 'town' ? 9 : 7.2) + (c.l.kind === 'stn' ? 56 : 12)) * s;
+      c.w = (c.l.kind === 'tag' ? Math.min(170, c.l.text.length * 6.6 + 16) : c.l.text.length * (c.l.kind === 'town' ? 9 : 7.2) + (c.l.kind === 'stn' ? 56 : 12)) * s;
       c.h *= s;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && this.occluded(game, camera, c.x, c.y, c.z)) continue;
+      if (!c.force && c.l.kind !== 'tag' && this.occluded(game, camera, c.x, c.y, c.z)) continue;
       placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
       keep.add(c.l);
       this.place(c, s, w, h);
     }
     for (const l of this.towns.values()) if (l.shown && !keep.has(l)) this.hide(l);
     for (const l of this.stations.values()) if (l.shown && !keep.has(l)) this.hide(l);
+    for (const l of this.tags.values()) if (l.shown && !keep.has(l)) this.hide(l);
     // drop labels of removed towns / stations
     if (this.stations.size > game.stations.map.size) for (const [id, l] of this.stations) if (!game.stations.map.has(id)) { l.el.remove(); this.stations.delete(id); }
     if (this.towns.size > game.towns.list.length) for (const [id, l] of this.towns) if (!game.towns.list[id]) { l.el.remove(); this.towns.delete(id); }
@@ -177,6 +209,16 @@ export class Labels {
   }
 
   private setCls(l: Label, cls: string) { if (l.cls !== cls) { l.cls = cls; l.el.className = cls; } }
+
+  private setChips(l: Label, colors: string[] | undefined) {
+    if (!l.chips) return;
+    const sig = colors ? colors.join(',') : '';
+    if (sig === l.chipSig) return;
+    l.chipSig = sig;
+    l.chips.style.display = sig ? '' : 'none';
+    l.chips.replaceChildren(...(colors ?? []).slice(0, 6).map((c) => { const i = document.createElement('i'); i.style.background = c; return i; }));
+    if (colors && colors.length > 6) { const m = document.createElement('b'); m.textContent = `+${colors.length - 6}`; l.chips.appendChild(m); }
+  }
 
   private hide(l: Label) { l.shown = false; l.el.style.display = 'none'; }
 

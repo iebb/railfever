@@ -60,7 +60,8 @@ export class CameraController {
 
   setWorld(w: World) {
     this.world = w;
-    this.maxDist = Math.max(250, Math.min(750, w.size * 0.95));
+    // far enough to frame the whole map (1536 units on XL maps)
+    this.maxDist = Math.max(250, Math.min(1800, w.size * 1.1));
     this.follow = null;
     this.target.set(w.size / 2, 0, w.size / 2);
     this.distance = Math.min(this.maxDist, 90);

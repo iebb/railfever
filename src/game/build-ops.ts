@@ -1,6 +1,6 @@
 // Depots, signals, demolition and terraforming.
 import type { Game } from './game';
-import { NetKind, RAIL } from './constants';
+import { NetKind, RAIL, TRAM, ROAD_TYPES } from './constants';
 import { bezLine } from './geom';
 import { NEdge } from './network';
 import { distToRect, World } from './world';
@@ -8,9 +8,12 @@ import { rectsOverlap } from './towns';
 import { applyEarthworks, recomputeLocks, brush } from './terraform';
 import { planEdge, commitProposal, nodeGroup, Snap, Proposal } from './construction';
 
+/** Depot kinds: rail, road (buses) and tram (on a road with tram tracks). */
+export type DepotKind = NetKind | 'tram';
+
 export interface Depot {
   id: number;
-  kind: NetKind;
+  kind: DepotKind;
   x: number; z: number; y: number;
   angle: number;
   owner: number;
@@ -19,7 +22,13 @@ export interface Depot {
   edge: number;
 }
 
-export function depotSize(kind: NetKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : { w: 1.8, d: 1.6 }; }
+export function depotSize(kind: DepotKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : kind === 'tram' ? { w: 2.0, d: 3.9 } : { w: 1.8, d: 1.6 }; }
+
+/** Network kind of a depot's track (tram depots sit on roads). */
+export const depotNetKind = (kind: DepotKind): NetKind => (kind === 'rail' ? 'rail' : 'road');
+
+/** May company `owner` run trams on this edge? (tram tracks it may use) */
+export function tramUsable(g: Game, e: NEdge, owner: number): boolean { return !!e.tram && g.canUse(owner, e.tramOwner ?? -1); }
 
 export interface DepotPlan { ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number; demolish: number[] }
 
@@ -40,8 +49,8 @@ export class Depots {
     return out;
   }
 
-  /** Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. */
-  plan(kind: NetKind, x: number, z: number, angle: number, owner: number): DepotPlan {
+  /** Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. Tram depots connect to tram tracks. */
+  plan(kind: DepotKind, x: number, z: number, angle: number, owner: number): DepotPlan {
     const g = this.game;
     const w = g.world;
     const net = w.net;
@@ -61,7 +70,7 @@ export class Depots {
     }
     const fx = Math.sin(angle), fz = Math.cos(angle);
     const exitX = x + fx * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3)), exitZ = z + fz * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3));
-    const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : 60000, demolish: [] };
+    const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : kind === 'tram' ? 120000 : 60000, demolish: [] };
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
     if (!w.inside(x, z, 4)) failp('Too close to the map edge');
     let mx = -Infinity, mn = Infinity;
@@ -87,20 +96,21 @@ export class Depots {
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
     for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
     plan.cost += Math.round((mx - mn) * 20000);
-    if (kind === 'road' && plan.ok) {
-      const link = this.roadLink(exitX, exitZ, plan.y, owner, -1);
-      if (link && !link.ok) failp('Cannot connect to the road');
+    if (kind !== 'rail' && plan.ok) {
+      const tram = kind === 'tram';
+      const link = this.roadLink(exitX, exitZ, plan.y, owner, -1, tram);
+      if (link && !link.ok) failp(tram ? 'Cannot connect to the tram track' : 'Cannot connect to the road');
       else if (link) { for (const id of link.demolish) if (!plan.demolish.includes(id)) plan.demolish.push(id); plan.cost += link.cost; }
-      else if (!net.nearestEdge(exitX, exitZ, 4, 'road', (ed) => ed.depot < 0)) failp('No road nearby');
+      else if (!net.nearestEdge(exitX, exitZ, 4, 'road', (ed) => ed.depot < 0 && (!tram || tramUsable(g, ed, owner)))) failp(tram ? 'No tram track nearby' : 'No road nearby');
     }
     return plan;
   }
 
-  /** Street linking a road depot exit to the nearest road (null if none is needed or none is near). */
-  private roadLink(x: number, z: number, y: number, owner: number, exitNode: number): Proposal | null {
+  /** Street linking a road (tram) depot exit to the nearest road (tram track); null if none is needed or near. */
+  private roadLink(x: number, z: number, y: number, owner: number, exitNode: number, tram = false): Proposal | null {
     const g = this.game;
     const net = g.world.net;
-    const ne = net.nearestEdge(x, z, 4, 'road', (ed) => ed.depot < 0);
+    const ne = net.nearestEdge(x, z, 4, 'road', (ed) => ed.depot < 0 && (!tram || tramUsable(g, ed, owner)));
     if (!ne) return null;
     const nodeEnd = ne.s < 0.8 ? ne.edge.a : ne.s > ne.edge.len - 0.8 ? ne.edge.b : -1;
     const p = { x: 0, y: 0, z: 0 };
@@ -109,10 +119,10 @@ export class Depots {
     const end: Snap = nn ? { kind: 'node', x: nn.x, z: nn.z, y: nn.y, node: nn.id } : { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
     if (Math.hypot(end.x - x, end.z - z) <= 0.3) return null;
     const start: Snap = exitNode >= 0 ? { kind: 'node', x, z, y, node: exitNode } : { kind: 'free', x, z, y };
-    return planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+    return planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner, tram });
   }
 
-  commit(kind: NetKind, plan: DepotPlan, owner: number): string | null {
+  commit(kind: DepotKind, plan: DepotPlan, owner: number): string | null {
     const g = this.game;
     const w = g.world;
     const net = w.net;
@@ -122,13 +132,15 @@ export class Depots {
     const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
     const sz = depotSize(kind);
     const inX = plan.x - fx * (sz.d / 2 - 0.4), inZ = plan.z - fz * (sz.d / 2 - 0.4);
-    const inner = net.addNode(kind, inX, plan.y, inZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
-    const exit = plan.snapNode >= 0 ? net.nodes.get(plan.snapNode)! : net.addNode(kind, plan.exitX, plan.y, plan.exitZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
+    const nk = depotNetKind(kind);
+    const inner = net.addNode(nk, inX, plan.y, inZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
+    const exit = plan.snapNode >= 0 ? net.nodes.get(plan.snapNode)! : net.addNode(nk, plan.exitX, plan.y, plan.exitZ, kind === 'rail' ? fx : 0, kind === 'rail' ? fz : 0, owner);
     const len = Math.hypot(exit.x - inX, exit.z - inZ);
     const prof = new Float32Array(Math.max(2, Math.ceil(len) + 1)).fill(plan.y);
     prof[prof.length - 1] = exit.y;
     const id = this.nextId++;
-    const e = net.addEdge(kind, inner.id, exit.id, bezLine(inX, inZ, exit.x, exit.z), prof, [], kind === 'rail' ? 'standard' : 'road', owner, { depot: id });
+    const e = net.addEdge(nk, inner.id, exit.id, bezLine(inX, inZ, exit.x, exit.z), prof, [], kind === 'rail' ? 'standard' : 'road', owner,
+      kind === 'tram' ? { depot: id, tram: true, tramOwner: owner } : { depot: id });
     const dp: Depot = { id, kind, x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, owner, node: exit.id, edge: e.id };
     this.map.set(id, dp);
     // flatten the ground under the building
@@ -143,9 +155,9 @@ export class Depots {
     applyEarthworks(w, [e]);
     w.removeTreesNear(plan.x, plan.z, Math.hypot(sz.w, sz.d) / 2 + 0.5);
     w.markObjArea(plan.x - 4, plan.z - 4, plan.x + 4, plan.z + 4);
-    // road depots connect themselves to the nearest road (planned, demolitions and cost included, in plan())
-    if (kind === 'road') {
-      const link = this.roadLink(exit.x, exit.z, exit.y, owner, exit.id);
+    // road / tram depots connect themselves to the nearest road / tram track (planned, demolitions and cost included, in plan())
+    if (kind !== 'rail') {
+      const link = this.roadLink(exit.x, exit.z, exit.y, owner, exit.id, kind === 'tram');
       if (link && link.ok) commitProposal(g, link);
     }
     g.onNetworkChanged();
@@ -256,6 +268,7 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
   for (const e of edges) {
     if (e.station >= 0 || e.depot >= 0) continue;
     if (e.owner >= 0 && e.owner !== owner) { res.error = 'Owned by another company'; continue; }
+    if (e.tram && (e.tramOwner ?? -1) >= 0 && e.tramOwner !== owner) { res.error = 'Tram tracks of another company'; continue; }
     if (g.vehicles.isEdgeBusy(e.id)) { res.error = 'Vehicle in the way'; continue; }
     res.cost += (e.kind === 'rail' ? 400 : 250) * e.len; res.changed++;
     if (!dryRun) removed.push(e);
@@ -301,6 +314,105 @@ export function terraformBrush(g: Game, x: number, z: number, radius: number, mo
   if (!g.company(owner).economy.spend(cost, 'construction')) return { cost, error: 'Not enough money' };
   brush(g.world, x, z, radius, mode, 0.25, level, false);
   return { cost };
+}
+
+// ------------------------------------------------------------------ tram tracks
+
+export interface TramTrackResult { cost: number; changed: number; error: string | null }
+
+/** Is a tram physically on this edge? */
+function tramOn(g: Game, edgeId: number): boolean {
+  for (const v of g.vehicles.roads()) if (v.model?.kind === 'tram' && v.occupiedEdges().includes(edgeId)) return true;
+  return false;
+}
+
+/**
+ * Lay tram tracks (with overhead wire) in existing road edges, owned by `owner`, for TRAM.costPerUnit per
+ * unit. Roads of other companies need an access agreement; edges that already carry tracks are skipped.
+ */
+export function addTramTracks(g: Game, edgeIds: number[], owner: number, dryRun = false): TramTrackResult {
+  const net = g.world.net;
+  const res: TramTrackResult = { cost: 0, changed: 0, error: null };
+  const todo: NEdge[] = [];
+  for (const id of new Set(edgeIds)) {
+    const e = net.edges.get(id);
+    if (!e || e.tram) continue;
+    if (e.kind !== 'road') { res.error = 'Tram tracks are laid in roads'; continue; }
+    if (e.station >= 0 || e.depot >= 0) { res.error = 'Not inside a depot'; continue; }
+    if (e.owner >= 0 && !g.canUse(owner, e.owner)) { res.error = 'Road of another company'; continue; }
+    res.cost += TRAM.costPerUnit * e.len; res.changed++;
+    todo.push(e);
+  }
+  res.cost = Math.round(res.cost);
+  if (dryRun || !todo.length) return res;
+  if (!g.company(owner).economy.spend(res.cost, 'construction')) return { cost: res.cost, changed: 0, error: 'Not enough money' };
+  for (const e of todo) { e.tram = true; e.tramOwner = owner; net.touchEdge(e); }
+  g.onNetworkChanged();
+  return res;
+}
+
+/** Take up tram tracks owned by `owner` (not under a tram; trams routed over them re-plan). */
+export function removeTramTracks(g: Game, edgeIds: number[], owner: number, dryRun = false): TramTrackResult {
+  const net = g.world.net;
+  const res: TramTrackResult = { cost: 0, changed: 0, error: null };
+  const todo: NEdge[] = [];
+  for (const id of new Set(edgeIds)) {
+    const e = net.edges.get(id);
+    if (!e || !e.tram || e.depot >= 0) continue;
+    if (e.tramOwner !== owner) { res.error = 'Tram tracks of another company'; continue; }
+    if (tramOn(g, e.id)) { res.error = 'Tram in the way'; continue; }
+    res.cost += TRAM.removePerUnit * e.len; res.changed++;
+    todo.push(e);
+  }
+  res.cost = Math.round(res.cost);
+  if (dryRun || !todo.length) return res;
+  g.company(owner).economy.spend(res.cost, 'construction', true);
+  for (const e of todo) { delete e.tram; delete e.tramOwner; net.touchEdge(e); }
+  g.onNetworkChanged();
+  return res;
+}
+
+/**
+ * Road edges along the shortest road path between the road points nearest to (ax,az) and (bx,bz)
+ * (e.g. for laying tram tracks by dragging along streets). Null if not connected.
+ */
+export function roadPath(g: Game, ax: number, az: number, bx: number, bz: number, maxLen = 400): number[] | null {
+  const net = g.world.net;
+  const ok = (e: NEdge) => e.kind === 'road' && e.depot < 0 && e.station < 0;
+  const ea = net.nearestEdge(ax, az, 2, 'road', ok), eb = net.nearestEdge(bx, bz, 2, 'road', ok);
+  if (!ea || !eb) return null;
+  if (ea.edge.id === eb.edge.id) return [ea.edge.id];
+  // Dijkstra over nodes, starting from both ends of the first edge
+  const dist = new Map<number, number>(), via = new Map<number, number>();
+  const open: [number, number][] = [];
+  const start = (n: number, d: number) => { dist.set(n, d); via.set(n, -1); open.push([d, n]); };
+  start(ea.edge.a, ea.s); start(ea.edge.b, ea.edge.len - ea.s);
+  const goal = new Set([eb.edge.a, eb.edge.b]);
+  let found = -1;
+  while (open.length) {
+    open.sort((p, q) => p[0] - q[0]);
+    const [d, u] = open.shift()!;
+    if (d > (dist.get(u) ?? Infinity)) continue;
+    if (goal.has(u)) { found = u; break; }
+    if (d > maxLen) break;
+    for (const eid of net.nodes.get(u)?.edges ?? []) {
+      const e = net.edges.get(eid);
+      if (!e || !ok(e)) continue;
+      const v = e.a === u ? e.b : e.a, nd = d + e.len * ((ROAD_TYPES[e.type] ?? ROAD_TYPES.road).speed > 60 ? 1.1 : 1);
+      if (nd < (dist.get(v) ?? Infinity)) { dist.set(v, nd); via.set(v, eid); open.push([nd, v]); }
+    }
+  }
+  if (found < 0) return null;
+  const out = [eb.edge.id];
+  for (let n = found, guard = 0; guard < 10000; guard++) {
+    const eid = via.get(n) ?? -1;
+    if (eid < 0) break;
+    out.push(eid);
+    const e = net.edges.get(eid)!;
+    n = e.a === n ? e.b : e.a;
+  }
+  out.push(ea.edge.id);
+  return [...new Set(out.reverse())];
 }
 
 export function isWorld(w: World) { return !!w; }

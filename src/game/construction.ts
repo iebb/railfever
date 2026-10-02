@@ -1,6 +1,6 @@
 // Free-form construction planner for tracks and roads.
 import type { Game } from './game';
-import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y } from './constants';
+import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM } from './constants';
 import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
 } from './geom';
@@ -29,6 +29,8 @@ export interface BuildOptions {
   town?: boolean;
   /** roads: straight segment with free ends (no tangent continuity at dead ends), e.g. grid streets */
   straight?: boolean;
+  /** roads: lay tram tracks (with overhead wire) in the new road, owned by `owner` */
+  tram?: boolean;
 }
 
 export interface CrossingPlan {
@@ -60,7 +62,82 @@ export interface Proposal {
   demolish: number[];
   trees: number;
   cost: number;
-  stats: { len: number; maxGrade: number; minRadius: number; bridges: number; tunnels: number; speed: number };
+  stats: {
+    len: number; maxGrade: number; minRadius: number; bridges: number; tunnels: number; speed: number;
+    /** rail: what sharing the formation saves (further tracks built together, or beside an existing track) */
+    sharedSaving?: number;
+    /** cost split: track (and road surface) on the ground, bridges / viaducts, tunnels, earthworks, the rest */
+    costSplit?: { track: number; bridges: number; tunnels: number; earthworks: number; other: number };
+  };
+}
+
+/**
+ * Structure cost per unit as a multiple of the ground track (or road) cost per unit: viaducts and bridges by
+ * deck height above the ground or river bed (rail 5x low .. 8x from 50 m up; roads 3.5x .. 5x), tunnels by
+ * depth below the surface (rail 9.5x shallow .. 13x from 80 m down; roads 7x .. 9.5x).
+ */
+export function structureFactor(kind: NetKind, type: 'bridge' | 'tunnel', h: number): number {
+  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 5 + 3 * k : 3.5 + 1.5 * k; }
+  const k = Math.min(6, Math.max(0, h - 1.9)) / 6;
+  return kind === 'rail' ? 9.5 + 3.5 * k : 7 + 2.5 * k;
+}
+
+/**
+ * Track cost shares where a track shares a graded formation, bridge or tunnel (further tracks built in the
+ * same go, or a track laid beside an existing one): materials, structures (bridge / tunnel premium) and
+ * earthworks.
+ */
+export const SHARED_TRACK = { materials: 0.6, structures: 0.35, earthworks: 0.3 };
+
+/** Height of an existing track running parallel beside (x, z) along (tx, tz), 0.25..maxLat across, or null. */
+function formationBeside(g: Game, x: number, z: number, tx: number, tz: number, maxLat: number): number | null {
+  const net = g.world.net;
+  let best: number | null = null, bl = Infinity;
+  for (const e of net.edgesNear(x - maxLat, z - maxLat, x + maxLat, z + maxLat)) {
+    if (e.kind !== 'rail') continue;
+    const ge = net.geo(e);
+    let bd = Infinity, bi = 0;
+    for (let j = 0; j < ge.n; j++) { const dd = (ge.pts[j * 3] - x) ** 2 + (ge.pts[j * 3 + 2] - z) ** 2; if (dd < bd) { bd = dd; bi = j; } }
+    const ex = ge.tan[bi * 2], ez = ge.tan[bi * 2 + 1];
+    if (Math.abs(ex * tx + ez * tz) < 0.9) continue;
+    const ox = x - ge.pts[bi * 3], oz = z - ge.pts[bi * 3 + 2];
+    const lat = Math.abs(ox * ez - oz * ex), along = Math.abs(ox * ex + oz * ez);
+    if (lat < 0.25 || lat > maxLat || along > 0.6 || lat >= bl) continue;
+    bl = lat;
+    best = ge.pts[bi * 3 + 1];
+  }
+  return best;
+}
+
+/**
+ * Per track of a rail proposal, per PSTEP sample: does it run beside an existing track (0.25-1.25 units
+ * across, parallel, at the same height)? Such stretches share that track's formation, bridges and tunnels.
+ */
+function besideExisting(g: Game, prop: Proposal): Uint8Array[] {
+  const net = g.world.net, p = { x: 0, z: 0 };
+  return prop.tracks.map((tp) => {
+    const tab = arcTable(tp.bez);
+    const n = Math.max(1, Math.ceil(tp.len / PSTEP));
+    const out = new Uint8Array(n);
+    for (let i = 0; i < n; i++) {
+      const s = Math.min(tp.len, (i + 0.5) * PSTEP), t = tAtS(tab, s);
+      bezPoint(tp.bez, t, p);
+      const d = bezDeriv(tp.bez, t), dl = Math.hypot(d.x, d.z) || 1;
+      const y = profAt(tp.prof, tp.len, s);
+      for (const e of net.edgesNear(p.x - 1.3, p.z - 1.3, p.x + 1.3, p.z + 1.3)) {
+        if (e.kind !== 'rail') continue;
+        const ge = net.geo(e);
+        let best = Infinity, bi = 0;
+        for (let j = 0; j < ge.n; j++) { const dd = (ge.pts[j * 3] - p.x) ** 2 + (ge.pts[j * 3 + 2] - p.z) ** 2; if (dd < best) { best = dd; bi = j; } }
+        const tx = ge.tan[bi * 2], tz = ge.tan[bi * 2 + 1];
+        if (Math.abs((tx * d.x + tz * d.z) / dl) < 0.9 || Math.abs(ge.pts[bi * 3 + 1] - y) > 0.35) continue;
+        const ox = p.x - ge.pts[bi * 3], oz = p.z - ge.pts[bi * 3 + 2];
+        const lat = Math.abs(ox * tz - oz * tx), along = Math.abs(ox * tx + oz * tz);
+        if (lat >= 0.25 && lat <= 1.25 && along < 0.6) { out[i] = 1; break; }
+      }
+    }
+    return out;
+  });
 }
 
 const BRIDGE_H = 1.1;   // >11 m above ground -> bridge
@@ -158,6 +235,20 @@ export function findSnap(g: Game, kind: NetKind, x: number, z: number, radius = 
     return { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: ne.edge.id, s: ne.s };
   }
   return { kind: 'free', x, z, y: w.heightAt(x, z) };
+}
+
+/** Owners of the rails a snap joins (rail: its nodes / edge; roads: the tram tracks there). */
+function snapOwners(g: Game, sn: Snap, kind: NetKind): number[] {
+  const net = g.world.net, out: number[] = [];
+  const edgeOwner = (e: NEdge | undefined) => { if (e) out.push(kind === 'rail' ? e.owner : e.tram ? e.tramOwner ?? -1 : -1); };
+  if (sn.kind === 'edge') edgeOwner(net.edges.get(sn.edge!));
+  else if (sn.kind === 'node') for (const id of sn.group ?? [sn.node!]) {
+    const n = net.nodes.get(id);
+    if (!n) continue;
+    if (kind === 'rail') out.push(n.owner);
+    else for (const eid of n.edges) edgeOwner(net.edges.get(eid));
+  }
+  return out;
 }
 
 // ------------------------------------------------------------------------------------ geometry
@@ -324,6 +415,13 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   if (sg && sg.length > 1) { fa.x = cs.x; fa.z = cs.z; }
   const fb = endFrame(g, ce.kind === 'node' && eg && eg.length === N && N > 1 ? { ...end } : ce, { x: fa.x, z: fa.z }, kind, straight);
   if (eg && eg.length === N && N > 1) { fb.x = ce.x; fb.z = ce.z; }
+  // another company's rails (or tram tracks): joining them needs the right to use that company's network;
+  // the joined pieces stay theirs, the new track is the builder's
+  if (!opts.town && opts.owner >= 0 && (kind === 'rail' || opts.tram)) {
+    for (const sn of [start, end]) for (const o of snapOwners(g, sn, kind)) {
+      if (o >= 0 && o !== opts.owner && !g.canUse(opts.owner, o)) fail(`${kind === 'rail' ? 'Track' : 'Tram tracks'} of ${g.company(o).name}: needs track access`);
+    }
+  }
   // the end must be ahead of the start tangent
   const chx = fb.x - fa.x, chz = fb.z - fa.z, chl = Math.hypot(chx, chz);
   if (fa.fixed && (fa.tx * chx + fa.tz * chz) / chl < -0.2) fail('Target is behind the track direction');
@@ -405,6 +503,14 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     for (let j = Math.max(0, i - win); j <= Math.min(M - 1, i + win); j++) { sum += Math.max(terr[j], WATER_Y + 0.15); cnt++; }
     desired.push(sum / cnt);
   }
+  // rail beside an existing track: keep to that track's formation (a widened bank, cutting, bridge or tunnel)
+  if (kind === 'rail') {
+    for (let i = 0; i < M; i++) {
+      const d = bezDeriv(centreBez, tAtS(ctab, sArr[i])), l = Math.hypot(d.x, d.z) || 1;
+      const h = formationBeside(g, xs[i], zs[i], d.x / l, d.z / l, 1.25 + spread);
+      if (h !== null) desired[i] = h;
+    }
+  }
   const cons: Constraint[] = [];
   // the height offset applies to the end being placed; a free start sits on the ground
   const startY = fa.y ?? terr[0];
@@ -460,7 +566,9 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const yn = sol.y[ci];
     const secOld = net.sectionAt(e, c.sOld);
     let mode: CrossingPlan['mode'];
-    const levelOk = c.angle > 0.4 && secOld === 'ground' && e.depot < 0 && e.station < 0;
+    // at grade (a diamond with switches) only across one's own or usable track, else over or under it
+    const levelOk = c.angle > 0.4 && secOld === 'ground' && e.depot < 0 && e.station < 0
+      && !(kind === 'rail' && e.kind === 'rail' && e.owner >= 0 && e.owner !== opts.owner && !opts.town && !g.canUse(opts.owner, e.owner));
     const levelMode: CrossingPlan['mode'] = kind === 'rail' ? (e.kind === 'rail' ? 'diamond' : 'level') : e.kind === 'rail' ? 'level' : 'junction';
     if (opts.crossing === 'level' && levelOk) mode = levelMode;
     else if (opts.crossing === 'over') mode = 'over';
@@ -561,11 +669,15 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
         if (opts.town) { fail('Buildings in the way'); continue; }
         demolish.add(b.id);
       }
-      // stations and depots
-      for (const st of g.stations.footprintsNear(p.x, p.z, hw + 0.2)) {
-        if (nearEnd) continue;
-        void st;
-        fail('Station in the way');
+      // stations: their structures where the new line runs at their height (it may pass under an elevated
+      // deck between the piers; underground stations only have their entrances at street level)
+      if (!nearEnd) for (const st of g.stations.footprintsNear(p.x, p.z, hw + 0.2)) {
+        for (const f of g.stations.footprints(st)) {
+          if (distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) > hw + 0.2) continue;
+          if (f.y0 !== undefined && f.y1 !== undefined && (yy + RAIL.clearance <= f.y0 || yy - 0.2 >= f.y1)) continue;
+          fail('Station in the way');
+          break;
+        }
       }
       for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd) { void dp; fail('Depot in the way'); } }
       // parallel conflicts with other edges
@@ -588,22 +700,58 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   prop.demolish = [...demolish];
   prop.trees = trees;
 
-  // ---- cost
+  // ---- cost: track materials (bridges x6, tunnels x9) and earthworks. The first track of a formation pays
+  // them in full; further tracks built with it, and stretches of track laid beside an existing one (at the
+  // same height), share the formation: materials 60 %, structures and earthworks 30 % (SHARED_TRACK)
   let cost = 0;
   if (!opts.town) {
     const per = kind === 'rail' ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).costPerUnit;
-    for (const tp of prop.tracks) {
-      let bl = 0, tl = 0;
-      for (const s of tp.sections) { if (s.type === 'bridge') bl += s.s1 - s.s0; else tl += s.s1 - s.s0; }
-      cost += per * (tp.len - bl - tl) + per * 6 * bl + per * 9 * tl;
+    const beside = kind === 'rail' ? besideExisting(g, prop) : null;
+    const S = SHARED_TRACK;
+    const split = { track: 0, bridges: 0, tunnels: 0, earthworks: 0, other: 0 };
+    let full = 0;
+    const q = { x: 0, z: 0 };
+    prop.tracks.forEach((tp, ti) => {
+      const n = Math.max(1, Math.ceil(tp.len / PSTEP));
+      const tab = arcTable(tp.bez);
+      for (let i = 0; i < n; i++) {
+        const s0 = i * PSTEP, s1 = Math.min(tp.len, s0 + PSTEP), sm = (s0 + s1) / 2, ds = s1 - s0;
+        let sec: 'bridge' | 'tunnel' | null = null;
+        for (const x of tp.sections) if (sm >= x.s0 && sm <= x.s1) sec = x.type;
+        let prem = 0;
+        if (sec) {
+          bezPoint(tp.bez, tAtS(tab, sm), q);
+          const y = profAt(tp.prof, tp.len, sm), t = w.heightAt(q.x, q.z);
+          prem = structureFactor(kind, sec, sec === 'bridge' ? y - t : t - y) - 1;
+        }
+        full += per * ds * (1 + prem);
+        const shared = kind === 'rail' && (ti > 0 || beside![ti][i] === 1);
+        const base = per * ds * (shared ? S.materials : 1), extra = per * ds * prem * (shared ? S.structures : 1);
+        cost += base + extra;
+        if (sec === 'bridge') split.bridges += base + extra; else if (sec === 'tunnel') split.tunnels += base + extra; else split.track += base;
+      }
+    });
+    // earthworks along the centre line: in full for the formation (unless it widens an existing one), a
+    // share for every further track
+    const N = prop.tracks.length, b0 = beside?.[0];
+    for (let i = 0; i < M; i++) {
+      if (type[i] !== 0) continue;
+      const v = Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2) * 900;
+      const k = b0 ? Math.min(b0.length - 1, Math.floor((sArr[i] / L) * b0.length)) : 0;
+      full += v * N;
+      const ev = kind === 'rail' ? v * ((b0 && b0[k] ? S.earthworks : 1) + S.earthworks * (N - 1)) : v;
+      cost += ev;
+      split.earthworks += ev;
     }
-    // earthworks estimate
-    let vol = 0;
-    for (let i = 0; i < M; i++) if (type[i] === 0) vol += Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2);
-    cost += vol * 900;
+    if (kind === 'rail') prop.stats.sharedSaving = Math.max(0, Math.round(full - cost));
+    const before = cost;
+    if (opts.tram && kind === 'road') for (const tp of prop.tracks) cost += TRAM.costPerUnit * tp.len;
     for (const id of prop.demolish) { const b = w.buildings.get(id); if (b) cost += 6000 + b.pop * 2500; }
     cost += prop.trees * 250;
     for (const c of crossings) if (c.mode === 'level' || c.mode === 'diamond') cost += 15000;
+    split.other = cost - before;
+    for (const k of Object.keys(split) as (keyof typeof split)[]) split[k] = Math.round(split[k]);
+    prop.stats.costSplit = split;
   }
   prop.cost = Math.round(cost);
   if (!opts.town && !g.company(opts.owner).economy.canAfford(prop.cost)) prop.warnings.push('Not enough money');
@@ -666,7 +814,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
       const bez = { ...tp.bez, x0: na.x, z0: na.z, x3: nb.x, z3: nb.z };
       const prof = tp.prof.slice();
       prof[0] = na.y; prof[prof.length - 1] = nb.y;
-      created.push(net.addEdge(opts.kind, na.id, nb.id, bez, prof, tp.sections, opts.type, opts.owner));
+      created.push(net.addEdge(opts.kind, na.id, nb.id, bez, prof, tp.sections, opts.type, opts.owner, opts.tram && opts.kind === 'road' ? { tram: true, tramOwner: opts.owner } : {}));
     }
     // crossings
     for (const c of prop.crossings) {

@@ -14,6 +14,10 @@ export const BAY = 0.32;
 export { FLOOR_H };
 
 
+/** Simplified parts of the building being built, recorded for its far LOD version (null = not recording). */
+interface FarPart { k: 'box' | 'gable' | 'hip' | 'flat' | 'ends' | 'spire'; a: number[]; c?: number; cell?: number; along?: boolean; tint?: number; seed?: number; fh?: number }
+let REC: FarPart[] | null = null;
+
 /**
  * Builder for facade walls (world material): uv in (bay, floor) units, aCell = FACADE_CELL0 + facade
  * atlas cell, aSeed for the lit-window pattern. Writes into the given world builder (or its own).
@@ -68,6 +72,7 @@ export class FacadeBuilder {
     const fl = P(-hw, hd), fr = P(hw, hd), bl = P(-hw, -hd), br = P(hw, -hd);
     const sg = opts.sideGround ?? -1;
     const fh = opts.floorH ?? FLOOR_H;
+    if (REC) REC.push({ k: 'box', a: [cx, y, cz, W, D, H, fx, fz], cell: upper, tint, seed, fh });
     if (!opts.skipFront) {
       if (opts.frontCell === undefined) this.wall(fl[0], fl[1], fr[0], fr[1], y, y + H, fx, fz, upper, ground, tint, seed, fh, opts.door ?? -1);
       else if (opts.frontCell >= 0) this.wall(fl[0], fl[1], fr[0], fr[1], y, y + H, fx, fz, opts.frontCell, -1, tint, seed, H);
@@ -96,7 +101,8 @@ function slope(W: WB, a: V3, b: V3, c: V3, d: V3, sc: number, ox: number, oz: nu
 }
 
 /** Gabled roof; ridge along local z (forward) if `alongForward`. Textured slopes plus eave undersides. */
-export function roofGable(W: WB, cx: number, y: number, cz: number, w: number, d: number, h: number, fx: number, fz: number, color: number, alongForward: boolean, cell = WC.ROOF_TILES) {
+export function roofGable(W: WB, cx: number, y: number, cz: number, w: number, d: number, h: number, fx: number, fz: number, color: number, alongForward: boolean, cell = WC.ROOF_TILES, under = true) {
+  if (REC) REC.push({ k: 'gable', a: [cx, y, cz, w, d, h, fx, fz], c: color, cell, along: alongForward });
   const rx = fz, rz = -fx;
   const [ax, az, bx, bz, ha, hl] = alongForward ? [rx, rz, fx, fz, w / 2, d / 2] : [fx, fz, rx, rz, d / 2, w / 2];
   const P = (a: number, b: number, yy: number): V3 => [cx + ax * a + bx * b, yy, cz + az * a + bz * b];
@@ -106,6 +112,7 @@ export function roofGable(W: WB, cx: number, y: number, cz: number, w: number, d
     const e0 = P(s * ha, -hl, y), e1 = P(s * ha, hl, y), r1 = P(0, hl, y + h), r0 = P(0, -hl, y + h);
     slope(W, e0, e1, r1, r0, sc, ax * s, az * s);
   }
+  if (!under) return;
   // eave undersides (seen from below/sides)
   W.use(WC.PLAIN, color, 1).color(color, 0.5);
   for (const s of [-1, 1]) {
@@ -117,6 +124,7 @@ export function roofGable(W: WB, cx: number, y: number, cz: number, w: number, d
 
 /** Hipped roof: four sloped faces, ridge along the longer side. */
 export function roofHip(W: WB, cx: number, y: number, cz: number, w: number, d: number, h: number, fx: number, fz: number, color: number, cell = WC.ROOF_TILES) {
+  if (REC) REC.push({ k: 'hip', a: [cx, y, cz, w, d, h, fx, fz], c: color, cell });
   const rx = fz, rz = -fx;
   const P = (a: number, b: number, yy: number): V3 => [cx + rx * a + fx * b, yy, cz + rz * a + fz * b];
   const hw = w / 2, hd = d / 2;
@@ -136,21 +144,38 @@ export function roofHip(W: WB, cx: number, y: number, cz: number, w: number, d: 
   }
 }
 
-/** Flat roof with a low parapet. */
+/** Horizontal quad facing up, corners a..d in either winding; uv rectangle as WB.quad. */
+function hq(W: WB, a: V3, b: V3, c: V3, d: V3, uv: [number, number, number, number]) {
+  const ny = (b[2] - a[2]) * (d[0] - a[0]) - (b[0] - a[0]) * (d[2] - a[2]);
+  if (ny >= 0) W.quad(...a, ...b, ...c, ...d, uv);
+  else W.quad(...a, ...d, ...c, ...b, [uv[1], uv[0], uv[3], uv[2]]);
+}
+
+/** Flat roof with a low parapet ring (roof surface inside it; no hidden or coplanar faces). */
 export function roofFlat(W: WB, cx: number, y: number, cz: number, w: number, d: number, fx: number, fz: number, color = 0x9a9890) {
-  W.use(WC.ROOF_FLAT, color, 1);
-  W.tbox(cx, y, cz, w, 0.02, d, fx, fz, WSCALE.ROOF_FLAT, false);
-  W.use(WC.CONCRETE, 0xbab6ae, 1);
+  if (REC) REC.push({ k: 'flat', a: [cx, y, cz, w, d, fx, fz], c: color });
   const rx = fz, rz = -fx;
-  const t = 0.04, ph = 0.07;
-  W.tbox(cx + fx * (d / 2 - t / 2), y, cz + fz * (d / 2 - t / 2), w, ph, t, fx, fz, 1);
-  W.tbox(cx - fx * (d / 2 - t / 2), y, cz - fz * (d / 2 - t / 2), w, ph, t, fx, fz, 1);
-  W.tbox(cx + rx * (w / 2 - t / 2), y, cz + rz * (w / 2 - t / 2), t, ph, d - 2 * t, fx, fz, 1);
-  W.tbox(cx - rx * (w / 2 - t / 2), y, cz - rz * (w / 2 - t / 2), t, ph, d - 2 * t, fx, fz, 1);
+  const t = Math.min(0.04, w * 0.2, d * 0.2), ph = 0.07;
+  const hw = w / 2, hd = d / 2, iw = hw - t, id = hd - t;
+  const P = (a: number, b: number, yy: number): V3 => [cx + rx * a + fx * b, yy, cz + rz * a + fz * b];
+  const sc = WSCALE.ROOF_FLAT, ys = y + 0.02, yt = y + ph;
+  W.use(WC.ROOF_FLAT, color, 1);
+  hq(W, P(-iw, -id, ys), P(iw, -id, ys), P(iw, id, ys), P(-iw, id, ys), [0, 0, (2 * iw) / sc, (2 * id) / sc]);
+  W.use(WC.CONCRETE, 0xbab6ae, 1);
+  const O = [P(-hw, -hd, yt), P(hw, -hd, yt), P(hw, hd, yt), P(-hw, hd, yt)];
+  const I = [P(-iw, -id, yt), P(iw, -id, yt), P(iw, id, yt), P(-iw, id, yt)];
+  const out = [[-fx, -fz], [rx, rz], [fx, fz], [-rx, -rz]];
+  for (let i = 0; i < 4; i++) {
+    const j = (i + 1) & 3, nx = out[i][0], nz = out[i][1];
+    W.twall(O[i][0], O[i][2], O[j][0], O[j][2], y, yt, y, yt, nx, nz, 1);
+    W.twall(I[i][0], I[i][2], I[j][0], I[j][2], ys, yt, ys, yt, -nx, -nz, 1);
+    hq(W, O[i], O[j], I[j], I[i], [0, 0, 1, 0.04]);
+  }
 }
 
 /** Gable end walls (triangles) under a gabled roof. */
 export function gableWalls(W: WB, cx: number, y: number, cz: number, w: number, d: number, h: number, fx: number, fz: number, color: number, alongForward: boolean) {
+  if (REC) REC.push({ k: 'ends', a: [cx, y, cz, w, d, h, fx, fz], c: color, along: alongForward });
   const rx = fz, rz = -fx;
   const [ax, az, bx, bz, hw, hl] = alongForward ? [rx, rz, fx, fz, w / 2, d / 2] : [fx, fz, rx, rz, d / 2, w / 2];
   const P = (a: number, b: number, yy: number): V3 => [cx + ax * a + bx * b, yy, cz + az * a + bz * b];
@@ -226,12 +251,73 @@ const ROOFS_TILE = [0xb5583a, 0xc0653f, 0xa04a30, 0x9a5236, 0x8b4a33, 0xb86b48];
 const ROOFS_SLATE = [0x5a6068, 0x4b525a, 0x64686c, 0x52565e];
 const AWNINGS = [0xb83b3b, 0x2f6e9e, 0x3c8c4e, 0xd09a2a, 0x6b4a8a];
 
-export function buildBuilding(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, ctx?: ChunkCtx) {
+/**
+ * A building (near detail into W/Dt/fac). With `far`, a simplified version (facade boxes and plain roofs,
+ * no details) is emitted into it as well, for the distant LOD of the super-chunk.
+ */
+export function buildBuilding(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, ctx?: ChunkCtx, far?: WB | null) {
   // land use without a building (until the game exports BT_PARK / BT_PLAZA they are keyed off the numbers)
   if (b.type === BT_PARK || b.type === BT_PLAZA) {
     if (ctx) { if (b.type === BT_PARK) buildPark(ctx, b); else buildPlaza(ctx, b); }
     return;
   }
+  if (!far) { buildNear(w, b, W, Dt, fac); return; }
+  const parts: FarPart[] = [];
+  REC = parts;
+  try { buildNear(w, b, W, Dt, fac, parts); } finally { REC = null; }
+  emitFar(w, b, far, parts);
+}
+
+const FARF = new FacadeBuilder();
+
+/**
+ * The far version from recorded parts: one quad per facade wall, plain roofs. Walls standing on the
+ * building base reach down into the ground (no plinth) unless the lot is steep enough to show one.
+ */
+function emitFar(w: World, b: Building, F: WB, parts: FarPart[]) {
+  const ff = FARF;
+  ff.gb = F;
+  const lowest = lowestUnder(w, b.x, b.z, b.angle, b.w, b.d);
+  const base = b.y + 0.04;
+  const plinth = b.y - lowest > 0.12;
+  if (plinth) {
+    F.use(WC.STONE, 0xa59d90, 1);
+    F.tbox(b.x, lowest - 0.06, b.z, b.w + 0.03, base - lowest + 0.06, b.d + 0.03, Math.sin(b.angle), Math.cos(b.angle), WSCALE.STONE, false, false);
+  }
+  const y0 = lowest - 0.03;
+  for (const p of parts) {
+    const a = p.a;
+    if (p.k === 'box') {
+      if (!plinth && Math.abs(a[1] - base) < 1e-4) {
+        // same number of floors, stretched down to the ground
+        const H = a[5] + (a[1] - y0), floors = Math.max(1, Math.round(a[5] / p.fh!));
+        ff.boxWalls(a[0], y0, a[2], a[3], a[4], H, a[6], a[7], p.cell!, -1, p.tint!, p.seed!, { floorH: H / floors });
+      } else ff.boxWalls(a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], p.cell!, -1, p.tint!, p.seed!, { floorH: p.fh });
+    }
+    else if (p.k === 'gable') roofGable(F, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], p.c!, p.along!, p.cell, false);
+    else if (p.k === 'hip') roofHip(F, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], p.c!, p.cell);
+    else if (p.k === 'ends') gableWalls(F, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], p.c!, p.along!);
+    else if (p.k === 'flat') {
+      const [cx, y, cz, wd, dd, fx, fz] = a;
+      const rx = fz, rz = -fx, hw = wd / 2, hd = dd / 2, yy = y + 0.01, sc = WSCALE.ROOF_FLAT;
+      const P = (u: number, v: number): V3 => [cx + rx * u + fx * v, yy, cz + rz * u + fz * v];
+      F.use(WC.ROOF_FLAT, p.c!, 1);
+      hq(F, P(-hw, -hd), P(hw, -hd), P(hw, hd), P(-hw, hd), [0, 0, wd / sc, dd / sc]);
+    } else if (p.k === 'spire') {
+      const [tx, sy, tz, hs, sh, fx, fz] = a;
+      const rx = fz, rz = -fx;
+      const apex: V3 = [tx, sy + sh, tz];
+      const cs: V3[] = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([u, v]) => [tx + rx * u * hs + fx * v * hs, sy, tz + rz * u * hs + fz * v * hs]);
+      F.use(WC.ROOF_SLATE, p.c!, 1);
+      for (let i = 0; i < 4; i++) {
+        const q0 = cs[i], q1 = cs[(i + 1) % 4];
+        F.ttri(...q0, 0, 0, ...q1, 1, 0, ...apex, 0.5, 2, (q0[0] + q1[0]) / 2 - tx, 0, (q0[2] + q1[2]) / 2 - tz);
+      }
+    }
+  }
+}
+
+function buildNear(w: World, b: Building, W: WB, Dt: WB, fac: FacadeBuilder, parts?: FarPart[]) {
   const r = new RNG(b.seed);
   const fx = Math.sin(b.angle), fz = Math.cos(b.angle);
   const rx = fz, rz = -fx;
@@ -389,6 +475,7 @@ export function buildBuilding(w: World, b: Building, W: WB, Dt: WB, fac: FacadeB
       const apex: V3 = [tx, sy + sh, tz];
       const cs: V3[] = [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([a, bb]) => [tx + rx * a * hs + fx * bb * hs, sy, tz + rz * a * hs + fz * bb * hs]);
       W.use(WC.ROOF_SLATE, 0x4f7a6a, 1);
+      if (parts) parts.push({ k: 'spire', a: [tx, sy, tz, hs, sh, fx, fz], c: 0x4f7a6a });
       for (let i = 0; i < 4; i++) {
         const p = cs[i], q = cs[(i + 1) % 4];
         const mx = (p[0] + q[0]) / 2 - tx, mz = (p[2] + q[2]) / 2 - tz;
@@ -406,16 +493,28 @@ function balconies(Dt: WB, cx: number, cz: number, fx: number, fz: number, Wd: n
   const bays = Math.max(1, Math.round(Wd / BAY));
   const pick: number[] = [];
   for (let k = 0; k < bays; k++) if ((bays >= 3 && (k === 0 || k === bays - 1)) || (bays < 3 && k === 0) || (k % 3 === 1 && r.chance(0.4))) pick.push(k);
+  // slab (top, bottom, front edge) and a railing of double-sided panels: 18 triangles per balcony
+  const hw = BAY * 0.45, f0 = D / 2, f1 = D / 2 + 0.12;
   for (let f = 1; f < floors; f++) {
-    const yy = y + f * FLOOR_H;
+    const yy = y + f * FLOOR_H, ys = yy - 0.012, yt = yy + 0.002, yr = yy + 0.08;
     for (const k of pick) {
       const a = -Wd / 2 + (k + 0.5) * (Wd / bays);
-      const bx = cx + rx * a + fx * (D / 2 + 0.06), bz = cz + rz * a + fz * (D / 2 + 0.06);
+      const l0x = cx + rx * (a - hw) + fx * f0, l0z = cz + rz * (a - hw) + fz * f0;
+      const r0x = cx + rx * (a + hw) + fx * f0, r0z = cz + rz * (a + hw) + fz * f0;
+      const l1x = l0x + fx * (f1 - f0), l1z = l0z + fz * (f1 - f0), r1x = r0x + fx * (f1 - f0), r1z = r0z + fz * (f1 - f0);
       Dt.use(WC.CONCRETE, 0xc8c4bc, 0);
-      Dt.box(bx, yy - 0.012, bz, BAY * 0.9, 0.014, 0.12, fx, fz, false);
+      Dt.ttri(l0x, yt, l0z, 0, 0, r0x, yt, r0z, 0, 0, r1x, yt, r1z, 0, 0, 0, 1, 0);
+      Dt.ttri(l0x, yt, l0z, 0, 0, r1x, yt, r1z, 0, 0, l1x, yt, l1z, 0, 0, 0, 1, 0);
+      Dt.ttri(l0x, ys, l0z, 0, 0, r0x, ys, r0z, 0, 0, r1x, ys, r1z, 0, 0, 0, -1, 0);
+      Dt.ttri(l0x, ys, l0z, 0, 0, r1x, ys, r1z, 0, 0, l1x, ys, l1z, 0, 0, 0, -1, 0);
+      Dt.twall(l1x, l1z, r1x, r1z, ys, yt, ys, yt, fx, fz);
       Dt.use(WC.METAL, rail, 0);
-      Dt.box(bx + fx * 0.055, yy, bz + fz * 0.055, BAY * 0.9, 0.08, 0.008, fx, fz);
-      for (const s of [-1, 1]) Dt.box(bx + rx * s * BAY * 0.445, yy, bz + rz * s * BAY * 0.445, 0.008, 0.08, 0.11, fx, fz);
+      Dt.twall(l1x, l1z, r1x, r1z, yt, yr, yt, yr, fx, fz);
+      Dt.twall(l1x, l1z, r1x, r1z, yt, yr, yt, yr, -fx, -fz);
+      Dt.twall(l0x, l0z, l1x, l1z, yt, yr, yt, yr, -rx, -rz);
+      Dt.twall(l0x, l0z, l1x, l1z, yt, yr, yt, yr, rx, rz);
+      Dt.twall(r0x, r0z, r1x, r1z, yt, yr, yt, yr, rx, rz);
+      Dt.twall(r0x, r0z, r1x, r1z, yt, yr, yt, yr, -rx, -rz);
     }
   }
 }

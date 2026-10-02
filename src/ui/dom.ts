@@ -89,8 +89,8 @@ export function field(label: string, control: Node, hint?: string): HTMLElement 
 }
 
 /** Checkbox styled as a switch. */
-export function toggle(label: string, checked: boolean, onChange: (v: boolean) => void, hint?: string): HTMLElement {
-  const c = h('input', { type: 'checkbox', checked, class: 'sw-in' }) as HTMLInputElement;
+export function toggle(label: string, checked: boolean, onChange: (v: boolean) => void, hint?: string, disabled = false): HTMLElement {
+  const c = h('input', { type: 'checkbox', checked, class: 'sw-in', disabled }) as HTMLInputElement;
   if (checked) c.setAttribute('checked', '');
   c.addEventListener('change', () => onChange(c.checked));
   return h('label', { class: 'switch' }, c, h('span', { class: 'sw' }), h('span', { class: 'sw-l' }, label, hint ? h('small', null, hint) : null));

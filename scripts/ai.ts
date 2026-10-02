@@ -14,8 +14,10 @@ console.log(`map ${SIZE} seed ${seed}: ${g.towns.list.length} towns, pop ${g.tow
 // time the AI work per day
 const aiTime = g.ais.map(() => ({ t: 0, n: 0, max: 0 }));
 g.ais.forEach((ai, i) => {
-  const f = ai.daily.bind(ai);
+  // daily() picks projects; work() runs the project's units spread over the day (max: the slowest call)
+  const f = ai.daily.bind(ai), w = ai.work.bind(ai);
   ai.daily = () => { const t = performance.now(); f(); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].n++; aiTime[i].max = Math.max(aiTime[i].max, dt); };
+  ai.work = (f0: number, f1: number) => { const t = performance.now(); w(f0, f1); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].max = Math.max(aiTime[i].max, dt); };
 });
 let errors = 0;
 const origWarn = console.warn;

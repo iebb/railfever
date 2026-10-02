@@ -5,7 +5,7 @@ import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { Train } from '../src/game/train';
 import { fails, check, build, free, railOpts, nodeNear, fmt } from './lib';
-import { nodeSnap, buildRailDepot } from '../src/game/ai';
+import { nodeSnap, buildRailDepot } from '../src/game/routing';
 
 const g = Game.create({ size: 192, seed: 4, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 });
 g.economy.money = 1e8;

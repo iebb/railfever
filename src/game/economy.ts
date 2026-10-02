@@ -1,14 +1,18 @@
 // Company finances.
 
-export type Category = 'construction' | 'vehicles' | 'running' | 'maintenance' | 'income' | 'interest';
-export const CATEGORIES: Category[] = ['income', 'construction', 'vehicles', 'running', 'maintenance', 'interest'];
+export type Category = 'construction' | 'vehicles' | 'running' | 'maintenance' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition';
+/** Report order: income first, then the expenses. */
+export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'running', 'maintenance', 'trackFees', 'interest', 'acquisition'];
 export const CATEGORY_LABEL: Record<Category, string> = {
   income: 'Passenger income',
+  trackIncome: 'Track access income',
   construction: 'Construction',
   vehicles: 'Vehicle purchases',
   running: 'Vehicle running costs',
   maintenance: 'Infrastructure maintenance',
+  trackFees: 'Track access fees',
   interest: 'Loan interest',
+  acquisition: 'Company acquisitions',
 };
 
 export const COSTS = {
@@ -37,8 +41,14 @@ export const COSTS = {
 
 export interface MonthRecord { year: number; month: number; v: Record<Category, number> }
 
-function emptyRecord(): Record<Category, number> {
-  return { income: 0, construction: 0, vehicles: 0, running: 0, maintenance: 0, interest: 0 };
+export function emptyRecord(): Record<Category, number> {
+  return { income: 0, construction: 0, vehicles: 0, running: 0, maintenance: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0 };
+}
+/** Fill categories missing in an older record with 0. */
+function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Category, number> {
+  const r = emptyRecord();
+  if (v) for (const k of CATEGORIES) if (typeof v[k] === 'number') r[k] = v[k]!;
+  return r;
 }
 
 export class Economy {
@@ -51,6 +61,16 @@ export class Economy {
   months: MonthRecord[] = [];
   yearTotals: { year: number; v: Record<Category, number> }[] = [];
   thisYear: Record<Category, number> = emptyRecord();
+
+  /** Restore from saved JSON (older saves lack some categories). */
+  static fromJSON(d: any): Economy {
+    const e = Object.assign(new Economy(), d ?? {});
+    e.current = fullRecord(d?.current);
+    e.thisYear = fullRecord(d?.thisYear);
+    e.months = (d?.months ?? []).map((m: MonthRecord) => ({ year: m.year, month: m.month, v: fullRecord(m.v) }));
+    e.yearTotals = (d?.yearTotals ?? []).map((y: { year: number; v: Record<Category, number> }) => ({ year: y.year, v: fullRecord(y.v) }));
+    return e;
+  }
 
   canAfford(x: number) { return this.money >= x; }
 
@@ -91,7 +111,16 @@ export class Economy {
     if (this.yearTotals.length > 10) this.yearTotals.shift();
     this.thisYear = emptyRecord();
   }
+  /** Cash minus loan (without assets; see Game.companyValue). */
   get netWorth() { return this.money - this.loan; }
+  /** Profit of the last complete year (or of this year so far when there is none). */
+  get lastYearProfit() {
+    const y = this.yearTotals[this.yearTotals.length - 1];
+    const v = y ? y.v : this.thisYear;
+    let s = 0;
+    for (const k of CATEGORIES) if (k !== 'acquisition') s += v[k];
+    return s;
+  }
 }
 
 export interface Company {
@@ -100,9 +129,14 @@ export interface Company {
   color: string;
   ai: boolean;
   economy: Economy;
+  /** bought by another company: kept for ids and history, hidden in the UI, owns nothing */
+  defunct?: boolean;
+  /** id of the company that bought this one */
+  boughtBy?: number;
 }
 
-export const COMPANY_COLORS = ['#e8a33d', '#3d8be8', '#d6453d', '#47b36b'];
+/** Company colours: the player first, then up to 7 AI companies (mutually distinct hues). */
+export const COMPANY_COLORS = ['#e8a33d', '#3d8be8', '#d6453d', '#47b36b', '#9a5fd6', '#22b8c2', '#e0609e', '#8a96a8'];
 
 export function fmtMoney(x: number): string {
   const neg = x < 0;

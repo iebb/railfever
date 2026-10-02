@@ -35,6 +35,10 @@ export interface NEdge {
   owner: number;
   station: number;
   depot: number;
+  /** road edges only: embedded tram tracks (with overhead wire) */
+  tram?: boolean;
+  /** company owning the tram tracks (-1 / undefined = none) */
+  tramOwner?: number;
   version: number;
 }
 
@@ -288,7 +292,8 @@ export class Network {
       if (sec.s0 < s) sec1.push({ s0: sec.s0, s1: Math.min(sec.s1, s), type: sec.type });
       if (sec.s1 > s) sec2.push({ s0: Math.max(0, sec.s0 - s), s1: sec.s1 - s, type: sec.type });
     }
-    const extra = { station: e.station, depot: e.depot };
+    const extra: Partial<NEdge> = { station: e.station, depot: e.depot };
+    if (e.tram) { extra.tram = true; extra.tramOwner = e.tramOwner; }
     // detach the old edge without triggering removal side effects on nodes
     const na = this.nodes.get(e.a)!, nb = this.nodes.get(e.b)!;
     const crossings = [...this.crossings.values()].filter((c) => c.e1 === id || c.e2 === id);

@@ -1,7 +1,7 @@
 // Road vehicles: buses on lines and ambient town traffic, driving on lane curves of the road graph.
 import { Vehicle } from './vehicle';
 import type { Game } from './game';
-import type { Depot } from './build-ops';
+import { Depot, tramUsable } from './build-ops';
 import { Curve3, curvePoint, makeCurve, NEdge } from './network';
 import { KMH_TO_UPS, ROAD_TYPES } from './constants';
 import { curveSpeed } from './construction';
@@ -142,12 +142,16 @@ export function roadNext(g: Game, e: NEdge, dir: number): { edge: NEdge; dir: nu
   return out;
 }
 
-/** A* from the end of lane (edge, dir) to an edge carrying a stop of the target station. */
-export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000): RCont[] | null {
+/**
+ * A* from the end of lane (edge, dir) to an edge carrying a stop of the target station. `allow` restricts
+ * the edges (trams: tram tracks the owner may use); where nothing allowed continues, turning is cheap.
+ */
+export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000, allow?: (e: NEdge) => boolean): RCont[] | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.stops.length) return null;
-  const goals = new Set(st.stops.map((p) => p.edge));
+  const goals = new Set(st.stops.filter((p) => { const e = net.edges.get(p.edge); return !!e && (!allow || allow(e)); }).map((p) => p.edge));
+  if (!goals.size) return null;
   const tx = st.x, tz = st.z;
   const NE: number[] = [], ND: number[] = [], NG: number[] = [], NP: number[] = [];
   const best = new Map<number, number>();
@@ -165,10 +169,29 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
     NE.push(e.id); ND.push(d); NG.push(gc); NP.push(parent);
     heap.push(NE.length - 1, gc + heur(e, d));
   };
-  const nodeDeg = (e: NEdge, d: number) => net.nodes.get(d > 0 ? e.b : e.a)?.edges.length ?? 0;
-  for (const c of roadNext(g, edge, dir)) {
-    push(c.edge, c.dir, cost(c.edge) + (c.uturn ? (nodeDeg(edge, dir) <= 1 ? 2 : 40) : 0), -1);
-  }
+  /**
+   * Push the continuations of lane (e, d) in roadNext's order (no allocations): the (allowed) edges at its end
+   * node, then the U-turn, which is cheap at a dead end (of the allowed network).
+   */
+  const expand = (e: NEdge, d: number, gc: number, parent: number) => {
+    const nodeId = d > 0 ? e.b : e.a;
+    const node = net.nodes.get(nodeId);
+    if (!node) return;
+    let open = false;
+    if (allow) for (const fid of node.edges) {
+      if (fid === e.id) continue;
+      const f = net.edges.get(fid);
+      if (f && f.depot < 0 && allow(f)) { open = true; break; }
+    }
+    for (const fid of node.edges) {
+      if (fid === e.id) continue;
+      const f = net.edges.get(fid);
+      if (!f || f.depot >= 0 || (allow && !allow(f))) continue;
+      push(f, f.a === nodeId ? 1 : -1, gc + cost(f), parent);
+    }
+    if (e.depot < 0) push(e, -d, gc + cost(e) + (allow ? (open ? 40 : 2) : node.edges.length <= 1 ? 2 : 40), parent);
+  };
+  expand(edge, dir, 0, -1);
   let n = 0;
   while (heap.size) {
     const i = heap.pop();
@@ -181,9 +204,7 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
       return out.reverse();
     }
     if (++n > maxExpand) break;
-    for (const c of roadNext(g, e, d)) {
-      push(c.edge, c.dir, NG[i] + cost(c.edge) + (c.uturn ? (nodeDeg(e, d) <= 1 ? 2 : 40) : 0), i);
-    }
+    expand(e, d, NG[i], i);
   }
   return null;
 }
@@ -216,6 +237,8 @@ export class RoadVehicle extends Vehicle {
   depotId: number;
   loadTimer = 0;
   retryTimer = 0;
+  /** seconds between route searches while there is no route (doubles up to 32 s: no repeated full searches) */
+  retryWait = 2;
   junctionWait = 0;
   stuck = 0;
   ttl = 0;
@@ -245,6 +268,14 @@ export class RoadVehicle extends Vehicle {
   }
 
   get length() { return this.model ? this.model.length : this.style === 3 ? 0.7 : 0.45; }
+  /** trams run only on tram tracks their owner may use */
+  get isTram() { return this.model?.kind === 'tram'; }
+  /** edge filter for route planning (null: any road) */
+  routeFilter(): ((e: NEdge) => boolean) | undefined {
+    if (!this.isTram) return undefined;
+    const g = this.game, owner = this.owner;
+    return (e: NEdge) => tramUsable(g, e, owner);
+  }
   get capacity() { return this.model?.capacity ?? 0; }
   get maxSpeedKmh() { return this.model?.speed ?? 60; }
   get maxSpeed() { return this.cruise; }
@@ -372,10 +403,10 @@ export class RoadVehicle extends Vehicle {
       return true;
     }
     const be = net.edges.get(base.e);
-    const r = be ? findRoadRoute(g, be, base.dir, target.id) : null;
+    const r = be ? findRoadRoute(g, be, base.dir, target.id, 40000, this.routeFilter()) : null;
     if (!r) {
       this.state = 'noroute';
-      this.status = 'No route to ' + target.name;
+      this.status = (this.isTram && !target.stops.some((p) => { const e = net.edges.get(p.edge); return e && tramUsable(g, e, this.owner); }) ? target.name + ' has no tram stop' : 'No route to ' + target.name);
       return false;
     }
     this.route = r;
@@ -387,6 +418,7 @@ export class RoadVehicle extends Vehicle {
 
   onLineChanged() {
     this.fixCargo();
+    this.retryWait = 2;
     if (!this.seg) { this.state = 'depot'; this.retryTimer = 0; return; }
     if (this.state === 'loading') return;
     this.planRoute();
@@ -417,10 +449,19 @@ export class RoadVehicle extends Vehicle {
       if (!nxt || !valid(nxt)) return false;
       this.ahead = [nxt];
     } else this.ahead = [];
-    this.trail = this.trail.filter(valid).slice(0, 2);
+    this.trail = this.trail.filter(valid);
+    this.trimTrail();
     this.route = [];
     if (this.ambient) this.fill();
     return true;
+  }
+
+  /** Keep the path behind as long as the body needs (+0.5), at least two segments: long articulated
+   * trams place every section along it with pointBehind. */
+  private trimTrail() {
+    let keep = 0, behind = this.pos;
+    while (keep < this.trail.length && (keep < 2 || behind < this.length + 0.5)) behind += this.trail[keep++].len;
+    if (this.trail.length > keep) this.trail.length = keep;
   }
 
   returnToDepot(reason: string) {
@@ -474,7 +515,10 @@ export class RoadVehicle extends Vehicle {
         if (this.retryTimer <= 0) {
           this.retryTimer = 2;
           if (!this.seg) this.tryLeaveDepot();
-          else this.planRoute();
+          else {
+            this.retryWait = this.planRoute() ? 2 : Math.min(32, this.retryWait * 2);
+            this.retryTimer = this.retryWait;
+          }
         }
         if (this.seg) this.drive(dt);
         return;
@@ -572,7 +616,7 @@ export class RoadVehicle extends Vehicle {
       if (this.ambient && this.ttl < 0 && this.seg.kind === 'lane') { this.state = 'stopped'; return; }
       this.pos -= this.seg.len;
       this.trail.unshift(this.seg);
-      if (this.trail.length > 3) this.trail.length = 3;
+      this.trimTrail();
       this.seg = this.ahead.shift()!;
       if (this.ahead.length < 3) this.fill();
     }
@@ -582,11 +626,11 @@ export class RoadVehicle extends Vehicle {
   destroy() { this.seg = null; }
 }
 
-/** Can a bus leaving this depot reach the station? */
+/** Can a bus (tram, from a tram depot) leaving this depot reach the station? */
 export function roadDepotReaches(g: Game, dp: Depot, stationId: number): boolean {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return false;
-  return !!findRoadRoute(g, stub, 1, stationId, 60000);
+  return !!findRoadRoute(g, stub, 1, stationId, 60000, dp.kind === 'tram' ? (e) => tramUsable(g, e, dp.owner) : undefined);
 }
 
 /** Do two connector curves cross (2D)? */

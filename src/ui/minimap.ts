@@ -5,6 +5,10 @@ import type { UI } from './ui';
 import { h, icon } from './dom';
 import { WATER_Y } from '../game/constants';
 import { loadFonts } from './fonts';
+import type { MapMode } from './mapmodes';
+import { servedColor, hexCss } from './mapmodes';
+import { PLAYER } from '../game/game';
+import { catchShapes, catchColor } from './gameapi';
 
 export class Minimap {
   el: HTMLDivElement;
@@ -23,6 +27,8 @@ export class Minimap {
   visible = true;
   layers = { network: true, vehicles: true, names: true };
   private layerBtns: Record<string, HTMLButtonElement> = {};
+  private mode: MapMode = 'none';
+  private modeBtns: Record<string, HTMLButtonElement> = {};
   private dragging = false;
   private readonly px = 216;
   private ray = new THREE.Raycaster();
@@ -46,8 +52,9 @@ export class Minimap {
       return b;
     };
     const collapse = h('button', { class: 'ibtn sm', 'data-tip': 'Collapse map', 'data-key': 'M', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
+    const modeBtn = (m: 'lines' | 'demand' | 'catchment', ic: string, tip: string) => (this.modeBtns[m] = h('button', { class: 'ibtn sm mm-layer', 'data-tip': tip, 'data-key': m === 'lines' ? 'M' : m === 'demand' ? 'P' : 'O', 'data-sfx': 'none', 'aria-label': tip, onclick: () => this.ui.mapModes.toggle(m) }, icon(ic, 15)));
     this.el = h('div', { class: 'minimap glass' },
-      h('div', { class: 'mm-head' }, h('span', { class: 'mm-title' }, 'Map'), layer('network', 'rail', 'Network'), layer('vehicles', 'train', 'Vehicles'), layer('names', 'towns', 'Town names'), collapse),
+      h('div', { class: 'mm-head' }, h('span', { class: 'mm-title' }, 'Map'), layer('network', 'rail', 'Network'), layer('vehicles', 'train', 'Vehicles'), layer('names', 'towns', 'Town names'), modeBtn('lines', 'map', 'Lines map'), modeBtn('demand', 'demand', 'Demand'), modeBtn('catchment', 'catchment', 'Catchment'), collapse),
       this.view);
     ui.root.appendChild(this.el);
     loadFonts().then(() => { this.netVer = -1; });
@@ -75,6 +82,13 @@ export class Minimap {
   }
 
   reset() { this.baseTimer = 0; this.netTimer = 0; this.netVer = -1; this.heightsVer = -1; this.terrain = null; }
+
+  /** Map view (lines / demand) drawn on the overlay layer. */
+  setMapMode(m: MapMode) {
+    this.mode = m;
+    this.overTimer = 0;
+    for (const [k, b] of Object.entries(this.modeBtns)) b.classList.toggle('on', k === m);
+  }
 
   /** Terrain colours from heights and water with hill shading, trees and buildings (offscreen, once). */
   private renderTerrain() {
@@ -160,6 +174,17 @@ export class Minimap {
       };
       stroke('road', (o) => (o < 0 ? 'rgba(210,214,220,0.55)' : 'rgba(255,170,110,0.75)'), Math.max(1, k * 0.9));
       stroke('rail', (o) => g.company(o).color, Math.max(1.6, k * 1.2));
+      // tram tracks in roads
+      const tp = new Path2D();
+      let trams = 0;
+      for (const e of net.edges.values()) {
+        if (!e.tram) continue;
+        const b = e.bez;
+        tp.moveTo(b.x0 * k, b.z0 * k);
+        tp.bezierCurveTo(b.x1 * k, b.z1 * k, b.x2 * k, b.z2 * k, b.x3 * k, b.z3 * k);
+        trams++;
+      }
+      if (trams) { ctx.lineWidth = Math.max(1.2, k * 0.7); ctx.strokeStyle = '#c084fc'; ctx.stroke(tp); }
       for (const st of g.stations.map.values()) {
         const r = 2.6 * this.dpr;
         ctx.fillStyle = '#10161f';
@@ -198,6 +223,74 @@ export class Minimap {
     const P = this.over.width;
     const k = P / g.world.size;
     ctx.clearRect(0, 0, P, P);
+    // map views
+    if (this.mode === 'demand' && this.ui.mapModes.demand?.regions?.length) {
+      // districts by served share, the strongest flows between them
+      const d = this.ui.mapModes.demand;
+      const byId = new Map(d.regions.map((r) => [r.id, r]));
+      for (const r of d.regions) {
+        ctx.beginPath(); ctx.arc(r.x * k, r.z * k, Math.max(1.5 * this.dpr, r.r * k), 0, Math.PI * 2);
+        ctx.globalAlpha = 0.35; ctx.fillStyle = hexCss(servedColor(r.served)); ctx.fill();
+      }
+      const maxT = Math.max(1, d.flows[0]?.trips ?? 1);
+      ctx.lineCap = 'round';
+      for (let i = Math.min(d.flows.length, 200) - 1; i >= 0; i--) {
+        const f = d.flows[i];
+        if (i >= 50 && !(f.served > 0.01)) continue;
+        const A = byId.get(f.a), B = byId.get(f.b);
+        if (!A || !B) continue;
+        ctx.strokeStyle = hexCss(servedColor(f.served));
+        ctx.globalAlpha = 0.3 + Math.sqrt(f.trips / maxT) * 0.65;
+        ctx.lineWidth = (0.6 + Math.sqrt(f.trips / maxT) * 3.4) * this.dpr;
+        ctx.beginPath(); ctx.moveTo(A.x * k, A.z * k); ctx.lineTo(B.x * k, B.z * k); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+    } else if (this.mode === 'demand' && this.ui.mapModes.demand) {
+      const d = this.ui.mapModes.demand;
+      const towns = new Map(d.towns.map((t) => [t.id, t]));
+      const maxP = Math.max(1, d.maxPotential);
+      ctx.lineCap = 'round';
+      // as in the 3D view: the 50 strongest connections and all served ones, the strongest drawn last
+      for (let i = Math.min(d.pairs.length, 400) - 1; i >= 0; i--) {
+        const p = d.pairs[i];
+        if (i >= 50 && !(p.served > 0.01)) continue;
+        const A = towns.get(p.a), B = towns.get(p.b);
+        if (!A || !B) continue;
+        ctx.strokeStyle = hexCss(servedColor(p.served));
+        ctx.globalAlpha = 0.3 + Math.sqrt(p.potential / maxP) * 0.65;
+        ctx.lineWidth = (0.8 + Math.sqrt(p.potential / maxP) * 4) * this.dpr;
+        ctx.beginPath(); ctx.moveTo(A.x * k, A.z * k); ctx.lineTo(B.x * k, B.z * k); ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      for (const t of d.towns) {
+        const f = this.ui.mapModes.shares.get(t.id) ?? 0;
+        const r = (2 + Math.sqrt(t.pop) * 0.06) * this.dpr;
+        ctx.fillStyle = hexCss(servedColor(f));
+        ctx.beginPath(); ctx.arc(t.x * k, t.z * k, r, 0, Math.PI * 2); ctx.fill();
+      }
+    } else if (this.mode === 'catchment') {
+      for (const st of g.stations.map.values()) {
+        if (st.owner !== PLAYER) continue;
+        for (const c of catchShapes(g, st, true)) {
+          const col = hexCss(catchColor(c));
+          ctx.beginPath(); ctx.arc(c.x * k, c.z * k, Math.max(1.5 * this.dpr, c.r * k), 0, Math.PI * 2);
+          ctx.globalAlpha = 0.22; ctx.fillStyle = col; ctx.fill();
+          ctx.globalAlpha = 0.9; ctx.strokeStyle = col; ctx.lineWidth = this.dpr; ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+    } else if (this.mode === 'lines') {
+      ctx.lineJoin = 'round';
+      ctx.lineWidth = 2 * this.dpr;
+      for (const l of g.lines.map.values()) {
+        if (l.stops.length < 2 || (!this.ui.mapModes.showAll && l.owner !== PLAYER)) continue;
+        ctx.strokeStyle = l.color;
+        ctx.beginPath();
+        l.stops.forEach((sid, i) => { const st = g.stations.get(sid); if (!st) return; if (i) ctx.lineTo(st.x * k, st.z * k); else ctx.moveTo(st.x * k, st.z * k); });
+        if (l.stops.length > 2) ctx.closePath();
+        ctx.stroke();
+      }
+    }
     if (this.layers.vehicles) {
       const p = { x: 0, y: 0, z: 0 };
       const r = 1.6 * this.dpr;
