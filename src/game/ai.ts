@@ -17,7 +17,7 @@ import { linearStops, outAndBack } from './lines';
 import { WATER_Y, TRACK_TYPES, UNIT_M } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal } from './construction';
-import { Train, depotReaches, findRailRoute, railNext, lineCongestion } from './train';
+import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongestion } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy } from './economy';
@@ -657,7 +657,8 @@ export class AIController {
     // trains on another company's railway (track access): much cheaper than building
     if (focus.rail > 0 && avail > 1_800_000) this.shareOptions(opts, own, D);
     // long-distance coaches over the country roads between towns
-    if (focus.road > 0 && avail > 900_000 && pickCoach(g.year)) {
+    const coach = pickCoach(g.year);
+    if (focus.road > 0 && avail > 900_000 && coach) {
       const T = g.towns.list;
       for (let i = 0; i < T.length; i++) for (let j = i + 1; j < T.length; j++) {
         const A = T[i], B = T[j];
@@ -668,9 +669,10 @@ export class AIController {
         // no third service between the same towns unless demand is large
         const trips = D.pair(A.id, B.id);
         if ((served.get(this.pairKey(A.id, B.id)) ?? 0) >= (trips > 300 ? 3 : 2)) continue;
-        // two coaches of ~45 seats
-        const carried = Math.min(D.pair(A.id, B.id) * 0.25 * 12 * share(A.id, B.id), 2 * 45 * 2 * (360 / (d * 1.3 / 2.5 + 6)));
-        const score = roi(carried * fareAt(d, 90), 2 * 32_000 + 12_000, 700_000);
+        // two coaches of the year (opcosts / fares estimates, as for the railways)
+        const sv = this.serviceYear([coach!], 2, d, d * 1.3, 'road');
+        const carried = Math.min(D.pair(A.id, B.id) * 0.25 * 12 * share(A.id, B.id), sv.seats);
+        const score = roi(carried * sv.perPax, sv.running + 12_000, 700_000);
         opts.push({ score: score * fw(focus.road), kind: 'coach', towns: [A.id, B.id] });
       }
     }
@@ -678,7 +680,10 @@ export class AIController {
     if (focus.road > 0 && avail > 900_000) {
       for (const T of g.towns.list) {
         if (T.pop < BUS_MIN_POP || this.isFailed('bus' + T.id) || own.some((l) => l.kind === 'bus' && l.towns.length === 1 && l.towns.includes(T.id)) || !this.localRoom(T)) continue;
-        const score = roi(D.local(T.id) * 0.3 * 12 * fareAt(22, 45, 80), 3 * 22_000 + 15_000, 650_000);
+        // three buses of the year between the town's districts (opcosts / fares estimates)
+        const bm = pickBus(g.year, T.pop);
+        const sv = bm ? this.serviceYear([bm], 3, 22, 26, 'street') : null;
+        const score = sv ? roi(Math.min(D.local(T.id) * 0.3 * 12, sv.seats) * sv.perPax, sv.running + 15_000, 650_000) : 0;
         opts.push({ score: score * (busLines === 0 ? 1.15 : 1) * fw(focus.road), kind: 'bus', towns: [T.id] });
       }
     }
@@ -703,7 +708,9 @@ export class AIController {
       if (tp.available()) {
         const town = tramExt(tp).candidates?.()[0];
         if (town && this.localRoom(town)) {
-          const score = roi(D.local(town.id) * 0.45 * 12 * fareAt(25, 40, 80), 3 * 30_000 + 60_000, 2_200_000);
+          const tm = availableModels(g.year, 'tram').sort((a, b) => b.capacity / b.cost - a.capacity / a.cost)[0];
+          const sv = tm ? this.serviceYear([tm], 3, 25, 28, 'street') : null;
+          const score = sv ? roi(Math.min(D.local(town.id) * 0.45 * 12, sv.seats) * sv.perPax, sv.running + 60_000, 2_200_000) : 0;
           opts.push({ score: score * (tramLines === 0 ? 1.15 : 1) * fw(focus.tram), kind: 'tram', towns: [town.id] });
         }
       }
@@ -727,7 +734,7 @@ export class AIController {
     if (!opts.length) { this.state.phase = 'idle'; this.state.cooldown = Math.round(60 / act); return; }
     // one of the best few, the better ones (squared score) much more likely
     opts.sort((a, b) => b.score - a.score);
-    if (AIController.profile) this.lastOptions = opts.slice(0, 8).map((o) => ({ kind: o.kind, towns: o.towns, score: o.score }));
+    if (AIController.profile) this.lastOptions = opts.map((o) => ({ kind: o.kind, towns: o.towns, score: o.score }));
     const top = opts.slice(0, 4);
     let r = this.rng.next() * top.reduce((a, o) => a + o.score * o.score, 0), pick = top[0];
     for (const o of top) { r -= o.score * o.score; if (r <= 0) { pick = o; break; } }
@@ -844,9 +851,9 @@ export class AIController {
     const rails = [...this.lines].filter(([lid, info]) => info.kind === 'rail' && info.shared === undefined && !!g.lines.get(lid));
     if (!rails.length) return false;
     for (const [lid, info] of [rails[this.rng.int(rails.length)]]) {
-      const l = g.lines.get(lid)!;
-      const path = linearStops(l.stops);
-      if (!path) continue;
+      const l = g.lines.get(lid);
+      const path = l && l.id === lid ? linearStops(l.stops) : null;
+      if (!l || !path) continue;
       const served = new Set(path.map((sid) => g.stations.get(sid)?.townId ?? -1));
       // our track between consecutive stations, and the towns it passes within reach of a station
       for (let i = 0; i + 1 < path.length; i++) {
@@ -1187,7 +1194,7 @@ export class AIController {
     for (const [lid, info] of this.lines) {
       if (info.kind !== 'rail' || info.shared !== undefined) continue;
       const l = g.lines.get(lid);
-      const path = l ? linearStops(l.stops) : null;
+      const path = l && l.id === lid ? linearStops(l.stops) : null;
       if (path && (path[0] === stationId || path[path.length - 1] === stationId)) return true;
     }
     return false;
@@ -1265,7 +1272,8 @@ export class AIController {
       const ug: StationPlan | null = yield* this.centreStation(T, other, PLATFORM);
       if (!ug || !reach(ug, other) || !(end === 'a' ? leadsMeet(ug, other, LEAD) : leadsMeet(other, ug, LEAD))) continue;
       const popOf = (q: StationPlan) => g.stations.popInShapes(g.stations.planCatchShapes(q));
-      if (popOf(ug) < popOf(sp) * 1.3) continue;
+      // (only for a company with the money: the station and its tunnel cost several times a ground station)
+      if (popOf(ug) < popOf(sp) * 1.3 || (ug.cost - sp.cost) * 3 > this.available()) continue;
       pr = end === 'a' ? { a: ug, b: pr.b } : { a: pr.a, b: ug };
       this.note(`${what} ${A.name}-${B.name}: an underground station in central ${T.name}`);
     }
@@ -1395,7 +1403,7 @@ export class AIController {
     if (yield* routeConflictGen(g, prof, 'rail', tracks, exclude, 40)) return fail('route runs along other tracks or roads', 720);
     yield;
     const e0 = net.nextEdge;
-    const chain = chainGen(g, fAs[0], way, { kind: 'rail', type, tracks, heightOffset: 0, crossing: 'auto', owner }, join ? null : fBs[0], prof, (globalThis as { DBG_CHAIN?: boolean }).DBG_CHAIN ? (x: string) => console.log('  chain: ' + x) : undefined);
+    const chain = chainGen(g, fAs[0], way, { kind: 'rail', type, tracks, heightOffset: 0, crossing: 'auto', owner }, join ? null : fBs[0], prof);
     let r = chain.next();
     while (!r.done) { this.track(e0); yield; r = chain.next(); }
     this.track(e0);
@@ -1459,31 +1467,38 @@ export class AIController {
       }
     }
     yield;
-    // ---- depot: one of ours that reaches both stations, else on a siding off the new line (station ends stay
-    // free for extensions), else behind a station
+    // ---- depot: one of ours that serves both stations, else on a siding off the new line (station ends stay
+    // free for extensions), else behind a station. A depot serves the line when its trains reach one station and
+    // go on from there to the other (trains leave a siding one way and turn at the first station; a depot behind a
+    // platform track that leads nowhere else would strand them): one that does not is taken up again
     const d0 = net.nextEdge;
-    let dep = -1;
-    for (const d of g.depots.map.values()) if (d.owner === owner && d.kind === 'rail' && depotReaches(g, d, stA.id) && depotReaches(g, d, stB.id)) { dep = d.id; break; }
+    let dep = -1, first = -1;
+    for (const d of g.depots.map.values()) {
+      if (d.owner !== owner || d.kind !== 'rail') continue;
+      const f = depotServes(g, d, stA.id, stB.id);
+      if (f >= 0) { dep = d.id; first = f; break; }
+    }
     const ownDepot = dep < 0;
-    if (dep < 0) dep = yield* this.depotNearLine([...p.edges], stB.x, stB.z, 60);
-    if (dep < 0) dep = yield* this.depotNearLine([...p.edges], stA.x, stA.z, 60);
-    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) dep = this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z });
+    const take = (id: number): boolean => {
+      if (id < 0) return false;
+      const d = g.depots.get(id), f = d ? depotServes(g, d, stA.id, stB.id) : -1;
+      if (f >= 0) { dep = id; first = f; return true; }
+      this.removeDepotBranch(id);
+      return false;
+    };
+    for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
+    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
     this.track(d0);
-    if (dep < 0) return fail('no depot site', 720);
+    if (dep < 0) return fail('no depot site that serves both stations', 720);
     if (ownDepot) p.depots.push(dep);
     const dp = g.depots.get(dep)!;
-    // (trains leave it for both stations: a depot behind a platform that does not lead on would strand them)
-    if (!depotReaches(g, dp, stA.id) || !depotReaches(g, dp, stB.id)) {
-      if ((globalThis as { DBG_CHAIN?: boolean }).DBG_CHAIN) console.log(`  depot ${dp.id} at (${dp.x.toFixed(1)},${dp.z.toFixed(1)}) reaches ${stA.name} ${depotReaches(g, dp, stA.id)}, ${stB.name} ${depotReaches(g, dp, stB.id)}; node edges ${net.nodes.get(dp.node)?.edges.map((id) => { const e = net.edges.get(id)!; return id + ':' + e.type + ':dp' + e.depot; }).join(',')}`);
-      return fail('depot cut off', 720);
-    }
     yield;
     // ---- line: extend our line ending at the hub (through trains stopping at every station: a multi-town
     // line A–hub–B, out and back), or a new one
     // (or ours ending at B's station, joined: extended back to A)
     const endsAt = (st: Station | null, other: Station) => st ? [...this.lines].find(([lid, info]) => {
       const l = g.lines.get(lid);
-      const path = l ? linearStops(l.stops) : null;
+      const path = l && l.id === lid ? linearStops(l.stops) : null;
       return info.kind === 'rail' && info.shared === undefined && !info.urban && !!path && (path[0] === st.id || path[path.length - 1] === st.id) && !path.includes(other.id);
     }) : undefined;
     const extA = endsAt(hub, stB), extB = extA ? undefined : endsAt(hubB, stA);
@@ -1509,7 +1524,7 @@ export class AIController {
         // a through service: the route keeps its letter and numbering (their AS01…, our BS08…)
         g.lines.inheritRoute(line.id, froute!.line);
         this.stats.multiTown = Math.max(this.stats.multiTown, fpath.length + 1);
-      } else line.stops = depotReaches(g, dp, stA.id) ? [stA.id, stB.id] : [stB.id, stA.id];
+      } else line.stops = first === stA.id ? [stA.id, stB.id] : [stB.id, stA.id];
       if (early) g.lines.rebuild();
     }
     // signals for the new or extended line (before its trains run)
@@ -1936,13 +1951,15 @@ export class AIController {
     const g = this.game;
     if (!models.length) return { seats: 0, perPax: 0, running: 0, trackUpkeep: 0, headway: 0, kmh: 0 };
     const cap = models.reduce((a, c) => a + c.capacity, 0);
-    const vcap = Math.min(...models.map((m) => m.speed), TRACK_TYPES[trackType]?.speed ?? 160);
+    // (road vehicles: 'road' country roads, 'street' in town; no track of their own to keep up)
+    const road = trackType === 'road' || trackType === 'street';
+    const vcap = Math.min(...models.map((m) => m.speed), road ? (trackType === 'road' ? 90 : 50) : TRACK_TYPES[trackType]?.speed ?? 160);
     const yr = estimateVehicleYear(models, len / 1.15, g.year, load, vcap);
     const hopS = YEAR_S / Math.max(0.1, yr.trips);
     const headway = (2 * hopS) / Math.max(1, n);
     const kmh = (len * UNIT_M) / 1000 / (hopS / 3600);
     const perPax = estimateLegFare(dist, kmh, headway, 1, len / Math.max(1, dist));
-    return { seats: n * yr.trips * cap * load, perPax, running: n * yr.total, trackUpkeep: len * (trackBasePerUnit(trackType) + n * yr.trackWearPerUnit), headway, kmh };
+    return { seats: n * yr.trips * cap * load, perPax, running: n * yr.total, trackUpkeep: road ? 0 : len * (trackBasePerUnit(trackType) + n * yr.trackWearPerUnit), headway, kmh };
   }
 
   /**
@@ -1976,7 +1993,7 @@ export class AIController {
     const g = this.game, net = g.world.net, out: { st: Station; line: Line; path: number[]; towns: number[]; side: 1 | -1 }[] = [];
     for (const [lid, info] of this.lines) {
       if (info.kind !== 'rail' || info.shared !== undefined || info.joined || info.urban || info.hsr) continue;
-      const l = g.lines.get(lid), path = l ? linearStops(l.stops) : null;
+      const l = g.lines.get(lid), path = l && l.id === lid ? linearStops(l.stops) : null;
       if (!l || !path || path.length < 2) continue;
       for (const [end, p] of [[path[path.length - 1], path], [path[0], [...path].reverse()]] as [number, number[]][]) {
         const st = g.stations.get(end);
@@ -2195,7 +2212,6 @@ export class AIController {
         opt = { trackType: mode, level: lv, height };
       } else opt = { trackType: mode, level: lv };
       const pl = g.stations.planRail(x, z, ang, PL, 2, me, opt);
-      if ((globalThis as { DBG_URBAN?: boolean }).DBG_URBAN) console.log(`  [${lv} ${ang.toFixed(2)}] t${t.toFixed(1)}: ${pl.ok ? (pl.join ? 'join' : 'ok y' + pl.y.toFixed(2)) : pl.error}${prev ? ' prev y' + prev.y.toFixed(2) + ' reach ' + reach.toFixed(2) : ''}`);
       if (!pl.ok || pl.join || (prev && Math.abs(pl.y - prev.y) > reach + 0.05)) return null;
       // stairs up to a deck (or a ramp's way) must not stand where the line runs on beyond the platform ends
       if (lv !== 'underground') for (const e of pl.entrances) {
@@ -2224,7 +2240,7 @@ export class AIController {
           for (const d of offs) {
             const t = target + d;
             if (got.length && t - tPrev < PL + 6) continue;
-            if (++tries % 6 === 0) yield;
+            if (++tries % 2 === 0) yield;
             pl = site(a, lat, t, lv, got[got.length - 1]);
             if (pl) { at = t; break; }
           }
@@ -2233,7 +2249,6 @@ export class AIController {
           tPrev = at;
           target = at + SP;
         }
-        if ((globalThis as { DBG_URBAN?: boolean }).DBG_URBAN) console.log(`  => ${lv} ${a.toFixed(2)} ${lat}: ${got.length} sites (${tries} tries)`);
         if (got.length > plans.length) { plans = got; angle = a; level = lv; }
         if (plans.length >= n || tries > 1500) break search;
       }
@@ -2272,15 +2287,13 @@ export class AIController {
       const pj = planEdge(g, nodeSnap(g, a[0], 'rail'), nodeSnap(g, b[0], 'rail'), opts);
       if (!pj.ok || commitProposal(g, pj)) {
         const na = net.nodes.get(a[0])!, nb = net.nodes.get(b[0])!;
+        // (what stands in the way: station parts along the line)
         const hits = new Set<string>();
-        for (let t = 0.02; t < 1; t += 0.02) {
+        for (let t = 0.05; t < 1; t += 0.05) {
           const x = na.x + (nb.x - na.x) * t, z = na.z + (nb.z - na.z) * t;
-          for (const st of g.stations.footprintsNear(x, z, 1)) for (const f of g.stations.footprints(st)) {
-            const d = distToRect(x, z, f.x, f.z, f.angle, f.w / 2, f.d / 2);
-            if (d <= 1) hits.add(`${st.name}${st === sts[i] || st === sts[i + 1] ? '*' : ''} ${f.part} t=${t.toFixed(2)} d=${d.toFixed(2)} y ${f.y0?.toFixed(2)}..${f.y1?.toFixed(2)}`);
-          }
+          for (const st of g.stations.footprintsNear(x, z, 1)) for (const f of g.stations.footprints(st)) if (distToRect(x, z, f.x, f.z, f.angle, f.w / 2, f.d / 2) <= 1) hits.add(`${st.name} ${f.part ?? ''}`.trim());
         }
-        return fail(`track ${sts[i].name}-${sts[i + 1].name}: ${pj.errors[0] ?? 'cannot build'} (${Math.hypot(na.x - nb.x, na.z - nb.z).toFixed(1)} u, heights ${na.y.toFixed(2)} / ${nb.y.toFixed(2)}${hits.size ? ', ' + [...hits].join(', ') : ''})`, 720);
+        return fail(`track ${sts[i].name}-${sts[i + 1].name}: ${pj.errors[0] ?? 'cannot build'} (${Math.hypot(na.x - nb.x, na.z - nb.z).toFixed(1)} u, heights ${na.y.toFixed(2)} / ${nb.y.toFixed(2)}${hits.size ? '; ' + [...hits].slice(0, 4).join(', ') : ''})`, 720);
       }
       this.track(e0);
       yield;
@@ -2665,7 +2678,9 @@ export class AIController {
     let grew = false;
     for (const [lid, info] of [...this.lines]) {
       const l = g.lines.get(lid);
-      if (!l) { this.lines.delete(lid); continue; }
+      // (a line merged into another as a service pattern: lines.get follows the redirect to the other line, which is
+      // looked after under its own id, if it is ours)
+      if (!l || l.id !== lid) { this.lines.delete(lid); continue; }
       // a line we may no longer run (we left its stations, it was closed to us): our vehicles off it
       if (info.joined && !g.lines.canOperate(l, this.companyId)) {
         for (const v of l.vehicles.map((id) => g.vehicles.get(id)).filter((x) => !!x && x.owner === this.companyId)) { g.vehicles.sell(v!.id); this.stats.sold++; }

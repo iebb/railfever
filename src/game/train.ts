@@ -847,6 +847,24 @@ export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: Vehic
 }
 
 /**
+ * Can trains from this depot serve a line between stations a and b: reach one of them (a depot on a siding sends its
+ * trains off one way) and go on from the platform they arrive at — straight on, or reversing there — to the other?
+ * Returns the station to call at first, or -1 (e.g. a depot behind a platform track that leads nowhere else).
+ */
+export function depotServes(g: Game, dp: Depot, a: number, b: number, cars?: VehicleModel[]): number {
+  const stub = g.world.net.edges.get(dp.edge);
+  if (!stub) return -1;
+  const rule = cars ? consistRule(cars) : null;
+  for (const [x, y] of [[a, b], [b, a]]) {
+    const r = findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule);
+    const last = r?.conts[r.conts.length - 1]?.edge;
+    if (!last) continue;
+    if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, last, d, dp.owner, false, rule), y, dp.owner, -1, 80000, false, rule))) return x;
+  }
+  return -1;
+}
+
+/**
  * Can these vehicles run the line: from each stop to the next, some way their track rule allows? Null if
  * so, else why not (for a warning before buying, and for the AI).
  */
