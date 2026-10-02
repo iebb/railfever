@@ -21,7 +21,7 @@ interface Label {
   badges: HTMLSpanElement | null;
   sym: HTMLSpanElement | null;
   text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string; symText: string;
-  badgeRef: LabelBadge[] | null; badgeMax: number; nBadges: number;
+  badgeSig: string; badgeMax: number; nBadges: number;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
 }
 
@@ -61,6 +61,7 @@ export class Labels {
   /** lines map station display: only these stations, drawn as pins with all their numbers; null = normal plates */
   pinStations: Set<number> | null = null;
   private tags = new Map<number, Label>();
+  private hoveredTag: number | null = null;
   private hl: number | null = null;
   private v = new THREE.Vector3();
   private cands: Cand[] = [];
@@ -83,6 +84,7 @@ export class Labels {
   highlight(stationId: number | null) { this.hl = stationId; }
 
   clear() {
+    this.setHoverTag(null);
     this.container.innerHTML = '';
     this.towns.clear();
     this.stations.clear();
@@ -91,6 +93,10 @@ export class Labels {
     this.hl = null;
     this.complexRef = null;
     this.badgeRef = null;
+    this.parts.clear(); this.merged.clear();
+    this.lineChips.clear(); this.routeTags.clear(); this.townInfo.clear();
+    this.badges = null; this.complexOf = null; this.pinStations = null;
+    this.cands.length = 0; this.pool.length = 0; this.keep.clear();
   }
 
   private make(kind: 'town' | 'stn' | 'tag', onClick: () => void): Label {
@@ -113,7 +119,7 @@ export class Labels {
     el.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
     el.style.display = 'none';
     this.container.appendChild(el);
-    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeRef: null, badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeSig: '', badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
   }
 
   /** Complex parts and merged badges, when the complexes or the badges changed. */
@@ -134,7 +140,7 @@ export class Labels {
 
   update(game: Game, camera: THREE.PerspectiveCamera, w: number, h: number, camDist: number) {
     if (this.visible !== this.wasVisible) { this.wasVisible = this.visible; this.container.style.display = this.visible ? '' : 'none'; }
-    if (!this.visible) return;
+    if (!this.visible) { this.setHoverTag(null); return; }
     const world = game.world;
     const cands = this.cands;
     cands.length = 0;
@@ -187,8 +193,8 @@ export class Labels {
       let l = this.tags.get(id);
       if (!l) {
         l = this.make('tag', () => this.onClickTag(id));
-        l.el.addEventListener('pointerenter', () => this.onHoverTag(id));
-        l.el.addEventListener('pointerleave', () => this.onHoverTag(null));
+        l.el.addEventListener('pointerenter', () => this.setHoverTag(id));
+        l.el.addEventListener('pointerleave', () => { if (this.hoveredTag === id) this.setHoverTag(null); });
         this.tags.set(id, l);
       }
       if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
@@ -198,7 +204,10 @@ export class Labels {
       if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
       cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 5000, 1, t.hl, 20));
     }
-    for (const [id, l] of this.tags) if (!this.routeTags.has(id)) { l.el.remove(); this.tags.delete(id); }
+    for (const [id, l] of this.tags) if (!this.routeTags.has(id)) {
+      if (this.hoveredTag === id) this.setHoverTag(null);
+      l.el.remove(); this.tags.delete(id);
+    }
     // ---- project & cull
     const v = this.v;
     let n = 0;
@@ -291,10 +300,12 @@ export class Labels {
     if (colors && colors.length > 6) { const m = document.createElement('b'); m.textContent = `+${colors.length - 6}`; l.chips.appendChild(m); }
   }
 
-  /** Numbering badges on a plate (at most `max`, then +n); DOM rebuilt only when the list or the cap changes. */
+  /** Numbering badges on a plate (at most `max`, then +n); compare content rather than refreshed objects. */
   private setBadges(l: Label, list: LabelBadge[] | null, max: number) {
-    if (!l.badges || (l.badgeRef === list && l.badgeMax === max)) return;
-    l.badgeRef = list;
+    if (!l.badges) return;
+    const sig = JSON.stringify((list ?? []).map((b) => [b.code, b.prefix, b.num, b.color]));
+    if (l.badgeSig === sig && l.badgeMax === max) return;
+    l.badgeSig = sig;
     l.badgeMax = max;
     const show = list ? list.slice(0, max) : [];
     l.nBadges = show.length + (list && list.length > max ? 1 : 0);
@@ -310,7 +321,16 @@ export class Labels {
     if (list && list.length > max) { const m = document.createElement('span'); m.className = 'snum-more'; m.textContent = `+${list.length - max}`; l.badges.appendChild(m); }
   }
 
-  private hide(l: Label) { l.shown = false; l.el.style.display = 'none'; }
+  private setHoverTag(id: number | null) {
+    if (this.hoveredTag === id) return;
+    this.hoveredTag = id;
+    this.onHoverTag(id);
+  }
+
+  private hide(l: Label) {
+    if (this.hoveredTag != null && this.tags.get(this.hoveredTag) === l) this.setHoverTag(null);
+    l.shown = false; l.el.style.display = 'none';
+  }
 
   private place(c: Cand, s: number, w: number, h: number) {
     const l = c.l;

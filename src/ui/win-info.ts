@@ -19,7 +19,7 @@ import { KIND_META } from './format';
 import { demandView, stationDemand } from '../game/demand';
 import { townDemandShare } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
-import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, ENTRANCE_COST, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex } from '../game/stations';
+import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, ENTRANCE_COST, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf } from '../game/stations';
 import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
 import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
@@ -54,14 +54,18 @@ export function openStation(ui: UI, id: number) {
   const up: StationBuild = { length: st.rail?.length ?? DEFAULT_PLATFORM_LENGTH, tracks: st.rail?.tracks ?? 2, through: st.rail?.through ?? 0, level: st.rail?.level ?? 'ground', side: 'auto' };
   const restyle: RestyleState = { current: styleOf(st.rail?.style).id, selected: styleOf(st.rail?.style).id };
   let upCache: { key: string; plan: UpgradePlan } | null = null;
+  let railSig = JSON.stringify(st.rail);
   const syncBuild = () => {
     const r = g.stations.get(id)?.rail;
     if (r) { up.length = r.length; up.tracks = r.tracks; up.through = r.through ?? 0; up.level = r.level; }
+    up.side = 'auto';
+    railSig = JSON.stringify(r ?? null);
     upCache = null;
   };
   const render = () => {
     const s = g.stations.get(id);
     if (!s) { win.close(); return; }
+    if (JSON.stringify(s.rail) !== railSig) syncBuild();
     const mine = s.owner === PLAYER;
     ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine ? [['build', 'Build'] as [string, string]] : [])], render);
     win.title.textContent = s.name;
@@ -150,7 +154,7 @@ export function openStation(ui: UI, id: number) {
       }
     } else {
       buildTab(ui, s, up, () => {
-        const key = `${up.length}|${up.tracks}|${up.through}|${up.level}|${up.side}|${s.rail?.style}|${s.rail?.length}|${s.rail?.tracks}|${g.networkVersion}|${g.world.net.version}`;
+        const key = `${up.length}|${up.tracks}|${up.through}|${up.level}|${up.side}|${railSig}|${g.networkVersion}|${g.world.net.version}`;
         if (!upCache || upCache.key !== key) upCache = { key, plan: planStationUpgrade(g, s.id, up) };
         return upCache.plan;
       }, rerender, win.body);
@@ -239,10 +243,7 @@ function capacityPanel(ui: UI, s: Station, after: () => void): HTMLElement | nul
       h('b', null, advice.join(' · ')),
       up && !up.ok ? h('div', null, up.error ?? 'No room to expand here') : null,
       s.owner !== PLAYER ? h('div', null, `${g.company(s.owner).name} can expand this station.`) : null,
-      up ? h('div', { class: 'btns' }, h('button', { class: 'btn sm primary', disabled: !up.ok || !g.economy.canAfford(up.cost), 'data-sfx': 'none', onclick: () => {
-        const fresh = expandPlan(g, s.id);
-        if (fresh) commitExpand(ui, fresh, after);
-      } }, icon('upgrade', 15), up.ok ? `Expand · ${fmtMoney(up.cost)}` : 'Expand')) : null)) : null);
+      up ? h('div', { class: 'btns' }, h('button', { class: 'btn sm primary', disabled: !up.ok || !g.economy.canAfford(up.cost), 'data-sfx': 'none', onclick: () => commitExpand(ui, s.id, after) }, icon('upgrade', 15), up.ok ? `Expand · ${fmtMoney(up.cost)}` : 'Expand')) : null)) : null);
 }
 
 /** Changing just the passenger building preserves the station's platforms and service. */
@@ -381,7 +382,7 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
   add(body,
     section('Rebuild', changed ? 'planned' : 'as built'),
     field('Platforms', stepper(`${Math.round(up.length * 10)} m`, () => { up.length = Math.max(4, up.length - 2); after(); }, () => { up.length = Math.min(60, up.length + 2); after(); }, 'Platform length')),
-    field('Tracks', stepper(String(up.tracks), () => { up.tracks = Math.max(r.tracks, up.tracks - 1); after(); }, () => { up.tracks = Math.min(8, up.tracks + 1); after(); }), 'With platforms · up to 8'),
+    field('Tracks', stepper(String(up.tracks), () => { up.tracks = Math.max(g.stations.get(s.id)?.rail?.tracks ?? up.tracks, up.tracks - 1); after(); }, () => { up.tracks = Math.min(8, up.tracks + 1); after(); }), 'With platforms · up to 8'),
     field('Through', stepper(String(up.through), () => { up.through = Math.max(0, up.through - 1); after(); }, () => { up.through = Math.min(2, up.through + 1); after(); }), 'Without platforms, for trains that do not stop'),
     field('Level', seg<StationLevel>([['ground', 'Ground'], ['elevated', 'Elevated'], ['underground', 'Underground']], up.level, (v) => { up.level = v; after(); })),
     field('Expand side', seg<StationBuild['side']>([['auto', 'Auto'], ['left', 'Left'], ['right', 'Right']], up.side, (v) => { up.side = v; after(); }), 'Auto chooses the side with room'),
@@ -395,15 +396,26 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
         if (err) { ui.toast(err, 'bad'); return; }
         ui.sound('station', { x: s.x, z: s.z });
         ui.toast(`${s.name} rebuilt`, 'good');
-        if (s.rail) { up.length = s.rail.length; up.tracks = s.rail.tracks; up.through = s.rail.through ?? 0; up.level = s.rail.level; }
+        const current = g.stations.get(s.id)?.rail;
+        if (current) { up.length = current.length; up.tracks = current.tracks; up.through = current.through ?? 0; up.level = current.level; }
         after();
       } }, icon('upgrade', 16), pl && pl.ok ? `Rebuild for ${fmtMoney(pl.cost)}` : 'Rebuild'),
-      changed ? h('button', { class: 'btn ghost', onclick: () => { up.length = r.length; up.tracks = r.tracks; up.through = r.through ?? 0; up.level = r.level; up.side = 'auto'; after(); } }, 'Reset') : null,
+      changed ? h('button', { class: 'btn ghost', onclick: () => {
+        const current = g.stations.get(s.id)?.rail;
+        if (current) { up.length = current.length; up.tracks = current.tracks; up.through = current.through ?? 0; up.level = current.level; }
+        up.side = 'auto'; after();
+      } }, 'Reset') : null,
       h('span', { class: 'spacer' }),
       h('button', { class: 'btn', 'data-tip': 'Place the station somewhere else; lines and passengers move with it', onclick: () => {
+        const current = g.stations.get(s.id);
+        const r = current?.rail;
+        if (!r || current.owner !== PLAYER) return;
         const T = ui.tools;
-        T.setTool('station');
+        T.setTool(railModeOf(r.trackType) === 'mainline' ? 'station' : 'metro-station');
         T.stationLen = r.length; T.stationTracks = r.tracks; T.stationLevel = r.level;
+        T.stationType = r.trackType; T.stationStyle = styleOf(r.style).id;
+        T.stationThrough = r.through ?? 0; T.throughMode = r.throughMode ?? 'middle';
+        T.stationOnLine = false; T.stationAngle = r.angle;
         if (r.level === 'elevated') T.stationHeight = r.height || T.stationHeight;
         if (r.level === 'underground') T.stationDepth = r.depth || T.stationDepth;
         T.relocating = s.id;
@@ -525,8 +537,10 @@ export function openVehicle(ui: UI, id: number) {
     const after = () => { win.last = undefined; render(); };
     let lineEl: Node;
     if (mine) {
-      const sel = h('select', { class: 'select', 'aria-label': 'Line' }, h('option', { value: '', selected: v2.lineId == null }, '— no line —'),
-        g.lines.all().filter((l) => l.kind === kind && (l.owner === PLAYER || l.operators?.includes(PLAYER))).map((l) => h('option', { value: String(l.id), selected: l.id === v2.line?.id }, l.name + (l.owner !== PLAYER ? ' · partner' : ''))));
+      const lines = g.lines.all().filter((l) => l.kind === kind && (l.owner === PLAYER || l.operators?.includes(PLAYER)));
+      const current = lines.find((l) => l.id === v2.line?.id);
+      const sel = h('select', { class: 'select', 'aria-label': 'Line' }, h('option', { value: '', selected: !current }, '— no line —'),
+        lines.map((l) => h('option', { value: String(l.id), selected: l.id === current?.id }, l.name + (l.owner !== PLAYER ? ' · partner' : ''))));
       sel.addEventListener('change', () => {
         const next = sel.value ? g.lines.get(Number(sel.value)) : null;
         const err = next ? g.lines.operateError(next, PLAYER) : null;
@@ -687,7 +701,14 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: wagons[wagons.length - 1]?.id ?? '', count: 2,
     unit: unitDefault?.id ?? '', unitN: 1, bus: buses[buses.length - 1]?.id ?? '', line: initialLine?.id ?? lineId, depot: depotId };
   let purchaseCars: VehicleModel[] = [];
+  const validateSelection = () => {
+    const line = state.line != null ? g.lines.get(state.line) : null;
+    state.line = line && line.kind === kind && g.lines.canOperate(line, PLAYER) ? line.id : null;
+    const depot = state.depot != null ? g.depots.get(state.depot) : null;
+    if (!depot || depot.owner !== PLAYER || depot.kind !== kind) state.depot = null;
+  };
   const render = () => {
+    validateSelection();
     clear(win.body);
     const modelRow = (m: VehicleModel, selected: boolean, onSel: () => void) => {
       const pick = () => { onSel(); render(); };
@@ -750,7 +771,8 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     let warn = '';
     const line = state.line != null ? g.lines.get(state.line) : undefined;
     const resolved = state.depot ?? findDepot(ui, kind, line, cars);
-    const dp = resolved != null ? g.depots.get(resolved) : null;
+    const candidate = resolved != null ? g.depots.get(resolved) : null;
+    const dp = candidate?.owner === PLAYER && candidate.kind === kind ? candidate : null;
     const depotSel = h('select', { class: 'select', 'aria-label': 'Purchase depot' },
       h('option', { value: '', selected: state.depot == null }, 'Auto · connected depot'),
       g.depots.all().filter((d) => d.kind === kind && d.owner === PLAYER).map((d) => h('option', { value: String(d.id), selected: d.id === state.depot }, `${depotTitle(d.kind)} ${d.id} · ${g.towns.nearest(d.x, d.z)?.name ?? 'Countryside'}`)));
@@ -803,6 +825,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     }
     const buy = () => {
       // Window morphing may keep this button's listener: read the latest composition and line on click.
+      validateSelection();
       const chosenCars = purchaseCars;
       const chosenLine = state.line != null ? g.lines.get(state.line) : undefined;
       if (!chosenCars.length) return;
@@ -811,7 +834,8 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
         dId = findDepot(ui, kind, chosenLine, chosenCars);
         if (dId == null) { ui.toast(`No ${depotTitle(kind).toLowerCase()} connected to this line for the selected model. Build one first.`, 'bad'); return; }
       }
-      if (g.depots.get(dId)?.owner !== PLAYER) { ui.toast('Choose one of your own depots', 'bad'); return; }
+      const depot = g.depots.get(dId);
+      if (!depot || depot.owner !== PLAYER || depot.kind !== kind) { ui.toast('Choose a depot for this vehicle from your company', 'bad'); return; }
       const r = rail ? g.vehicles.buyTrain(dId, chosenCars, state.line) : g.vehicles.buyRoad(dId, chosenCars[0], state.line);
       if (typeof r === 'string') { ui.toast(r, 'bad'); return; }
       ui.toast(`${r.name} purchased`, 'good');

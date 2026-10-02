@@ -263,8 +263,15 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ tool switching
+  /** Finish an edit, or discard its id when changing games. Clear it before canonicalizing. */
+  endLineEdit(canonicalize = true) {
+    const id = this.lineEditId;
+    this.lineEditId = null;
+    if (canonicalize && id != null) this.ui.onLineEdited(id);
+  }
+
   setTool(t: ToolId) {
-    if (this.tool === 'line-edit' && t !== 'line-edit') { const id = this.lineEditId; this.lineEditId = null; if (id != null) this.ui.onLineEdited(id); }
+    if (this.tool === 'line-edit' && t !== 'line-edit') this.endLineEdit();
     // modes started from windows (moving a station / depot, adding an entrance) end with any tool change
     this.relocating = null;
     this.relocatingDepot = null;
@@ -1390,6 +1397,8 @@ export class Tools {
    */
   stationTrackType(near?: string): string {
     if (this.stationType !== 'auto' && TRACK_TYPES[this.stationType]) return this.stationType;
+    const moving = this.relocating != null ? this.game.stations.get(this.relocating)?.rail : null;
+    if (moving && TRACK_TYPES[moving.trackType]) return moving.trackType;
     if (near && TRACK_TYPES[near] && (this.tool !== 'station' || TRACK_TYPES[near].mode === 'mainline')) return near;
     if (this.tool === 'metro-station') return 'metro';
     const rt = (this.profiles.get('rail')?.railType as string | undefined) ?? 'standard';
@@ -1399,6 +1408,9 @@ export class Tools {
   /** Building style of a planned station: the chosen one where it can be built, else the automatic one. */
   stationStyleFor(x: number, z: number, type: string): string {
     const lv = this.stationLevel, year = this.game.year;
+    const moving = this.relocating != null ? this.game.stations.get(this.relocating)?.rail : null;
+    // Existing buildings can be moved after their style has stopped being sold.
+    if (moving && this.stationStyle === (moving.style ?? 'classic') && lv === moving.level && this.stationTracks === moving.tracks && STATION_STYLES[this.stationStyle]) return this.stationStyle;
     if (this.stationStyle !== 'auto' && stationStyles(lv, this.stationTracks, year).some((s) => s.id === this.stationStyle)) return this.stationStyle;
     return autoStationStyle(this.game, x, z, this.stationTracks, lv, railModeOf(type));
   }

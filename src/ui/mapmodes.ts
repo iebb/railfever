@@ -5,7 +5,7 @@ import type { UI } from './ui';
 import type { Line } from '../game/lines';
 import { PLAYER } from '../game/game';
 import { h, icon, clear, seg } from './dom';
-import { getFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
+import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
 import { townDemandShare, catchShapes, catchRadius, catchColor, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
@@ -75,8 +75,9 @@ export class MapModes {
     this.card.style.display = 'none';
     ui.root.appendChild(this.card);
     const lb = ui.renderer.labels;
-    lb.onHoverTag = (id) => { if (this.mode === 'lines') this.hoverLine = id; };
+    lb.onHoverTag = (id) => { if (id == null || this.mode === 'lines') this.hoverLine = id; };
     lb.onClickTag = (id) => this.ui.openLine(id);
+    this.card.addEventListener('pointerleave', () => { this.hoverLine = null; });
     try { const d = localStorage.getItem(DISPLAY_KEY); if (d === 'lines' || d === 'stations') this.display = d; } catch { /* ignore */ }
   }
 
@@ -121,17 +122,23 @@ export class MapModes {
   /** Lines shown (mode / company filter), refreshed twice a second or when the filter or the lines change. */
   private visibleLines(dt: number): Line[] {
     const g = this.ui.game;
+    if (validateFilter(g, this.filter)) { this.filterVer++; this.listSig = ''; }
     this.visT -= dt;
     if (this.visT <= 0 || this.visFv !== this.filterVer || this.visLv !== g.lines.version || this.visN !== g.lines.map.size) {
       this.visT = 0.5; this.visFv = this.filterVer; this.visLv = g.lines.version; this.visN = g.lines.map.size;
       this.vis = g.lines.all().filter((l) => l.stops.length >= 2 && lineMatches(g, l, this.filter)).sort((a, b) => a.id - b.id);
       this.visIds.clear();
       for (const l of this.vis) this.visIds.add(l.id);
+      if (this.hoverLine != null && !this.visIds.has(this.hoverLine)) this.hoverLine = null;
     }
     return this.vis;
   }
   /** Is a line shown by the lines map's filter (minimap)? */
-  lineVisible(l: Line): boolean { return this.mode === 'lines' ? this.visIds.has(l.id) : lineMatches(this.ui.game, l, this.filter); }
+  lineVisible(l: Line): boolean {
+    if (this.mode !== 'lines') return lineMatches(this.ui.game, l, this.filter);
+    this.visibleLines(0); // The minimap may draw before this frame's map update.
+    return this.visIds.has(l.id);
+  }
 
   /** Switch the lines map between its line display and its station display (opening it if closed). */
   toggleDisplay() {
@@ -141,6 +148,7 @@ export class MapModes {
   setDisplay(d: 'lines' | 'stations') {
     if (d === this.display) return;
     this.display = d;
+    this.hoverLine = null;
     this.saveDisplay();
     this.styles.clear();
     this.labelSig = '';
@@ -189,6 +197,7 @@ export class MapModes {
     let shownSig = 0;
     for (const l of lines) shownSig = (shownSig * 31 + l.id * 7 + parseInt(l.color.slice(1), 16)) % 2147483647;
     if (this.lanesDirty || shownSig !== this.shownSig) {
+      this.hoverLine = null;
       this.lanesDirty = false;
       this.shownSig = shownSig;
       this.labelSig = '';
@@ -240,7 +249,7 @@ export class MapModes {
 
   private renderLinesCard(lines: Line[]) {
     const g = this.ui.game;
-    const sig = this.filterVer + '|' + this.display + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length + '|' + g.lines.version;
+    const sig = this.filterVer + '|' + this.display + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length + '|' + g.lines.version + '|' + g.activeCompanies.map((c) => c.id + ':' + c.name).join(';');
     if (sig === this.listSig) return;
     this.listSig = sig;
     const c = this.card;

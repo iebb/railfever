@@ -17,7 +17,7 @@ import { fmtPct, fmtMult, KIND_META } from './format';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
 import { demandView } from '../game/demand';
-import { getFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LineMode } from './lineid';
+import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LineMode } from './lineid';
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns } from '../game/patterns';
@@ -34,6 +34,7 @@ export function openLines(ui: UI) {
   const win = ui.wm.open('lines', 'Lines', { width: 560, icon: 'lines', color: 'var(--accent)' });
   const f = getFilter('lines');
   const render = () => {
+    validateFilter(g, f);
     clear(win.body);
     const all = g.lines.all();
     const mine = all.filter((l) => l.owner === PLAYER);
@@ -74,7 +75,7 @@ export function openLines(ui: UI) {
 }
 
 // ------------------------------------------------------------------ intercity bus suggestions
-let suggCache: { key: string; rows: { a: number; b: number; dist: number; potential: number }[] } | null = null;
+const suggCaches = new WeakMap<Game, { key: string; rows: { a: number; b: number; dist: number; potential: number }[] }>();
 
 /**
  * Town pairs linked by roads (one road network component) without a bus line of the player, strongest demand
@@ -83,6 +84,7 @@ let suggCache: { key: string; rows: { a: number; b: number; dist: number; potent
 function intercitySuggestions(ui: UI): HTMLElement | null {
   const g = ui.game;
   const key = `${g.networkVersion}|${g.lines.version}|${Math.floor(g.day / 30)}`;
+  let suggCache = suggCaches.get(g);
   if (!suggCache || suggCache.key !== key) {
     const net = g.world.net;
     // road connectivity (union-find over road nodes)
@@ -108,6 +110,7 @@ function intercitySuggestions(ui: UI): HTMLElement | null {
       rows.push({ a, b, dist: p.dist, potential: p.potential });
     }
     suggCache = { key, rows };
+    suggCaches.set(g, suggCache);
   }
   if (!suggCache.rows.length) return null;
   const name = (id: number) => g.towns.list[id]?.name ?? '?';
@@ -132,8 +135,12 @@ function newLine(ui: UI, kind: LineKind) {
 }
 
 export function editLine(ui: UI, id: number) {
+  // End X before starting Y, including when both use the same tool.
+  if (ui.tools.tool === 'line-edit' && ui.tools.lineEditId !== id) ui.tools.endLineEdit();
+  const line = ui.game.lines.get(id);
+  if (!line || line.owner !== PLAYER) return;
   ui.tools.setTool('line-edit');
-  ui.tools.lineEditId = id;
+  ui.tools.lineEditId = line.id;
   ui.hud.onToolChange();
   ui.toast('Click stations on the map to add them as stops', 'info');
 }
@@ -330,6 +337,7 @@ export function openVehicles(ui: UI) {
   const win = ui.wm.open('vehicles', 'Vehicles', { width: 600, icon: 'vehicles', color: 'var(--accent)' });
   const f = getFilter('vehicles');
   const render = () => {
+    validateFilter(g, f);
     clear(win.body);
     const all = g.vehicles.all();
     const vs = all.filter((v) => vehicleMatches(g, v, f)).sort((a, b) => b.profitYear - a.profitYear);

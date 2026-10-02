@@ -23,6 +23,7 @@ import { catchShapes, catchColor } from './gameapi';
 import { canonicalizeLines, MergeNotice } from '../game/patterns';
 import { allBadges } from './lineid';
 import { TOOL_META } from './hud';
+import { pruneMemos } from './win-ops';
 import { stationComplex } from '../game/stations';
 import * as info from './win-info';
 import * as lines from './win-lines';
@@ -59,6 +60,7 @@ export class UI {
   private floatLayer: HTMLDivElement;
   private floats: FloatText[] = [];
   private refreshTimer = 0;
+  private cacheTimer = 0;
   private incomeAcc = new Map<number, number>();
   private incomeTimer = 0;
   /** time of the last sound (a generic click is skipped when an action already made a sound) */
@@ -122,12 +124,17 @@ export class UI {
   }
 
   setGame(g: Game) {
+    // A load discards the old edit: its id must never be canonicalized against the new game.
+    this.tools?.endLineEdit(false);
     this.game = g;
     this.wm.closeAll();
+    this.toastBox.replaceChildren();
+    this.floatLayer.replaceChildren(); this.floats = []; this.incomeAcc.clear();
     this.following = null;
     this.catchmentStation = -1;
     this.linePathSig.clear();
     this.lineBroken.clear();
+    this.marksSig = ''; this.complexSig = ''; this.complexT = 0; this.cacheTimer = 0;
     if (!this.tools) this.tools = new Tools(this);
     this.tools.onToolChange = () => this.hud.onToolChange();
     this.renderer.controls.singleTouchPan = () => this.tools.tool === 'inspect';
@@ -210,6 +217,13 @@ export class UI {
     this.tools.update(dt);
     this.refreshTimer -= dt;
     if (this.refreshTimer <= 0) { this.refreshTimer = 0.3; this.wm.refreshAll(); }
+    this.cacheTimer -= dt;
+    if (this.cacheTimer <= 0) {
+      this.cacheTimer = 1;
+      pruneMemos(g);
+      for (const id of this.linePathSig.keys()) if (!g.lines.map.has(id)) this.linePathSig.delete(id);
+      for (const id of this.lineBroken.keys()) if (!g.lines.map.has(id)) this.lineBroken.delete(id);
+    }
     // income floaters
     this.incomeTimer -= dt;
     if (this.incomeTimer <= 0) {
@@ -370,8 +384,9 @@ export class UI {
 
   /** A toast with an action button (e.g. "Auto-signal"); clicking the button runs it and closes the toast. */
   toastAction(msg: string, kind: 'info' | 'good' | 'bad', label: string, fn: () => void) {
+    const game = this.game;
     const el = h('div', { class: 'toast link ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg),
-      h('button', { class: 'btn sm toast-btn', onclick: (e: Event) => { e.stopPropagation(); el.remove(); fn(); } }, label));
+      h('button', { class: 'btn sm toast-btn', onclick: (e: Event) => { e.stopPropagation(); el.remove(); if (this.game === game) fn(); } }, label));
     this.pushToast(el, 9000);
     if (kind === 'bad') this.sound('error');
   }

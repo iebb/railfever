@@ -13,6 +13,7 @@ import { fmtDate, fmtHeight, newsDate, fmtPct, TYPE_META } from './format';
 import type { StationLevel } from './gameapi';
 import { stationStyles, catchBonusOf } from './gameapi';
 import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
+import { styleOf } from '../game/station-styles';
 import { audio } from '../audio/engine';
 
 interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
@@ -522,6 +523,11 @@ export class Hud {
   private styleOpts(): HTMLElement {
     const T = this.ui.tools, g = this.ui.game;
     const list = stationStyles(T.stationLevel, T.stationTracks, g.year);
+    const moving = T.relocating != null ? g.stations.get(T.relocating)?.rail : null;
+    if (moving && T.stationLevel === moving.level && T.stationTracks === moving.tracks) {
+      const retained = styleOf(moving.style);
+      if (!list.some((st) => st.id === retained.id)) list.push(retained);
+    }
     const cur = T.stationStyle !== 'auto' && list.some((st) => st.id === T.stationStyle) ? T.stationStyle : 'auto';
     const pick = (id: string) => { T.stationStyle = id; T.refreshHover(); this.renderCard(); };
     const chip = (id: string, label: string, tip: string, bonus = 0) => h('button', { class: 'styb' + (cur === id ? ' on' : ''), 'data-tip': tip, role: 'radio', 'aria-checked': cur === id ? 'true' : 'false', onclick: () => pick(id) }, label, bonus ? h('small', null, `+${Math.round(bonus * 100)}%`) : null);

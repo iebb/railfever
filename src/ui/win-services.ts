@@ -32,19 +32,21 @@ function copyPatterns(l: Line): ServicePattern[] {
   return linePatterns(l).map((p) => ({ ...p, stops: [...p.stops], ids: p.ids ? [...p.ids] : [...l.stops] }));
 }
 
-/** Per station of the route: per pattern whether it stops ('stop'), passes ('pass') or lies beyond its termini ('out'). */
-export function patternMatrix(l: Line): { stations: number[]; cells: ('stop' | 'pass' | 'out')[][]; patterns: ServicePattern[] } {
+/** Per route occurrence: stop/pass/out flags. Only a symmetric out-and-back pairs its two directions. */
+export function patternMatrix(l: Line): { stations: number[]; stopIndices: number[][]; cells: ('stop' | 'pass' | 'out')[][]; patterns: ServicePattern[] } {
   const ps = linePatterns(l);
   const r = lineRoute(l);
-  const stations = r.stations.length ? r.stations : [...new Set(l.stops)];
-  const pos = new Map(stations.map((s, i) => [s, i]));
+  const stations = r.stations;
+  const stopIndices = stations.map((_, i) => r.turn > 0 && i > 0 && i < r.turn ? [i, l.stops.length - i] : [i]);
   const cells = stations.map(() => ps.map(() => 'pass' as 'stop' | 'pass' | 'out'));
   ps.forEach((p, j) => {
     let lo = Infinity, hi = -Infinity;
-    l.stops.forEach((s, i) => { if (p.stops[i] !== false) { const k = pos.get(s) ?? 0; lo = Math.min(lo, k); hi = Math.max(hi, k); cells[k][j] = 'stop'; } });
+    stopIndices.forEach((indices, k) => {
+      if (indices.some((i) => p.stops[i] !== false)) { lo = Math.min(lo, k); hi = Math.max(hi, k); cells[k][j] = 'stop'; }
+    });
     if (!r.loop) stations.forEach((_, k) => { if ((k < lo || k > hi) && cells[k][j] !== 'stop') cells[k][j] = 'out'; });
   });
-  return { stations, cells, patterns: ps };
+  return { stations, stopIndices, cells, patterns: ps };
 }
 
 /** Services tab: the pattern matrix (editable on own lines), headways and vehicles per pattern, adding patterns. */
@@ -52,16 +54,18 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
   const g = ui.game;
   const mine = l.owner === PLAYER;
   if (l.stops.length < 2) { add(body, h('div', { class: 'pad' }, 'A line needs two stops before it can run several services.')); return; }
-  const { stations, cells, patterns } = patternMatrix(l);
+  const { stations, stopIndices, cells, patterns } = patternMatrix(l);
   let heads: { pid: number; vehicles: number; headway: number }[] = [];
   try { heads = patternHeadways(g, l); } catch { heads = []; }
   const byPat = vehiclesByPattern(g, l);
   const apply = (list: ServicePattern[]) => { const err = setPatterns(g, l.id, list); if (err) ui.toast(err, 'bad'); else ui.sound('toggle', { pitch: 1.05 }); after(); };
-  const toggle = (j: number, sid: number) => {
+  const toggle = (j: number, row: number) => {
     const list = copyPatterns(l);
     const p = list[j];
-    const on = l.stops.some((s, i) => s === sid && p.stops[i] !== false);
-    const flags = l.stops.map((s, i) => (s === sid ? !on : p.stops[i] !== false));
+    const indices = patternMatrix(l).stopIndices[row];
+    if (!p || !indices) return;
+    const on = indices.some((i) => p.stops[i] !== false);
+    const flags = l.stops.map((_, i) => (indices.includes(i) ? !on : p.stops[i] !== false));
     if (new Set(l.stops.filter((_, i) => flags[i])).size < 2) { ui.toast('A service stops at two stations at least', 'info'); return; }
     p.stops = flags;
     p.ids = [...l.stops];
@@ -89,12 +93,12 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
   const rows = stations.map((sid, k) => {
     const st = g.stations.get(sid);
     const b = badgeOn(g, l.id, sid);
-    return h('tr', null,
+    return h('tr', { 'data-stop-index': stopIndices[k][0] },
       h('td', { class: 'st' }, b ? badgeEl(b, 'sm') : null, h('a', { class: 'link', onclick: () => ui.openStation(sid) }, st?.name ?? '?')),
       patterns.map((p, j) => {
         const c = cells[k][j];
         const tip = c === 'stop' ? `${p.name} stops at ${st?.name}` : c === 'out' ? `${p.name} turns before ${st?.name}` : `${p.name} passes ${st?.name}`;
-        return h('td', null, h('button', { class: `svb ${p.kind}${c === 'stop' ? '' : ' ' + c}`, disabled: !mine, 'data-tip': mine ? tip + ' — click to change' : tip, 'aria-label': tip, 'data-sfx': 'none', onclick: () => toggle(j, sid) }, h('i')));
+        return h('td', null, h('button', { class: `svb ${p.kind}${c === 'stop' ? '' : ' ' + c}`, disabled: !mine, 'data-tip': mine ? tip + ' — click to change' : tip, 'aria-label': tip, 'data-sfx': 'none', onclick: () => toggle(j, k) }, h('i')));
       }));
   });
   add(body,
@@ -107,8 +111,10 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
     const sug = suggestExpress(g, l);
     add(body, h('div', { class: 'btns' },
       h('button', { class: 'btn', disabled: !sug, 'data-tip': sug ? 'Stops at the termini, interchanges and the busier stations' : 'Nothing worth skipping (four stations or more, some of them small)', onclick: () => {
-        if (!sug) return;
-        const p = addPattern(g, l.id, sug.kind, sug.stops, nameFor(ui, l, sug.kind, sug.stops));
+        const current = g.lines.get(l.id);
+        const fresh = current ? suggestExpress(g, current) : null;
+        if (!current || !fresh) { ui.toast('No express service to add now', 'info'); after(); return; }
+        const p = addPattern(g, current.id, fresh.kind, fresh.stops, nameFor(ui, current, fresh.kind, fresh.stops));
         if (p) { ui.sound('toggle', { pitch: 1.15 }); ui.toast(`${p.name} added — assign vehicles to it in the Vehicles tab`, 'good'); }
         after();
       } }, icon('services', 16), sug ? `Add ${PATTERN_LABEL[sug.kind]}` : 'Add express'),

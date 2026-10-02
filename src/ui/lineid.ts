@@ -103,7 +103,7 @@ export function badgeHtml(b: Badge, size: '' | 'sm' | 'lg' = ''): string {
   return `<span class="snum${size ? ' ' + size : ''}" style="--c:${esc(b.color)}" aria-label="${esc(b.code)}"><i>${esc(b.prefix)}</i><b>${esc(b.num)}</b></span>`;
 }
 
-interface BadgeCache { ver: number; n: number; t: number; map: Map<number, Badge[]> }
+interface BadgeCache { ver: number; n: number; stations: number; t: number; map: Map<number, Badge[]> }
 const badgeCaches = new WeakMap<Game, BadgeCache>();
 
 /**
@@ -113,7 +113,7 @@ const badgeCaches = new WeakMap<Game, BadgeCache>();
 export function allBadges(g: Game): Map<number, Badge[]> {
   const now = performance.now();
   let c = badgeCaches.get(g);
-  if (c && c.ver === g.lines.version && c.n === g.lines.map.size && now - c.t < 3000) return c.map;
+  if (c && c.ver === g.lines.version && c.n === g.lines.map.size && c.stations === g.stations.map.size && now - c.t < 3000) return c.map;
   const map = new Map<number, Badge[]>();
   const L = g.lines as unknown as { stationCode?: (l: number, s: number) => string; routeCode?: (l: Line) => string };
   if (L.stationCode && L.routeCode) {
@@ -121,6 +121,7 @@ export function allBadges(g: Game): Map<number, Badge[]> {
     for (const l of lines) {
       const route = L.routeCode.call(g.lines, l);
       for (const sid of new Set(l.stops)) {
+        if (!g.stations.map.has(sid)) continue;
         const code = L.stationCode.call(g.lines, l.id, sid);
         if (!code) continue;
         const sp = splitCode(code, route);
@@ -130,9 +131,18 @@ export function allBadges(g: Game): Map<number, Badge[]> {
       }
     }
   }
-  c = { ver: g.lines.version, n: g.lines.map.size, t: now, map };
+  // Keep unchanged lists (and the map itself) stable across the periodic colour check.
+  for (const [sid, list] of map) {
+    const old = c?.map.get(sid);
+    if (old && old.length === list.length && old.every((b, i) => {
+      const n = list[i];
+      return b.code === n.code && b.prefix === n.prefix && b.num === n.num && b.color === n.color && b.line === n.line;
+    })) map.set(sid, old);
+  }
+  const same = c && c.map.size === map.size && [...map].every(([sid, list]) => c!.map.get(sid) === list);
+  c = { ver: g.lines.version, n: g.lines.map.size, stations: g.stations.map.size, t: now, map: same ? c!.map : map };
   badgeCaches.set(g, c);
-  return map;
+  return c.map;
 }
 
 /** A station's numbering badges (empty when no numbered line stops there). */
@@ -176,8 +186,18 @@ export function saveFilters() {
   try { localStorage.setItem(FILTER_KEY, JSON.stringify(store())); } catch { /* ignore */ }
 }
 
+/** A remembered company may have been bought out or be absent from the loaded game. */
+export function validateFilter(g: Game, f: LineFilter): boolean {
+  if (f.company === 'mine' || f.company === 'all') return false;
+  if (typeof f.company === 'number' && f.company !== PLAYER && g.activeCompanies.some((c) => c.id === f.company)) return false;
+  f.company = 'mine';
+  saveFilters();
+  return true;
+}
+
 /** Does a line pass a view's filter? */
 export function lineMatches(g: Game, l: Line, f: LineFilter): boolean {
+  validateFilter(g, f);
   if (f.company === 'mine') { if (l.owner !== PLAYER && !l.operators?.includes(PLAYER)) return false; }
   else if (f.company !== 'all' && l.owner !== f.company && !l.operators?.includes(f.company)) return false;
   return !f.hidden.includes(lineMode(g, l));
@@ -185,6 +205,7 @@ export function lineMatches(g: Game, l: Line, f: LineFilter): boolean {
 
 /** Does a vehicle pass a view's filter? */
 export function vehicleMatches(g: Game, v: Vehicle, f: LineFilter): boolean {
+  validateFilter(g, f);
   if (f.company === 'mine' ? v.owner !== PLAYER : f.company !== 'all' && v.owner !== f.company) return false;
   return !f.hidden.includes(vehicleMode(g, v));
 }
@@ -194,6 +215,7 @@ export function vehicleMatches(g: Game, v: Vehicle, f: LineFilter): boolean {
  * `compact`: icons only (narrow cards). `onChange` runs after every change (the filter is saved).
  */
 export function filterBar(g: Game, f: LineFilter, counts: Partial<Record<LineMode, number>>, onChange: () => void, compact = false, owners = true): HTMLElement {
+  validateFilter(g, f);
   const chips = LINE_MODES.filter((m) => (counts[m] ?? 0) > 0 || !f.hidden.includes(m) || m === 'rail' || m === 'bus').map((m) => {
     const on = !f.hidden.includes(m), n = counts[m] ?? 0;
     const meta = MODE_META[m];
@@ -217,6 +239,7 @@ export function filterBar(g: Game, f: LineFilter, counts: Partial<Record<LineMod
 
 /** Line counts per mode (for the filter chips), of the lines passing the company part of the filter. */
 export function modeCounts(g: Game, lines: Line[], f: LineFilter): Partial<Record<LineMode, number>> {
+  validateFilter(g, f);
   const out: Partial<Record<LineMode, number>> = {};
   const only = { hidden: [] as LineMode[], company: f.company };
   for (const l of lines) if (lineMatches(g, l, only)) { const m = lineMode(g, l); out[m] = (out[m] ?? 0) + 1; }

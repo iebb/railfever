@@ -22,12 +22,29 @@ import type { PartnerPolicy } from '../game/lines';
 
 // ------------------------------------------------------------------ small cache (per game; keyed results)
 const memos = new WeakMap<Game, Map<string, { key: string; v: unknown; t: number }>>();
-/** Result of `fn` cached under `name` while `key` stays the same (and for at most `maxAge` ms). */
-export function memo<T>(g: Game, name: string, key: string, fn: () => T, maxAge = Infinity): T {
+const LINE_MEMOS = new Set(['cong', 'sigfix', 'dblfix', 'route', 'elec']);
+const STATION_MEMOS = new Set(['platfix', 'station-expand', 'restyle']);
+
+/** Drop entries for deleted entities, even when their windows are no longer open. */
+export function pruneMemos(g: Game) {
+  const m = memos.get(g);
+  if (!m) return;
+  for (const [name, c] of m) {
+    const [kind, id, depot] = name.split(':');
+    const lineGone = (LINE_MEMOS.has(kind) || kind === 'rail-warning' && id !== 'none') && !g.lines.map.has(Number(id));
+    const stationGone = STATION_MEMOS.has(kind) && !g.stations.map.has(Number(id));
+    const depotGone = kind === 'rail-warning' && depot !== 'none' && !g.depots.map.has(Number(depot))
+      || kind === 'find-depot' && typeof c.v === 'number' && !g.depots.map.has(c.v);
+    if (lineGone || stationGone || depotGone) m.delete(name);
+  }
+}
+
+/** Cache while `key` stays the same; `minAge` also throttles recomputations during rapid network changes. */
+export function memo<T>(g: Game, name: string, key: string, fn: () => T, maxAge = Infinity, minAge = 0): T {
   let m = memos.get(g);
   if (!m) { m = new Map(); memos.set(g, m); }
   const c = m.get(name), now = performance.now();
-  if (c && c.key === key && now - c.t < maxAge) return c.v as T;
+  if (c && (now - c.t < minAge || c.key === key && now - c.t < maxAge)) return c.v as T;
   const v = fn();
   m.set(name, { key, v, t: now });
   return v;
@@ -122,7 +139,7 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
     advice = `${plural(top.trains, 'train')} queue${top.trains === 1 ? 's' : ''} for a free platform at ${st?.name ?? 'a station'}: give it more platforms.`;
     if (st && st.owner === PLAYER) {
       const up = memo(g, 'platfix:' + st.id, String(nv), () => expandPlan(g, st.id));
-      if (up?.ok) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(up.cost), 'data-sfx': 'none', onclick: () => commitExpand(ui, up, after) }, icon('upgrade', 15), `${up.tracks} platforms at ${st.name} · ${fmtMoney(up.cost)}`));
+      if (up?.ok) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(up.cost), 'data-sfx': 'none', onclick: () => commitExpand(ui, st.id, after) }, icon('upgrade', 15), `${up.tracks} platforms at ${st.name} · ${fmtMoney(up.cost)}`));
       else if (up) advice += ` (${up.error ?? 'no room to expand'})`;
       btns.push(h('button', { class: 'btn sm', onclick: () => ui.openStation(st.id) }, 'Station…'));
     }
@@ -133,10 +150,13 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
       const key = nv + '|' + all.slice(0, 40).join(',');
       const plan = memo(g, 'dblfix:' + l.id, key, () => doubleFor(g, singleRun(g, all)));
       if (plan?.ok) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(plan.cost), 'data-sfx': 'none', onclick: () => {
-        const r = commitDoubleTrack(g, plan, true, { rightHand: ui.tools.rightHand });
+        const current = lineCongestion(g, l.id);
+        const fresh = doubleFor(g, singleRun(g, current.blockedStretches.flat()));
+        if (!fresh?.ok) { ui.toast(fresh?.errors[0] ?? 'No single-track stretch to double here now', 'info'); after(); return; }
+        const r = commitDoubleTrack(g, fresh, true, { rightHand: ui.tools.rightHand });
         if (r.error) { ui.toast(r.error, 'bad'); return; }
         ui.sound('build-rail');
-        ui.toast(`Double track: ${fmtLen(plan.length)} · ${plural(r.signals, 'signal')} · ${plural(r.crossovers, 'crossover')}`, 'good');
+        ui.toast(`Double track: ${fmtLen(fresh.length)} · ${plural(r.signals, 'signal')} · ${plural(r.crossovers, 'crossover')}`, 'good');
         after();
       } }, icon('parallel', 15), `Double ${fmtLen(plan.length)} · ${fmtMoney(plan.cost)}`));
       else if (plan) advice += ` (${plan.errors[0] ?? 'cannot be doubled here'}: try the Double track tool)`;
@@ -167,10 +187,13 @@ export function expandPlan(g: Game, stationId: number): UpgradePlan | null {
   return planStationUpgrade(g, stationId, { tracks: rec.tracks, through: rec.through, length: rec.length, side: 'auto' });
 }
 
-export function commitExpand(ui: UI, up: UpgradePlan, after: () => void) {
+export function commitExpand(ui: UI, stationId: number, after: () => void) {
   const g = ui.game;
+  const st = g.stations.get(stationId);
+  if (!st?.rail || st.owner !== PLAYER) { ui.toast('Choose one of your rail stations to expand', 'bad'); after(); return; }
+  const up = expandPlan(g, stationId);
+  if (!up?.ok) { ui.toast(up?.error ?? 'This station cannot be expanded now', 'bad'); after(); return; }
   const err = commitStationUpgrade(g, up);
-  const st = g.stations.get(up.station);
   if (err === 'busy') { ui.toast('A train is in the station — try again in a moment', 'info'); return; }
   if (err) { ui.toast(err, 'bad'); return; }
   ui.sound('station', st ? { x: st.x, z: st.z } : {});
@@ -189,10 +212,10 @@ export interface RouteInfo {
   through: boolean;
 }
 
-/** Route of a rail line by owner and track type (cached per network, stops and vehicles). */
-export function routeInfo(g: Game, l: Line): RouteInfo | null {
+/** Route by owner and type, cached per network / stops / vehicles and recomputed at most once a second. */
+export function routeInfo(g: Game, l: Line, fresh = false): RouteInfo | null {
   if (l.kind !== 'rail' || l.stops.length < 2) return null;
-  const key = `${g.networkVersion}|${l.stops.join(',')}|${l.vehicles.length}|${g.lines.isLoop(l)}`;
+  const key = `${g.networkVersion}|${g.world.net.version}|${l.owner}|${l.stops.join(',')}|${l.vehicles.join(',')}|${g.lines.isLoop(l)}`;
   return memo(g, 'route:' + l.id, key, () => {
     const owners = lineOperators(g, l.id);
     const p = computeLinePath(g, l);
@@ -210,7 +233,7 @@ export function routeInfo(g: Game, l: Line): RouteInfo | null {
     for (const sid of l.stops) for (const id of g.stations.get(sid)?.rail?.edges ?? []) { const e = net.edges.get(id); if (e?.type === 'standard' && !standard.includes(id)) standard.push(id); }
     const modes = new Set([...types.keys()].map((t) => TRACK_TYPES[t]?.mode ?? 'mainline'));
     return { owners, types, standard, through: owners.length > 1 || modes.size > 1 };
-  });
+  }, fresh ? 0 : Infinity, fresh ? 0 : 1000);
 }
 
 /** Through service and route summary: who owns the track (shares), which track types it runs on. */
@@ -240,7 +263,9 @@ export function compatPanel(ui: UI, l: Line, after: () => void): HTMLElement | n
   if (wire && r?.standard.length) {
     const pre = memo(g, 'elec:' + l.id, g.networkVersion + '|' + r.standard.length, () => electrify(g, r.standard, PLAYER, true));
     if (pre.changed) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(pre.cost), 'data-sfx': 'none', onclick: () => {
-      const res = electrify(g, r.standard, PLAYER);
+      const current = g.lines.get(l.id);
+      const fresh = current ? routeInfo(g, current, true) : null;
+      const res = electrify(g, fresh?.standard ?? [], PLAYER);
       if (!res.changed) { ui.toast(res.error ?? 'Nothing to electrify', 'bad'); return; }
       ui.sound('build-rail', { pitch: 1.25 });
       ui.toast(`${fmtLen(res.length)} of the line electrified${res.error ? ` — ${res.error}` : ''}`, res.error ? 'info' : 'good');

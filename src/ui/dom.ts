@@ -17,6 +17,8 @@ export function h<K extends keyof HTMLElementTagNameMap>(tag: K, attrs?: Attrs |
         else Object.assign(el.style, v);
       } else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2).toLowerCase(), v);
       else if (k === 'html') el.innerHTML = v;
+      // Window refresh compares markup: selected must be reflected there as well as in the live option.
+      else if (k === 'selected') { (el as HTMLOptionElement).selected = !!v; el.toggleAttribute('selected', !!v); }
       else if (k in el && typeof v !== 'string') (el as any)[k] = v;
       else el.setAttribute(k, String(v));
     }
