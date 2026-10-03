@@ -13,6 +13,7 @@ import type { AIController } from '../src/game/ai';
 import type { Station } from '../src/game/stations';
 import type { Town } from '../src/game/towns';
 import { emptyRecord } from '../src/game/economy';
+import { TRIPS_PER_MONTH } from '../src/game/demand';
 import { serialize, deserialize } from '../src/game/save';
 import { planConnection, commitConnection, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
 import { depotReaches } from '../src/game/train';
@@ -212,6 +213,18 @@ function fixtureResidents(g: Game, t: Town, x: number, z: number, pop: number): 
   t.buildings.add(b.id);
 }
 
+/** Small, calibrated OD flows: useful transfers below the old trip gates, without overriding the defaults. */
+function fixtureFlows(g: Game, stations: Station[], produced = 3): void {
+  const n = stations.length;
+  g.demand.regions = stations.map((st, id) => {
+    const t = fixtureTown(g, st.x, st.z, produced / TRIPS_PER_MONTH, 10);
+    st.townId = t.id;
+    return { id, town: t.id, kind: 'town' as const, x: st.x, z: st.z, r: 10, pop: t.pop, jobs: 0, produced, attracted: produced };
+  });
+  g.demand.od = Float32Array.from({ length: n * n }, (_, i) => Math.floor(i / n) === i % n ? 0 : 1 / (n - 1));
+  g.demand.ld = new Float32Array(n * n);
+}
+
 /** Lay a straight own track from a node to another (pieces of ~10 units, each over / under / level as it fits). */
 function straightTrack(g: Game, from: number, to: number, me: number): boolean {
   const net = g.world.net;
@@ -281,10 +294,11 @@ export function scenarios() {
       const la = lineWithTrain(g, me, depotAtTerminus ? [U, T] : [T, U]);
       const home = g.vehicles.get(g.lines.get(la)!.vehicles[0]) as unknown as { depotId: number };
       lineWithTrain(g, me, [V, W]);
-      const threshold = networkOptions.throughTrips;
-      networkOptions.throughTrips = 0;
       runNetworkTask(ai, 'connect');
-      networkOptions.throughTrips = threshold;
+      check(stat(ai, 'netThrough') === 0, `connect (${kind}): no construction without demand`);
+      fixtureFlows(g, [T, U, V, W]);
+      g.day += 181;
+      runNetworkTask(ai, 'connect');
       const l = g.lines.get(la)!;
       const dest = l.stops.find((s) => s === V.id || s === W.id);
       console.log(`  ${kind}: ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
@@ -307,10 +321,10 @@ export function scenarios() {
     const B1 = station(g, 140, 20, 0, 10, 1, me)!, B2 = station(g, 140, 226, 0, 10, 1, me)!;
     build(g, nodeSnap(g, endNode(g, B1, 0, true), 'rail'), nodeSnap(g, endNode(g, B2, 0, false), 'rail'), railOpts(me), 'line B');
     const la = lineWithTrain(g, me, [A1, A2]), lb = lineWithTrain(g, me, [B1, B2]);
-    const threshold = networkOptions.interchangeTrips;
-    networkOptions.interchangeTrips = 0;
     runNetworkTask(ai, 'interchange');
-    networkOptions.interchangeTrips = threshold;
+    check(stat(ai, 'netInterchanges') === 0, 'interchange: no construction without demand');
+    fixtureFlows(g, [A1, A2, B1, B2]);
+    runNetworkTask(ai, 'interchange');
     const LA = g.lines.get(la)!, LB = g.lines.get(lb)!;
     console.log(`  ${LA.name}: ${LA.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${LB.name}: ${LB.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
     const newA = LA.stops.find((s) => s !== A1.id && s !== A2.id), newB = LB.stops.find((s) => s !== B1.id && s !== B2.id);
@@ -409,13 +423,15 @@ export function scenarios() {
     const P = station(g, 40, 128, Math.PI / 2, 10, 1, me)!, Q = station(g, 216, 128, Math.PI / 2, 10, 1, me)!;
     build(g, nodeSnap(g, endNode(g, P, 0, true), 'rail'), nodeSnap(g, endNode(g, Q, 0, false), 'rail'), railOpts(me), 'line');
     const lid = lineWithTrain(g, me, [P, Q]);
-    // a new district south of the line, halfway between the stations (64 houses, ~1600 residents)
-    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) g.world.addBuilding({ townId: -1, x: 116 + i * 3.2, z: 136 + j * 3.2, angle: 0, w: 1.2, d: 1.1, type: 1, floors: 2, pop: 25, seed: i * 8 + j, y: 3, built: 0 });
+    // a small new district south of the line (192 residents: below the previous population gate)
+    for (let i = 0; i < 8; i++) for (let j = 0; j < 8; j++) g.world.addBuilding({ townId: -1, x: 116 + i * 3.2, z: 136 + j * 3.2, angle: 0, w: 1.2, d: 1.1, type: 1, floors: 2, pop: 3, seed: i * 8 + j, y: 3, built: 0 });
     runNetworkTask(ai, 'insert');
     const l = g.lines.get(lid)!;
     console.log(`  ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}; ${ai.log.slice(-1).join('')}`);
     check(stat(ai, 'netInserted') === 1 && l.stops.length > 2, 'insert: a station on the line by the new district');
     check(routes(g, P, Q, me), 'insert: the line still runs end to end');
+    const inserted = l.stops.map((id) => g.stations.get(id)).find((s) => s?.id !== P.id && s?.id !== Q.id);
+    check(!!inserted?.rail && l.vehicles.every((id) => (g.vehicles.get(id) as unknown as { length: number }).length <= inserted.rail!.length), 'insert: the smaller station fits every train');
     // not twice: the district is covered now
     g.day += 181;
     runNetworkTask(ai, 'insert');
@@ -493,14 +509,16 @@ export function scenarios() {
     const T = fixtureTown(g, 128, 128);
     const H = station(g, 128, 128, Math.PI / 2, 10, 1, me, { style: 'none' })!, B = station(g, 226, 128, Math.PI / 2, 10, 1, me)!;
     build(g, nodeSnap(g, endNode(g, H, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'H-B');
-    lineWithTrain(g, me, [H, B]);
+    const lid = lineWithTrain(g, me, [H, B]);
     fixtureResidents(g, T, 128, 150, 4000); // already within the halt's catchment
     fixtureResidents(g, T, 128, 171, 1); // extra catchment too small to pay back
     runNetworkTask(ai, 'capacity');
     check(H.rail?.style === 'none' && stat(ai, 'netRestyled') === 0, 'building: a rich company keeps a halt when extra catchment does not pay');
     const radius = g.stations.catchmentRadius(H);
     g.day += 361;
-    fixtureResidents(g, T, 132, 171, 300);
+    fixtureResidents(g, T, 132, 171, 30);
+    H.catchPop = 4000; H.pickupLast = 24;
+    g.lines.get(lid)!.passLast = 24; g.lines.get(lid)!.incomeLast = 1_440_000;
     const money = g.company(me).economy.money;
     runNetworkTask(ai, 'capacity');
     console.log(`  ${H.name}: ${H.rail?.style}; ${ai.log.slice(-1).join('')}`);
@@ -576,7 +594,8 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
   for (const seed of seeds) {
     const t0 = performance.now();
     Object.assign(networkProfile, { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, tasks: {}, decisions: {} });
-    let errors = 0, minMoney = Infinity, overLoan = false, insolvent = false, lastDay = -1;
+    let errors = 0, minMoney = Infinity, overLoan = false, insolvent = false, bankrupt = false, lastDay = -1;
+    const companyMinMoney = new Map<number, number>();
     const warn = console.warn;
     console.warn = (...a: unknown[]) => { errors++; warn('WARN', ...a); };
     const g = nai ? netWorld(seed, years, size, nai, (gg) => {
@@ -585,15 +604,24 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
       for (const ai of gg.ais) {
         const e = gg.company(ai.companyId).economy;
         minMoney = Math.min(minMoney, e.money);
+        companyMinMoney.set(ai.companyId, Math.min(companyMinMoney.get(ai.companyId) ?? Infinity, e.money));
         overLoan ||= e.loan > e.maxLoan;
         insolvent ||= e.money + Math.max(0, e.maxLoan - e.loan) < 0;
       }
+      bankrupt ||= gg.companies.some((c) => c.ai && c.defunct);
       if (process.argv.includes('--progress') && gg.day % 360 === 0) console.log(`  seed ${seed}: year ${gg.day / 360}/${years}`);
     }) : aiWorld(seed, years, size);
     console.warn = warn;
     const m = aiNetMetrics(g);
     const st = g.ais.map((ai) => ai.stats as unknown as Record<string, number>);
     const sum = (k: string) => st.reduce((a, x) => a + (x[k] ?? 0), 0);
+    const companies = g.ais.map((ai) => {
+      const s = ai.stats as unknown as Record<string, number>, e = g.company(ai.companyId).economy;
+      return { company: ai.companyId, code: g.company(ai.companyId).code, grown: s.grown ?? 0, paired: s.paired ?? 0,
+        through: s.netThrough ?? 0, inserted: s.netInserted ?? 0, interchanges: s.netInterchanges ?? 0,
+        restyled: s.netRestyled ?? 0, decommissioned: s.netDecommissioned ?? 0, stopsMerged: s.netStopsMerged ?? 0,
+        cash: e.money, loan: e.loan, maxLoan: e.maxLoan, minMoney: companyMinMoney.get(ai.companyId) ?? e.money };
+    });
     const mid = midLineCrossovers(g).filter((c) => c.owner > 0);
     const subs = subsetLinePairs(g);
     const { calls, ms } = networkProfile;
@@ -601,14 +629,16 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
     console.log(`  stations per rail town ${fmt(m.stations / Math.max(1, m.railTowns), 2)}; mid-line crossovers ${mid.length}; subset/superset line pairs ${subs.length}`);
     console.log(`  AI: stations grown ${sum('grown')}, merged ${sum('merged')}, joined at a town's station ${sum('joinedStations')}, single tracks paired ${sum('paired')}, junctions ${sum('connections')}, stub track taken up ${fmt(sum('stubs'), 0)} u, lines ${sum('lines')}, rail stations ${sum('railStations')}`);
     console.log(`  network: ${NET_KEYS.map((k) => `${k.slice(3)} ${sum(k)}`).join(', ')}`);
+    console.log(`  actions per company: ${companies.map((c) => `${c.code}: grown ${c.grown}, through ${c.through}, inserted ${c.inserted}, interchanges ${c.interchanges}, buildings ${c.restyled}, closed ${c.decommissioned}, stops merged ${c.stopsMerged}`).join('; ')}`);
     console.log(`  opportunities: ${Object.entries(networkProfile.decisions).map(([k, n]) => `${k} ${n}`).join(', ') || 'none'}`);
     console.log(`  money: ${g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return `${g.company(ai.companyId).code} ${fmt(e.money / 1e6, 1)}M (loan ${fmt(e.loan / 1e6, 1)}/${fmt(e.maxLoan / 1e6, 0)}M)`; }).join(', ')}${isFinite(minMoney) ? `; lowest cash ${fmt(minMoney / 1e6, 1)}M` : ''}`);
     console.log(`  network work: ${calls} calls, ${networkProfile.steps} units (max ${networkProfile.maxSteps}/${NETWORK_WORK_UNITS} per call), avg ${fmt(ms / Math.max(1, calls), 3)} ms, max ${fmt(networkProfile.max, 1)} ms, ${networkProfile.slow} over 15 ms; per company max ${g.ais.map((ai) => fmt(networkPlanner(ai)?.prof.max ?? 0, 1)).join('/')} ms; steps by task ${Object.entries(networkProfile.tasks).map(([k, v]) => `${k} ${v.steps}x max ${fmt(v.max, 1)}`).join(', ')}`);
     if (process.argv.includes('--json')) console.log('METRICS ' + JSON.stringify({ seed, off, stations: m.stations, railParts: m.railParts, railTowns: m.railTowns,
       stationsPerTown: m.stations / Math.max(1, m.railTowns), multiTowns: m.multiTowns, midCrossovers: mid.length, subsets: subs.length,
-      paired: sum('paired'), connections: sum('connections'), through: sum('netThrough'), inserted: sum('netInserted'), interchanges: sum('netInterchanges'),
+      grown: sum('grown'), paired: sum('paired'), connections: sum('connections'), through: sum('netThrough'), inserted: sum('netInserted'), interchanges: sum('netInterchanges'),
       consolidated: sum('netConsolidated'), restyled: sum('netRestyled'), relevelled: sum('netRelevelled'), decommissioned: sum('netDecommissioned'),
-      minMoney, overLoan, insolvent, money: g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return { company: ai.companyId, cash: e.money, loan: e.loan, maxLoan: e.maxLoan }; }),
+      stopsMerged: sum('netStopsMerged'), minMoney, overLoan, insolvent, bankrupt, errors, companies, opportunities: networkProfile.decisions,
+      money: g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return { company: ai.companyId, cash: e.money, loan: e.loan, maxLoan: e.maxLoan }; }),
       calls, units: networkProfile.steps, maxUnits: networkProfile.maxSteps, avgMs: ms / Math.max(1, calls), maxMs: networkProfile.max }));
     for (const ai of g.ais) {
       const notes = ai.log.filter((x) => /rebuilt|merged|joined|paired|junction|stub|station|closed|took up|interchange|combined|moved|lifted|crossovers|runs through|catchment/.test(x)).slice(-5);
@@ -622,7 +652,7 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
     check(errors === 0, `seed ${seed}: no AI errors (${errors})`);
     // Wall time under contention is reported, never used as a simulation rule or a correctness assertion.
     check(networkProfile.maxSteps <= NETWORK_WORK_UNITS, `seed ${seed}: network work stays within the deterministic allowance`);
-    check(!overLoan && !insolvent && g.companies.every((c) => !c.ai || !c.defunct), `seed ${seed}: no bankrupt company or loan beyond its limit`);
+    check(!overLoan && !insolvent && !bankrupt && g.companies.every((c) => !c.ai || !c.defunct), `seed ${seed}: no bankrupt company or loan beyond its limit`);
     const errs = netReservations(g);
     check(errs.length === 0, `seed ${seed}: reservations consistent ${errs.slice(0, 2).join('; ')}`);
   }
