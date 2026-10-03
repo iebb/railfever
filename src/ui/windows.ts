@@ -1,5 +1,6 @@
 // Floating, draggable window cards (bottom sheets on narrow screens) with throttled refresh.
 import { h, icon } from './dom';
+import { uiScale } from './uiscale';
 
 export interface Win {
   id: string;
@@ -15,6 +16,8 @@ export interface Win {
   close: () => void;
   /** last rendered markup (refreshes that produce the same markup are skipped) */
   last?: string;
+  /** element that had the focus when the window opened (focus goes back there when it closes) */
+  opener?: HTMLElement | null;
 }
 
 export interface WinOpts {
@@ -36,22 +39,28 @@ export class WindowManager {
   private z = 100;
   private cascade = 0;
   constructor(private root: HTMLElement) {
-    window.addEventListener('resize', () => {
-      for (const w of this.wins.values()) {
-        const W = window.innerWidth, H = window.innerHeight;
-        const r = w.el.getBoundingClientRect();
-        w.el.style.left = Math.max(0, Math.min(W - Math.min(r.width, W), r.left)) + 'px';
-        w.el.style.top = Math.max(60, Math.min(H - 80, r.top)) + 'px';
-      }
-    });
+    // (an interface-size change also arrives as a resize: windows grow with --uis)
+    window.addEventListener('resize', () => this.keepOnScreen());
+  }
+
+  /** Keep every window wholly on screen (by its measured size; below the top bar where it fits). */
+  private keepOnScreen() {
+    const W = window.innerWidth, H = window.innerHeight, top = Math.round(60 * uiScale());
+    for (const w of this.wins.values()) {
+      const r = w.el.getBoundingClientRect();
+      w.el.style.left = Math.max(0, Math.min(W - Math.min(r.width, W), r.left)) + 'px';
+      w.el.style.top = Math.max(Math.min(top, Math.max(0, H - r.height)), Math.min(H - r.height - 8, r.top)) + 'px';
+    }
   }
 
   get narrow() { return window.innerWidth <= 720; }
 
   open(id: string, title: string, opts: WinOpts = {}): Win {
+    const opener = document.activeElement;
     const ex = this.wins.get(id);
     if (ex) {
       ex.title.textContent = title;
+      ex.el.setAttribute('aria-label', title);
       ex.sub.textContent = opts.sub ?? '';
       ex.refresh = opts.refresh;
       ex.onClose = opts.onClose;
@@ -62,6 +71,7 @@ export class WindowManager {
       ex.tabsEl.dataset.sig = '';
       this.setHead(ex, opts);
       this.focus(ex);
+      this.takeFocus(ex, opener);
       return ex;
     }
     const titleEl = h('span', { class: 'win-title' }, title);
@@ -72,13 +82,16 @@ export class WindowManager {
     const tabsEl = h('div', { class: 'win-tabs', role: 'tablist' });
     tabsEl.style.display = 'none';
     const body = h('div', { class: 'win-body' });
-    const el = h('div', { class: 'win ' + (opts.cls ?? ''), role: 'dialog', 'aria-label': title }, header, tabsEl, body);
+    // tabindex -1: the window itself takes the focus when it opens (Tab then walks its controls)
+    const el = h('div', { class: 'win ' + (opts.cls ?? ''), role: 'dialog', 'aria-label': title, tabindex: '-1' }, header, tabsEl, body);
     const width = opts.width ?? 360;
-    el.style.width = width + 'px';
+    // the interface size (--uis) zooms the window's contents (style.css); its box grows with them
+    el.style.width = `calc(${width}px * var(--uis, 1))`;
+    const s = uiScale(), sw = width * s;
     const W = window.innerWidth, H = window.innerHeight;
     const k = this.cascade++ % 6;
-    const x = Math.max(8, Math.min(W - width - 10, opts.x ?? W - width - 16 - k * 26));
-    const y = Math.max(64, Math.min(H - 320, opts.y ?? 70 + k * 26));
+    const x = Math.max(8, Math.min(W - sw - 10, opts.x ?? W - sw - 16 - k * 26));
+    const y = Math.max(64 * s, Math.min(H - 320, opts.y ?? 70 * s + k * 26));
     el.style.left = x + 'px';
     el.style.top = y + 'px';
     this.root.appendChild(el);
@@ -91,6 +104,7 @@ export class WindowManager {
         if (this.wins.get(id) === win) this.wins.delete(id);
         win.onClose?.();
         if (!this.silent) this.sfx.close();
+        if (el.contains(document.activeElement)) this.returnFocus(win);
         // fade / scale out, then remove
         el.classList.add('closing');
         setTimeout(() => el.remove(), 140);
@@ -114,8 +128,30 @@ export class WindowManager {
     });
     this.wins.set(id, win);
     this.focus(win);
+    this.takeFocus(win, opener);
     if (!this.silent) this.sfx.open();
     return win;
+  }
+
+  /**
+   * Move the keyboard focus into a window that opened (the window itself: it is labelled, and Tab continues with its
+   * first control), remembering where it came from. Never taken away from a text field the player is typing in.
+   */
+  private takeFocus(w: Win, opener: Element | null) {
+    if (typingIn(document.activeElement) || w.el.contains(document.activeElement)) return;
+    // (re-opened from inside itself: keep the original opener)
+    if (opener instanceof HTMLElement && opener !== document.body && !w.el.contains(opener)) w.opener = opener;
+    w.el.focus({ preventScroll: true });
+  }
+
+  /** A window with the focus closed: back to its opener if that is still there, else to the window on top. */
+  private returnFocus(w: Win) {
+    const o = w.opener;
+    if (!this.silent && o && o.isConnected && !o.closest('[inert], .win.closing') && o.getClientRects().length) { o.focus({ preventScroll: true }); return; }
+    let top: Win | null = null, tz = -1;
+    if (!this.silent) for (const x of this.wins.values()) { const z = Number(x.el.style.zIndex); if (x !== w && z > tz) { tz = z; top = x; } }
+    if (top) top.el.focus({ preventScroll: true });
+    else (document.activeElement as HTMLElement | null)?.blur?.();
   }
 
   private setHead(w: Win, opts: WinOpts) {
@@ -171,6 +207,36 @@ export class WindowManager {
       morphChildren(real, tmp);
     }
   }
+}
+
+/** Is this element a text field (typing must keep its focus)? */
+function typingIn(a: Element | null): boolean {
+  if (!(a instanceof HTMLElement)) return false;
+  if (a.isContentEditable || a.tagName === 'TEXTAREA' || a.tagName === 'SELECT') return true;
+  return a.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'range', 'color', 'file', 'submit', 'reset', 'image'].includes((a as HTMLInputElement).type);
+}
+
+/**
+ * Make everything beside `layer` in its parent inert (no focus, no clicks, hidden from assistive technology) while a
+ * full-screen layer such as the title screen is open, including elements added meanwhile. Returns the undo.
+ */
+export function inertBehind(layer: HTMLElement): () => void {
+  const root = layer.parentElement;
+  if (!root) return () => {};
+  const done: HTMLElement[] = [];
+  const mark = (el: Element) => {
+    if (el === layer || !(el instanceof HTMLElement) || el.hasAttribute('inert')) return;
+    el.setAttribute('inert', '');
+    done.push(el);
+  };
+  for (const el of Array.from(root.children)) mark(el);
+  const mo = typeof MutationObserver !== 'undefined' ? new MutationObserver((recs) => { for (const r of recs) r.addedNodes.forEach((n) => { if (n instanceof Element) mark(n); }); }) : null;
+  mo?.observe(root, { childList: true });
+  return () => {
+    mo?.disconnect();
+    for (const el of done) el.removeAttribute('inert');
+    done.length = 0;
+  };
 }
 
 const REPLACE_TAGS = new Set(['BUTTON', 'A', 'SELECT', 'INPUT', 'CANVAS', 'TEXTAREA', 'LABEL']);

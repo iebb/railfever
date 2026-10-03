@@ -73,11 +73,17 @@ export interface Hop { line: number; alight: number; cost: number; lines?: numbe
 export type PartnerPolicy = 'open' | 'invite' | 'closed';
 export const PARTNER_POLICIES: PartnerPolicy[] = ['open', 'invite', 'closed'];
 
-/** Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams. */
+/**
+ * Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams.
+ * Chosen for colour-blind players too (delta E under deuteranopia, protanopia and tritanopia): in the order pickColor
+ * hands them out (listed in that order) consecutive colours of one mode stay >= 20 apart; with modes mixed, consecutive
+ * colours of the first six lines stay >= 15 apart in every creation order. Later in long mixed sequences, and with the
+ * fallback hues used once these lists run out, closer pairs can still occur. Saved lines keep their colour.
+ */
 export const LINE_PALETTES: Record<Transport, string[]> = {
-  rail: ['#d7263d', '#1b6ec2', '#2a9d4b', '#7b2cbf', '#f08c00', '#00897b', '#c2185b', '#3949ab', '#8d6e00', '#5d4037', '#0097a7', '#6a1b9a'],
-  road: ['#ff6f61', '#42a5f5', '#8bc34a', '#ffb300', '#ab47bc', '#26a69a', '#ff8a65', '#78909c', '#ec407a', '#9ccc65', '#5c6bc0', '#ffd54f'],
-  tram: ['#e53935', '#00acc1', '#fb8c00', '#5e35b1', '#43a047', '#d81b60', '#1e88e5', '#795548', '#c0ca33', '#00897b'],
+  rail: ['#ee204b', '#0f5dbe', '#2da167', '#b8810d', '#7b04fa', '#d686bf', '#8261ff', '#8e3788', '#27670e', '#a14062', '#ad85f9', '#ff7380'],
+  road: ['#e75464', '#89a6eb', '#c5d794', '#f6cd1b', '#42e3fc', '#b67a19', '#05a886', '#a481ff', '#ffa1b8', '#94e56e', '#a9af16', '#b281c0'],
+  tram: ['#f5284b', '#24c3fe', '#b38415', '#8858ba', '#83c17e', '#ff8bb4', '#7f54ff', '#ba2b85', '#4b95f2', '#3f7627', '#d33d69', '#bd82c4'],
 };
 
 /** HSL -> '#rrggbb'. */
