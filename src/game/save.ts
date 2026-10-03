@@ -23,7 +23,7 @@ import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 import { walkRoadsChanged } from './catchment';
-import { stationMailJSON, restoreStationMail, restoreMail, addMail, type MailWait } from './mail';
+import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
 const VERSION = 3;
 /** Save formats this build reads (v2: older single-record saves). */
@@ -317,7 +317,7 @@ function physOf(v: Vehicle): number[] | null {
   const p = v as unknown as { tractionJ?: number; regenJ?: number; auxJ?: number; km?: number; hours?: number };
   return typeof p.tractionJ === 'number' ? [p.tractionJ, p.regenJ ?? 0, p.auxJ ?? 0, p.km ?? 0, p.hours ?? 0] : null;
 }
-function restoreBase(v: Vehicle, d: any) {
+function restoreBase(g: Game, v: Vehicle, d: any) {
   v.owner = d.owner; v.name = d.name; v.lineId = d.lineId; v.stopIndex = d.stopIndex; restoreCargo(v, d.cargo ?? []);
   v.load = d.load; v.state = d.state; v.status = d.status; v.profitYear = d.profitYear; v.profitLast = d.profitLast;
   v.incomeYear = d.incomeYear; v.boughtDay = d.boughtDay; v.value = d.value; v.stateTime = d.stateTime ?? 0;
@@ -328,7 +328,7 @@ function restoreBase(v: Vehicle, d: any) {
   if (Array.isArray(d.ops)) [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt] = (d.ops as number[]).map((x) => Number(x) || 0);
   else v.opMark = -1;
   v.opLast = d.opLast ? { ...d.opLast } : null;
-  if (Array.isArray(d.mail)) restoreMail(v, d.mail);
+  if (Array.isArray(d.mail)) restoreMail(g, v, d.mail);
   v.mailLoad = Number(d.mailLoad) || 0; v.mailDelivered = Number(d.mailDelivered) || 0;
   if (Array.isArray(d.phys)) {
     const p = v as unknown as Record<string, number>;
@@ -527,7 +527,7 @@ export function deserialize(d: any): Game {
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
     if (s.mail) {
       st.mail = restoreStationMail(s.mail);
-      for (const w of (s.mail.waiting ?? []) as MailWait[]) addMail(g, st, w.line, w.alight, w.dest, w.count, w.t);
+      restoreMailQueue(g, st, s.mail.waiting ?? []);
     }
     g.stations.map.set(st.id, st);
   }
@@ -568,7 +568,7 @@ export function deserialize(d: any): Game {
   const makeRoad = (vd: any): RoadVehicle => {
     const model = vd.model ? MODEL_BY_ID.get(vd.model) ?? null : null;
     const r = new RoadVehicle(g, vd.id, model, vd.depotId, !!vd.ambient, 1);
-    restoreBase(r, vd);
+    restoreBase(g, r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
     r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2; r.needsReplan = !!vd.needsReplan;
@@ -590,7 +590,7 @@ export function deserialize(d: any): Game {
     if (vd.type === 'train') {
       const cars = (vd.cars as string[]).map((id) => MODEL_BY_ID.get(id)).filter((m): m is NonNullable<typeof m> => !!m);
       const t = new Train(g, vd.id, cars, vd.depotId);
-      restoreBase(t, vd);
+      restoreBase(g, t, vd);
       t.speed = vd.speed; t.waitTime = vd.waitTime ?? 0; t.retryTimer = vd.retryTimer ?? 0; t.loadTimer = vd.loadTimer ?? 0;
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;

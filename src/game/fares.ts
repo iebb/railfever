@@ -217,22 +217,37 @@ export function transferWalkTime(gapUnits: number): number { return TRANSFER_WAL
 
 // ------------------------------------------------------------------------------ mail
 /**
- * Mail fares: per unit of mail (MAIL_UNIT_T, 0.1 t) and unit of effective distance, the long-leg passenger rate
- * (FARE_RATE at the long-distance compensation); the time factor clamp((mailRefTime / leg) ^ exp, min, max) rewards
- * fast collection and carriage. No direct bonus, boarding charge or city-centre term; each leg pays for itself.
+ * Mail fares, kept apart from the passenger fares so they can be recalibrated on their own (scripts/mailcal.ts). A
+ * journey pays once, when the mail is delivered: `rate` per unit of mail (MAIL_UNIT_T, 0.1 t) and unit of effective
+ * distance from where it was posted to its destination (d^2 / (d + shortHop), tapering gently beyond taperFrom), times
+ * the time factor clamp((mailRefTime(d) / journey time) ^ exp, min, max) and `transfer` for every change of vehicle on
+ * the way. The legs share the receipts by the distances they carried (mail.ts settleMail), so splitting a journey
+ * never earns more than carrying it direct. No direct bonus, boarding charge or city-centre term.
  */
-export const MAIL_FARE = { rate: (FARE_RATE * PASSENGER_LONG_FARE_SCALE) / PASSENGER_FARE_SCALE, exp: 1.0, min: 0.15, max: 1.6 };
+export const MAIL_FARE = { rate: 13.65, shortHop: 10, taperFrom: 500, taperScale: 5000, exp: 1.0, min: 0.15, max: 1.6, transfer: 0.9 };
+/** The alternative for mail: `baseS` collection and sorting, then a van at `kmh` on a `detour` of the straight distance. */
+export const MAIL_REF = { baseS: 240, kmh: 50, detour: 1.3 };
 /** Demand elasticity of mail (mail.ts): clamp((mailRefTime / expected time) ^ exp, min, max). */
 export const MAIL_TRIP = { exp: 0.8, min: 0.3, max: 1.25 };
-/** The alternative for mail (s): collection and sorting, then a van at 50 km/h on a 1.3x detour of the straight distance. */
-export function mailRefTime(d: number): number { return 240 + (Math.max(0, d) * UNIT_M * 1.3) / (50 / 3.6); }
+/** The time mail would take by the alternative (s) over a straight-line distance of `d` units. */
+export function mailRefTime(d: number): number { return MAIL_REF.baseS + (Math.max(0, d) * UNIT_M * MAIL_REF.detour) / (MAIL_REF.kmh / 3.6); }
+/** Effective distance (units) of a mail journey for its fare. */
+export function mailEffDist(d: number): number {
+  if (!(d > 1)) return 0;
+  const e = (d * d) / (d + MAIL_FARE.shortHop);
+  return d <= MAIL_FARE.taperFrom ? e : e / Math.sqrt(1 + (d - MAIL_FARE.taperFrom) / MAIL_FARE.taperScale);
+}
+/** Time factor of a mail journey of `d` units that took `seconds` from posting to delivery. */
+export function mailTimeFactor(d: number, seconds: number): number {
+  return clamp(Math.pow(mailRefTime(d) / Math.max(1, seconds), MAIL_FARE.exp), MAIL_FARE.min, MAIL_FARE.max);
+}
 /**
- * Income for `units` of mail carried a straight-line distance of `d` units on a leg that took `legSeconds` since
- * the mail was posted or reached the station it was loaded at (waiting counts in full: mail is not "lost demand").
+ * Receipts for `units` of mail delivered `d` units (straight line, from where it was posted) after `seconds` since
+ * posting, with `changes` changes of vehicle on the way (waiting counts in full: mail is not "lost demand").
  */
-export function mailFare(d: number, legSeconds: number, units: number): number {
+export function mailFare(d: number, seconds: number, units: number, changes = 0): number {
   if (!(d > 1) || !(units > 0)) return 0;
-  return units * MAIL_FARE.rate * effDist(d) * clamp(Math.pow(mailRefTime(d) / Math.max(1, legSeconds), MAIL_FARE.exp), MAIL_FARE.min, MAIL_FARE.max);
+  return units * MAIL_FARE.rate * mailEffDist(d) * mailTimeFactor(d, seconds) * Math.pow(MAIL_FARE.transfer, Math.max(0, changes));
 }
 /** How much more (or less) mail is sent by a service of expected time `seconds` over `d` units than the alternative's. */
 export function mailTripFactor(d: number, seconds: number): number {

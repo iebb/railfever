@@ -62,10 +62,12 @@ export const MAIL_UNIT_T = 0.1;
 /**
  * Mail calibration (mail.ts): mail units posted per unit of the passenger generation rate (demand.ts GEN_RATE), so
  * mail inherits the passenger recalibration of the compressed calendar. scripts/mailcal.ts (intercity railways with
- * a van and three coaches, seeds 7 / 23 / 51, 1950 and 2000) allows 0.60-0.75 for its targets (mail 15-35% of
- * passenger income in 1950, 10-30% in 2000, vans within +-50% of the coaches' load); 0.67 is the middle.
+ * a van and three coaches, seeds 7 / 23 / 51, 1950 and 2000) allows 0.143-0.196 for its targets (mail 15-35% of
+ * passenger income on average in 1950, 10-30% in 2000, each route 10-45% / 8-40%; vans within +-50% of the coaches'
+ * load on average, 0.33-2x on each route); 0.17 is about the middle. Recalibrate it with mailcal when passenger
+ * catchments or generation change (mail shares the walking catchments).
  */
-export const MAIL_PER_PAX = 0.67;
+export const MAIL_PER_PAX = 0.17;
 /**
  * Mail per person by year (piecewise linear; 1950 = 1): by weight about +30% from 1950 to 2000, then about flat
  * (letters halve, parcels grow two to three times).
@@ -78,6 +80,21 @@ export const MAIL_ERA: readonly [number, number][] = [[1870, 0.35], [1900, 0.5],
  * tracks + `perStop` x stops); mail beyond it is lost.
  */
 export const MAIL_STATION = { acceptPop: 25, cap: 400, base: 20, perPop: 0.02, perTrack: 15, perStop: 5 };
+/**
+ * Mail feeders (mail.ts allocate), the post office's counterpart of the passengers' car feeders (MAINLINE_FEEDERS,
+ * the same rules by mail service): mail from the buildings of a town of `minTownPop`+ that no mail station reaches on
+ * foot is brought to its railway stations served by mail-carrying trains to other towns, by the quality of that mail
+ * service (1 at a combined mail headway of `fullHeadway` s or less, 0 from `cutoffHeadway` s): this `share` x the
+ * quality, from within `reach` units by road, shared by the weight quality / (1 + distance / `decay`).
+ */
+export const MAIL_FEEDER = { share: 0.5, reach: 84, decay: 30, minTownPop: 1500, fullHeadway: 100, cutoffHeadway: 200 };
+/**
+ * Mail capture (mail.ts weights), as the passengers' local capture: a station whose mail routes reach the towns that
+ * receive `full` of its town's mail (the gravity shares) posts at the full rate; one reaching fewer posts `floor` +
+ * (1 - `floor`) x their share / `full` of it (mail for towns beyond is handed over at the railhead and goes on from
+ * there), shared out over the towns it reaches by their gravity shares and routed trip factors.
+ */
+export const MAIL_CAPTURE = { floor: 0.6, full: 0.5 };
 
 /** Sea level. */
 export const WATER_Y = 0;

@@ -8,7 +8,7 @@ import { fareFor, distanceFare, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS, type Cargo } from './constants';
-import { unloadMail, loadMail, fixMail } from './mail';
+import { unloadMail, loadMail, fixMail, type MailLeg } from './mail';
 
 /**
  * Passengers aboard, by boarding stop / drop-off / destination. `day`: game day they boarded (older saves);
@@ -17,10 +17,11 @@ import { unloadMail, loadMail, fixMail } from './mail';
  */
 export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
 /**
- * Mail aboard, by loading station / drop-off / destination (key from:alight:dest): `count` units (MAIL_UNIT_T); `t0`:
- * sim time (s) the leg began (the mail was posted, or reached the station it was loaded at). See mail.ts.
+ * Mail aboard, by loading station / drop-off / destination / origin (key from:alight:dest:o): `count` units
+ * (MAIL_UNIT_T) and their journey (mail.ts MailJourney: origin `o`, its distance `od` to the destination, posting time
+ * `p`, changes `c`, earlier `legs`).
  */
-export interface MailGroup { alight: number; dest: number; count: number; from: number; t0: number }
+export interface MailGroup { alight: number; dest: number; count: number; from: number; o: number; od: number; p: number; c: number; legs: MailLeg[] }
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
@@ -206,7 +207,7 @@ export abstract class Vehicle {
       g.onIncome(income, this, st);
     }
     // mail: off (delivered, or waiting for its next leg), then on; handling a unit of mail takes 1.5 x a passenger
-    const mailOff = this.mailCargo.size ? unloadMail(g, this, st, now) : 0;
+    const mailOff = this.mailCargo.size ? unloadMail(g, this, st) : 0;
     moved += this.boardStation(st);
     const mailMoved = mailOff + (this.mailCapacity > 0 ? loadMail(g, this, st) : 0);
     return 2.0 + (mailMoved > 0 ? Math.max(moved * perPax, mailMoved * perPax * 1.5) : moved * perPax);

@@ -1,10 +1,13 @@
-// Mail, the second cargo. A station accepting mail posts it daily from its catchment (letters and parcels by building
-// type, the era and its town's size) to the other towns the mail network reaches, in shares of a gravity model between
-// the towns (MailModel.townShares), addressed to the station each town's mail is best routed to. Mail rides
-// only vehicles with room for it (mail vans behind the locomotive, mail vans and trucks, postbuses, the postal unit)
-// along its own routing (Lines.mailRouting: the passenger tables where the same vehicles carry both), waits in its own
-// station queues (Station.mail) and pays per leg by distance and the time since it was posted or reached the station
-// (fares.ts mailFare, booked as 'mailIncome'). Station, line and town mail state is created on first use and mail
+// Mail, the second cargo. A station accepting mail posts it daily from the residents and jobs it collects mail from
+// (its own share of the buildings around mail stations and the post office's feeders to frequent mail trains, by mail
+// service alone: MailModel.allocate) to the other towns the mail network reaches, in shares of a gravity model between
+// the towns (MailModel.townShares) scaled by the capture of the share it reaches (MAIL_CAPTURE), addressed to the
+// station each town's mail is best routed to. Mail rides only vehicles with room for it (mail vans behind the
+// locomotive, mail vans and trucks, postbuses, the postal unit) along its own routing (Lines.mailRouting: the passenger
+// tables where the same vehicles carry both) and waits in its own station queues (Station.mail). A journey keeps where
+// and when it was posted, its changes of vehicle and the legs that carried it; it pays once, when delivered (fares.ts
+// mailFare: the whole journey's distance and time, x 0.9 per change), shared by its legs' vehicles and lines by the
+// distances they carried (booked as 'mailIncome'). Station, line and town mail state is created on first use and mail
 // draws on its own random stream: a game without mail vehicles plays, and saves, exactly as before.
 import type { Game } from './game';
 import type { Station } from './stations';
@@ -14,16 +17,28 @@ import type { Hop, Line } from './lines';
 import type { Town } from './towns';
 import { RNG } from './rng';
 import { GEN_RATE } from './demand';
-import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION } from './constants';
+import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
-import { boarding, servesStation } from './patterns';
+import { boarding, servesStation, patternHeadways, linePatterns, mailFleet } from './patterns';
+import { walkingCatchment, walkWeight, coverOf } from './catchment';
 
-/** Mail waiting at a station for `line` to `alight` on its way to `dest`: `count` units, waiting since `t` (sim s, mean). */
-export interface MailWait { line: number; alight: number; dest: number; count: number; t: number }
+/**
+ * A leg mail has been carried on: the vehicle, its line and its owner then, and the straight-line distance (units)
+ * from where it got on to where it got off. Legs of a group are per unit of mail (averaged when groups merge).
+ */
+export type MailLeg = [vehicle: number, line: number, owner: number, dist: number];
+/**
+ * A mail journey (per unit; averages when groups merge): `o` the station it was posted at, `od` the straight-line
+ * distance from there to its destination (units), `p` when it was posted (sim s), `c` its changes of vehicle so far,
+ * `legs` the legs that carried it so far (sorted by vehicle, line, owner).
+ */
+export interface MailJourney { o: number; od: number; p: number; c: number; legs: MailLeg[] }
+/** Mail waiting at a station for `line` to `alight` on its way to `dest`: `count` units and their journey (key line:alight:dest:o). */
+export interface MailWait extends MailJourney { line: number; alight: number; dest: number; count: number }
 
 /** A station's mail (Station.mail, created on first use). Counts are units of MAIL_UNIT_T (0.1 t). */
 export interface StationMail {
-  /** queues by line:alight:dest, and their total */
+  /** queues by line:alight:dest:origin, and their total */
   waiting: Map<string, MailWait>;
   total: number;
   /** 0..1: scales posting (as the passenger rating scales generation); see MailModel.rate */
@@ -43,13 +58,11 @@ export interface StationMail {
 export interface LineMail { month: number; last: number; incomeYear: number; incomeLast: number }
 /** A town's mail (Town.mail): posted at and delivered to its stations, this / last month. */
 export interface TownMail { postedMonth: number; postedLast: number; deliveredMonth: number; deliveredLast: number }
-/** Where a station's mail goes: destination stations (one per town), their weights and their sum (the posting factor). */
+/** Where a station's mail goes: destination stations (one per town), their weights and their sum (the posting factor, `served`). */
 export interface MailDemand { dest: number[]; w: number[]; served: number }
 
 /** Mail per resident by building type (houses and apartments 1, shops 1.5, offices 2, towers 1.6, churches 0.3). */
 export const MAIL_TYPE_WEIGHT = [1, 1, 1, 1.5, 1, 2, 1.6, 0.3, 0, 0];
-/** Reach (units) of the building mix around a station (mailMix): about its walking catchment. */
-const MIX_REACH = 34;
 
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 const NO_MAIL: MailDemand = { dest: [], w: [], served: 0 };
@@ -59,7 +72,7 @@ const NO_MAIL: MailDemand = { dest: [], w: [], served: 0 };
  */
 const reachable = (st: Station) => st.roadAccess !== false;
 
-/** Mail units posted per weighted catchment resident and game day, before the era, town size, rating and service. */
+/** Mail units posted per weighted resident and game day, before the era, town size, rating and service. */
 export function mailGenRate(): number { return MAIL_PER_PAX * GEN_RATE; }
 /** Mail per person in `year` relative to 1950 (MAIL_ERA, piecewise linear). */
 export function mailEra(year: number): number {
@@ -89,33 +102,115 @@ export function mailLostShare(m: StationMail): number {
   return lost > 0 ? lost / (lost + m.pickupMonth + m.pickupLast) : 0;
 }
 
+// ------------------------------------------------------------------------------ journeys
+const stationDist = (g: Game, a: number, b: number) => {
+  const sa = g.stations.get(a), sb = g.stations.get(b);
+  return sa && sb ? Math.hypot(sa.x - sb.x, sa.z - sb.z) : 0;
+};
+/** A journey posted now at `st` for station `dest`. */
+export function newJourney(g: Game, st: Station, dest: number): MailJourney {
+  return { o: st.id, od: stationDist(g, st.id, dest), p: simNow(g), c: 0, legs: [] };
+}
+/** The journey part of a group (a copy). */
+export function journeyOf(j: MailJourney): MailJourney { return { o: j.o, od: j.od, p: j.p, c: j.c, legs: j.legs.map((l) => [l[0], l[1], l[2], l[3]]) }; }
+const legKey = (l: MailLeg) => l[0] + ':' + l[1] + ':' + l[2];
+const byLeg = (a: MailLeg, b: MailLeg) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+/** The journey after one more leg (the same units: its distance adds to that vehicle's), and a change of vehicle if `change`. */
+function afterLeg(j: MailJourney, v: Vehicle, line: Line | null, dist: number, change: boolean): MailJourney {
+  const leg: MailLeg = [v.id, line?.id ?? -1, v.owner, dist];
+  const legs = j.legs.map((l): MailLeg => [l[0], l[1], l[2], l[3]]);
+  const same = legs.find((l) => legKey(l) === legKey(leg));
+  if (same) same[3] += dist; else { legs.push(leg); legs.sort(byLeg); }
+  return { o: j.o, od: j.od, p: j.p, c: j.c + (change ? 1 : 0), legs };
+}
+/** Merge `n` units of journey `j` into a group of `m` units (per-unit averages; legs by vehicle, line and owner). */
+function blend(into: MailJourney, m: number, j: MailJourney, n: number) {
+  const t = m + n;
+  if (!(t > 0)) return;
+  into.od = (into.od * m + j.od * n) / t;
+  into.p = (into.p * m + j.p * n) / t;
+  into.c = (into.c * m + j.c * n) / t;
+  if (!into.legs.length && !j.legs.length) return;
+  const sum = new Map<string, MailLeg>();
+  for (const l of into.legs) sum.set(legKey(l), [l[0], l[1], l[2], l[3] * m]);
+  for (const l of j.legs) { const k = legKey(l), s = sum.get(k); if (s) s[3] += l[3] * n; else sum.set(k, [l[0], l[1], l[2], l[3] * n]); }
+  into.legs = [...sum.values()].map((l): MailLeg => [l[0], l[1], l[2], l[3] / t]).sort(byLeg);
+}
+/** A waiting group in its fixed key order (saves write groups as they are). */
+function waitGroup(line: number, alight: number, dest: number, count: number, j: MailJourney): MailWait {
+  return { line, alight, dest, count, o: j.o, od: j.od, p: j.p, c: j.c, legs: j.legs.map((l): MailLeg => [l[0], l[1], l[2], l[3]]) };
+}
+/** Mail aboard in its fixed key order. */
+function cargoGroup(alight: number, dest: number, count: number, from: number, j: MailJourney): MailGroup {
+  return { alight, dest, count, from, o: j.o, od: j.od, p: j.p, c: j.c, legs: j.legs.map((l): MailLeg => [l[0], l[1], l[2], l[3]]) };
+}
+
+/** The owner a share of receipts goes to: the vehicle's, else the line's, else the leg's (a bought company: its buyer). */
+function payee(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number): number {
+  let who = v ? v.owner : line ? line.owner : owner;
+  for (let k = 0; k < 8 && g.companies[who]?.defunct && g.companies[who].boughtBy !== undefined; k++) who = g.companies[who].boughtBy!;
+  return who;
+}
+/** Book a share of mail receipts: the company ('mailIncome'), the vehicle, its line (total and mail part), the AI's rail ledger. */
+function book(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number, amount: number) {
+  if (!(amount > 0)) return;
+  const who = payee(g, v, line, owner);
+  g.company(who).economy.earn(amount, 'mailIncome');
+  if (v) { v.profitYear += amount; v.incomeYear += amount; }
+  if (line) {
+    line.incomeYear += amount;
+    lineMail(line).incomeYear += amount;
+    if (line.kind === 'rail') g.ais.find((a) => a.companyId === who)?.railPolicy.operating(line.id, amount);
+  }
+}
+
+/**
+ * Mail delivered at `st`: counted (station, town) and paid. The journey's receipts (fares.ts mailFare: posting to now,
+ * the distance from its origin, x 0.9 per change) are shared by its legs by the distances they carried: the delivering
+ * vehicle (`by`, its last leg) and the earlier legs. Returns the delivering vehicle's share.
+ */
+export function settleMail(g: Game, st: Station, count: number, j: MailJourney, by: { v: Vehicle; line: Line | null; dist: number } | null): number {
+  deliverMail(g, st, count);
+  const fare = mailFare(j.od, simNow(g) - j.p, count, j.c);
+  if (!(fare > 0)) return 0;
+  let total = by ? Math.max(0, by.dist) : 0;
+  for (const l of j.legs) total += Math.max(0, l[3]);
+  if (!(total > 0)) {
+    if (!by) return 0;
+    book(g, by.v, by.line ?? undefined, by.v.owner, fare);
+    return fare;
+  }
+  let mine = 0;
+  if (by && by.dist > 0) { mine = (fare * by.dist) / total; book(g, by.v, by.line ?? undefined, by.v.owner, mine); }
+  for (const l of j.legs) if (l[3] > 0) book(g, g.vehicles.get(l[0]), g.lines.get(l[1]), l[2], (fare * l[3]) / total);
+  return mine;
+}
+
 // ------------------------------------------------------------------------------ station queues
 /**
- * `count` units of mail wait at `st` for `line` to `alight` on their way to `dest`, since `t` (default now). A walking
- * hop (WALK_LINE) carries them to the linked station `alight`: delivered there, or queued for their next leg.
+ * `count` units of mail on journey `j` wait at `st` for `line` to `alight` on their way to `dest`. A walking hop
+ * (WALK_LINE) carries them to the linked station `alight`: delivered there, or queued for their next leg.
  */
-export function addMail(g: Game, st: Station, line: number, alight: number, dest: number, count: number, t?: number, depth = 0) {
+export function addMail(g: Game, st: Station, line: number, alight: number, dest: number, count: number, j: MailJourney, depth = 0) {
   if (count <= 0) return;
-  const at = t ?? simNow(g);
-  if (line === WALK_LINE) { walkMail(g, st, alight, dest, count, at, depth); return; }
-  const m = stationMail(g, st), key = line + ':' + alight + ':' + dest, w = m.waiting.get(key);
-  if (w) { w.t = (w.t * w.count + at * count) / (w.count + count); w.count += count; }
-  else m.waiting.set(key, { line, alight, dest, count, t: at });
+  if (line === WALK_LINE) { walkMail(g, st, alight, dest, count, j, depth); return; }
+  const m = stationMail(g, st), key = line + ':' + alight + ':' + dest + ':' + j.o, w = m.waiting.get(key);
+  if (w) { blend(w, w.count, j, count); w.count += count; }
+  else m.waiting.set(key, waitGroup(line, alight, dest, count, j));
   m.total += count;
 }
 
-/** Mail walked to the linked station `toId` (the walk counts towards its next leg). */
-function walkMail(g: Game, from: Station, toId: number, dest: number, count: number, t: number, depth: number) {
+/** Mail walked to the linked station `toId`: delivered there, or queued for its next leg there. */
+function walkMail(g: Game, from: Station, toId: number, dest: number, count: number, j: MailJourney, depth: number) {
   const to = g.stations.get(toId);
   if (!to || depth > 4) { stationMail(g, from).lostMonth += count; return; }
-  if (toId === dest) { deliverMail(g, to, count); return; }
+  if (toId === dest) { settleMail(g, to, count, j, null); return; }
   const hop = g.lines.mailNextHop(toId, dest);
   if (!hop) { stationMail(g, to).lostMonth += count; return; }
-  const at = t - transferWalkTime(g.stations.gap(from, to));
-  g.lines.distribute(hop, count, (l, n) => addMail(g, to, l, hop.alight, dest, n, at, depth + 1), 'mail', g.mail.random);
+  g.lines.distribute(hop, count, (l, n) => addMail(g, to, l, hop.alight, dest, n, j, depth + 1), 'mail', g.mail.random);
 }
 
-/** Mail reached its destination station: delivered (station, town). */
+/** Mail reached its destination station: counted (station, town). settleMail pays for it. */
 export function deliverMail(g: Game, st: Station, count: number) {
   stationMail(g, st).arrivedMonth += count;
   const town = g.towns.list[st.townId];
@@ -158,8 +253,8 @@ export function rerouteMail(g: Game, st: Station) {
   for (const w of old) {
     const hop = g.lines.mailNextHop(st.id, w.dest);
     if (!hop) { m.lostMonth += w.count; continue; }
-    if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) addMail(g, st, w.line, w.alight, w.dest, w.count, w.t);
-    else g.lines.distribute(hop, w.count, (line, n) => addMail(g, st, line, hop.alight, w.dest, n, w.t), 'mail', g.mail.random);
+    if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) addMail(g, st, w.line, w.alight, w.dest, w.count, w);
+    else g.lines.distribute(hop, w.count, (line, n) => addMail(g, st, line, hop.alight, w.dest, n, w), 'mail', g.mail.random);
   }
 }
 
@@ -170,7 +265,7 @@ export function redirectMail(g: Game, from: number, into: number) {
     if (!m || ![...m.waiting.values()].some((w) => w.line === from)) continue;
     const old = [...m.waiting.values()];
     m.waiting.clear(); m.total = 0;
-    for (const w of old) addMail(g, st, w.line === from ? into : w.line, w.alight, w.dest, w.count, w.t);
+    for (const w of old) addMail(g, st, w.line === from ? into : w.line, w.alight, w.dest, w.count, w);
   }
 }
 
@@ -182,8 +277,8 @@ export function mergeLineMail(a: Line, b: Line) {
 }
 
 /**
- * Station `b` becomes part of `a` (Stations.absorb): its mail state joins a's, mail anywhere heading to or changing
- * at `b` heads for `a`, and mail aboard vehicles is re-addressed (`re` maps station ids).
+ * Station `b` becomes part of `a` (Stations.absorb): its mail state joins a's, mail anywhere heading to, changing at or
+ * posted at `b` is re-addressed to `a` (mail now at its destination is delivered), also aboard vehicles (`re` maps ids).
  */
 export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => number) {
   const moved = b.mail ? [...b.mail.waiting.values()] : [];
@@ -195,25 +290,24 @@ export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => 
     ma.rating = Math.max(ma.rating, mb.rating); ma.lastPickup = Math.max(ma.lastPickup, mb.lastPickup); ma.lastKmh = Math.max(ma.lastKmh, mb.lastKmh);
     delete b.mail;
   }
+  const requeue = (st: Station, w: MailWait) => {
+    const j = { ...journeyOf(w), o: re(w.o) };
+    if (re(w.dest) === st.id) settleMail(g, st, w.count, j, null);
+    else addMail(g, st, w.line, re(w.alight), re(w.dest), w.count, j);
+  };
   for (const st of g.stations.map.values()) {
     const m = st.mail;
-    if (st === b || !m || ![...m.waiting.values()].some((w) => w.alight === b.id || w.dest === b.id)) continue;
+    if (st === b || !m || ![...m.waiting.values()].some((w) => w.alight === b.id || w.dest === b.id || w.o === b.id)) continue;
     const old = [...m.waiting.values()];
     m.waiting.clear(); m.total = 0;
-    for (const w of old) {
-      if (re(w.dest) === st.id) deliverMail(g, st, w.count);
-      else addMail(g, st, w.line, re(w.alight), re(w.dest), w.count, w.t);
-    }
+    for (const w of old) requeue(st, w);
   }
-  for (const w of moved) {
-    if (re(w.dest) === a.id) deliverMail(g, a, w.count);
-    else addMail(g, a, w.line, re(w.alight), re(w.dest), w.count, w.t);
-  }
+  for (const w of moved) requeue(a, w);
   for (const v of g.vehicles.map.values()) {
-    if (![...v.mailCargo.values()].some((c) => c.alight === b.id || c.dest === b.id || c.from === b.id)) continue;
+    if (![...v.mailCargo.values()].some((c) => c.alight === b.id || c.dest === b.id || c.from === b.id || c.o === b.id)) continue;
     const old = [...v.mailCargo.values()];
     v.mailCargo.clear();
-    for (const c of old) putMail(v, { ...c, alight: re(c.alight), dest: re(c.dest), from: re(c.from) });
+    for (const c of old) putMail(v, cargoGroup(re(c.alight), re(c.dest), c.count, re(c.from), { ...journeyOf(c), o: re(c.o) }));
   }
 }
 
@@ -235,17 +329,27 @@ export function mailByTown(g: Game, stationId: number): { town: number; count: n
 }
 
 // ------------------------------------------------------------------------------ vehicles
-/** Add a group to a vehicle's mail (merged with one of the same from:alight:dest, leg times weighted). */
+/** Add a group to a vehicle's mail (merged with one of the same from:alight:dest:origin, the journeys averaged). */
 function putMail(v: Vehicle, c: MailGroup) {
-  const k = c.from + ':' + c.alight + ':' + c.dest, o = v.mailCargo.get(k);
-  if (o) { o.t0 = (o.t0 * o.count + c.t0 * c.count) / Math.max(1, o.count + c.count); o.count += c.count; }
-  else v.mailCargo.set(k, { ...c });
+  const k = c.from + ':' + c.alight + ':' + c.dest + ':' + c.o, o = v.mailCargo.get(k);
+  if (o) { blend(o, o.count, c, c.count); o.count += c.count; }
+  else v.mailCargo.set(k, cargoGroup(c.alight, c.dest, c.count, c.from, c));
+}
+
+/** A saved journey (format 3 saves of the first mail build had a leg time `t` / `t0` and no journey). */
+function savedJourney(g: Game, d: any, at: number): MailJourney {
+  const num = (x: unknown, def: number) => (typeof x === 'number' && Number.isFinite(x) ? x : def);
+  const o = num(d?.o, at);
+  return {
+    o, od: num(d?.od, stationDist(g, o, num(d?.dest, o))), p: num(d?.p, num(d?.t, num(d?.t0, simNow(g)))), c: num(d?.c, 0),
+    legs: Array.isArray(d?.legs) ? d.legs.map((l: number[]): MailLeg => [num(l[0], -1), num(l[1], -1), num(l[2], -1), num(l[3], 0)]) : [],
+  };
 }
 
 /** Restore a vehicle's mail from a save (groups re-keyed, duplicates merged). */
-export function restoreMail(v: Vehicle, list: MailGroup[]) {
+export function restoreMail(g: Game, v: Vehicle, list: any[]) {
   v.mailCargo.clear();
-  for (const c of list) putMail(v, { alight: c.alight, dest: c.dest, count: c.count, from: c.from, t0: c.t0 });
+  for (const c of list) putMail(v, cargoGroup(c.alight, c.dest, c.count, c.from, savedJourney(g, c, c.from)));
 }
 
 /** Re-target mail whose drop-off is no longer served by the vehicle's pattern (to the next stop; re-keyed). */
@@ -253,46 +357,37 @@ export function fixMail(v: Vehicle, l: Line, next: Station | null) {
   if (!next || ![...v.mailCargo.values()].some((c) => !servesStation(l, v.pattern, c.alight))) return;
   const old = [...v.mailCargo.values()];
   v.mailCargo.clear();
-  for (const c of old) putMail(v, servesStation(l, v.pattern, c.alight) ? c : { ...c, alight: next.id });
-}
-
-/** Book mail income: the company ('mailIncome'), the vehicle, its line (total and mail part), the AI's rail ledger. */
-function bookMail(g: Game, v: Vehicle, st: Station, income: number) {
-  g.company(v.owner).economy.earn(income, 'mailIncome');
-  v.profitYear += income;
-  v.incomeYear += income;
-  const line = v.line;
-  if (line) {
-    line.incomeYear += income;
-    lineMail(line).incomeYear += income;
-    if (line.kind === 'rail') g.ais.find((a) => a.companyId === v.owner)?.railPolicy.operating(line.id, income);
-  }
-  g.onIncome(income, v, st);
+  for (const c of old) putMail(v, servesStation(l, v.pattern, c.alight) ? c : cargoGroup(next.id, c.dest, c.count, c.from, c));
 }
 
 /**
- * Mail for this station gets off (delivered, or queued for its next leg from now on) and pays its leg. Returns the
- * units unloaded.
+ * Mail gets off at `st` after riding vehicle `v` from `from`: delivered (paid, by its whole journey), or queued for its
+ * next leg (this leg recorded, a change of vehicle unless it walks on to its destination), or lost without a route.
  */
-export function unloadMail(g: Game, v: Vehicle, st: Station, now: number): number {
+function leaveVehicle(g: Game, v: Vehicle, st: Station, c: MailGroup, n: number): number {
+  const line = v.line, from = g.stations.get(c.from), dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
+  if (c.dest === st.id) { v.mailDelivered += n; return settleMail(g, st, n, c, { v, line, dist }); }
+  const hop = g.lines.mailNextHop(st.id, c.dest);
+  if (!hop) { stationMail(g, st).lostMonth += n; return 0; }
+  const dest = g.stations.get(c.dest);
+  if (hop.line === WALK_LINE && hop.alight === c.dest && dest) { v.mailDelivered += n; return settleMail(g, dest, n, c, { v, line, dist }); }
+  const j = st.id === c.from ? journeyOf(c) : afterLeg(c, v, line, dist, true);
+  g.lines.distribute(hop, n, (l, k) => addMail(g, st, l, hop.alight, c.dest, k, j), 'mail', g.mail.random);
+  return 0;
+}
+
+/** Mail for this station gets off (delivered and paid, or queued for its next leg). Returns the units unloaded. */
+export function unloadMail(g: Game, v: Vehicle, st: Station): number {
   let moved = 0, income = 0;
   for (const [k, c] of v.mailCargo) {
     if (c.alight !== st.id) continue;
-    const from = g.stations.get(c.from);
-    const dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
-    income += mailFare(dist, now - c.t0, c.count);
-    if (c.dest === st.id) { deliverMail(g, st, c.count); v.mailDelivered += c.count; }
-    else {
-      const hop = g.lines.mailNextHop(st.id, c.dest);
-      if (hop) g.lines.distribute(hop, c.count, (line, n) => addMail(g, st, line, hop.alight, c.dest, n, now), 'mail', g.mail.random);
-      else stationMail(g, st).lostMonth += c.count;
-    }
+    v.mailCargo.delete(k);
+    income += leaveVehicle(g, v, st, c, c.count);
     moved += c.count;
     v.mailLoad -= c.count;
-    v.mailCargo.delete(k);
   }
   if (v.mailLoad < 1e-9) v.mailLoad = 0;
-  if (income > 0) bookMail(g, v, st, income);
+  if (income > 0) g.onIncome(income, v, st);
   return moved;
 }
 
@@ -316,7 +411,7 @@ export function loadMail(g: Game, v: Vehicle, st: Station): number {
     const take = Math.min(room, w.count);
     w.count -= take; m.total -= take;
     if (w.count <= 0) m.waiting.delete(k);
-    putMail(v, { alight: w.alight, dest: w.dest, count: take, from: st.id, t0: w.t });
+    putMail(v, cargoGroup(w.alight, w.dest, take, st.id, w));
     v.mailLoad += take; room -= take; picked += take;
   }
   if (picked > 0) { m.pickupMonth += picked; lineMail(line).month += picked; }
@@ -324,8 +419,8 @@ export function loadMail(g: Game, v: Vehicle, st: Station): number {
 }
 
 /**
- * Take `units` of a vehicle's mail off at station `st` (a shorter consist, Vehicles.recompose): queued again there
- * for their next leg (their leg time kept), or lost without a station or route. Returns the units taken off.
+ * Take `units` of a vehicle's mail off at station `st` (a shorter consist, Vehicles.recompose): delivered here, queued
+ * again for its next leg (a leg and a change when it rode here), or lost without a station or route. Returns the units.
  */
 export function offloadMail(g: Game, v: Vehicle, units: number, st: Station | null): number {
   let left = units;
@@ -334,10 +429,7 @@ export function offloadMail(g: Game, v: Vehicle, units: number, st: Station | nu
     const n = Math.min(left, c.count);
     c.count -= n; v.mailLoad -= n; left -= n;
     if (c.count <= 0) v.mailCargo.delete(k);
-    const hop = st && c.dest !== st.id ? g.lines.mailNextHop(st.id, c.dest) : undefined;
-    if (st && hop) g.lines.distribute(hop, n, (line, q) => addMail(g, st, line, hop.alight, c.dest, q, c.t0), 'mail', g.mail.random);
-    else if (st && c.dest === st.id) deliverMail(g, st, n);
-    else if (st) stationMail(g, st).lostMonth += n;
+    if (st) leaveVehicle(g, v, st, c, n);
   }
   if (v.mailLoad < 1e-9) v.mailLoad = 0;
   return units - left;
@@ -355,9 +447,11 @@ export function isFull(v: Vehicle, mode: FullLoad = v.mailOnly ? 'mail' : 'pax')
 }
 
 // ------------------------------------------------------------------------------ saves
-/** A station's mail for a save (queues as a list). */
-export function stationMailJSON(m: StationMail): object { return { ...m, waiting: [...m.waiting.values()].map((w) => ({ ...w })) }; }
-/** A station's mail from a save: the state without its queues (deserialize re-queues them with addMail). */
+/** A station's mail for a save (queues as a list, each group in its fixed key order). */
+export function stationMailJSON(m: StationMail): object {
+  return { ...m, waiting: [...m.waiting.values()].map((w) => waitGroup(w.line, w.alight, w.dest, w.count, w)) };
+}
+/** A station's mail from a save: the state without its queues (deserialize re-queues them with restoreMailQueue). */
 export function restoreStationMail(d: any): StationMail {
   const num = (x: unknown, def = 0) => (typeof x === 'number' && Number.isFinite(x) ? x : def);
   return {
@@ -367,13 +461,17 @@ export function restoreStationMail(d: any): StationMail {
     lastPickup: num(d?.lastPickup), lastKmh: num(d?.lastKmh),
   };
 }
+/** Re-queue a saved station's mail (groups in their saved order). */
+export function restoreMailQueue(g: Game, st: Station, list: any[]) {
+  for (const w of list) addMail(g, st, w.line, w.alight, w.dest, w.count, savedJourney(g, w, st.id));
+}
 
 // ------------------------------------------------------------------------------ the mail model (game.mail)
 /**
  * Mail generation, destinations and ratings (Game.mail). Daily (game.ts, after the passengers): every station that
- * accepts mail posts mailPop x mailGenRate x era x town factor x (0.2 + rating) x served units, shared out over its
- * destinations at random rounding (its own random stream), then queues are trimmed and ratings move. Monthly and
- * yearly: the counters roll over.
+ * accepts mail posts mailPop x mailGenRate x era x town factor x (0.2 + rating) x served units (served: the capture of
+ * the towns it reaches x their trip factors, see weights), shared out over its destinations at random rounding (its
+ * own random stream), then queues are trimmed and ratings move. Monthly and yearly: the counters roll over.
  */
 export class MailModel {
   private rng: RNG | null = null;
@@ -382,7 +480,7 @@ export class MailModel {
   private share = new Float64Array(0);
   private dayKey: number[] = [];
   private dests = new Map<number, MailDemand>();
-  private pops = new Map<number, number>();
+  private pops: Map<number, number> | null = null;
 
   constructor(private g: Game) {}
 
@@ -390,30 +488,76 @@ export class MailModel {
   get random(): RNG { return this.rng ??= new RNG(this.g.options.seed * 131 + 11); }
 
   /**
-   * Weighted residents of a station's catchment for mail: its walking catchment population (catchPop) times the
-   * building mix around it (shops, offices and towers post more), plus its car feeders (demand.ts). Cached for the day.
+   * Weighted residents (MAIL_TYPE_WEIGHT by building) a mail station collects mail from, by mail service alone (the
+   * passenger share-out plays no part): every building a mail station reaches on foot is shared by the mail stations
+   * reaching it, as passengers share theirs (walkWeight of the walk, coverOf the best); of the buildings no mail station
+   * reaches, the post office brings MAIL_FEEDER.share x the quality of the mail service to the railway stations of
+   * towns of 1,500+ with frequent mail trains to other towns within reach by road (the passengers' car feeder rules,
+   * by mail service). Worked out for the day.
    */
   mailPop(st: Station): number {
     this.refreshDay();
-    let p = this.pops.get(st.id);
-    if (p === undefined) {
-      p = st.catchPop * this.mailMix(st) + Math.max(0, this.g.demand.generationPopulation(st) - st.catchPop);
-      this.pops.set(st.id, p);
-    }
-    return p;
+    if (!this.pops) this.pops = this.allocate();
+    return this.pops.get(st.id) ?? 0;
   }
 
-  /** Mail per resident around a station (MAIL_TYPE_WEIGHT by building, nearer buildings weigh more; 1 if none). */
-  mailMix(st: Station): number {
-    const near = this.g.world.buildingsNear(st.x, st.z, MIX_REACH).filter((b) => b.pop > 0).sort((a, b) => a.id - b.id);
-    let sum = 0, weighted = 0;
-    for (const b of near) {
-      const d = Math.hypot(b.x - st.x, b.z - st.z);
-      if (d > MIX_REACH) continue;
-      const w = b.pop / (1 + d / 8);
-      sum += w; weighted += w * (MAIL_TYPE_WEIGHT[b.type] ?? 1);
+  /** The mail allocation of every mail station (see mailPop). Ordered sums: by building id, station id, town id. */
+  private allocate(): Map<number, number> {
+    const g = this.g, B = g.world.buildings, out = new Map<number, number>();
+    const stations = [...g.lines.mailStations].map((id) => g.stations.get(id)).filter((st): st is Station => !!st && reachable(st)).sort((a, b) => a.id - b.id);
+    const reach = new Map<number, [number, number][]>();
+    for (const st of stations) for (const [bid, w] of walkingCatchment(g, st).buildings) {
+      const list = reach.get(bid), e: [number, number] = [st.id, walkWeight(w.distance)];
+      if (list) list.push(e); else reach.set(bid, [e]);
     }
-    return sum > 0 ? weighted / sum : 1;
+    for (const bid of [...reach.keys()].sort((a, b) => a - b)) {
+      const b = B.get(bid);
+      if (!b || b.pop <= 0) continue;
+      const list = reach.get(bid)!;
+      let sum = 0, best = 0;
+      for (const [, w] of list) { sum += w; if (w > best) best = w; }
+      const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * coverOf(best);
+      for (const [sid, w] of list) out.set(sid, (out.get(sid) ?? 0) + (mail * w) / sum);
+    }
+    // mail feeders: the town's buildings no mail station reaches on foot, by road from the railway stations with
+    // frequent mail trains to other towns (the car feeders' geometry: demand.ts feederReach)
+    const F = MAIL_FEEDER, claims = new Map<number, { sum: number; q: number; list: [number, number][] }>();
+    for (const st of stations) {
+      const q = this.feederQuality(st);
+      if (!(q > 0)) continue;
+      for (const [bid, d] of g.demand.feederReach(st, F.reach)) {
+        if (reach.has(bid)) continue;
+        const b = B.get(bid);
+        if (!b || b.pop <= 0 || b.townId !== st.townId) continue;
+        const w = q / (1 + d / F.decay), c = claims.get(bid);
+        if (c) { c.sum += w; c.q = Math.max(c.q, q); c.list.push([st.id, w]); } else claims.set(bid, { sum: w, q, list: [[st.id, w]] });
+      }
+    }
+    for (const bid of [...claims.keys()].sort((a, b) => a - b)) {
+      const b = B.get(bid)!, c = claims.get(bid)!, mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * F.share * c.q;
+      for (const [sid, w] of c.list) out.set(sid, (out.get(sid) ?? 0) + (mail * w) / c.sum);
+    }
+    return out;
+  }
+
+  /**
+   * Quality of a station's mail feeders (MAIL_FEEDER), 0..1: a railway station of a town of minTownPop+ by the combined
+   * headway of the mail-carrying patterns calling there on railways to other towns (passengers: demand.ts
+   * mainlineFrequency).
+   */
+  private feederQuality(st: Station): number {
+    const g = this.g, F = MAIL_FEEDER;
+    if (!st.rail || st.townId < 0 || (g.towns.list[st.townId]?.pop ?? 0) < F.minTownPop) return 0;
+    let frequency = 0;
+    for (const l of g.lines.map.values()) {
+      if (l.kind !== 'rail' || !l.stops.includes(st.id) || mailFleet(g, l) === 'none') continue;
+      if (!l.stops.some((id) => { const s = g.stations.get(id); return !!s?.rail && s.townId !== st.townId; })) continue;
+      for (const h of patternHeadways(g, l, 'mail')) {
+        const p = linePatterns(l).find((p) => p.id === h.pid);
+        if (h.headway > 0 && l.stops.some((id, i) => id === st.id && p?.stops[i] !== false)) frequency += 1 / h.headway;
+      }
+    }
+    return frequency > 0 ? clamp((F.cutoffHeadway - 1 / frequency) / (F.cutoffHeadway - F.fullHeadway), 0, 1) : 0;
   }
 
   /** Does the station accept mail? A line with vehicles carrying mail calls, it is reachable, and enough people post. */
@@ -453,7 +597,8 @@ export class MailModel {
 
   /**
    * Where a station's mail goes: per other town the accepting station its mail is routed to fastest (lowest hop cost;
-   * ties: the lower id), weighted by the town share and mailTripFactor of the routed time. Cached for the day.
+   * ties: the lower id), weighted by the town share and mailTripFactor of the routed time, scaled by the capture of
+   * the share reached (MAIL_CAPTURE, as the passengers' local capture). Cached for the day.
    */
   weights(st: Station): MailDemand {
     this.refreshDay();
@@ -470,29 +615,36 @@ export class MailModel {
     }
     const { n, share } = this.townShares();
     const dest: number[] = [], w: number[] = [];
-    let served = 0;
+    let reached = 0;
     for (const U of [...best.keys()].sort((a, b) => a - b)) {
       const s = T < n && U < n ? share[T * n + U] : 0;
       if (!(s > 0)) continue;
       const b = best.get(U)!, ds = g.stations.get(b.d)!;
-      const v = s * mailTripFactor(Math.hypot(ds.x - st.x, ds.z - st.z), b.hop.cost);
-      dest.push(b.d); w.push(v); served += v;
+      dest.push(b.d); w.push(s * mailTripFactor(Math.hypot(ds.x - st.x, ds.z - st.z), b.hop.cost)); reached += s;
     }
+    const C = MAIL_CAPTURE, k = reached > 0 ? (C.floor + (1 - C.floor) * Math.min(1, reached / C.full)) / reached : 0;
+    let served = 0;
+    for (let i = 0; i < w.length; i++) { w[i] *= k; served += w[i]; }
     const res: MailDemand = { dest, w, served };
     this.dests.set(st.id, res);
     return res;
   }
 
-  /** Day caches (destinations, mail populations) hold for the day while routing, demand, network and catchments do. */
+  /**
+   * Day caches (destinations, mail allocations) hold for the day while routing, demand, the network, catchments,
+   * stations, lots and terrain stay as they are.
+   */
   private refreshDay() {
-    const g = this.g, k = this.dayKey;
-    if (k[0] === g.day && k[1] === g.lines.version && k[2] === g.demand.version && k[3] === g.networkVersion && k[4] === g.stations.catchVersion) return;
-    this.dayKey = [g.day, g.lines.version, g.demand.version, g.networkVersion, g.stations.catchVersion];
+    const g = this.g, w = g.world, k = this.dayKey;
+    if (k[0] === g.day && k[1] === g.lines.version && k[2] === g.demand.version && k[3] === g.networkVersion && k[4] === g.stations.catchVersion &&
+      k[5] === g.stations.walkVersion && k[6] === w.lotVersions.version && k[7] === w.terrainVersions.version && k[8] === w.net.roadVersions.version) return;
+    this.dayKey = [g.day, g.lines.version, g.demand.version, g.networkVersion, g.stations.catchVersion, g.stations.walkVersion,
+      w.lotVersions.version, w.terrainVersions.version, w.net.roadVersions.version];
     this.dests.clear();
-    this.pops.clear();
+    this.pops = null;
   }
 
-  /** Units a station posts per day at its current rating and service (for the UI and estimates). */
+  /** Units a station posts per day at its current rating and service (for the UI and estimates; 0 where it accepts none). */
   rate(st: Station): number {
     if (!this.accepts(st)) return 0;
     const town = this.g.towns.list[st.townId];
@@ -534,7 +686,8 @@ export class MailModel {
       if (c <= 0) continue;
       const d = dw.dest[i], hop = table?.get(d);
       if (!hop) continue;
-      g.lines.distribute(hop, c, (line, k) => addMail(g, st, line, hop.alight, d, k, now), 'mail', rng);
+      const j: MailJourney = { o: st.id, od: stationDist(g, st.id, d), p: now, c: 0, legs: [] };
+      g.lines.distribute(hop, c, (line, k) => addMail(g, st, line, hop.alight, d, k, j), 'mail', rng);
       given += c;
     }
     m.genMonth += given;

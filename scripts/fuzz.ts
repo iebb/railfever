@@ -47,7 +47,7 @@ function invariants(): string[] {
     if (st.waitingTotal < 0) errs.push(`station ${st.id} negative waiting`);
     if (st.mail) {
       let sum = 0;
-      for (const w of st.mail.waiting.values()) { sum += w.count; if (!(w.count > 0) || !isFinite(w.t)) errs.push(`station ${st.id} bad mail group ${JSON.stringify(w)}`); }
+      for (const w of st.mail.waiting.values()) { sum += w.count; if (!(w.count > 0) || !isFinite(w.p) || !(w.c >= 0) || !(w.od >= 0) || w.legs.some((l) => !(l[3] >= 0))) errs.push(`station ${st.id} bad mail group ${JSON.stringify(w)}`); }
       if (Math.abs(sum - st.mail.total) > 1e-6 || st.mail.total < 0) errs.push(`station ${st.id} mail total ${st.mail.total} vs groups ${sum}`);
       if (!(st.mail.rating >= 0 && st.mail.rating <= 1)) errs.push(`station ${st.id} mail rating ${st.mail.rating}`);
     }
@@ -66,7 +66,7 @@ function invariants(): string[] {
     if (v.load < 0 || v.load > v.capacity + 1e-6) errs.push(`${v.name} load ${v.load}/${v.capacity}`);
     if (v.mailLoad < 0 || v.mailLoad > v.mailCapacity + 1e-6) errs.push(`${v.name} mail ${v.mailLoad}/${v.mailCapacity}`);
     let mail = 0;
-    for (const c of v.mailCargo.values()) { mail += c.count; if (!(c.count > 0) || !isFinite(c.t0)) errs.push(`${v.name} bad mail group ${JSON.stringify(c)}`); }
+    for (const c of v.mailCargo.values()) { mail += c.count; if (!(c.count > 0) || !isFinite(c.p) || !(c.c >= 0) || !(c.od >= 0) || c.legs.some((l) => !(l[3] >= 0))) errs.push(`${v.name} bad mail group ${JSON.stringify(c)}`); }
     if (Math.abs(mail - v.mailLoad) > 1e-6) errs.push(`${v.name} mail groups ${mail} vs load ${v.mailLoad}`);
     if (v instanceof Train) {
       for (const s of v.segs) if (s.e >= 0 && !net.edges.has(s.e)) errs.push(`${v.name} on missing edge ${s.e}`);

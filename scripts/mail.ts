@@ -2,17 +2,19 @@
 // carries mail beside the passengers and books 'mailIncome' while passenger income stays within 3%; mail trains carry
 // mail only; mail fare units; postbus -> rail transfers through a linked stop; trams never carry mail; queue trimming,
 // lost mail and the mail rating; recomposing (refused on a short platform, while running; paid and refunded); merged
-// stations and lines keep their mail.
+// stations and lines keep their mail; journeys priced whole and shared by their legs; mail catchments by mail service
+// alone; mail feeders by the mail service; a single line's capture.
 // npx esbuild scripts/mail.ts --bundle --platform=node --format=esm --outfile=$S/mail.mjs && node $S/mail.mjs
 import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { MODEL_BY_ID, MODELS, availableModels, carriesMail, mailOnlyModel, type VehicleModel } from '../src/game/vehicle-types';
-import { MAIL_UNIT_T, MAIL_STATION } from '../src/game/constants';
-import { mailFare, mailRefTime, effDist, MAIL_FARE } from '../src/game/fares';
-import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull } from '../src/game/mail';
+import { MAIL_UNIT_T, MAIL_STATION, MAIL_CAPTURE } from '../src/game/constants';
+import { mailFare, mailRefTime, mailEffDist as effDist, mailTripFactor, MAIL_FARE, simNow } from '../src/game/fares';
+import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull, newJourney, loadMail, unloadMail } from '../src/game/mail';
 import { mailFleet, canonicalizeLines } from '../src/game/patterns';
 import { mergeStops } from '../src/game/stations';
 import { serialize, deserialize } from '../src/game/save';
-import { fails, check, fmt, placeAndConnect, depotBehind, addBusStop, roadDepotNear, Train, RoadVehicle } from './lib';
+import { bezLine } from '../src/game/geom';
+import { fails, check, fmt, placeAndConnect, depotBehind, addBusStop, roadDepotNear, busStopSites, Train, RoadVehicle } from './lib';
 
 if (!process.argv[1]?.endsWith('mail.mjs')) throw new Error('bundle this test as mail.mjs');
 const M = (id: string) => MODEL_BY_ID.get(id)!;
@@ -25,7 +27,8 @@ const runDays = (g: Game, days: number, each?: () => void) => { for (let d = 0; 
   check(Math.abs(mailFare(d, ref, 1) - MAIL_FARE.rate * effDist(d)) < 1e-9, `a unit of mail carried 1 km as fast as the alternative pays rate x effective distance (${fmt(mailFare(d, ref, 1), 1)})`);
   check(Math.abs(MAIL_FARE.rate - 13.65) < 1e-9, 'the mail rate is the long-leg passenger rate (13.65)');
   check(Math.abs(mailFare(d, ref / 4, 10) - 10 * MAIL_FARE.rate * effDist(d) * 1.6) < 1e-9 && Math.abs(mailFare(d, ref * 20, 10) - 10 * MAIL_FARE.rate * effDist(d) * 0.15) < 1e-9, 'the time factor is clamped to 0.15 .. 1.6');
-  check(mailFare(d, ref * 2, 4) < mailFare(d, ref, 4) && mailFare(0.5, ref, 4) === 0 && mailFare(d, ref, 0) === 0, 'slower legs pay less; no fare without distance or mail');
+  check(mailFare(d, ref * 2, 4) < mailFare(d, ref, 4) && mailFare(0.5, ref, 4) === 0 && mailFare(d, ref, 0) === 0, 'slower journeys pay less; no fare without distance or mail');
+  check(Math.abs(mailFare(d, ref, 5, 2) - 0.81 * mailFare(d, ref, 5)) < 1e-9, 'each change of vehicle costs 10% of the receipts');
   check(Math.abs(mailEra(1950) - 1) < 1e-12 && Math.abs(mailEra(2000) - 1.35) < 1e-12 && mailEra(1800) === 0.35 && Math.abs(mailEra(1962.5) - 1.1) < 1e-12, 'mail per person by era');
   check(townMailFactor(3000) === 1 && townMailFactor(100) === 0.75 && townMailFactor(1e6) === 1.3, 'town size factor');
   check(MODELS.filter((m) => m.kind === 'tram').every((m) => !carriesMail(m)), 'trams never carry mail');
@@ -158,7 +161,7 @@ runDays(vans.g, 360 * 3, () => {
   const hop = g.lines.mailNextHop(A.id, vans.pr.B.id)!;
   const lost0 = m.lostMonth, cap = mailQueueCap(g, A);
   check(cap === Math.floor(Math.min(MAIL_STATION.cap, MAIL_STATION.base + MAIL_STATION.perPop * g.mail.mailPop(A) + MAIL_STATION.perTrack * A.rail!.tracks + MAIL_STATION.perStop * A.stops.length)), `queue cap ${cap}`);
-  addMail(g, A, hop.line, hop.alight, vans.pr.B.id, 1000);
+  addMail(g, A, hop.line, hop.alight, vans.pr.B.id, 1000, newJourney(g, A, vans.pr.B.id));
   const before = m.total;
   trimMail(g, A);
   check(m.total === cap && m.lostMonth - lost0 === before - cap, `over the cap: trimmed to ${cap}, ${before - cap} units lost`);
@@ -188,7 +191,7 @@ runDays(vans.g, 360 * 3, () => {
   // mail aboard beyond the room of the shorter train is queued at the platform again
   const other = st.id === f.pr.A.id ? f.pr.B.id : f.pr.A.id;
   t.mailCargo.clear();
-  t.mailCargo.set(`${st.id}:${other}:${other}`, { from: st.id, alight: other, dest: other, count: 30, t0: g.day * 2 });
+  t.mailCargo.set(`${st.id}:${other}:${other}:${st.id}`, { alight: other, dest: other, count: 30, from: st.id, ...newJourney(g, st, other) });
   t.mailLoad = 30;
   const queued = st.mail?.total ?? 0;
   check(g.vehicles.recompose(t, [M('diesel_b'), M('coach_ic'), M('coach_ic')]) === null, 'the van removed at the platform');
@@ -215,7 +218,7 @@ runDays(vans.g, 360 * 3, () => {
   check(!!pair, 'two adjacent bus stops');
   if (pair) {
     const [ia, ib] = pair, a = g.stations.get(ia)!, b = g.stations.get(ib)!, B = vans.pr.B.id;
-    addMail(g, b, vans.line.id, vans.pr.A.id, B, 12);
+    addMail(g, b, vans.line.id, vans.pr.A.id, B, 12, newJourney(g, b, B));
     stationMail(g, b).genMonth += 5;
     const genA = stationMail(g, a).genMonth;
     const res = mergeStops(g, ia, ib);
@@ -227,7 +230,7 @@ runDays(vans.g, 360 * 3, () => {
   l2.stops = [...vans.line.stops];
   const t2 = g.vehicles.buyTrain(vans.dep, [M('diesel_b'), M('van_ic'), M('coach_ic')], l2.id) as Train;
   const A = g.stations.get(vans.pr.A.id)!;
-  addMail(g, A, l2.id, vans.pr.B.id, vans.pr.B.id, 7);
+  addMail(g, A, l2.id, vans.pr.B.id, vans.pr.B.id, 7, newJourney(g, A, vans.pr.B.id));
   (l2.mail ??= { month: 0, last: 0, incomeYear: 0, incomeLast: 0 }).incomeYear += 1000;
   const inc = vans.line.mail?.incomeYear ?? 0;
   const merged = canonicalizeLines(g, l2.id);
@@ -300,6 +303,125 @@ runDays(vans.g, 360 * 3, () => {
     }
     check(same && day === 240, 'a mail-only game replays exactly after loading (240 days, saves every 30)');
   }
+}
+
+// ---- journeys: priced once, by the whole journey (distance from where it was posted, time since then, x 0.9 per change),
+// shared by the legs by the distances they carried; splitting a journey never earns more than carrying it direct
+{
+  /** A flat map with one straight street and mail stops on it; mail trucks on lines between stops (they stay in the depot). */
+  const straight = (stopsX: number[], lines: [number, number][]) => {
+    const h = Game.create({ size: 256, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 2000 });
+    h.aiEnabled = false; h.world.h.fill(4); h.world.heightsVersion++;
+    const net = h.world.net, a = net.addNode('road', 20, 4, 60, 0, 0, -1), b = net.addNode('road', 220, 4, 60, 0, 0, -1);
+    net.addEdge('road', a.id, b.id, bezLine(20, 60, 220, 60), new Float32Array(201).fill(4), [], 'street', -1);
+    h.economy.money = 1e8;
+    const ids = stopsX.map((x) => addBusStop(h, x, 60, 0)), dep = roadDepotNear(h, 100, 60, 0);
+    const trucks = lines.map(([i, j]) => {
+      const l = h.lines.create('road', 0);
+      l.stops = [ids[i], ids[j]];
+      return h.vehicles.buyRoad(dep, M('mailtruck_c'), l.id) as RoadVehicle;
+    });
+    return { h, ids, trucks, ok: ids.every((id) => id >= 0) && dep >= 0 && trucks.every((t) => t instanceof RoadVehicle) };
+  };
+  const at = (h: Game, seconds: number) => { h.tick = Math.round(seconds / h.tickSeconds); };
+  /** Post 10 units at the first stop at 200 s, ride `legs` ([truck, from, to, start s, end s]); the trucks' receipts. */
+  const journey = (w: ReturnType<typeof straight>, dest: number, legs: [number, number, number, number, number][], save?: number) => {
+    let { h } = w;
+    at(h, 200);
+    const S0 = h.stations.get(w.ids[0])!, hop = h.lines.mailNextHop(S0.id, w.ids[dest])!;
+    h.stations.addMail(S0, hop.line, hop.alight, w.ids[dest], 10);
+    legs.forEach(([k, a, b, t0, t1], i) => {
+      if (i === save) h = deserialize(JSON.parse(JSON.stringify(serialize(h))));
+      const v = h.vehicles.get(w.trucks[k].id)!;
+      at(h, 200 + t0); loadMail(h, v, h.stations.get(w.ids[a])!);
+      at(h, 200 + t1); unloadMail(h, v, h.stations.get(w.ids[b])!);
+    });
+    return { income: w.trucks.map((t) => h.vehicles.get(t.id)!.incomeYear), company: h.economy.thisYear.mailIncome, delivered: h.stations.get(w.ids[dest])!.mail?.arrivedMonth ?? 0 };
+  };
+  const X = [40, 65, 90, 115, 140];
+  const direct = straight(X, [[0, 4]]), split = straight(X, [[0, 1], [1, 2], [2, 3], [3, 4]]), split2 = straight(X, [[0, 1], [1, 2], [2, 3], [3, 4]]);
+  const feeder = straight([40, 45, 140], [[0, 1], [1, 2]]);
+  check(direct.ok && split.ok && split2.ok && feeder.ok, 'straight-street fixtures');
+  if (direct.ok && split.ok && split2.ok && feeder.ok) {
+    const fare = (changes: number) => mailFare(100, 1000, 10, changes);
+    const d = journey(direct, 4, [[0, 0, 4, 0, 1000]]);
+    const sp = journey(split, 4, [[0, 0, 1, 0, 250], [1, 1, 2, 250, 500], [2, 2, 3, 500, 750], [3, 3, 4, 750, 1000]]);
+    const sv = journey(split2, 4, [[0, 0, 1, 0, 250], [1, 1, 2, 250, 500], [2, 2, 3, 500, 750], [3, 3, 4, 750, 1000]], 2);
+    const fd = journey(feeder, 2, [[0, 0, 1, 900, 950], [1, 1, 2, 950, 1000]]);
+    const sum = (x: number[]) => x.reduce((a, b) => a + b, 0);
+    console.log(`journeys of 10 units over 1 km in 1000 s: direct ${fmt(d.company, 1)}, four legs ${fmt(sp.company, 1)} (${sp.income.map((x) => fmt(x, 1)).join(' / ')}), 50 m feeder after 900 s then the trunk ${fmt(fd.company, 1)} (${fd.income.map((x) => fmt(x, 1)).join(' / ')})`);
+    check(Math.abs(d.company - fare(0)) < 1e-6 && d.delivered === 10, `direct: the journey fare (${fmt(fare(0), 1)})`);
+    check(Math.abs(sp.company - fare(3)) < 1e-6 && Math.abs(sum(sp.income) - sp.company) < 1e-6 && sp.company < d.company, `four legs: the same journey x 0.9^3 (${fmt(sp.company / d.company, 3)} of direct), never more`);
+    check(sp.income.every((x) => Math.abs(x - sp.company / 4) < 1e-6), 'the legs share the receipts by the distances they carried (a quarter each)');
+    check(Math.abs(fd.company - fare(1)) < 1e-6 && Math.abs(fd.income[0] - fd.company * 0.05) < 1e-6 && Math.abs(fd.income[1] - fd.company * 0.95) < 1e-6, `a short feeder after a long wait: the journey keeps its age (${fmt(fd.company / d.company, 3)} of direct; feeder 5%, trunk 95%)`);
+    check(sv.income.every((x, i) => x === sp.income[i]) && sv.company === sp.company, 'a journey saved halfway pays exactly the same (journey state in the saves)');
+  }
+}
+
+// ---- mail catchments by mail service alone: a passenger bus beside mail-only stops takes none of their mail
+{
+  const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 2000 });
+  g.economy.money = 1e9;
+  const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
+  const sites = busStopSites(g, big, 0, 16, 30);
+  const P = sites.map(([x, z]) => addBusStop(g, x, z, 0));
+  /** A street point 4.5-9 units from (x, z) where a separate stop fits. */
+  const beside = (x: number, z: number): [number, number] | null => {
+    for (const e of g.towns.streets(big, 0)) for (let s = 0.5; s < e.len; s += 1) {
+      const p = { x: 0, y: 0, z: 0 };
+      g.world.net.pointAt(e, s, p);
+      const d = Math.hypot(p.x - x, p.z - z), bp = d >= 4.5 && d <= 9 ? g.stations.planBusStop(p.x, p.z, 0) : null;
+      if (bp?.ok && !bp.join) return [p.x, p.z];
+    }
+    return null;
+  };
+  const near = sites.map(([x, z]) => beside(x, z));
+  const Mids = near.map((q) => (q ? addBusStop(g, q[0], q[1], 0) : -1));
+  const dep = sites.length ? roadDepotNear(g, sites[0][0], sites[0][1], 0) : -1;
+  check(P.length === 2 && P.every((id) => id >= 0) && Mids.every((id) => id >= 0 && !P.includes(id)) && dep >= 0, 'passenger stops and mail-only stops beside them');
+  if (P.length === 2 && Mids.every((id) => id >= 0 && !P.includes(id)) && dep >= 0) {
+    const pl = g.lines.create('road', 0);
+    pl.stops = P;
+    const bus = g.vehicles.buyRoad(dep, M('bus_c'), pl.id) as RoadVehicle;
+    runDays(g, 3);
+    const shares = (id: number) => JSON.stringify(g.stations.buildingShares(id));
+    const before = P.map((id) => [g.stations.get(id)!.catchPop, shares(id)]);
+    const ml = g.lines.create('road', 0);
+    ml.stops = Mids;
+    check(g.vehicles.buyRoad(dep, M('mailtruck_c'), ml.id) instanceof RoadVehicle, 'a mail truck on the mail-only stops');
+    runDays(g, 3);
+    check(P.every((id, i) => g.stations.get(id)!.catchPop === before[i][0] && shares(id) === before[i][1]), 'mail service leaves the passenger catchments exactly as they were');
+    const mailPops = () => Mids.map((id) => g.mail.mailPop(g.stations.get(id)!));
+    const withBus = mailPops();
+    g.vehicles.sell(bus.id);
+    const withoutBus = mailPops();
+    console.log(`mail-only stops beside a passenger bus: mail population ${withBus.map((x) => fmt(x, 1)).join(' / ')} with the bus, ${withoutBus.map((x) => fmt(x, 1)).join(' / ')} without`);
+    check(withBus.every((x, i) => x === withoutBus[i]), 'passenger service takes nothing from the mail catchments');
+    check(Mids.every((id) => g.mail.accepts(g.stations.get(id)!)), 'the mail-only stops accept mail');
+  }
+}
+
+// ---- mail feeders follow the mail service (as the passengers' car feeders follow theirs); a single line's capture
+{
+  const f = fixture([M('diesel_b'), M('van_ic'), M('coach_ic'), M('coach_ic')]);
+  const g = f.g, A = g.stations.get(f.pr.A.id)!, B = g.stations.get(f.pr.B.id)!;
+  const mailPops = () => [A, B].map((st) => g.mail.mailPop(st));
+  runDays(g, 2);
+  const sparse = mailPops(), paxSparse = [A, B].map((st) => g.demand.generationPopulation(st));
+  const buy = (cars: VehicleModel[]) => check(g.vehicles.buyTrain(f.dep, cars, f.line.id) instanceof Train, 'another train bought');
+  buy([M('diesel_b'), M('coach_ic'), M('coach_ic'), M('coach_ic')]); buy([M('diesel_b'), M('coach_ic'), M('coach_ic'), M('coach_ic')]);
+  runDays(g, 2);
+  const paxOnly = mailPops(), paxFrequent = [A, B].map((st) => g.demand.generationPopulation(st));
+  buy([M('diesel_b'), M('van_ic'), M('coach_ic'), M('coach_ic')]); buy([M('diesel_b'), M('van_ic'), M('coach_ic'), M('coach_ic')]);
+  runDays(g, 2);
+  const frequent = mailPops();
+  console.log(`mail feeders: mail population ${sparse.map((x) => fmt(x, 0)).join(' / ')} with one van train, ${paxOnly.map((x) => fmt(x, 0)).join(' / ')} with two more passenger trains (passengers ${paxSparse.map((x) => fmt(x, 0)).join(' / ')} -> ${paxFrequent.map((x) => fmt(x, 0)).join(' / ')}), ${frequent.map((x) => fmt(x, 0)).join(' / ')} with three van trains`);
+  check(sparse.every((x, i) => x === paxOnly[i]) && paxFrequent.some((x, i) => x > paxSparse[i]), 'passenger trains bring passengers car feeders, and the mail none');
+  check(frequent.some((x, i) => x > paxOnly[i]) && frequent.every((x, i) => x >= paxOnly[i]), 'frequent mail trains bring the mail feeders of the town');
+  const { n, share } = g.mail.townShares(), s = share[A.townId * n + B.townId], hop = g.lines.mailNextHop(A.id, B.id)!, w = g.mail.weights(A);
+  const capture = MAIL_CAPTURE.floor + (1 - MAIL_CAPTURE.floor) * Math.min(1, s / MAIL_CAPTURE.full);
+  const tf = mailTripFactor(Math.hypot(B.x - A.x, B.z - A.z), hop.cost);
+  check(w.dest.length === 1 && w.dest[0] === B.id && Math.abs(w.served - capture * tf) < 1e-12, `a line to one town that receives ${fmt(100 * s, 1)}% of the mail posts ${fmt(capture, 3)} x the trip factor (${fmt(w.served, 3)})`);
 }
 
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');

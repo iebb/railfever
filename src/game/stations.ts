@@ -16,7 +16,7 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
-import { addMail, trimMail, rerouteMail, absorbMail, type StationMail } from './mail';
+import { addMail, trimMail, rerouteMail, absorbMail, newJourney, type StationMail, type MailJourney } from './mail';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -2861,8 +2861,8 @@ export class Stations {
     }
   }
 
-  /** Mail (units of MAIL_UNIT_T) waits at `st` for `line` to `alight` on its way to `dest`, since `t` (mail.ts addMail). */
-  addMail(st: Station, line: number, alight: number, dest: number, count: number, t?: number) { addMail(this.game, st, line, alight, dest, count, t); }
+  /** Mail (units of MAIL_UNIT_T) waits at `st` for `line` to `alight` on its way to `dest`, on journey `j` (default: posted here now). */
+  addMail(st: Station, line: number, alight: number, dest: number, count: number, j?: MailJourney) { addMail(this.game, st, line, alight, dest, count, j ?? newJourney(this.game, st, dest)); }
   /** Mail beyond the station's queue cap is lost (mail.ts trimMail). */
   trimMail(st: Station) { trimMail(this.game, st); }
   /** Mail re-routed after the routing changed (mail.ts rerouteMail; Lines.rebuild does this for every station). */
