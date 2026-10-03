@@ -73,10 +73,28 @@ export const SPEED_EXP = 0.55, SPEED_MIN = 0.35, SPEED_MAX = 2.6, SPEED_MAX_SHOR
 /** tripFactor = clamp((refTime / doorToDoor) ^ TRIP_EXP, TRIP_MIN, TRIP_MAX) (demand elasticity). */
 export const TRIP_EXP = 0.7, TRIP_MIN = 0.3, TRIP_MAX = 2.5;
 /**
- * No-transfer bonus: passengers whose whole journey is one ride (no change of vehicle) pay this much more on it
- * (routing also charges transfers, patterns.ts TRANSFER_PENALTY_S, so direct services are preferred).
+ * Transfers cost income (2.6.x, replacing the old +20% no-transfer bonus): each change of vehicle takes 10% off the
+ * income of the journey's later legs. Legs are paid one at a time (each operator earns its own leg), so a leg after
+ * k changes pays TRANSFER_FARE_FACTOR^k of its fare (x0.9, x0.81, ...): a journey with transfers earns about 10%
+ * less per transfer than the same journey made directly. Routing also charges transfers (patterns.ts
+ * TRANSFER_PENALTY_S), so direct services are preferred and attract more trips.
  */
-export const NO_TRANSFER_BONUS = 0.2;
+export const TRANSFER_FARE_FACTOR = 0.9;
+/**
+ * Fare multiplier of a leg whose `count` passengers have made `transfers` changes of vehicle so far, in all (a
+ * passenger group shares its history: transfers / count changes each). 1 for a direct journey's legs.
+ */
+export function transferFareFactor(transfers: number, count = 1): number {
+  const k = count > 0 && transfers > 0 ? transfers / count : 0;
+  return k > 0 ? Math.pow(TRANSFER_FARE_FACTOR, k) : 1;
+}
+/**
+ * Fare level of every leg (distance fare, rail minimum, bus and tram boarding): 1.2 since the transfer reduction
+ * replaced the +20% no-transfer bonus, so a direct journey (most of them) pays what it did before, while legs after a
+ * change pay x0.9 per change. Without it direct incomes fell by a sixth and the economy bands failed (scripts/economy.ts:
+ * intercity payback 103 years instead of 51, operating results 50% below the calibrated baseline).
+ */
+export const FARE_LEVEL = 1.2;
 /**
  * A leg counts at most this many scheduled headways of its service as waiting: a backlog beyond what the line
  * carries is lost demand (passengers give up), not a slower trip for those who ride.
@@ -144,9 +162,9 @@ export function railLegFare(d: number, before = 0): number {
  */
 export function baseFare(d: number, mode?: FareMode, railBefore = 0): number {
   const distance = distanceFare(d);
-  if (mode === 'rail') return railBefore > 0 ? railLegFare(d, railBefore) : Math.max(RAIL_FARE.minimum, distance);
+  if (mode === 'rail') return FARE_LEVEL * (railBefore > 0 ? railLegFare(d, railBefore) : Math.max(RAIL_FARE.minimum, distance));
   const road = mode && ROAD_FARES[mode];
-  return road ? road.boarding + distance * road.distance : distance;
+  return FARE_LEVEL * (road ? road.boarding + distance * road.distance : distance);
 }
 
 /** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..1.8 on short trips, ..2.6 on long ones. */
@@ -195,12 +213,13 @@ export function estimateLegTime(distUnits: number, avgKmh: number, headwaySec: n
  * counts alone understates intercity boardings. Approximate that capture from the same distance decay, bounded
  * at 4x since the estimate lacks the actual catchments and other destinations. This adjusts forecast volume,
  * never the fare a real passenger pays. Set `odDemand=false` when `count` is an actual number of boardings.
- * Two-stop projects are direct rides and earn the actual no-transfer bonus. No second calendar rate scale.
+ * Two-stop projects are direct rides and earn the full fare; `direct=false` prices a leg after one change of vehicle
+ * (TRANSFER_FARE_FACTOR, as vehicle.ts pays it). No second calendar rate scale.
  */
 export function estimateLegFare(distUnits: number, avgKmh: number, headwaySec: number, count = 1, detour = 1.15, direct = true, odDemand = true, context: FareContext = {}): number {
   const share = 1 / Math.pow(1 + (Math.max(0, distUnits) / LOCAL_DEMAND_DISTANCE) ** 2, LOCAL_DEMAND_EXP);
   const capture = odDemand ? clamp((0.6 + 0.4 * Math.min(1, share / LOCAL_SERVED_SHARE)) / share, 1, 4) : 1;
-  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count * capture, context) * (direct ? 1 + NO_TRANSFER_BONUS : 1);
+  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count * capture, context) * (direct ? 1 : TRANSFER_FARE_FACTOR);
 }
 
 /**

@@ -31,7 +31,7 @@ import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
-import { networkDaily } from './ai-network';
+import { networkDaily, scheduleNetworkTask, XLINK_REACH } from './ai-network';
 import { RailPolicy } from './ai-rail';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
@@ -1086,6 +1086,9 @@ export interface LineInfo {
   express?: number; expressLook?: number;
   /** rail: day the line was electrified (its trains may then be electric), or minus the day it was last looked at */
   electric?: number;
+  /** rail: a direct service across two companies' networks (ai-network.ts xlink): its operators' trains together stay
+   * within the lead operator's maxVehicles, as the track it shares with both companies' lines allows */
+  across?: boolean;
 }
 
 /** A place on a station's approach track where a new line can join it (see approachJunctions). */
@@ -1789,12 +1792,13 @@ export class AIController {
    */
   hubFor(T: Town, toward: P2): Station | null {
     const g = this.game, net = g.world.net, me = this.companyId;
-    // ours first; else another company's on an open network (its line can be continued by our trains)
+    // ours first; else another AI company's whose network is open to ours and ours to it (mutual open access: our track
+    // joins its station; never the player's) — its line can be continued by our trains
     let foreign: Station | null = null;
     for (const st of g.stations.map.values()) {
       if (st.townId !== T.id || !st.rail) continue;
       const mine = st.owner === me;
-      if (!mine && (foreign || st.owner < 0 || g.accessPolicy(st.owner) !== 'open' || !g.canUse(me, st.owner))) continue;
+      if (!mine && (foreign || !this.agrees(st.owner))) continue;
       const r = st.rail, ax = Math.sin(r.angle), az = Math.cos(r.angle);
       const dx = toward.x - st.x, dz = toward.z - st.z, dl = Math.hypot(dx, dz) || 1;
       const along = (ax * dx + az * dz) / dl;
@@ -1805,6 +1809,16 @@ export class AIController {
       foreign = st;
     }
     return foreign;
+  }
+
+  /**
+   * Mutual open access with another AI company: both networks open to each other (never the player, whose track the AI
+   * does not alter). The standing consent for joint track works, as the network planner's (ai-network.ts agrees).
+   */
+  private agrees(other: number): boolean {
+    const g = this.game, me = this.companyId, co = g.companies[other];
+    return other === me || (other > 0 && !!co?.ai && !co.defunct && g.accessPolicy(me) === 'open' && g.accessPolicy(other) === 'open'
+      && g.canUse(me, other) && g.canUse(other, me));
   }
 
   /** Stations (in order, ending at `st`) of another company's railway line that ends at `st` (out and back), and that line. */
@@ -1949,7 +1963,9 @@ export class AIController {
     const g = this.game;
     const sts = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((x): x is Station => !!x?.rail);
     const passing = sts.filter((x) => x.rail!.tracks >= 2).length;
-    return Math.max(2, Math.min(6, 1 + passing));
+    // (a direct service across two companies' networks: the lead operator's plan for all its operators' trains)
+    const lead = g.aiOf(l.owner)?.railLineInfo(l.id);
+    return Math.max(lead?.across ? 1 : 2, Math.min(6, 1 + passing, lead?.across ? lead.maxVehicles : Infinity));
   }
 
   // ---------------------------------------------------------------- electrification (9)
@@ -2147,7 +2163,7 @@ export class AIController {
     let best: Station | null = null, bd = Infinity;
     for (const st of g.stations.map.values()) {
       if (st.townId !== T.id || !st.rail || railModeOf(st.rail.trackType) !== 'mainline') continue;
-      if (st.owner !== me && (st.owner < 0 || g.accessPolicy(st.owner) !== 'open' || !g.canUse(me, st.owner))) continue;
+      if (st.owner !== me && !this.agrees(st.owner)) continue;
       const d = Math.hypot(st.x - near.x, st.z - near.z) + (st.owner === me ? 0 : 25);
       if (d < bd) { bd = d; best = st; }
     }
@@ -2383,10 +2399,13 @@ export class AIController {
     let join: { S: Station; J: JunctionSite } | null = null;
     let plan: RoutePlan | string = 'no route';
     const S = hubB ? null : this.townStation(B, pr.b);
-    if (S && this.newCatchShare(pr.b) < 0.6) {
+    // (a terminus of our own right beside another company's station would duplicate it: join that station's approach
+    // where a junction fits, whatever share of the new site's catchment it covers)
+    const duplicate = !!S && S.owner !== owner && Math.hypot(S.x - pr.b.x, S.z - pr.b.z) - (S.rail!.length + PLATFORM) / 2 <= XLINK_REACH;
+    if (S && (this.newCatchShare(pr.b) < 0.6 || duplicate)) {
       if (hs && S.rail!.length < hsUnit!.length + 0.4) return fail('existing station platforms too short', 720);
       for (const J of this.approachJunctions(S, frontA).slice(0, 4)) {
-        if (J.owner !== owner && !g.canUse(owner, J.owner)) continue;
+        if (J.owner !== owner && !this.agrees(J.owner)) continue;
         const W = this.mergePoint(J, frontA);
         if (!W) continue;
         yield;
@@ -2673,6 +2692,10 @@ export class AIController {
     this.note(`${hub ? 'extended railway ' + hub.name + '-' + stB.name + (ext ? ' (line ' + line.name + ')' : '') : 'opened ' + what + ' ' + stA.name + '-' + stB.name}${hubB ? ' (joined at ' + hubB.name + ')' : ''}: ${Math.round(len)} u, ${res.bridges} bridges, ${res.tunnels} tunnels`);
     if (hs) { this.stats.hsr++; const inf = this.lines.get(line.id); if (inf) inf.hsr = true; }
     this.canonical(line.id);
+    // a new station of ours beside another company's network: the network planner looks at linking the two soon
+    // (direct services across both; ai-network.ts xlink)
+    for (const st of [stA, stB]) if (st.owner === owner && [...g.stations.map.values()].some((o) => o.rail && o.owner !== owner && this.agrees(o.owner)
+      && Math.hypot(o.x - st.x, o.z - st.z) < 200 && g.stations.gap(o, st) <= XLINK_REACH)) { scheduleNetworkTask(this, 'xlink', 30); break; }
   }
 
   /**

@@ -1,18 +1,18 @@
-// Base vehicle class: passengers (boarding by service pattern, fares with the value of time and a no-transfer
-// bonus), the stop sequence (a vehicle targets only the stops of its service pattern) and the odometer for the
+// Base vehicle class: passengers (boarding by service pattern, fares with the value of time, less after each change
+// of vehicle), the stop sequence (a vehicle targets only the stops of its service pattern) and the odometer for the
 // operating costs (opcosts.ts).
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
-import { fareFor, distanceFare, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
+import { fareFor, distanceFare, legacyFare, simNow, transferFareFactor, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS } from './constants';
 
 /**
  * Passengers aboard, by boarding stop / drop-off / destination. `day`: game day they boarded (older saves);
- * `t0`: sim time (s) they started waiting at the boarding stop (the leg's time = wait + ride); `transfers`: how many
- * of them changed vehicles earlier on this journey (the others get the no-transfer bonus at their destination).
+ * `t0`: sim time (s) they started waiting at the boarding stop (the leg's time = wait + ride); `transfers`: the changes
+ * of vehicle they made earlier on this journey, in all (transfers / count each: every leg pays x0.9 per change).
  */
 export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
 
@@ -158,8 +158,8 @@ export abstract class Vehicle {
       // the rail minimum once per journey: the distance fares of their earlier rail legs count towards it
       const ctx = stationFareContext(g, from, st, mode), before = c.rail ?? 0;
       let f = fareFor(dist, leg, c.count, mode === 'rail' && before > 0 ? { ...ctx, railBefore: before } : ctx);
-      const tr = Math.min(c.count, Math.max(0, c.transfers ?? 0));
-      if (c.dest === st.id && tr < c.count) f *= 1 + (NO_TRANSFER_BONUS * (c.count - tr)) / c.count;
+      // each change of vehicle earlier on the journey takes 10% off this leg (fares.ts TRANSFER_FARE_FACTOR)
+      f *= transferFareFactor(c.transfers ?? 0, c.count);
       income += f;
       if (c.dest === st.id) {
         st.arrivedMonth += c.count;
@@ -167,10 +167,11 @@ export abstract class Vehicle {
         const town = g.towns.list[st.townId];
         if (town) town.passTransMonth += c.count;
       } else {
-        // changing here: they wait for their next leg (all of them have transferred now)
+        // changing here: they wait for their next leg, each with one change of vehicle more
         const hop = g.lines.nextHop(st.id, c.dest);
         const rail = mode === 'rail' ? before + distanceFare(dist) : before;
-        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n, rail));
+        const changes = 1 + (c.count > 0 ? Math.max(0, c.transfers ?? 0) / c.count : 0);
+        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n * changes, rail));
       }
       moved += c.count;
       this.load -= c.count;

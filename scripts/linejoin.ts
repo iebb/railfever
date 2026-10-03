@@ -9,7 +9,7 @@ import { Train, findRailRoute, railNext, lineCompatibility } from '../src/game/t
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { connectStationThroat } from '../src/game/trackops';
 import { serialize, deserialize } from '../src/game/save';
-import { fareFor, simNow, NO_TRANSFER_BONUS } from '../src/game/fares';
+import { fareFor, simNow } from '../src/game/fares';
 import { bezLine } from '../src/game/geom';
 import {
   canJoinLines, joinLines, lineRoute, linePatterns, patternStops, boards,
@@ -135,7 +135,7 @@ console.log('own lines, through services and passengers');
   g.listeners.income.push((amount, v, st) => {
     if (v.id !== tt.id || st.id !== E.id || delivered) return;
     income = amount;
-    expected = fareFor(Math.hypot(E.x - A.x, E.z - A.z), simNow(g) - t0, count) * (1 + NO_TRANSFER_BONUS);
+    expected = fareFor(Math.hypot(E.x - A.x, E.z - A.z), simNow(g) - t0, count);
     delivered = true;
   });
   run(g, 400, () => {
@@ -163,7 +163,7 @@ console.log('own lines, through services and passengers');
   check(equal([...seen.get(tw.id)!].sort(), [A.id, W.id, J.id].sort()) && equal([...seen.get(tr.id)!].sort(), [A.id, J.id].sort()) && equal([...seen.get(te.id)!].sort(), [J.id, E.id].sort()), 'actual old trains turn at their old termini and retain their local/rapid calls');
   check(seen.get(tt.id)?.size === 4 && seen.get(tt.id)?.has(E.id), 'through train actually runs from Thornthorpe to Rockton');
   check(boarded && stayedAtJunction && delivered && transfers === 0 && tt.delivered === count, 'passengers stay aboard at Lockworth and reach Rockton without changing');
-  check(expected > 0 && Math.abs(income - expected) < 1e-6, `actual direct fare includes the ${NO_TRANSFER_BONUS * 100}% no-transfer bonus`);
+  check(expected > 0 && Math.abs(income - expected) < 1e-6, 'actual direct fare is the full fare (no change of vehicle, no transfer reduction)');
   check(checkReservations(g).length === 0, 'reservations remain consistent after joining and running');
   const loaded = exactSave(g, 'running joined services');
   const state = (x: Game) => JSON.stringify({ lines: x.lines.all(), redirects: [...x.lines.redirect], money: x.companies.map((c) => c.economy.money), vehicles: x.vehicles.all().map((v) => [v.lineId, v.pattern, v.stopIndex, v.state, v.delivered, v.load]) });
