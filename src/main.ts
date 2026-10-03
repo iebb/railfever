@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { Game, MAX_FRAME_SECONDS, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
-import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot, captureSave, encodeSnapshot } from './game/save';
+import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot, captureSave, encodeSnapshot, saveIncompatibility } from './game/save';
 import { loadFonts } from './ui/fonts';
 import { defaultTowns, DEFAULT_MAP_SIZE } from './ui/title';
 import { aiConfigsFor, MAX_AI } from './ui/gameapi';
@@ -180,7 +180,8 @@ async function boot() {
       autosaveNeedsBackup = true;
       try { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
       catch (backupError) { console.warn('Could not back up the failed autosave', backupError); }
-      ui.toast('Could not load the autosave — here is a new map', 'bad');
+      const why = saveIncompatibility(auto);
+      ui.toast(why ? `${why} Here is a new map; the old autosave is kept as 'Autosave (failed to load)'.` : 'Could not load the autosave — here is a new map', 'bad');
     }
   }
   if (!game) {

@@ -1,4 +1,5 @@
 // Save games (v3): a tick-consistent dynamic snapshot and immutable lossless world chunks.
+import { GAME_VERSION } from './version';
 import { Game, TICKS_PER_DAY } from './game';
 import { World, Building, Tree, SAVE_VERTICES, SAVE_TREES } from './world';
 import type { NNode, NEdge, Crossing, Section } from './network';
@@ -23,6 +24,8 @@ import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 
 const VERSION = 3;
+/** Save formats this build reads (v2: older single-record saves). */
+const READABLE = [2, VERSION];
 const TREE_CHUNK = SAVE_TREES;
 
 /** Self-contained so the same codec runs in a Blob worker in the one-file offline build. */
@@ -177,7 +180,7 @@ export function captureSave(g: Game) {
   const start = performance.now(), c = worldChunks(g.world);
   const state = cloneState(serializeState(g, chunkWorld(g.world, c, (t) => t.key), true));
   const chunks = [...c.h, ...c.lock, ...c.trees];
-  const meta = { date: g.dateString(), saved: Date.now(), money: g.economy.money };
+  const meta = { date: g.dateString(), saved: Date.now(), money: g.economy.money, format: VERSION, game: GAME_VERSION };
   saveStats.snapshots++; saveStats.lastSnapshotMs = performance.now() - start;
   return { state, chunks, meta };
 }
@@ -339,7 +342,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
   let profileAt = 0;
   const V = g.vehicles as any;
   return {
-    version: VERSION,
+    version: VERSION, game: GAME_VERSION,
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
@@ -387,7 +390,9 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
 // ------------------------------------------------------------------------------ deserialize
 
 export function deserialize(d: any): Game {
-  if (!d || (d.version !== 2 && d.version !== VERSION)) throw new Error('Unsupported save version (this game uses format ' + VERSION + ')');
+  if (!d) throw new Error('Not a Railfever save');
+  const why = saveIncompatibility({ version: d.version, game: d.game });
+  if (why || d.version === undefined) throw new Error(why ?? 'Not a Railfever save');
   const wd = d.world;
   const w = new World(wd.size);
   let tr: Float32Array;
@@ -619,7 +624,7 @@ export function saveWorkerSource(): string {
         let data;
         if (kind === 'file') {
           const text = (x) => typeof x === 'string' ? x : 'gz:' + codec.base64(x);
-          data = 'rf3:' + JSON.stringify({version: 3, data: text(raw.data), parts: raw.parts.map(p => [p.key, text(p.data)])});
+          data = 'rf3:' + JSON.stringify({version: 3, game: ${JSON.stringify(GAME_VERSION)}, data: text(raw.data), parts: raw.parts.map(p => [p.key, text(p.data)])});
         } else data = await codec.encode(kind, kind === 'json' ? codec.profiles(raw) : raw, stride);
         self.postMessage({id, data}, data instanceof Uint8Array ? [data.buffer] : []);
       } catch (e) { self.postMessage({id, error: String(e && e.message || e)}); }
@@ -673,7 +678,7 @@ async function encodeValue(kind: string, raw: any, stride = 0): Promise<Uint8Arr
   await new Promise<void>((r) => setTimeout(r, 0));
   if (kind === 'file') {
     const text = (x: Uint8Array | string) => typeof x === 'string' ? x : 'gz:' + b64(x);
-    return 'rf3:' + JSON.stringify({ version: VERSION, data: text(raw.data), parts: raw.parts.map((p: any) => [p.key, text(p.data)]) });
+    return 'rf3:' + JSON.stringify({ version: VERSION, game: GAME_VERSION, data: text(raw.data), parts: raw.parts.map((p: any) => [p.key, text(p.data)]) });
   }
   if (kind === 'json') {
     const d = { ...raw, world: { ...raw.world, buildings: [] as any[] },
@@ -768,7 +773,15 @@ async function gunzip(data: string): Promise<string> {
   return gunzipBytes(unb64(data.slice(3)));
 }
 
-export interface SlotInfo { slot: string; name: string; date: string; saved: number; money: number }
+export interface SlotInfo { slot: string; name: string; date: string; saved: number; money: number; format?: number; game?: string }
+
+/** Why a save can't be read by this build, or null. Saves without a marker are older ones this build reads. */
+export function saveIncompatibility(info: { format?: unknown; version?: unknown; game?: unknown } | null | undefined): string | null {
+  const format = info?.format ?? info?.version;
+  if (format === undefined || (typeof format === 'number' && READABLE.includes(format))) return null;
+  const by = typeof info?.game === 'string' ? `Railfever v${info.game}` : typeof format === 'number' && format > VERSION ? 'a newer version of Railfever' : 'an older version of Railfever';
+  return `This save is not compatible with this version (v${GAME_VERSION}): it was made by ${by}.`;
+}
 
 let slotCache: SlotInfo[] = [];
 async function refreshSlots() {
@@ -799,7 +812,7 @@ export function saveToSlot(g: Game, slot: string, name: string): Promise<void> {
 
 async function backupRecord(rec: StoredSave, slot: string, name: string, once: boolean): Promise<void> {
   const old = rec.meta as Partial<SlotInfo> | null;
-  const meta: SlotInfo = { slot, name, date: old?.date ?? '', saved: old?.saved ?? Date.now(), money: old?.money ?? 0 };
+  const meta: SlotInfo = { slot, name, date: old?.date ?? '', saved: old?.saved ?? Date.now(), money: old?.money ?? 0, format: old?.format, game: old?.game };
   const backup: StoredSave = { ...rec, slot, data: typeof rec.data === 'string' ? rec.data : rec.data.slice(), meta };
   if (once) await putSaveOnce(backup);
   else await putSave(backup);
@@ -841,7 +854,7 @@ export async function importFromText(text: string): Promise<Game> {
   text = text.trim();
   if (!text.startsWith('rf3:')) return deserialize(JSON.parse(await gunzip(text)));
   const file = JSON.parse(text.slice(4));
-  if (file.version !== VERSION || !Array.isArray(file.parts)) throw new Error('Unsupported save file version');
+  if (file.version !== VERSION || !Array.isArray(file.parts)) throw new Error(saveIncompatibility({ version: file.version, game: file.game }) ?? 'Not a Railfever save file');
   const parts = file.parts.map(([key, data]: [string, string]) => ({ key, data }));
   const rec: StoredSave = { slot: '', meta: null, data: file.data, parts, partKeys: parts.map((p: any) => p.key) };
   const d = await recordState(rec), g = deserialize(d);

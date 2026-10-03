@@ -1,4 +1,5 @@
 // Title screen over the live (blurred) world: wordmark, main actions and the new-game card.
+import { GAME_VERSION } from '../game/version';
 import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
@@ -77,7 +78,7 @@ export function showTitle(o: TitleOpts) {
       btn('plus', 'New game', '', () => openCard()),
       btn('save', 'Load game', '', () => { close(false); openSaveLoad(ui, 'load'); }),
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
-    h('div', { class: 'title-foot' }, 'Runs entirely in your browser — no internet needed.'),
+    h('div', { class: 'title-foot' }, `Railfever v${GAME_VERSION}${/\/preview\//.test(location.pathname) ? ' preview' : ''} · runs entirely in your browser — no internet needed.`),
   );
   row.appendChild(main);
   root.appendChild(row);

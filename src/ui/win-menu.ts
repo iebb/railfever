@@ -2,7 +2,7 @@
 import type { UI } from './ui';
 import { h, clear, section, icon, toggle, field, add } from './dom';
 import { fmtMoney } from '../game/economy';
-import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
+import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText, saveIncompatibility } from '../game/save';
 import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
@@ -42,12 +42,15 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
     if (!slots.length) add(win.body, h('div', { class: 'pad' }, 'No saved games yet.'));
     slots.sort((a, b) => (a.slot === 'autosave' ? -1 : b.slot === 'autosave' ? 1 : b.saved - a.saved));
     for (const s of slots) {
+      const incompatible = saveIncompatibility(s);
       add(win.body, h('div', { class: 'slot' },
-        h('div', { style: 'min-width:0' }, h('b', null, s.name), h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}`)),
+        h('div', { style: 'min-width:0' }, h('b', null, s.name),
+          h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}${s.game ? ` · v${s.game}` : ''}`),
+          incompatible ? h('div', { class: 'neg' }, 'Not compatible with this version') : null),
         h('div', { class: 'rowbtns' },
           mode === 'save'
             ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); savedNotice(ui); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
-            : h('button', { class: 'btn sm primary', onclick: async () => {
+            : h('button', { class: 'btn sm primary', disabled: !!incompatible, 'data-tip': incompatible ?? undefined, onclick: async () => {
               try {
                 const g = await loadFromSlot(s.slot);
                 if (await (ui.app.setGame(g) as unknown as Promise<boolean>)) { win.close(); ui.toast('Game loaded', 'good'); }
