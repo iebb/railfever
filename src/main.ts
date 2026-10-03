@@ -145,6 +145,7 @@ function loop(now: number) {
       renderer.frame(dt);
     } catch (e) { console.error(e); }
     try { ui.update(dt); } catch (e) { console.error(e); }
+    renderer.loopMs = performance.now() - t0;
     try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
     // Opening Load from the preview title does not turn that preview into a played game.
     if (!ui.titleOpen && !game.paused && !ui.wm.get('saveload') && !switching) played = true;

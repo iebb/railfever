@@ -483,14 +483,18 @@ vRfGlass = step(2.5, aPaint);`);
     return px > HI_PX * d ? 2 : px > MIN_PX * d ? 1 : 0;
   }
 
-  update(game: Game, dt: number, light: number, pointScale = 1200, camera?: THREE.Camera) {
+  /**
+   * `pointScale`: drawing-buffer pixels per unit at unit distance (point sprite sizes); `lodScale`: the same at the
+   * configured resolution, for the LOD / culling choices (a dynamic-resolution step must not switch models).
+   */
+  update(game: Game, dt: number, light: number, pointScale = 1200, camera?: THREE.Camera, lodScale = pointScale) {
     const night = this.mats.uniforms.uNight.value;
     if (this.game !== game || this.profileVersion !== game.world.net.version) {
       this.profileRanges.clear();
       this.profileVersion = game.world.net.version;
     }
     this.game = game;
-    this.pxScale = pointScale;
+    this.pxScale = lodScale;
     this.cull = !!camera;
     if (camera) {
       this.camPos.setFromMatrixPosition(camera.matrixWorld);

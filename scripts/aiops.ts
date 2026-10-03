@@ -108,7 +108,9 @@ if (want('hsr')) {
   ai.state.cooldown = 1e9;
   const T = [...g.towns.list].sort((p, q) => q.pop - p.pop);
   const pairs: [Town, Town][] = [];
-  for (const A of T) for (const B of T) { if (A.id >= B.id || Math.min(A.pop, B.pop) < 1500) continue; const d = Math.hypot(A.x - B.x, A.z - B.z); if (d >= 220 && d <= 450) pairs.push([A, B]); }
+  // Walking-aware station sites can shorten a town-to-town corridor by almost a kilometre. Leave enough
+  // actual running distance for the HSR acceleration/braking physics to exceed 160 km/h in this speed test.
+  for (const A of T) for (const B of T) { if (A.id >= B.id || Math.min(A.pop, B.pop) < 1500) continue; const d = Math.hypot(A.x - B.x, A.z - B.z); if (d >= 340 && d <= 450) pairs.push([A, B]); }
   pairs.sort((p, q) => q[0].pop * q[1].pop - p[0].pop * p[1].pop);
   AIController.forceBuild = true;
   // (the first pairs whose route can be built: a high-speed line needs wide curves and gentle grades)

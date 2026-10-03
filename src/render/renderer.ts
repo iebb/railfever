@@ -34,6 +34,34 @@ export interface GraphicsSettings {
 }
 
 const SETTINGS_VERSION = 2;
+/**
+ * Resolution steps of the automatic mode (fractions of the capped device pixel ratio): a few clearly separated
+ * levels (each ~1.4x the pixels of the next), changed with hysteresis, so the image does not keep pumping.
+ */
+const AUTO_STEPS = [1, 0.85, 0.72, 0.6, 0.5];
+/**
+ * Seconds of headroom before the automatic resolution tries a step up to a level; four times longer for every time
+ * the resolution had to leave that level again (a failed try, or a later slowdown), up to UP_WAIT_MAX, until a step
+ * up to it or a finer level has held for UP_HELD seconds.
+ */
+const UP_WAIT = 6;
+const UP_WAIT_MAX = 900;
+const UP_HELD = 600;
+/** Seconds without descents after a descent that did not help; doubled each time, up to DOWN_BLOCK_MAX. */
+const DOWN_BLOCK = 60;
+const DOWN_BLOCK_MAX = 900;
+/**
+ * Safety net of the automatic resolution, whatever its logic decides (every change counts, undos included): at least
+ * RES_GAP seconds between changes, at most RES_PER_MIN changes in any minute, and RES_COOL seconds of calm after a
+ * change that undid the one before it - no oscillation can be faster than this.
+ */
+const RES_GAP = 8;
+const RES_PER_MIN = 4;
+const RES_COOL = 30;
+/** Display period the automatic resolution aims at (ms): 60 fps. */
+const VSYNC = 1000 / 60;
+/** Refresh interval (s) of the far shadow cascade for moving vehicles (doubled while the resolution is cut). */
+const FAR_SHADOW_EVERY = 0.1;
 /** Largest half-extent of the shadow box (units); wider views keep shadows around the focus and fade them out. */
 const SHADOW_MAX = 170;
 const WARM = new THREE.Color(0.95, 0.65, 0.45);
@@ -162,6 +190,8 @@ export class Renderer {
   };
   /** simulation milliseconds of the last frame (set by the main loop, shown in the debug overlay) */
   simMs = 0;
+  /** main-thread milliseconds of the last whole frame (simulation, rendering, UI; set by the main loop) */
+  loopMs = 0;
   /** current dynamic resolution scale (fraction of the capped device pixel ratio) */
   resScale = 1;
   fps = 60;
@@ -192,9 +222,82 @@ export class Renderer {
   private lastFrameT = 0;
   private frameMs = 16.7;
   private cpuMs = 0;
+  /**
+   * Main-thread time after a frame before a task posted at its end runs (UI updates, the browser's own style /
+   * layout / paint of the page, queued tasks): busy main-thread time the frame interval includes but the GPU does
+   * not cause (a GPU-bound frame leaves the main thread idle). Sampled with one outstanding MessageChannel probe
+   * (every 4th frame, automatic resolution only); partial evidence: tasks after the probe are only seen when the
+   * browser reports them as long tasks (longMs).
+   */
+  private postMs = 0;
+  private probe: MessageChannel | null = null;
+  private probeT = -1;
+  private probeN = 0;
+  /** milliseconds of other long main-thread tasks (not the ones that ran our frames) in the current window */
+  private longMs = 0;
+  /** recent loop start times: a long task containing one of them ran our frame (measured as loop time already) */
+  private frameStarts = new Float64Array(64);
+  private frameStartN = 0;
   private dynAcc = 0; private dynN = 0; private dynSum = 0; private dynCpu = 0;
-  private dynHold = 0; private dynProbeFail = 0; private lastScaleUp = 0;
+  /** GPU timer samples at the start of the window (fresh samples per window decide whether the timer is used) */
+  private gpuS0 = 0;
+  /** GPU timer distrusted until (render time), after its readings repeatedly failed to explain slow frames */
+  private gpuDistrustUntil = 0; private gpuDistrust = 30; private gpuOdd = 0;
+  /**
+   * GPU timer vindicated until (render time): while it was set aside, steps down did not help either, so its
+   * reading (the GPU is not the limit) was right - e.g. a display or a power saver capping the frame rate - and slow
+   * frames it does not explain are not held against it for a while (longer each time)
+   */
+  private gpuVindicatedUntil = 0; private gpuVindicate = 60;
+  /** performance-relevant settings the automatic resolution's state was learned under */
+  private perfKey = '';
+  /** frame intervals of the current measurement window (frame-interval mode uses their median: one long frame,
+   *  e.g. a garbage collection or a save, is not a reason to lower the resolution) */
+  private dynIv: number[] = [];
+  /** index into AUTO_STEPS (automatic mode) */
+  private resStep = 0;
+  /** render times (this.time) of the last step change and the last step down */
+  private lastChange = -1e9; private lastDown = -1e9;
+  /** seconds of headroom seen for the next step up, and needed before taking it (see UP_WAIT) */
+  private upHeadroom = 0; private upWait = UP_WAIT;
+  /** per level: how often the resolution had to leave it again since it or a finer level last held */
+  private levelDrops = AUTO_STEPS.map(() => 0);
+  /** the level reached and held, and since when (it and coarser levels are forgiven after UP_HELD seconds) */
+  private heldLevel = -1; private heldSince = 0;
+  /** a trial step up: the step it came from, windows left to watch it, the frame interval before it */
+  private upTrial: { from: number; left: number; before: number } | null = null;
+  /**
+   * The last step down, checked against fresh measurements (a step down that does not help is undone: the cost is
+   * not in the pixels): the frame interval before it, the GPU time before it and the time predicted for the new
+   * step (when the GPU timer was used), and the step to return to. Judged by the GPU time while the timer stays in
+   * use, by the frame interval otherwise (so a change of timing source does not lose the check).
+   */
+  private downCheck: { ivBefore: number; gpuBefore: number; predicted: number; origin: number } | null = null;
+  private downBlockUntil = 0; private downBackoff = DOWN_BLOCK;
+  /**
+   * an undone descent, confirmed by the first window back at the old step against the measurement from before the
+   * descent: only clearly slower than that means the load rose meanwhile (and descents may resume)
+   */
+  private verify: { gpu: boolean; before: number } | null = null;
+  /** render times of the recent resolution changes, and no change before `resCalmUntil` (see RES_GAP) */
+  private resChanges: number[] = []; private resCalmUntil = 0;
+  /** frame-interval mode: consecutive slow windows (a descent starts on the second: no reaction to a burst) */
+  private slowRun = 0;
+  /** whether the last evaluated window used the GPU timer */
+  private lastTimed = false;
+  /** ambient occlusion suspension: seconds too slow at the lowest step, headroom at full resolution, back-off */
+  private slowAtFloor = 0; private aoHeadroom = 0; private aoWait = 10; private aoResumedAt = -1e9;
+  /** capped device pixel ratio the controller's evidence was measured under */
+  private effectiveDPR = this.maxPR();
   private appliedPR = 0;
+  /**
+   * The drawing buffer (canvas) and the post targets must follow the size / resolution. Resizing a canvas clears it,
+   * so this is applied at the start of a frame, before anything is drawn: a canvas resized after the frame was
+   * drawn is presented cleared (a black frame).
+   */
+  private sizeDirty = true;
+  /** drawing-buffer pixels per world unit at unit distance at the configured resolution (LOD choices) */
+  private lodScale = 1200;
   // shadows
   private shadowKey = new Float64Array(9);
   private shadowKeyFar = new Float64Array(9);
@@ -202,6 +305,8 @@ export class Renderer {
   private sb = new Float64Array(6);
   private shadowTimer = 0;
   private shadowFrame = 0;
+  /** seconds since the far shadow cascade was last rendered */
+  private farAge = 0;
   /** half-extent the view footprint would need (beyond SHADOW_MAX the box is clamped) */
   private shadowNeed = 0;
   /** distance fade of all shadows (1 = full), and whether the skipped shadow map is out of date */
@@ -234,6 +339,28 @@ export class Renderer {
     container.appendChild(this.renderer.domElement);
     this.renderer.domElement.className = 'gl';
     this.gpu = GpuTimer.create(this.renderer);
+    if (typeof MessageChannel !== 'undefined') {
+      this.probe = new MessageChannel();
+      this.probe.port1.onmessage = () => {
+        this.postMs = this.postMs * 0.8 + Math.min(250, performance.now() - this.probeT) * 0.2;
+        this.probeT = -1;
+      };
+    }
+    // long tasks that did not run one of our frames (timers, input, saves, other scripts): main-thread time the probe
+    // can miss (Chromium only; elsewhere the descent checks of the automatic resolution have to do)
+    try {
+      if (typeof PerformanceObserver !== 'undefined' && PerformanceObserver.supportedEntryTypes?.includes('longtask')) {
+        new PerformanceObserver((list) => {
+          if (this.settings.resolution !== 'auto') return;
+          for (const e of list.getEntries()) {
+            const a = e.startTime, b = a + e.duration;
+            let ours = false;
+            for (let k = 0; k < this.frameStarts.length && !ours; k++) ours = this.frameStarts[k] >= a && this.frameStarts[k] <= b;
+            if (!ours) this.longMs += e.duration;
+          }
+        }).observe({ type: 'longtask' });
+      }
+    } catch { /* not supported */ }
 
     this.camera = new THREE.PerspectiveCamera(38, Math.max(1, container.clientWidth) / Math.max(1, container.clientHeight), 0.05, 3000);
 
@@ -283,7 +410,12 @@ export class Renderer {
     for (const m of [this.mats.matte, this.mats.metal, this.mats.facade, this.mats.tree, this.mats.body, ...extra]) applyClouds(m);
 
     this.controls = new CameraController(this.camera, this.renderer.domElement, null, (x, y) => this.pickGround(x, y));
-    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('resize', () => {
+      // the buffers follow at the start of the next frame; the projection right away (picking in between)
+      this.sizeDirty = true;
+      this.camera.aspect = Math.max(1, this.container.clientWidth) / Math.max(1, this.container.clientHeight);
+      this.camera.updateProjectionMatrix();
+    });
     window.addEventListener('keydown', (e) => {
       if (e.key !== 'F3') return;
       e.preventDefault();
@@ -321,15 +453,19 @@ export class Renderer {
   /** Device pixel ratio cap from the settings. */
   private maxPR() { return Math.max(0.5, Math.min(window.devicePixelRatio || 1, this.settings.pixelRatio || 1.5)); }
 
-  private targetPR() {
+  private targetPR(auto = this.resScale) {
     const r = this.settings.resolution;
-    const k = r === 'auto' ? this.resScale : typeof r === 'number' ? r : 1;
+    const k = r === 'auto' ? auto : typeof r === 'number' ? r : 1;
     // quantised so small corrections don't reallocate render targets
     return Math.max(0.35, Math.round(this.maxPR() * k * 16) / 16);
   }
 
   resize() {
+    this.sizeDirty = false;
     const w = Math.max(1, this.container.clientWidth), h = Math.max(1, this.container.clientHeight);
+    // level-of-detail choices (terrain, vehicles) use the pixels of the configured resolution, not those of the
+    // automatic scale: a dynamic-resolution step must never switch LODs
+    this.lodScale = Math.floor(h * this.targetPR(1)) / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
     const pr = this.targetPR();
     if (pr !== this.appliedPR) { this.appliedPR = pr; this.renderer.setPixelRatio(pr); }
     this.renderer.setSize(w, h);
@@ -427,8 +563,11 @@ export class Renderer {
 
   applySettings() {
     try { localStorage.setItem('railfever.settings', JSON.stringify({ ...this.settings, v: SETTINGS_VERSION })); } catch { /* ignore */ }
-    if (this.settings.resolution !== 'auto') this.resScale = 1;
-    this.resize();
+    // what the automatic resolution measured and learned no longer holds when the mode or the cost changes
+    const st = this.settings, key = `${st.resolution}|${st.pixelRatio}|${st.shadows}|${st.shadowQuality}|${st.ao}`;
+    if (key !== this.perfKey) { this.perfKey = key; this.resetAuto(); }
+    // applied at the start of the next frame (see sizeDirty)
+    this.sizeDirty = true;
     this.sun.castShadow = this.settings.shadows;
     // high quality: two cascades (sharp near the camera); low: one 1024 map
     const cascades = this.settings.shadows && this.settings.shadowQuality !== 'low';
@@ -444,7 +583,6 @@ export class Renderer {
     this.shadowKey.fill(NaN);
     this.shadowKeyFar.fill(NaN);
     this.labels.visible = this.settings.labels;
-    if (this.settings.ao) this.aoSuspended = false;
     this.updateDebugEl();
   }
 
@@ -659,7 +797,12 @@ export class Renderer {
 
   frame(dt: number) {
     if (!this.game) return;
+    // a change in capped DPR invalidates evidence before the new drawing-buffer density is applied
+    if (this.maxPR() !== this.effectiveDPR) { this.resetAuto(); this.sizeDirty = true; }
+    // (also a pixel ratio that changed without a resize event: window moved to another display, browser zoom)
+    if (this.sizeDirty || this.targetPR() !== this.appliedPR) this.resize();
     const t0 = performance.now();
+    this.frameStarts[this.frameStartN++ & 63] = t0 - this.simMs;
     const interval = this.lastFrameT ? t0 - this.lastFrameT : 16.7;
     this.lastFrameT = t0;
     if (interval > 0 && interval < 250) this.frameMs = this.frameMs * 0.9 + interval * 0.1;
@@ -671,8 +814,10 @@ export class Renderer {
     info.reset();
     this.gpu?.poll();
     this.controls.update(dt);
+    // point sprites are sized in drawing-buffer pixels; LOD choices use the resolution-independent scale
     const dbh = this.renderer.getDrawingBufferSize(this.tmpV2).y;
     const pointScale = dbh / (2 * Math.tan((this.camera.fov * Math.PI) / 360));
+    const lodScale = this.lodScale;
     const focus = this.controls.focusInto(this.focusV);
     const dist = this.controls.smoothDistance;
     const cam = this.camera;
@@ -686,7 +831,7 @@ export class Renderer {
     cam.updateProjectionMatrix();
     cam.updateMatrixWorld();
     const dirtyO = g.world.dirtyObj.size;
-    const dirtyT = this.terrain.update(cam, pointScale);
+    const dirtyT = this.terrain.update(cam, lodScale);
     this.objects.update(6);
     this.updateLighting();
     this.mats.update(this.time, this.night);
@@ -697,7 +842,7 @@ export class Renderer {
     this.terrain.uniforms.uTime.value = this.time;
     this.terrain.waterMat.uniforms.uTime.value = this.time;
     this.overlay.update(dt, cam);
-    this.vehicles.update(g, dt, this.light, pointScale, cam);
+    this.vehicles.update(g, dt, this.light, pointScale, cam, lodScale);
     // shadow map: re-render only when something can have changed
     const sm = this.renderer.shadowMap;
     sm.needsUpdate = false;
@@ -708,6 +853,7 @@ export class Renderer {
       this.lastCamM.copy(cam.matrixWorld);
       this.shadowTimer -= dt;
       this.shadowFrame++;
+      this.farAge += dt;
       // received shadows fade out with view distance before the footprint ends and towards the edge of a
       // clamped box (no hard line or square); zoomed far out they fade away and the shadow pass is skipped
       shadowFadeUniforms.uShadowDist.value.set(this.shadowReach * 0.72, this.shadowReach * 0.95);
@@ -717,13 +863,18 @@ export class Renderer {
       if (Math.abs(this.shadowFade - fade) < 0.005) this.shadowFade = fade;
       this.sun.shadow.intensity = this.shadowFade;
       this.sunFar.shadow.intensity = this.shadowFade;
-      // static view: moving vehicles need fresh shadows, at 30 Hz once they are small on screen
+      // static view: moving vehicles need fresh shadows, at least 30 Hz once they are small on screen: every other
+      // frame at 60 fps, every frame once every other frame would fall below 30 Hz (frames over 17.5 ms)
       const outerShadow = this.sunFar.castShadow ? this.sunFar.shadow : this.sun.shadow;
-      const tick = !g.paused && (outerShadow.camera.right < 40 || (this.shadowFrame & 1) === 0);
+      const tick = !g.paused && (outerShadow.camera.right < 40 || (this.shadowFrame & 1) === 0 || this.frameMs > 17.5);
+      // vehicles moving in the far cascade: its map is the expensive one, refreshed for them at 10 Hz (5 Hz while the
+      // automatic resolution is cutting pixels) instead of only when the view or the world changes
+      if (this.sunFar.castShadow && !g.paused && this.vehicles.instances > 0 && this.farAge >= FAR_SHADOW_EVERY * (this.resStep > 0 ? 2 : 1)) this.sunFar.shadow.needsUpdate = true;
       const want = moved || camMoved || dirtyT || dirtyO || tick || this.shadowTimer <= 0 || (this.sunFar.castShadow && this.sunFar.shadow.needsUpdate);
       if (this.shadowFade < 0.01) { if (want) this.shadowStale = true; }
       else if (want || this.shadowStale) {
         if (this.shadowStale && this.sunFar.castShadow) this.sunFar.shadow.needsUpdate = true;
+        if (this.sunFar.shadow.needsUpdate) this.farAge = 0;
         sm.needsUpdate = true; this.shadowTimer = 0.5; this.shadowStale = false;
       }
     }
@@ -757,44 +908,206 @@ export class Renderer {
     this.stats.tris = info.render.triangles;
     this.labels.update(g, cam, this.container.clientWidth, this.container.clientHeight, dist);
     this.cpuMs = this.cpuMs * 0.9 + (performance.now() - t0) * 0.1;
-    this.autoResolution(dt);
+    if (this.probe && this.probeT < 0 && this.settings.resolution === 'auto' && !document.hidden && !g.paused && (++this.probeN & 3) === 0) {
+      this.probeT = performance.now();
+      this.probe.port2.postMessage(0);
+    }
+    this.autoResolution(dt, interval);
     if (this.settings.debug) this.updateDebug(dt);
     void focus;
   }
 
   /**
-   * Dynamic resolution: hold ~60 fps by scaling the drawing buffer. Uses GPU timer queries when the
-   * browser exposes them, otherwise the frame interval (only when the CPU is not the bottleneck).
+   * Dynamic resolution: hold ~60 fps by stepping the drawing buffer through AUTO_STEPS, judged per window of ~1 s.
+   * A step down goes straight to the step predicted to fit: from the GPU time while a GPU timer delivers fresh
+   * samples that explain the frame times, otherwise from the frame interval (the step that would save one display
+   * period if the cost is in the pixels; only while the main thread is not the bottleneck). Every step down is
+   * checked against fresh measurements and undone when it did not help (further descents wait, longer each time);
+   * every step up is watched against the frame interval before it and undone when it slowed the frames (the next
+   * try waits longer). Whatever this decides, changes are rate-limited (RES_GAP, RES_PER_MIN, RES_COOL) and an
+   * ambiguous case keeps the current step. A new size is applied at the start of the next frame (sizeDirty).
+   * Known limits: timed CPU recovery can hold 72% instead of 85%; nonlinear GPU cost can falsely vindicate a timer.
    */
-  private autoResolution(dt: number) {
+  private autoResolution(dt: number, interval: number) {
     if (this.settings.resolution !== 'auto') return;
     this.dynAcc += dt; this.dynN++;
-    this.dynSum += this.gpu && this.gpu.samples > 10 ? this.gpu.ms : this.frameMs;
-    this.dynCpu += this.cpuMs + this.simMs;
-    this.dynHold -= dt;
-    if (this.dynAcc < 0.75) return;
-    const avg = this.dynSum / this.dynN, cpu = this.dynCpu / this.dynN;
-    this.dynAcc = 0; this.dynN = 0; this.dynSum = 0; this.dynCpu = 0;
-    if (this.dynHold > 0 || document.hidden) return;
-    const gpuTimed = !!this.gpu && this.gpu.samples > 10;
-    let k = this.resScale;
-    if (gpuTimed) {
-      if (avg > 13) k *= Math.max(0.8, Math.sqrt(11 / avg));
-      else if (avg < 8.5) k *= Math.min(1.12, Math.sqrt(10.5 / avg));
+    this.dynSum += this.gpu ? this.gpu.ms : 0;
+    this.dynCpu += Math.max(this.cpuMs + this.simMs + this.postMs, this.loopMs);
+    if (this.dynIv.length < 512) this.dynIv.push(interval);
+    if (this.dynAcc < 1) return;
+    const iv = this.dynIv.sort((a, b) => a - b), med = iv[iv.length >> 1], p80 = iv[Math.floor(iv.length * 0.8)];
+    const n = this.dynN, win = this.dynAcc, gpuMs = this.dynSum / n, cpu = (this.dynCpu + this.longMs) / n;
+    const fresh = this.gpu ? this.gpu.samples - this.gpuS0 : 0;
+    this.dynAcc = 0; this.dynN = 0; this.dynSum = 0; this.dynCpu = 0; this.longMs = 0; iv.length = 0;
+    this.gpuS0 = this.gpu ? this.gpu.samples : 0;
+    // a window that saw a change (targets reallocated, smoothed timings catching up) is not representative
+    if (document.hidden || this.time - this.lastChange < 1.5) return;
+    const t = this.time, i = this.resStep, last = AUTO_STEPS.length - 1;
+    // a level that held long enough also proves the coarser levels can be trusted again
+    if (this.heldLevel === i && t - this.heldSince >= UP_HELD) { this.levelDrops.fill(0, i); this.heldLevel = -1; }
+    // the GPU timer is used while it delivers fresh samples and its readings explain slow frames; a timer that
+    // under-reports (frames miss 60 fps while neither its time nor the main thread accounts for it) is set aside
+    let timed = !!this.gpu && fresh >= Math.max(3, n >> 2) && t >= this.gpuDistrustUntil;
+    if (timed && t >= this.gpuVindicatedUntil) {
+      this.gpuOdd = med > 18.5 && gpuMs < med * 0.6 && cpu < med * 0.6 ? this.gpuOdd + 1 : 0;
+      if (this.gpuOdd >= 2) {
+        this.gpuOdd = 0; timed = false;
+        this.gpuDistrustUntil = t + this.gpuDistrust;
+        this.gpuDistrust = Math.min(480, this.gpuDistrust * 2);
+      }
+    }
+    if (timed !== this.lastTimed) { this.lastTimed = timed; this.slowRun = 0; }
+    // the interval the main thread alone would allow (display periods): the GPU only limits the frames beyond it
+    const cpuFloor = Math.max(1, Math.ceil((cpu * 1.05) / VSYNC)) * VSYNC, cpuBound = cpuFloor > VSYNC * 1.5;
+    // an undone descent is confirmed by the first window back at the old step: clearly slower there than before the
+    // descent means the load rose meanwhile (the check was spoiled), so descents may resume at once
+    const vf = this.verify;
+    this.verify = null;
+    if (vf && (!vf.gpu || timed) && (vf.gpu ? gpuMs : med) > vf.before * 1.15) { this.downBlockUntil = 0; this.downBackoff = Math.max(DOWN_BLOCK, this.downBackoff / 2); }
+    // nothing changes until the safety net allows it; pending checks and trials wait for that (with fresh evidence)
+    const free = t >= this.resCalmUntil && t - (this.resChanges[this.resChanges.length - 1] ?? -1e9) >= RES_GAP &&
+      this.resChanges.filter((c) => t - c < 60).length < RES_PER_MIN;
+    // reserve room for the trial and its undo at the first allowed time, within the same minute cap
+    const trialFree = free && this.resChanges.filter((c) => t + RES_GAP - c < 60).length < RES_PER_MIN - 1;
+    // a trial step up is watched for two windows: if it slows the frames (beyond the interval before it, at least
+    // below 60 fps) it goes back down and the next try waits longer; a GPU timer that predicted room for it is
+    // wrong and set aside for a while
+    const tr = this.upTrial;
+    if (tr) {
+      if (med > Math.max(18.5, tr.before * 1.1)) {
+        if (!free) return;
+        this.upTrial = null;
+        if (timed) { this.gpuDistrustUntil = t + this.gpuDistrust; this.gpuDistrust = Math.min(480, this.gpuDistrust * 2); }
+        this.stepTo(tr.from, true);
+        return;
+      }
+      if (--tr.left <= 0) { this.upTrial = null; this.heldLevel = i; this.heldSince = t; }
+    }
+    // the pending check of the last step down: by the GPU time while the timer stays in use, else by the interval
+    const dc = this.downCheck;
+    if (dc) {
+      const byGpu = timed && dc.gpuBefore > 0;
+      const helped = byGpu ? gpuMs <= dc.gpuBefore - 0.4 * (dc.gpuBefore - dc.predicted) : med <= dc.ivBefore * 0.85 || p80 < 17.4;
+      if (helped) { this.downCheck = null; this.downBackoff = DOWN_BLOCK; }
+      else {
+        if (!free) return;
+        this.downCheck = null;
+        this.undoDescent(dc.origin, byGpu, byGpu ? dc.gpuBefore : dc.ivBefore, timed);
+        return;
+      }
+    }
+    // GPU time scales a little less than the pixel count (geometry, fixed passes)
+    const at = (j: number) => gpuMs * Math.pow(AUTO_STEPS[j] / AUTO_STEPS[i], 1.7);
+    let slow: boolean, up: boolean;
+    if (timed) {
+      // the GPU budget: 13 ms for 60 fps; with a main-thread bottleneck, up to the interval the main thread allows
+      const budget = cpuBound ? Math.max(13, cpuFloor * 0.95) : 13, fit = cpuBound ? Math.max(11, cpuFloor * 0.8) : 11;
+      slow = gpuMs > budget;
+      if (slow && i < last && t >= this.downBlockUntil) {
+        if (!trialFree) return;
+        let j = i + 1;
+        while (j < last && at(j) > fit) j++;
+        this.downCheck = { ivBefore: med, gpuBefore: gpuMs, predicted: at(j), origin: i };
+        this.stepTo(j);
+        return;
+      }
+      up = i > 0 && at(i - 1) < (cpuBound ? Math.max(10.5, cpuFloor * 0.8) : 10.5);
     } else {
-      const gpuBound = cpu < avg * 0.6;
-      if (avg > 18.5 && gpuBound) k *= 0.88;
-      else if (avg < 17.4 && this.time - this.lastScaleUp > 4 + this.dynProbeFail * 6) { k *= 1.08; this.lastScaleUp = this.time; }
-      else if (avg > 18.5 && this.time - this.lastScaleUp < 2) this.dynProbeFail = Math.min(5, this.dynProbeFail + 1);
+      const gpuBound = cpu < med * 0.6;
+      slow = med > 18.5 && gpuBound;
+      this.slowRun = slow ? this.slowRun + 1 : 0;
+      if (this.slowRun >= 2 && i < last && t >= this.downBlockUntil) {
+        if (!trialFree) return;
+        // the step that would save one display period if the cost is in the pixels (vsync quantises the interval:
+        // a smaller step could show no gain at all and pass for "not the GPU")
+        const f = Math.max(0.3, (med - VSYNC) / med);
+        let j = i + 1;
+        while (j < last && Math.pow(AUTO_STEPS[j] / AUTO_STEPS[i], 1.7) > f) j++;
+        this.downCheck = { ivBefore: med, gpuBefore: 0, predicted: 0, origin: i };
+        this.stepTo(j);
+        return;
+      }
+      // room for a trial step up: (nearly) every frame makes the display rate, or the frames are held up elsewhere
+      // (main thread, or steps down were just shown not to help) - then a step up costs nothing, judged against the
+      // interval before it
+      up = i > 0 && (p80 < 17.4 || !gpuBound || t < this.downBlockUntil);
     }
-    k = Math.max(0.5, Math.min(1, k));
-    // still too slow at the lowest resolution: drop ambient occlusion; bring it back with headroom
-    if (k <= 0.5 && (gpuTimed ? avg > 13 : avg > 18.5)) this.aoSuspended = true;
-    if (k >= 1 && (gpuTimed ? avg < 7 : avg < 16.9) && this.aoSuspended && this.settings.ao) { this.aoSuspended = false; this.dynHold = 3; }
-    if (Math.abs(k - this.resScale) > 0.01) {
-      this.resScale = k;
-      if (this.targetPR() !== this.appliedPR) { this.resize(); this.dynHold = 1.5; }
+    this.upWait = i > 0 ? Math.min(UP_WAIT_MAX, UP_WAIT * 4 ** this.levelDrops[i - 1]) : UP_WAIT;
+    if (!up) this.upHeadroom = 0;
+    else if ((this.upHeadroom += win) >= this.upWait && t - this.lastDown >= 8) {
+      if (!trialFree) return;
+      this.upTrial = { from: i, left: 2, before: med };
+      this.stepTo(i - 1);
+      return;
     }
+    // still too slow at the lowest step: drop ambient occlusion; bring it back after sustained headroom at the
+    // full resolution (waiting longer each time it had to be dropped again soon after)
+    this.slowAtFloor = slow && i === last ? this.slowAtFloor + win : 0;
+    if (this.slowAtFloor >= 2 && this.settings.ao && !this.aoSuspended) {
+      this.aoSuspended = true; this.slowAtFloor = 0; this.lastChange = t;
+      if (t - this.aoResumedAt < 30) this.aoWait = Math.min(120, this.aoWait * 2);
+    }
+    if (this.aoSuspended && i === 0 && (timed ? gpuMs < 7 : med < 16.9)) {
+      if ((this.aoHeadroom += win) >= this.aoWait) { this.aoSuspended = false; this.aoHeadroom = 0; this.aoResumedAt = t; this.lastChange = t; }
+    } else this.aoHeadroom = 0;
+  }
+
+  /**
+   * A descent that did not help (`gpu`: judged by the GPU time; `before`: the measurement from before it): back to
+   * where it started, and no further descent for a while (longer each time) unless the next window shows the load
+   * rose. A GPU timer that was set aside (it saw no GPU limit) turned out right: it is used again, for a while.
+   */
+  private undoDescent(origin: number, gpu: boolean, before: number, timed: boolean) {
+    const t = this.time;
+    this.downBlockUntil = t + this.downBackoff;
+    this.downBackoff = Math.min(DOWN_BLOCK_MAX, this.downBackoff * 2);
+    this.verify = { gpu, before };
+    if (!timed && this.gpu && t < this.gpuDistrustUntil) {
+      this.gpuDistrustUntil = 0; this.gpuDistrust = 30;
+      this.gpuVindicatedUntil = t + this.gpuVindicate;
+      this.gpuVindicate = Math.min(960, this.gpuVindicate * 2);
+    }
+    this.stepTo(origin, true);
+  }
+
+  /**
+   * Change the automatic resolution step. `undo`: reverting the change before (a step down that did not help, a step
+   * up that slowed the frames) - not counted as a step up, and followed by RES_COOL seconds without changes.
+   */
+  private stepTo(j: number, undo = false) {
+    j = Math.max(0, Math.min(AUTO_STEPS.length - 1, j));
+    const i = this.resStep, t = this.time;
+    if (j === i) return;
+    if (j > i) {
+      // leaving a level downwards: the next step up to it waits longer
+      this.levelDrops[i] = Math.min(this.levelDrops[i] + 1, 16);
+      this.lastDown = t;
+    }
+    if (j !== this.heldLevel) this.heldLevel = -1;
+    this.resStep = j;
+    this.resScale = AUTO_STEPS[j];
+    this.lastChange = t;
+    this.upHeadroom = 0;
+    this.resChanges.push(t);
+    if (this.resChanges.length > RES_PER_MIN) this.resChanges.shift();
+    if (undo) { this.resCalmUntil = t + RES_COOL; this.heldLevel = j; this.heldSince = t; }
+    if (this.targetPR() !== this.appliedPR) this.sizeDirty = true;
+  }
+
+  /**
+   * Forget the automatic resolution's measurements, trials, checks and back-offs and start again at full resolution
+   * (the resolution mode or a setting that changes the cost per pixel changed: nothing learned still holds).
+   */
+  private resetAuto() {
+    this.dynAcc = 0; this.dynN = 0; this.dynSum = 0; this.dynCpu = 0; this.dynIv.length = 0; this.longMs = 0;
+    this.gpuS0 = this.gpu ? this.gpu.samples : 0;
+    this.effectiveDPR = this.maxPR(); this.aoSuspended = false;
+    this.upTrial = null; this.downCheck = null; this.verify = null; this.slowRun = 0; this.upHeadroom = 0; this.slowAtFloor = 0; this.aoHeadroom = 0;
+    this.upWait = UP_WAIT; this.levelDrops.fill(0); this.heldLevel = -1; this.downBlockUntil = 0; this.downBackoff = DOWN_BLOCK; this.aoWait = 10;
+    this.gpuOdd = 0; this.gpuDistrustUntil = 0; this.gpuDistrust = 30; this.gpuVindicatedUntil = 0; this.gpuVindicate = 60;
+    this.lastDown = -1e9; this.resChanges.length = 0; this.resCalmUntil = 0;
+    this.lastChange = this.time;
+    this.resStep = 0; this.resScale = 1;
   }
 
   // ------------------------------------------------------------------ debug overlay

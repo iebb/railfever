@@ -144,6 +144,8 @@ export class ObjectsView {
   private lampGeo: THREE.BufferGeometry;
   private camPos = new THREE.Vector3();
   private hasCam = false;
+  /** signal / crossing lamps shown (camera low enough; with hysteresis) */
+  private lampsOn = true;
   private treeCam = new THREE.Vector3(Infinity, Infinity, Infinity);
   /** super-chunks waiting for their details */
   private detailQueue = new Set<number>();
@@ -738,7 +740,8 @@ export class ObjectsView {
     void si;
     let d = 0;
     if (this.hasCam) d = s.box.distanceToPoint(this.camPos);
-    const detailOn = !this.hasCam || d < DETAIL_DIST;
+    // (a few units of hysteresis: a camera hovering at the threshold must not flip the details every frame)
+    const detailOn = !this.hasCam || d < DETAIL_DIST + (s.detailOn ? 3 : -3);
     // near trees: close and in view (with a margin for shadows cast into the view and for turning)
     let nearOn = !this.hasCam || d < TREE_DIST + TREE_FADE + TREE_GUARD;
     if (nearOn && this.hasCam) nearOn = this.frustum.intersectsBox(this.vbox.copy(s.box).expandByScalar(TREE_MARGIN));
@@ -749,7 +752,8 @@ export class ObjectsView {
     if (si >= 0) {
       if (!s.detailBuilt && (!this.hasCam || d < DETAIL_DIST + 15)) this.detailQueue.add(si);
       else if (s.detailBuilt && this.hasCam && d > DETAIL_DIST + 90) { this.detailQueue.delete(si); this.dropDetail(si); }
-      else if (s.detailBuilt) this.detailQueue.delete(si);
+      // (also out of range: queued before the first camera, e.g. by buildAll; built only to be dropped again)
+      else this.detailQueue.delete(si);
     }
     if (s.world && (s.nA || s.nC)) {
       // hysteresis so a camera hovering at the threshold doesn't flip every frame
@@ -844,8 +848,8 @@ export class ObjectsView {
         if (far !== R.far) this.setRegionFar(i, far);
       }
       const gy = Math.max(0, this.game.world.heightAt(this.camPos.x, this.camPos.z));
-      const lampsOn = this.camPos.y - gy < LAMP_DIST;
-      for (const m of [this.lampMesh, this.xlMesh, this.boomMesh]) if (m) m.visible = lampsOn;
+      this.lampsOn = this.camPos.y - gy < LAMP_DIST + (this.lampsOn ? 8 : -8);
+      for (const m of [this.lampMesh, this.xlMesh, this.boomMesh]) if (m) m.visible = this.lampsOn;
     }
     const V = this.game.vehicles;
     this.sigTimer -= dt;

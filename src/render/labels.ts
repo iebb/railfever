@@ -6,15 +6,25 @@ import * as THREE from 'three';
 import type { Game } from '../game/game';
 import { TRACK_TYPES, WATER_Y } from '../game/constants';
 import { svg } from '../ui/icons';
+import { uiScale } from '../ui/uiscale';
 
 /** A station number badge as the UI computes it (ui/lineid.ts Badge). */
 export interface LabelBadge { code: string; prefix: string; num: string; color: string }
 
 const STATION_NAME_MAX_DIST = 170;
+/**
+ * Hysteresis of the label selection: a label shown in the last frame keeps this much priority (about 12 units of
+ * distance for a station plate) and must sink clearly behind the terrain before it is hidden, so labels that
+ * compete for a place don't trade it back and forth while the camera moves or waiting counts change.
+ */
+const LABEL_KEEP = 500;
+const OCCLUDE_KEEP = 0.4;
 // Three ordinary wheel notches: exp(100 * 0.0014) per notch (camera.ts).
 const RAIL_SYMBOL_MAX_DIST = STATION_NAME_MAX_DIST * Math.exp(3 * 100 * 0.0014);
 const RAIL_SYMBOL_FADE_DIST = STATION_NAME_MAX_DIST * Math.exp(2 * 100 * 0.0014);
 const RAIL_SYMBOL_SIZE = 28;
+/** a small numbering badge on a plate (25 px square + 2 px gap, style.css .snum.sm) and a plate showing badges */
+const BADGE_W = 27, BADGED_PLATE_H = 29;
 
 /** Normal station plates become rail-only symbols for three more zoom steps. */
 export function stationLabelMode(camDist: number, rail: boolean): 'plate' | 'symbol' | 'hidden' {
@@ -222,7 +232,7 @@ export class Labels {
       if (pins) y -= 0.9;
       const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
       // Selection raises symbol priority, but may not bypass their collisions or distance fade.
-      cands.push(this.cand(l, s.x, y, s.z, prio, compact ? stMax : force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force && !compact, compact ? RAIL_SYMBOL_SIZE : pins ? 40 : 24, compact, compact ? symbolOpacity : 1));
+      cands.push(this.cand(l, s.x, y, s.z, prio, compact ? stMax : force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force && !compact, compact ? RAIL_SYMBOL_SIZE : pins ? 44 : l.nBadges ? BADGED_PLATE_H : 24, compact, compact ? symbolOpacity : 1));
     }
     // ---- line name tags (lines map)
     for (const [id, t] of this.routeTags) {
@@ -255,6 +265,7 @@ export class Labels {
       c.sx = (v.x * 0.5 + 0.5) * w;
       c.sy = (-v.y * 0.5 + 0.5) * h;
       if (!c.force) c.prio -= c.d * (c.l.kind === 'stn' && !c.compact ? 40 : 2);
+      if (!c.force && c.l.shown) c.prio += LABEL_KEEP;
       cands[n++] = c;
     }
     cands.length = n;
@@ -265,18 +276,20 @@ export class Labels {
     const keep = this.keep;
     keep.clear();
     const cap = pins ? Math.max(this.maxVisible, 90) : this.maxVisible;
+    // the interface size (Settings) zooms the labels' contents: their boxes grow with it
+    const ui = uiScale();
     for (const c of cands) {
       if (keep.size >= cap && !c.force) break;
       // never shrink below ~11 px text (smallest plate text is 12 px)
       const s = (c.compact ? 1 : Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2))) * c.scale;
       const L = c.l;
-      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * 23 : 12)) * s;
-      c.h *= s;
+      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
+      c.h *= s * ui;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z)) continue;
+      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z, L.shown ? OCCLUDE_KEEP : 0.05)) continue;
       placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
       keep.add(L);
       this.place(c, s, w, h);
@@ -400,15 +413,15 @@ export class Labels {
     void w; void h;
   }
 
-  /** Is the straight line from the camera to the point blocked by terrain? */
-  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number): boolean {
+  /** Is the straight line from the camera to the point blocked by terrain (by more than `margin`)? */
+  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number, margin: number): boolean {
     const wd = game.world;
     const c = camera.position;
     for (let i = 1; i < 12; i++) {
       const f = i / 12;
       const px = c.x + (x - c.x) * f, pz = c.z + (z - c.z) * f;
       if (!wd.inside(px, pz)) continue;
-      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - 0.05) return true;
+      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - margin) return true;
     }
     return false;
   }
