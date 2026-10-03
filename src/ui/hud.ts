@@ -15,6 +15,8 @@ import { stationStyles, catchBonusOf } from './gameapi';
 import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
 import { styleOf } from '../game/station-styles';
 import { audio } from '../audio/engine';
+import { onStorageMode, storageMode } from '../game/storage';
+import { exportSave } from './win-menu';
 
 interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
 
@@ -148,6 +150,8 @@ export class Hud {
   private prevTool: ToolId | undefined;
   private mapBtns: Record<string, HTMLButtonElement> = {};
   private saveEl: HTMLSpanElement;
+  private storageBanner: HTMLElement | null = null;
+  private storageDismissed = false;
   /** track tool: offer 3 and 4 parallel tracks too */
   private moreTracks = false;
   private accessBtn: HTMLButtonElement;
@@ -238,15 +242,30 @@ export class Hud {
     // the options card lives at the bottom right, clear of the build area and the minimap
     R.appendChild(this.card);
     window.addEventListener('resize', () => this.placeCard());
+    onStorageMode((mode) => {
+      if (mode !== 'memory') return;
+      this.showSave('memory');
+      if (this.storageBanner || this.storageDismissed) return;
+      this.storageBanner = h('div', { class: 'storage-banner', role: 'status', 'aria-live': 'polite' },
+        icon('warning', 18), h('span', null, "Saves won't survive a reload in this browser mode — use Export to keep your game"),
+        h('button', { class: 'btn sm', onclick: () => exportSave(this.ui) }, 'Export'),
+        h('button', { class: 'ibtn sm', 'aria-label': 'Dismiss storage notice', onclick: () => {
+          this.storageDismissed = true; this.storageBanner?.remove(); this.storageBanner = null;
+        } }, icon('close', 16)));
+      R.appendChild(this.storageBanner);
+    });
   }
 
   /** Small autosave indicator under the clock: "Saving…", then "Saved" (fades), or "Save failed". */
-  showSave(state: 'saving' | 'saved' | 'error') {
+  showSave(state: 'saving' | 'saved' | 'error' | 'memory') {
+    if (state === 'saved' && storageMode() === 'memory') state = 'memory';
     const el = this.saveEl;
     clearTimeout(this.saveHide);
     el.className = 'savechip show ' + state;
-    el.replaceChildren(icon(state === 'error' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : 'Autosave failed');
-    if (state !== 'saving') this.saveHide = window.setTimeout(() => { el.classList.remove('show'); }, state === 'error' ? 5000 : 1600);
+    el.replaceChildren(icon(state === 'error' || state === 'memory' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : state === 'memory' ? 'Session only — use Export' : 'Autosave failed');
+    if (state !== 'saving' && state !== 'memory') this.saveHide = window.setTimeout(() => {
+      if (storageMode() === 'memory') this.showSave('memory'); else el.classList.remove('show');
+    }, state === 'error' ? 5000 : 1600);
   }
 
   /** Highlight the active map view button. */
@@ -277,6 +296,9 @@ export class Hud {
   }
 
   setGame(g: Game) {
+    clearTimeout(this.saveHide);
+    if (storageMode() === 'memory') this.showSave('memory');
+    else { this.saveEl.className = 'savechip'; this.saveEl.replaceChildren(); }
     this.unread = 0;
     this.prevTool = undefined;
     this.syncVol();

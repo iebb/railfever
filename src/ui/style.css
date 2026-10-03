@@ -578,6 +578,12 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .savechip.show { opacity: 1; transform: none; }
 .savechip.saved .ic { color: var(--pos); }
 .savechip.error { color: var(--warn); }
+.savechip.memory { color: var(--warn); }
+.storage-banner { position: absolute; z-index: 95000; top: 76px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid var(--warn); border-radius: var(--r-m); background: var(--surface-solid); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; font-size: var(--fs-13); }
+.storage-banner > .ic { color: var(--warn); flex-shrink: 0; }
+.storage-banner > span { flex: 1; }
+.storage-banner button { flex-shrink: 0; }
+@media (max-width: 640px) { .storage-banner { top: 100px; flex-wrap: wrap; width: calc(100vw - 24px); } .storage-banner > span { min-width: 190px; } }
 .ng-card { flex: 0 0 auto; width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
 /* menu and new-game card always side by side; they stack only on narrow screens */
 @media (max-width: 1040px) { .title-main { flex: 0 1 420px; } }
