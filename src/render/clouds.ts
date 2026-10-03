@@ -63,6 +63,9 @@ export function applyClouds(mat: THREE.Material, needsNoise = true) {
     sh.uniforms.uShadowEdge = shadowFadeUniforms.uShadowEdge;
     sh.uniforms.uShadowDist = shadowFadeUniforms.uShadowDist;
     sh.uniforms.uCascade = shadowFadeUniforms.uCascade;
+    // idempotent: a material derived from one that already has cloud shadows (e.g. the far trees, which
+    // inherit the tree material's onBeforeCompile) must not get the declarations twice
+    if (sh.vertexShader.includes('vRfCloudPos')) return;
     sh.vertexShader = sh.vertexShader
       .replace('#include <common>', '#include <common>\nvarying vec3 vRfCloudPos;')
       .replace('#include <project_vertex>', `{
