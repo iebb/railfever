@@ -2,7 +2,8 @@
 import type { UI } from './ui';
 import { h, clear, section, icon, toggle, field, add } from './dom';
 import { fmtMoney } from '../game/economy';
-import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
+import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText, saveIncompatibility } from '../game/save';
+import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
@@ -18,6 +19,7 @@ export function openMenu(ui: UI) {
     item('export', 'Export save to file', () => exportSave(ui)),
     item('import', 'Import save from file…', () => importSave(ui)),
     item('company', 'Companies', () => { win.close(); ui.openCompetitors(); }),
+    item('money', 'Finances (I)', () => { win.close(); ui.openFinances(); }),
     item('key', 'Track access', () => { win.close(); ui.openTrackAccess(); }),
     item('signal', 'Auto-signal railway', () => { win.close(); ui.openAutoSignal(); }),
     item('settings', 'Settings', () => { win.close(); openSettings(ui); }),
@@ -34,35 +36,50 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
     if (mode === 'save') {
       const name = h('input', { class: 'input', style: 'flex:1', value: `${ui.game.player.name} – ${fmtDate(ui.game)}`, 'aria-label': 'Save name' }) as HTMLInputElement;
       add(win.body, h('div', { class: 'inline' }, name, h('button', { class: 'btn primary', onclick: async () => {
-        try { await saveToSlot(ui.game, 'slot' + Date.now(), name.value); ui.toast('Game saved', 'good'); render(); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); }
+        try { await saveToSlot(ui.game, 'slot' + Date.now(), name.value); savedNotice(ui); render(); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); }
       } }, icon('save', 16), 'Save')));
     }
     add(win.body, section('Saved games', String(slots.length)));
     if (!slots.length) add(win.body, h('div', { class: 'pad' }, 'No saved games yet.'));
     slots.sort((a, b) => (a.slot === 'autosave' ? -1 : b.slot === 'autosave' ? 1 : b.saved - a.saved));
     for (const s of slots) {
+      const incompatible = saveIncompatibility(s);
       add(win.body, h('div', { class: 'slot' },
-        h('div', { style: 'min-width:0' }, h('b', null, s.name), h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}`)),
+        h('div', { style: 'min-width:0' }, h('b', null, s.name),
+          h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}${s.game ? ` · v${s.game}` : ''}`),
+          incompatible ? h('div', { class: 'neg' }, 'Not compatible with this version') : null),
         h('div', { class: 'rowbtns' },
           mode === 'save'
-            ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); ui.toast('Game saved', 'good'); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
-            : h('button', { class: 'btn sm primary', onclick: async () => {
-              try { const g = await loadFromSlot(s.slot); win.close(); ui.app.setGame(g); ui.toast('Game loaded', 'good'); } catch (e) { ui.toast('Load failed: ' + (e as Error).message, 'bad'); }
+            ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); savedNotice(ui); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
+            : h('button', { class: 'btn sm primary', disabled: !!incompatible, 'data-tip': incompatible ?? undefined, onclick: async () => {
+              try {
+                const g = await loadFromSlot(s.slot);
+                if (await (ui.app.setGame(g) as unknown as Promise<boolean>)) { win.close(); ui.toast('Game loaded', 'good'); }
+              } catch (e) { ui.toast('Load failed: ' + (e as Error).message, 'bad'); }
             } }, 'Load'),
           h('button', { class: 'ibtn sm', 'data-tip': 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
     }
-    add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
+    add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, storageMode() === 'memory'
+      ? "Saves won't survive a reload in this browser mode — use Export to keep your game"
+      : 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
+    add(win.body, h('div', { class: 'btns right' }, h('button', { class: 'btn', onclick: () => exportSave(ui) }, icon('export', 16), 'Export'), h('button', { class: 'btn', onclick: () => importSave(ui) }, icon('import', 16), 'Import')));
   };
   render();
 }
 
-async function exportSave(ui: UI) {
+function savedNotice(ui: UI) {
+  ui.hud.showSave('saved');
+  ui.toast(storageMode() === 'memory' ? 'Saved for this session — Export to keep your game' : 'Game saved', storageMode() === 'memory' ? 'info' : 'good');
+}
+
+export async function exportSave(ui: UI) {
   try {
     const blob = await exportToFile(ui.game);
     const a = h('a', { href: URL.createObjectURL(blob), download: `railfever-${ui.game.year}.rfsave` });
     document.body.appendChild(a);
     a.click();
     a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   } catch (e) { ui.toast('Export failed: ' + (e as Error).message, 'bad'); }
 }
 
@@ -71,7 +88,10 @@ function importSave(ui: UI) {
   inp.addEventListener('change', async () => {
     const f = inp.files?.[0];
     if (!f) return;
-    try { const g = await importFromText(await f.text()); ui.wm.closeAll(); ui.app.setGame(g); ui.toast('Game imported', 'good'); }
+    try {
+      const g = await importFromText(await f.text());
+      if (await (ui.app.setGame(g) as unknown as Promise<boolean>)) { ui.wm.closeAll(); ui.toast('Game imported', 'good'); }
+    }
     catch (e) { ui.toast('Import failed: ' + (e as Error).message, 'bad'); }
   });
   inp.click();
@@ -164,12 +184,14 @@ export function openHelp(ui: UI) {
       <li>Open <b>Rail</b> or <b>Road</b> in the dock (<kbd>2</kbd> / <kbd>6</kbd>). Click to set the start — on open ground, a track end, or onto a track to branch off.</li>
       <li>Move the mouse: the preview shows the curve, bridges (blue), tunnels (purple), crossings and buildings in the way (red). The card shows cost, length, grade, radius and speed.</li>
       <li>Click to build. Construction continues from the new end with a smooth curve; <b>right-click</b>, <kbd>Esc</kbd> or a long press ends it. You can also drag to build one section.</li>
+      <li>On touch, tap to preview the cost, then tap the same spot to confirm. A tap elsewhere moves the preview. For track, tap the start, then preview and confirm the end.</li>
       <li>Options: standard, electric or high-speed track (up to 400 km/h), <b>1–4 parallel tracks</b>, road type, the <b>end height</b> (<kbd>[</kbd> <kbd>]</kbd>, ±5 m) for bridges and tunnels, and how to cross other lines. Hold <kbd>Shift</kbd> over a track to copy it as a parallel track.</li>
     </ol>
     <h4>Getting started</h4>
     <ol>
       <li>Place a <b>train station</b> (<kbd>3</kbd>) near each of two towns — <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotates. It lines up with nearby track ends; manual rotation switches off Align to track. Its catchment follows walkable streets drawn in the transport mode’s colour.</li>
       <li>Connect the stations with track and add a <b>train depot</b> (<kbd>5</kbd>) at a free track end.</li>
+      <li>Start with single track and one-platform halts; keep cash for the train. Bridges, tunnels and demolition cost extra. Open <b>Finances</b> (<kbd>I</kbd>, the money plate or Menu) to review costs or borrow. Money warnings offer <b>Borrow</b> and <b>Open finances</b>.</li>
       <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>Rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
       <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
@@ -214,6 +236,7 @@ export function openHelp(ui: UI) {
     </ul>
     <h4>Keys</h4>
     <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotate stations / depots · <kbd>+</kbd>/<kbd>−</kbd> or <kbd>Ctrl</kbd>+wheel / pinch zoom · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance overlay · <kbd>Esc</kbd> cancel / close</p>
+    <p><kbd>I</kbd> finances · <kbd>,</kbd> slower · <kbd>.</kbd> faster (1×, 2×, 4×, 8×). <kbd>R</kbd>/<kbd>F</kbd> tilt the camera.</p>
     <p>Space / Enter activates a keyboard-focused button or control. Global shortcuts are ignored while editing text or using form controls; Esc still cancels or closes.</p>
     </div>`;
 }

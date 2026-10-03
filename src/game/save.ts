@@ -1,6 +1,7 @@
-// Save games (format v2): the free-form world, network, companies, AI and vehicles as compressed JSON.
+// Save games (v3): a tick-consistent dynamic snapshot and immutable lossless world chunks.
+import { GAME_VERSION } from './version';
 import { Game, TICKS_PER_DAY } from './game';
-import { World, Building, Tree } from './world';
+import { World, Building, Tree, SAVE_VERTICES, SAVE_TREES } from './world';
 import type { NNode, NEdge, Crossing, Section } from './network';
 import type { Town } from './towns';
 import type { Station, WaitGroup } from './stations';
@@ -22,7 +23,203 @@ import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 
-const VERSION = 2;
+const VERSION = 3;
+/** Save formats this build reads (v2: older single-record saves). */
+const READABLE = [2, VERSION];
+const TREE_CHUNK = SAVE_TREES;
+
+/** Self-contained so the same codec runs in a Blob worker in the one-file offline build. */
+export function saveCodec() {
+  const base64 = (a: Uint8Array) => {
+    let s = '';
+    for (let i = 0; i < a.length; i += 0x8000) s += String.fromCharCode(...a.subarray(i, i + 0x8000));
+    return btoa(s);
+  };
+  const packFloats = (a: Float32Array, stride = 0) => {
+    const words = new Uint32Array(a.buffer, a.byteOffset, a.length), n = a.length, out = new Uint8Array(n * 4);
+    let prev = 0, prev2 = 0;
+    for (let i = 0; i < n; i++) {
+      const prediction = stride && i > stride ? prev + words[i - stride] - words[i - stride - 1] : 2 * prev - prev2;
+      const v = words[i], x = (v - prediction) >>> 0; prev2 = prev; prev = v;
+      for (let b = 0; b < 4; b++) out[b * n + i] = x >>> (b * 8);
+    }
+    return out;
+  };
+  const unpackFloats = (a: Uint8Array, stride = 0) => {
+    if (a.length % 4) throw new Error('Invalid float chunk');
+    const n = a.length / 4, out = new Float32Array(n), words = new Uint32Array(out.buffer);
+    let prev = 0, prev2 = 0;
+    for (let i = 0; i < n; i++) {
+      let x = 0;
+      for (let b = 0; b < 4; b++) x |= a[b * n + i] << (b * 8);
+      const prediction = stride && i > stride ? prev + words[i - stride] - words[i - stride - 1] : 2 * prev - prev2;
+      const v = (x + prediction) >>> 0;
+      words[i] = v; prev2 = prev; prev = v;
+    }
+    return out;
+  };
+  const zip = async (a: Uint8Array): Promise<Uint8Array | string> => {
+    if (typeof CompressionStream === 'undefined') return 'b64:' + base64(a);
+    const stream = new Blob([a as BlobPart]).stream().pipeThrough(new CompressionStream('gzip'));
+    return new Uint8Array(await new Response(stream).arrayBuffer());
+  };
+  const encode = async (kind: string, raw: Float32Array | Uint8Array | unknown, stride = 0) => {
+    const a = kind === 'json' ? new TextEncoder().encode(JSON.stringify(raw))
+      : kind === 'lock' ? raw as Uint8Array : packFloats(raw as Float32Array, stride);
+    return zip(a);
+  };
+  const unpackNodes = (p: any, start = 0, end = p.kind.length) => {
+    const nodes = [];
+    for (let i = start; i < Math.min(end, p.kind.length); i++) {
+      const at = i * 8, a = p.values;
+      const n: any = { id: a[at], kind: p.kind[i], x: a[at + 1], y: a[at + 2], z: a[at + 3], dx: a[at + 4], dz: a[at + 5],
+        edges: Array.from(p.edgeIds.subarray(p.edgeOffsets[i], p.edgeOffsets[i + 1])), signal: a[at + 6], owner: a[at + 7] };
+      if (p.signalKind[i] !== undefined) n.signalKind = p.signalKind[i];
+      if (p.signalPass[i] !== undefined) n.signalPass = p.signalPass[i];
+      nodes.push(n);
+    }
+    return nodes;
+  };
+  // The snapshot packs nodes and concatenates profiles to avoid thousands of object/buffer clones.
+  // Stored JSON still uses ordinary node records and the v2 byte-plane profile representation.
+  const profiles = (d: any) => {
+    if (!Array.isArray(d.world.buildings)) {
+      const { fields, values } = d.world.buildings;
+      d.world.buildings = [];
+      for (let at = 0; at < values.length; at += fields.length) {
+        const b: Record<string, number> = {};
+        fields.forEach((key: string, i: number) => { b[key] = values[at + i]; });
+        d.world.buildings.push(b);
+      }
+    }
+    if (!Array.isArray(d.net.nodes) && d.net.nodes) d.net.nodes = unpackNodes(d.net.nodes);
+    for (const e of d.net.edges) {
+      if (d.net.profiles) e.prof = d.net.profiles.subarray(e.prof[0], e.prof[0] + e.prof[1]);
+      if (!(e.prof instanceof Float32Array)) continue;
+      const src = new Uint8Array(e.prof.buffer, e.prof.byteOffset, e.prof.byteLength), n = e.prof.length, out = new Uint8Array(n * 4);
+      for (let i = 0; i < n; i++) for (let b = 0; b < 4; b++) out[b * n + i] = src[i * 4 + b];
+      e.prof = base64(out);
+    }
+    delete d.net.profiles;
+    return d;
+  };
+  return { base64, packFloats, unpackFloats, encode, profiles, unpackNodes };
+}
+const codec = saveCodec();
+
+interface SaveChunk {
+  key: string; kind: 'h' | 'lock' | 'trees'; raw: Float32Array | Uint8Array; stride: number;
+  text?: string; encoded?: Promise<Uint8Array | string>;
+}
+interface WorldCache { h: SaveChunk[]; lock: SaveChunk[]; trees: SaveChunk[]; heights: number[]; treeVersions: number[]; prefix: string; revision: number }
+const worldCaches = new WeakMap<World, WorldCache>();
+export const saveStats = { copiedChunks: 0, encodedChunks: 0, snapshots: 0, lastSnapshotMs: 0, lastPostMs: 0, lastEncodeMs: 0 };
+
+function sameBytes(a: ArrayBufferView, b: ArrayBufferView): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  const n = Math.floor(a.byteLength / 4), aw = new Uint32Array(a.buffer, a.byteOffset, n), bw = new Uint32Array(b.buffer, b.byteOffset, n);
+  for (let i = 0; i < n; i++) if (aw[i] !== bw[i]) return false;
+  const au = new Uint8Array(a.buffer, a.byteOffset, a.byteLength), bu = new Uint8Array(b.buffer, b.byteOffset, b.byteLength);
+  for (let i = n * 4; i < au.length; i++) if (au[i] !== bu[i]) return false;
+  return true;
+}
+function worldChunks(w: World): WorldCache {
+  let c = worldCaches.get(w);
+  if (!c) {
+    c = { h: [], lock: [], trees: [], heights: [], treeVersions: [], prefix: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2), revision: 0 };
+    worldCaches.set(w, c);
+  }
+  const chunk = (kind: SaveChunk['kind'], raw: SaveChunk['raw']): SaveChunk => {
+    saveStats.copiedChunks++;
+    return { key: c!.prefix + '/' + kind + '/' + c!.revision++, kind, raw, stride: kind === 'h' ? w.size + 1 : 0 };
+  };
+  for (let i = 0, at = 0; at < w.h.length; i++, at += SAVE_VERTICES) {
+    if (c.heights[i] !== w.saveHeightVersions[i]) {
+      const a = w.h.subarray(at, at + SAVE_VERTICES);
+      if (!c.h[i] || !sameBytes(a, c.h[i].raw)) c.h[i] = chunk('h', a.slice());
+      c.heights[i] = w.saveHeightVersions[i];
+    }
+    // Some network/station writers change lock bytes directly. Comparing words is cheap, and avoids
+    // guessed invalidations or re-deriving historical locks that are not exactly reproducible.
+    const a = w.lock.subarray(at, at + SAVE_VERTICES);
+    if (!c.lock[i] || !sameBytes(a, c.lock[i].raw)) c.lock[i] = chunk('lock', a.slice());
+  }
+  for (let at = 0, i = 0; at < w.trees.length; at += TREE_CHUNK, i++) {
+    const n = Math.min(TREE_CHUNK, w.trees.length - at), prev = c.trees[i]?.raw as Float32Array | undefined;
+    if (prev?.length === n * 5 && c.treeVersions[i] === (w.saveTreeVersions[i] ?? 0)) continue;
+    let changed = !prev || prev.length !== n * 5;
+    if (!changed) for (let j = 0; j < n; j++) {
+      const t = w.trees[at + j];
+      if (t ? Math.fround(t.x) !== prev![j] || Math.fround(t.z) !== prev![n + j] || Math.fround(t.s) !== prev![2 * n + j] || t.type !== prev![3 * n + j] || Math.fround(t.tint) !== prev![4 * n + j] : !Number.isNaN(prev![j])) { changed = true; break; }
+    }
+    if (changed) {
+      const a = new Float32Array(n * 5);
+      for (let j = 0; j < n; j++) {
+        const t = w.trees[at + j];
+        if (!t) { a[j] = NaN; continue; }
+        a[j] = t.x; a[n + j] = t.z; a[2 * n + j] = t.s; a[3 * n + j] = t.type; a[4 * n + j] = t.tint;
+      }
+      c.trees[i] = chunk('trees', a);
+    }
+    c.treeVersions[i] = w.saveTreeVersions[i] ?? 0;
+  }
+  c.trees.length = c.treeVersions.length = Math.ceil(w.trees.length / TREE_CHUNK);
+  return c;
+}
+function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknown) {
+  return { encoding: 'predict32-chunks', vertices: SAVE_VERTICES, treeChunk: TREE_CHUNK, treeCount: w.trees.length,
+    h: c.h.map(value), lock: c.lock.map(value), trees: c.trees.map(value) };
+}
+/** Synchronous single-JSON form for tests/tools; autosaves use captureSave and worker encoding. */
+export function serialize(g: Game): any {
+  const c = worldChunks(g.world);
+  return serializeState(g, chunkWorld(g.world, c, (t) => t.text ??= b64(t.kind === 'lock' ? t.raw : codec.packFloats(t.raw as Float32Array, t.stride))));
+}
+/** Everything is detached from the live game in this call, before any await or worker work. */
+export function captureSave(g: Game) {
+  const start = performance.now(), c = worldChunks(g.world);
+  const state = cloneState(serializeState(g, chunkWorld(g.world, c, (t) => t.key), true));
+  const chunks = [...c.h, ...c.lock, ...c.trees];
+  const meta = { date: g.dateString(), saved: Date.now(), money: g.economy.money, format: VERSION, game: GAME_VERSION };
+  saveStats.snapshots++; saveStats.lastSnapshotMs = performance.now() - start;
+  return { state, chunks, meta };
+}
+/** Save entities are plain enumerable records. Copying those directly avoids structuredClone's
+ * extra serialization pass; packed buffers were already copied by serializeState. */
+function cloneState(value: any): any {
+  if (!value || typeof value !== 'object' || ArrayBuffer.isView(value)) return value;
+  if (Array.isArray(value)) return value.map(cloneState);
+  const out: Record<string, unknown> = {};
+  for (const key of Object.keys(value)) out[key] = cloneState(value[key]);
+  return out;
+}
+const BUILDING_FIELDS = ['id', 'townId', 'x', 'z', 'angle', 'w', 'd', 'type', 'floors', 'pop', 'seed', 'y', 'built'] as const;
+function buildingRecords(w: World, binary: boolean) {
+  if (binary) {
+    const values = new Float64Array(w.buildings.size * BUILDING_FIELDS.length);
+    let at = 0;
+    for (const b of w.buildings.values()) for (const key of BUILDING_FIELDS) values[at++] = b[key];
+    return { fields: BUILDING_FIELDS, values };
+  }
+  return [...w.buildings.values()].map((b) => Object.fromEntries(BUILDING_FIELDS.map((key) => [key, b[key]])));
+}
+function nodeRecord(n: NNode) {
+  return { id: n.id, kind: n.kind, x: n.x, y: n.y, z: n.z, dx: n.dx, dz: n.dz, edges: n.edges.slice(), signal: n.signal, owner: n.owner,
+    ...(n.signalKind === undefined ? {} : { signalKind: n.signalKind }), ...(n.signalPass === undefined ? {} : { signalPass: n.signalPass }) };
+}
+function packNodes(nodes: NNode[]) {
+  const values = new Float64Array(nodes.length * 8), edgeOffsets = new Uint32Array(nodes.length + 1);
+  const edgeIds = new Float64Array(nodes.reduce((n, p) => n + p.edges.length, 0));
+  let at = 0, edge = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    values[at++] = n.id; values[at++] = n.x; values[at++] = n.y; values[at++] = n.z;
+    values[at++] = n.dx; values[at++] = n.dz; values[at++] = n.signal; values[at++] = n.owner;
+    edgeOffsets[i] = edge; edgeIds.set(n.edges, edge); edge += n.edges.length;
+  }
+  edgeOffsets[nodes.length] = edge;
+  return { values, edgeOffsets, edgeIds, kind: nodes.map((n) => n.kind), signalKind: nodes.map((n) => n.signalKind), signalPass: nodes.map((n) => n.signalPass) };
+}
 
 // ------------------------------------------------------------------------------ binary helpers
 
@@ -138,29 +335,31 @@ function depotSeg(g: Game, dp: Depot, length: number): TSeg | null {
 
 // ------------------------------------------------------------------------------ serialize
 
-export function serialize(g: Game): any {
-  const w = g.world;
-  const net = w.net;
-  const trees = new Float32Array(w.trees.length * 5);
-  w.trees.forEach((t, i) => {
-    if (!t) { trees[i * 5] = NaN; return; }
-    trees.set([t.x, t.z, t.s, t.type, t.tint], i * 5);
-  });
+function serializeState(g: Game, world: any, binaryProfiles = false): any {
+  const w = g.world, net = w.net;
+  const edges = [...net.edges.values()];
+  const profiles = binaryProfiles ? new Float32Array(edges.reduce((n, e) => n + e.prof.length, 0)) : null;
+  let profileAt = 0;
   const V = g.vehicles as any;
   return {
-    version: VERSION,
+    version: VERSION, game: GAME_VERSION,
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     world: {
-      size: w.size, h: f32enc(w.h), lock: b64(w.lock), trees: f32enc(trees),
-      buildings: [...w.buildings.values()], nextBuildingId: w.nextBuildingId,
+      ...world, size: w.size, freeTrees: w.freeTrees.slice(),
+      buildings: buildingRecords(w, binaryProfiles), nextBuildingId: w.nextBuildingId,
     },
     net: {
-      nodes: [...net.nodes.values()],
-      edges: [...net.edges.values()].map((e) => ({ ...e, prof: f32enc(e.prof) })),
+      nodes: binaryProfiles ? packNodes([...net.nodes.values()]) : [...net.nodes.values()].map(nodeRecord),
+      edges: edges.map((e) => {
+        if (!profiles) return { ...e, prof: f32enc(e.prof) };
+        const prof = [profileAt, e.prof.length]; profiles.set(e.prof, profileAt); profileAt += e.prof.length;
+        return { ...e, prof };
+      }),
+      ...(profiles ? { profiles } : {}),
       crossings: [...net.crossings.values()],
       nextNode: net.nextNode, nextEdge: net.nextEdge, nextCrossing: net.nextCrossing,
       // changes the vehicles have not taken in yet (flushed at the start of the next update)
@@ -191,18 +390,48 @@ export function serialize(g: Game): any {
 // ------------------------------------------------------------------------------ deserialize
 
 export function deserialize(d: any): Game {
-  if (!d || d.version !== VERSION) throw new Error('Unsupported save version (this game uses format ' + VERSION + ')');
+  if (!d) throw new Error('Not a Railfever save');
+  const why = saveIncompatibility({ version: d.version, game: d.game });
+  if (why || d.version === undefined) throw new Error(why ?? 'Not a Railfever save');
   const wd = d.world;
   const w = new World(wd.size);
-  w.h.set(f32dec(wd.h).subarray(0, w.h.length));
-  w.lock.set(unb64(wd.lock).subarray(0, w.lock.length));
+  let tr: Float32Array;
+  if (d.version === 2) {
+    w.h.set(f32dec(wd.h).subarray(0, w.h.length));
+    w.lock.set(unb64(wd.lock).subarray(0, w.lock.length));
+    tr = f32dec(wd.trees);
+  } else {
+    if (wd.encoding !== 'predict32-chunks' || wd.vertices !== SAVE_VERTICES || wd.treeChunk !== TREE_CHUNK)
+      throw new Error('Unsupported world chunk encoding');
+    const floats = (x: string | Uint8Array, stride = 0) => codec.unpackFloats(typeof x === 'string' ? unb64(x) : x, stride);
+    let at = 0;
+    for (const chunk of wd.h) { const a = floats(chunk, w.size + 1); w.h.set(a, at); at += a.length; }
+    if (at !== w.h.length) throw new Error('Incomplete heightmap');
+    at = 0;
+    for (const chunk of wd.lock) { const a = typeof chunk === 'string' ? unb64(chunk) : chunk; w.lock.set(a, at); at += a.length; }
+    if (at !== w.lock.length) throw new Error('Incomplete lock grid');
+    tr = new Float32Array(wd.treeCount * 5);
+    at = 0;
+    for (const chunk of wd.trees) {
+      const a = floats(chunk), n = a.length / 5;
+      for (let i = 0; i < n; i++) for (let f = 0; f < 5; f++) tr[(at + i) * 5 + f] = a[f * n + i];
+      at += n;
+    }
+    if (at !== wd.treeCount) throw new Error('Incomplete trees');
+  }
   // trees keep their ids (index)
-  const tr = f32dec(wd.trees);
   for (let i = 0; i < tr.length / 5; i++) {
     if (isNaN(tr[i * 5])) { w.trees[i] = null; w.freeTrees.push(i); continue; }
     const t: Tree = { x: tr[i * 5], z: tr[i * 5 + 1], s: tr[i * 5 + 2], type: tr[i * 5 + 3], tint: tr[i * 5 + 4] };
     w.trees[i] = t;
+    w.indexSavedTree(i, t);
     w.treeGrid.insert(i, t.x, t.z, t.x, t.z);
+  }
+  if (Array.isArray(wd.freeTrees)) {
+    const holes = new Set(w.freeTrees);
+    if (wd.freeTrees.length !== holes.size || new Set(wd.freeTrees).size !== holes.size || wd.freeTrees.some((id: number) => !holes.has(id)))
+      throw new Error('Invalid free tree ids');
+    w.freeTrees = wd.freeTrees.slice();
   }
   for (const b0 of wd.buildings as Building[]) {
     const b = { ...b0 };
@@ -387,27 +616,172 @@ export function deserialize(d: any): Game {
 
 // ------------------------------------------------------------------------------ storage
 
-async function gzipBytes(text: string): Promise<Uint8Array | null> {
-  if (typeof CompressionStream === 'undefined') return null;
-  const cs = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
-  return new Uint8Array(await new Response(cs).arrayBuffer());
+/** No external URL or asset: this source is embedded in the final standalone HTML. */
+export function saveWorkerSource(): string {
+  return `const codec = (${saveCodec.toString()})();
+    self.onmessage = async ({data: {id, kind, raw, stride}}) => {
+      try {
+        let data;
+        if (kind === 'file') {
+          const text = (x) => typeof x === 'string' ? x : 'gz:' + codec.base64(x);
+          data = 'rf3:' + JSON.stringify({version: 3, game: ${JSON.stringify(GAME_VERSION)}, data: text(raw.data), parts: raw.parts.map(p => [p.key, text(p.data)])});
+        } else data = await codec.encode(kind, kind === 'json' ? codec.profiles(raw) : raw, stride);
+        self.postMessage({id, data}, data instanceof Uint8Array ? [data.buffer] : []);
+      } catch (e) { self.postMessage({id, error: String(e && e.message || e)}); }
+    };`;
 }
+let worker: Worker | null = null, workerUnavailable = false, jobId = 0;
+const jobs = new Map<number, { resolve: (v: Uint8Array | string) => void; reject: (e: Error) => void }>();
+function getWorker(): Worker | null {
+  if (worker || workerUnavailable) return worker;
+  if (typeof Worker === 'undefined') { workerUnavailable = true; return null; }
+  try {
+    const url = URL.createObjectURL(new Blob([saveWorkerSource()], { type: 'text/javascript' }));
+    try { worker = new Worker(url); } finally { URL.revokeObjectURL(url); }
+    worker.onmessage = (e: MessageEvent) => {
+      const job = jobs.get(e.data.id); if (!job) return;
+      jobs.delete(e.data.id);
+      if (e.data.error) job.reject(new Error(e.data.error)); else job.resolve(e.data.data);
+    };
+    worker.onerror = () => {
+      worker?.terminate(); worker = null; workerUnavailable = true;
+      for (const job of jobs.values()) job.reject(new Error('Save worker unavailable'));
+      jobs.clear();
+    };
+  } catch { workerUnavailable = true; worker = null; }
+  return worker;
+}
+async function encodeValue(kind: string, raw: any, stride = 0): Promise<Uint8Array | string> {
+  const w = getWorker();
+  if (w) {
+    try {
+      return await new Promise<Uint8Array | string>((resolve, reject) => {
+        const id = ++jobId; jobs.set(id, { resolve, reject });
+        // Only copied chunks are transferable: cached snapshots must remain immutable/reusable.
+        const start = performance.now();
+        try {
+          const value = kind === 'json' ? { ...raw,
+            world: { ...raw.world, buildings: { ...raw.world.buildings, values: raw.world.buildings.values.slice() } },
+            net: { ...raw.net, profiles: raw.net.profiles.slice(), nodes: { ...raw.net.nodes,
+              values: raw.net.nodes.values.slice(), edgeIds: raw.net.nodes.edgeIds.slice(), edgeOffsets: raw.net.nodes.edgeOffsets.slice() } },
+          } : kind === 'file' ? raw : raw.slice();
+          const transfer = ArrayBuffer.isView(value) ? [value.buffer as ArrayBuffer]
+            : kind === 'json' ? [value.world.buildings.values.buffer, value.net.profiles.buffer,
+              value.net.nodes.values.buffer, value.net.nodes.edgeIds.buffer, value.net.nodes.edgeOffsets.buffer] : [];
+          w.postMessage({ id, kind, raw: value, stride }, transfer);
+          saveStats.lastPostMs += performance.now() - start;
+        } catch (e) { jobs.delete(id); reject(e as Error); }
+      });
+    } catch { /* file:// policies can forbid Blob workers: use the sliced fallback below */ }
+  }
+  // One chunk per task if workers are unavailable. Capture already detached all mutable game data.
+  await new Promise<void>((r) => setTimeout(r, 0));
+  if (kind === 'file') {
+    const text = (x: Uint8Array | string) => typeof x === 'string' ? x : 'gz:' + b64(x);
+    return 'rf3:' + JSON.stringify({ version: VERSION, game: GAME_VERSION, data: text(raw.data), parts: raw.parts.map((p: any) => [p.key, text(p.data)]) });
+  }
+  if (kind === 'json') {
+    const d = { ...raw, world: { ...raw.world, buildings: [] as any[] },
+      net: { ...raw.net, nodes: [] as any[], edges: raw.net.edges.map((e: any) => ({ ...e })) } };
+    const { fields, values } = raw.world.buildings;
+    for (let at = 0; at < values.length; at += 500 * fields.length) {
+      const batch = { world: { buildings: { fields, values: values.subarray(at, at + 500 * fields.length) } }, net: { edges: [] } };
+      d.world.buildings.push(...codec.profiles(batch).world.buildings);
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+    for (let at = 0; at < raw.net.nodes.kind.length; at += 500) {
+      d.net.nodes.push(...codec.unpackNodes(raw.net.nodes, at, at + 500));
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+    for (let at = 0; at < d.net.edges.length; at += 100) {
+      codec.profiles({ world: { buildings: [] }, net: { edges: d.net.edges.slice(at, at + 100), profiles: raw.net.profiles } });
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+    delete d.net.profiles;
+    return codec.encode('json', d);
+  }
+  return codec.encode(kind, raw, stride);
+}
+
+export async function encodeSnapshot(snapshot: ReturnType<typeof captureSave>): Promise<StoredSave> {
+  const start = performance.now(); saveStats.lastPostMs = 0;
+  const parts = snapshot.chunks.map(async (t) => {
+    if (!t.encoded) {
+      saveStats.encodedChunks++;
+      t.encoded = encodeValue(t.kind, t.raw, t.stride).catch((e) => { t.encoded = undefined; throw e; });
+    }
+    return { key: t.key, data: await t.encoded };
+  });
+  const data = await encodeValue('json', snapshot.state);
+  const encoded = await Promise.all(parts);
+  saveStats.lastEncodeMs = performance.now() - start;
+  return { slot: '', meta: snapshot.meta, data, partKeys: encoded.map((p) => p.key), parts: encoded };
+}
+async function decodeBytes(data: Uint8Array | string): Promise<Uint8Array> {
+  if (typeof data === 'string') {
+    if (data.startsWith('b64:')) return unb64(data.slice(4));
+    if (!data.startsWith('gz:')) throw new Error('Invalid compressed chunk');
+    data = unb64(data.slice(3));
+  }
+  if (typeof DecompressionStream === 'undefined') throw new Error('This browser cannot decompress this save');
+  const stream = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+async function recordState(rec: StoredSave): Promise<any> {
+  const text = typeof rec.data === 'string' && !rec.data.startsWith('b64:') ? await gunzip(rec.data)
+    : new TextDecoder().decode(await decodeBytes(rec.data));
+  const d = JSON.parse(text);
+  if (rec.partKeys) {
+    const parts = new Map((rec.parts ?? []).map((p) => [p.key, p.data]));
+    const refs = [...d.world.h, ...d.world.lock, ...d.world.trees];
+    if (refs.length !== rec.partKeys.length || refs.some((k, i) => k !== rec.partKeys![i])) throw new Error('Invalid save manifest');
+    for (const field of ['h', 'lock', 'trees']) d.world[field] = await Promise.all(d.world[field].map(async (key: string) => {
+      const data = parts.get(key); if (data === undefined) throw new Error('Missing save chunk: ' + key);
+      return decodeBytes(data);
+    }));
+  }
+  return d;
+}
+/** A resumed game reuses the stored compressed chunks too, so its first autosave only writes state.
+ * Verify bytes against the restored world: load-time upgrades may have changed individual chunks.
+ * Imported files get fresh keys, so their untrusted identifiers cannot alias another stored save. */
+function reuseLoadedParts(g: Game, d: any, rec: StoredSave, keepKeys: boolean) {
+  if (d.version !== VERSION || !rec.partKeys || !rec.parts) return;
+  const c = worldChunks(g.world), encoded = new Map(rec.parts.map((p) => [p.key, p.data]));
+  let index = 0;
+  for (const [field, chunks] of [['h', c.h], ['lock', c.lock], ['trees', c.trees]] as const) {
+    for (let i = 0; i < chunks.length; i++, index++) {
+      const chunk = chunks[i], source = d.world[field][i], key = rec.partKeys[index];
+      if (!source || !encoded.has(key)) continue;
+      const bytes = typeof source === 'string' ? unb64(source) : source;
+      const raw = field === 'lock' ? bytes : codec.unpackFloats(bytes, chunk.stride);
+      if (!sameBytes(raw, chunk.raw)) continue;
+      if (keepKeys) chunk.key = key;
+      chunk.encoded = Promise.resolve(encoded.get(key)!);
+    }
+  }
+}
+
 async function gunzipBytes(u8: Uint8Array): Promise<string> {
   const ds = new Blob([u8 as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
   return await new Response(ds).text();
 }
-/** Text form (exported files, legacy saves). */
-async function gzip(text: string): Promise<string> {
-  const u8 = await gzipBytes(text);
-  return u8 ? 'gz:' + b64(u8) : 'raw:' + text;
-}
+/** Text form used by older exported files and localStorage saves. */
 async function gunzip(data: string): Promise<string> {
   if (data.startsWith('raw:')) return data.slice(4);
   if (!data.startsWith('gz:')) return data;
   return gunzipBytes(unb64(data.slice(3)));
 }
 
-export interface SlotInfo { slot: string; name: string; date: string; saved: number; money: number }
+export interface SlotInfo { slot: string; name: string; date: string; saved: number; money: number; format?: number; game?: string }
+
+/** Why a save can't be read by this build, or null. Saves without a marker are older ones this build reads. */
+export function saveIncompatibility(info: { format?: unknown; version?: unknown; game?: unknown } | null | undefined): string | null {
+  const format = info?.format ?? info?.version;
+  if (format === undefined || (typeof format === 'number' && READABLE.includes(format))) return null;
+  const by = typeof info?.game === 'string' ? `Railfever v${info.game}` : typeof format === 'number' && format > VERSION ? 'a newer version of Railfever' : 'an older version of Railfever';
+  return `This save is not compatible with this version (v${GAME_VERSION}): it was made by ${by}.`;
+}
 
 let slotCache: SlotInfo[] = [];
 async function refreshSlots() {
@@ -416,22 +790,30 @@ async function refreshSlots() {
 }
 /** Resolves once the saved slots are known (IndexedDB is asynchronous; old localStorage saves are migrated). */
 export const slotsReady: Promise<void> = (async () => {
-  try { await migrateLegacy(); await refreshSlots(); } catch (e) { console.warn('save storage unavailable', e); }
+  try { await migrateLegacy(); } catch (e) { console.warn('legacy save migration unavailable', e); }
+  try { await refreshSlots(); } catch (e) { console.warn('save storage unavailable', e); }
 })();
 
-/** Save to IndexedDB (gzip-compressed binary). */
-export async function saveToSlot(g: Game, slot: string, name: string): Promise<void> {
-  const json = JSON.stringify(serialize(g));
-  const data = (await gzipBytes(json)) ?? json;
-  const meta: SlotInfo = { slot, name, date: g.dateString(), saved: Date.now(), money: g.economy.money };
-  await putSave({ slot, data, meta });
-  slotCache = [meta, ...slotCache.filter((s) => s.slot !== slot)].sort((a, b) => b.saved - a.saved);
+const slotWrites = new Map<string, Promise<void>>();
+/** Capture now, then serialize writes to a slot so a slow older snapshot cannot overwrite a newer one. */
+export function saveToSlot(g: Game, slot: string, name: string): Promise<void> {
+  const snapshot = captureSave(g);
+  const previous = slotWrites.get(slot) ?? Promise.resolve();
+  const write = previous.catch(() => {}).then(async () => {
+    const rec = await encodeSnapshot(snapshot);
+    const meta: SlotInfo = { slot, name, ...snapshot.meta };
+    await putSave({ ...rec, slot, meta });
+    slotCache = [meta, ...slotCache.filter((s) => s.slot !== slot)].sort((a, b) => b.saved - a.saved);
+  });
+  slotWrites.set(slot, write);
+  write.then(() => { if (slotWrites.get(slot) === write) slotWrites.delete(slot); }, () => { if (slotWrites.get(slot) === write) slotWrites.delete(slot); });
+  return write;
 }
 
 async function backupRecord(rec: StoredSave, slot: string, name: string, once: boolean): Promise<void> {
   const old = rec.meta as Partial<SlotInfo> | null;
-  const meta: SlotInfo = { slot, name, date: old?.date ?? '', saved: old?.saved ?? Date.now(), money: old?.money ?? 0 };
-  const backup: StoredSave = { slot, data: typeof rec.data === 'string' ? rec.data : rec.data.slice(), meta };
+  const meta: SlotInfo = { slot, name, date: old?.date ?? '', saved: old?.saved ?? Date.now(), money: old?.money ?? 0, format: old?.format, game: old?.game };
+  const backup: StoredSave = { ...rec, slot, data: typeof rec.data === 'string' ? rec.data : rec.data.slice(), meta };
   if (once) await putSaveOnce(backup);
   else await putSave(backup);
   await refreshSlots();
@@ -448,10 +830,11 @@ export async function loadFromSlot(slot: string): Promise<Game> {
   await slotsReady;
   const rec = await getSave(slot);
   if (!rec) throw new Error('Empty slot');
-  const text = typeof rec.data === 'string' ? await gunzip(rec.data) : await gunzipBytes(rec.data);
-  const d = JSON.parse(text);
+  const d = await recordState(rec);
   if (slot === 'autosave' && d && !d.opsVersion) await backupRecord(rec, 'autosave-v2.3', 'Autosave (v2.3 backup)', true);
-  return deserialize(d);
+  const g = deserialize(d);
+  reuseLoadedParts(g, d, rec, true);
+  return g;
 }
 
 /** Known save slots, newest first (complete once `slotsReady` has resolved). */
@@ -463,10 +846,18 @@ export function deleteSlot(slot: string) {
 }
 
 export async function exportToFile(g: Game): Promise<Blob> {
-  const data = await gzip(JSON.stringify(serialize(g)));
-  return new Blob([data], { type: 'application/octet-stream' });
+  const rec = await encodeSnapshot(captureSave(g));
+  return new Blob([await encodeValue('file', rec) as string], { type: 'application/octet-stream' });
 }
 
 export async function importFromText(text: string): Promise<Game> {
-  return deserialize(JSON.parse(await gunzip(text.trim())));
+  text = text.trim();
+  if (!text.startsWith('rf3:')) return deserialize(JSON.parse(await gunzip(text)));
+  const file = JSON.parse(text.slice(4));
+  if (file.version !== VERSION || !Array.isArray(file.parts)) throw new Error(saveIncompatibility({ version: file.version, game: file.game }) ?? 'Not a Railfever save file');
+  const parts = file.parts.map(([key, data]: [string, string]) => ({ key, data }));
+  const rec: StoredSave = { slot: '', meta: null, data: file.data, parts, partKeys: parts.map((p: any) => p.key) };
+  const d = await recordState(rec), g = deserialize(d);
+  reuseLoadedParts(g, d, rec, false);
+  return g;
 }
