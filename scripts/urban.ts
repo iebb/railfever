@@ -1,3 +1,5 @@
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Urban rail: station modes from the platform track type (main line / metro / light rail) with their catchment
 // walking limits and layouts; strict catchment (only street-connected buildings, shared out among stations,
 // worked out alike after loading); a dense underground metro line (6 stations, ~10 units apart, platform screen
@@ -149,6 +151,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const trains: Train[] = [];
   for (let i = 0; i < 4; i++) { const t = g.vehicles.buyTrain(dep, [model('metro_b')], l.id); if (t instanceof Train) trains.push(t); }
   check(trains.length === 4, `4 metro trains (${trains.length})`);
+  startFleet(g, trains, 20);
   const r = runTrains(g, trains, 360);
   const counts = trains.map((t) => r.arrivals.get(t.id)?.length ?? 0);
   const seen = new Set(trains.flatMap((t) => r.arrivals.get(t.id) ?? []));
@@ -216,3 +219,26 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
 
 console.log(`(${fmt((performance.now() - T0) / 1000, 1)} s)`);
 done();
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
+}

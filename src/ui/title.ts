@@ -1,4 +1,5 @@
 // Title screen over the live (blurred) world: wordmark, main actions and the new-game card.
+import { GAME_VERSION } from '../game/version';
 import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
@@ -79,9 +80,9 @@ export function showTitle(o: TitleOpts) {
       g && o.resumed ? btn('play', 'Continue', o.resumed.saved ? `${g.dateString()} · saved ${ago(o.resumed.saved)}` : g.dateString(), () => close(), true) : null,
       g && !o.resumed ? btn('play', 'Play this map', `${g.towns.list.length} towns · ${g.options.startYear}`, () => close(), true) : null,
       btn('plus', 'New game', '', () => openCard()),
-      btn('save', 'Load game', '', () => { close(); openSaveLoad(ui, 'load'); }),
+      btn('save', 'Load game', '', () => { close(false); openSaveLoad(ui, 'load'); }),
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
-    h('div', { class: 'title-foot' }, 'Runs entirely in your browser — no internet needed.'),
+    h('div', { class: 'title-foot' }, `Railfever v${GAME_VERSION}${/\/preview\//.test(location.pathname) ? ' preview' : ''} · runs entirely in your browser — no internet needed.`),
   );
   row.appendChild(main);
   root.appendChild(row);
@@ -117,10 +118,11 @@ export function showTitle(o: TitleOpts) {
         field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', 'data-tip': 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
           h('button', { class: 'btn ghost', onclick: () => { c.remove(); card = null; root.classList.remove('card-open'); if (o.newGame && g) close(); } }, 'Cancel'),
-          h('button', { class: 'btn primary lg', onclick: () => {
-            close(false);
+          h('button', { class: 'btn primary lg', onclick: async () => {
             const nt = Math.min(st.towns, Math.round((st.size * st.size) / 3000));
-            ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai) });
+            // The shell returns success after confirmation, preservation, and world creation.
+            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai) }) as unknown as Promise<boolean>);
+            if (started) close(false);
           } }, icon('play', 18), 'Start')),
       );
     };

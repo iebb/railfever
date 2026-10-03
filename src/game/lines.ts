@@ -32,6 +32,10 @@ export interface Line {
    * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
    */
   loop?: boolean;
+  /** Automatic headway regulation; absent in older saves means enabled. */
+  evenSpacing?: boolean;
+  /** Simulation-second departure clocks, separately for each service pattern (saved with the line). */
+  spacing?: Record<string, PatternSpacing>;
   /** rail route letter (the Y of station numbers XY01), unique among the owner's rail lines; see Lines.lineCode */
   code?: string;
   /**
@@ -47,6 +51,15 @@ export interface Line {
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+}
+
+export interface PatternSpacing {
+  /** Stop sequence and served flags these clocks belong to; route edits discard old clocks. */
+  route: string;
+  /** station + outgoing stop (direction) -> last departure */
+  departures: Record<string, { at: number; vehicle: number; recent?: number[] }>;
+  /** depot + entry stop/direction -> last successful release (different entry points are independent). */
+  released?: Record<string, number>;
 }
 
 /**
@@ -175,7 +188,7 @@ export class Lines {
     const line: Line = {
       id, owner, name: '', color: this.pickColor(kind, owner), kind, num: this.freeNumber(kind, owner),
       stops: [], vehicles: [], passMonth: 0, passLast: 0, incomeYear: 0, incomeLast: 0, costYear: 0, costLast: 0,
-      autoName: true, autoColor: true,
+      autoName: true, autoColor: true, evenSpacing: true,
     };
     line.name = this.autoNameOf(line);
     this.autoText.set(id, line.name);
@@ -209,6 +222,14 @@ export class Lines {
     if (color === null) { l.autoColor = true; l.color = this.pickColor(l.kind, l.owner, l.id); return; }
     l.color = color;
     l.autoColor = false;
+  }
+
+  setEvenSpacing(id: number, enabled: boolean) {
+    const l = this.get(id);
+    if (!l) return;
+    l.evenSpacing = enabled;
+    delete l.spacing;
+    for (const vid of l.vehicles) this.game.vehicles.get(vid)?.resetSpacing();
   }
 
   // ---------------------------------------------------------------- automatic names and colours
@@ -664,6 +685,11 @@ export class Lines {
     }
     if (typeof l.autoName !== 'boolean') l.autoName = false;
     if (typeof l.autoColor !== 'boolean') l.autoColor = false;
+    if (typeof l.evenSpacing !== 'boolean') l.evenSpacing = true;
+    if (d.spacing) l.spacing = Object.fromEntries(Object.entries(d.spacing as Record<string, PatternSpacing>).map(([pid, s]) =>
+      [pid, { ...s, departures: Object.fromEntries(Object.entries(s.departures).map(([key, dep]) =>
+        [key, { ...dep, ...(dep.recent ? { recent: [...dep.recent] } : {}) }])),
+        ...(s.released ? { released: { ...s.released } } : {}) }]));
     if (l.kind === 'rail') {
       if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
     } else {
