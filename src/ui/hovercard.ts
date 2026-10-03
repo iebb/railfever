@@ -73,7 +73,8 @@ export class HoverCard {
     if (t.kind === 'vehicle') {
       const v = g.vehicles.get(t.id);
       if (!v) return null;
-      if (!v.worldPos(p)) return null;
+      // the drawn (interpolated) position, so the card stays on the vehicle between simulation ticks
+      if (!g.vehicles.renderWorldPos(v, p)) return null;
       p.y += 0.9;
       return p;
     }
