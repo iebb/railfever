@@ -590,6 +590,7 @@ export class Game {
     }
     this.usage.clear();
     this.metered = new Set(this.access.map((a) => a.owner));
+    return wear;
   }
 
   /** `user` pays `owner` an access fee (booked as fees / fee income). */
@@ -936,7 +937,8 @@ export class Game {
     const y = this.options.startYear + Math.floor(pd / (DAYS_PER_MONTH * MONTHS_PER_YEAR)), m = Math.floor(pd / DAYS_PER_MONTH) % MONTHS_PER_YEAR;
     for (const co of this.companies) if (!co.defunct) co.economy.spend(this.maintenanceOf(co.id) / 12, 'maintenance', true);
     this.vehicles.monthly();
-    this.billAccess();
+    const wear = this.billAccess();
+    for (const ai of this.ais) ai.railPolicy.monthEnd(wear);
     for (const co of this.companies) if (!co.defunct) co.economy.endMonth(y, m);
     for (const st of this.stations.map.values()) {
       st.genLast = st.genMonth; st.genMonth = 0;

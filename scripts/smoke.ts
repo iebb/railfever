@@ -22,7 +22,10 @@ const loco = MODEL_BY_ID.get('diesel_b')!, coach = MODEL_BY_ID.get('coach_ic')!;
 
 // ------------------------------------------------------------------ 1. single-track line between two towns
 const e0 = net.nextEdge;
-const pair = placeAndConnect(g, 60, 150, 0)!;
+// The passenger checks need a served population under today's demand calibration. Tiny villages can
+// legitimately produce no intercity train passengers in two years (seed 11), even on a working railway.
+const quiet = new Set(g.towns.list.filter((t) => t.pop < 500).map((t) => t.id));
+const pair = (placeAndConnect(g, 60, 150, 0, quiet) ?? placeAndConnect(g, 150, 240, 0, quiet))!;
 check(pair, 'station pair placed and connected');
 const { A, B, TA, TB, con } = pair;
 console.log(`rail: ${TA.name} (${TA.pop}) <-> ${TB.name} (${TB.pop}), ${fmt(Math.hypot(TA.x - TB.x, TA.z - TB.z))} units`);
@@ -57,11 +60,11 @@ let dbl = { ok: false, signals: 0, crossovers: 0, len: 0 };
 let dblDepot = -1, dblLine = -1;
 const eDbl = net.nextEdge;
 {
-  const used = new Set([TA.id, TB.id]);
+  const used = new Set([TA.id, TB.id, ...quiet]);
   // Reduced catchments choose different sites. A failed corridor rules out that pair, not both towns.
   const tried = new Set<string>();
   for (let attempt = 0; attempt < 12 && !dbl.ok; attempt++) {
-    const pr2 = placeStationPair(g, 70, 200, 0, used, 16, tried);
+    const pr2 = placeStationPair(g, 70, 300, 0, used, 16, tried);
     if (!pr2) break;
     tried.add(pr2.TA.id + ':' + pr2.TB.id);
     console.log(`double track: ${pr2.TA.name} <-> ${pr2.TB.name}`);

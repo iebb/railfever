@@ -178,7 +178,10 @@ export abstract class Vehicle {
       g.company(this.owner).economy.earn(income, 'income');
       this.profitYear += income;
       this.incomeYear += income;
-      if (line) { line.incomeYear += income; }
+      if (line) {
+        line.incomeYear += income;
+        if (line.kind === 'rail') g.ais.find((a) => a.companyId === this.owner)?.railPolicy.operating(line.id, income);
+      }
       g.onIncome(income, this, st);
     }
     moved += this.boardStation(st);

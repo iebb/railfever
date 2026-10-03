@@ -2,7 +2,7 @@
 import { Game } from '../src/game/game';
 import { findSnap, planEdge, commitProposal, BuildOptions, Snap, Proposal } from '../src/game/construction';
 import { toggleSignal } from '../src/game/build-ops';
-import { finishDoubleTrack } from '../src/game/trackops';
+import { finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { Train, CROSS_BASE, findRailRoute, railNext, depotReaches } from '../src/game/train';
@@ -168,6 +168,7 @@ export function checkReservations(g: Game): string[] {
   const V = g.vehicles as any;
   const res: Map<number, number> = V.res;
   for (const [r, id] of res) {
+    if (id === WORKS_HOLD && g.world.net.edges.has(r) && g.stations.heldForWorks(r)) continue;
     const t = g.vehicles.get(id);
     if (!(t instanceof Train)) { errs.push(`reservation ${r} by missing train ${id}`); continue; }
     if (!t.segs.some((s) => s.res.includes(r))) errs.push(`reservation ${r} by ${t.name} not on its path`);

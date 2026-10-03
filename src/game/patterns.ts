@@ -378,7 +378,16 @@ export function lineTable(g: Game, l: Line): LineTable {
   // (exact positions: a station rebuilt longer moves its centre by less than a unit, and the timetable reads the
   // exact distances; the town decides a road hop's speed cap)
   for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? s.x + ',' + s.z + (s.rail ? s.rail.trackType : '') + '/' + s.townId : '') + ';'; }
-  for (const [p, vs] of byPat) { key += '|' + p + ':'; for (const v of vs) key += v.id + '/' + v.maxSpeedKmh + '.'; }
+  for (const [p, vs] of byPat) {
+    key += '|' + p + ':';
+    for (const v of vs) {
+      const stock = v as unknown as { cars?: VehicleModel[]; model?: VehicleModel | null };
+      // Editing a consist changes its acceleration and loaded mass without changing its top speed. Sort
+      // model ids so a train reversing at a terminus still has the same timetable key.
+      const models = stock.cars ?? (stock.model ? [stock.model] : []);
+      key += v.id + '/' + v.maxSpeedKmh + '/' + models.map((m) => m.id).sort().join(',') + '.';
+    }
+  }
   for (const p of l.patterns ?? []) { key += '|' + p.id + ':'; for (const x of servedFlags(l, p)) key += x ? '1' : '0'; }
   if (hit && hit.key === key) { hit.ver = g.lines.version; hit.stops = l.stops; hit.nv = l.vehicles.length; return hit; }
   const n = l.stops.length;

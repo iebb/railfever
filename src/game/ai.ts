@@ -32,6 +32,7 @@ import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } f
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
 import { networkDaily } from './ai-network';
+import { RailPolicy } from './ai-rail';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1062,7 +1063,7 @@ interface Project {
   joint?: { partner: number; spent: [number, number]; share: number };
 }
 
-interface LineInfo {
+export interface LineInfo {
   /** bus: town buses or long-distance coaches (two towns) */
   kind: 'rail' | 'bus' | 'tram'; towns: number[]; depot: number; maxVehicles: number; opened: number; lastSold?: number;
   /** trains run on this company's network under a track access agreement */
@@ -1126,6 +1127,7 @@ const BUS_MIN_POP = 1500;
  * and acquisitions. Uses only the public construction API. `config` may be changed at any time.
  */
 export class AIController {
+  readonly railPolicy: RailPolicy;
   state: AIState = { phase: 'idle', cooldown: 10, projects: 0 };
   stats: AIStats = {
     railStations: 0, busStops: 0, track: 0, road: 0, bridges: 0, tunnels: 0, lines: 0, vehicles: 0, failed: 0, spent: 0, sold: 0, trams: 0, shared: 0, acquired: 0,
@@ -1168,6 +1170,7 @@ export class AIController {
   };
 
   constructor(public game: Game, public companyId: number, config?: Partial<AIConfig>) {
+    this.railPolicy = new RailPolicy(this);
     this.cfg = normalizeAIConfig(config);
     this.rng = new RNG((game.options.seed * 977 + companyId * 7919) >>> 0);
     this.state.cooldown = Math.round((12 + companyId * 9) / this.config.activeness);
@@ -1259,12 +1262,15 @@ export class AIController {
     if (this.disposed) return;
     this.checkConfig();
     try {
+      this.railPolicy.daily();
       if (this.cooperationReserved()) return;
+      if (this.railPolicy.deepTrouble) this.recoverCash();
       if (this.relengthen.length) this.replaceTrains();
       // a project's work units run spread over the day (see work)
       if (this.job) return;
       // the network it has: stations grown, tracks paired and joined, lines merged or closed (ai-network.ts)
       networkDaily(this);
+      if (this.railPolicy.deepTrouble) { this.state.phase = 'cutting operating costs'; return; }
       // Other construction can remove or isolate a forecourt street. Restore passenger access before
       // investing in another route, with a retry interval when no affordable repair fits.
       for (const st of this.game.stations.map.values()) {
@@ -1361,6 +1367,8 @@ export class AIController {
 
   /** Lines this controller runs (for the UI / tests). */
   managedLines(): number[] { return [...this.lines.keys()]; }
+  railLineInfo(id: number): LineInfo | undefined { return this.lines.get(id); }
+  railNote(text: string) { this.note(text); }
 
   // ---------------------------------------------------------------- choosing projects
   private pairKey(a: number, b: number) { return a < b ? `${a}-${b}` : `${b}-${a}`; }
@@ -1713,6 +1721,13 @@ export class AIController {
   private abandon(p: Project) {
     const g = this.game;
     if (p.kind === 'tram') { this.tram?.cleanup(); return; }
+    // A completed railway survives interrupted works, including the interval before its first train is bought.
+    const live = p.line >= 0 ? g.lines.get(p.line) : undefined;
+    if (live?.kind === 'rail' && new Set(live.stops).size >= 2) {
+      this.adoptLines(true);
+      this.note(`kept ${live.name} after interrupted works`);
+      return;
+    }
     if (p.line >= 0) {
       const l = g.lines.get(p.line);
       if (l) { for (const vid of [...l.vehicles]) g.vehicles.sell(vid); g.lines.delete(l.id); }
@@ -1896,14 +1911,10 @@ export class AIController {
     }
     // still stuck: one train fewer (the newest of ours), and no more than that from now on
     const ours = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train && v.owner === me);
-    if (ours.length > 1) {
-      const t = ours.reduce((a, b) => (b.id > a.id ? b : a));
-      g.vehicles.sell(t.id);
-      this.stats.sold++;
+    if (ours.length > 1 && this.railPolicy.fewer(l, 1, 'fewer trains for congestion')) {
       info.maxVehicles = Math.max(1, Math.min(info.maxVehicles, ours.length - 1));
       info.congestion = 3;
       info.lastSold = g.day;
-      this.note(`${l.name} congested: sold ${t.name}`);
       return true;
     }
     return false;
@@ -2317,6 +2328,14 @@ export class AIController {
       // (only for a company with the money: the station and its tunnel cost several times a ground station)
       if (popOf(ug) < popOf(sp) * 1.3 || (ug.cost - sp.cost) * 3 > this.available()) continue;
       pr = end === 'a' ? { a: ug, b: pr.b } : { a: pr.a, b: ug };
+      // The surface pair's other station faced the outskirts site. Moving this end into the centre can
+      // leave its last approach pointing across a street; choose a surface site facing the new platforms.
+      if (!(end === 'a' ? hubB : hub) && other.level === 'ground') {
+        const town = end === 'a' ? B : A;
+        const aligned = yield* aiStationSiteGen(g, town, ug, { tracks: ST, length: PLATFORM, owner,
+          front: LEAD + 2, back: 20, quick: true, accept: (q) => end === 'a' ? leadsMeet(ug, q, LEAD) : leadsMeet(q, ug, LEAD) });
+        if (aligned && reach(ug, aligned)) pr = end === 'a' ? { a: ug, b: aligned } : { a: aligned, b: ug };
+      }
       underground = true;
       this.note(`${what} ${A.name}-${B.name}: an underground station in central ${T.name}`);
     }
@@ -2352,14 +2371,14 @@ export class AIController {
         const W = this.mergePoint(J, frontA);
         if (!W) continue;
         yield;
-        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, retries: 2, parallel: 3, sliced: true }, AI_ROUTE_WORK);
+        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, gradeMargin: underground ? 0.95 : undefined, retries: 2, parallel: 3, sliced: true }, AI_ROUTE_WORK);
         if (typeof pj !== 'string') { plan = pj; join = { S, J }; break; }
       }
       if (!join && hs) return fail(`no junction into ${S.name}`, 720);
       if (!join) this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`);
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
-    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
+    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, gradeMargin: underground ? 0.95 : undefined, retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
     // (an underground centre station the line cannot reach, or pay for: the railway with stations on the ground)
     const ground = function* (self: AIController, why: string): Generator<void, void> { self.note(`${what} ${A.name}-${B.name}: underground station dropped (${why})`); yield* self.railJob(A, B, hubId, type, false); };
     if (typeof plan === 'string') { if (underground) return yield* ground(this, plan); return fail(plan, plan.startsWith('route runs') ? 720 : 900); }
@@ -2461,7 +2480,7 @@ export class AIController {
     if (join) for (const id of join.J.chain) exclude.add(id);
     const yB = join ? join.J.y : stB.rail.y;
     if (!prof || Math.abs(stA.rail.y - pr.a.y) > 1e-6 || (!join && Math.abs(stB.rail.y - pr.b.y) > 1e-6)) {
-      prof = yield* chainProfileGen(g, [start, ...way], tracks, stA.rail.y, yB, 'rail', exclude, false, undefined, type, 256);
+      prof = yield* chainProfileGen(g, [start, ...way], tracks, stA.rail.y, yB, 'rail', exclude, false, undefined, type, 256, underground ? 0.95 : 0.85);
       if (!prof) return fail('too steep');
       yield;
     }
@@ -4107,17 +4126,47 @@ export class AIController {
   }
 
   // ---------------------------------------------------------------- management
+  /** Six months at the debt ceiling: suspend building and free surplus stock before retiring a service. */
+  private recoverCash() {
+    const g = this.game, e = this.eco;
+    if (this.job && !this.project?.joint) {
+      this.job.return(undefined); if (this.project) this.abandon(this.project);
+      this.job = null; this.project = null;
+      this.note('paused new projects: cash at the loan limit for six months');
+    }
+    const lines = g.lines.all().sort((a, b) => this.railPolicy.lossOrder(a.id, b.id));
+    const surplus = lines.filter((l) => l.kind !== 'rail').flatMap((l) => l.vehicles
+      .map((id) => g.vehicles.get(id)).filter((v) => v?.owner === this.companyId).slice(1))
+      .sort((a, b) => a!.profitLast - b!.profitLast || b!.id - a!.id);
+    for (const v of surplus) {
+      if (e.money >= 0) break;
+      g.vehicles.sell(v!.id); this.stats.sold++;
+      this.note(`sold surplus ${v!.name} during cash recovery`);
+    }
+    for (const l of lines) {
+      if (e.money >= 0) break;
+      if (l.kind !== 'rail' || !this.railPolicy.fleet(l).length) continue;
+      const s = this.railPolicy.account(l);
+      // Shorter consists have had their annual trial; an emergency frequency cut still gets a full year.
+      if (s.step >= 1 && g.day - s.lastCut >= 360 && this.railPolicy.fewer(l, this.railPolicy.surplus(l).length, 'fewer trains during cash recovery')) {
+        s.step = Math.max(2, s.step); s.lastCut = g.day;
+      }
+    }
+  }
+
   /** Take over lines of ours that no project registered (bought companies, older saves). */
-  private adoptLines() {
+  private adoptLines(includeProject = false) {
     const g = this.game, me = this.companyId;
     for (const l of g.lines.map.values()) {
-      if (l.owner !== me || this.lines.has(l.id) || (this.project && this.project.line === l.id)) continue;
+      if (l.owner !== me || this.lines.has(l.id) || (!includeProject && this.project?.line === l.id)) continue;
       const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is NonNullable<typeof v> => !!v);
-      const dep = vs.length ? (vs[0] as Train | RoadVehicle).depotId : -1;
+      const dep = vs.length ? (vs[0] as Train | RoadVehicle).depotId : l.kind === 'rail'
+        ? [...g.depots.map.values()].find((d) => d.owner === me && d.kind === 'rail' && l.stops.some((sid) => depotReaches(g, d, sid)))?.id ?? -1 : -1;
       if (dep === undefined || dep < 0 || !g.depots.get(dep)) continue;
       const towns = [...new Set(l.stops.map((s) => g.stations.get(s)?.townId ?? -1).filter((t) => t >= 0))];
       const kind = l.kind === 'rail' ? 'rail' : l.kind === 'tram' ? 'tram' : 'bus';
-      this.lines.set(l.id, { kind, towns, depot: dep, maxVehicles: kind === 'rail' ? Math.max(1, vs.length) : kind === 'tram' ? Math.max(4, vs.length) : Math.max(5, vs.length), opened: g.day - 360 });
+      this.lines.set(l.id, { kind, towns, depot: dep, maxVehicles: kind === 'rail' ? Math.max(1, vs.length) : kind === 'tram' ? Math.max(4, vs.length) : Math.max(5, vs.length),
+        opened: this.railPolicy.accounts.get(l.id)?.opened ?? (vs.length ? Math.min(...vs.map((v) => v.boughtDay)) : g.day) });
     }
   }
 
@@ -4127,8 +4176,9 @@ export class AIController {
     if (e.money < 500_000) { while (e.money < 1_000_000 && e.borrow()) { /* */ } }
     else if (!this.job && e.money > 3_000_000 * (0.6 + c.risk) && e.loan > 0) { while (e.money > 2_000_000 && e.loan > 0 && e.repay()) { /* */ } }
     this.adoptLines();
+    if (this.railPolicy.deepTrouble) this.recoverCash();
     let grew = false;
-    for (const [lid, info] of [...this.lines]) {
+    for (const [lid, info] of [...this.lines].sort(([a], [b]) => this.railPolicy.lossOrder(a, b))) {
       const l = g.lines.get(lid);
       // (a line merged into another as a service pattern: lines.get follows the redirect to the other line, which is
       // looked after under its own id, if it is ours)
@@ -4146,13 +4196,30 @@ export class AIController {
       const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is NonNullable<typeof v> => !!v && v.owner === this.companyId);
       // a line that lost its stops (track access ended, stations gone): close it (leave it, if it is another's),
       // as we do one we no longer run trains on
-      if (new Set(l.stops).size < 2 || (info.joined && !vs.length && g.day - info.opened > 90)) {
+      if (new Set(l.stops).size < 2 || (info.kind !== 'rail' && info.joined && !vs.length && g.day - info.opened > 90)) {
+        if (info.kind === 'rail') { this.note(`${l.name}: service suspended until its stations are restored`); continue; }
         for (const v of vs) { g.vehicles.sell(v.id); this.stats.sold++; }
         if (info.joined) g.lines.leave(lid, this.companyId); else g.lines.delete(lid);
         this.lines.delete(lid);
         if (info.shared !== undefined) this.removeDepotBranch(info.depot);
         this.note(`${info.joined ? 'left' : 'closed'} ${l.name}`);
         continue;
+      }
+      if (info.kind === 'rail') {
+        const close = this.railPolicy.review(l);
+        if (close && info.joined) {
+          this.railPolicy.event(l, 'closed', 'left after five losing years and staged cuts');
+          for (const v of vs) { g.vehicles.sell(v.id); this.stats.sold++; }
+          g.lines.leave(lid, this.companyId); this.lines.delete(lid);
+          this.note(`left ${l.name}: five consecutive losing years after service cuts`);
+          g.postNews(`${this.name} leaves ${l.name} after five consecutive losing years.`, 'ai');
+          continue;
+        }
+        const account = this.railPolicy.account(l);
+        if (account.step > 0 || this.railPolicy.deepTrouble) {
+          // Allow restoration of a missing minimum service below; no expansion during its annual trial.
+          if (vs.length) continue;
+        }
       }
       // trains stuck on our railways: signals, passing loops, double track, fewer trains (in that order)
       if (info.kind === 'rail' && info.shared === undefined && this.relieveCongestion(l, info)) continue;
@@ -4166,7 +4233,7 @@ export class AIController {
       // rebuilt bigger before more trains are bought (one station a month)
       if (info.kind === 'rail' && info.shared === undefined && !info.joined && !grew && vs.length && this.growLineStations(l)) { grew = true; continue; }
       // a railway still without trains (money ran short when it opened): its first train
-      if (!vs.length && info.kind === 'rail' && info.shared === undefined && g.depots.get(info.depot)) {
+      if (!vs.length && info.kind === 'rail' && g.lines.canOperate(l, this.companyId) && g.depots.get(info.depot)) {
         const sts = l.stops.map((sid) => g.stations.get(sid)).filter((x): x is Station => !!x?.rail);
         const platform = Math.min(...sts.map((x) => x.rail!.length), 99), span = sts.reduce((m, x) => Math.max(m, Math.hypot(x.x - sts[0].x, x.z - sts[0].z)), 0);
         const unit = info.urban ? this.urbanUnit(info.urban, platform) : null;
@@ -4178,8 +4245,8 @@ export class AIController {
         }
         continue;
       }
-      // sell chronically unprofitable vehicles (keep one per line unless money is tight)
-      for (const v of vs) {
+      // Rail service reductions belong to the staged operating-loss policy, even with negative cash.
+      for (const v of info.kind === 'rail' ? [] : vs) {
         if (v.age < 2.5 || v.profitLast >= -0.25 * v.runningCost || v.profitYear > 0) continue;
         if (vs.length > 1 || e.money < 0) { g.vehicles.sell(v.id); this.stats.sold++; info.lastSold = g.day; this.note(`sold ${v.name}`); break; }
       }
@@ -4220,8 +4287,10 @@ export class AIController {
     }
     if (!this.job && g.access.length) this.endUnusedAccess();
     // a town the line passes: a station on the line there (through station; the line stops at it)
-    if (!this.job && this.rng.chance(0.35 * act)) this.addIntermediateStation();
-    this.considerAcquisition();
+    if (!this.railPolicy.deepTrouble) {
+      if (!this.job && this.rng.chance(0.35 * act)) this.addIntermediateStation();
+      this.considerAcquisition();
+    }
   }
 
   /**
@@ -4289,8 +4358,10 @@ export class AIController {
       const cars = ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m);
       const cost = cars.reduce((a, c) => a + c.cost, 0);
       if (cars.length < 2 || this.available() < cost - g.vehicles.resaleValue(t) + 500_000 || !this.borrowFor(cost)) continue;
+      if (this.railPolicy.account(l).step > 0 || this.railPolicy.deepTrouble) continue;
       const nt = g.vehicles.buyTrain(dep, cars, l.id);
       if (typeof nt === 'string') continue;
+      nt.pattern = t.pattern;
       const name = t.name;
       g.vehicles.sell(t.id);
       this.stats.vehicles++; this.stats.sold++;
@@ -4555,6 +4626,7 @@ export class AIController {
         ...this.state, rng: this.rng.state, failed: [...this.failed], stats: this.stats, lines: [...this.lines],
         project: this.project, lastAcq: this.lastAcq, tram, relengthen: this.relengthen, stationCare: [...this.stationCare].sort((x, y) => x[0] - y[0]),
         accessCare: [...this.accessCare].sort((x, y) => x[0] - y[0]),
+        rail: this.railPolicy.save(),
       },
     };
   }
@@ -4569,6 +4641,7 @@ export class AIController {
     if (Array.isArray(s.failed)) this.failed = new Map(s.failed);
     if (s.stats) this.stats = { ...this.stats, ...s.stats };
     if (Array.isArray(s.lines)) this.lines = new Map(s.lines);
+    this.railPolicy.load(s.rail);
     if (typeof s.lastAcq === 'number') this.lastAcq = s.lastAcq;
     if (Array.isArray(s.stationCare)) this.stationCare = new Map(s.stationCare);
     if (Array.isArray(s.accessCare)) this.accessCare = new Map(s.accessCare);

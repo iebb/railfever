@@ -636,16 +636,17 @@ export function routeCurveSpeed(way: OPoint[], type: string, maxSpeed: number): 
  * respects crossings with existing edges (level where possible, else over/under with clearance).
  * Roads cross roads over/under unless `roadJunctions` (country roads meeting at level junctions).
  */
-export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard'): ChainProfile | null {
-  return runGen(chainProfileGen(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type));
+export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', gradeMargin = 0.85): ChainProfile | null {
+  return runGen(chainProfileGen(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, 0, gradeMargin));
 }
 
 /** Identical sampling, crossing order and height solutions, with deterministic optional pauses. */
-export function* chainProfileGen(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', step = 0): Generator<void, ChainProfile | null> {
-  return yield* planningGen('terrain fit', chainProfileWork(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, step));
+export function* chainProfileGen(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', step = 0, gradeMargin = 0.85): Generator<void, ChainProfile | null> {
+  return yield* planningGen('terrain fit', chainProfileWork(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, step, gradeMargin));
 }
 
-function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number>, roadJunctions: boolean, diag: { crossings: P2[] } | undefined, type: string, slice: number): Generator<void, ChainProfile | null> {
+/** gradeMargin: the fraction of the track's legal grade the profile may use (default 0.85; tunnel ramps may use 0.95). */
+function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number>, roadJunctions: boolean, diag: { crossings: P2[] } | undefined, type: string, slice: number, gradeMargin: number): Generator<void, ChainProfile | null> {
   const xs: number[] = [], zs: number[] = [], ss: number[] = [], tr: number[] = [];
   let acc = 0, work = 0;
   // HSR clearances are tight: sample the same circular pieces the builder will use, rather than a Hermite
@@ -684,7 +685,8 @@ function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y
   }
   lo[0] = hi[0] = y0; lo[n - 1] = hi[n - 1] = y1;
   const step = ss.map((v, i) => (i ? v - ss[i - 1] : 0));
-  const grade = (kind === 'rail' ? (TRACK_TYPES[type] ?? TRACK_TYPES.standard).maxGrade : ROAD_TYPES.road.maxGrade) * 0.85;
+  // A tunnel ramp can explicitly use more of the legal grade; the builder still validates every piece.
+  const grade = (kind === 'rail' ? (TRACK_TYPES[type] ?? TRACK_TYPES.standard).maxGrade : ROAD_TYPES.road.maxGrade) * Math.min(1, Math.max(0.5, gradeMargin));
   let y = solveHeights(desired, step, lo, hi, grade);
   if (!y) return null;
   // crossings with existing edges
@@ -724,9 +726,10 @@ function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y
   if (cr.length) {
     type Mode = 'level' | 'over' | 'under';
     const clr = RAIL.clearance + 0.15;
-    const solve = (modes: Mode[]) => {
+    const solve = (modes: (Mode | undefined)[]) => {
       const lo2 = lo.slice(), hi2 = hi.slice();
       cr.forEach((c, j) => {
+        if (!modes[j]) return;
         // a window around the crossing, so segment ends close to it already have the clearance (or,
         // for level crossings, a height from which the crossing height is reachable within the grade)
         for (let k = Math.max(0, c.i - 3); k <= Math.min(n - 1, c.i + 3); k++) {
@@ -757,6 +760,24 @@ function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y
         const r = solve(cb); if (r) { sol = r; modes = cb; break; }
         if (slice && ++solves % 8 === 0) yield;
       }
+    }
+    if (!sol && kind === 'rail' && gradeMargin > 0.85 && cr.length > 6 && cr.length <= 32) {
+      // A city tunnel can need under-crossings near its platforms and level crossings farther up its ramp.
+      // Keep a small beam of feasible partial profiles instead of enumerating 3^N street combinations.
+      let beam: { modes: (Mode | undefined)[]; changes: number; y: number[] }[] = [{ modes: new Array(cr.length), changes: 0, y }];
+      const order = cr.map((_, i) => i).sort((a, b) => cr[a].sc - cr[b].sc || a - b);
+      for (const j of order) {
+        const next: typeof beam = [];
+        for (const b of beam) for (const m of [base[j], ...(['level', 'over', 'under'] as Mode[]).filter((m) => m !== base[j])]) {
+          if (m === 'level' && (!cr[j].levelOk || cr[j].tunnel)) continue;
+          const cb = b.modes.slice(); cb[j] = m;
+          const r = solve(cb);
+          if (r) next.push({ modes: cb, changes: b.changes + Number(m !== base[j]), y: r });
+        }
+        beam = next.sort((a, b) => a.changes - b.changes).slice(0, 8);
+        if (!beam.length) break;
+      }
+      if (beam.length) { sol = beam[0].y; modes = beam[0].modes as Mode[]; }
     }
     if (!sol) { if (diag) diag.crossings = cr.map((c) => ({ x: c.x, z: c.z })); return null; }
     y = sol;
@@ -840,6 +861,8 @@ export interface RouteOpts {
   cell?: number;
   /** Rail type: controls grades and whether level crossings are legal. */
   type?: string;
+  /** Fraction of the track's legal grade used for the profile (default 0.85; tunnel ramps may use 0.95). */
+  gradeMargin?: number;
   /** Legal slower curves within the station approach, rather than the trunk's speed target. */
   approachR?: number; approachLength?: number;
   /** AI-only work slicing; synchronous callers keep their original schedule. */
@@ -886,7 +909,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     }
     yield;
     const diag = { crossings: [] as P2[] };
-    const prof = yield* chainProfileGen(g, fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag, o.type, o.sliced ? 256 : 0);
+    const prof = yield* chainProfileGen(g, fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag, o.type, o.sliced ? 256 : 0, o.gradeMargin);
     if (!prof) {
       why = 'too steep';
       const add = diag.crossings.filter((p) => !nearEnds(p));
