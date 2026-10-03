@@ -514,6 +514,7 @@ export class Vehicles {
     t.name = (dp.owner === 0 ? 'Train ' : g.company(dp.owner).name.split(' ')[0] + ' Train ') + t.id;
     this.map.set(t.id, t);
     if (lineId != null) t.setLine(lineId);
+    if (tl?.kind === 'rail') g.ais.find((a) => a.companyId === dp.owner)?.railPolicy.operating(tl.id, 0);
     return t;
   }
 
