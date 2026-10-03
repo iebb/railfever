@@ -15,7 +15,8 @@ import { Minimap } from './minimap';
 import { computeLinePath } from './linepaths';
 import { Hud } from './hud';
 import { newsDate, fmtCompact } from './format';
-import { audio, Sfx, PlayOpts } from '../audio/engine';
+import { audio, cashPitch, Sfx, PlayOpts } from '../audio/engine';
+import { fmtMoney } from '../game/economy';
 import { UiTips } from './tips';
 import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
@@ -77,6 +78,8 @@ export class UI {
   /** left column holding the checklist, the map view card and the minimap */
   leftCol!: HTMLDivElement;
   private lastDebug: boolean | null = null;
+  private compactPanels = false;
+  private restoreMinimap = false;
 
   constructor(public root: HTMLElement, public renderer: Renderer, public app: AppHooks) {
     this.loadPrefs();
@@ -88,7 +91,7 @@ export class UI {
     this.hoverCard = new HoverCard(this);
     this.checklist = new Checklist(this);
     this.mapModes = new MapModes(this);
-    this.mapModes.onChange = () => { this.linePathSig.clear(); this.marksSig = ''; this.hud.syncMapButtons(); this.checklist.setAutoCollapse(this.mapModes.mode !== 'none'); };
+    this.mapModes.onChange = () => { this.linePathSig.clear(); this.marksSig = ''; this.hud.syncMapButtons(); this.syncCompactPanels(); };
     // left column: checklist, map view card and minimap flow top to bottom without overlapping
     this.leftCol = h('div', { class: 'leftcol' });
     root.appendChild(this.leftCol);
@@ -98,6 +101,7 @@ export class UI {
     this.floatLayer = h('div', { class: 'floats' });
     root.appendChild(this.floatLayer);
     window.addEventListener('keydown', this.onKey);
+    window.addEventListener('resize', () => this.syncCompactPanels());
     // generic UI sounds: clicks on controls and switch toggles (specific actions play their own sound)
     root.addEventListener('click', (e) => {
       // Pointer activation must not retain keyboard focus and swallow the next shortcut.
@@ -170,6 +174,17 @@ export class UI {
     this.sound(sp === 0 ? 'pause' : 'speed', { pitch: sp === 0 ? (this.game.paused ? 0.8 : 1.2) : 0.85 + sp * 0.05 });
   }
 
+  /** Free map space while a tool is open; restore the player's minimap choice afterwards. */
+  syncCompactPanels() {
+    if (!this.tools || !this.minimap || !this.checklist) return;
+    const compact = window.innerWidth < 1280 && (window.innerHeight <= 768 || window.innerWidth <= 720) && this.tools.tool !== 'inspect';
+    this.checklist.setAutoCollapse(this.mapModes.mode !== 'none' || compact);
+    if (compact === this.compactPanels) return;
+    this.compactPanels = compact;
+    if (compact) { this.restoreMinimap = this.minimap.visible; if (this.minimap.visible) this.minimap.toggle(); }
+    else if (this.restoreMinimap && !this.minimap.visible) this.minimap.toggle();
+  }
+
   private onKey = (e: KeyboardEvent) => {
     if (!this.game || this.titleOpen) return;
     const k = e.key;
@@ -188,6 +203,13 @@ export class UI {
     if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
     if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
+    if (k === ',' || k === '.') {
+      e.preventDefault();
+      const speeds = [1, 2, 4, 8];
+      const index = Math.max(0, speeds.indexOf(this.game.speed));
+      this.setSpeed(speeds[Math.max(0, Math.min(speeds.length - 1, index + (k === '.' ? 1 : -1)))]);
+      return;
+    }
     if ((k === 'r' || k === 'R') && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
       T.rotate(e.shiftKey ? -1 : 1);
       this.hud.onToolChange();
@@ -205,6 +227,7 @@ export class UI {
     else if (lk === 't') this.openTowns();
     else if (lk === 'c') this.openCompetitors();
     else if (lk === 'k') this.openTrackAccess();
+    else if (lk === 'i') this.openFinances();
     else if (lk === 'n') this.hud.toggleNews();
     else if (lk === 'm') this.mapModes.toggle('lines');
     else if (lk === 'h') this.minimap.toggle();
@@ -244,7 +267,7 @@ export class UI {
     }
     if (this.floats.length) this.updateFloats(dt);
     const dbg = !!(this.renderer.settings as unknown as { debug?: boolean }).debug;
-    if (dbg !== this.lastDebug) { this.lastDebug = dbg; this.leftCol.classList.toggle('below-debug', dbg); }
+    if (dbg !== this.lastDebug) { this.lastDebug = dbg; this.leftCol.classList.toggle('below-debug', dbg); this.root.classList.toggle('debug-ui', dbg); }
     this.minimap.update(dt);
     this.hoverCard.update(dt);
     this.checklist.update(dt);
@@ -384,7 +407,9 @@ export class UI {
 
   toast(msg: string, kind: 'info' | 'good' | 'bad' = 'info') {
     const el = h('div', { class: 'toast ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg));
-    this.pushToast(el, 3200);
+    const finance = this.needsMoney(msg);
+    if (finance) { el.classList.add('finance-toast'); el.append(this.financeActions(() => el.remove())); }
+    this.pushToast(el, finance ? 12000 : 3200);
     if (kind === 'bad') this.sound('error');
   }
 
@@ -393,9 +418,33 @@ export class UI {
     const game = this.game;
     const el = h('div', { class: 'toast link ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg),
       h('button', { class: 'btn sm toast-btn', onclick: (e: Event) => { e.stopPropagation(); el.remove(); if (this.game === game) fn(); } }, label));
+    if (this.needsMoney(msg)) { el.classList.add('finance-toast'); el.append(this.financeActions(() => el.remove())); }
     this.pushToast(el, 9000);
     if (kind === 'bad') this.sound('error');
   }
+
+  needsMoney(msg: string) { return /not enough money|can(?:not|'t) afford/i.test(msg); }
+
+  /** One loan step, using the same limit and operation as the Finances window. */
+  borrowLoan(): boolean {
+    const e = this.game.economy;
+    if (!e.borrow()) { this.toast('Maximum loan reached', 'bad'); return false; }
+    this.sound('cash', { pitch: cashPitch(e.loanStep) });
+    this.tools.refreshHover();
+    this.wm.refreshAll();
+    this.toast(`Borrowed ${fmtMoney(e.loanStep)}`, 'good');
+    return true;
+  }
+
+  financeActions(onAction: () => void = () => {}): HTMLDivElement {
+    const game = this.game, e = game.economy;
+    return h('div', { class: 'finance-actions inline wrap' },
+      h('button', { class: 'btn sm', disabled: e.loan + e.loanStep > e.maxLoan, 'data-sfx': 'none', 'data-tip': e.loan + e.loanStep > e.maxLoan ? 'Maximum loan reached' : undefined,
+        onclick: (event: Event) => { event.stopPropagation(); if (this.game === game && this.borrowLoan()) onAction(); } }, `Borrow ${fmtMoney(e.loanStep)}`),
+      h('button', { class: 'btn sm', onclick: (event: Event) => { event.stopPropagation(); if (this.game === game) { this.openFinances(); onAction(); } } }, 'Open finances'));
+  }
+
+  isDebtNews(n: News) { return n.text.startsWith('Warning: your company is in debt.'); }
 
   private pushToast(el: HTMLElement, ms: number) {
     this.toastBox.appendChild(el);
@@ -406,6 +455,14 @@ export class UI {
 
   private onNews(n: News) {
     this.hud.onNews(n);
+    if (this.isDebtNews(n)) {
+      if (!this.titleOpen) this.sound('notify', { volume: 0.35 });
+      const game = this.game;
+      const el = h('button', { class: 'toast news info link', 'data-sfx': 'none', onclick: () => { if (this.game === game) this.openFinances(); } },
+        h('span', { class: 'news-date' }, newsDate(game, n)), h('span', null, n.text), h('b', { class: 'toast-act' }, 'Open finances'));
+      this.pushToast(el, 9000);
+      return;
+    }
     // requests for access to the player's network: always shown, click to review
     const request = n.text.includes('requests access to your tracks');
     if (request) {
@@ -507,7 +564,7 @@ export class UI {
   addStopToLine(lineId: number, stationId: number) { lines.addStopToLine(this, lineId, stationId); }
   openVehicles() { lines.openVehicles(this); }
   openTowns() { lines.openTowns(this); }
-  openFinances() { company.openFinances(this); }
+  openFinances() { this.checklist.financesSeen(); company.openFinances(this); }
   openCompetitors() { company.openCompetitors(this); }
   openTrackAccess() { access.openTrackAccess(this); }
   /** Auto-signal a line, a stretch of track or (no argument) all of the player's railway, with a preview. */

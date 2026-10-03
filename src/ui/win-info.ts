@@ -707,8 +707,11 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   const meta = KIND_META[kind];
   const win = ui.wm.open('buy-' + kind + '-' + (depotId ?? 'line'), rail ? 'Train composer' : `Buy ${meta.vehicle}`, { width: 470, icon: meta.icon, color: meta.color, sub: depotId != null ? depotTitle(kind) : 'For a line', cls: 'purchase-info' });
   const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon'), emus = availableModels(year, 'emu'), buses = availableModels(year, kind === 'tram' ? 'tram' : 'bus');
-  const initialLine = lineId != null ? g.lines.get(lineId) : null;
   const initialDepot = depotId != null ? g.depots.get(depotId) : null;
+  const reachableLines = lineId == null && initialDepot?.owner === PLAYER
+    ? g.lines.all().filter((line) => line.kind === kind && g.lines.canOperate(line, PLAYER) && line.stops.length >= 2 &&
+      (rail ? depotServes(g, initialDepot, line.stops[0], line.stops[1]) >= 0 : roadDepotReaches(g, initialDepot, line.stops[0]))) : [];
+  const initialLine = lineId != null ? g.lines.get(lineId) : reachableLines.length === 1 ? reachableLines[0] : null;
   const exit = initialDepot ? g.world.net.nodes.get(initialDepot.node)?.edges.map((id) => g.world.net.edges.get(id)).find((e) => e?.kind === 'rail' && e.depot < 0) : null;
   const trackType = initialLine?.stops.map((id) => g.stations.get(id)?.rail?.trackType).find(Boolean) ?? exit?.type;
   const units = emus.filter((m) => !trackType || modelTracks(m).includes(trackType));
@@ -821,6 +824,8 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
       dp && state.depot == null ? h('div', { class: 'muted station-advice' }, `Selected automatically: ${depotTitle(dp.kind)} ${dp.id}`) : null,
       compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
       opError || !dp ? h('div', { class: 'warn' }, icon('warning', 16), opError ?? `No ${depotTitle(kind).toLowerCase()} ${line ? 'connected to this line for the selected model' : 'available'}. Build one or choose another depot.`) : null,
+      !g.economy.canAfford(cost) ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' },
+        h('b', null, `Not enough money: ${fmtMoney(cost)} needed, ${fmtMoney(g.economy.money)} available`), ui.financeActions(render))) : null,
       h('div', { class: 'btns right' }, h('button', { class: 'btn primary', disabled: !cars.length || !dp || !!opError || dp.owner !== PLAYER || !g.economy.canAfford(cost), 'data-sfx': 'none', onclick: () => buy() }, icon('plus', 16), `Buy for ${fmtMoney(cost)}`)),
     );
     if (depotId != null && g.depots.get(depotId)?.owner === PLAYER) {

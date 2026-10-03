@@ -953,7 +953,7 @@ export class Game {
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     this.lines.catchmentDirty = true;
     this.deferCatchment = true;
-    if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');
+    if (this.economy.money < 0 && m % 3 === 2) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'info');
   }
 
   private onNewYear() {
