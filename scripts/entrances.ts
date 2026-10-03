@@ -14,7 +14,8 @@ import {
   planStationUpgrade, commitStationUpgrade, railWidth,
 } from '../src/game/stations';
 import type { Station, EntranceKind } from '../src/game/stations';
-import { walkingCatchment, walkingCatchmentWithout, walkingPopulation } from '../src/game/catchment';
+import { walkingCatchment, walkingCatchmentWithout, walkingPopulation, entrancePlanCatchment } from '../src/game/catchment';
+import { stationCrossings } from '../src/game/station-styles';
 import { runNetworkTask } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
@@ -128,8 +129,8 @@ function fixture(owner = 0) {
   check(!clash, `entrances clear of tracks, roads, the building and each other (${clash ?? 'clear'})`);
 
   // collisions: a house where the entrance would stand, an underground kind at a ground station
-  const blocker = house(g, 94, 94.6, 0, 5);
-  const blocked = g.stations.planEntrance(S.id, 94, 94.6, 0, 'underpass');
+  const blocker = house(g, 97.5, 94.6, 0, 5);
+  const blocked = g.stations.planEntrance(S.id, 97.5, 94.6, 0, 'underpass');
   check(!blocked.ok && /Building/.test(blocked.error ?? ''), `a house in the way blocks the site (${blocked.error})`);
   g.world.removeBuilding(blocker.id);
   check(!g.stations.planEntrance(S.id, 92.5, 94.6, 0, 'pavilion').ok, 'street pavilions are for stations below or above the street');
@@ -210,6 +211,58 @@ function fixture(owner = 0) {
   check(OU.catchPop === U.catchPop && OU.catchPop > 0, `old save: the same walking catchment (${OU.catchPop.toFixed(0)})`);
 }
 
+// ------------------------------------------------------------------------------------------ the station's own crossings
+{
+  console.log('ground station: added entrances keep clear of the station\u2019s own footbridge and stairs');
+  // a six-track classic station (three island platforms: its own underpass stairs and footbridge), a street beside
+  // the tracks on the north side, the building's street on the south
+  const g = flatGame(192, 3), road = streets(g);
+  const width = railWidth({ tracks: 6, through: 0, trackOffsets: [], platforms: [], throughOffsets: [] } as never);
+  road(40, 96 + width / 2 + 2.8, 150, 96 + width / 2 + 2.8);
+  const S = station(g, 96, 96, Math.PI / 2, 12, 6, 0)!;
+  const r = S.rail!;
+  road(40, 96 - (r.width / 2 + 1.3), 150, 96 - (r.width / 2 + 1.3));
+  const own = stationCrossings(r);
+  check(r.platforms.length === 3 && own.footbridge !== null && own.stairs.length === 3, `fixture: 120 m, 3 platforms, its own footbridge at ${own.footbridge?.toFixed(2)} and stairs (${own.stairs.map((q) => q.along.toFixed(2)).join(', ')})`);
+  const north = (a: number) => ({ x: 96 + a, z: 96 - (r.width / 2 + 0.6) });
+  const over = g.stations.planEntrance(S.id, north(own.footbridge!).x, north(own.footbridge!).z, 0, 'footbridge');
+  check(!over.ok && /own footbridge/.test(over.error ?? ''), `no added footbridge over the station's own (${over.error ?? 'accepted'})`);
+  const onStairs = g.stations.planEntrance(S.id, north(own.stairs[0].along).x, north(own.stairs[0].along).z, 0, 'underpass');
+  check(!onStairs.ok && /own stairs/.test(onStairs.error ?? ''), `no added underpass on the station's own stairs (${onStairs.error ?? 'accepted'})`);
+  // lengthening moves the station's own footbridge: an added one beside it moves on (or goes), never over it
+  const g2 = flatGame(192, 3), road2 = streets(g2);
+  road2(40, 96 + width / 2 + 2.8, 150, 96 + width / 2 + 2.8);
+  const S2 = station(g2, 96, 96, Math.PI / 2, 10, 6, 0)!;
+  road2(40, 96 - (S2.rail!.width / 2 + 1.3), 150, 96 - (S2.rail!.width / 2 + 1.3));
+  const before = stationCrossings(S2.rail!).footbridge!;
+  const fb = g2.stations.planEntrance(S2.id, 96 + 4.2, 96 - (S2.rail!.width / 2 + 0.6), 0, 'footbridge');
+  check(fb.ok && !g2.stations.commitEntrance(S2.id, fb, 0), `100 m: a footbridge at 42 m along, clear of the station's own at ${(before * 10).toFixed(0)} m (${fb.error ?? 'built'})`);
+  const up = planStationUpgrade(g2, S2.id, { length: 12 });
+  check(up.ok && !commitStationUpgrade(g2, up), `lengthened to 120 m (${up.error ?? 'ok'})`);
+  const r2 = g2.stations.get(S2.id)!.rail!, after = stationCrossings(r2).footbridge!;
+  const clashes = r2.entrances.filter((e) => { const x = entranceAlong(r2, e); return x + 0.75 + 0.1 > after - 0.15 && x - 0.75 - 0.1 < after + 0.45; });
+  check(r2.entrances.length === 1 && !clashes.length, `after lengthening its footbridge stays clear of the station's own (now at ${(after * 10).toFixed(0)} m; added one at ${r2.entrances.map((e) => (entranceAlong(r2, e) * 10).toFixed(0)).join(', ')} m)`);
+}
+
+// ------------------------------------------------------------------------------------------ the station's own hall at street level
+{
+  console.log('below / above the street: an added entrance never stands on the station\u2019s own hall');
+  // (the street right beside the hall: a pavilion on its sidewalk there would stand on the hall)
+  const g = flatGame(192, 3), road = streets(g);
+  road(40, 99.5, 150, 99.5);
+  const U = station(g, 96, 96, Math.PI / 2, 12, 2, 0, { trackType: 'metro', style: 'classic' })!;
+  const r = U.rail!;
+  check(r.level === 'underground' && r.style === 'classic' && !!r.forecourt, `fixture: an underground station with a hall at street level (${r.style}, forecourt ${!!r.forecourt})`);
+  const hall = r.building;
+  const onHall = g.stations.planEntrance(U.id, hall.x, 99.5 - 0.9, 0);
+  check(!onHall.ok && /hall/.test(onHall.error ?? ''), `no pavilion on or in front of its own hall (${onHall.error ?? 'accepted'})`);
+  const clear = [...r.entrances, hall].reduce((x, q) => Math.max(x, q.x), 0) + 6;
+  const away = g.stations.planEntrance(U.id, clear, 99.5 - 0.9, 0);
+  check(away.ok, `a pavilion further along the street is fine (${away.error ?? 'ok'})`);
+  const built = r.entrances.every((e) => !rectsOverlap({ x: e.x, z: e.z, angle: e.angle, w: 0.7, d: 1.1 }, hall, 0));
+  check(built, 'the entrances planned with it keep clear of its hall');
+}
+
 // ------------------------------------------------------------------------------------------ AI (fixture)
 function aiFixture() {
   const g = Game.create({ size: 192, seed: 5, towns: 0, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 1 });
@@ -265,6 +318,61 @@ const stat = (ai: AIController, k: string) => (ai.stats as unknown as Record<str
   flush(g2);
   runNetworkTask(ai2, 'capacity');
   check(stat(ai2, 'netEntrances') === 0 && H2.rail!.entrances.length === 0, 'no residents across the tracks: the AI adds no entrance');
+}
+
+// ------------------------------------------------------------------------------------------ AI: access streets through houses
+/**
+ * The AI fixture with the north street away from the tracks (an entrance there needs an access street) and a house
+ * standing where the cheapest one, a gate at the east platform end, would run its street; `others` more houses on the
+ * north street beyond it.
+ */
+function streetThroughHouse(blockPop: number, others: number) {
+  const g = Game.create({ size: 192, seed: 5, towns: 0, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 1 });
+  const w = g.world;
+  for (let z = 0; z <= w.size; z++) for (let x = 0; x <= w.size; x++) w.h[w.vi(x, z)] = 3;
+  for (let i = 0; i < w.trees.length; i++) if (w.trees[i]) w.removeTreesNear(w.trees[i]!.x, w.trees[i]!.z, 0.1);
+  for (const id of [...w.buildings.keys()]) w.removeBuilding(id);
+  g.aiAcquisitions = false;
+  const ai = g.ais[0], me = ai.companyId;
+  g.company(me).economy.money = 200_000_000;
+  ai.state.cooldown = 1e9;
+  const road = streets(g);
+  road(30, 99.2, 150, 99.2); road(30, 89, 150, 89);
+  for (let x = 74; x <= 118; x += 4) house(g, x, 100.6, Math.PI, 30);
+  const H = station(g, 96, 96, Math.PI / 2, 10, 2, me)!, B = station(g, 160, 96, Math.PI / 2, 10, 2, me)!;
+  build(g, nodeSnap(g, endNode(g, H, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'H-B');
+  const l = g.lines.create('rail', me);
+  l.stops = [H.id, B.id];
+  g.lines.rebuild();
+  const dep = depotFor(g, B, H, me);
+  const train = dep >= 0 ? g.vehicles.buyTrain(dep, loco(), l.id) : 'no depot';
+  check(typeof train !== 'string', `street fixture: a train on the line (${typeof train === 'string' ? train : 'ok'})`);
+  const gate = g.stations.planEntrance(H.id, 96 + 4.5, 94.5, me, 'gate', { street: false });
+  const blocker = house(g, gate.door?.x ?? 100.5, 91.2, Math.PI, blockPop);
+  for (let i = 0; i < others; i++) house(g, 104 + i * 3, 87.4, 0, 60);
+  flush(g);
+  return { g, ai, me, H, blocker };
+}
+{
+  console.log('AI: residents an access street demolishes are no gain, and are compensated');
+  const { g, ai, me, H, blocker } = streetThroughHouse(80, 0);
+  const plan = g.stations.planEntrance(H.id, 96 + 4.5, 94.5, me, 'gate');
+  check(plan.ok && !!plan.access?.demolish.includes(blocker.id), `fixture: the gate's street runs through the house (${plan.error ?? `demolishes ${plan.access?.demolish.length}`})`);
+  check(!entrancePlanCatchment(g, H, plan).buildings.has(blocker.id), 'the forecast (AI and tool preview) leaves the demolished house out');
+  const money = g.company(me).economy.money;
+  runNetworkTask(ai, 'capacity');
+  check(stat(ai, 'netEntrances') === 0 && g.world.buildings.has(blocker.id) && H.rail!.entrances.length === 0,
+    `no entrance whose only new residents its own street demolishes (${H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; spent ${Math.round(money - g.company(me).economy.money)})`);
+  // with residents beyond it, the AI builds and pays compensation for the house it demolishes
+  const b = streetThroughHouse(10, 5);
+  const spends: [number, string, boolean][] = [];
+  const eco = b.g.company(b.me).economy, spend = eco.spend.bind(eco);
+  eco.spend = (x, cat, force = false) => { spends.push([x, cat, force]); return spend(x, cat, force); };
+  runNetworkTask(b.ai, 'capacity');
+  eco.spend = spend;
+  const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - (3000 + 10 * 1250)) < 1e-6);
+  check(stat(b.ai, 'netEntrances') === 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
+    `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);
 }
 
 // ------------------------------------------------------------------------------------------ AI (seeded world)

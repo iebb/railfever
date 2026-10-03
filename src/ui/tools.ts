@@ -1461,6 +1461,9 @@ export class Tools {
     }
     ov.setFootprints(rects);
     ov.setProposal(pl.access ?? null);
+    const gone = pl.ok ? pl.access?.demolish ?? [] : [];
+    ov.setDemolish(gone.length ? gone : null);
+    // (the forecast leaves out the buildings its access street demolishes)
     const walk = pl.ok ? entrancePlanCatchment(g, st, pl) : null;
     drawCatchStreets(ov, 'hover', walk);
     const cm = catchModeOf(railModeOf(r.trackType)), R = catchWalkLimit(cm, catchBonusOf(r.style));
@@ -1473,7 +1476,9 @@ export class Tools {
     if (pl.ok && pl.landings.length > 1) rows.push(['walk', `Stairs on both sides of the tracks · ${pl.landings.filter((q) => q.road).length === 2 ? 'streets on both' : 'a street on one'}`]);
     if (pl.access) rows.push(['road', `Access street ${fmtLen(pl.access.stats.len)} · ${fmtMoney(pl.access.cost)} (included)`]);
     if (pl.ok) rows.push(['coin', `Upkeep ${fmtMoney(T.upkeep)} a year`]);
-    this.tip({ title: `${T.name} · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: pl.ok ? pl.warnings : [], hint: ground ? 'Click beside the tracks to build · Esc when done' : 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
+    const warn = pl.ok ? [...pl.warnings] : [];
+    if (gone.length) warn.push(`Its access street demolishes ${plural(gone.length, 'building')} (${gone.reduce((n, id) => n + (g.world.buildings.get(id)?.pop ?? 0), 0).toLocaleString('en-US')} residents)`);
+    this.tip({ title: `${T.name} · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn, hint: ground ? 'Click beside the tracks to build · Esc when done' : 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
   }
 
   /** Object under a ground point (stations first, then depots, network, buildings, towns). */

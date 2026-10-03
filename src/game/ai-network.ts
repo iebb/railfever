@@ -1981,6 +1981,16 @@ class NetPlanner {
       return pop;
     };
     const gain = (pop: number, kind: EntranceKind, outlay: number) => (pop * perRes - ENTRANCE_TYPES[kind].upkeep) * years - outlay;
+    /** residents of the station lost with the buildings an access street demolishes (they are no forecast gain either) */
+    const lost = (ids: number[]) => {
+      let pop = 0;
+      for (const id of [...ids].sort((a, b) => a - b)) {
+        const b = g.world.buildings.get(id);
+        if (!b || !covered.has(id)) continue;
+        pop += b.pop / (1 + g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length);
+      }
+      return pop;
+    };
     let best: { spot: { kind?: EntranceKind; x: number; z: number }; plan: EntrancePlan; gain: number; pop: number } | null = null;
     const seen = new Set<string>();
     for (const spot of this.entranceSpots(st)) {
@@ -2008,14 +2018,17 @@ class NetPlanner {
       // planned in full with its access street, and valued again
       plan = g.stations.planEntrance(st.id, best.spot.x, best.spot.z, this.me, best.spot.kind);
       if (!plan.ok || (plan.access && !this.safeRoadPlan(plan.access))) { this.considered('ent.street'); return false; }
-      pop = newly(entrancePlanCatchment(g, st, plan));
+      // (the forecast leaves out what its street demolishes; residents the station reaches there are lost)
+      pop = newly(entrancePlanCatchment(g, st, plan)) - lost(plan.access?.demolish ?? []);
       const outlay = plan.access ? plan.cost - plan.access.cost + this.roadOutlay(plan.access) : plan.cost;
       if (gain(pop, plan.kind, outlay) <= 0) { this.considered('ent.street'); return false; }
     }
     if (!this.canSpend(plan.cost, 0.15)) { this.considered('ent.funds'); return false; }
     const dem = plan.access ? [...plan.access.demolish] : [];
+    // their residents before they go (building the entrance demolishes them: compensation reads these)
+    const residents = dem.map((id) => g.world.buildings.get(id)).filter((b): b is NonNullable<typeof b> => !!b).map((b) => ({ townId: b.townId, pop: b.pop }));
     if (g.stations.commitEntrance(st.id, plan, this.me)) return false;
-    this.compensate(dem);
+    this.compensate(dem, residents);
     this.bump('netEntrances');
     this.careFor('sty' + st.id, 360);
     this.note(`${st.name}: ${ENTRANCE_TYPES[plan.kind].name.toLowerCase()} (${Math.round(pop)} residents newly within walking reach)`);

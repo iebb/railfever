@@ -12,7 +12,7 @@ import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
 import { growThroat, throatFree, holdThroat, releaseHold } from './trackops';
 import { autoSignalLine } from './signals';
-import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
+import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, type WalkingCatchment } from './catchment';
@@ -128,6 +128,12 @@ export const ENTRANCE_TYPES: Record<EntranceKind, EntranceType> = {
 };
 /** Ground entrances: the gap between the track area and an entrance, and the least room between two of them along the platforms. */
 const ENTRANCE_GAP = 0.15, ENTRANCE_SPACING = 1.0;
+/**
+ * Along the platforms, how far a crossing's structures reach either side of where its stairs meet them: an added
+ * footbridge's deck and the stair enclosures beside it, other entrances' stair wells; the station's own footbridge
+ * (deck and stair blocks, from `own.footbridge` - 0.15 to + 0.45) and underpass stairs; and the least gap between two.
+ */
+const CROSSING_HALF = { footbridge: 0.75, stairs: 0.3, ownStairs: 0.25 }, CROSSING_GAP = 0.1;
 /** A ground entrance's stairs keep this far inside the platform ends; a gate's stairs lie this far in from its end. */
 const ENTRANCE_END = 0.7, GATE_STAIRS = 0.75;
 /** An access street ends this far in front of an entrance's street side (within the landing's road reach)... */
@@ -976,7 +982,10 @@ export class Stations {
         for (const q of roadPts) if (q.lon * end > length / 2 + bs.d) d = Math.min(d, Math.hypot(q.x - fc.x, q.z - fc.z));
         return d;
       };
-      const conflict = (r: Rect, h: number, dem: Set<number>) => this.rectConflict(r, y0 - 0.2, y0 + h, dem, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      // (below / above the street: never over the entrances planned beside it)
+      const keep = level === 'ground' ? [] : plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: ENTRANCE_SIZE[level].w, d: ENTRANCE_SIZE[level].d }));
+      const conflict = (r: Rect, h: number, dem: Set<number>) => keep.some((q) => rectsOverlap(r, q, 0.1)) ? 'Entrance in the way'
+        : this.rectConflict(r, y0 - 0.2, y0 + h, dem, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
       /** a site over one of the station's own entrances (rebuilding in place) only when nothing else fits */
       const over = (r: Rect) => (opts.avoid?.some((q) => rectsOverlap(r, q, 0.1)) ? 1000 : 0);
       const popOf = (dem: Set<number>) => { let p = 0; for (const id of dem) p += w.buildings.get(id)?.pop ?? 0; return p; };
@@ -1564,10 +1573,27 @@ export class Stations {
     const fp = this.platformRect(st)!;
     if (distToRect(ex, ez, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) > ENTRANCE_REACH) return none(`Too far from the platforms (max ${ENTRANCE_REACH * 10} m)`, k);
     if (r.entrances.some((q) => Math.hypot(q.x - ex, q.z - ez) < 3)) return none('Another entrance is too close', k);
+    // the station's own street-level structures first (entranceFree ignores the station): its hall, its forecourt,
+    // its entrances and an elevated deck's piers
+    const own = this.ownStreetError(st, { x: ex, z: ez, angle: ang, w: sz.w, d: sz.d });
+    if (own) return none(own, k);
     const dem = this.entranceFree(lv, ex, ez, ang, fp, ne.edge.id, st.id);
     if (!dem || dem.length) return none('Something is in the way', k);
     const cost = entranceCost(k, r);
     return { ok: true, warnings: [], kind: k, entrance: { x: ex, z: ez, angle: ang, kind: k, cost }, cost, access: null, landings: [{ x: ex, z: ez, angle: ang, road: true }] };
+  }
+
+  /** Why a structure at street level would stand on a station's own hall, forecourt, entrance or viaduct pier (null: clear). */
+  private ownStreetError(st: Station, rect: Rect): string | null {
+    const r = st.rail!;
+    for (const f of this.structures(st)) {
+      if ((f.part === 'building' || f.part === 'entrance' || f.part === 'pier') && rectsOverlap(rect, f, 0.1))
+        return f.part === 'building' ? 'The station hall is in the way' : f.part === 'pier' ? 'A viaduct pier is in the way' : 'Another entrance is in the way';
+    }
+    if (styleOf(r.style).placement !== 'none') for (const f of [r.forecourt, r.forecourt2]) {
+      if (f && distToRect(f.x, f.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < 0.6) return 'In front of the station hall';
+    }
+    return null;
   }
 
   /** A ground station's entrance (see planEntrance). */
@@ -1614,10 +1640,22 @@ export class Stations {
     return { along, near: site(side), far: site(-side) };
   }
 
-  /** Ground stations: why an entrance with its stairs at `along` would clash with another's or the concourse (null: it fits). */
+  /**
+   * Ground stations: why an entrance with its stairs at `along` would clash with another crossing: added entrances,
+   * the station's own footbridge and underpass stairs (station-styles.ts stationCrossings, as drawn), a concourse or a
+   * train shed (null: it fits).
+   */
   private stairsError(r: RailPart, kind: EntranceKind, along: number): string | null {
     const a = kind === 'gate' ? (along >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - GATE_STAIRS) : along;
-    for (const e of r.entrances) if (Math.abs(entranceAlong(r, e) - a) < ENTRANCE_SPACING) return 'Too close to the stairs of another entrance';
+    const half = kind === 'footbridge' ? CROSSING_HALF.footbridge : CROSSING_HALF.stairs;
+    const clash = (lo: number, hi: number) => a + half + CROSSING_GAP > lo && a - half - CROSSING_GAP < hi;
+    for (const e of r.entrances) {
+      const x = entranceAlong(r, e), h = entranceKind('ground', e) === 'footbridge' ? CROSSING_HALF.footbridge : CROSSING_HALF.stairs;
+      if (Math.abs(x - a) < ENTRANCE_SPACING || clash(x - h, x + h)) return 'Too close to the stairs of another entrance';
+    }
+    const own = stationCrossings(r);
+    if (own.footbridge !== null && clash(own.footbridge - 0.15, own.footbridge + 0.45)) return 'The station\u2019s own footbridge is in the way';
+    for (const q of own.stairs) if (clash(q.along - CROSSING_HALF.ownStairs, q.along + CROSSING_HALF.ownStairs)) return 'Too close to the station\u2019s own stairs';
     const pl = styleOf(r.style).placement, b = r.building, a0 = (b.x - r.x) * Math.sin(r.angle) + (b.z - r.z) * Math.cos(r.angle);
     if (pl === 'over' && Math.abs(a - a0) < b.w / 2 + 0.5) return 'The concourse is in the way';
     // a terminal's train shed covers the platforms from its head building (as build-stations.ts draws it)
@@ -1659,11 +1697,15 @@ export class Stations {
     for (const e of old) {
       const k = entranceKind('ground', e);
       if (!GROUND_ENTRANCES.includes(k)) { lost++; continue; }
-      const lon = (e.x - r.x) * Math.sin(r.angle) + (e.z - r.z) * Math.cos(r.angle);
-      const { along, near, far } = this.groundSites(r, k, entranceSide(r, e), lon);
-      const fail = this.stairsError(r, k, along) ?? this.landingError(st, k, near);
-      if (fail) { lost++; if (typeof r.cost === 'number') r.cost = Math.max(0, r.cost - (e.cost ?? 0)); continue; }
-      const both = !!e.far && !this.landingError(st, k, far);
+      const lon = (e.x - r.x) * Math.sin(r.angle) + (e.z - r.z) * Math.cos(r.angle), side = entranceSide(r, e);
+      // where it stood, else a little along the platforms (the station's own crossings may have moved with it)
+      let fit: ReturnType<Stations['groundSites']> | null = null;
+      for (const shift of k === 'gate' ? [0] : [0, 0.5, -0.5, 1, -1, 1.5, -1.5]) {
+        const sites = this.groundSites(r, k, side, lon + shift);
+        if (!this.stairsError(r, k, sites.along) && !this.landingError(st, k, sites.near)) { fit = sites; break; }
+      }
+      if (!fit) { lost++; if (typeof r.cost === 'number') r.cost = Math.max(0, r.cost - (e.cost ?? 0)); continue; }
+      const { near, far } = fit, both = !!e.far && !this.landingError(st, k, far);
       r.entrances.push({ x: near.x, z: near.z, angle: near.angle, kind: k, ...(both ? { far } : {}), ...(e.cost !== undefined ? { cost: e.cost } : {}) });
     }
     return lost;
@@ -2708,9 +2750,13 @@ export class Stations {
     if (level !== 'ground' && L2 === r.length && T2 === r.tracks && Th2 === Th0 && style !== styleOf(r.style).id) {
       // a new building at street level for a station below or above the street (tracks and entrances stay)
       const ign = new Set<number>([...r.edges, ...r.throughEdges, ...ends.flatMap((t) => [...t[0].approach, ...t[1].approach])]);
-      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style });
+      const sz = ENTRANCE_SIZE[level];
+      const kept = r.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d }));
+      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid: kept });
       if (!p2.ok) return bad(p2.error ?? 'No room for the building');
       if (p2.style !== style) return bad('No room for a station building at street level here');
+      // (its entrances stay: the new building must not stand on them)
+      if (kept.some((q) => rectsOverlap(p2.building, q, 0.1))) return bad('No room for a station building at street level beside its entrances');
       let cost = Math.max(0, restyle);
       for (const id of p2.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
       return { ok: true, warnings: p2.warnings, station: st.id, cost: Math.round(cost + (p2.access?.cost ?? 0)), length: r.length, tracks: r.tracks, through: Th0, plan: p2, delta: [0, 0], keep: [], cuts: [], rebuild: false, restyleOnly: true };

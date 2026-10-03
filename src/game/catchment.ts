@@ -515,8 +515,18 @@ export function entranceCatchment(g: Game, st: Station, entrance: number): Walki
   const reach = level === 'ground' ? landingReach(k) : ENTRANCE_SIZE[level].d / 2 + 0.9;
   return extraAccessCatchment(g, st, entranceLandings(e).map((p) => ({ x: p.x, z: p.z, reach })));
 }
-/** Walking catchment of a planned entrance on its own: its landings on a road, or the end of its access street. */
+/**
+ * Walking catchment of a planned entrance on its own: its landings on a road, or the end of its access street. The
+ * buildings its access street demolishes are left out (a forecast copy; the cached catchment stays as it is).
+ */
 export function entrancePlanCatchment(g: Game, st: Station, plan: EntrancePlan): WalkingCatchment {
+  const walk = entranceStreetsCatchment(g, st, plan), gone = plan.access?.demolish ?? [];
+  if (!gone.some((id) => walk.buildings.has(id))) return walk;
+  const buildings = new Map(walk.buildings);
+  for (const id of gone) buildings.delete(id);
+  return { get segments() { return walk.segments; }, buildings };
+}
+function entranceStreetsCatchment(g: Game, st: Station, plan: EntrancePlan): WalkingCatchment {
   const r = st.rail;
   if (!r || !plan.entrance) return EMPTY;
   const k = entranceKind(r.level ?? 'ground', plan.entrance), reach = landingReach(k);

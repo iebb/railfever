@@ -85,6 +85,45 @@ export const STATION_STYLES: Record<string, StationBuildingStyle> = {
 /** The style of an id (unknown or missing ids: 'classic'). */
 export function styleOf(id?: string): StationBuildingStyle { return (id && STATION_STYLES[id]) || STATION_STYLES.classic; }
 
+/** What a ground station's platforms carry: its canopies' look ('shed': a terminal's train shed covers them). */
+export type CanopyKind = 'classic' | 'modern' | 'heritage' | 'shelter' | 'shed';
+/**
+ * Per style: the platform canopies and the way to the platforms, 'auto' (the station's own underpass with stairs on
+ * each platform, and a footbridge across them when there are three or more) or 'own' (the building's: a concourse,
+ * a terminal's head concourse).
+ */
+export const STYLE_PLATFORMS: Record<string, { canopy: CanopyKind; access: 'auto' | 'own' }> = {
+  none: { canopy: 'shelter', access: 'auto' }, shelter: { canopy: 'shelter', access: 'auto' }, classic: { canopy: 'classic', access: 'auto' },
+  brick: { canopy: 'heritage', access: 'auto' }, modern: { canopy: 'modern', access: 'auto' },
+  concourse: { canopy: 'modern', access: 'own' }, terminal: { canopy: 'shed', access: 'own' },
+};
+/** The platform canopies and access of a style id (as styleOf). */
+export function stylePlatforms(id?: string): { canopy: CanopyKind; access: 'auto' | 'own' } { return STYLE_PLATFORMS[styleOf(id).id] ?? STYLE_PLATFORMS.classic; }
+/** Covered length of a platform `PL` long by canopy kind, at a station with `L` long platforms. */
+export function canopyLength(kind: CanopyKind, PL: number, L: number): number {
+  if (kind === 'shed') return 0;
+  if (kind === 'shelter') return Math.min(1.4, PL * 0.3);
+  if (kind === 'modern') return PL * (L < 12 ? 0.5 : 0.6);
+  return PL * (L < 12 ? 0.4 : 0.5);
+}
+/**
+ * A ground station's own ways across to its platforms (styles with 'auto' access), along the axis from its centre:
+ * the underpass stairs on each platform (`platform` indexes RailPart.platforms) and, with three or more platforms,
+ * the footbridge across them all. The renderer draws them here; added entrances keep clear of them.
+ */
+export function stationCrossings(r: { length: number; tracks: number; through?: number; style?: string; platforms: { w: number; from?: number; to?: number }[] }):
+  { stairs: { platform: number; along: number }[]; footbridge: number | null } {
+  const P = stylePlatforms(r.style), L = r.length, out: { stairs: { platform: number; along: number }[]; footbridge: number | null } = { stairs: [], footbridge: null };
+  if (P.access !== 'auto') return out;
+  if (r.platforms.length >= 2 || r.tracks + (r.through ?? 0) >= 2) r.platforms.forEach((p, i) => {
+    const a0 = p.from ?? -L / 2, a1 = p.to ?? L / 2, mid = (a0 + a1) / 2, PL = a1 - a0 - 0.1;
+    if (Math.min(0.2, p.w - 0.34) < 0.1 || PL < 1.4) return;
+    out.stairs.push({ platform: i, along: mid - Math.max(0.3, Math.min(canopyLength(P.canopy, PL, L) / 2 - 0.3, PL / 2 - 0.9)) });
+  });
+  if (r.platforms.length >= 3) out.footbridge = Math.min(L / 2 - 0.9, Math.max(L * 0.28, canopyLength(P.canopy, L - 0.1, L) / 2 + 0.3));
+  return out;
+}
+
 /** Styles that can be built at a level for a number of platform tracks in a year. */
 export function stylesFor(level: StationLevel, tracks: number, year: number): StationBuildingStyle[] {
   return Object.values(STATION_STYLES).filter((s) => s.levels.includes(level) && tracks >= s.minTracks && tracks <= s.maxTracks && year >= s.from && (s.to === undefined || year < s.to));

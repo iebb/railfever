@@ -6,7 +6,8 @@
 // depots.
 import type { Station, RailPart, Entrance } from '../game/stations';
 import { railWidth, entranceKind, entranceLandings, entranceAlong, ENTRANCE_TYPES } from '../game/stations';
-import { styleOf, CONCOURSE_PAVILION } from '../game/station-styles';
+import { styleOf, CONCOURSE_PAVILION, STYLE_PLATFORMS, canopyLength, stationCrossings } from '../game/station-styles';
+import type { CanopyKind } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
 import type { Depot } from '../game/build-ops';
 import { depotSize } from '../game/build-ops';
@@ -74,8 +75,8 @@ function platform(W: WB, cx: number, cz: number, fx: number, fz: number, w: numb
 
 // ------------------------------------------------------------------------------ style registry
 
-/** What is drawn on the platforms: canopy look ('shed': the terminal's train shed covers them). */
-export type CanopyKind = 'classic' | 'modern' | 'heritage' | 'shelter' | 'shed';
+/** What is drawn on the platforms: canopy look ('shed': the terminal's train shed covers them; station-styles.ts). */
+export type { CanopyKind };
 
 /** One station building style: platform canopies, the way to the platforms, the building itself. */
 export interface StationBuilder {
@@ -121,14 +122,15 @@ function sceneOf(ctx: ChunkCtx, st: Station, r: RailPart, color: number): Statio
 /** A hall drawn at a pose: ground floor at `base`, plinth from `lo`, `floors` storeys. */
 type Hall = (s: StationScene, p: BuildingPose, base: number, lo: number, floors: number) => void;
 
+// (canopies and the way to the platforms per style are shared with the game: station-styles.ts STYLE_PLATFORMS)
 export const STATION_BUILDERS: Record<string, StationBuilder> = {
-  none: { canopy: 'shelter', access: 'auto', ground: noneGround, street: () => undefined },
-  shelter: { canopy: 'shelter', access: 'auto', ground: (s) => sideStation(s, shelterHut), street: (s) => streetStation(s, shelterHut) },
-  classic: { canopy: 'classic', access: 'auto', ground: (s) => sideStation(s, classicHall), street: (s) => streetStation(s, classicHall) },
-  brick: { canopy: 'heritage', access: 'auto', ground: (s) => sideStation(s, brickHall), street: (s) => streetStation(s, brickHall) },
-  modern: { canopy: 'modern', access: 'auto', ground: (s) => sideStation(s, modernHall), street: (s) => streetStation(s, modernHall) },
-  concourse: { canopy: 'modern', access: 'own', ground: concourseGround, street: concourseUnderDeck },
-  terminal: { canopy: 'shed', access: 'own', ground: terminalGround, street: (s) => streetStation(s, classicHall) },
+  none: { ...STYLE_PLATFORMS.none, ground: noneGround, street: () => undefined },
+  shelter: { ...STYLE_PLATFORMS.shelter, ground: (s) => sideStation(s, shelterHut), street: (s) => streetStation(s, shelterHut) },
+  classic: { ...STYLE_PLATFORMS.classic, ground: (s) => sideStation(s, classicHall), street: (s) => streetStation(s, classicHall) },
+  brick: { ...STYLE_PLATFORMS.brick, ground: (s) => sideStation(s, brickHall), street: (s) => streetStation(s, brickHall) },
+  modern: { ...STYLE_PLATFORMS.modern, ground: (s) => sideStation(s, modernHall), street: (s) => streetStation(s, modernHall) },
+  concourse: { ...STYLE_PLATFORMS.concourse, ground: concourseGround, street: concourseUnderDeck },
+  terminal: { ...STYLE_PLATFORMS.terminal, ground: terminalGround, street: (s) => streetStation(s, classicHall) },
 };
 
 /** The builder of a style id ('classic' for unknown ids, as styleOf). */
@@ -217,14 +219,6 @@ function platformsAndCanopies(ctx: ChunkCtx, r: RailPart, color: number, kind: C
   }
 }
 
-/** Covered length of a platform by canopy kind. */
-function canopyLength(kind: CanopyKind, PL: number, L: number): number {
-  if (kind === 'shed') return 0;
-  if (kind === 'shelter') return Math.min(1.4, PL * 0.3);
-  if (kind === 'modern') return PL * (L < 12 ? 0.5 : 0.6);
-  return PL * (L < 12 ? 0.4 : 0.5);
-}
-
 /** A platform canopy (columns, roof, fascia, lamps, benches) of a kind, `CL` long, centred at `mid`. */
 function canopy(ctx: ChunkCtx, kind: CanopyKind, at: (off: number, along: number) => [number, number], off: number, mid: number, pw: number,
   CL: number, PY: number, fx: number, fz: number, color: number) {
@@ -310,28 +304,20 @@ function canopy(ctx: ChunkCtx, kind: CanopyKind, at: (off: number, along: number
  * for 3+ platforms also a footbridge across all of them.
  */
 function platformAccess(s: StationScene) {
-  const { ctx, r, PY, fx, fz, rx, rz, L } = s;
+  const { ctx, r, PY, fx, fz, rx, rz } = s;
   const W = ctx.w, D = ctx.d;
-  const np = r.platforms.length;
-  const tracks = r.tracks + (r.through ?? 0);
-  if (np >= 2 || tracks >= 2) {
-    for (const p of r.platforms) {
-      const [a0, a1] = platRange(r, p);
-      const mid = (a0 + a1) / 2, PL = a1 - a0 - 0.1;
-      const CL = canopyLength(stationBuilder(r.style).canopy, PL, L);
-      const along = mid - Math.max(0.3, Math.min(CL / 2 - 0.3, PL / 2 - 0.9));
-      const sw = Math.min(0.2, p.w - 0.34);
-      if (sw < 0.1 || PL < 1.4) continue;
-      const [ux, uz] = s.at(p.off, along);
-      stairWell(W, D, ux, PY, uz, fx, fz, sw, 0.42, 0.06);
-    }
+  // where they lie is shared with the game (entrances keep clear of them): station-styles.ts stationCrossings
+  const own = stationCrossings(r);
+  for (const q of own.stairs) {
+    const p = r.platforms[q.platform];
+    const [ux, uz] = s.at(p.off, q.along);
+    stairWell(W, D, ux, PY, uz, fx, fz, Math.min(0.2, p.w - 0.34), 0.42, 0.06);
   }
-  if (np < 3) return;
+  if (own.footbridge === null) return;
   // footbridge across all platforms (beyond the canopies), stairs down onto each
   const offs = r.platforms.map((p) => p.off);
   const o0 = Math.min(...offs), o1 = Math.max(...offs);
-  const CL = canopyLength(stationBuilder(r.style).canopy, L - 0.1, L);
-  const a = Math.min(L / 2 - 0.9, Math.max(L * 0.28, CL / 2 + 0.3));
+  const a = own.footbridge;
   const FY = PY + 0.62;
   const [mx, mz] = s.at((o0 + o1) / 2, a);
   W.use(WC.CONCRETE, 0xa9b0b5, 1);
@@ -849,12 +835,8 @@ function stairSpot(s: StationScene, p: RailPart['platforms'][number], a: number,
   const [a0, a1] = platRange(s.r, p);
   const lo = a0 + len / 2 + 0.15, hi = a1 - len / 2 - 0.15;
   if (hi < lo) return null;
-  const B = stationBuilder(s.r.style), avoid: number[] = [];
-  if (B.access === 'auto' && (s.r.platforms.length >= 2 || s.r.tracks + (s.r.through ?? 0) >= 2)) {
-    const mid = (a0 + a1) / 2, PL = a1 - a0 - 0.1;
-    avoid.push(mid - Math.max(0.3, Math.min(canopyLength(B.canopy, PL, s.L) / 2 - 0.3, PL / 2 - 0.9)));
-  }
-  if (B.access === 'auto' && s.r.platforms.length >= 3) avoid.push(Math.min(s.L / 2 - 0.9, Math.max(s.L * 0.28, canopyLength(B.canopy, s.L - 0.1, s.L) / 2 + 0.3)));
+  const own = stationCrossings(s.r), i = s.r.platforms.indexOf(p);
+  const avoid = [...own.stairs.filter((q) => q.platform === i).map((q) => q.along), ...(own.footbridge !== null ? [own.footbridge + 0.15] : [])];
   let at = Math.max(lo, Math.min(hi, a));
   for (const v of avoid) if (Math.abs(at - v) < len / 2 + 0.3) at = at >= v ? v + len / 2 + 0.32 : v - len / 2 - 0.32;
   return at >= lo && at <= hi && Math.abs(at - a) < 1.2 ? at : null;
