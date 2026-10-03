@@ -82,6 +82,7 @@ function baseOf(v: Vehicle) {
     // ops: service pattern, overtaking hold, odometer and last month's costs, train energy counters (opcosts.ts)
     pattern: v.pattern ?? null, holdTime: v.holdTime, ops: [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt], opLast: v.opLast,
     phys: physOf(v),
+    spacing: v.spacing,
   };
 }
 /** Energy counters a train's physics keeps between the monthly charges (if it has them). */
@@ -96,6 +97,7 @@ function restoreBase(v: Vehicle, d: any) {
   v.homeX = d.homeX ?? v.homeX; v.homeZ = d.homeZ ?? v.homeZ; v.delivered = d.delivered ?? 0;
   if (typeof d.pattern === 'number') v.pattern = d.pattern;
   v.holdTime = d.holdTime ?? 0;
+  v.restoreSpacing(d.spacing);
   if (Array.isArray(d.ops)) [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt] = (d.ops as number[]).map((x) => Number(x) || 0);
   else v.opMark = -1;
   v.opLast = d.opLast ? { ...d.opLast } : null;

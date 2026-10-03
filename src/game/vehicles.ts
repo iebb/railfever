@@ -8,6 +8,8 @@ import { RNG } from './rng';
 import { curvePoint, type NEdge } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
+import { spacingSchedule } from './patterns';
+import { simNow } from './fares';
 
 /** Occupancy key: a lane (edge, direction) or one connector (from lane -> to lane) through a junction. */
 const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
@@ -299,6 +301,50 @@ export class Vehicles {
     return best <= look ? best : Infinity;
   }
 
+  /** A blocked/braking train already needs this path; road vehicles must not queue behind a spacing hold. */
+  spacingBlocked(v: Vehicle): boolean {
+    if (v instanceof Train) {
+      for (const o of this.map.values()) if (o instanceof Train && o !== v && o.blockedBy === v.id &&
+        (o.state === 'waiting' || o.state === 'running')) return true;
+    } else if (v instanceof RoadVehicle && v.seg) {
+      let s = v.seg, rear = v.pos - v.length, k = 0;
+      while (true) {
+        const list = this.occ.get(segKey(s));
+        if (list) for (let i = 0; i < list.n; i++) {
+          const o = list.v[i];
+          if (o === v || !o.seg || segKey(o.seg) !== segKey(s) || o.state === 'loading' || o.speed >= 0.05) continue;
+          const gap = rear - o.pos;
+          if (gap >= -0.05 && gap < 0.8) return true;
+        }
+        if (rear >= 0.8 || k >= v.trail.length) break;
+        s = v.trail[k++]; rear += s.len;
+      }
+    }
+    return false;
+  }
+
+  private spacingReleaseKey(v: Vehicle): string {
+    v.targetStation(); // normalise an old / skipped stop index before choosing the entry direction
+    return (v instanceof Train || v instanceof RoadVehicle ? v.depotId : -1) + ':' + v.stopIndex;
+  }
+
+  /** A depot's releases into the same pattern/direction are staggered; failed exits consume no slot. */
+  waitForSpacingRelease(v: Vehicle): boolean {
+    const s = spacingSchedule(this.game, v);
+    const released = s?.clock.released?.[this.spacingReleaseKey(v)];
+    if (s && s.vehicles >= 2 && released !== undefined && simNow(this.game) - released < s.headway) {
+      v.status = 'Waiting to depart (spacing)';
+      return true;
+    }
+    return false;
+  }
+
+  noteSpacingRelease(v: Vehicle) {
+    v.resetSpacing(); // returning to a depot cancels any unfinished station departure
+    const s = spacingSchedule(this.game, v);
+    if (s) (s.clock.released ??= {})[this.spacingReleaseKey(v)] = simNow(this.game);
+  }
+
   /** May v enter connector c (no conflicting vehicle inside the junction)? */
   junctionFree(v: RoadVehicle, c: RSeg): boolean {
     const list = this.nodeOcc.get(c.node);
@@ -398,6 +444,11 @@ export class Vehicles {
       amb.length = n;
       if (--this.ambientTicks <= 0) { this.ambientTicks = Math.round(8 / this.game.tickSeconds); this.manageAmbient(); }
     } else if (this.ambient.length) this.ambient = [];
+    // A follower updated later this tick may have just found this platform/lane blocked. End the hold now,
+    // before a committed tick (or a save) can contain a spacing hold obstructing another vehicle's path.
+    for (const v of this.map.values()) if (v.state === 'loading' && v.status === 'Holding for even spacing' && this.spacingBlocked(v)) {
+      if (v instanceof Train || v instanceof RoadVehicle) v.depart();
+    }
   }
 
   /** Keep the ambient traffic population in line with town sizes. */
