@@ -1,6 +1,6 @@
 import './ui/style.css';
 import * as THREE from 'three';
-import { Game, NewGameOptions } from './game/game';
+import { Game, MAX_FRAME_SECONDS, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
 import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot } from './game/save';
@@ -107,11 +107,11 @@ let last = performance.now();
 const focusV = new THREE.Vector3();
 function loop(now: number) {
   const wallDt = Math.max(0, (now - last) / 1000);
-  const dt = Math.min(0.1, wallDt);
+  const dt = Math.min(MAX_FRAME_SECONDS, wallDt);
   last = now;
   if (game) {
     const t0 = performance.now();
-    try { game.update(wallDt); } catch (e) { console.error(e); }
+    try { game.update(dt); } catch (e) { console.error(e); }
     renderer.simMs = performance.now() - t0;
     try {
       if (ui.titleOpen) {

@@ -86,9 +86,12 @@ const BUYOUT_PREMIUM = 1.25;
 export { GEN_RATE };
 /** Every committed simulation tick advances this many seconds, at every game speed. */
 export const TICK = 0.05;
-export const TICKS_PER_DAY = DAY_SECONDS / TICK;
-/** Drop wall time beyond this many ticks at 1x after a stalled frame. */
-const MAX_FRAME_TICKS = 8;
+export const TICKS_PER_DAY = Math.round(DAY_SECONDS / TICK);
+if (Math.abs(DAY_SECONDS / TICK - TICKS_PER_DAY) > 1e-9) throw new Error('DAY_SECONDS must contain an integer number of simulation ticks');
+/** Shared wall-time cap for simulation pacing, camera smoothing and visual effects. */
+export const MAX_FRAME_SECONDS = 8 * TICK;
+/** A frame may release fewer ticks when simulation work is expensive. */
+const FRAME_BUDGET_MS = 20;
 
 export class Game {
   world: World;
@@ -149,12 +152,8 @@ export class Game {
     this.tick = this.day * TICKS_PER_DAY + Math.floor(Math.max(0, f) * TICKS_PER_DAY + 1e-7);
   }
   speed = 1;
-  private _paused = false;
-  get paused() { return this._paused; }
-  set paused(paused: boolean) {
-    if (paused !== this._paused) { this.accumulator = 0; this.vehicles.resetRenderPoses(); }
-    this._paused = paused;
-  }
+  // Pause freezes the interpolation remainder and previous vehicle poses too.
+  paused = false;
   /** Wall-time remainder belongs to the scheduler, never the saved simulation. */
   private accumulator = 0;
   get alpha() { return this.accumulator / TICK; }
@@ -797,11 +796,17 @@ export class Game {
       return;
     }
     if (!Number.isFinite(dtReal) || dtReal <= 0 || !Number.isFinite(this.speed) || this.speed <= 0) return;
-    this.accumulator += Math.min(dtReal, MAX_FRAME_TICKS * TICK) * this.speed;
+    this.accumulator += Math.min(dtReal, MAX_FRAME_SECONDS) * this.speed;
     // A tiny tolerance prevents floating wall-time sums (e.g. three 1/60 frames) losing a whole tick.
     const ticks = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    // Keep only the fractional tick, even if the budget drops some of this frame's whole ticks.
     this.accumulator = Math.max(0, this.accumulator - ticks * TICK);
-    for (let i = 0; i < ticks && !this.paused; i++) this.stepTick();
+    const started = performance.now();
+    for (let i = 0; i < ticks && !this.paused; i++) {
+      this.stepTick();
+      // Wall time controls release rate only; stepTick never reads this pacing clock.
+      if (performance.now() - started >= FRAME_BUDGET_MS) break;
+    }
   }
 
   /** Apply pending network changes to vehicles (normally done at the start of a tick). */

@@ -115,7 +115,9 @@ export function trainCarPoses(t: Train, out: CarPose[], slots?: CarSlot[], game?
     const L = sl ? sl.len : t.cars[i].length, gap = sl ? sl.gap : CAR_GAP;
     const p = out[i] ?? (out[i] = { x: 0, y: 0, z: 0, fx: 0, fy: 0, fz: 1, a: { x: 0, y: 0, z: 0 }, da: { x: 0, y: 0, z: 0 }, b: { x: 0, y: 0, z: 0 }, db: { x: 0, y: 0, z: 0 }, ea: -1, eb: -1, hidden: false });
     const ra = point(off + 0.18 * L, p.a, p.da);
+    p.ea = ra?.seg.e ?? -1;
     const rb = point(off + 0.82 * L, p.b, p.db);
+    p.eb = rb?.seg.e ?? -1;
     let hidden = false;
     if (canHide) {
       const rf = point(off, tE);
@@ -123,7 +125,6 @@ export function trainCarPoses(t: Train, out: CarPose[], slots?: CarSlot[], game?
     }
     off += L + gap;
     if (!ra || !rb) { p.hidden = true; continue; }
-    p.ea = ra.seg.e; p.eb = rb.seg.e;
     p.hidden = hidden;
     let fx = p.a.x - p.b.x, fy = p.a.y - p.b.y, fz = p.a.z - p.b.z;
     let l = Math.hypot(fx, fy, fz);
@@ -390,7 +391,6 @@ export class VehiclesView {
   smoke = new Smoke();
   lights = new Lights();
   private emitAcc = new Map<number, number>();
-  private lastSpeed = new Map<number, number>();
   private poses: CarPose[] = [];
   private models = new WeakMap<VehicleModel, ModelGeo>();
   private frustum = new THREE.Frustum();
@@ -514,7 +514,6 @@ vRfGlass = step(2.5, aPaint);`);
     this.smoke.mat.uniforms.uScale.value = pointScale;
     if ((this.tick & 255) === 0) {
       for (const id of this.emitAcc.keys()) if (!game.vehicles.get(id)) this.emitAcc.delete(id);
-      for (const id of this.lastSpeed.keys()) if (!game.vehicles.get(id)) this.lastSpeed.delete(id);
       for (const [key, entry] of this.profileRanges) if (this.tick - entry.used >= 256) this.profileRanges.delete(key);
     }
   }
@@ -523,13 +522,11 @@ vRfGlass = step(2.5, aPaint);`);
     if (!t.onMap) return;
     if (this.cull) {
       const len = t.length;
-      if (!this.game!.vehicles.renderPointBehind(t, len / 2, tE) || !this.lod(tE.x, tE.y, tE.z, len)) { this.lastSpeed.set(t.id, t.speed); return; }
+      if (!this.game!.vehicles.renderPointBehind(t, len / 2, tE) || !this.lod(tE.x, tE.y, tE.z, len)) return;
     }
     const slots = this.trainLayout(t);
     const n = trainCarPoses(t, this.poses, slots, this.game!);
-    const prev = this.lastSpeed.get(t.id) ?? t.speed;
-    this.lastSpeed.set(t.id, t.speed);
-    const accel = dt > 0 ? (t.speed - prev) / dt : 0;
+    const accel = this.game!.vehicles.renderAcceleration(t);
     const active = t.state === 'running' || t.state === 'waiting' || t.state === 'loading';
     for (let i = 0; i < n; i++) {
       const p = this.poses[i];
@@ -611,10 +608,12 @@ vRfGlass = step(2.5, aPaint);`);
     }
     if (v.model && v.model.kind === 'tram') { this.updateTram(v, v.model, night); return; }
     const L = v.length;
-    const f = vehicles.renderPointBehind(v, 0, tA), r = vehicles.renderPointBehind(v, L, tB);
-    if (!f || !r) return;
-    if (v.hiddenAt(f.seg, f.pos) && v.hiddenAt(r.seg, r.pos)) return;
-    tA.y = this.surfaceY(f.seg, f.pos, tA.x, tA.z, tA.y);
+    const f = vehicles.renderPointBehind(v, 0, tA);
+    if (!f) return;
+    const frontSeg = f.seg, frontPos = f.pos;
+    const r = vehicles.renderPointBehind(v, L, tB);
+    if (!r || (v.hiddenAt(frontSeg, frontPos) && v.hiddenAt(r.seg, r.pos))) return;
+    tA.y = this.surfaceY(frontSeg, frontPos, tA.x, tA.z, tA.y);
     tB.y = this.surfaceY(r.seg, r.pos, tB.x, tB.z, tB.y);
     let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
     const l = Math.hypot(fx, fy, fz);
@@ -782,12 +781,16 @@ vRfGlass = step(2.5, aPaint);`);
     const acc = this.lin(this.game ? this.game.company(v.owner).color : '#e8a33d');
     let off = 0;
     for (let i = 0; i < t.n; i++, off += t.sec + TRAM_GAP) {
-      const f = vehicles.renderPointBehind(v, off, tE), r = vehicles.renderPointBehind(v, off + t.sec, tE);
-      if (!f || !r || (v.hiddenAt(f.seg, f.pos) && v.hiddenAt(r.seg, r.pos))) continue;
+      const f = vehicles.renderPointBehind(v, off, tE);
+      if (!f) continue;
+      const frontHidden = v.hiddenAt(f.seg, f.pos);
+      const r = vehicles.renderPointBehind(v, off + t.sec, tE);
+      if (!r || (frontHidden && v.hiddenAt(r.seg, r.pos))) continue;
       const front = vehicles.renderPointBehind(v, off + t.sec * 0.15, tA);
-      const rear = vehicles.renderPointBehind(v, off + t.sec * 0.85, tB);
-      if (!front || !rear) continue;
+      if (!front) continue;
       tA.y = this.surfaceY(front.seg, front.pos, tA.x, tA.z, tA.y);
+      const rear = vehicles.renderPointBehind(v, off + t.sec * 0.85, tB);
+      if (!rear) continue;
       tB.y = this.surfaceY(rear.seg, rear.pos, tB.x, tB.z, tB.y);
       let fx = tA.x - tB.x, fy = tA.y - tB.y, fz = tA.z - tB.z;
       const l = Math.hypot(fx, fy, fz);

@@ -236,7 +236,8 @@ export function deserialize(d: any): Game {
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
 
   const g = new Game({ ...d.options }, w);
-  g.tick = Number.isSafeInteger(d.tick) && d.tick >= 0 ? d.tick : Math.max(0, Math.round(((d.day ?? 0) + (d.dayFrac ?? 0)) * TICKS_PER_DAY));
+  g.tick = Number.isSafeInteger(d.tick) && d.tick >= 0 ? d.tick : Math.max(0,
+    (d.day ?? 0) * TICKS_PER_DAY + Math.min(TICKS_PER_DAY - 1, Math.max(0, Math.floor((d.dayFrac ?? 0) * TICKS_PER_DAY + 1e-6))));
   g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)

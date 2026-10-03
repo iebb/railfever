@@ -17,7 +17,7 @@ const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
 interface Occ { v: RoadVehicle[]; s: number[]; n: number }
 
 /** Previous committed pose, only for rendering; absent from saves and simulation decisions. */
-interface RenderPose { segs: (TSeg | RSeg)[]; head: number; pos: number; reversed: boolean; length: number; tick: number }
+interface RenderPose { segs: (TSeg | RSeg)[]; head: number; pos: number; reversed: boolean; length: number; speed: number; tick: number }
 interface RenderPoint<S> { seg: S; pos: number }
 
 export class Vehicles {
@@ -43,6 +43,7 @@ export class Vehicles {
   private renderPoses = new WeakMap<Vehicle, RenderPose>();
   private prevPoint = { x: 0, y: 0, z: 0 };
   private prevDir = { x: 0, y: 0, z: 0 };
+  private renderPoint: RenderPoint<TSeg | RSeg> = { seg: null!, pos: 0 };
 
   constructor(private game: Game) {
     const net = game.world.net;
@@ -61,39 +62,50 @@ export class Vehicles {
   private rememberPose(v: Vehicle) {
     if (!(v instanceof Train || v instanceof RoadVehicle)) return;
     let p = this.renderPoses.get(v);
-    if (!p) { p = { segs: [], head: 0, pos: 0, reversed: false, length: 0, tick: 0 }; this.renderPoses.set(v, p); }
+    if (!p) { p = { segs: [], head: 0, pos: 0, reversed: false, length: 0, speed: 0, tick: 0 }; this.renderPoses.set(v, p); }
     p.segs.length = 0;
     if (v instanceof Train) {
-      for (const s of v.segs) p.segs.push(s);
+      for (let i = 0; i <= v.headSeg && i < v.segs.length; i++) p.segs.push(v.segs[i]);
       p.head = v.headSeg; p.pos = v.headPos; p.reversed = v.reversed;
     } else {
       for (let i = v.trail.length - 1; i >= 0; i--) p.segs.push(v.trail[i]);
       if (v.seg) p.segs.push(v.seg);
       p.head = p.segs.length - 1; p.pos = v.pos;
     }
-    p.length = v.length; p.tick = this.game.tick;
+    p.length = v.length; p.speed = v.speed; p.tick = this.game.tick;
   }
 
-  /** Interpolate committed poses without moving the vehicle, extending a route or reserving track. */
+  /** Acceleration in units/s² of the last committed tick, stable between rendered frames. */
+  renderAcceleration(v: Train | RoadVehicle): number {
+    const p = this.renderPoses.get(v);
+    return p && p.tick === this.game.tick - 1 ? (v.speed - p.speed) / this.game.tickSeconds : 0;
+  }
+
+  /** Interpolate committed poses without changing simulation state. Returned metadata is scratch: consume before the next query. */
   renderPointBehind(v: Train, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg> | null;
   renderPointBehind(v: RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<RSeg> | null;
   renderPointBehind(v: Train | RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg | RSeg> | null;
   renderPointBehind(v: Train | RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg | RSeg> | null {
-    let current: RenderPoint<TSeg | RSeg>;
+    const current = this.renderPoint;
     if (v instanceof Train) {
-      const q = v.pointBehind(d, out, dir);
-      if (!q) return null;
-      current = { seg: q.seg, pos: q.sp };
+      if (!v.segs.length) return null;
+      let i = v.headSeg, pos = v.headPos, behind = d;
+      while (behind > pos && i > 0) { behind -= pos; pos = v.segs[--i].len; }
+      const s = v.segs[i];
+      pos = Math.max(0, pos - behind);
+      curvePoint(s.curve, s.dir > 0 ? pos : s.len - pos, out, dir);
+      if (dir && s.dir < 0) { dir.x = -dir.x; dir.y = -dir.y; dir.z = -dir.z; }
+      current.seg = s; current.pos = pos;
     } else {
       if (!v.seg) return null;
       let s = v.seg, pos = v.pos, k = 0, behind = d;
       while (behind > pos && k < v.trail.length) { behind -= pos; s = v.trail[k++]; pos = s.len; }
       pos = Math.max(0, Math.min(s.len, pos - behind));
       curvePoint(s.curve, pos, out, dir);
-      current = { seg: s, pos };
+      current.seg = s; current.pos = pos;
     }
     const p = this.renderPoses.get(v), alpha = this.game.alpha;
-    if (this.game.paused || !p || !p.segs.length || p.tick !== this.game.tick - 1 || p.length !== v.length) return current;
+    if (!p || !p.segs.length || p.tick !== this.game.tick - 1 || p.length !== v.length) return current;
     const reversed = v instanceof Train && p.reversed !== v.reversed;
     let behind = reversed ? p.length - d : d, i = p.head, pos = p.pos;
     while (behind > pos && i > 0) { behind -= pos; pos = p.segs[--i].len; }
@@ -112,8 +124,9 @@ export class Vehicles {
       const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
       dir.x /= len; dir.y /= len; dir.z /= len;
     }
-    if (s === current.seg) return { seg: s, pos: pos + (current.pos - pos) * alpha };
-    return alpha < 0.5 ? { seg: s, pos } : current;
+    if (s === current.seg) current.pos = pos + (current.pos - pos) * alpha;
+    else if (alpha < 0.5) { current.seg = s; current.pos = pos; }
+    return current;
   }
 
   /** Camera follow uses the same interpolated centre as the vehicle bodies. */

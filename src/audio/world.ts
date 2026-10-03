@@ -67,7 +67,7 @@ class Slot {
   car: OscillatorNode | null = null; carF: BiquadFilterNode | null = null; carG: GainNode | null = null;
   /** high-speed wind roar */
   wind: GainNode | null = null; windF: BiquadFilterNode | null = null;
-  next = 0; nextJoint = 0; throttle = 0; lastSpeed = -1; seen = 0; dying = 0; gain = 0; d = 1e9; lastRamp = -1;
+  next = 0; nextJoint = 0; throttle = 0; seen = 0; dying = 0; gain = 0; d = 1e9; lastRamp = -1;
   x = 0; y = 0; z = 0; alt = 1;
   /** coaches: 0 in town .. 1 out on country roads (deeper, steadier engine and more tyre roar) */
   rural = 0; ruralAt = -1;
@@ -410,8 +410,7 @@ export class WorldAudio {
     if (ramp) { s.lastRamp = now; this.place(s, L, p.x, p.y + 0.3, p.z, now, 1); }
     const speed = v.speed;
     const vis = speed * gs; // units per real second
-    const accel = s.lastSpeed < 0 || dt <= 0 ? 0 : (speed - s.lastSpeed) / Math.max(1e-3, dt * gs);
-    s.lastSpeed = speed;
+    const accel = g.vehicles.renderAcceleration(v);
     const working = accel > 0.002 || (speed > 0.05 && accel > -0.002 && v.state === 'running');
     const thr = clamp((accel > 0.002 ? 0.55 + accel * 25 : working ? 0.3 : 0.08) + (vis > 0.2 ? 0.15 : 0), 0, 1);
     s.throttle += (thr - s.throttle) * Math.min(1, dt * 2.5);

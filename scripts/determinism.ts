@@ -1,4 +1,5 @@
-// Headless multiplayer evidence; never patches the simulation or its clocks/RNGs.
+// Headless multiplayer evidence; outcome streams never patch the simulation or its clocks/RNGs.
+// Isolated pacing/render regressions use controlled ticks and a virtual clock, restored before the streams.
 // node_modules/.bin/esbuild scripts/determinism.ts --bundle --platform=node --format=esm \
 //   --outfile=$S/determinism.mjs
 // node $S/determinism.mjs [--seed=7] [--days=360] [--every=30] [--size=384] [--ais=2]
@@ -7,7 +8,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { Game, TICK, TICKS_PER_DAY, type NewGameOptions } from '../src/game/game';
+import * as THREE from 'three';
+import { Game, TICK, TICKS_PER_DAY, MAX_FRAME_SECONDS, type NewGameOptions } from '../src/game/game';
 import { World } from '../src/game/world';
 import { DAY_SECONDS } from '../src/game/constants';
 import { serialize, deserialize } from '../src/game/save';
@@ -15,6 +17,10 @@ import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { Train } from '../src/game/train';
 import { RoadVehicle, roadDepotReaches } from '../src/game/roadvehicle';
 import { addBusStop, busStopSites, depotBehind, placeAndConnect, roadDepotNear } from './lib';
+import { makeCurve } from '../src/game/network';
+import { CameraController } from '../src/render/camera';
+import { VehiclesView, trainCarPoses, trainSlots } from '../src/render/vehicles-view';
+import { WorldAudio } from '../src/audio/world';
 
 function numberOption(name: string, fallback: number, min = 1): number {
   const arg = process.argv.slice(2).find((s) => s.startsWith(`--${name}=`));
@@ -157,21 +163,25 @@ function compare(label: string, a: Capture, b: Capture, day: number): boolean {
   return false;
 }
 
-type Stream = { name: string; g: Game; fixture: Fixture; dt: number; calls: number; active: boolean };
+type Stream = { name: string; g: Game; fixture: Fixture; dt: number; calls: number; suppliedSeconds: number; active: boolean };
 
 function advance(s: Stream, seconds: number) {
-  // Drive by integer update indices, not game.day or accumulated wall-clock floats.
-  // All checkpoints/commands land at the same total supplied seconds in every stream.
-  const end = Math.round(seconds / s.dt);
-  if (Math.abs(end * s.dt - seconds) > 1e-8) throw new Error('Checkpoint does not align with dt');
-  while (s.calls < end) { s.g.update(s.dt); s.calls++; }
-  assert.equal(s.g.tick, Math.round(seconds / TICK), `${s.name}: exact committed tick at checkpoint`);
+  // Pacing can drop wall time, so compare outcomes and issue commands at identical committed ticks.
+  const end = Math.round(seconds / TICK);
+  if (Math.abs(end * TICK - seconds) > 1e-8) throw new Error('Checkpoint does not align with ticks');
+  while (s.g.tick < end) {
+    const dt = Math.min(s.dt, (end - s.g.tick - s.g.alpha) * TICK);
+    s.g.update(dt); s.calls++; s.suppliedSeconds += dt;
+  }
+  assert.equal(s.g.tick, end, `${s.name}: exact committed tick at checkpoint`);
   assert.equal(s.g.dayFrac, 0, `${s.name}: integer day boundary`);
 }
 
 /** Scheduler and legacy-save boundaries, using an empty headless world without patching methods. */
 function checkScheduler() {
   const empty = () => new Game({ size: 64, seed: 1, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 }, new World(64));
+  assert(Number.isInteger(TICKS_PER_DAY), 'calendar modulo uses an integer tick count');
+  assert.equal(TICKS_PER_DAY * TICK, DAY_SECONDS, 'a day contains a whole number of ticks');
   const g = empty();
   g.update(1 / 60); g.update(1 / 60);
   assert.equal(g.tick, 0, 'partial frames do not enter simulation');
@@ -184,18 +194,19 @@ function checkScheduler() {
   g.update(TICK / 2);
   g.paused = true; g.update(10);
   assert.equal(g.tick, 1, 'pause stops ticks');
-  assert.equal(g.alpha, 0, 'pause clears the wall-time remainder');
+  assert.equal(g.alpha, 0.5, 'pause freezes the wall-time remainder');
   g.paused = false; g.update(TICK / 2);
-  assert.equal(g.tick, 1, 'resume starts with a fresh remainder');
+  assert.equal(g.tick, 2, 'resume continues the retained remainder');
+  assert.equal(g.alpha, 0);
   g.stepTick();
-  assert.equal(g.tick, 2, 'headless stepTick always commits one tick');
+  assert.equal(g.tick, 3, 'headless stepTick always commits one tick');
   for (const speed of [1, 2, 4, 8]) {
     const paced = empty(); paced.speed = speed;
     for (let frame = 0; frame < 60; frame++) paced.update(1 / 60);
     assert.equal(paced.tick, 20 * speed, `one wall second at ${speed}x`);
     const tick = paced.tick;
     paced.update(1000);
-    assert.equal(paced.tick - tick, 8 * speed, `stalled frame is bounded at ${speed}x`);
+    assert(paced.tick > tick && paced.tick - tick <= 8 * speed, `stalled frame is bounded at ${speed}x`);
     assert(paced.alpha >= 0 && paced.alpha < 1);
   }
   const month = empty(); month.tick = 30 * TICKS_PER_DAY - 1;
@@ -213,7 +224,16 @@ function checkScheduler() {
   assert.equal(loaded.alpha, 0, 'wall-time remainder stays outside the saved simulation');
   const legacy = { ...data, day: 5, dayFrac: 0.425 }; delete legacy.tick;
   assert.equal(deserialize(legacy).tick, 217, 'legacy fractional days derive ticks');
-  assert.equal(deserialize({ ...legacy, dayFrac: 0.999999999999 }).tick, 240, 'legacy floating day boundary rounds to its tick');
+  assert.equal(deserialize({ ...legacy, dayFrac: 0.999999999999 }).tick, 239, 'legacy conversion preserves the pending day boundary');
+  const pendingMonth = deserialize({ ...legacy, day: 29, dayFrac: 0.99 });
+  const cash = pendingMonth.economy.money, interest = pendingMonth.economy.loan * pendingMonth.economy.interestRate / 12;
+  assert.equal(pendingMonth.tick, 30 * TICKS_PER_DAY - 1);
+  pendingMonth.update(TICK);
+  assert.equal(pendingMonth.day, 30, 'one tick fires the pending legacy month boundary');
+  assert.equal(pendingMonth.economy.months.length, 1, 'onNewMonth closes the saved month');
+  assert.equal(pendingMonth.economy.months[0].v.interest, -interest, 'month-end interest is charged');
+  assert.equal(pendingMonth.economy.money, cash - interest, 'month-end charges reduce cash');
+  assert(pendingMonth.lines.catchmentDirty, 'onNewMonth schedules the catchment refresh');
   const date = empty(); date.day = 29; date.dayFrac = 0.999999999999;
   assert.equal(date.tick, 1200, 'writable calendar tolerates accumulated physics-time roundoff');
   date.day = 359; date.dayFrac = 0.99;
@@ -225,6 +245,158 @@ function checkScheduler() {
     assert.equal(JSON.stringify(serialize(deserialize(JSON.parse(data)))), data, `ambient countdown round trip at tick ${tick}`);
   }
   console.log('SCHEDULER: PASS fractional frames, pause/resume, 1x/2x/4x/8x, bounded stalls, monthly catchment, exact/legacy tick saves');
+}
+
+/** Frame-time feedback from review2/probes/spiral.ts, with tick costs on a virtual pacing clock. */
+function checkPacingAndRendering() {
+  const empty = (size = 64) => new Game({ size, seed: 1, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 }, new World(size));
+  let clockMs = 0;
+  const clockDescriptor = Object.getOwnPropertyDescriptor(performance, 'now');
+  Object.defineProperty(performance, 'now', { configurable: true, value: () => clockMs });
+  try {
+    checkScheduler();
+    for (const costMs of [6.5, 8, 12, 25, 120]) {
+      const g = empty(); g.speed = 8;
+      const step = g.stepTick.bind(g);
+      g.stepTick = () => { step(); clockMs += costMs; };
+      let wall = 0, dt = 1 / 60, frames = 0, worstMs = 0;
+      while (wall < 20) {
+        const before = g.tick;
+        g.update(dt);
+        const ticks = g.tick - before;
+        assert(ticks <= Math.ceil(20 / costMs), 'pacing stops after the tick that exhausts the budget');
+        assert(g.alpha >= 0 && g.alpha < 1, 'dropped backlog leaves only a fractional tick');
+        const frameMs = Math.max(1000 / 60, 8 + costMs * ticks);
+        worstMs = Math.max(worstMs, frameMs);
+        dt = frameMs / 1000; wall += dt; frames++; clockMs += frameMs - costMs * ticks;
+      }
+      assert(frames / wall >= 7, `8x with ${costMs} ms ticks remains responsive: ${frames / wall} fps`);
+      assert(g.tick * TICK / wall < 8, 'expensive ticks slow the release rate');
+      const replay = empty();
+      for (let i = 0; i < g.tick; i++) replay.stepTick();
+      assert.equal(JSON.stringify(serialize(g)), JSON.stringify(serialize(replay)), 'pacing changes no committed outcomes');
+      g.stepTick = step;
+      const tick = g.tick;
+      g.update((1 - g.alpha) * TICK / (2 * g.speed));
+      assert.equal(g.tick, tick, 'discarded whole ticks never spill into the next frame');
+      console.log(`PACING: 8x, ${costMs} ms/tick: ${(frames / wall).toFixed(1)} fps, worst ${worstMs.toFixed(1)} ms`);
+    }
+
+    const movingTrain = (g: Game, acceleration = 0) => {
+      const t = new Train(g, 1, [MODEL_BY_ID.get('diesel_b')!], -1);
+      const curve = makeCurve([0, 0, 32, 256, 0, 32]);
+      t.segs = [{ e: 1, dir: 1, curve, len: curve.len, res: [], limit: 100, tunnels: [] }];
+      t.headPos = 32 + t.length / 2; t.speed = 0.06; t.state = 'running';
+      t.update = (dt) => { t.speed += acceleration * dt; t.headPos += t.speed * dt; };
+      g.vehicles.map.set(t.id, t); g.vehicles.ambientEnabled = false;
+      return t;
+    };
+    const close = (a: number, b: number, message: string) => assert(Math.abs(a - b) < 1e-10, `${message}: ${a} vs ${b}`);
+    // The reviewer's pausepop/interp probes, with a controlled straight path to check every resume frame.
+    const paused = empty(), t = movingTrain(paused); t.speed = 3;
+    paused.update(TICK); paused.update(TICK / 3);
+    const out = new THREE.Vector3(); paused.vehicles.renderWorldPos(t, out);
+    let previousX = out.x;
+    const alpha = paused.alpha, tick = paused.tick;
+    paused.paused = true;
+    for (const dt of [1 / 60, 0.4, 10]) {
+      paused.update(dt); paused.vehicles.renderWorldPos(t, out);
+      close(out.x, previousX, 'pausing preserves the drawn pose');
+      assert.equal(paused.alpha, alpha); assert.equal(paused.tick, tick);
+    }
+    paused.paused = false;
+    for (let frame = 0; frame < 6; frame++) {
+      paused.update(TICK / 3); paused.vehicles.renderWorldPos(t, out);
+      close(out.x - previousX, t.speed * TICK / 3, 'every resume frame continues moving');
+      previousX = out.x;
+    }
+
+    // The accel.ts probe now checks both consumers on tickless frames and at different release rates.
+    for (const speed of [1, 8]) for (const fps of [60, 144]) {
+      const g = empty(), t = movingTrain(g, 0.01); g.speed = speed; g.stepTick();
+      const view = Object.create(VehiclesView.prototype) as any;
+      const acceleration: number[] = [];
+      Object.assign(view, { game: g, cull: false, poses: [], lod: () => 1,
+        trainLayout: () => trainSlots(t.cars), slotGeo: () => ({ exhaust: [new THREE.Vector3()], bogies: [] }),
+        pair: () => ({ lo: { push: () => 0, mat16: new Float32Array(16) } }),
+        emitExhaust: (_id: number, _e: unknown, _o: number, _pts: unknown, _v: number, a: number) => acceleration.push(a) });
+      const worldAudio = Object.create(WorldAudio.prototype) as any;
+      worldAudio.tmp = { x: 0, y: 0, z: 0 };
+      const slot = { kind: 'diesel', key: t.id, throttle: 0, lastRamp: Infinity, nextJoint: Infinity };
+      let throttle = 0;
+      for (let frame = 0; frame < 12; frame++) {
+        g.update(1 / fps);
+        close(g.vehicles.renderAcceleration(t), 0.01, 'acceleration is stable between ticks');
+        view.updateTrain(t, 1 / fps, 0);
+        worldAudio.vehicleSlot(g, slot, {}, 1 / fps, speed, frame / fps);
+        const target = Math.min(1, 0.55 + 0.01 * 25 + (t.speed * speed > 0.2 ? 0.15 : 0));
+        throttle += (target - throttle) * Math.min(1, 2.5 / fps);
+        close(slot.throttle, throttle, 'audio throttle follows tick acceleration on every frame');
+      }
+      assert.equal(acceleration.length, 12);
+      for (const a of acceleration) close(a, 0.01, 'exhaust uses tick acceleration on every frame');
+    }
+
+    // A long look-ahead must never be copied; retained segments still render bogies on different edges.
+    const poses = empty(), train = movingTrain(poses);
+    const base = train.segs[0];
+    train.segs = [base, { ...base, e: 2 }, ...Array.from({ length: 200 }, () => ({ ...base, e: 3 }))];
+    train.headSeg = 1; train.headPos = train.cars[0].length / 2;
+    (poses.vehicles as any).rememberPose(train);
+    const previous = (poses.vehicles as any).renderPoses.get(train);
+    assert.equal(previous.segs.length, 2, 'pose storage excludes every reserved segment ahead of the head');
+    poses.vehicles.resetRenderPoses();
+    const metadata = poses.vehicles.renderPointBehind(train, 0, out);
+    const other = poses.vehicles.renderPointBehind(train, train.length, out);
+    assert.equal(metadata, other, 'point metadata reuses scratch storage');
+    train.pointBehind = () => { throw new Error('render query allocated a Train.pointBehind result'); };
+    const cars: Parameters<typeof trainCarPoses>[1] = [];
+    trainCarPoses(train, cars, undefined, poses);
+    assert.equal(cars[0].ea, 2); assert.equal(cars[0].eb, 1, 'front metadata is consumed before the next scratch query');
+    // Road bodies and tram sections must retain distinct front/rear metadata too.
+    for (const id of ['bus_c', 'tram_a']) {
+      const g = empty(), m = MODEL_BY_ID.get(id)!, road = new RoadVehicle(g, 2, m, -1);
+      const curve = makeCurve([0, 0, 0, 20, 0, 0]);
+      const lane = { kind: 'lane' as const, e: 1, dir: 1, node: 0, from: 0, fromDir: 1, curve, len: curve.len, limit: 100, tunnels: [], crossings: [] };
+      road.seg = { ...lane, e: 2 }; road.trail = [lane]; road.pos = road.length / 2;
+      const view = Object.create(VehiclesView.prototype) as any;
+      const surfaces: number[] = [];
+      let bodies = 0;
+      const batch = { push: () => { bodies++; return 0; }, mat16: new Float32Array(16), col3: new Float32Array(3), acc3: new Float32Array(3) };
+      Object.assign(view, { game: g, cull: false, lod: () => 1, pair: () => ({ lo: batch }), model: () => ({}),
+        lin: () => new Float32Array(3), tram: () => ({ n: 1, sec: road.length, style: m.style, roles: ['single'] }),
+        surfaceY: (seg: { e: number }) => { surfaces.push(seg.e); return 0; } });
+      view.updateRoad(road, 0);
+      assert.equal(bodies, 1, `${id} is drawn across the lane boundary`);
+      assert.deepEqual(surfaces, [2, 1], `${id} keeps the correct lane under each end`);
+    }
+
+    // Follow smoothing consumes the same 0.4 s cap as the scheduler, including frames below 10 fps.
+    const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'window');
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { addEventListener() {} } });
+    try {
+      const g = empty(256), t = movingTrain(g); g.speed = 8; t.speed = 3; t.headPos = 128 + t.length / 2;
+      const dom = { addEventListener() {}, style: {} } as unknown as HTMLElement;
+      const camera = new CameraController(new THREE.PerspectiveCamera(), dom, g.world, () => null);
+      camera.follow = () => new THREE.Vector3();
+      camera.followPosition = (p) => g.vehicles.renderWorldPos(t, p);
+      let expectedX = 128;
+      for (const wallDt of [0.2, 1 / 3, 0.4, 1]) {
+        const dt = Math.min(wallDt, MAX_FRAME_SECONDS);
+        g.update(dt); g.vehicles.renderWorldPos(t, out);
+        expectedX += (out.x - expectedX) * (1 - Math.exp(-dt * 8));
+        camera.update(dt);
+        close(camera.focus.x, expectedX, 'slow-frame camera uses the full clamped simulation wall time');
+      }
+    } finally {
+      if (windowDescriptor) Object.defineProperty(globalThis, 'window', windowDescriptor);
+      else Reflect.deleteProperty(globalThis, 'window');
+    }
+    console.log('RENDER: PASS frozen pause poses, smooth resume, tick acceleration (exhaust/audio), bounded pose storage, scratch metadata, slow-frame follow');
+  } finally {
+    if (clockDescriptor) Object.defineProperty(performance, 'now', clockDescriptor);
+    else Reflect.deleteProperty(performance, 'now');
+  }
 }
 
 type ScheduledCommand = { day: number; kind: 'rename-lines' | 'repay-loan' | 'change-line-color' };
@@ -247,7 +419,7 @@ function apply(s: Stream, c: ScheduledCommand) {
 
 function summary(s: Stream) {
   const g = s.g;
-  return { stream: s.name, suppliedSeconds: s.calls * s.dt, updates: s.calls,
+  return { stream: s.name, suppliedSeconds: s.suppliedSeconds, updates: s.calls,
     tick: g.tick, day: g.day, dayFrac: g.dayFrac, companies: g.activeCompanies.length,
     edges: g.world.net.edges.size, stations: g.stations.map.size, lines: g.lines.map.size, vehicles: g.vehicles.map.size,
     delivered: g.vehicles.all().filter((v) => v.owner === 0).reduce((n, v) => n + v.delivered, 0),
@@ -255,7 +427,8 @@ function summary(s: Stream) {
 }
 
 function main() {
-  checkScheduler();
+  checkPacingAndRendering();
+  if (process.argv.includes('--scheduler-only')) return;
   const seed = numberOption('seed', 7, 0), days = numberOption('days', 360), every = numberOption('every', 30);
   const size = numberOption('size', 384, 192), ais = numberOption('ais', 2, 0);
   if (ais > 7) throw new Error('--ais must be <= 7');
@@ -266,7 +439,7 @@ function main() {
     const g = Game.create({ ...options }); // Each world is fresh, with its own options object.
     const fixture = buildFixture(g);
     console.log(`  ${name}: fixture ${digest(canonical(fixture.transcript)).slice(0, 16)}; rail ${fixture.railLine}, bus ${fixture.busLine}, train ${fixture.train}`);
-    return { name, dt, g, fixture, calls: 0, active: true };
+    return { name, dt, g, fixture, calls: 0, suppliedSeconds: 0, active: true };
   });
   const initial = capture(streams[0].g);
   for (const s of streams.slice(1)) {
@@ -301,7 +474,7 @@ function main() {
   for (const s of streams) console.log('  final ' + JSON.stringify(summary(s)));
   console.log(`IDENTICAL FIXED STEPS: ${fixedFailed ? 'FAIL' : `PASS through ${days} nominal days`}`);
   for (const s of streams.slice(2)) console.log(`CHUNKING ${s.dt}: ${s.active ? `MATCH through ${days} days (${s.g.tick} ticks)` : 'DIVERGED (first observation above)'}`);
-  console.log('Scope: one process/JS engine, one fixture; equal hashes do not prove cross-browser or save/resume determinism. No time or RNG monkeypatches.');
+  console.log('Scope: one process/JS engine, one fixture; equal hashes do not prove cross-browser or save/resume determinism. Outcome streams use unmodified clocks/RNGs.');
   process.exitCode = fixedFailed || (chunkFailed && process.argv.includes('--strict-chunking')) ? 1 : 0;
 }
 
