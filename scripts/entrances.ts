@@ -19,7 +19,7 @@ import { planRelevel, commitRelevel } from '../src/game/trackops';
 import type { Station, EntranceKind } from '../src/game/stations';
 import { walkingCatchment, walkingCatchmentWithout, walkingPopulation, entrancePlanCatchment } from '../src/game/catchment';
 import { stationCrossings } from '../src/game/station-styles';
-import { runNetworkTask } from '../src/game/ai-network';
+import { runNetworkTask, networkDaily, networkPlanner, saveNetwork } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { flatGame, station, endNode, loco, depotFor, check, build, railOpts, nodeSnap, done } from './stationlib';
@@ -421,6 +421,25 @@ const stat = (ai: AIController, k: string) => (ai.stats as unknown as Record<str
   flush(g2);
   runNetworkTask(ai2, 'capacity');
   check(stat(ai2, 'netEntrances') === 0 && H2.rail!.entrances.length === 0, 'no residents across the tracks: the AI adds no entrance');
+}
+
+// ------------------------------------------------------------------------------------------ AI: valued over work units
+{
+  console.log('AI: the entrance is valued over work units (a saved cursor); a game saved mid-valuation resumes alike');
+  const { g, ai, H } = aiFixture();
+  // (the capacity job and its work items, one station each; then a work unit a day as the planner runs it)
+  runNetworkTask(ai, 'capacity', 1);
+  const cursorOf = (x: Game) => saveNetwork(x).companies.find(([id]) => id === ai.companyId)?.[1].job?.items?.find((i) => i.entrance)?.entrance;
+  let units = 0;
+  while (units < 60 && !((cursorOf(g)?.at ?? 0) > 0) && networkPlanner(ai)?.task) { networkDaily(ai); units++; }
+  const cur = cursorOf(g);
+  check(!!cur && cur.at > 0 && H.rail!.entrances.length === 0, `mid-valuation after ${units} work units: a saved cursor (${JSON.stringify(cur)})`);
+  console.log(`  saved after ${units} work units, mid-valuation: ${JSON.stringify(cur)}`);
+  const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+  check(JSON.stringify(serialize(loaded)) === data && JSON.stringify(cursorOf(loaded)) === JSON.stringify(cur), 'the cursor and its best place so far round-trip');
+  for (const w of [g, loaded]) for (let i = 0; i < 60 && networkPlanner(w.ais[0])?.task; i++) networkDaily(w.ais[0]);
+  check(stat(ai, 'netEntrances') === 1 && H.rail!.entrances.length === 1 && JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)),
+    `resuming builds the same entrance in both (${H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)) ? 'identical' : 'differ'})`);
 }
 
 // ------------------------------------------------------------------------------------------ AI: access streets through houses

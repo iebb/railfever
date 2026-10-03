@@ -19,7 +19,7 @@ import type { Town } from '../src/game/towns';
 import { emptyRecord } from '../src/game/economy';
 import { TRIPS_PER_MONTH } from '../src/game/demand';
 import { serialize, deserialize } from '../src/game/save';
-import { planConnection, commitConnection, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
+import { planConnection, commitConnection, connectStationThroat, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
 import { depotReaches } from '../src/game/train';
 import { nodeSnap } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
@@ -27,9 +27,10 @@ import { MODELS } from '../src/game/vehicle-types';
 import { RoadVehicle, makeLaneSeg } from '../src/game/roadvehicle';
 import { outAndBack } from '../src/game/lines';
 import { canJoinLines, patternHeadways } from '../src/game/patterns';
+import * as Patterns from '../src/game/patterns';
 import { closestOnPolyline } from '../src/game/geom';
 import { aiWorld, sidingEdges } from './networks';
-import { fails, check, fmt, checkReservations, build, free, railOpts, roadOpts, edgeSnapAt, nodeNear, busStopSites, addBusStop, roadDepotNear, depotBehind } from './lib';
+import { fails, check, fmt, checkReservations, connectDouble, build, free, railOpts, roadOpts, edgeSnapAt, nodeNear, busStopSites, addBusStop, roadDepotNear, depotBehind } from './lib';
 import { station, endNode, newTrack, loco, depotFor, runTrains } from './stationlib';
 
 export interface AINetMetrics {
@@ -613,9 +614,183 @@ function reviewChecks() {
   }
 }
 
+function midConnectionChecks() {
+  console.log('midconnect: crossing routes, through demand, ownership and running trains');
+  for (const mode of ['own', 'shared', 'player', 'no-demand', 'incompatible', 'congested', 'capacity'] as const) {
+    const { g, ai, me } = aiFlat();
+    const other = mode === 'player' ? 0 : mode === 'shared' ? g.addAICompany({ accessPolicy: 'open' }).id : me;
+    if (mode === 'shared') { g.company(other).economy.money = 200_000_000; g.ais[1].state.cooldown = 1e9; }
+    g.setAccessPolicy(0, 'open'); g.refreshAccess();
+    const tracks = mode === 'capacity' ? 1 : 2;
+    const A = station(g, 32, 128, Math.PI / 2, 10, tracks, me)!, B = station(g, 224, 128, Math.PI / 2, 10, tracks, me)!;
+    const C = station(g, 128, 32, 0, 10, tracks, other)!, D = station(g, 128, 224, 0, 10, tracks, other)!;
+    check(!!build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'midconnect A'), 'midconnect: first railway built');
+    check(!!build(g, nodeSnap(g, endNode(g, C, 0, true), 'rail'), nodeSnap(g, endNode(g, D, 0, false), 'rail'), railOpts(other), 'midconnect B'), 'midconnect: crossing railway built');
+    for (const st of [A, B, C, D]) connectStationThroat(g, st.id, st.owner);
+    const a = g.lines.get(lineWithTrain(g, me, [A, B]))!, b = g.lines.get(lineWithTrain(g, other, [C, D]))!;
+    fixtureFlows(g, [A, B, C, D], mode === 'no-demand' ? 0 : 600);
+    fixtureTown(g, 128, 128, 6000, 20);
+    if (mode === 'incompatible') for (const t of g.vehicles.trains()) t.cars = [MODELS.find((m) => m.id === 'metro_a')!];
+    if (mode === 'congested') { const t = g.vehicles.get(a.vehicles[0]) as Train; t.state = 'waiting'; t.stuckTime = 300; }
+    const before = JSON.stringify([...g.world.net.edges.values()].filter((e) => e.owner === other)), money = g.company(me).economy.money;
+    runNetworkTask(ai, 'midconnect');
+    const positive = mode === 'own' || mode === 'shared';
+    if (!positive) {
+      check(!stat(ai, 'netMidConnections') && g.lines.all().length === 2 && g.company(me).economy.money === money, `midconnect ${mode}: no unjustified connection or service`);
+      if (mode === 'player') check(JSON.stringify([...g.world.net.edges.values()].filter((e) => e.owner === 0)) === before, 'midconnect: player track untouched even under open access');
+      continue;
+    }
+    const through = g.lines.all().find((l) => l.id !== a.id && l.id !== b.id && l.owner === me);
+    check(stat(ai, 'netMidConnections') === 1 && !!through, `midconnect ${mode}: connecting curve and through service opened (${ai.log.slice(-2).join('; ')})`);
+    if (!through) { console.log('midconnect decisions', networkProfile.decisions); continue; }
+    const path = [...new Set(through.stops)];
+    check(path.some((sid) => a.stops.includes(sid)) && path.some((sid) => b.stops.includes(sid)) && g.lines.ownsStationOn(through, me), 'midconnect: the route uses both halves and owns a station');
+    const train = g.vehicles.get(through.vehicles[0]) as Train;
+    g.aiEnabled = false;
+    const run = runTrains(g, [train], 720), visited = new Set(run.arrivals.get(train.id));
+    check(path.every((sid) => visited.has(sid)) && train.state !== 'noroute', `midconnect ${mode}: its train runs end to end and back (${[...visited]}, ${train.status})`);
+    if (!path.every((sid) => visited.has(sid))) console.log('midconnect train diagnostics', through.stops, g.vehicles.trains().map((t) => ({ id: t.id, line: t.lineId, state: t.state, status: t.status, station: t.atStation, target: t.routeTarget, stuck: t.stuckTime, by: t.blockedBy, depot: t.depotId, segs: t.segs.map((s) => s.e), pending: t.pending.map((s) => s.e) })), [...g.world.net.nodes.values()].filter((n) => n.signal).map((n) => [n.id, n.x, n.z, n.signal, n.signalKind]));
+    check(checkReservations(g).length === 0, 'midconnect: train reservations remain consistent');
+    if (mode === 'shared') check([...g.world.net.edges.values()].some((e) => e.owner === other && e.kind === 'rail'), 'midconnect: partner retains its infrastructure ownership');
+  }
+}
+
+function railPatienceChecks() {
+  console.log('rail patience: annual staged cuts, recovery, last train and exact saved accounts');
+  const { g, ai, me } = aiFlat();
+  const A = station(g, 40, 128, Math.PI / 2, 10, 1, me)!, B = station(g, 214, 128, Math.PI / 2, 10, 1, me)!;
+  build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'patience track');
+  const l = g.lines.get(lineWithTrain(g, me, [A, B]))!, first = g.vehicles.get(l.vehicles[0]) as Train;
+  for (let i = 0; i < 2; i++) g.vehicles.buyTrain(first.depotId, loco(), l.id);
+  const metadata = (ai as unknown as { lines: Map<number, any> }).lines;
+  metadata.set(l.id, { kind: 'rail', towns: [], depot: first.depotId, maxVehicles: 3, opened: 0 });
+  const express = Patterns.addPattern(g, l.id, 'express')!;
+  Patterns.setVehiclePattern(g, l.vehicles[2], express.id);
+  const initialCars = first.cars.length;
+  const originalCycle = patternHeadways(g, l)[0].cycle;
+  let loaded: Game | null = null;
+  for (let month = 1; month <= 60; month++) {
+    for (const w of loaded ? [g, loaded] : [g]) {
+      w.day = month * 30;
+      const controller = w.ais[0];
+      controller.railPolicy.operating(l.id, -10_000);
+      controller.railPolicy.monthEnd(new Map());
+      runNetworkTask(controller, 'decommission');
+    }
+    if (month < 60) check(g.lines.map.has(l.id), `rail patience: service survives ${month} months of losses`);
+    if (month === 12) {
+      check(first.cars.length < initialCars && l.vehicles.length === 3, 'rail patience: empty consists shortened before frequency cuts');
+      const cycle = patternHeadways(g, l)[0].cycle, replay = deserialize(serialize(g));
+      check(cycle !== originalCycle && patternHeadways(replay, replay.lines.get(l.id)!)[0].cycle === cycle,
+        'rail patience: shorter consist refreshes its timetable and reloads identically');
+    }
+    if (month === 24) {
+      check(l.vehicles.length === 2, 'rail patience: fewer trains, with one kept per pattern');
+      g.stations.refreshAccess(true);
+      const saved = JSON.stringify(serialize(g)); loaded = deserialize(JSON.parse(saved));
+      if (JSON.stringify(serialize(loaded)) !== saved) {
+        const a = serialize(g), b = serialize(loaded);
+        for (const key of Object.keys(a).filter((key) => JSON.stringify(a[key]) !== JSON.stringify(b[key]))) {
+          const x = JSON.stringify(a[key]), y = JSON.stringify(b[key]); let at = 0; while (at < Math.min(x.length, y.length) && x[at] === y[at]) at++;
+          console.log('rail save difference', key, x.slice(Math.max(0, at - 80), at + 200), 'vs', y.slice(Math.max(0, at - 80), at + 200));
+        }
+      }
+      check(JSON.stringify(serialize(loaded)) === saved, 'rail patience: mid-policy save round-trips exactly');
+    }
+    if (month === 36) check(Patterns.linePatterns(l).length === 1, 'rail patience: express dropped after a year at reduced frequency');
+    if (month === 48) {
+      check(l.vehicles.length === 1, 'rail patience: final single-train shuttle trial');
+      const e = g.company(me).economy; e.money = -1_000_000; e.loan = e.maxLoan;
+      const train = g.vehicles.get(l.vehicles[0])!; train.boughtDay = 0; train.profitLast = -1_000_000; train.profitYear = -50_000;
+      // Both copies receive the same distress input, including normal monthly management.
+      if (loaded) { const ce = loaded.company(me).economy; ce.money = e.money; ce.loan = e.loan;
+        const t = loaded.vehicles.get(train.id)!; t.boughtDay = 0; t.profitLast = train.profitLast; t.profitYear = train.profitYear; }
+      ai.monthly(); loaded?.ais[0].monthly();
+      check(l.vehicles.length === 1, 'rail patience: negative cash never sells the last train');
+    }
+    if (loaded) check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), `rail patience: exact monthly replay at ${month} months`);
+  }
+  const closed = ai.railPolicy.events.find((e) => e.kind === 'closed');
+  check(!g.lines.map.has(l.id) && closed?.lossYears === 5 && closed.age >= 1800, 'rail patience: closes only after five complete losing years and annual trials');
+  g.day += 400; runNetworkTask(ai, 'decommission'); runNetworkTask(ai, 'decommission');
+  check(!g.stations.all().some((s) => s.owner === me) && ![...g.world.net.edges.values()].some((e) => e.owner === me && e.kind === 'rail'), 'rail patience: unused infrastructure retired after closure grace');
+  // A profitable operating year clears the consecutive loss count even after very large capital expenditure.
+  const { g: recovery, ai: controller, me: owner } = aiFlat();
+  const x = station(recovery, 40, 128, Math.PI / 2, 10, 1, owner)!, y = station(recovery, 214, 128, Math.PI / 2, 10, 1, owner)!;
+  build(recovery, nodeSnap(recovery, endNode(recovery, x, 0, true), 'rail'), nodeSnap(recovery, endNode(recovery, y, 0, false), 'rail'), railOpts(owner));
+  const id = lineWithTrain(recovery, owner, [x, y]), rail = recovery.lines.get(id)!;
+  for (let m = 1; m <= 24; m++) {
+    recovery.day = m * 30;
+    if (m === 13) recovery.company(owner).economy.spend(5_000_000, 'construction', true);
+    controller.railPolicy.operating(id, m <= 12 ? -10_000 : 500_000);
+    controller.railPolicy.monthEnd(new Map()); controller.railPolicy.review(rail);
+  }
+  const s = controller.railPolicy.account(rail);
+  check(s.lossYears === 0 && s.step === 0 && s.lastProfit > 0, 'rail patience: operating recovery restores growth and resets losses, capital excluded');
+
+  // A completed route can be saved/interrupted between creating the line and buying its first train.
+  const probe = controller as unknown as { project: any; job: Generator<void, void> | null; abandon(p: any): void };
+  const depot = (recovery.vehicles.get(rail.vehicles[0]) as Train).depotId;
+  for (const vid of [...rail.vehicles]) recovery.vehicles.sell(vid);
+  const edges = [...recovery.world.net.edges.values()].filter((e) => e.owner === owner && e.kind === 'rail').map((e) => e.id);
+  probe.project = { kind: 'rail', towns: [], stations: [x.id, y.id], edges: [...edges], depots: [depot], line: id, started: recovery.day, built: true };
+  probe.abandon(probe.project); probe.project = null;
+  check(recovery.lines.map.has(id) && recovery.depots.get(depot) && edges.every((eid) => recovery.world.net.edges.has(eid)) && controller.managedLines().includes(id),
+    'rail patience: completed infrastructure with no train survives interrupted construction and is adopted');
+  controller.monthly();
+  check(rail.vehicles.length === 1, 'rail patience: an interrupted empty railway restores its minimum service');
+
+  const train = recovery.vehicles.get(rail.vehicles[0]) as Train;
+  for (let i = 0; i < 2; i++) check(typeof recovery.vehicles.buyTrain(depot, [...train.cars], id) !== 'string', 'rail distress: surplus train bought');
+  const e = recovery.company(owner).economy;
+  e.money = -2_000_000; e.loan = e.maxLoan;
+  s.step = 1; s.lastCut = recovery.day; s.lossYears = 2; s.lastProfit = -120_000; s.lossSince = 0;
+  controller.railPolicy.daily();
+  recovery.day += 179; controller.railPolicy.daily();
+  check(!controller.railPolicy.deepTrouble, 'rail distress: recovery waits for six months at the loan ceiling');
+  probe.project = { kind: 'rail', towns: [], stations: [], edges: [], depots: [], line: -1, started: recovery.day, built: false };
+  probe.job = (function* (): Generator<void, void> { while (true) yield; })();
+  recovery.day++; controller.daily();
+  check(controller.railPolicy.deepTrouble && !controller.busy && !probe.project && rail.vehicles.length === 3,
+    'rail distress: stops new works, while giving the shorter-train trial its full year');
+  const savedPolicy = controller.railPolicy.save(), restoredPolicy = deserialize(serialize(recovery)).ais[0].railPolicy.save();
+  check(JSON.stringify(savedPolicy) === JSON.stringify(restoredPolicy), 'rail distress: six-month clock and loss/cut state persist exactly');
+  recovery.day = s.lastCut + 360; controller.daily(); runNetworkTask(controller, 'decommission');
+  check(rail.vehicles.length === 1 && recovery.lines.map.has(id) && !controller.railPolicy.events.some((event) => event.kind === 'closed'),
+    'rail distress: sells surplus after the annual trial and protects the last train and young line');
+}
+
+function worksReplayChecks() {
+  console.log('station works: owned holds, split edges and exact replay through expiry');
+  const { g, me } = aiFlat();
+  const A = station(g, 32, 128, Math.PI / 2, 10, 2, me)!, B = station(g, 224, 128, Math.PI / 2, 10, 2, me)!;
+  check(connectDouble(g, A, B, me).ok, 'station works: directional double-track fixture built');
+  const l = g.lines.get(lineWithTrain(g, me, [A, B]))!, train = g.vehicles.get(l.vehicles[0]) as Train;
+  g.aiEnabled = false;
+  while (g.day < 360 && !(train.state === 'loading' && train.atStation === A.id)) g.stepTick();
+  check(train.state === 'loading' && train.atStation === A.id, 'station works: train occupies the platform');
+  const plan = planStationUpgrade(g, A.id, { tracks: 3 });
+  check(plan.ok && commitStationUpgrade(g, plan) === 'busy', 'station works: upgrade waits for the occupied throat');
+  const holds = g.stations.saveWorks();
+  check(holds.length > 0 && holds[0][1].edges.length > 0 && checkReservations(g).length === 0, 'station works: holds have a live station owner');
+  if (!holds.length) return;
+  const edge = g.world.net.edges.get(holds[0][1].edges[0])!;
+  const split = g.world.net.splitEdge(edge.id, edge.len / 2)!;
+  check(split && g.vehicles.getRes(split.e1.id) === WORKS_HOLD && g.vehicles.getRes(split.e2.id) === WORKS_HOLD
+    && !g.vehicles.getRes(edge.id) && checkReservations(g).length === 0, 'station works: a turnout split transfers the hold to both descendants');
+  g.onNetworkChanged(); g.flushNetworkChanges(); g.stations.refreshAccess(true);
+  const json = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(json));
+  check(JSON.stringify(serialize(loaded)) === json && checkReservations(loaded).length === 0, 'station works: pending holds round-trip exactly');
+  for (const until = g.day + 31; g.day < until;) { g.stepTick(); loaded.stepTick(); }
+  check(!g.stations.saveWorks().length && !loaded.stations.saveWorks().length && checkReservations(g).length === 0 && checkReservations(loaded).length === 0,
+    'station works: both copies release every descendant at the saved deadline');
+  check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), 'station works: exact replay through a saved possession');
+}
+
 export function scenarios() {
   networkOptions.enabled = false;
   roadChecks(); joinChecks(); stationPairChecks(); reviewChecks();
+  midConnectionChecks(); railPatienceChecks(); worksReplayChecks();
   // 1. pairing: two lines leave a station on its two platform tracks, side by side for 60 units, then part
   {
     console.log('pair: two single tracks side by side become one double track');
@@ -755,9 +930,9 @@ export function scenarios() {
     check(before >= 1 && after === 0, 'crossovers: none left on plain line');
     check(routes(g, A, B, me), 'crossovers: the line still runs');
   }
-  // 8. a loss-making route closed, its stations taken up after the grace period
+  // 8. Two losing years keep a minimum rail service; upkeep alone also counts as an operating loss.
   {
-    console.log('decommission: two years of losses');
+    console.log('decommission: two years of losses tolerated');
     const { g, ai, me } = aiFlat();
     const A = station(g, 40, 128, Math.PI / 2, 10, 1, me)!, B = station(g, 214, 128, Math.PI / 2, 10, 1, me)!;
     build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'line');
@@ -767,13 +942,7 @@ export function scenarios() {
     for (const vid of l.vehicles) { const v = g.vehicles.get(vid)!; v.boughtDay = g.day - 1000; }
     l.incomeLast = 100_000; l.costLast = 900_000; l.incomeYear = 50_000; l.costYear = 600_000;
     runNetworkTask(ai, 'decommission');
-    check(!g.lines.get(lid) && stat(ai, 'netDecommissioned') === 1 && !g.vehicles.trains().some((t) => t.owner === me), 'decommission: the line closed, its train sold');
-    g.day += 400;
-    runNetworkTask(ai, 'decommission');
-    runNetworkTask(ai, 'decommission');
-    const left = [...g.stations.map.values()].filter((s) => s.owner === me).length, track = [...g.world.net.edges.values()].filter((e) => e.owner === me && e.kind === 'rail').length;
-    console.log(`  after the grace period: ${left} stations, ${track} track edges of ours, retired ${stat(ai, 'netRetired')}`);
-    check(left === 0 && track === 0, 'decommission: unused stations and track taken up');
+    check(!!g.lines.get(lid) && stat(ai, 'netDecommissioned') === 0 && l.vehicles.length === 1, 'decommission: two losses do not close a railway or sell its last train');
   }
   // 9. a district grown up beside a line between its stations: a station inserted there
   for (const fragmented of [false, true]) {
@@ -911,7 +1080,7 @@ function stateChecks() {
   timers.companies[0][1].demand = { day: 119, nt: 2, P: [0, 1 / 3, Math.PI, 0] };
   loadNetwork(g, timers);
   const state = saveNetwork(g), data = JSON.parse(JSON.stringify(serialize(g))), loaded = deserialize(data);
-  check(state.companies[0][1].next.length === 14 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
+  check(state.companies[0][1].next.length === 15 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
     && state.companies[0][1].retire.length > 0, 'save: schedules, cooldowns, station changes and removal grace are populated');
   check(state.companies[0][1].sizes[0][1].day === 120, 'save: station growth cooldown retains the day of the actual change');
   check(JSON.stringify(state) === JSON.stringify(saveNetwork(loaded)), 'save: planner fields round-trip exactly through JSON');

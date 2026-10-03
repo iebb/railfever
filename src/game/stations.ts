@@ -10,7 +10,7 @@ import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
-import { growThroat, throatFree, holdThroat, releaseHold } from './trackops';
+import { growThroat, throatFree, holdThroat, releaseHold, WORKS_HOLD } from './trackops';
 import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
@@ -710,6 +710,16 @@ export class Stations {
   constructor(private game: Game) {
     const net = game.world.net;
     net.onSplit.push((old, e1, e2, s) => {
+      for (const h of this.holds.values()) {
+        const i = h.edges.indexOf(old.id);
+        if (i >= 0) {
+          h.edges.splice(i, 1, e1.id, e2.id);
+          if (game.vehicles.getRes(old.id) === WORKS_HOLD) {
+            game.vehicles.setRes(e1.id, WORKS_HOLD); game.vehicles.setRes(e2.id, WORKS_HOLD);
+            game.vehicles.releaseRes(old.id, WORKS_HOLD);
+          }
+        }
+      }
       for (const st of this.map.values()) {
         for (const stop of st.stops) {
           if (stop.edge !== old.id) continue;
@@ -724,6 +734,11 @@ export class Stations {
       }
     });
     net.onRemove.push((e) => {
+      for (const [sid, h] of this.holds) {
+        if (h.edges.includes(e.id)) game.vehicles.releaseRes(e.id, WORKS_HOLD);
+        h.edges = h.edges.filter((id) => id !== e.id);
+        if (!h.edges.length) this.holds.delete(sid);
+      }
       for (const st of [...this.map.values()]) {
         const before = st.stops.length;
         st.stops = st.stops.filter((p) => p.edge !== e.id);
@@ -1583,6 +1598,8 @@ export class Stations {
     const st = this.map.get(id);
     if (!st) return null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) if (g.vehicles.isEdgeBusy(eid)) return 'Train in the station';
+    const hold = this.holds.get(id);
+    if (hold) { releaseHold(g, hold.edges); this.holds.delete(id); }
     const site = st.rail ? { x: st.x, z: st.z, rail: st.rail } : null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) g.world.net.removeEdge(eid);
     this.markStation(st);
@@ -3151,8 +3168,26 @@ export class Stations {
     return out.sort((p, q) => p.lat - q.lat).map((q) => q.ids);
   }
 
-  /** Station works waiting for a free throat: track held so no train enters (see commitUpgrade). Not saved. */
+  /** Station works waiting for a free throat: track held so no train enters (see commitUpgrade). */
   private holds = new Map<number, { edges: number[]; until: number }>();
+
+  heldForWorks(edge: number): boolean {
+    return [...this.holds].some(([sid, h]) => this.map.has(sid) && h.until > this.game.day && h.edges.includes(edge));
+  }
+  saveWorks(): [number, { edges: number[]; until: number }][] {
+    return [...this.holds].map(([sid, h]): [number, typeof h] => [sid, { edges: [...h.edges], until: h.until }]).sort((a, b) => a[0] - b[0]);
+  }
+  loadWorks(holds: ReturnType<Stations['saveWorks']>) {
+    for (const h of this.holds.values()) releaseHold(this.game, h.edges);
+    this.holds.clear();
+    for (const [sid, h] of holds) {
+      if (!this.map.has(sid)) continue;
+      const edges = h.edges.filter((id) => this.game.world.net.edges.has(id));
+      if (!edges.length) continue;
+      this.holds.set(sid, { edges, until: h.until });
+      for (const id of edges) this.game.vehicles.setRes(id, WORKS_HOLD);
+    }
+  }
 
   /**
    * Daily platform sampling for the capacity figures (game.ts, once a day): occupied platform tracks, trains

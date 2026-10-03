@@ -300,7 +300,10 @@ export function chargeVehicles(g: Game) {
     eco.spend(c.energy, 'energy', true);
     v.profitYear -= c.total;
     const l = v.line;
-    if (l) l.costYear += c.total;
+    if (l) {
+      l.costYear += c.total;
+      if (l.kind === 'rail') g.ais.find((a) => a.companyId === v.owner)?.railPolicy.operating(l.id, -c.total);
+    }
   }
 }
 
