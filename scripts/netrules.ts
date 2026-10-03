@@ -2,7 +2,7 @@
 // separated), crossovers right outside every station (=====x==[station]==x=====) with through trains running
 // freely and mid-line crossovers tidied away, and bus stops shared between lines and companies.
 // npx esbuild scripts/netrules.ts --bundle --platform=node --format=esm --outfile=$S/netrules.mjs && node $S/netrules.mjs
-import { Game } from '../src/game/game';
+import { TICKS_PER_DAY, Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { mergeStops } from '../src/game/stations';
 import type { Station } from '../src/game/stations';
@@ -167,6 +167,9 @@ const legs = (g: Game) => [...g.world.net.edges.values()].filter((e) => {
   const exp = g.lines.create('rail', 0); exp.stops = [A.id, B.id]; g.lines.rebuild();
   const trains = [...[0, 1].map(() => g.vehicles.buyTrain(dA, loco(), local.id) as Train), ...[0, 1].map(() => g.vehicles.buyTrain(dA, loco(), exp.id) as Train)];
   autoSignalNetwork(g, 0);
+  // even spacing releases trains from the depot a headway apart: finish that staged start (bounded)
+  // before measuring a full year
+  for (let d = 0; d < 120 && trains.some((t) => t.opLastSt < 0); d++) for (let k = 0; k < TICKS_PER_DAY; k++) g.stepTick();
   const r = runTrains(g, trains, 360);
   const counts = trains.map((t) => r.arrivals.get(t.id)?.length ?? 0);
   console.log(`  1 year: locals ${counts.slice(0, 2).join('/')}, expresses ${counts.slice(2).join('/')}, worst wait ${r.worst.days} days (${r.worst.kind})`);

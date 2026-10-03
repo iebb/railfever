@@ -22,6 +22,7 @@ import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
+import { walkRoadsChanged } from './catchment';
 
 const VERSION = 3;
 /** Save formats this build reads (v2: older single-record saves). */
@@ -368,6 +369,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
       dirtyNodes: [...net.dirtyNodes], dirtyEdges: [...net.dirtyEdges],
     },
     networkDirty: !!(g as any).networkDirty,
+    // A street edit still awaiting its network flush must invalidate catchments at that flush, not on load.
+    catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, waiting: [...s.waiting.values()] })),
@@ -484,6 +487,8 @@ export function deserialize(d: any): Game {
   for (const s of d.stations as any[]) {
     // station fields (levels, entrances, transfer links, road access) with defaults for older saves
     const st: Station = restoreStation(s);
+    // daily() adds onPlat after its other sampling fields; preserve that insertion order in an early save.
+    if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0);
     g.stations.map.set(st.id, st);
@@ -588,6 +593,13 @@ export function deserialize(d: any): Game {
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
   try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
+  // Walking caches also track which street edits must dirty catchments. Restore those dependencies now;
+  // leaving them cold would skip a recompute in the loaded game. A pending share-out does this next tick,
+  // including its road-access refresh; don't apply those changes early while loading. Prime with saved access.
+  const S = g.stations as any, accessVersion = S.accessVersion;
+  S.accessVersion = net.version;
+  if (!d.catchmentDirty) for (const st of g.stations.map.values()) g.stations.catchmentBuildings(st);
+  S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
     const restored = g.stations.get(s.id)?.waiting.get(wg.line + ':' + wg.alight + ':' + wg.dest);
@@ -595,6 +607,7 @@ export function deserialize(d: any): Game {
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
   g.lines.catchmentDirty = !!d.catchmentDirty;
+  g.lines.catchmentRoadsDirty = !!d.catchmentRoadsDirty;
   // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
   if (!d.opsVersion) {
     try { for (const n of canonicalizeLines(g, undefined, { sameOwnerOnly: true })) g.postNews(n.text, 'info'); }
