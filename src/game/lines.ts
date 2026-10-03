@@ -156,12 +156,17 @@ export class Lines {
   catchmentDirty = false;
   /** Keep the saved pending-refresh flag: demand regions can move while walking inputs stay fixed. */
   markDemandSharesDirty() { this.catchmentDirty = true; }
+  /** Street invalidation saved before its pending network change was flushed. */
+  catchmentRoadsDirty = false;
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
   constructor(private game: Game) {
     // stations rebuilt, moved or merged (longer platforms, another level, a stop combined): timetables and journey
     // times read their positions, so the routing is worked out again (a saved game then loads to the same routing)
-    game.listeners?.network?.push(() => this.checkStations());
+    game.listeners?.network?.push(() => {
+      if (this.catchmentRoadsDirty) { this.catchmentRoadsDirty = false; this.catchmentDirty = true; }
+      this.checkStations();
+    });
   }
 
   /** where the stations were when the routing was last worked out */
