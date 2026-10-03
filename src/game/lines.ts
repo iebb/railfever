@@ -200,6 +200,7 @@ export class Lines {
       autoName: true, autoColor: true, evenSpacing: true,
     };
     line.name = this.autoNameOf(line);
+    this.ensureCode(line);
     this.autoText.set(id, line.name);
     this.map.set(id, line);
     return line;
@@ -277,8 +278,12 @@ export class Lines {
   /** The company letter (Company.code). */
   companyCode(owner: number): string { return this.game.company(owner).code ?? '?'; }
 
-  /** The route letter of a rail line, assigned if absent (unique among its owner's rail lines); '' for other modes. */
+  /** Read the saved route letter; allocation belongs to creation, rebuilding and migration, never display. */
   routeCode(l: Line): string {
+    return l.kind === 'rail' ? l.code ?? '' : '';
+  }
+  /** Allocate or repair a route letter during a deliberate model operation. */
+  private ensureCode(l: Line): string {
     if (l.kind !== 'rail') return '';
     if (l.code && !this.codeTaken(l.code, l.owner, l.id)) return l.code;
     l.code = this.freeCode(l);
@@ -301,7 +306,7 @@ export class Lines {
   /** A rail line's symbol: company letter + route letter, e.g. 'AS' (unique in the game); '' for other modes. */
   lineCode(id: number): string {
     const l = this.map.get(id);
-    return l?.kind === 'rail' ? this.companyCode(l.owner) + this.routeCode(l) : '';
+    return l?.kind === 'rail' && l.code ? this.companyCode(l.owner) + l.code : '';
   }
 
   /** Stations of a line in route order (out-and-back lines from one end to the other; else in stop order). */
@@ -326,8 +331,8 @@ export class Lines {
   stationCode(lineId: number, stationId: number): string {
     const l = this.map.get(lineId), st = this.game.stations.get(stationId);
     if (!l || l.kind !== 'rail' || !st || !l.stops.includes(stationId)) return '';
-    const n = this.ensureNumbers(l).get(stationId);
-    return n === undefined ? '' : this.companyCode(st.owner >= 0 ? st.owner : l.owner) + this.routeCode(l) + String(n).padStart(2, '0');
+    const n = l.numbers?.find(([sid]) => sid === stationId)?.[1];
+    return n === undefined || !l.code ? '' : this.companyCode(st.owner >= 0 ? st.owner : l.owner) + l.code + String(n).padStart(2, '0');
   }
 
   /** All rail numbers of a station (one per rail line stopping there; interchanges have several), with their lines. */
@@ -353,7 +358,7 @@ export class Lines {
   inheritRoute(lineId: number, fromId: number) {
     const l = this.map.get(lineId), f = this.map.get(fromId);
     if (!l || !f || l.kind !== 'rail' || f.kind !== 'rail' || l === f) return;
-    const code = this.routeCode(f);
+    const code = this.ensureCode(f);
     if (!this.codeTaken(code, l.owner, l.id)) l.code = code;
     const fm = this.ensureNumbers(f);
     const route = this.routeStations(l);
@@ -566,7 +571,11 @@ export class Lines {
     this.servedStations.clear();
     this.version++;
     this.refreshNames();
-    for (const l of this.map.values()) if (l.kind === 'rail' && l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
+    // Also migrate empty/provisional lines: opening one must never be the event that gives it a code.
+    for (const l of this.map.values()) if (l.kind === 'rail') {
+      this.ensureCode(l);
+      if (l.stops.length) this.ensureNumbers(l);
+    }
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)

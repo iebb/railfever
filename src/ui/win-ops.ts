@@ -24,6 +24,7 @@ import type { PartnerPolicy } from '../game/lines';
 const memos = new WeakMap<Game, Map<string, { key: string; v: unknown; t: number }>>();
 const LINE_MEMOS = new Set(['cong', 'sigfix', 'dblfix', 'route', 'elec']);
 const STATION_MEMOS = new Set(['platfix', 'station-expand', 'restyle']);
+const VEHICLE_MEMOS = new Set(['van-add', 'van-drop']);
 
 /** Drop entries for deleted entities, even when their windows are no longer open. */
 export function pruneMemos(g: Game) {
@@ -33,9 +34,10 @@ export function pruneMemos(g: Game) {
     const [kind, id, depot] = name.split(':');
     const lineGone = (LINE_MEMOS.has(kind) || kind === 'rail-warning' && id !== 'none') && !g.lines.map.has(Number(id));
     const stationGone = STATION_MEMOS.has(kind) && !g.stations.map.has(Number(id));
+    const vehicleGone = VEHICLE_MEMOS.has(kind) && !g.vehicles.map.has(Number(id));
     const depotGone = kind === 'rail-warning' && depot !== 'none' && !g.depots.map.has(Number(depot))
       || kind === 'find-depot' && typeof c.v === 'number' && !g.depots.map.has(c.v);
-    if (lineGone || stationGone || depotGone) m.delete(name);
+    if (lineGone || stationGone || vehicleGone || depotGone) m.delete(name);
   }
 }
 

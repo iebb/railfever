@@ -893,7 +893,6 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   const oldKeep: Line = { ...keep, stops: [...keep.stops] };
   const sources = [oldKeep, drop];
   const oldPatterns = sources.map((l) => linePatterns(l).map((p) => ({ ...p, stops: [...servedFlags(l, l.patterns?.length ? p : null)], ids: [...l.stops] })));
-  g.lines.routeCode(keep);
   const renumber = opts.renumber ?? (lineRoute(oldKeep).stations[0] === check.junction);
   // A join keeps the visible name, even when that name used to follow the termini automatically.
   if (keep.autoName) keep.joinedName = keep.name;

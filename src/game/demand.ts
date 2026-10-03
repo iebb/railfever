@@ -500,6 +500,11 @@ export class DemandModel {
   /** Coverage of each region by a station (share of the region's residents it serves), [region, coverage][]. */
   coverage(st: Station, feeders = true): [number, number][] {
     this.refreshFeeders();
+    return this.coverageSnapshot(st, feeders);
+  }
+
+  /** UI estimate from the last computed walking shares and feeder pools; never refreshes access or catchments. */
+  coverageSnapshot(st: Station, feeders = true): [number, number][] {
     const sh = this.shares.get(st.id);
     const pops = new Map((sh ?? []).map(([r, s]) => [r, st.catchPop * s]));
     for (const [r, pop] of (feeders ? this.feeders.get(st.id)?.regions : undefined) ?? []) pops.set(r, (pops.get(r) ?? 0) + pop);
@@ -768,10 +773,9 @@ export interface DemandView { towns: DemandTown[]; pairs: DemandPair[]; regions:
 
 const viewCache = new WeakMap<Game, { key: string; view: DemandView }>();
 
-/** Demand by town, region, town pair and regional flow, for `company`'s view (served counts every company's lines). */
+/** Demand from the last computed catchment snapshot (served counts every company's lines).
+ * Pending construction/monthly refreshes belong to the simulation, including while the UI is open. */
 export function demandView(g: Game, company = 0): DemandView {
-  // (catchments first: recomputing them bumps the model's version, which is part of the key)
-  g.lines.flushCatchment();
   const m = g.demand;
   const key = `${g.day}:${g.lines.version}:${m.version}:${company}`;
   const c = viewCache.get(g);
@@ -788,25 +792,24 @@ function firstRide(g: Game, hop: Hop | undefined, dest: number): number {
 }
 
 function computeView(g: Game, company: number): DemandView {
-  g.lines.flushCatchment();
   const m = g.demand;
-  if (!m.regions.length) m.rebuild();
   const R = m.regions, n = R.length, T = g.towns.list, nt = T.length;
   // reach[r * n + q]: share of r's residents in catchments reaching stations that cover q, weighted by that coverage
   const reach = new Float64Array(n * n), reachMine = new Float64Array(n * n);
   const servedPop = new Float64Array(n);
   const townStations = new Int32Array(nt);
   const cov = new Map<number, [number, number][]>();
-  for (const st of g.stations.map.values()) cov.set(st.id, m.coverage(st));
+  for (const st of g.stations.map.values()) cov.set(st.id, m.coverageSnapshot(st));
   for (const st of g.stations.map.values()) {
     const table = g.lines.routing.get(st.id);
-    if (!table || !table.size || !stationActive(g, st)) continue;
+    // Read saved access too: stationActive/hasAccess can apply a pending street edit.
+    if (!table || !table.size || st.roadAccess === false) continue;
     if (st.townId >= 0 && st.townId < nt) townStations[st.townId]++;
     const from = cov.get(st.id)!;
     for (const [r, cr] of from) servedPop[r] += cr * R[r].pop;
     for (const [d, hop] of table) {
       const to = cov.get(d), ds = g.stations.get(d);
-      if (!to || !to.length || !ds || !stationActive(g, ds)) continue;
+      if (!to || !to.length || !ds || ds.roadAccess === false) continue;
       const mine = g.lines.get(firstRide(g, hop, d))?.owner === company;
       for (const [r, cr] of from) for (const [q, cq] of to) {
         reach[r * n + q] += cr * cq;
