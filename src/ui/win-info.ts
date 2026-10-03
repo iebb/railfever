@@ -7,7 +7,7 @@ import { availableModels, VehicleModel, MODEL_BY_ID, modelTracks } from '../game
 import { Train, depotReaches, depotServes, lineCompatibility, trackAllows } from '../game/train';
 import { RoadVehicle, roadDepotReaches } from '../game/roadvehicle';
 import type { Line } from '../game/lines';
-import { BUILDING_TYPES } from '../game/towns';
+import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES, TRAM } from '../game/constants';
 import { curveSpeed } from '../game/construction';
@@ -19,7 +19,7 @@ import { KIND_META } from './format';
 import { demandView, stationDemand } from '../game/demand';
 import { townDemandShare } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
-import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, ENTRANCE_COST, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf } from '../game/stations';
+import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, ENTRANCE_COST, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf, lostShare } from '../game/stations';
 import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
 import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
@@ -102,6 +102,10 @@ export function openStation(ui: UI, id: number) {
         !mine && s.owner >= 0 ? accessRows(ui, s.owner, g.stationMaintenance(s), () => { win.last = undefined; render(); }) : null,
         ui.kv('New passengers', `${fmtInt(s.genLast)} last month`),
         ui.kv('Boarded · arrived', `${fmtInt(s.pickupLast)} · ${fmtInt(s.arrivedLast)}`),
+        ui.kv('Gave up waiting', h('span', {
+          class: s.lostLast > 0 ? 'neg' : '',
+          'data-tip': `${fmtPct(lostShare(s))} of the passengers here gave up waiting (this and last month): the queue outgrew the station. More frequent or larger vehicles help; it lowers the rating.`,
+        }, `${fmtInt(s.lostLast)} last month`)),
         h('div', { class: 'btns' },
           h('button', { class: 'btn', onclick: () => ui.centerOn(s.x, s.z) }, icon('target', 16), 'Center'),
           h('button', { class: 'btn' + (ui.catchmentStation === id ? ' on' : ''), onclick: () => { ui.setCatchment(ui.catchmentStation === id ? -1 : id); win.last = undefined; render(); } }, icon('catchment', 16), 'Catchment'),
@@ -175,16 +179,18 @@ export function openTown(ui: UI, id: number) {
     clear(win.body);
     const counts = new Map<number, number>();
     for (const bid of town.buildings) { const b = g.world.buildings.get(bid); if (b) counts.set(b.type, (counts.get(b.type) ?? 0) + 1); }
-    const pct = town.passGenLast ? Math.min(1, town.passTransLast / town.passGenLast) : 0;
-    const growth = town.served === 0 ? 'Slow' : town.served === 1 ? 'Good' : 'Fast';
-    win.sub.textContent = town.served ? `${town.served} active station${town.served > 1 ? 's' : ''}` : 'No public transport';
+    const sv = townService(g, town);
+    const lost = town.passLostLast ?? 0;
+    win.sub.textContent = sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport';
     add(win.body, 
       h('div', { class: 'tiles' },
         tile(fmtInt(town.pop), 'Population'),
         tile(fmtInt(town.buildings.size), 'Buildings'),
-        tile(fmtPct(pct), 'Transported', '', bar(pct)),
-        tile(growth, 'Growth', town.served ? 'pos' : '')),
+        tile(sv.stations ? fmtPct(sv.transported) : '—', 'Transported', '', bar(sv.stations ? sv.transported : 0)),
+        tile(sv.label[0].toUpperCase() + sv.label.slice(1), 'Growth', sv.score >= 0.2 ? 'pos' : '')),
+      ui.kv('Growth', h('span', { 'data-tip': growthTip(sv) }, growthText(sv))),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
+      ui.kv('Gave up waiting', h('span', { class: lost > 0 ? 'neg' : '' }, `${fmtInt(lost)} last month`)),
       demandRows(ui, id),
       section('Buildings'),
       h('div', { class: 'list' }, [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => h('div', { class: 'row' }, h('span', null, BUILDING_TYPES[t]?.name ?? '?'), h('span', { class: 'num' }, String(c))))),
@@ -193,6 +199,17 @@ export function openTown(ui: UI, id: number) {
   };
   win.refresh = render;
   render();
+}
+
+/** What drives a town's growth: "fast — 64% of passengers transported, 3 active stations". */
+function growthText(sv: TownService): string {
+  if (!sv.stations) return `${sv.label} — no active stations`;
+  return `${sv.label} — ${fmtPct(sv.transported)} of passengers transported, ${sv.stations} active station${sv.stations > 1 ? 's' : ''}`;
+}
+function growthTip(sv: TownService): string {
+  if (!sv.stations) return 'Towns grow faster with public transport: stations a vehicle called at in the last three months, frequent vehicles and room for every passenger.';
+  return `Residents near active stations: ${fmtPct(sv.coverage)} (weighted by how often vehicles called in the last 30 days: ${fmtPct(sv.reach)}) · mean station rating ${fmtPct(sv.rating)} · ` +
+    `builds ${sv.speed.toFixed(1)}× as often as a town without public transport`;
 }
 
 /** Trip demand of a town and its strongest connections (from the demand model). */

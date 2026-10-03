@@ -11,6 +11,7 @@ import { fmtMoney } from '../game/economy';
 import type { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
 import { stationBadges, badgeHtml } from './lineid';
+import { townService } from '../game/towns';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
 
@@ -138,13 +139,14 @@ export class HoverCard {
     }
     const town = g.towns.list[t.id];
     if (!town) return null;
-    const pct = town.passGenLast ? Math.min(100, Math.round((town.passTransLast / town.passGenLast) * 100)) : 0;
-    const growth = town.served === 0 ? 'slow' : town.served === 1 ? 'good' : 'fast';
+    // growth follows the town's public transport (towns.ts townService, as in the town window)
+    const sv = townService(g, town);
+    const pct = sv.stations ? Math.round(sv.transported * 100) : 0;
     return {
       color: '#eef2f7',
       html: `<div class="hc-title">${svg('towns', 16)}<span>${esc(town.name)}</span></div>` +
-        `<div class="hc-sub">${town.served ? `${town.served} active station${town.served > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
-        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${growth}</b>`)}</div>` +
+        `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
+        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}</div>` +
         `<div class="hc-hint">Click for details</div>`,
     };
   }

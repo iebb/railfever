@@ -892,36 +892,9 @@ export class Game {
       const cap = 600 + (st.rail ? st.rail.tracks * st.rail.length * 12 : 0) + st.stops.length * 150;
       this.stations.trimWaiting(st, cap);
     }
-    // station ratings
-    for (const st of this.stations.map.values()) {
-      const days = this.day - st.lastPickup;
-      let target = 0.33;
-      target += days <= 7 ? 0.27 : days <= 14 ? 0.18 : days <= 30 ? 0.08 : 0;
-      target += st.waitingTotal < 100 ? 0.15 : st.waitingTotal < 400 ? 0.08 : st.waitingTotal < 1200 ? 0 : -0.12;
-      target += Math.min(0.17, Math.max(0, (st.lastSpeed - 45) / 900));
-      if (!this.lines.stationServed(st.id)) target = Math.min(target, 0.5);
-      st.rating += (target - st.rating) * 0.04;
-      st.rating = Math.max(0, Math.min(1, st.rating));
-    }
-    // town growth (towns grow faster when served by frequent public transport)
-    for (const town of this.towns.list) {
-      if (this.day < town.nextGrowthDay) continue;
-      let served = 0;
-      for (const st of this.stations.map.values()) {
-        if (this.day - st.lastPickup > 90 || !this.lines.stationServed(st.id)) continue; // v2 time scale: a train every ~2 months still serves a town
-        if (Math.hypot(st.x - town.x, st.z - town.z) <= town.radius + 10) served++;
-      }
-      town.served = served;
-      const base = served === 0 ? 60 : served === 1 ? 26 : served === 2 ? 17 : 11;
-      town.nextGrowthDay = this.day + Math.round(base * (0.7 + this.rng.next() * 0.6));
-      const steps = 1 + Math.floor(town.pop / 2500) + (served > 0 ? 1 : 0);
-      const before = town.pop;
-      for (let i = 0; i < steps; i++) this.towns.growStep(town, this.rng, this.day);
-      this.towns.recomputePop(town);
-      if (Math.floor(before / 1000) < Math.floor(town.pop / 1000) && town.pop >= 2000) {
-        this.postNews(`${town.name} is booming: population passes ${Math.floor(town.pop / 1000) * 1000}!`, 'good', town.x, town.z);
-      }
-    }
+    // station ratings (and service frequency), then town growth paced by the towns' public transport (towns.ts)
+    this.stations.updateRatings();
+    this.towns.daily();
     // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
     if (this.aiEnabled) for (const ai of [...this.ais]) {
       ai.daily();
@@ -969,10 +942,12 @@ export class Game {
       st.genLast = st.genMonth; st.genMonth = 0;
       st.pickupLast = st.pickupMonth; st.pickupMonth = 0;
       st.arrivedLast = st.arrivedMonth; st.arrivedMonth = 0;
+      st.lostLast = st.lostMonth || 0; st.lostMonth = 0;
     }
     for (const t of this.towns.list) {
       t.passGenLast = t.passGenMonth; t.passGenMonth = 0;
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
+      t.passLostLast = t.passLostMonth ?? 0; t.passLostMonth = 0;
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)

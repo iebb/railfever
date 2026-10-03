@@ -462,10 +462,12 @@ export class Vehicles {
       const t = g.towns.nearest(p.x, p.z);
       if (t) count.set(t.id, (count.get(t.id) ?? 0) + 1);
     }
-    let budget = 320 - this.ambient.length;
+    // cars in proportion to the towns' population (Towns.traffic: one per ~150 inhabitants, 120 to 900 on the map)
+    const traffic = g.towns.traffic();
+    let budget = traffic.cars - this.ambient.length;
     for (const town of g.towns.list) {
       if (budget <= 0) break;
-      const want = Math.min(32, Math.floor(town.pop / 110));
+      const want = Math.floor(town.pop / traffic.perCar);
       let have = count.get(town.id) ?? 0;
       if (have >= want) continue;
       const streets = g.towns.streets(town, 0);
