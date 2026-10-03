@@ -6,6 +6,7 @@ import { COMPANY_COLORS } from '../game/economy';
 import { AI_NAMES } from '../game/ai';
 import { openSaveLoad, openSettings } from './win-menu';
 import { MAX_AI, aiConfigsFor, presetOf, AI_PRESETS } from './gameapi';
+import { inertBehind } from './windows';
 
 export interface TitleOpts {
   ui: UI;
@@ -47,11 +48,14 @@ export function showTitle(o: TitleOpts) {
   if (g) g.paused = true;
   ui.titleOpen = true;
   ui.tools?.setTool('inspect');
-  const root = h('div', { class: 'title', role: 'dialog', 'aria-label': 'Railfever' });
+  const root = h('div', { class: 'title', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Railfever', tabindex: '-1' });
   const row = h('div', { class: 'title-row' });
   const main = h('div', { class: 'title-main' });
   let card: HTMLElement | null = null;
+  /** a11y: the HUD and windows behind the title take no focus or clicks while it is open */
+  let releaseHud = () => {};
   const close = (resume = true) => {
+    releaseHud();
     root.remove();
     window.removeEventListener('keydown', onKey, true);
     ui.titleOpen = false;
@@ -82,6 +86,8 @@ export function showTitle(o: TitleOpts) {
   row.appendChild(main);
   root.appendChild(row);
   ui.root.appendChild(root);
+  releaseHud = inertBehind(root);
+  if (!root.contains(document.activeElement)) root.focus({ preventScroll: true });
 
   function openCard() {
     if (card) return;

@@ -937,3 +937,81 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .lbl.tag .lcolor { margin: -1px 5px -1px -4px; box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85); }
 .lbl.stn .lbl-mark.lcolor { width: 10px; height: 17px; padding: 0; flex: none; }
 .list.stops .row > .lcolor { flex: none !important; }
+
+/* ================================================================ accessibility
+   Interface size, minimum text sizes, focus rings, colour-blind-safe mode colours and the second cues of the map
+   views' legends. Kept in one block. */
+
+/* Interface size (Settings → Interface; src/ui/uiscale.ts sets --uis and data-uis on <html>): CSS zoom lays the HUD,
+   the left column, toasts, news, windows and the title screen out again at 90–130 % (sharp text, no transform).
+   Lengths in vw / vh inside a zoomed box are zoomed too, so those limits are divided by --uis. Boxes placed by
+   script (windows, tool card, cursor tooltip, hints, hover card, map labels) keep their own box and zoom contents. */
+:root { --uis: 1; }
+#app .hud, #app .dockwrap, #app .leftcol, #app .toasts, #app .drawer, #app .title { zoom: var(--uis); }
+#app .dockwrap { max-width: calc((100vw - 20px) / var(--uis)); }
+#app .toasts { width: min(540px, calc((100vw - 20px) / var(--uis))); }
+#app .drawer { width: min(390px, calc((100vw - 20px) / var(--uis))); }
+#app .win > *, #app .toolcard > *, #app .tooltip > *, #app .uitip > *, #app .hovercard > *, #app .labels .lbl > * { zoom: var(--uis); }
+#app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); max-height: calc(100vh - 220px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
+@media (min-width: 721px) { #app .toolcard { width: calc(356px * var(--uis)); } }
+#app .tooltip { min-width: calc(160px * var(--uis)); max-width: calc(300px * var(--uis)); padding: calc(10px * var(--uis)) calc(12px * var(--uis)); }
+#app .uitip { gap: calc(8px * var(--uis)); padding: calc(6px * var(--uis)) calc(9px * var(--uis)) calc(6px * var(--uis)) calc(11px * var(--uis)); font-size: calc(var(--fs-13) * var(--uis)); max-width: calc(300px * var(--uis)); }
+#app .hovercard { min-width: calc(170px * var(--uis)); max-width: calc(260px * var(--uis)); padding: calc(9px * var(--uis)) calc(11px * var(--uis)) calc(10px * var(--uis)); }
+#app .lbl.tag { max-width: calc(170px * var(--uis)); }
+#app .lbl.stn.compact { width: calc(28px * var(--uis)); height: calc(28px * var(--uis)); padding: calc(4px * var(--uis)); }
+#app .float { font-size: calc(var(--fs-16) * var(--uis)); }
+#app .float.income { font-size: calc(18px * var(--uis)); }
+/* the top bar needs more room at larger sizes: the map buttons go (as below 1360 px), and the clock moves under the
+   bar (toasts below it) wherever it would cover the action buttons (about 1110 px of unscaled width) */
+@media (max-width: 1560px) { :root[data-uis="115"] .hud-tr .hbtn[data-key="M"], :root[data-uis="115"] .hud-tr .hbtn[data-key="P"], :root[data-uis="115"] .hud-tr .hbtn[data-key="O"] { display: none; } }
+@media (max-width: 1770px) { :root[data-uis="130"] .hud-tr .hbtn[data-key="M"], :root[data-uis="130"] .hud-tr .hbtn[data-key="P"], :root[data-uis="130"] .hud-tr .hbtn[data-key="O"] { display: none; } }
+@media (max-width: 1280px) { :root[data-uis="115"] .hud-tc { top: 64px; } :root[data-uis="115"] .toasts { top: 112px; } }
+@media (max-width: 1445px) { :root[data-uis="130"] .hud-tc { top: 64px; } :root[data-uis="130"] .toasts { top: 112px; } }
+/* title screen: menu and new-game card side by side only while they fit (as the 1040 / 920 / 760 px rules above) */
+@media (max-width: 1196px) { :root[data-uis="115"] .title-main { flex: 0 1 420px; } }
+@media (max-width: 1352px) { :root[data-uis="130"] .title-main { flex: 0 1 420px; } }
+@media (max-width: 1058px) { :root[data-uis="115"] .title.card-open .title-main { display: none; } }
+@media (max-width: 1196px) { :root[data-uis="130"] .title.card-open .title-main { display: none; } }
+@media (max-width: 874px) { :root[data-uis="115"] .title-row { flex-wrap: wrap; } :root[data-uis="115"] .title-main { flex: 1 1 100%; } }
+@media (max-width: 988px) { :root[data-uis="130"] .title-row { flex-wrap: wrap; } :root[data-uis="130"] .title-main { flex: 1 1 100%; } }
+
+/* the interface-size buttons share the settings field evenly */
+.seg.uiscale { display: flex; width: 100%; }
+.seg.uiscale .segb { flex: 1; justify-content: center; padding: 0 4px; }
+
+/* Smallest text at 100 %: numbering badges have 10 px letters (were 7.5 and 9 px) in slightly larger squares. */
+.snum { width: 29px; height: 29px; }
+.snum i { font-size: 10px; }
+.snum.sm { width: 25px; height: 25px; }
+.snum.sm i { font-size: 10px; }
+.snum.sm b { font-size: 11px; }
+
+/* Windows and the title screen take the focus when they open (Tab continues with their controls): a quiet ring
+   around a keyboard-focused window, none around the whole title screen. */
+#app .win:focus-visible { outline: 2px solid rgba(255, 176, 32, 0.55); outline-offset: 1px; }
+#app .title:focus, #app .title:focus-visible { outline: none; }
+
+/* Transport-mode colours: tram, metro and light rail moved so all five catchment modes stay >= ~20 delta E apart
+   for deuteranopia, protanopia and tritanopia (tram vs rail was 3); matches CATCH_COLOR in gameapi.ts. */
+:root { --tram: #b25ec5; --metro: #41dfcf; --lightrail: #9fe079; }
+.flag.shared { background: rgba(178, 94, 197, 0.18); color: color-mix(in srgb, var(--tram) 62%, #fff); }
+
+/* Map-view legends repeat the map's second cue. Signals: thin free, dashed reserved, wide occupied blocks; large
+   path and small block signals; diamond (two-way) and arrow (one-way) heads. Catchment: solid, dashed and dotted
+   rings like the streets. */
+.mc-row > i.mc-thin { height: 3px; }
+.mc-row > i.mc-wide { height: 7px; border-radius: 3px; }
+.mc-row > i.mc-dash { height: 5px; background: repeating-linear-gradient(90deg, var(--c) 0 5px, rgba(11, 15, 20, 0.7) 5px 8px) !important; }
+.mc-row > i.mc-dot { width: 8px; height: 8px; margin: 0 3px; border-radius: 50%; }
+.mc-row > i.mc-dot.big { width: 11px; height: 11px; margin: 0 1.5px; }
+.mc-row > i.mc-diamond { width: 9px; height: 9px; margin: 0 2px; border-radius: 1px; transform: rotate(45deg); }
+.mc-row > i.mc-arrow { width: 0; height: 0; margin: 0 1px; border-radius: 0; background: none !important; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--c); }
+.mc-row > i.mc-ring.metro, .mc-row > i.mc-ring.lightrail { border-style: dashed; }
+.mc-row > i.mc-ring.tram { border-style: dotted; }
+/* Demand: orange (unserved, dashed) → pale yellow → blue (served, solid); see servedColor in mapmodes.ts. */
+.mc-grad i {
+  height: 7px; background: linear-gradient(90deg, #ff7a2f, #ffe08a, #5ea8ff);
+  -webkit-mask-image: linear-gradient(90deg, transparent 50%, #000 78%), repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 8px);
+  mask-image: linear-gradient(90deg, transparent 50%, #000 78%), repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 8px);
+  -webkit-mask-composite: source-over; mask-composite: add;
+}

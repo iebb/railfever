@@ -1,6 +1,7 @@
 // Menu, save / load, settings and help windows.
 import type { UI } from './ui';
-import { h, clear, section, icon, toggle, field, add } from './dom';
+import { h, clear, section, icon, toggle, field, add, seg } from './dom';
+import { UI_SCALES, uiScale, setUiScale } from './uiscale';
 import { fmtMoney } from '../game/economy';
 import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
 import { fmtDate, fmtLen } from './format';
@@ -125,6 +126,17 @@ export function openSettings(ui: UI) {
     if ('debug' in s) win.body.append(flag('debug'));
     const g = ui.game;
     const grid = () => (r.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid;
+    // interface size: text, HUD, cards, windows and map labels at 90–130 % (kept when the window re-renders)
+    const uiSize = () => {
+      const sg = seg(UI_SCALES.map((v) => [v, `${Math.round(v * 100)}%`] as [number, string]), uiScale(), (v) => {
+        const focused = win.body.contains(document.activeElement);
+        setUiScale(v);
+        render();
+        if (focused) (win.body.querySelector('.uiscale .segb.on') as HTMLElement | null)?.focus({ preventScroll: true });
+      }, 'uiscale');
+      sg.setAttribute('aria-label', 'Interface size');
+      return field('Interface size', sg, 'Text, panels, windows and map labels');
+    };
     // audio: volume sliders (0–100 %) and mute
     const vol = (key: keyof Omit<AudioSettings, 'muted'>, label: string, hint?: string) => {
       const rng = h('input', { type: 'range', min: '0', max: '100', value: String(Math.round(audio.settings[key] * 100)), class: 'range', 'aria-label': label }) as HTMLInputElement;
@@ -141,6 +153,7 @@ export function openSettings(ui: UI) {
       vol('world', 'World', 'Construction, trains, stations'),
       vol('ambient', 'Ambience', 'Wind, birds, town and traffic'),
       section('Interface'),
+      uiSize(),
       toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
       toggle('Construction grid', (grid()?.value ?? 0) > 0, (v) => { const u = grid(); if (u) u.value = v ? 1 : 0; }, 'G'),
       toggle('Show the getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
@@ -187,7 +200,7 @@ export function openHelp(ui: UI) {
     <h4>Lines, demand and companies</h4>
     <ul>
       <li>Lines are named automatically from their stops and get their own colour and company/route symbol. Click the name or symbol in a line window to change the name or colour (empty name = automatic again). Station badges such as <b>AS01</b> identify a station on each line.</li>
-      <li>The <b>Lines map</b> (<kbd>M</kbd>) has <b>Lines / Stations</b> displays: coloured routes with line symbols, or station dots with numbering badges. Press <kbd>B</kbd> to switch (or open Stations when the map is closed). Filter by transport mode and company. The <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (red = unserved, green = served). <kbd>Esc</kbd> closes either.</li>
+      <li>The <b>Lines map</b> (<kbd>M</kbd>) has <b>Lines / Stations</b> displays: coloured routes with line symbols, or station dots with numbering badges. Press <kbd>B</kbd> to switch (or open Stations when the map is closed). Filter by transport mode and company. The <b>Demand</b> view (<kbd>P</kbd>) shows potential trips between towns (orange dashed arcs = unserved, blue solid arcs = served). <kbd>Esc</kbd> closes either.</li>
       <li>In <b>Companies</b> (<kbd>C</kbd>) you can add AI rivals (up to seven, each with a style: cautious, aggressive, rail baron, bus operator, tram builder…), change their settings, and buy them out — you take over their network, vehicles, cash and loan.</li>
       <li><b>Track access</b>: networks are <b>open</b> by default — any company may run on another's tracks and stations without asking (unless blocked) and pays its usage share of the upkeep (× the owner's multiplier: at 2× and 50/50 usage the user pays 2/3). In Track access (<kbd>K</kbd>) you can switch to Ask, Approve all or Reject all, block companies, and see who uses what.</li>
       <li><b>Shared lines</b>: use a line’s Vehicles tab to invite partners or join an open line. Each company keeps its vehicles and fares; an operator must own a station on that line. Shared bus/tram stops show each company’s lines and estimated upkeep share in the station window.</li>

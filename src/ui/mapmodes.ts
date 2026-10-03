@@ -14,23 +14,36 @@ import { fmtInt } from './dom';
 
 export type MapMode = 'none' | 'lines' | 'demand' | 'catchment' | 'signals';
 
-/** Red (unserved) → amber → green (served). */
+/**
+ * Orange (unserved) → pale yellow → blue (served): a colour-blind-safe ramp (the ends stay > 100 delta E apart under
+ * deuteranopia, protanopia and tritanopia; the old red → green ramp fell to 14). Desire lines also get dashes by
+ * served share (servedDash) as a second cue.
+ */
+export const SERVED_RAMP = ['#ff7a2f', '#ffe08a', '#5ea8ff'] as const;
+const RAMP_RGB = SERVED_RAMP.map((c) => { const n = parseInt(c.slice(1), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; });
 export function servedColor(f: number): number {
   const t = Math.max(0, Math.min(1, f));
-  const c0 = t < 0.5 ? [0xff, 0x5a, 0x5f] : [0xff, 0xb0, 0x20];
-  const c1 = t < 0.5 ? [0xff, 0xb0, 0x20] : [0x4a, 0xde, 0x80];
+  const c0 = RAMP_RGB[t < 0.5 ? 0 : 1];
+  const c1 = RAMP_RGB[t < 0.5 ? 1 : 2];
   const k = t < 0.5 ? t * 2 : (t - 0.5) * 2;
   const r = Math.round(c0[0] + (c1[0] - c0[0]) * k), g = Math.round(c0[1] + (c1[1] - c0[1]) * k), b = Math.round(c0[2] + (c1[2] - c0[2]) * k);
   return (r << 16) | (g << 8) | b;
 }
 export const hexCss = (c: number) => '#' + c.toString(16).padStart(6, '0');
+/** Dash pattern of a desire line by served share: short dashes when unserved, longer as service grows, solid when served. */
+export const servedDash = (f: number) => (f >= 0.97 ? 0 : 0.35 + 0.55 * Math.max(0, f));
 
 /** Lines map: route width in px (normal / selected), spacing of lines sharing track, world dimming. */
 const ROUTE_W = 5, ROUTE_W_SEL = 8, LANE_STEP = 6.5;
 const DIM: Record<MapMode, number> = { none: 0, lines: 0.4, demand: 0.3, catchment: 0.16, signals: 0.34 };
-/** Signal blocks overlay: free, reserved (a train's path is set through it) and occupied blocks; path / block signals. */
-const BLOCK_COLOR = { free: 0x3f9a62, reserved: 0xffb020, occupied: 0xff5a5f };
-const SIG_COLOR = { path: 0xc084fc, block: 0x5ac8fa };
+/**
+ * Signal blocks overlay: free, reserved (a train's path is set through it) and occupied blocks; path / block signals.
+ * Blue / yellow / vermilion stay apart for colour-blind players; free blocks are thin, reserved ones dashed and
+ * occupied ones wider (second cue). Signals: colour and size give the kind (path signals pink and larger, block
+ * signals white), the head the direction (diamond two-way, arrow one-way).
+ */
+const BLOCK_COLOR = { free: 0x4d8fe0, reserved: 0xffd23f, occupied: 0xf2542d };
+const SIG_COLOR = { path: 0xff85c0, block: 0xf5f7fa };
 const DISPLAY_KEY = 'railfever.linesmap';
 
 export class MapModes {
@@ -304,11 +317,12 @@ export class MapModes {
       this.blocks = { ver: g.networkVersion, of, pts };
       this.blockSig = '';
       // the signals
-      const spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color: number }[] = [];
+      const spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color: number; size: number }[] = [];
       for (const n of net.nodes.values()) {
         if (n.kind !== 'rail' || !n.signal || n.owner !== PLAYER) continue;
         const f = n.signal === 3 ? -1 : 1;
-        spots.push({ x: n.x, y: n.y, z: n.z, dx: (n.dx || 1) * f, dz: n.dz * f, existing: false, twoWay: n.signal === 1, color: SIG_COLOR[n.signalKind === 'block' ? 'block' : 'path'] });
+        const block = n.signalKind === 'block';
+        spots.push({ x: n.x, y: n.y, z: n.z, dx: (n.dx || 1) * f, dz: n.dz * f, existing: false, twoWay: n.signal === 1, color: SIG_COLOR[block ? 'block' : 'path'], size: block ? 1 : 1.3 });
       }
       ov.setSignalGhosts(spots);
     }
@@ -323,8 +337,8 @@ export class MapModes {
       for (const [id, b] of B.of) (occ.has(b) ? layers.occupied : res.has(b) ? layers.reserved : layers.free).push(B.pts.get(id)!);
       ov.setTrackLayers([
         { pts: layers.free, color: BLOCK_COLOR.free, width: 4 },
-        { pts: layers.reserved, color: BLOCK_COLOR.reserved, width: 6 },
-        { pts: layers.occupied, color: BLOCK_COLOR.occupied, width: 6 },
+        { pts: layers.reserved, color: BLOCK_COLOR.reserved, width: 5.5, dash: 0.55, dashPx: 12 },
+        { pts: layers.occupied, color: BLOCK_COLOR.occupied, width: 7 },
       ]);
     }
     this.listT -= 0.25;
@@ -333,22 +347,27 @@ export class MapModes {
 
   private renderSignalsCard(occ: number, res: number, blocks: number) {
     const g = this.ui.game;
-    let path = 0, block = 0;
-    for (const n of g.world.net.nodes.values()) if (n.kind === 'rail' && n.signal && n.owner === PLAYER) { if (n.signalKind === 'block') block++; else path++; }
+    let path = 0, block = 0, twoWay = 0;
+    for (const n of g.world.net.nodes.values()) if (n.kind === 'rail' && n.signal && n.owner === PLAYER) { if (n.signalKind === 'block') block++; else path++; if (n.signal === 1) twoWay++; }
     const c = this.card;
     clear(c);
-    const sw = (col: number, t: string, num: string) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { style: `background:${hexCss(col)}` }), h('span', { class: 'mc-name' }, t), h('span', { class: 'mc-num' }, num));
+    // legend swatches repeat the map's second cues: thin / dashed / wide blocks; large pink path and small white block
+    // signals; diamond heads for two-way and arrows for one-way signals (shown neutral)
+    const sw = (col: number, t: string, num: string, cls = '') => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: cls, style: `--c:${hexCss(col)};background:${hexCss(col)}` }), h('span', { class: 'mc-name' }, t), h('span', { class: 'mc-num' }, num));
+    const SHAPE = 0xc9d1dc;
     c.append(
       h('div', { class: 'mc-head' }, icon('signal', 18), h('span', { class: 'mc-title' }, 'Signals'), h('span', { class: 'mc-sub' }, `${path + block}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close signals view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
         h('div', { class: 'mc-list' },
-          sw(BLOCK_COLOR.free, 'Free blocks', String(blocks - occ - res)),
-          sw(BLOCK_COLOR.reserved, 'Reserved (a train\u2019s path is set)', String(res)),
-          sw(BLOCK_COLOR.occupied, 'Occupied by a train', String(occ)),
-          sw(SIG_COLOR.path, 'Path signals ◆', String(path)),
-          sw(SIG_COLOR.block, 'Block signals ▲', String(block))),
-        h('div', { class: 'mc-note' }, 'A block runs from one signal to the next. Path signals guard junctions and station entries; block signals space trains on open line.'),
+          sw(BLOCK_COLOR.free, 'Free blocks', String(blocks - occ - res), 'mc-thin'),
+          sw(BLOCK_COLOR.reserved, 'Reserved (a train\u2019s path is set)', String(res), 'mc-dash'),
+          sw(BLOCK_COLOR.occupied, 'Occupied by a train', String(occ), 'mc-wide'),
+          sw(SIG_COLOR.path, 'Path signals (larger)', String(path), 'mc-dot big'),
+          sw(SIG_COLOR.block, 'Block signals', String(block), 'mc-dot'),
+          sw(SHAPE, 'Two-way signals', String(twoWay), 'mc-diamond'),
+          sw(SHAPE, 'One-way signals', String(path + block - twoWay), 'mc-arrow')),
+        h('div', { class: 'mc-note' }, 'A block runs from one signal to the next. Path signals guard junctions and station entries; block signals space trains on open line. Arrows point the way trains may pass.'),
         h('div', { class: 'btns' }, h('button', { class: 'btn sm', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'))),
     );
   }
@@ -370,7 +389,8 @@ export class MapModes {
     const n = (m: CatchMode) => mine.filter((s) => { const mode = g.stations.mode(s); return (mode === 'mainline' ? 'rail' : mode) === m; }).length;
     const c = this.card;
     clear(c);
-    const row = (m: CatchMode, label: string, r: number) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: 'mc-ring', style: `--c:${hexCss(CATCH_COLOR[m])}` }), h('span', { class: 'mc-name' }, label), h('span', { class: 'mc-num' }, `${Math.round(r * 10)} m · ${n(m)}`));
+    // the ring's border repeats the mode's dash pattern on the map (solid, dashed, dotted)
+    const row = (m: CatchMode, label: string, r: number) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: 'mc-ring ' + m, style: `--c:${hexCss(CATCH_COLOR[m])}` }), h('span', { class: 'mc-name' }, label), h('span', { class: 'mc-num' }, `${Math.round(r * 10)} m · ${n(m)}`));
     c.append(
       h('div', { class: 'mc-head' }, icon('catchment', 18), h('span', { class: 'mc-title' }, 'Catchment'), h('span', { class: 'mc-sub' }, `${fmtInt(reach)} residents`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close catchment view', onclick: () => this.set('none') }, icon('close', 16))),
@@ -380,7 +400,7 @@ export class MapModes {
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
           inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
-        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
+        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (metro, light rail and tram dashed). Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
     );
   }
 
@@ -409,7 +429,7 @@ export class MapModes {
       const A = byId.get(f.a), B = byId.get(f.b);
       if (!A || !B) continue;
       const k = Math.sqrt(f.trips / maxT), dist = Math.hypot(A.x - B.x, A.z - B.z);
-      arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.25 + k * 0.7, color: servedColor(f.served), h: 1.5 + dist * 0.2 });
+      arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.25 + k * 0.7, color: servedColor(f.served), dash: servedDash(f.served), h: 1.5 + dist * 0.2 });
     }
     if (!regions.length) {
       // older model without regions: town pairs
@@ -419,7 +439,7 @@ export class MapModes {
         const A = towns.get(p.a), B = towns.get(p.b);
         if (!A || !B) continue;
         const k = Math.sqrt(p.potential / maxP);
-        arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.28 + k * 0.67, color: servedColor(p.served), h: 2 + p.dist * 0.2 });
+        arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.28 + k * 0.67, color: servedColor(p.served), dash: servedDash(p.served), h: 2 + p.dist * 0.2 });
       }
     }
     ov.setArcs(arcs);
@@ -493,25 +513,25 @@ export class MapModes {
         class: 'mc-row',
         'data-tip': `${fmtInt(f.trips)} trips / month · ${(dist / 100).toFixed(1)} km · ${Math.round(f.served * 100)}% served`,
         onclick: () => this.ui.centerOn((A.x + B.x) / 2, (A.z + B.z) / 2, Math.max(50, dist * 0.9)),
-      }, h('i', { style: `background:${hexCss(servedColor(f.served))}` }), h('span', { class: 'mc-name' }, `${this.regionName(A)} – ${this.regionName(B)}`), h('span', { class: 'mc-num' }, fmtInt(f.trips)));
+      }, h('i', { class: servedDash(f.served) ? 'mc-dash' : '', style: `--c:${hexCss(servedColor(f.served))};background:${hexCss(servedColor(f.served))}` }), h('span', { class: 'mc-name' }, `${this.regionName(A)} – ${this.regionName(B)}`), h('span', { class: 'mc-num' }, fmtInt(f.trips)));
     };
     c.append(
       h('div', { class: 'mc-head' }, icon('demand', 18), h('span', { class: 'mc-title' }, 'Demand'), h('span', { class: 'mc-sub' }, `${Math.round(total > 0 ? (carried / total) * 100 : 0)}% served`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close demand view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-grad' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
+        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Colour scale: orange and dashed = unserved, blue and solid = served' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, fmtInt(total)), h('span', null, 'trips / month between towns')),
           regions.length ? h('div', null, h('b', null, String(regions.length)), h('span', null, 'districts')) : null,
           h('div', null, h('b', null, `${Math.round(carried > 0 ? (mine / carried) * 100 : 0)}%`), h('span', null, 'of carried trips start on your lines')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a station`)) : null),
-        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts, brighter where they produce more trips. Arcs: trips per month between districts. Hover a district for details.' : 'Arc width: potential trips per month.'),
+        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts, brighter where they produce more trips. Arcs: trips per month between districts, dashed while unserved, solid once served. Hover a district for details.' : 'Arc width: potential trips per month; dashed arcs are unserved, solid ones served.'),
         flows.length || pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest unserved flows') : null,
         flows.length ? h('div', { class: 'mc-list' }, flows.map(flowRow)) : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {
           class: 'mc-row', 'data-tip': `${fmtInt(p.potential)} trips / month · ${(p.dist / 100).toFixed(1)} km`,
           onclick: () => { const A = g.towns.list[p.a], B = g.towns.list[p.b]; if (A && B) this.ui.centerOn((A.x + B.x) / 2, (A.z + B.z) / 2, Math.max(60, p.dist * 0.9)); },
-        }, h('i', { style: `background:${hexCss(servedColor(p.served))}` }), h('span', { class: 'mc-name' }, `${tname(p.a)} – ${tname(p.b)}`), h('span', { class: 'mc-num' }, fmtInt(p.potential))))) : null),
+        }, h('i', { class: servedDash(p.served) ? 'mc-dash' : '', style: `--c:${hexCss(servedColor(p.served))};background:${hexCss(servedColor(p.served))}` }), h('span', { class: 'mc-name' }, `${tname(p.a)} – ${tname(p.b)}`), h('span', { class: 'mc-num' }, fmtInt(p.potential))))) : null),
     );
   }
 }
