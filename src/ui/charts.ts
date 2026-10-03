@@ -1,7 +1,8 @@
 // Consistent canvas charts: grid with value labels, bar and line series, month ticks.
 import { fmtMoney } from '../game/economy';
 
-export interface Series { values: number[]; color: string; kind?: 'line' | 'bar'; label?: string }
+/** `dash`: a dashed line (a second cue beside the colour, e.g. mail income). */
+export interface Series { values: number[]; color: string; kind?: 'line' | 'bar'; label?: string; dash?: number[] }
 
 export interface ChartOpts {
   w?: number;
@@ -70,9 +71,11 @@ export function chart(series: Series[], opts: ChartOpts = {}): HTMLCanvasElement
     ctx.strokeStyle = s.color;
     ctx.lineWidth = 2;
     ctx.lineJoin = 'round';
+    ctx.setLineDash(s.dash ?? []);
     ctx.beginPath();
     s.values.forEach((v, i) => { const x = padL + i * bw + bw / 2, y = Y(v); if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
     ctx.stroke();
+    ctx.setLineDash([]);
     const li = s.values.length - 1;
     ctx.fillStyle = s.color;
     ctx.beginPath(); ctx.arc(padL + li * bw + bw / 2, Y(s.values[li]), 3, 0, Math.PI * 2); ctx.fill();

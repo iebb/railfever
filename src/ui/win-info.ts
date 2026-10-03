@@ -1,6 +1,6 @@
 // Info windows: stations, towns, track/road edges, vehicles, depots and the purchase dialog (train composer).
 import type { UI } from './ui';
-import { PLAYER } from '../game/game';
+import { PLAYER, type Game } from '../game/game';
 import { h, clear, fmtInt, bar, tile, section, icon, stepper, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { availableModels, VehicleModel, MODEL_BY_ID, modelTracks, carriesMail, mailOnlyModel } from '../game/vehicle-types';
@@ -11,7 +11,8 @@ import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES, TRAM } from '../game/constants';
 import { curveSpeed } from '../game/construction';
-import { fmtLen, fmtPct, fmtMult, equalUseShare, TYPE_META } from './format';
+import { fmtLen, fmtPct, fmtMult, equalUseShare, TYPE_META, fmtMail, fmtMailLoad, stationShowsMail } from './format';
+import { mailByTown, mailLostShare } from '../game/mail';
 import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
 import type { LineKind } from '../game/constants';
@@ -110,6 +111,7 @@ export function openStation(ui: UI, id: number) {
           class: s.lostLast > 0 ? 'neg' : '',
           'data-tip': `${fmtPct(lostShare(s))} of the passengers here gave up waiting (this and last month): the queue outgrew the station. More frequent or larger vehicles help; it lowers the rating.`,
         }, `${fmtInt(s.lostLast)} last month`)),
+        mailPanel(ui, s, lines),
         h('div', { class: 'btns' },
           h('button', { class: 'btn', onclick: () => ui.centerOn(s.x, s.z) }, icon('target', 16), 'Center'),
           h('button', { class: 'btn' + (ui.catchmentStation === id ? ' on' : ''), onclick: () => { ui.setCatchment(ui.catchmentStation === id ? -1 : id); win.last = undefined; render(); } }, icon('catchment', 16), 'Catchment'),
@@ -124,8 +126,10 @@ export function openStation(ui: UI, id: number) {
       for (const wg of s.waiting.values()) byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count);
       const sorted = [...byDest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14);
       const towns = stationDemand(g, s.id).slice(0, 6);
+      // mail: one destination station per town, so by town is the whole picture (the lines it waits for as dots)
+      const mail = stationShowsMail(g, s) ? mailByTown(g, s.id) : [];
       add(win.body, section('Waiting by destination town', `${fmtInt(s.waitingTotal)} total`));
-      if (!sorted.length) add(win.body, h('div', { class: 'pad' }, 'Nobody is waiting here.'));
+      if (!sorted.length) add(win.body, h('div', { class: 'pad' }, mail.length ? 'No passengers are waiting here.' : 'Nobody is waiting here.'));
       else {
         add(win.body, h('div', { class: 'list' }, towns.map((e) => h('div', { class: 'row' },
           h('span', null, g.towns.list[e.town]?.name ?? 'Elsewhere'),
@@ -136,6 +140,16 @@ export function openStation(ui: UI, id: number) {
           })),
           h('span', { class: 'num' }, fmtInt(e.count))))));
         add(win.body, section('By station'), h('div', { class: 'list' }, sorted.map(([d, c]) => h('div', { class: 'row' }, ui.stationLink(d), h('span', { class: 'num' }, fmtInt(c))))));
+      }
+      if (mail.length) {
+        add(win.body, section('Mail by destination town', h('span', { class: 'inline' }, icon('mail', 14), `${fmtMail(s.mail?.total ?? 0)} total`)),
+          h('div', { class: 'list mail-towns' }, mail.slice(0, 10).map((e) => h('div', { class: 'row' },
+            h('span', null, g.towns.list[e.town]?.name ?? 'Elsewhere'),
+            h('span', { class: 'ldots' }, e.lines.slice(0, 5).map((x) => {
+              const l = g.lines.get(x.line);
+              return l ? h('i', { style: `--c:${l.color}`, 'data-tip': `${l.name}: ${fmtMail(x.count)}` }) : null;
+            })),
+            h('span', { class: 'num' }, fmtMail(e.count))))));
       }
     } else if (win.tab === 'lines') {
       add(win.body, section('Lines serving this station'));
@@ -195,6 +209,8 @@ export function openTown(ui: UI, id: number) {
       ui.kv('Growth', h('span', { 'data-tip': growthTip(sv) }, growthText(sv))),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
       ui.kv('Gave up waiting', h('span', { class: lost > 0 ? 'neg' : '' }, `${fmtInt(lost)} last month`)),
+      // (Town.mail exists from the town's first mail on)
+      town.mail ? ui.kv('Mail last month', `${fmtMail(town.mail.postedLast)} posted · ${fmtMail(town.mail.deliveredLast)} delivered`) : null,
       demandRows(ui, id),
       section('Buildings'),
       h('div', { class: 'list' }, [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => h('div', { class: 'row' }, h('span', null, BUILDING_TYPES[t]?.name ?? '?'), h('span', { class: 'num' }, String(c))))),
@@ -234,6 +250,32 @@ function demandRows(ui: UI, id: number): HTMLElement | null {
       return h('div', { class: 'row link', 'data-tip': `${fmtPct(p.served)} served · ${(p.dist / 100).toFixed(1)} km`, onclick: () => o && ui.openTown(o.id) },
         h('span', null, o?.name ?? '?'), h('span', { class: 'ldots' }, h('i', { style: `--c:${hexCss(servedColor(p.served))}` })), h('span', { class: 'num' }, `${fmtInt(p.potential)} / mo`));
     })) : h('div', { class: 'pad muted' }, 'No other towns nearby.'));
+}
+
+/**
+ * Mail at a station that handles it (stationShowsMail; never a tram stop): mail waiting and the mail rating, mail
+ * posted, loaded and delivered last month, mail lost. Reads Station.mail only: the window never creates mail state.
+ */
+function mailPanel(ui: UI, s: Station, lines: Line[]): HTMLElement | null {
+  const g = ui.game;
+  if (!stationShowsMail(g, s)) return null;
+  const m = s.mail;
+  const carriers = lines.filter((l) => l.vehicles.some((id) => g.vehicles.get(id)?.carries('mail'))).length;
+  // a mail line calls but nothing has been posted this month or last: no other town's mail station within reach,
+  // or (nearly) nobody posts here
+  const quiet = g.lines.mailServed(s.id) && (!m || m.genMonth + m.genLast === 0);
+  return h('div', { class: 'mail-panel' },
+    section('Mail', h('span', { class: 'inline' }, icon('mail', 14), carriers ? `${carriers} line${carriers > 1 ? 's' : ''} with room for mail` : 'no mail line now')),
+    h('div', { class: 'tiles' },
+      tile(fmtMail(m?.total ?? 0), 'Mail waiting'),
+      tile(m ? fmtPct(m.rating) : '—', 'Mail rating', m && m.rating < 0.4 ? 'neg' : '', bar(m?.rating ?? 0))),
+    ui.kv('New mail', `${fmtMail(m?.genLast ?? 0)} last month`),
+    ui.kv('Loaded · delivered', `${fmtMail(m?.pickupLast ?? 0)} · ${fmtMail(m?.arrivedLast ?? 0)}`),
+    m && (m.lostLast > 0 || m.lostMonth > 0) ? ui.kv('Mail lost', h('span', {
+      class: m.lostLast > 0 ? 'neg' : '',
+      'data-tip': `${fmtPct(mailLostShare(m))} of the mail here was lost (this and last month): the queue outgrew the station, or no route was left. More frequent mail vans help; it lowers the mail rating.`,
+    }, `${fmtMail(m.lostLast)} last month`)) : null,
+    quiet ? h('div', { class: 'muted station-advice' }, 'Nothing posted here this month or last. Mail goes from town to town: it needs a vehicle with room for mail calling here and at a station in another town, and people within walking reach. A stop beside a bigger station shares its catchment: merge the two.') : null);
 }
 
 /** Capacity figures are sampled by the simulation; expansion plans are cached until the layout changes. */
@@ -561,11 +603,13 @@ export function openEdge(ui: UI, id: number) {
 // ------------------------------------------------------------------ vehicles
 export function vehicleDesc(v: Vehicle): string {
   if (v instanceof Train) {
-    const loco = v.cars.filter((c) => c.kind === 'loco');
+    // as made up (locomotive, mail vans, coaches), whichever way round the train stands
+    const cars = v.madeUp;
+    const loco = cars.filter((c) => c.kind === 'loco');
     const wn = new Map<string, number>();
-    for (const w of v.cars) if (w.kind === 'wagon') wn.set(w.name, (wn.get(w.name) ?? 0) + 1);
+    for (const w of cars) if (w.kind === 'wagon') wn.set(w.name, (wn.get(w.name) ?? 0) + 1);
     const units = new Map<string, number>();
-    for (const c of v.cars) if (c.kind === 'emu') units.set(c.name, (units.get(c.name) ?? 0) + 1);
+    for (const c of cars) if (c.kind === 'emu') units.set(c.name, (units.get(c.name) ?? 0) + 1);
     return [loco.length > 1 ? `${loco.length}× ${loco[0].name}` : loco[0]?.name, ...[...wn.entries()].map(([n, c]) => `${c}× ${n}`), ...[...units].map(([n, c]) => `${c}× ${n}`)].filter(Boolean).join(' + ');
   }
   return (v as RoadVehicle).model?.name ?? 'Car';
@@ -582,6 +626,8 @@ export function openVehicle(ui: UI, id: number) {
     if (!v2) { win.close(); return; }
     win.title.textContent = v2.name;
     win.sub.textContent = vehicleDesc(v2) + (v2 instanceof Train ? ` · ${Math.round(v2.length * 10)} m` : '');
+    const scroll = win.body.scrollTop;
+    const focusedVanButton = win.body.querySelector<HTMLButtonElement>('.stepper .stp:focus')?.getAttribute('aria-label');
     clear(win.body);
     const mine = v2.owner === PLAYER;
     const kind = vk;
@@ -602,15 +648,19 @@ export function openVehicle(ui: UI, id: number) {
     } else lineEl = v2.line ? lineTag(g, v2.line, () => ui.openLine(v2.line!.id)) : document.createTextNode('—');
     const target = v2.targetStation();
     const load = v2.capacity ? v2.load / v2.capacity : 0;
+    const room = v2.mailCapacity;
     const compat = v2 instanceof Train ? railWarning(ui, v2.cars, v2.line, v2.depotId) : null;
-    add(win.body, 
+    add(win.body,
       h('div', { class: 'tiles' },
         tile(`${v2.speedKmh.toFixed(0)}`, `km/h of ${v2.maxSpeedKmh}`),
-        tile(`${v2.load}/${v2.capacity}`, 'Passengers', '', bar(load, 'var(--info)')),
+        // a mail van, truck or train has no seats: its mail instead of 0/0 passengers
+        v2.capacity > 0 || room <= 0 ? tile(`${v2.load}/${v2.capacity}`, 'Passengers', '', bar(load, 'var(--info)')) : null,
+        room > 0 ? tile(fmtMailLoad(v2.mailLoad, room), 'Mail', 'mail', bar(v2.mailLoad / room, 'var(--mail)')) : null,
         tile(fmtMoney(v2.profitYear), 'Profit this year', v2.profitYear < 0 ? 'neg' : 'pos'),
         tile(`${v2.age.toFixed(1)}`, 'Years old')),
       h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Line'), h('span', { class: 'v' }, lineEl)),
       vehicleService(ui, v2, after),
+      mine && v2 instanceof Train ? mailVanControl(ui, v2, after) : null,
       compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
       ui.kv('Status', v2.status),
       target ? h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Next stop'), h('span', { class: 'v' }, ui.stationLink(target.id))) : null,
@@ -626,6 +676,11 @@ export function openVehicle(ui: UI, id: number) {
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
     );
+    if (scroll) win.body.scrollTop = scroll;
+    if (focusedVanButton) {
+      const buttons = [...win.body.querySelectorAll<HTMLButtonElement>('.stepper .stp')];
+      (buttons.find((b) => b.getAttribute('aria-label') === focusedVanButton && !b.disabled) ?? buttons.find((b) => !b.disabled))?.focus({ preventScroll: true });
+    }
   };
   win.refresh = render;
   render();
@@ -653,6 +708,77 @@ function vehicleService(ui: UI, v: Vehicle, after: () => void): HTMLElement | nu
       const w = ui.wm.get('line-' + l.id);
       if (w) { w.tab = 'services'; w.last = undefined; w.refresh?.(); }
     } }, icon('lines', 15), 'Edit services…')));
+}
+
+/** Most mail vans a train takes (behind its locomotive, as the train composer offers). */
+const MAX_VANS = 3;
+const isVan = (c: VehicleModel) => c.kind === 'wagon' && carriesMail(c);
+
+/**
+ * A locomotive-hauled train with one mail van more or fewer, as made up (locomotive first): a van is coupled behind the
+ * locomotive and the vans already there (ahead of the coaches), the same model as the last van while it is still
+ * built, else the newest; the last van is the one taken off. A mail train keeps one van.
+ */
+function vanChange(g: Game, t: Train, more: boolean): { cars: VehicleModel[]; van: VehicleModel } | string {
+  const cars = t.madeUp;
+  if (!cars.length || cars[0].kind !== 'loco') return 'Multiple units take no mail vans';
+  const vans = cars.filter(isVan);
+  if (more) {
+    if (vans.length >= MAX_VANS) return `At most ${MAX_VANS} mail vans`;
+    const avail = availableModels(g.year, 'wagon', true);
+    const last = vans[vans.length - 1];
+    const van = (last && avail.find((m) => m.id === last.id)) || avail[avail.length - 1];
+    if (!van) return 'No mail van is built this year';
+    let at = 0;
+    while (at < cars.length && (cars[at].kind === 'loco' || isVan(cars[at]))) at++;
+    return { cars: [...cars.slice(0, at), van, ...cars.slice(at)], van };
+  }
+  let i = cars.length - 1;
+  while (i >= 0 && !isVan(cars[i])) i--;
+  if (i < 0) return 'No mail van to uncouple';
+  if (vans.length === 1 && !cars.some((c) => c.kind === 'wagon' && !carriesMail(c))) return 'A mail train keeps one van: sell the train instead';
+  return { cars: cars.filter((_, k) => k !== i), van: cars[i] };
+}
+
+/**
+ * Mail vans of the player's locomotive-hauled train: one more or one fewer through Vehicles.recompose (in the depot,
+ * or while the train stands at a platform it still fits), with the price or refund, or why not (recomposeError).
+ */
+function mailVanControl(ui: UI, t: Train, after: () => void): HTMLElement | null {
+  const g = ui.game;
+  const cars = t.madeUp;
+  if (!cars.length || cars[0].kind !== 'loco') return null;
+  const n = cars.filter(isVan).length;
+  const add = vanChange(g, t, true), drop = vanChange(g, t, false);
+  // (recomposeError routes the new consist over the line for electric traction: checked again only when the train,
+  // the network, the money or the consist changes)
+  const check = (c: { cars: VehicleModel[] } | string, tag: string): string | null => {
+    if (typeof c === 'string') return c;
+    const key = [t.state, t.atStation, t.onMap, t.headSeg, Math.round(t.headPos * 100), t.lineId, g.networkVersion, g.world.net.version, g.lines.version,
+      g.economy.canAfford(c.cars.reduce((s, m) => s + m.cost, 0) - t.cars.reduce((s, m) => s + m.cost, 0)), c.cars.map((m) => m.id).join(',')].join('|');
+    return memo(g, `van-${tag}:${t.id}`, key, () => g.vehicles.recomposeError(t, c.cars), 2000);
+  };
+  const addErr = check(add, 'add'), dropErr = check(drop, 'drop');
+  const refund = typeof drop === 'string' || t.value <= 0 ? 0 : g.vehicles.resaleValue(t) * drop.van.cost / t.value;
+  const apply = (more: boolean) => {
+    const c = vanChange(g, t, more);
+    const err = typeof c === 'string' ? c : g.vehicles.recompose(t, c.cars);
+    if (err) { ui.toast(err, err.startsWith('The train must') ? 'info' : 'bad'); after(); return; }
+    ui.sound(more ? 'purchase' : 'cash', more ? undefined : { pitch: cashPitch(refund) });
+    ui.toast(more ? `Mail van coupled to ${t.name}` : `Mail van uncoupled from ${t.name}`, 'good');
+    after();
+  };
+  const btn = (ic: string, label: string, err: string | null, tip: string, more: boolean) =>
+    h('button', { class: 'stp', 'aria-label': label, disabled: !!err, 'data-tip': err ?? tip, 'data-sfx': 'none', onclick: () => apply(more) }, icon(ic, 14));
+  const parked = !t.onMap || (t.state === 'loading' && t.atStation >= 0);
+  const hint = !parked ? 'Couple or uncouple vans in the depot, or while the train stands at a platform'
+    : [typeof add !== 'string' ? (addErr ? addErr : `add a ${add.van.name} (${fmtMail(add.van.mail ?? 0)}) for ${fmtMoney(add.van.cost)}`) : add,
+      typeof drop !== 'string' ? (dropErr ? dropErr : `uncouple one for ${fmtMoney(refund)} back`) : null].filter(Boolean).join(' · ');
+  return field('Mail vans', h('div', { class: 'stepper' },
+    btn('minus', 'Uncouple a mail van', dropErr, typeof drop === 'string' ? drop : `Uncouple a ${drop.van.name}: ${fmtMoney(refund)} back`, false),
+    h('span', { class: 'stp-v' }, `${n} of ${MAX_VANS}`),
+    btn('plus', 'Couple a mail van', addErr, typeof add === 'string' ? add : `Couple a ${add.van.name} (${fmtMail(add.van.mail ?? 0)}): ${fmtMoney(add.van.cost)}`, true)),
+    hint ? hint[0].toUpperCase() + hint.slice(1) : undefined);
 }
 
 /** No annualisation or aggregate company fees: show the vehicle's own last monthly bill. */
@@ -713,6 +839,9 @@ function upgradeVehicle(ui: UI, v: Vehicle) {
   const dId = g.depots.get(cur) ? cur : findDepot(ui, kind, v.line);
   if (dId == null) { ui.toast('No depot available for the replacement', 'bad'); return; }
   const cost = opt.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v);
+  const error = (!g.company(v.owner).economy.canAfford(cost) ? 'Not enough money' : v.line ? g.lines.operateError(v.line, v.owner) : null)
+    ?? (kind === 'rail' ? railWarning(ui, opt.cars, v.line, dId) : null);
+  if (error) { ui.toast(error, 'bad'); return; }
   if (!confirm(`Replace ${v.name} with ${opt.label}? Net cost ${fmtMoney(cost)}.`)) return;
   const lineId = v.lineId;
   g.vehicles.sell(v.id);
@@ -744,7 +873,9 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   const rail = kind === 'rail';
   const meta = KIND_META[kind];
   const win = ui.wm.open('buy-' + kind + '-' + (depotId ?? 'line'), rail ? 'Train composer' : `Buy ${meta.vehicle}`, { width: 470, icon: meta.icon, color: meta.color, sub: depotId != null ? depotTitle(kind) : 'For a line', cls: 'purchase-info' });
-  const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon'), emus = availableModels(year, 'emu'), buses = availableModels(year, kind === 'tram' ? 'tram' : 'bus');
+  const locos = availableModels(year, 'loco'), emus = availableModels(year, 'emu'), buses = availableModels(year, kind === 'tram' ? 'tram' : 'bus');
+  // passenger coaches and mail vans are listed apart (vans couple behind the locomotive, ahead of the coaches)
+  const wagons = availableModels(year, 'wagon', false), vans = availableModels(year, 'wagon', true);
   const initialDepot = depotId != null ? g.depots.get(depotId) : null;
   const reachableLines = lineId == null && initialDepot?.owner === PLAYER
     ? g.lines.all().filter((line) => line.kind === kind && g.lines.canOperate(line, PLAYER) && line.stops.length >= 2 &&
@@ -759,7 +890,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   const lastOf = (list: VehicleModel[]) => pax(list)[pax(list).length - 1] ?? list[list.length - 1];
   const unitDefault = lastOf(primaryUnits) ?? lastOf(units) ?? lastOf(emus);
   const state = { train: (emus.length && (trackType === 'metro' || trackType === 'lightrail' || trackType === 'highspeed') ? 'unit' : 'hauled') as 'hauled' | 'unit',
-    loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: lastOf(wagons)?.id ?? '', count: 2,
+    loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: lastOf(wagons)?.id ?? '', count: 2, van: vans[vans.length - 1]?.id ?? '', vanN: 0,
     unit: unitDefault?.id ?? '', unitN: 1, bus: lastOf(buses)?.id ?? '', line: initialLine?.id ?? lineId, depot: depotId };
   let purchaseCars: VehicleModel[] = [];
   const validateSelection = () => {
@@ -770,6 +901,9 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   };
   const render = () => {
     validateSelection();
+    // (a click re-renders the composer: it keeps its scroll position, the steppers sit below the model lists)
+    const scroll = win.body.scrollTop;
+    const focusIndex = [...win.body.querySelectorAll('.model, .stp, .segb')].indexOf(document.activeElement!);
     clear(win.body);
     const modelRow = (m: VehicleModel, selected: boolean, onSel: () => void) => {
       const pick = () => { onSel(); render(); };
@@ -779,6 +913,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
         h('div', { class: 'mstats' },
           h('span', null, icon('speed', 13), `${m.speed} km/h`),
           m.capacity ? h('span', null, icon('people', 13), `${m.capacity}${m.kind === 'emu' ? ' / unit' : ''}`) : null,
+          m.mail ? h('span', { class: 'mstat-mail', 'data-tip': 'Room for mail' }, icon('mail', 13), `${fmtMail(m.mail)}${m.kind === 'emu' ? ' / unit' : ''}`) : null,
           m.power ? h('span', null, `${m.power} kW`) : null,
           h('span', null, icon('length', 13), `${Math.round(m.length * 10)} m`),
           h('span', null, `${fmtMoney(m.running)}/yr base`)),
@@ -790,37 +925,64 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     if (rail) {
       if (emus.length) add(win.body, field('Train type', seg([['hauled', 'Locomotive + coaches'], ['unit', 'Multiple units']], state.train, (v) => { state.train = v; render(); })));
       if (state.train === 'unit') {
+        // the postal unit (mail only) apart from the passenger units
+        const paxUnits = emus.filter((m) => !carriesMail(m)), postUnits = emus.filter(carriesMail);
         add(win.body, section('Multiple units', 'price and capacity per whole unit'));
-        for (const m of emus) add(win.body, modelRow(m, state.unit === m.id, () => (state.unit = m.id)));
+        for (const m of paxUnits) add(win.body, modelRow(m, state.unit === m.id, () => (state.unit = m.id)));
+        if (postUnits.length) {
+          add(win.body, section('Postal units', h('span', { class: 'inline' }, icon('mail', 14), 'mail only')));
+          for (const m of postUnits) add(win.body, modelRow(m, state.unit === m.id, () => (state.unit = m.id)));
+        }
         add(win.body, field('Units', stepper(String(state.unitN), () => { state.unitN = Math.max(1, state.unitN - 1); render(); }, () => { state.unitN = Math.min(4, state.unitN + 1); render(); }), 'Couple complete units; cars are included in the unit price'));
       } else {
         add(win.body, section('Locomotive'));
         for (const m of locos) add(win.body, modelRow(m, state.loco === m.id, () => (state.loco = m.id)));
         add(win.body, section('Coaches'));
         for (const m of wagons) add(win.body, modelRow(m, state.wagon === m.id, () => (state.wagon = m.id)));
-        add(win.body, h('div', { class: 'inline wrap', style: 'margin-top:10px' },
+        if (vans.length) {
+          add(win.body, section('Mail vans', h('span', { class: 'inline' }, icon('mail', 14), 'behind the locomotive')));
+          for (const m of vans) add(win.body, modelRow(m, state.vanN > 0 && state.van === m.id, () => { state.van = m.id; if (!state.vanN) state.vanN = 1; }));
+        }
+        // locomotive(s), then 0-3 mail vans, then the coaches (none: a mail train)
+        add(win.body, h('div', { class: 'inline wrap composer-steps', style: 'margin-top:10px' },
           h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Locomotives'), stepper(String(state.locoN), () => { state.locoN = Math.max(1, state.locoN - 1); render(); }, () => { state.locoN = Math.min(2, state.locoN + 1); render(); })),
-          h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Coaches'), stepper(String(state.count), () => { state.count = Math.max(1, state.count - 1); render(); }, () => { state.count = Math.min(14, state.count + 1); render(); }))));
+          vans.length ? h('div', { class: 'opt', role: 'group', 'aria-label': 'Mail vans' }, h('span', { class: 'opt-l' }, 'Mail vans'), stepper(String(state.vanN), () => { state.vanN = Math.max(0, state.vanN - 1); if (!state.vanN && !state.count) state.count = 1; render(); }, () => { state.vanN = Math.min(MAX_VANS, state.vanN + 1); render(); }, `0–${MAX_VANS} vans behind the locomotive`)) : null,
+          h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Coaches'), stepper(String(state.count), () => { state.count = Math.max(state.vanN > 0 ? 0 : 1, state.count - 1); render(); }, () => { state.count = Math.min(14, state.count + 1); render(); }, state.vanN > 0 ? 'None: a mail train' : ''))));
       }
     } else {
-      // long-distance coaches (faster, more seats, for intercity lines on country roads) listed apart from city buses
+      // long-distance coaches (faster, more seats, for intercity lines on country roads) listed apart from city
+      // buses; postbuses (seats and a mail compartment) and mail vans and trucks (mail only) apart from both
       const isCoach = (m: VehicleModel) => kind === 'road' && /coach/.test(m.style ?? '');
-      const city = buses.filter((m) => !isCoach(m)), coaches = buses.filter(isCoach);
-      add(win.body, section(coaches.length ? 'City buses' : 'Model'));
+      const pax = buses.filter((m) => !carriesMail(m));
+      const city = pax.filter((m) => !isCoach(m)), coaches = pax.filter(isCoach);
+      const postbuses = buses.filter((m) => carriesMail(m) && !mailOnlyModel(m)), mailVans = buses.filter(mailOnlyModel);
+      add(win.body, section(coaches.length || postbuses.length || mailVans.length ? 'City buses' : 'Model'));
       for (const m of city) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
       if (coaches.length) {
         add(win.body, section('Long-distance coaches', 'intercity lines'));
         for (const m of coaches) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
       }
+      if (postbuses.length) {
+        add(win.body, section('Postbuses', h('span', { class: 'inline' }, icon('mail', 14), 'seats and a mail compartment')));
+        for (const m of postbuses) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      }
+      if (mailVans.length) {
+        add(win.body, section('Mail vans & trucks', h('span', { class: 'inline' }, icon('mail', 14), 'mail only')));
+        for (const m of mailVans) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      }
     }
-    const loco = MODEL_BY_ID.get(state.loco), wagon = MODEL_BY_ID.get(state.wagon), unit = MODEL_BY_ID.get(state.unit), bus = MODEL_BY_ID.get(state.bus);
+    const loco = MODEL_BY_ID.get(state.loco), wagon = MODEL_BY_ID.get(state.wagon), van = MODEL_BY_ID.get(state.van), unit = MODEL_BY_ID.get(state.unit), bus = MODEL_BY_ID.get(state.bus);
+    const nVans = van && vans.includes(van) ? state.vanN : 0;
     const cars: VehicleModel[] = rail
       ? state.train === 'unit' ? unit ? Array<VehicleModel>(state.unitN).fill(unit) : []
-        : (loco ? [...Array<VehicleModel>(state.locoN).fill(loco), ...(wagon ? Array<VehicleModel>(state.count).fill(wagon) : [])] : [])
+        : (loco ? [...Array<VehicleModel>(state.locoN).fill(loco), ...(van ? Array<VehicleModel>(nVans).fill(van) : []), ...(wagon ? Array<VehicleModel>(nVans ? state.count : Math.max(1, state.count)).fill(wagon) : [])] : [])
       : bus ? [bus] : [];
     purchaseCars = cars;
     const cost = cars.reduce((s, c) => s + c.cost, 0);
     const cap = cars.reduce((s, c) => s + c.capacity, 0);
+    const mailCap = cars.reduce((s, c) => s + (c.mail ?? 0), 0);
+    // the mail tile while the selection carries mail or mail stock is on offer (never for trams)
+    const mailOffered = mailCap > 0 || (rail ? (state.train === 'unit' ? emus.some(carriesMail) : vans.length > 0) : kind === 'road' && buses.some(carriesMail));
     const spd = cars.length ? Math.min(...cars.map((c) => c.speed)) : 0;
     const len = cars.reduce((s, c) => s + c.length + CAR_GAP, 0);
     const lines = g.lines.all().filter((l) => l.kind === kind && (l.owner === PLAYER || l.operators?.includes(PLAYER)));
@@ -844,18 +1006,20 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     if (rail && line) {
       let minName = '';
       for (const sid of line.stops) { const st = g.stations.get(sid); if (st?.rail && st.rail.length < minP) { minP = st.rail.length; minName = st.name; } }
-      if (isFinite(minP) && len > minP) warn = `The train (${Math.round(len * 10)} m) is longer than the platforms at ${minName} (${Math.round(minP * 10)} m) — use fewer ${state.train === 'unit' ? 'units' : 'coaches'}.`;
+      // (the length counts the mail vans too)
+      if (isFinite(minP) && len > minP) warn = `The train (${Math.round(len * 10)} m) is longer than the platforms at ${minName} (${Math.round(minP * 10)} m) — use fewer ${state.train === 'unit' ? 'units' : nVans ? 'coaches or mail vans' : 'coaches'}.`;
     }
-    // composition strip
-    const strip = rail && cars.length ? h('div', { class: 'consist', title: 'Composition' }, cars.map((c) => h('span', { class: 'car' + (c.kind === 'loco' ? ' loco' : c.kind === 'emu' ? ' unit' : ''), style: `flex:${c.length};--c:${hex(c.color)}`, 'data-tip': c.kind === 'emu' ? `${c.name} · ${c.unitCars ?? 1} cars` : c.name }))) : null;
+    // composition strip (mail vans hatched)
+    const strip = rail && cars.length ? h('div', { class: 'consist', title: 'Composition' }, cars.map((c) => h('span', { class: 'car' + (c.kind === 'loco' ? ' loco' : c.kind === 'emu' ? ' unit' : '') + (carriesMail(c) ? ' van' : ''), style: `flex:${c.length};--c:${hex(c.color)}`, 'data-tip': c.kind === 'emu' ? `${c.name} · ${c.unitCars ?? 1} cars` : carriesMail(c) ? `${c.name} · ${fmtMail(c.mail ?? 0)} of mail` : c.name }))) : null;
     const power = cars.reduce((s, c) => s + c.power, 0);
-    add(win.body, 
+    add(win.body,
       section('Summary'),
       strip,
-      rail && state.train === 'unit' && unit ? ui.kv('Whole units', `${state.unitN} × ${unit.unitCars ?? 1} cars · ${unit.capacity} passengers / unit`) : null,
+      rail && state.train === 'unit' && unit ? ui.kv('Whole units', `${state.unitN} × ${unit.unitCars ?? 1} cars · ${unit.capacity ? `${unit.capacity} passengers` : `${fmtMail(unit.mail ?? 0)} of mail`} / unit`) : null,
       h('div', { class: 'summary' },
         tile(fmtMoney(cost), 'Price'),
         tile(String(cap), 'Passengers'),
+        mailOffered ? tile(fmtMail(mailCap), 'Mail', 'mail') : null,
         tile(String(spd), 'km/h'),
         rail ? tile(`${Math.round(len * 10)} m`, isFinite(minP) ? `of ${Math.round(minP * 10)} m platform` : 'Length', warn ? 'neg' : '') : null,
         rail ? tile(`${power}`, 'kW') : null),
@@ -886,6 +1050,8 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
           h('div', { class: 'list' }, here.map((v) => h('div', { class: 'row link', onclick: () => openVehicle(ui, v.id) }, h('span', null, v.name), h('span', { class: 'muted' }, v.status)))));
       }
     }
+    if (scroll) win.body.scrollTop = scroll;
+    if (focusIndex >= 0) win.body.querySelectorAll<HTMLElement>('.model, .stp, .segb')[focusIndex]?.focus({ preventScroll: true });
     const buy = () => {
       // Window morphing may keep this button's listener: read the latest composition and line on click.
       validateSelection();

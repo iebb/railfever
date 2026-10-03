@@ -66,6 +66,13 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. One rail fare for every track type, with a minimum per boarding so short city hops pay too. Journeys without transfers get a **20% bonus**.
 - Operating costs cover energy, crew, vehicle maintenance and track wear; high-speed services cost more to run. The economy includes loans with interest and finance reports with cost breakdowns and charts.
 
+**Mail**
+
+- Stations post mail from their walking catchment (more from shops and offices, by era and town size) to the other towns your mail network reaches. Mail has its own queues and rating, is counted in tonnes, and pays by distance and how fast it arrives (Mail income in the finances).
+- Rail: the train composer couples 0–3 mail vans behind the locomotive, and a train of vans only is a mail train. The vehicle window adds or removes vans while the train stands at a platform or in its depot. A postal multiple unit carries mail only.
+- Road: postbuses carry passengers and some mail; mail vans and trucks carry mail only. Trams carry no mail.
+- The station, line, vehicle and town windows show mail waiting, the mail rating, mail posted, loaded and delivered, mail income and the mail load factor.
+
 **Sound**
 
 - Procedural sound effects (WebAudio, no audio files): interface sounds, construction, demolition, cash chimes, positional trains (steam chuffs, diesel rumble, era-specific electric motor hum and whine, high-speed wind roar, rail-joint clatter, horns and whistles), tram traction, level-crossing bells, station chimes, and camera-following ambience (birds, wind, town hum, surf, crickets at night). Volume sliders per group and a mute button in the top bar.
