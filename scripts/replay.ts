@@ -17,7 +17,9 @@ const saved = (g: Game) => JSON.stringify(serialize(g));
 function fixture() {
   const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 2 });
   g.economy.money = 40_000_000;
-  const pr = placeAndConnect(g, 60, 150, 0, new Set(), 1, () => {});
+  // The shorter walking catchments change site ranking: seed 23's nearby pairs no longer connect. Keep
+  // the same replay scenario with a longer pair when needed; all round-trip and daily equality checks stay.
+  const pr = placeAndConnect(g, 60, 150, 0, new Set(), 1, () => {}) ?? placeAndConnect(g, 150, 240, 0, new Set(), 1, () => {});
   check(!!pr, 'player railway stations connected');
   if (!pr) return null;
   const dep = depotBehind(g, pr.A, pr.B, 0);

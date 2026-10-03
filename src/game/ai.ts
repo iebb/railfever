@@ -3523,7 +3523,9 @@ export class AIController {
    * than platforms and turnouts allow. Neighbouring catchments overlap: the forecast shares their buildings.
    */
   private urbanLayout(T: Town, mode: 'metro' | 'lightrail') {
-    const g = this.game, spacing = Math.max((mode === 'metro' ? 12 : 7) + TRACK_TYPES[mode].minRadius * 2 + 2, walkLimit('rail') * (mode === 'metro' ? 0.72 : 0.6));
+    // A light-rail terminus needs two crossover diagonals and their clearances between platforms. The walking
+    // reach may shrink, but the 18-unit throat cannot: shorter gaps leave both tracks two-way and trains blocked.
+    const g = this.game, spacing = Math.max((mode === 'metro' ? 12 : 7) + Math.max(TRACK_TYPES[mode].minRadius * 2 + 2, mode === 'lightrail' ? 18 : 0), walkLimit('rail') * (mode === 'metro' ? 0.72 : 0.6));
     const sts = [...g.stations.map.values()].filter((s) => s.townId === T.id && s.rail && railModeOf(s.rail.trackType) === 'mainline' && g.lines.stationServed(s.id));
     let pair: Station[] = [], dist = 0;
     for (const a of sts) for (const b of sts) {

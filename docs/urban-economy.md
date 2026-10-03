@@ -8,21 +8,21 @@ Rail is one transport mode. Main-line, metro and light-rail track and stations a
 
 Every rail vehicle runs on every track type, though electric traction needs the wire. Any rail line may stop at any rail station, and one line may mix the styles. Lines, numbering, codes, colours, catchments, fares, local demand and forecasts treat every rail line alike. The Urban tools are presets for the urban construction styles.
 
-The passenger calendar remains at 0.1 times the old daily generation rate. Fares are in calibrated game money: the boarding charges and the rail minimum are not literal real-world ticket prices. The main-line and high-speed distance fare curves and the regional OD rates are unchanged.
+The passenger calendar remains at a 0.1 scale. Covered residents now make 20% more trips: the local base rate is 0.0102 per game day before that scale, and the long-distance monthly rate is 0.0144, preserving their balance. Fares are in calibrated game money: the boarding charges and the rail minimum are not literal real-world ticket prices. The main-line and high-speed distance fare curves are unchanged.
 
 ## Walking reach
 
-Passengers walk along streets from forecourts, entrances and stops. The path-based walking limits are twice the earlier main-line, tram and bus limits. Metro and light-rail stations had shorter limits (12.6 and 10.5 units) and now share the rail limit:
+Passengers walk along streets from forecourts, entrances and stops. Every walking limit is 70% of the release-2.6 value. All rail stations share one limit, whatever their track type:
 
 | Mode | Limit | Along streets |
 | --- | ---: | ---: |
-| Rail, every station whatever its track type | 33.6 units | 420 m |
-| Tram | 30.8 units | 385 m |
-| Bus | 22.4 units | 280 m |
+| Rail, every station whatever its track type | 23.52 units | 294 m |
+| Tram | 21.56 units | 269.5 m (270 m in labels) |
+| Bus | 15.68 units | 196 m |
 
 The street distance includes the 1.25 street-grid allowance. Building bonuses extend all three limits as before. Labels and help text take the limits from `walkLimit`.
 
-Fewer people walk 400 m than 200 m. A building with a station within `FULL_COVER_WALK` (21 units, 210 m along streets) is fully covered. Further out, coverage falls with the walking weight `1 / (1 + d / 8)`, the same weight that shares buildings between stations. It is measured against the weight at 210 m: about 0.8 at a bus stop's limit and 0.6 at a rail station's.
+A building with a station within `FULL_COVER_WALK` (14.7 units, 147 m along streets) is fully covered. Further out, coverage falls with the walking weight `1 / (1 + d / 5.6)`, the same weight that shares buildings between stations. The weight's distance scale also falls by 30%, from 8 to 5.6 units, so both full coverage and the entire taper keep their shape at 70% of the old distances: about 0.8 coverage at a bus stop's limit and 0.6 at a rail station's.
 
 A building's coverage comes from its best walk (`coverOf`): the nearest eligible station sets it. The stations that reach it share that coverage in proportion to their weights (share = weight / sum of weights × coverage). A second stop as far away splits the building's coverage; it adds none. Before this rule, two far stops covered a building wholly where one covered 85% of it. The live, sliced and reference share-outs and the AI's forecasts use the same rule. `catchPop` is a station's share of residents. The hover counts show everyone within the walking limit.
 
@@ -30,14 +30,7 @@ Added entrances are access points of their station: side halls, footbridges and 
 
 A ground station's forecourt also reaches its own access street where that street starts below or above the levelled station ground. The street is laid before the station levels its site, and the station's steps bridge the difference, as its road-access check already assumed. Before, such a station could show road access but have no walking catchment.
 
-The street searches now cover four times the area. Catchment recomputes take longer (`scripts/catchperf.ts`, seed 23, timing runs on the final code):
-
-| Map | Mean before → after | Worst before → after | Mean simulation tick |
-| --- | ---: | ---: | ---: |
-| 768, 5 years | 1.8 → 5.5–5.9 ms | 9 → 24–26 ms | 0.36 → 0.43–0.45 ms |
-| 1024, 3 years | 1.1 → 3.5–3.6 ms | 4 → 12 ms | 0.36 → 0.34–0.36 ms |
-
-Recomputes stay incremental, and the comparison with a full reference recompute remains exact.
+At 70% of the distance, an unobstructed street grid's search area is 49% of the previous area. Recomputes stay incremental, and the comparison with a full reference recompute remains exact. The measured calibration below includes both a five-year 768-map run and cold recomputes on the identical release-2.6 saved world.
 
 ## Local demand and fares
 
@@ -49,13 +42,13 @@ Recomputes stay incremental, and the comparison with a full reference recompute 
 
 Within a town, local trips are multiplied by `1 + k × intensity × quality`. The quality depends on the service's journey time, including waiting. The mode that carries the journey sets `k` (`DemandModel.journeyMode`: rail when a rail line with trains carries any of its legs, else tram when a tram line does, else bus):
 
-- 6 for rail of any track type, so a cross-city main line's city stops count too
-- 3 for trams
-- 1.5 for buses
+- 8 for rail of any track type, so a cross-city main line's city stops count too (6 in release 2.6)
+- 4 for trams (3 in release 2.6)
+- 2 for buses (1.5 in release 2.6)
 
-Before, `k` was 18 for metro track and 15 for light rail (by the boarding station's platforms), main-line trains had no uplift, and the first unified version used 12 for rail. The platforms a station has no longer matter: an unused rail platform beside a bus stop once gave bus-only trips the rail uplift (5.85 times the demand). The 8% car drop-off allowance follows the carrying mode too. Village services receive no density uplift. Intercity OD generation is unchanged.
+Before rail unification, `k` was 18 for metro track and 15 for light rail (by the boarding station's platforms), main-line trains had no uplift, and the first unified version used 12 for rail. The platforms a station has no longer matter: an unused rail platform beside a bus stop once gave bus-only trips the rail uplift (5.85 times the demand). The 8% car drop-off allowance follows the carrying mode too. Village services receive no density uplift.
 
-Rail has one fare model, whatever the track or station style. A journey's rail legs pay their distance fares, together at least `RAIL_FARE.minimum` (500) before the speed factor (`railLegFare`). The first rail leg pays up to the minimum; a later one only what takes the journey's distance fares beyond it, so the operator of the first rail leg collects the minimum. The journey's rail fares so far travel with its waiting and cargo groups and are saved with them. The minimum binds on rail trips under about 300 m. Previously the fare depended on the boarding platform's track (metro 1,700 plus the distance component, light rail 900 plus it, main line the plain distance fare); the first unified version charged 1,000 on every leg, so four transfers earned 4.25 times the direct ride.
+Rail has one fare model, whatever the track or station style. A journey's rail legs pay their distance fares, together at least `RAIL_FARE.minimum` (550; 500 in release 2.6) before the speed factor (`railLegFare`). The smaller city catchments fill their useful queues before extra demand alone restores a comfortable subway payback; the 10% minimum increase improves that margin without raising long-distance fares or the queue limits. The first rail leg pays up to the minimum; a later one only what takes the journey's distance fares beyond it, so the operator of the first rail leg collects the minimum. The journey's rail fares so far travel with its waiting and cargo groups and are saved with them. The minimum binds on rail trips under about 345 m. Previously the fare depended on the boarding platform's track (metro 1,700 plus the distance component, light rail 900 plus it, main line the plain distance fare); the first unified version charged 1,000 on every leg, so four transfers earned 4.25 times the direct ride.
 
 The speed factor, which compares a leg's time with walking or driving, is capped at 1.8 on trips up to 100 units (1 km), rising to 2.6 from 300 units: a few minutes saved on a walk in town are worth less than the time ratio says, while long trips keep the premium of fast and high-speed services.
 
@@ -71,9 +64,9 @@ Rail stations with cross-town service also attract car drop-off and park-and-rid
 
 How many residents are eligible depends on the headway:
 
-- 100 simulation seconds or less: up to 50% of otherwise uncovered residents (85% before the walking reach doubled)
+- 100 simulation seconds or less: up to 75% of otherwise uncovered residents (50% in release 2.6)
 - longer headways: eligibility tapers off
-- 200 seconds or more: none
+- 300 seconds or more: none (200 seconds in release 2.6)
 
 Eligibility is not a ridership percentage. Eligible residents still produce the existing small regional OD rate, with the usual coverage and journey-time elasticity. The compressed game calendar makes simulation headways much longer in calendar days.
 
@@ -96,9 +89,9 @@ The AI still chooses a construction style for a city railway:
 - **Light-rail style** considers surface, elevated and underground alignments.
 - **Subway style** goes underground.
 
-Both are considered only in towns of at least 4,000 residents (`AIController.urbanPop`; 2,500 before). With the doubled reach, a few stops cover a smaller town, where buses or trams serve better. Subway style needs at least 5,000 residents (`centrePop`).
+Both are considered only in towns of at least 4,000 residents (`AIController.urbanPop`; 2,500 before release 2.6). A few stops can cover a smaller town, where buses or trams serve better. Subway style needs at least 5,000 residents (`centrePop`).
 
-Station spacing derives from the one rail reach: 0.72 of it (about 300 m) for subway style, 0.6 (about 250 m) for light-rail style. Before, the spacing was 1.8 times each style's own, smaller reach: about 280 m and 240 m. Platforms and turnouts set the minimum spacing. The result is an ordinary rail line: main-line trains may run through onto it, and its trains onto the main line.
+Station spacing derives from the one rail walking reach: 0.72 of it (about 212 m) for subway style, 0.6 (about 176 m) for light-rail style. Platforms, curves and turnouts set minimum spacings of 300 m and 250 m respectively. Light rail needs 180 m clear between 70 m platforms for the pair of terminal crossover diagonals and their clearances; using the shorter reach alone left the tracks two-way and the trains blocked. The result is an ordinary rail line: main-line trains may run through onto it, and its trains onto the main line.
 
 Main-line arrival transfers and trips between termini count in an interchange proposal. Stations at either owner's main-line terminus form explicit walking complexes. No walking transfer is set up between two stops of the same rail line, whatever their styles. Track connections are checked before construction. A light-rail-style line short of capital can open with three or four stops, leaving room to extend later. A second main-line station in a town counts only the ground that no existing rail station of any style covers.
 
@@ -138,7 +131,7 @@ Open-access AI companies with facing main-line termini in one city may jointly b
 - dense 8,000-person five-stop light-rail-style and subway-style lines, each repaying its full capital within a realistic band (light-rail style 3 to 8 years, subway style 4 to 15). The town's street grid crosses the line's corridor every 80 m, as a real grid does; the corridor was a free strip without a crossing street, on which a street-level line cost next to nothing
 - a bus complex with an unused rail platform, whose bus-only trips get the bus uplift
 - AI estimates priced with the receipts' fare model, for a rail and a bus leg
-- a park-and-ride main line with no walking residents, its stations at the ends of country roads beyond the doubled reach
+- a park-and-ride main line with no walking residents, its stations at the ends of country roads beyond walking reach
 - two 3,000-person towns joined by one train between central stations, which must be at least 15% full and break even after upkeep by year three
 - a two-company through tunnel
 - third-company and terminus-owner interchange lines
@@ -151,54 +144,73 @@ Its `--maps=7,23 --years=8 --size=768` mode measures naturally selected city rai
 
 The company capacity stress test injects its artificial crowd at the monthly decision, after normal queue abandonment. It freezes business decisions during its separate double-track physics observation.
 
-The HSR speed fixture uses towns 4 to 5.2 km apart (3.4 to 4.5 km before). With the doubled reach, stations stand at the facing edges of the towns, and a 3 km run tops out at 160 km/h under real acceleration and braking. The underground-centre fixture tries each partner town on a fresh copy of the map. Towards one of them, the route cannot climb out of the centre tunnel, both before and after this change.
+The HSR speed fixture uses towns 4 to 5.2 km apart (3.4 to 4.5 km before). Station sites can stand at the facing edges of the towns, and a 3 km run tops out at 160 km/h under real acceleration and braking. The underground-centre fixture tries each partner town on a fresh copy of the map. Towards one of them, the route cannot climb out of the centre tunnel, both before and after this change.
 
 Urban scenarios advance committed simulation ticks. The company save comparison likewise advances exactly sixty simulation days in both games. Fixed wall-frame counts can release different numbers of ticks under the frame-time budget.
 
-`growth.ts` checks town growth by service class. `GROWTH_FULL_REACH` rose from 0.12 to 0.3. With the doubled reach, one station can cover a small town completely. A station called only rarely still counts 15% of its catchment as reached, which used to count as full service.
+`growth.ts` checks town growth by service class. `GROWTH_FULL_REACH` rises from 0.3 to 0.4, and the credit in months without a call (`GROWTH_MIN_CALLS`) falls from 15% to 8%. The radius-only growth run had poorly served towns growing 1.84 times: rare calls could still give them nearly full growth credit. Coverage and actual frequency now matter more, while the unserved and best-service intervals (100 and 6 days), transport and rating factors, and all class targets stay unchanged.
 
 ## Measured calibration
 
-Fixed seed-7 controls, final full year of four, no AI. The sites, service and costs are unchanged. Amounts are thousands of game money a year: v2.5 (b7dfcc3), the first unified version (83ba5bd), and now.
+Release 2.6 (`d95e283`) → 70% walking limits, using the same seed-7 economy controls, final full year of four, no AI. Income and operating result include infrastructure upkeep and are thousands of game money a year. The intercity and bus capital is unchanged; the radius-sensitive village site search produces a slightly cheaper alignment.
 
-| Control | Income | Operating result | Boardings a year, load |
+| Control | Income, old → new | Operating result, old → new | Boardings/year, old → new | Load, old → new | Full-capital payback, old → new |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Intercity rail | 502.7 → 490.7 | +167.5 → +155.4 | 233 → 248 | 15.6% → 18.3% | 51.0 → 55.0 years |
+| Busy bus, two articulated buses | 196.4 → 175.8 | +122.5 → +101.8 | 422 → 373 | 28.8% → 25.9% | 5.6 → 6.7 years |
+| Short bus | 23.1 → 18.2 | −10.7 → −15.6 | 154 → 122 | 17.0% → 13.4% | never → never |
+| Village rail | 305.2 → 242.1 | −68.4 → −133.2 | 83 → 54 | 7.2% → 4.2% | never → never |
+
+The new economy baseline was captured only after the independent load, full-capital payback, village-loss and split-journey bands passed, and after checking urban economics. Its comment records the old and new constants and results; all bands remain unchanged. Narrower walking reach intentionally reduces the short bus and village line's traffic. The separate feeders and 20% higher generation per covered resident sustain the useful intercity service.
+
+Urban fixtures remain 8,000-person towns with five stations across a real street grid:
+
+| Service | Release 2.6 | 70% walking limits |
+| --- | ---: | ---: |
+| Light-rail style | 14.24M invested, +4.10M/year, 3.5-year payback | 14.14M invested, +3.10M/year, 4.6-year payback |
+| Subway style | 28.64M invested, +3.46M/year, 8.3-year payback | 28.38M invested, +2.12M/year, 13.4-year payback |
+| Two 3,000-person towns, central stations, year 3 | 20.5% load, +468k/year | 27.0% load, +690k/year |
+
+Reducing walking reach alone failed the independent intercity economics and left subway payback at 14.9 years. Its shorter light-rail spacing also left no room for the terminal crossover pair, blocking all four trains. The physical spacing floor, modest demand and feeder calibration, and 10% rail minimum increase address those measured problems. Increasing urban demand beyond 8/4/2 mostly filled the queue caps without improving subway payback, so the final calibration keeps that uplift and preserves the queue limits.
+
+The four-transfer exploit remains 1.48 times the direct journey, as with the distance fares alone. A bus complex's unused rail platform still gives exactly the plain bus demand. AI estimates still agree with passenger receipts. The overlapping-stop fixture now uses a house about 183 m from each bus stop, beyond full coverage but inside the shorter walking limit: two equally distant stops share the same coverage as one.
+
+The 20-year 768-map runs, seeds 7 and 23, keep every raw class mean inside its target without relying on the sample tolerance. Classes follow the service each town actually received, so class membership can change.
+
+| Growth class | Release 2.6 | 70% walking limits | Target |
 | --- | ---: | ---: | ---: |
-| Intercity rail, stations at the town edges | 95.4 → 495.3 → 502.7 | −242 → +160 → +167 | 46 → 231 → 233, 15.6% |
-| Busy bus, two articulated buses | 113.7 → 225.7 → 196.4 | +40 → +151 → +122 | 231 → 473 → 422, 28.8% |
-| Short bus | 8.7 → 22.7 → 23.1 | −25 → −11 → −11 | 59 → 150 → 154 |
-| Village rail | 226.3 → 302.6 → 305.2 | −139 → −71 → −68 | 70 → 82 → 83 |
+| Well served | 2.066× (20 towns) | 1.955× (19 towns) | 1.6–2.5× |
+| Poorly served | 1.603× (5 towns) | 1.458× (6 towns) | 1.3–1.6× |
+| Unserved | 1.285× (1 town) | 1.202× (1 town) | 1.1–1.3× |
 
-The busy bus repays its buses in 4.4 years and its full capital (buses, stops and depot) in 5.6; it lost 13% when two stops stopped adding coverage to buildings far from both. The intercity line repays its train in 9.0 years and its full capital (a hilly line with five bridges and three tunnels) in 51.
-
-Purpose-built services in `urbanecon.ts`, first unified version → now:
-
-| Service | First unified version | Now |
+| Seed | Abandonment over 20 years, old → new | Abandonment in final year, old → new |
 | --- | ---: | ---: |
-| Two 3,000-person towns, central stations, year 3 | load 20.5%, +468k a year | unchanged |
-| 8,000-person town, five-stop light-rail style | 7.7M at street level on a free strip, +7.20M a year, 1.1-year payback | 14.2M elevated over a real street grid, +4.10M a year, 3.5-year payback |
-| 8,000-person town, five-stop subway style | 28.6M, +5.70M a year, 5.0-year payback | 28.6M, +3.46M a year, 8.3-year payback |
-| Third-company interchange line | +6.15M a year, 956 transfers | +2.90M a year, 758 transfers |
-| Terminus-owner interchange line | +8.74M a year, 853 transfers | +4.20M a year, 1,711 transfers |
+| 7 | 16.0% → 24.0% | 16.7% → 29.2% |
+| 23 | 14.9% → 12.8% | 21.8% → 20.3% |
 
-City hops earn less now: the rail minimum binds only below 300 m, the premium for speed on short trips is capped, and the rail uplift is 6.
+Both run totals remain below 30%, and both final years below 35%. Seed 7 has more abandonment after recalibration, within the unchanged ceilings; the feedback on station ratings and passenger generation remains in place.
 
-Exploits and estimates, first unified version → now:
+The separate seed-11 tiny-village smoke control connects Glendale (260 residents) and Greenham (175), runs for exactly two years and must carry passengers:
 
-- **One journey over four transfers** (48 units in 160 s): 4.25 → 1.48 times the direct ride. The distance fares alone make it 1.48.
-- **A bus complex with an unused rail platform:** 5.85 → 1.00 times the demand of the plain bus stop.
-- **A house 263 m from two stops:** covered 100% → 84.5%, as by one stop.
-- **The AI's estimate for a short rail route:** 1,029 against receipts of 2,386 per passenger → identical.
-
-AI sweep: seeds 7, 11, 23 and 51, 768 maps, five years, three AI companies, first unified version → now:
-
-| Measure | First unified version | Now |
+| Measurement | Release 2.6 | 70% walking limits |
 | --- | ---: | ---: |
-| AI rail lines with trains | 9 (4 main-line only, 5 on urban track) | 10 (4, 6) |
-| Seeds with a line on urban track | 4 of 4 | 4 of 4 |
-| Companies with a railway | 9 of 12 | 10 of 12 |
-| Companies with a positive operating result in the last year | 12 of 12 (total 12.0M, worst +0.12M) | 11 of 12 (total 9.4M, worst −0.12M) |
-| Lowest cash, mean loans | 0.59M, 12.2M | 0.92M, 13.9M |
-| Passengers who gave up in the last month | 28%, 35%, 61%, 28% | 15%, 15%, 22%, 20% |
-| Bankrupt companies | 0 | 0 |
+| Station walking residents | 281.8 / 171.0 | 187.4 / 153.6 |
+| Passengers delivered in two years | 146 | 136 |
 
-Over the 20-year growth runs (seeds 7 and 23), the share of passengers who gave up waiting fell from 43% and 42% (48% and 55% in the last year) to 16% and 15% (17% and 22% in the last year); v2.5 had 26% and 17%. Well-served towns grow 2.07 times, poorly served ones 1.60 and unserved ones 1.29, all inside their targets.
+Catchment timing uses Node 20.18.2, seed 23, a 768 map and three AI companies. The five-year runs use `--timing-only --cpu`, excluding allocations from the independent reference comparison.
+
+| Measurement | Release 2.6 | 70% walking limits |
+| --- | ---: | ---: |
+| Live recompute mean | 11.60 ms | 4.72 ms |
+| Live recompute p99 | 39.16 ms | 15.46 ms |
+| Live recompute maximum | 220.77 ms | 21.64 ms |
+| Live recompute mean CPU | 15.36 ms | 7.94 ms |
+| Identical-world cold recompute mean | 6.45 ms | 2.85 ms |
+| Identical-world cold recompute median | 5.44 ms | 2.48 ms |
+| Five-year passengers delivered | 11,722 | 13,307 |
+
+The live runs end with 43 → 48 stations and 6,602 → 6,456 buildings. To isolate walking geometry from those changed networks, the cold comparison loads the same release-2.6 saved world (41 stations, 6,602 buildings), forces a complete recompute, discards five warm-up samples and measures twenty more. Mean cold time falls about 56%; live mean falls about 59%. Wall maxima include host scheduling and garbage collection. The unchanged-call maximum also stays tiny: 0.0053 → 0.0044 ms.
+
+All 44 requested gate cases pass, with their independent bands unchanged. This includes smoke 7/11/23, twenty exact 120-day network-job replays, through-service saves, full/reference catchment comparisons, migration of eighteen legacy saves from `review/t23`, and both mature-network and staggered-depot 400-day exact replays for seeds 7 and 23. The final gate's AI timing outlier passed on an unchanged isolated retry (27.2 ms maximum against the existing 30 ms limit).
+
+Radius-specific checks in `stations`, `bigstations` and `urban` now assert the reduced limits and retained building bonus. `walkcatch` checks clipped streets, a house removed from the old catchment, the proportionally scaled taper, the new map-legend distances, and equal-distance overlapping stops beyond full coverage. `entrances` checks that added landings retain nearby surviving houses and exclude the far ends. Smoke adds the explicit tiny-village control; replay widens its route-search fallback because seed 23's shorter-radius site ranking no longer connects its nearby pair. Every exactness check remains in place.

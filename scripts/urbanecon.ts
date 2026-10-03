@@ -190,7 +190,7 @@ if (!arg('maps')) {
       let ticks = 0;
       runDays(g, 360, () => { if (++ticks % 4 === 0) for (const id of line.vehicles) { const v = g.vehicles.get(id)!; if (['running', 'loading', 'waiting'].includes(v.state)) loads.push(v.load / v.capacity); } });
       load = loads.reduce((x, y) => x + y, 0) / Math.max(1, loads.length); net = profit(g, line);
-      console.log(`  year ${year}: income ${fmt(line.incomeLast / 1e3, 0)}k, running ${fmt(line.costLast / 1e3, 0)}k, upkeep ${fmt(g.maintenanceOf(1) / 1e3, 0)}k -> ${fmt(net / 1e3, 0)}k; load ${fmt(load * 100, 1)}%; walking ${fmt(sa.catchPop, 0)} / ${fmt(sb.catchPop, 0)}`);
+      console.log(`  year ${year}: income ${fmt(line.incomeLast / 1e3, 0)}k, running ${fmt(line.costLast / 1e3, 0)}k, upkeep ${fmt(g.maintenanceOf(1) / 1e3, 0)}k -> ${fmt(net / 1e3, 0)}k; load ${fmt(load * 100, 1)}%; walking ${fmt(sa.catchPop, 0)} / ${fmt(sb.catchPop, 0)}, headway ${fmt(patternHeadways(g, line)[0]?.headway ?? 0, 0)}s`);
     }
     check(load >= 0.15 && net >= 0, `a rail line between two 3,000-person towns with central stations is ${fmt(load * 100, 0)}% full and breaks even after upkeep by year three`);
     check(checkReservations(g).length === 0, 'two-town reservations consistent');

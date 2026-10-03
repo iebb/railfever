@@ -7,9 +7,9 @@ import type { StationPlan } from '../src/game/stations';
 import { ROAD_TYPES } from '../src/game/constants';
 import { bezLine } from '../src/game/geom';
 import {
-  walkingCatchment, walkingPopulation, planWalkingCatchment, walkSitePop, walkLimit, FRONTAGE_REACH,
+  walkingCatchment, walkingPopulation, planWalkingCatchment, walkSitePop, walkLimit, FRONTAGE_REACH, FULL_COVER_WALK, walkWeight, coverOf,
 } from '../src/game/catchment';
-import { drawCatchStreets } from '../src/ui/gameapi';
+import { drawCatchStreets, catchWalkLimit } from '../src/ui/gameapi';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { roadDepotNear } from './lib';
 import { flatGame, station, check, done } from './stationlib';
@@ -27,8 +27,10 @@ function bus(g: Game, x: number, z: number) {
 }
 function flush(g: Game) { g.stations.refreshAccess(true); g.lines.catchmentDirty = true; g.lines.flushCatchment(); }
 
-check(CATCHMENT_RADIUS.rail === 33.6 && CATCHMENT_RADIUS.tram === 30.8 && CATCHMENT_RADIUS.bus === 22.4 && Object.keys(CATCHMENT_RADIUS).join() === 'rail,tram,bus', 'path-based limits twice the earlier ones (rail 168, tram 154, bus 112 m); one rail limit for every track type');
+check(CATCHMENT_RADIUS.rail === 23.52 && CATCHMENT_RADIUS.tram === 21.56 && CATCHMENT_RADIUS.bus === 15.68 && FULL_COVER_WALK === 14.7 && Object.keys(CATCHMENT_RADIUS).join() === 'rail,tram,bus', 'walking and full-coverage limits reduced by 30%; one rail limit for every track type');
 check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 3.125 / Math.PI), '1.25 grid allowance preserves circular area to within 0.6%');
+check([0, 8, 21, 28, 42, 50.4].every((oldDistance) => near(walkWeight(oldDistance * 0.7), 1 / (1 + oldDistance / 8)) && near(coverOf(walkWeight(oldDistance * 0.7)), Math.min(1, (1 + 21 / 8) / (1 + oldDistance / 8)))), 'distance weights and the full-coverage taper keep the release-2.6 shape at 70% of the distances');
+check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLimit(mode) * 10)} m`).join(', ') === '294 m, 270 m, 196 m', 'mapmodes legend distances derive from the shorter walking limits, including the grid allowance');
 
 {
   console.log('river barrier, long-edge origins and bidirectional country-road walks');
@@ -36,13 +38,15 @@ check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 
   const l0 = node(g, 62, 20), l1 = node(g, 62, 110), r0 = node(g, 70, 20), r1 = node(g, 70, 110);
   const left = road(g, l0, l1), right = road(g, r0, r1), S = bus(g, 62, 60);
   const across = house(g, 72, 60, -Math.PI / 2), down = house(g, 60, 68, Math.PI / 2), up = house(g, 60, 52, Math.PI / 2);
-  const farDoor = house(g, 57.5, 60, Math.PI / 2), beyond = house(g, 60, 90, Math.PI / 2);
+  const farDoor = house(g, 57.5, 60, Math.PI / 2), beyond = house(g, 60, 90, Math.PI / 2), trimmed = house(g, 60, 82, Math.PI / 2);
   flush(g);
   const c = walkingCatchment(g, S);
   check(Math.hypot(across.x - S.x, across.z - S.z) < CATCHMENT_RADIUS.bus && !c.buildings.has(across.id), 'across a river, inside the former circle, without a reachable bridge: not covered');
   check(c.buildings.has(down.id) && c.buildings.has(up.id) && near(c.buildings.get(down.id)!.distance, 9.6), 'down/up a country road within budget: covered, including the 1.6-unit door leg');
   check(!c.buildings.has(farDoor.id) && !c.buildings.has(beyond.id), `a door farther than ${FRONTAGE_REACH} from a street or beyond the walking limit is excluded`);
-  check(c.segments.every((s) => s.edge === left.id && s.z0 >= 32 - 1e-8 && s.z1 <= 88 + 1e-8), 'isochrone clips a long road edge even when neither endpoint is reachable');
+  check(!c.buildings.has(trimmed.id), 'a street-connected home inside the old bus limit but outside the shorter limit is excluded');
+  const origin = S.stops[0].z, limit = walkLimit('bus');
+  check(c.segments.every((s) => s.edge === left.id && s.z0 >= origin - limit - 1e-8 && s.z1 <= origin + limit + 1e-8), 'isochrone clips a long road edge to the shorter budget even when neither endpoint is reachable');
   const ra = net.addNode('rail', 62, 3, 60, 1, 0), rb = net.addNode('rail', 70, 3, 60, 1, 0);
   net.addEdge('rail', ra.id, rb.id, bezLine(62, 60, 70, 60), new Float32Array(9).fill(3), [], 'standard', 0);
   check(!walkingCatchment(g, S).buildings.has(across.id), 'a railway across the river never becomes a walking path');
@@ -179,12 +183,12 @@ check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 
 
 {
   // Coverage follows the best walk: a second stop just as far away shares the building's coverage, it adds none
-  // (a house 26 units' walk from either stop is covered as from one stop at that distance).
+  // (a house about 18 units' walk from either stop is covered as from one stop at that distance).
   const g = flatGame();
   const n = (x: number, z: number) => node(g, x, z);
   const w0 = n(20, 60), w1 = n(66, 60), w2 = n(160, 60), s0 = n(66, 110);
   road(g, w0, w1, 'street'); road(g, w1, w2, 'street'); road(g, w1, s0, 'street');
-  const h = house(g, 64, 79, Math.PI / 2, 100);
+  const h = house(g, 64, 71, Math.PI / 2, 100);
   const A = bus(g, 60, 60), C = bus(g, 140, 60);
   const line = g.lines.create('road'); line.stops = [A.id, C.id];
   const depotId = roadDepotNear(g, 140, 60, 0);
@@ -196,7 +200,7 @@ check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 
   const two = g.stations.stationsForBuilding(h.id), cover2 = two.w.reduce((a, b) => a + b, 0);
   const dA = walkingCatchment(g, A).buildings.get(h.id)?.distance ?? 0, dB = walkingCatchment(g, B).buildings.get(h.id)?.distance ?? 0;
   console.log(`  a house ${dA.toFixed(1)} / ${dB.toFixed(1)} units' walk from two stops: covered ${cover1.toFixed(4)} by one, ${cover2.toFixed(4)} by both (${two.w.map((x) => x.toFixed(4)).join(' + ')})`);
-  check(dA > 21 && near(dA, dB) && cover1 < 1 && near(cover1, cover2) && two.st.length === 2 && near(two.w[0], two.w[1]), 'a second stop as far away shares the coverage of the best walk, it adds none');
+  check(dA > FULL_COVER_WALK && near(dA, dB) && cover1 < 1 && near(cover1, cover2) && two.st.length === 2 && near(two.w[0], two.w[1]), 'a second stop as far away shares the coverage of the best walk, it adds none');
 }
 
 done(T0);

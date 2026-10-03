@@ -14,27 +14,46 @@ import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train, ch
 import { distanceFare, simNow } from '../src/game/fares';
 import { RAIL_FARE } from '../src/game/constants';
 import { bezLine } from '../src/game/geom';
+import { patternHeadways } from '../src/game/patterns';
 
 const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
 const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
-// Measured with the doubled street-walking reach (rail 336 m for every track type, bus 224 m, before the 1.25 grid
-// allowance; a building's coverage from its best walk, beyond 210 m partly), one rail fare (distance, at least 500 per
-// journey), a lower premium for speed on short trips and the town growth recalibrated for it. Four years, final full
-// year, no AI. Income / operating result, k a year: v2.5 (b7dfcc3) -> rail unification (83ba5bd) -> now:
-// intercity rail 95.4 / -242 -> 495.3 / +160 -> 502.7 / +167, busy bus 113.7 / +40 -> 225.7 / +151 -> 196.4 / +122,
-// short bus 8.7 / -25 -> 22.7 / -11 -> 23.1 / -11, village rail 226.3 / -139 -> 302.6 / -71 -> 305.2 / -68. The last
-// step: two stops in reach of a far building no longer cover more of it than the nearer one alone (the busy bus loses
-// 13%); the rail minimum per journey and the cap on short trips leave these longer rides alone. (The baseline of
-// v2.5 held incomes 89.1 / 100.7 / 8.8 / 207.3 and no operating results, so its profit checks compared with NaN.)
+// Re-captured after the independent load/payback/village/exploit bands and urban economics passed. Release 2.6
+// (d95e283) -> 70% walking limits: rail/tram/bus 33.6/30.8/22.4 -> 23.52/21.56/15.68 units, full coverage 21 -> 14.7,
+// weight scale 8 -> 5.6. Local/long-distance generation +20%; urban uplift 6/3/1.5 -> 8/4/2; separate car feeders
+// 50% -> 75%, cutoff headway 200 -> 300 s; rail minimum 500 -> 550 once per journey. Growth full reach 0.3 -> 0.4,
+// no-call credit 0.15 -> 0.08. Four years, final full year, no AI. Income / operating result, k/year, old -> new:
+// intercity 502.7 / +167.5 -> 490.7 / +155.4, busy bus 196.4 / +122.5 -> 175.8 / +101.8,
+// short bus 23.1 / -10.7 -> 18.2 / -15.6, village railway 305.2 / -68.4 -> 242.1 / -133.2.
+// Intercity and busy-bus full-capital paybacks 51.0 -> 55.0 and 5.6 -> 6.7 years; urban fixtures light rail 3.5 -> 4.6
+// and subway 8.3 -> 13.4. Narrower walks intentionally reduce local/village traffic; covered residents and separate
+// urban feeders sustain the useful intercity service. No balance checks or queue limits have been loosened.
 // These are repeatability checks; the bands below the simulation are the balance checks.
 const seed7Baseline = {
-  seed: 7, results: [
-    {"name": "rail Oldwood-Coldden (104 u track)", "income": 502726.59966382926, "net": 167466.54658117896},
-    {"name": "busy bus in Oldwood (2x Metro Articulated)", "income": 196445.43460631106, "net": 122465.37336505955},
-    {"name": "short bus in Oldwood (1x City Liner)", "income": 23117.980833346955, "net": -10684.805153068486},
-    {"name": "village rail Redwell(345)-Southley(237)", "income": 305222.185270129, "net": -68403.73979545679},
-  ],
+  "seed": 7,
+  "results": [
+    {
+      "name": "rail Oldwood-Coldden (104 u track)",
+      "income": 490727.68561051134,
+      "net": 155353.67224508338
+    },
+    {
+      "name": "busy bus in Oldwood (2x Metro Articulated)",
+      "income": 175757.10905794488,
+      "net": 101796.7907211971
+    },
+    {
+      "name": "short bus in Oldwood (1x City Liner)",
+      "income": 18235.172678850053,
+      "net": -15560.166389677128
+    },
+    {
+      "name": "village rail Redwell(345)-Southley(237)",
+      "income": 242145.6385487659,
+      "net": -133161.3952190478
+    }
+  ]
 };
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
 g.economy.money = 1e9;
@@ -147,6 +166,7 @@ for (const c of cases) {
   const mm = months.get(c.line.id)!, ll = loads.get(c.line.id)!;
   const pax = mm.reduce((a, b) => a + b, 0), load = ll.reduce((a, b) => a + b, 0) / Math.max(1, ll.length);
   results.push({ name: c.name, income: inc, boardings: pax, load, net, capital: c.capital });
+  console.log('  access: ' + c.line.stops.map((id) => { const st = g.stations.get(id)!; return `${fmt(st.catchPop, 0)} walking / ${fmt(g.demand.generationPopulation(st), 0)} eligible`; }).join(' | ') + '; headway ' + patternHeadways(g, c.line).map((p) => fmt(p.headway, 0)).join('/') + 's');
   console.log('  vehicles: ' + c.line.vehicles.map((id) => { const v = g.vehicles.get(id)!; return v.state + ' ' + v.status + ' d=' + v.delivered; }).join(' | '));
   console.log(`${c.name}, ${fmt(c.dist, 0)} u apart: income ${fmt(inc / 1e3, 0)}k, running ${fmt(run / 1e3, 0)}k, maintenance ${fmt(c.maint / 1e3, 0)}k -> net ${fmt(net / 1e3, 0)}k/yr; vehicles ${fmt(c.cost / 1e3, 0)}k -> payback ${net > 0 ? fmt(c.cost / net, 1) + ' yrs' : 'never'}, full capital ${fmt(c.capital / 1e3, 0)}k -> ${net > 0 ? fmt(c.capital / net, 1) + ' yrs' : 'never'}; boardings ${fmt(pax / 12, 1)}/month avg (${pax}/year), load ${fmt(load * 100, 1)}%`);
 }

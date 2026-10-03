@@ -44,7 +44,8 @@ export interface StationDemand { dest: number[]; w: number[]; served: number }
  * PASSENGER_RATE_SCALE: a 2-second game day cannot sustain the old queues between physically timed trains.
  * Apply the same scale to LD_RATE, so local/long-distance shares and tripFactor elasticity keep their meaning.
  */
-export const GEN_RATE = 0.0085 * PASSENGER_RATE_SCALE;
+// Covered residents make 20% more trips after the walking limits shrink; local and regional rates scale together.
+export const GEN_RATE = 0.0102 * PASSENGER_RATE_SCALE;
 /** Trips per inhabitant per month when covered by a station with a typical rating. */
 export const TRIPS_PER_MONTH = GEN_RATE * DAYS_PER_MONTH * (0.2 + 0.65);
 /** Towns from this size are split into a centre and outer districts. */
@@ -60,7 +61,7 @@ export const ldDecay = (d: number) => {
   return t * t * (3 - 2 * t) * Math.pow(d / 100, -0.8);
 };
 /** Long-distance trips per inhabitant and month, per 1,000 attraction (jobs + 0.4 residents) at the far end, at 100 units. */
-export const LD_RATE = 0.012 * PASSENGER_RATE_SCALE;
+export const LD_RATE = 0.0144 * PASSENGER_RATE_SCALE;
 /** Trip factor of a typical service of the game (it leaves the demand as it was); fast direct services earn more. */
 export const TF_TYPICAL = 1.3;
 
