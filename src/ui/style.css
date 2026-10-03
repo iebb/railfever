@@ -899,3 +899,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (max-width: 420px) {
   .share-trades { grid-template-columns: 1fr; }
 }
+
+/* Rail symbols beyond the station-name zoom range; keep the plate DOM for zooming back in. */
+.lbl.stn.compact { width: 28px; height: 28px; padding: 4px; box-sizing: border-box; border-radius: 8px; }
+.lbl.stn.compact .lbl-ico { flex: none; background: none; }
+.lbl.stn.compact .lbl-ico .ic { width: 18px; height: 18px; }
+.lbl.stn.compact .lbl-name,
+.lbl.stn.compact .lbl-wait,
+.lbl.stn.compact .lbl-mark,
+.lbl.stn.compact .lbl-chips,
+.lbl.stn.compact .lbl-badges { display: none; }
