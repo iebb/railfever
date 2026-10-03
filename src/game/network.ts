@@ -141,6 +141,29 @@ export class Network {
     return n;
   }
 
+  /**
+   * Synchronous, read-only planning with unconnected nodes. Their prospective IDs are local to this scope:
+   * no allocator or version advances, and cleanup preserves the existing map / spatial query order even
+   * when planning throws. Do not commit or yield inside `preview`; allocate durable nodes on commit instead.
+   */
+  withTemporaryNodes<T>(kind: NetKind, points: { x: number; y: number; z: number; dx?: number; dz?: number }[], owner: number, preview: (nodes: NNode[]) => T): T {
+    const nodes: NNode[] = [];
+    let id = this.nextNode;
+    try {
+      for (const p of points) {
+        while (this.nodes.has(id)) id++; // nested planning scopes must not replace each other's nodes
+        const n: NNode = { id: id++, kind, x: p.x, y: p.y, z: p.z, dx: p.dx ?? 0, dz: p.dz ?? 0, edges: [], signal: 0, owner };
+        nodes.push(n);
+        this.nodes.set(n.id, n);
+        this.nodeGrid.insert(n.id, n.x, n.z, n.x, n.z);
+      }
+      return preview(nodes);
+    } finally {
+      // These nodes have no edges: remove them without structural-change listeners or version bumps.
+      for (const n of nodes) { this.nodes.delete(n.id); this.nodeGrid.remove(n.id); }
+    }
+  }
+
   removeNode(id: number) {
     const n = this.nodes.get(id);
     if (!n) return;

@@ -433,17 +433,14 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
     queue.shift();
   }
   plan.points = pts;
-  // plan every segment between temporary nodes (removed again)
-  const tmp = pts.map((p) => net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, owner).id);
-  try {
+  // Plan every segment with exact node directions, without consuming IDs or changing the network version.
+  net.withTemporaryNodes('rail', pts.map((p) => ({ x: p.x, y: p.y, z: p.z, dx: -p.tx, dz: -p.tz })), owner, (tmp) => {
     for (let k = 0; k + 1 < pts.length; k++) {
-      const prop = planEdge(g, nodeSnapOf(g, tmp[k]), nodeSnapOf(g, tmp[k + 1]), railOpts(owner, { type: lineType(g, plan.steps) }));
+      const prop = planEdge(g, nodeSnapOf(g, tmp[k].id), nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps) }));
       plan.proposals.push(prop);
       if (!prop.ok) fail(`New track (${m10(pts[k].u)}-${m10(pts[k + 1].u)} m of ${m10(U)} m): ${prop.errors[0] ?? 'cannot build'}`);
     }
-  } finally {
-    for (const id of tmp) net.removeNode(id);
-  }
+  });
   const conn = (e: DoubleEnd, inner: number) => {
     const o = offAt(inner);
     if (e.kind === 'platform') { const m = net.nodes.get(e.node)!; return connectS(g, owner, { x: m.x, z: m.z, y: m.y, tx: o.tx, tz: o.tz, node: e.node }, o, chainSet, true).cost; }
