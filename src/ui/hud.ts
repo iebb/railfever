@@ -9,7 +9,8 @@ import { h, icon, clear, seg, stepper, kbd, toggle, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES, LINE_LEVEL, ELECTRIFY } from '../game/constants';
 import { structureFactor } from '../game/construction';
-import { fmtDate, fmtHeight, newsDate, fmtPct, TYPE_META } from './format';
+import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct, TYPE_META } from './format';
+import { walkLimit } from '../game/catchment';
 import type { StationLevel } from './gameapi';
 import { stationStyles, catchBonusOf } from './gameapi';
 import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
@@ -98,7 +99,7 @@ const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 
 const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   rail: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'height'], [['Shift'], 'parallel copy']],
   road: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'height']],
-  station: [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Ctrl', 'Wheel'], 'rotate']],
+  station: [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Alt', 'Wheel'], 'rotate']],
   busstop: [[['Click'], 'on a road']],
   'depot-rail': [[['Click'], 'place'], [['R'], 'rotate']],
   'depot-road': [[['Click'], 'next to a road'], [['R'], 'rotate']],
@@ -112,7 +113,7 @@ const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   terraform: [[['Hold'], 'apply brush']],
   'line-edit': [[['Click'], 'add station'], [['Esc'], 'done']],
   metro: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'end height'], [['Shift'], 'parallel copy']],
-  'metro-station': [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Ctrl', 'Wheel'], 'rotate']],
+  'metro-station': [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Alt', 'Wheel'], 'rotate']],
   electrify: [[['Click'], 'one track'], [['Drag'], 'along the line'], [['Esc'], 'cancel']],
   connect: [[['Click'], 'first track'], [['Click'], 'second track'], [['Esc'], 'pick again']],
   relevel: [[['Click'], 'one track'], [['Drag'], 'along a stretch'], [['Esc'], 'cancel']],
@@ -609,7 +610,7 @@ export class Hud {
       const onLine = T.stationOnLine && T.relocating == null;
       if (!onLine) {
         const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', 'Metro platforms: 300 m catchment, platform screen doors, underground by default'], ['lightrail', 'Light rail', 'Light-rail platforms: 250 m catchment']]
+          ? [['metro', 'Metro', `Metro platforms: ${fmtLen(walkLimit('metro'))} walking distance along streets before building bonuses, platform screen doors, underground by default`], ['lightrail', 'Light rail', `Light-rail platforms: ${fmtLen(walkLimit('lightrail'))} walking distance along streets before building bonuses`]]
           : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
         if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
         opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));

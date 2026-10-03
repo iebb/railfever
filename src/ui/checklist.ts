@@ -58,7 +58,7 @@ export class Checklist {
       { id: 'track', title: 'Connect them with track', hint: 'Build from a platform end to the other station.', action: this.tool('rail', 'Track tool') },
       { id: 'depot', title: 'Add a train depot', hint: 'Place it at a free end of your track.', action: this.tool('depot-rail', 'Depot tool') },
       { id: 'train', title: 'Buy a train', hint: 'Click your depot to open the train composer.' },
-      { id: 'line', title: 'Create a rail line', hint: 'Lines → New rail line, then click both stations.', action: ['Open lines', () => this.ui.openLines()] },
+      { id: 'line', title: 'Create a rail line', hint: 'Lines → Rail line, then click both stations.', action: ['Open lines', () => this.ui.openLines()] },
       { id: 'delivery', title: 'Deliver the first passengers', hint: 'Assign the train to the line and let it run.' },
     ];
   }

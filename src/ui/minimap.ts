@@ -51,7 +51,7 @@ export class Minimap {
       this.layerBtns[key] = b;
       return b;
     };
-    const collapse = h('button', { class: 'ibtn sm', 'data-tip': 'Collapse map', 'data-key': 'M', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
+    const collapse = h('button', { class: 'ibtn sm', 'data-tip': 'Collapse map', 'data-key': 'H', 'aria-label': 'Collapse minimap', onclick: () => this.toggle() }, icon('chevd', 15));
     const modeBtn = (m: 'lines' | 'demand' | 'catchment', ic: string, tip: string) => (this.modeBtns[m] = h('button', { class: 'ibtn sm mm-layer', 'data-tip': tip, 'data-key': m === 'lines' ? 'M' : m === 'demand' ? 'P' : 'O', 'data-sfx': 'none', 'aria-label': tip, onclick: () => this.ui.mapModes.toggle(m) }, icon(ic, 15)));
     this.el = h('div', { class: 'minimap glass' },
       h('div', { class: 'mm-head' }, h('span', { class: 'mm-title' }, 'Map'), layer('network', 'rail', 'Network'), layer('vehicles', 'train', 'Vehicles'), layer('names', 'towns', 'Town names'), modeBtn('lines', 'map', 'Lines map'), modeBtn('demand', 'demand', 'Demand'), modeBtn('catchment', 'catchment', 'Catchment'), collapse),
@@ -68,11 +68,6 @@ export class Minimap {
     this.over.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; this.dragging = true; nav(e); e.preventDefault(); });
     window.addEventListener('pointermove', (e) => { if (this.dragging) nav(e); });
     window.addEventListener('pointerup', () => { this.dragging = false; });
-    window.addEventListener('keydown', (e) => {
-      const tag = (e.target as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || this.ui.titleOpen) return;
-      if ((e.key === 'm' || e.key === 'M') && !e.ctrlKey && !e.metaKey) this.toggle();
-    });
   }
 
   toggle() {

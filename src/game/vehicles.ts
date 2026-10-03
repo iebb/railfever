@@ -485,7 +485,17 @@ export class Vehicles {
     return v;
   }
 
-  resaleValue(v: Vehicle) { return v.value * Math.max(0.1, 0.75 - v.age * 0.06); }
+  resaleValue(v: Vehicle) {
+    const vehicle = v as Train | RoadVehicle;
+    // Depot stock with no recorded service keeps its purchase value, including across saves.
+    const unused = !vehicle.onMap && v.opLastSt < 0 && v.opMark < 0 && !v.opSec && !v.opDist &&
+      !v.delivered && !v.opLast?.hours && !v.opLast?.km &&
+      (!(v instanceof Train) || (!v.hours && !v.km)) && !v.status.startsWith('Returned to depot');
+    const grace = 30 / 360;
+    if (unused || v.age < grace) return v.value;
+    // Continuous from full price after 30 days to a 10% floor at 15 game years.
+    return v.value * Math.max(0.1, 1 - (v.age - grace) * 0.9 / (15 - grace));
+  }
 
   sell(id: number) {
     const v = this.map.get(id);

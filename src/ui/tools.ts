@@ -20,7 +20,7 @@ import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
 import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
-import { pointWalkingCatchment, stopWalkingCatchment } from '../game/catchment';
+import { pointWalkingCatchment, stopWalkingCatchment, walkLimit } from '../game/catchment';
 import { STATION_STYLES } from '../game/station-styles';
 import { servesKind } from './win-lines';
 import { accessState, policyText, requestAccessUI } from './win-access';
@@ -50,13 +50,13 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   inspect: { name: 'Inspect', hint: 'Click stations, vehicles, depots, towns, buildings or tracks for details.' },
   rail: { name: 'Build track', hint: 'Click to start, click again to build — construction continues from the new end with a smooth curve. Right-click, Esc or a long press ends the chain. Snap onto track ends to extend, onto track to branch. Hold Shift over a track to copy it as a parallel track.' },
   road: { name: 'Build road', hint: 'Click to start, click again to build — continues from the new end. Snap onto roads to create junctions. Connect to town streets so buses can reach them.' },
-  station: { name: 'Train station', hint: 'Click to place. R / Shift+R or Ctrl+wheel rotate by 15°. Lines up with a nearby track end; connect its tracks with the track tool.' },
+  station: { name: 'Train station', hint: 'Click to place. R / Shift+R or Alt+wheel rotate by 15°. Lines up with a nearby track end; connect its tracks with the track tool.' },
   busstop: { name: 'Bus stop', hint: 'Click on a road. Next to one of your train stations it joins it (passengers transfer).' },
   tram: { name: 'Tram tracks', hint: 'Add to roads: click a road, or press and drag along streets to lay tracks with overhead wire. New road builds a road with tracks; Remove takes your tracks up.' },
   tramstop: { name: 'Tram stop', hint: 'Click on a road with tram tracks. Next to one of your stations it joins it (passengers transfer).' },
-  'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R rotates when away from roads.' },
-  'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R rotates.' },
-  'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R rotates when away from roads.' },
+  'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
+  'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R / Shift+R or Alt+wheel rotates.' },
+  'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
   signal: { name: 'Signals', hint: 'Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
   double: { name: 'Double track', hint: 'Click one of your single tracks, or drag along it, to lay a second track beside it with switches at both ends (into a free platform where a station is). Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
   entrance: { name: 'Add entrance', hint: 'Click beside a road near the station to add a street entrance (stair tower or pavilion). Every entrance brings its own catchment area.' },
@@ -64,7 +64,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
   metro: { name: 'Urban rail', hint: 'Metro and light-rail track: underground (subway), elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. Metro units and light-rail vehicles run on it; commuter EMUs run on metro and electrified track, so lines can through-run.' },
-  'metro-station': { name: 'Urban station', hint: 'Metro or light-rail station: underground by default, with street entrances; stations may be close together (~1 km). R rotates; it lines up with nearby track ends. Catchment: metro 300 m, light rail 250 m.' },
+  'metro-station': { name: 'Urban station', hint: `Metro or light-rail station: underground by default, with street entrances; stations may be close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. Walking catchment along streets: metro ${fmtLen(walkLimit('metro'))}, light rail ${fmtLen(walkLimit('lightrail'))}, before station-building bonuses.` },
   electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: standard track becomes electrified track for electric locomotives and EMUs (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
   connect: { name: 'Connect tracks', hint: 'Click a point on one track, then a point on another: a connecting curve with turnouts into both tracks is planned within the curve and grade limits, and signalled where the track is. Click to build; Esc or right-click picks the first track again.' },
   relevel: { name: 'Re-level', hint: 'Drag along a stretch of your track to lift it onto a viaduct or sink it into a tunnel in place, with ramps at both ends; stations on it go with it, lines and signals are kept.' },
@@ -222,7 +222,7 @@ export class Tools {
     window.addEventListener('pointerup', this.onUp);
     canvas.addEventListener('pointerleave', () => { if (!this.down) { this.overMap = false; this.hideTip(); } });
     window.addEventListener('pointercancel', (e) => { this.touches.delete(e.pointerId); if (this.down?.id === e.pointerId) this.down = null; });
-    // Ctrl+wheel rotates stations and depots (captured before the camera zooms)
+    // Alt+wheel rotates stations and depots; Ctrl+wheel / pinch always reaches camera zoom.
     window.addEventListener('wheel', this.onWheel, { capture: true, passive: false });
     const shift = (e: KeyboardEvent) => { if (e.key === 'Shift' && this.shift !== (e.type === 'keydown')) { this.shift = e.type === 'keydown'; if (this.railBuild) this.moveDirty = true; } };
     window.addEventListener('keydown', shift);
@@ -268,7 +268,12 @@ export class Tools {
   endLineEdit(canonicalize = true) {
     const id = this.lineEditId;
     this.lineEditId = null;
-    if (canonicalize && id != null) this.ui.onLineEdited(id);
+    if (!canonicalize || id == null) return;
+    const line = this.game.lines.map.get(id);
+    if (line?.owner === PLAYER && !line.stops.length && !line.vehicles.length) {
+      this.game.lines.delete(id); // freeNumber reuses this line's number on the next creation
+      this.ui.wm.close('line-' + id);
+    } else this.ui.onLineEdited(id);
   }
 
   setTool(t: ToolId) {
@@ -317,7 +322,14 @@ export class Tools {
   refreshHover() { this.planKey = ''; this.moveDirty = true; if (this.start) this.planDirty = true; }
 
   rotate(dir = 1) {
-    if (this.stationTool) { this.stationAngle = norm(this.stationAngle + dir * 15 * DEG); if (this.autoAlign) { this.autoAlign = false; this.onToolChange(); } }
+    if (this.stationTool) {
+      this.stationAngle = norm(this.stationAngle + dir * 15 * DEG);
+      if (this.autoAlign) {
+        this.autoAlign = false;
+        this.onToolChange();
+        this.ui.toast('Align to track off: manual rotation', 'info');
+      }
+    }
     else if (this.tool === 'depot-rail' || this.tool === 'depot-road' || this.tool === 'depot-tram') this.depotAngle = norm(this.depotAngle + dir * 15 * DEG);
     else return;
     this.refreshHover();
@@ -489,11 +501,11 @@ export class Tools {
   };
 
   private onWheel = (e: WheelEvent) => {
-    if (!e.ctrlKey || e.target !== this.canvas) return;
+    if (e.ctrlKey || !e.altKey || e.target !== this.canvas) return;
     if (!this.stationTool && this.tool !== 'depot-rail' && this.tool !== 'depot-road' && this.tool !== 'depot-tram') return;
     e.preventDefault();
     e.stopPropagation();
-    this.wheelAcc += e.deltaMode === 1 ? e.deltaY * 30 : e.deltaY;
+    this.wheelAcc += e.deltaMode === 1 ? e.deltaY * 30 : e.deltaMode === 2 ? e.deltaY * 300 : e.deltaY;
     while (Math.abs(this.wheelAcc) >= 40) { const s = Math.sign(this.wheelAcc); this.wheelAcc -= s * 40; this.rotate(s); }
   };
 
@@ -682,7 +694,9 @@ export class Tools {
       if (now - this.dozeAt > 120) {
         this.dozeAt = now;
         const res = bulldoze(g, r.x0, r.z0, r.x1, r.z1, PLAYER, true);
-        this.tip(res.changed ? { title: 'Clear area', cost: res.cost, rows: [['bulldoze', plural(res.changed, 'object')]], err: res.error ? [res.error] : [] } : { title: 'Clear area', rows: [['info', 'Nothing to remove']] }, res.changed ? 'err' : 'info');
+        this.tip({ title: 'Clear area', cost: res.cost || undefined,
+          rows: res.changed ? [['bulldoze', plural(res.changed, 'object')]] : res.error ? [] : [['info', 'Nothing to remove']],
+          err: res.error ? [res.error] : [] }, res.changed || res.error ? 'err' : 'info');
       }
     }
   }
@@ -787,7 +801,7 @@ export class Tools {
         this.dozeAt = now;
         const r = bulldoze(g, p.x, p.z, p.x, p.z, PLAYER, true);
         if (r.changed) this.tip({ title: 'Demolish', cost: r.cost, err: r.error ? [r.error] : [], hint: 'Drag to clear an area' }, 'err');
-        else if (r.error) this.tip({ title: 'Demolish', err: [r.error] }, 'err');
+        else if (r.error) this.tip({ title: 'Demolish', cost: r.cost || undefined, err: [r.error] }, 'err');
         else this.hideTip();
         break;
       }
@@ -1999,6 +2013,30 @@ export class Tools {
 
   private doBulldoze(x0: number, z0: number, x1: number, z1: number) {
     const g = this.game;
+    const preview = bulldoze(g, x0, z0, x1, z1, PLAYER, true);
+    if (preview.error === 'Not enough money') { this.ui.toast(preview.error, 'bad'); this.hideTip(); return; }
+    const stationLines = g.lines.all().filter((l) => l.stops.some((sid) => preview.stationIds.includes(sid)));
+    const stationEdges = new Set(preview.stationIds.flatMap((sid) => {
+      const st = g.stations.get(sid);
+      return st?.rail ? [...st.rail.edges, ...st.rail.throughEdges] : [];
+    }));
+    const vehicles = [...g.vehicles.trains(), ...g.vehicles.roads()].filter((v) =>
+      preview.depotIds.includes(v.depotId) || stationLines.some((l) => l.vehicles.includes(v.id)) ||
+      preview.stationIds.includes(v.targetStation()?.id ?? -1) || v.occupiedEdges().some((eid) => stationEdges.has(eid)));
+    const lines = g.lines.all().filter((l) => stationLines.includes(l) || vehicles.some((v) => v.lineId === l.id));
+    if (lines.length || vehicles.length) {
+      const stations = preview.stationIds.map((sid) => g.stations.get(sid)?.name).filter(Boolean);
+      const depots = preview.depotIds.map((id) => {
+        const dp = g.depots.get(id)!;
+        return `${dp.kind === 'rail' ? 'Train' : dp.kind === 'tram' ? 'Tram' : 'Bus'} depot #${id}`;
+      });
+      const some = (names: string[], n = 8) => names.length <= n ? names.join(', ') || 'None' : `${names.slice(0, n).join(', ')} and ${names.length - n} more`;
+      const message = [`Demolish ${[...stations, ...depots].join(', ')}?`,
+        `Affected lines: ${some(lines.map((l) => l.name))}`,
+        `Affected vehicles: ${some(vehicles.map((v) => v.name))}`,
+        `Demolition costs ${fmtMoney(preview.cost)}. Construction costs are not refunded.`].join('\n\n');
+      if (!confirm(message)) { this.hideTip(); return; }
+    }
     const r = bulldoze(g, x0, z0, x1, z1, PLAYER, false);
     if (r.error) this.ui.toast(r.error, 'bad');
     if (r.changed) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('demolish', { x: (x0 + x1) / 2, z: (z0 + z1) / 2 }); }

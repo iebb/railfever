@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import type { Game, NewGameOptions, News } from '../game/game';
 import { PLAYER } from '../game/game';
 import type { Renderer } from '../render/renderer';
+import { shortcutBlocked } from '../render/camera';
 import { WindowManager } from './windows';
 import { Tools, ToolId, Hit } from './tools';
 import { h, icon } from './dom';
@@ -99,6 +100,9 @@ export class UI {
     window.addEventListener('keydown', this.onKey);
     // generic UI sounds: clicks on controls and switch toggles (specific actions play their own sound)
     root.addEventListener('click', (e) => {
+      // Pointer activation must not retain keyboard focus and swallow the next shortcut.
+      const button = (e.target as HTMLElement | null)?.closest<HTMLElement>('button, [role="button"]');
+      if (e.detail > 0 && button === document.activeElement) button?.blur();
       const el = (e.target as HTMLElement | null)?.closest?.('button, .model, .row.link, tr.clickable, .chip, .swatch.big') as HTMLElement | null;
       if (!el || (el as HTMLButtonElement).disabled) return;
       const sfx = el.dataset?.sfx;
@@ -167,23 +171,22 @@ export class UI {
   }
 
   private onKey = (e: KeyboardEvent) => {
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (!this.game || e.metaKey || e.ctrlKey || this.titleOpen) return;
+    if (!this.game || this.titleOpen) return;
     const k = e.key;
     const T = this.tools;
-    const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
-    if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
-    // urban rail category, connect tracks; lines map display (lines / stations with their numbers)
-    if (k === 'u' || k === 'U') { T.setTool(TOOL_META[T.tool].cat === 'urban' ? 'inspect' : 'metro'); return; }
-    if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
-    if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === 'Escape') {
       if (T.cancel()) return;
       if (this.mapModes.mode !== 'none') { this.mapModes.set('none'); return; }
       if (!this.wm.closeTop()) this.hud.closeNews();
       return;
     }
+    if (shortcutBlocked(e) || e.metaKey || e.ctrlKey) return;
+    const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
+    if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
+    // urban rail category, connect tracks; lines map display (lines / stations with their numbers)
+    if (k === 'u' || k === 'U') { T.setTool(TOOL_META[T.tool].cat === 'urban' ? 'inspect' : 'metro'); return; }
+    if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
+    if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
     if ((k === 'r' || k === 'R') && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
       T.rotate(e.shiftKey ? -1 : 1);
@@ -204,6 +207,7 @@ export class UI {
     else if (lk === 'k') this.openTrackAccess();
     else if (lk === 'n') this.hud.toggleNews();
     else if (lk === 'm') this.mapModes.toggle('lines');
+    else if (lk === 'h') this.minimap.toggle();
     else if (lk === 'p') this.mapModes.toggle('demand');
     else if (lk === 'o') this.mapModes.toggle('catchment');
     else if (k === 'F1') { e.preventDefault(); this.openHelp(); }

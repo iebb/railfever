@@ -949,7 +949,11 @@ export class Game {
       if (c.level < 2 || this.day - (this.congestionTold.get(l.id) ?? -1e9) < 180) continue;
       this.congestionTold.set(l.id, this.day);
       const fix = { signals: 'signals on the line', platforms: 'more platforms at the stations where trains wait', loops: 'passing loops on the single track', double: 'a second track', 'fewer-trains': 'fewer trains', none: '' }[c.suggestion];
-      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad');
+      const st = this.stations.get(l.stops[0]);
+      const p = { x: st?.x ?? this.world.size / 2, y: 0, z: st?.z ?? this.world.size / 2 };
+      const waiting = l.vehicles.map((id) => this.vehicles.get(id)).find((v) => v?.state === 'waiting');
+      waiting?.worldPos(p);
+      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad', p.x, p.z);
     }
   }
 

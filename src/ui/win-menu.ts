@@ -3,8 +3,9 @@ import type { UI } from './ui';
 import { h, clear, section, icon, toggle, field, add } from './dom';
 import { fmtMoney } from '../game/economy';
 import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
-import { fmtDate } from './format';
+import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
+import { walkLimit, WALK_DETOUR } from '../game/catchment';
 
 export function openMenu(ui: UI) {
   const win = ui.wm.open('menu', 'Menu', { width: 280, x: window.innerWidth - 300, y: 64, icon: 'menu', color: '#eef2f7' });
@@ -88,63 +89,68 @@ const ORDER = ['shadows', 'ao', 'clouds', 'dayNight', 'labels'];
 
 export function openSettings(ui: UI) {
   const r = ui.renderer;
-  const s = r.settings as unknown as Record<string, unknown>;
   const win = ui.wm.open('settings', 'Settings', { width: 390, icon: 'settings', color: '#eef2f7' });
-  const apply = () => r.applySettings();
-  const humanize = (k: string) => k.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
-  const flag = (key: string) => {
-    const [label, hint] = SETTING_LABELS[key] ?? [humanize(key)];
-    return toggle(label, !!s[key], (v) => { s[key] = v; apply(); }, hint);
+  const render = () => {
+    clear(win.body);
+    const s = r.settings as unknown as Record<string, unknown>;
+    const apply = () => r.applySettings();
+    const humanize = (k: string) => k.replace(/([A-Z])/g, ' $1').replace(/^./, (c) => c.toUpperCase());
+    const flag = (key: string) => {
+      const [label, hint] = SETTING_LABELS[key] ?? [humanize(key)];
+      return toggle(label, !!s[key], (v) => { s[key] = v; apply(); }, hint);
+    };
+    win.body.append(section('Graphics'));
+    const bools = Object.keys(s).filter((k) => typeof s[k] === 'boolean' && k !== 'debug');
+    for (const key of [...ORDER.filter((k) => bools.includes(k)), ...bools.filter((k) => !ORDER.includes(k))]) win.body.append(flag(key));
+    if ('shadowQuality' in s) {
+      const q = h('select', { class: 'select', 'aria-label': 'Shadow quality' }, ['high', 'low'].map((v) => h('option', { value: v, selected: s.shadowQuality === v }, v[0].toUpperCase() + v.slice(1))));
+      q.addEventListener('change', () => { s.shadowQuality = q.value; apply(); });
+      win.body.append(field('Shadow quality', q));
+    }
+    if ('resolution' in s) {
+      const opts: [string, string][] = [['auto', 'Auto (holds ~60 fps)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']];
+      const cur = String(s.resolution);
+      const sel = h('select', { class: 'select', 'aria-label': 'Resolution' }, opts.map(([v, l]) => h('option', { value: v, selected: v === cur }, l)));
+      sel.addEventListener('change', () => { s.resolution = sel.value === 'auto' ? 'auto' : Number(sel.value); apply(); });
+      win.body.append(field('Resolution', sel, 'Render scale on top of the pixel ratio'));
+    }
+    if ('pixelRatio' in s) {
+      const vals = [1, 1.25, 1.5, 2];
+      const cur = Number(s.pixelRatio);
+      if (!vals.some((v) => Math.abs(v - cur) < 0.01)) vals.push(cur);
+      const sc = h('select', { class: 'select', 'aria-label': 'Max pixel ratio' }, vals.sort((a, b) => a - b).map((v) => h('option', { value: String(v), selected: Math.abs(cur - v) < 0.01 }, `${v}×`)));
+      sc.addEventListener('change', () => { s.pixelRatio = Number(sc.value); apply(); });
+      win.body.append(field('Max pixel ratio', sc, `Display: ${(window.devicePixelRatio || 1).toFixed(2)}×`));
+    }
+    if ('debug' in s) win.body.append(flag('debug'));
+    const g = ui.game;
+    const grid = () => (r.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid;
+    // audio: volume sliders (0–100 %) and mute
+    const vol = (key: keyof Omit<AudioSettings, 'muted'>, label: string, hint?: string) => {
+      const rng = h('input', { type: 'range', min: '0', max: '100', value: String(Math.round(audio.settings[key] * 100)), class: 'range', 'aria-label': label }) as HTMLInputElement;
+      const val = h('span', { class: 'stp-v' }, `${rng.value}%`);
+      rng.addEventListener('input', () => { audio.settings[key] = Number(rng.value) / 100; val.textContent = `${rng.value}%`; ui.hud.syncVol(); });
+      rng.addEventListener('change', () => { audio.saveSettings(); ui.sound(key === 'ui' ? 'click' : key === 'world' ? 'build' : 'toggle'); });
+      return field(label, h('div', { class: 'inline', style: 'flex:1' }, rng, val), hint);
+    };
+    win.body.append(
+      section('Audio'),
+      toggle('Mute all sound', audio.settings.muted, (v) => { audio.settings.muted = v; audio.saveSettings(); ui.hud.syncVol(); }),
+      vol('master', 'Master'),
+      vol('ui', 'Interface', 'Clicks, windows, notifications'),
+      vol('world', 'World', 'Construction, trains, stations'),
+      vol('ambient', 'Ambience', 'Wind, birds, town and traffic'),
+      section('Interface'),
+      toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
+      toggle('Construction grid', (grid()?.value ?? 0) > 0, (v) => { const u = grid(); if (u) u.value = v ? 1 : 0; }, 'G'),
+      toggle('Show the getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
+      section('Simulation'),
+      toggle('Ambient town traffic', g.vehicles.ambientEnabled, (v) => { g.vehicles.ambientEnabled = v; g.vehicles.manageAmbient(); }),
+      toggle('AI companies build', g.aiEnabled, (v) => { g.aiEnabled = v; }),
+    );
   };
-  win.body.append(section('Graphics'));
-  const bools = Object.keys(s).filter((k) => typeof s[k] === 'boolean' && k !== 'debug');
-  for (const key of [...ORDER.filter((k) => bools.includes(k)), ...bools.filter((k) => !ORDER.includes(k))]) win.body.append(flag(key));
-  if ('shadowQuality' in s) {
-    const q = h('select', { class: 'select', 'aria-label': 'Shadow quality' }, ['high', 'low'].map((v) => h('option', { value: v, selected: s.shadowQuality === v }, v[0].toUpperCase() + v.slice(1))));
-    q.addEventListener('change', () => { s.shadowQuality = q.value; apply(); });
-    win.body.append(field('Shadow quality', q));
-  }
-  if ('resolution' in s) {
-    const opts: [string, string][] = [['auto', 'Auto (holds ~60 fps)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']];
-    const cur = String(s.resolution);
-    const sel = h('select', { class: 'select', 'aria-label': 'Resolution' }, opts.map(([v, l]) => h('option', { value: v, selected: v === cur }, l)));
-    sel.addEventListener('change', () => { s.resolution = sel.value === 'auto' ? 'auto' : Number(sel.value); apply(); });
-    win.body.append(field('Resolution', sel, 'Render scale on top of the pixel ratio'));
-  }
-  if ('pixelRatio' in s) {
-    const vals = [1, 1.25, 1.5, 2];
-    const cur = Number(s.pixelRatio);
-    if (!vals.some((v) => Math.abs(v - cur) < 0.01)) vals.push(cur);
-    const sc = h('select', { class: 'select', 'aria-label': 'Max pixel ratio' }, vals.sort((a, b) => a - b).map((v) => h('option', { value: String(v), selected: Math.abs(cur - v) < 0.01 }, `${v}×`)));
-    sc.addEventListener('change', () => { s.pixelRatio = Number(sc.value); apply(); });
-    win.body.append(field('Max pixel ratio', sc, `Display: ${(window.devicePixelRatio || 1).toFixed(2)}×`));
-  }
-  if ('debug' in s) win.body.append(flag('debug'));
-  const g = ui.game;
-  const grid = () => (r.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid;
-  // audio: volume sliders (0–100 %) and mute
-  const vol = (key: keyof Omit<AudioSettings, 'muted'>, label: string, hint?: string) => {
-    const rng = h('input', { type: 'range', min: '0', max: '100', value: String(Math.round(audio.settings[key] * 100)), class: 'range', 'aria-label': label }) as HTMLInputElement;
-    const val = h('span', { class: 'stp-v' }, `${rng.value}%`);
-    rng.addEventListener('input', () => { audio.settings[key] = Number(rng.value) / 100; val.textContent = `${rng.value}%`; ui.hud.syncVol(); });
-    rng.addEventListener('change', () => { audio.saveSettings(); ui.sound(key === 'ui' ? 'click' : key === 'world' ? 'build' : 'toggle'); });
-    return field(label, h('div', { class: 'inline', style: 'flex:1' }, rng, val), hint);
-  };
-  win.body.append(
-    section('Audio'),
-    toggle('Mute all sound', audio.settings.muted, (v) => { audio.settings.muted = v; audio.saveSettings(); ui.hud.syncVol(); }),
-    vol('master', 'Master'),
-    vol('ui', 'Interface', 'Clicks, windows, notifications'),
-    vol('world', 'World', 'Construction, trains, stations'),
-    vol('ambient', 'Ambience', 'Wind, birds, town and traffic'),
-    section('Interface'),
-    toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
-    toggle('Construction grid', (grid()?.value ?? 0) > 0, (v) => { const u = grid(); if (u) u.value = v ? 1 : 0; }, 'G'),
-    toggle('Show the getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
-    section('Simulation'),
-    toggle('Ambient town traffic', g.vehicles.ambientEnabled, (v) => { g.vehicles.ambientEnabled = v; g.vehicles.manageAmbient(); }),
-    toggle('AI companies build', g.aiEnabled, (v) => { g.aiEnabled = v; }),
-  );
+  win.refresh = render;
+  render();
 }
 
 export function openHelp(ui: UI) {
@@ -152,7 +158,7 @@ export function openHelp(ui: UI) {
   win.body.innerHTML = `
     <div class="help">
     <h4>Camera</h4>
-    <p><b>Right-drag</b> pan · <b>Middle-drag</b> or <kbd>Alt</kbd> + drag rotate &amp; tilt · <b>Wheel</b> zoom · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd> <kbd>E</kbd> rotate · <kbd>R</kbd> <kbd>F</kbd> tilt · <kbd>M</kbd> lines map. On touch: two fingers pan, pinch and rotate.</p>
+    <p><b>Right-drag</b> pan · <b>Middle-drag</b>, <kbd>Alt</kbd> + left-drag, or <kbd>Shift</kbd>/<kbd>Alt</kbd> + right-drag rotate &amp; tilt · <b>Wheel</b>, <kbd>Ctrl</kbd> + wheel / trackpad pinch, or <kbd>+</kbd>/<kbd>−</kbd> zoom · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd> <kbd>E</kbd> rotate · <kbd>R</kbd> <kbd>F</kbd> tilt · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap. On touch: two fingers pan, pinch and rotate.</p>
     <h4>Building track and roads</h4>
     <ol>
       <li>Open <b>Rail</b> or <b>Road</b> in the dock (<kbd>2</kbd> / <kbd>6</kbd>). Click to set the start — on open ground, a track end, or onto a track to branch off.</li>
@@ -162,12 +168,14 @@ export function openHelp(ui: UI) {
     </ol>
     <h4>Getting started</h4>
     <ol>
-      <li>Place a <b>train station</b> (<kbd>3</kbd>) near two towns — <kbd>R</kbd> rotates, it lines up with nearby track ends. The green circle is its catchment.</li>
+      <li>Place a <b>train station</b> (<kbd>3</kbd>) near each of two towns — <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotates. It lines up with nearby track ends; manual rotation switches off Align to track. Its catchment follows walkable streets drawn in the transport mode’s colour.</li>
       <li>Connect the stations with track and add a <b>train depot</b> (<kbd>5</kbd>) at a free track end.</li>
-      <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>New rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
+      <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>Rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
       <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
     </ol>
+    <h4>Walking catchments</h4>
+    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are main line ${fmtLen(walkLimit('rail') / WALK_DETOUR)}, metro ${fmtLen(walkLimit('metro') / WALK_DETOUR)}, light rail ${fmtLen(walkLimit('lightrail') / WALK_DETOUR)}, tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of main line ${fmtLen(walkLimit('rail'))}, metro ${fmtLen(walkLimit('metro'))}, light rail ${fmtLen(walkLimit('lightrail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances.</p>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
       <li><b>Urban</b> (<kbd>U</kbd>) opens the metro and light-rail category. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban stations use the matching platform tracks and can have street entrances.</li>
@@ -205,6 +213,7 @@ export function openHelp(ui: UI) {
       <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). With track access you can join their network with your own track and use their stations and stops.</li>
     </ul>
     <h4>Keys</h4>
-    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>Esc</kbd> cancel / close</p>
+    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotate stations / depots · <kbd>+</kbd>/<kbd>−</kbd> or <kbd>Ctrl</kbd>+wheel / pinch zoom · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance overlay · <kbd>Esc</kbd> cancel / close</p>
+    <p>Space / Enter activates a keyboard-focused button or control. Global shortcuts are ignored while editing text or using form controls; Esc still cancels or closes.</p>
     </div>`;
 }

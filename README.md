@@ -60,7 +60,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 
 **Passengers and economy**
 
-- **Strict catchment**: stations attract passengers only from buildings inside their catchment circles; overlapping catchments share demand. Stations have ratings and waiting passengers grouped by destination.
+- **Walking catchments**: passengers reach stations and stops by walking along streets from forecourts and entrances, with distances that vary by transport mode and station building. Reachable streets are drawn in each mode’s colour; overlapping catchments share demand. Stations have ratings and waiting passengers grouped by destination.
 - **One route is one line**: routes of the same mode contained in a longer route become service patterns of that line. Lines can share tracks and stations, with **transfers** for local and long-distance journeys.
 - Local, Rapid, Express and Limited Express patterns can skip stops or short-turn at their first and last stopping stations. Non-stopping trains use through tracks where available; passengers board only services that stop where they need to alight.
 - Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. Journeys without transfers get a **20% bonus**.
@@ -81,15 +81,17 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 | Action | Input |
 | --- | --- |
 | Pan | Right-drag, WASD or arrow keys |
-| Rotate / tilt | Middle-drag, Shift/Alt + drag, Q/E, R/F |
-| Zoom | Mouse wheel (towards the cursor), `+` / `-` |
+| Rotate / tilt | Middle-drag, Alt + left-drag, Shift/Alt + right-drag, Q/E, R/F |
+| Zoom | Mouse wheel (towards the cursor), Ctrl + wheel / trackpad pinch, `+` / `-` |
 | Tools | 1 inspect, 2 track, 3 station, 4 signal, 5 train depot, 6 road, 7 bus stop, 8 bus depot, 9 demolish, 0 terraform |
 | Network tools | U urban rail, J connect tracks |
-| While building | Click to build and continue or drag one section, Esc or right-click to end, PgUp/PgDn or `[` `]` height (5 m steps), Shift over a track to copy it in parallel, R to rotate stations and depots |
+| While building | Click to build and continue or drag one section, Esc or right-click to end, PgUp/PgDn or `[` `]` height (5 m steps), Shift over a track to copy it in parallel, R / Shift+R or Alt + wheel to rotate stations and depots |
 | Windows | L lines, V vehicles, T towns, C companies, K track access, N news, F1 help |
-| Map views | M lines map, B toggle Lines / Stations display (opens Stations when closed), P demand, O catchment |
+| Map views | M lines map, H collapse minimap, B toggle Lines / Stations display (opens Stations when closed), P demand, O catchment |
 | Other | Space pause, G grid, F3 performance overlay, Esc cancel/close |
 | Touch | Two fingers pan, pinch and rotate; long press ends construction |
+
+Space / Enter activates a keyboard-focused button or control. Global shortcuts are ignored while editing text or using form controls; Esc still cancels or closes.
 
 ## Quick start
 
