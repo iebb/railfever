@@ -851,6 +851,8 @@ vRfGlass = step(2.5, aPaint);`);
     for (const p of this.batches.values()) { p.hi.dispose(); p.lo.dispose(); }
     this.batches.clear();
     this.bogies.b2.dispose(); this.bogies.b3.dispose();
+    // Bogie geometry is created for this view, unlike the shared cached vehicle models.
+    this.bogies.b2.geo.dispose(); this.bogies.b3.geo.dispose();
     this.smoke.geo.dispose();
     this.lights.geo.dispose();
     this.paintMat.dispose();

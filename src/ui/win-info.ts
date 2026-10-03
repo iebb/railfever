@@ -626,6 +626,8 @@ export function openVehicle(ui: UI, id: number) {
     if (!v2) { win.close(); return; }
     win.title.textContent = v2.name;
     win.sub.textContent = vehicleDesc(v2) + (v2 instanceof Train ? ` · ${Math.round(v2.length * 10)} m` : '');
+    const scroll = win.body.scrollTop;
+    const focusedVanButton = win.body.querySelector<HTMLButtonElement>('.stepper .stp:focus')?.getAttribute('aria-label');
     clear(win.body);
     const mine = v2.owner === PLAYER;
     const kind = vk;
@@ -674,6 +676,11 @@ export function openVehicle(ui: UI, id: number) {
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
     );
+    if (scroll) win.body.scrollTop = scroll;
+    if (focusedVanButton) {
+      const buttons = [...win.body.querySelectorAll<HTMLButtonElement>('.stepper .stp')];
+      (buttons.find((b) => b.getAttribute('aria-label') === focusedVanButton && !b.disabled) ?? buttons.find((b) => !b.disabled))?.focus({ preventScroll: true });
+    }
   };
   win.refresh = render;
   render();
@@ -832,6 +839,9 @@ function upgradeVehicle(ui: UI, v: Vehicle) {
   const dId = g.depots.get(cur) ? cur : findDepot(ui, kind, v.line);
   if (dId == null) { ui.toast('No depot available for the replacement', 'bad'); return; }
   const cost = opt.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v);
+  const error = (!g.company(v.owner).economy.canAfford(cost) ? 'Not enough money' : v.line ? g.lines.operateError(v.line, v.owner) : null)
+    ?? (kind === 'rail' ? railWarning(ui, opt.cars, v.line, dId) : null);
+  if (error) { ui.toast(error, 'bad'); return; }
   if (!confirm(`Replace ${v.name} with ${opt.label}? Net cost ${fmtMoney(cost)}.`)) return;
   const lineId = v.lineId;
   g.vehicles.sell(v.id);
@@ -893,6 +903,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
     validateSelection();
     // (a click re-renders the composer: it keeps its scroll position, the steppers sit below the model lists)
     const scroll = win.body.scrollTop;
+    const focusIndex = [...win.body.querySelectorAll('.model, .stp, .segb')].indexOf(document.activeElement!);
     clear(win.body);
     const modelRow = (m: VehicleModel, selected: boolean, onSel: () => void) => {
       const pick = () => { onSel(); render(); };
@@ -935,7 +946,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
         // locomotive(s), then 0-3 mail vans, then the coaches (none: a mail train)
         add(win.body, h('div', { class: 'inline wrap composer-steps', style: 'margin-top:10px' },
           h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Locomotives'), stepper(String(state.locoN), () => { state.locoN = Math.max(1, state.locoN - 1); render(); }, () => { state.locoN = Math.min(2, state.locoN + 1); render(); })),
-          vans.length ? h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Mail vans'), stepper(String(state.vanN), () => { state.vanN = Math.max(0, state.vanN - 1); if (!state.vanN && !state.count) state.count = 1; render(); }, () => { state.vanN = Math.min(MAX_VANS, state.vanN + 1); render(); }, `0–${MAX_VANS} vans behind the locomotive`)) : null,
+          vans.length ? h('div', { class: 'opt', role: 'group', 'aria-label': 'Mail vans' }, h('span', { class: 'opt-l' }, 'Mail vans'), stepper(String(state.vanN), () => { state.vanN = Math.max(0, state.vanN - 1); if (!state.vanN && !state.count) state.count = 1; render(); }, () => { state.vanN = Math.min(MAX_VANS, state.vanN + 1); render(); }, `0–${MAX_VANS} vans behind the locomotive`)) : null,
           h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Coaches'), stepper(String(state.count), () => { state.count = Math.max(state.vanN > 0 ? 0 : 1, state.count - 1); render(); }, () => { state.count = Math.min(14, state.count + 1); render(); }, state.vanN > 0 ? 'None: a mail train' : ''))));
       }
     } else {
@@ -1040,6 +1051,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
       }
     }
     if (scroll) win.body.scrollTop = scroll;
+    if (focusIndex >= 0) win.body.querySelectorAll<HTMLElement>('.model, .stp, .segb')[focusIndex]?.focus({ preventScroll: true });
     const buy = () => {
       // Window morphing may keep this button's listener: read the latest composition and line on click.
       validateSelection();

@@ -154,7 +154,8 @@ export class HoverCard {
       color: '#eef2f7',
       html: `<div class="hc-title">${svg('towns', 16)}<span>${esc(town.name)}</span></div>` +
         `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
-        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}</div>` +
+        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}` +
+        `${town.mail ? stat('mail', `<b>${tonnes(town.mail.postedLast)}</b> t mail posted/mo`) : ''}</div>` +
         `<div class="hc-hint">Click for details</div>`,
     };
   }
