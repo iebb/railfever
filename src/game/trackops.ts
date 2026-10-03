@@ -9,7 +9,7 @@ import type { NEdge, Section } from './network';
 import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions, structureFactor } from './construction';
 import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
 import type { DepotPlan } from './build-ops';
-import { stationLayout, defaultPlatformLength, railModeOf } from './stations';
+import { stationLayout, defaultPlatformLength, railModeOf, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
@@ -1468,8 +1468,9 @@ export interface RelevelPlan {
   edges: { id: number; prof: Float32Array; sections: Section[] }[];
   /** new node heights (the stretch's outer ends keep theirs: the ramps start there) */
   nodes: { id: number; y: number }[];
-  /** stations on the stretch, rebuilt at the new level in place (tracks kept): their plans */
-  stations: { id: number; plan: StationPlan }[];
+  /** stations on the stretch, rebuilt at the new level in place (tracks kept): their plans (and the price of new
+   * access streets to added entrances of a ground station staying on the ground, paid as they are built) */
+  stations: { id: number; plan: StationPlan; streets?: number }[];
   /** level crossings / diamonds on the stretch that become under- or overpasses */
   crossings: number[];
   /** ramp length at each outer end of the stretch (units) */
@@ -1518,14 +1519,21 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
   const stY = new Map<number, number>();
   for (const sid of stations) {
     const st = g.stations.get(sid)!, r = st.rail!;
+    // (a ground station staying on the ground keeps its added entrances where they still fit: the building avoids them)
+    const ground = level === 'ground' && (r.level ?? 'ground') === 'ground';
+    const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
     const sp = g.stations.planRail(r.x, r.z, r.angle, r.length, r.tracks, owner, {
       level, ignoreStation: sid, ignoreEdges: set, through: r.through ?? 0, throughMode: r.throughMode, trackType: r.trackType,
-      platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth,
+      platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth, avoid,
     });
     if (!sp.ok) return fail(`${st.name}: ${sp.error ?? 'cannot be rebuilt at that level'}`);
-    plan.stations.push({ id: sid, plan: sp });
+    // its added entrances: beside the platforms where they fit and a street reaches them (ground), else they go
+    const fit = ground ? g.stations.previewRefit(st, sp) : null;
+    const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt at the new level');
+    for (const w of [...refitWarnings(fit), ...(gone ? [gone] : [])]) plan.warnings.push(`${st.name}: ${w[0].toLowerCase()}${w.slice(1)}`);
+    plan.stations.push({ id: sid, plan: sp, ...(fit?.streets ? { streets: fit.streets } : {}) });
     stY.set(sid, sp.y);
-    plan.cost += Math.max(0, sp.cost - (r.cost ?? 0) * 0.3);
+    plan.cost += Math.max(0, sp.cost - (r.cost ?? 0) * 0.3) + (fit?.streets ?? 0);
   }
   // the stretch's nodes: outer ends (track continues beyond, or nothing: a dead end) and inner ones
   const nodesOf = new Map<number, number[]>();
@@ -1660,7 +1668,8 @@ export function commitRelevel(g: Game, plan: RelevelPlan, opts: { waitForTrains?
   if (opts.waitForTrains && plan.edges.some((x) => g.vehicles.isEdgeBusy(x.id))) return 'busy';
   const eco = g.company(plan.owner).economy;
   if (!eco.canAfford(plan.cost)) return 'Not enough money';
-  eco.spend(plan.cost, 'construction');
+  // (new access streets to stations' added entrances are paid as they are built)
+  eco.spend(plan.cost - plan.stations.reduce((c, s) => c + (s.streets ?? 0), 0), 'construction');
   for (const n of plan.nodes) { const node = net.nodes.get(n.id); if (node) node.y = n.y; }
   const ground: NEdge[] = [];
   for (const x of plan.edges) {

@@ -11,7 +11,7 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, catchModeOf, entranceAlong, railWidth } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, catchModeOf, entranceAlong, railWidth, entrancesGo } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
@@ -830,8 +830,9 @@ export class Tools {
         if (pl.links.length) rows.push(['plus', `Links with ${esc(pl.links.map((x) => x.name).join(', '))} (transfers)`]);
         if (pos.snapped) rows.push(['target', pos.snapped === 'end' ? 'Lined up with the track end' : 'Aligned with the track']);
         const warn = [...pl.warnings];
-        const added = moving?.rail?.entrances.filter((e) => e.kind).length ?? 0;
-        if (added) warn.push(`Its ${added === 1 ? 'added entrance stays' : `${added} added entrances stay`} behind (demolished)`);
+        // (its added entrances do not move with it: taken down, as a rebuild or re-level that drops them says)
+        const gone = moving?.rail ? entrancesGo(moving.rail.level ?? 'ground', moving.rail.entrances, 'taken down at the old site') : null;
+        if (gone) warn.push(gone);
         if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access — this station won\u2019t attract passengers');
         if (pl.ok && pl.demolish.length) warn.push(`Demolishes ${plural(pl.demolish.length, 'building')}`);
         if (pl.ok && !g.economy.canAfford(pl.cost) && !warn.includes('Not enough money')) warn.push('Not enough money');

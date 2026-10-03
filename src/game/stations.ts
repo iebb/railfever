@@ -220,6 +220,50 @@ function entranceKey(r: RailPart): string {
   return k;
 }
 
+/**
+ * What rebuilding a ground station in place (or merging two) does to one of its added entrances: 'stays' where it
+ * stood, 'moves' along the platforms, 'street' moves and gets a new access street, or goes: 'room' (no room beside
+ * the new track area) or 'cut' (no street reaches it there, and a new one would not be cheap).
+ */
+export type EntranceFate = 'stays' | 'moves' | 'street' | 'room' | 'cut';
+/** A rebuild's effect on a ground station's added entrances (Stations.refitEntrances, previewed by planUpgrade). */
+export interface EntranceRefit {
+  /** per entrance, in order: its kind, its fate, and whether a crossing loses its stairs across the tracks or the
+   * street there (its own side's keeps its street, or it goes) */
+  fates: { kind: EntranceKind; fate: EntranceFate; lostFar?: boolean; farCut?: boolean }[];
+  /** price of the new access streets */
+  streets: number;
+}
+/** An entrance a rebuilt station's walkers no longer reach gets a new access street up to this share of its price. */
+const ENTRANCE_RECONNECT = 0.5;
+/** Places tried along the platforms when a rebuilt station's entrance no longer fits where it stood. */
+const REFIT_SHIFTS = [0, 0.25, -0.25, 0.5, -0.5, 0.75, -0.75, 1, -1, 1.25, -1.25, 1.5, -1.5];
+
+/**
+ * Warning for a station's added entrances that a rebuild, move or re-level takes down: "Its added footbridge goes
+ * (why)", "Its 2 added entrances go (why)" (null: none). Their price leaves the station's value, their upkeep stops.
+ */
+export function entrancesGo(level: StationLevel, entrances: Entrance[], why: string): string | null {
+  const added = entrances.filter((e) => e.kind);
+  if (!added.length) return null;
+  const what = added.length === 1 ? `added ${ENTRANCE_TYPES[entranceKind(level, added[0])].name.toLowerCase()} goes` : `${added.length} added entrances go`;
+  return `Its ${what} (${why})`;
+}
+/** Warnings for what a rebuild in place does to a ground station's added entrances (see EntranceRefit). */
+export function refitWarnings(f: EntranceRefit | null | undefined): string[] {
+  const out: string[] = [];
+  for (const x of f?.fates ?? []) {
+    const n = `Its added ${ENTRANCE_TYPES[x.kind].name.toLowerCase()}`;
+    if (x.fate === 'room') out.push(`${n} goes (no room beside the new platforms)`);
+    else if (x.fate === 'cut') out.push(`${n} goes (no street reaches it beside the new platforms)`);
+    else if (x.fate === 'street') out.push(`${n} moves along the platforms and gets a new access street`);
+    if (x.fate === 'room' || x.fate === 'cut') continue;
+    if (x.lostFar) out.push(`${n} loses its stairs across the tracks`);
+    else if (x.farCut) out.push(`${n} loses its street across the tracks`);
+  }
+  return out;
+}
+
 export interface RailPart {
   x: number; z: number; y: number;
   /** axis direction (radians): tracks run along (sin a, cos a) */
@@ -629,6 +673,8 @@ export interface UpgradePlan {
   rebuild: boolean;
   /** only the building changes (a station below or above the street: tracks and entrances stay) */
   restyleOnly?: boolean;
+  /** a ground station rebuilt in place: what becomes of its added entrances (new access streets are in `cost`) */
+  entrances?: EntranceRefit;
 }
 
 export class Stations {
@@ -788,9 +834,10 @@ export class Stations {
   /** Cached station structure volumes (planning queries hit these per sample point). */
   private structCache = new WeakMap<RailPart, { key: string; v: Volume[] }>();
 
-  private structures(st: Station): Volume[] {
-    const r = st.rail;
-    if (!r) return [];
+  private structures(st: Station): Volume[] { return st.rail ? this.structuresOf(st.rail) : []; }
+
+  /** Structure volumes of a rail part (a station's, or a planned one when previewing a rebuild). */
+  private structuresOf(r: RailPart): Volume[] {
     const b = r.building;
     const key = `${this.game.world.heightsVersion}|${r.x}|${r.z}|${r.y}|${r.angle}|${r.length}|${r.tracks}|${r.through ?? 0}|${r.width ?? 0}|${r.level}|${b.x}|${b.z}|${b.w}|${b.d}|${entranceKey(r)}|${(r.piers ?? []).length}|${r.style ?? ''}`;
     const c = this.structCache.get(r);
@@ -1213,6 +1260,8 @@ export class Stations {
     const keepOut: Rect[] = [plan.footprint, plan.building, ...extra];
     for (const end of [1, -1]) if (end !== headEnd) keepOut.push({ x: plan.x + ax * end * (plan.length / 2 + LEAD / 2), z: plan.z + az * end * (plan.length / 2 + LEAD / 2), angle: plan.angle, w: half * 2, d: LEAD });
     const blocked = (x: number, z: number, m: number) => keepOut.some((r) => distToRect(x, z, r.x, r.z, r.angle, r.w / 2, r.d / 2) < m);
+    // (an entrance's street may join a street closer than a street can be long, e.g. its old one: further along it)
+    const near = side ? 1.05 : 0;
     // candidate road points: along every road near the forecourt, nearest first, outside the keep-out areas
     const cands: { e: NEdge; s: number; d: number }[] = [];
     const p = { x: 0, y: 0, z: 0 };
@@ -1222,7 +1271,7 @@ export class Stations {
       for (let s = 0; s <= e.len; s += Math.min(2, Math.max(0.5, e.len / 4))) {
         net.pointAt(e, s, p);
         const d = Math.hypot(p.x - fx, p.z - fz);
-        if (d > reach || blocked(p.x, p.z, 0.6) || net.sectionAt(e, s) !== 'ground' || across(p.x, p.z)) continue;
+        if (d > reach || d < near || blocked(p.x, p.z, 0.6) || net.sectionAt(e, s) !== 'ground' || across(p.x, p.z)) continue;
         if (!best || d < best.d) best = { s, d };
       }
       if (best) cands.push({ e, ...best });
@@ -1429,17 +1478,7 @@ export class Stations {
     plan.layout.trackOffsets.forEach((off, i) => edges.push(lay(off, String(i), st.id)));
     plan.layout.throughOffsets.forEach((off, i) => through.push(lay(off, 'T' + i, -1)));
     const level = plan.level;
-    st.rail = {
-      x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, length: L, tracks: plan.tracks,
-      trackOffsets: plan.layout.trackOffsets, platforms: plan.layout.platforms, edges: edges.map((e) => e.id),
-      through: plan.layout.throughOffsets.length, throughOffsets: plan.layout.throughOffsets, throughEdges: through.map((e) => e.id), width: plan.layout.width, throughMode: plan.throughMode,
-      trackType: plan.trackType ?? 'standard', platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
-      style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
-      building: plan.building,
-      level, underground: level === 'underground', depth: plan.depth, height: plan.height,
-      entrances: plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle })), piers: plan.piers.map((p) => ({ ...p })),
-      forecourt: plan.forecourt ?? undefined, cost: plan.cost,
-    };
+    st.rail = this.partOf(plan, edges.map((e) => e.id), through.map((e) => e.id));
     st.x = plan.x; st.z = plan.z;
     if (level === 'ground') {
       this.levelGround(plan);
@@ -1457,6 +1496,22 @@ export class Stations {
     this.repairSite(st);
     w.markObjArea(plan.x - L - 30, plan.z - L - 30, plan.x + L + 30, plan.z + L + 30);
     this.markStation(st);
+  }
+
+  /** The rail part a plan builds, with its platform and through track edges (none: a planned part, for previews). */
+  private partOf(plan: StationPlan, edges: number[], through: number[]): RailPart {
+    const level = plan.level;
+    return {
+      x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, length: plan.length, tracks: plan.tracks,
+      trackOffsets: plan.layout.trackOffsets, platforms: plan.layout.platforms, edges,
+      through: plan.layout.throughOffsets.length, throughOffsets: plan.layout.throughOffsets, throughEdges: through, width: plan.layout.width, throughMode: plan.throughMode,
+      trackType: plan.trackType ?? 'standard', platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
+      style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
+      building: plan.building,
+      level, underground: level === 'underground', depth: plan.depth, height: plan.height,
+      entrances: plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle })), piers: plan.piers.map((p) => ({ ...p })),
+      forecourt: plan.forecourt ?? undefined, cost: plan.cost,
+    };
   }
 
   /** Flatten the ground under a small street-level structure. */
@@ -1665,10 +1720,11 @@ export class Stations {
 
   /**
    * Can a ground entrance's landing stand at `p`? Level, dry ground near the platforms' height, clear of the station's
-   * own structures and forecourts, of buildings, tracks, roads, other stations and depots. Null if it can, else the reason.
+   * own structures and forecourts (of rail part `r`: the station's, or a planned one), of buildings, tracks, roads,
+   * other stations and depots. Null if it can, else the reason.
    */
-  private landingError(st: Station, kind: EntranceKind, p: { x: number; z: number; angle: number }): string | null {
-    const w = this.game.world, r = st.rail!, T = ENTRANCE_TYPES[kind];
+  private landingError(st: Station, kind: EntranceKind, p: { x: number; z: number; angle: number }, r: RailPart = st.rail!): string | null {
+    const w = this.game.world, T = ENTRANCE_TYPES[kind];
     const rect = landingRect(kind, p);
     if (!w.inside(p.x, p.z, 3)) return 'Too close to the map edge';
     const fxa = Math.sin(p.angle), fza = Math.cos(p.angle), rxa = fza, rza = -fxa;
@@ -1680,35 +1736,102 @@ export class Stations {
     if (mn < WATER_Y + 0.15) return 'Water in the way';
     if (mx - mn > 0.6) return 'The ground is too uneven here';
     if (Math.abs(sum / 5 - r.y) > T.rise) return 'The ground lies too far above or below the platforms';
-    for (const f of this.structures(st)) if (rectsOverlap(rect, f, 0.1)) return f.part === 'entrance' ? 'Another entrance is in the way' : 'The station is in the way';
-    for (const f of [this.forecourt(st), r.forecourt2]) if (f && distToRect(f.x, f.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < 0.6) return 'In front of the station building';
+    for (const f of this.structuresOf(r)) if (rectsOverlap(rect, f, 0.1)) return f.part === 'entrance' ? 'Another entrance is in the way' : 'The station is in the way';
+    for (const f of [this.forecourtOf(r), r.forecourt2]) if (f && distToRect(f.x, f.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < 0.6) return 'In front of the station building';
     return this.rectConflict(rect, mn - 0.2, kind === 'footbridge' ? Math.max(mx + 0.5, r.y + 1.0) : mx + 0.6, null, { groundEdges: true, ignoreStation: st.id });
   }
 
   /**
-   * After a ground station's rail part was rebuilt in place or merged: its added entrances beside the new track area,
-   * on the same side and at the same place along the platforms, where they still fit. Returns how many were lost.
+   * After a ground station's rail part was rebuilt in place or merged: its added entrances beside the new track area
+   * (`part`: a planned one, previewing), each on its side of the tracks as near as it fits to where it stood along
+   * the platforms (the station's own crossings may have moved with it). One a street reached still reaches one: a
+   * place a street reaches comes first (with both landings of a crossing that had them), else a short access street
+   * from the nearest place, where that costs at most ENTRANCE_RECONNECT of its price and demolishes nothing; else it
+   * goes, as one without room does (its price leaves the station's value, its upkeep stops). Fills the part's
+   * entrances; unless previewing, builds the streets, grounds the moved landings, and notes the player's losses in
+   * the news (`what` the station went through).
    */
-  private refitEntrances(st: Station, old: Entrance[]): number {
-    const r = st.rail;
-    if (!r || (r.level ?? 'ground') !== 'ground') return old.length;
+  private refitEntrances(st: Station, old: Entrance[], o: { part?: RailPart; preview?: boolean; what?: string } = {}): EntranceRefit {
+    const g = this.game, out: EntranceRefit = { fates: [], streets: 0 };
+    const r = o.part ?? st.rail, commit = !o.preview;
+    if (!r || (r.level ?? 'ground') !== 'ground') return out;
     r.entrances = [];
-    let lost = 0;
+    const fx = Math.sin(r.angle), fz = Math.cos(r.angle), width = railWidth(r);
+    const site = { x: r.x, z: r.z, angle: r.angle, length: r.length, layout: { width }, footprint: { x: r.x, z: r.z, angle: r.angle, w: width, d: r.length }, building: r.building };
+    type Fit = ReturnType<Stations['groundSites']> & { both: boolean; access: [boolean, boolean]; shift: number };
     for (const e of old) {
       const k = entranceKind('ground', e);
-      if (!GROUND_ENTRANCES.includes(k)) { lost++; continue; }
-      const lon = (e.x - r.x) * Math.sin(r.angle) + (e.z - r.z) * Math.cos(r.angle), side = entranceSide(r, e);
-      // where it stood, else a little along the platforms (the station's own crossings may have moved with it)
-      let fit: ReturnType<Stations['groundSites']> | null = null;
-      for (const shift of k === 'gate' ? [0] : [0, 0.5, -0.5, 1, -1, 1.5, -1.5]) {
+      const go = (fate: 'room' | 'cut') => {
+        out.fates.push({ kind: k, fate });
+        if (commit && typeof r.cost === 'number') r.cost = Math.max(0, r.cost - (e.cost ?? 0));
+      };
+      if (!GROUND_ENTRANCES.includes(k)) { go('room'); continue; }
+      const lon = (e.x - r.x) * fx + (e.z - r.z) * fz, side = entranceSide(r, e);
+      // The landing a street reached (its own side's first: where its walkers come from) must still reach one; the
+      // other one keeps its street, and a crossing both landings, where they can.
+      const hadNear = this.landingOnStreet(k, e), hadFar = !!e.far && this.landingOnStreet(k, e.far);
+      const ess = hadNear ? 0 : hadFar ? 1 : -1;
+      const lostEss = (f: Fit) => ess >= 0 && !f.access[ess as 0 | 1], farCut = (f: Fit) => ess === 0 && hadFar && !f.access[1];
+      const rank = (f: Fit) => (lostEss(f) ? 4 : 0) + (farCut(f) ? 2 : 0) + (e.far && !f.both ? 1 : 0);
+      const fits: Fit[] = [], tried = new Set<number>();
+      let best: Fit | null = null;
+      for (const shift of k === 'gate' ? [0] : REFIT_SHIFTS) {
         const sites = this.groundSites(r, k, side, lon + shift);
-        if (!this.stairsError(r, k, sites.along) && !this.landingError(st, k, sites.near)) { fit = sites; break; }
+        const at = Math.round(sites.along * 1000);
+        if (tried.has(at)) continue;
+        tried.add(at);
+        if (this.stairsError(r, k, sites.along) || this.landingError(st, k, sites.near, r)) continue;
+        const both = !!e.far && !this.landingError(st, k, sites.far, r);
+        const f: Fit = { ...sites, both, access: [this.landingOnStreet(k, sites.near), both && this.landingOnStreet(k, sites.far)], shift };
+        fits.push(f);
+        if (!best || rank(f) < rank(best)) best = f;
+        if (rank(f) === 0) break;
       }
-      if (!fit) { lost++; if (typeof r.cost === 'number') r.cost = Math.max(0, r.cost - (e.cost ?? 0)); continue; }
-      const { near, far } = fit, both = !!e.far && !this.landingError(st, k, far);
-      r.entrances.push({ x: near.x, z: near.z, angle: near.angle, kind: k, ...(both ? { far } : {}), ...(e.cost !== undefined ? { cost: e.cost } : {}) });
+      if (!best) { go('room'); continue; }
+      let street: Proposal | null = null;
+      if (lostEss(best)) {
+        // no street reaches that landing where the entrance fits: a short access street from its street side (on
+        // its side of the tracks), from the nearest place first
+        const price = e.cost ?? entranceCost(k, r);
+        const others = r.entrances.flatMap((q) => entranceLandings(q).map((p) => landingRect(entranceKind('ground', q), p)));
+        for (const f of [...fits].sort((a, b) => rank(a) - rank(b))) {
+          if (ess === 1 && !f.both) continue;
+          const lands = f.both ? [f.near, f.far] : [f.near], door = landingDoor(k, lands[ess]);
+          const prop = this.planAccessStreet(door.x, door.z, site, st.owner, undefined, [...others, ...lands.map((p) => landingRect(k, p))], ess ? -side : side, ENTRANCE_STREET);
+          if (prop && !prop.demolish.length && prop.cost <= price * ENTRANCE_RECONNECT) { street = prop; best = f; break; }
+        }
+        if (!street || (commit && commitProposal(g, street))) { go('cut'); continue; }
+        out.streets += street.cost;
+      }
+      const { near, far, both } = best;
+      const ne: Entrance = { x: near.x, z: near.z, angle: near.angle, kind: k, ...(both ? { far } : {}), ...(e.cost !== undefined ? { cost: e.cost } : {}) };
+      r.entrances.push(ne);
+      out.fates.push({ kind: k, fate: street ? 'street' : best.shift === 0 ? 'stays' : 'moves', ...(e.far && !both ? { lostFar: true } : farCut(best) ? { farCut: true } : {}) });
+      if (commit) {
+        const T = ENTRANCE_TYPES[k];
+        for (const p of entranceLandings(ne)) {
+          this.padGround(landingRect(k, p));
+          g.world.removeTreesNear(p.x, p.z, Math.hypot(T.w, T.d) / 2 + 0.6);
+          g.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
+        }
+      }
     }
-    return lost;
+    if (commit) {
+      if (r.entrances.length) this.repairSite(st);
+      const gone = out.fates.filter((f) => f.fate === 'room' || f.fate === 'cut');
+      if (gone.length && !g.company(st.owner).ai) {
+        const why = gone.every((f) => f.fate === 'cut') ? 'no street reaches it beside the new platforms' : gone.every((f) => f.fate === 'room') ? 'no room beside the new platforms' : 'no room or no street beside the new platforms';
+        g.postNews(`${st.name} ${o.what ?? 'rebuilt'}: ${gone.length === 1 ? `its ${ENTRANCE_TYPES[gone[0].kind].name.toLowerCase()} was` : `${gone.length} of its entrances were`} taken down (${gone.length === 1 ? why : why.replace(' it ', ' them ')}).`, 'bad', st.x, st.z);
+      }
+    }
+    return out;
+  }
+
+  /** What rebuilding a ground station as `plan` (in place, still on the ground) would do to its added entrances. Pure. */
+  previewRefit(st: Station, plan: StationPlan): EntranceRefit | null {
+    const r = st.rail;
+    if (!r || (r.level ?? 'ground') !== 'ground' || plan.level !== 'ground' || !r.entrances.length) return null;
+    return this.refitEntrances(st, r.entrances, { part: this.partOf(plan, [], []), preview: true });
   }
 
   /** Build a planned entrance (planEntrance; the AI's evaluated plans). Null = OK, else the reason. */
@@ -1806,9 +1929,11 @@ export class Stations {
   }
 
   /** The street side of a ground station's building (where the access road ends). */
-  forecourt(st: Station): { x: number; z: number } | null {
-    const r = st.rail;
-    if (!r || (r.level ?? 'ground') !== 'ground') return null;
+  forecourt(st: Station): { x: number; z: number } | null { return st.rail ? this.forecourtOf(st.rail) : null; }
+
+  /** The street side of a ground rail part's building (a station's, or a planned one). */
+  private forecourtOf(r: RailPart): { x: number; z: number } | null {
+    if ((r.level ?? 'ground') !== 'ground') return null;
     if (r.forecourt) return r.forecourt;
     const b = r.building, fx = Math.sin(b.angle), fz = Math.cos(b.angle);
     return { x: b.x - fx * (b.d / 2 + FORECOURT), z: b.z - fz * (b.d / 2 + FORECOURT) };
@@ -2249,8 +2374,8 @@ export class Stations {
     for (const id of A.edges) { const e = net.edges.get(id); if (e && e.station !== a.id) { e.station = a.id; net.markEdge(e); } }
     a.x = A.x; a.z = A.z;
     b.rail = null;
-    // a ground station's added entrances: beside the united track area where they still fit
-    if ((A.level ?? 'ground') === 'ground' && entrances.length) this.refitEntrances(a, entrances);
+    // a ground station's added entrances: beside the united track area where they still fit and a street reaches them
+    if ((A.level ?? 'ground') === 'ground' && entrances.length) { this.refitEntrances(a, entrances, { what: 'merged' }); this.markStation(a); }
     this.absorb(a, b);
     return null;
   }
@@ -2741,10 +2866,14 @@ export class Stations {
     const blockedEnds = ([[connected[0], 1], [connected[1], -1]] as [boolean, 1 | -1][]).filter(([c]) => c).map(([, e]) => e);
     const rebuild = (lv: StationLevel) => {
       if (connected[0] || connected[1]) return bad(lv !== (r.level ?? 'ground') ? 'The level of a connected station cannot be changed' : 'The tracks of a connected station cannot be rearranged like that');
-      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style });
-      const added = (r.level ?? 'ground') === 'ground' ? r.entrances.length : 0;
-      const warnings = added ? [...plan.warnings, `Its ${added === 1 ? 'added entrance goes' : `${added} added entrances go`} (rebuilt anew)`] : plan.warnings;
-      return { ok: plan.ok, error: plan.error, warnings, station: st.id, cost: plan.cost + 20000, length: L2, tracks: T2, through: Th2, plan, delta: [0, 0] as [number, number], keep: [], cuts: [], rebuild: true };
+      const ground = lv === 'ground' && (r.level ?? 'ground') === 'ground';
+      const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
+      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid });
+      // still on the ground: its added entrances stay beside the new platforms where they fit; at another level they go
+      const fit = plan.ok && ground ? this.previewRefit(st, plan) : null;
+      const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt anew');
+      const warnings = [...plan.warnings, ...refitWarnings(fit), ...(gone ? [gone] : [])];
+      return { ok: plan.ok, error: plan.error, warnings, station: st.id, cost: plan.cost + 20000 + (fit?.streets ?? 0), length: L2, tracks: T2, through: Th2, plan, delta: [0, 0] as [number, number], keep: [], cuts: [], rebuild: true, ...(fit ? { entrances: fit } : {}) };
     };
     if (level !== (r.level ?? 'ground')) return rebuild(level);
     if (level !== 'ground' && L2 === r.length && T2 === r.tracks && Th2 === Th0 && style !== styleOf(r.style).id) {
@@ -2855,7 +2984,10 @@ export class Stations {
     for (const id of plan.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
     const warnings = [...plan.warnings];
     if (T2 + Th2 > r.tracks + (r.through ?? 0) && ends.some((t) => t[0].approach.length || t[1].approach.length)) warnings.push('New tracks get turnouts onto the neighbouring track where there is room');
-    return { ok: true, warnings, station: st.id, cost: Math.max(0, Math.round(cost)), length: L2, tracks: T2, through: Th2, plan, delta: [dF, dB], keep: sh.keys, cuts, rebuild: false };
+    // its added entrances beside the new track area: where they still fit and a street still reaches them
+    const fit = this.previewRefit(st, plan);
+    if (fit) { cost += fit.streets; warnings.push(...refitWarnings(fit)); }
+    return { ok: true, warnings, station: st.id, cost: Math.max(0, Math.round(cost)), length: L2, tracks: T2, through: Th2, plan, delta: [dF, dB], keep: sh.keys, cuts, rebuild: false, ...(fit ? { entrances: fit } : {}) };
   }
 
   /**
@@ -2869,7 +3001,18 @@ export class Stations {
     const r = st?.rail;
     if (!st || !r) return 'No such rail station';
     if (!up.plan) return up.error ?? 'Cannot rebuild';
-    if (up.rebuild) return this.relocate(st.id, up.plan, up.cost);
+    if (up.rebuild) {
+      // rebuilt anew on its site: still on the ground, its added entrances stay beside the platforms where they fit
+      const old = r.entrances, keep = (r.level ?? 'ground') === 'ground' && up.plan.level === 'ground';
+      const err = this.relocate(st.id, up.plan, up.cost - (up.entrances?.streets ?? 0));
+      if (!err && keep && old.length) {
+        const nr = st.rail!;
+        if (typeof nr.cost === 'number') nr.cost += old.reduce((c, e) => c + (e.cost ?? 0), 0);
+        this.refitEntrances(st, old);
+        this.markStation(st);
+      }
+      return err;
+    }
     if (up.restyleOnly) {
       const co = g.company(st.owner);
       if (!co.economy.canAfford(up.cost)) return 'Not enough money';
@@ -2915,7 +3058,8 @@ export class Stations {
     if (hold) { releaseHold(g, hold.edges); this.holds.delete(st.id); }
     const co = g.company(st.owner);
     if (!co.economy.canAfford(up.cost)) return 'Not enough money';
-    co.economy.spend(up.cost - (up.plan.access?.cost ?? 0), 'construction');
+    // (new access streets to added entrances are paid as they are built)
+    co.economy.spend(up.cost - (up.plan.access?.cost ?? 0) - (up.entrances?.streets ?? 0), 'construction');
     const plan = up.plan;
     const signalled = this.signalledNear(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
@@ -2943,9 +3087,10 @@ export class Stations {
     for (const eid of [...r.edges, ...r.throughEdges]) net.removeEdge(eid);
     this.markStation(st);
     st.rail = null;
-    this.buildRailPart(st, { ...plan, cost: (r.cost ?? 0) + up.cost }, st.owner, reuse);
+    this.buildRailPart(st, { ...plan, cost: (r.cost ?? 0) + up.cost - (up.entrances?.streets ?? 0) }, st.owner, reuse);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
-    // the added entrances of a ground station stay where they still fit beside the new track area
+    // the added entrances of a ground station stay beside the new track area where they still fit and a street still
+    // reaches them (a short new access street where needed), else they go
     if ((r.level ?? 'ground') === 'ground' && r.entrances.length) { this.refitEntrances(st, r.entrances); this.markStation(st); }
     // new tracks at connected ends: turnout ladders onto the neighbouring tracks' approaches (crossovers in the way
     // are laid again beyond them); the throat signals again
@@ -3122,16 +3267,21 @@ export class Stations {
     if (!st || !r) return;
     this.markStation(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
+    // added entrances: a ground station staying on the ground keeps them beside its platforms where they still fit
+    // (refitEntrances); at another level they go (planRelevel warns), their price leaving the station's value
+    const added = r.entrances.filter((e) => e.kind), keep = (r.level ?? 'ground') === 'ground' && plan.level === 'ground';
+    const addedCost = added.reduce((c, e) => c + (e.cost ?? 0), 0);
     r.level = plan.level; r.underground = plan.level === 'underground'; r.y = plan.y; r.depth = plan.depth; r.height = plan.height;
     r.entrances = plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle }));
     r.piers = plan.piers.map((p) => ({ ...p }));
     r.style = plan.style; r.building = plan.building;
     r.forecourt = plan.forecourt ?? undefined; r.forecourt2 = plan.forecourt2 ?? undefined;
-    r.cost = Math.round((r.cost ?? 0) * 0.7 + plan.cost);
+    r.cost = Math.round(Math.max(0, (r.cost ?? 0) - addedCost) * 0.7 + plan.cost) + (keep ? addedCost : 0);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     if (plan.level === 'ground') this.levelGround(plan);
     else for (const f of this.footprints(st)) if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
     this.repairSite(st);
+    if (keep && added.length) this.refitEntrances(st, added, { what: 're-levelled' });
     this.markStation(st);
     this.accessVersion = -1;
     g.lines.catchmentDirty = true;

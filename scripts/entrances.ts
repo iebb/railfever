@@ -1,7 +1,9 @@
 // Station entrances: a ground station's side hall, footbridge / underpass and platform-end gate on both sides of
 // the tracks (sites, collisions, stairs spacing, access streets), the walking catchment they add, removal (station
-// window and demolition), costs and upkeep, rebuilding in place, save / load (exact, old saves), and the AI adding
-// entrances where the residents they newly reach pay for them (a fixture, then a seeded world).
+// window and demolition), costs and upkeep, rebuilding in place (moved entrances keep a street, or go with a
+// warning), re-levelling, save / load (exact, old saves), and the AI adding entrances where the residents they newly
+// reach pay for them (fixtures: called directly and in the running game, saved and reloaded), then a long run on a
+// seeded world that must replay exactly after loading (entrances there as the AI finds them worth it).
 // Bundle as entrances.mjs (esbuild --bundle --platform=node --format=esm) and run with node.
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
@@ -11,8 +13,9 @@ import { distToRect } from '../src/game/world';
 import { bulldoze } from '../src/game/build-ops';
 import {
   ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceLandings, entranceKind, landingRect, entranceAlong,
-  planStationUpgrade, commitStationUpgrade, railWidth,
+  planStationUpgrade, commitStationUpgrade, railWidth, entranceUpkeep, entrancesGo, landingDoor,
 } from '../src/game/stations';
+import { planRelevel, commitRelevel } from '../src/game/trackops';
 import type { Station, EntranceKind } from '../src/game/stations';
 import { walkingCatchment, walkingCatchmentWithout, walkingPopulation, entrancePlanCatchment } from '../src/game/catchment';
 import { stationCrossings } from '../src/game/station-styles';
@@ -37,6 +40,11 @@ function streets(g: G, owner = -1) {
 }
 const house = (g: G, x: number, z: number, angle: number, p = 20, townId = -1) =>
   g.world.addBuilding({ townId, x, z, angle, w: 0.8, d: 0.8, type: 0, floors: 2, pop: p, seed: 1, y: 3, built: 0 });
+/** Residents only entrance `i` of a station brings within walking reach (as the station window lists them). */
+const alone = (g: G, S: Station, i: number) => { const wo = walkingCatchmentWithout(g, S, i).buildings; return pop(g, [...walkingCatchment(g, S).buildings.keys()].filter((id) => !wo.has(id))); };
+/** Everything planning may not change. */
+const stateOf = (g: G) => JSON.stringify([serialize(g), g.world.net.nextNode, g.world.net.nextEdge, g.world.net.version, g.networkVersion,
+  g.lines.catchmentDirty, g.stations.walkVersion, [...g.world.dirtyObj], [...g.world.dirtyTerrain]]);
 /** Landings of every entrance clear of the track area, roads and each other. */
 function clearOfEverything(g: G, st: Station): string | null {
   const r = st.rail!, net = g.world.net;
@@ -83,8 +91,7 @@ function fixture(owner = 0) {
   check(north.every((id) => !beforeSet.has(id)) && south.some((id) => beforeSet.has(id)), `before: only south houses within walking reach (${before.toFixed(0)} residents)`);
 
   // planning is pure: every kind on both sides, with and without access streets, leaves the game as it was
-  const state = () => JSON.stringify([serialize(g), g.world.net.nextNode, g.world.net.nextEdge, g.world.net.version, g.networkVersion,
-    g.lines.catchmentDirty, g.stations.walkVersion, [...g.world.dirtyObj], [...g.world.dirtyTerrain]]);
+  const state = () => stateOf(g);
   const before0 = state();
   let planned = 0;
   for (const kind of GROUND_ENTRANCES) for (const z of [94.6, 97.6]) for (const x of [91, 94, 96, 99, 101]) planned += g.stations.planEntrance(S.id, x, z, 0, kind).ok ? 1 : 0;
@@ -244,6 +251,102 @@ function fixture(owner = 0) {
   check(r2.entrances.length === 1 && !clashes.length, `after lengthening its footbridge stays clear of the station's own (now at ${(after * 10).toFixed(0)} m; added one at ${r2.entrances.map((e) => (entranceAlong(r2, e) * 10).toFixed(0)).join(', ')} m)`);
 }
 
+// ------------------------------------------------------------------------------------------ rebuilding: entrances keep a street
+/**
+ * A ground station along x (right of the axis is north, -z) with the building's street south of the tracks and a
+ * street `gap` beyond the track area to the north, houses along it: an entrance on the north side needs its own
+ * access street.
+ */
+function farStreet(tracks: number, length: number, gap: number) {
+  const g = flatGame(192, 3), road = streets(g);
+  const width = railWidth({ tracks, through: 0, trackOffsets: [], platforms: [], throughOffsets: [] } as never);
+  road(40, 96 + width / 2 + 2.8, 150, 96 + width / 2 + 2.8);
+  const S = station(g, 96, 96, Math.PI / 2, length, tracks, 0)!;
+  const nz = 96 - (S.rail!.width / 2 + gap);
+  road(40, nz, 150, nz);
+  for (let x = 70; x <= 122; x += 3) house(g, x, nz - 1.6, 0);
+  flush(g);
+  return { g, S };
+}
+{
+  console.log('rebuilding in place: a moved entrance keeps a street to its residents, or goes (warned, with its upkeep)');
+  // six tracks: lengthening moves the station's own footbridge onto the added one, which moves on along the
+  // platforms, away from the end of its access street
+  const { g, S } = farStreet(6, 10, 5);
+  const fb = g.stations.planEntrance(S.id, 96 + 4.15, 96 - (S.rail!.width / 2 + 0.6), 0, 'footbridge');
+  check(fb.ok && !!fb.access && !g.stations.commitEntrance(S.id, fb, 0), `a footbridge with its own access street to the north street (${fb.error ?? `${fb.access?.stats.len.toFixed(1)} u`})`);
+  flush(g);
+  const gain0 = alone(g, S, 0), keep0 = g.stationMaintenance(S) - (20000 + S.rail!.tracks * S.rail!.length * 500);
+  check(gain0 > 100 && keep0 === ENTRANCE_TYPES.footbridge.upkeep, `it brings ${gain0} residents for ${keep0} a year`);
+  const before = stateOf(g);
+  const up = planStationUpgrade(g, S.id, { length: 12 });
+  check(stateOf(g) === before, 'planning the rebuild (with what becomes of its entrances) changes nothing');
+  check(up.ok && up.entrances?.fates[0]?.fate === 'street' && up.entrances.streets > 0 && up.warnings.some((w) => /footbridge moves .*new access street/.test(w)),
+    `the plan says so: it moves and gets a new access street, included in the price (${up.error ?? `${up.warnings.join('; ')}; street ${up.entrances?.streets}`})`);
+  const money = g.economy.money;
+  check(!commitStationUpgrade(g, up) && Math.abs(money - g.economy.money - up.cost) < 1, `rebuilt for the planned price (${Math.round(money - g.economy.money)} of ${up.cost})`);
+  flush(g);
+  const r2 = g.stations.get(S.id)!.rail!, e2 = r2.entrances[0];
+  check(r2.entrances.length === 1 && Math.abs(entranceAlong(r2, e2) - 4.15) > 0.5 && g.stations.entranceAccess(S, e2),
+    `the footbridge moved along the platforms (${(entranceAlong(r2, e2) * 10).toFixed(0)} m) and a street reaches it`);
+  const gain1 = alone(g, S, 0);
+  check(gain1 >= gain0 * 0.8, `it still brings its residents (${gain0} -> ${gain1})`);
+  console.log(`  lengthened 100 -> 120 m: the footbridge moved ${((entranceAlong(r2, e2) - 4.15) * 10).toFixed(0)} m along with a new ${up.entrances?.streets} street; its residents ${gain0} -> ${gain1}`);
+  check(!clearOfEverything(g, S), `clear of tracks, roads and the building (${clearOfEverything(g, S) ?? 'clear'})`);
+
+  // a gate at the platform end moves with it; houses stand where its new street would run: it goes
+  const g2 = flatGame(192, 3), road = streets(g2);
+  road(30, 99.2, 150, 99.2); road(30, 89, 150, 89);
+  for (let x = 80; x <= 116; x += 3) house(g2, x, 87.4, 0);
+  const S2 = station(g2, 96, 96, Math.PI / 2, 10, 2, 0)!;
+  flush(g2);
+  const gate = g2.stations.planEntrance(S2.id, 100.5, 94.5, 0, 'gate');
+  check(gate.ok && !!gate.access && !g2.stations.commitEntrance(S2.id, gate, 0), `a gate at the east platform end with its access street (${gate.error ?? 'built'})`);
+  flush(g2);
+  const e0 = S2.rail!.entrances[0], price = e0.cost!, value0 = S2.rail!.cost!;
+  check(alone(g2, S2, 0) > 100 && entranceUpkeep(S2.rail) === ENTRANCE_TYPES.gate.upkeep, `the gate brings ${alone(g2, S2, 0)} residents`);
+  // (the platforms grow by 10 m at each end: its new street side)
+  const door = landingDoor('gate', { x: e0.x + 1, z: e0.z, angle: e0.angle });
+  for (const [dx, dz] of [[-0.6, -1.3], [0.4, -1.3], [1.4, -1.0], [-1.6, -1.5]]) house(g2, door.x + dx, door.z + dz, 0, 5);
+  flush(g2);
+  const up2 = planStationUpgrade(g2, S2.id, { length: 12 });
+  check(up2.ok && up2.entrances?.fates[0]?.fate === 'cut' && up2.warnings.some((w) => /gate goes \(no street reaches it/.test(w)),
+    `the plan warns that the gate goes (${up2.error ?? up2.warnings.join('; ')})`);
+  const news0 = g2.news.length;
+  check(!commitStationUpgrade(g2, up2), 'rebuilt');
+  flush(g2);
+  const r3 = g2.stations.get(S2.id)!.rail!;
+  check(r3.entrances.length === 0 && entranceUpkeep(r3) === 0 && g2.stationMaintenance(S2) === 20000 + r3.tracks * r3.length * 500,
+    `the gate is gone, its upkeep with it (${r3.entrances.length} entrances, ${g2.stationMaintenance(S2)} a year)`);
+  check(r3.cost === value0 + up2.cost - price, `its price left the station's value (${value0} + ${up2.cost} - ${price} = ${r3.cost})`);
+  check(g2.news.length > news0 && /gate was taken down/.test(g2.news[g2.news.length - 1].text), `noted in the news ("${g2.news[g2.news.length - 1]?.text}")`);
+  console.log(`  a gate whose new street would demolish houses: "${up2.warnings.join('; ')}"; news: "${g2.news[g2.news.length - 1]?.text}"`);
+
+  // re-levelling: lifted onto a viaduct its added entrances go (warned, like moving the station); brought back to
+  // the ground in place they stay
+  for (const level of ['elevated', 'ground'] as const) {
+    const { g: g3, S: S3 } = farStreet(2, 10, 5);
+    const f3 = g3.stations.planEntrance(S3.id, 98, 96 - (S3.rail!.width / 2 + 0.6), 0, 'footbridge');
+    check(f3.ok && !g3.stations.commitEntrance(S3.id, f3, 0), `re-level (${level}): a footbridge with its street`);
+    flush(g3);
+    const gone = entrancesGo('ground', S3.rail!.entrances, 'taken down at the old site');
+    check(gone === 'Its added footbridge goes (taken down at the old site)', `moving the station warns alike ("${gone}")`);
+    const value = S3.rail!.cost!, price3 = S3.rail!.entrances[0].cost!;
+    const rp = planRelevel(g3, [...S3.rail!.edges], level, 0);
+    const warned = rp.warnings.some((w) => w.startsWith(`${S3.name}: its added footbridge goes`));
+    check(rp.ok && warned === (level !== 'ground'), `re-level (${level}): ${level !== 'ground' ? 'warns that the footbridge goes' : 'no warning'} (${rp.error ?? (rp.warnings.join('; ') || 'none')})`);
+    check(!commitRelevel(g3, rp), `re-levelled (${level})`);
+    flush(g3);
+    const r4 = g3.stations.get(S3.id)!.rail!, sp = rp.stations.find((x) => x.id === S3.id)?.plan;
+    // (the station's value: 70% of the old structures plus the new ones; an entrance that stays keeps its price)
+    const want = sp ? Math.round((value - price3) * 0.7 + sp.cost) + (level === 'ground' ? price3 : 0) : NaN;
+    if (level === 'ground') check(r4.entrances.length === 1 && g3.stations.entranceAccess(S3, r4.entrances[0]) && alone(g3, S3, 0) > 100 && r4.cost === want,
+      `back on the ground: the footbridge stays, on its street, at its price (${r4.cost} = ${want})`);
+    else check(r4.level === 'elevated' && !r4.entrances.some((e) => e.kind) && entranceUpkeep(r4) === 0 && r4.cost === want,
+      `on the viaduct: the footbridge is gone with its upkeep and value (${r4.entrances.length} stair towers; ${r4.cost} = ${want})`);
+  }
+}
+
 // ------------------------------------------------------------------------------------------ the station's own hall at street level
 {
   console.log('below / above the street: an added entrance never stands on the station\u2019s own hall');
@@ -375,10 +478,40 @@ function streetThroughHouse(blockPop: number, others: number) {
     `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);
 }
 
-// ------------------------------------------------------------------------------------------ AI (seeded world)
+// ------------------------------------------------------------------------------------------ AI (running game, saved and reloaded)
+{
+  console.log('AI in the running game: the entrance comes by its own schedule, and a game saved halfway there decides alike');
+  // the day the AI builds it, running on its own (the network tasks' schedule: no direct call)
+  const probe = aiFixture();
+  let day = -1;
+  while (probe.g.day < 120 && day < 0) { probe.g.stepTick(); if (probe.H.rail!.entrances.length) day = probe.g.day; }
+  check(day > 1 && stat(probe.ai, 'netEntrances') === 1 && probe.ai.log.some((l) => /residents newly within walking reach/.test(l)),
+    `the AI adds the entrance on its own (day ${day}: ${probe.ai.log.filter((l) => /walking reach/.test(l)).join('') || 'none'})`);
+  console.log(`  day ${day}: ${probe.ai.log.filter((l) => /walking reach/.test(l)).join('') || 'no entrance'}`);
+  // the same game saved halfway there (its network planner under way) and reloaded: both build it that day
+  const { g, H, north } = aiFixture();
+  while (g.day < Math.floor(day / 2)) g.stepTick();
+  const saved = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(saved));
+  check(JSON.stringify(serialize(loaded)) === saved && !H.rail!.entrances.length, `saved on day ${g.day}, before the entrance: round trip exact`);
+  const LH = loaded.stations.get(H.id)!;
+  let dayA = -1, dayB = -1;
+  while (g.day < day + 30) {
+    g.stepTick(); loaded.stepTick();
+    if (dayA < 0 && H.rail!.entrances.length) dayA = g.day;
+    if (dayB < 0 && LH.rail!.entrances.length) dayB = loaded.day;
+  }
+  flush(g); flush(loaded);
+  check(north.filter((id) => walkingCatchment(g, H).buildings.has(id)).length >= 6, 'it reaches the houses across the tracks');
+  const sa = serialize(g) as Record<string, unknown>, sb = serialize(loaded) as Record<string, unknown>;
+  const differ = Object.keys(sa).filter((k) => JSON.stringify(sa[k]) !== JSON.stringify(sb[k]));
+  check(dayA === day && dayB === day && JSON.stringify(LH.rail!.entrances) === JSON.stringify(H.rail!.entrances) && !differ.length,
+    `the original and the reloaded game build the same entrance on day ${day} (${dayA}, ${dayB}; ${differ.join(', ') || 'identical'})`);
+}
+
+// ------------------------------------------------------------------------------------------ AI (seeded world: a long run, replayed)
 {
   const seed = Number(process.argv[2] ?? 23), years = Number(process.argv[3] ?? 4);
-  console.log(`AI on seed ${seed}: ${years} years, 384 map, 3 rail-minded companies (saved and reloaded two years before the end)`);
+  console.log(`AI on seed ${seed}: ${years} years, 384 map, 3 rail-minded companies (saved and reloaded two years before the end; entrances where the AI finds them worth it)`);
   const g = Game.create({ size: 384, seed, towns: 9, hilliness: 'hilly', water: 'medium', startYear: 1985, aiConfigs: new Array(3).fill({ focus: { rail: 2.5, road: 0.8, tram: 0.5 } }) });
   g.aiAcquisitions = false;
   const count = (x: Game) => x.ais.reduce((n, a) => n + stat(a, 'netEntrances'), 0);
@@ -394,8 +527,7 @@ function streetThroughHouse(blockPop: number, others: number) {
   const stations = [...g.stations.map.values()].filter((st) => st.rail && st.owner > 0);
   const kept = stations.flatMap((st) => st.rail!.entrances.filter((e) => e.kind).map((e) => `${st.name}: ${e.kind}`));
   console.log(`  ${stations.length} AI rail stations now; ${n} entrances added (${mid} before the save), standing: ${kept.join('; ') || 'none'}`);
-  check(n > 0 && notes.length === n, `seed ${seed}: the AI added entrances where they pay (${n})`);
-  check(n > mid, `seed ${seed}: an entrance decision falls in the replayed year (${mid} -> ${n})`);
+  check(notes.length === n, `seed ${seed}: every entrance the AI added came with its reason (${n})`);
   for (const st of stations) if (st.rail!.entrances.some((e) => e.kind)) { const clash = clearOfEverything(g, st); check(!clash, `seed ${seed}: ${st.name}'s entrances clear (${clash ?? 'ok'})`); }
   const sa = serialize(g) as Record<string, unknown>, sb = serialize(loaded) as Record<string, unknown>;
   const differ = Object.keys(sa).filter((k) => JSON.stringify(sa[k]) !== JSON.stringify(sb[k]));
