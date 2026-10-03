@@ -8,7 +8,40 @@
 // compressed (DAY_SECONDS per game day), so waits and rides are real-time seconds even though a year passes in
 // 360 * DAY_SECONDS of them. `simNow(g)` is the continuous clock.
 import type { Game } from './game';
-import { DAY_SECONDS, UNIT_M, PASSENGER_FARE_SCALE, PASSENGER_LONG_FARE_SCALE, PASSENGER_FARE_BLEND, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE } from './constants';
+import { DAY_SECONDS, UNIT_M, PASSENGER_FARE_SCALE, PASSENGER_LONG_FARE_SCALE, PASSENGER_FARE_BLEND, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_FARES, URBAN_DEMAND } from './constants';
+import type { Station } from './stations';
+
+export type UrbanMode = keyof typeof URBAN_FARES;
+export interface FareContext { mode?: UrbanMode; /** 0..1, both ends in a dense city centre */ centre?: number }
+export interface DemandSite { x: number; z: number; townId: number }
+const intensityCache = new WeakMap<Game, { key: string; values: Map<string, number> }>();
+
+/** Actual nearby residents/jobs, rather than town-wide population as a proxy for a dense station neighbourhood. */
+export function urbanIntensity(g: Game, site: DemandSite): number {
+  const t = g.towns.list[site.townId];
+  if (!t || t.pop <= URBAN_DEMAND.minPop) return 0;
+  const key = `${g.day}:${g.world.net.version}:${g.world.nextBuildingId}:${g.world.buildings.size}:${g.world.heightsVersion}`;
+  let cache = intensityCache.get(g);
+  if (!cache || cache.key !== key) { cache = { key, values: new Map() }; intensityCache.set(g, cache); }
+  const id = `${site.townId}:${t.pop}:${t.radius}:${site.x}:${site.z}`;
+  const previous = cache.values.get(id); if (previous !== undefined) return previous;
+  const size = clamp((t.pop - URBAN_DEMAND.minPop) / (URBAN_DEMAND.fullPop - URBAN_DEMAND.minPop), 0, 1);
+  let pop = 0;
+  const R = 20;
+  for (const b of g.world.buildingsNear(site.x, site.z, R)) if (b.townId === t.id && Math.hypot(b.x - site.x, b.z - site.z) <= R) pop += b.pop;
+  const density = clamp(pop / (Math.PI * R * R * URBAN_DEMAND.density), 0, 1);
+  const centre = clamp((t.radius * 1.25 - Math.hypot(site.x - t.x, site.z - t.z)) / Math.max(8, t.radius * 0.65), 0, 1);
+  const value = size * density * centre;
+  cache.values.set(id, value); return value;
+}
+
+/** One context for real receipts and AI estimates; main-line/HSR trains retain their distance fare. */
+export function stationFareContext(g: Game, from: Station | undefined, to: Station, mode?: UrbanMode): FareContext {
+  if (!from) return {};
+  const sameTown = from.townId >= 0 && from.townId === to.townId;
+  const centre = sameTown ? Math.min(urbanIntensity(g, from), urbanIntensity(g, to)) : 0;
+  return { mode, centre };
+}
 
 /** The alternative to public transport: walking (with a detour factor) and driving (detour, walk to the car, parking). */
 export const ALT = { walkKmh: 5, walkDetour: 1.2, carKmh: 60, carDetour: 1.3, carAccessS: 240 };
@@ -43,14 +76,17 @@ const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 /** Walking time (s) for a straight-line distance of `d` units. */
 export function walkTime(d: number): number { return (Math.max(0, d) * UNIT_M * ALT.walkDetour) / (ALT.walkKmh / 3.6); }
 /** Driving time (s) incl. getting to the car and parking, for a straight-line distance of `d` units. */
-export function carTime(d: number): number { return ALT.carAccessS + (Math.max(0, d) * UNIT_M * ALT.carDetour) / (ALT.carKmh / 3.6); }
+export function carTime(d: number, centre = 0): number {
+  const c = clamp(centre, 0, 1);
+  return ALT.carAccessS + 360 * c + (Math.max(0, d) * UNIT_M * ALT.carDetour) / ((ALT.carKmh * (1 - 0.65 * c)) / 3.6);
+}
 
 /**
  * Time (sim seconds) the trip of straight-line distance `d` units would take by the alternative: walking for short
  * trips, blending into the car beyond ~300 m (a smooth minimum of the two).
  */
-export function refTime(d: number): number {
-  const w = walkTime(d), c = carTime(d);
+export function refTime(d: number, centre = 0): number {
+  const w = walkTime(d), c = carTime(d, centre);
   if (!(w > 0)) return 1;
   return Math.pow(Math.pow(w, -4) + Math.pow(c, -4), -0.25);
 }
@@ -71,27 +107,31 @@ export function fareCalibration(d: number): number {
 }
 
 /** Base fare of one passenger for a leg of straight-line distance `d` units (before the speed factor). */
-export function baseFare(d: number): number { return FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d); }
+export function baseFare(d: number, mode?: UrbanMode): number {
+  const distance = FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d);
+  const urban = mode && URBAN_FARES[mode];
+  return urban ? urban.boarding + distance * urban.distance : distance;
+}
 
 /** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..2.6. */
-export function speedFactor(d: number, legSeconds: number): number {
+export function speedFactor(d: number, legSeconds: number, centre = 0): number {
   if (!(d > 1)) return 1;
-  return clamp(Math.pow(refTime(d) / Math.max(1, legSeconds), SPEED_EXP), SPEED_MIN, SPEED_MAX);
+  return clamp(Math.pow(refTime(d, centre) / Math.max(1, legSeconds), SPEED_EXP), SPEED_MIN, SPEED_MAX);
 }
 
 /**
  * Income for `count` passengers on a leg of straight-line distance `distUnits` that took `legSeconds` (waiting at
  * the boarding stop + riding + transfer walk): count x base(d) x speedFactor.
  */
-export function fareFor(distUnits: number, legSeconds: number, count: number): number {
+export function fareFor(distUnits: number, legSeconds: number, count: number, context: FareContext = {}): number {
   if (!(distUnits > 1) || !(count > 0)) return 0;
-  return count * baseFare(distUnits) * speedFactor(distUnits, legSeconds);
+  return count * baseFare(distUnits, context.mode) * speedFactor(distUnits, legSeconds, context.centre);
 }
 
 /** The parts of a fare (for the UI): base per passenger, the speed factor, the alternative's time and the leg time. */
-export function fareBreakdown(distUnits: number, legSeconds: number): { base: number; factor: number; refSeconds: number; legSeconds: number; perPassenger: number } {
-  const base = baseFare(distUnits), factor = speedFactor(distUnits, legSeconds);
-  return { base, factor, refSeconds: refTime(distUnits), legSeconds, perPassenger: base * factor };
+export function fareBreakdown(distUnits: number, legSeconds: number, context: FareContext = {}): { base: number; factor: number; refSeconds: number; legSeconds: number; perPassenger: number } {
+  const base = baseFare(distUnits, context.mode), factor = speedFactor(distUnits, legSeconds, context.centre);
+  return { base, factor, refSeconds: refTime(distUnits, context.centre), legSeconds, perPassenger: base * factor };
 }
 
 /**
@@ -120,10 +160,10 @@ export function estimateLegTime(distUnits: number, avgKmh: number, headwaySec: n
  * never the fare a real passenger pays. Set `odDemand=false` when `count` is an actual number of boardings.
  * Two-stop projects are direct rides and earn the actual no-transfer bonus. No second calendar rate scale.
  */
-export function estimateLegFare(distUnits: number, avgKmh: number, headwaySec: number, count = 1, detour = 1.15, direct = true, odDemand = true): number {
+export function estimateLegFare(distUnits: number, avgKmh: number, headwaySec: number, count = 1, detour = 1.15, direct = true, odDemand = true, context: FareContext = {}): number {
   const share = 1 / Math.pow(1 + (Math.max(0, distUnits) / LOCAL_DEMAND_DISTANCE) ** 2, LOCAL_DEMAND_EXP);
   const capture = odDemand ? clamp((0.6 + 0.4 * Math.min(1, share / LOCAL_SERVED_SHARE)) / share, 1, 4) : 1;
-  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count * capture) * (direct ? 1 + NO_TRANSFER_BONUS : 1);
+  return fareFor(distUnits, estimateLegTime(distUnits, avgKmh, headwaySec, detour), count * capture, context) * (direct ? 1 + NO_TRANSFER_BONUS : 1);
 }
 
 /**

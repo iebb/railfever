@@ -4,7 +4,7 @@
 // the line's infrastructure (Game.edgeMaintenance / stationMaintenance); track wear is in the company totals.
 // npx esbuild scripts/economy.ts --bundle --platform=node --format=esm --outfile=$S/economy.mjs && node $S/economy.mjs [seed]
 // Seed 7 checks the catchment-calibrated incomes below. --json=/path/before.json saves another seed's exact results;
-// --baseline=/path/before.json checks each income stays within 25% of that baseline instead.
+// --baseline=/path/before.json checks each income stays within 15% of that baseline instead.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
@@ -150,7 +150,9 @@ if (baseline) {
     if (b) {
       const ratio = r.income / Math.max(1, b.income);
       console.log(`  income before -> after ${r.name}: ${fmt(b.income / 1000)}k -> ${fmt(r.income / 1000)}k (${fmt((ratio - 1) * 100, 1)}%)`);
-      check(ratio >= 0.75 && ratio <= 1.25, `${r.name} income within 25% of baseline`);
+      check(ratio >= 0.85 && ratio <= 1.15, `${r.name} income within 15% of baseline`);
+      const profitChange = Math.abs(r.net - b.net) / Math.max(1, Math.abs(b.net));
+      check(profitChange <= 0.15, `${r.name} operating result within 15% of baseline`);
     }
   }
 }

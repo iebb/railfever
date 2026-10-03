@@ -871,7 +871,7 @@ export class Game {
       if (!table || table.size === 0) continue;
       const dw = this.demand.weights(st);
       if (!(dw.served > 0)) continue;
-      st.genAccum += st.catchPop * GEN_RATE * (0.2 + st.rating) * dw.served;
+      st.genAccum += this.demand.generationPopulation(st) * GEN_RATE * (0.2 + st.rating) * dw.served;
       const n = Math.floor(st.genAccum);
       if (n <= 0) continue;
       st.genAccum -= n;

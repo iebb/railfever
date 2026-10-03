@@ -94,6 +94,7 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   const aiRail = g.stations.all().filter((st) => st.owner > 0 && st.rail);
   const withAccess = aiRail.filter((st) => g.stations.hasAccess(st)).length;
   console.log(`  AI rail stations with road access: ${withAccess}/${aiRail.length}`);
+  for (const st of aiRail) if (!g.stations.hasAccess(st)) console.log(`    no access: ${st.name} (${st.rail?.level ?? 'ground'}), ${g.aiOf(st.owner)?.phase}`);
   check(withAccess === aiRail.length, 'AI rail stations are connected to the roads');
 }
 {
@@ -107,6 +108,14 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     l.incomeLast = l.costLast * 2 + 1_000_000; // a line that pays
     // (no new project meanwhile: the money is for the longer platforms and train)
     if (!ai.busy) ai.state.cooldown = Math.max(ai.state.cooldown, 400);
+    // This is a capacity stress fixture. Inject at the decision instant as well: natural walking-catchment
+    // queues are deliberately trimmed before monthly management and would erase the synthetic crowd.
+    const crowd = () => { for (const sid of l.stops) {
+      const st = g.stations.get(sid)!; const other = l.stops.find((x) => x !== sid)!;
+      g.stations.addWaiting(st, l.id, other, other, 400 - Math.min(400, st.waitingTotal));
+    } };
+    const manage = ai.monthly.bind(ai);
+    ai.monthly = () => { crowd(); manage(); };
     let longer = -1;
     for (let d = 0; d < 180 && longer < 0; d++) {
       for (const sid of l.stops) { const st = g.stations.get(sid)!; const other = l.stops.find((x) => x !== sid)!; g.stations.addWaiting(st, l.id, other, other, 400 - Math.min(400, st.waitingTotal)); }
@@ -114,6 +123,7 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
       while (g.day === d0) g.update(0.25);
       for (const id of l.vehicles) { const tr = g.vehicles.get(id); if (tr instanceof Train && tr.cars.length - 1 > n0) longer = tr.cars.length - 1; }
     }
+    ai.monthly = manage;
     const platform = Math.min(...l.stops.map((sid) => g.stations.get(sid)?.rail?.length ?? 99));
     const fits = pickTrain(g.year, platform, 150, 5)!.length - 1;
     console.log(`  lengthening: ${l.name} ${n0} -> ${longer} coaches (platforms ${platform} take ${fits}); ${ai.log.slice(-1)[0]}`);
@@ -179,7 +189,11 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
           const dest = l.stops.find((id) => id !== sid), st = g.stations.get(sid);
           if (st && dest !== undefined) g.stations.addWaiting(st, l.id, dest, dest, 40);
         }
+        // Keep the rebuilt service fixed while checking track operation. Otherwise a scheduled business
+        // decision can close this losing test line during the observation and remove all measured trains.
+        const aiEnabled = g.aiEnabled; g.aiEnabled = false;
         for (const d0 = g.day; g.day < d0 + 120;) g.update(0.25);
+        g.aiEnabled = aiEnabled;
         const del1 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
         const lost = l.vehicles.map((id) => g.vehicles.get(id)).filter((v) => v && v.state === 'noroute');
         console.log(`  double track: ${done}; ${signals} signals on the company's track; ${l.vehicles.length} trains delivered ${del0} -> ${del1} in 120 days, ${lost.length} without route`);
@@ -431,7 +445,9 @@ g.aiAcquisitions = true;
   check(g2.lines.all().every((l) => { const o = g.lines.get(l.id)!; return o.name === l.name && o.autoName === l.autoName && o.num === l.num && o.color === l.color && o.autoColor === l.autoColor; }), 'line naming state restored');
   check(!!lr && g2.lines.get(lr.id)!.name === 'Renamed line' && !g2.lines.get(lr.id)!.autoName, 'renamed line stays renamed');
   check(JSON.stringify(g2.economy.thisYear) === JSON.stringify(g.economy.thisYear), 'economy categories restored');
-  for (let d = 0; d < 60 * 8; d++) { g.update(0.125); g2.update(0.125); }
+  // Compare exactly sixty simulation days. The wall-clock frame budget may drop different ticks in the
+  // warm original and cold loaded game; those scheduling differences are not save-state differences.
+  for (let tick = 0; tick < 60 * g.ticksPerDay; tick++) { g.stepTick(); g2.stepTick(); }
   const m1 = g.companies.map((c) => Math.round(c.economy.money)), m2 = g2.companies.map((c) => Math.round(c.economy.money));
   console.log(`  60 days after loading: money ${m1.map(fmtMoney).join(' / ')} vs ${m2.map(fmtMoney).join(' / ')}; ${g.ais.map((a) => `${g.company(a.companyId).name.split(' ')[0]}: ${a.phase}, loan ${fmtMoney(g.company(a.companyId).economy.loan)}`).join('; ')}`);
   check(m1.every((m, i) => Math.abs(m - m2[i]) <= 0.02 * Math.max(1, Math.abs(m), Math.abs(m2[i]))), 'loaded game runs on alike');
