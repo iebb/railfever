@@ -6,12 +6,12 @@ import type { Town } from './towns';
 import { railCatchShapes, type Station, type StationPlan } from './stations';
 import type { NNode, NEdge } from './network';
 import { NetKind, RAIL, TRACK_TYPES, ROAD_TYPES, WATER_Y } from './constants';
-import { planEdge, commitProposal, findSnap, freeSide, BuildOptions, Snap, Proposal } from './construction';
-import { recomputeLocks } from './terraform';
+import { planEdge, commitProposal, findSnap, freeSide, fitCurve, curveSpeed, structureFactor, BuildOptions, Snap, Proposal } from './construction';
+import { recomputeLocks, EARTHWORKS } from './terraform';
 import { depotSize } from './build-ops';
 import { distToRect } from './world';
 import { Heap } from './train';
-import { segIntersect, angleBetween } from './geom';
+import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 
 
 // ============================================================================ geometry helpers
@@ -85,6 +85,11 @@ export interface CorridorOpts {
   /** which rail counts as running alongside: conventional track (default) or high-speed track (an HSR may run beside
    * conventional rail, and conventional rail beside an HSR) */
   trackClass?: TrackClass;
+  /** Track limits and the radius the corridor's straights must leave room to fit. */
+  type?: string;
+  minR?: number;
+  /** Short, slower curves may fit the station tangents within this distance of either end. */
+  approachLength?: number;
 }
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
@@ -116,6 +121,8 @@ export class CorridorSearch {
   private forbid: { x: number; z: number; a: number; w: number; d: number; r: number }[] = [];
   private lead: number;
   private startV = -1;
+  private minRun: number;
+  private runs: number;
   /** per vertex and axis (heading mod 180°): 0 unknown, 1 clear, 2 existing rail alongside */
   private par: Uint8Array | null = null;
   private field: RailField | null = null;
@@ -126,13 +133,16 @@ export class CorridorSearch {
   constructor(private g: Game, private from: OPoint, private to: OPoint, private opts: CorridorOpts) {
     const size = g.world.size;
     this.C = opts.cell ?? Math.max(4, Math.ceil(size / 96));
+    // Two 45-degree corners share a straight: each needs R*tan(22.5 degrees).
+    this.minRun = opts.minR ? Math.max(MIN_RUN, Math.ceil(2 * opts.minR * Math.tan(Math.PI / 8) / this.C)) : MIN_RUN;
+    this.runs = Math.max(4, this.minRun + 1);
     this.n = Math.floor(size / this.C) + 1;
     const N = this.n * this.n;
     this.info = new Uint8Array(N);
     this.hgt = new Float32Array(N);
-    this.gcost = new Float32Array(N * 32).fill(Infinity);
-    this.parent = new Int32Array(N * 32).fill(-1);
-    this.closed = new Uint8Array(N * 32);
+    this.gcost = new Float32Array(N * 8 * this.runs).fill(Infinity);
+    this.parent = new Int32Array(N * 8 * this.runs).fill(-1);
+    this.closed = new Uint8Array(N * 8 * this.runs);
     for (const st of g.stations.map.values()) for (const f of g.stations.footprints(st)) this.forbid.push({ x: f.x, z: f.z, a: f.angle, w: f.w / 2 + 1.5, d: f.d / 2 + 1.5, r: Math.hypot(f.w / 2 + 1.5, f.d / 2 + 1.5) });
     for (const dp of g.depots.map.values()) this.forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5, r: Math.hypot(2.5, 3.5) });
     this.lead = opts.lead ?? 10;
@@ -143,7 +153,7 @@ export class CorridorSearch {
     this.goalDirs = new Set();
     DIRS.forEach(([dx, dz], i) => { if ((dx * to.tx + dz * to.tz) / Math.hypot(dx, dz) > 0.64) this.goalDirs.add(i); });
     const h0 = nearestDir(from.tx, from.tz);
-    const st = (s0 * 8 + h0) * 4 + 1;
+    const st = (s0 * 8 + h0) * this.runs + 1;
     this.gcost[st] = 0;
     this.heap.push(st, this.heur(s0));
   }
@@ -196,7 +206,8 @@ export class CorridorSearch {
   step(budget: number): 'running' | 'done' | 'failed' {
     if (this.state !== 'running') return this.state;
     const n = this.n, C = this.C;
-    const grade = this.opts.kind === 'rail' ? 0.03 : 0.07;
+    const railGrade = this.opts.type ? (TRACK_TYPES[this.opts.type] ?? TRACK_TYPES.standard).maxGrade * 0.85 : 0.03;
+    const grade = this.opts.kind === 'rail' ? railGrade : 0.07;
     const bcost = this.opts.buildingCost ?? 1, sc = this.opts.slopeCost ?? 1;
     const maxExpand = this.opts.maxExpand ?? 250000;
     while (budget-- > 0) {
@@ -204,19 +215,20 @@ export class CorridorSearch {
       const s = this.heap.pop();
       if (this.closed[s]) continue;
       this.closed[s] = 1;
-      const u = s >> 5, h = (s >> 2) & 7, run = s & 3;
+      const vh = Math.floor(s / this.runs), u = vh >> 3, h = vh & 7, run = s % this.runs;
       if (u === this.goal && this.goalDirs.has(h)) { this.finish(s); return this.state; }
       if (++this.expanded > maxExpand) { this.state = 'failed'; return this.state; }
       const ux = u % n, uz = Math.floor(u / n);
       this.probe(u);
       const hu = this.hgt[u];
+      const nearStation = this.opts.approachLength && (this.heur(u) < this.opts.approachLength || Math.hypot(ux * C - this.from.x, uz * C - this.from.z) < this.opts.approachLength);
       for (const dt of [0, 1, -1]) {
-        if (dt && run < MIN_RUN) continue;
+        if (dt && run < (nearStation ? MIN_RUN : this.minRun)) continue;
         const di = (h + dt + 8) & 7;
         const vx = ux + DIRS[di][0], vz = uz + DIRS[di][1];
         if (vx < 1 || vz < 1 || vx >= n - 1 || vz >= n - 1) continue;
         const v = vz * n + vx;
-        const ns = (v * 8 + di) * 4 + (dt ? 0 : Math.min(3, run + 1));
+        const ns = (v * 8 + di) * this.runs + (dt ? 0 : Math.min(this.runs - 1, run + 1));
         if (this.closed[ns]) continue;
         const f = this.probe(v);
         if (f & 16 && v !== this.goal && u !== this.startV) continue;
@@ -260,8 +272,8 @@ export class CorridorSearch {
     for (let q = s; q >= 0; q = this.parent[q]) chain.push(q);
     chain.reverse();
     for (let i = 0; i < chain.length; i++) {
-      const v = chain[i] >> 5, h = (chain[i] >> 2) & 7;
-      const nh = i + 1 < chain.length ? (chain[i + 1] >> 2) & 7 : -2;
+      const vh = Math.floor(chain[i] / this.runs), v = vh >> 3, h = vh & 7;
+      const nh = i + 1 < chain.length ? Math.floor(chain[i + 1] / this.runs) & 7 : -2;
       if (i === 0 || i === chain.length - 1 || nh !== h) verts.push({ x: (v % this.n) * this.C, z: Math.floor(v / this.n) * this.C });
       lastH = h;
     }
@@ -527,7 +539,50 @@ export interface ChainResult { ok: boolean; error?: string; cost: number; endNod
 
 export interface ChainProfile {
   s: number[]; x: number[]; z: number[]; y: number[]; terr: number[];
-  crossings: { x: number; z: number; mode: 'level' | 'over' | 'under'; edge: number }[];
+  crossings: { x: number; z: number; mode: 'level' | 'over' | 'under'; edge: number; s?: number; span?: number }[];
+}
+
+/** The circular pieces that chained construction fits, including the tangent at the biarc joint. */
+function chainPieces(a: OPoint, b: OPoint): OPoint[] {
+  const L = Math.hypot(b.x - a.x, b.z - a.z);
+  if (L < 1e-6 || (a.tx * (b.x - a.x) + a.tz * (b.z - a.z)) / L > 0.9995 && (b.tx * (b.x - a.x) + b.tz * (b.z - a.z)) / L > 0.9995) return [a, b];
+  const j = biarcJunction(a, b);
+  if (!j || Math.hypot(j.x - a.x, j.z - a.z) < 1.2 || Math.hypot(b.x - j.x, b.z - j.z) < 1.2) return [a, b];
+  const dx = j.x - a.x, dz = j.z - a.z, l = Math.hypot(dx, dz), ux = dx / l, uz = dz / l;
+  const dp = a.tx * ux + a.tz * uz;
+  return [a, { ...j, tx: 2 * dp * ux - a.tx, tz: 2 * dp * uz - a.tz }, b];
+}
+
+/** Validate fitted curves before building, with a separate (still legal) radius at station approaches. */
+function curveConflict(way: OPoint[], minR: number, approachR: number, approachLength: number): { at: P2; radius: number } | null {
+  const lengths = way.map((p, i) => i ? Math.hypot(p.x - way[i - 1].x, p.z - way[i - 1].z) : 0);
+  const total = lengths.reduce((a, b) => a + b, 0);
+  let s = 0;
+  for (let i = 1; i < way.length; i++) {
+    const parts = chainPieces(way[i - 1], way[i]);
+    for (let j = 1; j < parts.length; j++) {
+      const a = parts[j - 1], b = parts[j];
+      const radius = bezMinRadius(fitCurve({ ...a, fixed: true, y: null }, { ...b, fixed: true, y: null }), 48);
+      const required = s < approachLength || total - s - lengths[i] < approachLength ? approachR : minR;
+      if (radius + 1e-3 < required) return { at: { x: (a.x + b.x) / 2, z: (a.z + b.z) / 2 }, radius };
+    }
+    s += lengths[i];
+  }
+  return null;
+}
+
+/** Distance-weighted speed cap of an alignment, including the slower station curves. */
+export function routeCurveSpeed(way: OPoint[], type: string, maxSpeed: number): number {
+  let length = 0, time = 0;
+  for (let i = 1; i < way.length; i++) {
+    const parts = chainPieces(way[i - 1], way[i]);
+    for (let j = 1; j < parts.length; j++) {
+      const bez = fitCurve({ ...parts[j - 1], fixed: true, y: null }, { ...parts[j], fixed: true, y: null });
+      const ds = arcTable(bez).len, speed = Math.min(maxSpeed, TRACK_TYPES[type].speed, curveSpeed(bezMinRadius(bez, 48), type));
+      length += ds; time += ds / speed;
+    }
+  }
+  return time ? length / time : maxSpeed;
 }
 
 /**
@@ -535,19 +590,25 @@ export interface ChainProfile {
  * respects crossings with existing edges (level where possible, else over/under with clearance).
  * Roads cross roads over/under unless `roadJunctions` (country roads meeting at level junctions).
  */
-export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }): ChainProfile | null {
+export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard'): ChainProfile | null {
   const xs: number[] = [], zs: number[] = [], ss: number[] = [], tr: number[] = [];
   let acc = 0;
+  // HSR clearances are tight: sample the same circular pieces the builder will use, rather than a Hermite
+  // approximation that can put a road crossing on the other side of a waypoint.
+  if (type === 'highspeed') way = way.flatMap((b, i) => i ? chainPieces(way[i - 1], b).slice(1) : [b]);
   for (let i = 1; i < way.length; i++) {
     const a = way[i - 1], b = way[i];
-    const L = Math.hypot(b.x - a.x, b.z - a.z);
+    const bez = type === 'highspeed' ? fitCurve({ ...a, fixed: true, y: null }, { ...b, fixed: true, y: null }) : null;
+    const tab = bez ? arcTable(bez) : null;
+    const L = tab?.len ?? Math.hypot(b.x - a.x, b.z - a.z);
     const k = Math.max(1, Math.ceil(L));
     for (let j = i === 1 ? 0 : 1; j <= k; j++) {
       const f = j / k;
       // cubic Hermite between oriented points (approximates the biarc)
       const h00 = 2 * f ** 3 - 3 * f * f + 1, h10 = f ** 3 - 2 * f * f + f, h01 = -2 * f ** 3 + 3 * f * f, h11 = f ** 3 - f * f;
-      const x = h00 * a.x + h10 * a.tx * L + h01 * b.x + h11 * b.tx * L;
-      const z = h00 * a.z + h10 * a.tz * L + h01 * b.z + h11 * b.tz * L;
+      const p = bez ? bezPoint(bez, tAtS(tab!, f * L)) : null;
+      const x = p?.x ?? h00 * a.x + h10 * a.tx * L + h01 * b.x + h11 * b.tx * L;
+      const z = p?.z ?? h00 * a.z + h10 * a.tz * L + h01 * b.z + h11 * b.tz * L;
       if (xs.length) acc += Math.hypot(x - xs[xs.length - 1], z - zs[zs.length - 1]);
       xs.push(x); zs.push(z); ss.push(acc);
       tr.push(terrRef(g, x, z, a.tx, a.tz, tracks));
@@ -566,14 +627,14 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
   }
   lo[0] = hi[0] = y0; lo[n - 1] = hi[n - 1] = y1;
   const step = ss.map((v, i) => (i ? v - ss[i - 1] : 0));
-  const grade = (kind === 'rail' ? TRACK_TYPES.standard.maxGrade : ROAD_TYPES.road.maxGrade) * 0.85;
+  const grade = (kind === 'rail' ? (TRACK_TYPES[type] ?? TRACK_TYPES.standard).maxGrade : ROAD_TYPES.road.maxGrade) * 0.85;
   let y = solveHeights(desired, step, lo, hi, grade);
   if (!y) return null;
   // crossings with existing edges
   const net = g.world.net;
   let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
   for (let i = 0; i < n; i++) { bx0 = Math.min(bx0, xs[i]); bx1 = Math.max(bx1, xs[i]); bz0 = Math.min(bz0, zs[i]); bz1 = Math.max(bz1, zs[i]); }
-  const cr: { i: number; sc: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; edge: number }[] = [];
+  const cr: { i: number; sc: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; span: number; edge: number }[] = [];
   for (const e of net.edgesNear(bx0 - 1, bz0 - 1, bx1 + 1, bz1 + 1)) {
     if (exclude.has(e.id)) continue;
     const box = net.grid.box(e.id);
@@ -590,8 +651,8 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
         const sec = net.sectionAt(e, sOld);
         cr.push({
           i: r[0] < 0.5 ? i : i + 1, sc: ss[i] + (ss[i + 1] - ss[i]) * r[0], x: ax + (bx - ax) * r[0], z: az + (bz - az) * r[0], yo: net.heightAtS(e, sOld),
-          levelOk: Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road' && !roadJunctions),
-          tunnel: sec === 'tunnel', edge: e.id,
+          levelOk: type !== 'highspeed' && e.type !== 'highspeed' && Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road' && !roadJunctions),
+          tunnel: sec === 'tunnel', span: (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(ang)) + 0.3, edge: e.id,
         });
       }
     }
@@ -617,6 +678,10 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
     const base: Mode[] = cr.map((c) => (!c.tunnel && Math.abs(y![c.i] - c.yo) < 0.35 && c.levelOk ? 'level' : y![c.i] >= c.yo ? 'over' : 'under'));
     let modes = base;
     let sol = solve(base);
+    if (!sol && type === 'highspeed') for (const mode of ['over', 'under'] as const) {
+      const cb = cr.map(() => mode), r = solve(cb);
+      if (r) { sol = r; modes = cb; break; }
+    }
     if (!sol && cr.length <= 6) {
       // other combinations, fewest changes first
       const alts = cr.map((c, j) => (['level', 'over', 'under'] as Mode[]).filter((m) => m !== base[j] && (m !== 'level' || (c.levelOk && !c.tunnel))));
@@ -628,7 +693,7 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
     }
     if (!sol) { if (diag) diag.crossings = cr.map((c) => ({ x: c.x, z: c.z })); return null; }
     y = sol;
-    cr.forEach((c, j) => crossings.push({ x: c.x, z: c.z, mode: modes[j], edge: c.edge }));
+    cr.forEach((c, j) => crossings.push({ x: c.x, z: c.z, mode: modes[j], edge: c.edge, s: c.sc, span: c.tunnel ? 0 : c.span }));
   }
   return { s: ss, x: xs, z: zs, y, terr: tr, crossings };
 }
@@ -647,7 +712,7 @@ export function routeConflictAt(g: Game, prof: ChainProfile, kind: NetKind, trac
 }
 
 /** routeConflictAt in steps: a pause every `step` samples along the route (0: none). */
-export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set(), step = 0): Generator<void, P2 | null> {
+export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set(), step = 0, structures = false): Generator<void, P2 | null> {
   const net = g.world.net;
   const hw = (kind === 'rail' ? 0.32 : ROAD_TYPES.road.half) + (tracks - 1) * RAIL.spacing * 0.5;
   const n = prof.x.length;
@@ -664,6 +729,16 @@ export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tr
     const x = prof.x[i], z = prof.z[i];
     // the ends attach to stations/streets
     if (prof.s[i] < 2 || prof.s[n - 1] - prof.s[i] < 2) continue;
+    // A direct HSR alignment has no forbidden grid cells to protect station buildings and depot plots.
+    // Check their actual footprints and vertical clearance, as planEdge does.
+    if (structures) {
+      for (const st of g.stations.footprintsNear(x, z, hw + 0.2)) for (const f of g.stations.footprints(st)) {
+        if (distToRect(x, z, f.x, f.z, f.angle, f.w / 2, f.d / 2) > hw + 0.2) continue;
+        if (f.y0 !== undefined && f.y1 !== undefined && (prof.y[i] + RAIL.clearance <= f.y0 || prof.y[i] - 0.2 >= f.y1)) continue;
+        return { x, z };
+      }
+      if (g.depots.near(x, z, hw + 0.6).length) return { x, z };
+    }
     for (const e of net.edgesNear(x - hw - 1.2, z - hw - 1.2, x + hw + 1.2, z + hw + 1.2)) {
       const box = net.grid.box(e.id);
       if (box && (x < box[0] - hw || x > box[2] + hw || z < box[1] - hw || z > box[3] + hw)) continue;
@@ -695,6 +770,10 @@ export interface RouteOpts {
   parallel?: number; trackClass?: TrackClass;
   /** corridor grid spacing (default by map size; coarser: longer straights, wider curves) */
   cell?: number;
+  /** Rail type: controls grades and whether level crossings are legal. */
+  type?: string;
+  /** Legal slower curves within the station approach, rather than the trunk's speed target. */
+  approachR?: number; approachLength?: number;
 }
 export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; expanded: number }
 
@@ -707,56 +786,69 @@ export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; ex
 export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budget = 2000): Generator<void, RoutePlan | string> {
   const extra: { x0: number; z0: number; x1: number; z1: number; r: number }[] = [];
   const nearEnds = (p: P2, r = 8) => Math.hypot(p.x - from.x, p.z - from.z) < r || Math.hypot(p.x - to.x, p.z - to.z) < r;
+  const physicalR = o.kind === 'rail' ? TRACK_TYPES[o.type ?? 'standard']?.minRadius ?? 0 : 0;
+  const minR = Math.max(physicalR, o.minR ?? 0), approachR = Math.max(physicalR, o.approachR ?? minR);
   let why = '';
-  for (let attempt = 0; attempt <= (o.retries ?? 2); attempt++) {
+  for (let attempt = o.type === 'highspeed' ? -1 : 0; attempt <= (o.retries ?? 2); attempt++) {
     // the straight leads must not overlap when the ends are close
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
-    const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell });
-    while (cs.step(budget) === 'running') yield;
-    if (!cs.path) return why || 'no corridor';
-    const al = alignCorridor(cs.path, from, to, o.rmax, o.rgood);
-    if (al.minR < (o.minR ?? 0)) {
+    let path: P2[] | null = [{ x: from.x, z: from.z }, { x: to.x, z: to.z }], expanded = 0;
+    if (attempt >= 0) {
+      const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, minR: o.type === 'highspeed' ? minR : undefined, approachLength: o.approachLength });
+      while (cs.step(budget) === 'running') yield;
+      path = cs.path; expanded = cs.expanded;
+    }
+    if (!path) return why || 'no corridor';
+    const al = alignCorridor(path, from, to, o.rmax, o.rgood);
+    const way = [...al.way, ...(o.post ?? [])];
+    const fullWay = [...(o.pre ?? []), ...way];
+    const curveHit = o.type === 'highspeed' ? curveConflict(fullWay, minR, approachR, o.approachLength ?? 0) : null;
+    if (curveHit || o.type !== 'highspeed' && al.minR < (o.minR ?? 0)) {
       // a tight corner usually means a jog around an obstacle: search again keeping away from it
       why = 'curves too tight';
-      if (!al.minAt || nearEnds(al.minAt, 6)) return why;
-      extra.push({ x0: al.minAt.x, z0: al.minAt.z, x1: al.minAt.x, z1: al.minAt.z, r: 5 });
+      const at = curveHit?.at ?? al.minAt;
+      if (attempt < 0) continue;
+      if (!at || nearEnds(at, 6)) return why;
+      extra.push({ x0: at.x, z0: at.z, x1: at.x, z1: at.z, r: 5 });
       continue;
     }
     yield;
-    const way = [...al.way, ...(o.post ?? [])];
     const diag = { crossings: [] as P2[] };
-    const prof = chainProfile(g, [...(o.pre ?? []), ...way], o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag);
+    const prof = chainProfile(g, fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag, o.type);
     if (!prof) {
       why = 'too steep';
       const add = diag.crossings.filter((p) => !nearEnds(p));
-      if (!add.length) return why;
+      if (!add.length) { if (attempt < 0) continue; return why; }
       for (const p of add) extra.push({ x0: p.x, z0: p.z, x1: p.x, z1: p.z, r: 5 });
       continue;
     }
     yield;
-    const hit = routeConflictAt(g, prof, o.kind, o.tracks, o.exclude);
+    const hit = o.type === 'highspeed' ? yield* routeConflictGen(g, prof, o.kind, o.tracks, o.exclude, 40, true) : routeConflictAt(g, prof, o.kind, o.tracks, o.exclude);
     if (hit) {
       why = 'route runs along other tracks or roads';
-      if (nearEnds(hit, 3)) return why;
+      if (nearEnds(hit, 3)) { if (attempt < 0) continue; return why; }
       extra.push({ x0: hit.x, z0: hit.z, x1: hit.x, z1: hit.z, r: nearEnds(hit) ? 2.5 : 4 });
       continue;
     }
-    return { way, prof, minR: al.minR, expanded: cs.expanded };
+    return { way, prof, minR: al.minR, expanded };
   }
   return why;
 }
 
 /** Rough construction cost of a profiled chain (track, structures, earthworks). */
-export function estimateChainCost(prof: { y: number[]; terr: number[]; s: number[] }, tracks: number, kind: NetKind, type: string): { cost: number; bridge: number; tunnel: number } {
+export function estimateChainCost(prof: { y: number[]; terr: number[]; s: number[]; crossings?: ChainProfile['crossings'] }, tracks: number, kind: NetKind, type: string): { cost: number; bridge: number; tunnel: number } {
   const per = kind === 'rail' ? (TRACK_TYPES[type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[type] ?? ROAD_TYPES.road).costPerUnit;
+  const hs = kind === 'rail' && type === 'highspeed';
   let cost = 0, bridge = 0, tunnel = 0;
   const hw = kind === 'rail' ? 0.32 + (tracks - 1) * RAIL.spacing * 0.5 : 0.34;
   for (let i = 1; i < prof.y.length; i++) {
     const ds = prof.s[i] - prof.s[i - 1];
     const d = prof.y[i] - prof.terr[i];
-    if (prof.terr[i] < WATER_Y + 0.05 || d > 1.1) { cost += per * 6 * ds * tracks; bridge += ds; }
-    else if (d < -1.9) { cost += per * 9 * ds * tracks; tunnel += ds; }
-    else cost += per * ds * tracks + Math.abs(d) * ds * (hw * 2 + 1.5 + Math.abs(d) * 2) * 900;
+    // Even a low overpass needs a bridge across the crossed line's formation, as in planEdge.
+    const overpass = hs && prof.crossings?.some((c) => c.mode === 'over' && c.s !== undefined && (c.span ?? 0) > 0 && Math.abs(prof.s[i] - c.s) <= c.span!);
+    if (overpass || prof.terr[i] < WATER_Y + 0.05 || d > 1.1) { cost += per * (hs ? structureFactor(kind, 'bridge', d) : 6) * ds * tracks; bridge += ds; }
+    else if (d < -1.9) { cost += per * (hs ? structureFactor(kind, 'tunnel', -d) : 9) * ds * tracks; tunnel += ds; }
+    else cost += per * ds * tracks + Math.abs(d) * ds * (hw * 2 + 1.5 + Math.abs(d) * 2) * 900 * (hs ? TRACK_TYPES.highspeed.formation : 1);
   }
   return { cost, bridge, tunnel };
 }
@@ -797,11 +889,11 @@ export function nodeAt(g: Game, kind: NetKind, x: number, z: number): NNode | nu
 
 /** One planEdge/commit step with fallbacks for crossings and heights. */
 function buildSegment(g: Game, start: Snap, end: Snap, opts: BuildOptions, endY: number | null, res: ChainResult, log?: (s: string) => void): Proposal | null {
-  const tries: Partial<BuildOptions>[] = [{}, { crossing: 'level' }, { crossing: 'over' }, { crossing: 'under' }];
+  const tries: Partial<BuildOptions>[] = opts.type === 'highspeed' ? [{}, { crossing: 'over' }, { crossing: 'under' }] : [{}, { crossing: 'level' }, { crossing: 'over' }, { crossing: 'under' }];
   let last: Proposal | null = null;
   const cl = Math.hypot(end.x - start.x, end.z - start.z) || 1;
   let firstErr = '';
-  for (const useH of endY !== null ? [true, false] : [false]) {
+  for (const useH of endY !== null ? opts.type === 'highspeed' ? [true] : [true, false] : [false]) {
     if (!useH && endY !== null && last) firstErr = last.errors.join(', ') + ` (crossings ${last.crossings.map((c) => c.mode).join('/')})`;
     for (const t of tries) {
       const o: BuildOptions = { ...opts, ...t };
@@ -910,8 +1002,7 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
     return q;
   };
   const yEnd = prof ? prof.y[prof.y.length - 1] : 0;
-  // (wide-curve track: no stubs of a few units between waypoints, they would have to turn sharply)
-  const minLeg = opts.kind === 'rail' && (TRACK_TYPES[opts.type]?.minRadius ?? 0) >= 25 ? 4 : 1.2;
+  const minLeg = 1.2;
   for (let i = 0; i < way.length; i++) {
     const n = net.nodes.get(cur);
     if (!n) { res.error = 'Lost the chain'; return res; }
@@ -925,7 +1016,7 @@ export function* chainGen(g: Game, startNode: number, way: OPoint[], opts: Build
       const ex = new Set<number>(n.edges);
       if (goalNode !== null) for (const id of nodeSnap(g, goalNode, opts.kind).group ?? [goalNode]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
       for (const id of nodeSnap(g, cur, opts.kind).group ?? [cur]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
-      const np = chainProfile(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex);
+      const np = chainProfile(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex, false, undefined, opts.type);
       if (!np) { res.error = 'Too steep: the route left its planned heights'; log?.(`re-plan of heights failed at waypoint ${i}`); return res; }
       prof = np;
     }
