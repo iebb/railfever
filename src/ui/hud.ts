@@ -26,7 +26,7 @@ interface Cat { id: string; label: string; icon: string; color: string; tip: str
 const CATS: Cat[] = [
   { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
   { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, double track, signals, depot, electrify, connect', keys: '2 4 5 J', tools: ['rail', 'double', 'signal', 'depot-rail', 'electrify', 'connect'] },
-  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--metro)', tip: 'Urban rail: metro and light-rail track, stations, lift / sink track', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
+  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'Urban-style rail presets: subway and light-rail track and close-spaced stations, lift / sink track. Ordinary rail: any train and any rail line may use them', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
   { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
   { id: 'tram', label: 'Tram', icon: 'tram', color: 'var(--tram)', tip: 'Tram: tracks, stops, depot', keys: '', tools: ['tram', 'tramstop', 'depot-tram'] },
   { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
@@ -52,9 +52,9 @@ export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string;
   'line-edit': { icon: 'lines', key: '', cat: 'lines', color: 'var(--accent)' },
   double: { icon: 'parallel', key: '', cat: 'rail', color: 'var(--rail)' },
   entrance: { icon: 'entrance', key: '', cat: 'stations', color: 'var(--station)' },
-  metro: { icon: 'metro', key: 'U', cat: 'urban', color: 'var(--metro)' },
-  'metro-station': { icon: 'station', key: '', cat: 'urban', color: 'var(--metro)' },
-  relevel: { icon: 'relevel', key: '', cat: 'urban', color: 'var(--metro)' },
+  metro: { icon: 'metro', key: 'U', cat: 'urban', color: 'var(--rail)' },
+  'metro-station': { icon: 'station', key: '', cat: 'urban', color: 'var(--rail)' },
+  relevel: { icon: 'relevel', key: '', cat: 'urban', color: 'var(--rail)' },
   electrify: { icon: 'bolt', key: '', cat: 'rail', color: 'var(--rail)' },
   connect: { icon: 'connect', key: 'J', cat: 'rail', color: 'var(--rail)' },
 };
@@ -92,8 +92,8 @@ const TRAY_TIP: Partial<Record<ToolId, string>> = {
   double: 'Upgrade to double track: lay a second track beside one of yours, with switches at both ends.',
   electrify: 'Electrify: overhead wire turns standard track into electrified track for electric locomotives and EMUs.',
   connect: 'Connect tracks: a curve with turnouts from one track into another (junctions, through running).',
-  metro: 'Urban track: metro and light rail, underground (subway), elevated or on the ground.',
-  'metro-station': 'Urban station: metro and light-rail stations, underground by default, close together.',
+  metro: 'Urban-style track preset: metro or light-rail track, underground (subway), elevated or on the ground. Ordinary rail for every train and line.',
+  'metro-station': 'Urban-style station preset: metro or light-rail platforms, underground by default, close together. Same walking reach and fares as every rail station.',
   relevel: 'Re-level: lift a stretch of your track onto a viaduct or sink it into a tunnel, in place.',
 };
 const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', double: 'Double', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop', entrance: 'Entrance', metro: 'Urban track', 'metro-station': 'Station', relevel: 'Re-level', electrify: 'Electrify', connect: 'Connect' };
@@ -610,7 +610,7 @@ export class Hud {
         ['auto', 'Auto', 'Choose a permitted crossing for the terrain and track type'],
         ['over', 'Overpass', 'Build above the line being crossed'],
         ['under', 'Underpass', 'Build below the line being crossed'],
-        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and reserved light rail need an overpass or underpass'],
+        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and light-rail track need an overpass or underpass'],
       ], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'electrify') {
@@ -649,7 +649,7 @@ export class Hud {
       const onLine = T.stationOnLine && T.relocating == null;
       if (!onLine) {
         const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', `Metro platforms: ${fmtLen(walkLimit('metro'))} walking distance along streets before building bonuses, platform screen doors, underground by default`], ['lightrail', 'Light rail', `Light-rail platforms: ${fmtLen(walkLimit('lightrail'))} walking distance along streets before building bonuses`]]
+          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`]]
           : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
         if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
         opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));

@@ -33,7 +33,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Free-form track building: click to start, click to build, and keep clicking to chain smooth curves. The planner fits Bezier curves to radius and gradient limits, grades cuttings and embankments, and adds **bridges** (girder, truss or arch), covered **tunnels** with portals sized for parallel tracks, and retaining walls.
 - **Parallel tracks**: build 1–4 tracks at once, or upgrade single track later. Hold Shift over a track to copy it as a parallel track.
 - **Height offset** (PgUp/PgDn or `[` `]`) and crossing preference (auto, **overpass**, **underpass**, level) for grade-separated junctions.
-- Standard and electric track (160 km/h), metro (100 km/h), light rail (80 km/h) and high-speed track (up to 400 km/h). All except standard are electrified; existing standard and platform tracks can be electrified.
+- Standard and electric track (160 km/h), metro (100 km/h), light rail (80 km/h) and high-speed track (up to 400 km/h). All except standard are electrified; existing standard and platform tracks can be electrified. Metro and light rail are construction styles of one rail mode: every train runs on every track type (electric traction under the wire), and one rail line may mix main-line, metro and light-rail track and stations.
 - Ground, elevated and underground lines and stations, with height/depth controls, street entrances and closely spaced urban stops. Re-level existing track and stations together, with connecting ramps.
 - Switches anywhere along a track, diamond crossings, level crossings with animated barriers and buffer stops. **Connect tracks** builds signalled junctions; directional double track gets crossovers immediately outside both station ends.
 - Free-placed stations of any length and orientation, with up to **8 platform tracks**, 1–2 optional through tracks, canopies and platform access. Expansion connects new platforms with automatic throat ladders. Stations can also be inserted into existing lines; depots attach to track ends.
@@ -60,10 +60,10 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 
 **Passengers and economy**
 
-- **Walking catchments**: passengers reach stations and stops by walking along streets from forecourts and entrances, with distances that vary by transport mode and station building. Reachable streets are drawn in each mode’s colour; overlapping catchments share demand. Stations have ratings and waiting passengers grouped by destination.
+- **Walking catchments**: passengers reach stations and stops by walking along streets from forecourts and entrances: up to 420 m for every rail station (whatever its track type), 385 m for trams and 280 m for buses, more with a station building. Residents beyond about 200 m walk less often and count partly. Reachable streets are drawn in each mode’s colour; overlapping catchments share demand. Stations have ratings and waiting passengers grouped by destination.
 - **One route is one line**: routes of the same mode contained in a longer route become service patterns of that line. Lines can share tracks and stations, with **transfers** for local and long-distance journeys.
 - Local, Rapid, Express and Limited Express patterns can skip stops or short-turn at their first and last stopping stations. Non-stopping trains use through tracks where available; passengers board only services that stop where they need to alight.
-- Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. Journeys without transfers get a **20% bonus**.
+- Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. One rail fare for every track type, with a minimum per boarding so short city hops pay too. Journeys without transfers get a **20% bonus**.
 - Operating costs cover energy, crew, vehicle maintenance and track wear; high-speed services cost more to run. The economy includes loans with interest and finance reports with cost breakdowns and charts.
 
 **Sound**

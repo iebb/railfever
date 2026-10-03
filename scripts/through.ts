@@ -222,7 +222,7 @@ function counter(trains: Train[]) {
   while (g.day < 720) g.update(0.25);
   const st = g.ais.map((a) => a.stats);
   const urbanLines = g.lines.all().filter((l) => l.kind === 'rail' && l.owner > 0 && l.stops.some((sid) => { const s2 = g.stations.get(sid); return !!s2?.rail && (s2.rail.trackType === 'metro' || s2.rail.trackType === 'lightrail'); }));
-  console.log(`  2 years (${fmt((performance.now() - t0) / 1000, 0)} s): urban lines ${urbanLines.map((l) => `${l.name} (${new Set(l.stops).size} stations)`).join(', ') || 'none'}; stats urban ${st.map((x) => x.urban).join('/')}, through ${st.map((x) => x.through).join('/')}; ${g.ais.map((a) => a.log.filter((x) => /metro|light rail|through/.test(x)).slice(-3).join(' | ')).join(' || ')}`);
+  console.log(`  2 years (${fmt((performance.now() - t0) / 1000, 0)} s): urban lines ${urbanLines.map((l) => `${l.name} (${new Set(l.stops).size} stations)`).join(', ') || 'none'}; stats urban ${st.map((x) => x.urban).join('/')}, through ${st.map((x) => x.through).join('/')}; ${g.ais.map((a) => a.log.filter((x) => /metro|light rail|city railway|through/.test(x)).slice(-3).join(' | ')).join(' || ')}`);
   check(urbanLines.length >= 1, 'the AI opened an urban railway (metro or light rail)');
 }
 

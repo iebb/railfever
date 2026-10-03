@@ -493,7 +493,9 @@ function streetThroughHouse(blockPop: number, others: number) {
   runNetworkTask(b.ai, 'capacity');
   eco.spend = spend;
   const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - (3000 + 10 * 1250)) < 1e-6);
-  check(stat(b.ai, 'netEntrances') === 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
+  // (this station's entrance: with the doubled walking reach a gate at the far station, whose street ends at the same
+  // roads, can now reach these houses too and pay for itself)
+  check(b.H.rail!.entrances.length === 1 && stat(b.ai, 'netEntrances') >= 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
     `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);
 }
 

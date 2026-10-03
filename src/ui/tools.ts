@@ -11,7 +11,7 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, catchModeOf, entranceAlong, railWidth, entrancesGo } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, entranceAlong, railWidth, entrancesGo } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
@@ -65,8 +65,8 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   bulldoze: { name: 'Demolish', hint: 'Click to remove an object, or drag a rectangle to clear an area. Other companies’ property is protected.' },
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
-  metro: { name: 'Urban rail', hint: 'Metro and light-rail track: underground (subway), elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. Metro units and light-rail vehicles run on it; commuter EMUs run on metro and electrified track, so lines can through-run.' },
-  'metro-station': { name: 'Urban station', hint: `Metro or light-rail station: underground by default, with street entrances; stations may be close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. Walking catchment along streets: metro ${fmtLen(walkLimit('metro'))}, light rail ${fmtLen(walkLimit('lightrail'))}, before station-building bonuses.` },
+  metro: { name: 'Urban-style track', hint: 'A preset for city railways: metro track (subway style) or light-rail track, underground, elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. It is ordinary rail: every train may run on it (electric ones under the wire it carries) and one rail line may mix it with main-line track, so services through-run.' },
+  'metro-station': { name: 'Urban-style station', hint: `A preset for city stations on metro or light-rail track: underground by default with street entrances, side platforms, close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. An ordinary rail station: any rail line may stop here, with the same walking reach (${fmtLen(walkLimit('rail'))} along streets, before station-building bonuses) and fares as every rail station.` },
   electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: standard track becomes electrified track for electric locomotives and EMUs (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
   connect: { name: 'Connect tracks', hint: 'Click a point on one track, then a point on another: a connecting curve with turnouts into both tracks is planned within the curve and grade limits, and signalled where the track is. Click to build; Esc or right-click picks the first track again.' },
   relevel: { name: 'Re-level', hint: 'Drag along a stretch of your track to lift it onto a viaduct or sink it into a tunnel in place, with ramps at both ends; stations on it go with it, lines and signals are kept.' },
@@ -817,7 +817,7 @@ export class Tools {
         const lv = pl.level;
         const moving = this.relocating != null ? g.stations.get(this.relocating) : undefined;
         const bonus = catchBonusOf(pl.style);
-        const reach = Math.round(catchWalkLimit(catchModeOf(railModeOf(pl.trackType)), bonus) * 10);
+        const reach = Math.round(catchWalkLimit('rail', bonus) * 10);
         const tt = TRACK_TYPES[pl.trackType];
         const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
         if (tt) rows.push(['rail', `${esc(tt.name)}${pl.psd ? ' · platform doors' : ''}`]);
@@ -836,8 +836,8 @@ export class Tools {
         if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access — this station won\u2019t attract passengers');
         if (pl.ok && pl.demolish.length) warn.push(`Demolishes ${plural(pl.demolish.length, 'building')}`);
         if (pl.ok && !g.economy.canAfford(pl.cost) && !warn.includes('Not enough money')) warn.push('Not enough money');
-        const kindName = pl.mode === 'metro' ? 'metro station' : pl.mode === 'lightrail' ? 'light-rail station' : 'station';
-        const title = moving ? `Move ${esc(moving.name)}` : lv === 'elevated' ? `Elevated ${kindName}` : lv === 'underground' ? `Underground ${kindName}` : pl.mode === 'mainline' ? 'Train station' : kindName[0].toUpperCase() + kindName.slice(1);
+        // (one kind of rail station: the track type row names the construction style)
+        const title = moving ? `Move ${esc(moving.name)}` : lv === 'elevated' ? 'Elevated station' : lv === 'underground' ? 'Underground station' : 'Train station';
         this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn, hint: moving ? 'Click to move the station here · Esc cancels' : undefined }, pl.ok ? 'ok' : 'err');
         break;
       }
@@ -1467,7 +1467,8 @@ export class Tools {
     // (the forecast leaves out the buildings its access street demolishes)
     const walk = pl.ok ? entrancePlanCatchment(g, st, pl) : null;
     drawCatchStreets(ov, 'hover', walk);
-    const cm = catchModeOf(railModeOf(r.trackType)), R = catchWalkLimit(cm, catchBonusOf(r.style));
+    // (every rail station walks alike: the one rail reach with the station building's bonus)
+    const R = catchWalkLimit('rail', catchBonusOf(r.style));
     let fresh = 0, reach = 0;
     if (walk) {
       const covered = walkingCatchment(g, st).buildings;

@@ -108,9 +108,10 @@ if (want('hsr')) {
   ai.state.cooldown = 1e9;
   const T = [...g.towns.list].sort((p, q) => q.pop - p.pop);
   const pairs: [Town, Town][] = [];
-  // Walking-aware station sites can shorten a town-to-town corridor by almost a kilometre. Leave enough
-  // actual running distance for the HSR acceleration/braking physics to exceed 160 km/h in this speed test.
-  for (const A of T) for (const B of T) { if (A.id >= B.id || Math.min(A.pop, B.pop) < 1500) continue; const d = Math.hypot(A.x - B.x, A.z - B.z); if (d >= 340 && d <= 450) pairs.push([A, B]); }
+  // Walking-aware station sites can shorten a town-to-town corridor by almost a kilometre, more with the doubled
+  // walking reach (sites at the facing edges of the towns still cover them). Leave enough actual running distance
+  // for the HSR acceleration/braking physics to exceed 160 km/h in this speed test.
+  for (const A of T) for (const B of T) { if (A.id >= B.id || Math.min(A.pop, B.pop) < 1500) continue; const d = Math.hypot(A.x - B.x, A.z - B.z); if (d >= 400 && d <= 520) pairs.push([A, B]); }
   pairs.sort((p, q) => q[0].pop * q[1].pop - p[0].pop * p[1].pop);
   AIController.forceBuild = true;
   // (the first pairs whose route can be built: a high-speed line needs wide curves and gentle grades)
@@ -185,23 +186,30 @@ if (want('express')) {
 // ------------------------------------------------------------------ 5. underground station in a big town's centre
 if (want('centre')) {
   console.log('underground city-centre station');
-  const g = Game.create({ size: 768, seed: 5, towns: 16, hilliness: 'flat', water: 'low', startYear: 2000, aiConfigs: [{ startMoney: 300_000_000 }] });
-  g.aiAcquisitions = false;
-  const ai = AI(g);
-  ai.state.cooldown = 1e9;
+  const make = () => {
+    const g = Game.create({ size: 768, seed: 5, towns: 16, hilliness: 'flat', water: 'low', startYear: 2000, aiConfigs: [{ startMoney: 300_000_000 }] });
+    g.aiAcquisitions = false;
+    AI(g).state.cooldown = 1e9;
+    return g;
+  };
+  let g = make(), ai = AI(g);
   const T = [...g.towns.list].sort((p, q) => q.pop - p.pop);
-  const big = T[0];
-  // (the first of a few partner towns whose railway can be built: routes depend on the land between)
-  const others = T.filter((t) => t !== big && t.pop > 800 && Math.hypot(t.x - big.x, t.z - big.z) > 150 && Math.hypot(t.x - big.x, t.z - big.z) < 340).slice(0, 4);
+  let big = T[0];
+  // (the first of a few partner towns whose railway leaves the centre underground: routes depend on the land
+  // between, and where the tunnel cannot climb out towards a partner the AI drops the underground station and builds
+  // on the ground; each partner is tried on a fresh copy of the map)
+  const others = T.filter((t) => t !== big && t.pop > 800 && Math.hypot(t.x - big.x, t.z - big.z) > 150 && Math.hypot(t.x - big.x, t.z - big.z) < 340).slice(0, 4).map((t) => t.id);
   AIController.forceBuild = true;
   let st: Station | undefined, other: Town | undefined;
   if (big.pop < AIController.centrePop) console.log(`  (no big town: ${big.name} ${big.pop})`);
-  else for (const o of others) {
+  else for (const [i, oid] of others.entries()) {
+    if (i > 0) { g = make(); ai = AI(g); big = g.towns.list[big.id]; }
+    const o = g.towns.list[oid];
     ai.startProject('rail', [big.id, o.id]);
     while (ai.busy) g.update(0.25);
     console.log(`  ${big.name} (${big.pop}) - ${o.name}: ${ai.log.slice(-2).join(' | ')}`);
     st = [...g.stations.map.values()].find((s) => s.townId === big.id && s.owner === ai.companyId && s.rail);
-    if (st && g.lines.all().some((l) => l.owner === ai.companyId && l.stops.includes(st!.id))) { other = o; break; }
+    if (st && g.lines.all().some((l) => l.owner === ai.companyId && l.stops.includes(st!.id))) { other = o; if (st.rail!.level === 'underground') break; }
   }
   AIController.forceBuild = false;
   console.log(`  station ${st?.name} ${st?.rail?.level} ${st ? fmt(Math.hypot(st.x - big.x, st.z - big.z), 0) + ' u from the centre' : ''}${other ? ', line to ' + other.name : ''}`);

@@ -54,7 +54,7 @@ import type { RoadVehicle, RSeg } from './roadvehicle';
 import { tramUsable } from './build-ops';
 import { closestOnPolyline } from './geom';
 import { YEAR_S, estimateVehicleYear } from './opcosts';
-import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, type WalkingCatchment } from './catchment';
+import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
 
 // ============================================================================ optional primitives (feature-detected)
@@ -1797,9 +1797,9 @@ class NetPlanner {
     if (!r) return 0;
     const b0 = styleOf(r.style).catchBonus ?? 0, b1 = styleOf(style).catchBonus ?? 0;
     if (!(b1 > b0)) return 0;
-    const mode = railModeOf(r.trackType), cm = mode === 'mainline' ? 'rail' : mode;
-    const shapes = (b: number) => (r.level ?? 'ground') === 'ground' ? railCatchShapes(r.x, r.z, r.angle, r.length, true, cm, b)
-      : r.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + b), mode: cm, active: true }));
+    // (one walking reach for every rail station, whatever its track type)
+    const shapes = (b: number) => (r.level ?? 'ground') === 'ground' ? railCatchShapes(r.x, r.z, r.angle, r.length, true, 'rail', b)
+      : r.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS.rail * (1 + b), mode: 'rail' as const, active: true }));
     const inner = shapes(b0), outer = shapes(b1);
     const others = [...g.stations.map.values()].filter((o) => o !== st && o.rail && Math.hypot(o.x - st.x, o.z - st.z) < 160).flatMap((o) => g.stations.catchmentShapes(o, true));
     let extra = 0;
@@ -2059,15 +2059,18 @@ class NetPlanner {
     if (!this.linesAt(st.id).some((l) => this.fleet(l).ours.length)) return finish('ent.unserved');
     const covered = walkingCatchment(g, st).buildings;
     const perRes = this.residentValue(st), years = 5 + 5 * this.ai.config.risk;
-    /** residents a catchment newly brings to this station, shared with the other served stations reaching them */
+    /**
+     * residents a catchment newly brings to this station, counted as the share-out counts them (Stations.computeShares):
+     * beyond FULL_COVER_WALK only partly (fewer walk that far), shared with the other served stations reaching them
+     */
     const newly = (walk: WalkingCatchment) => {
       let pop = 0;
-      for (const id of [...walk.buildings.keys()].sort((a, b) => a - b)) {
+      for (const [id, at] of [...walk.buildings].sort((a, b) => a[0] - b[0])) {
         if (covered.has(id)) continue;
         const b = g.world.buildings.get(id);
         if (!b || b.pop <= 0) continue;
         const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
-        pop += b.pop / (1 + others);
+        pop += b.pop * Math.min(1, walkWeight(at.distance) / FULL_COVER_WEIGHT) / (1 + others);
       }
       return pop;
     };
@@ -2106,7 +2109,9 @@ class NetPlanner {
     for (const id of [...(plan.access?.demolish ?? [])].sort((a, b) => a - b)) {
       const b = g.world.buildings.get(id);
       if (!b || !covered.has(id)) continue;
-      lost += b.pop / (1 + g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length);
+      // (the station's share of them now, partial coverage included; before the next share-out an equal split)
+      const sf = g.stations.stationsForBuilding(id), k = sf.st.indexOf(st.id);
+      lost += k >= 0 ? b.pop * sf.w[k] : b.pop / (1 + sf.st.filter((s) => s !== st.id && g.lines.stationServed(s)).length);
     }
     // (the forecast leaves out what its street demolishes; residents the station reaches there are lost)
     const pop = newly(entrancePlanCatchment(g, st, plan)) - lost;
@@ -2844,8 +2849,9 @@ class NetPlanner {
   // ================================================================ stations inserted where towns grew (9l)
   /** Residents within a station's catchment at (x, z) along a line not covered by any other rail station there. */
   private uncovered(x: number, z: number, angle: number, length: number, mode: 'mainline' | 'metro' | 'lightrail', coverCache: Map<number, boolean>, existing: { x: number; z: number; r: number }[]): number {
-    const g = this.g, w = g.world, cm = mode === 'mainline' ? 'rail' : mode;
-    const shapes = railCatchShapes(x, z, angle, length, true, cm, 0);
+    // (one walking reach for every rail style: `mode` sets only the callers' spacing and thresholds)
+    const g = this.g, w = g.world;
+    const shapes = railCatchShapes(x, z, angle, length, true, 'rail', 0);
     let pop = 0;
     const seen = new Set<number>();
     for (const c of shapes) for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
@@ -2955,9 +2961,9 @@ class NetPlanner {
       const mode = railModeOf(sts[0].rail!.trackType);
       let covered = cover.get(mode);
       if (!covered) cover.set(mode, covered = new Map());
-      const existing = [...g.stations.map.values()].filter((s) => s.rail && railModeOf(s.rail.trackType) === mode)
-        .flatMap((s) => g.stations.catchmentShapes(s, true));
-      const spacing = MIN_SPACING[mode], R = CATCHMENT_RADIUS[mode === 'mainline' ? 'rail' : mode];
+      // (every rail station covers its residents, whatever its track type)
+      const existing = [...g.stations.map.values()].filter((s) => s.rail).flatMap((s) => g.stations.catchmentShapes(s, true));
+      const spacing = MIN_SPACING[mode], R = CATCHMENT_RADIUS.rail;
       const platform = this.platformFor(l);
       let best: { e: number; s: number; pop: number; x: number; z: number; a: number; b: number } | null = null;
       for (const [a, b] of this.pairsOf(l)) {

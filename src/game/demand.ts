@@ -9,14 +9,14 @@
 // reports towns, regions, town pairs and the largest regional flows for the UI.
 import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
-import { WALK_LINE, railModeOf } from './stations';
+import { WALK_LINE, PLATFORM_LENGTH } from './stations';
 import type { Hop } from './lines';
-import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, NO_TRANSFER_BONUS, type DemandSite, type UrbanMode } from './fares';
+import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, NO_TRANSFER_BONUS, type DemandSite, type FareMode } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
 import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
-import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, type WalkingCatchment } from './catchment';
+import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns } from './patterns';
 
 export interface Region {
@@ -69,9 +69,11 @@ const INTRA = 0.35;
 /** Stations closer than this (units) share few trips within a region (people walk). */
 const WALK = 25;
 
-/** Only short trips within the same town get the urban uplift; regional and long-distance OD stay unchanged. */
-export function localTripMultiplier(g: Game, site: DemandSite, mode: UrbanMode | 'mainline', quality = 1): number {
-  if (mode === 'mainline') return 1;
+/**
+ * Only short trips within the same town get the urban uplift, by mode (rail: every track type alike); regional and
+ * long-distance OD stay unchanged.
+ */
+export function localTripMultiplier(g: Game, site: DemandSite, mode: FareMode, quality = 1): number {
   return 1 + URBAN_DEMAND[mode] * urbanIntensity(g, site) * Math.max(0.35, Math.min(1.5, quality));
 }
 const localCapture = (local: number, localF: number) => local > 0
@@ -331,12 +333,12 @@ export class DemandModel {
     return tripFactor(Math.max(1, hop.cost), refTime(Math.hypot(d.x - st.x, d.z - st.z), centre)) / TF_TYPICAL;
   }
 
-  /** Only actual cross-town main-line patterns attract car feeders; combine their scheduled frequencies. */
+  /** Only actual cross-town rail patterns (any track type) attract car feeders; combine their scheduled frequencies. */
   private mainlineFrequency(st: Station): number {
     let frequency = 0;
     for (const l of this.g.lines.map.values()) {
       if (l.kind !== 'rail' || !l.stops.includes(st.id) || !l.stops.some((id) => {
-        const s = this.g.stations.get(id); return s?.rail && s.townId !== st.townId && railModeOf(s.rail.trackType) === 'mainline';
+        const s = this.g.stations.get(id); return s?.rail && s.townId !== st.townId;
       })) continue;
       for (const h of patternHeadways(this.g, l)) {
         const p = linePatterns(l).find((p) => p.id === h.pid);
@@ -466,7 +468,7 @@ export class DemandModel {
       if (!stationActive(this.g, st) || !this.g.lines.stationServed(st.id)) continue;
       if ([...(this.g.lines.routing.get(st.id)?.keys() ?? [])].some((id) => this.g.stations.get(id)?.townId !== st.townId))
         for (const bid of walkingCatchment(this.g, st).buildings.keys()) covered.add(bid);
-      if (st.rail && railModeOf(st.rail.trackType) === 'mainline') stations.push(st);
+      if (st.rail) stations.push(st);
     }
     const pools = this.feederPools(stations.map((st) => this.feederSite(st)), covered);
     stations.forEach((st, i) => this.feeders.set(st.id, pools[i]));
@@ -520,7 +522,7 @@ export class DemandModel {
     const n = this.regions.length, od = this.od, ld = this.ld;
     const parts: { d: number; x: number; y: number; f: number; local: number; feeder: number }[] = [];
     let local = 0, localF = 0;
-    const mode = st.rail ? railModeOf(st.rail.trackType) : st.stops.some((s) => g.world.net.edges.get(s.edge)?.tram) ? 'tram' : 'bus';
+    const mode: FareMode = st.rail ? 'rail' : st.stops.some((s) => g.world.net.edges.get(s.edge)?.tram) ? 'tram' : 'bus';
     for (const [d, hop] of table) {
       const ds = g.stations.get(d);
       if (!ds || !stationActive(g, ds)) continue;
@@ -538,7 +540,7 @@ export class DemandModel {
       if (!(x > 0) && !(y > 0)) continue;
       const f = this.serviceFactor(st, ds, hop);
       parts.push({ d, x, y, f, local: sameTown ? localTripMultiplier(g, st, mode, f) * st.catchPop / Math.max(1, originPop) : 1,
-        feeder: !sameTown && mode === 'mainline' && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1 });
+        feeder: !sameTown && mode === 'rail' && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1 });
       local += x; localF += x * f;
     }
     // local trips: the station's rate (60% of the full rate for a single destination, the full rate once it reaches
@@ -560,9 +562,12 @@ export class DemandModel {
   /**
    * Read-only project estimate using street walks, the same overlapping-building shares, OD capture and service
    * elasticity as weights(). Counts covered people once. No fixed town coverage or assumed train occupancy.
-   * Transfer demand is existing main-line arrivals continuing to these districts, not another population pool.
+   * One rail model whatever the construction `style` of the stops (only the platform length, for the queue a stop
+   * holds, follows it): every stop is limited by the queue it holds between trains. Cross-town trips draw on the car
+   * feeder pool too; a city line's (every stop in one town) transfer demand is the arrivals at the town's other served
+   * rail stations continuing to these districts, not another population pool.
    */
-  forecastLine(points: (StationPlan | Station | ForecastSite)[], mode: RailMode, kmh: number, headway: number): ServiceForecast {
+  forecastLine(points: (StationPlan | Station | ForecastSite)[], style: RailMode, kmh: number, headway: number): ServiceForecast {
     const g = this.g;
     if (!this.regions.length) this.rebuild();
     const n = this.regions.length;
@@ -572,23 +577,26 @@ export class DemandModel {
       return { x: p.x, z: p.z, townId, pop: 0, regions: new Map<number, number>(),
         walk: 'walk' in p ? p.walk : built ? walkingCatchment(g, p) : planWalkingCatchment(g, p) };
     });
+    const ownStation = (id: number) => points.some((p) => 'id' in p && p.id === id);
     const sums = new Map<number, number>();
-    for (const s of sites) for (const [bid, walk] of s.walk.buildings) sums.set(bid, (sums.get(bid) ?? 0) + 1 / (1 + walk.distance / 8));
-    // Competing served stops share a building just as they do after construction.
+    for (const s of sites) for (const [bid, walk] of s.walk.buildings) sums.set(bid, (sums.get(bid) ?? 0) + walkWeight(walk.distance));
+    // Competing served stops share a building just as they do after construction (far-only buildings partly covered).
     for (const st of g.stations.map.values()) {
-      if (points.some((p) => 'id' in p && p.id === st.id) || !g.lines.stationServed(st.id)) continue;
-      for (const [bid, walk] of walkingCatchment(g, st).buildings) if (sums.has(bid)) sums.set(bid, sums.get(bid)! + 1 / (1 + walk.distance / 8));
+      if (ownStation(st.id) || !g.lines.stationServed(st.id)) continue;
+      for (const [bid, walk] of walkingCatchment(g, st).buildings) if (sums.has(bid)) sums.set(bid, sums.get(bid)! + walkWeight(walk.distance));
     }
     for (const s of sites) for (const [bid, walk] of s.walk.buildings) {
       const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
-      const pop = b.pop / (1 + walk.distance / 8) / sums.get(bid)!;
+      const pop = b.pop * walkWeight(walk.distance) / Math.max(sums.get(bid)!, FULL_COVER_WEIGHT);
       const r = this.regionOf(b); if (r < 0) continue;
       s.pop += pop; s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
     }
     // Keep the walking-only population for intra-town trips: car feeders provide regional access, not extra
     // local residents at the platforms. This matches weights() when a through railway has several city stops.
     const walking = sites.map((s) => ({ pop: s.pop, regions: new Map(s.regions) }));
-    if (mode === 'mainline') {
+    // A city line has no cross-town trips, hence no car feeders (as in weights(): only cross-town service has a pool).
+    const city = sites.every((s) => s.townId >= 0 && s.townId === sites[0].townId);
+    if (!city) {
       const covered = new Set<number>(sums.keys());
       for (const st of g.stations.map.values()) if (g.lines.stationServed(st.id)
         && [...(g.lines.routing.get(st.id)?.keys() ?? [])].some((id) => g.stations.get(id)?.townId !== st.townId))
@@ -597,14 +605,15 @@ export class DemandModel {
         const p = points[i], access = 'access' in p ? p.access?.tracks.flatMap((t) => [t.start, t.end]) : undefined;
         return 'id' in p ? { ...s, quality: feederQuality(headway), access: this.feederSite(p).access } : { ...s, quality: feederQuality(headway), access };
       });
-      for (const st of g.stations.map.values()) if (st.rail && railModeOf(st.rail.trackType) === 'mainline' && stationActive(g, st)
-        && g.lines.stationServed(st.id) && !points.some((p) => 'id' in p && p.id === st.id)) extra.push(this.feederSite(st));
+      for (const st of g.stations.map.values()) if (st.rail && stationActive(g, st) && g.lines.stationServed(st.id) && !ownStation(st.id))
+        extra.push(this.feederSite(st));
       const pools = this.feederPools(extra, covered);
       sites.forEach((s, i) => {
         s.pop += pools[i].pop;
         for (const [r, pop] of pools[i].regions) s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
       });
     }
+    const platform = PLATFORM_LENGTH[style] ?? PLATFORM_LENGTH.mainline;
     let boardings = 0, revenue = 0, transfers = 0;
     for (let i = 0; i < sites.length; i++) {
       const s = sites[i]; if (!s.pop) continue;
@@ -630,32 +639,33 @@ export class DemandModel {
       const k = localF > 0 ? localCapture(local, localF) / localF : 0;
       const wanted = parts.map((p) => {
         const sameTown = s.townId >= 0 && s.townId === sites[p.j].townId;
-        const factor = sameTown ? localTripMultiplier(g, s, mode, p.f) * p.sourceShare : 1;
-        const feeder = mode === 'mainline' && !sameTown ? 1 + MAINLINE_FEEDER_SHARE : 1;
+        const factor = sameTown ? localTripMultiplier(g, s, 'rail', p.f) * p.sourceShare : 1;
+        const feeder = !sameTown ? 1 + MAINLINE_FEEDER_SHARE : 1;
         const count = s.pop * TRIPS_PER_MONTH * 12 * (p.count * p.f * k * factor + p.ld * Math.max(0.3, Math.min(2, p.f))) * feeder;
         return count;
       });
-      // Passengers abandon queues between sparse physically timed trains. Use the very same useful queue
-      // ceiling as Stations.trimWaiting, with one call per cycle at termini and two in the middle.
+      // Passengers abandon queues between sparse physically timed trains. Use the very same useful queue ceiling as
+      // Stations.trimWaiting (walking residents and platform space), with one call per cycle at termini and two in
+      // the middle, for every rail stop (a busy city stop on a through line as on a city line).
       const sum = wanted.reduce((a, c) => a + c, 0);
-      const queue = Math.min(300, 12 + s.pop * 0.035 + 2 * (mode === 'metro' ? 12 : mode === 'lightrail' ? 7 : 12) * 0.75);
+      const queue = Math.min(300, 12 + walking[i].pop * 0.035 + 2 * platform * 0.75);
       const slots = queue * (360 * DAY_SECONDS) / Math.max(1, headway) * (i === 0 || i === sites.length - 1 ? 1 : 2);
-      const capture = mode === 'mainline' ? 1 : Math.min(1, slots / Math.max(1, sum));
+      const capture = Math.min(1, slots / Math.max(1, sum));
       for (let j = 0; j < parts.length; j++) {
         const p = parts[j], count = wanted[j] * capture;
         boardings += count;
-        revenue += fareFor(p.d, p.seconds, count, { mode: mode === 'mainline' ? undefined : mode, centre: p.centre }) * (1 + NO_TRANSFER_BONUS);
+        revenue += fareFor(p.d, p.seconds, count, { mode: 'rail', centre: p.centre }) * (1 + NO_TRANSFER_BONUS);
       }
     }
-    if (mode !== 'mainline') for (const st of g.stations.map.values()) {
-      if (!st.rail || railModeOf(st.rail.trackType) !== 'mainline' || !g.lines.stationServed(st.id)) continue;
+    if (city) for (const st of g.stations.map.values()) {
+      if (!st.rail || ownStation(st.id) || !g.lines.stationServed(st.id)) continue;
       const near = sites.find((s) => s.townId === st.townId && Math.hypot(s.x - st.x, s.z - st.z) <= 16);
       if (!near) continue;
       const arrivals = Math.max(st.arrivedLast * 12, st.catchPop * TRIPS_PER_MONTH * 12 * this.weights(st).served);
       const count = arrivals * 0.3; // continuing inbound trips and the reciprocal trip to the station
       const d = Math.max(15, sites.reduce((a, s) => a + Math.hypot(s.x - near.x, s.z - near.z), 0) / sites.length);
       transfers += count; boardings += count;
-      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode, centre: urbanIntensity(g, near) });
+      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode: 'rail', centre: urbanIntensity(g, near) });
     }
     return { boardings, revenue, transfers, covered: sites.reduce((a, s) => a + s.pop, 0) };
   }

@@ -4,7 +4,7 @@ import type { Building } from './world';
 import { curvePoint, type NEdge, type EdgeGeo } from './network';
 import type { Snap } from './construction';
 import type { Station, StationPlan, CatchMode, RailMode, EntrancePlan } from './stations';
-import { CATCHMENT_RADIUS, ENTRANCE_SIZE, catchModeOf, railModeOf, entranceKind, entranceLandings, landingReach } from './stations';
+import { CATCHMENT_RADIUS, ENTRANCE_SIZE, entranceKind, entranceLandings, landingReach } from './stations';
 import { ROAD_TYPES } from './constants';
 import { closestOnPolyline, arcTable, bezPoint, tAtS } from './geom';
 import { styleOf } from './station-styles';
@@ -14,7 +14,17 @@ import { SpatialGrid, RegionVersions, type RegionSnapshot } from './spatial';
 export const WALK_DETOUR = 1.25;
 /** Maximum off-street walk from a building's facade door to its frontage on a road. */
 export const FRONTAGE_REACH = 3;
+/** Walking budget along streets: the mode's nominal limit (one for every rail station), building bonus, grid allowance. */
 export const walkLimit = (mode: CatchMode, bonus = 0) => CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR;
+/** Weight of a building for a station it can walk to, by the walk along streets (units): nearer stations get more. */
+export const walkWeight = (distance: number) => 1 / (1 + distance / 8);
+/**
+ * Residents within this walk (units along streets) of the stations that reach them are fully covered. Farther ones
+ * walk less often: their coverage falls with the walking weight, relative to its value here (about 0.6 at a rail
+ * station's full reach), so the doubled reach adds riders at a falling rate. Shares never sum past 1.
+ */
+export const FULL_COVER_WALK = 21;
+export const FULL_COVER_WEIGHT = walkWeight(FULL_COVER_WALK);
 
 export function pedestrianRoad(e: NEdge): boolean {
   return e.kind === 'road' && e.depot < 0 && ROAD_TYPES[e.type]?.pedestrians !== false;
@@ -93,6 +103,28 @@ function snapRoad(g: Game, x: number, z: number, reach: number): RoadPoint | nul
   return best;
 }
 
+/**
+ * A station's own forecourt street, where snapRoad finds no street at ground level: its dead end at the forecourt,
+ * whatever lies there. The street is laid before the station levels its ground, so its first metres can end up below
+ * (or above) the levelled forecourt; the station's steps bridge that, as Stations.railReachable assumes.
+ */
+function forecourtStreet(g: Game, x: number, z: number, reach: number): RoadPoint | null {
+  const net = g.world.net;
+  let best: RoadPoint | null = null;
+  for (const id of net.grid.query(x - reach, z - reach, x + reach, z + reach)) {
+    const e = net.edges.get(id);
+    if (!e || !pedestrianRoad(e)) continue;
+    for (const [node, s] of [[e.a, 0], [e.b, e.len]] as const) {
+      const n = net.nodes.get(node);
+      if (!n || n.edges.length !== 1) continue;
+      const d = Math.hypot(n.x - x, n.z - z);
+      if (d > reach || (best && (d > best.leg || (d === best.leg && id > best.edge)))) continue;
+      best = { edge: id, s, leg: d, x, z };
+    }
+  }
+  return best;
+}
+
 /** Can a walk start from (x, z) onto a street within `reach` (on the ground, at about its height, not across water)? */
 export function walkableStreetNear(g: Game, x: number, z: number, reach: number): boolean { return !!snapRoad(g, x, z, reach); }
 
@@ -111,16 +143,16 @@ function stationAccess(g: Game, st: Station, skip = -1): Access[] {
   const out: Access[] = [], r = st.rail;
   if (!st.roadAccess) return out;
   if (r) {
-    const mode = catchModeOf(railModeOf(r.trackType)), limit = walkLimit(mode, styleOf(r.style).catchBonus);
-    const add = (p: { x: number; z: number } | null | undefined, reach: number) => {
+    const mode: CatchMode = 'rail', limit = walkLimit(mode, styleOf(r.style).catchBonus);
+    const add = (p: { x: number; z: number } | null | undefined, reach: number, forecourt = false) => {
       if (!p) return;
-      const q = snapRoad(g, p.x, p.z, reach);
+      const q = snapRoad(g, p.x, p.z, reach) ?? (forecourt ? forecourtStreet(g, p.x, p.z, reach) : null);
       if (q) out.push({ ...q, mode, limit });
     };
     const level = r.level ?? 'ground';
     if (level === 'ground') {
       const reach = styleOf(r.style).placement === 'none' ? 1.6 : 0.9;
-      add(g.stations.forecourt(st), reach); add(r.forecourt2, reach);
+      add(g.stations.forecourt(st), reach, true); add(r.forecourt2, reach, true);
       // added entrances: a side hall or gate, a footbridge's / underpass's stairs on either side of the tracks
       r.entrances.forEach((e, i) => { if (i !== skip) for (const p of entranceLandings(e)) add(p, landingReach(entranceKind(level, e))); });
     } else {
@@ -377,19 +409,18 @@ class WalkingCache {
     c.complexEpoch = this.complexEpoch;
     if (!c.lots || !w.lotVersions.unchanged(c.lots) || terrainChanged) {
       // With unchanged walking paths, an attributed lot edit only needs that building's distance.
+      const squares = sources.map((s) => { const r = s.limit + FRONTAGE_REACH; return [s.x - r, s.z - r, s.x + r, s.z + r]; });
       const changed = !graphChanged && !terrainChanged && c.lots ? w.changedLots(c.lots) : null;
       const ids = changed ?? new Set<number>(), buildings = changed ? new Map(c.value.buildings) : new Map<number, WalkBuilding>();
-      if (!changed) for (const s of sources) {
-        const r = s.limit + FRONTAGE_REACH;
-        for (const id of w.bgrid.query(s.x - r, s.z - r, s.x + r, s.z + r)) ids.add(id);
-      }
+      if (!changed) for (const q of squares) for (const id of w.bgrid.query(q[0], q[1], q[2], q[3])) ids.add(id);
       for (const id of ids) {
         buildings.delete(id);
         const b = w.buildings.get(id); if (!b) continue;
         if (changed) {
           const box = w.bgrid.box(id);
-          if (!box || !sources.some((s) => { const r = s.limit + FRONTAGE_REACH;
-            return box[0] <= s.x + r && box[2] >= s.x - r && box[1] <= s.z + r && box[3] >= s.z - r; })) continue;
+          let inside = false;
+          if (box) for (const q of squares) if (box[0] <= q[2] && box[2] >= q[0] && box[1] <= q[3] && box[3] >= q[1]) { inside = true; break; }
+          if (!inside) continue;
         }
         const p = this.frontage(b); if (!p) continue;
         for (const reach of c.reaches) {
@@ -493,14 +524,14 @@ export function walkingCatchmentWithout(g: Game, st: Station, entrance: number):
 }
 /**
  * Walking catchment from extra access points of a station on their own (an entrance being planned or valued, or one
- * entrance's reach): the station's mode and building bonus; passages through the station lead only between these
- * points. Each point snaps to a road within `reach`; `legScale` stretches that walk (a street still to be built
+ * entrance's reach): the one rail reach and the station building's bonus; passages through the station lead only
+ * between these points. Each point snaps to a road within `reach`; `legScale` stretches that walk (a street still to be built
  * rarely runs straight) and `leg` is walked before it.
  */
 export function extraAccessCatchment(g: Game, st: Station, points: { x: number; z: number; reach: number; leg?: number; legScale?: number }[]): WalkingCatchment {
   const r = st.rail;
   if (!r) return EMPTY;
-  const mode = catchModeOf(railModeOf(r.trackType)), limit = walkLimit(mode, styleOf(r.style).catchBonus), sources: Access[] = [];
+  const mode: CatchMode = 'rail', limit = walkLimit(mode, styleOf(r.style).catchBonus), sources: Access[] = [];
   for (const p of points) {
     const q = snapRoad(g, p.x, p.z, p.reach);
     if (q) sources.push({ ...q, leg: q.leg * (p.legScale ?? 1) + (p.leg ?? 0), mode, limit });
@@ -567,7 +598,7 @@ function accessSnap(g: Game, sn: Snap, mode: CatchMode, bonus: number, leg: numb
 /** Read-only hover estimate. Proposed access streets debit their length before reaching existing roads. */
 export function planWalkingCatchment(g: Game, plan: StationPlan): WalkingCatchment {
   if (!plan.roadAccess) return EMPTY;
-  const mode = catchModeOf(plan.mode), bonus = styleOf(plan.style).catchBonus, limit = walkLimit(mode, bonus), sources: Access[] = [];
+  const mode: CatchMode = 'rail', bonus = styleOf(plan.style).catchBonus, limit = walkLimit(mode, bonus), sources: Access[] = [];
   const add = (p: { x: number; z: number } | null | undefined, reach: number) => { if (p) { const q = snapRoad(g, p.x, p.z, reach); if (q) sources.push({ ...q, mode, limit }); } };
   if (plan.level === 'ground') { add(plan.forecourt, styleOf(plan.style).placement === 'none' ? 1.6 : 0.9); add(plan.forecourt2, 0.9); }
   else { for (const e of plan.entrances) add(e, ENTRANCE_SIZE[plan.level].d / 2 + 0.9); if (styleOf(plan.style).placement !== 'none') add(plan.forecourt, 0.9); }
@@ -619,9 +650,9 @@ export function stopWalkingCatchment(g: Game, edge: number, s: number, mode: 'tr
   return q ? cache(g).calculate(`stop:${edge}:${s}:${mode}`, [q]) : EMPTY;
 }
 
-/** Fast AI site estimate, deliberately beginning at the nearest usable road node. */
+/** Fast AI site estimate, deliberately beginning at the nearest usable road node. Any rail style walks as 'rail'. */
 export function walkSitePop(g: Game, x: number, z: number, mode: CatchMode | RailMode | 'road'): number {
-  const cm: CatchMode = mode === 'mainline' ? 'rail' : mode === 'road' ? 'bus' : mode;
+  const cm: CatchMode = mode === 'road' ? 'bus' : mode === 'tram' || mode === 'bus' ? mode : 'rail';
   const net = g.world.net, limit = walkLimit(cm);
   const usable = (n: { edges: number[] }) => n.edges.some((id) => { const e = net.edges.get(id); return !!e && pedestrianRoad(e); });
   let n = net.nearestNode(x, z, limit, 'road', usable);

@@ -8,11 +8,15 @@
 // compressed (DAY_SECONDS per game day), so waits and rides are real-time seconds even though a year passes in
 // 360 * DAY_SECONDS of them. `simNow(g)` is the continuous clock.
 import type { Game } from './game';
-import { DAY_SECONDS, UNIT_M, PASSENGER_FARE_SCALE, PASSENGER_LONG_FARE_SCALE, PASSENGER_FARE_BLEND, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_FARES, URBAN_DEMAND } from './constants';
+import { DAY_SECONDS, UNIT_M, PASSENGER_FARE_SCALE, PASSENGER_LONG_FARE_SCALE, PASSENGER_FARE_BLEND, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, RAIL_FARE, ROAD_FARES, URBAN_DEMAND } from './constants';
 import type { Station } from './stations';
 
-export type UrbanMode = keyof typeof URBAN_FARES;
-export interface FareContext { mode?: UrbanMode; /** 0..1, both ends in a dense city centre */ centre?: number }
+/**
+ * Fare and local-demand modes: rail (one model for main-line, metro and light-rail track and any mix of them on a
+ * line), tram and bus. Without a mode a leg pays the plain distance fare (legacy estimates).
+ */
+export type FareMode = 'rail' | 'tram' | 'bus';
+export interface FareContext { mode?: FareMode; /** 0..1, both ends in a dense city centre */ centre?: number }
 export interface DemandSite { x: number; z: number; townId: number }
 const intensityCache = new WeakMap<Game, { key: string; values: Map<string, number> }>();
 
@@ -35,8 +39,8 @@ export function urbanIntensity(g: Game, site: DemandSite): number {
   cache.values.set(id, value); return value;
 }
 
-/** One context for real receipts and AI estimates; main-line/HSR trains retain their distance fare. */
-export function stationFareContext(g: Game, from: Station | undefined, to: Station, mode?: UrbanMode): FareContext {
+/** One context for real receipts and AI estimates (rail: the distance fare with its boarding minimum). */
+export function stationFareContext(g: Game, from: Station | undefined, to: Station, mode?: FareMode): FareContext {
   if (!from) return {};
   const sameTown = from.townId >= 0 && from.townId === to.townId;
   const centre = sameTown ? Math.min(urbanIntensity(g, from), urbanIntensity(g, to)) : 0;
@@ -106,11 +110,15 @@ export function fareCalibration(d: number): number {
   return PASSENGER_LONG_FARE_SCALE + (PASSENGER_FARE_SCALE - PASSENGER_LONG_FARE_SCALE) / (1 + (Math.max(0, d) / PASSENGER_FARE_BLEND) ** 2);
 }
 
-/** Base fare of one passenger for a leg of straight-line distance `d` units (before the speed factor). */
-export function baseFare(d: number, mode?: UrbanMode): number {
+/**
+ * Base fare of one passenger for a leg of straight-line distance `d` units (before the speed factor): rail pays the
+ * distance fare with a minimum per boarding (RAIL_FARE), tram and bus a boarding charge plus their distance share.
+ */
+export function baseFare(d: number, mode?: FareMode): number {
   const distance = FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d);
-  const urban = mode && URBAN_FARES[mode];
-  return urban ? urban.boarding + distance * urban.distance : distance;
+  if (mode === 'rail') return Math.max(RAIL_FARE.minimum, distance);
+  const road = mode && ROAD_FARES[mode];
+  return road ? road.boarding + distance * road.distance : distance;
 }
 
 /** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..2.6. */

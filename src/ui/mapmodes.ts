@@ -386,7 +386,7 @@ export class MapModes {
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);
     const pop = g.towns.list.reduce((a, t) => a + t.pop, 0);
     const towns = g.towns.list.filter((t) => !mine.some((s) => Math.hypot(s.x - t.x, s.z - t.z) < t.radius + 10));
-    const n = (m: CatchMode) => mine.filter((s) => { const mode = g.stations.mode(s); return (mode === 'mainline' ? 'rail' : mode) === m; }).length;
+    const n = (m: CatchMode) => mine.filter((s) => g.stations.catchMode(s) === m).length;
     const c = this.card;
     clear(c);
     // the ring's border repeats the mode's dash pattern on the map (solid, dashed, dotted)
@@ -395,12 +395,12 @@ export class MapModes {
       h('div', { class: 'mc-head' }, icon('catchment', 18), h('span', { class: 'mc-title' }, 'Catchment'), h('span', { class: 'mc-sub' }, `${fmtInt(reach)} residents`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close catchment view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-list' }, row('rail', 'Train stations', catchWalkLimit('rail')), row('metro', 'Metro stations', catchWalkLimit('metro')), row('lightrail', 'Light rail stations', catchWalkLimit('lightrail')), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
+        h('div', { class: 'mc-list' }, row('rail', 'Rail stations', catchWalkLimit('rail')), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
           inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
-        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (metro, light rail and tram dashed). Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
+        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (tram dashed). Every rail station has the same reach, whatever its track type. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
     );
   }
 

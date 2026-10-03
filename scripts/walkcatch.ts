@@ -25,7 +25,7 @@ function bus(g: Game, x: number, z: number) {
 }
 function flush(g: Game) { g.stations.refreshAccess(true); g.lines.catchmentDirty = true; g.lines.flushCatchment(); }
 
-check(CATCHMENT_RADIUS.rail === 16.8 && CATCHMENT_RADIUS.metro === 12.6 && CATCHMENT_RADIUS.lightrail === 10.5 && CATCHMENT_RADIUS.tram === 15.4 && CATCHMENT_RADIUS.bus === 11.2, 'rail limits reduced a further 40%; tram and bus unchanged');
+check(CATCHMENT_RADIUS.rail === 33.6 && CATCHMENT_RADIUS.tram === 30.8 && CATCHMENT_RADIUS.bus === 22.4 && Object.keys(CATCHMENT_RADIUS).join() === 'rail,tram,bus', 'path-based limits twice the earlier ones (rail 168, tram 154, bus 112 m); one rail limit for every track type');
 check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 3.125 / Math.PI), '1.25 grid allowance preserves circular area to within 0.6%');
 
 {
@@ -34,13 +34,13 @@ check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 
   const l0 = node(g, 62, 20), l1 = node(g, 62, 110), r0 = node(g, 70, 20), r1 = node(g, 70, 110);
   const left = road(g, l0, l1), right = road(g, r0, r1), S = bus(g, 62, 60);
   const across = house(g, 72, 60, -Math.PI / 2), down = house(g, 60, 68, Math.PI / 2), up = house(g, 60, 52, Math.PI / 2);
-  const farDoor = house(g, 57.5, 60, Math.PI / 2), beyond = house(g, 60, 76, Math.PI / 2);
+  const farDoor = house(g, 57.5, 60, Math.PI / 2), beyond = house(g, 60, 90, Math.PI / 2);
   flush(g);
   const c = walkingCatchment(g, S);
-  check(Math.hypot(across.x - S.x, across.z - S.z) < 11.2 && !c.buildings.has(across.id), 'across a river, inside the former circle, without a reachable bridge: not covered');
+  check(Math.hypot(across.x - S.x, across.z - S.z) < CATCHMENT_RADIUS.bus && !c.buildings.has(across.id), 'across a river, inside the former circle, without a reachable bridge: not covered');
   check(c.buildings.has(down.id) && c.buildings.has(up.id) && near(c.buildings.get(down.id)!.distance, 9.6), 'down/up a country road within budget: covered, including the 1.6-unit door leg');
   check(!c.buildings.has(farDoor.id) && !c.buildings.has(beyond.id), `a door farther than ${FRONTAGE_REACH} from a street or beyond the walking limit is excluded`);
-  check(c.segments.every((s) => s.edge === left.id && s.z0 >= 46 - 1e-8 && s.z1 <= 74 + 1e-8), 'isochrone clips a long road edge even when neither endpoint is reachable');
+  check(c.segments.every((s) => s.edge === left.id && s.z0 >= 32 - 1e-8 && s.z1 <= 88 + 1e-8), 'isochrone clips a long road edge even when neither endpoint is reachable');
   const ra = net.addNode('rail', 62, 3, 60, 1, 0), rb = net.addNode('rail', 70, 3, 60, 1, 0);
   net.addEdge('rail', ra.id, rb.id, bezLine(62, 60, 70, 60), new Float32Array(9).fill(3), [], 'standard', 0);
   check(!walkingCatchment(g, S).buildings.has(across.id), 'a railway across the river never becomes a walking path');
