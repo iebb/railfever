@@ -57,6 +57,15 @@ export const catchModeOf = (m: RailMode): CatchMode => (m === 'mainline' ? 'rail
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
 export const TRANSFER_RANGE = 14;
+/** Station rating: days over which the service frequency (Station.callRate) is averaged. */
+const CALL_RATE_DAYS = 30;
+/** Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). */
+export const RATING_LOST = 0.25;
+/** Share of a station's passengers who gave up waiting rather than board (this and last month), 0..1. */
+export function lostShare(st: Station): number {
+  const lost = (st.lostMonth || 0) + (st.lostLast || 0);
+  return lost > 0 ? lost / (lost + st.pickupMonth + st.pickupLast) : 0;
+}
 /**
  * Automatic walking links when a station is built: metro / light-rail stations link to stations of the same mode
  * only when (nearly) touching (dense lines: neighbouring stops are no interchange), to other modes within
@@ -213,6 +222,10 @@ export interface Station {
   genMonth: number; genLast: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
+  /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
+  lostMonth: number; lostLast: number;
+  /** service frequency: rolling share of the days on which a vehicle called (about the last month; updateRatings) */
+  callRate: number;
   built: number;
   /** stations linked for walking transfers (a transfer complex), both ways */
   links: number[];
@@ -530,7 +543,8 @@ export class Stations {
     const st: Station = {
       id: this.nextId++, name: this.stationName(x, z, town), owner, townId: town ? town.id : -1, x, z, rail: null, stops: [],
       waiting: new Map(), waitingTotal: 0, rating: 0.65, lastPickup: g.day, lastSpeed: 0,
-      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0, built: g.day,
+      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0,
+      lostMonth: 0, lostLast: 0, callRate: 0, built: g.day,
       links: [], roadAccess: true,
     };
     this.map.set(st.id, st);
@@ -1677,8 +1691,9 @@ export class Stations {
     // statistics
     a.genMonth += b.genMonth; a.pickupMonth += b.pickupMonth; a.arrivedMonth += b.arrivedMonth;
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
+    a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
-    a.rating = Math.max(a.rating, b.rating);
+    a.rating = Math.max(a.rating, b.rating); a.callRate = Math.max(a.callRate, b.callRate);
     // links
     for (const o of b.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== b.id); if (os && os !== a) this.addLink(a, os); }
     b.links = [];
@@ -2077,6 +2092,10 @@ export class Stations {
     g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count))));
   }
 
+  /**
+   * Passengers beyond the station's useful queue give up waiting: counted per station and town and month
+   * (lostMonth, Town.passLostMonth); the share who give up lowers the station's rating (updateRatings).
+   */
   trimWaiting(st: Station, max: number) {
     // The caller's legacy platform cap is a hard ceiling. People in the catchment and the size of the transfer
     // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
@@ -2094,15 +2113,21 @@ export class Stations {
     let spare = max - groups.reduce((n, x) => n + x.count, 0);
     groups.sort((a, b) => b.remainder - a.remainder);
     for (const x of groups) if (spare > 0) { x.count++; spare--; }
-    let tot = 0;
+    let tot = 0, lost = 0;
     for (const x of groups) {
       const g = x.g;
       g.count = x.count;
+      lost += x.oldCount - x.count;
       // transfers (passengers of the group who already changed) shrink with it
       if (x.transfers) g.transfers = Math.min(g.count, Math.round(x.transfers * g.count / x.oldCount));
       if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
+    if (lost > 0) {
+      st.lostMonth = (st.lostMonth || 0) + lost;
+      const town = this.game.towns.list[st.townId];
+      if (town) town.passLostMonth = (town.passLostMonth ?? 0) + lost;
+    }
   }
 
   rerouteWaiting(st: Station) {
@@ -2455,6 +2480,27 @@ export class Stations {
   }
 
   /**
+   * Daily station ratings (game.ts): a rating moves towards a target from the days since a vehicle last called,
+   * the queue, the speed of the services and the share of passengers who gave up waiting (lostShare); a station
+   * no line serves stays at or below 50 %. Also the service frequency (callRate: share of days with a call).
+   */
+  updateRatings() {
+    const g = this.game;
+    for (const st of this.map.values()) {
+      const days = g.day - st.lastPickup;
+      st.callRate = (st.callRate || 0) + ((days <= 1 ? 1 : 0) - (st.callRate || 0)) / CALL_RATE_DAYS;
+      let target = 0.33;
+      target += days <= 7 ? 0.27 : days <= 14 ? 0.18 : days <= 30 ? 0.08 : 0;
+      target += st.waitingTotal < 100 ? 0.15 : st.waitingTotal < 400 ? 0.08 : st.waitingTotal < 1200 ? 0 : -0.12;
+      target += Math.min(0.17, Math.max(0, (st.lastSpeed - 45) / 900));
+      target -= RATING_LOST * lostShare(st);
+      if (!g.lines.stationServed(st.id)) target = Math.min(target, 0.5);
+      st.rating += (target - st.rating) * 0.04;
+      st.rating = Math.max(0, Math.min(1, st.rating));
+    }
+  }
+
+  /**
    * How busy a rail station's platforms are and whether it should grow (more platform tracks, through tracks
    * for trains passing without stopping, longer platforms for longer trains); null for stations without rail.
    */
@@ -2637,6 +2683,8 @@ export function restoreStation(s: any): Station {
     stops: (s.stops ?? []).map((p: any) => ({ ...p })),
     links: [...(s.links ?? [])],
     roadAccess: s.roadAccess ?? true,
+    // older saves: no passengers lost yet; a typical service frequency (a call every ten days) to start from
+    lostMonth: s.lostMonth ?? 0, lostLast: s.lostLast ?? 0, callRate: s.callRate ?? 0.1,
     onPlat: s.onPlat ? [...s.onPlat] : undefined,
     waiting: new Map(),
   };

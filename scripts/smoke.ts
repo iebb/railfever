@@ -352,10 +352,13 @@ let errors = 0, nanMsg: string | null = null;
 const T1 = performance.now();
 const days = 720, startDay = g.day;
 let lastLog = -1;
+// passengers generated at the two stations over the run (a small station may go a month or two without any)
+let genA = 0, genB = 0, genMonthNo = Math.floor(g.day / 30);
 const cr = levelCrossing > 0 ? net.crossings.get(levelCrossing) : undefined;
 const pv = { x: 0, y: 0, z: 0 };
 while (g.day < startDay + days) {
   try { g.update(0.25); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 6).join('\n')); if (errors > 3) break; }
+  if (Math.floor(g.day / 30) !== genMonthNo) { genMonthNo = Math.floor(g.day / 30); genA += A.genLast; genB += B.genLast; }
   for (const t of [train, ...dTrains]) {
     if (!(t instanceof Train)) continue;
     if (t.state === 'loading' && lastAt.get(t.id) !== t.atStation) {
@@ -410,7 +413,7 @@ const arr = (t: Train | undefined) => (t ? [...(arrivals.get(t.id)?.values() ?? 
 check(errors === 0, 'no exceptions');
 check(!nanMsg, 'no NaN positions ' + (nanMsg ?? ''));
 check(arr(train).length === 2 && arr(train).every((n) => n >= 3), `train served both stations repeatedly (${arr(train).join('/')})`);
-check(A.genLast + A.genMonth > 0 && B.genLast + B.genMonth > 0, 'passengers generated');
+check(genA + A.genMonth > 0 && genB + B.genMonth > 0, `passengers generated (${genA + A.genMonth} / ${genB + B.genMonth})`);
 check(train.delivered > 0, `train delivered passengers (${train.delivered})`);
 check(line.incomeYear + line.incomeLast > 0, 'rail line income > 0');
 check(busArr >= 4 && (bus?.delivered ?? 0) > 0, `town bus served its stops (${busArr} stops, ${bus?.delivered} delivered)`);
