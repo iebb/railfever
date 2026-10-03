@@ -1,5 +1,5 @@
 // The world: continuous terrain heightmap, trees, buildings and the transport network.
-import { SpatialGrid } from './spatial';
+import { SpatialGrid, RegionVersions, type RegionSnapshot } from './spatial';
 import { Network } from './network';
 import { WATER_Y } from './constants';
 
@@ -35,7 +35,21 @@ export class World {
   readonly lock: Uint8Array;
   net: Network;
   buildings = new Map<number, Building>();
-  bgrid = new SpatialGrid(4);
+  readonly lotVersions = new RegionVersions();
+  private lotChanges = new Map<number, Map<number, number>>();
+  readonly terrainVersions = new RegionVersions();
+  /** Facade connectors are short: a small terrain edit need not re-snap every door in a 32-unit region. */
+  readonly frontageTerrainVersions = new RegionVersions(4);
+  // Index hooks also cover save load's direct map/index writes and footprint relocations.
+  bgrid = new SpatialGrid(4, 100000, (id, box) => {
+    this.lotVersions.bump(box);
+    if (!box) { this.lotChanges.clear(); return; }
+    for (const region of RegionVersions.ids(box)) {
+      let changes = this.lotChanges.get(region);
+      if (!changes) { changes = new Map(); this.lotChanges.set(region, changes); }
+      changes.set(id, this.lotVersions.version);
+    }
+  });
   nextBuildingId = 1;
   trees: (Tree | null)[] = [];
   treeGrid = new SpatialGrid(8);
@@ -53,6 +67,16 @@ export class World {
   set heightsVersion(v: number) {
     this.heightVersion = v;
     for (let i = 0; i < this.saveHeightVersions.length; i++) this.saveHeightVersions[i]++;
+  }
+  private catchHeights = 0;
+  private catchTerrain = 0;
+
+  /** Bulk height writers (generation/load tools) may only have a global version: invalidate safely. */
+  syncCatchmentTerrain() {
+    if (this.heightsVersion - this.catchHeights > this.terrainVersions.version - this.catchTerrain) {
+      this.terrainVersions.bump(); this.frontageTerrainVersions.bump();
+    }
+    this.catchHeights = this.heightsVersion; this.catchTerrain = this.terrainVersions.version;
   }
 
   constructor(size: number) {
@@ -101,6 +125,8 @@ export class World {
     this.h[i] = v;
     this.heightVersion++;
     this.saveHeightVersions[Math.floor(i / SAVE_VERTICES)]++;
+    this.terrainVersions.bump([x - 1, z - 1, x + 1, z + 1]);
+    this.frontageTerrainVersions.bump([x - 1, z - 1, x + 1, z + 1]);
     const tc = Math.ceil(this.size / TERRAIN_CHUNK);
     for (let dz = -1; dz <= 0; dz++) for (let dx = -1; dx <= 0; dx++) {
       const cx = x + dx, cz = z + dz;
@@ -154,6 +180,19 @@ export class World {
     this.bgrid.remove(id);
     this.markObj(b.x, b.z);
     this.setBuildingLocks(b, false);
+  }
+  /** Call after an in-place building change; reindexing invalidates both its old and new regions. */
+  touchBuilding(b: Building) {
+    const r = Math.hypot(b.w, b.d) / 2;
+    this.bgrid.insert(b.id, b.x - r, b.z - r, b.x + r, b.z + r);
+    this.markObj(b.x, b.z);
+  }
+  /** Changed building IDs in a dependency snapshot; null means a bulk change needs a full local query. */
+  changedLots(s: RegionSnapshot): Set<number> | null {
+    if (this.lotVersions.fallbackVersion > s.version) return null;
+    const ids = new Set<number>();
+    for (const region of s.ids) for (const [id, version] of this.lotChanges.get(region) ?? []) if (version > s.version) ids.add(id);
+    return ids;
   }
   private setBuildingLocks(b: Building, on: boolean) {
     const r = Math.hypot(b.w, b.d) / 2 + 0.5;

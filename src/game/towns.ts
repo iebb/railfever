@@ -504,6 +504,8 @@ export class Towns {
       w.h[k] = h + (base - h) * wgt;
     }
     w.heightsVersion++;
+    w.terrainVersions.bump([cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1]);
+    w.frontageTerrainVersions.bump([cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1]);
   }
 
   /** Flattest direction around a point (valleys, coasts), how anisotropic the ground is and whether water is near. */

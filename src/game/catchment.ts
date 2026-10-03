@@ -1,13 +1,14 @@
 // Derived pedestrian catchments. Road direction and ownership do not restrict walking.
 import type { Game } from './game';
 import type { Building } from './world';
-import type { NEdge } from './network';
+import { curvePoint, type NEdge, type EdgeGeo } from './network';
 import type { Snap } from './construction';
 import type { Station, StationPlan, CatchMode, RailMode } from './stations';
 import { CATCHMENT_RADIUS, ENTRANCE_SIZE, catchModeOf, railModeOf } from './stations';
 import { ROAD_TYPES } from './constants';
 import { closestOnPolyline, arcTable, bezPoint, tAtS } from './geom';
 import { styleOf } from './station-styles';
+import { SpatialGrid, RegionVersions, type RegionSnapshot } from './spatial';
 
 /** A square grid's Manhattan isochrone has area 2L². 1.25 makes it close to πR² (−0.5%). */
 export const WALK_DETOUR = 1.25;
@@ -42,13 +43,44 @@ function dryLeg(g: Game, x: number, z: number, qx: number, qz: number): boolean 
   return true;
 }
 
+const segmentGrids = new WeakMap<EdgeGeo, SpatialGrid>();
+/** Identical ordered projections to closestOnPolyline, visiting only nearby segments of long roads. */
+function closestRoad(x: number, z: number, geo: EdgeGeo, reach: number) {
+  const xs = geo.pts, pad = reach + 1e-8, x0 = x - pad, z0 = z - pad, x1 = x + pad, z1 = z + pad;
+  let ids: number[] | undefined;
+  if (geo.n >= 128) {
+    let grid = segmentGrids.get(geo);
+    if (!grid) {
+      grid = new SpatialGrid(4);
+      for (let i = 0; i < geo.n - 1; i++) {
+        const ax = xs[i * 3], az = xs[i * 3 + 2], bx = xs[(i + 1) * 3], bz = xs[(i + 1) * 3 + 2];
+        grid.insert(i, Math.min(ax, bx), Math.min(az, bz), Math.max(ax, bx), Math.max(az, bz));
+      }
+      segmentGrids.set(geo, grid);
+    }
+    ids = grid.query(x0, z0, x1, z1).sort((a, b) => a - b);
+  }
+  let best = Infinity, bi = 0, bf = 0;
+  for (let k = 0, n = ids ? ids.length : geo.n - 1; k < n; k++) {
+    const i = ids ? ids[k] : k;
+    const ax = xs[i * 3], az = xs[i * 3 + 2], bx = xs[(i + 1) * 3], bz = xs[(i + 1) * 3 + 2];
+    if ((ax < x0 && bx < x0) || (ax > x1 && bx > x1) || (az < z0 && bz < z0) || (az > z1 && bz > z1)) continue;
+    const dx = bx - ax, dz = bz - az, l2 = dx * dx + dz * dz;
+    let f = l2 > 1e-12 ? ((x - ax) * dx + (z - az) * dz) / l2 : 0;
+    f = f < 0 ? 0 : f > 1 ? 1 : f;
+    const qx = ax + dx * f, qz = az + dz * f, d = (x - qx) * (x - qx) + (z - qz) * (z - qz);
+    if (d < best) { best = d; bi = i; bf = f; }
+  }
+  return { i: bi, f: bf, d: Math.sqrt(best) };
+}
+
 function snapRoad(g: Game, x: number, z: number, reach: number): RoadPoint | null {
   const net = g.world.net;
   let best: RoadPoint | null = null;
   for (const id of net.grid.query(x - reach, z - reach, x + reach, z + reach)) {
     const e = net.edges.get(id);
     if (!e || !pedestrianRoad(e)) continue;
-    const geo = net.geo(e), c = closestOnPolyline(x, z, geo.pts, 3, geo.n);
+    const geo = net.geo(e), c = closestRoad(x, z, geo, reach);
     if (c.d > reach || (best && (c.d > best.leg || (c.d === best.leg && id > best.edge)))) continue;
     // Geometry's Float32 arc table can round its last sample past e.len. Clamp before using graph costs:
     // an out-of-edge portal would otherwise introduce a negative endpoint leg into a zero-length passage.
@@ -122,127 +154,234 @@ class Heap {
   }
 }
 
-interface Region { net: number; lots: string; roadSig: string; lotSig: string; roadVersion: number; lotVersion: number }
-interface Cached { roadKey: string; networkKey: string; bounds: Access[]; lotKey: string; reaches: Reach[]; portals: Portal[]; byEdge: Map<number, number[]>; value: WalkingCatchment }
+interface Cached {
+  bounds: Access[]; roads: RegionSnapshot; terrain: RegionSnapshot; lots?: RegionSnapshot;
+  roadState: Map<number, [number, string, number, boolean, number]>; roadFallback: number;
+  complexEpoch: number; neighbors: number[]; reaches: Reach[]; portals: Portal[];
+  byEdge: Map<number, number[]>; geometry: Map<number, { len: number; a: number; b: number; geo: EdgeGeo }>; segments?: WalkSegment[]; value: WalkingCatchment;
+}
+interface StationAccess {
+  key: string; points: Access[]; roads: RegionSnapshot; terrain: RegionSnapshot; version: number; order: number;
+  links: string; extent: number; x: number; z: number;
+}
+
+function regionIds(points: { x: number; z: number; limit: number }[]): number[] {
+  const ids = new Set<number>();
+  for (const p of points) {
+    const r = p.limit + FRONTAGE_REACH;
+    for (const id of RegionVersions.ids([p.x - r, p.z - r, p.x + r, p.z + r])) ids.add(id);
+  }
+  return [...ids];
+}
+function sameAccess(a: Access[], b: Access[]): boolean {
+  return a.length === b.length && a.every((p, i) => {
+    const q = b[i];
+    return p.edge === q.edge && p.s === q.s && p.leg === q.leg && p.x === q.x && p.z === q.z && p.mode === q.mode && p.limit === q.limit;
+  });
+}
+function samePortals(a: Access[], b: Access[]): boolean {
+  return a === b || (a.length === b.length && a.every((p, i) => {
+    const q = b[i]; return p.edge === q.edge && p.s === q.s && p.leg === q.leg && p.x === q.x && p.z === q.z;
+  }));
+}
 
 class WalkingCache {
-  private regions = new Map<string, Region>();
   private entries = new Map<string, Cached>();
-  private frontages = new Map<number, { key: string; point: RoadPoint | null }>();
-  private accesses = new Map<number, { key: string; points: Access[] }>();
-  private lotEpoch = 0;
+  private frontages = new Map<number, { x: number; z: number; roads: RegionSnapshot; roadFallback: number;
+    terrain: RegionSnapshot; terrainFallback: number; point: RoadPoint | null }>();
+  private accesses = new Map<number, StationAccess>();
+  private complexGrid = new SpatialGrid(32);
+  private complexEpoch = 0;
+  private syncedStations = -1;
+  private syncedRoads = -1;
+  private syncedTerrain = -1;
+  private syncedCount = -1;
+  private prunedLots = -1;
+  private roadCheckSerial = 0;
   constructor(private g: Game) {}
+
   refreshBuildings() {
-    this.lotEpoch++;
-    for (const key of this.entries.keys()) if (key.startsWith('station:') && !this.g.stations.map.has(Number(key.slice(8)))) this.entries.delete(key);
-    for (const id of this.accesses.keys()) if (!this.g.stations.map.has(id)) this.accesses.delete(id);
+    this.syncStations();
+    if (this.prunedLots === this.g.world.lotVersions.version) return;
+    this.prunedLots = this.g.world.lotVersions.version;
     for (const id of this.frontages.keys()) if (!this.g.world.buildings.has(id)) this.frontages.delete(id);
   }
   roadsChanged(): boolean {
-    for (const [key, c] of this.entries) if (key.startsWith('station:') && this.regionKeys(c.bounds).road !== c.networkKey) return true;
+    for (const [key, c] of this.entries) if (key.startsWith('station:') && !this.sameRoads(c)) return true;
     return false;
   }
-  access(st: Station): Access[] {
-    const r = st.rail, w = this.g.world;
-    const key = `${w.net.version}:${w.heightsVersion}:${st.roadAccess}:${r?.trackType}:${r?.style}:${r?.level}|` +
-      JSON.stringify([r?.building, r?.forecourt, r?.forecourt2, r?.entrances, st.stops]);
-    const old = this.accesses.get(st.id); if (old?.key === key) return old.points;
-    const points = stationAccess(this.g, st); this.accesses.set(st.id, { key, points }); return points;
+
+  private roadState(ids: number[]): Map<number, [number, string, number, boolean, number]> {
+    const net = this.g.world.net, out = new Map<number, [number, string, number, boolean, number]>();
+    for (const region of ids) for (const id of net.roadRegions.get(region) ?? []) {
+      const e = net.edges.get(id); if (e?.kind === 'road' && !out.has(id)) out.set(id, [e.version, e.type, e.depot, pedestrianRoad(e), 0]);
+    }
+    return out;
+  }
+  private sameRoads(c: Cached): boolean {
+    const roads = this.g.world.net.roadVersions;
+    if (roads.unchanged(c.roads)) return true;
+    if (roads.fallbackVersion !== c.roadFallback) return false;
+    // A failed build can add and remove a road before the tick ends. Compare exact local inputs in that
+    // rare case, using the event-maintained membership index; no spatial queries, sorting or signatures.
+    const net = this.g.world.net, serial = ++this.roadCheckSerial;
+    let count = 0;
+    for (const region of c.roads.ids) for (const id of net.roadRegions.get(region) ?? []) {
+      const e = net.edges.get(id); if (e?.kind !== 'road') continue;
+      const old = c.roadState.get(id);
+      if (old?.[4] === serial) continue;
+      if (!old || old[0] !== e.version || old[1] !== e.type || old[2] !== e.depot || old[3] !== pedestrianRoad(e)) return false;
+      old[4] = serial; count++;
+    }
+    if (count !== c.roadState.size) return false;
+    roads.refresh(c.roads);
+    return true;
   }
 
-  /** Region versions change only for local edits. A far-away road does not discard a station's Dijkstra. */
-  private region(cx: number, cz: number): Region {
-    const g = this.g, w = g.world, net = w.net, key = `${cx},${cz}`, C = 32;
-    let r = this.regions.get(key);
-    if (!r) { r = { net: -1, lots: '', roadSig: '', lotSig: '', roadVersion: 0, lotVersion: 0 }; this.regions.set(key, r); }
-    if (r.net !== net.version) {
-      const sig = net.grid.query(cx * C, cz * C, (cx + 1) * C, (cz + 1) * C)
-        .map((id) => net.edges.get(id)!).filter((e) => e?.kind === 'road').sort((a, b) => a.id - b.id)
-        .map((e) => `${e.id}:${e.version}:${e.type}:${e.depot}:${pedestrianRoad(e)}`).join(';');
-      if (sig !== r.roadSig) { r.roadSig = sig; r.roadVersion++; }
-      r.net = net.version;
+  /** Scan station metadata once per edit, never once per station's walking calculation. */
+  private syncStations() {
+    const g = this.g, w = g.world, roads = w.net.roadVersions, terrain = w.terrainVersions;
+    if (this.syncedStations === g.stations.walkVersion && this.syncedRoads === roads.version &&
+      this.syncedTerrain === terrain.version && this.syncedCount === g.stations.map.size) return;
+    this.syncedStations = g.stations.walkVersion; this.syncedRoads = roads.version;
+    this.syncedTerrain = terrain.version; this.syncedCount = g.stations.map.size;
+    let order = 0;
+    for (const st of g.stations.map.values()) {
+      const r = st.rail;
+      const key = JSON.stringify([st.x, st.z, st.roadAccess, r?.length, r?.trackType, r?.style, r?.level,
+        r?.building, r?.forecourt, r?.forecourt2, r?.entrances, st.stops, st.links]);
+      const old = this.accesses.get(st.id);
+      if (old && old.key === key && roads.unchanged(old.roads) && terrain.unchanged(old.terrain)) { old.order = order++; continue; }
+      let points = stationAccess(g, st);
+      if (old && sameAccess(old.points, points)) points = old.points;
+      // Access snapping can gain a new contact even for a station with no current access points.
+      const extent = r ? r.length / 2 + 28 : 10;
+      const ids = RegionVersions.ids([st.x - extent, st.z - extent, st.x + extent, st.z + extent]);
+      // Unusually placed entrances/merged stops also need their own local dependencies.
+      for (const p of [g.stations.forecourt(st), r?.forecourt2, ...(r?.entrances ?? []), ...st.stops])
+        if (p) ids.push(...RegionVersions.ids([p.x - 4, p.z - 4, p.x + 4, p.z + 4]));
+      const links = old?.key === key ? old.links : st.links.join(',');
+      // Other stations use these portals' geometry and passages, not this station's style or walking budget.
+      const version = old && samePortals(old.points, points) && old.links === links ? old.version : ++this.complexEpoch;
+      if (old && (old.x !== st.x || old.z !== st.z || old.extent !== extent)) this.complexEpoch++;
+      this.accesses.set(st.id, { key, points, roads: roads.snapshot(ids), terrain: terrain.snapshot(ids), version, order: order++,
+        links, extent, x: st.x, z: st.z });
+      this.complexGrid.insert(st.id, st.x - extent, st.z - extent, st.x + extent, st.z + extent);
     }
-    const lots = `${this.lotEpoch}:${w.nextBuildingId}:${w.buildings.size}`;
-    if (r.lots !== lots) {
-      const sig = w.bgrid.query(cx * C, cz * C, (cx + 1) * C, (cz + 1) * C)
-        .map((id) => w.buildings.get(id)!).filter(Boolean).sort((a, b) => a.id - b.id)
-        .map((b) => `${b.id}:${b.x}:${b.z}:${b.angle}:${b.w}:${b.d}`).join(';');
-      if (sig !== r.lotSig) { r.lotSig = sig; r.lotVersion++; }
-      r.lots = lots;
+    for (const id of this.accesses.keys()) if (!g.stations.map.has(id)) {
+      this.accesses.delete(id); this.complexGrid.remove(id); this.entries.delete(`station:${id}`); this.complexEpoch++;
     }
-    return r;
   }
 
-  private regionKeys(points: { x: number; z: number; limit: number }[]): { road: string; lot: string } {
-    const seen = new Set<string>(), roads: string[] = [], lots: string[] = [];
-    for (const p of points) {
-      const r = p.limit + FRONTAGE_REACH;
-      for (let cz = Math.floor((p.z - r) / 32); cz <= Math.floor((p.z + r) / 32); cz++) for (let cx = Math.floor((p.x - r) / 32); cx <= Math.floor((p.x + r) / 32); cx++) {
-        const key = `${cx},${cz}`; if (seen.has(key)) continue; seen.add(key);
-        const v = this.region(cx, cz); roads.push(`${key}:${v.roadVersion}`); lots.push(`${key}:${v.lotVersion}`);
-      }
+  access(st: Station): Access[] { this.syncStations(); return this.accesses.get(st.id)!.points; }
+
+  /** Warm lots/terrain only. Observing pending road edits here would alter refreshAccess's dirty trigger. */
+  prepare(st: Station) {
+    const key = `station:${st.id}`, c = this.entries.get(key);
+    if (!c || !this.g.world.net.roadVersions.unchanged(c.roads)) return;
+    this.calculate(key, this.access(st));
+  }
+
+  private nearby(sources: Access[]): number[] {
+    const ids = new Set<number>();
+    for (const s of sources) for (const id of this.complexGrid.query(s.x - s.limit, s.z - s.limit, s.x + s.limit, s.z + s.limit)) {
+      const st = this.g.stations.map.get(id)!;
+      const extent = st.rail ? st.rail.length / 2 + 28 : 10;
+      if (Math.hypot(st.x - s.x, st.z - s.z) <= s.limit + extent) ids.add(id);
     }
-    return { road: roads.join(';'), lot: lots.join(';') + `|${this.g.world.heightsVersion}` };
+    // Preserve the original Map iteration order: it controls Dijkstra tie and floating-point sum order.
+    return [...ids].sort((a, b) => this.accesses.get(a)!.order - this.accesses.get(b)!.order);
   }
 
   private frontage(b: Building): RoadPoint | null {
     const x = b.x + Math.sin(b.angle) * b.d / 2, z = b.z + Math.cos(b.angle) * b.d / 2;
-    const key = `${x}:${z}|${this.regionKeys([{ x, z, limit: 0 }]).road}|${this.g.world.heightsVersion}`;
-    const old = this.frontages.get(b.id);
-    if (old?.key === key) return old.point;
-    const point = snapRoad(this.g, x, z, FRONTAGE_REACH); this.frontages.set(b.id, { key, point }); return point;
+    const w = this.g.world, roads = w.net.frontageRoadVersions, old = this.frontages.get(b.id);
+    if (old && old.x === x && old.z === z && old.roadFallback === w.net.roadVersions.fallbackVersion && roads.unchanged(old.roads) &&
+      old.terrainFallback === w.terrainVersions.fallbackVersion && w.frontageTerrainVersions.unchanged(old.terrain)) return old.point;
+    const ids = RegionVersions.ids([x - FRONTAGE_REACH, z - FRONTAGE_REACH, x + FRONTAGE_REACH, z + FRONTAGE_REACH], roads.cell);
+    const point = snapRoad(this.g, x, z, FRONTAGE_REACH);
+    const terrainIds = RegionVersions.ids([x - FRONTAGE_REACH, z - FRONTAGE_REACH, x + FRONTAGE_REACH, z + FRONTAGE_REACH], w.frontageTerrainVersions.cell);
+    this.frontages.set(b.id, { x, z, roads: roads.snapshot(ids), roadFallback: w.net.roadVersions.fallbackVersion,
+      terrain: w.frontageTerrainVersions.snapshot(terrainIds),
+      terrainFallback: w.terrainVersions.fallbackVersion, point }); return point;
   }
 
   calculate(key: string, sources: Access[], complex = true): WalkingCatchment {
     if (!sources.length) return EMPTY;
-    const g = this.g, net = g.world.net, versions = this.regionKeys(sources);
-    const portals: Portal[] = sources.map((s) => ({ ...s, jumps: [] }));
-    const addPortal = (p: RoadPoint) => { const i = portals.length; portals.push({ ...p, jumps: [] }); return i; };
-    // Explicit station complexes are pedestrian passages. Rail edges themselves are never walkable.
-    if (complex) {
-      const access = new Map<number, number[]>();
-      for (const st of g.stations.map.values()) {
-        const extent = st.rail ? st.rail.length / 2 + 28 : 10;
-        if (!sources.some((s) => Math.hypot(st.x - s.x, st.z - s.z) <= s.limit + extent)) continue;
-        const pts = this.access(st).filter((p) => sources.some((s) => Math.hypot(p.x - s.x, p.z - s.z) <= s.limit));
-        if (!pts.length) continue;
-        const ids = pts.map(addPortal); access.set(st.id, ids);
-        const join = (a: number, b: number) => {
-          const p = portals[a], q = portals[b], cost = p.leg + Math.hypot(p.x - q.x, p.z - q.z) + q.leg;
-          p.jumps.push({ to: b, cost }); q.jumps.push({ to: a, cost });
-        };
-        for (let a = 0; a < ids.length; a++) for (let b = a + 1; b < ids.length; b++) join(ids[a], ids[b]);
-      }
-      for (const st of g.stations.map.values()) for (const to of st.links) {
-        if (st.id >= to) continue;
-        for (const a of access.get(st.id) ?? []) for (const b of access.get(to) ?? []) {
-          const p = portals[a], q = portals[b], cost = p.leg + Math.hypot(p.x - q.x, p.z - q.z) + q.leg;
-          p.jumps.push({ to: b, cost }); q.jumps.push({ to: a, cost });
+    this.syncStations();
+    const g = this.g, w = g.world, net = w.net;
+    let c = this.entries.get(key), nearby: number[] | undefined, neighbors: number[] | undefined;
+    const terrainChanged = !c || !w.terrainVersions.unchanged(c.terrain);
+    // Terrain can change facade connectors, but Dijkstra depends only on roads and snapped portals.
+    let graphChanged = !c || (c.bounds !== sources && !sameAccess(c.bounds, sources)) || !this.sameRoads(c);
+    if (complex && (!c || c.complexEpoch !== this.complexEpoch)) {
+      nearby = this.nearby(sources);
+      neighbors = nearby.flatMap((id) => [id, this.accesses.get(id)!.version]);
+      if (!c || neighbors.length !== c.neighbors.length || neighbors.some((v, i) => v !== c!.neighbors[i])) graphChanged = true;
+    }
+    if (graphChanged) {
+      const portals: Portal[] = sources.map((s) => ({ ...s, jumps: [] }));
+      const addPortal = (p: RoadPoint) => { const i = portals.length; portals.push({ ...p, jumps: [] }); return i; };
+      // Explicit station complexes are pedestrian passages. Rail edges themselves are never walkable.
+      if (complex) {
+        nearby ??= this.nearby(sources);
+        neighbors ??= nearby.flatMap((id) => [id, this.accesses.get(id)!.version]);
+        const access = new Map<number, number[]>();
+        for (const id of nearby) {
+          const pts = this.accesses.get(id)!.points.filter((p) => sources.some((s) => Math.hypot(p.x - s.x, p.z - s.z) <= s.limit));
+          if (!pts.length) continue;
+          const ids = pts.map(addPortal); access.set(id, ids);
+          const join = (a: number, b: number) => {
+            const p = portals[a], q = portals[b], cost = p.leg + Math.hypot(p.x - q.x, p.z - q.z) + q.leg;
+            p.jumps.push({ to: b, cost }); q.jumps.push({ to: a, cost });
+          };
+          for (let a = 0; a < ids.length; a++) for (let b = a + 1; b < ids.length; b++) join(ids[a], ids[b]);
+        }
+        for (const id of nearby) for (const to of g.stations.map.get(id)!.links) {
+          if (id >= to) continue;
+          for (const a of access.get(id) ?? []) for (const b of access.get(to) ?? []) {
+            const p = portals[a], q = portals[b], cost = p.leg + Math.hypot(p.x - q.x, p.z - q.z) + q.leg;
+            p.jumps.push({ to: b, cost }); q.jumps.push({ to: a, cost });
+          }
         }
       }
-    }
-    const sig = portals.map((p) => `${p.edge}:${p.s}:${p.leg}:${p.jumps.map((j) => `${j.to}:${j.cost}`).join(',')}`).join(';');
-    const roadKey = versions.road + '|' + sources.map((s) => `${s.mode}:${s.limit}`).join(';') + '|' + sig;
-    let c = this.entries.get(key);
-    if (!c || c.roadKey !== roadKey) {
       const byEdge = new Map<number, number[]>();
       portals.forEach((p, i) => { const a = byEdge.get(p.edge); if (a) a.push(i); else byEdge.set(p.edge, [i]); });
       const groups = new Map<string, number[]>();
       sources.forEach((s, i) => { const k = `${s.mode}:${s.limit}`, a = groups.get(k); if (a) a.push(i); else groups.set(k, [i]); });
       const reaches = [...groups.values()].map((ids) => this.dijkstra(sources[ids[0]], ids, portals, byEdge));
-      c = { roadKey, networkKey: versions.road, bounds: sources, lotKey: '', reaches, portals, byEdge, value: { segments: this.segments(reaches, portals, byEdge), buildings: new Map() } };
+      const ids = regionIds(sources);
+      // Pin immutable sampled geometry so a deferred UI read remains valid even after roads are edited.
+      const geometry = new Map<number, { len: number; a: number; b: number; geo: EdgeGeo }>();
+      for (const reach of reaches) for (const id of reach.edges) if (!geometry.has(id)) {
+        const e = net.edges.get(id)!; geometry.set(id, { len: e.len, a: e.a, b: e.b, geo: net.geo(e) });
+      }
+      c = { bounds: sources, roads: net.roadVersions.snapshot(ids), terrain: w.terrainVersions.snapshot(ids),
+        roadState: this.roadState(ids), roadFallback: net.roadVersions.fallbackVersion,
+        complexEpoch: this.complexEpoch, neighbors: neighbors ?? [], reaches, portals, byEdge, geometry, value: EMPTY };
+      c.value = this.value(c, new Map());
       this.entries.set(key, c);
       // Hover/site estimates are disposable; station entries persist until that station is removed.
       if (this.entries.size > g.stations.map.size + 80) for (const k of this.entries.keys()) if (!k.startsWith('station:')) { this.entries.delete(k); break; }
     }
-    if (c.lotKey !== versions.lot) {
-      const ids = new Set<number>(), buildings = new Map<number, WalkBuilding>();
-      for (const s of sources) {
+    c = c!;
+    c.complexEpoch = this.complexEpoch;
+    if (!c.lots || !w.lotVersions.unchanged(c.lots) || terrainChanged) {
+      // With unchanged walking paths, an attributed lot edit only needs that building's distance.
+      const changed = !graphChanged && !terrainChanged && c.lots ? w.changedLots(c.lots) : null;
+      const ids = changed ?? new Set<number>(), buildings = changed ? new Map(c.value.buildings) : new Map<number, WalkBuilding>();
+      if (!changed) for (const s of sources) {
         const r = s.limit + FRONTAGE_REACH;
-        for (const id of g.world.bgrid.query(s.x - r, s.z - r, s.x + r, s.z + r)) ids.add(id);
+        for (const id of w.bgrid.query(s.x - r, s.z - r, s.x + r, s.z + r)) ids.add(id);
       }
       for (const id of ids) {
-        const b = g.world.buildings.get(id); if (!b) continue;
+        buildings.delete(id);
+        const b = w.buildings.get(id); if (!b) continue;
+        if (changed) {
+          const box = w.bgrid.box(id);
+          if (!box || !sources.some((s) => { const r = s.limit + FRONTAGE_REACH;
+            return box[0] <= s.x + r && box[2] >= s.x - r && box[1] <= s.z + r && box[3] >= s.z - r; })) continue;
+        }
         const p = this.frontage(b); if (!p) continue;
         for (const reach of c.reaches) {
           const d = this.distance(reach, p.edge, p.s, c.portals, c.byEdge) + p.leg;
@@ -250,7 +389,8 @@ class WalkingCache {
           if (d < (buildings.get(id)?.distance ?? Infinity)) buildings.set(id, { distance: d, limit: reach.limit });
         }
       }
-      c.value = { segments: c.value.segments, buildings }; c.lotKey = versions.lot;
+      c.value = this.value(c, buildings); c.lots = w.lotVersions.snapshot(c.roads.ids);
+      c.terrain = w.terrainVersions.snapshot(c.roads.ids);
     }
     return c.value;
   }
@@ -294,22 +434,27 @@ class WalkingCache {
     return d;
   }
 
-  private segments(reaches: Reach[], portals: Portal[], byEdge: Map<number, number[]>): WalkSegment[] {
-    const net = this.g.world.net, out: WalkSegment[] = [];
+  private value(c: Cached, buildings: Map<number, WalkBuilding>): WalkingCatchment {
+    const self = this;
+    return { get segments() { return c.segments ??= self.segments(c.reaches, c.portals, c.byEdge, c.geometry); }, buildings };
+  }
+
+  private segments(reaches: Reach[], portals: Portal[], byEdge: Map<number, number[]>, geometry: Cached['geometry']): WalkSegment[] {
+    const out: WalkSegment[] = [];
     for (const r of reaches) for (const id of r.edges) {
-      const e = net.edges.get(id)!;
+      const { len, a, b, geo } = geometry.get(id)!;
       const spans: [number, number][] = [];
-      const add = (s: number, d: number) => { if (d <= r.limit) spans.push([Math.max(0, s - (r.limit - d)), Math.min(e.len, s + (r.limit - d))]); };
-      add(0, r.nodes.get(e.a) ?? Infinity); add(e.len, r.nodes.get(e.b) ?? Infinity);
+      const add = (s: number, d: number) => { if (d <= r.limit) spans.push([Math.max(0, s - (r.limit - d)), Math.min(len, s + (r.limit - d))]); };
+      add(0, r.nodes.get(a) ?? Infinity); add(len, r.nodes.get(b) ?? Infinity);
       for (const i of byEdge.get(id) ?? []) add(portals[i].s, r.portals.get(i) ?? Infinity);
       spans.sort((a, b) => a[0] - b[0]);
       const merged: [number, number][] = [];
       for (const span of spans) { const last = merged[merged.length - 1]; if (last && span[0] <= last[1]) last[1] = Math.max(last[1], span[1]); else merged.push([...span]); }
       for (const [s0, s1] of merged) {
-        const n = Math.ceil((s1 - s0) / 2), p = { x: 0, y: 0, z: 0 }; net.pointAt(e, s0, p);
+        const n = Math.ceil((s1 - s0) / 2), p = { x: 0, y: 0, z: 0 }; curvePoint(geo, s0, p);
         for (let i = 1; i <= n; i++) {
           const x0 = p.x, z0 = p.z, a = s0 + (s1 - s0) * (i - 1) / n, b = s0 + (s1 - s0) * i / n;
-          net.pointAt(e, b, p); out.push({ x0, z0, x1: p.x, z1: p.z, edge: id, s0: a, s1: b, mode: r.mode });
+          curvePoint(geo, b, p); out.push({ x0, z0, x1: p.x, z1: p.z, edge: id, s0: a, s1: b, mode: r.mode });
         }
       }
     }
@@ -319,12 +464,19 @@ class WalkingCache {
 
 const caches = new WeakMap<Game, WalkingCache>();
 function cache(g: Game): WalkingCache { let c = caches.get(g); if (!c) { c = new WalkingCache(g); caches.set(g, c); } return c; }
-/** Re-check local building geometry at monthly/structural catchment updates; paths remain cached. */
+/** Prepare local caches once for a share update; unchanged regions and station paths survive. */
 export function refreshWalkBuildings(g: Game) { cache(g).refreshBuildings(); }
 export function walkRoadsChanged(g: Game): boolean { return cache(g).roadsChanged(); }
+export function prepareWalkingCatchment(g: Game, st: Station) { cache(g).prepare(st); }
 export function walkingCatchment(g: Game, st: Station): WalkingCatchment {
   g.stations.refreshAccess();
   return cache(g).calculate(`station:${st.id}`, cache(g).access(st));
+}
+/** Independent cache, for exact incremental/full checks without mutating the live walking cache. */
+export function fullWalkingCatchments(g: Game): Map<number, WalkingCatchment> {
+  const c = new WalkingCache(g), out = new Map<number, WalkingCatchment>();
+  for (const st of g.stations.map.values()) out.set(st.id, c.calculate(`station:${st.id}`, c.access(st)));
+  return out;
 }
 export function walkingPopulation(g: Game, c: WalkingCatchment): number {
   let pop = 0; for (const id of c.buildings.keys()) pop += g.world.buildings.get(id)?.pop ?? 0; return pop;

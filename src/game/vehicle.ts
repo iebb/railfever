@@ -95,7 +95,7 @@ export abstract class Vehicle {
     if (nl && !nl.vehicles.includes(this.id)) nl.vehicles.push(this.id);
     this.stopIndex = 0;
     this.resetSpacing();
-    g.lines.rebuild();
+    g.lines.rebuild(false);
     this.onLineChanged();
   }
 

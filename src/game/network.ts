@@ -4,7 +4,7 @@ import { NetKind, PSTEP, ROAD_TYPES, LANE_OFFSET } from './constants';
 import {
   Bez, arcTable, tAtS, bezPoint, bezDeriv, bezSplit, startTangent, endTangent, bezMinRadius, closestOnPolyline, Vec3Like,
 } from './geom';
-import { SpatialGrid } from './spatial';
+import { SpatialGrid, RegionVersions } from './spatial';
 
 export interface NNode {
   id: number;
@@ -118,7 +118,32 @@ export class Network {
   nextNode = 1;
   nextEdge = 1;
   nextCrossing = 1;
-  grid = new SpatialGrid(8);
+  readonly roadVersions = new RegionVersions();
+  /** Short facade connectors need a tighter dependency area than station walking paths. */
+  readonly frontageRoadVersions = new RegionVersions(8);
+  /** Road membership of each versioned region, maintained by the same index mutation hooks. */
+  readonly roadRegions = new Map<number, Set<number>>();
+  private indexedRoads = new Set<number>();
+  // Include old boxes on removal/splitting, new boxes on insertion, and save load's index writes.
+  grid = new SpatialGrid(8, 100000, (id, box, added) => {
+    if (!box) { this.roadVersions.bump(); this.frontageRoadVersions.bump(); this.roadRegions.clear(); this.indexedRoads.clear(); }
+    else if (added ? this.edges.get(id)?.kind === 'road' : this.indexedRoads.has(id)) {
+      this.roadVersions.bump(box);
+      this.frontageRoadVersions.bump(box);
+      for (const region of RegionVersions.ids(box)) {
+        if (added) {
+          let edges = this.roadRegions.get(region);
+          if (!edges) { edges = new Set(); this.roadRegions.set(region, edges); }
+          edges.add(id);
+        } else {
+          const edges = this.roadRegions.get(region); edges?.delete(id);
+          if (!edges?.size) this.roadRegions.delete(region);
+        }
+      }
+    }
+    if (added && this.edges.get(id)?.kind === 'road') this.indexedRoads.add(id);
+    else this.indexedRoads.delete(id);
+  });
   nodeGrid = new SpatialGrid(8);
   version = 0;
   /** edges and nodes touched since vehicles last processed a network change (see Vehicles.onNetworkChanged) */
@@ -236,6 +261,10 @@ export class Network {
     e.version++;
     this.version++;
     this.geoCache.delete(e.id);
+    if (e.kind === 'road') {
+      const box = this.grid.box(e.id);
+      this.roadVersions.bump(box); this.frontageRoadVersions.bump(box);
+    }
     this.markEdge(e);
   }
 
