@@ -5,6 +5,7 @@ import { Train } from './train';
 import { routeBetween } from './ai-network';
 import { linePatterns, patternOf, removePattern, setVehiclePattern, addPattern } from './patterns';
 import { fmtMoney } from './economy';
+import { carriesMail } from './vehicle-types';
 
 export const RAIL_YEAR = 360;
 export interface RailAccount {
@@ -167,7 +168,7 @@ export class RailPolicy {
         let removed = 0;
         if (s.occupancy < 0.3) for (const t of trains) {
           if (t.state !== 'loading' && t.state !== 'depot') continue;
-          const wagons = t.cars.filter((c) => c.kind === 'wagon'), emus = t.cars.filter((c) => c.kind === 'emu');
+          const wagons = t.cars.filter((c) => c.kind === 'wagon' && !carriesMail(c)), emus = t.cars.filter((c) => c.kind === 'emu' && !carriesMail(c));
           const car = wagons.length > 1 ? wagons[wagons.length - 1] : emus.length > 1 ? emus[emus.length - 1] : null;
           if (!car || t.load > t.capacity - car.capacity) continue;
           const refund = g.vehicles.resaleValue(t) * car.cost / t.value;
@@ -176,7 +177,7 @@ export class RailPolicy {
           g.company(this.me).economy.earn(refund, 'vehicles');
           removed++;
         }
-        if (!removed && s.occupancy < 0.3 && trains.some((t) => t.cars.filter((c) => c.kind === 'wagon' || c.kind === 'emu').length > 1)) return false;
+        if (!removed && s.occupancy < 0.3 && trains.some((t) => t.cars.filter((c) => (c.kind === 'wagon' || c.kind === 'emu') && !carriesMail(c)).length > 1)) return false;
         if (removed) {
           // Seats and mass affect the timetable even when the locomotive's top speed is unchanged.
           g.lines.rebuild();
