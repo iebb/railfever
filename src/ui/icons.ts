@@ -106,6 +106,8 @@ const P: Record<string, string> = {
   gauge: 'M4.5 18a9 9 0 1 1 15 0 M12 13l3.5-5 M12 13h.01',
   join: 'M8 12h8 M12 8v8 M12 3a9 9 0 1 0 0 18a9 9 0 1 0 0-18z',
   leave: 'M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3 M10 16l-4-4 4-4 M6 12h10',
+  // mail: an envelope (mail waiting, mail loads, mail vans)
+  mail: 'M4.5 5.5h15a1.5 1.5 0 0 1 1.5 1.5v10a1.5 1.5 0 0 1-1.5 1.5h-15A1.5 1.5 0 0 1 3 17V7a1.5 1.5 0 0 1 1.5-1.5z M3.5 7l8.5 6.2L20.5 7',
 };
 
 export const ICON_NAMES = Object.keys(P);
