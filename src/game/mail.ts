@@ -200,9 +200,15 @@ export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => 
     if (st === b || !m || ![...m.waiting.values()].some((w) => w.alight === b.id || w.dest === b.id)) continue;
     const old = [...m.waiting.values()];
     m.waiting.clear(); m.total = 0;
-    for (const w of old) if (re(w.dest) !== st.id) addMail(g, st, w.line, re(w.alight), re(w.dest), w.count, w.t);
+    for (const w of old) {
+      if (re(w.dest) === st.id) deliverMail(g, st, w.count);
+      else addMail(g, st, w.line, re(w.alight), re(w.dest), w.count, w.t);
+    }
   }
-  for (const w of moved) if (re(w.dest) !== a.id) addMail(g, a, w.line, re(w.alight), re(w.dest), w.count, w.t);
+  for (const w of moved) {
+    if (re(w.dest) === a.id) deliverMail(g, a, w.count);
+    else addMail(g, a, w.line, re(w.alight), re(w.dest), w.count, w.t);
+  }
   for (const v of g.vehicles.map.values()) {
     if (![...v.mailCargo.values()].some((c) => c.alight === b.id || c.dest === b.id || c.from === b.id)) continue;
     const old = [...v.mailCargo.values()];
@@ -488,6 +494,7 @@ export class MailModel {
 
   /** Units a station posts per day at its current rating and service (for the UI and estimates). */
   rate(st: Station): number {
+    if (!this.accepts(st)) return 0;
     const town = this.g.towns.list[st.townId];
     const dw = this.weights(st);
     return this.mailPop(st) * mailGenRate() * mailEra(this.g.year) * townMailFactor(town?.pop ?? 0) * (0.2 + (st.mail?.rating ?? 0.65)) * dw.served;

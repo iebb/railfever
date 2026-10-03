@@ -585,7 +585,7 @@ export class Vehicles {
       if (t.state !== 'loading' || t.atStation < 0) return 'The train must stand in its depot or at a platform';
       const head = t.segs[t.headSeg], e = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
       const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
-      if (len > t.length + 1e-9 && (!e || e.station !== t.atStation || t.headPos < len + 0.05)) return 'The longer train does not fit on this platform';
+      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'The train does not fit on this platform';
     }
     if (t.lineId != null) { const why = lineCompatibility(g, t.lineId, cars); if (why) return why; }
     const { added } = consistDiff(t.cars, cars);
