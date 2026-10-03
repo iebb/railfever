@@ -109,7 +109,7 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const sh = g.stations.catchmentShapes(S);
   // (a station building draws people from further away: +20% for the classic one)
   const RB = CATCHMENT_RADIUS.rail * (1 + styleOf(S.rail!.style).catchBonus);
-  check(S.rail!.style === 'classic' && Math.abs(RB - 48) < 1e-9, 'a classic station building widens the 400 m catchment by 20%');
+  check(S.rail!.style === 'classic' && Math.abs(RB - 33.6) < 1e-9, 'a classic station building widens the 280 m catchment by 20%');
   check(sh.length === 3 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(Math.max(...sh.map((c) => c.x)) - 132) < 0.01, 'rail: 3 circles along the platforms (ends and centre)');
   const busId = g.stations.nextId;
   check(!g.stations.commitBusStop(50, 100, 0), 'bus stop built');
@@ -122,9 +122,9 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const tram = g.stations.get(tramId)!;
   const rb = g.stations.catchmentShapes(bus)[0], rt = g.stations.catchmentShapes(tram)[0];
   console.log(`  radii: rail ${sh[0].r}, tram ${rt?.r} (${rt?.mode}), bus ${rb?.r} (${rb?.mode})`);
-  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, 'tram and bus radii, rail > tram > bus');
-  // measured from the platforms: a house 46 beyond a platform end is in, one 55 from every circle is out
-  const hin = house(g, 132 + 46, 104), hout = house(g, 128, 104 + 55), hside = house(g, 128, 104 + 47);
+  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 11.2 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 15.4 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '112 m bus and 154 m tram radii, rail > tram > bus');
+  // From the platforms: 32 beyond an end / 33 to the side are in; 40 away (inside the old radius) is out.
+  const hin = house(g, 132 + 32, 104), hout = house(g, 128, 104 + 40), hside = house(g, 128, 104 + 33);
   const cb = new Set(g.stations.catchmentBuildings(S));
   check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'catchment measured from the platform area');
   // no road access: no catchment

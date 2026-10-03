@@ -14,7 +14,7 @@ import type { Hop } from './lines';
 import { tripFactor, refTime } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAYS_PER_MONTH, STATION_RADIUS, BUSSTOP_RADIUS, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE } from './constants';
+import { DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 
 export interface Region {
@@ -82,14 +82,9 @@ export function stationActive(g: Game, st: Station): boolean {
   return s.hasAccess ? s.hasAccess(st) !== false : true;
 }
 
-/** Catchment circles of a station (stations.ts catchmentShapes when there is one). */
+/** Canonical station catchment circles, including mode, building bonuses and road access. */
 export function catchmentCircles(g: Game, st: Station): { x: number; z: number; r: number }[] {
-  const s = g.stations as unknown as { catchmentShapes?: (st: Station) => { x: number; z: number; r: number }[] };
-  if (s.catchmentShapes) return s.catchmentShapes(st);
-  const out: { x: number; z: number; r: number }[] = [];
-  if (st.rail) out.push({ x: st.rail.x, z: st.rail.z, r: STATION_RADIUS + st.rail.length / 2 });
-  for (const p of st.stops) out.push({ x: p.x, z: p.z, r: BUSSTOP_RADIUS });
-  return out;
+  return g.stations.catchmentShapes(st);
 }
 
 const NO_DEMAND: StationDemand = { dest: [], w: [], served: 0 };

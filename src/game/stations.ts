@@ -38,7 +38,7 @@ export type PlatformStyle = 'island' | 'side';
  * Catchment radius per mode (units, 1 = 10 m): main-line rail ('rail'), metro and light rail from the platforms
  * (or the entrances), tram / bus from the stop. A station draws passengers only from buildings inside its circles.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 40, metro: 30, lightrail: 25, tram: 22, bus: 16 };
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 28, metro: 21, lightrail: 17.5, tram: 15.4, bus: 11.2 };
 /** A catchment circle; inactive ones (a rail part without road access) draw no passengers. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */

@@ -3,7 +3,7 @@
 // overheads, crew, energy, maintenance; track base upkeep + wear). Line maintenance below is the base upkeep of
 // the line's infrastructure (Game.edgeMaintenance / stationMaintenance); track wear is in the company totals.
 // npx esbuild scripts/economy.ts --bundle --platform=node --format=esm --outfile=$S/economy.mjs && node $S/economy.mjs [seed]
-// Seed 7 checks the pre-calibration incomes below. --json=/path/before.json saves another seed's exact results;
+// Seed 7 checks the catchment-calibrated incomes below. --json=/path/before.json saves another seed's exact results;
 // --baseline=/path/before.json checks each income stays within 25% of that baseline instead.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
@@ -15,13 +15,13 @@ import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train, ch
 const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
 const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
-// Measured before changing demand/fares: original rates, four years, final full year, no AI.
+// Measured with the 30% smaller per-mode catchments: four years, final full year, no AI.
 const seed7Baseline = {
   seed: 7, results: [
-    { name: 'rail Weyport-Ashwick (133 u track)', income: 1173514 },
-    { name: 'busy bus in Oldwood (2x Metro Articulated)', income: 164533 },
-    { name: 'short bus in Oldwood (1x City Liner)', income: 15475 },
-    { name: 'village rail Redwell(345)-Southley(237)', income: 806741 },
+    { name: 'rail Weyport-Ashwick (139 u track)', income: 1609979 },
+    { name: 'busy bus in Oldwood (2x Metro Articulated)', income: 77793 },
+    { name: 'short bus in Oldwood (1x City Liner)', income: 10045 },
+    { name: 'village rail Redwell(333)-Southley(237)', income: 348732 },
   ],
 };
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });

@@ -68,11 +68,15 @@ const eDbl = net.nextEdge;
     if (!dbl.ok) { removeEdges(g, newRailEdges(g, eTry), 0); g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id); continue; }
     console.log(`  crossovers ${dbl.crossovers}, signals ${dbl.signals}`);
     const dep2 = depotBehind(g, pr2.A, pr2.B, 0);
-    if (dbl.ok && dep2 > 0) {
-      const l2 = g.lines.create('rail', 0);
-      l2.stops = [pr2.A.id, pr2.B.id];
-      dblDepot = dep2; dblLine = l2.id;
+    if (dep2 <= 0) {
+      removeEdges(g, newRailEdges(g, eTry), 0);
+      g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id);
+      dbl.ok = false;
+      continue;
     }
+    const l2 = g.lines.create('rail', 0);
+    l2.stops = [pr2.A.id, pr2.B.id];
+    dblDepot = dep2; dblLine = l2.id;
   }
 }
 check(dbl.ok && dbl.crossovers === 2 && dbl.signals >= 2, 'double track with crossovers and signals');
