@@ -3,12 +3,9 @@ import type { AIController, LineInfo } from './ai';
 import { modelYearCost } from './ai';
 import type { Game } from './game';
 import type { Line } from './lines';
-import type { Station, StationPlan } from './stations';
 import { railModeOf } from './stations';
-import type { ForecastSite } from './demand';
-import { planWalkingCatchment, walkingCatchment, walkWeight, coverOf } from './catchment';
 import { MAIL_STATION, DAY_SECONDS } from './constants';
-import { mailEra, mailGenRate, townMailFactor, mailQueueCap } from './mail';
+import { mailEra, mailGenRate, townMailFactor, mailQueueCap, mailQueueCapOf, mailCapture, routedJourney, type MailPoint } from './mail';
 import { mailFare, mailTripFactor, estimateLegTime } from './fares';
 import { lineTable } from './patterns';
 import { Train } from './train';
@@ -19,7 +16,7 @@ const YEAR_SECONDS = YEAR * DAY_SECONDS;
 const MARGIN = 1.5;
 // Vehicles.recomposeError requires this much platform behind the new tail.
 const PLATFORM_CLEARANCE = 0.05;
-type MailSite = Station | StationPlan | ForecastSite;
+type MailSite = MailPoint;
 /** Only van targets are queued: intervening passenger changes must survive the platform operation. */
 export type MailQueue = [number, string[]][];
 export interface MailLoad { capacity: number; lowSince: number }
@@ -62,80 +59,107 @@ export function pickMailVan(year: number, cars: VehicleModel[]): VehicleModel | 
     .sort((a, b) => value(b) - value(a))[0] ?? null;
 }
 
-/** Project catchments share buildings with each other and the existing passenger stations, as demand does. */
-function sitePopulations(g: Game, points: MailSite[]): number[] {
-  const walks = points.map((p) => 'walk' in p ? p.walk : 'id' in p ? walkingCatchment(g, p) : planWalkingCatchment(g, p));
-  const sums = new Map<number, number>(), best = new Map<number, number>();
-  const reach = (id: number, w: number) => { sums.set(id, (sums.get(id) ?? 0) + w); best.set(id, Math.max(best.get(id) ?? 0, w)); };
-  for (const walk of walks) for (const [id, b] of walk.buildings) reach(id, walkWeight(b.distance));
-  for (const st of g.stations.map.values()) {
-    if (!g.lines.stationServed(st.id) || points.some((p) => 'id' in p && p.id === st.id)) continue;
-    for (const [id, b] of walkingCatchment(g, st).buildings) if (sums.has(id)) reach(id, walkWeight(b.distance));
-  }
-  return points.map((p, i) => {
-    if ('id' in p) return g.mail.mailPop(p);
-    let pop = 0;
-    for (const [id, b] of walks[i].buildings) pop += (g.world.buildings.get(id)?.pop ?? 0)
-      * walkWeight(b.distance) / sums.get(id)! * coverOf(best.get(id)!);
-    // mailMix reads only the site's position; there is no temporary station or routing mutation.
-    return pop * g.mail.mailMix({ x: p.x, z: p.z } as Station);
-  });
-}
+const townOf = (g: Game, p: MailSite) => ('townId' in p ? p.townId : g.towns.nearest(p.x, p.z)?.id ?? -1);
+/** People can reach it: a station unless its road access is known to be missing (mail.ts), a plan with road access. */
+const reachableSite = (p: MailSite) => ('id' in p ? p.roadAccess !== false : !('roadAccess' in p) || !!p.roadAccess);
 
-/** Annual receipts at actual mail rates, or the same generation model over a proposed direct service. */
+/**
+ * Annual mail receipts of a railway through `points` with mail vans of `capacity` units on trains every `headway` s, by
+ * the rules of the real receipts (mail.ts, fares.ts):
+ *  - a line already carrying mail: every accepting station's mail (its rate and destinations) whose routed journey
+ *    rides the line, at the line's share of each journey's receipts (by the distances its legs carry);
+ *  - otherwise (a project, or a line without vans yet): its points as mail stations (MailModel.forecastPops: catchments
+ *    shared with the other mail stations, mail feeders by this service), posting by era, town size, rating and the
+ *    capture of the towns the line reaches, each to the fastest point of each other town, direct.
+ * Whole journeys pay mailFare (distance from posting, time to delivery, x 0.9 per change), within the vans' room per
+ * departure at each boarding station. Read-only: no mail state, no random numbers.
+ */
 export function forecastMailRevenue(g: Game, points: MailSite[], kmh: number, headway: number, capacity: number, line?: Line): number {
   if (points.length < 2 || !(kmh > 0) || !(headway > 0) || !(capacity > 0)) return 0;
+  if (line && line.vehicles.some((id) => (g.vehicles.get(id)?.mailCapacity ?? 0) > 0)) return routedRevenue(g, line, headway, capacity);
+  return directRevenue(g, points, kmh, headway, capacity, line);
+}
+
+/** Receipts of the mail riding `line` now (forecastMailRevenue), its room per departure `capacity`. */
+function routedRevenue(g: Game, line: Line, headway: number, capacity: number): number {
+  const board = new Map<number, { units: number; receipts: number }>();
+  const part = (lines: number[]) => {
+    // mail is shared over parallel lines by their mail fleets (Lines.distribute)
+    const w = lines.map((id) => Math.max(1, g.lines.fleetSize(id, 'mail')));
+    return w[lines.indexOf(line.id)] / w.reduce((a, b) => a + b, 0);
+  };
+  for (const st of [...g.stations.map.values()].sort((a, b) => a.id - b.id)) {
+    if (!g.mail.accepts(st)) continue;
+    const dw = g.mail.weights(st);
+    if (!(dw.served > 0)) continue;
+    const daily = g.mail.rate(st);
+    for (let j = 0; j < dw.dest.length; j++) {
+      const jr = routedJourney(g, st.id, dw.dest[j]);
+      if (!jr || !jr.legs.some((l) => l.lines.includes(line.id))) continue;
+      const units = (daily * YEAR * dw.w[j]) / dw.served, fare = mailFare(jr.od, jr.seconds, 1, jr.changes);
+      const total = jr.legs.reduce((s, l) => s + l.dist, 0);
+      for (const leg of jr.legs) {
+        if (!leg.lines.includes(line.id)) continue;
+        const u = units * part(leg.lines), e = board.get(leg.from) ?? { units: 0, receipts: 0 };
+        e.units += u;
+        e.receipts += u * fare * (total > 0 ? leg.dist / total : 1 / jr.legs.length);
+        board.set(leg.from, e);
+      }
+    }
+  }
+  let revenue = 0;
+  for (const [id, e] of [...board].sort(([a], [b]) => a - b)) {
+    const st = g.stations.get(id), room = (YEAR_SECONDS / headway) * Math.min(capacity, st ? mailQueueCap(g, st) : capacity);
+    revenue += e.receipts * Math.min(1, room / Math.max(1, e.units));
+  }
+  return revenue;
+}
+
+/** Receipts of direct mail between the points of a new mail service (forecastMailRevenue). */
+function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number, capacity: number, line?: Line): number {
   const { n, share } = g.mail.townShares();
-  const pop = sitePopulations(g, points);
-  const towns = points.map((p) => 'townId' in p ? p.townId : g.towns.nearest(p.x, p.z)?.id ?? -1);
+  const pops = g.mail.forecastPops(points, headway, line);
+  const towns = points.map((p) => townOf(g, p));
+  const ok = points.map((p, i) => towns[i] >= 0 && towns[i] < n && reachableSite(p) && pops[i] >= MAIL_STATION.acceptPop);
   const table = line ? lineTable(g, line) : null;
   let revenue = 0;
   for (let i = 0; i < points.length; i++) {
+    if (!ok[i]) continue;
     const p = points[i], T = towns[i];
-    if (T < 0 || T >= n || pop[i] < MAIL_STATION.acceptPop || ('roadAccess' in p && !p.roadAccess)) continue;
-    const slots = YEAR_SECONDS / headway;
-    const queue = 'id' in p ? mailQueueCap(g, p) : Math.min(MAIL_STATION.cap,
-      MAIL_STATION.base + MAIL_STATION.perPop * pop[i] + MAIL_STATION.perTrack * 2);
-    const room = slots * Math.min(capacity, queue);
-    const parts: { units: number; fare: number }[] = [];
-    // Existing service includes mail feeding another line: value only the leg this line carries.
-    const weights = 'id' in p && line && line.vehicles.some((id) => (g.vehicles.get(id)?.mailCapacity ?? 0) > 0)
-      ? g.mail.weights(p) : null;
-    if (weights && weights.served > 0 && 'id' in p && line) {
-      const daily = g.mail.rate(p);
-      for (let j = 0; j < weights.dest.length; j++) {
-        const hop = g.lines.mailNextHop(p.id, weights.dest[j]);
-        if (!hop || !(hop.lines ?? [hop.line]).includes(line.id)) continue;
-        const to = g.stations.get(hop.alight), seconds = lineTable(g, line, 'mail').edges.find((e) => e.from === p.id && e.to === hop.alight)?.cost;
-        if (!to || seconds === undefined) continue;
-        const d = Math.hypot(to.x - p.x, to.z - p.z);
-        parts.push({ units: daily * YEAR * weights.w[j] / weights.served / (hop.lines?.length ?? 1), fare: mailFare(d, seconds, 1) });
-      }
-    } else {
-      const best = new Map<number, { j: number; seconds: number }>();
-      for (let j = 0; j < points.length; j++) {
-        const U = towns[j], q = points[j];
-        if (U < 0 || U === T || pop[j] < MAIL_STATION.acceptPop || ('roadAccess' in q && !q.roadAccess)) continue;
-        const d = Math.hypot(q.x - p.x, q.z - p.z);
-        const seconds = table && 'id' in p && 'id' in q
-          ? table.edges.find((e) => e.from === p.id && e.to === q.id)?.cost
-          : estimateLegTime(d, kmh, headway, 1.05);
-        if (seconds === undefined) continue;
-        const old = best.get(U);
-        const tie = 'id' in q ? q.id : j;
-        const oldPoint = old && points[old.j], oldTie = oldPoint && 'id' in oldPoint ? oldPoint.id : old?.j ?? Infinity;
-        if (!old || seconds < old.seconds || (seconds === old.seconds && tie < oldTie)) best.set(U, { j, seconds });
-      }
-      const daily = pop[i] * mailGenRate() * mailEra(g.year) * townMailFactor(g.towns.list[T]?.pop ?? 0)
-        * (0.2 + ('mail' in p ? p.mail?.rating ?? 0.65 : 0.65));
-      for (const [U, b] of [...best].sort(([a], [b]) => a - b)) {
-        const q = points[b.j], d = Math.hypot(q.x - p.x, q.z - p.z);
-        const weight = U < n ? share[T * n + U] * mailTripFactor(d, b.seconds) : 0;
-        parts.push({ units: daily * YEAR * weight, fare: mailFare(d, b.seconds, 1) });
-      }
+    // per other town the point its mail is fastest to (ties: the lower station id, as MailModel.weights)
+    const best = new Map<number, { j: number; seconds: number }>();
+    for (let j = 0; j < points.length; j++) {
+      const U = towns[j], q = points[j];
+      if (!ok[j] || U === T) continue;
+      const d = Math.hypot(q.x - p.x, q.z - p.z);
+      const seconds = table && 'id' in p && 'id' in q
+        ? table.edges.find((e) => e.from === p.id && e.to === q.id)?.cost
+        : estimateLegTime(d, kmh, headway, 1.05);
+      if (seconds === undefined) continue;
+      const old = best.get(U);
+      const tie = 'id' in q ? q.id : j;
+      const oldPoint = old && points[old.j], oldTie = oldPoint && 'id' in oldPoint ? oldPoint.id : old?.j ?? Infinity;
+      if (!old || seconds < old.seconds || (seconds === old.seconds && tie < oldTie)) best.set(U, { j, seconds });
     }
-    const units = parts.reduce((s, p) => s + p.units, 0), fit = Math.min(1, room / Math.max(1, units));
-    revenue += parts.reduce((s, p) => s + p.units * p.fare, 0) * fit;
+    // the destinations' weights and the capture of the towns reached (MailModel.weights), direct journeys
+    const parts: { w: number; fare: number }[] = [];
+    let reached = 0;
+    for (const [U, b] of [...best].sort(([a], [b]) => a - b)) {
+      const s = share[T * n + U];
+      if (!(s > 0)) continue;
+      const q = points[b.j], d = Math.hypot(q.x - p.x, q.z - p.z);
+      parts.push({ w: s * mailTripFactor(d, b.seconds), fare: mailFare(d, b.seconds, 1) });
+      reached += s;
+    }
+    if (!parts.length) continue;
+    const k = mailCapture(reached) / reached;
+    const daily = pops[i] * mailGenRate() * mailEra(g.year) * townMailFactor(g.towns.list[T]?.pop ?? 0)
+      * (0.2 + ('mail' in p ? p.mail?.rating ?? 0.65 : 0.65));
+    const units = parts.map((x) => daily * YEAR * x.w * k), total = units.reduce((a, b) => a + b, 0);
+    const tracks = 'id' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks : 2, stops = 'id' in p ? p.stops.length : 0;
+    const room = (YEAR_SECONDS / headway) * Math.min(capacity, mailQueueCapOf(pops[i], tracks, stops));
+    const fit = Math.min(1, room / Math.max(1, total));
+    revenue += parts.reduce((s, x, k) => s + units[k] * x.fare, 0) * fit;
   }
   return revenue;
 }
@@ -255,7 +279,13 @@ export class MailPolicy {
     for (let i = 0; i < trains.length; i++) if (targets[i].length !== mailVans(trains[i]).length) queue(trains[i], targets[i]);
   }
 
-  save(): MailPolicyState { return { mailQueue: this.mailQueue.map(([id, vans]) => [id, [...vans]]), mailLoads: [...this.mailLoads].map(([id, s]) => [id, { ...s }]) }; }
+  /** Saved once it holds something: an AI without vans or queued van changes saves as before mail. */
+  save(): Partial<MailPolicyState> {
+    const out: Partial<MailPolicyState> = {};
+    if (this.mailQueue.length) out.mailQueue = this.mailQueue.map(([id, vans]) => [id, [...vans]]);
+    if (this.mailLoads.size) out.mailLoads = [...this.mailLoads].map(([id, s]) => [id, { ...s }]);
+    return out;
+  }
   load(s: Partial<MailPolicyState>) {
     this.mailQueue = (s.mailQueue ?? []).map(([id, vans]) => [id, [...vans]]);
     this.mailLoads = new Map((s.mailLoads ?? []).map(([id, v]) => [id, { ...v }]));

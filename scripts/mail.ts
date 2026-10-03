@@ -9,7 +9,7 @@ import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { MODEL_BY_ID, MODELS, availableModels, carriesMail, mailOnlyModel, type VehicleModel } from '../src/game/vehicle-types';
 import { MAIL_UNIT_T, MAIL_STATION, MAIL_CAPTURE } from '../src/game/constants';
 import { mailFare, mailRefTime, mailEffDist as effDist, mailTripFactor, MAIL_FARE, simNow } from '../src/game/fares';
-import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull, newJourney, loadMail, unloadMail } from '../src/game/mail';
+import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull, newJourney, loadMail, unloadMail, mailByTown } from '../src/game/mail';
 import { mailFleet, canonicalizeLines } from '../src/game/patterns';
 import { mergeStops } from '../src/game/stations';
 import { serialize, deserialize } from '../src/game/save';
@@ -147,6 +147,18 @@ runDays(vans.g, 360 * 3, () => {
     console.log(`transfers: posted across town ${postedS1}, at ${A.name} ${postedA}; delivered at ${B.name} ${deliveredB - B0} (postbus carried up to ${onPostbus} units; line ${JSON.stringify(bl.mail)})`);
     check(postedS1 > 0 && (bl.mail?.month ?? 0) + (bl.mail?.last ?? 0) + onPostbus > 0, 'the postbus carries mail posted across town');
     check(deliveredB - B0 > postedA, `the railway delivers more than its own station posted: postbus mail changed to the train (${deliveredB - B0} > ${postedA})`);
+    // the station window's mail by town reads the queues of every origin (keys line:alight:dest:o) and creates nothing
+    const rail = g.lines.mailNextHop(A.id, B.id)!, before = stationMail(g, A).total;
+    addMail(g, A, rail.line, rail.alight, B.id, 3, newJourney(g, A, B.id));
+    addMail(g, A, rail.line, rail.alight, B.id, 4, newJourney(g, S1, B.id));
+    const keys = [...A.mail!.waiting.keys()].filter((k) => k.startsWith(`${rail.line}:${rail.alight}:${B.id}:`));
+    const byTown = mailByTown(g, A.id), toB = byTown.find((e) => e.town === B.townId);
+    check(keys.includes(`${rail.line}:${rail.alight}:${B.id}:${A.id}`) && keys.includes(`${rail.line}:${rail.alight}:${B.id}:${S1.id}`) && A.mail!.total === before + 7,
+      'mail from two origins for the same leg waits in two groups (key line:alight:dest:origin)');
+    check(byTown.reduce((n, e) => n + e.count, 0) === A.mail!.total && !!toB && toB.lines.reduce((n, x) => n + x.count, 0) === toB.count && new Set(byTown.map((e) => e.town)).size === byTown.length,
+      `mail by destination town counts every group once (${byTown.map((e) => `${g.towns.list[e.town]?.name}: ${e.count}`).join(', ')})`);
+    const quiet = [...g.stations.map.values()].find((st) => !st.mail);
+    check(mailByTown(g, -1).length === 0 && (!quiet || (mailByTown(g, quiet.id).length === 0 && !quiet.mail)), 'mail by town of a station without mail is empty and creates no mail state');
   }
 }
 

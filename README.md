@@ -68,7 +68,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 
 **Mail**
 
-- Stations post mail from their walking catchment (more from shops and offices, by era and town size) to the other towns your mail network reaches. Mail has its own queues and rating, is counted in tonnes, and pays by distance and how fast it arrives (Mail income in the finances).
+- Stations post mail from their walking catchment (more from shops and offices, by era and town size) to the other towns your mail network reaches; main-line stations with frequent mail trains also collect it from the rest of their town. A line to a single town still carries most of its towns' mail, handed over where it ends. Mail has its own queues and rating and is counted in tonnes. It pays once, when delivered, by the distance from where it was posted and how fast it arrived, less 10% for each change of vehicle, shared by the vehicles that carried it (Mail income in the finances).
 - Rail: the train composer couples 0–3 mail vans behind the locomotive, and a train of vans only is a mail train. The vehicle window adds or removes vans while the train stands at a platform or in its depot. A postal multiple unit carries mail only.
 - Road: postbuses carry passengers and some mail; mail vans and trucks carry mail only. Trams carry no mail.
 - The station, line, vehicle and town windows show mail waiting, the mail rating, mail posted, loaded and delivered, mail income and the mail load factor.

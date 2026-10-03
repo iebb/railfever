@@ -1,5 +1,6 @@
 // Mail AI: natural 1950 games (two rail-focused AIs, six years, seeds 7/23), platform queues, annual reviews,
-// van-safe passenger growth/cuts, and exact mid-run saves. Bundle as aimail.mjs and run there.
+// van-safe passenger growth/cuts, exact mid-run saves, and forecasts against the receipts they predict (the economy
+// test's railway with a van, seeds 7/23 in 1950 and seed 7 in 2000). Bundle as aimail.mjs and run there.
 import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { pickTrain, modelYearCost, type LineInfo } from '../src/game/ai';
@@ -7,7 +8,7 @@ import { forecastMailRevenue, projectMail, mailVans, type MailQueue } from '../s
 import { MODEL_BY_ID, carriesMail } from '../src/game/vehicle-types';
 import { lineTable } from '../src/game/patterns';
 import { railModeOf } from '../src/game/stations';
-import { addMail } from '../src/game/mail';
+import { addMail, newJourney, stationMail } from '../src/game/mail';
 import type { Line } from '../src/game/lines';
 import { fails, check, fmt, placeAndConnect, depotBehind, Train, checkNaN, checkReservations } from './lib';
 
@@ -52,8 +53,6 @@ function policyChecks() {
   probe.lines.set(l.id, info);
   g.lines.rebuild(); g.lines.flushCatchment(); g.stations.refreshAccess(true);
   g.day = 179;
-  // Known catchment sizes isolate the economics/decision boundaries from the site selector.
-  for (const st of [pr.A, pr.B]) st.catchPop = 3000;
   const table = lineTable(g, l), headway = 1 / table.pats.reduce((s, p) => s + p.freq, 0);
   const points = [pr.A, pr.B], cars = t.madeUp;
   const preview = forecastMailRevenue(g, points, t.maxSpeedKmh * 0.6, headway, 60, l);
@@ -114,10 +113,13 @@ function policyChecks() {
 
   g.day = (info.mailLook ?? g.day) + 360;
   for (const st of points) {
-    st.catchPop = 3000;
+    // well-rated stations post more (MailModel.rate): enough mail for a second van to pay
+    stationMail(g, st).rating = 1;
     const other = points.find((s) => s.id !== st.id)!;
-    addMail(g, st, l.id, other.id, other.id, 100);
+    addMail(g, st, l.id, other.id, other.id, 100, newJourney(g, st, other.id));
   }
+  const second = forecastMailRevenue(g, points, t.maxSpeedKmh * 0.6, headway, 120, l);
+  console.log(`  second van: forecast ${fmt(second / 1000)}k/year for two vans (the line's own mail, routed)`);
   ai.mailPolicy.mailLoads.set(t.id, { capacity: t.mailCapacity, lowSince: g.day });
   ai.mailPolicy.manage(l, info);
   check(ai.mailPolicy.mailQueue[0]?.[1].length === 2, 'a profitable backlog above 1.5 van capacities queues a second van');
@@ -215,6 +217,10 @@ function naturalRun(seed: number) {
     if (g.day % 360 === 0) console.log(`seed ${seed}: year ${g.day / 360}/${YEARS}, AI rail lines ${g.lines.all().filter((l) => l.kind === 'rail' && l.owner > 0).length}, mail lines ${mailLines.size}, max ${maxVans} vans/train`);
   }
   const income = g.companies.filter((c) => c.ai).reduce((s, c) => s + c.economy.yearTotals.reduce((s, y) => s + y.v.mailIncome, 0) + c.economy.thisYear.mailIncome, 0);
+  // the lines with vans last year: mail beside their passengers (mailcal's single trains: 14-30%)
+  let lineMail = 0, linePax = 0;
+  for (const id of mailLines) { const l = g.lines.get(id); if (l?.mail) { lineMail += l.mail.incomeLast; linePax += l.incomeLast - l.mail.incomeLast; } }
+  console.log(`seed ${seed}: lines with vans last year: mail ${fmt(lineMail / 1000)}k beside passengers ${fmt(linePax / 1000)}k (${fmt(100 * lineMail / Math.max(1, linePax), 1)}%)`);
   if (!mailLines.size) for (const ai of g.ais) console.log(`  ${g.company(ai.companyId).name}: ${ai.log.join('\n  ')}`);
   check(mailLines.size > 0, `seed ${seed}: at least one AI line gets vans`);
   check(openedWithVans > 0, `seed ${seed}: a profitable new rail project opens with vans`);
@@ -227,7 +233,46 @@ function naturalRun(seed: number) {
   console.log(`seed ${seed}: mail ${fmt(income / 1000)}k, van operation ${fmt(costs / 1000)}k (plus price/8 ${fmt(capital / 1000)}k), ${openedWithVans} opening trains; saved day ${replayDay}, ${g.day - replayDay} identical replay days; ${fmt((performance.now() - start) / 1000)}s`);
 }
 
+/**
+ * Forecasts by the rules of the real receipts: the economy test's railway (the best pair of towns 80-160 units apart)
+ * with one train. Forecast as a new mail service before the van (direct), then with the van coupled, run three years
+ * and compare the last year's mail receipts; at the start of that year, forecast again from the line's actual mail
+ * (routed) and compare with the same year.
+ */
+function forecastChecks() {
+  console.log('forecasts against receipts');
+  for (const [seed, year] of [[7, 1950], [23, 1950], [7, 2000]]) {
+    const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: year });
+    g.economy.money = 1e9;
+    const pr = placeAndConnect(g, 80, 160, 0, new Set(), 1, () => {});
+    if (!pr) { check(false, `${year} seed ${seed}: railway built`); continue; }
+    const depot = depotBehind(g, pr.A, pr.B, 0), l = g.lines.create('rail', 0);
+    l.stops = [pr.A.id, pr.B.id];
+    const cars = pickTrain(year, 16, 150, 3)!, van = MODEL_BY_ID.get(year < 1975 ? 'van_steel' : 'van_ic')!;
+    const plain = g.vehicles.buyTrain(depot, cars, l.id);
+    if (!(plain instanceof Train)) { check(false, `${year} seed ${seed}: train bought`); continue; }
+    for (let k = 0; k < 2 * TICKS_PER_DAY; k++) g.stepTick();
+    const service = () => { const pats = lineTable(g, l).pats; return { headway: 1 / pats.reduce((s, p) => s + p.freq, 0), kmh: plain.maxSpeedKmh * 0.6 }; };
+    const s0 = service(), points = [pr.A, pr.B];
+    const direct = forecastMailRevenue(g, points, s0.kmh, s0.headway, van.mail!, l);
+    check(g.mail.toJSON() === null && points.every((st) => !st.mail), `${year} seed ${seed}: forecasting creates no mail state`);
+    g.vehicles.sell(plain.id);
+    const t = g.vehicles.buyTrain(depot, [cars[0], van, ...cars.slice(1)], l.id);
+    if (!(t instanceof Train)) { check(false, `${year} seed ${seed}: train with a van bought`); continue; }
+    let routed = 0;
+    for (let d = 0; d < 3 * 360; d++) {
+      if (d === 2 * 360) { const s = service(); routed = forecastMailRevenue(g, points, s.kmh, s.headway, van.mail!, l); }
+      for (let k = 0; k < TICKS_PER_DAY; k++) g.stepTick();
+    }
+    const actual = l.mail?.incomeLast ?? 0;
+    console.log(`  ${year} seed ${seed} ${pr.TA.name}-${pr.TB.name}: mail receipts ${fmt(actual / 1000)}k in year three; forecast as a new service ${fmt(direct / 1000)}k (x${fmt(direct / Math.max(1, actual), 2)}), from the line's mail ${fmt(routed / 1000)}k (x${fmt(routed / Math.max(1, actual), 2)})`);
+    check(actual > 0 && direct >= 0.67 * actual && direct <= 1.5 * actual, `${year} seed ${seed}: the new-service forecast is within 0.67-1.5x of the receipts (x${fmt(direct / Math.max(1, actual), 2)})`);
+    check(routed >= 0.75 * actual && routed <= 1.33 * actual, `${year} seed ${seed}: the forecast from the line's mail is within 0.75-1.33x of the receipts (x${fmt(routed / Math.max(1, actual), 2)})`);
+  }
+}
+
 policyChecks();
+forecastChecks();
 for (const seed of seeds) naturalRun(seed);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

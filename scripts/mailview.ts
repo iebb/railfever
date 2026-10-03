@@ -20,7 +20,8 @@ function bounded(v: MailView, label: string) {
     p.potential >= 0 && p.carried >= 0 && p.carried <= p.potential + 1e-9 && p.share >= 0 && p.share <= 1 &&
     close(p.share, p.potential > 0 ? p.carried / p.potential : 0);
   check(v.towns.every(valid) && v.pairs.every(valid) && v.carried <= v.potential + 1e-9, `${label}: carried <= potential and shares in 0..1`);
-  check(close(v.potential, v.pairs.reduce((n, p) => n + p.potential, 0)) && close(v.carried, v.pairs.reduce((n, p) => n + p.carried, 0)), `${label}: pairs count both directions once`);
+  // (a town's carried mail also counts mail for towns beyond its lines, handed over where they end: MAIL_CAPTURE)
+  check(close(v.potential, v.pairs.reduce((n, p) => n + p.potential, 0)) && v.pairs.reduce((n, p) => n + p.carried, 0) <= v.carried + 1e-9, `${label}: pairs count both directions once, carrying at most what the towns send`);
   check(close(v.potential, v.towns.reduce((n, t) => n + t.potential, 0)) && close(v.carried, v.towns.reduce((n, t) => n + t.carried, 0)), `${label}: outgoing town totals match the network`);
 }
 
@@ -68,6 +69,12 @@ g.lines.flushCatchment();
 const vanBefore = footprint(g), vans = mailView(g);
 const pair = vans.pairs.find((p) => p.a === Math.min(pr.TA.id, pr.TB.id) && p.b === Math.max(pr.TA.id, pr.TB.id));
 check(vans !== plain && vans.carried > plain.carried && !!pair && pair.share > 0, 'adding a van invalidates the cache and raises the carried share');
+{
+  // a line to one town carries most of its towns' mail (the capture floor), more than that pair's own share
+  const ends = [pr.TA.id, pr.TB.id].map((id) => vans.towns.find((t) => t.id === id)!);
+  console.log(`one van line: ${ends.map((t) => `${g.towns.list[t.id].name} ${fmt(100 * t.share, 1)}% of its mail carried`).join(', ')}; the pair ${fmt(100 * (pair?.share ?? 0), 1)}%`);
+  check(!!pair && ends.every((t) => t.share > 0) && vans.carried > pair.carried, 'the towns at the ends send mail for towns beyond the line too');
+}
 check(footprint(g) === vanBefore && [...g.stations.map.values()].every((st) => !st.mail), 'forecasting the van service does not create station mail');
 bounded(vans, 'van service');
 check(g.vehicles.recompose(train, cars) === null, 'van removed again in the depot');

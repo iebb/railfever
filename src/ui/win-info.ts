@@ -275,7 +275,7 @@ function mailPanel(ui: UI, s: Station, lines: Line[]): HTMLElement | null {
       class: m.lostLast > 0 ? 'neg' : '',
       'data-tip': `${fmtPct(mailLostShare(m))} of the mail here was lost (this and last month): the queue outgrew the station, or no route was left. More frequent mail vans help; it lowers the mail rating.`,
     }, `${fmtMail(m.lostLast)} last month`)) : null,
-    quiet ? h('div', { class: 'muted station-advice' }, 'Nothing posted here this month or last. Mail goes from town to town: it needs a vehicle with room for mail calling here and at a station in another town, and people within walking reach. A stop beside a bigger station shares its catchment: merge the two.') : null);
+    quiet ? h('div', { class: 'muted station-advice' }, 'Nothing posted here this month or last. Mail goes from town to town: it needs a vehicle with room for mail calling here and at a station in another town, and people within walking reach. A stop beside another mail station shares its catchment with it: merge the two.') : null);
 }
 
 /** Capacity figures are sampled by the simulation; expansion plans are cached until the layout changes. */

@@ -10,17 +10,17 @@
 // distances they carried (booked as 'mailIncome'). Station, line and town mail state is created on first use and mail
 // draws on its own random stream: a game without mail vehicles plays, and saves, exactly as before.
 import type { Game } from './game';
-import type { Station } from './stations';
+import type { Station, StationPlan } from './stations';
 import { WALK_LINE } from './stations';
 import type { Vehicle, MailGroup } from './vehicle';
 import type { Hop, Line } from './lines';
 import type { Town } from './towns';
 import { RNG } from './rng';
-import { GEN_RATE } from './demand';
+import { GEN_RATE, type ForecastSite } from './demand';
 import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
-import { boarding, servesStation, patternHeadways, linePatterns, mailFleet } from './patterns';
-import { walkingCatchment, walkWeight, coverOf } from './catchment';
+import { boarding, servesStation, patternHeadways, linePatterns, mailFleet, TRANSFER_PENALTY_S } from './patterns';
+import { walkingCatchment, planWalkingCatchment, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
  * A leg mail has been carried on: the vehicle, its line and its owner then, and the straight-line distance (units)
@@ -83,6 +83,14 @@ export function mailEra(year: number): number {
 }
 /** Distance decay of mail between towns (d in units): the long-distance trips' (d / 100)^-0.8, flat below 300 m. */
 export function mailDecay(d: number): number { return Math.pow(Math.max(30, d) / 100, -0.8); }
+/**
+ * Capture of a station's mail (MAIL_CAPTURE): the part of its full posting rate it posts when the towns its mail
+ * routes reach receive `reached` (0..1) of its town's mail (the gravity shares).
+ */
+export function mailCapture(reached: number): number {
+  const C = MAIL_CAPTURE;
+  return reached > 0 ? C.floor + (1 - C.floor) * Math.min(1, reached / C.full) : 0;
+}
 /** Bigger towns post more per head (business mail): clamp(1 + 0.15 log2(pop / 3000), 0.75, 1.3). */
 export function townMailFactor(pop: number): number { return clamp(1 + 0.15 * Math.log2(Math.max(1, pop) / 3000), 0.75, 1.3); }
 
@@ -219,8 +227,36 @@ export function deliverMail(g: Game, st: Station, count: number) {
 
 /** Most mail (units) a station holds: min(cap, base + perPop x mailPop + perTrack x platforms + perStop x stops). */
 export function mailQueueCap(g: Game, st: Station): number {
+  return mailQueueCapOf(g.mail.mailPop(st), st.rail?.tracks ?? 0, st.stops.length);
+}
+/** mailQueueCap of a station with this mail population, platform tracks and stops (also for forecasts). */
+export function mailQueueCapOf(pop: number, tracks: number, stops: number): number {
   const c = MAIL_STATION;
-  return Math.max(0, Math.floor(Math.min(c.cap, c.base + c.perPop * g.mail.mailPop(st) + c.perTrack * (st.rail?.tracks ?? 0) + c.perStop * st.stops.length)));
+  return Math.max(0, Math.floor(Math.min(c.cap, c.base + c.perPop * pop + c.perTrack * tracks + c.perStop * stops)));
+}
+
+/** A leg of a routed mail journey (routedJourney): the line or lines sharing it, where it boards, its straight-line distance. */
+export interface RoutedLeg { lines: number[]; from: number; dist: number }
+/**
+ * The mail journey from station `from` to `dest` as the mail routing carries it (forecasts): its legs, its changes of
+ * vehicle, the straight-line distance it pays for and its expected time from posting to delivery (the routing cost:
+ * the waits for the next vehicle and the rides, without the transfer penalty, which is a preference rather than time).
+ * Null without a route.
+ */
+export function routedJourney(g: Game, from: number, dest: number): { od: number; seconds: number; changes: number; legs: RoutedLeg[] } | null {
+  const first = g.lines.mailNextHop(from, dest);
+  if (!first) return null;
+  const legs: RoutedLeg[] = [];
+  let at = from, hop: Hop | undefined = first;
+  for (let k = 0; hop && k < 16; k++) {
+    if (hop.line !== WALK_LINE) legs.push({ lines: hop.lines ?? [hop.line], from: at, dist: stationDist(g, at, hop.alight) });
+    at = hop.alight;
+    if (at === dest) break;
+    hop = g.lines.mailNextHop(at, dest);
+  }
+  if (at !== dest || !legs.length) return null;
+  const changes = legs.length - 1;
+  return { od: stationDist(g, from, dest), seconds: Math.max(1, first.cost - TRANSFER_PENALTY_S * changes), changes, legs };
 }
 
 /** Mail beyond the station's queue cap is lost (largest remainders keep exactly the cap; counted as lost). */
@@ -467,6 +503,65 @@ export function restoreMailQueue(g: Game, st: Station, list: any[]) {
 }
 
 // ------------------------------------------------------------------------------ the mail model (game.mail)
+/** A site of a mail allocation (allocateMail): a mail station, or a station a forecast adds (key: its id, or below 0). */
+interface AllocSite {
+  key: number; townId: number;
+  /** the buildings it reaches on foot (walking catchment) */
+  walk: WalkingCatchment['buildings'];
+  /** its feeder quality (MAIL_FEEDER), and the buildings within feeder reach by road (asked for when quality > 0) */
+  quality: number; feeders: () => Map<number, number>;
+}
+/** A place a mail forecast looks at: a station, a planned one, or a site with its walking catchment worked out. */
+export type MailPoint = Station | StationPlan | ForecastSite;
+
+/**
+ * The mail allocation of these sites (MailModel.mailPop): every building a site reaches on foot is shared by the sites
+ * reaching it (walkWeight of the walk, coverOf the best); of the buildings no site reaches, those of a site's town within
+ * its feeder reach send MAIL_FEEDER.share x the best quality claiming them, shared by quality / (1 + distance / decay).
+ * Weighted by MAIL_TYPE_WEIGHT. Ordered sums: by building id, then the sites' order.
+ */
+function allocateMail(g: Game, sites: AllocSite[]): Map<number, number> {
+  const B = g.world.buildings, out = new Map<number, number>();
+  const reach = new Map<number, [number, number][]>();
+  for (const s of sites) for (const [bid, w] of s.walk) {
+    const list = reach.get(bid), e: [number, number] = [s.key, walkWeight(w.distance)];
+    if (list) list.push(e); else reach.set(bid, [e]);
+  }
+  for (const bid of [...reach.keys()].sort((a, b) => a - b)) {
+    const b = B.get(bid);
+    if (!b || b.pop <= 0) continue;
+    const list = reach.get(bid)!;
+    let sum = 0, best = 0;
+    for (const [, w] of list) { sum += w; if (w > best) best = w; }
+    const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * coverOf(best);
+    for (const [key, w] of list) out.set(key, (out.get(key) ?? 0) + (mail * w) / sum);
+  }
+  // mail feeders: the town's buildings no site reaches on foot, by road from the railway stations with frequent mail
+  // trains to other towns (the car feeders' geometry: demand.ts feederReach)
+  const F = MAIL_FEEDER, claims = new Map<number, { sum: number; q: number; list: [number, number][] }>();
+  for (const s of sites) {
+    if (!(s.quality > 0)) continue;
+    for (const [bid, d] of s.feeders()) {
+      if (reach.has(bid)) continue;
+      const b = B.get(bid);
+      if (!b || b.pop <= 0 || b.townId !== s.townId) continue;
+      const w = s.quality / (1 + d / F.decay), c = claims.get(bid);
+      if (c) { c.sum += w; c.q = Math.max(c.q, s.quality); c.list.push([s.key, w]); } else claims.set(bid, { sum: w, q: s.quality, list: [[s.key, w]] });
+    }
+  }
+  for (const bid of [...claims.keys()].sort((a, b) => a - b)) {
+    const b = B.get(bid)!, c = claims.get(bid)!, mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * F.share * c.q;
+    for (const [key, w] of c.list) out.set(key, (out.get(key) ?? 0) + (mail * w) / c.sum);
+  }
+  return out;
+}
+/** Feeder quality of a combined mail frequency (1 / s) at a railway station of a town of `townPop`. */
+function feederQualityOf(frequency: number, townPop: number): number {
+  const F = MAIL_FEEDER;
+  if (!(frequency > 0) || townPop < F.minTownPop) return 0;
+  return clamp((F.cutoffHeadway - 1 / frequency) / (F.cutoffHeadway - F.fullHeadway), 0, 1);
+}
+
 /**
  * Mail generation, destinations and ratings (Game.mail). Daily (game.ts, after the passengers): every station that
  * accepts mail posts mailPop x mailGenRate x era x town factor x (0.2 + rating) x served units (served: the capture of
@@ -501,63 +596,64 @@ export class MailModel {
     return this.pops.get(st.id) ?? 0;
   }
 
-  /** The mail allocation of every mail station (see mailPop). Ordered sums: by building id, station id, town id. */
+  /** The mail allocation of every mail station (see mailPop): the mail stations in id order (allocateMail). */
   private allocate(): Map<number, number> {
-    const g = this.g, B = g.world.buildings, out = new Map<number, number>();
+    const g = this.g;
     const stations = [...g.lines.mailStations].map((id) => g.stations.get(id)).filter((st): st is Station => !!st && reachable(st)).sort((a, b) => a.id - b.id);
-    const reach = new Map<number, [number, number][]>();
-    for (const st of stations) for (const [bid, w] of walkingCatchment(g, st).buildings) {
-      const list = reach.get(bid), e: [number, number] = [st.id, walkWeight(w.distance)];
-      if (list) list.push(e); else reach.set(bid, [e]);
-    }
-    for (const bid of [...reach.keys()].sort((a, b) => a - b)) {
-      const b = B.get(bid);
-      if (!b || b.pop <= 0) continue;
-      const list = reach.get(bid)!;
-      let sum = 0, best = 0;
-      for (const [, w] of list) { sum += w; if (w > best) best = w; }
-      const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * coverOf(best);
-      for (const [sid, w] of list) out.set(sid, (out.get(sid) ?? 0) + (mail * w) / sum);
-    }
-    // mail feeders: the town's buildings no mail station reaches on foot, by road from the railway stations with
-    // frequent mail trains to other towns (the car feeders' geometry: demand.ts feederReach)
-    const F = MAIL_FEEDER, claims = new Map<number, { sum: number; q: number; list: [number, number][] }>();
-    for (const st of stations) {
-      const q = this.feederQuality(st);
-      if (!(q > 0)) continue;
-      for (const [bid, d] of g.demand.feederReach(st, F.reach)) {
-        if (reach.has(bid)) continue;
-        const b = B.get(bid);
-        if (!b || b.pop <= 0 || b.townId !== st.townId) continue;
-        const w = q / (1 + d / F.decay), c = claims.get(bid);
-        if (c) { c.sum += w; c.q = Math.max(c.q, q); c.list.push([st.id, w]); } else claims.set(bid, { sum: w, q, list: [[st.id, w]] });
-      }
-    }
-    for (const bid of [...claims.keys()].sort((a, b) => a - b)) {
-      const b = B.get(bid)!, c = claims.get(bid)!, mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * F.share * c.q;
-      for (const [sid, w] of c.list) out.set(sid, (out.get(sid) ?? 0) + (mail * w) / c.sum);
-    }
-    return out;
+    return allocateMail(g, stations.map((st) => this.site(st, this.feederQuality(st))));
+  }
+
+  /** A station as a site of a mail allocation, with this feeder quality. */
+  private site(st: Station, quality: number): AllocSite {
+    const g = this.g;
+    return { key: st.id, townId: st.townId, walk: walkingCatchment(g, st).buildings, quality, feeders: () => g.demand.feederReach(st, MAIL_FEEDER.reach) };
   }
 
   /**
    * Quality of a station's mail feeders (MAIL_FEEDER), 0..1: a railway station of a town of minTownPop+ by the combined
    * headway of the mail-carrying patterns calling there on railways to other towns (passengers: demand.ts
-   * mainlineFrequency).
+   * mainlineFrequency). Forecasts leave out `without`'s service and add `extra` (1 / s).
    */
-  private feederQuality(st: Station): number {
-    const g = this.g, F = MAIL_FEEDER;
-    if (!st.rail || st.townId < 0 || (g.towns.list[st.townId]?.pop ?? 0) < F.minTownPop) return 0;
-    let frequency = 0;
+  private feederQuality(st: Station, without?: Line, extra = 0): number {
+    const g = this.g, townPop = g.towns.list[st.townId]?.pop ?? 0;
+    if (!st.rail || st.townId < 0 || townPop < MAIL_FEEDER.minTownPop) return 0;
+    let frequency = extra;
     for (const l of g.lines.map.values()) {
-      if (l.kind !== 'rail' || !l.stops.includes(st.id) || mailFleet(g, l) === 'none') continue;
+      if (l === without || l.kind !== 'rail' || !l.stops.includes(st.id) || mailFleet(g, l) === 'none') continue;
       if (!l.stops.some((id) => { const s = g.stations.get(id); return !!s?.rail && s.townId !== st.townId; })) continue;
       for (const h of patternHeadways(g, l, 'mail')) {
         const p = linePatterns(l).find((p) => p.id === h.pid);
         if (h.headway > 0 && l.stops.some((id, i) => id === st.id && p?.stops[i] !== false)) frequency += 1 / h.headway;
       }
     }
-    return frequency > 0 ? clamp((F.cutoffHeadway - 1 / frequency) / (F.cutoffHeadway - F.fullHeadway), 0, 1) : 0;
+    return feederQualityOf(frequency, townPop);
+  }
+
+  /**
+   * Mail populations (mailPop) the points would have as mail stations of a railway with mail trains every `headway`
+   * s (forecasts; read-only, nothing cached): they join today's mail stations and share the buildings they reach on
+   * foot with them as mail stations do (an existing station by its catchment, a planned one by its plan's); in towns
+   * of 1,500+ they get mail feeders by the quality of their mail service with this one (in place of `line`'s own).
+   * Planned points are railway stations.
+   */
+  forecastPops(points: MailPoint[], headway: number, line?: Line): number[] {
+    const g = this.g, extra = headway > 0 ? 1 / headway : 0;
+    const own = new Set(points.filter((p): p is Station => 'id' in p).map((p) => p.id));
+    const sites: AllocSite[] = [];
+    for (const id of [...g.lines.mailStations].sort((a, b) => a - b)) {
+      const st = g.stations.get(id);
+      if (st && reachable(st) && !own.has(id)) sites.push(this.site(st, this.feederQuality(st)));
+    }
+    const keys = points.map((p, i) => ('id' in p ? p.id : -1 - i));
+    points.forEach((p, i) => {
+      if ('id' in p) { if (reachable(p)) sites.push(this.site(p, this.feederQuality(p, line, extra))); return; }
+      const townId = 'townId' in p ? p.townId : g.towns.nearest(p.x, p.z)?.id ?? -1;
+      const walk = 'walk' in p ? p.walk.buildings : planWalkingCatchment(g, p).buildings;
+      const access = 'access' in p && p.access ? p.access.tracks.flatMap((t) => [t.start, t.end]) : undefined;
+      sites.push({ key: keys[i], townId, walk, quality: feederQualityOf(extra, g.towns.list[townId]?.pop ?? 0), feeders: () => g.demand.feederReachAt(p, access, MAIL_FEEDER.reach) });
+    });
+    const pops = allocateMail(g, sites);
+    return keys.map((k) => pops.get(k) ?? 0);
   }
 
   /** Does the station accept mail? A line with vehicles carrying mail calls, it is reachable, and enough people post. */
@@ -622,7 +718,7 @@ export class MailModel {
       const b = best.get(U)!, ds = g.stations.get(b.d)!;
       dest.push(b.d); w.push(s * mailTripFactor(Math.hypot(ds.x - st.x, ds.z - st.z), b.hop.cost)); reached += s;
     }
-    const C = MAIL_CAPTURE, k = reached > 0 ? (C.floor + (1 - C.floor) * Math.min(1, reached / C.full)) / reached : 0;
+    const k = reached > 0 ? mailCapture(reached) / reached : 0;
     let served = 0;
     for (let i = 0; i < w.length; i++) { w[i] *= k; served += w[i]; }
     const res: MailDemand = { dest, w, served };

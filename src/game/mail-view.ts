@@ -5,7 +5,10 @@ import { MAIL_TYPE_WEIGHT, mailEra, mailGenRate, townMailFactor } from './mail';
 
 export interface MailTown {
   id: number; x: number; z: number; pop: number; radius: number;
-  /** Potential outgoing mail and the estimated part carried by the current mail network (t/month). */
+  /**
+   * Potential outgoing mail and the estimated part carried by the current mail network (t/month), including mail for
+   * towns beyond the network that its stations hand over where their lines end (mail.ts MAIL_CAPTURE).
+   */
   potential: number; carried: number;
   /** Carried / potential, bounded to 0..1. */
   share: number;
@@ -16,7 +19,10 @@ export interface MailTown {
 export interface MailPair {
   /** Town ids, a < b; distance in world units. */
   a: number; b: number; dist: number;
-  /** Mail in both directions, in t/month; carried is estimated from posting rates and routed weights. */
+  /**
+   * Mail in both directions, in t/month; carried is estimated from posting rates and routed weights, at most the
+   * pair's potential in each direction (mail sent on beyond a town counts for its own town, not for the pair).
+   */
   potential: number; carried: number; share: number;
 }
 
@@ -79,14 +85,21 @@ function computeView(g: Game): MailView {
       if (U >= 0 && U < n && U !== st.townId) carried[st.townId * n + U] += rate * dw.w[i] / dw.served;
     }
   }
-  // Fast services and high ratings can unlock more posting than the baseline potential. Bound each direction
-  // separately before combining pairs, keeping the displayed share meaningful even with overlapping stations.
+  // A station reaching few towns still posts most of its mail (the capture floor, mail.ts MAIL_CAPTURE): the mail
+  // for towns beyond rides to the towns it reaches and is handed over there. So a town's carried mail is bounded by
+  // its own potential, while each direction of a pair is bounded by that pair's potential (fast services and high
+  // ratings can also post more than the baseline potential), keeping the displayed shares within 0..1.
   let total = 0, transported = 0;
-  for (const t of towns) for (let U = 0; U < n; U++) {
-    const k = t.id * n + U;
-    carried[k] = Math.max(0, Math.min(potential[k], carried[k]));
-    t.potential += potential[k]; t.carried += carried[k];
-    total += potential[k]; transported += carried[k];
+  for (const t of towns) {
+    let posted = 0;
+    for (let U = 0; U < n; U++) {
+      const k = t.id * n + U;
+      posted += carried[k];
+      carried[k] = Math.max(0, Math.min(potential[k], carried[k]));
+      t.potential += potential[k];
+    }
+    t.carried = Math.max(0, Math.min(t.potential, posted));
+    total += t.potential; transported += t.carried;
   }
   for (const t of towns) t.share = t.potential > 0 ? t.carried / t.potential : 0;
   const pairs: MailPair[] = [];

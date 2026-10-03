@@ -532,7 +532,7 @@ export class MapModes {
           h('div', null, h('b', null, fmtMailTonnes(d.potential)), h('span', null, 'potential t / month')),
           h('div', null, h('b', null, fmtMailTonnes(d.carried)), h('span', null, 'estimated carried t / month')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a mail station`)) : null),
-        h('div', { class: 'mc-note' }, 'Arc width: potential mail in both directions. Colour and dash length: estimated carried share from mail routes, catchments and station ratings. Rings and labels: each town’s outgoing mail. Add mail vans, trucks or postbuses to carry mail.'),
+        h('div', { class: 'mc-note' }, 'Arc width: potential mail in both directions. Colour and dash length: estimated carried share from mail routes, catchments and station ratings. Rings and labels: each town’s outgoing mail, with mail for towns beyond the network that rides to where its lines end. Add mail vans, trucks or postbuses to carry mail.'),
         pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest uncarried flows') : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {
           class: 'mc-row', 'data-tip': `${fmtMailTonnes(p.potential)} t / month potential · ${fmtMailTonnes(p.carried)} t / month estimated carried · ${(p.dist / 100).toFixed(1)} km · ${Math.round(p.share * 100)}% carried`,
