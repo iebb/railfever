@@ -32,7 +32,7 @@ export interface Line {
    * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
    */
   loop?: boolean;
-  /** route letter (the Y of station numbers XY01), unique among the owner's lines; see Lines.lineCode */
+  /** rail route letter (the Y of station numbers XY01), unique among the owner's rail lines; see Lines.lineCode */
   code?: string;
   /**
    * shared lines: the owner is the lead operator; `operators` are the other companies that run vehicles on the
@@ -40,7 +40,7 @@ export interface Line {
    */
   operators?: number[];
   partners?: PartnerPolicy;
-  /** station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
+  /** rail station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
   numbers?: [number, number][];
   /**
    * service patterns (patterns.ts): locals, rapids, expresses and short-turns of the line, per stop whether they
@@ -241,14 +241,15 @@ export class Lines {
   /** The company letter (Company.code). */
   companyCode(owner: number): string { return this.game.company(owner).code ?? '?'; }
 
-  /** The route letter of a line, given one if it has none yet (unique among its owner's lines). */
+  /** The route letter of a rail line, assigned if absent (unique among its owner's rail lines); '' for other modes. */
   routeCode(l: Line): string {
+    if (l.kind !== 'rail') return '';
     if (l.code && !this.codeTaken(l.code, l.owner, l.id)) return l.code;
     l.code = this.freeCode(l);
     return l.code;
   }
   private codeTaken(code: string, owner: number, except: number): boolean {
-    for (const o of this.map.values()) if (o.id !== except && o.owner === owner && o.code === code) return true;
+    for (const o of this.map.values()) if (o.kind === 'rail' && o.id !== except && o.owner === owner && o.code === code) return true;
     return false;
   }
   /** A free route letter: from the names of its first terminus (and the line name), else the first free one. */
@@ -261,17 +262,18 @@ export class Lines {
     return '?';
   }
 
-  /** The line's symbol: company letter + route letter, e.g. 'AS' (unique in the game). */
+  /** A rail line's symbol: company letter + route letter, e.g. 'AS' (unique in the game); '' for other modes. */
   lineCode(id: number): string {
     const l = this.map.get(id);
-    return l ? this.companyCode(l.owner) + this.routeCode(l) : '';
+    return l?.kind === 'rail' ? this.companyCode(l.owner) + this.routeCode(l) : '';
   }
 
   /** Stations of a line in route order (out-and-back lines from one end to the other; else in stop order). */
   routeStations(l: Line): number[] { return linearStops(l.stops) ?? [...new Set(l.stops)]; }
 
-  /** Numbers for the line's stations: kept where they have one, the next free numbers for new ones. */
+  /** Numbers for a rail line's stations: kept where they have one, the next free numbers for new ones. */
   private ensureNumbers(l: Line): Map<number, number> {
+    if (l.kind !== 'rail') return new Map();
     const route = this.routeStations(l), inRoute = new Set(route);
     const m = new Map((l.numbers ?? []).filter(([sid]) => inRoute.has(sid)));
     let next = 1;
@@ -283,38 +285,38 @@ export class Lines {
 
   /**
    * A station's number on a line, JR style: the station owner's company letter, the route letter and the number,
-   * e.g. 'AS01' (through services: another company's stations on the route carry its letter). '' if not a stop.
+   * e.g. 'AS01' (through services: another company's stations on the route carry its letter). '' for non-rail or non-stops.
    */
   stationCode(lineId: number, stationId: number): string {
     const l = this.map.get(lineId), st = this.game.stations.get(stationId);
-    if (!l || !st || !l.stops.includes(stationId)) return '';
+    if (!l || l.kind !== 'rail' || !st || !l.stops.includes(stationId)) return '';
     const n = this.ensureNumbers(l).get(stationId);
     return n === undefined ? '' : this.companyCode(st.owner >= 0 ? st.owner : l.owner) + this.routeCode(l) + String(n).padStart(2, '0');
   }
 
-  /** All numbers of a station (one per line stopping there; interchanges have several), with their lines. */
+  /** All rail numbers of a station (one per rail line stopping there; interchanges have several), with their lines. */
   stationCodeEntries(stationId: number): { line: number; code: string }[] {
     const out: { line: number; code: string }[] = [];
-    for (const l of this.map.values()) if (l.stops.includes(stationId)) { const c = this.stationCode(l.id, stationId); if (c) out.push({ line: l.id, code: c }); }
+    for (const l of this.map.values()) if (l.kind === 'rail' && l.stops.includes(stationId)) { const c = this.stationCode(l.id, stationId); if (c) out.push({ line: l.id, code: c }); }
     return out;
   }
   stationCodes(stationId: number): string[] { return [...new Set(this.stationCodeEntries(stationId).map((e) => e.code))]; }
 
-  /** Number the line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
+  /** Number a rail line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
   renumber(lineId: number) {
     const l = this.map.get(lineId);
-    if (!l) return;
+    if (!l || l.kind !== 'rail') return;
     l.numbers = this.routeStations(l).map((sid, i) => [sid, i + 1] as [number, number]);
   }
 
   /**
-   * Through service: line `lineId` continues the route of line `fromId` (another company's, say): it takes its
+   * Through service: rail line `lineId` continues the route of rail line `fromId` (another company's, say): it takes its
    * route letter (where its owner has no other route with that letter) and its station numbers, and numbers its
    * further stations on from there (A's stations AS01…AS07, then B's BS08…).
    */
   inheritRoute(lineId: number, fromId: number) {
     const l = this.map.get(lineId), f = this.map.get(fromId);
-    if (!l || !f || l === f) return;
+    if (!l || !f || l.kind !== 'rail' || f.kind !== 'rail' || l === f) return;
     const code = this.routeCode(f);
     if (!this.codeTaken(code, l.owner, l.id)) l.code = code;
     const fm = this.ensureNumbers(f);
@@ -382,7 +384,7 @@ export class Lines {
     l.owner = owner;
     if (l.operators) l.operators = l.operators.filter((o) => o !== owner);
     l.num = this.freeNumber(l.kind, owner, l.id);
-    if (l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
+    if (l.kind === 'rail' && l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
     if (l.autoColor) {
       let clash = false;
       for (const o of this.map.values()) if (o !== l && colorDistance(o.color, l.color) < 12) { clash = true; break; }
@@ -525,7 +527,7 @@ export class Lines {
     this.servedStations.clear();
     this.version++;
     this.refreshNames();
-    for (const l of this.map.values()) if (l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
+    for (const l of this.map.values()) if (l.kind === 'rail' && l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
@@ -656,7 +658,12 @@ export class Lines {
     }
     if (typeof l.autoName !== 'boolean') l.autoName = false;
     if (typeof l.autoColor !== 'boolean') l.autoColor = false;
-    if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
+    if (l.kind === 'rail') {
+      if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
+    } else {
+      delete l.code;
+      delete l.numbers;
+    }
     if (Array.isArray(d.operators)) l.operators = [...d.operators];
     if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));
     return l;

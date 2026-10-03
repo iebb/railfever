@@ -60,7 +60,7 @@ export class Labels {
   onClickTown: (id: number) => void = () => {};
   onClickStation: (id: number) => void = () => {};
   visible = true;
-  /** stop marks of open lines: station id -> colour and stop numbers (shown in front of the name) */
+  /** stop marks of open lines: rail numbers or a colour chip (shown in front of the name) */
   marks = new Map<number, { color: string; text: string }>();
   /** maximum number of labels on screen */
   maxVisible = 60;
@@ -132,7 +132,7 @@ export class Labels {
       badges = document.createElement('span'); badges.className = 'lbl-badges';
       el.append(ico, badges, mark, name, sub, chips);
     } else if (kind === 'tag') {
-      sym = document.createElement('span'); sym.className = 'lsym sm'; sym.style.display = 'none';
+      sym = document.createElement('span'); sym.className = 'lcolor sm';
       el.append(sym, name);
     } else el.append(name, sub);
     el.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
@@ -234,8 +234,8 @@ export class Labels {
         this.tags.set(id, l);
       }
       if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
-      const code = t.code ?? '';
-      if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.style.display = code ? '' : 'none'; }
+      const code = game.lines.get(id)?.kind === 'rail' ? t.code ?? '' : '';
+      if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.className = code ? 'lsym sm' : 'lcolor sm'; }
       this.setCls(l, t.hl ? 'lbl tag hl' : 'lbl tag');
       if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
       cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 5000, 1, t.hl, 20));
@@ -270,7 +270,7 @@ export class Labels {
       // never shrink below ~11 px text (smallest plate text is 12 px)
       const s = (c.compact ? 1 : Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2))) * c.scale;
       const L = c.l;
-      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 0) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * 23 : 12)) * s;
+      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * 23 : 12)) * s;
       c.h *= s;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
       let hit = false;
@@ -318,8 +318,13 @@ export class Labels {
 
   private setMark(l: Label, mk: { color: string; text: string } | undefined) {
     if (!l.mark) return;
-    const t = mk ? mk.text : '';
-    if (t !== l.markText) { l.markText = t; l.mark.textContent = t; l.mark.style.display = t ? '' : 'none'; }
+    // The UI also supplies stop-order indices for unnumbered lines; draw those as colour chips.
+    const t = mk ? mk.text.split(',').filter((code) => !/^\d+$/.test(code)).join(',') : '';
+    if (t !== l.markText) { l.markText = t; l.mark.textContent = t; }
+    const cls = 'lbl-mark' + (mk && !t ? ' lcolor sm' : '');
+    if (l.mark.className !== cls) l.mark.className = cls;
+    const display = mk ? '' : 'none';
+    if (l.mark.style.display !== display) l.mark.style.display = display;
     const c = mk ? mk.color : '';
     if (c !== l.markColor) { l.markColor = c; l.mark.style.background = c; }
   }

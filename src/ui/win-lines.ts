@@ -207,7 +207,7 @@ export function openLine(ui: UI, id: number) {
     const route = routeInfo(g, l);
     const nPat = l.patterns?.length ?? 0;
     add(win.body, h('div', { class: 'linehead' },
-      h('button', { class: 'lsymbtn', 'data-tip': mine ? 'Line colour' : `Line ${l.name}`, 'aria-label': mine ? 'Line colour' : 'Line symbol', disabled: !mine, onclick: () => { if (!mine) return; palette = !palette; rerender(); } }, lineSymbol(g, l, 'lg')),
+      h('button', { class: 'lsymbtn', 'data-tip': mine ? 'Line colour' : `Line ${l.name}`, 'aria-label': mine || l.kind !== 'rail' ? 'Line colour' : 'Line symbol', disabled: !mine, onclick: () => { if (!mine) return; palette = !palette; rerender(); } }, lineSymbol(g, l, 'lg')),
       nameEl,
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
@@ -241,7 +241,7 @@ export function openLine(ui: UI, id: number) {
         const noRoute = broken.some(([a]) => a === sid);
         const b = l.kind === 'rail' ? badgeOn(g, l.id, sid) : null;
         list.appendChild(h('div', { class: 'row' },
-          b ? badgeEl(b, 'sm') : h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)),
+          b ? badgeEl(b, 'sm') : l.kind === 'rail' ? h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)) : lineSymbol(g, l, 'sm'),
           ui.stationLink(sid),
           st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `Station of ${g.company(st.owner).name}: upkeep shared by usage at ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
           stopDots(l, i),

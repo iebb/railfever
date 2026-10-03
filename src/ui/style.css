@@ -926,3 +926,11 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (min-width: 721px) {
   .linejoin-info { max-height: min(620px, calc(100vh - 200px)); }
 }
+
+/* Unnumbered bus, coach and tram lines retain their colour identity. */
+.lcolor { display: inline-block; width: 14px; height: 20px; border-radius: 4px; background: var(--c); flex: none; vertical-align: middle; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); }
+.lcolor.sm { width: 10px; height: 17px; border-radius: 3px; }
+.lcolor.lg { width: 28px; height: 30px; border-radius: 7px; }
+.lbl.tag .lcolor { margin: -1px 5px -1px -4px; box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85); }
+.lbl.stn .lbl-mark.lcolor { width: 10px; height: 17px; padding: 0; flex: none; }
+.list.stops .row > .lcolor { flex: none !important; }

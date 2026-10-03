@@ -1,4 +1,4 @@
-// Line identity, JR style: line symbols (the company letter + route letter on the line colour), station numbering
+// Line identity: JR-style rail symbols (the company letter + route letter on the line colour), rail station numbering
 // badges (AS01: white rounded square with the line colour as its border), the transport mode of a line, and the
 // per-view mode / company filters of every line view (remembered in localStorage).
 import type { Game } from '../game/game';
@@ -65,16 +65,19 @@ export function vehicleMode(g: Game, v: Vehicle): LineMode {
 }
 
 // ------------------------------------------------------------------ symbols and badges
-/** The line's symbol text: company letter + route letter (Lines.lineCode), or a mode letter and number. */
+/** A rail line's symbol text: company letter + route letter (Lines.lineCode), or R + number; '' for other modes. */
 export function lineCodeOf(g: Game, l: Line): string {
+  if (l.kind !== 'rail') return '';
   const fn = (g.lines as unknown as { lineCode?: (id: number) => string }).lineCode;
   const c = fn ? fn.call(g.lines, l.id) : '';
-  return c && !c.includes('?') ? c : (l.kind === 'rail' ? 'R' : l.kind === 'tram' ? 'T' : 'B') + l.num;
+  return c && !c.includes('?') ? c : 'R' + l.num;
 }
 
-/** JR-style line symbol: a rounded square in the line colour with the white (or dark) code. */
+/** Rail: JR-style code symbol. Other modes: a plain chip in the line colour, paired with the name by callers. */
 export function lineSymbol(g: Game, l: Line, size: '' | 'sm' | 'lg' = ''): HTMLElement {
-  return h('span', { class: 'lsym' + (size ? ' ' + size : ''), style: `--c:${l.color};--ink:${inkOn(l.color)}`, 'aria-label': `Line ${lineCodeOf(g, l)}` }, lineCodeOf(g, l));
+  if (l.kind !== 'rail') return h('span', { class: 'lcolor' + (size ? ' ' + size : ''), style: `--c:${l.color}`, 'aria-label': l.name });
+  const code = lineCodeOf(g, l);
+  return h('span', { class: 'lsym' + (size ? ' ' + size : ''), style: `--c:${l.color};--ink:${inkOn(l.color)}`, 'aria-label': `Line ${code}` }, code);
 }
 
 /** Symbol + name of a line as one clickable chip (lists, station windows). */
@@ -107,7 +110,7 @@ interface BadgeCache { ver: number; n: number; stations: number; t: number; map:
 const badgeCaches = new WeakMap<Game, BadgeCache>();
 
 /**
- * Station numbering badges of every station (one per serving line, in line order), cached: rebuilt when the line
+ * Rail station numbering badges of every station (one per serving rail line, in line order), cached: rebuilt when the line
  * network changes, and every few seconds for colour changes. One map read per station afterwards.
  */
 export function allBadges(g: Game): Map<number, Badge[]> {
@@ -117,7 +120,7 @@ export function allBadges(g: Game): Map<number, Badge[]> {
   const map = new Map<number, Badge[]>();
   const L = g.lines as unknown as { stationCode?: (l: number, s: number) => string; routeCode?: (l: Line) => string };
   if (L.stationCode && L.routeCode) {
-    const lines = [...g.lines.map.values()].filter((l) => l.stops.length > 0).sort((a, b) => a.id - b.id);
+    const lines = [...g.lines.map.values()].filter((l) => l.kind === 'rail' && l.stops.length > 0).sort((a, b) => a.id - b.id);
     for (const l of lines) {
       const route = L.routeCode.call(g.lines, l);
       for (const sid of new Set(l.stops)) {
