@@ -15,6 +15,7 @@ import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
+import { walkingCatchment, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -35,11 +36,11 @@ export type CatchMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus';
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Catchment radius per mode (units, 1 = 10 m): main-line rail ('rail'), metro and light rail from the platforms
- * (or the entrances), tram / bus from the stop. A station draws passengers only from buildings inside its circles.
+ * Nominal walking limit per mode (units, 1 = 10 m), after the 30% cut and a further 40% rail cut.
+ * catchment.ts applies the street-grid allowance and measures paths from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 28, metro: 21, lightrail: 17.5, tram: 15.4, bus: 11.2 };
-/** A catchment circle; inactive ones (a rail part without road access) draw no passengers. */
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 16.8, metro: 12.6, lightrail: 10.5, tram: 15.4, bus: 11.2 };
+/** Legacy reach metadata for site scoring; passenger coverage uses catchment.ts. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */
 export const DEFAULT_PLATFORM_LENGTH = 8;
@@ -1096,7 +1097,7 @@ export class Stations {
   /** Is (x, z) within `r` of a road that belongs to a real road network (not just an isolated stub)? */
   private roadContact(x: number, z: number, r: number): boolean {
     const net = this.game.world.net;
-    const ne = net.nearestEdge(x, z, r, 'road', (e) => e.depot < 0);
+    const ne = net.nearestEdge(x, z, r, 'road', pedestrianRoad);
     if (!ne) return false;
     // connected: at least ~20 units of road reachable from it
     const seen = new Set<number>([ne.edge.id]);
@@ -1109,7 +1110,7 @@ export class Stations {
       for (const nid of [e.a, e.b]) for (const id of net.nodes.get(nid)?.edges ?? []) {
         if (seen.has(id)) continue;
         const f = net.edges.get(id);
-        if (f && f.kind === 'road' && f.depot < 0) { seen.add(id); queue.push(f); }
+        if (f && pedestrianRoad(f)) { seen.add(id); queue.push(f); }
       }
     }
     return len >= 20;
@@ -1433,7 +1434,7 @@ export class Stations {
   private railReachable(st: Station): boolean {
     const r = st.rail;
     if (!r) return false;
-    if (st.stops.length) return true;
+    if (st.stops.some((s) => { const e = this.game.world.net.edges.get(s.edge); return !!e && pedestrianRoad(e); })) return true;
     if ((r.level ?? 'ground') === 'ground') {
       const f = this.forecourt(st), reach = styleOf(r.style).placement === 'none' ? NO_BUILDING_REACH : 0.9;
       return (!!f && this.roadContact(f.x, f.z, reach)) || (!!r.forecourt2 && this.roadContact(r.forecourt2.x, r.forecourt2.z, reach));
@@ -1448,7 +1449,7 @@ export class Stations {
     const v = this.game.world.net.version;
     if (!force && v === this.accessVersion) return;
     this.accessVersion = v;
-    let changed = false;
+    let changed = walkRoadsChanged(this.game);
     for (const st of this.map.values()) {
       const a = !st.rail || this.railReachable(st);
       if (a !== st.roadAccess) { st.roadAccess = a; changed = true; }
@@ -1890,9 +1891,8 @@ export class Stations {
 
   // ---------------------------------------------------------------- catchment & passengers
   /**
-   * Catchment circles of a station: rail along the platforms (ground) or around the entrances (elevated /
-   * underground) with the radius of its mode (main line, metro, light rail), tram and bus stops around the stop.
-   * Only active ones (with road access) unless `all`.
+   * Legacy access/reach metadata for AI scoring. Actual passenger coverage and UI use walkingCatchment.
+   * Only access points connected to streets are active; `r` is the nominal walking limit.
    */
   catchmentShapes(st: Station, all = false): CatchShape[] {
     const out: CatchShape[] = [];
@@ -1900,28 +1900,29 @@ export class Stations {
     if (r) {
       this.refreshAccess();
       const act = st.roadAccess, cm = catchModeOf(railModeOf(r.trackType)), bonus = styleOf(r.style).catchBonus;
-      if ((r.level ?? 'ground') === 'ground') out.push(...railCatchShapes(r.x, r.z, r.angle, r.length, act, cm, bonus));
-      else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act });
+      if ((r.level ?? 'ground') === 'ground') {
+        for (const p of [this.forecourt(st), r.forecourt2]) if (p) out.push({ ...p, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act });
+      } else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act && this.entranceAccess(st, e) });
     }
     const net = this.game.world.net;
-    for (const p of st.stops) out.push(stopCatchShape(p.x, p.z, !!net.edges.get(p.edge)?.tram));
+    for (const p of st.stops) { const e = net.edges.get(p.edge); out.push({ ...stopCatchShape(p.x, p.z, !!e?.tram), active: !!e && pedestrianRoad(e) }); }
     return all ? out : out.filter((c) => c.active);
   }
 
-  /** Catchment circles a planned rail station would have (inactive without road access). */
+  /** Planned access/reach metadata; see planWalkingCatchment for the walking preview. */
   planCatchShapes(plan: StationPlan): CatchShape[] {
     const cm = catchModeOf(plan.mode ?? 'mainline'), bonus = styleOf(plan.style).catchBonus;
-    if (plan.level === 'ground') return railCatchShapes(plan.x, plan.z, plan.angle, plan.length, plan.roadAccess, cm, bonus);
-    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess }));
+    if (plan.level === 'ground') return [plan.forecourt, plan.forecourt2].filter((p): p is { x: number; z: number } => !!p).map((p) => ({ ...p, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess }));
+    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess && e.access }));
   }
 
-  /** Largest catchment radius of a station (rail: from the centre over the platforms; a building widens it, see catchBonus). */
+  /** Nominal walking limit of a station, before the grid detour allowance. */
   catchmentRadius(st: Station) {
-    if (st.rail) return CATCHMENT_RADIUS[catchModeOf(railModeOf(st.rail.trackType))] * (1 + styleOf(st.rail.style).catchBonus) + st.rail.length / 2;
+    if (st.rail) return CATCHMENT_RADIUS[catchModeOf(railModeOf(st.rail.trackType))] * (1 + styleOf(st.rail.style).catchBonus);
     return st.stops.some((p) => this.game.world.net.edges.get(p.edge)?.tram) ? CATCHMENT_RADIUS.tram : CATCHMENT_RADIUS.bus;
   }
 
-  /** Residents within a set of catchment circles (each building counted once). */
+  /** Legacy circular AI site estimate (routing.ts migrates separately); never used for passenger coverage. */
   popInShapes(shapes: { x: number; z: number; r: number }[]): number {
     const w = this.game.world;
     const seen = new Set<number>();
@@ -1936,13 +1937,7 @@ export class Stations {
 
   /** Buildings within the (active) catchment of a station. */
   catchmentBuildings(st: Station): number[] {
-    const w = this.game.world;
-    const out = new Set<number>();
-    for (const c of this.catchmentShapes(st)) for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
-      const b = w.buildings.get(id);
-      if (b && Math.hypot(b.x - c.x, b.z - c.z) <= c.r) out.add(id);
-    }
-    return [...out];
+    return [...walkingCatchment(this.game, st).buildings.keys()];
   }
 
   /** Exact catchment: per station its buildings and shares, per building its stations and shares (see computeShares). */
@@ -1955,11 +1950,10 @@ export class Stations {
   catchMaxB = 0;
 
   /**
-   * Share out every building with people among the stations whose (active) catchment circles hold it: only served
-   * stations when any of them is served; nearer stations take more (weight 1 at a circle's centre down to 0.25 at
-   * its rim, the station's best circle counting). The shares of a building sum to 1. Building-major over a coarse
-   * grid of the circles (much cheaper than querying the building grid per station). Ratings play no part, so the
-   * same buildings, stations and lines give the same shares (a loaded game rebuilds them exactly).
+   * Split each reachable building among stations, preferring served stations when any is served. Weight is
+   * 1 / (1 + walking distance / 8), so a nearer station always receives more regardless of its mode's limit.
+   * Cached local Dijkstra results survive unrelated edits and monthly population changes. Ratings play no part;
+   * identical buildings, stations and lines rebuild identical shares after loading.
    */
   private computeShares(maxB: number) {
     const w = this.game.world;
@@ -1967,54 +1961,36 @@ export class Stations {
     this.sharesReady = true;
     this.catchMaxB = maxB;
     this.catchVersion++;
-    const circles: { st: Station; x: number; z: number; r: number }[] = [];
-    for (const st of this.map.values()) for (const c of this.catchmentShapes(st)) circles.push({ st, x: c.x, z: c.z, r: c.r });
-    if (!circles.length) return;
-    const C = 32, key = (cx: number, cz: number) => cx * 4096 + cz;
-    const cells = new Map<number, number[]>();
-    circles.forEach((c, i) => {
-      for (let cz = Math.floor((c.z - c.r) / C); cz <= Math.floor((c.z + c.r) / C); cz++) for (let cx = Math.floor((c.x - c.r) / C); cx <= Math.floor((c.x + c.r) / C); cx++) {
-        const k = key(cx, cz);
-        const a = cells.get(k);
-        if (a) a.push(i); else cells.set(k, [i]);
-      }
-    });
+    refreshWalkBuildings(this.game);
+    const covered = new Map<number, { st: Station; distance: number }[]>();
+    for (const st of this.map.values()) for (const [id, walk] of walkingCatchment(this.game, st).buildings) {
+      const b = w.buildings.get(id);
+      if (!b || b.pop <= 0 || id > maxB) continue;
+      const a = covered.get(id), c = { st, distance: walk.distance };
+      if (a) a.push(c); else covered.set(id, [c]);
+    }
     const served = new Map<number, boolean>();
     const isServed = (s: Station) => { let v = served.get(s.id); if (v === undefined) { v = this.game.lines.stationServed(s.id); served.set(s.id, v); } return v; };
-    const sts: Station[] = [], q: number[] = [];
-    for (const b of w.buildings.values()) {
-      if (b.pop <= 0 || b.id > maxB) continue;
-      const idx = cells.get(key(Math.floor(b.x / C), Math.floor(b.z / C)));
-      if (!idx) continue;
-      sts.length = 0; q.length = 0;
-      let anyServed = false;
-      for (const i of idx) {
-        const c = circles[i];
-        const d2 = (b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z);
-        if (d2 > c.r * c.r) continue;
-        const rel = Math.sqrt(d2) / c.r, k = sts.indexOf(c.st);
-        if (k >= 0) { if (rel < q[k]) q[k] = rel; continue; }
-        sts.push(c.st); q.push(rel);
-        if (isServed(c.st)) anyServed = true;
-      }
-      if (!sts.length) continue;
+    for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
+      const anyServed = reaches.some((r) => isServed(r.st));
       let sum = 0;
       const wt: number[] = [];
-      for (let k = 0; k < sts.length; k++) {
-        const v = anyServed && !isServed(sts[k]) ? 0 : 1 - 0.75 * q[k] * q[k];
+      for (const r of reaches) {
+        const v = anyServed && !isServed(r.st) ? 0 : 1 / (1 + r.distance / 8);
         wt.push(v); sum += v;
       }
       if (!(sum > 0)) continue;
       const rec = { st: [] as number[], w: [] as number[] };
-      for (let k = 0; k < sts.length; k++) {
+      for (let k = 0; k < reaches.length; k++) {
         if (wt[k] <= 0) continue;
         const sh = wt[k] / sum;
-        rec.st.push(sts[k].id); rec.w.push(sh);
-        let ps = this.shareSt.get(sts[k].id);
-        if (!ps) { ps = { ids: [], w: [] }; this.shareSt.set(sts[k].id, ps); }
-        ps.ids.push(b.id); ps.w.push(sh);
+        const stId = reaches[k].st.id;
+        rec.st.push(stId); rec.w.push(sh);
+        let ps = this.shareSt.get(stId);
+        if (!ps) { ps = { ids: [], w: [] }; this.shareSt.set(stId, ps); }
+        ps.ids.push(id); ps.w.push(sh);
       }
-      this.shareB.set(b.id, rec);
+      this.shareB.set(id, rec);
     }
   }
 
@@ -2025,9 +2001,9 @@ export class Stations {
   }
 
   /**
-   * Exact catchment of a station: the buildings inside its (active) circles and the share of each building's
-   * people it serves (parallel arrays; a building in several stations' circles is split among them, see
-   * computeShares). Passenger generation and attraction both go by these: nothing beyond the circles. Updated
+   * Exact catchment of a station: buildings reachable on foot and the share of each building's people it
+   * serves (parallel arrays; overlapping walking catchments split the population, see computeShares).
+   * Passenger generation and attraction both use these shares. Updated
    * with the catchment (lines.flushCatchment); read-only.
    */
   buildingShares(st: Station | number): { ids: number[]; w: number[] } {

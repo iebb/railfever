@@ -7,7 +7,7 @@ import { PLAYER } from '../game/game';
 import { h, icon, clear, seg } from './dom';
 import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
-import { townDemandShare, catchShapes, catchRadius, catchColor, CATCH_COLOR, CatchMode } from './gameapi';
+import { townDemandShare, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
 import type { Arc, ShareRing } from '../render/overlay';
 import { fmtInt } from './dom';
@@ -98,7 +98,7 @@ export class MapModes {
       lb.pinStations = null;
     }
     if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.shares.clear(); }
-    if (prev === 'catchment') { ov.setCatchments('map', null); this.catchSig = ''; }
+    if (prev === 'catchment') { drawCatchStreets(ov, 'map', null); this.catchSig = ''; }
     if (prev === 'signals') { ov.setTrackLayers(null); ov.setSignalGhosts(null); this.blocks = null; this.blockSig = ''; }
     ov.setDim(DIM[m]);
     this.hoverLine = null;
@@ -358,16 +358,16 @@ export class MapModes {
   private updateCatchment() {
     const g = this.ui.game;
     const mine = g.stations.all().filter((s) => s.owner === PLAYER);
-    const sig = g.networkVersion + '|' + mine.length + '|' + Math.floor(g.day / 30);
+    const sig = g.world.net.version + '|' + g.stations.catchVersion + '|' + mine.length + '|' + Math.floor(g.day / 30);
     if (sig === this.catchSig) return;
     this.catchSig = sig;
-    const shapes = mine.flatMap((s) => catchShapes(g, s, true));
-    this.ui.renderer.overlay.setCatchments('map', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
+    const segments = mine.flatMap((s) => catchStreets(g, s).segments);
+    drawCatchStreets(this.ui.renderer.overlay, 'map', { segments, buildings: new Map() });
     const inactive = mine.filter((s) => s.rail && !s.roadAccess).length;
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);
     const pop = g.towns.list.reduce((a, t) => a + t.pop, 0);
     const towns = g.towns.list.filter((t) => !mine.some((s) => Math.hypot(s.x - t.x, s.z - t.z) < t.radius + 10));
-    const n = (m: CatchMode) => shapes.filter((c) => c.mode === m).length;
+    const n = (m: CatchMode) => mine.filter((s) => { const mode = g.stations.mode(s); return (mode === 'mainline' ? 'rail' : mode) === m; }).length;
     const c = this.card;
     clear(c);
     const row = (m: CatchMode, label: string, r: number) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: 'mc-ring', style: `--c:${hexCss(CATCH_COLOR[m])}` }), h('span', { class: 'mc-name' }, label), h('span', { class: 'mc-num' }, `${Math.round(r * 10)} m · ${n(m)}`));
@@ -375,12 +375,12 @@ export class MapModes {
       h('div', { class: 'mc-head' }, icon('catchment', 18), h('span', { class: 'mc-title' }, 'Catchment'), h('span', { class: 'mc-sub' }, `${fmtInt(reach)} residents`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close catchment view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-list' }, row('rail', 'Train stations', catchRadius('rail')), row('tram', 'Tram stops', catchRadius('tram')), row('bus', 'Bus stops', catchRadius('bus'))),
+        h('div', { class: 'mc-list' }, row('rail', 'Train stations', catchWalkLimit('rail')), row('metro', 'Metro stations', catchWalkLimit('metro')), row('lightrail', 'Light rail stations', catchWalkLimit('lightrail')), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
-          inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access (grey)`)) : null),
-        h('div', { class: 'mc-note' }, 'Passengers come from homes inside the circles: rail stations reach farthest, bus stops the least. Hover a station to see its own area.')),
+          inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
+        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
     );
   }
 

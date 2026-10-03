@@ -91,7 +91,7 @@ export function openStation(ui: UI, id: number) {
           tile(String(lines.length), 'Lines')),
         ui.kv('Facilities', parts.join(' + ') || '—'),
         s.rail ? ui.kv('Level', s.rail.level === 'elevated' ? `Elevated · ${Math.round(s.rail.height * 10)} m` : s.rail.level === 'underground' ? `Underground · ${Math.round(s.rail.depth * 10)} m deep` : 'Ground') : null,
-        s.rail ? ui.kv('Building style', h('span', { class: 'inline wrap' }, `${styleOf(s.rail.style).name} · +${fmtPct(styleOf(s.rail.style).catchBonus)} radius`,
+        s.rail ? ui.kv('Building style', h('span', { class: 'inline wrap' }, `${styleOf(s.rail.style).name} · +${fmtPct(styleOf(s.rail.style).catchBonus)} walking reach`,
           mine ? h('button', { class: 'btn sm', onclick: () => { win.tab = 'build'; rerender(); } }, 'Restyle…') : null)) : null,
         s.rail ? ui.kv('Road access', s.roadAccess ? h('span', { class: 'pos' }, s.rail.level === 'ground' ? 'Connected to the street' : 'Entrances on the street') : h('span', { class: 'neg' }, 'None — no passengers')) : null,
         mine && s.rail && !s.roadAccess ? h('div', { class: 'warn' }, icon('warning', 16),
@@ -257,15 +257,15 @@ function restylePanel(ui: UI, s: Station, state: RestyleState, after: () => void
   state.selected = chosen.id;
   const sel = h('select', { class: 'select', 'aria-label': 'Station building style' },
     !choices.some((x) => x.id === current.id) ? h('option', { value: current.id, selected: chosen.id === current.id, disabled: true }, `${current.name} (current)`) : null,
-    choices.map((x) => h('option', { value: x.id, selected: x.id === chosen.id }, `${x.name} · +${fmtPct(x.catchBonus)} radius`)));
+    choices.map((x) => h('option', { value: x.id, selected: x.id === chosen.id }, `${x.name} · +${fmtPct(x.catchBonus)} walking reach`)));
   sel.addEventListener('change', () => { state.selected = sel.value; after(); });
   const changed = chosen.id !== current.id;
   const key = `${g.networkVersion}|${g.world.net.version}|${r.level}|${r.tracks}|${r.through}|${r.length}|${current.id}|${chosen.id}|${g.year}`;
   const pl = changed ? memo(g, 'restyle:' + s.id, key, () => planStationUpgrade(g, s.id, { style: chosen.id })) : null;
   return h('div', { class: 'station-restyle' },
-    section('Restyle', `${current.name} · +${fmtPct(current.catchBonus)} radius`),
+    section('Restyle', `${current.name} · +${fmtPct(current.catchBonus)} walking reach`),
     field('Building', sel, chosen.desc),
-    ui.kv('Catchment radius bonus', `+${fmtPct(chosen.catchBonus)}`),
+    ui.kv('Walking reach bonus', `+${fmtPct(chosen.catchBonus)}`),
     pl ? ui.kv(pl.ok ? 'Restyle cost' : 'Not possible', h('span', { class: pl.ok ? '' : 'neg' }, pl.ok ? fmtMoneyFull(pl.cost) : pl.error ?? 'Cannot restyle')) : null,
     pl?.warnings.length ? h('div', { class: 'warn' }, icon('warning', 16), pl.warnings.join(' · ')) : null,
     h('div', { class: 'btns' }, h('button', { class: 'btn primary', disabled: !pl?.ok || !g.economy.canAfford(pl.cost), 'data-sfx': 'none', onclick: () => {

@@ -72,6 +72,8 @@ export const ELECTRIFY = { costPerUnit: 2500, from: 'standard', to: 'electric' }
 export const LINE_LEVEL = { height: { min: 1.2, max: 1.8, def: 1.5 }, depth: { min: 1.5, max: 3, def: 2.2 } };
 
 export interface RoadType {
+  /** Pedestrians may use country roads as well as streets; false excludes walking. */
+  pedestrians?: boolean;
   id: string;
   name: string;
   /** carriageway half width */

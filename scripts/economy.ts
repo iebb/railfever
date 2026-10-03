@@ -15,13 +15,14 @@ import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train, ch
 const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
 const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
-// Measured with the 30% smaller per-mode catchments: four years, final full year, no AI.
+// Measured with street walking catchments, the further 40% rail cut and the 1.25 grid allowance.
+// Four years, final full year, no AI.
 const seed7Baseline = {
   seed: 7, results: [
-    { name: 'rail Weyport-Ashwick (139 u track)', income: 1609979 },
-    { name: 'busy bus in Oldwood (2x Metro Articulated)', income: 77793 },
-    { name: 'short bus in Oldwood (1x City Liner)', income: 10045 },
-    { name: 'village rail Redwell(333)-Southley(237)', income: 348732 },
+    {"name": "rail Oldwood-Coldden (104 u track)", "income": 89125.6661359764},
+    {"name": "busy bus in Oldwood (2x Metro Articulated)", "income": 100698.7020182792},
+    {"name": "short bus in Oldwood (1x City Liner)", "income": 8821.836396471499},
+    {"name": "village rail Redwell(345)-Southley(237)", "income": 207281.82900900082},
   ],
 };
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });

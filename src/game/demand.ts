@@ -82,11 +82,6 @@ export function stationActive(g: Game, st: Station): boolean {
   return s.hasAccess ? s.hasAccess(st) !== false : true;
 }
 
-/** Canonical station catchment circles, including mode, building bonuses and road access. */
-export function catchmentCircles(g: Game, st: Station): { x: number; z: number; r: number }[] {
-  return g.stations.catchmentShapes(st);
-}
-
 const NO_DEMAND: StationDemand = { dest: [], w: [], served: 0 };
 
 /** The regional demand model of a game (kept in game.demand, saved with it). */
@@ -299,36 +294,16 @@ export class DemandModel {
   recomputeShares() {
     const g = this.g, w = g.world;
     this.shares.clear();
-    const seen = new Set<number>();
-    // strict catchment (stations.ts): each building's people are split among the stations whose circles hold it;
-    // a station draws on its shares only (nothing beyond its circles)
-    const exact = (g.stations as unknown as { buildingShares?: (st: Station) => { ids: number[]; w: number[] } }).buildingShares;
+    // Strict walking catchment: demand uses the same distance-weighted building shares as passenger generation.
     for (const st of g.stations.map.values()) {
       if (!stationActive(g, st)) continue;
       const m = new Map<number, number>();
-      if (exact) {
-        const sh = exact.call(g.stations, st);
-        for (let i = 0; i < sh.ids.length; i++) {
-          const b = w.buildings.get(sh.ids[i]);
-          if (!b || b.pop <= 0) continue;
-          const r = this.regionOf(b);
-          if (r >= 0) m.set(r, (m.get(r) ?? 0) + b.pop * sh.w[i]);
-        }
-        let tot = 0;
-        for (const v of m.values()) tot += v;
-        if (tot > 0) this.shares.set(st.id, [...m].sort((a, b) => a[0] - b[0]).map(([r, v]) => [r, v / tot]));
-        continue;
-      }
-      seen.clear();
-      for (const c of catchmentCircles(g, st)) {
-        for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
-          if (seen.has(id)) continue;
-          const b = w.buildings.get(id);
-          if (!b || b.pop <= 0 || (b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z) > c.r * c.r) continue;
-          seen.add(id);
-          const r = this.regionOf(b);
-          if (r >= 0) m.set(r, (m.get(r) ?? 0) + b.pop);
-        }
+      const sh = g.stations.buildingShares(st);
+      for (let i = 0; i < sh.ids.length; i++) {
+        const b = w.buildings.get(sh.ids[i]);
+        if (!b || b.pop <= 0) continue;
+        const r = this.regionOf(b);
+        if (r >= 0) m.set(r, (m.get(r) ?? 0) + b.pop * sh.w[i]);
       }
       let tot = 0;
       for (const v of m.values()) tot += v;

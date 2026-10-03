@@ -174,6 +174,11 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
         const signals = [...g.world.net.nodes.values()].filter((n) => n.signal && n.owner === ai.companyId).length;
         const del0 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
         const each0 = new Map(l.vehicles.map((id) => [id, g.vehicles.get(id)?.delivered ?? 0] as [number, number]));
+        // Exercise the rebuilt railway even when the smaller walking catchment produces very few trips.
+        for (const sid of new Set(l.stops)) {
+          const dest = l.stops.find((id) => id !== sid), st = g.stations.get(sid);
+          if (st && dest !== undefined) g.stations.addWaiting(st, l.id, dest, dest, 40);
+        }
         for (const d0 = g.day; g.day < d0 + 120;) g.update(0.25);
         const del1 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
         const lost = l.vehicles.map((id) => g.vehicles.get(id)).filter((v) => v && v.state === 'noroute');

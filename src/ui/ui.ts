@@ -19,7 +19,7 @@ import { UiTips } from './tips';
 import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
 import { MapModes } from './mapmodes';
-import { catchShapes, catchColor } from './gameapi';
+import { catchStreets, drawCatchStreets } from './gameapi';
 import { canonicalizeLines, MergeNotice } from '../game/patterns';
 import { allBadges } from './lineid';
 import { TOOL_META } from './hud';
@@ -68,6 +68,7 @@ export class UI {
   private lastNewsSfx = 0;
   reduceTransparency = false;
   catchmentStation = -1;
+  private catchmentSig = '';
   private linePathSig = new Map<number, string>();
   lineBroken = new Map<number, [number, number][]>();
   following: number | null = null;
@@ -254,6 +255,7 @@ export class UI {
       else if (!('follow' in cam)) { const p = { x: 0, y: 0, z: 0 }; if (v.worldPos(p)) this.renderer.controls.jumpTo(p.x, p.z); }
     }
     if (this.catchmentStation >= 0 && (!g.stations.get(this.catchmentStation) || !this.wm.get('station-' + this.catchmentStation))) this.setCatchment(-1);
+    else if (this.catchmentStation >= 0 && this.catchmentSig !== `${g.world.net.version}:${g.stations.catchVersion}`) this.setCatchment(this.catchmentStation);
     this.highlightLabel(this.tools.hoverStation ?? (this.catchmentStation >= 0 ? this.catchmentStation : null));
   }
 
@@ -465,10 +467,11 @@ export class UI {
   setCatchment(id: number) {
     const g = this.game;
     this.catchmentStation = id;
+    this.catchmentSig = `${g.world.net.version}:${g.stations.catchVersion}`;
     const st = id >= 0 ? g.stations.get(id) : undefined;
-    if (!st) { this.renderer.overlay.setCatchments('sel', null); return; }
+    if (!st) { drawCatchStreets(this.renderer.overlay, 'sel', null); return; }
     const group = g.stations.complex(st.id).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x);
-    this.renderer.overlay.setCatchments('sel', group.flatMap((s) => catchShapes(g, s, true)).map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
+    drawCatchStreets(this.renderer.overlay, 'sel', { segments: group.flatMap((s) => catchStreets(g, s).segments), buildings: new Map() });
   }
 
   /** Open the info window for a picked object. */

@@ -58,10 +58,12 @@ let dblDepot = -1, dblLine = -1;
 const eDbl = net.nextEdge;
 {
   const used = new Set([TA.id, TB.id]);
-  for (let attempt = 0; attempt < 4 && !dbl.ok; attempt++) {
-    const pr2 = placeStationPair(g, 70, 200, 0, used);
+  // Reduced catchments choose different sites. A failed corridor rules out that pair, not both towns.
+  const tried = new Set<string>();
+  for (let attempt = 0; attempt < 12 && !dbl.ok; attempt++) {
+    const pr2 = placeStationPair(g, 70, 200, 0, used, 16, tried);
     if (!pr2) break;
-    used.add(pr2.TA.id); used.add(pr2.TB.id);
+    tried.add(pr2.TA.id + ':' + pr2.TB.id);
     console.log(`double track: ${pr2.TA.name} <-> ${pr2.TB.name}`);
     const eTry = net.nextEdge;
     dbl = connectDouble(g, pr2.A, pr2.B, 0);

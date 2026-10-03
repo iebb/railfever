@@ -105,7 +105,7 @@ const connectedAt = (g: Game, st: Station, front: boolean) => g.stations.trackEn
   check(!g.stations.commitRail(ug, 0), 'underground station built (entrances only)');
   const U = g.stations.get(uid)!;
   const rs = planStationUpgrade(g, U.id, { style: 'classic' });
-  check(rs.ok && !!rs.restyleOnly && !commitStationUpgrade(g, rs) && U.rail!.style === 'classic' && U.rail!.level === 'underground' && Math.abs((g.stations.catchmentShapes(U)[0]?.r ?? 0) - 33.6) < 1e-6, `a street-level building added later (${rs.error ?? 'ok'}): catchment 336 m`);
+  check(rs.ok && !!rs.restyleOnly && !commitStationUpgrade(g, rs) && U.rail!.style === 'classic' && U.rail!.level === 'underground' && Math.abs((g.stations.catchmentShapes(U)[0]?.r ?? 0) - 20.16) < 1e-6, `a street-level building added later (${rs.error ?? 'ok'}): walking limit 201.6 m before the grid allowance`);
   const g3 = deserialize(JSON.parse(JSON.stringify(serialize(g))));
   check(JSON.stringify(g3.stations.catchmentShapes(g3.stations.get(U.id)!)) === JSON.stringify(g.stations.catchmentShapes(U)), 'save round trip keeps the building and its catchment');
   const odd = restoreStation(JSON.parse(JSON.stringify({ ...built[2], waiting: [], rail: { ...built[2].rail, style: 'gothic-revival' } })));

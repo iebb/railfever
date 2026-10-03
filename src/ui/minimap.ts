@@ -8,7 +8,7 @@ import { loadFonts } from './fonts';
 import type { MapMode } from './mapmodes';
 import { servedColor, hexCss } from './mapmodes';
 import { PLAYER } from '../game/game';
-import { catchShapes, catchColor } from './gameapi';
+import { catchStreets, CATCH_COLOR } from './gameapi';
 
 export class Minimap {
   el: HTMLDivElement;
@@ -269,13 +269,12 @@ export class Minimap {
         ctx.beginPath(); ctx.arc(t.x * k, t.z * k, r, 0, Math.PI * 2); ctx.fill();
       }
     } else if (this.mode === 'catchment') {
+      ctx.lineCap = 'round'; ctx.lineWidth = 2 * this.dpr; ctx.globalAlpha = 0.9;
       for (const st of g.stations.map.values()) {
         if (st.owner !== PLAYER) continue;
-        for (const c of catchShapes(g, st, true)) {
-          const col = hexCss(catchColor(c));
-          ctx.beginPath(); ctx.arc(c.x * k, c.z * k, Math.max(1.5 * this.dpr, c.r * k), 0, Math.PI * 2);
-          ctx.globalAlpha = 0.22; ctx.fillStyle = col; ctx.fill();
-          ctx.globalAlpha = 0.9; ctx.strokeStyle = col; ctx.lineWidth = this.dpr; ctx.stroke();
+        for (const s of catchStreets(g, st).segments) {
+          ctx.strokeStyle = hexCss(CATCH_COLOR[s.mode]);
+          ctx.beginPath(); ctx.moveTo(s.x0 * k, s.z0 * k); ctx.lineTo(s.x1 * k, s.z1 * k); ctx.stroke();
         }
       }
       ctx.globalAlpha = 1;

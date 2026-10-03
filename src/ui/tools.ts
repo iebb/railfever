@@ -11,7 +11,7 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, CATCHMENT_RADIUS, ENTRANCE_SIZE, relocateStation, ThroughMode, railModeOf, catchModeOf } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_SIZE, relocateStation, ThroughMode, railModeOf, catchModeOf } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
 import { CROSS_LABEL, MarkerKind } from '../render/overlay';
@@ -19,7 +19,8 @@ import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
-import { planStation, StationLevel, catchRadius, catchShapes, catchColor, CATCH_COLOR, planCatchShapes, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
+import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
+import { pointWalkingCatchment, stopWalkingCatchment } from '../game/catchment';
 import { STATION_STYLES } from '../game/station-styles';
 import { servesKind } from './win-lines';
 import { accessState, policyText, requestAccessUI } from './win-access';
@@ -306,6 +307,7 @@ export class Tools {
 
   private clearVisuals() {
     this.overlay.clear();
+    drawCatchStreets(this.overlay, 'hover', null);
     const u = this.terr;
     if (u.uHiOn) u.uHiOn.value = 0;
     if (u.uCircle) u.uCircle.value.w = 0;
@@ -726,15 +728,15 @@ export class Tools {
         // the access street a ground station builds to the nearest road
         ov.setProposal(pl.access ?? null);
         // catchment with the building style's bonus (grows / shrinks live with the chosen style)
-        const shapes = planCatchShapes(g, pl);
-        ov.setCatchments('hover', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: pl.ok ? catchColor(c) : 0xff6b6b })));
-        const pop = g.stations.popInShapes(shapes);
+        const walk = planCatchStreets(g, pl);
+        drawCatchStreets(ov, 'hover', walk, pl.ok ? undefined : 0xff6b6b);
+        const pop = catchStreetPop(g, walk);
         const lv = pl.level;
         const moving = this.relocating != null ? g.stations.get(this.relocating) : undefined;
         const bonus = catchBonusOf(pl.style);
-        const reach = Math.round(CATCHMENT_RADIUS[catchModeOf(railModeOf(pl.trackType))] * (1 + bonus) * 10);
+        const reach = Math.round(catchWalkLimit(catchModeOf(railModeOf(pl.trackType)), bonus) * 10);
         const tt = TRACK_TYPES[pl.trackType];
-        const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
+        const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
         if (tt) rows.push(['rail', `${esc(tt.name)}${pl.psd ? ' · platform doors' : ''}`]);
         const sty = STATION_STYLES[pl.style];
         if (sty) rows.push(['station', `${esc(sty.name)}${bonus ? ` · <b>+${Math.round(bonus * 100)}%</b> reach` : ''}`]);
@@ -866,7 +868,7 @@ export class Tools {
     const hit = this.hitAt(p.x, p.z);
     ov.setHoverEdge(null);
     ov.setFootprints(null);
-    if (this.hoverStation != null && (hit?.kind !== 'station' || hit.id !== this.hoverStation)) ov.setCatchments('hover', null);
+    if (this.hoverStation != null && (hit?.kind !== 'station' || hit.id !== this.hoverStation)) drawCatchStreets(ov, 'hover', null);
     this.hoverStation = null;
     // demand view: districts under the cursor explain their trips
     if (this.tool === 'inspect' && (!hit || hit.kind === 'town' || hit.kind === 'building')) {
@@ -886,7 +888,7 @@ export class Tools {
       const rects = g.stations.footprints(st).map((f) => ({ ...f, color: 0xffb020, y: st.rail?.y, lift: 0.12 }));
       for (const s of st.stops) rects.push({ x: s.x, z: s.z, angle: 0, w: 0.9, d: 0.9, color: 0xffb020, y: undefined, lift: 0.08 });
       ov.setFootprints(rects);
-      ov.setCatchments('hover', catchShapes(g, st, true).map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
+      drawCatchStreets(ov, 'hover', catchStreets(g, st));
       if (this.tool === 'line-edit') {
         const l = this.lineEditId != null ? g.lines.get(this.lineEditId) : null;
         const okKind = !!l && servesKind(g, st, l.kind);
@@ -1300,7 +1302,7 @@ export class Tools {
     const ne = net.nearestEdge(p.x, p.z, 1.6, 'rail', (e) => e.station < 0 && e.depot < 0);
     if (!ne || ne.edge.owner !== PLAYER) {
       this.onTrack = null;
-      ov.setStationGhost(null); ov.setSegments('throat', null); ov.setCatchments('hover', null);
+      ov.setStationGhost(null); ov.setSegments('throat', null); drawCatchStreets(ov, 'hover', null);
       this.tip(ne ? { title: 'Station on the line', err: [`Track of ${g.company(ne.edge.owner).name}`] } : { title: 'Station on the line', rows: [['station', 'Point at one of your tracks: the station is cut into the line there']] }, ne ? 'err' : 'info');
       return;
     }
@@ -1314,15 +1316,14 @@ export class Tools {
     ov.setStationGhost(st);
     ov.setSegments('throat', pl.throat, pl.ok ? 0xffd84a : 0xff6b6b);
     if (st) {
-      const shapes = g.stations.planCatchShapes(st);
-      ov.setCatchments('hover', shapes.map((c) => ({ x: c.x, z: c.z, r: c.r, color: pl.ok ? catchColor(c) : 0xff6b6b })));
-    } else ov.setCatchments('hover', null);
+      drawCatchStreets(ov, 'hover', planCatchStreets(g, st), pl.ok ? undefined : 0xff6b6b);
+    } else drawCatchStreets(ov, 'hover', null);
     const rows: [string, string][] = [];
     if (st) {
       rows.push(['station', `${plural(st.tracks, 'platform track')}${st.through ? ` + ${st.through} through` : ''} × ${st.length * 10} m`]);
       rows.push(['rail', `cuts the ${pl.mains.length > 1 ? 'double' : 'single'} track; ${plural(pl.throat.length, 'throat connection')}`]);
       if (st.level !== 'ground') rows.push([st.level === 'elevated' ? 'bridge' : 'tunnel', st.level === 'elevated' ? 'elevated with the line' : 'underground with the line']);
-      rows.push(['people', `<b>${g.stations.popInShapes(g.stations.planCatchShapes(st)).toLocaleString('en-US')}</b> residents in reach`]);
+      rows.push(['people', `<b>${catchStreetPop(g, planCatchStreets(g, st)).toLocaleString('en-US')}</b> residents in walking reach`]);
     }
     this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click to build · trains keep running through it' : 'Straight, level track is needed for the platforms' }, pl.ok ? 'ok' : 'err');
   }
@@ -1358,10 +1359,11 @@ export class Tools {
     const sz = ENTRANCE_SIZE[st.rail.level];
     const at = pl.entrance ?? { x: p.x, z: p.z, angle: 0 };
     ov.setFootprints([{ x: at.x, z: at.z, angle: at.angle, w: sz.w, d: sz.d, color: pl.ok ? 0x46e07a : 0xff6b6b, lift: 0.12 }]);
-    const cm = catchModeOf(railModeOf(st.rail.trackType)), R = CATCHMENT_RADIUS[cm] * (1 + catchBonusOf(st.rail.style));
-    ov.setCatchments('hover', pl.ok ? [{ x: at.x, z: at.z, r: R, color: CATCH_COLOR[cm] }] : null);
-    const pop = pl.ok ? g.stations.popInShapes([{ x: at.x, z: at.z, r: R }]) : 0;
-    this.tip({ title: `Entrance · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows: pl.ok ? [['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${Math.round(R * 10)} m`]] : [], err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], hint: 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
+    const cm = catchModeOf(railModeOf(st.rail.trackType)), bonus = catchBonusOf(st.rail.style), R = catchWalkLimit(cm, bonus);
+    const walk = pl.ok ? pointWalkingCatchment(g, at.x, at.z, cm, bonus, sz.d / 2 + 0.9) : null;
+    drawCatchStreets(ov, 'hover', walk);
+    const pop = walk ? catchStreetPop(g, walk) : 0;
+    this.tip({ title: `Entrance · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows: pl.ok ? [['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${Math.round(R * 10)} m walking`]] : [], err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], hint: 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
   }
 
   /** Object under a ground point (stations first, then depots, network, buildings, towns). */
@@ -1760,10 +1762,11 @@ export class Tools {
       const off = g.world.net.halfWidth(pl.edge) - 0.12;
       ov.setFootprints([{ x: q.x + Math.cos(a) * off, z: q.z - Math.sin(a) * off, angle: a, w: 0.3, d: tram ? 2.2 : 1.2, color, y: q.y, lift: 0.06 }]);
       ov.setMarker('hover0', q, 'point', color);
-      const R = catchRadius(tram ? 'tram' : 'bus');
-      ov.setCatchments('hover', [{ x: q.x, z: q.z, r: R, color: CATCH_COLOR[tram ? 'tram' : 'bus'] }]);
-      const pop = this.coveredPop(q.x, q.z, R);
-      const rows: [string, string][] = [['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${Math.round(R * 10)} m`]];
+      const mode = tram ? 'tram' : 'bus', R = catchWalkLimit(mode);
+      const walk = stopWalkingCatchment(g, pl.edge.id, pl.s!, mode);
+      drawCatchStreets(ov, 'hover', walk);
+      const pop = catchStreetPop(g, walk);
+      const rows: [string, string][] = [['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${Math.round(R * 10)} m walking`]];
       if (pl.join) rows.push(['plus', `Joins ${esc(pl.join.name)}`]);
       const lk = linkNames(g, pl);
       if (lk) rows.push(['plus', `Links with ${esc(lk)} (transfers)`]);
@@ -1774,7 +1777,7 @@ export class Tools {
     } else {
       ov.setFootprints(null);
       ov.setMarker('hover0', { x: p.x, y: p.y, z: p.z }, 'free', 0xff5a4a);
-      ov.setCatchments('hover', null);
+      drawCatchStreets(ov, 'hover', null);
       this.tip({ title: tram ? 'Tram stop' : 'Bus stop', err: [tramErr || (pl.error ?? 'Cannot build')] }, 'err');
     }
   }
