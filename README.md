@@ -56,6 +56,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Urban networks include underground metros, elevated/light-rail lines and cross-city links, with through services where compatible.
 - Network building includes station growth, pairing single tracks, signalled junctions, interchange and infill stations, consolidation of nearby termini, and decommissioning unprofitable routes. Construction can include building demolition and terraforming.
 - Congestion response adds signals, passing loops, double track or platforms. Companies join shared lines instead of duplicating routes.
+- Companies with open track access link their networks: new lines share a neighbour's station, and where two companies' railways run side by side a connecting curve (with passing loops on single track) carries direct trains across both when the riders pay for it, the owner earning access fees and invited to run trains too; otherwise a walking transfer links their stations. AI companies never alter the player's track.
 - AI construction can be switched off in the Companies window or the settings; their vehicles keep running.
 
 **Passengers and economy**
@@ -63,7 +64,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - **Walking catchments**: passengers reach stations and stops by walking along streets from forecourts and entrances: up to 294 m for every rail station (whatever its track type), 270 m for trams and 196 m for buses, more with a station building. Residents beyond 147 m walk less often and count partly. Reachable streets are drawn in each mode’s colour; overlapping catchments share demand. Stations have ratings and waiting passengers grouped by destination.
 - **One route is one line**: routes of the same mode contained in a longer route become service patterns of that line. Lines can share tracks and stations, with **transfers** for local and long-distance journeys.
 - Local, Rapid, Express and Limited Express patterns can skip stops or short-turn at their first and last stopping stations. Non-stopping trains use through tracks where available; passengers board only services that stop where they need to alight.
-- Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. One rail fare for every track type, with a minimum per journey so short city hops pay too. Journeys without transfers get a **20% bonus**.
+- Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. One rail fare for every track type, with a minimum per journey so short city hops pay too. **Each change of vehicle takes 10%** off the fare of the leg ending in it and of every later leg: a journey with one change earns 10% less than the same journey made directly, with two changes 10-19% less, so direct services earn more.
 - Operating costs cover energy, crew, vehicle maintenance and track wear; high-speed services cost more to run. The economy includes loans with interest and finance reports with cost breakdowns and charts.
 
 **Sound**

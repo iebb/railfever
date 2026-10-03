@@ -11,7 +11,7 @@ import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
 import { WALK_LINE, PLATFORM_LENGTH } from './stations';
 import type { Hop } from './lines';
-import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, NO_TRANSFER_BONUS, type DemandSite, type FareMode } from './fares';
+import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, TRANSFER_FARE_FACTOR, type DemandSite, type FareMode } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
 import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS, RAIL_FARE } from './constants';
@@ -684,7 +684,8 @@ export class DemandModel {
       for (let j = 0; j < parts.length; j++) {
         const p = parts[j], count = wanted[j] * capture;
         boardings += count;
-        revenue += fareFor(p.d, p.seconds, count, { mode: 'rail', centre: p.centre }) * (1 + NO_TRANSFER_BONUS);
+        // (direct rides on the line: the full fare; a leg ending in a change or after one pays TRANSFER_FARE_FACTOR, as below)
+        revenue += fareFor(p.d, p.seconds, count, { mode: 'rail', centre: p.centre });
       }
     }
     if (city) for (const st of g.stations.map.values()) {
@@ -695,8 +696,8 @@ export class DemandModel {
       const count = arrivals * 0.3; // continuing inbound trips and the reciprocal trip to the station
       const d = Math.max(15, sites.reduce((a, s) => a + Math.hypot(s.x - near.x, s.z - near.z), 0) / sites.length);
       transfers += count; boardings += count;
-      // (their journey paid the rail minimum on the main line: the city leg adds its distance fare)
-      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode: 'rail', centre: urbanIntensity(g, near), railBefore: RAIL_FARE.minimum });
+      // (their journey paid the rail minimum on the main line: the city leg adds its distance fare, before or after a change)
+      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode: 'rail', centre: urbanIntensity(g, near), railBefore: RAIL_FARE.minimum }) * TRANSFER_FARE_FACTOR;
     }
     return { boardings, revenue, transfers, covered: sites.reduce((a, s) => a + s.pop, 0) };
   }

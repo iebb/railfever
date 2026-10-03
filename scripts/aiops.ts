@@ -296,5 +296,19 @@ if (want('demand')) {
   check(typeof sf === 'function', 'service factor in the demand model');
 }
 
+// route evaluation is a pure, per-game memo: another game in the process (an earlier one in the same tab) or an earlier
+// query of nearly the same size never changes a result (2.7: one shared map keyed by 4-unit buckets made seed 23 run
+// differently after seed 5)
+if (want('memo')) {
+  console.log('route evaluation memo: per game and exact');
+  const a = flatGame(256), b = flatGame(256), models = [M('diesel_b'), M('coach_ic')];
+  AI(a).serviceYear(models, 2, 101, 121);
+  const first = AI(b).serviceYear(models, 2, 99, 119), fresh = AI(b).serviceYearCalc(models, 2, 99, 119, 'standard', 0.7);
+  AI(b).serviceYear(models, 2, 100, 120);
+  const again = AI(b).serviceYear(models, 2, 99, 119);
+  check(JSON.stringify(first) === JSON.stringify(fresh) && JSON.stringify(again) === JSON.stringify(fresh),
+    'route evaluation ignores other games and nearby queries (exact, per game)');
+}
+
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

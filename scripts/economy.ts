@@ -213,7 +213,9 @@ if (seed === 7) {
     rail = 0;
     const direct = settle(ids[0], ids[4], ids[4], 160, 0);
     rail = 0;
-    return { direct, split: [0, 1, 2, 3].reduce((n, i) => n + settle(ids[i], ids[i + 1], ids[4], 40, i > 0 ? 1 : 0), 0) };
+    // (leg i after i changes of vehicle, each leg but the last ending in another: each change takes 10% off the leg
+    // ending in it and the later legs, fares.ts TRANSFER_FARE_FACTOR)
+    return { direct, split: [0, 1, 2, 3].reduce((n, i) => n + settle(ids[i], ids[i + 1], ids[4], 40, i), 0) };
   };
   const { direct, split } = journey();
   // the same without any minimum: short legs earn a little more per unit by the distance curve alone

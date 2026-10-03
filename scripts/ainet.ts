@@ -20,7 +20,7 @@ import { emptyRecord } from '../src/game/economy';
 import { TRIPS_PER_MONTH } from '../src/game/demand';
 import { serialize, deserialize } from '../src/game/save';
 import { planConnection, commitConnection, connectStationThroat, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
-import { depotReaches } from '../src/game/train';
+import { depotReaches, Train } from '../src/game/train';
 import { nodeSnap } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { MODELS } from '../src/game/vehicle-types';
@@ -655,6 +655,170 @@ function midConnectionChecks() {
   }
 }
 
+/** Towns of stations (one region each) with uniform OD flows between them: `produced` trips a month per town. */
+function townFlows(g: Game, groups: Station[][], produced: number): Town[] {
+  const n = groups.length, towns: Town[] = [];
+  g.demand.regions = groups.map((sts, id) => {
+    const x = sts.reduce((s, st) => s + st.x, 0) / sts.length, z = sts.reduce((s, st) => s + st.z, 0) / sts.length;
+    const t = fixtureTown(g, x, z, Math.max(1, produced) / TRIPS_PER_MONTH, 12);
+    for (const st of sts) st.townId = t.id;
+    towns.push(t);
+    return { id, town: t.id, kind: 'town' as const, x, z, r: 12, pop: t.pop, jobs: 0, produced, attracted: produced };
+  });
+  g.demand.od = Float32Array.from({ length: n * n }, (_, i) => Math.floor(i / n) === i % n ? 0 : 1 / (n - 1));
+  g.demand.ld = new Float32Array(n * n);
+  return towns;
+}
+
+/**
+ * The Rockmouth screenshot: blue's line (ours) ends at T right beside red's terminus R in one town (red's line runs
+ * south from R, its depot lead north of it; T's free end faces R); single-track lines with a passing station halfway
+ * (M1, M2) to towns Y (blue's far end) and S (red's). 'extended': blue's line goes on west from T across red's line
+ * (grade-separated, as when it is buried under the town). 'player' / 'closed' / 'nodemand': the negative cases.
+ */
+function xlinkFixture(mode: 'ai' | 'extended' | 'busy' | 'player' | 'closed' | 'nodemand') {
+  if (mode === 'busy') return xlinkBusyFixture();
+  const { g, ai, me } = aiFlat();
+  const other = mode === 'player' ? 0 : g.addAICompany({ accessPolicy: 'open' }).id;
+  if (mode !== 'player') { g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 30_000_000; }
+  else g.economy.money = 30_000_000;
+  g.setAccessPolicy(0, 'open'); g.refreshAccess();
+  const R = station(g, 100, 100, 0, 10, 2, other, { style: 'none' })!, M2 = station(g, 100, 160, 0, 10, 2, other)!, S = station(g, 100, 220, 0, 10, 2, other)!;
+  for (const [x, y] of [[R, M2], [M2, S]]) check(!!build(g, nodeSnap(g, endNode(g, x, 0, true), 'rail'), nodeSnap(g, endNode(g, y, 0, false), 'rail'), railOpts(other), 'red line'), 'xlink fixture: red railway built');
+  const tx = mode === 'extended' ? 150 : 118;
+  const T = station(g, tx, 112, Math.PI / 2, 10, 2, me, { style: 'none' })!, M1 = station(g, (tx + 228) / 2, 112, Math.PI / 2, 10, 2, me)!, Y = station(g, 228, 112, Math.PI / 2, 10, 2, me)!;
+  for (const [x, y] of [[T, M1], [M1, Y]]) check(!!build(g, nodeSnap(g, endNode(g, x, 0, true), 'rail'), nodeSnap(g, endNode(g, y, 0, false), 'rail'), railOpts(me), 'blue line'), 'xlink fixture: blue railway built');
+  let W: Station | null = null;
+  if (mode === 'extended') {
+    W = station(g, 24, 112, Math.PI / 2, 10, 2, me, { style: 'none' })!;
+    check(!!W && straightTrack(g, endNode(g, T, 0, false), endNode(g, W, 0, true), me), 'xlink fixture: blue extended west across red\'s line');
+  }
+  for (const st of [R, M2, S, T, M1, Y, W]) if (st) connectStationThroat(g, st.id, st.owner);
+  const red = g.lines.get(lineWithTrain(g, other, [R, M2, S, M2], R))!;
+  const blue = g.lines.get(lineWithTrain(g, me, W ? [Y, M1, T, W, T, M1] : [Y, M1, T, M1], Y))!;
+  if (mode === 'closed') { g.ais[1].config.accessPolicy = 'ask'; g.refreshAccess(); }
+  const groups = [[Y], [M1], [T, R], [M2], [S], ...(W ? [[W]] : [])];
+  townFlows(g, groups, mode === 'nodemand' ? 0 : 240);
+  if (mode === 'nodemand') g.demand.od.fill(0);
+  if (g.stations.gap(T, R) <= 14) g.stations.link(T.id, R.id);
+  return { g, ai, me, other, R, M2, S, T, M1, Y, W, red, blue };
+}
+
+/**
+ * The screenshot as AI lines usually are: single track between two stations, two trains each (full), blue's terminus T
+ * beside red's R. A direct train bypassing both termini would hold both lines' sections at once: a passing loop is laid
+ * beside the junction on each line.
+ */
+function xlinkBusyFixture() {
+  const { g, ai, me } = aiFlat(384);
+  const other = g.addAICompany({ accessPolicy: 'open' }).id;
+  g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 30_000_000;
+  const R = station(g, 100, 100, 0, 10, 2, other, { style: 'none' })!, S = station(g, 100, 320, 0, 10, 2, other)!;
+  check(!!build(g, nodeSnap(g, endNode(g, R, 0, true), 'rail'), nodeSnap(g, endNode(g, S, 0, false), 'rail'), railOpts(other), 'red line'), 'xlink busy: red railway built');
+  const T = station(g, 118, 112, Math.PI / 2, 10, 2, me, { style: 'none' })!, Y = station(g, 330, 112, Math.PI / 2, 10, 2, me)!;
+  check(!!build(g, nodeSnap(g, endNode(g, T, 0, true), 'rail'), nodeSnap(g, endNode(g, Y, 0, false), 'rail'), railOpts(me), 'blue line'), 'xlink busy: blue railway built');
+  for (const st of [R, S, T, Y]) connectStationThroat(g, st.id, st.owner);
+  const red = g.lines.get(lineWithTrain(g, other, [R, S], R))!, blue = g.lines.get(lineWithTrain(g, me, [Y, T], Y))!;
+  for (const l of [red, blue]) {
+    const depot = (g.vehicles.get(l.vehicles[0]) as Train).depotId;
+    check(typeof g.vehicles.buyTrain(depot, loco(), l.id) !== 'string', 'xlink busy: a second train on each line');
+  }
+  townFlows(g, [[Y], [T, R], [S]], 240);
+  g.stations.link(T.id, R.id);
+  return { g, ai, me, other, R, M2: null as Station | null, S, T, M1: null as Station | null, Y, W: null as Station | null, red, blue };
+}
+
+function xlinkChecks() {
+  console.log('xlink: two AI companies\' railways side by side in one town get linked for direct services');
+  for (const mode of ['ai', 'extended', 'busy', 'player', 'closed', 'nodemand'] as const) {
+    const f = xlinkFixture(mode), { g, ai, me, other, T, Y, S, red, blue } = f, net = g.world.net;
+    const lines0 = g.lines.all().length, money0 = g.company(me).economy.money, own0 = JSON.stringify([red.stops, red.vehicles, blue.stops, blue.vehicles]);
+    const player = () => JSON.stringify({ e: [...net.edges.values()].filter((e) => e.owner === 0), n: [...net.nodes.values()].filter((n) => n.owner === 0) });
+    const before = player(), hopBefore = mode === 'extended' ? null : g.lines.nextHop(Y.id, S.id);
+    runNetworkTask(ai, 'xlink');
+    const joint = g.lines.all().find((l) => l.owner === me && l.id !== blue.id && l.stops.includes(S.id));
+    const positive = mode === 'ai' || mode === 'extended' || mode === 'busy';
+    console.log(`  ${mode}: links ${stat(ai, 'netXLinks')}, services ${stat(ai, 'netXServices')}, walking ${stat(ai, 'netXComplex')}; ${ai.log.slice(-2).join(' | ')}`);
+    if (!positive) {
+      check(!stat(ai, 'netXLinks') && !joint && g.lines.all().length === lines0 && g.company(me).economy.money === money0, `xlink ${mode}: no connection, no service, nothing spent`);
+      if (mode === 'player') check(player() === before, 'xlink player: the player\'s track and nodes are untouched');
+      continue;
+    }
+    check(stat(ai, 'netXLinks') === 1 && !!joint, `xlink ${mode}: the networks are linked and a direct service runs across (${JSON.stringify(Object.fromEntries(Object.entries(networkProfile.decisions).filter(([k]) => k.startsWith('xlink'))))})`);
+    if (!joint) continue;
+    const path = [...new Set(joint.stops)], from = path[0], to = path[path.length - 1];
+    const hopAfter = g.lines.nextHop(from, to);
+    console.log(`  ${mode}: ${joint.name}: ${path.map((id) => g.stations.get(id)?.name).join(' - ')}; before: ${hopBefore ? `${Math.round(hopBefore.cost)} s via ${g.lines.get(hopBefore.line)?.name}` : 'no route'}, now ${Math.round(hopAfter?.cost ?? -1)} s`);
+    check(blue.stops.includes(from) && red.stops.includes(to) && g.stations.get(from)?.owner === me && g.stations.get(to)?.owner === other
+      && g.lines.ownsStationOn(joint, me) && g.lines.ownsStationOn(joint, other), `xlink ${mode}: the joint line runs from a far station of blue's line to one of red's, both companies own stations on it`);
+    check(hopAfter?.line === joint.id && hopAfter.alight === to, `xlink ${mode}: passengers across the networks ride directly, without a change`);
+    // T's free end stays free: blue can still extend west from its terminus (e.g. underground through the town)
+    if (mode === 'ai') check(g.stations.trackEnds(T).some((t) => net.nodes.get(t.back)?.edges.length === 1)
+      && ai.hubFor(g.towns.list[T.townId], { x: T.x - 120, z: T.z }) === T, 'xlink: the terminus keeps its free end (the line can still grow from it)');
+    check(JSON.stringify([red.stops, red.vehicles, blue.stops, blue.vehicles]) === own0 && g.lines.get(red.id) === red && g.lines.get(blue.id) === blue, `xlink ${mode}: both companies' own lines run as before`);
+    const theirs = joint.vehicles.filter((id) => g.vehicles.get(id)?.owner === other).length;
+    // (the busy lines have room for one direct train only, ours: no mutual train there)
+    if (mode !== 'busy') check(theirs >= 1 && joint.operators?.includes(other), `xlink ${mode}: red runs through trains on the joint line too (mutual through running, ${theirs})`);
+    else check(stat(ai, 'netXLoops') === 2 && joint.vehicles.length === 1, `xlink busy: a passing loop beside the junction on each line, one direct train (${stat(ai, 'netXLoops')} loops)`);
+    g.aiEnabled = false;
+    const trains = joint.vehicles.map((id) => g.vehicles.get(id) as Train);
+    const locals = [...red.vehicles, ...blue.vehicles].map((id) => g.vehicles.get(id) as Train);
+    const run = runTrains(g, [...trains, ...locals], 720);
+    for (const t of trains) {
+      const seen = new Set(run.arrivals.get(t.id));
+      check(seen.has(path[0]) && seen.has(path[path.length - 1]) && t.state !== 'noroute', `xlink ${mode}: ${g.company(t.owner).name}'s train runs end to end and back (${[...seen].map((id) => g.stations.get(id)?.name)}; ${t.status})`);
+    }
+    // the own lines' trains keep running their services meanwhile (none starved behind the direct ones)
+    const calls = locals.map((t) => run.arrivals.get(t.id)?.length ?? 0);
+    console.log(`  ${mode}: calls in 720 days: direct ${trains.map((t) => run.arrivals.get(t.id)?.length ?? 0).join('/')}, own lines ${calls.join('/')}; longest wait ${fmt(run.worst.days, 3)} days (${run.worst.kind})`);
+    check(locals.every((t) => t.state !== 'noroute') && calls.every((n) => n >= 6) && run.worst.days < 120, `xlink ${mode}: the companies' own trains keep running beside the direct ones`);
+    const paid = g.agreement(me, other)?.paidTotal ?? 0, earned = g.agreement(other, me)?.paidTotal ?? 0;
+    console.log(`  ${mode}: fees blue -> red ${fmt(paid / 1000, 1)}k, red -> blue ${fmt(earned / 1000, 1)}k; cash blue ${fmt(g.company(me).economy.money / 1e6, 2)}M, red ${fmt(g.company(other).economy.money / 1e6, 2)}M`);
+    check(paid > 0 && (earned > 0 || mode === 'busy'), `xlink ${mode}: track access fees flow ${mode === 'busy' ? 'to the owner' : 'both ways'}`);
+    check([me, other].every((id) => { const c = g.company(id); return !c.defunct && c.economy.money > 0 && c.economy.loan <= c.economy.maxLoan; }), `xlink ${mode}: both companies stay solvent`);
+    check(checkReservations(g).length === 0, `xlink ${mode}: reservations remain consistent`);
+  }
+  console.log('xlink: new lines share another AI company\'s station (its free end), never the player\'s or a closed network\'s');
+  for (const mode of ['ai', 'player', 'closed'] as const) {
+    const { g, ai, S } = xlinkFixture(mode);
+    // (S: red's far terminus, its free end facing south; a railway from a town to the south would end there)
+    const hub = ai.hubFor(g.towns.list[S.townId], { x: S.x, z: S.z + 150 });
+    check(mode === 'ai' ? hub === S : hub === null, `new lines (${mode}): ${mode === 'ai' ? 'a railway into the town shares red\'s station' : 'no foreign station to share'}`);
+  }
+  console.log('xlink: a mid-task save replays exactly, and a rolled-back curve leaves only older track');
+  {
+    // Rebuild the fixture's derived demand first; its injected regions are not part of the save format.
+    const f = xlinkFixture('ai'), g = deserialize(JSON.parse(JSON.stringify(serialize(f.g)))), ai = g.ais[0];
+    runNetworkTask(ai, 'xlink', 2);
+    const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+    const cursor = saveNetwork(g).companies.find(([id]) => id === ai.companyId)?.[1].job?.items?.find((i) => (i as { xlink?: unknown }).xlink);
+    check(networkPlanner(ai)?.task === 'xlink' && !!cursor && JSON.stringify(serialize(loaded)) === data, 'xlink: the survey\'s cursor is saved mid-job and round-trips');
+    networkOptions.enabled = true;
+    for (const w of [g, loaded]) for (let n = 0; n < 100 && networkPlanner(w.ais[0])?.task; n++) networkDaily(w.ais[0]);
+    networkOptions.enabled = false;
+    check(stat(ai, 'netXLinks') === 1 && JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), 'xlink: resuming the saved job builds exactly the same link, service and world');
+  }
+  for (const mode of ['ai', 'busy'] as const) {
+    // the trains cannot be bought once the curve (and the passing loops) are down: only the new track goes, the split
+    // halves of both lines' track stay, signals as they were
+    const f = xlinkFixture(mode), { g, ai, me, other } = f, net = g.world.net;
+    const length = (owner: number) => [...net.edges.values()].filter((e) => e.kind === 'rail' && e.owner === owner && e.depot < 0).reduce((s, e) => s + e.len, 0);
+    const signals = () => JSON.stringify([...net.nodes.values()].filter((n) => n.signal).map((n) => [n.x, n.z, n.signal, n.signalKind ?? '', n.signalPass ?? '']).sort());
+    const ours = length(me), theirs = length(other), money = g.company(me).economy.money, lines = g.lines.all().length, nextEdge = net.nextEdge, signals0 = signals();
+    const buy = g.vehicles.buyTrain;
+    g.vehicles.buyTrain = () => 'test: no train';
+    try { runNetworkTask(ai, 'xlink'); } finally { g.vehicles.buyTrain = buy; }
+    check(net.nextEdge > nextEdge && !stat(ai, 'netXLinks') && ai.log.some((s) => /given up: no train; works refunded/.test(s)), `xlink rollback (${mode}): a curve was built, then given up`);
+    // (split halves of both lines' track carry new ids: their owners and lengths are what count)
+    const split = [...net.edges.values()].filter((e) => e.id >= nextEdge && e.kind === 'rail');
+    console.log(`  rollback (${mode}): ours ${fmt(ours, 3)} -> ${fmt(length(me), 3)} u, red's ${fmt(theirs, 3)} -> ${fmt(length(other), 3)} u; split halves ${split.map((e) => `${e.owner === me ? 'ours' : 'red'} ${fmt(e.len)}`).join(', ')}`);
+    check(Math.abs(length(me) - ours) < 1e-3 && Math.abs(length(other) - theirs) < 1e-3 && split.some((e) => e.owner === other),
+      `xlink rollback (${mode}): the new track is taken up, the split halves of both lines' track stay (their full lengths)`);
+    check(g.company(me).economy.money === money && g.lines.all().length === lines && routes(g, f.Y, f.T, me) && routes(g, f.R, f.S, other) && signals() === signals0,
+      `xlink rollback (${mode}): the works are refunded, no line is left behind, signals as they were, both railways run as before`);
+  }
+}
+
 function railPatienceChecks() {
   console.log('rail patience: annual staged cuts, recovery, last train and exact saved accounts');
   const { g, ai, me } = aiFlat();
@@ -789,8 +953,9 @@ function worksReplayChecks() {
 
 export function scenarios() {
   networkOptions.enabled = false;
+  if (process.argv[3] === 'xlink') { xlinkChecks(); networkOptions.enabled = true; return; }
   roadChecks(); joinChecks(); stationPairChecks(); reviewChecks();
-  midConnectionChecks(); railPatienceChecks(); worksReplayChecks();
+  midConnectionChecks(); xlinkChecks(); railPatienceChecks(); worksReplayChecks();
   // 1. pairing: two lines leave a station on its two platform tracks, side by side for 60 units, then part
   {
     console.log('pair: two single tracks side by side become one double track');
@@ -1080,7 +1245,7 @@ function stateChecks() {
   timers.companies[0][1].demand = { day: 119, nt: 2, P: [0, 1 / 3, Math.PI, 0] };
   loadNetwork(g, timers);
   const state = saveNetwork(g), data = JSON.parse(JSON.stringify(serialize(g))), loaded = deserialize(data);
-  check(state.companies[0][1].next.length === 15 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
+  check(state.companies[0][1].next.length === 16 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
     && state.companies[0][1].retire.length > 0, 'save: schedules, cooldowns, station changes and removal grace are populated');
   check(state.companies[0][1].sizes[0][1].day === 120, 'save: station growth cooldown retains the day of the actual change');
   check(JSON.stringify(state) === JSON.stringify(saveNetwork(loaded)), 'save: planner fields round-trip exactly through JSON');

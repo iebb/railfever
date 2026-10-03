@@ -13,7 +13,7 @@ import { outAndBack, linearStops } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
-import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime, NO_TRANSFER_BONUS } from '../src/game/fares';
+import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime } from '../src/game/fares';
 import { localTripMultiplier } from '../src/game/demand';
 import { URBAN_PAYBACK } from '../src/game/constants';
 import { patternHeadways } from '../src/game/patterns';
@@ -168,7 +168,7 @@ if (!arg('maps')) {
     const g = flat(1), ai = g.ais[0] as AIController & Record<string, any>;
     for (const [models, track, dist, len, mode] of [[[M('emu_b')], 'electric', 24, 28, 'rail'], [[M('bus_c')], 'street', 18, 20, 'bus']] as const) {
       const sv = ai.serviceYearCalc([...models], 2, dist, len, track, 0.7);
-      const receipt = fareFor(dist, estimateLegTime(dist, sv.kmh, sv.headway, len / dist), 1, { mode }) * (1 + NO_TRANSFER_BONUS);
+      const receipt = fareFor(dist, estimateLegTime(dist, sv.kmh, sv.headway, len / dist), 1, { mode });
       const estimate = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, false, { mode });
       const generic = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, true, { mode });
       console.log(`  ${mode}: ${dist} u, estimate ${fmt(sv.perPax, 0)} per trip (receipt ${fmt(receipt, 0)} per passenger)`);

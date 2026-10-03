@@ -54,6 +54,8 @@ The speed factor, which compares a leg's time with walking or driving, is capped
 
 Tram and bus receipts are a boarding charge (80 and 12) plus 90% of the old distance component. AI forecasts, project and improvement estimates, vehicle receipts and the line fares panel use the same context. Dense-centre trips add parking time and reduce car speed. Walking remains the reference for very short journeys.
 
+Changes of vehicle cost income (release 2.7): each one takes 10% off the fare of the leg ending in it and of every later leg (`TRANSFER_FARE_FACTOR`, 0.9). Legs are still paid one at a time, each to its operator: a leg after k changes pays 0.9^k, one 0.9 more when its passengers change at its end. A journey with one change earns exactly 10% less than the same legs without a change, whatever their lengths; with two changes 10–19% less (16% for three equal legs). This replaces the 20% bonus direct journeys earned; every fare is 1.2 times its old base (`FARE_LEVEL`), so a direct journey pays what it did. Waiting and cargo groups never mix passengers with different changes so far, just as they never mix rail fare histories: `fareGroupKey` adds the change class (0, 1, 2, 3 or more; the last pays its mean, within 0.2% of the exact fares for three and four changes). Older saves counted the passengers who had changed rather than their changes; read as one change each, a mixed group pays its mean (0.9^0.5 for half, within 0.2% of the exact split). AI forecasts price a journey with a change at 0.9 on every leg, and the cross-company link task values today's journeys across two networks the same way.
+
 A station's rating scales its passenger generation, and passengers who give up waiting lower it by up to 0.6 (`RATING_LOST`; 0.25 before). The share who gave up this and last month also reduces the station's generation directly, as OpenTTD's ratings do: where vehicles leave people behind, fewer set out.
 
 ## Car access to rail
@@ -138,9 +140,9 @@ Open-access AI companies with facing main-line termini in one city may jointly b
 
 Its `--maps=7,23 --years=8 --size=768` mode measures naturally selected city railways. It records town population when trains start operating, and captures operating profit exactly two years later. A qualifying service must be profitable both at that observation and at the end of the run.
 
-`economy.ts`, `economy-ops.ts` and `ridership.ts` keep separate controls for existing rail and bus economics. The fixed income and operating-result controls must stay within ±15% of the baseline in `economy.ts`; that baseline is a repeatability check, re-captured with its history in the file. Independent bands check balance: the intercity line runs 10–80% full and repays its full capital within 60 years, the busy bus runs 15–80% full and repays its full capital in 1.5–8 years, and the village railway does not pay its way. An exploit check splits one journey over four transfers: it may earn no more than the distance fares alone make it (1.48 times the direct ride).
+`economy.ts`, `economy-ops.ts` and `ridership.ts` keep separate controls for existing rail and bus economics. The fixed income and operating-result controls must stay within ±15% of the baseline in `economy.ts`; that baseline is a repeatability check, re-captured with its history in the file. Independent bands check balance: the intercity line runs 10–80% full and repays its full capital within 60 years, the busy bus runs 15–80% full and repays its full capital in 1.5–8 years, and the village railway does not pay its way. An exploit check splits one journey over four legs: it may earn no more than the distance fares alone make it, with the same changes of vehicle (1.47 times the direct ride against 1.41 by the distance fares, within the 5% allowance).
 
-`walkcatch.ts` checks that a second stop as far away adds no coverage. `growth.ts` caps the passengers who give up waiting at 30% over a run and 35% in its last year.
+`walkcatch.ts` checks that a second stop as far away adds no coverage. `growth.ts` caps the passengers who give up waiting at 30% over a run and 35% in its last year. `fares.ts` checks fare-history and change-class cohorts through waiting, boarding, transfers, absorption, line redirects and saves, and the journey-level transfer reduction.
 
 The company capacity stress test injects its artificial crowd at the monthly decision, after normal queue abandonment. It freezes business decisions during its separate double-track physics observation.
 
@@ -196,6 +198,38 @@ The separate seed-11 tiny-village smoke control connects Glendale (260 residents
 | --- | ---: | ---: |
 | Station walking residents | 281.8 / 171.0 | 187.4 / 153.6 |
 | Passengers delivered in two years | 146 | 136 |
+
+### Release 2.7: transfer rule, riders who give up, one game per memo
+
+Release 2.7 combines the 70% walking limits with the transfer rule above (every fare 1.2 times its old base, each change of vehicle 10% off the leg ending in it and every later leg), the AI's cross-company links, two AI changes and a determinism fix:
+
+- A bus or tram line at its fleet limit, earning over twice its costs, whose riders gave up waiting by two vehicle-loads or more last month (its share of each stop's queue), may run one vehicle more; its stops still bound the fleet, and trams the street. The capacity rule also counts those riders as waiting: on small stops a busy line never shows a long queue, they give up instead. In the seed-7 growth run both companies' trams at Wilwood Market Cross earned 8.5 times their costs, capped at five each, while 1,238 passengers a year gave up at that stop alone.
+- The AI's route-evaluation memo was one map for every game in the process, keyed by distances rounded to 4 units: its values were the first query's of each bucket, so an earlier game in the same tab (or the queries before a save) changed a game's later choices. It is per game and exact now. `growth.ts` runs seed 23 after seed 7 in one process, so earlier seed-23 numbers depended on seed 7's run.
+
+The economy controls are unchanged (direct journeys pay what they did): intercity 490.7k income, 55.0-year full-capital payback; busy bus 175.8k, 6.7 years; village rail −133.2k. The urban fixtures, the two-town line (27.0% load, +690k in year three) and the seed-11 tiny village (136 passengers in two years) are unchanged too. The split-journey exploit check reads 1.47 times the direct ride against 1.41 by the distance fares alone.
+
+Growth, 20 years on 768 maps (seeds 7 and 23 are the test's; 5 and 11 a second sample). "Merged" is 2.7 before the capacity rule and the memo fix:
+
+| Growth class, seeds 7 / 23 | 70% walking limits | Merged | Release 2.7 | Target |
+| --- | ---: | ---: | ---: | ---: |
+| Well served | 1.96× (19 towns) | 1.96× (18) | 1.96× (19) | 1.6–2.5× |
+| Poorly served | 1.43× (6) | 1.49× (7) | 1.58× (6) | 1.3–1.6× |
+| Unserved | 1.14× (1) | 1.21× (1) | 1.23× (1) | 1.1–1.3× |
+
+| Growth class, seeds 5 / 11 | 70% walking limits | Merged | Release 2.7 |
+| --- | ---: | ---: | ---: |
+| Well served | 1.64× (16) | 1.64× (15) | 1.67× (16) |
+| Poorly served | 1.51× (7) | 1.46× (7) | 1.51× (8) |
+| Unserved | 1.24× (3) | 1.20× (4) | 1.14× (2) |
+
+| Passengers who gave up, run / final year | 70% walking limits | Merged | Release 2.7 |
+| --- | ---: | ---: | ---: |
+| Seed 7 | 24% / 29% | 27% / 36% | 23% / 30% |
+| Seed 23 | 13% / 24% | 14% / 18% | 12% / 17% |
+| Seed 5 | 19% / 24% | 20% / 25% | 19% / 24% |
+| Seed 11 | 13% / 17% | 10% / 11% | 10% / 11% |
+
+In the merged build seed 7's final year passed the 35% ceiling: a third company was bought three years earlier than before, and the profitable trams above stayed capped. Letting the fleet follow riders who give up by a single vehicle-load a month brought seed 7 to 19% / 29% but raised the poorly served class to 1.73× (two small towns gained service late in the run: Oakmoor 268 → 766 residents, Hayhaven 242 → 437); two vehicle-loads, as adopted, keeps every class and ceiling inside its unchanged target on both samples. Over the four seeds the poorly served class grows 1.47× before release 2.7 and 1.54× with it.
 
 Catchment timing uses Node 20.18.2, seed 23, a 768 map and three AI companies. The five-year runs use `--timing-only --cpu`, excluding allocations from the independent reference comparison.
 

@@ -14,13 +14,15 @@ import { growThroat, throatFree, holdThroat, releaseHold, WORKS_HOLD } from './t
 import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
-import { simNow, transferWalkTime, fareGroupKey, railHistory } from './fares';
+import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
- * (weighted mean; fares.ts simNow), `transfers`: how many of them have changed vehicles on this journey (ops, 9j/9k).
+ * (weighted mean; fares.ts simNow), `transfers`: the changes of vehicle they made on this journey so far, in all
+ * (transfers / count each; each change takes 10% off the leg ending in it and every later leg, fares.ts
+ * TRANSFER_FARE_FACTOR). A group's passengers share their fare history and change class (fares.ts fareGroupKey).
  */
 export interface WaitGroup {
   line: number; alight: number; dest: number; count: number; t?: number; transfers?: number;
@@ -2776,9 +2778,10 @@ export class Stations {
     if (count <= 0) return;
     rail = railHistory(rail);
     if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
-    const key = fareGroupKey(line, alight, dest, rail);
-    // ops: when they started waiting (weighted mean), how many already changed vehicles, their rail fares so far
-    const at = t ?? simNow(this.game), tr = Math.max(0, Math.min(count, transferred));
+    // ops: when they started waiting (weighted mean), their changes of vehicle so far, their rail fares so far; groups
+    // never mix fare histories or change classes (each pays its own minimum and transfer reduction)
+    const at = t ?? simNow(this.game), tr = Math.max(0, transferred);
+    const key = fareGroupKey(line, alight, dest, rail, changeClass(tr, count));
     const g = st.waiting.get(key);
     if (g) {
       g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
@@ -2807,7 +2810,7 @@ export class Stations {
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
     const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to)) : 0);
-    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count)), rail));
+    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail));
   }
 
   /**
@@ -2836,8 +2839,8 @@ export class Stations {
       const g = x.g;
       g.count = x.count;
       lost += x.oldCount - x.count;
-      // transfers (passengers of the group who already changed) shrink with it
-      if (x.transfers) g.transfers = Math.min(g.count, Math.round(x.transfers * g.count / x.oldCount));
+      // transfers (the group's changes of vehicle so far) shrink with it
+      if (x.transfers) g.transfers = Math.round(x.transfers * g.count / x.oldCount);
       if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
