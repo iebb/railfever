@@ -3,8 +3,8 @@ import type { Game } from './game';
 import type { Building } from './world';
 import { curvePoint, type NEdge, type EdgeGeo } from './network';
 import type { Snap } from './construction';
-import type { Station, StationPlan, CatchMode, RailMode } from './stations';
-import { CATCHMENT_RADIUS, ENTRANCE_SIZE, catchModeOf, railModeOf } from './stations';
+import type { Station, StationPlan, CatchMode, RailMode, EntrancePlan } from './stations';
+import { CATCHMENT_RADIUS, ENTRANCE_SIZE, catchModeOf, railModeOf, entranceKind, entranceLandings, landingReach } from './stations';
 import { ROAD_TYPES } from './constants';
 import { closestOnPolyline, arcTable, bezPoint, tAtS } from './geom';
 import { styleOf } from './station-styles';
@@ -93,6 +93,9 @@ function snapRoad(g: Game, x: number, z: number, reach: number): RoadPoint | nul
   return best;
 }
 
+/** Can a walk start from (x, z) onto a street within `reach` (on the ground, at about its height, not across water)? */
+export function walkableStreetNear(g: Game, x: number, z: number, reach: number): boolean { return !!snapRoad(g, x, z, reach); }
+
 function pointOnRoad(g: Game, edge: number, s: number, mode: CatchMode, bonus = 0): Access | null {
   const e = g.world.net.edges.get(edge);
   if (!e || !pedestrianRoad(e)) return null;
@@ -100,8 +103,11 @@ function pointOnRoad(g: Game, edge: number, s: number, mode: CatchMode, bonus = 
   return { edge, s, leg: 0, x: p.x, z: p.z, mode, limit: walkLimit(mode, bonus) };
 }
 
-/** Access is individual: an unconnected entrance contributes nothing even if another entrance works. */
-function stationAccess(g: Game, st: Station): Access[] {
+/**
+ * Access is individual: an unconnected entrance contributes nothing even if another entrance works. `skip`: leave
+ * out that entrance (what it alone adds, see walkingCatchmentWithout).
+ */
+function stationAccess(g: Game, st: Station, skip = -1): Access[] {
   const out: Access[] = [], r = st.rail;
   if (!st.roadAccess) return out;
   if (r) {
@@ -115,8 +121,10 @@ function stationAccess(g: Game, st: Station): Access[] {
     if (level === 'ground') {
       const reach = styleOf(r.style).placement === 'none' ? 1.6 : 0.9;
       add(g.stations.forecourt(st), reach); add(r.forecourt2, reach);
+      // added entrances: a side hall or gate, a footbridge's / underpass's stairs on either side of the tracks
+      r.entrances.forEach((e, i) => { if (i !== skip) for (const p of entranceLandings(e)) add(p, landingReach(entranceKind(level, e))); });
     } else {
-      for (const e of r.entrances) add(e, ENTRANCE_SIZE[level].d / 2 + 0.9);
+      r.entrances.forEach((e, i) => { if (i !== skip) add(e, ENTRANCE_SIZE[level].d / 2 + 0.9); });
       if (styleOf(r.style).placement !== 'none') add(r.forecourt, 0.9);
     }
     // A road stop inside a merged station gives access to its rail platforms too.
@@ -258,7 +266,7 @@ class WalkingCache {
       const extent = r ? r.length / 2 + 28 : 10;
       const ids = RegionVersions.ids([st.x - extent, st.z - extent, st.x + extent, st.z + extent]);
       // Unusually placed entrances/merged stops also need their own local dependencies.
-      for (const p of [g.stations.forecourt(st), r?.forecourt2, ...(r?.entrances ?? []), ...st.stops])
+      for (const p of [g.stations.forecourt(st), r?.forecourt2, ...(r?.entrances ?? []).flatMap(entranceLandings), ...st.stops])
         if (p) ids.push(...RegionVersions.ids([p.x - 4, p.z - 4, p.x + 4, p.z + 4]));
       const links = old?.key === key ? old.links : st.links.join(',');
       // Other stations use these portals' geometry and passages, not this station's style or walking budget.
@@ -306,7 +314,8 @@ class WalkingCache {
       terrainFallback: w.terrainVersions.fallbackVersion, point }); return point;
   }
 
-  calculate(key: string, sources: Access[], complex = true): WalkingCatchment {
+  /** `own`: a station whose passages use these access points instead of its own (a station less one entrance). */
+  calculate(key: string, sources: Access[], complex = true, own?: { id: number; points: Access[] }): WalkingCatchment {
     if (!sources.length) return EMPTY;
     this.syncStations();
     const g = this.g, w = g.world, net = w.net;
@@ -328,7 +337,7 @@ class WalkingCache {
         neighbors ??= nearby.flatMap((id) => [id, this.accesses.get(id)!.version]);
         const access = new Map<number, number[]>();
         for (const id of nearby) {
-          const pts = this.accesses.get(id)!.points.filter((p) => sources.some((s) => Math.hypot(p.x - s.x, p.z - s.z) <= s.limit));
+          const pts = (id === own?.id ? own.points : this.accesses.get(id)!.points).filter((p) => sources.some((s) => Math.hypot(p.x - s.x, p.z - s.z) <= s.limit));
           if (!pts.length) continue;
           const ids = pts.map(addPortal); access.set(id, ids);
           const join = (a: number, b: number) => {
@@ -472,6 +481,58 @@ export function walkingCatchment(g: Game, st: Station): WalkingCatchment {
   g.stations.refreshAccess();
   return cache(g).calculate(`station:${st.id}`, cache(g).access(st));
 }
+/**
+ * A station's walking catchment without one of its entrances (the station window: what each entrance newly covers is
+ * the station's catchment less this one).
+ */
+export function walkingCatchmentWithout(g: Game, st: Station, entrance: number): WalkingCatchment {
+  g.stations.refreshAccess();
+  const points = stationAccess(g, st, entrance);
+  // (its own passages lead only between the access points it keeps)
+  return cache(g).calculate(`without:${st.id}:${entrance}`, points, true, { id: st.id, points });
+}
+/**
+ * Walking catchment from extra access points of a station on their own (an entrance being planned or valued, or one
+ * entrance's reach): the station's mode and building bonus; passages through the station lead only between these
+ * points. Each point snaps to a road within `reach`; `legScale` stretches that walk (a street still to be built
+ * rarely runs straight) and `leg` is walked before it.
+ */
+export function extraAccessCatchment(g: Game, st: Station, points: { x: number; z: number; reach: number; leg?: number; legScale?: number }[]): WalkingCatchment {
+  const r = st.rail;
+  if (!r) return EMPTY;
+  const mode = catchModeOf(railModeOf(r.trackType)), limit = walkLimit(mode, styleOf(r.style).catchBonus), sources: Access[] = [];
+  for (const p of points) {
+    const q = snapRoad(g, p.x, p.z, p.reach);
+    if (q) sources.push({ ...q, leg: q.leg * (p.legScale ?? 1) + (p.leg ?? 0), mode, limit });
+  }
+  return cache(g).calculate(`extra:${st.id}:${sources.map((q) => `${q.edge}:${q.s}:${q.leg}`).join('|')}`, sources, true, { id: st.id, points: sources });
+}
+/** One entrance's own walking catchment (what its landings reach on their own). */
+export function entranceCatchment(g: Game, st: Station, entrance: number): WalkingCatchment {
+  const r = st.rail, e = r?.entrances[entrance];
+  if (!r || !e) return EMPTY;
+  const level = r.level ?? 'ground', k = entranceKind(level, e);
+  const reach = level === 'ground' ? landingReach(k) : ENTRANCE_SIZE[level].d / 2 + 0.9;
+  return extraAccessCatchment(g, st, entranceLandings(e).map((p) => ({ x: p.x, z: p.z, reach })));
+}
+/** Walking catchment of a planned entrance on its own: its landings on a road, or the end of its access street. */
+export function entrancePlanCatchment(g: Game, st: Station, plan: EntrancePlan): WalkingCatchment {
+  const r = st.rail;
+  if (!r || !plan.entrance) return EMPTY;
+  const k = entranceKind(r.level ?? 'ground', plan.entrance), reach = landingReach(k);
+  const points: { x: number; z: number; reach: number; leg?: number }[] = plan.landings.filter((p) => p.road && !plan.access).map((p) => ({ x: p.x, z: p.z, reach }));
+  if (plan.access) {
+    // the new street: walked to its far end (where it meets the road network), then on along the streets
+    const door = plan.door ?? plan.landings[0];
+    for (const t of plan.access.tracks) for (const sn of [t.start, t.end]) {
+      if (Math.hypot(sn.x - door.x, sn.z - door.z) < 0.5) continue;
+      points.push({ x: sn.x, z: sn.z, reach: 0.6, leg: plan.access.stats.len + 0.6 });
+    }
+    for (const p of plan.landings.slice(1)) if (p.road) points.push({ x: p.x, z: p.z, reach });
+  }
+  return extraAccessCatchment(g, st, points);
+}
+
 /** Independent cache, for exact incremental/full checks without mutating the live walking cache. */
 export function fullWalkingCatchments(g: Game): Map<number, WalkingCatchment> {
   const c = new WalkingCache(g), out = new Map<number, WalkingCatchment>();

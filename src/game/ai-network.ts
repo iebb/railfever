@@ -27,12 +27,12 @@
 // a few town buildings demolished where that gives a better site (cost plus compensation, a small rating hit).
 import type { Game } from './game';
 import type { AIController } from './ai';
-import type { Station, StationPlan } from './stations';
+import type { Station, StationPlan, EntrancePlan, EntranceKind } from './stations';
 import type { NEdge, NNode } from './network';
 import type { Line } from './lines';
 import type { Economy } from './economy';
 import type { Proposal, BuildOptions, Snap } from './construction';
-import { railModeOf, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS } from './stations';
+import { railModeOf, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide } from './stations';
 import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
 import * as Trackops from './trackops';
 import * as StationsMod from './stations';
@@ -54,7 +54,8 @@ import type { RoadVehicle, RSeg } from './roadvehicle';
 import { tramUsable } from './build-ops';
 import { closestOnPolyline } from './geom';
 import { YEAR_S } from './opcosts';
-import { walkingCatchment } from './catchment';
+import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, type WalkingCatchment } from './catchment';
+import { distToRect } from './world';
 
 // ============================================================================ optional primitives (feature-detected)
 
@@ -132,12 +133,15 @@ export const NETWORK_WORK_UNITS = 4;
 
 /** Spacing of stations along a line by mode (units): no station inserted closer to another one. */
 const MIN_SPACING: Record<string, number> = { mainline: Math.max(30, CATCHMENT_RADIUS.rail * 1.1), metro: 18, lightrail: 15 };
+/** The AI adds entrances to a station up to this many in all. */
+const ENTRANCE_MAX = 6;
 /** Residents a new station must newly cover (beyond the other stations' catchment) to be inserted. */
 const INSERT_POP: Record<string, number> = { mainline: 650, metro: 900, lightrail: 450 };
 
 /** Counters (in AIController.stats, saved with it): the ones ai.ts declares and this module's own. */
 type NetStat = 'grown' | 'merged' | 'paired' | 'connections' | 'stubs' | 'netDecommissioned' | 'netRetired' | 'netInserted' | 'netInterchanges'
-  | 'netLinesMerged' | 'netRestyled' | 'netConsolidated' | 'netStopsMerged' | 'netThrough' | 'netRelevelled' | 'netCrossovers' | 'netGraded' | 'netDemolished' | 'netJoined' | 'netRoads' | 'netRoadUnitsSaved';
+  | 'netLinesMerged' | 'netRestyled' | 'netConsolidated' | 'netStopsMerged' | 'netThrough' | 'netRelevelled' | 'netCrossovers' | 'netGraded' | 'netDemolished' | 'netJoined' | 'netRoads' | 'netRoadUnitsSaved'
+  | 'netEntrances';
 
 /** Frame cost of the daily network work over all companies (tests / profiling). */
 export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, decisions: {} as Record<string, number>,
@@ -1894,20 +1898,25 @@ class NetPlanner {
           }
         }
         // A blocked throat need not prevent a worthwhile building upgrade on the existing platforms.
-        if (res !== 'done' && !this.cared('sty' + st.id)) this.restyle(st, cap.terminus);
+        const restyled = res !== 'done' && !this.cared('sty' + st.id) && this.restyle(st, cap.terminus);
+        // nor an extra entrance (one change per station at a time)
+        if (res !== 'done' && !restyled && !this.cared('ent' + st.id)) this.entrance(st);
         yield;
         continue;
       }
       if (!want) this.considered('grow.enoughRoom');
       // a station building where its wider catchment pays for it (9m); halts stay halts
-      if (!this.cared('sty' + st.id)) { this.restyle(st, cap.terminus); yield; }
+      let restyled = false;
+      if (!this.cared('sty' + st.id)) { restyled = this.restyle(st, cap.terminus); yield; }
+      // an extra entrance where the residents it newly reaches pay for it (one change per station at a time)
+      if (!restyled && !this.cared('ent' + st.id) && g.stations.get(st.id)?.rail) { this.entrance(st); yield; }
     }
   }
 
-  /** Upgrade a station's building when the catchment it adds pays for it within a few years (or take a useless one down at a quiet halt). */
-  private restyle(st: Station, terminus: boolean) {
+  /** Upgrade a station's building when the catchment it adds pays for it within a few years (or take a useless one down at a quiet halt). True when rebuilt. */
+  private restyle(st: Station, terminus: boolean): boolean {
     const g = this.g, r = st.rail!;
-    if (!this.mayAlter([...r.edges, ...r.throughEdges])) return;
+    if (!this.mayAlter([...r.edges, ...r.throughEdges])) return false;
     this.careFor('sty' + st.id, 360);
     const mode = railModeOf(r.trackType), T = g.towns.list[st.townId], pop = T?.pop ?? 0;
     const cur = styleOf(r.style).id;
@@ -1930,15 +1939,125 @@ class NetPlanner {
       const gain = annual * years - plan.cost;
       if (gain > 0 && (!best || gain > best.gain)) best = { style: s, gain, plan };
     }
-    if (!best || !this.canSpend(best.plan.cost, 0.15)) return;
+    if (!best || !this.canSpend(best.plan.cost, 0.15)) return false;
     const plan = best.plan;
     const dem = plan.plan ? [...plan.plan.demolish] : [];
     const err = commitStationUpgrade(g, plan);
-    if (err) { if (err === 'busy') this.careFor('sty' + st.id, 10); return; }
+    if (err) { if (err === 'busy') this.careFor('sty' + st.id, 10); return false; }
     this.compensate(dem);
     this.bump('netRestyled');
     this.note(`${st.name}: ${styleOf(best.style).name.toLowerCase()} (its catchment pays for it)`);
     this.recentlyChanged(st, 0);
+    return true;
+  }
+
+  /**
+   * An extra entrance where the residents it newly brings within walking reach pay for it within a few years, as a
+   * station building does (restyle): at a ground station a footbridge or underpass to both sides of the tracks, a
+   * side hall or a platform-end gate (with an access street where no road passes), else a pavilion / stair tower
+   * beside a street. Candidates are valued cheaply first (a street still to be built: estimated from the nearest
+   * road), then only the best is planned in full and checked again. Once a year per station at most (cooldown
+   * 'ent<id>', saved with the planner); fixed candidate order, residents summed by building id. True when built.
+   */
+  private entrance(st: Station): boolean {
+    const g = this.g, r = st.rail;
+    if (!r) return false;
+    this.careFor('ent' + st.id, 360);
+    // one change per station a year: none within a year of its last rebuild or new building
+    if (r.entrances.length >= ENTRANCE_MAX || this.recentlyChanged(st, 360)) return false;
+    if (!this.linesAt(st.id).some((l) => this.fleet(l).ours.length)) { this.considered('ent.unserved'); return false; }
+    const covered = walkingCatchment(g, st).buildings;
+    const perRes = this.residentValue(st), years = 5 + 5 * this.ai.config.risk;
+    /** residents a catchment newly brings to this station, shared with the other served stations reaching them */
+    const newly = (walk: WalkingCatchment) => {
+      let pop = 0;
+      for (const id of [...walk.buildings.keys()].sort((a, b) => a - b)) {
+        if (covered.has(id)) continue;
+        const b = g.world.buildings.get(id);
+        if (!b || b.pop <= 0) continue;
+        const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
+        pop += b.pop / (1 + others);
+      }
+      return pop;
+    };
+    const gain = (pop: number, kind: EntranceKind, outlay: number) => (pop * perRes - ENTRANCE_TYPES[kind].upkeep) * years - outlay;
+    let best: { spot: { kind?: EntranceKind; x: number; z: number }; plan: EntrancePlan; gain: number; pop: number } | null = null;
+    const seen = new Set<string>();
+    for (const spot of this.entranceSpots(st)) {
+      let pl = g.stations.planEntrance(st.id, spot.x, spot.z, this.me, spot.kind, { street: false });
+      if (!pl.entrance && spot.alt) pl = g.stations.planEntrance(st.id, spot.x, spot.z, this.me, spot.alt, { street: false });
+      if (!pl.entrance) continue;
+      const e = pl.entrance, key = `${pl.kind}:${pl.ok}:${[e, e.far].filter(Boolean).map((p) => `${p!.x.toFixed(2)},${p!.z.toFixed(2)}`).sort().join('/')}${pl.ok ? '' : `:${pl.door?.x},${pl.door?.z}`}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      let walk: WalkingCatchment, outlay = pl.cost;
+      if (pl.ok) walk = entrancePlanCatchment(g, st, pl);
+      else if (pl.door) {
+        // a street still to be built: from the door to the nearest road on its side, a little longer than straight
+        const q = g.stations.sideRoad(st.id, pl.door.x, pl.door.z, entranceSide(r, e), 12);
+        if (!q) continue;
+        walk = extraAccessCatchment(g, st, [{ x: q.x, z: q.z, reach: 0.3, leg: q.d * 1.3 }]);
+        outlay += q.d * 1.3 * (ROAD_TYPES.street?.costPerUnit ?? 3500) + 20_000;
+      } else continue;
+      const pop = newly(walk), v = gain(pop, pl.kind, outlay);
+      if (v > 0 && (!best || v > best.gain)) best = { spot: { kind: pl.kind, x: spot.x, z: spot.z }, plan: pl, gain: v, pop };
+    }
+    if (!best) { this.considered('ent.none'); return false; }
+    let plan = best.plan, pop = best.pop;
+    if (!plan.ok) {
+      // planned in full with its access street, and valued again
+      plan = g.stations.planEntrance(st.id, best.spot.x, best.spot.z, this.me, best.spot.kind);
+      if (!plan.ok || (plan.access && !this.safeRoadPlan(plan.access))) { this.considered('ent.street'); return false; }
+      pop = newly(entrancePlanCatchment(g, st, plan));
+      const outlay = plan.access ? plan.cost - plan.access.cost + this.roadOutlay(plan.access) : plan.cost;
+      if (gain(pop, plan.kind, outlay) <= 0) { this.considered('ent.street'); return false; }
+    }
+    if (!this.canSpend(plan.cost, 0.15)) { this.considered('ent.funds'); return false; }
+    const dem = plan.access ? [...plan.access.demolish] : [];
+    if (g.stations.commitEntrance(st.id, plan, this.me)) return false;
+    this.compensate(dem);
+    this.bump('netEntrances');
+    this.careFor('sty' + st.id, 360);
+    this.note(`${st.name}: ${ENTRANCE_TYPES[plan.kind].name.toLowerCase()} (${Math.round(pop)} residents newly within walking reach)`);
+    return true;
+  }
+
+  /** Candidate places for an extra entrance, in a fixed order (kind, a point to plan it near; `alt`: the kind to try where it does not fit). */
+  private entranceSpots(st: Station): { kind?: EntranceKind; alt?: EntranceKind; x: number; z: number }[] {
+    const g = this.g, r = st.rail!, net = g.world.net;
+    const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx, L = r.length, half = railWidth(r) / 2 + 1;
+    const at = (side: number, a: number) => ({ x: r.x + rx * side * half + fx * a, z: r.z + rz * side * half + fz * a });
+    if ((r.level ?? 'ground') === 'ground') {
+      const out: { kind?: EntranceKind; alt?: EntranceKind; x: number; z: number }[] = [];
+      for (const a of L >= 6 ? [0, -0.3 * L, 0.3 * L] : [0]) for (const side of [1, -1]) {
+        out.push({ kind: 'footbridge', alt: 'underpass', ...at(side, a) }, { kind: 'hall', ...at(side, a) });
+      }
+      for (const end of [1, -1]) for (const side of [1, -1]) out.push({ kind: 'gate', ...at(side, end * L / 2) });
+      return out;
+    }
+    // below / above the street: beside the streets around the platforms, far from the entrances it has
+    const fp = g.stations.platformRect(st)!, R = L / 2 + 16;
+    const pts: { x: number; z: number; d: number }[] = [];
+    const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+    for (const e of net.edgesNear(r.x - R, r.z - R, r.x + R, r.z + R)) {
+      if (!pedestrianRoad(e)) continue;
+      for (let s = 2; s < e.len - 2; s += 5) {
+        net.pointAt(e, s, p, d);
+        if (distToRect(p.x, p.z, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) > 14) continue;
+        const l = Math.hypot(d.x, d.z) || 1, off = net.halfWidth(e) + 0.5;
+        for (const sd of [1, -1]) {
+          const x = p.x - (d.z / l) * off * sd, z = p.z + (d.x / l) * off * sd;
+          pts.push({ x, z, d: r.entrances.reduce((m, q) => Math.min(m, Math.hypot(q.x - x, q.z - z)), Infinity) });
+        }
+      }
+    }
+    pts.sort((a, b) => b.d - a.d || a.x - b.x || a.z - b.z);
+    const out: { x: number; z: number }[] = [];
+    for (const q of pts) {
+      if (q.d < 6 || out.length >= 8) break;
+      if (out.every((o) => Math.hypot(o.x - q.x, o.z - q.z) >= 5)) out.push({ x: q.x, z: q.z });
+    }
+    return out;
   }
 
   // ================================================================ pairing single tracks (9g)

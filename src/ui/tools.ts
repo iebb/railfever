@@ -11,7 +11,8 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_SIZE, relocateStation, ThroughMode, railModeOf, catchModeOf } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, catchModeOf, entranceAlong, railWidth } from '../game/stations';
+import type { EntranceKind } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
 import { CROSS_LABEL, MarkerKind } from '../render/overlay';
@@ -20,7 +21,8 @@ import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
 import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
-import { pointWalkingCatchment, stopWalkingCatchment, walkLimit } from '../game/catchment';
+import { stopWalkingCatchment, walkLimit, walkingCatchment, entrancePlanCatchment } from '../game/catchment';
+import type { FootRect } from '../render/overlay';
 import { STATION_STYLES } from '../game/station-styles';
 import { servesKind } from './win-lines';
 import { accessState, policyText, requestAccessUI } from './win-access';
@@ -59,7 +61,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
   signal: { name: 'Signals', hint: 'Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
   double: { name: 'Double track', hint: 'Click one of your single tracks, or drag along it, to lay a second track beside it with switches at both ends (into a free platform where a station is). Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
-  entrance: { name: 'Add entrance', hint: 'Click beside a road near the station to add a street entrance (stair tower or pavilion). Every entrance brings its own catchment area.' },
+  entrance: { name: 'Add entrance', hint: 'Add an entrance: beside a road near an underground or elevated station (pavilion or stair tower); beside the tracks of a ground station, on either side (a side entrance, a footbridge or underpass to both sides, or a gate at a platform end). Every entrance brings its own catchment area.' },
   bulldoze: { name: 'Demolish', hint: 'Click to remove an object, or drag a rectangle to clear an area. Other companies’ property is protected.' },
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
@@ -147,8 +149,10 @@ export class Tools {
   relocating: number | null = null;
   /** depot tool moving an existing depot (its id), else null */
   relocatingDepot: number | null = null;
-  /** entrance tool: the underground / elevated station getting a new entrance */
+  /** entrance tool: the station getting a new entrance */
   entranceStation: number | null = null;
+  /** entrance tool at a ground station: the kind of entrance (side hall, footbridge, underpass, platform-end gate) */
+  entranceKind: EntranceKind = 'footbridge';
   /** signal tool: click places / cycles (or removes); a drag along a track places a series at the spacing */
   signalMode: 'place' | 'remove' = 'place';
   signalKind: 'oneway' | 'twoway' = 'oneway';
@@ -558,7 +562,7 @@ export class Tools {
       this.stationType, this.stationStyle, this.stationLen, this.stationTracks, this.stationLevel, this.stationHeight, this.stationDepth,
       this.stationThrough, this.throughMode, this.stationOnLine, this.stationAngle, this.autoAlign, this.relocating, this.relocatingDepot,
       this.depotAngle, this.signalMode, this.signalKind, this.signalClass, this.signalPass, this.signalSpacing,
-      this.doubleSide, this.directional, this.rightHand, this.relevelTo, this.tramMode, this.entranceStation, this.terraMode, this.brushRadius]);
+      this.doubleSide, this.directional, this.rightHand, this.relevelTo, this.tramMode, this.entranceStation, this.entranceKind, this.terraMode, this.brushRadius]);
   }
 
   private onWheel = (e: WheelEvent) => {
@@ -826,6 +830,8 @@ export class Tools {
         if (pl.links.length) rows.push(['plus', `Links with ${esc(pl.links.map((x) => x.name).join(', '))} (transfers)`]);
         if (pos.snapped) rows.push(['target', pos.snapped === 'end' ? 'Lined up with the track end' : 'Aligned with the track']);
         const warn = [...pl.warnings];
+        const added = moving?.rail?.entrances.filter((e) => e.kind).length ?? 0;
+        if (added) warn.push(`Its ${added === 1 ? 'added entrance stays' : `${added} added entrances stay`} behind (demolished)`);
         if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access — this station won\u2019t attract passengers');
         if (pl.ok && pl.demolish.length) warn.push(`Demolishes ${plural(pl.demolish.length, 'building')}`);
         if (pl.ok && !g.economy.canAfford(pl.cost) && !warn.includes('Not enough money')) warn.push('Not enough money');
@@ -860,7 +866,9 @@ export class Tools {
         if (this.dragRect) break;
         const net = g.world.net;
         const ne = net.nearestEdge(p.x, p.z, 0.9);
-        ov.setHoverEdge(ne && ne.edge.station < 0 && ne.edge.depot < 0 ? ne.edge.id : null, 0xff5a5f);
+        // (a click on a station building or entrance takes that, not the street beside it: see bulldoze)
+        const onStructure = g.stations.footprintsNear(p.x, p.z, 0.1).some((s) => g.stations.footprints(s).some((f) => f.part !== 'platforms' && distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1));
+        ov.setHoverEdge(ne && !onStructure && ne.edge.station < 0 && ne.edge.depot < 0 ? ne.edge.id : null, 0xff5a5f);
         const now = performance.now();
         if (now - this.dozeAt < 40) break;
         this.dozeAt = now;
@@ -1439,16 +1447,33 @@ export class Tools {
   private hoverEntrance(p: THREE.Vector3) {
     const g = this.game, ov = this.overlay;
     const st = this.entranceStation != null ? g.stations.get(this.entranceStation) : undefined;
-    if (!st?.rail || st.rail.level === 'ground') { ov.setFootprints(null); this.tip({ title: 'Add entrance', err: ['Pick an underground or elevated station first (station window → Add entrance)'] }, 'err'); return; }
-    const pl = g.stations.planEntrance(st.id, p.x, p.z, PLAYER);
-    const sz = ENTRANCE_SIZE[st.rail.level];
-    const at = pl.entrance ?? { x: p.x, z: p.z, angle: 0 };
-    ov.setFootprints([{ x: at.x, z: at.z, angle: at.angle, w: sz.w, d: sz.d, color: pl.ok ? 0x46e07a : 0xff6b6b, lift: 0.12 }]);
-    const cm = catchModeOf(railModeOf(st.rail.trackType)), bonus = catchBonusOf(st.rail.style), R = catchWalkLimit(cm, bonus);
-    const walk = pl.ok ? pointWalkingCatchment(g, at.x, at.z, cm, bonus, sz.d / 2 + 0.9) : null;
+    const r = st?.rail;
+    if (!st || !r) { ov.setFootprints(null); ov.setProposal(null); drawCatchStreets(ov, 'hover', null); this.tip({ title: 'Add entrance', err: ['Pick a station first (station window → Build → Add entrance)'] }, 'err'); return; }
+    const ground = r.level === 'ground';
+    const pl = g.stations.planEntrance(st.id, p.x, p.z, PLAYER, ground ? this.entranceKind : undefined);
+    const T = ENTRANCE_TYPES[pl.kind];
+    // its landings (paler where no road passes), and a ground entrance's way across the tracks
+    const sites = pl.landings.length ? pl.landings : [{ x: p.x, z: p.z, angle: r.angle, road: false }];
+    const rects: FootRect[] = sites.map((q) => ({ x: q.x, z: q.z, angle: q.angle, w: T.w, d: T.d, color: !pl.ok ? 0xff6b6b : q.road ? 0x46e07a : 0xb9dd8f, lift: 0.12 }));
+    if (ground && pl.entrance && pl.kind !== 'gate') {
+      const a = entranceAlong(r, pl.entrance), fx = Math.sin(r.angle), fz = Math.cos(r.angle);
+      rects.push({ x: r.x + fx * a, z: r.z + fz * a, angle: r.angle + Math.PI / 2, w: 0.26, d: railWidth(r) + 0.3, color: pl.ok ? 0x9fe3b4 : 0xff9a8a, y: r.y + (pl.kind === 'footbridge' ? 0.75 : 0.14), lift: 0.02 });
+    }
+    ov.setFootprints(rects);
+    ov.setProposal(pl.access ?? null);
+    const walk = pl.ok ? entrancePlanCatchment(g, st, pl) : null;
     drawCatchStreets(ov, 'hover', walk);
-    const pop = walk ? catchStreetPop(g, walk) : 0;
-    this.tip({ title: `Entrance · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows: pl.ok ? [['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${Math.round(R * 10)} m walking`]] : [], err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], hint: 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
+    const cm = catchModeOf(railModeOf(r.trackType)), R = catchWalkLimit(cm, catchBonusOf(r.style));
+    let fresh = 0, reach = 0;
+    if (walk) {
+      const covered = walkingCatchment(g, st).buildings;
+      for (const id of walk.buildings.keys()) { const b = g.world.buildings.get(id); if (!b) continue; reach += b.pop; if (!covered.has(id)) fresh += b.pop; }
+    }
+    const rows: [string, string][] = pl.ok ? [['entrance', esc(T.desc)], ['people', `<b>${fresh.toLocaleString('en-US')}</b> residents newly within ${Math.round(R * 10)} m walking (${reach.toLocaleString('en-US')} in its reach)`]] : [];
+    if (pl.ok && pl.landings.length > 1) rows.push(['walk', `Stairs on both sides of the tracks · ${pl.landings.filter((q) => q.road).length === 2 ? 'streets on both' : 'a street on one'}`]);
+    if (pl.access) rows.push(['road', `Access street ${fmtLen(pl.access.stats.len)} · ${fmtMoney(pl.access.cost)} (included)`]);
+    if (pl.ok) rows.push(['coin', `Upkeep ${fmtMoney(T.upkeep)} a year`]);
+    this.tip({ title: `${T.name} · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: pl.ok ? pl.warnings : [], hint: ground ? 'Click beside the tracks to build · Esc when done' : 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
   }
 
   /** Object under a ground point (stations first, then depots, network, buildings, towns). */
@@ -2070,8 +2095,9 @@ export class Tools {
       case 'connect': this.clickConnect(); break;
       case 'entrance': {
         if (!p || this.entranceStation == null) return;
-        const pl = g.stations.planEntrance(this.entranceStation, p.x, p.z, PLAYER);
-        const err = g.stations.addEntrance(this.entranceStation, p.x, p.z, PLAYER);
+        const ground = g.stations.get(this.entranceStation)?.rail?.level === 'ground';
+        const pl = g.stations.planEntrance(this.entranceStation, p.x, p.z, PLAYER, ground ? this.entranceKind : undefined);
+        const err = g.stations.commitEntrance(this.entranceStation, pl, PLAYER);
         if (err) { this.ui.toast(err, 'bad'); return; }
         this.ui.floatCost(pl.cost, e.clientX, e.clientY);
         this.ui.sound('station', { x: p.x, z: p.z, pitch: 1.2 });

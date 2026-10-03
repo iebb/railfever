@@ -1,9 +1,11 @@
 // Rail stations: platforms (ramps, coping, canopies, signage), the passenger building in the station's style
 // (STATION_BUILDERS by station-styles.ts id - none, shelter, classic, brick, modern, concourse, terminal - with
-// 'classic' for unknown ids), footbridges and underpasses to every platform, underground entrances and
-// elevated decks with stair towers (plus a street-level building when the style is not 'none'), and depots.
-import type { Station, RailPart } from '../game/stations';
-import { railWidth } from '../game/stations';
+// 'classic' for unknown ids), footbridges and underpasses to every platform, a ground station's added entrances
+// (side halls, footbridges with stair towers, underpasses with stair pavilions, platform-end gates), underground
+// entrances and elevated decks with stair towers (plus a street-level building when the style is not 'none'), and
+// depots.
+import type { Station, RailPart, Entrance } from '../game/stations';
+import { railWidth, entranceKind, entranceLandings, entranceAlong, ENTRANCE_TYPES } from '../game/stations';
 import { styleOf, CONCOURSE_PAVILION } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
 import type { Depot } from '../game/build-ops';
@@ -147,6 +149,8 @@ export function buildStation(ctx: ChunkCtx, st: Station, color: number) {
   const B = stationBuilder(r.style);
   if (s.level === 'underground') { undergroundStation(ctx, st, r as RailPartX, color); if (s.sty.placement !== 'none') B.street(s); return; }
   if (s.level === 'elevated') { elevatedStation(ctx, st, r as RailPartX, color, B.canopy === 'shed' ? 'classic' : B.canopy); if (s.sty.placement !== 'none') B.street(s); return; }
+  // added entrances: built by the chunk that owns their street-side structure
+  for (const e of r.entrances ?? []) if (inChunk(ctx, e.x, e.z)) groundEntrance(s, e);
   if (!inChunk(ctx, r.x, r.z)) return;
   platformsAndCanopies(ctx, r, color, B.canopy, s.headEnd);
   if (B.access === 'auto') platformAccess(s);
@@ -823,6 +827,254 @@ function clearOfBuildings(ctx: ChunkCtx, x: number, z: number, margin: number): 
     if (distToRect(x, z, b.x, b.z, b.angle, b.w / 2, b.d / 2) < margin) return false;
   }
   return true;
+}
+
+// ------------------------------------------------------------------------------ added entrances (ground stations)
+
+/** Material of a ground station's added entrances: its building's (by era without one). */
+type EntranceLook = 'classic' | 'brick' | 'modern';
+function entranceLook(s: StationScene): EntranceLook {
+  const id = s.sty.id;
+  return id === 'brick' ? 'brick' : id === 'modern' || id === 'concourse' ? 'modern' : id === 'classic' || id === 'terminal' ? 'classic' : s.modern ? 'modern' : 'classic';
+}
+
+/** Lateral offset of a point from the station axis (right positive). */
+const latOf = (s: StationScene, x: number, z: number) => (x - s.r.x) * s.rx + (z - s.r.z) * s.rz;
+
+/**
+ * Where an entrance's stairs go on a platform near `a` (along the axis): clear of the station's own underpass
+ * stairs and footbridge (platformAccess) and of the platform ends; null when the platform does not reach there.
+ */
+function stairSpot(s: StationScene, p: RailPart['platforms'][number], a: number, len: number): number | null {
+  const [a0, a1] = platRange(s.r, p);
+  const lo = a0 + len / 2 + 0.15, hi = a1 - len / 2 - 0.15;
+  if (hi < lo) return null;
+  const B = stationBuilder(s.r.style), avoid: number[] = [];
+  if (B.access === 'auto' && (s.r.platforms.length >= 2 || s.r.tracks + (s.r.through ?? 0) >= 2)) {
+    const mid = (a0 + a1) / 2, PL = a1 - a0 - 0.1;
+    avoid.push(mid - Math.max(0.3, Math.min(canopyLength(B.canopy, PL, s.L) / 2 - 0.3, PL / 2 - 0.9)));
+  }
+  if (B.access === 'auto' && s.r.platforms.length >= 3) avoid.push(Math.min(s.L / 2 - 0.9, Math.max(s.L * 0.28, canopyLength(B.canopy, s.L - 0.1, s.L) / 2 + 0.3)));
+  let at = Math.max(lo, Math.min(hi, a));
+  for (const v of avoid) if (Math.abs(at - v) < len / 2 + 0.3) at = at >= v ? v + len / 2 + 0.32 : v - len / 2 - 0.32;
+  return at >= lo && at <= hi && Math.abs(at - a) < 1.2 ? at : null;
+}
+
+/** Underpass stairs down from every platform near `a` (painted wells with railings, as the station's own). */
+function platformStairwells(s: StationScene, a: number) {
+  for (const p of s.r.platforms) {
+    const sw = Math.min(0.2, p.w - 0.34);
+    if (sw < 0.1) continue;
+    const at = stairSpot(s, p, a, 0.42);
+    if (at === null) continue;
+    const [ux, uz] = s.at(p.off, at);
+    stairWell(s.ctx.w, s.ctx.d, ux, s.PY, uz, s.fx, s.fz, sw, 0.42, 0.06);
+  }
+}
+
+/** A name sign on two posts beside an entrance, facing ±(nx,nz). */
+function entranceSign(s: StationScene, x: number, y: number, z: number, nx: number, nz: number) {
+  const D = s.ctx.d;
+  D.use(WC.METAL, 0x50565b);
+  for (const o of [-0.07, 0.07]) D.cylinder(x - nz * o, y, z + nx * o, 0.006, 0.27, 4);
+  boardText(D, x, y + 0.22, z, nx, nz, 0.2, 0.05, s.color);
+  boardText(D, x, y + 0.22, z, -nx, -nz, 0.2, 0.05, s.color);
+}
+
+/**
+ * A ground station's added entrance (see stations.ts EntranceKind): a side hall beside the platforms, a footbridge
+ * with stair towers down to the street on each side, an underpass with stair pavilions, or a platform-end gate;
+ * stairs onto every platform where it crosses the tracks.
+ */
+function groundEntrance(s: StationScene, e: Entrance) {
+  const k = entranceKind('ground', e);
+  const a = entranceAlong(s.r, e);
+  const seed = s.st.id * 53 + Math.round(Math.abs(e.x * 7 + e.z * 13));
+  if (k === 'footbridge') footbridgeEntrance(s, e, a, seed);
+  else if (k === 'underpass') { for (const p of entranceLandings(e)) subwayStairs(s, p); platformStairwells(s, a); }
+  else if (k === 'gate') gateEntrance(s, e, a);
+  else { sideHall(s, e, seed); platformStairwells(s, a); }
+}
+
+/** Side hall: a small booking hall in the station's material, its door towards the street, an underpass to the platforms. */
+function sideHall(s: StationScene, e: Entrance, seed: number) {
+  const { ctx } = s, W = ctx.w, D = ctx.d, fac = ctx.fac;
+  const T = ENTRANCE_TYPES.hall, ex = Math.sin(e.angle), ez = Math.cos(e.angle), rx = ez, rz = -ex;
+  const BL = T.w - 0.04, BD = T.d - 0.04, look = entranceLook(s);
+  const [hi, lo] = groundRange(ctx, e.x, e.z, ex, ez, BL + 0.04, BD + 0.04);
+  const yf = hi + 0.03, H = look === 'modern' ? 0.34 : 0.38;
+  W.use(look === 'modern' ? WC.CONCRETE : WC.STONE, look === 'modern' ? 0xa9a59d : 0xb4aa98, 1);
+  W.tbox(e.x, lo - 0.06, e.z, BL + 0.04, yf - (lo - 0.06), BD + 0.04, ex, ez, look === 'modern' ? WSCALE.CONCRETE : WSCALE.STONE);
+  if (look === 'modern') {
+    fac.boxWalls(e.x, yf, e.z, BL, BD, H, ex, ez, FC.GLASS, FC.LOBBY, 0xffffff, seed, { door: FC.LOBBY, floorH: H });
+    // slab roof overhanging the front, company colour fascia with the name
+    const RW = BL + 0.16, RD = BD + 0.26, cx = e.x + ex * 0.08, cz = e.z + ez * 0.08;
+    W.use(WC.PLAIN, s.color, 1);
+    W.tbox(cx, yf + H, cz, RW, 0.045, RD, ex, ez, 1, true, false);
+    W.use(WC.ROOF_FLAT, 0x8e979d, 1);
+    flatQuad(W, cx, yf + H + 0.045, cz, ex, ez, -RW / 2, RW / 2, -RD / 2, RD / 2);
+    W.use(WC.METAL, 0x3a4046, 1);
+    for (const sg of [-1, 1]) W.box(cx + rx * sg * (RW / 2 - 0.03) + ex * (RD / 2 - 0.03), yf, cz + rz * sg * (RW / 2 - 0.03) + ez * (RD / 2 - 0.03), 0.025, H, 0.025, ex, ez);
+    boardText(D, cx + ex * (RD / 2 + 0.004), yf + H + 0.022, cz + ez * (RD / 2 + 0.004), ex, ez, Math.min(0.7, RW * 0.6), 0.03, s.color);
+  } else {
+    const brick = look === 'brick';
+    fac.boxWalls(e.x, yf, e.z, BL, BD, H, ex, ez, brick ? FC.BRICK : FC.STATION, -1, 0xffffff, seed, { door: brick ? FC.BRICK_DOOR : FC.TOWN_DOOR, floorH: H });
+    W.use(WC.PLAIN, s.color, 1);
+    W.box(e.x, yf + H - 0.04, e.z, BL + 0.02, 0.04, BD + 0.02, ex, ez);
+    if (brick) {
+      const RH = Math.min(0.26, BD * 0.4);
+      roofGable(W, e.x, yf + H, e.z, BL + 0.1, BD + 0.14, RH, ex, ez, 0x4c5157, false, WC.ROOF_SLATE);
+      gableWalls(W, e.x, yf + H, e.z, BL, BD, RH - 0.01, ex, ez, 0x9b5a45, false);
+    } else roofHip(W, e.x, yf + H, e.z, BL + 0.1, BD + 0.1, Math.min(BL, BD) * 0.3, ex, ez, 0x5a6066, WC.ROOF_SLATE);
+    // porch over the door, the name above it
+    W.use(WC.ROOF_FLAT, 0x5b5f63, 1);
+    W.tbox(e.x + ex * (BD / 2 + 0.07), yf + 0.29, e.z + ez * (BD / 2 + 0.07), Math.min(0.42, BL * 0.4), 0.02, 0.14, ex, ez, WSCALE.ROOF_FLAT, true, true);
+    boardText(D, e.x + ex * (BD / 2 + 0.014), yf + H - 0.075, e.z + ez * (BD / 2 + 0.014), ex, ez, Math.min(0.6, BL * 0.5), 0.045, s.color);
+  }
+  D.use(WC.LAMP, 0xfff1c8);
+  D.box(e.x + ex * (BD / 2 + 0.02), yf + 0.27, e.z + ez * (BD / 2 + 0.02), 0.05, 0.01, 0.03, ex, ez, true);
+  ctx.lights.push(e.x + ex * (BD / 2 + 0.05), yf + 0.26, e.z + ez * (BD / 2 + 0.05));
+  ticketMachine(D, e.x + rx * (BL / 2 - 0.12) + ex * (BD / 2 + 0.05), yf, e.z + rz * (BL / 2 - 0.12) + ez * (BD / 2 + 0.05), ex, ez, s.color);
+  frontPaving(ctx, [e.x + ex * BD / 2, e.z + ez * BD / 2], ex, ez, BL + 0.08, yf - 0.004, 0.3);
+}
+
+/**
+ * Footbridge: a covered deck over the tracks at the platforms' footbridge height, stair towers down to the street at
+ * its landings (one side or both), glazed stair enclosures down onto every platform it passes.
+ */
+function footbridgeEntrance(s: StationScene, e: Entrance, a: number, seed: number) {
+  const { ctx, r, PY, fx, fz, rx, rz, width } = s, W = ctx.w, D = ctx.d, fac = ctx.fac;
+  const T = ENTRANCE_TYPES.footbridge, look = entranceLook(s), modern = look === 'modern';
+  const FY = PY + 0.62, WH = 0.22, DW = 0.32;
+  const lands = entranceLandings(e), side = latOf(s, e.x, e.z) >= 0 ? 1 : -1;
+  // the deck: from this tower's inner face to the far one's (or across the whole track area)
+  const l0 = latOf(s, e.x, e.z) - side * (T.d / 2 - 0.02);
+  // (one side only: the deck ends just past the farthest platform)
+  const reachP = r.platforms.reduce((m, p) => Math.max(m, -side * p.off + p.w / 2), -Infinity);
+  const l1 = e.far ? latOf(s, e.far.x, e.far.z) + side * (T.d / 2 - 0.02) : -side * Math.min(width / 2 + 0.06, Math.max(reachP + 0.05, -width / 2 + 0.3));
+  const len = Math.abs(l1 - l0), [cx, cz] = s.at((l0 + l1) / 2, a);
+  W.use(WC.CONCRETE, 0xa9b0b5, 1);
+  W.tbox(cx, FY - 0.07, cz, DW, 0.07, len, rx, rz, WSCALE.CONCRETE, true, false);
+  for (const sg of [-1, 1]) {
+    const [p0x, p0z] = s.at(l0, a + sg * (DW / 2 - 0.01)), [p1x, p1z] = s.at(l1, a + sg * (DW / 2 - 0.01));
+    fac.wall(p0x, p0z, p1x, p1z, FY, FY + WH, fx * sg, fz * sg, FC.GLASS, -1, 0xffffff, seed + 1, WH);
+    fac.wall(p1x, p1z, p0x, p0z, FY, FY + WH, -fx * sg, -fz * sg, FC.GLASS, -1, 0xdfe6ea, seed + 2, WH);
+  }
+  W.use(WC.ROOF_FLAT, modern ? 0xc3c9cd : 0x7b848a, 1);
+  W.tbox(cx, FY + WH, cz, DW + 0.05, 0.025, len + 0.03, rx, rz, WSCALE.ROOF_FLAT, true, true);
+  W.use(WC.PLAIN, s.color, 1);
+  for (const sg of [-1, 1]) { const [qx, qz] = s.at((l0 + l1) / 2, a + sg * (DW / 2 + 0.024)); W.box(qx, FY + WH - 0.03, qz, 0.008, 0.035, len + 0.03, rx, rz, false); }
+  // stair enclosures down onto each platform beside the deck (towards the longer part of the platform)
+  for (const p of r.platforms) {
+    const sw = Math.min(0.26, p.w - 0.16);
+    if (sw < 0.12) continue;
+    const [a0, a1] = platRange(r, p);
+    if (a < a0 + 0.2 || a > a1 - 0.2) continue;
+    const dir = a1 - a >= a - a0 ? 1 : -1, c = a + dir * (DW / 2 + 0.29);
+    if (c - 0.3 < a0 + 0.12 || c + 0.3 > a1 - 0.12) continue;
+    const [qx, qz] = s.at(p.off, c), H = FY + WH - PY;
+    fac.boxWalls(qx, PY, qz, sw + 0.06, 0.58, H, fx * dir, fz * dir, FC.GLASS, -1, 0xffffff, seed + 5, { floorH: H, skipFront: true });
+    roofFlat(W, qx, PY + H, qz, sw + 0.1, 0.62, fx * dir, fz * dir, 0x8c8a86);
+    darkRoom(W, qx, qz, fx * dir, fz * dir, sw + 0.02, 0.54, PY, PY + H - 0.01);
+    stairUp(W, qx, PY, qz, fx * dir, fz * dir, sw, 0.5, FY - PY);
+  }
+  // stair towers at the landings: from the street up to the deck, door on the street side
+  for (const p of lands) {
+    const ex = Math.sin(p.angle), ez = Math.cos(p.angle);
+    const SW = T.w - 0.03, [hi, lo] = groundRange(ctx, p.x, p.z, ex, ez, SW + 0.04, SW + 0.04), g = hi + 0.03, top = FY + WH + 0.06;
+    W.use(modern ? WC.CONCRETE : WC.STONE, modern ? 0xa9a59d : 0xa8a090, 1);
+    W.tbox(p.x, lo - 0.06, p.z, SW + 0.04, g - (lo - 0.06), SW + 0.04, ex, ez, modern ? WSCALE.CONCRETE : WSCALE.STONE, false, true);
+    // (stone with windows as the station building's; brick; a glazed shaft from the 1960s)
+    const door = modern ? FC.LOBBY : look === 'brick' ? FC.BRICK_DOOR : FC.TOWN_DOOR;
+    fac.boxWalls(p.x, g, p.z, SW, SW, top - g, ex, ez, modern ? FC.GLASS : look === 'brick' ? FC.BRICK : FC.STATION, door, 0xffffff, seed + 7, { door, floorH: Math.max(0.3, (top - g) / Math.max(1, Math.round((top - g) / 0.32))) });
+    roofFlat(W, p.x, top, p.z, SW + 0.04, SW + 0.04, ex, ez, 0x7c7a76);
+    W.use(WC.PLAIN, s.color, 1);
+    W.box(p.x, top - 0.05, p.z, SW + 0.012, 0.05, SW + 0.012, ex, ez, false);
+    boardText(D, p.x + ex * (SW / 2 + 0.01), top - 0.12, p.z + ez * (SW / 2 + 0.01), ex, ez, SW * 0.8, 0.04, s.color);
+    D.use(WC.LAMP, 0xfff1c8);
+    D.box(p.x + ex * (SW / 2 + 0.02), g + 0.27, p.z + ez * (SW / 2 + 0.02), 0.05, 0.01, 0.03, ex, ez, true);
+    ctx.lights.push(p.x + ex * (SW / 2 + 0.05), g + 0.26, p.z + ez * (SW / 2 + 0.05));
+    frontPaving(ctx, [p.x + ex * SW / 2, p.z + ez * SW / 2], ex, ez, SW + 0.06, g - 0.004, 0.3);
+  }
+}
+
+/** Underpass stairs at street level: a paved well going down towards the tracks, railings, a canopy (modern) and a name sign. */
+function subwayStairs(s: StationScene, p: { x: number; z: number; angle: number }) {
+  const { ctx } = s, W = ctx.w, D = ctx.d;
+  const T = ENTRANCE_TYPES.underpass, ex = Math.sin(p.angle), ez = Math.cos(p.angle), rx = ez, rz = -ex;
+  const PW = T.w, PD = T.d, modern = entranceLook(s) === 'modern';
+  const [hi, lo] = groundRange(ctx, p.x, p.z, ex, ez, PW + 0.06, PD + 0.06);
+  const g = hi + 0.025;
+  W.use(WC.PAVING, 0xd6d0c4, 0);
+  W.tbox(p.x, lo - 0.05, p.z, PW + 0.06, g - (lo - 0.05), PD + 0.06, ex, ez, WSCALE.PAVING, false, true);
+  // the well: top step at the street side, down towards the tracks; low walls round it
+  const sw = PW - 0.2, sl = PD - 0.2;
+  stairWell(W, D, p.x, g, p.z, ex, ez, sw, sl, 0);
+  W.use(WC.STONE, modern ? 0xb3afa6 : 0xa8a090, 1);
+  for (const sg of [-1, 1]) W.tbox(p.x + rx * sg * (sw / 2 + 0.03), g, p.z + rz * sg * (sw / 2 + 0.03), 0.05, 0.08, sl + 0.06, ex, ez, WSCALE.STONE);
+  W.tbox(p.x - ex * (sl / 2 + 0.03), g, p.z - ez * (sl / 2 + 0.03), sw + 0.11, 0.08, 0.05, ex, ez, WSCALE.STONE);
+  D.use(WC.METAL, modern ? 0x8a9298 : 0x2f3438);
+  for (const sg of [-1, 1]) D.box(p.x + rx * sg * (sw / 2 + 0.03), g + 0.08, p.z + rz * sg * (sw / 2 + 0.03), 0.01, 0.06, sl + 0.04, ex, ez);
+  if (modern) {
+    // glass canopy on four posts, company colour fascia
+    const CH = 0.3;
+    D.use(WC.METAL, 0x3a4046);
+    for (const [u, v] of [[-1, -1], [1, -1], [-1, 1], [1, 1]]) D.box(p.x + rx * u * (PW / 2 - 0.03) + ex * v * (PD / 2 - 0.05), g, p.z + rz * u * (PW / 2 - 0.03) + ez * v * (PD / 2 - 0.05), 0.018, CH, 0.018, ex, ez);
+    W.use(WC.PLAIN, 0x9fb8c6, 1);
+    W.tbox(p.x, g + CH, p.z, PW + 0.04, 0.015, PD + 0.02, ex, ez, 1, true, true);
+    W.use(WC.PLAIN, s.color, 1);
+    W.box(p.x, g + CH - 0.03, p.z, PW + 0.046, 0.03, PD + 0.026, ex, ez, false);
+    boardText(D, p.x + ex * (PD / 2 + 0.016), g + CH + 0.003, p.z + ez * (PD / 2 + 0.016), ex, ez, PW * 0.7, 0.024, s.color);
+  } else {
+    // a lamp post with the name board at the front corner
+    const lx = p.x + rx * (PW / 2 + 0.02) + ex * (PD / 2 - 0.04), lz = p.z + rz * (PW / 2 + 0.02) + ez * (PD / 2 - 0.04);
+    D.use(WC.METAL, 0x2f3438);
+    D.cylinder(lx, g, lz, 0.01, 0.42, 6);
+    D.use(WC.LAMP, 0xfff1c8);
+    D.box(lx, g + 0.42, lz, 0.05, 0.04, 0.05, ex, ez, true);
+    ctx.lights.push(lx, g + 0.42, lz);
+    boardText(D, lx + ex * 0.012, g + 0.3, lz + ez * 0.012, ex, ez, 0.22, 0.05, s.color);
+  }
+  frontPaving(ctx, [p.x + ex * PD / 2, p.z + ez * PD / 2], ex, ez, PW + 0.06, g - 0.004, 0.3);
+}
+
+/**
+ * Platform-end gate: a paved pad beside the platform end with a gate, ticket machine and name sign; a path onto the
+ * platform beside it, else an underpass to the platforms (tracks lie in between).
+ */
+function gateEntrance(s: StationScene, e: Entrance, a: number) {
+  const { ctx, r, width } = s, W = ctx.w, D = ctx.d;
+  const T = ENTRANCE_TYPES.gate, ex = Math.sin(e.angle), ez = Math.cos(e.angle), rx = ez, rz = -ex;
+  const PW = T.w, PD = T.d, side = latOf(s, e.x, e.z) >= 0 ? 1 : -1;
+  const [hi, lo] = groundRange(ctx, e.x, e.z, ex, ez, PW + 0.04, PD + 0.04);
+  const g = hi + 0.03;
+  W.use(WC.PAVING, 0xcfcac0, 0);
+  W.tbox(e.x, lo - 0.05, e.z, PW, g - (lo - 0.05), PD, ex, ez, WSCALE.PAVING, false, true);
+  // a platform along this side of the track area: a path across to it, else the underpass starts here
+  const edge = r.platforms.find((p) => (p.off + side * p.w / 2) * side >= width / 2 - 0.35 && (a >= platRange(r, p)[0] - 0.2 && a <= platRange(r, p)[1] + 0.2));
+  if (edge) {
+    // a path from the pad across to the foot of the platform's end ramp
+    const outer = edge.off + side * edge.w / 2, inner = latOf(s, e.x, e.z) - side * PD / 2;
+    const end = (a >= 0 ? 1 : -1) * (r.length / 2 - 0.13);
+    const [cx, cz] = s.at((outer + inner) / 2, end), base = Math.min(lo, r.y) - 0.05;
+    W.use(WC.PAVING, 0xd2cec6, 0);
+    W.tbox(cx, base, cz, 0.16, g - base, Math.abs(inner - outer) + 0.04, s.rx, s.rz, WSCALE.PAVING, false, true);
+  } else {
+    stairWell(W, D, e.x - ex * 0.04, g, e.z - ez * 0.04, ex, ez, Math.min(0.2, PW - 0.4), Math.min(0.3, PD - 0.12), 0.06);
+    platformStairwells(s, a);
+  }
+  // gate posts and a low fence along the track side (open towards the platform end where a path leads on), a
+  // ticket machine, the name sign
+  D.use(WC.METAL, 0x40464b);
+  const fy = g;
+  for (const sg of [-1, 1]) D.box(e.x + rx * sg * (PW / 2 - 0.03) + ex * (PD / 2 - 0.03), fy, e.z + rz * sg * (PW / 2 - 0.03) + ez * (PD / 2 - 0.03), 0.03, 0.16, 0.03, ex, ez);
+  // (the pad's own right (rx,rz) runs along the tracks: towards the platform end where it is the axis' end side)
+  const toEnd = (rx * s.fx + rz * s.fz) * (a >= 0 ? 1 : -1) >= 0 ? 1 : -1, fw = edge ? PW / 2 - 0.02 : PW - 0.04;
+  const fc = edge ? -toEnd * (PW / 4 - 0.01) : 0;
+  for (const h of [0.08, 0.04]) D.box(e.x - ex * (PD / 2 - 0.02) + rx * fc, fy + h, e.z - ez * (PD / 2 - 0.02) + rz * fc, fw, 0.012, 0.008, ex, ez);
+  ticketMachine(D, e.x + rx * (PW / 2 - 0.1) + ex * (PD / 2 - 0.1), fy, e.z + rz * (PW / 2 - 0.1) + ez * (PD / 2 - 0.1), ex, ez, s.color);
+  entranceSign(s, e.x - rx * (PW / 2 - 0.12) + ex * (PD / 2 - 0.08), fy, e.z - rz * (PW / 2 - 0.12) + ez * (PD / 2 - 0.08), ex, ez);
+  frontPaving(ctx, [e.x + ex * PD / 2, e.z + ez * PD / 2], ex, ez, PW + 0.04, g - 0.004, 0.3);
 }
 
 // ------------------------------------------------------------------------------ underground stations

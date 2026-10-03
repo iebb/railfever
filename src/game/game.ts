@@ -1,7 +1,7 @@
 // The game: owns all simulation state and advances time.
 import { World } from './world';
 import { Towns } from './towns';
-import { Stations } from './stations';
+import { Stations, entranceUpkeep } from './stations';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
 import { Depots } from './build-ops';
@@ -541,10 +541,10 @@ export class Game {
   }
   /**
    * Yearly maintenance of a station (platforms and stops; the platform tracks count as edges): an elevated
-   * station costs about 3x a ground one, an underground one about 6x.
+   * station costs about 3x a ground one, an underground one about 6x; entrances added later by their kind.
    */
   stationMaintenance(st: Station): number {
-    return (st.rail ? (20000 + st.rail.tracks * st.rail.length * 500) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1) : 0) + st.stops.length * 3000;
+    return (st.rail ? (20000 + st.rail.tracks * st.rail.length * 500) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1) + entranceUpkeep(st.rail) : 0) + st.stops.length * 3000;
   }
 
   /**

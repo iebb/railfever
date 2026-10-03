@@ -13,7 +13,8 @@ import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct, TYPE_META } from './forma
 import { walkLimit } from '../game/catchment';
 import type { StationLevel } from './gameapi';
 import { stationStyles, catchBonusOf } from './gameapi';
-import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
+import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf, GROUND_ENTRANCES, ENTRANCE_TYPES, entranceCost } from '../game/stations';
+import type { EntranceKind } from '../game/stations';
 import { styleOf } from '../game/station-styles';
 import { audio } from '../audio/engine';
 import { onStorageMode, storageMode } from '../game/storage';
@@ -74,7 +75,7 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   'depot-tram': 'Click next to a road with tram tracks.',
   signal: 'Click to add or cycle a signal · drag along a track to place block signals.',
   double: 'Click or drag along one of your single tracks to double it.',
-  entrance: 'Click beside a road near the station.',
+  entrance: 'Click beside the tracks (ground station) or a road near the station.',
   bulldoze: 'Click to remove, drag to clear an area.',
   terraform: 'Hold the button to reshape the ground.',
   'line-edit': 'Click stations to add them as stops.',
@@ -110,7 +111,7 @@ const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   'depot-tram': [[['Click'], 'next to tram tracks'], [['R'], 'rotate']],
   signal: [[['Click'], 'add / cycle signal'], [['Drag'], 'block signals along a track'], [['Right-click'], 'remove']],
   double: [[['Click'], 'one track'], [['Drag'], 'along the line'], [['Esc'], 'cancel']],
-  entrance: [[['Click'], 'beside a road'], [['Esc'], 'done']],
+  entrance: [[['Click'], 'beside the tracks or a road'], [['Esc'], 'done']],
   bulldoze: [[['Click'], 'remove'], [['Drag'], 'clear area']],
   terraform: [[['Hold'], 'apply brush']],
   'line-edit': [[['Click'], 'add station'], [['Esc'], 'done']],
@@ -522,7 +523,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Station tools: a new platform track type (urban: platform length and level follow the type's defaults). */
@@ -633,7 +634,12 @@ export class Hud {
       if (T.directional) opts.push(opt('Run on', seg<string>([['right', 'Right'], ['left', 'Left']], T.rightHand ? 'right' : 'left', (v) => { T.rightHand = v === 'right'; redo(); })));
     } else if (t === 'entrance') {
       const st = T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation) : undefined;
-      opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, st?.name ?? '—'), h('span', { class: 'muted' }, st?.rail ? `${st.rail.entrances.length} entrance${st.rail.entrances.length === 1 ? '' : 's'}` : ''));
+      const r = st?.rail;
+      opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, st?.name ?? '—'), h('span', { class: 'muted' }, r ? `${r.entrances.length} entrance${r.entrances.length === 1 ? '' : 's'}` : ''));
+      if (r?.level === 'ground') {
+        const label: Record<string, string> = { hall: 'Side hall', footbridge: 'Footbridge', underpass: 'Underpass', gate: 'End gate' };
+        opts.push(opt('Type', seg<EntranceKind>(GROUND_ENTRANCES.map((k) => [k, label[k], `${ENTRANCE_TYPES[k].desc} · ${fmtMoney(entranceCost(k, r))} · upkeep ${fmtMoney(ENTRANCE_TYPES[k].upkeep)} a year`]), T.entranceKind, (v) => { T.entranceKind = v; redo(); })));
+      }
       opts.push(h('button', { class: 'btn sm primary', onclick: () => { const id = T.entranceStation; T.setTool('inspect'); if (id != null) this.ui.openStation(id); } }, icon('check', 14), 'Done'));
     } else if (T.stationTool) {
       if (T.relocating != null) {

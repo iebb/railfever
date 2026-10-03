@@ -259,6 +259,9 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
 
 // ------------------------------------------------------------------ demolition
 
+/** Demolition charge for one station entrance. */
+const ENTRANCE_DEMOLITION = 5000;
+
 export interface BulldozeResult {
   cost: number; error: string | null; changed: number;
   /** Owned structures hit by the selection, for the UI's demolition confirmation. */
@@ -285,11 +288,25 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
   const edges = point ? (() => { const ne = net.nearestEdge(x0, z0, 0.9); return ne ? [ne.edge] : []; })()
     : net.edgesNear(x0, z0, x1, z1).filter((e) => { const geo = net.geo(e); for (let i = 0; i < geo.n; i++) if (inArea(geo.pts[i * 3], geo.pts[i * 3 + 2], 0)) return true; return false; });
   // stations
+  let structureHit = false;
   for (const st of g.stations.all()) {
-    const hit = g.stations.footprints(st).some((f) => point ? distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1 : inArea(f.x, f.z, 0)) ||
-      st.stops.some((p) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
-    if (!hit) continue;
+    const parts = g.stations.footprints(st).filter((f) => point ? distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1 : inArea(f.x, f.z, 0));
+    const stopHit = st.stops.some((p) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
+    if (!parts.length && !stopHit) continue;
+    if (parts.some((f) => f.part !== 'platforms')) structureHit = true;
     if (st.owner !== owner) { res.error = 'Owned by another company'; continue; }
+    // only entrances hit: they go and the station stays (a station below or above the street keeps one: its
+    // last entrance takes the whole station, as before)
+    const doors = [...new Set(parts.map((f) => f.entrance ?? -1))].sort((a, b) => b - a);
+    const r = st.rail;
+    if (r && !stopHit && parts.every((f) => f.part === 'entrance' && f.entrance !== undefined) && ((r.level ?? 'ground') === 'ground' || doors.length < r.entrances.length)) {
+      for (const i of doors) {
+        const err = g.stations.removeEntranceError(st.id, i, owner);
+        if (err) { res.error = err; continue; }
+        planRemoval(ENTRANCE_DEMOLITION, () => g.stations.removeEntrance(st.id, i, owner));
+      }
+      continue;
+    }
     res.stationIds.push(st.id);
     if (st.rail && (point ? g.stations.footprints(st).some((f) => distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1) : true)) {
       // Matches Stations.removeStation's blocker without changing stations.ts.
@@ -314,9 +331,9 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
     if (err) { res.error = err; continue; }
     planRemoval(15000, () => g.depots.remove(dp.id));
   }
-  // edges
+  // edges (a click on a station building or entrance takes that, not the street beside it)
   const removed: NEdge[] = [];
-  for (const e of edges) {
+  for (const e of point && structureHit ? [] : edges) {
     if (e.station >= 0 || e.depot >= 0 || stationEdges.has(e.id)) continue;
     if (e.owner >= 0 && e.owner !== owner) { res.error = 'Owned by another company'; continue; }
     if (e.tram && (e.tramOwner ?? -1) >= 0 && e.tramOwner !== owner) { res.error = 'Tram tracks of another company'; continue; }
