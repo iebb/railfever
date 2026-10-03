@@ -21,26 +21,28 @@ import { buildRoadEdge, buildRoadNode, buildBusStops, buildCrossing } from './bu
 import { buildStation, buildDepot } from './build-stations';
 import { portalKeepouts, inKeepout, Keepout } from './build-structures';
 import { buildBuilding, FacadeBuilder } from './build-buildings';
-import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance, forestTreeInstances } from './trees';
+import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance, forestTreeInstances, TREE_FADE, treeDensity, treeCameraUniform } from './trees';
 
 /** Object chunks per super-chunk side. */
 const SC = 2;
 /** Super-chunks per near-tree region side (128 units): near trees are drawn per region and variant. */
 const IR = 2;
-/** Super-chunks per impostor region side (512 units): all trees of the region, split from the near models in the shader. */
+/** Super-chunks per impostor region side (512 units): compact candidate buffers, two species buckets. */
 const IRF = 8;
 /** Super-chunks per far world region side (256 units): compact baked copy of the region, drawn instead of its super-chunks. */
 const RS = 4;
 /** Camera distance to a far world region's box beyond which its compact copy is drawn. */
 export const REGION_DIST = 280;
 /** Camera distance (to the super-chunk box) beyond which detail meshes are hidden. */
-export const DETAIL_DIST = 75;
+export const DETAIL_DIST = 65;
 /** Camera distance beyond which trees switch to impostors. */
-export const TREE_DIST = 125;
+export const TREE_DIST = 80;
+/** CPU selections survive up to two units of camera movement without exposing a missing tree. */
+const TREE_GUARD = 3;
 /** Super-chunks this far outside the view frustum still get near trees (shadows into the view, turning). */
 const TREE_MARGIN = 10;
 /** Camera distance beyond which buildings switch to their simplified version (facade boxes, plain roofs). */
-export const BLD_DIST = 105;
+export const BLD_DIST = 85;
 /** Camera height above ground beyond which signal/crossing lamps are hidden. */
 const LAMP_DIST = 160;
 
@@ -90,6 +92,8 @@ interface Super {
   /** far impostor instances per kind (broadleaf, conifer) */
   farM: Float32Array[] | null;
   farC: Float32Array[] | null;
+  farV: Float32Array[] | null;
+  farRank: Float32Array[] | null;
   detail: THREE.Mesh | null;
   /** details of all its chunks are built (they are built when the camera comes near, dropped when it leaves) */
   detailBuilt: boolean;
@@ -140,6 +144,7 @@ export class ObjectsView {
   private lampGeo: THREE.BufferGeometry;
   private camPos = new THREE.Vector3();
   private hasCam = false;
+  private treeCam = new THREE.Vector3(Infinity, Infinity, Infinity);
   /** super-chunks waiting for their details */
   private detailQueue = new Set<number>();
   /** per chunk: hash of the terrain heights under it and a 2-unit margin (draped roads reach over the border) */
@@ -161,9 +166,9 @@ export class ObjectsView {
   /** near-tree regions (IR x IR super-chunks each): one instanced mesh per variant over the near super-chunks */
   private nr: number;
   private regions: { near: (THREE.InstancedMesh | null)[]; ncap: number[]; dirty: boolean }[];
-  /** impostor regions (IRF x IRF super-chunks): every tree of the region (the shader hides the near ones) */
+  /** Impostor regions: CPU compaction at distance boundaries; fixed-density regions stay static. */
   private nri: number;
-  private impRegions: { mesh: (THREE.InstancedMesh | null)[]; cap: number[]; dirty: boolean }[];
+  private impRegions: { mesh: (THREE.InstancedMesh | null)[]; cap: number[]; dirty: boolean; box: THREE.Box3; level: number }[];
   /** far world regions (RS x RS super-chunks) */
   private nl: number;
   private fregions: FarRegion[];
@@ -174,7 +179,7 @@ export class ObjectsView {
     this.outs = Array.from({ length: this.n * this.n }, EMPTY_OUT);
     this.tsig = new Float64Array(this.n * this.n).fill(-1);
     this.supers = Array.from({ length: this.ns * this.ns }, () => ({
-      group: new THREE.Group(), meshes: [], treeSig: -1, treeBox: new THREE.Box3(), nearM: null, nearC: null, farM: null, farC: null, detail: null, detailBuilt: false,
+      group: new THREE.Group(), meshes: [], treeSig: -1, treeBox: new THREE.Box3(), nearM: null, nearC: null, farM: null, farC: null, farV: null, farRank: null, detail: null, detailBuilt: false,
       world: null, nA: 0, nB: 0, nC: 0, bldFar: null, box: new THREE.Box3(), empty: true, detailOn: true, nearOn: true,
     }));
     for (const s of this.supers) { s.group.matrixAutoUpdate = false; this.group.add(s.group); }
@@ -182,11 +187,11 @@ export class ObjectsView {
     this.treeGeos = createTreeGeometries();
     this.regions = Array.from({ length: this.nr * this.nr }, () => ({ near: this.treeGeos.map(() => null), ncap: this.treeGeos.map(() => 0), dirty: true }));
     this.nri = Math.ceil(this.ns / IRF);
-    this.impRegions = Array.from({ length: this.nri * this.nri }, () => ({ mesh: new Array(IMPOSTOR_KINDS).fill(null), cap: new Array(IMPOSTOR_KINDS).fill(0), dirty: true }));
+    this.impRegions = Array.from({ length: this.nri * this.nri }, () => ({ mesh: new Array(IMPOSTOR_KINDS).fill(null), cap: new Array(IMPOSTOR_KINDS).fill(0), dirty: true, box: new THREE.Box3(), level: -1 }));
     this.nl = Math.ceil(this.ns / RS);
     this.fregions = Array.from({ length: this.nl * this.nl }, () => ({ mesh: null, glow: null, dirty: true, far: false, box: new THREE.Box3() }));
     mats.uniforms.uTreeDist.value = TREE_DIST;
-    this.impGeos = createImpostorGeometries();
+    this.impGeos = createImpostorGeometries(this.treeGeos);
     // barrier boom: red/white bar along +x from the pivot, unit length
     const bg = new GeoBuilder();
     for (let i = 0; i < 6; i++) { bg.color(i % 2 ? 0xffffff : 0xd0302a); bg.box((i + 0.5) / 6, -0.009, 0, 1 / 6, 0.018, 0.016, 1, 0, false); }
@@ -404,8 +409,24 @@ export class ObjectsView {
     return Math.floor(sz / IRF) * this.nri + Math.floor(sx / IRF);
   }
 
+  /** A whole region inside a density plateau needs no CPU rewrite when the camera moves. */
+  private treeRegionLevel(box: THREE.Box3) {
+    if (!this.hasCam || box.isEmpty()) return -1;
+    const p = this.camPos, lo = box.distanceToPoint(p);
+    const hi = Math.hypot(Math.max(Math.abs(p.x - box.min.x), Math.abs(p.x - box.max.x)),
+      Math.max(Math.abs(p.y - box.min.y), Math.abs(p.y - box.max.y)), Math.max(Math.abs(p.z - box.min.z), Math.abs(p.z - box.max.z)));
+    if (lo > 1320 + TREE_GUARD) return 3;
+    if (lo > 840 + TREE_GUARD && hi < 1100 - TREE_GUARD) return 2;
+    if (lo > 400 + TREE_GUARD && hi < 720 - TREE_GUARD) return 1;
+    if (lo > TREE_DIST + TREE_FADE + TREE_GUARD && hi < 320 - TREE_GUARD) return 0;
+    return -1;
+  }
+
   /** Rewrite the tree instances (near per variant, far impostors) of regions whose near/far sets changed. */
   private updateRegions() {
+    const nearLimit = (TREE_DIST + TREE_FADE + TREE_GUARD) ** 2;
+    const distanceSq = (a: Float32Array, offset: number) =>
+      (a[offset + 12] - this.camPos.x) ** 2 + (a[offset + 13] - this.camPos.y) ** 2 + (a[offset + 14] - this.camPos.z) ** 2;
     for (let ri = 0; ri < this.regions.length; ri++) {
       const R = this.regions[ri];
       if (!R.dirty) continue;
@@ -419,7 +440,11 @@ export class ObjectsView {
       // near trees: one instanced mesh per variant over the near super-chunks of the region
       for (let v = 0; v < this.treeGeos.length; v++) {
         let total = 0, cnt = 0;
-        for (const s of all) { if (!s.nearM) continue; const k = s.nearM[v].length / 16; total += k; if (s.nearOn) cnt += k; }
+        for (const s of all) {
+          if (!s.nearM) continue;
+          const a = s.nearM[v]; total += a.length / 16;
+          if (s.nearOn) for (let i = 0; i < a.length; i += 16) if (!this.hasCam || distanceSq(a, i) <= nearLimit) cnt++;
+        }
         let mesh = R.near[v];
         if (!cnt) { if (mesh) mesh.visible = false; continue; }
         if (!mesh || R.ncap[v] < cnt) {
@@ -433,9 +458,12 @@ export class ObjectsView {
         const box = new THREE.Box3();
         for (const s of all) {
           if (!s.nearM || !s.nearOn || !s.nearM[v].length) continue;
-          ma.set(s.nearM[v], o * 16);
-          ca.set(s.nearC![v], o * 3);
-          o += s.nearM[v].length / 16;
+          const a = s.nearM[v], c = s.nearC![v];
+          for (let i = 0; i < a.length / 16; i++) {
+            if (this.hasCam && distanceSq(a, i * 16) > nearLimit) continue;
+            ma.set(a.subarray(i * 16, i * 16 + 16), o * 16);
+            ca.set(c.subarray(i * 3, i * 3 + 3), o * 3); o++;
+          }
           box.union(s.treeBox);
         }
         mesh.count = o;
@@ -444,7 +472,7 @@ export class ObjectsView {
         mesh.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
       }
     }
-    // impostors: every tree of the region (static until the region's trees change), one mesh per kind
+    // Compact impostors on the CPU: shader-hidden instances would still submit their triangles.
     for (let ri = 0; ri < this.impRegions.length; ri++) {
       const R = this.impRegions[ri];
       if (!R.dirty) continue;
@@ -455,6 +483,8 @@ export class ObjectsView {
         const s = this.supers[sz * this.ns + sx];
         if (s.farM) members.push(s);
       }
+      R.box.makeEmpty(); for (const s of members) R.box.union(s.treeBox);
+      R.level = this.treeRegionLevel(R.box);
       for (let kd = 0; kd < IMPOSTOR_KINDS; kd++) {
         let total = 0;
         for (const s of members) total += s.farM![kd].length / 16;
@@ -467,17 +497,27 @@ export class ObjectsView {
         }
         const mesh = R.mesh[kd]!;
         const ma = mesh.instanceMatrix.array as Float32Array, ca = mesh.instanceColor!.array as Float32Array;
+        const va = mesh.geometry.getAttribute('aTreeVariant').array as Float32Array;
+        const ranks = mesh.geometry.getAttribute('aTreeRank').array as Float32Array;
         let o = 0;
         const box = new THREE.Box3();
         for (const s of members) {
           if (!s.farM![kd].length) continue;
-          ma.set(s.farM![kd], o * 16);
-          ca.set(s.farC![kd], o * 3);
-          o += s.farM![kd].length / 16;
+          const a = s.farM![kd], c = s.farC![kd], v = s.farV![kd], rank = s.farRank![kd];
+          for (let i = 0; i < a.length / 16; i++) {
+            const d = this.hasCam ? Math.sqrt(distanceSq(a, i * 16)) : 0;
+            if (this.hasCam && (d < TREE_DIST - TREE_FADE - TREE_GUARD || rank[i] > treeDensity(d - TREE_GUARD) + 0.015)) continue;
+            const density = this.hasCam ? treeDensity(d) : 1;
+            // Modest crown/height compensation; the root remains anchored to the same terrain point.
+            const crown = 1 + 0.42 * (1 - density) / 0.875, height = 1 + 0.16 * (1 - density) / 0.875;
+            ma.set(a.subarray(i * 16, i * 16 + 16), o * 16);
+            for (const column of [0, 4, 8]) for (let k = 0; k < 3; k++) ma[o * 16 + column + k] *= column === 4 ? height : crown;
+            ca.set(c.subarray(i * 3, i * 3 + 3), o * 3); va[o] = v[i]; ranks[o] = rank[i]; o++;
+          }
           box.union(s.treeBox);
         }
         mesh.count = o;
-        mesh.visible = true;
+        mesh.visible = o > 0;
         uploadInstances(mesh, o);
         mesh.boundingSphere = box.getBoundingSphere(new THREE.Sphere());
       }
@@ -668,7 +708,7 @@ export class ObjectsView {
     for (const t of allTrees) { sig = (sig * 31 + Math.round(t.x * 64) * 7 + Math.round(t.z * 64) + t.type) | 0; cnt++; }
     sig = (sig ^ (cnt * 2654435761)) | 0;
     if (sig !== s.treeSig || !cnt) {
-      s.nearM = s.nearC = s.farM = s.farC = null;
+      s.nearM = s.nearC = s.farM = s.farC = s.farV = s.farRank = null;
       s.treeBox.makeEmpty();
       s.treeSig = sig;
       this.regions[this.regionOf(si)].dirty = true;
@@ -678,13 +718,13 @@ export class ObjectsView {
         const nd = nearTreeData(trees, this.treeGeos.length);
         s.nearM = nd.m; s.nearC = nd.c;
         const fd = impostorData(trees, this.treeGeos, this.impGeos);
-        s.farM = fd.m; s.farC = fd.c;
+        s.farM = fd.m; s.farC = fd.c; s.farV = fd.v; s.farRank = fd.rank;
         let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
         for (const t of trees) {
           if (t.x < x0) x0 = t.x; if (t.x > x1) x1 = t.x; if (t.z < z0) z0 = t.z; if (t.z > z1) z1 = t.z;
           if (t.y < y0) y0 = t.y; if (t.y + 2.5 * t.s > y1) y1 = t.y + 2.5 * t.s;
         }
-        s.treeBox.set(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+        s.treeBox.set(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1)).expandByScalar(3);
       }
     }
     if (!s.treeBox.isEmpty()) box.union(s.treeBox);
@@ -700,7 +740,7 @@ export class ObjectsView {
     if (this.hasCam) d = s.box.distanceToPoint(this.camPos);
     const detailOn = !this.hasCam || d < DETAIL_DIST;
     // near trees: close and in view (with a margin for shadows cast into the view and for turning)
-    let nearOn = !this.hasCam || d < TREE_DIST;
+    let nearOn = !this.hasCam || d < TREE_DIST + TREE_FADE + TREE_GUARD;
     if (nearOn && this.hasCam) nearOn = this.frustum.intersectsBox(this.vbox.copy(s.box).expandByScalar(TREE_MARGIN));
     if (nearOn !== s.nearOn && s.farM) this.regions[this.regionOf(si >= 0 ? si : this.supers.indexOf(s))].dirty = true;
     s.detailOn = detailOn; s.nearOn = nearOn;
@@ -781,6 +821,15 @@ export class ObjectsView {
     if (camera) {
       camera.updateMatrixWorld();
       camera.getWorldPosition(this.camPos);
+      treeCameraUniform.value.copy(this.camPos);
+      if (this.treeCam.distanceToSquared(this.camPos) >= 4) {
+        this.treeCam.copy(this.camPos);
+        for (const r of this.regions) r.dirty = true;
+        for (const r of this.impRegions) {
+          const level = this.treeRegionLevel(r.box);
+          if (level < 0 || level !== r.level) r.dirty = true;
+        }
+      }
       this.frustum.setFromProjectionMatrix(this.fm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse));
       this.hasCam = true;
       this.supers.forEach((s, i) => this.applyLod(s, i));
@@ -864,7 +913,7 @@ export class ObjectsView {
   dispose() {
     for (const s of this.supers) {
       for (const o of s.meshes) { s.group.remove(o); disposeObj(o); }
-      s.meshes = []; s.treeSig = -1; s.nearM = s.nearC = s.farM = s.farC = null;
+      s.meshes = []; s.treeSig = -1; s.nearM = s.nearC = s.farM = s.farC = s.farV = s.farRank = null;
     }
     for (const m of [this.lampMesh, this.boomMesh, this.xlMesh]) if (m) { this.group.remove(m); m.dispose(); }
     this.lampMesh = this.boomMesh = this.xlMesh = null;
@@ -894,6 +943,10 @@ function uploadInstances(mesh: THREE.InstancedMesh, count: number) {
   const m = mesh.instanceMatrix, c = mesh.instanceColor!;
   m.clearUpdateRanges(); m.addUpdateRange(0, count * 16); m.needsUpdate = true;
   c.clearUpdateRanges(); c.addUpdateRange(0, count * 3); c.needsUpdate = true;
+  for (const name of ['aTreeVariant', 'aTreeRank']) {
+    const a = mesh.geometry.getAttribute(name) as THREE.InstancedBufferAttribute | undefined;
+    if (a) { a.clearUpdateRanges(); a.addUpdateRange(0, count); a.needsUpdate = true; }
+  }
 }
 
 function disposeObj(o: THREE.Object3D) {

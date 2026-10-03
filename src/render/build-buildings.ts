@@ -280,7 +280,8 @@ function emitFar(w: World, b: Building, F: WB, parts: FarPart[]) {
   ff.gb = F;
   const lowest = lowestUnder(w, b.x, b.z, b.angle, b.w, b.d);
   const base = b.y + 0.04;
-  const plinth = b.y - lowest > 0.12;
+  // Subpixel base bands can share the facade's ground-reaching quad; retain visible terrace walls.
+  const plinth = b.y - lowest > 0.4;
   if (plinth) {
     F.use(WC.STONE, 0xa59d90, 1);
     F.tbox(b.x, lowest - 0.06, b.z, b.w + 0.03, base - lowest + 0.06, b.d + 0.03, Math.sin(b.angle), Math.cos(b.angle), WSCALE.STONE, false, false);
