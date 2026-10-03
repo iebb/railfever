@@ -122,6 +122,7 @@ function loop(now: number) {
       renderer.frame(dt);
     } catch (e) { console.error(e); }
     try { ui.update(dt); } catch (e) { console.error(e); }
+    renderer.loopMs = performance.now() - t0;
     try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
     if (ui.titleOpen) { if (!played) autosaveTimer = 0; } else played = true;
     if (!game.paused) autosaveTimer += dt;

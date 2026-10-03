@@ -11,6 +11,13 @@ import { svg } from '../ui/icons';
 export interface LabelBadge { code: string; prefix: string; num: string; color: string }
 
 const STATION_NAME_MAX_DIST = 170;
+/**
+ * Hysteresis of the label selection: a label shown in the last frame keeps this much priority (about 12 units of
+ * distance for a station plate) and must sink clearly behind the terrain before it is hidden, so labels that
+ * compete for a place don't trade it back and forth while the camera moves or waiting counts change.
+ */
+const LABEL_KEEP = 500;
+const OCCLUDE_KEEP = 0.4;
 // Three ordinary wheel notches: exp(100 * 0.0014) per notch (camera.ts).
 const RAIL_SYMBOL_MAX_DIST = STATION_NAME_MAX_DIST * Math.exp(3 * 100 * 0.0014);
 const RAIL_SYMBOL_FADE_DIST = STATION_NAME_MAX_DIST * Math.exp(2 * 100 * 0.0014);
@@ -255,6 +262,7 @@ export class Labels {
       c.sx = (v.x * 0.5 + 0.5) * w;
       c.sy = (-v.y * 0.5 + 0.5) * h;
       if (!c.force) c.prio -= c.d * (c.l.kind === 'stn' && !c.compact ? 40 : 2);
+      if (!c.force && c.l.shown) c.prio += LABEL_KEEP;
       cands[n++] = c;
     }
     cands.length = n;
@@ -276,7 +284,7 @@ export class Labels {
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z)) continue;
+      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z, L.shown ? OCCLUDE_KEEP : 0.05)) continue;
       placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
       keep.add(L);
       this.place(c, s, w, h);
@@ -400,15 +408,15 @@ export class Labels {
     void w; void h;
   }
 
-  /** Is the straight line from the camera to the point blocked by terrain? */
-  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number): boolean {
+  /** Is the straight line from the camera to the point blocked by terrain (by more than `margin`)? */
+  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number, margin: number): boolean {
     const wd = game.world;
     const c = camera.position;
     for (let i = 1; i < 12; i++) {
       const f = i / 12;
       const px = c.x + (x - c.x) * f, pz = c.z + (z - c.z) * f;
       if (!wd.inside(px, pz)) continue;
-      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - 0.05) return true;
+      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - margin) return true;
     }
     return false;
   }
