@@ -17,6 +17,7 @@ import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { addMail, trimMail, rerouteMail, absorbMail, newJourney, type StationMail, type MailJourney } from './mail';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -400,6 +401,8 @@ export interface Station {
   roadAccess: boolean;
   /** rolling platform figures (Stations.daily): share of platform tracks occupied, trains calling / passing per day, trains on the platforms */
   occ?: number; tpd?: number; ppd?: number; onPlat?: number[];
+  /** mail: queues, rating and monthly figures (mail.ts), from the station's first mail or mail vehicle on */
+  mail?: StationMail;
 }
 
 /** Collision rectangle of a station structure with its vertical extent (y0..y1), what it is and (entrances) which one. */
@@ -2242,6 +2245,8 @@ export class Stations {
       for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
     }
     for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+    // mail: b's queues and figures join a's; mail heading to or changing at b heads for a (also aboard vehicles)
+    absorbMail(g, a, b, re);
     for (const v of g.vehicles.map.values()) {
       let hit = false;
       for (const c of v.cargo.values()) if (c.alight === b.id || c.dest === b.id || c.from === b.id) { hit = true; break; }
@@ -2850,6 +2855,13 @@ export class Stations {
       if (town) town.passLostMonth = (town.passLostMonth ?? 0) + lost;
     }
   }
+
+  /** Mail (units of MAIL_UNIT_T) waits at `st` for `line` to `alight` on its way to `dest`, on journey `j` (default: posted here now). */
+  addMail(st: Station, line: number, alight: number, dest: number, count: number, j?: MailJourney) { addMail(this.game, st, line, alight, dest, count, j ?? newJourney(this.game, st, dest)); }
+  /** Mail beyond the station's queue cap is lost (mail.ts trimMail). */
+  trimMail(st: Station) { trimMail(this.game, st); }
+  /** Mail re-routed after the routing changed (mail.ts rerouteMail; Lines.rebuild does this for every station). */
+  rerouteMail(st: Station) { rerouteMail(this.game, st); }
 
   rerouteWaiting(st: Station) {
     const lines = this.game.lines;

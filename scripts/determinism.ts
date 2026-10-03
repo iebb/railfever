@@ -50,7 +50,8 @@ function buildFixture(g: Game): Fixture {
   rail.stops = [pair.A.id, pair.B.id];
   g.lines.rebuild();
   transcript.push({ kind: 'create-line', mode: 'rail', id: rail.id, stops: [...rail.stops] });
-  const models = ['diesel_b', 'coach_ic', 'coach_ic'];
+  // (a mail van behind the locomotive: mail queues, loads and fares replicate too)
+  const models = ['diesel_b', 'van_ic', 'coach_ic', 'coach_ic'];
   const cars = models.map((id) => {
     const m = MODEL_BY_ID.get(id);
     if (!m) throw new Error(`Fixture: unknown model ${id}`);

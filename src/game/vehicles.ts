@@ -1,7 +1,7 @@
-// Vehicle manager: ownership, reservations, spatial hash, purchases and ambient traffic.
+// Vehicle manager: ownership, reservations, spatial hash, purchases, recomposition and ambient traffic.
 import type { Game } from './game';
 import { Vehicle } from './vehicle';
-import { Train, CROSS_BASE, type TSeg } from './train';
+import { Train, CROSS_BASE, lineCompatibility, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
@@ -10,6 +10,38 @@ import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 import { spacingSchedule } from './patterns';
 import { simNow } from './fares';
+import { offloadMail } from './mail';
+import type { Station } from './stations';
+
+/** Cars added and removed between two consists (by model, as multisets). */
+export function consistDiff(from: VehicleModel[], to: VehicleModel[]): { added: VehicleModel[]; removed: VehicleModel[] } {
+  const left = new Map<string, number>();
+  for (const c of from) left.set(c.id, (left.get(c.id) ?? 0) + 1);
+  const added: VehicleModel[] = [];
+  for (const c of to) { const n = left.get(c.id) ?? 0; if (n > 0) left.set(c.id, n - 1); else added.push(c); }
+  const removed: VehicleModel[] = [];
+  for (const c of from) { const n = left.get(c.id) ?? 0; if (n > 0) { removed.push(c); left.set(c.id, n - 1); } }
+  return { added, removed };
+}
+
+/**
+ * Take `count` passengers off a vehicle at station `st` (a shorter consist): they wait there for their next leg (their
+ * waiting time kept), or are lost without a station or route.
+ */
+function offloadPassengers(g: Game, v: Vehicle, count: number, st: Station | null) {
+  let left = Math.ceil(count);
+  for (const [k, c] of [...v.cargo]) {
+    if (left <= 0) break;
+    const n = Math.min(left, c.count);
+    c.count -= n; v.load -= n; left -= n;
+    if (c.count <= 0) v.cargo.delete(k);
+    if (!st) continue;
+    if (c.dest === st.id) { st.arrivedMonth += n; continue; }
+    const hop = g.lines.nextHop(st.id, c.dest);
+    if (hop) g.lines.distribute(hop, n, (line, q) => g.stations.addWaiting(st, line, hop.alight, c.dest, q, 0, c.t0, 0, c.rail ?? 0));
+  }
+  if (v.load < 1e-9) v.load = 0;
+}
 
 /** Occupancy key: a lane (edge, direction) or one connector (from lane -> to lane) through a junction. */
 const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
@@ -537,6 +569,56 @@ export class Vehicles {
     this.map.set(v.id, v);
     if (lineId != null) v.setLine(lineId);
     return v;
+  }
+
+  /**
+   * Why a train cannot be made up of `cars` (locomotive(s) first, then mail vans and coaches, or multiple units)
+   * now, or null: in its depot, or loading at a platform when the new train still fits on the platform track
+   * behind its head; its line's track must suit the new consist; the owner pays for the cars added.
+   */
+  recomposeError(t: Train, cars: VehicleModel[]): string | null {
+    const g = this.game;
+    const emu = cars.length > 0 && cars[0].kind === 'emu';
+    if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
+    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu' || c.kind === 'bus' || c.kind === 'tram')) return 'Multiple units only couple with multiple units';
+    if (t.onMap) {
+      if (t.state !== 'loading' || t.atStation < 0) return 'The train must stand in its depot or at a platform';
+      const head = t.segs[t.headSeg], e = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
+      const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
+      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'The train does not fit on this platform';
+    }
+    if (t.lineId != null) { const why = lineCompatibility(g, t.lineId, cars); if (why) return why; }
+    const { added } = consistDiff(t.cars, cars);
+    const cost = added.reduce((s, c) => s + c.cost, 0);
+    if (cost > 0 && !g.company(t.owner).economy.canAfford(cost)) return 'Not enough money';
+    return null;
+  }
+
+  /**
+   * Make a train up anew (`cars` in made-up order, locomotive first: Train.madeUp gives the current ones; add or remove
+   * coaches, mail vans or units: Vehicles.recomposeError says when). Added cars are
+   * paid at their price, removed ones refunded at the train's resale share of their price (the train's value follows
+   * its cars). Passengers and mail beyond the new room get off at the platform (queued for their next leg there).
+   * Null = OK, else why not.
+   */
+  recompose(t: Train, cars: VehicleModel[]): string | null {
+    const err = this.recomposeError(t, cars);
+    if (err) return err;
+    const g = this.game, eco = g.company(t.owner).economy;
+    const { added, removed } = consistDiff(t.cars, cars);
+    const cost = added.reduce((s, c) => s + c.cost, 0), price = removed.reduce((s, c) => s + c.cost, 0);
+    const refund = price > 0 && t.value > 0 ? this.resaleValue(t) * price / t.value : 0;
+    if (cost > 0 && !eco.spend(cost, 'vehicles')) return 'Not enough money';
+    if (refund > 0) eco.earn(refund, 'vehicles');
+    t.value += cost - price;
+    // the new consist the way round the train stands (its locomotive at the end it was at)
+    t.cars = t.runsBackward ? [...cars].reverse() : [...cars];
+    g.lines.rebuild(false);
+    // (after the tables follow the new consist: the cargo that gets off is routed on as the network now runs)
+    const st = t.onMap && t.atStation >= 0 ? g.stations.get(t.atStation) ?? null : null;
+    if (t.load > t.capacity) offloadPassengers(g, t, t.load - t.capacity, st);
+    if (t.mailLoad > t.mailCapacity) offloadMail(g, t, t.mailLoad - t.mailCapacity, st);
+    return null;
   }
 
   resaleValue(v: Vehicle) {

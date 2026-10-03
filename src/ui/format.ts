@@ -1,7 +1,9 @@
 // Display formatting shared by the HUD, windows and tooltips.
 import type { Game, News } from '../game/game';
+import type { Line } from '../game/lines';
+import type { Station } from '../game/stations';
 import { MONTH_NAMES } from '../game/game';
-import { DAYS_PER_MONTH, MONTHS_PER_YEAR } from '../game/constants';
+import { DAYS_PER_MONTH, MONTHS_PER_YEAR, MAIL_UNIT_T } from '../game/constants';
 import type { LineKind } from '../game/constants';
 
 const MONTH_DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
@@ -40,6 +42,34 @@ export const fmtPct = (f: number, digits = 0) => `${(f * 100).toFixed(digits)}%`
 export const fmtMult = (m: number) => `×${Number.isInteger(m) ? m : m.toFixed(2).replace(/0$/, '')}`;
 /** Share of an item's maintenance a user pays at multiplier m when it uses the item as much as the owner. */
 export const equalUseShare = (m: number) => (m > 0 ? m / (1 + m) : 0);
+
+/** Mail (whole units of MAIL_UNIT_T) in tonnes, without the unit: 0.4, 12.5, 1,240. */
+export function tonnes(units: number): string {
+  const t = Math.max(0, units) * MAIL_UNIT_T;
+  return t < 100 ? String(Math.round(t * 10) / 10) : Math.round(t).toLocaleString('en-US');
+}
+/** Mail in tonnes with the unit: "2.4 t". */
+export const fmtMail = (units: number) => `${tonnes(units)} t`;
+/** Load of a vehicle's mail room: "2.4 / 6 t". */
+export const fmtMailLoad = (load: number, room: number) => `${tonnes(load)} / ${tonnes(room)} t`;
+
+/** Does a vehicle of the line carry mail, or has the line carried any (Line.mail)? Reads only. */
+export function lineCarriesMail(g: Game, l: Line): boolean {
+  if (l.mail) return true;
+  for (const id of l.vehicles) if (g.vehicles.get(id)?.carries('mail')) return true;
+  return false;
+}
+
+/**
+ * Should the station show mail: it has handled mail (Station.mail) or a vehicle with room for mail calls there. Never
+ * at a tram stop (trams carry no mail). Reads only: the UI never creates mail state.
+ */
+export function stationShowsMail(g: Game, s: Station): boolean {
+  if (!s.mail && !g.lines.mailServed(s.id)) return false;
+  if (s.rail) return true;
+  const lines = g.lines.linesAt(s.id);
+  return lines.length ? lines.some((l) => l.kind !== 'tram') : !s.stops.every((p) => !!g.world.net.edges.get(p.edge)?.tram);
+}
 
 /** Compact money for floating text: $850, $1.2k, $45k, $1.25M. */
 export function fmtCompact(x: number): string {

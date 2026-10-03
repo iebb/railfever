@@ -1,13 +1,13 @@
-// Fuzz test: random construction, bulldozing, signals, stations, depots, lines, vehicles, terraforming,
-// tram tracks / tram depots / trams and save/load round trips while simulating; checks network / vehicle
-// invariants (incl. tram edges) after every step.
+// Fuzz test: random construction, bulldozing, signals, stations, depots, lines, vehicles (mail vans, mail trucks and
+// postbuses among them), recomposed trains, terraforming, tram tracks / tram depots / trams and save/load round trips
+// while simulating; checks network / vehicle / passenger and mail invariants (incl. tram edges) after every step.
 // npx esbuild scripts/fuzz.ts --bundle --platform=node --format=esm --outfile=$S/fuzz.mjs && node $S/fuzz.mjs [seed] [steps]
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, findSnap, Snap } from '../src/game/construction';
 import { toggleSignal, bulldoze, terraformBrush, addTramTracks, removeTramTracks, roadPath, tramUsable } from '../src/game/build-ops';
 import { tramDepotGen, pathPoints } from '../src/game/ai-tram';
 import { runGen } from '../src/game/routing';
-import { availableModels } from '../src/game/vehicle-types';
+import { availableModels, type VehicleModel } from '../src/game/vehicle-types';
 import { buildRailDepot, buildRoadDepot } from '../src/game/routing';
 import { RNG } from '../src/game/rng';
 import { serialize, deserialize } from '../src/game/save';
@@ -45,6 +45,12 @@ function invariants(): string[] {
     for (const eid of st.rail?.edges ?? []) if (!net.edges.has(eid)) errs.push(`station ${st.id} lists missing edge ${eid}`);
     for (const p of st.stops) if (!net.edges.get(p.edge) || net.edges.get(p.edge)!.kind !== 'road') errs.push(`stop of station ${st.id} on missing road ${p.edge}`);
     if (st.waitingTotal < 0) errs.push(`station ${st.id} negative waiting`);
+    if (st.mail) {
+      let sum = 0;
+      for (const w of st.mail.waiting.values()) { sum += w.count; if (!(w.count > 0) || !isFinite(w.p) || !(w.c >= 0) || !(w.od >= 0) || w.legs.some((l) => !(l[3] >= 0))) errs.push(`station ${st.id} bad mail group ${JSON.stringify(w)}`); }
+      if (Math.abs(sum - st.mail.total) > 1e-6 || st.mail.total < 0) errs.push(`station ${st.id} mail total ${st.mail.total} vs groups ${sum}`);
+      if (!(st.mail.rating >= 0 && st.mail.rating <= 1)) errs.push(`station ${st.id} mail rating ${st.mail.rating}`);
+    }
   }
   for (const d of g.depots.map.values()) {
     if (!net.edges.has(d.edge) || !net.nodes.has(d.node)) errs.push(`depot ${d.id} lost its track`);
@@ -58,6 +64,10 @@ function invariants(): string[] {
   for (const v of g.vehicles.map.values()) {
     if (v.lineId != null && !g.lines.get(v.lineId)?.vehicles.includes(v.id)) errs.push(`${v.name} line ${v.lineId} does not list it`);
     if (v.load < 0 || v.load > v.capacity + 1e-6) errs.push(`${v.name} load ${v.load}/${v.capacity}`);
+    if (v.mailLoad < 0 || v.mailLoad > v.mailCapacity + 1e-6) errs.push(`${v.name} mail ${v.mailLoad}/${v.mailCapacity}`);
+    let mail = 0;
+    for (const c of v.mailCargo.values()) { mail += c.count; if (!(c.count > 0) || !isFinite(c.p) || !(c.c >= 0) || !(c.od >= 0) || c.legs.some((l) => !(l[3] >= 0))) errs.push(`${v.name} bad mail group ${JSON.stringify(c)}`); }
+    if (Math.abs(mail - v.mailLoad) > 1e-6) errs.push(`${v.name} mail groups ${mail} vs load ${v.mailLoad}`);
     if (v instanceof Train) {
       for (const s of v.segs) if (s.e >= 0 && !net.edges.has(s.e)) errs.push(`${v.name} on missing edge ${s.e}`);
       if (v.segs.length && (v.headSeg < 0 || v.headSeg >= v.segs.length)) errs.push(`${v.name} bad headSeg`);
@@ -139,7 +149,7 @@ for (let step = 0; step < STEPS; step++) {
         for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
         did('line edit');
       }
-    } else if (k < 0.84) {
+    } else if (k < 0.81) {
       op = 'buy';
       const deps = g.depots.all();
       if (deps.length) {
@@ -153,6 +163,18 @@ for (let step = 0; step < STEPS; step++) {
           const trams = availableModels(g.year, 'tram');
           if (trams.length && typeof g.vehicles.buyRoad(dp.id, r.pick(trams), line) !== 'string') did('buy tram');
         } else if (typeof g.vehicles.buyRoad(dp.id, r.pick(availableModels(g.year, 'bus')), line) !== 'string') did('buy bus');
+      }
+    } else if (k < 0.84) {
+      op = 'recompose';
+      // a train made up anew: its locomotive(s), 0-2 mail vans, coaches (or units), sometimes something odd
+      const ts = g.vehicles.trains();
+      if (ts.length) {
+        const t = ts[r.int(ts.length)], made = t.madeUp, head = made.filter((c) => c.kind === 'loco' || c.kind === 'emu');
+        const vans = availableModels(g.year, 'wagon', true), coaches = availableModels(g.year, 'wagon', false);
+        const cars: VehicleModel[] = head[0]?.kind === 'emu' ? head.slice(0, 1 + r.int(2))
+          : [...head.slice(0, 1), ...Array.from({ length: vans.length ? r.int(3) : 0 }, () => r.pick(vans)), ...Array.from({ length: coaches.length ? r.int(4) : 0 }, () => r.pick(coaches))];
+        if (r.chance(0.1)) cars.reverse();
+        if (!g.vehicles.recompose(t, cars)) did('recompose');
       }
     } else if (k < 0.89) {
       op = 'sell';

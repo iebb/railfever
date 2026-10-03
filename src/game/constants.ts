@@ -52,6 +52,53 @@ export const URBAN_PAYBACK = { metro: 15, lightrail: 9, crosscity: 15 };
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 
+/**
+ * The cargoes lines carry: passengers and mail. Line tables, routing, boarding and headways take a cargo (default
+ * passengers); a vehicle carries passengers unless it is mail-only (no seats and room for mail: Vehicle.mailOnly).
+ */
+export type Cargo = 'pax' | 'mail';
+/** Mail is counted in units of this many tonnes (VehicleModel.mail, queues, loads); the UI shows tonnes. */
+export const MAIL_UNIT_T = 0.1;
+/**
+ * Mail calibration (mail.ts): mail units posted per unit of the passenger generation rate (demand.ts GEN_RATE), so
+ * mail inherits the passenger recalibration of the compressed calendar. scripts/mailcal.ts on 2.7 (30% shorter walks,
+ * so smaller mail catchments too): single intercity railways with a van and three coaches (seeds 7 / 23 / 51, 1950 and
+ * 2000) carry mail worth 15-21% of their passenger income, vans 0.44-0.58x as full as the coaches; the AI networks'
+ * railways about 50% (their passengers are shared with bus stops and ride the trains only between towns). Below about
+ * 0.18 a van no longer pays its way on a single line (the AI's margin: 1.5x its operating cost and price/8). Recalibrate
+ * it with mailcal when passenger catchments or generation change (mail shares the walking catchments).
+ */
+export const MAIL_PER_PAX = 0.2;
+/**
+ * Mail per person by year (piecewise linear; 1950 = 1): by weight about +30% from 1950 to 2000, then about flat
+ * (letters halve, parcels grow two to three times).
+ */
+export const MAIL_ERA: readonly [number, number][] = [[1870, 0.35], [1900, 0.5], [1925, 0.75], [1950, 1], [1975, 1.2], [2000, 1.35], [2010, 1.25], [2025, 1.35]];
+/**
+ * Mail stations: a station accepts mail (posts it, and receives its town's mail) when a mail-carrying line serves it
+ * and its weighted catchment (mail.ts mailPop) is at least `acceptPop`: a halt that reaches hardly anyone handles none,
+ * a town's station at its edge still does. Queue cap: min(`cap`, `base` + `perPop` x mailPop + `perTrack` x platform
+ * tracks + `perStop` x stops); mail beyond it is lost.
+ */
+export const MAIL_STATION = { acceptPop: 25, cap: 400, base: 20, perPop: 0.02, perTrack: 15, perStop: 5 };
+/**
+ * Mail feeders (mail.ts allocate), the post office's counterpart of the passengers' car feeders (MAINLINE_FEEDERS,
+ * the same rules by mail service): mail from the buildings of a town of `minTownPop`+ that no mail station reaches on
+ * foot is brought to its railway stations served by mail-carrying trains to other towns, by the quality of that mail
+ * service (1 at a combined mail headway of `fullHeadway` s or less, 0 from `cutoffHeadway` s, as the car feeders): this
+ * `share` x the quality, from within `reach` units by road, shared by the weight quality / (1 + distance / `decay`).
+ * The share is small (the car feeders': 0.75): mail stations keep the whole catchment they reach on foot, passengers
+ * share theirs with the bus stops, and frequent mail trains are the networks' (scripts/mailcal.ts).
+ */
+export const MAIL_FEEDER = { share: 0.1, reach: 84, decay: 30, minTownPop: 1500, fullHeadway: 100, cutoffHeadway: 300 };
+/**
+ * Mail capture (mail.ts weights), as the passengers' local capture: a station whose mail routes reach the towns that
+ * receive `full` of its town's mail (the gravity shares) posts at the full rate; one reaching fewer posts `floor` +
+ * (1 - `floor`) x their share / `full` of it (mail for towns beyond is handed over at the railhead and goes on from
+ * there), shared out over the towns it reaches by their gravity shares and routed trip factors.
+ */
+export const MAIL_CAPTURE = { floor: 0.6, full: 0.5 };
+
 /** Sea level. */
 export const WATER_Y = 0;
 

@@ -84,7 +84,7 @@ export class Checklist {
       }
       this.stationEstimate = cheapest;
     }
-    const locos = availableModels(g.year, 'loco'), coaches = availableModels(g.year, 'wagon');
+    const locos = availableModels(g.year, 'loco'), coaches = availableModels(g.year, 'wagon', false);
     const train = (locos[locos.length - 1]?.cost ?? 0) + 2 * (coaches[coaches.length - 1]?.cost ?? 0);
     const station = isFinite(this.stationEstimate) ? `an ${DEFAULT_PLATFORM_LENGTH * 10} m halt here ~${fmtMoney(this.stationEstimate)}` : 'check each halt’s preview price';
     return `Keep money for a train: ${station}, single track ~${fmtMoney(TRACK_TYPES.standard.costPerUnit * 100)}/km, a starter train ~${fmtMoney(train)}. Bridges and demolition add cost.`;

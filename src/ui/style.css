@@ -752,6 +752,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .mc-modes { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
 .mc-modes .seg { flex: 1; }
 .mc-modes .segb { flex: 1; justify-content: center; height: 28px; padding: 0 8px; font-size: var(--fs-12); }
+/* Mail demand map (scoped to the map card). The shared legend keeps the passenger palette and dash cues. */
+.mapcard .mc-demand-toggle { margin-bottom: 8px; }
+.mapcard .mc-demand-toggle .segb { min-width: 0; }
+.mapcard .mc-mail .mc-stats b { min-width: 54px; }
+.mapcard .mc-mail .mc-stats > div { align-items: flex-start; }
+.mapcard .mc-mail .mc-stats > div > span { min-width: 0; line-height: 1.35; }
+.mapcard .mc-mail .mc-num { font-variant-numeric: tabular-nums; }
 .mc-row .lsym { margin-right: -2px; }
 .mc-stn { display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 6px; border-radius: 7px; cursor: pointer; font-size: var(--fs-13); }
 .mc-stn:hover { background: var(--raised-2); }
@@ -940,6 +947,20 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .vehicle-info .kv .select { width: 100%; min-width: 0; }
 .vehicle-service { display: flex; align-items: center; gap: 6px; width: 100%; min-width: 0; }
 .vehicle-service .select { flex: 1; min-width: 0; width: 0; }
+
+/* Mail: envelope white (--mail: apart from the blue, green and yellow series under deuteranopia, protanopia and
+   tritanopia, delta E 2000 >= ~20) with a second cue wherever colour alone would tell: mail vans hatched in the
+   composition strip, the mail income line dashed. Also the mail line under a tile, the station's mail panel, mail
+   stats on model rows and mail-only vehicles in the services header. */
+:root { --mail: #f8fafc; }
+.tile-mail { display: flex; align-items: center; gap: 4px; margin-top: 6px; min-width: 0; color: var(--text-2); font-size: var(--fs-12); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tile-mail .ic, .mstat-mail .ic, .svh-mail .ic { color: var(--text-3); }
+.mail-panel .tiles { margin-top: 2px; }
+.consist .car.van { background: repeating-linear-gradient(135deg, var(--c) 0 4px, color-mix(in srgb, var(--c) 50%, var(--mail)) 4px 6px); }
+.composer-steps { gap: 8px 16px; }
+.legend .lg-dash i { background: repeating-linear-gradient(90deg, var(--c) 0 5px, transparent 5px 8px); }
+.tbl td .loadmix { white-space: normal; }
+.svh .svh-mail { display: inline-flex; align-items: center; gap: 3px; color: var(--text-2); white-space: nowrap; }
 
 /* Finance history keeps every category readable at 1024 × 768 and on bottom sheets. */
 .finance-table { max-width: 100%; overflow-x: auto; overscroll-behavior: contain; }

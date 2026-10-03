@@ -67,6 +67,13 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Fares depend on distance and journey time, including waiting, riding and transfer walks, compared with walking or driving. One rail fare for every track type, with a minimum per journey so short city hops pay too. **Each change of vehicle takes 10%** off the fare of the leg ending in it and of every later leg: a journey with one change earns 10% less than the same journey made directly, with two changes 10-19% less, so direct services earn more.
 - Operating costs cover energy, crew, vehicle maintenance and track wear; high-speed services cost more to run. The economy includes loans with interest and finance reports with cost breakdowns and charts.
 
+**Mail**
+
+- Stations post mail from their walking catchment (more from shops and offices, by era and town size) to the other towns your mail network reaches; main-line stations with frequent mail trains also collect it from the rest of their town. A line to a single town still carries most of its towns' mail, handed over where it ends. Mail has its own queues and rating and is counted in tonnes. It pays once, when delivered, by the distance from where it was posted and how fast it arrived, less 10% for each change of vehicle, shared by the vehicles that carried it (Mail income in the finances).
+- Rail: the train composer couples 0–3 mail vans behind the locomotive, and a train of vans only is a mail train. The vehicle window adds or removes vans while the train stands at a platform or in its depot. A postal multiple unit carries mail only.
+- Road: postbuses carry passengers and some mail; mail vans and trucks carry mail only. Trams carry no mail.
+- The station, line, vehicle and town windows show mail waiting, the mail rating, mail posted, loaded and delivered, mail income and the mail load factor.
+
 **Sound**
 
 - Procedural sound effects (WebAudio, no audio files): interface sounds, construction, demolition, cash chimes, positional trains (steam chuffs, diesel rumble, era-specific electric motor hum and whine, high-speed wind roar, rail-joint clatter, horns and whistles), tram traction, level-crossing bells, station chimes, and camera-following ambience (birds, wind, town hum, surf, crickets at night). Volume sliders per group and a mute button in the top bar.
