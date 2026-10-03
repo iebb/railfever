@@ -19,9 +19,12 @@ import { planRelevel, commitRelevel } from '../src/game/trackops';
 import type { Station, EntranceKind } from '../src/game/stations';
 import { walkingCatchment, walkingCatchmentWithout, walkingPopulation, entrancePlanCatchment } from '../src/game/catchment';
 import { stationCrossings } from '../src/game/station-styles';
-import { runNetworkTask, networkDaily, networkPlanner, saveNetwork } from '../src/game/ai-network';
+import { runNetworkTask, networkDaily, networkPlanner, saveNetwork, loadNetwork } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { RoadVehicle } from '../src/game/roadvehicle';
+import { PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE } from '../src/game/constants';
+import { addBusStop, fails } from './lib';
 import { flatGame, station, endNode, loco, depotFor, check, build, railOpts, nodeSnap, done } from './stationlib';
 
 const T0 = performance.now();
@@ -78,6 +81,49 @@ function fixture(owner = 0) {
   const S = station(g, 96, 96, Math.PI / 2, 10, 2, owner)!;
   return { g, S, north, south };
 }
+
+// Read the real planner's saved valuation, then compare it with live shares after building that entrance.
+// Unequal walks to a served bus stop and the new railway entrance expose equal-stop-count attribution.
+{
+  console.log('entrance valuation: unequal overlapping walks match the live share-out');
+  const { g, ai, me, H } = aiFixture();
+  const near = addBusStop(g, 74, 93.9, 0), far = addBusStop(g, 140, 93.9, 0);
+  const busLine = g.lines.create('road', 0); busLine.stops = [near, far];
+  const bus = new RoadVehicle(g, g.vehicles.nextId++, MODEL_BY_ID.get('bus_c')!, -1, false);
+  bus.lineId = busLine.id; bus.state = 'stopped'; g.vehicles.map.set(bus.id, bus); busLine.vehicles.push(bus.id);
+  // An unserved overlapping stop must not participate while served stations reach the residents.
+  const unserved = addBusStop(g, 102, 93.9, 0);
+  g.lines.rebuild(); flush(g);
+  check(near >= 0 && far >= 0 && unserved >= 0 && g.lines.stationServed(near) && !g.lines.stationServed(unserved), 'overlap fixture has served and unserved competing stops');
+  const current = walkingCatchment(g, H).buildings;
+  runNetworkTask(ai, 'capacity', 0);
+  const network = saveNetwork(g), state = network.companies.find(([id]) => id === me)![1];
+  state.job = { task: 'capacity', cursor: 0, done: 0, items: [{ ids: [H.id], entrance: { at: 0 } }] };
+  loadNetwork(g, network);
+  networkDaily(ai);
+  const best = saveNetwork(g).companies.find(([id]) => id === me)?.[1].job?.items?.[0].entrance?.best;
+  check(!!best && H.rail!.entrances.length === 0, 'capture a positive saved entrance valuation before construction');
+  if (best) {
+    const plan = g.stations.planEntrance(H.id, best.x, best.z, me, best.kind, { street: false });
+    check(plan.ok && !plan.access, 'valued entrance reaches the existing street without new construction');
+    const loaded = deserialize(JSON.parse(JSON.stringify(serialize(g)))), st = loaded.stations.get(H.id)!;
+    const built = loaded.stations.planEntrance(st.id, best.x, best.z, me, best.kind, { street: false });
+    check(!loaded.stations.commitEntrance(st.id, built, me), 'build the valued entrance for a live share comparison');
+    flush(loaded);
+    let live = 0;
+    for (const id of walkingCatchment(loaded, st).buildings.keys()) {
+      if (current.has(id)) continue;
+      const shares = loaded.stations.stationsForBuilding(id), i = shares.st.indexOf(st.id);
+      if (i >= 0) live += loaded.world.buildings.get(id)!.pop * shares.w[i];
+    }
+    // Fixture has no observed pickups or income: the planner's fixed default annual value per resident.
+    const perResident = 2 * PASSENGER_RATE_SCALE * 300 * PASSENGER_FARE_SCALE * 1.5;
+    const valued = ((best.gain + plan.cost) / (5 + 5 * ai.config.risk) + ENTRANCE_TYPES[plan.kind].upkeep) / perResident;
+    console.log(`  entrance residents: valued ${valued}, live ${live}`);
+    check(live > 0 && Math.abs(valued - live) < 1e-8, 'entrance resident valuation equals live best coverage and relative walking weights');
+  }
+}
+if (process.argv.includes('--regression')) { done(); process.exit(fails.length ? 1 : 0); }
 
 // ------------------------------------------------------------------------------------------ placement
 {

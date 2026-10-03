@@ -72,10 +72,45 @@ function scenario() {
   const main: Line = g.lines.create('rail', 1); main.stops = outAndBack([far.id, J.id]); autoSignalLine(g, main.id, 1);
   if (!(g.vehicles.buyTrain(dep, [M('diesel_b'), M('coach_ic'), M('coach_ic')], main.id) instanceof Train)) throw new Error('main line train');
   (g.ais[0] as AnyAI).adoptLines();
+  // A completed main line can leave a future corridor hint before the city railway queues its through job.
+  g.ais[0].state.corridor = [J.id, W.id];
   const geometry = new Map([...g.world.net.edges.values()].filter((e) => e.owner === 1 && e.kind === 'rail').map((e) => [e.id, JSON.stringify({ bez: e.bez, prof: [...e.prof], a: e.a, b: e.b })]));
   return { g, ai: g.ais[0] as AnyAI, C, J, main, geometry };
 }
 const opened = (ai: AnyAI) => ai.stats.urban > 0;
+
+// Cancel at the saved follow-up checkpoint, before the outer urban generator enters throughJob.
+// Each real cancellation path must remove all saved work that could restart it after loading.
+for (const cancel of ['recoverCash', 'onError', 'dispose'] as const) {
+  console.log(`cancel a pending through service: ${cancel}`);
+  const { g, ai } = scenario();
+  g.aiEnabled = true; AIController.forceBuild = true;
+  ai.startProject('metro', [0]);
+  let ticks = 0;
+  while ((!opened(ai) || ai.project) && ai.busy && ticks++ < 200000) g.stepTick();
+  check(opened(ai) && !ai.project && !!ai.state.through, `${cancel}: city completed with through follow-up pending`);
+  const corridor = JSON.stringify(ai.state.corridor);
+  if (cancel === 'onError') { ai.errorLogged = true; ai.onError(new Error('cancellation regression')); }
+  else ai[cancel]();
+  const state = (ai.toJSON() as any).state;
+  check(!ai.busy && !state.through && !state.project && !state.tram, `${cancel}: no saved cancelled job or project remains`);
+  check(JSON.stringify(state.corridor) === corridor, `${cancel}: independent future corridor hint is retained`);
+  // Disposed controllers are removed from the AI list when bought; their direct record is checked above.
+  if (cancel !== 'dispose') {
+    const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+    check(!loaded.ais[0].busy && !loaded.ais[0].state.through, `${cancel}: loading does not restart cancelled work`);
+    check(JSON.stringify(serialize(loaded)) === data, `${cancel}: cancellation round trip is exact`);
+    const until = g.day + 2;
+    while (g.day < until) { g.stepTick(); loaded.stepTick(); }
+    check(ai.stats.through === 0 && loaded.ais[0].stats.through === 0 && JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)),
+      `${cancel}: cancelled through work replays exactly for two days`);
+  }
+  AIController.forceBuild = false;
+}
+if (process.argv.includes('--regression')) {
+  console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
+  process.exit(fails.length ? 1 : 0);
+}
 
 // ------------------------------------------------------------------ 1. saved at every tick around the through service
 {

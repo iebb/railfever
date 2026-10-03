@@ -14,7 +14,8 @@ import { growThroat, throatFree, holdThroat, releaseHold, WORKS_HOLD } from './t
 import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
-import { simNow, transferWalkTime } from './fares';
+import { simNow, transferWalkTime, fareGroupKey, railHistory } from './fares';
+import { cargoGroups } from './vehicle';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
@@ -2236,24 +2237,15 @@ export class Stations {
       if (!hit) continue;
       const old = [...st.waiting.values()];
       st.waiting.clear(); st.waitingTotal = 0;
-      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
+      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
     }
-    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
+    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
     for (const v of g.vehicles.map.values()) {
       let hit = false;
       for (const c of v.cargo.values()) if (c.alight === b.id || c.dest === b.id || c.from === b.id) { hit = true; break; }
       if (hit) {
         const old = [...v.cargo.values()];
-        v.cargo.clear();
-        for (const c of old) {
-          const n = { ...c, alight: re(c.alight), dest: re(c.dest), from: re(c.from) };
-          const k = n.from + ':' + n.alight + ':' + n.dest;
-          const o = v.cargo.get(k);
-          if (o) {
-            if (o.rail || n.rail) o.rail = ((o.rail ?? 0) * o.count + (n.rail ?? 0) * n.count) / Math.max(1, o.count + n.count);
-            o.day = (o.day * o.count + n.day * n.count) / Math.max(1, o.count + n.count); o.count += n.count;
-          } else v.cargo.set(k, n);
-        }
+        v.cargo = cargoGroups(old.map((c) => ({ ...c, alight: re(c.alight), dest: re(c.dest), from: re(c.from) })));
       }
       const t = v as unknown as { routeTarget?: number; atStation?: number };
       if (t.routeTarget === b.id) t.routeTarget = a.id;
@@ -2782,13 +2774,13 @@ export class Stations {
    */
   addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0) {
     if (count <= 0) return;
+    rail = railHistory(rail);
     if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
-    const key = line + ':' + alight + ':' + dest;
+    const key = fareGroupKey(line, alight, dest, rail);
     // ops: when they started waiting (weighted mean), how many already changed vehicles, their rail fares so far
     const at = t ?? simNow(this.game), tr = Math.max(0, Math.min(count, transferred));
     const g = st.waiting.get(key);
     if (g) {
-      if (rail || g.rail) g.rail = ((g.rail ?? 0) * g.count + rail * count) / (g.count + count);
       g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
     } else {
       const ng: WaitGroup = tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at };

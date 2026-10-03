@@ -88,6 +88,18 @@ export const TRANSFER_WALK = { mps: 1.25, baseS: 20 };
 /** Continuous sim clock (seconds): day + fraction, DAY_SECONDS each. */
 export function simNow(g: Game): number { return (g.day + g.dayFrac) * DAY_SECONDS; }
 
+/**
+ * A journey's rail fare history as it matters for later legs: railLegFare gives the same fare for every history at or
+ * above the minimum, so histories are capped there. Equal fares, and few distinct waiting / cargo groups.
+ */
+export function railHistory(rail: number | undefined): number { return Math.min(RAIL_FARE.minimum, Math.max(0, rail ?? 0)); }
+
+/** Waiting (line) or cargo (boarding stop) identity. Different rail histories cannot share a fare minimum. */
+export function fareGroupKey(lineOrFrom: number, alight: number, dest: number, rail = 0): string {
+  const key = lineOrFrom + ':' + alight + ':' + dest, r = railHistory(rail);
+  return r ? key + ':rail:' + r : key;
+}
+
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 
 /** Walking time (s) for a straight-line distance of `d` units. */

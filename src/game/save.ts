@@ -15,7 +15,8 @@ import { RoadVehicle, RSeg, RCont, makeLaneSeg, makeConn } from './roadvehicle';
 import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
 import { KMH_TO_UPS } from './constants';
-import type { Vehicle, CargoGroup } from './vehicle';
+import { cargoGroups, type Vehicle, type CargoGroup } from './vehicle';
+import { fareGroupKey } from './fares';
 import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
 import type { StoredSave } from './storage';
 import { saveOps, loadOps } from './opcosts';
@@ -284,18 +285,7 @@ const rsegD = (s: RSeg): RSegD => [s.kind === 'lane' ? 0 : 1, s.e, s.dir, s.node
 
 function cargoOf(v: Vehicle) { return [...v.cargo.values()]; }
 function restoreCargo(v: Vehicle, list: CargoGroup[]) {
-  v.cargo.clear();
-  for (const c of list) {
-    const k = c.from + ':' + c.alight + ':' + c.dest;
-    const o = v.cargo.get(k);
-    if (o) {
-      const n = Math.max(1, o.count + c.count);
-      o.day = (o.day * o.count + c.day * c.count) / n;
-      if (o.t0 !== undefined || c.t0 !== undefined) o.t0 = ((o.t0 ?? c.t0!) * o.count + (c.t0 ?? o.t0!) * c.count) / n;
-      if (o.transfers || c.transfers) o.transfers = (o.transfers ?? 0) + (c.transfers ?? 0);
-      o.count += c.count;
-    } else v.cargo.set(k, { ...c });
-  }
+  v.cargo = cargoGroups(list.map((c) => ({ ...c })));
 }
 
 function baseOf(v: Vehicle) {
@@ -629,7 +619,7 @@ export function deserialize(d: any): Game {
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
-    const restored = g.stations.get(s.id)?.waiting.get(wg.line + ':' + wg.alight + ':' + wg.dest);
+    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0));
     if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }

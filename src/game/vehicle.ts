@@ -4,7 +4,7 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
-import { fareFor, distanceFare, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
+import { fareFor, distanceFare, legacyFare, simNow, fareGroupKey, railHistory, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS } from './constants';
@@ -15,6 +15,19 @@ import { DAY_SECONDS } from './constants';
  * of them changed vehicles earlier on this journey (the others get the no-transfer bonus at their destination).
  */
 export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
+
+/** Re-key after retargeting/loading without combining groups whose drop-offs converged (or their clocks). */
+export function cargoGroups(groups: Iterable<CargoGroup>): Map<string, CargoGroup> {
+  const out = new Map<string, CargoGroup>();
+  for (const c of groups) {
+    if (c.rail !== undefined) c.rail = railHistory(c.rail) || undefined;
+    const base = fareGroupKey(c.from, c.alight, c.dest, c.rail ?? 0);
+    let key = base;
+    for (let i = 1; out.has(key); i++) key = base + ':' + i;
+    out.set(key, c);
+  }
+  return out;
+}
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
@@ -169,7 +182,7 @@ export abstract class Vehicle {
       } else {
         // changing here: they wait for their next leg (all of them have transferred now)
         const hop = g.lines.nextHop(st.id, c.dest);
-        const rail = mode === 'rail' ? before + distanceFare(dist) : before;
+        const rail = railHistory(mode === 'rail' ? before + distanceFare(dist) : before);
         if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n, rail));
       }
       moved += c.count;
@@ -212,13 +225,12 @@ export abstract class Vehicle {
         if (wg.transfers) wg.transfers = Math.max(0, wg.transfers - tr);
         st.waitingTotal -= take;
         if (wg.count <= 0) st.waiting.delete(k);
-        const ck = st.id + ':' + wg.alight + ':' + wg.dest;
+        const ck = fareGroupKey(st.id, wg.alight, wg.dest, wg.rail ?? 0);
         const cg = this.cargo.get(ck);
         if (cg) {
           cg.day = (cg.day * cg.count + g.day * take) / (cg.count + take);
           cg.t0 = ((cg.t0 ?? now) * cg.count + t0 * take) / (cg.count + take);
           cg.transfers = (cg.transfers ?? 0) + tr;
-          if (cg.rail || wg.rail) cg.rail = ((cg.rail ?? 0) * cg.count + (wg.rail ?? 0) * take) / (cg.count + take);
           cg.count += take;
         } else this.cargo.set(ck, wg.rail ? { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr, rail: wg.rail }
           : { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr });
@@ -239,7 +251,9 @@ export abstract class Vehicle {
     const l = this.line;
     if (!l || !l.stops.length) { this.dumpCargo(); return; }
     const next = this.targetStation();
-    for (const c of this.cargo.values()) if (!servesStation(l, this.pattern, c.alight) && next) c.alight = next.id;
+    let changed = false;
+    for (const c of this.cargo.values()) if (!servesStation(l, this.pattern, c.alight) && next) { c.alight = next.id; changed = true; }
+    if (changed) this.cargo = cargoGroups(this.cargo.values());
   }
 
   /** Drop all passengers (e.g. when sold or line removed). */

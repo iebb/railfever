@@ -1255,9 +1255,7 @@ export class AIController {
   private onError(e: unknown) {
     if (!this.errorLogged) { this.errorLogged = true; console.warn(`AI ${this.name}:`, e); }
     this.note('error: ' + String((e as Error)?.message ?? e));
-    try { this.job?.return(undefined); if (this.project) this.abandon(this.project); } catch { /* ignore */ }
-    this.project = null;
-    this.job = null;
+    try { this.cancelJob(); } catch { /* ignore */ }
     this.state.phase = 'idle';
     this.state.cooldown = 30;
   }
@@ -1333,9 +1331,7 @@ export class AIController {
   /** The company was bought: stop and remove a half-built project. */
   dispose() {
     if (this.disposed) return;
-    try { this.job?.return(undefined); if (this.project) this.abandon(this.project); } catch { /* ignore */ }
-    this.project = null;
-    this.job = null;
+    try { this.cancelJob(); } catch { /* ignore */ }
     this.disposed = true;
     this.state.phase = 'bought';
     const ls = this.game.world.net.onSplit, i = ls.indexOf(this.splitListener);
@@ -1735,8 +1731,15 @@ export class AIController {
       : p && !p.built ? Math.round((4 + this.rng.int(8)) / Math.sqrt(act)) : Math.round((20 + this.rng.int(20)) / Math.sqrt(act));
   }
 
+  /** Cancel both running work and the saved cursor, even when generator/project cleanup throws. */
+  private cancelJob() {
+    try { this.job?.return(undefined); if (this.project) this.abandon(this.project); }
+    finally { this.project = null; this.job = null; delete this.state.through; }
+  }
+
   /** Remove what an unfinished project built. */
   private abandon(p: Project) {
+    delete this.state.through;
     const g = this.game;
     if (p.kind === 'tram') { this.tram?.cleanup(); return; }
     // A completed railway survives interrupted works, including the interval before its first train is bought.
@@ -4240,8 +4243,7 @@ export class AIController {
   private recoverCash() {
     const g = this.game, e = this.eco;
     if (this.job && !this.project?.joint) {
-      this.job.return(undefined); if (this.project) this.abandon(this.project);
-      this.job = null; this.project = null;
+      this.cancelJob();
       this.note('paused new projects: cash at the loan limit for six months');
     }
     const lines = g.lines.all().sort((a, b) => this.railPolicy.lossOrder(a.id, b.id));
@@ -4746,12 +4748,12 @@ export class AIController {
     const s = data?.state;
     if (!s) return;
     this.state = { phase: s.phase ?? 'idle', cooldown: s.cooldown ?? 10, projects: s.projects ?? 0 };
+    if (Array.isArray(s.corridor) && s.corridor.length === 2) this.state.corridor = [s.corridor[0], s.corridor[1]];
     // a through service being planned resumes where it was (its cursor), as the running game goes on with it
-    if (s.through && typeof s.through.line === 'number') {
+    if (!s.project && s.through && typeof s.through.line === 'number') {
       this.state.through = { line: s.through.line, end: s.through.end, mode: s.through.mode === 'metro' ? 'metro' : 'lightrail', at: s.through.at ?? 0 };
       this.job = this.throughJob();
     }
-    if (Array.isArray(s.corridor) && s.corridor.length === 2) this.state.corridor = [s.corridor[0], s.corridor[1]];
     if (typeof s.rng === 'number') this.rng.state = s.rng;
     if (Array.isArray(s.failed)) this.failed = new Map(s.failed);
     if (s.stats) this.stats = { ...this.stats, ...s.stats };

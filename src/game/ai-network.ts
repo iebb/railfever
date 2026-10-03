@@ -2070,8 +2070,15 @@ class NetPlanner {
         if (covered.has(id)) continue;
         const b = g.world.buildings.get(id);
         if (!b || b.pop <= 0) continue;
-        const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
-        pop += b.pop * coverOf(walkWeight(at.distance)) / (1 + others);
+        const weight = walkWeight(at.distance);
+        let sum = weight, best = weight;
+        for (const sid of g.stations.stationsForBuilding(id).st) {
+          if (sid === st.id || !g.lines.stationServed(sid)) continue;
+          const other = g.stations.get(sid), reach = other && walkingCatchment(g, other).buildings.get(id);
+          if (!reach) continue;
+          const w = walkWeight(reach.distance); sum += w; best = Math.max(best, w);
+        }
+        pop += b.pop * weight / sum * coverOf(best);
       }
       return pop;
     };
