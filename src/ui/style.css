@@ -559,8 +559,8 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .title { position: absolute; inset: 0; z-index: 90000; display: flex; padding: var(--sp-6); overflow: auto; pointer-events: auto; background: radial-gradient(ellipse at 30% 40%, rgba(10, 14, 20, 0.35), rgba(8, 11, 16, 0.82)); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 .title * { pointer-events: auto; }
 /* safe centring: content wraps instead of overflowing off-screen */
-.title-row { margin: auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 28px; max-width: 100%; }
-.title-main { display: flex; flex-direction: column; gap: 22px; min-width: min(300px, 100%); max-width: 420px; animation: fadeIn 0.3s var(--ease); }
+.title-row { margin: auto; display: flex; flex-wrap: nowrap; align-items: center; justify-content: center; gap: 28px; width: 100%; max-width: 100%; }
+.title-main { display: flex; flex-direction: column; gap: 22px; flex: 0 0 420px; min-width: min(280px, 100%); max-width: 420px; animation: fadeIn 0.3s var(--ease); }
 .wordmark { font: 700 clamp(56px, 9vw, 104px)/0.86 var(--font-display); letter-spacing: 0.035em; color: #fff; text-shadow: 0 4px 30px rgba(0, 0, 0, 0.5); }
 .wordmark span { color: var(--accent); }
 .motif { display: block; width: 100%; max-width: 380px; height: auto; margin-top: -6px; }
@@ -578,7 +578,10 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .savechip.show { opacity: 1; transform: none; }
 .savechip.saved .ic { color: var(--pos); }
 .savechip.error { color: var(--warn); }
-.ng-card { width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
+.ng-card { flex: 0 0 auto; width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
+/* menu and new-game card always side by side; they stack only on narrow screens */
+@media (max-width: 1040px) { .title-main { flex: 0 1 420px; } }
+@media (max-width: 760px) { .title-row { flex-wrap: wrap; } .title-main { flex: 1 1 100%; } }
 .ng-title { font: 700 var(--fs-24)/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; margin-bottom: var(--sp-2); }
 .ai-chips { display: flex; gap: 5px; flex-wrap: wrap; }
 .ai-chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px 0 7px; border-radius: 6px; background: var(--raised); font: 600 var(--fs-12)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; }
