@@ -3,6 +3,7 @@ import type { UI } from './ui';
 import { h, clear, section, icon, toggle, field, add } from './dom';
 import { fmtMoney } from '../game/economy';
 import { saveToSlot, loadFromSlot, listSlots, deleteSlot, exportToFile, importFromText } from '../game/save';
+import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
@@ -34,7 +35,7 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
     if (mode === 'save') {
       const name = h('input', { class: 'input', style: 'flex:1', value: `${ui.game.player.name} – ${fmtDate(ui.game)}`, 'aria-label': 'Save name' }) as HTMLInputElement;
       add(win.body, h('div', { class: 'inline' }, name, h('button', { class: 'btn primary', onclick: async () => {
-        try { await saveToSlot(ui.game, 'slot' + Date.now(), name.value); ui.toast('Game saved', 'good'); render(); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); }
+        try { await saveToSlot(ui.game, 'slot' + Date.now(), name.value); savedNotice(ui); render(); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); }
       } }, icon('save', 16), 'Save')));
     }
     add(win.body, section('Saved games', String(slots.length)));
@@ -45,24 +46,36 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
         h('div', { style: 'min-width:0' }, h('b', null, s.name), h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}`)),
         h('div', { class: 'rowbtns' },
           mode === 'save'
-            ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); ui.toast('Game saved', 'good'); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
+            ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); savedNotice(ui); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
             : h('button', { class: 'btn sm primary', onclick: async () => {
-              try { const g = await loadFromSlot(s.slot); win.close(); ui.app.setGame(g); ui.toast('Game loaded', 'good'); } catch (e) { ui.toast('Load failed: ' + (e as Error).message, 'bad'); }
+              try {
+                const g = await loadFromSlot(s.slot);
+                if (await (ui.app.setGame(g) as unknown as Promise<boolean>)) { win.close(); ui.toast('Game loaded', 'good'); }
+              } catch (e) { ui.toast('Load failed: ' + (e as Error).message, 'bad'); }
             } }, 'Load'),
           h('button', { class: 'ibtn sm', 'data-tip': 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
     }
-    add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
+    add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, storageMode() === 'memory'
+      ? "Saves won't survive a reload in this browser mode — use Export to keep your game"
+      : 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
+    add(win.body, h('div', { class: 'btns right' }, h('button', { class: 'btn', onclick: () => exportSave(ui) }, icon('export', 16), 'Export'), h('button', { class: 'btn', onclick: () => importSave(ui) }, icon('import', 16), 'Import')));
   };
   render();
 }
 
-async function exportSave(ui: UI) {
+function savedNotice(ui: UI) {
+  ui.hud.showSave('saved');
+  ui.toast(storageMode() === 'memory' ? 'Saved for this session — Export to keep your game' : 'Game saved', storageMode() === 'memory' ? 'info' : 'good');
+}
+
+export async function exportSave(ui: UI) {
   try {
     const blob = await exportToFile(ui.game);
     const a = h('a', { href: URL.createObjectURL(blob), download: `railfever-${ui.game.year}.rfsave` });
     document.body.appendChild(a);
     a.click();
     a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   } catch (e) { ui.toast('Export failed: ' + (e as Error).message, 'bad'); }
 }
 
@@ -71,7 +84,10 @@ function importSave(ui: UI) {
   inp.addEventListener('change', async () => {
     const f = inp.files?.[0];
     if (!f) return;
-    try { const g = await importFromText(await f.text()); ui.wm.closeAll(); ui.app.setGame(g); ui.toast('Game imported', 'good'); }
+    try {
+      const g = await importFromText(await f.text());
+      if (await (ui.app.setGame(g) as unknown as Promise<boolean>)) { ui.wm.closeAll(); ui.toast('Game imported', 'good'); }
+    }
     catch (e) { ui.toast('Import failed: ' + (e as Error).message, 'bad'); }
   });
   inp.click();
