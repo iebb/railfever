@@ -316,7 +316,7 @@ export class Tools {
     this.parallel = null;
     this.hoverVeh = null;
     this.ui.hoverCard?.set(null);
-    this.ui.mapModes.clearRouteHover();
+    this.ui.mapModes.clearPointerHover();
     this.clearVisuals();
     const u = this.terr;
     if (u.uGrid) u.uGrid.value = CONSTRUCTION.includes(t) && t !== 'signal' ? 1 : 0;

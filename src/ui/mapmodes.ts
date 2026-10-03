@@ -64,8 +64,11 @@ export class MapModes {
   filter: LineFilter = getFilter('map');
   filterVer = 0;
   display: 'lines' | 'stations' = 'lines';
-  /** lines map hover sources: a legend row, the name tag, a station's number, the route under the pointer, a tap */
-  private hov = { list: null as number | null, tag: null as number | null, label: null as number | null, station: null as number | null, pick: null as LineSpot | null, tap: null as LineSpot | null };
+  /**
+   * lines map hover sources: a legend row under the pointer or with the keyboard focus, the name tag, a station's
+   * number, the route under the pointer, a tap
+   */
+  private hov = { list: null as number | null, kbd: null as number | null, tag: null as number | null, label: null as number | null, station: null as number | null, pick: null as LineSpot | null, tap: null as LineSpot | null };
   /** line whose numbers come first at interchanges (see orderFocus) */
   private focus: number | null = null;
   /** routes in a grid of world cells, for hover picking */
@@ -118,17 +121,33 @@ export class MapModes {
     try { const d = localStorage.getItem(DISPLAY_KEY); if (d === 'lines' || d === 'stations') this.display = d; } catch { /* ignore */ }
   }
 
-  /** Line highlighted with its name shown: hovered in the legend, by its name tag, a station's number or its route
-   *  (tapped on touch); null when none. */
+  /** Line highlighted with its name shown: hovered or focused in the legend, by its name tag, a station's number or
+   *  its route (tapped on touch); null when none. */
   get hoverLine(): number | null {
     const h = this.hov;
-    return h.list ?? h.tag ?? h.label ?? h.tap?.line ?? h.pick?.line ?? null;
+    return h.list ?? h.kbd ?? h.tag ?? h.label ?? h.tap?.line ?? h.pick?.line ?? null;
   }
 
   private clearHover() {
-    this.hov = { list: null, tag: null, label: null, station: null, pick: null, tap: null };
+    this.hov = { list: null, kbd: null, tag: null, label: null, station: null, pick: null, tap: null };
     this.focus = null;
     this.lastTag = null;
+  }
+
+  /** Does a line (still) stop at a station or another station of its transfer complex? */
+  private stopsAt(line: number, station: number): boolean {
+    const g = this.ui.game, l = g.lines.get(line);
+    if (!l || !g.stations.get(station)) return false;
+    if (l.stops.includes(station)) return true;
+    const of = this.ui.renderer.labels.complexOf, main = of?.get(station);
+    return main !== undefined && l.stops.some((s) => of!.get(s) === main);
+  }
+
+  /** Forget a station's number hovered or tapped once the station is gone or its line no longer stops there. */
+  private dropStaleStations() {
+    const h = this.hov;
+    if (h.tap?.station != null && !this.stopsAt(h.tap.line, h.tap.station)) h.tap = null;
+    if (h.station != null && (h.label == null || !this.stopsAt(h.label, h.station))) { h.label = null; h.station = null; }
   }
 
   /** Station whose numbers are under the pointer (lines map, line display): it gets the hover card. */
@@ -142,7 +161,10 @@ export class MapModes {
     this.hov.pick = this.pickRoute(clientX, clientY, ground);
     return !!this.hov.pick;
   }
+  /** The pointer left the map: forget the route under it (a line tapped on touch stays shown). */
   clearRouteHover() { this.hov.pick = null; }
+  /** Another tool: forget the route under the pointer and a tapped line. */
+  clearPointerHover() { this.hov.pick = null; this.hov.tap = null; }
 
   /**
    * A click on the map (inspect tool) in the lines map: a route opens its line. On touch the first tap only shows
@@ -158,10 +180,11 @@ export class MapModes {
     return true;
   }
 
+  /** The route under a screen point while the pointer is over the map (`ground`: the terrain point there). */
   private pickRoute(clientX: number, clientY: number, ground: THREE.Vector3 | null): LineSpot | null {
     if (this.mode !== 'lines' || !ground || this.index.empty) return null;
     const r = this.ui.renderer;
-    const hit = this.index.pick(r.camera, r.renderer.domElement.getBoundingClientRect(), clientX, clientY, ground, this.hoverLine);
+    const hit = this.index.pick(r.camera, r.renderer.domElement.getBoundingClientRect(), clientX, clientY, this.hoverLine);
     return hit && this.visIds.has(hit.line) ? { line: hit.line, x: hit.x, y: hit.y, z: hit.z } : null;
   }
 
@@ -230,6 +253,7 @@ export class MapModes {
       // forget hovers of lines no longer shown
       const h = this.hov;
       if (h.list != null && !vis.has(h.list)) h.list = null;
+      if (h.kbd != null && !vis.has(h.kbd)) h.kbd = null;
       if (h.tag != null && !vis.has(h.tag)) h.tag = null;
       if (h.label != null && !vis.has(h.label)) { h.label = null; h.station = null; }
       if (h.pick && !vis.has(h.pick.line)) h.pick = null;
@@ -274,6 +298,7 @@ export class MapModes {
     const g = this.ui.game;
     const ov = this.ui.renderer.overlay;
     const lines = this.visibleLines(dt);
+    this.dropStaleStations();
     // routes: checked when the network or the lines changed, else a few times a second
     this.pathT -= dt;
     if (this.pathT <= 0 || this.pathNv !== g.networkVersion || this.pathLv !== g.lines.version || this.pathFv !== this.visFv) {
@@ -361,7 +386,7 @@ export class MapModes {
    */
   private orderFocus(): number | null {
     const h = this.hov;
-    if (h.label == null && h.tag == null && h.tap?.station == null) this.focus = h.list ?? h.tap?.line ?? h.pick?.line ?? null;
+    if (h.label == null && h.tag == null && h.tap?.station == null) this.focus = h.list ?? h.kbd ?? h.tap?.line ?? h.pick?.line ?? null;
     return this.focus;
   }
 
@@ -412,7 +437,7 @@ export class MapModes {
     let t = this.lastTag;
     if (line == null) t = null;
     else if (!(h.tag === line && t?.line === line)) {
-      const spot = h.list === line ? null : h.label === line && h.station != null ? { line, x: 0, y: 0, z: 0, station: h.station } : h.tap?.line === line ? h.tap : h.pick?.line === line ? h.pick : null;
+      const spot = h.list === line || h.kbd === line ? null : h.label === line && h.station != null ? { line, x: 0, y: 0, z: 0, station: h.station } : h.tap?.line === line ? h.tap : h.pick?.line === line ? h.pick : null;
       const s = spot?.station != null ? g.stations.get(spot.station) : undefined;
       if (s) t = this.display === 'lines'
         ? { line, x: s.x, y: markY(g, s), z: s.z, gap: markHalfHeight(this.ui.renderer.controls.smoothDistance) + 5, below: true }
@@ -444,6 +469,9 @@ export class MapModes {
     if (sig === this.listSig) return;
     this.listSig = sig;
     const c = this.card;
+    // (a legend row with the keyboard focus keeps it through the rebuild)
+    let refocus: number | null = null;
+    for (const [id, row] of this.rows) if (row === document.activeElement) refocus = id;
     clear(c);
     this.rows.clear();
     this.rowOn = null;
@@ -462,12 +490,16 @@ export class MapModes {
         h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Routes in their colours, station numbers on the stations (B)'], ['stations', 'Stations', 'Station pins with names, waiting passengers and all numbers (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
         filterBar(g, this.filter, modeCounts(g, all, this.filter), () => { this.filterVer++; this.listSig = ''; }, true),
         lines.length
+          // rows are buttons: Tab to a line shows it on the map with its name, as pointing at it does; Enter opens it
           ? h('div', { class: 'mc-list' }, lines.map((l) => {
-            const row = h('div', {
-              class: 'mc-row',
+            const row = h('button', {
+              type: 'button', class: 'mc-row', 'data-sfx': 'none',
               'data-tip': `${l.name} · ${l.vehicles.length} vehicle${l.vehicles.length === 1 ? '' : 's'}${l.owner !== PLAYER ? ' · ' + g.company(l.owner).name : ''}`,
               onpointerenter: () => { this.hov.list = l.id; },
               onpointerleave: () => { if (this.hov.list === l.id) this.hov.list = null; },
+              onfocus: () => { this.hov.kbd = l.id; },
+              onblur: () => { if (this.hov.kbd === l.id) this.hov.kbd = null; },
+              onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); this.ui.openLine(l.id); } },
               onclick: () => this.ui.openLine(l.id),
             }, lineSymbol(g, l, 'sm'), icon(MODE_META[lineMode(g, l)].icon, 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null);
             this.rows.set(l.id, row);
@@ -477,6 +509,9 @@ export class MapModes {
         h('div', { class: 'mc-note' }, note),
         this.queue.length ? h('div', { class: 'mc-note' }, `Tracing routes… ${this.queue.length}`) : null),
     );
+    const again = refocus != null ? this.rows.get(refocus) : undefined;
+    if (again) again.focus({ preventScroll: true });
+    else if (refocus != null) this.hov.kbd = null;
     this.syncRows();
   }
 

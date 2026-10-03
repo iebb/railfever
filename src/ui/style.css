@@ -892,6 +892,12 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .lbl.mk.dim > * { opacity: 0.4; }
 .lbl.mk.hl .snum, .lbl.mk.hl .mk-dot { box-shadow: 0 0 0 2px #fff, 0 2px 8px rgba(0, 0, 0, 0.55); }
 .lbl.mk:hover { z-index: 240000 !important; }
+/* Lines map legend rows are buttons: Tab to a line shows it on the map with its name, Enter opens it. The focus ring
+   is drawn inside the row (the scrolling list would clip it outside). */
+#app button.mc-row { width: 100%; margin: 0; border: 0; background: transparent; text-align: left; font-size: var(--fs-13); font-weight: 500; }
+#app button.mc-row:hover, #app button.mc-row.on { background: var(--raised-2); }
+#app button.mc-row:active { background: var(--raised-3); }
+#app button.mc-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; background: var(--raised-2); }
 .svh button.pk { border: 0; cursor: pointer; transition: filter var(--t-fast), transform var(--t-fast); }
 .svh button.pk:hover { filter: brightness(1.15); }
 .svh button.pk:active { transform: scale(0.95); }
