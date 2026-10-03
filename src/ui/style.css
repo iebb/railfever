@@ -755,6 +755,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .mc-modes { display: flex; gap: 6px; align-items: center; margin-top: 2px; }
 .mc-modes .seg { flex: 1; }
 .mc-modes .segb { flex: 1; justify-content: center; height: 28px; padding: 0 8px; font-size: var(--fs-12); }
+/* Mail demand map (scoped to the map card). The shared legend keeps the passenger palette and dash cues. */
+.mapcard .mc-demand-toggle { margin-bottom: 8px; }
+.mapcard .mc-demand-toggle .segb { min-width: 0; }
+.mapcard .mc-mail .mc-stats b { min-width: 54px; }
+.mapcard .mc-mail .mc-stats > div { align-items: flex-start; }
+.mapcard .mc-mail .mc-stats > div > span { min-width: 0; line-height: 1.35; }
+.mapcard .mc-mail .mc-num { font-variant-numeric: tabular-nums; }
 .mc-row .lsym { margin-right: -2px; }
 .mc-stn { display: flex; align-items: center; gap: 6px; min-height: 30px; padding: 3px 6px; border-radius: 7px; cursor: pointer; font-size: var(--fs-13); }
 .mc-stn:hover { background: var(--raised-2); }

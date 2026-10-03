@@ -7,8 +7,9 @@ import { PLAYER } from '../game/game';
 import { h, icon, clear, seg } from './dom';
 import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
-import { townDemandShare, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode } from './gameapi';
+import { townDemandShare, mailDemandView, fmtMailTonnes, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
+import { mailView, type MailView } from '../game/mail-view';
 import type { Arc, ShareRing } from '../render/overlay';
 import { fmtInt } from './dom';
 
@@ -55,6 +56,8 @@ export class MapModes {
   /** line highlighted from the legend or its route tag */
   hoverLine: number | null = null;
   demand: DemandView | null = null;
+  demandLayer: 'pax' | 'mail' = 'pax';
+  mailDemand: MailView | null = null;
   /** demand view: share of each town's trips the network can carry (by town id) */
   shares = new Map<number, number>();
   /** the card (lines legend / demand summary); placed in the left column by the UI */
@@ -110,7 +113,7 @@ export class MapModes {
       lb.lineChips.clear(); lb.routeTags.clear();
       lb.pinStations = null;
     }
-    if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.shares.clear(); }
+    if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.mailDemand = null; this.shares.clear(); }
     if (prev === 'catchment') { drawCatchStreets(ov, 'map', null); this.catchSig = ''; }
     if (prev === 'signals') { ov.setTrackLayers(null); ov.setSignalGhosts(null); this.blocks = null; this.blockSig = ''; }
     ov.setDim(DIM[m]);
@@ -405,6 +408,27 @@ export class MapModes {
   }
 
   // ------------------------------------------------------------------ demand view
+  setDemandLayer(layer: 'pax' | 'mail') {
+    if (layer === this.demandLayer) return;
+    this.demandLayer = layer;
+    this.demand = null; this.mailDemand = null; this.shares.clear(); this.demandT = 0;
+    if (this.mode !== 'demand') return;
+    const ov = this.ui.renderer.overlay;
+    ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null);
+    this.ui.renderer.labels.townInfo.clear();
+    this.ui.sound('toggle', { pitch: layer === 'mail' ? 1.1 : 0.9 });
+    this.updateDemand(0);
+  }
+
+  private demandToggle() {
+    const toggle = seg<'pax' | 'mail'>([
+      ['pax', 'Passengers', 'Potential passenger trips and served share'],
+      ['mail', 'Mail', 'Potential mail tonnes and estimated carried share'],
+    ], this.demandLayer, (v) => this.setDemandLayer(v));
+    toggle.setAttribute('aria-label', 'Demand cargo');
+    return h('div', { class: 'mc-modes mc-demand-toggle' }, toggle);
+  }
+
   /**
    * Regional demand: districts as circles coloured by the share of their residents the network serves (more
    * opaque where they produce more trips), the strongest origin-destination flows as raised arcs (width by
@@ -414,11 +438,13 @@ export class MapModes {
     this.demandT -= dt;
     if (this.demandT > 0) return;
     this.demandT = 0.5;
+    if (this.demandLayer === 'mail') { this.updateMailDemand(); return; }
     const g = this.ui.game;
     const d = demandView(g, PLAYER);
     if (d === this.demand) return; // cached per game day and network version
     this.demand = d;
     const ov = this.ui.renderer.overlay;
+    ov.setShareRings(null);
     const regions = d.regions ?? [];
     const byId = new Map(regions.map((r) => [r.id, r]));
     // flows: the 50 strongest plus every served one; weak ones fade, strong ones on top
@@ -460,6 +486,60 @@ export class MapModes {
       info.set(t.id, `${Math.round(frac * 100)}% served · ${fmtInt(t.potential)}/mo`);
     }
     this.renderDemandCard(d);
+  }
+
+  private updateMailDemand() {
+    const d = mailView(this.ui.game);
+    if (d === this.mailDemand) return;
+    this.mailDemand = d;
+    this.demand = mailDemandView(d);
+    const ov = this.ui.renderer.overlay;
+    ov.setCatchments('demand', null);
+    const towns = new Map(d.towns.map((t) => [t.id, t]));
+    const maxP = Math.max(Number.EPSILON, d.maxPotential);
+    const arcs: Arc[] = [];
+    for (const p of d.pairs.filter((p, i) => i < 50 || p.share > 0.01).slice(0, 160).reverse()) {
+      const A = towns.get(p.a), B = towns.get(p.b);
+      if (!A || !B) continue;
+      const k = Math.sqrt(p.potential / maxP);
+      arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.28 + k * 0.67, color: servedColor(p.share), dash: servedDash(p.share), h: 2 + p.dist * 0.2 });
+    }
+    ov.setArcs(arcs);
+    const rings: ShareRing[] = [];
+    const info = this.ui.renderer.labels.townInfo;
+    info.clear(); this.shares.clear();
+    for (const t of d.towns) {
+      this.shares.set(t.id, t.share);
+      info.set(t.id, `${Math.round(t.share * 100)}% carried · ${fmtMailTonnes(t.potential)} t/mo`);
+      rings.push({ x: t.x, z: t.z, r: Math.max(6, t.radius + 2), frac: t.share, color: servedColor(t.share) });
+    }
+    ov.setShareRings(rings);
+    this.renderMailCard(d);
+  }
+
+  private renderMailCard(d: MailView) {
+    const g = this.ui.game, c = this.card;
+    clear(c);
+    const unserved = d.towns.filter((t) => t.stations === 0).length;
+    const pairs = d.pairs.filter((p) => p.share < 0.5).sort((a, b) => (b.potential - b.carried) - (a.potential - a.carried)).slice(0, 5);
+    c.append(
+      h('div', { class: 'mc-head' }, icon('demand', 18), h('span', { class: 'mc-title' }, 'Demand'), h('span', { class: 'mc-sub' }, `${Math.round(d.potential > 0 ? d.carried / d.potential * 100 : 0)}% carried`),
+        h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close demand view', onclick: () => this.set('none') }, icon('close', 16))),
+      h('div', { class: 'mc-body mc-mail' },
+        this.demandToggle(),
+        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Mail carried share: orange and short dashes = 0%, blue and solid = 100%' }, h('span', null, '0% carried'), h('i'), h('span', null, '100%')),
+        h('div', { class: 'mc-stats' },
+          h('div', null, h('b', null, fmtMailTonnes(d.potential)), h('span', null, 'potential t / month')),
+          h('div', null, h('b', null, fmtMailTonnes(d.carried)), h('span', null, 'estimated carried t / month')),
+          unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a mail station`)) : null),
+        h('div', { class: 'mc-note' }, 'Arc width: potential mail in both directions. Colour and dash length: estimated carried share from mail routes, catchments and station ratings. Rings and labels: each town’s outgoing mail. Add mail vans, trucks or postbuses to carry mail.'),
+        pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest uncarried flows') : null,
+        pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {
+          class: 'mc-row', 'data-tip': `${fmtMailTonnes(p.potential)} t / month potential · ${fmtMailTonnes(p.carried)} t / month estimated carried · ${(p.dist / 100).toFixed(1)} km · ${Math.round(p.share * 100)}% carried`,
+          onclick: () => { const A = g.towns.list[p.a], B = g.towns.list[p.b]; if (A && B) this.ui.centerOn((A.x + B.x) / 2, (A.z + B.z) / 2, Math.max(60, p.dist * 0.9)); },
+        }, h('i', { class: servedDash(p.share) ? 'mc-dash' : '', style: `--c:${hexCss(servedColor(p.share))};background:${hexCss(servedColor(p.share))}` }),
+        h('span', { class: 'mc-name' }, `${g.towns.list[p.a]?.name ?? '?'} – ${g.towns.list[p.b]?.name ?? '?'}`), h('span', { class: 'mc-num' }, `${fmtMailTonnes(p.potential)} t`)))) : null),
+    );
   }
 
   /** Name of a demand region: the town, its centre, or the compass sector of an outer district. */
@@ -519,6 +599,7 @@ export class MapModes {
       h('div', { class: 'mc-head' }, icon('demand', 18), h('span', { class: 'mc-title' }, 'Demand'), h('span', { class: 'mc-sub' }, `${Math.round(total > 0 ? (carried / total) * 100 : 0)}% served`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close demand view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
+        this.demandToggle(),
         h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Colour scale: orange and dashed = unserved, blue and solid = served' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, fmtInt(total)), h('span', null, 'trips / month between towns')),
