@@ -23,6 +23,8 @@ export interface Line {
   num: number;
   /** the name follows the stops until the line is renamed (Lines.rename) */
   autoName: boolean;
+  /** A joined line retains its automatic name; its numeric prefix still follows company renumbering. */
+  joinedName?: string;
   /** the colour was picked automatically (until Lines.setColor) */
   autoColor: boolean;
   /**
@@ -150,11 +152,17 @@ export class Lines {
     if (!first && this.map.size) this.rebuild();
   }
 
-  /** lines merged into another as a service pattern (patterns.ts canonicalizeLines): old id -> line and pattern */
+  /** Lines merged or joined in patterns.ts: old id -> surviving line and the old service's pattern. */
   redirect = new Map<number, { line: number; pattern: number }>();
   /** A line by id (the id of a line merged into another leads to that line). */
   get(id: number) { const l = this.map.get(id); if (l) return l; const r = this.redirect.get(id); return r ? this.map.get(r.line) : undefined; }
   all() { return [...this.map.values()]; }
+
+  /** Redirect a removed line and its earlier aliases, remapping their services to the surviving patterns. */
+  redirectLine(from: number, into: number, pattern: number, patterns: ReadonlyMap<number, number>) {
+    for (const [id, r] of this.redirect) if (r.line === from) this.redirect.set(id, { line: into, pattern: patterns.get(r.pattern) ?? pattern });
+    this.redirect.set(from, { line: into, pattern });
+  }
 
   create(kind: Transport, owner = 0): Line {
     const id = this.nextId++;
@@ -181,6 +189,7 @@ export class Lines {
   rename(id: number, name: string) {
     const l = this.map.get(id);
     if (!l) return;
+    delete l.joinedName;
     const n = name.trim().slice(0, 48);
     if (!n) { l.autoName = true; l.name = this.autoNameOf(l); this.autoText.set(id, l.name); return; }
     l.name = n;
@@ -330,6 +339,7 @@ export class Lines {
 
   /** Automatic name from the mode and the stops, e.g. "R1 Chalthorpe – Whitewell", "Bus 3 Chalthorpe: Central – North". */
   autoNameOf(l: Line): string {
+    if (l.joinedName) return l.joinedName.replace(/^(RE?|Bus |Tram )\d+/, (_, prefix: string) => prefix + l.num);
     const g = this.game;
     const sts: Station[] = [];
     for (const id of l.stops) { const s = g.stations.get(id); if (s && !sts.includes(s)) sts.push(s); }

@@ -909,3 +909,20 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .lbl.stn.compact .lbl-mark,
 .lbl.stn.compact .lbl-chips,
 .lbl.stn.compact .lbl-badges { display: none; }
+
+/* Joining lines: candidates, a complete route and the shared terminus before confirmation. */
+.linejoin-note { margin: 8px 0; font-size: var(--fs-12); line-height: 1.5; overflow-wrap: anywhere; }
+.linejoin-choices { display: grid; gap: 6px; }
+.linejoin-choice { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--hairline); border-radius: var(--r); background: var(--raised); color: inherit; text-align: left; cursor: pointer; }
+.linejoin-choice:hover, .linejoin-choice.on { border-color: var(--accent); background: var(--accent-soft); }
+.linejoin-choice-text { display: grid; gap: 3px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.linejoin-choice-text > .muted { font-size: var(--fs-12); }
+.linejoin-route { margin: 8px 0 12px 18px; padding-left: 20px; border-left: 3px solid var(--linejoin-color); }
+.linejoin-route li { padding: 6px 4px; overflow-wrap: anywhere; }
+.linejoin-route li > .flag { margin-left: 8px; }
+.linejoin-route .junction { font-weight: 600; }
+.linejoin-reason { display: grid; gap: 4px; padding: 8px 10px; font-size: var(--fs-12); line-height: 1.4; overflow-wrap: anywhere; }
+.linejoin-info .btns .btn { height: auto; min-height: 34px; white-space: normal; }
+@media (min-width: 721px) {
+  .linejoin-info { max-height: min(620px, calc(100vh - 200px)); }
+}

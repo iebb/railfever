@@ -20,7 +20,7 @@ import { demandView } from '../game/demand';
 import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LineMode } from './lineid';
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
-import { subsetOf, linePatterns } from '../game/patterns';
+import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
 
 /** Does the station offer stops for this transport mode? */
 export function servesKind(g: Game, st: Station, kind: LineKind): boolean {
@@ -266,6 +266,7 @@ export function openLine(ui: UI, id: number) {
       if (mine) {
         add(win.body, h('div', { class: 'btns' },
           h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
+          h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops before joining lines' : 'Combine two lines at a shared terminus into a through line', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),
           l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Signal the line’s track by the rules (preview first)', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
         if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'A line needs at least two stops.'));
       }
@@ -308,6 +309,61 @@ export function openLine(ui: UI, id: number) {
   };
   win.refresh = () => { if (!renaming) render(); };
   win.onClose = () => { if (ui.tools.tool === 'line-edit' && ui.tools.lineEditId === id) ui.tools.setTool('inspect'); };
+  render();
+}
+
+/** Pick a connected terminus, review the complete route and confirm the join. */
+function openLineJoin(ui: UI, id: number) {
+  const g = ui.game, line = g.lines.get(id);
+  if (!line || line.owner !== PLAYER) return;
+  const win = ui.wm.open('line-join-' + line.id, 'Join with line…', { width: 520, icon: 'lines', color: line.color, cls: 'linejoin-info' });
+  let selected: number | undefined;
+  let error = '';
+  const render = () => {
+    const l = g.lines.map.get(id);
+    if (!l || l.owner !== PLAYER) { win.close(); return; }
+    clear(win.body);
+    win.sub.textContent = l.name;
+    const choices = g.lines.all().filter((other) => other.id !== id).map((other) => ({ other, check: canJoinLines(g, l, other) }));
+    const candidates = choices.filter((c) => c.check.ok);
+    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines at a shared terminus. Through vehicles can carry passengers across the junction without changing trains or buses.'));
+    if (error) add(win.body, h('div', { class: 'alert warn', role: 'alert' }, error));
+    if (!candidates.length) {
+      add(win.body, h('div', { class: 'alert info' }, choices.length ? 'No lines can be joined right now.' : 'There are no other lines to join.'));
+      // Reasons at an actual shared terminus are most useful (disconnected platforms, access or rolling stock).
+      const rejected = choices.filter((c) => !c.check.ok).sort((a, b) => Number(b.check.junction !== null) - Number(a.check.junction !== null));
+      if (rejected.length) add(win.body, h('div', { class: 'list linejoin-reasons' }, rejected.slice(0, 8).map(({ other, check }) => h('div', { class: 'linejoin-reason' },
+        h('b', null, other.name), h('span', { class: 'muted' }, check.reason)))));
+      add(win.body, h('div', { class: 'muted linejoin-note' }, 'Both lines need the same transport kind, a shared terminus and a connected route. Each operator must own a station on the joined line and have access to the route.'));
+      return;
+    }
+    add(win.body, section('Lines you can join', `${candidates.length}`), h('div', { class: 'list linejoin-choices' }, candidates.map(({ other, check }) => h('button', {
+      class: 'linejoin-choice' + (selected === other.id ? ' on' : ''), 'aria-pressed': selected === other.id ? 'true' : 'false',
+      onclick: () => { selected = other.id; error = ''; win.last = undefined; render(); },
+    }, lineSymbol(g, other, 'sm'), h('span', { class: 'linejoin-choice-text' }, h('b', null, other.name),
+      h('span', { class: 'muted' }, `Join at ${g.stations.get(check.junction!)?.name ?? '?'} · ${g.company(other.owner).name}`)), h('span', { class: 'muted' }, 'Preview')))));
+    const choice = candidates.find((c) => c.other.id === selected);
+    if (!choice || !choice.check.ok) return;
+    const preview = choice.check, survivor = g.lines.map.get(preview.into)!;
+    const junctionName = g.stations.get(preview.junction)?.name ?? '?';
+    add(win.body, section('Joined route', 'out and back'), h('ol', { class: 'linejoin-route', style: `--linejoin-color:${survivor.color}`, 'aria-label': 'Joined route' },
+      preview.route.map((sid) => h('li', { class: sid === preview.junction ? 'junction' : '' },
+        h('span', null, g.stations.get(sid)?.name ?? '?'), sid === preview.junction ? h('span', { class: 'flag thru' }, 'Junction') : null))),
+      h('p', { class: 'linejoin-note' }, h('b', null, survivor.name), ' keeps its name, code and colour. Existing vehicles keep their owners and their old sections as short-turn services. New vehicles default to the full through route.'),
+      h('div', { class: 'btns' }, h('button', { class: 'btn primary', onclick: () => {
+        // Revalidate: access or track may have changed while the preview was open.
+        const result = joinLines(g, id, choice.other.id);
+        if (typeof result === 'string') { error = result; win.last = undefined; render(); return; }
+        win.close();
+        ui.wm.close('line-' + result.from);
+        ui.wm.close('line-' + result.into);
+        ui.wm.get('lines')?.refresh?.();
+        ui.toast(result.text, 'good');
+        ui.sound('notify');
+        openLine(ui, result.into);
+      } }, icon('check', 16), `Join lines at ${junctionName}`), h('button', { class: 'btn', onclick: () => win.close() }, 'Cancel')));
+  };
+  win.refresh = render;
   render();
 }
 
