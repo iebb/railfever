@@ -188,6 +188,8 @@ export class Tools {
   private ground: THREE.Vector3 | null = null;
   private down: { x: number; y: number; button: number; ground: THREE.Vector3 | null; moved: boolean; hadStart: boolean; id: number; touch: boolean; t: number } | null = null;
   private touches = new Set<number>();
+  /** the pointer is a finger (no hover: the lines map shows a line on a tap instead) */
+  private touchPointer = false;
   /** A touch placement is committed only after a second tap on this preview. */
   private touchPreview: { point: THREE.Vector3; client: { x: number; y: number }; signature: string } | null = null;
   private shift = false;
@@ -227,7 +229,7 @@ export class Tools {
     window.addEventListener('pointermove', this.onMove);
     window.addEventListener('pointerup', this.onUp);
     canvas.addEventListener('pointerleave', (e) => {
-      if (!this.down && !this.touchPreview && !(e.relatedTarget instanceof Node && this.tooltip.contains(e.relatedTarget))) { this.overMap = false; this.hideTip(); }
+      if (!this.down && !this.touchPreview && !(e.relatedTarget instanceof Node && this.tooltip.contains(e.relatedTarget))) { this.overMap = false; this.hideTip(); this.ui.mapModes.clearRouteHover(); }
     });
     window.addEventListener('pointercancel', (e) => {
       this.touches.delete(e.pointerId);
@@ -314,6 +316,7 @@ export class Tools {
     this.parallel = null;
     this.hoverVeh = null;
     this.ui.hoverCard?.set(null);
+    this.ui.mapModes.clearRouteHover();
     this.clearVisuals();
     const u = this.terr;
     if (u.uGrid) u.uGrid.value = CONSTRUCTION.includes(t) && t !== 'signal' ? 1 : 0;
@@ -399,6 +402,7 @@ export class Tools {
   private onDown = (e: PointerEvent) => {
     if (!this.game || e.altKey || (e.button !== 0 && e.button !== 2)) return;
     const touch = e.pointerType === 'touch';
+    this.touchPointer = touch;
     if (touch) {
       this.touches.add(e.pointerId);
       if (this.touches.size > 1) {
@@ -446,6 +450,7 @@ export class Tools {
     if ((e.target as HTMLElement)?.closest?.('.tooltip')) return;
     if (e.pointerType === 'touch' && this.touches.size > 1) return;
     if (this.down && e.pointerId !== this.down.id) return;
+    this.touchPointer = e.pointerType === 'touch';
     this.client = { x: e.clientX, y: e.clientY };
     if (e.shiftKey !== this.shift && this.railBuild) { this.shift = e.shiftKey; this.moveDirty = true; }
     const t = e.target as HTMLElement;
@@ -455,7 +460,7 @@ export class Tools {
       d.moved = true;
       if (d.button === 0 && this.tool === 'bulldoze' && d.ground) this.dragRect = { x0: d.ground.x, z0: d.ground.z, x1: d.ground.x, z1: d.ground.z };
     }
-    if (!this.overMap && !this.down) { this.hideTip(); return; }
+    if (!this.overMap && !this.down) { this.hideTip(); this.ui.mapModes.clearRouteHover(); return; }
     this.moveDirty = true;
     this.positionTip();
   };
@@ -780,6 +785,7 @@ export class Tools {
       if (!this.building) this.clearVisuals();
       ov.setMarker('hover0', null);
       this.ui.hoverCard?.set(null);
+      this.ui.mapModes.clearRouteHover();
       this.hideTip();
       return;
     }
@@ -945,6 +951,9 @@ export class Tools {
   private hoverInspect(p: THREE.Vector3) {
     const g = this.game, ov = this.overlay;
     const card = this.ui.hoverCard;
+    // lines map: the route under the pointer highlights its line and shows its name (stations keep their card);
+    // a finger does not hover (a tap shows the line, see click)
+    const onRoute = this.tool === 'inspect' && this.ui.mapModes.hoverRoute(this.client.x, this.client.y, this.touchPointer ? null : p);
     // vehicles under the cursor (throttled raycast; retried next frame while throttled)
     if (this.tool === 'inspect') {
       const now = performance.now();
@@ -959,11 +968,15 @@ export class Tools {
         return;
       }
     }
-    const hit = this.hitAt(p.x, p.z);
+    let hit = this.hitAt(p.x, p.z);
+    // (lines map: the station whose numbers are under the pointer)
+    const numbered = this.tool === 'inspect' ? this.ui.mapModes.labelStation : null;
+    if (numbered != null && g.stations.get(numbered)) hit = { kind: 'station', id: numbered };
     ov.setHoverEdge(null);
     ov.setFootprints(null);
     if (this.hoverStation != null && (hit?.kind !== 'station' || hit.id !== this.hoverStation)) drawCatchStreets(ov, 'hover', null);
     this.hoverStation = null;
+    if (onRoute && hit?.kind !== 'station' && hit?.kind !== 'depot') { card.set(null); this.hideTip(); return; }
     // demand view: districts under the cursor explain their trips
     if (this.tool === 'inspect' && (!hit || hit.kind === 'town' || hit.kind === 'building')) {
       const reg = this.ui.mapModes?.regionAt(p.x, p.z);
@@ -1990,8 +2003,10 @@ export class Tools {
       case 'inspect': {
         const vid = this.ui.renderer.pickVehicle(e.clientX, e.clientY);
         if (vid != null) { this.ui.openVehicle(vid); return; }
-        if (!p) return;
-        const hit = this.hitAt(p.x, p.z);
+        const hit = p ? this.hitAt(p.x, p.z) : null;
+        // lines map: a route (not a station or depot on it) opens its line; a touch tap first shows it
+        const routeOk = !!p && hit?.kind !== 'station' && hit?.kind !== 'depot';
+        if (this.ui.mapModes.clickRoute(e.clientX, e.clientY, routeOk ? p : null, e.pointerType === 'touch')) return;
         if (hit) this.ui.openHit(hit);
         return;
       }

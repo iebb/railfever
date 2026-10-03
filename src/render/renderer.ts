@@ -406,6 +406,7 @@ export class Renderer {
 
     this.vehicles = new VehiclesView(this.mats);
     this.labels = new Labels(container);
+    this.labels.wheelTarget = this.renderer.domElement;
     const extra = (this.mats as unknown as { extra?: THREE.Material[] }).extra ?? [];
     for (const m of [this.mats.matte, this.mats.metal, this.mats.facade, this.mats.tree, this.mats.body, ...extra]) applyClouds(m);
 

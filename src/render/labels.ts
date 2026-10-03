@@ -1,15 +1,40 @@
 // In-world signage: town name plates and station plates (company colour, pictogram, JR-style numbering badges,
-// waiting count, stop marks of open lines), one plate per transfer complex, station pins with their numbers in the
-// lines map's station display, and line name tags with their symbols. Priority-capped, decluttered,
-// terrain-occluded; DOM writes only on change.
+// waiting count, stop marks of open lines), one plate per transfer complex. In the lines map: the station numbers
+// drawn on the stations themselves (line display) or station pins with all their numbers (station display), and the
+// name tag of the line under the pointer. Priority-capped, decluttered, terrain-occluded; DOM writes only on change.
 import * as THREE from 'three';
 import type { Game } from '../game/game';
+import type { Station } from '../game/stations';
 import { WATER_Y } from '../game/constants';
+import { ROUTE_LIFT } from './overlay';
 import { svg } from '../ui/icons';
 import { uiScale } from '../ui/uiscale';
 
-/** A station number badge as the UI computes it (ui/lineid.ts Badge). */
-export interface LabelBadge { code: string; prefix: string; num: string; color: string }
+/** A station number badge as the UI computes it (ui/lineid.ts Badge); `line`: the line it numbers (hover, tap). */
+export interface LabelBadge { code: string; prefix: string; num: string; color: string; line?: number }
+
+/**
+ * A station in the lines map's line display, drawn on the station itself: its numbering badges on the lines shown
+ * (a stop dot in its first line's colour when none of them numbers it). Built by the UI when the lines, the filter or
+ * the highlighted lines change; the label's DOM is rebuilt only when `sig` changes.
+ */
+export interface StationMark {
+  badges: LabelBadge[];
+  /** the lines shown that stop here; a hover or tap on the stop dot (or the name) picks the first */
+  lines: number[];
+  /** stop dot colour (stations without numbers) */
+  color: string;
+  /** interchange rank (lines at the station or its transfer complex): interchanges win where markers overlap */
+  rank: number;
+  /** on a highlighted line (placed first), or dimmed while another line is highlighted */
+  on: boolean;
+  dim: boolean;
+  /** content signature */
+  sig: string;
+}
+
+/** A line name tag: anchor, text, colour, highlighted, line symbol; drawn `gap` px above the anchor, or below it. */
+export interface RouteTag { x: number; y: number; z: number; text: string; color: string; hl: boolean; code?: string; gap?: number; below?: boolean }
 
 const STATION_NAME_MAX_DIST = 170;
 /**
@@ -25,6 +50,18 @@ const RAIL_SYMBOL_FADE_DIST = STATION_NAME_MAX_DIST * Math.exp(2 * 100 * 0.0014)
 const RAIL_SYMBOL_SIZE = 28;
 /** a small numbering badge on a plate (25 px square + 2 px gap, style.css .snum.sm) and a plate showing badges */
 const BADGE_W = 27, BADGED_PLATE_H = 29;
+/**
+ * Station numbers on the stations (lines map): badges side by side before "+n", a badge's height, a stop dot, the
+ * "+n" pill; beyond the rail-symbol zoom band only the first number shows (with "+n"), and fully zoomed out the
+ * markers are drawn at MARK_MIN_SCALE (numbers stay >= 9 px at the default interface size).
+ */
+const MARK_ROW = 3, MARK_BH = 25, MARK_DOT = 14, MARK_MORE_W = 22;
+const MARK_FAR_DIST = RAIL_SYMBOL_MAX_DIST;
+const MARK_MIN_SCALE = 0.84, MARK_SCALE_DIST = 700;
+/** labels on screen with station numbers shown (they are small) */
+const MARK_CAP = 150;
+/** px town names stand higher while station numbers are shown */
+const TOWN_LIFT = 10;
 
 /** Normal station plates become rail-only symbols for three more zoom steps. */
 export function stationLabelMode(camDist: number, rail: boolean): 'plate' | 'symbol' | 'hidden' {
@@ -38,18 +75,44 @@ export function railSymbolOpacity(camDist: number): number {
   return t * t * (3 - 2 * t);
 }
 
+/** Scale of the lines map's station numbers: 1 up to the station-name zoom, MARK_MIN_SCALE fully zoomed out. */
+export function markScale(camDist: number): number {
+  const t = Math.max(0, Math.min(1, (camDist - STATION_NAME_MAX_DIST) / (MARK_SCALE_DIST - STATION_NAME_MAX_DIST)));
+  return 1 - (1 - MARK_MIN_SCALE) * t;
+}
+
+/** Height of a station's numbers in the lines map: on its routes (platform tracks, or the road at its stops). */
+export function markY(game: Game, s: Station): number {
+  return (s.rail ? s.rail.y : Math.max(game.world.heightAt(s.x, s.z), WATER_Y)) + ROUTE_LIFT;
+}
+
+/** Half the screen height of a station's numbers (px), for placing a line tag below them. */
+export function markHalfHeight(camDist: number): number { return (MARK_BH / 2) * markScale(camDist) * uiScale(); }
+
+/** Anchor of a station pin (lines map, station display): the dot at the foot of the pin. */
+export function pinY(game: Game, s: Station): number {
+  return (s.rail ? s.rail.y + 1.0 : Math.max(game.world.heightAt(s.x, s.z), WATER_Y) + 0.8) - 0.9;
+}
+
 interface Label {
   el: HTMLDivElement;
-  kind: 'town' | 'stn' | 'tag';
+  kind: 'town' | 'stn' | 'tag' | 'mk';
+  /** town, station or line id */
+  id: number;
   name: HTMLSpanElement;
   sub: HTMLSpanElement;
   ico: HTMLSpanElement | null;
   mark: HTMLSpanElement | null;
-  chips: HTMLSpanElement | null;
   badges: HTMLSpanElement | null;
   sym: HTMLSpanElement | null;
-  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string; symText: string;
+  /** station numbers (lines map): the further badges, the "+n" pill and the stop dot */
+  extra: HTMLSpanElement | null;
+  more: HTMLSpanElement | null;
+  dot: HTMLSpanElement | null;
+  text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; symText: string; markSig: string;
   badgeData: string[]; badgeMax: number; nBadges: number;
+  /** tags: px between the anchor and the tag, and whether it hangs below the anchor */
+  gap: number; below: boolean;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
 }
 
@@ -63,10 +126,24 @@ function inkFor(bg: string): string {
   return lum > 0.5 ? '#0d1219' : '#ffffff';
 }
 
+function span(cls: string): HTMLSpanElement { const e = document.createElement('span'); e.className = cls; return e; }
+
+/** A numbering badge element (white square, line-colour border, letters over the number). */
+function badgeSpan(b: LabelBadge, cls = 'snum sm'): HTMLSpanElement {
+  const e = span(cls);
+  e.style.setProperty('--c', b.color);
+  if (b.line != null) e.dataset.line = String(b.line);
+  const i = document.createElement('i'); i.textContent = b.prefix;
+  const n = document.createElement('b'); n.textContent = b.num;
+  e.append(i, n);
+  return e;
+}
+
 export class Labels {
   container: HTMLDivElement;
   private towns = new Map<number, Label>();
   private stations = new Map<number, Label>();
+  private markers = new Map<number, Label>();
   onClickTown: (id: number) => void = () => {};
   onClickStation: (id: number) => void = () => {};
   visible = true;
@@ -74,14 +151,16 @@ export class Labels {
   marks = new Map<number, { color: string; text: string }>();
   /** maximum number of labels on screen */
   maxVisible = 60;
-  /** colours of the lines serving each station (shown as chips on the plates, e.g. in the lines map) */
-  lineChips = new Map<number, string[]>();
   /** text replacing the population pill of towns (e.g. share transported in the demand view) */
   townInfo = new Map<number, string>();
-  /** line name tags on routes (lines map): line id -> anchor, text, colour, highlighted, line symbol */
-  routeTags = new Map<number, { x: number; y: number; z: number; text: string; color: string; hl: boolean; code?: string }>();
+  /** line name tags (lines map: the hovered line's): line id -> anchor, text, colour, highlighted, line symbol */
+  routeTags = new Map<number, RouteTag>();
   onClickTag: (lineId: number) => void = () => {};
   onHoverTag: (lineId: number | null) => void = () => {};
+  /** the pointer is over a station's number (its line) or its marker (lines map); null when it leaves */
+  onHoverLine: (lineId: number | null, stationId: number | null) => void = () => {};
+  /** a tap (touch) on a station's number in the lines map: show that line; false = already shown (the tap opens the station) */
+  onTapLine: (lineId: number, stationId: number) => boolean = () => false;
   /** station numbering badges by station (set by the UI; JR style 'AS01'), or null */
   badges: Map<number, LabelBadge[]> | null = null;
   /** badges shown on a normal plate (the station display of the lines map shows more) */
@@ -90,8 +169,18 @@ export class Labels {
   complexOf: Map<number, number> | null = null;
   /** lines map station display: only these stations, drawn as pins with all their numbers; null = normal plates */
   pinStations: Set<number> | null = null;
+  /** lines map line display: only these stations, drawn as their numbers on the station itself; null = off */
+  stationMarks: Map<number, StationMark> | null = null;
+  /** station whose numbers all show while zoomed out (tapped on touch, as pointing at it shows them) */
+  openStation: number | null = null;
+  /** receives wheel events over the lines map's labels (the 3D view: zooming works over a station's numbers) */
+  wheelTarget: HTMLElement | null = null;
   private tags = new Map<number, Label>();
   private hoveredTag: number | null = null;
+  private hoverLn: number | null = null;
+  private hoverStn: number | null = null;
+  /** pointer type of the last press on a label (a touch tap on a number shows its line first) */
+  private downType = '';
   private hl: number | null = null;
   private v = new THREE.Vector3();
   private cands: Cand[] = [];
@@ -108,6 +197,12 @@ export class Labels {
     this.container = document.createElement('div');
     this.container.className = 'labels';
     parent.appendChild(this.container);
+    this.container.addEventListener('wheel', (e) => {
+      const t = this.wheelTarget;
+      if (!t || !(e.target as HTMLElement | null)?.closest?.('.lbl.mk, .lbl.pin, .lbl.tag')) return;
+      e.preventDefault();
+      t.dispatchEvent(new WheelEvent(e.type, e));
+    }, { passive: false });
   }
 
   /** Emphasise one station label (e.g. the selected station), or none. */
@@ -115,41 +210,79 @@ export class Labels {
 
   clear() {
     this.setHoverTag(null);
+    this.setHoverLine(null, null);
     this.container.innerHTML = '';
     this.towns.clear();
     this.stations.clear();
+    this.markers.clear();
     this.tags.clear();
     this.marks.clear();
     this.hl = null;
     this.complexRef = null;
     this.badgeRef = null;
     this.parts.clear(); this.merged.clear();
-    this.lineChips.clear(); this.routeTags.clear(); this.townInfo.clear();
-    this.badges = null; this.complexOf = null; this.pinStations = null;
+    this.routeTags.clear(); this.townInfo.clear();
+    this.badges = null; this.complexOf = null; this.pinStations = null; this.stationMarks = null; this.openStation = null;
     this.cands.length = 0; this.pool.length = 0; this.keep.clear();
   }
 
-  private make(kind: 'town' | 'stn' | 'tag', onClick: () => void): Label {
+  private make(kind: Label['kind'], id: number, onClick: () => void): Label {
     const el = document.createElement('div');
     el.className = 'lbl ' + kind;
-    const name = document.createElement('span'); name.className = 'lbl-name';
-    const sub = document.createElement('span'); sub.className = kind === 'town' ? 'lbl-pop' : 'lbl-wait';
-    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null, chips: HTMLSpanElement | null = null, badges: HTMLSpanElement | null = null, sym: HTMLSpanElement | null = null;
+    const name = span('lbl-name');
+    const sub = span(kind === 'town' ? 'lbl-pop' : 'lbl-wait');
+    let ico: HTMLSpanElement | null = null, mark: HTMLSpanElement | null = null, badges: HTMLSpanElement | null = null, sym: HTMLSpanElement | null = null;
+    let extra: HTMLSpanElement | null = null, more: HTMLSpanElement | null = null, dot: HTMLSpanElement | null = null;
     if (kind === 'stn') {
-      ico = document.createElement('span'); ico.className = 'lbl-ico';
-      mark = document.createElement('span'); mark.className = 'lbl-mark'; mark.style.display = 'none';
-      chips = document.createElement('span'); chips.className = 'lbl-chips'; chips.style.display = 'none';
-      badges = document.createElement('span'); badges.className = 'lbl-badges';
-      el.append(ico, badges, mark, name, sub, chips);
+      ico = span('lbl-ico');
+      mark = span('lbl-mark'); mark.style.display = 'none';
+      badges = span('lbl-badges');
+      el.append(ico, badges, mark, name, sub);
+    } else if (kind === 'mk') {
+      dot = span('mk-dot'); badges = span('mk-b'); extra = span('mk-x'); more = span('mk-more');
+      el.append(dot, badges, extra, more, name);
     } else if (kind === 'tag') {
-      sym = document.createElement('span'); sym.className = 'lcolor sm';
+      sym = span('lcolor sm');
       el.append(sym, name);
     } else el.append(name, sub);
-    el.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
-    el.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
+    el.addEventListener('pointerdown', (e) => { e.stopPropagation(); this.downType = e.pointerType; });
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (this.downType === 'touch' && (kind === 'mk' || kind === 'stn') && this.tapLine(kind, id, e.target)) return;
+      onClick();
+    });
+    if (kind === 'mk' || kind === 'stn') {
+      // a number picks its line; elsewhere on a marker its station's first line (mouse and pen: touch taps instead)
+      el.addEventListener('pointerover', (e) => {
+        if (e.pointerType === 'touch' || (kind === 'stn' && !this.pinStations)) return;
+        const line = this.lineAt(kind, id, e.target);
+        this.setHoverLine(line, line == null ? null : id);
+      });
+      el.addEventListener('pointerleave', (e) => { if (e.pointerType !== 'touch' && this.hoverStn === id) this.setHoverLine(null, null); });
+    }
     el.style.display = 'none';
     this.container.appendChild(el);
-    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeData: [], badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+    return { el, kind, id, name, sub, ico, mark, badges, sym, extra, more, dot, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', symText: '', markSig: '', badgeData: [], badgeMax: -1, nBadges: 0, gap: 0, below: false, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+  }
+
+  /** The line a pointer on a station label picks: a number's line, else (station numbers) the station's first line. */
+  private lineAt(kind: Label['kind'], id: number, target: EventTarget | null): number | null {
+    const b = (target as HTMLElement | null)?.closest?.('[data-line]') as HTMLElement | null;
+    if (b?.dataset.line) return Number(b.dataset.line);
+    return kind === 'mk' ? this.stationMarks?.get(id)?.lines[0] ?? null : null;
+  }
+
+  /** Touch tap on a station's numbers (lines map): the first tap shows the line, as hovering does. */
+  private tapLine(kind: Label['kind'], id: number, target: EventTarget | null): boolean {
+    if (kind === 'stn' && !this.pinStations) return false;
+    const line = this.lineAt(kind, id, target);
+    return line != null && this.onTapLine(line, id);
+  }
+
+  private setHoverLine(line: number | null, station: number | null) {
+    if (line === this.hoverLn && station === this.hoverStn) return;
+    this.hoverLn = line; this.hoverStn = station;
+    this.onHoverLine(line, station);
   }
 
   /** Complex parts and merged badges, when the complexes or the badges changed. */
@@ -170,29 +303,49 @@ export class Labels {
 
   update(game: Game, camera: THREE.PerspectiveCamera, w: number, h: number, camDist: number) {
     if (this.visible !== this.wasVisible) { this.wasVisible = this.visible; this.container.style.display = this.visible ? '' : 'none'; }
-    if (!this.visible) { this.setHoverTag(null); return; }
+    if (!this.visible) { this.setHoverTag(null); this.setHoverLine(null, null); return; }
     const world = game.world;
     const cands = this.cands;
     cands.length = 0;
     const cp = camera.position;
     this.refreshComplexes();
     const pins = this.pinStations;
-    // ---- towns
+    const smarks = this.stationMarks;
+    // ---- towns (with station numbers on the map, their names stand a little higher: a central station sits below)
     const townMax = Math.max(180, camDist * 3.2);
+    const townGap = smarks ? TOWN_LIFT * uiScale() : 0;
     for (const t of game.towns.list) {
       let l = this.towns.get(t.id);
-      if (!l) { const id = t.id; l = this.make('town', () => this.onClickTown(id)); this.towns.set(t.id, l); }
+      if (!l) { const id = t.id; l = this.make('town', id, () => this.onClickTown(id)); this.towns.set(t.id, l); }
+      if (l.gap !== townGap) { l.gap = townGap; l.sx = -1e9; }
       const info = this.townInfo.get(t.id);
       this.setText(l, t.name.toUpperCase(), info ?? t.pop.toLocaleString('en-US'), !info && t.served > 0);
       this.setCls(l, t.pop >= 3000 ? 'lbl town big' : 'lbl town');
       const y = Math.max(world.heightAt(t.x, t.z), WATER_Y) + 3 + Math.min(5, t.pop / 2500);
       cands.push(this.cand(l, t.x, y, t.z, 1e5 + t.pop, townMax, 1, false, 34));
     }
+    // ---- station numbers on the stations (lines map, line display): every zoom level, interchanges and busy
+    // stations first where they overlap; only the first number beyond the rail-symbol band, names when close
+    if (smarks) {
+      const far = camDist >= MARK_FAR_DIST, named = camDist < STATION_NAME_MAX_DIST, ms = markScale(camDist);
+      for (const [id, m] of smarks) {
+        const s = game.stations.get(id);
+        if (!s) continue;
+        let l = this.markers.get(id);
+        if (!l) { l = this.make('mk', id, () => this.onClickStation(id)); this.markers.set(id, l); }
+        this.setMarkContent(l, m, s.name);
+        const isHl = this.hl === id;
+        this.setCls(l, 'lbl mk' + (m.badges.length ? '' : ' dot') + (far ? ' far' : '') + (named ? ' named' : '') + (m.on ? ' on' : '') + (m.dim && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (this.openStation === id ? ' open' : ''));
+        // numbered stations above town names, unnumbered stop dots below them (unless their line is highlighted)
+        const prio = isHl ? 1e9 : (m.badges.length ? 3e5 : 4e4) + (m.on ? 2e5 : 0) + m.rank * 5000 + Math.min(8000, s.waitingTotal * 4 + (s.pickupLast + s.arrivedLast) * 0.2);
+        cands.push(this.cand(l, s.x, markY(game, s), s.z, prio, 1e5, ms, isHl, m.badges.length ? MARK_BH : MARK_DOT));
+      }
+    }
     // ---- stations (one plate per transfer complex: its main station's, with everyone waiting there)
     const stMax = Math.max(60, camDist * 2.6);
     const symbolOpacity = railSymbolOpacity(camDist);
     const pinMax = Math.max(400, camDist * 4);
-    for (const s of game.stations.map.values()) {
+    if (!smarks) for (const s of game.stations.map.values()) {
       const mk = this.marks.get(s.id);
       const isHl = this.hl === s.id;
       const main = this.complexOf?.get(s.id);
@@ -205,7 +358,7 @@ export class Labels {
       if (mode === 'hidden') continue;
       const compact = mode === 'symbol';
       let l = this.stations.get(s.id);
-      if (!l) { const id = s.id; l = this.make('stn', () => this.onClickStation(id)); this.stations.set(s.id, l); }
+      if (!l) { const id = s.id; l = this.make('stn', id, () => this.onClickStation(id)); this.stations.set(s.id, l); }
       const ids = !part && main !== undefined ? this.parts.get(s.id) : undefined;
       let served = game.lines.stationServed(s.id), waiting = s.waitingTotal;
       let size = s.rail ? s.rail.tracks * s.rail.length : 0;
@@ -214,7 +367,6 @@ export class Labels {
       if (!compact) {
         this.setText(l, s.name, served ? String(waiting) : '–', false);
         this.setMark(l, pins ? undefined : mk);
-        this.setChips(l, pins ? undefined : this.lineChips.get(s.id));
         const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
         this.setBadges(l, bl, pins ? 5 : this.badgeMax);
       }
@@ -229,16 +381,16 @@ export class Labels {
       let y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
       // Underground station symbols belong above the surface, so terrain does not bury them.
       if (compact) y = Math.max(y, Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8);
-      if (pins) y -= 0.9;
+      if (pins) y = pinY(game, s);
       const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
       // Selection raises symbol priority, but may not bypass their collisions or distance fade.
       cands.push(this.cand(l, s.x, y, s.z, prio, compact ? stMax : force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force && !compact, compact ? RAIL_SYMBOL_SIZE : pins ? 44 : l.nBadges ? BADGED_PLATE_H : 24, compact, compact ? symbolOpacity : 1));
     }
-    // ---- line name tags (lines map)
+    // ---- line name tags (lines map: the line under the pointer), above everything and outside the declutter
     for (const [id, t] of this.routeTags) {
       let l = this.tags.get(id);
       if (!l) {
-        l = this.make('tag', () => this.onClickTag(id));
+        l = this.make('tag', id, () => this.onClickTag(id));
         l.el.addEventListener('pointerenter', () => this.setHoverTag(id));
         l.el.addEventListener('pointerleave', () => { if (this.hoveredTag === id) this.setHoverTag(null); });
         this.tags.set(id, l);
@@ -246,11 +398,14 @@ export class Labels {
       if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
       const code = game.lines.get(id)?.kind === 'rail' ? t.code ?? '' : '';
       if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.className = code ? 'lsym sm' : 'lcolor sm'; }
-      this.setCls(l, t.hl ? 'lbl tag hl' : 'lbl tag');
+      const gap = t.gap ?? 0, below = !!t.below;
+      if (l.gap !== gap || l.below !== below) { l.gap = gap; l.below = below; l.sx = -1e9; }
+      this.setCls(l, 'lbl tag' + (t.hl ? ' hl' : '') + (below ? ' below' : ''));
       if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
-      cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 5000, 1, t.hl, 20));
+      cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 1e5, 1, t.hl, 20));
     }
-    for (const [id, l] of this.tags) if (!this.routeTags.has(id)) {
+    // (tags of other lines stay hidden for the next hover; those of deleted lines go)
+    if (this.tags.size > this.routeTags.size) for (const [id, l] of this.tags) if (!game.lines.map.has(id)) {
       if (this.hoveredTag === id) this.setHoverTag(null);
       l.el.remove(); this.tags.delete(id);
     }
@@ -275,30 +430,47 @@ export class Labels {
     placed.length = 0;
     const keep = this.keep;
     keep.clear();
-    const cap = pins ? Math.max(this.maxVisible, 90) : this.maxVisible;
+    const cap = pins ? Math.max(this.maxVisible, 90) : smarks ? Math.max(this.maxVisible, MARK_CAP) : this.maxVisible;
     // the interface size (Settings) zooms the labels' contents: their boxes grow with it
     const ui = uiScale();
     for (const c of cands) {
       if (keep.size >= cap && !c.force) break;
-      // never shrink below ~11 px text (smallest plate text is 12 px)
-      const s = (c.compact ? 1 : Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2))) * c.scale;
       const L = c.l;
-      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
+      let x0: number, x1: number, y0: number, y1: number;
+      // never shrink below ~11 px text (smallest plate text is 12 px); station numbers scale by zoom alone
+      const s = L.kind === 'mk' ? c.scale : (c.compact ? 1 : Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2))) * c.scale;
       c.h *= s * ui;
-      const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
+      if (L.kind === 'mk') {
+        // centred on the station; the name (close up) hangs to the right of the numbers
+        const far = L.cls.includes(' far'), nb = L.nBadges;
+        c.w = (nb ? (far ? 1 : Math.min(nb, MARK_ROW)) * BADGE_W - 2 + (!far && nb > MARK_ROW ? MARK_MORE_W : 0) : MARK_DOT) * s * ui;
+        const name = L.cls.includes(' named') ? (L.text.length * 6.4 + 18) * s * ui : 0;
+        x0 = c.sx - c.w / 2; x1 = c.sx + c.w / 2 + name; y0 = c.sy - c.h / 2; y1 = c.sy + c.h / 2;
+      } else {
+        c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
+        const lift = L.kind === 'town' ? L.gap : 0;
+        x0 = c.sx - c.w / 2; x1 = c.sx + c.w / 2; y0 = c.sy - c.h - lift; y1 = c.sy - lift;
+      }
+      // station numbers and town names are separate layers that never push each other out (numbers drawn on top);
+      // stop dots without numbers give way to town names
+      const layer = L.kind === 'mk' && L.nBadges ? 1 : L.kind === 'town' ? 2 : 0;
       let hit = false;
-      if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
+      if (!c.force) for (let i = 0; i < placed.length; i += 5) if (layer + placed[i + 4] !== 3 && x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z, L.shown ? OCCLUDE_KEEP : 0.05)) continue;
-      placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
+      if (!c.force && L.kind !== 'tag' && L.kind !== 'mk' && !pins && this.occluded(game, camera, c.x, c.y, c.z, L.shown ? OCCLUDE_KEEP : 0.05)) continue;
+      // (tags float above the rest: the labels under them keep their places while the pointer moves)
+      if (L.kind === 'mk') placed.push(x0 - 2, y0 - 1, x1 + 2, y1 + 1, layer);
+      else if (L.kind !== 'tag') placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2, layer);
       keep.add(L);
-      this.place(c, s, w, h);
+      this.place(c, s);
     }
     for (const l of this.towns.values()) if (l.shown && !keep.has(l)) this.hide(l);
     for (const l of this.stations.values()) if (l.shown && !keep.has(l)) this.hide(l);
+    for (const l of this.markers.values()) if (l.shown && !keep.has(l)) this.hide(l);
     for (const l of this.tags.values()) if (l.shown && !keep.has(l)) this.hide(l);
     // drop labels of removed towns / stations
     if (this.stations.size > game.stations.map.size) for (const [id, l] of this.stations) if (!game.stations.map.has(id)) { l.el.remove(); this.stations.delete(id); }
+    if (this.markers.size > game.stations.map.size) for (const [id, l] of this.markers) if (!game.stations.map.has(id)) { if (this.hoverStn === id) this.setHoverLine(null, null); l.el.remove(); this.markers.delete(id); }
     if (this.towns.size > game.towns.list.length) for (const [id, l] of this.towns) if (!game.towns.list[id]) { l.el.remove(); this.towns.delete(id); }
   }
 
@@ -344,47 +516,46 @@ export class Labels {
 
   private setCls(l: Label, cls: string) { if (l.cls !== cls) { l.cls = cls; l.el.className = cls; } }
 
-  private setChips(l: Label, colors: string[] | undefined) {
-    if (!l.chips) return;
-    const sig = colors ? colors.join(',') : '';
-    if (sig === l.chipSig) return;
-    l.chipSig = sig;
-    l.chips.style.display = sig ? '' : 'none';
-    l.chips.replaceChildren(...(colors ?? []).slice(0, 6).map((c) => { const i = document.createElement('i'); i.style.background = c; return i; }));
-    if (colors && colors.length > 6) { const m = document.createElement('b'); m.textContent = `+${colors.length - 6}`; l.chips.appendChild(m); }
-  }
-
   /** Numbering badges on a plate (at most `max`, then +n); compare content rather than refreshed objects. */
   private setBadges(l: Label, list: LabelBadge[] | null, max: number) {
     if (!l.badges) return;
     const count = list?.length ?? 0;
     const data = l.badgeData;
-    let changed = data.length !== count * 4 || l.badgeMax !== max;
+    let changed = data.length !== count * 5 || l.badgeMax !== max;
     if (list) for (let j = 0; j < count && !changed; j++) {
-      const b = list[j], k = j * 4;
-      changed = data[k] !== b.code || data[k + 1] !== b.prefix || data[k + 2] !== b.num || data[k + 3] !== b.color;
+      const b = list[j], k = j * 5;
+      changed = data[k] !== b.code || data[k + 1] !== b.prefix || data[k + 2] !== b.num || data[k + 3] !== b.color || data[k + 4] !== String(b.line);
     }
     if (!changed) return;
-    data.length = count * 4;
+    data.length = count * 5;
     if (list) for (let j = 0; j < count; j++) {
-      const b = list[j], k = j * 4;
-      data[k] = b.code; data[k + 1] = b.prefix; data[k + 2] = b.num; data[k + 3] = b.color;
+      const b = list[j], k = j * 5;
+      data[k] = b.code; data[k + 1] = b.prefix; data[k + 2] = b.num; data[k + 3] = b.color; data[k + 4] = String(b.line);
     }
     l.badgeMax = max;
     const shown = Math.min(count, max);
     l.nBadges = shown + (count > max ? 1 : 0);
     l.badges.replaceChildren();
-    for (let j = 0; j < shown; j++) {
-      const b = list![j];
-      const e = document.createElement('span');
-      e.className = 'snum sm';
-      e.style.setProperty('--c', b.color);
-      const i = document.createElement('i'); i.textContent = b.prefix;
-      const n = document.createElement('b'); n.textContent = b.num;
-      e.append(i, n);
-      l.badges.appendChild(e);
-    }
-    if (list && list.length > max) { const m = document.createElement('span'); m.className = 'snum-more'; m.textContent = `+${list.length - max}`; l.badges.appendChild(m); }
+    for (let j = 0; j < shown; j++) l.badges.appendChild(badgeSpan(list![j]));
+    if (list && list.length > max) { const m = span('snum-more'); m.textContent = `+${list.length - max}`; l.badges.appendChild(m); }
+  }
+
+  /**
+   * A station's numbers on the station (lines map): the first badge, the others beside it (close up: up to MARK_ROW
+   * in all, then "+n"; zoomed out they show on hover and a "+n" pill sits on the corner), or a stop dot; the name.
+   */
+  private setMarkContent(l: Label, m: StationMark, name: string) {
+    if (l.text !== name) { l.text = name; l.name.textContent = name; l.markSig = ''; }
+    if (l.markSig === m.sig) return;
+    l.markSig = m.sig;
+    const n = m.badges.length;
+    l.nBadges = n;
+    l.badges!.replaceChildren(...m.badges.slice(0, 1).map((b) => badgeSpan(b)));
+    l.extra!.replaceChildren(...m.badges.slice(1).map((b) => badgeSpan(b)));
+    l.more!.dataset.row = n > MARK_ROW ? `+${n - MARK_ROW}` : '';
+    l.more!.dataset.far = n > 1 ? `+${n - 1}` : '';
+    l.dot!.style.setProperty('--c', m.color);
+    l.el.setAttribute('aria-label', n ? `${name}: ${m.badges.map((b) => b.code).join(', ')}` : name);
   }
 
   private setHoverTag(id: number | null) {
@@ -395,22 +566,26 @@ export class Labels {
 
   private hide(l: Label) {
     if (this.hoveredTag != null && this.tags.get(this.hoveredTag) === l) this.setHoverTag(null);
+    if ((l.kind === 'mk' || l.kind === 'stn') && this.hoverStn === l.id) this.setHoverLine(null, null);
     l.shown = false; l.el.style.display = 'none';
   }
 
-  private place(c: Cand, s: number, w: number, h: number) {
+  private place(c: Cand, s: number) {
     const l = c.l;
     if (!l.shown) { l.shown = true; l.el.style.display = ''; l.sx = -1e9; }
     if (Math.abs(c.sx - l.sx) > 0.5 || Math.abs(c.sy - l.sy) > 0.5 || Math.abs(s - l.sc) > 0.01) {
       l.sx = c.sx; l.sy = c.sy; l.sc = s;
-      l.el.style.transform = `translate3d(${c.sx.toFixed(1)}px, ${c.sy.toFixed(1)}px, 0) translate(-50%, -100%) scale(${s.toFixed(3)})`;
+      // station numbers: centred on the station; tags (and town names over station numbers): a gap above (or below)
+      // the anchor; plates stand on it
+      const at = l.kind === 'mk' ? '-50%, -50%' : l.below ? `-50%, ${l.gap.toFixed(1)}px` : l.gap ? `-50%, calc(-100% - ${l.gap.toFixed(1)}px)` : '-50%, -100%';
+      l.el.style.transform = `translate3d(${c.sx.toFixed(1)}px, ${c.sy.toFixed(1)}px, 0) translate(${at}) scale(${s.toFixed(3)})`;
     }
     const steps = c.compact ? 100 : 20;
     const op = c.force ? 1 : Math.round(Math.min(c.opacity, Math.max(0, Math.min(1, (c.maxDist - c.d) / (c.maxDist * 0.25)))) * steps) / steps;
     if (op !== l.op) { l.op = op; l.el.style.opacity = String(op); }
-    const z = 100000 - Math.round(c.d * 10);
+    // (station numbers above town names, the hovered line's tag above everything)
+    const z = l.kind === 'tag' ? 250000 : (l.kind === 'mk' ? 200000 : 100000) - Math.round(c.d * 10);
     if (Math.abs(z - l.z) > 5) { l.z = z; l.el.style.zIndex = String(z); }
-    void w; void h;
   }
 
   /** Is the straight line from the camera to the point blocked by terrain (by more than `margin`)? */

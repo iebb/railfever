@@ -16,6 +16,8 @@ export interface Ring { x: number; z: number; r: number }
 /** Line route display (screen space): width in px, lateral offset in px (or per vertex: `lanes`, one array per
  *  curve), opacity, animated direction chevrons, draw order among routes. */
 export interface LinePathOpts { width?: number; offset?: number; lanes?: ArrayLike<number>[]; lift?: number; opacity?: number; chevrons?: boolean; order?: number }
+/** Default height of line routes above their track or road (the lines map's station numbers and route picking use it). */
+export const ROUTE_LIFT = 0.35;
 /** Desire line between two points (screen space): width in px, colour, alpha, apex height (world units), dashes (see RibbonPoly). */
 export interface Arc { ax: number; az: number; bx: number; bz: number; w: number; color: number; h: number; alpha?: number; dash?: number }
 /** Catchment circle: centre, radius, colour (fill and outline). */
@@ -863,7 +865,7 @@ export class Overlay {
       return;
     }
     if (!m) { m = new ScreenRibbon(this.group, 50); this.linePaths.set(id, m); }
-    const lift = o.lift ?? 0.35;
+    const lift = o.lift ?? ROUTE_LIFT;
     m.set(curves.map((pts, i) => {
       const q = new Float32Array(pts);
       for (let k = 1; k < q.length; k += 3) q[k] += lift;
