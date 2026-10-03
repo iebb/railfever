@@ -9,7 +9,7 @@ import { Economy, Company, COMPANY_COLORS } from './economy';
 import { Shares, SHARE_COUNT } from './shares';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
 import { generateIntercityRoads } from './roads';
-import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, TRACK_TYPES, ROAD_TYPES, TRAM } from './constants';
+import { DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, TRACK_TYPES, ROAD_TYPES, TRAM, MAIL_UNIT_T } from './constants';
 import { RNG } from './rng';
 import { MODELS } from './vehicle-types';
 import type { Vehicle } from './vehicle';
@@ -20,6 +20,7 @@ import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
 import { resolveDeadlocks, lineCongestion } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
+import { MailModel } from './mail';
 
 export interface NewGameOptions {
   size: number;
@@ -102,6 +103,8 @@ export class Game {
   vehicles: Vehicles;
   /** regional passenger demand (districts, OD matrix, station catchment shares) */
   demand: DemandModel;
+  /** mail: posting, destinations, ratings and mail's own random stream (mail.ts) */
+  mail: MailModel;
   companies: Company[] = [];
   /** Corporate shareholders, dividends and subsidiary choices. */
   shares = new Shares(this);
@@ -188,6 +191,7 @@ export class Game {
     this.lines = new Lines(this);
     this.vehicles = new Vehicles(this);
     this.demand = new DemandModel(this);
+    this.mail = new MailModel(this);
     this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
     this.companies[PLAYER].code = this.freeCompanyCode(this.companies[PLAYER].name);
     this.allowAccess[PLAYER] = true;
@@ -895,6 +899,8 @@ export class Game {
       const cap = 600 + (st.rail ? st.rail.tracks * st.rail.length * 12 : 0) + st.stops.length * 150;
       this.stations.trimWaiting(st, cap);
     }
+    // mail: posting at the stations a mail line serves, queues trimmed, mail ratings (its own random stream)
+    this.mail.daily();
     // station ratings (and service frequency), then town growth paced by the towns' public transport (towns.ts)
     this.stations.updateRatings();
     this.towns.daily();
@@ -954,6 +960,7 @@ export class Game {
       t.passLostLast = t.passLostMonth ?? 0; t.passLostMonth = 0;
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
+    this.mail.monthly();
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();
@@ -967,6 +974,7 @@ export class Game {
       l.incomeLast = l.incomeYear; l.costLast = l.costYear;
       l.incomeYear = 0; l.costYear = 0;
     }
+    this.mail.yearly();
     this.shares.payDividends(this.year - 1);
     for (const co of this.companies) if (!co.defunct) {
       // Month end has already closed December. Attribute the distribution to that month and year.
@@ -978,7 +986,7 @@ export class Game {
       e.endYear(this.year - 1);
     }
     for (const m of MODELS) {
-      if (m.intro === this.year) this.postNews(`New vehicle available: ${m.name} (${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''})`, 'vehicle');
+      if (m.intro === this.year) this.postNews(`New vehicle available: ${m.name} (${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''}${m.mail ? ', ' + +(m.mail * MAIL_UNIT_T).toFixed(1) + ' t of mail' : ''})`, 'vehicle');
     }
   }
 

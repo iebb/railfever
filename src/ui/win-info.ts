@@ -3,7 +3,7 @@ import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import { h, clear, fmtInt, bar, tile, section, icon, stepper, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
-import { availableModels, VehicleModel, MODEL_BY_ID, modelTracks } from '../game/vehicle-types';
+import { availableModels, VehicleModel, MODEL_BY_ID, modelTracks, carriesMail, mailOnlyModel } from '../game/vehicle-types';
 import { Train, depotReaches, depotServes, lineCompatibility, trackAllows } from '../game/train';
 import { RoadVehicle, roadDepotReaches } from '../game/roadvehicle';
 import type { Line } from '../game/lines';
@@ -683,18 +683,22 @@ function vehicleCosts(v: Vehicle): HTMLElement {
 function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: string } | null {
   const year = ui.game.year;
   if (v instanceof Train) {
-    const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon');
+    // passenger coaches are replaced by the newest; mail vans stay as they are (behind the locomotive)
+    const coach = (c: VehicleModel) => c.kind === 'wagon' && !carriesMail(c);
+    const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon', false);
     const loco = locos[locos.length - 1], wagon = wagons[wagons.length - 1];
     const cur = v.cars.find((c) => c.kind === 'loco');
-    const curW = v.cars.find((c) => c.kind === 'wagon');
+    const curW = v.cars.find(coach);
     if (!loco || !cur || (loco.speed <= cur.speed && (!wagon || !curW || wagon.capacity <= curW.capacity))) return null;
-    const n = v.cars.filter((c) => c.kind === 'wagon').length;
+    const n = v.cars.filter(coach).length, vans = v.cars.filter((c) => c.kind === 'wagon' && carriesMail(c));
     const w = wagon ?? curW;
-    if (!w) return null;
-    return { cars: [loco, ...Array<VehicleModel>(n).fill(w)], label: `${loco.name} + ${n}× ${w.name}` };
+    if (!w && n) return null;
+    return { cars: [loco, ...vans, ...(w ? Array<VehicleModel>(n).fill(w) : [])], label: `${loco.name}${vans.length ? ` + ${vans.length}× mail van` : ''}${n && w ? ` + ${n}× ${w.name}` : ''}` };
   }
   const rv = v as RoadVehicle;
-  const buses = availableModels(year, rv.model?.kind === 'tram' ? 'tram' : 'bus');
+  // the same family: passenger buses, postbuses or mail vans and trucks
+  const family = (m: VehicleModel) => !rv.model || (carriesMail(m) === carriesMail(rv.model) && mailOnlyModel(m) === mailOnlyModel(rv.model));
+  const buses = availableModels(year, rv.model?.kind === 'tram' ? 'tram' : 'bus').filter(family);
   const best = buses[buses.length - 1];
   if (!rv.model || !best || best.id === rv.model.id || best.intro <= rv.model.intro) return null;
   return { cars: [best], label: best.name };
@@ -750,10 +754,13 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   const trackType = initialLine?.stops.map((id) => g.stations.get(id)?.rail?.trackType).find(Boolean) ?? exit?.type;
   const units = emus.filter((m) => !trackType || modelTracks(m).includes(trackType));
   const primaryUnits = units.filter((m) => m.tracks?.[0] === trackType);
-  const unitDefault = primaryUnits[primaryUnits.length - 1] ?? units[units.length - 1] ?? emus[emus.length - 1];
+  // (defaults: passenger stock; the mail vans, trucks and units are listed too)
+  const pax = (list: VehicleModel[]) => list.filter((m) => !carriesMail(m));
+  const lastOf = (list: VehicleModel[]) => pax(list)[pax(list).length - 1] ?? list[list.length - 1];
+  const unitDefault = lastOf(primaryUnits) ?? lastOf(units) ?? lastOf(emus);
   const state = { train: (emus.length && (trackType === 'metro' || trackType === 'lightrail' || trackType === 'highspeed') ? 'unit' : 'hauled') as 'hauled' | 'unit',
-    loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: wagons[wagons.length - 1]?.id ?? '', count: 2,
-    unit: unitDefault?.id ?? '', unitN: 1, bus: buses[buses.length - 1]?.id ?? '', line: initialLine?.id ?? lineId, depot: depotId };
+    loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: lastOf(wagons)?.id ?? '', count: 2,
+    unit: unitDefault?.id ?? '', unitN: 1, bus: lastOf(buses)?.id ?? '', line: initialLine?.id ?? lineId, depot: depotId };
   let purchaseCars: VehicleModel[] = [];
   const validateSelection = () => {
     const line = state.line != null ? g.lines.get(state.line) : null;

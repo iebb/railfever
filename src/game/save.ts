@@ -23,6 +23,7 @@ import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 import { walkRoadsChanged } from './catchment';
+import { stationMailJSON, restoreStationMail, restoreMail, addMail, type MailWait } from './mail';
 
 const VERSION = 3;
 /** Save formats this build reads (v2: older single-record saves). */
@@ -307,6 +308,8 @@ function baseOf(v: Vehicle) {
     pattern: v.pattern ?? null, holdTime: v.holdTime, ops: [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt], opLast: v.opLast,
     phys: physOf(v),
     spacing: v.spacing,
+    // mail aboard and delivered (only once the vehicle has carried mail: other saves are as before)
+    ...(v.mailCargo.size || v.mailLoad || v.mailDelivered ? { mail: [...v.mailCargo.values()].map((c) => ({ ...c })), mailLoad: v.mailLoad, mailDelivered: v.mailDelivered } : {}),
   };
 }
 /** Energy counters a train's physics keeps between the monthly charges (if it has them). */
@@ -325,6 +328,8 @@ function restoreBase(v: Vehicle, d: any) {
   if (Array.isArray(d.ops)) [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt] = (d.ops as number[]).map((x) => Number(x) || 0);
   else v.opMark = -1;
   v.opLast = d.opLast ? { ...d.opLast } : null;
+  if (Array.isArray(d.mail)) restoreMail(v, d.mail);
+  v.mailLoad = Number(d.mailLoad) || 0; v.mailDelivered = Number(d.mailDelivered) || 0;
   if (Array.isArray(d.phys)) {
     const p = v as unknown as Record<string, number>;
     ['tractionJ', 'regenJ', 'auxJ', 'km', 'hours'].forEach((k, i) => { p[k] = Number(d.phys[i]) || 0; });
@@ -399,7 +404,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
-    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON) })),
+    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON),
+      ...(s.mail ? { mail: stationMailJSON(s.mail) } : {}) })),
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
@@ -407,6 +413,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     lines: [...g.lines.map.values()], linesNextId: g.lines.nextId,
     // ops: line ids merged into others as service patterns; this month's track wear; save format of the ops data
     linesRedirect: [...g.lines.redirect], ops: saveOps(g), opsVersion: 1,
+    // mail's random stream (once mail has used it)
+    ...(g.mail.toJSON() ? { mail: g.mail.toJSON() } : {}),
     vehicles: [...g.vehicles.map.values()].map((v) => (v instanceof Train ? trainOf(v) : roadOf(v as RoadVehicle))),
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
@@ -517,6 +525,10 @@ export function deserialize(d: any): Game {
     if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
+    if (s.mail) {
+      st.mail = restoreStationMail(s.mail);
+      for (const w of (s.mail.waiting ?? []) as MailWait[]) addMail(g, st, w.line, w.alight, w.dest, w.count, w.t);
+    }
     g.stations.map.set(st.id, st);
   }
   g.stations.nextId = d.stationsNextId;
@@ -526,6 +538,7 @@ export function deserialize(d: any): Game {
   g.lines.nextId = d.linesNextId;
   for (const [k, r] of (d.linesRedirect ?? []) as [number, { line: number; pattern: number }][]) g.lines.redirect.set(k, { line: r.line, pattern: r.pattern });
   try { loadOps(g, d.ops); } catch (e) { console.warn('Save load: loadOps failed', e); }
+  g.mail.load(d.mail);
   g.firstArrival = new Set(d.firstArrival ?? []);
   g.news = (d.news ?? []).map((n: any) => ({ ...n }));
 

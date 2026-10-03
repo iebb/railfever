@@ -10,6 +10,7 @@ import { planEdge, commitProposal, findSnap, BuildOptions, Proposal } from './co
 import { NEdge, NNode } from './network';
 import { closestOnPolyline } from './geom';
 import { recomputeLocks, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
+import type { TownMail } from './mail';
 
 export const BT_HOUSE_S = 0, BT_HOUSE_L = 1, BT_TOWNHOUSE = 2, BT_SHOP = 3, BT_APARTMENT = 4,
   BT_OFFICE = 5, BT_TOWER = 6, BT_CHURCH = 7, BT_PARK = 8, BT_PLAZA = 9;
@@ -114,6 +115,8 @@ export interface Town {
   passGenMonth: number; passTransMonth: number; passGenLast: number; passTransLast: number;
   /** passengers who gave up waiting at the town's stations this / last month (Stations.trimWaiting; old saves: none) */
   passLostMonth?: number; passLostLast?: number;
+  /** mail posted at and delivered to the town's stations (mail.ts), from its first mail on */
+  mail?: TownMail;
   /** active stations near the town at its last growth step (see townService) */
   served: number;
   /** street grid (towns from old saves get one on their next growth step) */
@@ -183,7 +186,7 @@ export function townService(g: Game, town: Town): TownService {
   let stations = 0, catchPop = 0, reached = 0, rated = 0, boarded = 0, lost = 0;
   const R = town.radius + 10;
   for (const st of g.stations.map.values()) {
-    if (st.lastCall < 0 || g.day - st.lastCall > GROWTH_ACTIVE_DAYS || !g.lines.stationServed(st.id)) continue;
+    if (st.lastCall < 0 || g.day - st.lastCall > GROWTH_ACTIVE_DAYS || !(g.lines.stationServed(st.id) || g.lines.mailServed(st.id))) continue;
     if (Math.hypot(st.x - town.x, st.z - town.z) > R) continue;
     stations++;
     catchPop += st.catchPop;

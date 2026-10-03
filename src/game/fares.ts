@@ -214,3 +214,27 @@ export function legacyFare(dist: number, days: number, count: number): number {
 
 /** Time (s) of a walking transfer of `gapUnits` between linked stations. */
 export function transferWalkTime(gapUnits: number): number { return TRANSFER_WALK.baseS + (Math.max(0, gapUnits) * UNIT_M * 1.2) / TRANSFER_WALK.mps; }
+
+// ------------------------------------------------------------------------------ mail
+/**
+ * Mail fares: per unit of mail (MAIL_UNIT_T, 0.1 t) and unit of effective distance, the long-leg passenger rate
+ * (FARE_RATE at the long-distance compensation); the time factor clamp((mailRefTime / leg) ^ exp, min, max) rewards
+ * fast collection and carriage. No direct bonus, boarding charge or city-centre term; each leg pays for itself.
+ */
+export const MAIL_FARE = { rate: (FARE_RATE * PASSENGER_LONG_FARE_SCALE) / PASSENGER_FARE_SCALE, exp: 1.0, min: 0.15, max: 1.6 };
+/** Demand elasticity of mail (mail.ts): clamp((mailRefTime / expected time) ^ exp, min, max). */
+export const MAIL_TRIP = { exp: 0.8, min: 0.3, max: 1.25 };
+/** The alternative for mail (s): collection and sorting, then a van at 50 km/h on a 1.3x detour of the straight distance. */
+export function mailRefTime(d: number): number { return 240 + (Math.max(0, d) * UNIT_M * 1.3) / (50 / 3.6); }
+/**
+ * Income for `units` of mail carried a straight-line distance of `d` units on a leg that took `legSeconds` since
+ * the mail was posted or reached the station it was loaded at (waiting counts in full: mail is not "lost demand").
+ */
+export function mailFare(d: number, legSeconds: number, units: number): number {
+  if (!(d > 1) || !(units > 0)) return 0;
+  return units * MAIL_FARE.rate * effDist(d) * clamp(Math.pow(mailRefTime(d) / Math.max(1, legSeconds), MAIL_FARE.exp), MAIL_FARE.min, MAIL_FARE.max);
+}
+/** How much more (or less) mail is sent by a service of expected time `seconds` over `d` units than the alternative's. */
+export function mailTripFactor(d: number, seconds: number): number {
+  return clamp(Math.pow(mailRefTime(d) / Math.max(1, seconds), MAIL_TRIP.exp), MAIL_TRIP.min, MAIL_TRIP.max);
+}

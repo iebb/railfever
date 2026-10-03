@@ -21,7 +21,7 @@ import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongesti
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy } from './economy';
-import { availableModels, VehicleModel, MODEL_BY_ID } from './vehicle-types';
+import { availableModels, VehicleModel, MODEL_BY_ID, carriesMail } from './vehicle-types';
 import { estimateLegFare, estimateLegTime } from './fares';
 import { type ForecastSite } from './demand';
 import { walkSitePop, walkLimit, planWalkingCatchment, walkingCatchment, walkingPopulation, pointWalkingCatchment, pedestrianRoad } from './catchment';
@@ -963,7 +963,7 @@ export function modelYearCost(m: VehicleModel, year: number): number {
 
 /** A long-distance coach for the year (the fastest value for money); a town bus when there are none. */
 export function pickCoach(year: number): VehicleModel | null {
-  const coaches = availableModels(year, 'bus').filter((m) => m.style === 'coach');
+  const coaches = availableModels(year, 'bus', false).filter((m) => m.style === 'coach');
   const value = (m: VehicleModel) => (m.capacity * m.speed) / (m.cost + modelYearCost(m, year) * 8);
   return coaches.sort((a, b) => value(b) - value(a))[0] ?? pickBus(year);
 }
@@ -994,7 +994,7 @@ export function aiPlatformLength(popA: number, popB: number, year?: number): num
  */
 export function pickTrain(year: number, platform: number, lineLen: number, coaches = 2, electric = false): VehicleModel[] | null {
   // (electric locomotives only on electrified track: they could not leave the depot on the others)
-  const locos = availableModels(year, 'loco').filter((m) => electric || m.traction !== 'electric'), wagons = availableModels(year, 'wagon');
+  const locos = availableModels(year, 'loco').filter((m) => electric || m.traction !== 'electric'), wagons = availableModels(year, 'wagon', false);
   if (!locos.length || !wagons.length) return null;
   const value = (m: VehicleModel) => (Math.min(m.speed, lineLen > 220 ? 300 : 150) * (0.5 + m.power / 5000)) / (m.cost + modelYearCost(m, year) * 8);
   const loco = [...locos].sort((a, b) => value(b) - value(a))[0];
@@ -1005,7 +1005,7 @@ export function pickTrain(year: number, platform: number, lineLen: number, coach
 }
 
 export function pickBus(year: number, townPop = 3000): VehicleModel | null {
-  const buses = availableModels(year, 'bus').filter((m) => m.style !== 'coach');
+  const buses = availableModels(year, 'bus', false).filter((m) => m.style !== 'coach');
   // small towns: smaller buses
   const value = (m: VehicleModel) => (Math.min(m.capacity, townPop / 40) * Math.min(m.speed, 60)) / (m.cost + modelYearCost(m, year) * 8);
   return buses.sort((a, b) => value(b) - value(a))[0] ?? null;
@@ -3465,7 +3465,7 @@ export class AIController {
   // ---------------------------------------------------------------- urban railways (metro, light rail)
   /** High-speed units of the year (best seats x speed for the money and running costs), or null before there are any. */
   private hsrUnit(): VehicleModel | null {
-    const ms = availableModels(this.game.year, 'emu').filter((m) => m.id.startsWith('hsr') && (m.tracks ?? []).includes('highspeed'));
+    const ms = availableModels(this.game.year, 'emu', false).filter((m) => m.id.startsWith('hsr') && (m.tracks ?? []).includes('highspeed'));
     // (speed is what high-speed passengers pay for: the faster units of the year are worth their price)
     const value = (m: VehicleModel) => (m.capacity * Math.pow(m.speed, 1.6)) / (m.cost + modelYearCost(m, this.game.year) * 8);
     return ms.sort((a, b) => value(b) - value(a))[0] ?? null;
@@ -3473,7 +3473,7 @@ export class AIController {
 
   /** Urban rail vehicles for the year on this track type (the biggest that fit the platforms), or null. */
   private urbanUnit(mode: 'metro' | 'lightrail', platform: number): VehicleModel | null {
-    const ms = availableModels(this.game.year, 'emu').filter((m) => (m.tracks ?? []).includes(mode) && m.length <= platform - 0.4);
+    const ms = availableModels(this.game.year, 'emu', false).filter((m) => (m.tracks ?? []).includes(mode) && m.length <= platform - 0.4);
     // on metro track: metro trains first (commuter units also run there, for through services)
     const own = ms.filter((m) => m.id.startsWith(mode === 'metro' ? 'metro_' : 'lrv_'));
     const pool = own.length ? own : ms;
@@ -3895,7 +3895,7 @@ export class AIController {
     const upath = ustops[ustops.length - 1] === end.id ? [...ustops].reverse() : ustops;
     // its unit (any rail unit runs on every track type): the biggest electric commuter unit that fits every platform
     const shortest = Math.min(...[...mpath, ...upath].map((id) => g.stations.get(id)?.rail?.length ?? 0));
-    const unit = availableModels(g.year, 'emu').filter((m) => m.id.startsWith('emu_') && m.traction === 'electric' && m.length <= shortest - 0.4)
+    const unit = availableModels(g.year, 'emu', false).filter((m) => m.id.startsWith('emu_') && m.traction === 'electric' && m.length <= shortest - 0.4)
       .sort((a, b) => b.capacity - a.capacity)[0] ?? this.urbanUnit(t.mode, shortest);
     if (!unit) return false;
     // the main line's track and platforms to wire (ours, or an open network's at our cost): access and funds first
@@ -4419,7 +4419,8 @@ export class AIController {
     if (!isFinite(platform)) return false;
     let short = false, atPlatform = 0;
     for (const t of trains) {
-      const n = t.cars.filter((c) => c.kind === 'wagon').length;
+      // (passenger coaches: mail vans are another cargo's room)
+      const n = t.cars.filter((c) => c.kind === 'wagon' && !carriesMail(c)).length;
       const want = Math.min(5, n + (waiting > t.capacity * 4 ? 2 : 1));
       const cars = pickTrain(g.year, platform, span * 1.2, want, (info.electric ?? -1) > 0);
       if (!cars || cars.length - 1 <= n) { if (n < 5) atPlatform++; continue; }

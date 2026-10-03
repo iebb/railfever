@@ -1,13 +1,14 @@
 // Base vehicle class: passengers (boarding by service pattern, fares with the value of time and a no-transfer
-// bonus), the stop sequence (a vehicle targets only the stops of its service pattern) and the odometer for the
-// operating costs (opcosts.ts).
+// bonus) and mail (mail.ts: loading, unloading and mail fares), the stop sequence (a vehicle targets only the stops
+// of its service pattern) and the odometer for the operating costs (opcosts.ts).
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
 import { fareFor, distanceFare, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
-import { DAY_SECONDS } from './constants';
+import { DAY_SECONDS, type Cargo } from './constants';
+import { unloadMail, loadMail, fixMail } from './mail';
 
 /**
  * Passengers aboard, by boarding stop / drop-off / destination. `day`: game day they boarded (older saves);
@@ -15,6 +16,11 @@ import { DAY_SECONDS } from './constants';
  * of them changed vehicles earlier on this journey (the others get the no-transfer bonus at their destination).
  */
 export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
+/**
+ * Mail aboard, by loading station / drop-off / destination (key from:alight:dest): `count` units (MAIL_UNIT_T); `t0`:
+ * sim time (s) the leg began (the mail was posted, or reached the station it was loaded at). See mail.ts.
+ */
+export interface MailGroup { alight: number; dest: number; count: number; from: number; t0: number }
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
@@ -50,6 +56,10 @@ export abstract class Vehicle {
   homeX = 0; homeZ = 0;
   /** Passengers delivered (lifetime) */
   delivered = 0;
+  /** Mail aboard (MailGroup by from:alight:dest), its total and mail delivered (lifetime), in units of MAIL_UNIT_T. */
+  mailCargo = new Map<string, MailGroup>();
+  mailLoad = 0;
+  mailDelivered = 0;
   /** seconds this vehicle has held at its stop for a faster train to pass (patterns.ts holdForOvertake) */
   holdTime = 0;
   /** Hold/boarding clocks and the stop awaiting an actual departure (persisted by save.ts). */
@@ -69,6 +79,12 @@ export abstract class Vehicle {
   }
 
   abstract get capacity(): number;
+  /** Room for mail (units of MAIL_UNIT_T; 0: carries none). */
+  abstract get mailCapacity(): number;
+  /** No seats and room for mail: a mail van or truck, a mail train, the postal unit (Cargo 'mail' only). */
+  get mailOnly(): boolean { return this.capacity === 0 && this.mailCapacity > 0; }
+  /** Does the vehicle carry this cargo? Passengers: every vehicle but a mail-only one (a lone locomotive too). */
+  carries(cargo: Cargo): boolean { return cargo === 'mail' ? this.mailCapacity > 0 : !this.mailOnly; }
   /** Max speed in tiles/s */
   abstract get maxSpeed(): number;
   abstract get maxSpeedKmh(): number;
@@ -134,7 +150,10 @@ export abstract class Vehicle {
     if (this.spacing.boardIn > 0) return;
     this.spacing.boardIn = 1;
     const st = this.targetStation();
-    if (st) this.boardStation(st);
+    if (st) {
+      this.boardStation(st);
+      if (this.mailCapacity > 0) loadMail(this.game, this, st);
+    }
   }
 
   /** Unload and load passengers at a station. Returns dwell time in seconds. */
@@ -186,13 +205,18 @@ export abstract class Vehicle {
       }
       g.onIncome(income, this, st);
     }
+    // mail: off (delivered, or waiting for its next leg), then on; handling a unit of mail takes 1.5 x a passenger
+    const mailOff = this.mailCargo.size ? unloadMail(g, this, st, now) : 0;
     moved += this.boardStation(st);
-    return 2.0 + moved * perPax;
+    const mailMoved = mailOff + (this.mailCapacity > 0 ? loadMail(g, this, st) : 0);
+    return 2.0 + (mailMoved > 0 ? Math.max(moved * perPax, mailMoved * perPax * 1.5) : moved * perPax);
   }
 
   /** Boarding is shared by the arrival dwell and headway holds. Returns passengers picked up. */
   private boardStation(st: Station): number {
     const g = this.game, now = simNow(g), line = this.line;
+    // a mail-only vehicle takes no passengers; its call still counts as service (town growth: Station.lastCall)
+    if (this.mailOnly) { st.lastCall = g.day; return 0; }
     // load: passengers for stops this vehicle's pattern serves (and for which it is a service worth taking)
     let picked = 0;
     if (line) {
@@ -234,16 +258,20 @@ export abstract class Vehicle {
     return picked;
   }
 
-  /** Re-target passengers whose drop-off stop is no longer served by this vehicle (line or pattern changed). */
+  /** Re-target passengers and mail whose drop-off stop is no longer served by this vehicle (line or pattern changed). */
   fixCargo() {
     const l = this.line;
     if (!l || !l.stops.length) { this.dumpCargo(); return; }
     const next = this.targetStation();
     for (const c of this.cargo.values()) if (!servesStation(l, this.pattern, c.alight) && next) c.alight = next.id;
+    if (this.mailCargo.size) fixMail(this, l, next);
   }
 
-  /** Drop all passengers (e.g. when sold or line removed). */
-  dumpCargo() { this.cargo.clear(); this.load = 0; }
+  /** Drop all passengers and mail (e.g. when sold or line removed). */
+  dumpCargo() {
+    this.cargo.clear(); this.load = 0;
+    if (this.mailCargo.size || this.mailLoad) { this.mailCargo.clear(); this.mailLoad = 0; }
+  }
 
   get age(): number { return (this.game.day - this.boughtDay) / 360; }
 }

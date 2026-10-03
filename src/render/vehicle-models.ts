@@ -1545,6 +1545,7 @@ export function getModel(style: string, color: number, length: number): ModelGeo
     case 'hst': m = streamliner(color, 0x1d3f8a, length, 0.45, false); break;
     case 'bullet': m = streamliner(color, 0x1f5fa8, length, 0.85, true); break;
     case 'coach_wood': case 'coach_steel': case 'coach_ic': case 'coach_hs': m = coach(style, color, length); break;
+    case 'van_wood': case 'van_steel': case 'van_ic': m = coach(style.replace('van_', 'coach_'), color, length); break; // mail vans: as coaches for now
     default: m = bus(style, color, length); break;
   }
   cache.set(key, m);

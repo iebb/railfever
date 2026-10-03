@@ -52,6 +52,33 @@ export const URBAN_PAYBACK = { metro: 15, lightrail: 9, crosscity: 15 };
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 
+/**
+ * The cargoes lines carry: passengers and mail. Line tables, routing, boarding and headways take a cargo (default
+ * passengers); a vehicle carries passengers unless it is mail-only (no seats and room for mail: Vehicle.mailOnly).
+ */
+export type Cargo = 'pax' | 'mail';
+/** Mail is counted in units of this many tonnes (VehicleModel.mail, queues, loads); the UI shows tonnes. */
+export const MAIL_UNIT_T = 0.1;
+/**
+ * Mail calibration (mail.ts): mail units posted per unit of the passenger generation rate (demand.ts GEN_RATE), so
+ * mail inherits the passenger recalibration of the compressed calendar. scripts/mailcal.ts (intercity railways with
+ * a van and three coaches, seeds 7 / 23 / 51, 1950 and 2000) allows 0.60-0.75 for its targets (mail 15-35% of
+ * passenger income in 1950, 10-30% in 2000, vans within +-50% of the coaches' load); 0.67 is the middle.
+ */
+export const MAIL_PER_PAX = 0.67;
+/**
+ * Mail per person by year (piecewise linear; 1950 = 1): by weight about +30% from 1950 to 2000, then about flat
+ * (letters halve, parcels grow two to three times).
+ */
+export const MAIL_ERA: readonly [number, number][] = [[1870, 0.35], [1900, 0.5], [1925, 0.75], [1950, 1], [1975, 1.2], [2000, 1.35], [2010, 1.25], [2025, 1.35]];
+/**
+ * Mail stations: a station accepts mail (posts it, and receives its town's mail) when a mail-carrying line serves it
+ * and its weighted catchment (mail.ts mailPop) is at least `acceptPop`: a halt that reaches hardly anyone handles none,
+ * a town's station at its edge still does. Queue cap: min(`cap`, `base` + `perPop` x mailPop + `perTrack` x platform
+ * tracks + `perStop` x stops); mail beyond it is lost.
+ */
+export const MAIL_STATION = { acceptPop: 25, cap: 400, base: 20, perPop: 0.02, perTrack: 15, perStop: 5 };
+
 /** Sea level. */
 export const WATER_Y = 0;
 

@@ -16,7 +16,7 @@ import { cashPitch } from '../audio/engine';
 /** Share funding, repurchases and distributions are shown separately from operating profit. */
 const OPERATING = PROFIT_CATEGORIES;
 /** Rows hidden while they are zero in every column. */
-const OPTIONAL = new Set<Category>(['trackIncome', 'trackFees']);
+const OPTIONAL = new Set<Category>(['mailIncome', 'trackIncome', 'trackFees']);
 const valueOf = (v: Partial<Record<Category, number>>, k: Category) => typeof v[k] === 'number' && isFinite(v[k]!) ? v[k]! : 0;
 const recordSum = (v: Partial<Record<Category, number>>) => OPERATING.reduce((a, k) => a + valueOf(v, k), 0);
 const monthSum = (m: MonthRecord) => recordSum(m.v);
@@ -71,7 +71,7 @@ export function openFinances(ui: UI) {
       else {
         add(win.body, chart([
           { values: ms.map(monthSum), color: '#4ade80', kind: 'bar', label: 'Profit' },
-          { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
+          { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'mailIncome') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
           { values: ms.map((m) => operatingCosts(m.v)), color: '#ffc857', label: 'Operating costs' },
         ], { w: 548, h: 170, labels: monthLabels(e, 24) }),
         h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'), h('span', { style: '--c:#ffc857' }, h('i'), 'Vehicle costs, upkeep, wear & fees')),
@@ -86,7 +86,7 @@ export function openFinances(ui: UI) {
         const tbl = h('table', { class: 'tbl fin' }, h('tr', null, h('th', null, 'Year'), h('th', null, 'Income'), h('th', null, 'Costs'), h('th', null, 'Profit')));
         for (const y of [...years].reverse()) {
           const p = recordSum(y.v);
-          const inc = valueOf(y.v, 'income') + valueOf(y.v, 'trackIncome');
+          const inc = valueOf(y.v, 'income') + valueOf(y.v, 'mailIncome') + valueOf(y.v, 'trackIncome');
           tbl.appendChild(h('tr', null, h('td', null, String(y.year)), h('td', { class: 'pos' }, fmtMoney(inc)), h('td', { class: 'neg' }, fmtMoney(p - inc)), h('td', { class: p < 0 ? 'neg' : 'pos' }, fmtMoney(p))));
         }
         add(win.body, h('div', { class: 'finance-table' }, tbl));

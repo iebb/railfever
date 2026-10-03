@@ -15,7 +15,7 @@ import type { Vehicle } from './vehicle';
 import { aeroOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
 import type { NEdge } from './network';
-import { TRACK_TYPES, ROAD_TYPES, DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, UNIT_M } from './constants';
+import { TRACK_TYPES, ROAD_TYPES, DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, UNIT_M, MAIL_UNIT_T } from './constants';
 import { simNow } from './fares';
 
 /** Sim seconds in a game year (a vehicle in service all year runs this long). */
@@ -36,6 +36,8 @@ export const EFFICIENCY = { electric: 0.85, diesel: 0.35, steam: 0.07 };
 export const REGEN_SHARE = 0.3;
 /** Mass of a passenger (tonnes). */
 export const PAX_T = 0.075;
+/** A vehicle's load in passenger masses (PAX_T): its passengers and its mail (MAIL_UNIT_T a unit). */
+export function loadOf(v: { load: number; mailLoad: number }): number { return v.mailLoad ? v.load + (v.mailLoad * MAIL_UNIT_T) / PAX_T : v.load; }
 /** Track wear per unit of track per passage of one axle-load unit (16 t) at 160 km/h. */
 export const WEAR_RATE = 0.25;
 /** Base track maintenance (per unit and year) as a share of TRACK_TYPES.maintPerUnit (the rest comes from wear). */
@@ -322,7 +324,7 @@ export function noteServe(g: Game, v: Vehicle, stationId: number, x: number, z: 
     if (from && models.length) {
       const c = consistOf(models);
       const d = Math.hypot(from.x - x, from.z - z) * (c.road ? 1.3 : 1.15);
-      const h = hopEstimate(c, d * UNIT_M, v.load, c.road ? (c.kind === 'coach' ? 90 : 50) : Infinity);
+      const h = hopEstimate(c, d * UNIT_M, loadOf(v), c.road ? (c.kind === 'coach' ? 90 : 50) : Infinity);
       v.opDist += d;
       v.opJ += h.wheelJ;
       v.opBrakeJ += h.brakeJ;
@@ -385,7 +387,7 @@ export function trackPassage(g: Game, t: Vehicle & { cars: VehicleModel[]; speed
   if (e.owner < 0 || e.depot >= 0) return;
   const c = consistOf(t.cars);
   const kmh = t.speed * 36;
-  const w = passageWear(c, t.load, units, kmh);
+  const w = passageWear(c, loadOf(t), units, kmh);
   const s = state(g);
   s.wear.set(e.id, (s.wear.get(e.id) ?? 0) + w);
   s.wearOwner.set(e.id, e.owner);

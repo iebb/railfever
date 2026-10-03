@@ -1,5 +1,5 @@
-// Save/load round trip: serialize -> JSON -> deserialize mid-simulation (player lines + AI companies), then
-// continue both copies and check they stay consistent.
+// Save/load round trip: serialize -> JSON -> deserialize mid-simulation (player lines + AI companies, mail vans,
+// a mail train and a postbus), then continue both copies and check they stay consistent.
 // npx esbuild scripts/save.ts --bundle --platform=node --format=esm --outfile=$S/save.mjs && node $S/save.mjs [seed]
 import { gzipSync } from 'node:zlib';
 import { Game } from '../src/game/game';
@@ -18,6 +18,10 @@ const dep = depotBehind(g, pr.A, pr.B, 0);
 const line = g.lines.create('rail', 0);
 line.stops = [pr.A.id, pr.B.id];
 g.vehicles.buyTrain(dep, [MODEL_BY_ID.get('diesel_b')!, MODEL_BY_ID.get('coach_ic')!, MODEL_BY_ID.get('coach_ic')!], line.id);
+// mail: a mixed consist (a van behind the locomotive) and a mail train beside the passenger train
+const mixed = g.vehicles.buyTrain(dep, [MODEL_BY_ID.get('diesel_b')!, MODEL_BY_ID.get('van_ic')!, MODEL_BY_ID.get('coach_ic')!, MODEL_BY_ID.get('coach_ic')!], line.id);
+const mailTrain = g.vehicles.buyTrain(dep, [MODEL_BY_ID.get('diesel_b')!, MODEL_BY_ID.get('van_ic')!], line.id);
+check(mixed instanceof Train && mixed.mailCapacity > 0 && mailTrain instanceof Train && mailTrain.mailOnly, 'a mixed consist and a mail train');
 const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
 const sites = busStopSites(g, big, 0, 12, 30);
 if (sites.length === 2) {
@@ -26,6 +30,7 @@ if (sites.length === 2) {
   const bl = g.lines.create('road', 0);
   bl.stops = [s0, s1];
   for (let i = 0; i < 2; i++) g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id);
+  g.vehicles.buyRoad(bd, MODEL_BY_ID.get('postbus_b')!, bl.id);
 }
 // company state: AI settings, a track access agreement, a renamed line, a bought (defunct) company
 g.ais[0].config = { ...g.ais[0].config, activeness: 1.4, risk: 0.7, focus: { rail: 2, road: 1, tram: 0.5 } };
@@ -40,6 +45,13 @@ g.economy.money += 80_000_000;
 const bought = g.ais[1].companyId;
 check(g.buyCompany(0, bought) === null, 'player buys an AI company');
 while (g.day < 240 || busy()) g.update(0.25);
+// save with mail waiting at stations and aboard (at most another 200 days)
+const mailState = (x: Game) => ({
+  waiting: [...x.stations.map.values()].reduce((n, st) => n + (st.mail?.total ?? 0), 0),
+  aboard: x.vehicles.all().reduce((n, v) => n + v.mailLoad, 0),
+});
+for (let i = 0; i < 200 * 40 && (mailState(g).waiting === 0 || mailState(g).aboard === 0 || busy()); i++) g.stepTick();
+check(mailState(g).waiting > 0 && mailState(g).aboard > 0, `mail waiting (${mailState(g).waiting}) and aboard (${mailState(g).aboard}) at the save`);
 if (!g.ais.some((a) => networkPlanner(a)?.task)) runNetworkTask(g.ais[0], 'decommission', 1);
 check(g.ais.some((a) => !!networkPlanner(a)?.task), 'deliberately save during a network job');
 const t0 = performance.now();
@@ -65,6 +77,28 @@ check(JSON.stringify(g2.accessRequests) === JSON.stringify(g.accessRequests) && 
 check(!!g2.company(bought).defunct && g2.company(bought).boughtBy === 0 && !g2.ais.some((a) => a.companyId === bought), 'defunct company restored');
 check(g2.lines.get(line.id)?.name === 'Main Line' && g2.lines.all().every((l) => { const o = g.lines.get(l.id)!; return o.name === l.name && o.autoName === l.autoName && o.num === l.num && o.color === l.color; }), 'line names, numbers and colours restored');
 check(checkReservations(g2).length === 0, 'reservations rebuilt consistently');
+// mail restored: queues, mail aboard, line and town figures, mail's random stream
+check(JSON.stringify(mailState(g2)) === JSON.stringify(mailState(g)), 'mail waiting and aboard restored');
+check(!!data.mail && JSON.stringify(g2.mail.toJSON()) === JSON.stringify(g.mail.toJSON()), "mail's random stream saved and restored");
+check([...g.stations.map.values()].every((st) => JSON.stringify(st.mail ? [...st.mail.waiting.values()] : null) === JSON.stringify(g2.stations.get(st.id)?.mail ? [...g2.stations.get(st.id)!.mail!.waiting.values()] : null)), 'mail queues restored group by group');
+check(g.vehicles.all().every((v) => JSON.stringify([...v.mailCargo.values()]) === JSON.stringify([...g2.vehicles.get(v.id)!.mailCargo.values()]) && v.mailDelivered === g2.vehicles.get(v.id)!.mailDelivered), 'mail aboard restored vehicle by vehicle');
+check(g.lines.all().every((l) => JSON.stringify(l.mail) === JSON.stringify(g2.lines.get(l.id)!.mail)), 'line mail figures restored');
+check(g2.economy.months.length === g.economy.months.length && g.economy.months.every((m, i) => m.v.mailIncome === g2.economy.months[i].v.mailIncome), 'mail income history restored');
+check(g.lines.mailRouting.size > 0 && [...g.lines.mailRouting.keys()].join() === [...g2.lines.mailRouting.keys()].join(), 'mail routing rebuilt alike');
+// a save without mail state (format 3 before mail) loads: mail starts from the map seed
+{
+  const noMail = JSON.parse(json);
+  delete noMail.mail;
+  for (const st of noMail.stations) delete st.mail;
+  for (const v of noMail.vehicles) { delete v.mail; delete v.mailLoad; delete v.mailDelivered; }
+  for (const l of noMail.lines) delete l.mail;
+  for (const t of noMail.towns) delete t.mail;
+  for (const c of noMail.companies) for (const r of [c.economy.current, c.economy.thisYear, ...c.economy.months.map((m: { v: object }) => m.v)]) delete (r as Record<string, unknown>).mailIncome;
+  const old = deserialize(noMail);
+  check(old.economy.current.mailIncome === 0 && old.mail.toJSON() === null && [...old.stations.map.values()].every((st) => !st.mail), 'a save without mail loads (no mail state, the random stream from the seed)');
+  for (let i = 0; i < 40 * 30; i++) old.stepTick();
+  check(old.lines.mailActive && [...old.stations.map.values()].some((st) => st.mail), 'its mail vans start mail again');
+}
 // a second round trip of the loaded game must give the same data
 const json2 = JSON.stringify(serialize(g2));
 if (json2 !== json) {

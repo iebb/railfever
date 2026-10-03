@@ -1,15 +1,21 @@
 // Company finances.
 
 /**
- * Finance categories. Vehicle operating costs (opcosts.ts): 'running' = fixed overheads (older saves: all running
- * costs), 'crew', 'energy', 'vehicleMaint'; infrastructure: 'maintenance' (base upkeep), 'trackWear' (wear by
- * train passages).
+ * Finance categories. Income: 'income' (passenger fares), 'mailIncome' (mail, fares.ts mailFare). Vehicle operating
+ * costs (opcosts.ts): 'running' = fixed overheads (older saves: all running costs), 'crew', 'energy', 'vehicleMaint';
+ * infrastructure: 'maintenance' (base upkeep), 'trackWear' (wear by train passages).
  */
-export type Category = 'construction' | 'vehicles' | 'running' | 'crew' | 'energy' | 'vehicleMaint' | 'maintenance' | 'trackWear' | 'income' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition' | 'investments' | 'divestments' | 'dividends';
+export type Category = 'construction' | 'vehicles' | 'running' | 'crew' | 'energy' | 'vehicleMaint' | 'maintenance' | 'trackWear' | 'income' | 'mailIncome' | 'interest' | 'trackIncome' | 'trackFees' | 'acquisition' | 'investments' | 'divestments' | 'dividends';
 /** Report order: income first, then the expenses. */
-export const CATEGORIES: Category[] = ['income', 'trackIncome', 'construction', 'vehicles', 'crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees', 'interest', 'acquisition', 'investments', 'divestments', 'dividends'];
+export const CATEGORIES: Category[] = ['income', 'mailIncome', 'trackIncome', 'construction', 'vehicles', 'crew', 'energy', 'vehicleMaint', 'running', 'maintenance', 'trackWear', 'trackFees', 'interest', 'acquisition', 'investments', 'divestments', 'dividends'];
+/**
+ * Categories saved only once they hold money (added after save format 3 began): a game that never earned any saves
+ * exactly as before, and older saves read them as 0 (Economy.fromJSON).
+ */
+const SPARSE_CATEGORIES: readonly Category[] = ['mailIncome'];
 export const CATEGORY_LABEL: Record<Category, string> = {
   income: 'Passenger income',
+  mailIncome: 'Mail income',
   trackIncome: 'Track access income',
   construction: 'Construction',
   vehicles: 'Vehicle purchases',
@@ -64,7 +70,7 @@ export const COSTS = {
 export interface MonthRecord { year: number; month: number; v: Record<Category, number> }
 
 export function emptyRecord(): Record<Category, number> {
-  return { income: 0, construction: 0, vehicles: 0, running: 0, crew: 0, energy: 0, vehicleMaint: 0, maintenance: 0, trackWear: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0, investments: 0, divestments: 0, dividends: 0 };
+  return { income: 0, mailIncome: 0, construction: 0, vehicles: 0, running: 0, crew: 0, energy: 0, vehicleMaint: 0, maintenance: 0, trackWear: 0, interest: 0, trackIncome: 0, trackFees: 0, acquisition: 0, investments: 0, divestments: 0, dividends: 0 };
 }
 /** Fill categories missing in an older record with 0. */
 function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Category, number> {
@@ -92,6 +98,20 @@ export class Economy {
     e.months = (d?.months ?? []).map((m: MonthRecord) => ({ year: m.year, month: m.month, v: fullRecord(m.v) }));
     e.yearTotals = (d?.yearTotals ?? []).map((y: { year: number; v: Record<Category, number> }) => ({ year: y.year, v: fullRecord(y.v) }));
     return e;
+  }
+
+  /** Saved form: records leave out the sparse categories while they are 0 (see SPARSE_CATEGORIES). */
+  toJSON() {
+    const rec = (v: Record<Category, number>): Partial<Record<Category, number>> => {
+      if (SPARSE_CATEGORIES.every((k) => v[k])) return v;
+      const out: Partial<Record<Category, number>> = {};
+      for (const k of Object.keys(v) as Category[]) if (!SPARSE_CATEGORIES.includes(k) || v[k]) out[k] = v[k];
+      return out;
+    };
+    return {
+      ...this, current: rec(this.current), months: this.months.map((m) => ({ ...m, v: rec(m.v) })),
+      yearTotals: this.yearTotals.map((y) => ({ ...y, v: rec(y.v) })), thisYear: rec(this.thisYear),
+    };
   }
 
   canAfford(x: number) { return this.money >= x; }
