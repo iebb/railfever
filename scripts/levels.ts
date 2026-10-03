@@ -216,9 +216,10 @@ const mm = (...ids: string[]): VehicleModel[] => ids.map((id) => MODEL_BY_ID.get
 const on = (cars: VehicleModel[], type: string) => trackAllows(cars, { ...std[0], type } as NEdge);
 check(std.length === 2 && !on(mm('metro_b'), 'standard'), 'a metro EMU cannot use unelectrified track');
 check(!on(mm('bullet'), 'standard') && on(mm('bullet'), 'electric'), 'electric traction needs overhead wire');
-check(on(mm('diesel_b', 'coach_ic'), 'standard') && on(mm('diesel_b', 'coach_ic'), 'electric') && !on(mm('diesel_b', 'coach_ic'), 'metro') && !on(mm('steam_b'), 'lightrail'), 'steam and diesel stay on heavy-rail track');
+// metro and light-rail track are rails like any other: steam and diesel stock may use every rail track type
+check(on(mm('diesel_b', 'coach_ic'), 'standard') && on(mm('diesel_b', 'coach_ic'), 'electric') && on(mm('diesel_b', 'coach_ic'), 'metro') && on(mm('steam_b'), 'lightrail'), 'steam and diesel run on every rail track type');
 check(on(mm('metro_b'), 'metro') && on(mm('metro_b'), 'electric') && on(mm('emu_b'), 'metro') && on(mm('emu_b'), 'electric'), 'metro and commuter EMUs run on each other\'s track (through services)');
-check(on(mm('lrv_b'), 'lightrail') && on(mm('lrv_b'), 'metro') && !on(mm('lrv_b'), 'electric'), 'light rail vehicles on light rail and metro track');
+check(on(mm('lrv_b'), 'lightrail') && on(mm('lrv_b'), 'metro') && on(mm('lrv_b'), 'electric') && !on(mm('lrv_b'), 'standard'), 'light rail vehicles on every electrified rail track (not on unelectrified track)');
 const len = std.reduce((s, e) => s + e.len, 0);
 const dry = electrify(h, std.map((e) => e.id), 0, true);
 check(dry.error === null && dry.changed === 2 && Math.abs(dry.cost - Math.round(len * ELECTRIFY.costPerUnit)) <= 1, `electrification priced per unit (${M(dry.cost)} for ${fmt(len, 0)} units)`);
