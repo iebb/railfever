@@ -1,5 +1,5 @@
 // Save games (format v2): the free-form world, network, companies, AI and vehicles as compressed JSON.
-import { Game } from './game';
+import { Game, TICKS_PER_DAY } from './game';
 import { World, Building, Tree } from './world';
 import type { NNode, NEdge, Crossing, Section } from './network';
 import type { Town } from './towns';
@@ -149,7 +149,7 @@ export function serialize(g: Game): any {
   const V = g.vehicles as any;
   return {
     version: VERSION,
-    options: g.options, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
+    options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
     shares: g.shares.toJSON(),
@@ -236,7 +236,8 @@ export function deserialize(d: any): Game {
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
 
   const g = new Game({ ...d.options }, w);
-  g.day = d.day; g.dayFrac = d.dayFrac; g.visualTime = d.visualTime; g.rng.state = d.rng;
+  g.tick = Number.isSafeInteger(d.tick) && d.tick >= 0 ? d.tick : Math.max(0, Math.round(((d.day ?? 0) + (d.dayFrac ?? 0)) * TICKS_PER_DAY));
+  g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);

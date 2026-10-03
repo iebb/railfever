@@ -84,7 +84,11 @@ const INFRA_DEPRECIATION = 0.6;
 const STATION_LEVEL_FACTOR: Record<string, number> = { ground: 1, elevated: 3, underground: 6 };
 const BUYOUT_PREMIUM = 1.25;
 export { GEN_RATE };
-const MAX_STEP = 0.05;
+/** Every committed simulation tick advances this many seconds, at every game speed. */
+export const TICK = 0.05;
+export const TICKS_PER_DAY = DAY_SECONDS / TICK;
+/** Drop wall time beyond this many ticks at 1x after a stalled frame. */
+const MAX_FRAME_TICKS = 8;
 
 export class Game {
   world: World;
@@ -131,15 +135,34 @@ export class Game {
   /** owners whose infrastructure is metered this month (they have, or had, an agreement) */
   private metered = new Set<number>();
   options: NewGameOptions;
-  day = 0;
-  dayFrac = 0;
+  /** Number of committed simulation ticks (40 per game day). */
+  tick = 0;
+  /** Clock constants through the instance, keeping subsystem imports of Game type-only. */
+  get tickSeconds() { return TICK; }
+  get ticksPerDay() { return TICKS_PER_DAY; }
+  get day() { return Math.floor(this.tick / TICKS_PER_DAY); }
+  // Retain writable calendar properties for headless fixtures that jump to a date.
+  set day(day: number) { this.tick = Math.trunc(day) * TICKS_PER_DAY + this.tick % TICKS_PER_DAY; }
+  get dayFrac() { return (this.tick % TICKS_PER_DAY) / TICKS_PER_DAY; }
+  set dayFrac(f: number) {
+    // Direct physics fixtures accumulate seconds before setting the calendar: tolerate boundary roundoff.
+    this.tick = this.day * TICKS_PER_DAY + Math.floor(Math.max(0, f) * TICKS_PER_DAY + 1e-7);
+  }
   speed = 1;
-  paused = false;
+  private _paused = false;
+  get paused() { return this._paused; }
+  set paused(paused: boolean) {
+    if (paused !== this._paused) { this.accumulator = 0; this.vehicles.resetRenderPoses(); }
+    this._paused = paused;
+  }
+  /** Wall-time remainder belongs to the scheduler, never the saved simulation. */
+  private accumulator = 0;
+  get alpha() { return this.accumulator / TICK; }
   rng: RNG;
   news: News[] = [];
   firstArrival = new Set<number>();
   /** time-of-day for the visual cycle, 0..1 */
-  visualTime = 0.36;
+  get visualTime() { return (0.36 + (this.tick % (TICKS_PER_DAY * 120)) / (TICKS_PER_DAY * 120)) % 1; }
   listeners = {
     news: [] as ((n: News) => void)[],
     income: [] as ((amount: number, v: Vehicle, st: Station) => void)[],
@@ -153,7 +176,7 @@ export class Game {
   private assetCache = new Map<number, { key: string; a: CompanyAssets }>();
   /** the demand model came with the save (older saves: rebuilt once the world is loaded) */
   private demandSaved = false;
-  /** the monthly catchment recompute waits for the next frame */
+  /** the monthly catchment recompute waits for the next tick */
   private deferCatchment = false;
 
   constructor(opts: NewGameOptions, world?: World) {
@@ -257,7 +280,7 @@ export class Game {
     this.accessKeys.clear();
     for (const a of this.access) this.accessKeys.add(a.user * 4096 + a.owner);
   }
-  /** Open networks and blocks for canUse (after policy changes; every frame too, as the UI edits AI configs). */
+  /** Open networks and blocks for canUse (after policy changes; every tick too, as the UI edits AI configs). */
   refreshAccess() {
     const n = this.companies.length;
     if (this.openNet.length !== n) this.openNet = new Uint8Array(n);
@@ -766,20 +789,22 @@ export class Game {
 
   // ------------------------------------------------------------ simulation
   update(dtReal: number) {
-    this.deferCatchment = false;
-    this.refreshAccess();
-    this.lines.flushCatchment();
-    if (this.paused) return;
-    let dt = Math.min(dtReal, 0.25) * this.speed;
-    this.flushNetworkChanges();
-    while (dt > 1e-6) {
-      const step = Math.min(MAX_STEP, dt);
-      this.tick(step);
-      dt -= step;
+    if (this.paused) {
+      // Construction and policy edits still take effect while simulation time is stopped.
+      this.refreshAccess();
+      this.flushNetworkChanges();
+      this.lines.flushCatchment();
+      return;
     }
+    if (!Number.isFinite(dtReal) || dtReal <= 0 || !Number.isFinite(this.speed) || this.speed <= 0) return;
+    this.accumulator += Math.min(dtReal, MAX_FRAME_TICKS * TICK) * this.speed;
+    // A tiny tolerance prevents floating wall-time sums (e.g. three 1/60 frames) losing a whole tick.
+    const ticks = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    this.accumulator = Math.max(0, this.accumulator - ticks * TICK);
+    for (let i = 0; i < ticks && !this.paused; i++) this.stepTick();
   }
 
-  /** Apply pending network changes to vehicles (normally done at the start of update). */
+  /** Apply pending network changes to vehicles (normally done at the start of a tick). */
   flushNetworkChanges() {
     if (!this.networkDirty) return;
     this.networkDirty = false;
@@ -789,16 +814,18 @@ export class Game {
     for (const l of this.listeners.network) l();
   }
 
-  private tick(dt: number) {
-    this.vehicles.update(dt);
-    this.visualTime = (this.visualTime + dt / (DAY_SECONDS * 120)) % 1;
-    const f0 = this.dayFrac;
-    this.dayFrac += dt / DAY_SECONDS;
-    let days = 0;
-    while (this.dayFrac >= 1) {
-      this.dayFrac -= 1;
-      this.day++;
-      days++;
+  /** Advance exactly one simulation tick. Wall time, speed and pause are handled by update(). */
+  stepTick() {
+    this.deferCatchment = false;
+    this.refreshAccess();
+    this.lines.flushCatchment();
+    this.flushNetworkChanges();
+    this.vehicles.update(TICK);
+    const tickOfDay = this.tick % TICKS_PER_DAY;
+    // Finish this day's work before daily decisions can start a project for the next day.
+    if (this.aiEnabled) for (const ai of [...this.ais]) ai.work(tickOfDay, tickOfDay + 1);
+    this.tick++;
+    if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
       // trains in a circle of mutual waiting: one of them takes another way (every few days)
       if (this.day % 3 === 0) resolveDeadlocks(this);
@@ -807,8 +834,6 @@ export class Game {
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
       }
     }
-    // AI project work spread over the day (no frame takes a whole day's planning)
-    if (this.aiEnabled) for (const ai of [...this.ais]) ai.work(f0, this.dayFrac + days);
     this.flushNetworkChanges();
     if (!this.deferCatchment) this.lines.flushCatchment();
   }
@@ -941,7 +966,7 @@ export class Game {
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
-    // catchments are shared out again at the start of the next frame (not on top of the month's other work)
+    // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     this.lines.catchmentDirty = true;
     this.deferCatchment = true;
     if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');

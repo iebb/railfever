@@ -1,12 +1,12 @@
 // Vehicle manager: ownership, reservations, spatial hash, purchases and ambient traffic.
 import type { Game } from './game';
 import { Vehicle } from './vehicle';
-import { Train, CROSS_BASE } from './train';
+import { Train, CROSS_BASE, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
-import type { NEdge } from './network';
-import { closestOnPolyline } from './geom';
+import { curvePoint, type NEdge } from './network';
+import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 
 /** Occupancy key: a lane (edge, direction) or one connector (from lane -> to lane) through a junction. */
@@ -15,6 +15,10 @@ const segKey = (s: RSeg) => (s.kind === 'lane' ? s.e * 2 + (s.dir > 0 ? 1 : 0)
 
 /** Vehicles on one lane/connector with the start of the stretch they occupy (pooled, rebuilt per tick). */
 interface Occ { v: RoadVehicle[]; s: number[]; n: number }
+
+/** Previous committed pose, only for rendering; absent from saves and simulation decisions. */
+interface RenderPose { segs: (TSeg | RSeg)[]; head: number; pos: number; reversed: boolean; length: number; tick: number }
+interface RenderPoint<S> { seg: S; pos: number }
 
 export class Vehicles {
   map = new Map<number, Vehicle>();
@@ -32,7 +36,13 @@ export class Vehicles {
   private rng = new RNG(4242);
   private failedUpdates = new WeakSet<Vehicle>();
   ambientEnabled = true;
-  private ambientTimer = 0;
+  private ambientTicks = 0;
+  // Keep the save field in seconds for compatibility; its countdown is an integer number of ticks.
+  private get ambientTimer() { return this.ambientTicks * this.game.tickSeconds; }
+  private set ambientTimer(seconds: number) { this.ambientTicks = Math.max(0, Math.round(seconds / this.game.tickSeconds)); }
+  private renderPoses = new WeakMap<Vehicle, RenderPose>();
+  private prevPoint = { x: 0, y: 0, z: 0 };
+  private prevDir = { x: 0, y: 0, z: 0 };
 
   constructor(private game: Game) {
     const net = game.world.net;
@@ -45,6 +55,74 @@ export class Vehicles {
   trains(): Train[] { return [...this.map.values()].filter((v): v is Train => v.kind === 'train'); }
   roads(): RoadVehicle[] { return [...this.map.values()].filter((v): v is RoadVehicle => v.kind === 'road'); }
   ofOwner(owner: number) { return [...this.map.values()].filter((v) => v.owner === owner); }
+
+  resetRenderPoses() { this.renderPoses = new WeakMap(); }
+
+  private rememberPose(v: Vehicle) {
+    if (!(v instanceof Train || v instanceof RoadVehicle)) return;
+    let p = this.renderPoses.get(v);
+    if (!p) { p = { segs: [], head: 0, pos: 0, reversed: false, length: 0, tick: 0 }; this.renderPoses.set(v, p); }
+    p.segs.length = 0;
+    if (v instanceof Train) {
+      for (const s of v.segs) p.segs.push(s);
+      p.head = v.headSeg; p.pos = v.headPos; p.reversed = v.reversed;
+    } else {
+      for (let i = v.trail.length - 1; i >= 0; i--) p.segs.push(v.trail[i]);
+      if (v.seg) p.segs.push(v.seg);
+      p.head = p.segs.length - 1; p.pos = v.pos;
+    }
+    p.length = v.length; p.tick = this.game.tick;
+  }
+
+  /** Interpolate committed poses without moving the vehicle, extending a route or reserving track. */
+  renderPointBehind(v: Train, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg> | null;
+  renderPointBehind(v: RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<RSeg> | null;
+  renderPointBehind(v: Train | RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg | RSeg> | null;
+  renderPointBehind(v: Train | RoadVehicle, d: number, out: Vec3Like, dir?: Vec3Like): RenderPoint<TSeg | RSeg> | null {
+    let current: RenderPoint<TSeg | RSeg>;
+    if (v instanceof Train) {
+      const q = v.pointBehind(d, out, dir);
+      if (!q) return null;
+      current = { seg: q.seg, pos: q.sp };
+    } else {
+      if (!v.seg) return null;
+      let s = v.seg, pos = v.pos, k = 0, behind = d;
+      while (behind > pos && k < v.trail.length) { behind -= pos; s = v.trail[k++]; pos = s.len; }
+      pos = Math.max(0, Math.min(s.len, pos - behind));
+      curvePoint(s.curve, pos, out, dir);
+      current = { seg: s, pos };
+    }
+    const p = this.renderPoses.get(v), alpha = this.game.alpha;
+    if (this.game.paused || !p || !p.segs.length || p.tick !== this.game.tick - 1 || p.length !== v.length) return current;
+    const reversed = v instanceof Train && p.reversed !== v.reversed;
+    let behind = reversed ? p.length - d : d, i = p.head, pos = p.pos;
+    while (behind > pos && i > 0) { behind -= pos; pos = p.segs[--i].len; }
+    const s = p.segs[i];
+    pos = Math.max(0, Math.min(s.len, pos - behind));
+    const rail = v instanceof Train, sign = rail && s.dir < 0 ? -1 : 1;
+    curvePoint(s.curve, rail && s.dir < 0 ? s.len - pos : pos, this.prevPoint, dir ? this.prevDir : undefined);
+    out.x = this.prevPoint.x + (out.x - this.prevPoint.x) * alpha;
+    out.y = this.prevPoint.y + (out.y - this.prevPoint.y) * alpha;
+    out.z = this.prevPoint.z + (out.z - this.prevPoint.z) * alpha;
+    if (dir) {
+      const sg = reversed ? -sign : sign, q = this.prevDir;
+      dir.x = q.x * sg + (dir.x - q.x * sg) * alpha;
+      dir.y = q.y * sg + (dir.y - q.y * sg) * alpha;
+      dir.z = q.z * sg + (dir.z - q.z * sg) * alpha;
+      const len = Math.hypot(dir.x, dir.y, dir.z) || 1;
+      dir.x /= len; dir.y /= len; dir.z /= len;
+    }
+    if (s === current.seg) return { seg: s, pos: pos + (current.pos - pos) * alpha };
+    return alpha < 0.5 ? { seg: s, pos } : current;
+  }
+
+  /** Camera follow uses the same interpolated centre as the vehicle bodies. */
+  renderWorldPos(v: Vehicle, out: Vec3Like): boolean {
+    if (v instanceof Train || v instanceof RoadVehicle) {
+      if (this.renderPointBehind(v, v.length / 2, out)) return true;
+    }
+    return v.worldPos(out);
+  }
 
   // ---------------------------------------------------------------- reservations
   getRes(r: number): number { return this.res.get(r) ?? 0; }
@@ -272,6 +350,7 @@ export class Vehicles {
 
   // ---------------------------------------------------------------- update
   private updateVehicle(v: Vehicle, dt: number) {
+    this.rememberPose(v);
     if (v.state === 'stopped' && this.failedUpdates.has(v)) return;
     try { v.update(dt); }
     catch (e) {
@@ -304,8 +383,7 @@ export class Vehicles {
         if (a.state !== 'stopped' && a.seg) amb[n++] = a;
       }
       amb.length = n;
-      this.ambientTimer -= dt;
-      if (this.ambientTimer <= 0) { this.ambientTimer = 8; this.manageAmbient(); }
+      if (--this.ambientTicks <= 0) { this.ambientTicks = Math.round(8 / this.game.tickSeconds); this.manageAmbient(); }
     } else if (this.ambient.length) this.ambient = [];
   }
 

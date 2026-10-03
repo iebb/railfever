@@ -12,6 +12,8 @@ export class CameraController {
   private cur = { tx: 128, ty: 0, tz: 128, d: 60, yaw: Math.PI * 0.25, pitch: 0.8 };
   keys = new Set<string>();
   follow: (() => THREE.Vector3 | null) | null = null;
+  /** Optional render pose supplied by the game for the UI's followed vehicle. */
+  followPosition: ((out: THREE.Vector3) => boolean) | null = null;
   private drag: { mode: 'pan' | 'rotate'; x: number; y: number } | null = null;
   minDist = 1.5;
   maxDist = 700;
@@ -189,7 +191,10 @@ export class CameraController {
     if (!this.world) { cam.position.set(this.target.x, 50, this.target.z + 50); cam.lookAt(this.target); return; }
     if (this.follow) {
       const p = this.follow();
-      if (p) { this.target.x = p.x; this.target.z = p.z; this.clampTarget(); } else this.follow = null;
+      if (p) {
+        this.followPosition?.(p);
+        this.target.x = p.x; this.target.z = p.z; this.clampTarget();
+      } else this.follow = null;
     }
     this.target.y = this.ground(this.target.x, this.target.z);
     // smoothing

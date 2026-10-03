@@ -55,6 +55,10 @@ function setGame(g: Game) {
   played = false;
   renderer.setGame(g);
   ui.setGame(g);
+  renderer.controls.followPosition = (out) => {
+    const v = ui.following === null ? undefined : g.vehicles.get(ui.following);
+    return v ? g.vehicles.renderWorldPos(v, out) : false;
+  };
   try { audio.setGame(g); } catch (e) { console.warn('audio setGame failed', e); }
   // focus the camera on the biggest town
   const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
@@ -102,11 +106,12 @@ window.addEventListener('pagehide', () => { autosave('pagehide'); });
 let last = performance.now();
 const focusV = new THREE.Vector3();
 function loop(now: number) {
-  const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
+  const wallDt = Math.max(0, (now - last) / 1000);
+  const dt = Math.min(0.1, wallDt);
   last = now;
   if (game) {
     const t0 = performance.now();
-    try { game.update(dt); } catch (e) { console.error(e); }
+    try { game.update(wallDt); } catch (e) { console.error(e); }
     renderer.simMs = performance.now() - t0;
     try {
       if (ui.titleOpen) {

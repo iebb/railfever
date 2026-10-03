@@ -3,12 +3,14 @@
 //   --outfile=$S/determinism.mjs
 // node $S/determinism.mjs [--seed=7] [--days=360] [--every=30] [--size=384] [--ais=2]
 // Exit 1: identical-step replicas differ. Exit 2: invalid options/fixture/error.
-// Different-chunk results are observations, not failures; use --strict-chunking to fail on those too.
+// All chunk sizes should MATCH; --strict-chunking makes any chunking divergence fail the run.
+import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
-import { Game, type NewGameOptions } from '../src/game/game';
+import { Game, TICK, TICKS_PER_DAY, type NewGameOptions } from '../src/game/game';
+import { World } from '../src/game/world';
 import { DAY_SECONDS } from '../src/game/constants';
-import { serialize } from '../src/game/save';
+import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { Train } from '../src/game/train';
 import { RoadVehicle, roadDepotReaches } from '../src/game/roadvehicle';
@@ -163,6 +165,66 @@ function advance(s: Stream, seconds: number) {
   const end = Math.round(seconds / s.dt);
   if (Math.abs(end * s.dt - seconds) > 1e-8) throw new Error('Checkpoint does not align with dt');
   while (s.calls < end) { s.g.update(s.dt); s.calls++; }
+  assert.equal(s.g.tick, Math.round(seconds / TICK), `${s.name}: exact committed tick at checkpoint`);
+  assert.equal(s.g.dayFrac, 0, `${s.name}: integer day boundary`);
+}
+
+/** Scheduler and legacy-save boundaries, using an empty headless world without patching methods. */
+function checkScheduler() {
+  const empty = () => new Game({ size: 64, seed: 1, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 }, new World(64));
+  const g = empty();
+  g.update(1 / 60); g.update(1 / 60);
+  assert.equal(g.tick, 0, 'partial frames do not enter simulation');
+  assert(Math.abs(g.alpha - 2 / 3) < 1e-12, 'render alpha retains partial wall time');
+  g.update(1 / 60);
+  assert.equal(g.tick, 1, 'three 60 fps frames commit one tick');
+  assert.equal(g.alpha, 0);
+  for (const dt of [0, -1, NaN, Infinity]) g.update(dt);
+  assert.equal(g.tick, 1, 'invalid wall time does not tick');
+  g.update(TICK / 2);
+  g.paused = true; g.update(10);
+  assert.equal(g.tick, 1, 'pause stops ticks');
+  assert.equal(g.alpha, 0, 'pause clears the wall-time remainder');
+  g.paused = false; g.update(TICK / 2);
+  assert.equal(g.tick, 1, 'resume starts with a fresh remainder');
+  g.stepTick();
+  assert.equal(g.tick, 2, 'headless stepTick always commits one tick');
+  for (const speed of [1, 2, 4, 8]) {
+    const paced = empty(); paced.speed = speed;
+    for (let frame = 0; frame < 60; frame++) paced.update(1 / 60);
+    assert.equal(paced.tick, 20 * speed, `one wall second at ${speed}x`);
+    const tick = paced.tick;
+    paced.update(1000);
+    assert.equal(paced.tick - tick, 8 * speed, `stalled frame is bounded at ${speed}x`);
+    assert(paced.alpha >= 0 && paced.alpha < 1);
+  }
+  const month = empty(); month.tick = 30 * TICKS_PER_DAY - 1;
+  month.stepTick();
+  assert.equal(month.day, 30); assert.equal(month.dayFrac, 0);
+  assert(month.lines.catchmentDirty, 'monthly catchment waits for the next tick');
+  month.update(TICK / 2);
+  assert(month.lines.catchmentDirty, 'a render-only frame does not flush monthly catchment');
+  month.update(TICK / 2);
+  assert(!month.lines.catchmentDirty, 'next committed tick flushes monthly catchment');
+  const saved = empty(); saved.tick = 1234567; saved.update(TICK / 2);
+  const data = serialize(saved), loaded = deserialize(JSON.parse(JSON.stringify(data)));
+  assert.equal(loaded.tick, saved.tick, 'save restores the exact integer tick');
+  assert.equal(JSON.stringify(serialize(loaded)), JSON.stringify(data), 'tick save round trip is exact');
+  assert.equal(loaded.alpha, 0, 'wall-time remainder stays outside the saved simulation');
+  const legacy = { ...data, day: 5, dayFrac: 0.425 }; delete legacy.tick;
+  assert.equal(deserialize(legacy).tick, 217, 'legacy fractional days derive ticks');
+  assert.equal(deserialize({ ...legacy, dayFrac: 0.999999999999 }).tick, 240, 'legacy floating day boundary rounds to its tick');
+  const date = empty(); date.day = 29; date.dayFrac = 0.999999999999;
+  assert.equal(date.tick, 1200, 'writable calendar tolerates accumulated physics-time roundoff');
+  date.day = 359; date.dayFrac = 0.99;
+  assert.equal(date.tick, 14399, 'explicit date jumps retain the next daily boundary');
+  for (const tick of [35, 45, 60, 113, 158]) {
+    const timer = empty();
+    for (let i = 0; i < tick; i++) timer.stepTick();
+    const data = JSON.stringify(serialize(timer));
+    assert.equal(JSON.stringify(serialize(deserialize(JSON.parse(data)))), data, `ambient countdown round trip at tick ${tick}`);
+  }
+  console.log('SCHEDULER: PASS fractional frames, pause/resume, 1x/2x/4x/8x, bounded stalls, monthly catchment, exact/legacy tick saves');
 }
 
 type ScheduledCommand = { day: number; kind: 'rename-lines' | 'repay-loan' | 'change-line-color' };
@@ -186,13 +248,14 @@ function apply(s: Stream, c: ScheduledCommand) {
 function summary(s: Stream) {
   const g = s.g;
   return { stream: s.name, suppliedSeconds: s.calls * s.dt, updates: s.calls,
-    day: g.day, dayFrac: g.dayFrac, companies: g.activeCompanies.length,
+    tick: g.tick, day: g.day, dayFrac: g.dayFrac, companies: g.activeCompanies.length,
     edges: g.world.net.edges.size, stations: g.stations.map.size, lines: g.lines.map.size, vehicles: g.vehicles.map.size,
     delivered: g.vehicles.all().filter((v) => v.owner === 0).reduce((n, v) => n + v.delivered, 0),
     ai: g.ais.map((a) => ({ company: a.companyId, phase: a.state.phase, projects: a.state.projects, vehicles: a.stats.vehicles })) };
 }
 
 function main() {
+  checkScheduler();
   const seed = numberOption('seed', 7, 0), days = numberOption('days', 360), every = numberOption('every', 30);
   const size = numberOption('size', 384, 192), ais = numberOption('ais', 2, 0);
   if (ais > 7) throw new Error('--ais must be <= 7');
@@ -214,7 +277,7 @@ function main() {
   const rawSave = JSON.stringify(serialize(streams[0].g));
   console.log(`  initial save: ${Buffer.byteLength(rawSave)} JSON bytes; ${gzipSync(rawSave).byteLength} gzip bytes (Node gzip, not a network benchmark)`);
   console.log(`  initial state hash ${initial.hash}`);
-  const checkpoints = new Set<number>([days]);
+  const checkpoints = new Set<number>([1, days]);
   for (let day = every; day <= days; day += every) checkpoints.add(day);
   for (const c of commands) if (c.day <= days) checkpoints.add(c.day);
   let fixedFailed = false, chunkFailed = false, lastDay = 0;
@@ -231,13 +294,13 @@ function main() {
         s.active = false; // Retain its first divergence state; keep the independent comparisons running.
       }
     }
-    console.log(`  day ${day}: A ${ref.hash.slice(0, 16)}; identical fixed ${fixedFailed ? 'DIVERGED' : 'match'}`);
+    console.log(`  day ${day}, tick ${streams[0].g.tick}: A ${ref.hash.slice(0, 16)}; fixed ${fixedFailed ? 'DIVERGED' : 'MATCH'}; chunking ${chunkFailed ? 'DIVERGED' : 'MATCH'}`);
     lastDay = day;
     if (fixedFailed) break;
   }
   for (const s of streams) console.log('  final ' + JSON.stringify(summary(s)));
   console.log(`IDENTICAL FIXED STEPS: ${fixedFailed ? 'FAIL' : `PASS through ${days} nominal days`}`);
-  for (const s of streams.slice(2)) console.log(`CHUNKING ${s.dt}: ${s.active ? `no divergence observed through ${days} days` : 'DIVERGED (first observation above)'}`);
+  for (const s of streams.slice(2)) console.log(`CHUNKING ${s.dt}: ${s.active ? `MATCH through ${days} days (${s.g.tick} ticks)` : 'DIVERGED (first observation above)'}`);
   console.log('Scope: one process/JS engine, one fixture; equal hashes do not prove cross-browser or save/resume determinism. No time or RNG monkeypatches.');
   process.exitCode = fixedFailed || (chunkFailed && process.argv.includes('--strict-chunking')) ? 1 : 0;
 }

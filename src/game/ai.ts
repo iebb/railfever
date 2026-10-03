@@ -1191,13 +1191,14 @@ export class AIController {
 
   /**
    * The current project's work units, `budget` per game day spread evenly over the day (each company at its
-   * own phase), so planning never stalls a frame: called every simulation tick with the day fraction before
-   * and after the tick (after + whole days passed).
+   * own phase), so planning never stalls a frame: called with integer ticks within the day before and after
+   * the step (the final tick ends at TICKS_PER_DAY).
    */
-  work(f0: number, f1: number) {
+  work(t0: number, t1: number) {
     if (this.disposed || !this.job) return;
-    const n = this.budget, ph = (this.companyId * 0.37) % 1;
-    let units = Math.floor(f1 * n + ph) - Math.floor(f0 * n + ph);
+    const n = this.budget, phase = (this.companyId * 37) % 100, perDay = this.game.ticksPerDay;
+    const allowance = (tick: number) => Math.floor((tick * n * 100 + phase * perDay) / (perDay * 100));
+    let units = allowance(t1) - allowance(t0);
     try {
       for (; units > 0 && this.job; units--) {
         const t0 = AIController.profile ? performance.now() : 0;
