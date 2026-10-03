@@ -133,14 +133,16 @@ export interface Town {
  * densification) is Towns.growStep; this only sets how often a town takes its steps (scripts/growth.ts: over 20
  * years well-served towns grow about 1.6-2.5x, poorly served ones 1.3-1.6x, towns without service 1.1-1.3x).
  */
-/** A station near a town is active when a line serves it and a vehicle called within this many days (v2 calendar). */
+/** A station near a town is active when a line serves it and a vehicle called within this many days (v2 calendar; building it is no call). */
 export const GROWTH_ACTIVE_DAYS = 90;
 /** Mean days between growth steps without public transport (about 1 % a year for a balanced town) and with the best service. */
 export const GROWTH_DAYS_UNSERVED = 100, GROWTH_DAYS_BEST = 6;
 /** Share of the residents reached by frequent service at which the reach counts fully (walking catchments are small). */
 export const GROWTH_FULL_REACH = 0.12;
-/** Service frequency that counts fully: vehicles call on this share of days (Station.callRate; 0.05: every 20 days). */
+/** Service frequency that counts fully: vehicles called on this share of the last 30 days (Stations.callShare; 0.05: on two). */
 export const GROWTH_FULL_CALLS = 0.05;
+/** An active station without a call in the last 30 days still counts this much (a train every ~2 months still serves a town). */
+export const GROWTH_MIN_CALLS = 0.15;
 /** Station ratings from this (by catchment) count fully; lower ones slow growth. */
 export const GROWTH_FULL_RATING = 0.7;
 /** Growth speed labels by service score (index: score below 0.01, 0.2, 0.4, 0.6, else). */
@@ -152,7 +154,7 @@ export interface TownService {
   stations: number;
   /** share of the residents in the walking catchment of the active stations (0..1) */
   coverage: number;
-  /** that share weighted by how often vehicles call (0..1) */
+  /** that share weighted by how often vehicles called in the last 30 days (GROWTH_MIN_CALLS .. 1 from GROWTH_FULL_CALLS; 0..1) */
   reach: number;
   /** share of the passengers at the active stations who boarded rather than gave up waiting, this and last month (0..1) */
   transported: number;
@@ -169,17 +171,19 @@ export interface TownService {
 /**
  * A town's public transport service and growth speed (Towns.daily schedules growth steps by it; the town window
  * shows it): score = reach (up to GROWTH_FULL_REACH) x (0.3 + 0.7 transported) x (0.4 + 0.6 rating, up to
- * GROWTH_FULL_RATING); the speed goes from 1 (no service) to GROWTH_DAYS_UNSERVED / GROWTH_DAYS_BEST (score 1).
+ * GROWTH_FULL_RATING); the speed goes from 1 (no service) to GROWTH_DAYS_UNSERVED / GROWTH_DAYS_BEST (score 1). Each
+ * active station reaches its catchment by how often vehicles called in the last 30 days (Stations.callShare), from
+ * GROWTH_MIN_CALLS (none) to fully (GROWTH_FULL_CALLS).
  */
 export function townService(g: Game, town: Town): TownService {
   let stations = 0, catchPop = 0, reached = 0, rated = 0, boarded = 0, lost = 0;
   const R = town.radius + 10;
   for (const st of g.stations.map.values()) {
-    if (g.day - st.lastPickup > GROWTH_ACTIVE_DAYS || !g.lines.stationServed(st.id)) continue;
+    if (st.lastCall < 0 || g.day - st.lastCall > GROWTH_ACTIVE_DAYS || !g.lines.stationServed(st.id)) continue;
     if (Math.hypot(st.x - town.x, st.z - town.z) > R) continue;
     stations++;
     catchPop += st.catchPop;
-    reached += st.catchPop * Math.min(1, (st.callRate || 0) / GROWTH_FULL_CALLS);
+    reached += st.catchPop * (GROWTH_MIN_CALLS + (1 - GROWTH_MIN_CALLS) * Math.min(1, g.stations.callShare(st) / GROWTH_FULL_CALLS));
     rated += st.catchPop * st.rating;
     boarded += st.pickupMonth + st.pickupLast;
     lost += (st.lostMonth || 0) + (st.lostLast || 0);

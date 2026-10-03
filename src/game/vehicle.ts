@@ -188,6 +188,7 @@ export abstract class Vehicle {
     moved += picked;
     st.pickupMonth += picked;
     st.lastPickup = g.day;
+    st.lastCall = g.day;
     st.lastSpeed = Math.max(st.lastSpeed * 0.8, this.maxSpeedKmh);
     return 2.0 + moved * perPax;
   }

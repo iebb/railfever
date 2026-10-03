@@ -207,8 +207,8 @@ function growthText(sv: TownService): string {
   return `${sv.label} — ${fmtPct(sv.transported)} of passengers transported, ${sv.stations} active station${sv.stations > 1 ? 's' : ''}`;
 }
 function growthTip(sv: TownService): string {
-  if (!sv.stations) return 'Towns grow faster with public transport: stations served at least every few months, frequent vehicles and room for every passenger.';
-  return `Residents near active stations: ${fmtPct(sv.coverage)} (weighted by service frequency: ${fmtPct(sv.reach)}) · mean station rating ${fmtPct(sv.rating)} · ` +
+  if (!sv.stations) return 'Towns grow faster with public transport: stations a vehicle called at in the last three months, frequent vehicles and room for every passenger.';
+  return `Residents near active stations: ${fmtPct(sv.coverage)} (weighted by how often vehicles called in the last 30 days: ${fmtPct(sv.reach)}) · mean station rating ${fmtPct(sv.rating)} · ` +
     `builds ${sv.speed.toFixed(1)}× as often as a town without public transport`;
 }
 

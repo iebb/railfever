@@ -8,7 +8,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
 import type { Station } from '../src/game/stations';
 import { townService } from '../src/game/towns';
-import { fails, check, fmt } from './lib';
+import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { fails, check, fmt, busStopSites, addBusStop, roadDepotNear } from './lib';
 
 /** Monthly sample of a town: active stations (a vehicle called this month), their catchment, passengers, service. */
 interface Month { pop: number; act: number; act90: number; catch: number; gen: number; trans: number; lost: number; boarded: number; rating: number; calls: number; score?: number; speed?: number }
@@ -62,8 +63,8 @@ function simulate(seed: number): Run {
     const t = performance.now();
     for (let i = 0; i < g.ticksPerDay; i++) g.stepTick();
     yMs += performance.now() - t; yTicks += g.ticksPerDay;
-    // a vehicle called at the station yesterday
-    for (const st of g.stations.map.values()) if (g.day - st.lastPickup === 1) calls.set(st.id, (calls.get(st.id) ?? 0) + 1);
+    // a vehicle called at the station yesterday (lastCall: only vehicles set it; building a station is no call)
+    for (const st of g.stations.map.values()) if (st.lastCall >= 0 && g.day - st.lastCall === 1) calls.set(st.id, (calls.get(st.id) ?? 0) + 1);
     if (g.day % 30 !== 0) continue;
     // month end (the game has moved this month's counters to *Last): its counters of passengers who gave up against
     // ours; the stations' counters: their own passengers, plus those of stations merged into them during the month
@@ -78,7 +79,7 @@ function simulate(seed: number): Run {
       let act = 0, act90 = 0, cp = 0, rt = 0, cl = 0, boarded = 0;
       for (const st of g.stations.map.values()) {
         if (!g.lines.stationServed(st.id) || Math.hypot(st.x - town.x, st.z - town.z) > town.radius + 10) continue;
-        if (g.day - st.lastPickup <= 90) act90++;
+        if (st.lastCall >= 0 && g.day - st.lastCall <= 90) act90++;
         const c30 = calls.get(st.id) ?? 0;
         if (c30 <= 0) continue;
         act++; cp += st.catchPop; rt += st.rating * st.catchPop; cl += c30 * st.catchPop; boarded += st.pickupLast;
@@ -101,6 +102,39 @@ function simulate(seed: number): Run {
   console.log(`seed ${seed}: ${g.towns.list.length} towns, gen ${fmt(genMs / 1000, 1)} s, ${YEARS} years in ${fmt((performance.now() - T1) / 1000, 0)} s`);
   check(counterErr === 0, `seed ${seed}: station and town counters of passengers who gave up waiting match ours (${counterErr} mismatches)`);
   return { seed, size: SIZE, years: YEARS, towns: logs, yearly };
+}
+
+/**
+ * The service history of stations: building a station is no call (a town is not served before a vehicle calls), and
+ * the service frequency is the share of the last 30 days with a call (none left 31 days after the last one).
+ */
+function historyChecks() {
+  const g = Game.create({ size: 256, seed: 3, towns: 3, hilliness: 'flat', water: 'low', startYear: 1990 });
+  g.vehicles.ambientEnabled = false;
+  const town = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
+  const sites = busStopSites(g, town, 0, 10, 30);
+  const ids = sites.map(([x, z]) => addBusStop(g, x, z, 0));
+  const depot = sites.length ? roadDepotNear(g, sites[0][0], sites[0][1], 0) : -1;
+  if (ids.length < 2 || ids.some((id) => id < 0) || depot < 0) { console.log('  service history: no bus line could be built (skipped)'); return; }
+  const line = g.lines.create('road', 0);
+  line.stops = ids;
+  g.vehicles.buyRoad(depot, MODEL_BY_ID.get('bus_c')!, line.id);
+  g.lines.rebuild();
+  const st = ids.map((id) => g.stations.get(id)!);
+  const sv0 = townService(g, town);
+  check(st.every((s) => s.lastCall === -1 && s.callDays === 0) && sv0.stations === 0 && sv0.speed === 1,
+    `a bus line in its depot does not serve the town yet (${sv0.stations} active stations, speed ${fmt(sv0.speed, 2)})`);
+  // a vehicle calls every day for 90 days, then none: the share of the last 30 days with a call
+  const s0 = st[0];
+  const day = () => { g.day = g.day + 1; g.stations.updateRatings(); };
+  for (let d = 0; d < 90; d++) { s0.lastCall = g.day; day(); }
+  const lastCall = s0.lastCall, full = g.stations.callShare(s0);
+  while (g.day < lastCall + 30) day();
+  const at30 = g.stations.callShare(s0);
+  day();
+  const at31 = g.stations.callShare(s0);
+  check(full === 1 && Math.abs(at30 - 1 / 30) < 1e-9 && at31 === 0,
+    `service frequency: share of the last 30 days with a call (${fmt(full, 3)}; 30 days after the last call ${fmt(at30, 3)}, 31 days ${fmt(at31, 3)})`);
 }
 
 /**
@@ -180,6 +214,7 @@ function report(runs: Run[], checks: boolean) {
 
 // --report=a.json,b.json: only the report of earlier runs (dumped with --out), without the checks
 const reportOnly = opt('report');
+if (!reportOnly) historyChecks();
 const runs: Run[] = reportOnly ? reportOnly.split(',').flatMap((f) => JSON.parse(readFileSync(f, 'utf8')) as Run[]) : seeds.map(simulate);
 const out = opt('out');
 if (out && !reportOnly) writeFileSync(out, JSON.stringify(runs));

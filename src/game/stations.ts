@@ -57,8 +57,11 @@ export const catchModeOf = (m: RailMode): CatchMode => (m === 'mainline' ? 'rail
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
 export const TRANSFER_RANGE = 14;
-/** Station rating: days over which the service frequency (Station.callRate) is averaged. */
-const CALL_RATE_DAYS = 30;
+/** Days of service history a station keeps (Station.callDays): its service frequency is the share of them with a call (Stations.callShare). */
+export const CALL_DAYS = 30;
+const CALL_MASK = 2 ** CALL_DAYS - 1;
+/** Older saves (no history): a station a vehicle has called at starts from three calls in the last 30 days. */
+const OLD_SAVE_CALLS = 1 | (1 << 10) | (1 << 20);
 /** Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). */
 export const RATING_LOST = 0.25;
 /** Share of a station's passengers who gave up waiting rather than board (this and last month), 0..1. */
@@ -224,8 +227,10 @@ export interface Station {
   arrivedMonth: number; arrivedLast: number;
   /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
   lostMonth: number; lostLast: number;
-  /** service frequency: rolling share of the days on which a vehicle called (about the last month; updateRatings) */
-  callRate: number;
+  /** day a vehicle last called (stopped) at the station; -1 before the first call (unlike lastPickup, not the day it was built) */
+  lastCall: number;
+  /** days of the last CALL_DAYS on which a vehicle called, bit k: k + 1 days ago (updateRatings; Stations.callShare) */
+  callDays: number;
   built: number;
   /** stations linked for walking transfers (a transfer complex), both ways */
   links: number[];
@@ -544,7 +549,7 @@ export class Stations {
       id: this.nextId++, name: this.stationName(x, z, town), owner, townId: town ? town.id : -1, x, z, rail: null, stops: [],
       waiting: new Map(), waitingTotal: 0, rating: 0.65, lastPickup: g.day, lastSpeed: 0,
       catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0,
-      lostMonth: 0, lostLast: 0, callRate: 0, built: g.day,
+      lostMonth: 0, lostLast: 0, lastCall: -1, callDays: 0, built: g.day,
       links: [], roadAccess: true,
     };
     this.map.set(st.id, st);
@@ -1693,7 +1698,8 @@ export class Stations {
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
     a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
-    a.rating = Math.max(a.rating, b.rating); a.callRate = Math.max(a.callRate, b.callRate);
+    a.rating = Math.max(a.rating, b.rating);
+    a.lastCall = Math.max(a.lastCall, b.lastCall); a.callDays = (a.callDays | b.callDays) & CALL_MASK;
     // links
     for (const o of b.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== b.id); if (os && os !== a) this.addLink(a, os); }
     b.links = [];
@@ -2479,16 +2485,25 @@ export class Stations {
     }
   }
 
+  /** Service frequency: the share of the last CALL_DAYS days on which a vehicle called at the station (0..1). */
+  callShare(st: Station): number {
+    let m = st.callDays || 0, n = 0;
+    while (m) { m &= m - 1; n++; }
+    return n / CALL_DAYS;
+  }
+
   /**
    * Daily station ratings (game.ts): a rating moves towards a target from the days since a vehicle last called,
    * the queue, the speed of the services and the share of passengers who gave up waiting (lostShare); a station
-   * no line serves stays at or below 50 %. Also the service frequency (callRate: share of days with a call).
+   * no line serves stays at or below 50 %. Also the service history (callDays: the days a vehicle called, from lastCall).
    */
   updateRatings() {
     const g = this.game;
     for (const st of this.map.values()) {
       const days = g.day - st.lastPickup;
-      st.callRate = (st.callRate || 0) + ((days <= 1 ? 1 : 0) - (st.callRate || 0)) / CALL_RATE_DAYS;
+      // a vehicle called yesterday (building the station is no call: lastCall is only set by vehicles)
+      const called = st.lastCall >= 0 && g.day - st.lastCall === 1 ? 1 : 0;
+      st.callDays = (((st.callDays || 0) << 1) | called) & CALL_MASK;
       let target = 0.33;
       target += days <= 7 ? 0.27 : days <= 14 ? 0.18 : days <= 30 ? 0.08 : 0;
       target += st.waitingTotal < 100 ? 0.15 : st.waitingTotal < 400 ? 0.08 : st.waitingTotal < 1200 ? 0 : -0.12;
@@ -2665,6 +2680,12 @@ export class Stations {
   }
 }
 
+/** The service history of a saved station (older saves: from the day of its last pickup, if later than its building). */
+function callsOf(s: any): { lastCall: number; callDays: number } {
+  const lastCall = typeof s.lastCall === 'number' ? s.lastCall : s.lastPickup > s.built ? s.lastPickup : -1;
+  return { lastCall, callDays: typeof s.callDays === 'number' ? s.callDays : lastCall >= 0 ? OLD_SAVE_CALLS : 0 };
+}
+
 /** A station restored from a save: own copies of every array, defaults for fields older saves lack. */
 export function restoreStation(s: any): Station {
   const r = s.rail;
@@ -2683,8 +2704,9 @@ export function restoreStation(s: any): Station {
     stops: (s.stops ?? []).map((p: any) => ({ ...p })),
     links: [...(s.links ?? [])],
     roadAccess: s.roadAccess ?? true,
-    // older saves: no passengers lost yet; a typical service frequency (a call every ten days) to start from
-    lostMonth: s.lostMonth ?? 0, lostLast: s.lostLast ?? 0, callRate: s.callRate ?? 0.1,
+    // older saves: no passengers lost yet; a station picked up from after it was built has had calls (a typical
+    // frequency, three in the last 30 days, to start from)
+    lostMonth: s.lostMonth ?? 0, lostLast: s.lostLast ?? 0, ...callsOf(s),
     onPlat: s.onPlat ? [...s.onPlat] : undefined,
     waiting: new Map(),
   };
