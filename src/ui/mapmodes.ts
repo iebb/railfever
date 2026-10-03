@@ -1,15 +1,20 @@
-// Map views: "Lines map" (every line's route in its colour, side by side where lines share track) and
-// "Demand" (desire lines between towns by potential and served share, town rings with share transported).
+// Map views: "Lines map" (every line's route in its colour, side by side where lines share track, with the station
+// numbers on the stations and the name of the line under the pointer) and "Demand" (desire lines between towns by
+// potential and served share, town rings with share transported).
 import * as THREE from 'three';
 import type { UI } from './ui';
 import type { Line } from '../game/lines';
 import { PLAYER } from '../game/game';
 import { h, icon, clear, seg } from './dom';
-import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, MODE_META, LineFilter } from './lineid';
+import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, allBadges, MODE_META, LineFilter, Badge } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
 import { townDemandShare, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
+import { ROUTE_LIFT } from '../render/overlay';
 import type { Arc, ShareRing } from '../render/overlay';
+import { markY, markHalfHeight, pinY } from '../render/labels';
+import type { Labels, StationMark } from '../render/labels';
+import { RouteIndex } from './routepick';
 import { fmtInt } from './dom';
 
 export type MapMode = 'none' | 'lines' | 'demand' | 'catchment' | 'signals';
@@ -46,14 +51,33 @@ const BLOCK_COLOR = { free: 0x4d8fe0, reserved: 0xffd23f, occupied: 0xf2542d };
 const SIG_COLOR = { path: 0xff85c0, block: 0xf5f7fa };
 const DISPLAY_KEY = 'railfever.linesmap';
 
+/** Where a line was shown by a hover or a tap: a point on its route, or the station whose number it was. */
+interface LineSpot { line: number; x: number; y: number; z: number; station?: number }
+
 export class MapModes {
   mode: MapMode = 'none';
-  /** lines map: mode / company filter (remembered), and the display: routes ('lines') or numbered stations ('stations') */
+  /**
+   * lines map: mode / company filter (remembered), and the display: 'lines' (routes in their colours with the station
+   * numbers on the stations) or 'stations' (quiet routes under station pins with names, waiting and all numbers).
+   * Both show a line's name only while it is hovered (tapped on touch).
+   */
   filter: LineFilter = getFilter('map');
   filterVer = 0;
   display: 'lines' | 'stations' = 'lines';
-  /** line highlighted from the legend or its route tag */
-  hoverLine: number | null = null;
+  /**
+   * lines map hover sources: a legend row under the pointer or with the keyboard focus, the name tag, a station's
+   * number, the route under the pointer, a tap
+   */
+  private hov = { list: null as number | null, kbd: null as number | null, tag: null as number | null, label: null as number | null, station: null as number | null, pick: null as LineSpot | null, tap: null as LineSpot | null };
+  /** line whose numbers come first at interchanges (see orderFocus) */
+  private focus: number | null = null;
+  /** routes in a grid of world cells, for hover picking */
+  private index = new RouteIndex();
+  private lastTag: (LineSpot & { gap: number; below: boolean }) | null = null;
+  private badgeRef: Map<number, Badge[]> | null = null;
+  private complexRef: Map<number, number> | null = null;
+  private rows = new Map<number, HTMLElement>();
+  private rowOn: number | null = null;
   demand: DemandView | null = null;
   /** demand view: share of each town's trips the network can carry (by town id) */
   shares = new Map<number, number>();
@@ -66,6 +90,7 @@ export class MapModes {
   private visT = 0; private visFv = -1; private visLv = -1; private visN = -1;
   private pathT = 0; private pathNv = -1; private pathLv = -1; private pathFv = -1;
   private selIds = new Set<number>();
+  private winIds = new Set<number>();
   private pins = new Set<number>();
   private labelSig = '';
   private queue: number[] = [];
@@ -88,10 +113,91 @@ export class MapModes {
     this.card.style.display = 'none';
     ui.root.appendChild(this.card);
     const lb = ui.renderer.labels;
-    lb.onHoverTag = (id) => { if (id == null || this.mode === 'lines') this.hoverLine = id; };
+    lb.onHoverTag = (id) => { this.hov.tag = this.mode === 'lines' ? id : null; };
+    lb.onHoverLine = (line, station) => { const on = this.mode === 'lines'; this.hov.label = on ? line : null; this.hov.station = on ? station : null; };
+    lb.onTapLine = (line, station) => this.tapStation(line, station);
     lb.onClickTag = (id) => this.ui.openLine(id);
-    this.card.addEventListener('pointerleave', () => { this.hoverLine = null; });
+    this.card.addEventListener('pointerleave', () => { this.hov.list = null; });
     try { const d = localStorage.getItem(DISPLAY_KEY); if (d === 'lines' || d === 'stations') this.display = d; } catch { /* ignore */ }
+  }
+
+  /** Line highlighted with its name shown: hovered or focused in the legend, by its name tag, a station's number or
+   *  its route (tapped on touch); null when none. */
+  get hoverLine(): number | null {
+    const h = this.hov;
+    return h.list ?? h.kbd ?? h.tag ?? h.label ?? h.tap?.line ?? h.pick?.line ?? null;
+  }
+
+  private clearHover() {
+    this.hov = { list: null, kbd: null, tag: null, label: null, station: null, pick: null, tap: null };
+    this.focus = null;
+    this.lastTag = null;
+  }
+
+  /** Does a line (still) stop at a station or another station of its transfer complex? */
+  private stopsAt(line: number, station: number): boolean {
+    const g = this.ui.game, l = g.lines.get(line);
+    if (!l || !g.stations.get(station)) return false;
+    if (l.stops.includes(station)) return true;
+    const of = this.ui.renderer.labels.complexOf, main = of?.get(station);
+    return main !== undefined && l.stops.some((s) => of!.get(s) === main);
+  }
+
+  /** Forget a station's number hovered or tapped once the station is gone or its line no longer stops there. */
+  private dropStaleStations() {
+    const h = this.hov;
+    if (h.tap?.station != null && !this.stopsAt(h.tap.line, h.tap.station)) h.tap = null;
+    if (h.station != null && (h.label == null || !this.stopsAt(h.label, h.station))) { h.label = null; h.station = null; }
+  }
+
+  /** Station whose numbers are under the pointer (lines map, line display): it gets the hover card. */
+  get labelStation(): number | null { return this.mode === 'lines' && this.display === 'lines' ? this.hov.station : null; }
+
+  /**
+   * Lines map, inspect tool: the route under the pointer (client px; `ground`: the terrain point there, null clears)
+   * highlights its line and shows its name near the pointer. Returns whether a route is there.
+   */
+  hoverRoute(clientX: number, clientY: number, ground: THREE.Vector3 | null): boolean {
+    this.hov.pick = this.pickRoute(clientX, clientY, ground);
+    return !!this.hov.pick;
+  }
+  /** The pointer left the map: forget the route under it (a line tapped on touch stays shown). */
+  clearRouteHover() { this.hov.pick = null; }
+  /** Another tool: forget the route under the pointer and a tapped line. */
+  clearPointerHover() { this.hov.pick = null; this.hov.tap = null; }
+
+  /**
+   * A click on the map (inspect tool) in the lines map: a route opens its line. On touch the first tap only shows
+   * the line, as a hover does (a tap beside the routes hides it again). True when the click was taken.
+   */
+  clickRoute(clientX: number, clientY: number, ground: THREE.Vector3 | null, touch: boolean): boolean {
+    const hit = this.pickRoute(clientX, clientY, ground);
+    const h = this.hov;
+    if (!hit) { if (touch) h.tap = null; return false; }
+    if (touch && h.tap?.line !== hit.line) { h.tap = hit; return true; }
+    h.tap = null;
+    this.ui.openLine(hit.line);
+    return true;
+  }
+
+  /** The route under a screen point while the pointer is over the map (`ground`: the terrain point there). */
+  private pickRoute(clientX: number, clientY: number, ground: THREE.Vector3 | null): LineSpot | null {
+    if (this.mode !== 'lines' || !ground || this.index.empty) return null;
+    const r = this.ui.renderer;
+    const hit = this.index.pick(r.camera, r.renderer.domElement.getBoundingClientRect(), clientX, clientY, this.hoverLine);
+    return hit && this.visIds.has(hit.line) ? { line: hit.line, x: hit.x, y: hit.y, z: hit.z } : null;
+  }
+
+  /**
+   * Touch tap on a station's number (inspect tool): shows its line as hovering does; a second tap opens the station
+   * (false: the label's click goes ahead, as it does with other tools, e.g. adding the stop to a line).
+   */
+  private tapStation(line: number, station: number): boolean {
+    const t = this.hov.tap;
+    const st = this.ui.game?.stations.get(station);
+    if (this.mode !== 'lines' || this.ui.tools?.tool !== 'inspect' || !st || (t && t.line === line && t.station === station)) { this.hov.tap = null; return false; }
+    this.hov.tap = { line, x: st.x, y: 0, z: st.z, station };
+    return true;
   }
 
   toggle(m: Exclude<MapMode, 'none'>) { this.set(this.mode === m ? 'none' : m); }
@@ -107,14 +213,15 @@ export class MapModes {
       for (const id of this.paths.keys()) ov.setLinePath(id, null);
       this.paths.clear(); this.sigs.clear(); this.styles.clear(); this.tagPos.clear(); this.queue = []; this.shownSig = -1; this.labelSig = '';
       this.visT = 0; this.pathT = 0; this.visIds.clear();
-      lb.lineChips.clear(); lb.routeTags.clear();
-      lb.pinStations = null;
+      this.index.build([]); this.rows.clear(); this.rowOn = null;
+      lb.routeTags.clear();
+      lb.pinStations = null; lb.stationMarks = null; lb.openStation = null;
     }
     if (prev === 'demand') { ov.setArcs(null); ov.setShareRings(null); ov.setCatchments('demand', null); lb.townInfo.clear(); this.demand = null; this.shares.clear(); }
     if (prev === 'catchment') { drawCatchStreets(ov, 'map', null); this.catchSig = ''; }
     if (prev === 'signals') { ov.setTrackLayers(null); ov.setSignalGhosts(null); this.blocks = null; this.blockSig = ''; }
     ov.setDim(DIM[m]);
-    this.hoverLine = null;
+    this.clearHover();
     this.listSig = '';
     this.demandT = 0;
     this.card.style.display = m === 'none' ? 'none' : '';
@@ -140,9 +247,17 @@ export class MapModes {
     if (this.visT <= 0 || this.visFv !== this.filterVer || this.visLv !== g.lines.version || this.visN !== g.lines.map.size) {
       this.visT = 0.5; this.visFv = this.filterVer; this.visLv = g.lines.version; this.visN = g.lines.map.size;
       this.vis = g.lines.all().filter((l) => l.stops.length >= 2 && lineMatches(g, l, this.filter)).sort((a, b) => a.id - b.id);
-      this.visIds.clear();
-      for (const l of this.vis) this.visIds.add(l.id);
-      if (this.hoverLine != null && !this.visIds.has(this.hoverLine)) this.hoverLine = null;
+      const vis = this.visIds;
+      vis.clear();
+      for (const l of this.vis) vis.add(l.id);
+      // forget hovers of lines no longer shown
+      const h = this.hov;
+      if (h.list != null && !vis.has(h.list)) h.list = null;
+      if (h.kbd != null && !vis.has(h.kbd)) h.kbd = null;
+      if (h.tag != null && !vis.has(h.tag)) h.tag = null;
+      if (h.label != null && !vis.has(h.label)) { h.label = null; h.station = null; }
+      if (h.pick && !vis.has(h.pick.line)) h.pick = null;
+      if (h.tap && !vis.has(h.tap.line)) h.tap = null;
     }
     return this.vis;
   }
@@ -161,7 +276,7 @@ export class MapModes {
   setDisplay(d: 'lines' | 'stations') {
     if (d === this.display) return;
     this.display = d;
-    this.hoverLine = null;
+    this.clearHover();
     this.saveDisplay();
     this.styles.clear();
     this.labelSig = '';
@@ -170,10 +285,11 @@ export class MapModes {
   }
   private saveDisplay() { try { localStorage.setItem(DISPLAY_KEY, this.display); } catch { /* ignore */ } }
 
+  /** Lines with an open window (also in winIds) and the hovered line. */
   private selectedIds(): Set<number> {
-    const s = this.selIds;
-    s.clear();
-    for (const w of this.ui.wm.wins.values()) if (w.id.startsWith('line-')) s.add(Number(w.id.slice(5)));
+    const s = this.selIds, w = this.winIds;
+    s.clear(); w.clear();
+    for (const win of this.ui.wm.wins.values()) if (win.id.startsWith('line-')) { const id = Number(win.id.slice(5)); s.add(id); w.add(id); }
     if (this.hoverLine != null) s.add(this.hoverLine);
     return s;
   }
@@ -182,6 +298,7 @@ export class MapModes {
     const g = this.ui.game;
     const ov = this.ui.renderer.overlay;
     const lines = this.visibleLines(dt);
+    this.dropStaleStations();
     // routes: checked when the network or the lines changed, else a few times a second
     this.pathT -= dt;
     if (this.pathT <= 0 || this.pathNv !== g.networkVersion || this.pathLv !== g.lines.version || this.pathFv !== this.visFv) {
@@ -210,17 +327,20 @@ export class MapModes {
     let shownSig = 0;
     for (const l of lines) shownSig = (shownSig * 31 + l.id * 7 + parseInt(l.color.slice(1), 16)) % 2147483647;
     if (this.lanesDirty || shownSig !== this.shownSig) {
-      this.hoverLine = null;
       this.lanesDirty = false;
       this.shownSig = shownSig;
       this.labelSig = '';
       const lanes = laneOffsets(lines.map((l) => [l.id, this.paths.get(l.id)] as const));
+      const routes: { id: number; curves: Float32Array[]; lanes?: Float32Array[] }[] = [];
       for (const l of lines) {
         const p = this.paths.get(l.id);
         if (!p) continue;
         ov.setLinePath(l.id, p.curves, l.color, { lanes: lanes.get(l.id) });
         this.styles.delete(l.id);
+        routes.push({ id: l.id, curves: p.curves, lanes: lanes.get(l.id) });
       }
+      // (hover picking looks the routes up in a grid, built here and not per frame)
+      this.index.build(routes);
     }
     // style: selected / hovered lines wider with chevrons and on top, the others dimmed while one is selected;
     // the station display draws the routes thin and quiet under the station pins
@@ -237,56 +357,162 @@ export class MapModes {
       // loops always show their running direction
       ov.setLinePathStyle(l.id, { width: st ? (on ? 5 : 3) : on ? ROUTE_W_SEL : ROUTE_W, opacity: dim ? (st ? 0.3 : 0.45) : st ? 0.6 : 0.92, chevrons: on || (loop && !st), order: on ? 5 : 0 });
     }
-    // labels: line chips on station plates and name tags with the line symbol (line display), or station pins
-    // with their numbering badges (station display); rebuilt only when something they show changed
-    const lsig = `${shownSig}|${selSig}|${this.display}|${this.queue.length}|${g.lines.version}`;
-    if (lsig !== this.labelSig) {
-      this.labelSig = lsig;
-      const lb = this.ui.renderer.labels;
+    // labels: the station numbers on the stations (line display) or station pins with their numbers (station
+    // display), rebuilt only when something they show changed (the labels then touch only stations that changed)
+    const lb = this.ui.renderer.labels;
+    const focus = this.orderFocus();
+    const badges = allBadges(g);
+    const lsig = `${shownSig}|${selSig}|${focus}|${this.display}|${this.queue.length}|${g.lines.version}`;
+    if (lsig !== this.labelSig || badges !== this.badgeRef || lb.complexOf !== this.complexRef) {
+      this.labelSig = lsig; this.badgeRef = badges; this.complexRef = lb.complexOf;
       const pins = this.pins;
-      lb.lineChips.clear(); lb.routeTags.clear(); pins.clear();
-      for (const l of lines) for (const sid of l.stops) {
-        if (st) { pins.add(sid); continue; }
-        const a = lb.lineChips.get(sid);
-        if (!a) lb.lineChips.set(sid, [l.color]); else if (!a.includes(l.color)) a.push(l.color);
-      }
-      if (!st) for (const l of lines) {
-        const t = this.tagPos.get(l.id);
-        if (t) lb.routeTags.set(l.id, { x: t.x, y: t.y + 0.6, z: t.z, text: l.name, color: l.color, hl: sel.has(l.id), code: lineCodeOf(g, l) });
-      }
+      pins.clear();
+      if (st) for (const l of lines) for (const sid of l.stops) pins.add(sid);
       lb.pinStations = st ? pins : null;
+      lb.stationMarks = st ? null : this.stationMarks(lines, sel, this.winIds, focus, badges, lb.complexOf);
     }
+    this.updateTag(lb);
+    // (a tapped station shows all its numbers, as pointing at it does)
+    lb.openStation = this.hov.tap?.station ?? null;
+    this.syncRows();
     this.listT -= dt;
     if (this.listT <= 0) { this.listT = 0.5; this.renderLinesCard(lines); }
   }
 
+  /**
+   * The line whose numbers come first at interchanges: the one shown by its route, the legend or a tap on it. It keeps
+   * while the pointer is on a station's numbers or a name tag, or a tap shows a station's number, so the numbers
+   * never move under the pointer or finger.
+   */
+  private orderFocus(): number | null {
+    const h = this.hov;
+    if (h.label == null && h.tag == null && h.tap?.station == null) this.focus = h.list ?? h.kbd ?? h.tap?.line ?? h.pick?.line ?? null;
+    return this.focus;
+  }
+
+  /**
+   * Line display: every station of the lines shown, with its numbers on those lines (the focused line's first, then
+   * those with an open window: never the hovered one, which would move the numbers under the pointer), or a stop dot
+   * where none of them numbers it; ranked by the lines at the station or its transfer complex; dimmed while other
+   * lines are highlighted (`sel`).
+   */
+  private stationMarks(lines: Line[], sel: Set<number>, open: Set<number>, focus: number | null, badges: Map<number, Badge[]>, complexOf: Map<number, number> | null): Map<number, StationMark> {
+    const g = this.ui.game;
+    const out = new Map<number, StationMark>();
+    for (const l of lines) for (const sid of l.stops) {
+      let m = out.get(sid);
+      if (!m) { m = { badges: [], lines: [], color: l.color, rank: 0, on: false, dim: false, sig: '' }; out.set(sid, m); }
+      if (!m.lines.includes(l.id)) m.lines.push(l.id);
+    }
+    const atComplex = new Map<number, Set<number>>();
+    if (complexOf) for (const [sid, m] of out) {
+      const main = complexOf.get(sid);
+      if (main === undefined) continue;
+      let s = atComplex.get(main);
+      if (!s) atComplex.set(main, (s = new Set()));
+      for (const id of m.lines) s.add(id);
+    }
+    const order = (id: number) => (id === focus ? 0 : open.has(id) ? 1 : 2);
+    for (const [sid, m] of out) {
+      m.lines.sort((a, b) => order(a) - order(b));
+      // (lines running through on one route share a number: shown once)
+      m.badges = (badges.get(sid) ?? []).filter((b) => this.visIds.has(b.line)).sort((a, b) => order(a.line) - order(b.line))
+        .filter((b, i, a) => a.findIndex((o) => o.code === b.code) === i);
+      m.color = g.lines.get(m.lines[0])?.color ?? m.color;
+      const main = complexOf?.get(sid);
+      m.rank = Math.max(m.lines.length, main === undefined ? 0 : atComplex.get(main)?.size ?? 0);
+      m.on = m.lines.some((id) => sel.has(id));
+      m.dim = sel.size > 0 && !m.on;
+      m.sig = m.badges.length ? m.badges.map((b) => b.code + b.color + b.line).join(',') : m.color;
+    }
+    return out;
+  }
+
+  /**
+   * The hovered line's name tag: just above the pointer on its route, under the station whose number is hovered or
+   * tapped, or mid-route for a legend row; it keeps still while the pointer is on it. Written only when it changed.
+   */
+  private updateTag(lb: Labels) {
+    const g = this.ui.game, h = this.hov, line = this.hoverLine;
+    let t = this.lastTag;
+    if (line == null) t = null;
+    else if (!(h.tag === line && t?.line === line)) {
+      const spot = h.list === line || h.kbd === line ? null : h.label === line && h.station != null ? { line, x: 0, y: 0, z: 0, station: h.station } : h.tap?.line === line ? h.tap : h.pick?.line === line ? h.pick : null;
+      const s = spot?.station != null ? g.stations.get(spot.station) : undefined;
+      if (s) t = this.display === 'lines'
+        ? { line, x: s.x, y: markY(g, s), z: s.z, gap: markHalfHeight(this.ui.renderer.controls.smoothDistance) + 5, below: true }
+        : { line, x: s.x, y: pinY(g, s), z: s.z, gap: 9, below: true };
+      else if (spot && spot.station == null) t = { line, x: spot.x, y: spot.y + ROUTE_LIFT, z: spot.z, gap: 12, below: false };
+      else { const m = this.tagPos.get(line); t = m ? { line, x: m.x, y: m.y + 0.6, z: m.z, gap: 2, below: false } : null; }
+    }
+    this.lastTag = t;
+    const l = t ? g.lines.get(t.line) : undefined;
+    if (!t || !l) { if (lb.routeTags.size) lb.routeTags.clear(); return; }
+    const cur = lb.routeTags.get(t.line);
+    if (lb.routeTags.size === 1 && cur && cur.x === t.x && cur.y === t.y && cur.z === t.z && cur.gap === t.gap && cur.below === t.below && cur.text === l.name && cur.color === l.color) return;
+    lb.routeTags.clear();
+    lb.routeTags.set(t.line, { x: t.x, y: t.y, z: t.z, text: l.name, color: l.color, hl: true, code: lineCodeOf(g, l), gap: t.gap, below: t.below });
+  }
+
+  /** Legend: the hovered line's row lit (class only; the list itself is rebuilt at most twice a second). */
+  private syncRows() {
+    const id = this.hoverLine;
+    if (id === this.rowOn) return;
+    if (this.rowOn != null) this.rows.get(this.rowOn)?.classList.remove('on');
+    if (id != null) this.rows.get(id)?.classList.add('on');
+    this.rowOn = id;
+  }
+
   private renderLinesCard(lines: Line[]) {
     const g = this.ui.game;
-    const sig = this.filterVer + '|' + this.display + '|' + this.hoverLine + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length + '|' + g.lines.version + '|' + g.activeCompanies.map((c) => c.id + ':' + c.name).join(';');
+    const sig = this.filterVer + '|' + this.display + '|' + lines.map((l) => l.id + l.name + l.color + l.vehicles.length + g.lines.isLoop(l)).join(';') + '|' + this.queue.length + '|' + g.lines.version + '|' + g.activeCompanies.map((c) => c.id + ':' + c.name).join(';');
     if (sig === this.listSig) return;
     this.listSig = sig;
     const c = this.card;
+    // (a legend row with the keyboard focus keeps it through the rebuild)
+    let refocus: number | null = null;
+    for (const [id, row] of this.rows) if (row === document.activeElement) refocus = id;
     clear(c);
+    this.rows.clear();
+    this.rowOn = null;
     const all = g.lines.all().filter((l) => l.stops.length >= 2);
-    const numbered = this.display === 'stations' ? new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size : 0;
+    const numbered = new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size;
+    // (a line's name shows only while it is pointed at, or tapped on touch screens)
+    const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
+    const show = touch ? 'Tap a route or a number for its line’s name, again to open it.' : 'Point at a route or a number for its line’s name; click a route to open the line.';
+    const note = this.display === 'lines'
+      ? `${numbered ? `${numbered} numbered stations: the numbers sit on the stations` : 'Rail lines number their stations on the map'} (company + line letter + number, e.g. AS01; zoomed out the first, +n more). ${show}`
+      : `Pins with each station’s name, passengers waiting and all its numbers, e.g. AS01. ${show}`;
     c.append(
       h('div', { class: 'mc-head' }, icon('map', 18), h('span', { class: 'mc-title' }, 'Lines map'), h('span', { class: 'mc-sub' }, `${lines.length}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Close lines map', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Routes in their colours with line symbols (B)'], ['stations', 'Stations', 'Stations with their numbers, e.g. AS01 (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
+        h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Routes in their colours, station numbers on the stations (B)'], ['stations', 'Stations', 'Station pins with names, waiting passengers and all numbers (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
         filterBar(g, this.filter, modeCounts(g, all, this.filter), () => { this.filterVer++; this.listSig = ''; }, true),
         lines.length
-          ? h('div', { class: 'mc-list' }, lines.map((l) => h('div', {
-            class: 'mc-row' + (this.hoverLine === l.id ? ' on' : ''),
-            'data-tip': `${l.name} · ${l.vehicles.length} vehicle${l.vehicles.length === 1 ? '' : 's'}${l.owner !== PLAYER ? ' · ' + g.company(l.owner).name : ''}`,
-            onpointerenter: () => { this.hoverLine = l.id; },
-            onpointerleave: () => { if (this.hoverLine === l.id) this.hoverLine = null; },
-            onclick: () => this.ui.openLine(l.id),
-          }, lineSymbol(g, l, 'sm'), icon(MODE_META[lineMode(g, l)].icon, 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null)))
+          // rows are buttons: Tab to a line shows it on the map with its name, as pointing at it does; Enter opens it
+          ? h('div', { class: 'mc-list' }, lines.map((l) => {
+            const row = h('button', {
+              type: 'button', class: 'mc-row', 'data-sfx': 'none',
+              'data-tip': `${l.name} · ${l.vehicles.length} vehicle${l.vehicles.length === 1 ? '' : 's'}${l.owner !== PLAYER ? ' · ' + g.company(l.owner).name : ''}`,
+              onpointerenter: () => { this.hov.list = l.id; },
+              onpointerleave: () => { if (this.hov.list === l.id) this.hov.list = null; },
+              onfocus: () => { this.hov.kbd = l.id; },
+              onblur: () => { if (this.hov.kbd === l.id) this.hov.kbd = null; },
+              onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); this.ui.openLine(l.id); } },
+              onclick: () => this.ui.openLine(l.id),
+            }, lineSymbol(g, l, 'sm'), icon(MODE_META[lineMode(g, l)].icon, 14), h('span', { class: 'mc-name' }, l.name), g.lines.isLoop(l) ? h('span', { class: 'loopic', 'data-tip': 'Loop line' }, icon('loop', 12)) : null, l.owner !== PLAYER ? h('span', { class: 'mc-own', style: `--c:${g.company(l.owner).color}` }) : null);
+            this.rows.set(l.id, row);
+            return row;
+          }))
           : h('div', { class: 'mc-empty' }, all.length ? 'No lines match the filter.' : 'No lines with two or more stops yet.'),
-        this.display === 'stations' ? h('div', { class: 'mc-note' }, numbered ? `${numbered} numbered stations: company letter + line letter + number, e.g. AS01.` : 'Rail lines number their stations: company letter + line letter + number.') : null,
+        h('div', { class: 'mc-note' }, note),
         this.queue.length ? h('div', { class: 'mc-note' }, `Tracing routes… ${this.queue.length}`) : null),
     );
+    const again = refocus != null ? this.rows.get(refocus) : undefined;
+    if (again) again.focus({ preventScroll: true });
+    else if (refocus != null) this.hov.kbd = null;
+    this.syncRows();
   }
 
   // ------------------------------------------------------------------ signal blocks
