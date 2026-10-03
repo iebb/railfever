@@ -44,11 +44,11 @@ export type CatchMode = 'rail' | 'tram' | 'bus';
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Nominal walking limit per mode (units, 1 = 10 m): twice the earlier path-based limits (rail 16.8, tram 15.4,
- * bus 11.2). Rail is one mode: main-line, metro and light-rail stations walk alike. catchment.ts applies the
+ * Nominal walking limit per mode (units, 1 = 10 m): 70% of release 2.6's limits. Rail is one mode:
+ * main-line, metro and light-rail stations walk alike. catchment.ts applies the
  * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 33.6, tram: 30.8, bus: 22.4 };
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 23.52, tram: 21.56, bus: 15.68 };
 /** Legacy reach metadata for site scoring; passenger coverage uses catchment.ts. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */
@@ -2512,7 +2512,7 @@ export class Stations {
 
   /**
    * Split each reachable building among stations, preferring served stations when any is served. Weight is
-   * 1 / (1 + walking distance / 8) (catchment.ts walkWeight), so a nearer station always receives more regardless of
+   * catchment.ts walkWeight, so a nearer station always receives more regardless of
    * its mode's limit. The weights are normalised by their sum, but at least by the weight at FULL_COVER_WALK: a
    * building only far from every station is partly covered (fewer of its residents walk that far).
    * Cached local Dijkstra results survive unrelated edits and monthly population changes. Ratings play no part;

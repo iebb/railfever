@@ -16,14 +16,15 @@ export const WALK_DETOUR = 1.25;
 export const FRONTAGE_REACH = 3;
 /** Walking budget along streets: the mode's nominal limit (one for every rail station), building bonus, grid allowance. */
 export const walkLimit = (mode: CatchMode, bonus = 0) => CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR;
-/** Weight of a building for a station it can walk to, by the walk along streets (units): nearer stations get more. */
-export const walkWeight = (distance: number) => 1 / (1 + distance / 8);
+/** Weight by the street walk (units): nearer stations get more. Scale 8 -> 5.6 with the 30% shorter limits. */
+export const walkWeight = (distance: number) => 1 / (1 + distance / 5.6);
 /**
  * Residents within this walk (units along streets) of the stations that reach them are fully covered. Farther ones
  * walk less often: their coverage falls with the walking weight, relative to its value here (about 0.6 at a rail
- * station's full reach), so the doubled reach adds riders at a falling rate. Shares never sum past 1.
+ * station's full reach). Full coverage and the weight's distance scale both shrink by 30%, preserving the taper.
+ * Shares never sum past 1.
  */
-export const FULL_COVER_WALK = 21;
+export const FULL_COVER_WALK = 14.7;
 export const FULL_COVER_WEIGHT = walkWeight(FULL_COVER_WALK);
 /**
  * How much of a building its stations cover, from the best walking weight among them: wholly within FULL_COVER_WALK,

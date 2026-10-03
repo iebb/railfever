@@ -52,11 +52,11 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   console.log(`  metro plan: ${pm.ok ? 'ok' : pm.error}, ${pm.level}, depth ${fmt(pm.depth, 2)}, psd ${pm.psd}, ${pm.platformStyle}, ${pm.length * 10} m, ${pm.entrances.length} entrances, cost ${fmt(pm.cost / 1e6, 2)}M`);
   check(pm.ok && pm.mode === 'metro' && pm.level === 'underground' && pm.psd && pm.platformStyle === 'side' && pm.length === 12 && near(pm.depth, 2.2), 'metro: underground (22 m deep), platform screen doors, side platforms, 120 m platforms');
   const sm = g.stations.planCatchShapes(pm);
-  check(sm.length >= 2 && sm.every((c) => c.mode === 'rail' && c.r === CATCHMENT_RADIUS.rail && c.r === 33.6), `metro-track station: the one rail walking limit (336 m) at the ${sm.length} entrances`);
+  check(sm.length >= 2 && sm.every((c) => c.mode === 'rail' && c.r === CATCHMENT_RADIUS.rail && c.r === 23.52), `metro-track station: the one rail walking limit (235.2 m) at the ${sm.length} entrances`);
   const pl = g.stations.planRail(120, 124, PI2, defaultPlatformLength('lightrail'), 2, 0, { trackType: 'lightrail' });
-  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 33.6 && c.mode === 'rail'), `light-rail track: on the ground, side platforms, the same 336 m rail walking limit (${pl.error ?? 'ok'})`);
+  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 23.52 && c.mode === 'rail'), `light-rail track: on the ground, side platforms, the same 235.2 m rail walking limit (${pl.error ?? 'ok'})`);
   const pe = g.stations.planRail(180, 124, PI2, 8, 2, 0, { trackType: 'electric' });
-  check(pe.ok && pe.mode === 'mainline' && pe.platformStyle === 'island' && !pe.psd && pe.style === 'classic' && g.stations.planCatchShapes(pe).every((c) => Math.abs(c.r - 40.32) < 1e-9 && c.mode === 'rail'), `electric main line: island platform, the 336 m rail walking limit + 20% for its building (${pe.error ?? 'ok'})`);
+  check(pe.ok && pe.mode === 'mainline' && pe.platformStyle === 'island' && !pe.psd && pe.style === 'classic' && g.stations.planCatchShapes(pe).every((c) => Math.abs(c.r - 28.224) < 1e-9 && c.mode === 'rail'), `electric main line: island platform, the 235.2 m rail walking limit + 20% for its building (${pe.error ?? 'ok'})`);
   const built: [Station, string][] = [];
   for (const [p, tt] of [[pm, 'metro'], [pl, 'lightrail'], [pe, 'electric']] as const) {
     const id = g.stations.nextId;
