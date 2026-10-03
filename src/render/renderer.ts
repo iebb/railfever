@@ -39,10 +39,27 @@ const SETTINGS_VERSION = 2;
  * levels (each ~1.4x the pixels of the next), changed with hysteresis, so the image does not keep pumping.
  */
 const AUTO_STEPS = [1, 0.85, 0.72, 0.6, 0.5];
-/** Seconds of headroom before the automatic resolution tries the next step up (doubles after a failed try). */
+/**
+ * Seconds of headroom before the automatic resolution tries a step up to a level; four times longer for every time
+ * the resolution had to leave that level again (a failed try, or a later slowdown), up to UP_WAIT_MAX, until a step
+ * up to it has held for UP_HELD seconds.
+ */
 const UP_WAIT = 6;
-/** A step down within this many seconds of a step up means that step up failed. */
-const UP_FAIL = 30;
+const UP_WAIT_MAX = 900;
+const UP_HELD = 600;
+/** Seconds without descents after a descent that did not help; doubled each time, up to DOWN_BLOCK_MAX. */
+const DOWN_BLOCK = 60;
+const DOWN_BLOCK_MAX = 900;
+/**
+ * Safety net of the automatic resolution, whatever its logic decides (every change counts, undos included): at least
+ * RES_GAP seconds between changes, at most RES_PER_MIN changes in any minute, and RES_COOL seconds of calm after a
+ * change that undid the one before it - no oscillation can be faster than this.
+ */
+const RES_GAP = 8;
+const RES_PER_MIN = 4;
+const RES_COOL = 30;
+/** Display period the automatic resolution aims at (ms): 60 fps. */
+const VSYNC = 1000 / 60;
 /** Refresh interval (s) of the far shadow cascade for moving vehicles (doubled while the resolution is cut). */
 const FAR_SHADOW_EVERY = 0.1;
 /** Largest half-extent of the shadow box (units); wider views keep shadows around the focus and fade them out. */
@@ -239,22 +256,31 @@ export class Renderer {
   private dynIv: number[] = [];
   /** index into AUTO_STEPS (automatic mode) */
   private resStep = 0;
-  /** render times (this.time) of the last step change, the last step down and the last step up */
-  private lastChange = -1e9; private lastDown = -1e9; private lastUp = -1e9;
-  /** seconds of headroom seen for the next step up, and needed before taking it */
+  /** render times (this.time) of the last step change and the last step down */
+  private lastChange = -1e9; private lastDown = -1e9;
+  /** seconds of headroom seen for the next step up, and needed before taking it (see UP_WAIT) */
   private upHeadroom = 0; private upWait = UP_WAIT;
+  /** per level: how often the resolution had to leave it again since a step up to it last held */
+  private levelDrops = AUTO_STEPS.map(() => 0);
+  /** the level a step up reached and held, and since when (its drop count is forgiven after UP_HELD seconds) */
+  private heldLevel = -1; private heldSince = 0;
   /** a trial step up: the step it came from, windows left to watch it, the frame interval before it */
   private upTrial: { from: number; left: number; before: number } | null = null;
   /**
    * The last step down, checked against fresh measurements (a step down that does not help is undone: the cost is
-   * not in the pixels). GPU-timed: the GPU time before it and the time predicted for the new step. Frame-interval:
-   * the interval before it and the steps taken since it last improved (vsync quantises the interval, so a second
-   * step may be needed before a gain shows); `origin` is the step to return to.
+   * not in the pixels): the frame interval before it, the GPU time before it and the time predicted for the new
+   * step (when the GPU timer was used), and the step to return to. Judged by the GPU time while the timer stays in
+   * use, by the frame interval otherwise (so a change of timing source does not lose the check).
    */
-  private downCheck: { gpu: boolean; before: number; predicted: number; origin: number; n: number } | null = null;
-  private downBlockUntil = 0; private downBackoff = 20;
-  /** an undone descent, confirmed by the next window back at the old step (`ms`: what was measured lower down) */
-  private verify: { gpu: boolean; ms: number } | null = null;
+  private downCheck: { ivBefore: number; gpuBefore: number; predicted: number; origin: number } | null = null;
+  private downBlockUntil = 0; private downBackoff = DOWN_BLOCK;
+  /**
+   * an undone descent, confirmed by the first window back at the old step against the measurement from before the
+   * descent: only clearly slower than that means the load rose meanwhile (and descents may resume)
+   */
+  private verify: { gpu: boolean; before: number } | null = null;
+  /** render times of the recent resolution changes, and no change before `resCalmUntil` (see RES_GAP) */
+  private resChanges: number[] = []; private resCalmUntil = 0;
   /** frame-interval mode: consecutive slow windows (a descent starts on the second: no reaction to a burst) */
   private slowRun = 0;
   /** whether the last evaluated window used the GPU timer */
@@ -890,13 +916,13 @@ export class Renderer {
 
   /**
    * Dynamic resolution: hold ~60 fps by stepping the drawing buffer through AUTO_STEPS, judged per window of ~1 s.
-   * With a GPU timer that has fresh samples and explains the frame times, a step down goes straight to the step
-   * predicted to fit and a step up is tried when its predicted time leaves headroom; otherwise the frame interval
-   * decides (median per window; descents only when the main thread is not the bottleneck). Every step down is
-   * checked against fresh measurements and undone when it did not help (the cost is not in the pixels; further
-   * descents wait, longer each time); every step up is watched against the frame interval before it and undone when
-   * it slowed the frames (the next try waits longer). A new size is applied at the start of the next frame
-   * (sizeDirty), never after drawing.
+   * A step down goes straight to the step predicted to fit: from the GPU time while a GPU timer delivers fresh
+   * samples that explain the frame times, otherwise from the frame interval (the step that would save one display
+   * period if the cost is in the pixels; only while the main thread is not the bottleneck). Every step down is
+   * checked against fresh measurements and undone when it did not help (further descents wait, longer each time);
+   * every step up is watched against the frame interval before it and undone when it slowed the frames (the next
+   * try waits longer). Whatever this decides, changes are rate-limited (RES_GAP, RES_PER_MIN, RES_COOL) and an
+   * ambiguous case keeps the current step. A new size is applied at the start of the next frame (sizeDirty).
    */
   private autoResolution(dt: number, interval: number) {
     if (this.settings.resolution !== 'auto') return;
@@ -913,8 +939,8 @@ export class Renderer {
     // a window that saw a change (targets reallocated, smoothed timings catching up) is not representative
     if (document.hidden || this.time - this.lastChange < 1.5) return;
     const t = this.time, i = this.resStep, last = AUTO_STEPS.length - 1;
-    // a step up that held: the next one may come sooner again
-    if (this.lastUp > this.lastDown && t - this.lastUp > UP_FAIL) this.upWait = UP_WAIT;
+    // a step up that held long enough: that level is trusted again
+    if (this.heldLevel === i && t - this.heldSince >= UP_HELD) { this.levelDrops[i] = 0; this.heldLevel = -1; }
     // the GPU timer is used while it delivers fresh samples and its readings explain slow frames; a timer that
     // under-reports (frames miss 60 fps while neither its time nor the main thread accounts for it) is set aside
     let timed = !!this.gpu && fresh >= Math.max(3, n >> 2) && t >= this.gpuDistrustUntil;
@@ -926,65 +952,73 @@ export class Renderer {
         this.gpuDistrust = Math.min(480, this.gpuDistrust * 2);
       }
     }
-    if (timed !== this.lastTimed) { this.lastTimed = timed; this.slowRun = 0; if (this.downCheck) this.downCheck = null; }
-    // an undone descent is confirmed by the first window back at the old step: clearly slower there than it was lower
-    // down means the load rose during the check (the pixels did matter), so descents may resume at once
+    if (timed !== this.lastTimed) { this.lastTimed = timed; this.slowRun = 0; }
+    // the interval the main thread alone would allow (display periods): the GPU only limits the frames beyond it
+    const cpuFloor = Math.max(1, Math.ceil((cpu * 1.05) / VSYNC)) * VSYNC, cpuBound = cpuFloor > VSYNC * 1.5;
+    // an undone descent is confirmed by the first window back at the old step: clearly slower there than before the
+    // descent means the load rose meanwhile (the check was spoiled), so descents may resume at once
     const vf = this.verify;
     this.verify = null;
-    if (vf && vf.gpu === timed && (timed ? gpuMs : med) > vf.ms * 1.15) { this.downBlockUntil = 0; this.downBackoff = Math.max(20, this.downBackoff / 2); }
+    if (vf && (!vf.gpu || timed) && (vf.gpu ? gpuMs : med) > vf.before * 1.15) { this.downBlockUntil = 0; this.downBackoff = Math.max(DOWN_BLOCK, this.downBackoff / 2); }
+    // nothing changes until the safety net allows it; pending checks and trials wait for that (with fresh evidence)
+    const free = t >= this.resCalmUntil && t - (this.resChanges[this.resChanges.length - 1] ?? -1e9) >= RES_GAP &&
+      this.resChanges.filter((c) => t - c < 60).length < RES_PER_MIN;
     // a trial step up is watched for two windows: if it slows the frames (beyond the interval before it, at least
     // below 60 fps) it goes back down and the next try waits longer; a GPU timer that predicted room for it is
     // wrong and set aside for a while
     const tr = this.upTrial;
     if (tr) {
       if (med > Math.max(18.5, tr.before * 1.1)) {
+        if (!free) return;
         this.upTrial = null;
         if (timed) { this.gpuDistrustUntil = t + this.gpuDistrust; this.gpuDistrust = Math.min(480, this.gpuDistrust * 2); }
-        this.stepTo(tr.from);
+        this.stepTo(tr.from, true);
         return;
       }
-      if (--tr.left <= 0) this.upTrial = null;
+      if (--tr.left <= 0) { this.upTrial = null; this.heldLevel = i; this.heldSince = t; }
     }
+    // the pending check of the last step down: by the GPU time while the timer stays in use, else by the interval
+    const dc = this.downCheck;
+    if (dc) {
+      const byGpu = timed && dc.gpuBefore > 0;
+      const helped = byGpu ? gpuMs <= dc.gpuBefore - 0.4 * (dc.gpuBefore - dc.predicted) : med <= dc.ivBefore * 0.85 || p80 < 17.4;
+      if (helped) { this.downCheck = null; this.downBackoff = DOWN_BLOCK; }
+      else {
+        if (!free) return;
+        this.downCheck = null;
+        this.undoDescent(dc.origin, byGpu, byGpu ? dc.gpuBefore : dc.ivBefore, timed);
+        return;
+      }
+    }
+    // GPU time scales a little less than the pixel count (geometry, fixed passes)
+    const at = (j: number) => gpuMs * Math.pow(AUTO_STEPS[j] / AUTO_STEPS[i], 1.7);
     let slow: boolean, up: boolean;
     if (timed) {
-      // GPU time scales a little less than the pixel count (geometry, fixed passes)
-      const at = (j: number) => gpuMs * Math.pow(AUTO_STEPS[j] / AUTO_STEPS[i], 1.7);
-      slow = gpuMs > 13;
-      const dc = this.downCheck;
-      if (dc) {
-        this.downCheck = null;
-        // the step down must cut the GPU time by a fair part of the predicted gain, or it is undone
-        if (gpuMs > dc.before - 0.4 * (dc.before - dc.predicted)) { this.undoDescent(dc.origin, true, gpuMs); return; }
-        this.downBackoff = 20;
-      }
+      // the GPU budget: 13 ms for 60 fps; with a main-thread bottleneck, up to the interval the main thread allows
+      const budget = cpuBound ? Math.max(13, cpuFloor * 0.95) : 13, fit = cpuBound ? Math.max(11, cpuFloor * 0.8) : 11;
+      slow = gpuMs > budget;
       if (slow && i < last && t >= this.downBlockUntil) {
+        if (!free) return;
         let j = i + 1;
-        while (j < last && at(j) > 11) j++;
-        this.downCheck = { gpu: true, before: gpuMs, predicted: at(j), origin: i, n: 1 };
+        while (j < last && at(j) > fit) j++;
+        this.downCheck = { ivBefore: med, gpuBefore: gpuMs, predicted: at(j), origin: i };
         this.stepTo(j);
         return;
       }
-      up = i > 0 && at(i - 1) < 10.5;
+      up = i > 0 && at(i - 1) < (cpuBound ? Math.max(10.5, cpuFloor * 0.8) : 10.5);
     } else {
       const gpuBound = cpu < med * 0.6;
       slow = med > 18.5 && gpuBound;
       this.slowRun = slow ? this.slowRun + 1 : 0;
-      const dc = this.downCheck;
-      if (dc) {
-        const helped = med <= dc.before * 0.85 || p80 < 17.4;
-        if (helped && !slow) { this.downCheck = null; this.downBackoff = 20; }
-        else if (i < last && slow && (helped || dc.n < 2)) {
-          if (helped) { dc.before = med; dc.n = 1; } else dc.n++;
-          this.stepTo(i + 1);
-          return;
-        } else {
-          this.downCheck = null;
-          if (!helped) { this.undoDescent(dc.origin, false, med); return; }
-        }
-      }
       if (this.slowRun >= 2 && i < last && t >= this.downBlockUntil) {
-        this.downCheck = { gpu: false, before: med, predicted: 0, origin: i, n: 1 };
-        this.stepTo(i + 1);
+        if (!free) return;
+        // the step that would save one display period if the cost is in the pixels (vsync quantises the interval:
+        // a smaller step could show no gain at all and pass for "not the GPU")
+        const f = Math.max(0.3, (med - VSYNC) / med);
+        let j = i + 1;
+        while (j < last && Math.pow(AUTO_STEPS[j] / AUTO_STEPS[i], 1.7) > f) j++;
+        this.downCheck = { ivBefore: med, gpuBefore: 0, predicted: 0, origin: i };
+        this.stepTo(j);
         return;
       }
       // room for a trial step up: (nearly) every frame makes the display rate, or the frames are held up elsewhere
@@ -992,8 +1026,10 @@ export class Renderer {
       // interval before it
       up = i > 0 && (p80 < 17.4 || !gpuBound || t < this.downBlockUntil);
     }
+    this.upWait = i > 0 ? Math.min(UP_WAIT_MAX, UP_WAIT * 4 ** this.levelDrops[i - 1]) : UP_WAIT;
     if (!up) this.upHeadroom = 0;
     else if ((this.upHeadroom += win) >= this.upWait && t - this.lastDown >= 8) {
+      if (!free) return;
       this.upTrial = { from: i, left: 2, before: med };
       this.stepTo(i - 1);
       return;
@@ -1011,16 +1047,16 @@ export class Renderer {
   }
 
   /**
-   * A descent that did not help (`ms`: the GPU time or frame interval measured lower down): back to where it
-   * started, and no further descent for a while (longer each time) unless the next window contradicts it.
+   * A descent that did not help (`gpu`: judged by the GPU time; `before`: the measurement from before it): back to
+   * where it started, and no further descent for a while (longer each time) unless the next window shows the load
+   * rose. A GPU timer that was set aside (it saw no GPU limit) turned out right: it is used again, for a while.
    */
-  private undoDescent(origin: number, gpu: boolean, ms: number) {
+  private undoDescent(origin: number, gpu: boolean, before: number, timed: boolean) {
     const t = this.time;
     this.downBlockUntil = t + this.downBackoff;
-    this.downBackoff = Math.min(320, this.downBackoff * 2);
-    this.verify = { gpu, ms };
-    // a GPU timer that was set aside (it saw no GPU limit) turned out right: use it again, and for a while
-    if (!gpu && this.gpu && t < this.gpuDistrustUntil) {
+    this.downBackoff = Math.min(DOWN_BLOCK_MAX, this.downBackoff * 2);
+    this.verify = { gpu, before };
+    if (!timed && this.gpu && t < this.gpuDistrustUntil) {
       this.gpuDistrustUntil = 0; this.gpuDistrust = 30;
       this.gpuVindicatedUntil = t + this.gpuVindicate;
       this.gpuVindicate = Math.min(960, this.gpuVindicate * 2);
@@ -1028,20 +1064,27 @@ export class Renderer {
     this.stepTo(origin, true);
   }
 
-  /** Change the automatic resolution step (`restore`: undoing a step down that did not help, not a trial). */
-  private stepTo(j: number, restore = false) {
+  /**
+   * Change the automatic resolution step. `undo`: reverting the change before (a step down that did not help, a step
+   * up that slowed the frames) - not counted as a step up, and followed by RES_COOL seconds without changes.
+   */
+  private stepTo(j: number, undo = false) {
     j = Math.max(0, Math.min(AUTO_STEPS.length - 1, j));
     const i = this.resStep, t = this.time;
     if (j === i) return;
     if (j > i) {
-      // the first step down soon after a step up: that step up failed, the next one waits longer
-      if (this.lastUp > this.lastDown && t - this.lastUp < UP_FAIL) this.upWait = Math.min(120, this.upWait * 2);
+      // leaving a level downwards: the next step up to it waits longer
+      this.levelDrops[i] = Math.min(this.levelDrops[i] + 1, 16);
       this.lastDown = t;
-    } else if (!restore) this.lastUp = t;
+    }
+    if (j !== this.heldLevel) this.heldLevel = -1;
     this.resStep = j;
     this.resScale = AUTO_STEPS[j];
     this.lastChange = t;
     this.upHeadroom = 0;
+    this.resChanges.push(t);
+    if (this.resChanges.length > RES_PER_MIN) this.resChanges.shift();
+    if (undo) this.resCalmUntil = t + RES_COOL;
     if (this.targetPR() !== this.appliedPR) this.sizeDirty = true;
   }
 
@@ -1053,9 +1096,9 @@ export class Renderer {
     this.dynAcc = 0; this.dynN = 0; this.dynSum = 0; this.dynCpu = 0; this.dynIv.length = 0; this.longMs = 0;
     this.gpuS0 = this.gpu ? this.gpu.samples : 0;
     this.upTrial = null; this.downCheck = null; this.verify = null; this.slowRun = 0; this.upHeadroom = 0; this.slowAtFloor = 0; this.aoHeadroom = 0;
-    this.upWait = UP_WAIT; this.downBlockUntil = 0; this.downBackoff = 20; this.aoWait = 10;
+    this.upWait = UP_WAIT; this.levelDrops.fill(0); this.heldLevel = -1; this.downBlockUntil = 0; this.downBackoff = DOWN_BLOCK; this.aoWait = 10;
     this.gpuOdd = 0; this.gpuDistrustUntil = 0; this.gpuDistrust = 30; this.gpuVindicatedUntil = 0; this.gpuVindicate = 60;
-    this.lastDown = -1e9; this.lastUp = -1e9;
+    this.lastDown = -1e9; this.resChanges.length = 0; this.resCalmUntil = 0;
     this.lastChange = this.time;
     this.resStep = 0; this.resScale = 1;
   }
