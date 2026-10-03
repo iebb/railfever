@@ -1,7 +1,7 @@
 // The game: owns all simulation state and advances time.
 import { World } from './world';
 import { Towns } from './towns';
-import { Stations, entranceUpkeep } from './stations';
+import { Stations, entranceUpkeep, lostShare } from './stations';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
 import { Depots } from './build-ops';
@@ -872,7 +872,9 @@ export class Game {
       if (!table || table.size === 0) continue;
       const dw = this.demand.weights(st);
       if (!(dw.served > 0)) continue;
-      st.genAccum += this.demand.generationPopulation(st) * GEN_RATE * (0.2 + st.rating) * dw.served;
+      // fewer set out where many gave up waiting lately (they saw full vehicles and long queues; OpenTTD's ratings
+      // do likewise): the station's rating, and directly the share who gave up this and last month
+      st.genAccum += this.demand.generationPopulation(st) * GEN_RATE * (0.2 + st.rating) * dw.served * (1 - lostShare(st));
       const n = Math.floor(st.genAccum);
       if (n <= 0) continue;
       st.genAccum -= n;

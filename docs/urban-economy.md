@@ -24,9 +24,9 @@ The street distance includes the 1.25 street-grid allowance. Building bonuses ex
 
 Fewer people walk 400 m than 200 m. A building with a station within `FULL_COVER_WALK` (21 units, 210 m along streets) is fully covered. Further out, coverage falls with the walking weight `1 / (1 + d / 8)`, the same weight that shares buildings between stations. It is measured against the weight at 210 m: about 0.8 at a bus stop's limit and 0.6 at a rail station's.
 
-A building's share for each station is that station's weight divided by the larger of two values: the sum of the weights of all its stations, or the weight at 210 m. A building in reach of several stations is shared between them. It is wholly covered once their weights add up to the weight at 210 m. `catchPop` is a station's share of residents. The hover counts show everyone within the walking limit.
+A building's coverage comes from its best walk (`coverOf`): the nearest eligible station sets it. The stations that reach it share that coverage in proportion to their weights (share = weight / sum of weights × coverage). A second stop as far away splits the building's coverage; it adds none. Before this rule, two far stops covered a building wholly where one covered 85% of it. The live, sliced and reference share-outs and the AI's forecasts use the same rule. `catchPop` is a station's share of residents. The hover counts show everyone within the walking limit.
 
-Added entrances are access points of their station: side halls, footbridges and underpasses with stairs on both sides of the tracks, platform-end gates, pavilions and stair towers. Each walks the same rail reach with the station building's bonus, and the share-out counts its residents with the same taper. The AI values a candidate entrance by the residents it newly brings within reach, counted with that taper and split with the other served stations that reach them.
+Added entrances are access points of their station: side halls, footbridges and underpasses with stairs on both sides of the tracks, platform-end gates, pavilions and stair towers. Each walks the same rail reach with the station building's bonus, and the share-out counts its residents with the same taper. The AI values a candidate entrance by the residents it newly brings within reach, counted with that taper and split with the other served stations that reach them; residents an access street demolishes count at the station's current share.
 
 A ground station's forecourt also reaches its own access street where that street starts below or above the levelled station ground. The street is laid before the station levels its site, and the station's steps bridge the difference, as its road-access check already assumed. Before, such a station could show road access but have no walking catchment.
 
@@ -47,21 +47,21 @@ Recomputes stay incremental, and the comparison with a full reference recompute 
 - residents and jobs within 200 metres
 - proximity to the centre
 
-Within a town, local trips are multiplied by `1 + k × intensity × quality`. The quality depends on the service's journey time, including waiting. The mode sets `k`:
+Within a town, local trips are multiplied by `1 + k × intensity × quality`. The quality depends on the service's journey time, including waiting. The mode that carries the journey sets `k` (`DemandModel.journeyMode`: rail when a rail line with trains carries any of its legs, else tram when a tram line does, else bus):
 
-- 12 for rail of any track type, so a cross-city main line's city stops count too
+- 6 for rail of any track type, so a cross-city main line's city stops count too
 - 3 for trams
 - 1.5 for buses
 
-Before, `k` was 18 for metro track and 15 for light rail, and main-line trains had no uplift. Village services receive no density uplift. Intercity OD generation is unchanged.
+Before, `k` was 18 for metro track and 15 for light rail (by the boarding station's platforms), main-line trains had no uplift, and the first unified version used 12 for rail. The platforms a station has no longer matter: an unused rail platform beside a bus stop once gave bus-only trips the rail uplift (5.85 times the demand). The 8% car drop-off allowance follows the carrying mode too. Village services receive no density uplift. Intercity OD generation is unchanged.
 
-Rail has one fare model, whatever the track or station style. A boarding pays the distance fare but at least `RAIL_FARE.minimum` (1,000), both before the speed factor. Long trips and the high-speed premium follow distance and time saved, as before. Previously the fare depended on the boarding platform's track:
+Rail has one fare model, whatever the track or station style. A journey's rail legs pay their distance fares, together at least `RAIL_FARE.minimum` (500) before the speed factor (`railLegFare`). The first rail leg pays up to the minimum; a later one only what takes the journey's distance fares beyond it, so the operator of the first rail leg collects the minimum. The journey's rail fares so far travel with its waiting and cargo groups and are saved with them. The minimum binds on rail trips under about 300 m. Previously the fare depended on the boarding platform's track (metro 1,700 plus the distance component, light rail 900 plus it, main line the plain distance fare); the first unified version charged 1,000 on every leg, so four transfers earned 4.25 times the direct ride.
 
-- metro: 1,700 plus the distance component
-- light rail: 900 plus the distance component
-- main line: the plain distance fare
+The speed factor, which compares a leg's time with walking or driving, is capped at 1.8 on trips up to 100 units (1 km), rising to 2.6 from 300 units: a few minutes saved on a walk in town are worth less than the time ratio says, while long trips keep the premium of fast and high-speed services.
 
-Tram and bus receipts are a boarding charge (80 and 12) plus 90% of the old distance component. AI forecasts, vehicle receipts and the line fares panel use the same context. Dense-centre trips add parking time and reduce car speed. Walking remains the reference for very short journeys.
+Tram and bus receipts are a boarding charge (80 and 12) plus 90% of the old distance component. AI forecasts, project and improvement estimates, vehicle receipts and the line fares panel use the same context. Dense-centre trips add parking time and reduce car speed. Walking remains the reference for very short journeys.
+
+A station's rating scales its passenger generation, and passengers who give up waiting lower it by up to 0.6 (`RATING_LOST`; 0.25 before). The share who gave up this and last month also reduces the station's generation directly, as OpenTTD's ratings do: where vehicles leave people behind, fewer set out.
 
 ## Car access to rail
 
@@ -110,14 +110,18 @@ Forecasts (`DemandModel.forecastLine`) use one rail model whatever the style:
 
 The style sets only the platform length used for the queue.
 
-The through service joins a city line to a main line that ends within 900 m of the city line's depot end, in the same town. A connector of the city line's own track type runs from the terminus to the depot ramp, at least 50 m clear of the depot. The main line is electrified. A through line then runs the largest electric commuter unit that fits every platform from the main line into the city, entering at the end the connector joins. The service never ran before, for two reasons:
+The through service joins a city line to a main line that ends within 900 m of the city line's depot end, in the same town. A connector of the city line's own track type runs from the terminus to the depot ramp, at least 50 m clear of the depot. The main line is electrified. A through line then runs the largest electric commuter unit that fits every platform from the main line into the city, entering at the end the connector joins.
 
-- It looked for a unit whose first listed track type was electrified track, but every unit lists every track type, starting with standard track.
-- It looked up the ramp by edge ids that the station throat and double-track works had already replaced.
+It is built safely:
 
-In a scratch scenario, a subway-style line next to a main-line terminus now opens a through line that carries passengers for a year. A street-level light-rail-style ramp is usually too short to join clear of the depot.
+- **A follow-up of its own.** The city railway is a finished project before the through service is planned, so a save made from then on keeps it, whatever follows. The through job is saved with the company (`state.through`, a cursor over its candidates) and resumed after loading: a game saved at any tick of it loads exactly and goes on exactly as the original (`scripts/throughsave.ts`).
+- **All or nothing.** The candidates (free platform ends of usable termini) are tried one per work unit. The first that plans is built within that unit or not at all: funds, track access and wiring are checked first, the through line's unit is checked over the whole route (`lineCompatibility`) before it is bought, and a failure after the connector removes the connector only.
+- **The exact ramp.** The join point is an edge of the city line's own depot ramp and a distance along it, traced from the depot (`rampJoin`), never re-snapped by position: another track crossing above or below that spot is left alone.
+- **Provenance.** Work that cuts older track in two never takes the halves for its own. A project's tracked edges skip them (`splitPieces`), so abandoning a project removes only what it laid.
 
-Light-rail-style lines must repay from operating surplus within nine years; subway-style lines and through tunnels within fifteen. Urban ranking scales the return by that horizon against a six-year reference, so cheap regional services do not defer a viable city investment indefinitely. Conventional main-line civil works have a longer amortisation horizon plus a 3% capital allowance. High-speed rail keeps its existing investment threshold. Project selection and construction planning both yield between expensive forecasts and site checks.
+The service never ran before: it looked for a unit whose first listed track type was electrified track (every unit lists every track type, starting with standard track), and it looked up the ramp by edge ids that the station throat and double-track works had already replaced. A street-level light-rail-style ramp is usually too short to join clear of the depot.
+
+Light-rail-style lines must repay from operating surplus within nine years; subway-style lines and through tunnels within fifteen. Urban ranking scales the return by that horizon against a 4.5-year reference (six before the fares for city hops fell), so cheap regional services do not defer a viable city investment indefinitely. Conventional main-line civil works have a longer amortisation horizon plus a 3% capital allowance. High-speed rail keeps its existing investment threshold. Project selection and construction planning both yield between expensive forecasts and site checks.
 
 Planning takes a consistent regional-demand snapshot when it spans several simulation days. It caches walking geometry separately from daily population and service updates. Main-line sites must have lasting road access. A new forecourt street ending on a bridge would be removed by network maintenance, so such sites are rejected. So is a site without road access, which has no walking catchment; the legacy site search used to accept one by its catchment circles alone. Access is rechecked after track and depot construction. Lost access gets an affordable repair attempt before another route is started.
 
@@ -131,7 +135,9 @@ Open-access AI companies with facing main-line termini in one city may jointly b
 
 `scripts/urbanecon.ts` contains these fixtures:
 
-- dense 8,000-person five-stop light-rail-style and subway-style lines
+- dense 8,000-person five-stop light-rail-style and subway-style lines, each repaying its full capital within a realistic band (light-rail style 3 to 8 years, subway style 4 to 15). The town's street grid crosses the line's corridor every 80 m, as a real grid does; the corridor was a free strip without a crossing street, on which a street-level line cost next to nothing
+- a bus complex with an unused rail platform, whose bus-only trips get the bus uplift
+- AI estimates priced with the receipts' fare model, for a rail and a bus leg
 - a park-and-ride main line with no walking residents, its stations at the ends of country roads beyond the doubled reach
 - two 3,000-person towns joined by one train between central stations, which must be at least 15% full and break even after upkeep by year three
 - a two-company through tunnel
@@ -139,7 +145,9 @@ Open-access AI companies with facing main-line termini in one city may jointly b
 
 Its `--maps=7,23 --years=8 --size=768` mode measures naturally selected city railways. It records town population when trains start operating, and captures operating profit exactly two years later. A qualifying service must be profitable both at that observation and at the end of the run.
 
-`economy.ts`, `economy-ops.ts` and `ridership.ts` keep separate controls for existing rail and bus economics. The fixed income and operating-result controls must stay within ±15% of the baseline in `economy.ts`. That baseline was re-captured for the doubled reach. The previous one held no operating results, so its profit checks compared against NaN.
+`economy.ts`, `economy-ops.ts` and `ridership.ts` keep separate controls for existing rail and bus economics. The fixed income and operating-result controls must stay within ±15% of the baseline in `economy.ts`; that baseline is a repeatability check, re-captured with its history in the file. Independent bands check balance: the intercity line runs 10–80% full and repays its full capital within 60 years, the busy bus runs 15–80% full and repays its full capital in 1.5–8 years, and the village railway does not pay its way. An exploit check splits one journey over four transfers: it may earn no more than the distance fares alone make it (1.48 times the direct ride).
+
+`walkcatch.ts` checks that a second stop as far away adds no coverage. `growth.ts` caps the passengers who give up waiting at 30% over a run and 35% in its last year.
 
 The company capacity stress test injects its artificial crowd at the monthly decision, after normal queue abandonment. It freezes business decisions during its separate double-track physics observation.
 
@@ -151,61 +159,46 @@ Urban scenarios advance committed simulation ticks. The company save comparison 
 
 ## Measured calibration
 
-Fixed seed-7 controls, final full year of four, no AI. The sites, service and costs are unchanged. Amounts are thousands of game money a year.
+Fixed seed-7 controls, final full year of four, no AI. The sites, service and costs are unchanged. Amounts are thousands of game money a year: v2.5 (b7dfcc3), the first unified version (83ba5bd), and now.
 
-| Control | Income before → after | Operating result before → after | Boardings a year before → after |
+| Control | Income | Operating result | Boardings a year, load |
 | --- | ---: | ---: | ---: |
-| Intercity rail, stations at the town edges | 95.4 → 495.3 | −242 → +160 | 46 → 231 (load 3.4% → 15.5%) |
-| Busy bus, two articulated buses | 113.7 → 225.7 | +40 → +151 | 231 → 473 |
-| Short bus | 8.7 → 22.7 | −25 → −11 | 59 → 150 |
-| Village rail | 226.3 → 302.6 | −139 → −71 | 70 → 82 |
+| Intercity rail, stations at the town edges | 95.4 → 495.3 → 502.7 | −242 → +160 → +167 | 46 → 231 → 233, 15.6% |
+| Busy bus, two articulated buses | 113.7 → 225.7 → 196.4 | +40 → +151 → +122 | 231 → 473 → 422, 28.8% |
+| Short bus | 8.7 → 22.7 → 23.1 | −25 → −11 → −11 | 59 → 150 → 154 |
+| Village rail | 226.3 → 302.6 → 305.2 | −139 → −71 → −68 | 70 → 82 → 83 |
 
-The busy bus now pays back its buses in about 3.6 years (13.6 before), and the intercity line its train in 9.4. The intercity boardings rise more than the guide of three to four times. Its Coldden station stands at the town edge: the old reach covered 119 of 1,947 residents, the new one about 660.
+The busy bus repays its buses in 4.4 years and its full capital (buses, stops and depot) in 5.6; it lost 13% when two stops stopped adding coverage to buildings far from both. The intercity line repays its train in 9.0 years and its full capital (a hilly line with five bridges and three tunnels) in 51.
 
-Purpose-built services in `urbanecon.ts`:
+Purpose-built services in `urbanecon.ts`, first unified version → now:
 
-| Service | Before | After |
+| Service | First unified version | Now |
 | --- | ---: | ---: |
-| Two 3,000-person towns, central stations, year 3 | load 3.2%, −126k a year | load 20.5%, +468k a year |
-| 8,000-person town, five-stop light-rail style | 13.7M invested, +4.82M a year, 2.8-year payback | 7.7M (street level), +7.20M a year, 1.1-year payback |
-| 8,000-person town, five-stop subway style | 28.4M, +7.07M a year, 4.0-year payback | 28.6M, +5.70M a year, 5.0-year payback |
-| Park-and-ride main line, no walking residents | +0.60M a year (1,197 eligible) | −0.20M a year (121 eligible) |
-| Third-company interchange line | +4.07M a year, 486 transfers | +6.15M a year, 956 transfers |
-| Terminus-owner interchange line | +4.26M a year, 430 transfers | +8.74M a year, 853 transfers |
+| Two 3,000-person towns, central stations, year 3 | load 20.5%, +468k a year | unchanged |
+| 8,000-person town, five-stop light-rail style | 7.7M at street level on a free strip, +7.20M a year, 1.1-year payback | 14.2M elevated over a real street grid, +4.10M a year, 3.5-year payback |
+| 8,000-person town, five-stop subway style | 28.6M, +5.70M a year, 5.0-year payback | 28.6M, +3.46M a year, 8.3-year payback |
+| Third-company interchange line | +6.15M a year, 956 transfers | +2.90M a year, 758 transfers |
+| Terminus-owner interchange line | +8.74M a year, 853 transfers | +4.20M a year, 1,711 transfers |
 
-Notes on the purpose-built services:
+City hops earn less now: the rail minimum binds only below 300 m, the premium for speed on short trips is capped, and the rail uplift is 6.
 
-- **City lines:** both carry about 1.8 to 1.9 times as many passengers. The subway-style line's revenue still falls, because the 1,000 rail minimum replaces its 1,700 boarding charge plus distance.
-- **Light-rail-style line:** it now opens at street level.
-- **Park-and-ride line:** its stations moved beyond the doubled reach, and the car pool shrank by design.
-- **Through tunnel:** the forecast revenue is 5.79M a year (1.59M before). Fees flowed 83.7k one way and 173.3k the other (83.3k and 187.0k before).
-- **Terminus-owner line:** its company now tries a through service from the terminus, which fails on the geometry but takes a simulated day. During that day the normal line management adds a train, which lifts the line's result.
+Exploits and estimates, first unified version → now:
 
-AI sweep: seeds 7, 11, 23 and 51, 768 maps, five years, three AI companies.
+- **One journey over four transfers** (48 units in 160 s): 4.25 → 1.48 times the direct ride. The distance fares alone make it 1.48.
+- **A bus complex with an unused rail platform:** 5.85 → 1.00 times the demand of the plain bus stop.
+- **A house 263 m from two stops:** covered 100% → 84.5%, as by one stop.
+- **The AI's estimate for a short rail route:** 1,029 against receipts of 2,386 per passenger → identical.
 
-| Measure | Before | After |
+AI sweep: seeds 7, 11, 23 and 51, 768 maps, five years, three AI companies, first unified version → now:
+
+| Measure | First unified version | Now |
 | --- | ---: | ---: |
-| AI rail lines with trains | 9 (4 main-line only, 5 on urban track) | 9 (4, 5) |
-| Seeds with a city railway | 4 of 4 | 4 of 4 |
-| Companies with a railway | 9 of 12 | 9 of 12 |
-| Companies with a positive operating result in the last year | 10 of 12 (total 5.9M, worst −0.62M) | 12 of 12 (total 12.0M, worst +0.12M) |
-| Lowest cash, mean loans | 0.47M, 11.7M | 0.59M, 12.2M |
+| AI rail lines with trains | 9 (4 main-line only, 5 on urban track) | 10 (4, 6) |
+| Seeds with a line on urban track | 4 of 4 | 4 of 4 |
+| Companies with a railway | 9 of 12 | 10 of 12 |
+| Companies with a positive operating result in the last year | 12 of 12 (total 12.0M, worst +0.12M) | 11 of 12 (total 9.4M, worst −0.12M) |
+| Lowest cash, mean loans | 0.59M, 12.2M | 0.92M, 13.9M |
+| Passengers who gave up in the last month | 28%, 35%, 61%, 28% | 15%, 15%, 22%, 20% |
 | Bankrupt companies | 0 | 0 |
 
-Naturally selected city railways (`--maps=7,23 --years=8 --size=768`):
-
-- **Seed 7:** one city railway opening both before and after. No line qualifies, because the largest town stays below 5,000 (4,468 before, 4,781 after).
-- **Seed 23, before:** three qualifying Fairholm lines earned +1.09M, +0.11M and −0.01M a year at the end, and +1.90M, +0.16M and +0.12M at two years.
-- **Seed 23, after:** one qualifying line, RE1 Fairholm – Hartburgh Vale. It is a light-rail-style city line merged with a main line into one route, and earns +1.98M a year at the end and +0.94M at two years.
-
-Three-year 512-map ridership runs change the AI's networks, so their totals describe network choice as well as demand.
-
-| Seed | Boardings a year | Rail boardings | Mean load | Time full |
-| --- | ---: | ---: | ---: | ---: |
-| 7 | 1,674 → 2,255 | 1,117 → 1,035 | 20.2% → 39.9% | 0.0% → 13.3% |
-| 23 | 598 → 1,551 | 177 → 1,127 | 24.7% → 38.8% | 5.1% → 14.9% |
-| 51 | 770 → 1,794 | 202 → 879 | 34.1% → 39.5% | 0.5% → 5.7% |
-
-At stations present in both runs, boardings rose by a median of 1.9 times (90th percentile 6.5).
-
-Over the 20-year growth runs, the share of passengers who gave up waiting rose with demand, from 17–26% to 42–43%. Well-served towns grow 1.91 times, as before. Poorly served towns grow 1.57 times, inside their 1.3–1.6 target; before, they grew 1.74 times, above it. Unserved towns grow 1.31 times (1.22 before), inside the test's 0.1 slack around the 1.1–1.3 target.
+Over the 20-year growth runs (seeds 7 and 23), the share of passengers who gave up waiting fell from 43% and 42% (48% and 55% in the last year) to 16% and 15% (17% and 22% in the last year); v2.5 had 26% and 17%. Well-served towns grow 2.07 times, poorly served ones 1.60 and unserved ones 1.29, all inside their targets.

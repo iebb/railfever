@@ -179,6 +179,17 @@ function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknow
 const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffsets', 'platforms', 'edges', 'through', 'throughOffsets',
   'throughEdges', 'width', 'throughMode', 'trackType', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
   'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost'];
+/**
+ * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
+ * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike.
+ */
+const WAIT_KEYS = ['line', 'alight', 'dest', 'count', 't', 'transfers', 'rail'];
+function waitJSON(w: object): object {
+  const src = w as Record<string, unknown>, out: Record<string, unknown> = {};
+  for (const k of WAIT_KEYS) if (k in src) out[k] = src[k];
+  for (const k of Object.keys(src)) if (!(k in out)) out[k] = src[k];
+  return out;
+}
 function railPartJSON(r: object): object {
   const src = r as Record<string, unknown>, out: Record<string, unknown> = {};
   for (const k of RAIL_PART_KEYS) if (k in src) out[k] = src[k];
@@ -388,7 +399,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
-    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()] })),
+    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON) })),
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
@@ -505,7 +516,7 @@ export function deserialize(d: any): Game {
     // daily() adds onPlat after its other sampling fields; preserve that insertion order in an early save.
     if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
-    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0);
+    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
     g.stations.map.set(st.id, st);
   }
   g.stations.nextId = d.stationsNextId;

@@ -4,7 +4,7 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
-import { fareFor, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
+import { fareFor, distanceFare, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS } from './constants';
@@ -14,7 +14,7 @@ import { DAY_SECONDS } from './constants';
  * `t0`: sim time (s) they started waiting at the boarding stop (the leg's time = wait + ride); `transfers`: how many
  * of them changed vehicles earlier on this journey (the others get the no-transfer bonus at their destination).
  */
-export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number }
+export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
 
 export type VState = 'depot' | 'running' | 'loading' | 'waiting' | 'noroute' | 'stopped';
 
@@ -155,7 +155,9 @@ export abstract class Vehicle {
       const leg = now - (c.t0 ?? c.day * DAY_SECONDS);
       // one rail fare whatever the track or station style; road vehicles: tram or bus fares
       const mode: FareMode = this.kind === 'road' ? (line?.kind === 'tram' ? 'tram' : 'bus') : 'rail';
-      let f = fareFor(dist, leg, c.count, stationFareContext(g, from, st, mode));
+      // the rail minimum once per journey: the distance fares of their earlier rail legs count towards it
+      const ctx = stationFareContext(g, from, st, mode), before = c.rail ?? 0;
+      let f = fareFor(dist, leg, c.count, mode === 'rail' && before > 0 ? { ...ctx, railBefore: before } : ctx);
       const tr = Math.min(c.count, Math.max(0, c.transfers ?? 0));
       if (c.dest === st.id && tr < c.count) f *= 1 + (NO_TRANSFER_BONUS * (c.count - tr)) / c.count;
       income += f;
@@ -167,7 +169,8 @@ export abstract class Vehicle {
       } else {
         // changing here: they wait for their next leg (all of them have transferred now)
         const hop = g.lines.nextHop(st.id, c.dest);
-        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n));
+        const rail = mode === 'rail' ? before + distanceFare(dist) : before;
+        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n, rail));
       }
       moved += c.count;
       this.load -= c.count;
@@ -215,8 +218,10 @@ export abstract class Vehicle {
           cg.day = (cg.day * cg.count + g.day * take) / (cg.count + take);
           cg.t0 = ((cg.t0 ?? now) * cg.count + t0 * take) / (cg.count + take);
           cg.transfers = (cg.transfers ?? 0) + tr;
+          if (cg.rail || wg.rail) cg.rail = ((cg.rail ?? 0) * cg.count + (wg.rail ?? 0) * take) / (cg.count + take);
           cg.count += take;
-        } else this.cargo.set(ck, { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr });
+        } else this.cargo.set(ck, wg.rail ? { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr, rail: wg.rail }
+          : { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr });
         this.load += take;
         picked += take;
       }

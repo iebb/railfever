@@ -30,6 +30,8 @@ const UNSERVED_MONTHS = 0.1, WELL_MONTHS = 0.5, WELL_SERVICE = 0.08;
  */
 const TARGET: Record<Cls, [number, number]> = { 'well served': [1.6, 2.5], 'poorly served': [1.3, 1.6], 'unserved': [1.1, 1.3] };
 const SLACK = 0.1;
+/** Ceilings on the share of passengers who give up waiting: over a run of ten years or more, and in its last year. */
+const ABANDON_RUN = 0.3, ABANDON_YEAR = 0.35;
 
 const argv = process.argv.slice(2);
 const pos = argv.filter((a) => !a.startsWith('--'));
@@ -198,6 +200,15 @@ function report(runs: Run[], checks: boolean) {
   const ms = runs.flatMap((r) => r.yearly), ticks = ms.reduce((a, y) => a + y.ticks, 0);
   if (ticks) console.log(`  simulation: ${fmt(ms.reduce((a, y) => a + y.ms, 0) / ticks, 3)} ms per tick (AI included), ${Math.max(...ms.map((y) => y.ambient))} town cars at most`);
   if (!checks) return;
+  // An independent ceiling on passengers who give up waiting (the queue cap: the AI's fleets against the demand its
+  // catchments raise), over the run and in its last year, so a recalibration cannot hide overloaded networks.
+  for (const [i, r] of runs.entries()) {
+    const share = tot[i][1] / Math.max(1, tot[i][0]), last = r.yearly[r.yearly.length - 1];
+    const lastShare = last ? last.lost / Math.max(1, last.gen) : 0;
+    if (r.yearly.length < 10) continue;
+    check(share <= ABANDON_RUN, `seed ${r.seed}: ${fmt(share * 100, 0)}% of the passengers give up waiting over the run (at most ${ABANDON_RUN * 100}%)`);
+    check(lastShare <= ABANDON_YEAR, `seed ${r.seed}: ${fmt(lastShare * 100, 0)}% give up waiting in the last year (at most ${ABANDON_YEAR * 100}%)`);
+  }
   // growth responds to service: classes in order, their means near the targets (scaled to the run's length)
   const years = Math.max(...runs.map((r) => r.yearly.length));
   const scale = (x: number) => Math.pow(x, years / 20);

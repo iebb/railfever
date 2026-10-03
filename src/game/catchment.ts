@@ -25,6 +25,12 @@ export const walkWeight = (distance: number) => 1 / (1 + distance / 8);
  */
 export const FULL_COVER_WALK = 21;
 export const FULL_COVER_WEIGHT = walkWeight(FULL_COVER_WALK);
+/**
+ * How much of a building its stations cover, from the best walking weight among them: wholly within FULL_COVER_WALK,
+ * beyond that partly. Its stations share this in proportion to their weights (share = weight / sum * coverOf(best)):
+ * more stops at the same distance split the same coverage, they never add to it.
+ */
+export const coverOf = (best: number) => Math.min(1, best / FULL_COVER_WEIGHT);
 
 export function pedestrianRoad(e: NEdge): boolean {
   return e.kind === 'road' && e.depot < 0 && ROAD_TYPES[e.type]?.pedestrians !== false;
@@ -294,6 +300,9 @@ class WalkingCache {
       if (old && old.key === key && roads.unchanged(old.roads) && terrain.unchanged(old.terrain)) { old.order = order++; continue; }
       let points = stationAccess(g, st);
       if (old && sameAccess(old.points, points)) points = old.points;
+      // A station that lost every access point keeps no catchment entry: its old roads must not keep triggering
+      // roadsChanged (a game loaded since never made that entry, and must see the same triggers).
+      if (!points.length) this.entries.delete(`station:${st.id}`);
       // Access snapping can gain a new contact even for a station with no current access points.
       const extent = r ? r.length / 2 + 28 : 10;
       const ids = RegionVersions.ids([st.x - extent, st.z - extent, st.x + extent, st.z + extent]);

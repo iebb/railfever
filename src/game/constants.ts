@@ -22,10 +22,11 @@ export const PASSENGER_FARE_BLEND = 17;
 /** Shared local gravity/coverage parameters for demand and project revenue estimates. */
 export const LOCAL_DEMAND_DISTANCE = 40, LOCAL_DEMAND_EXP = 0.85, LOCAL_SERVED_SHARE = 0.15;
 /**
- * Urban trips use the same compressed calendar. Extra local trips apply only inside large, dense towns, by mode:
- * rail is one mode (main-line, metro and light-rail track alike), then tram and bus.
+ * Urban trips use the same compressed calendar. Extra local trips apply only inside large, dense towns, by the mode
+ * that carries the journey (demand.ts journeyMode): rail is one mode (main-line, metro and light-rail track alike),
+ * then tram and bus. Rail twice the tram: faster and more frequent, not a different kind of trip.
  */
-export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 12, tram: 3, bus: 1.5 };
+export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 6, tram: 3, bus: 1.5 };
 /** Small unmodelled car/drop-off feeder share of cross-town rail trips; bus/tram feeders are routed as real transfers. */
 export const MAINLINE_FEEDER_SHARE = 0.08;
 /**
@@ -35,11 +36,12 @@ export const MAINLINE_FEEDER_SHARE = 0.08;
  */
 export const MAINLINE_FEEDERS = { share: 0.5, fullHeadway: 100, cutoffHeadway: 200, reach: 84 };
 /**
- * Rail fares (one model for every track type): the distance fare, but at least `minimum` per boarding, so very short
- * hops pay sensibly (calibrated game money, before the speed factor; long trips and the high-speed premium follow
- * the distance and the time saved).
+ * Rail fares (one model for every track type): the distance fare, but at least `minimum` per journey (fares.ts
+ * railLegFare: transfers add none), so very short hops pay sensibly; it binds on rail trips under about 300 m
+ * (calibrated game money, before the speed factor; long trips and the high-speed premium follow the distance and the
+ * time saved).
  */
-export const RAIL_FARE = { minimum: 1000 };
+export const RAIL_FARE = { minimum: 500 };
 /** Tram and bus fares: a boarding charge in calibrated game money, followed by the scaled distance component. */
 export const ROAD_FARES = { tram: { boarding: 80, distance: 0.9 }, bus: { boarding: 12, distance: 0.9 } };
 /**

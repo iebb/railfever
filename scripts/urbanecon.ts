@@ -13,13 +13,13 @@ import { outAndBack, linearStops } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
-import { fareFor, refTime, urbanIntensity } from '../src/game/fares';
+import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime, NO_TRANSFER_BONUS } from '../src/game/fares';
 import { localTripMultiplier } from '../src/game/demand';
 import { URBAN_PAYBACK } from '../src/game/constants';
 import { patternHeadways } from '../src/game/patterns';
 import { walkingCatchment } from '../src/game/catchment';
 import { serialize, deserialize } from '../src/game/save';
-import { check, fails, fmt, build, railOpts, checkReservations } from './lib';
+import { check, fails, fmt, build, railOpts, checkReservations, addBusStop, roadDepotNear } from './lib';
 
 const M = (id: string) => MODEL_BY_ID.get(id)!;
 const arg = (key: string) => process.argv.find((s) => s.startsWith(`--${key}=`))?.slice(key.length + 3);
@@ -41,8 +41,12 @@ function road(g: Game, x0: number, z0: number, x1: number, z1: number) {
   const len = Math.hypot(x1 - x0, z1 - z0);
   net.addEdge('road', a.id, b.id, bezLine(x0, z0, x1, z1), new Float32Array(Math.ceil(len) + 1).fill(4), [], 'street', -1);
 }
-/** Dense apartment neighbourhoods on a connected pedestrian grid; reserve the centre railway alignment. */
-function town(g: Game, name: string, x: number, z: number, pop: number, width = 120, height = 64): Town {
+/**
+ * Dense apartment neighbourhoods on a connected pedestrian grid; reserve the centre railway alignment (no buildings
+ * on it). `crossStreets`: the grid's streets cross the alignment as well, as a real grid's do (else it is a free strip
+ * that a street-level line could take without a single crossing street).
+ */
+function town(g: Game, name: string, x: number, z: number, pop: number, width = 120, height = 64, crossStreets = false): Town {
   const t: Town = { id: g.towns.list.length, name, x, z, angle: 0, pop, radius: Math.max(width, height) * 0.6,
     buildings: new Set(), nextGrowthDay: 1e9, hasChurch: false, passGenMonth: 0, passTransMonth: 0,
     passGenLast: 0, passTransLast: 0, served: 0 };
@@ -51,7 +55,7 @@ function town(g: Game, name: string, x: number, z: number, pop: number, width = 
   const zs = Array.from({ length: Math.floor(height / 8) + 1 }, (_, i) => z - height / 2 + i * 8 + 4);
   for (const rz of zs) for (let i = 1; i < xs.length; i++) road(g, xs[i - 1], rz, xs[i], rz);
   for (const rx of xs) for (let i = 1; i < zs.length; i++) {
-    if (zs[i - 1] < z && zs[i] > z) continue;
+    if (!crossStreets && zs[i - 1] < z && zs[i] > z) continue;
     road(g, rx, zs[i - 1], rx, zs[i]);
   }
   const lots: { x: number; z: number; angle: number }[] = [];
@@ -134,6 +138,43 @@ if (!arg('maps')) {
     check(checkReservations(g).length === 0, 'main-line feeder reservations consistent');
     void ai;
   }
+  console.log('a bus complex with an unused rail platform');
+  {
+    // Only buses run there. The local uplift follows the service that carries the journey (demand.ts journeyMode),
+    // not the platforms the station has: an unused rail platform must not lend the bus trips the rail uplift.
+    const g = flat(0);
+    road(g, 20, 60, 200, 60);
+    const t: Town = { id: 0, name: 'Bus City', x: 72, z: 60, angle: 0, pop: 8000, buildings: new Set(), radius: 50, nextGrowthDay: 1e9, hasChurch: false,
+      passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, served: 0 };
+    g.towns.list.push(t);
+    const plan = g.stations.planRail(60, 54, Math.PI / 2, 10, 2, 0, { style: 'none', level: 'ground', trackType: 'standard' });
+    check(plan.ok && !g.stations.commitRail(plan, 0), `an unused rail platform beside the bus stop (${plan.error ?? 'ok'})`);
+    const A = addBusStop(g, 60, 60, 0), B = addBusStop(g, 84, 60, 0), st = g.stations.get(A)!;
+    for (const x of [64, 88]) t.buildings.add(g.world.addBuilding({ townId: 0, x, z: 62, angle: Math.PI, w: 1.4, d: 1.4, type: 4, floors: 1, pop: 4000, seed: x, y: 4, built: 0 }).id);
+    const line = g.lines.create('road'); line.stops = [A, B];
+    const depot = roadDepotNear(g, 140, 60, 0);
+    check(!!st.rail && depot >= 0 && typeof g.vehicles.buyRoad(depot, M('bus_c'), line.id) !== 'string', 'a mixed complex served by one bus line');
+    g.lines.rebuild(); g.stations.recomputeCatchment(); g.demand.rebuild(); g.demand.recomputeShares();
+    const served = () => { (g.demand as any).cache.clear(); return g.demand.weights(st).served; };
+    const withPlatform = served(), rail = st.rail; st.rail = null;
+    const busOnly = served(); st.rail = rail;
+    console.log(`  served demand ${fmt(withPlatform, 3)} with the unused platform, ${fmt(busOnly, 3)} as a plain bus stop`);
+    check(withPlatform > 0 && Math.abs(withPlatform / busOnly - 1) < 1e-9, 'bus-only trips get the bus uplift, whatever platforms the station has');
+  }
+  console.log('AI fare estimates use the fare model of the receipts');
+  {
+    // project and improvement estimates price a rail leg as vehicle.ts does (the rail minimum per journey), a bus
+    // leg with its boarding charge: an estimate and a passenger's receipt on the same leg agree
+    const g = flat(1), ai = g.ais[0] as AIController & Record<string, any>;
+    for (const [models, track, dist, len, mode] of [[[M('emu_b')], 'electric', 24, 28, 'rail'], [[M('bus_c')], 'street', 18, 20, 'bus']] as const) {
+      const sv = ai.serviceYearCalc([...models], 2, dist, len, track, 0.7);
+      const receipt = fareFor(dist, estimateLegTime(dist, sv.kmh, sv.headway, len / dist), 1, { mode }) * (1 + NO_TRANSFER_BONUS);
+      const estimate = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, false, { mode });
+      const generic = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, true, { mode });
+      console.log(`  ${mode}: ${dist} u, estimate ${fmt(sv.perPax, 0)} per trip (receipt ${fmt(receipt, 0)} per passenger)`);
+      check(Math.abs(estimate - receipt) < 1e-6 && Math.abs(sv.perPax - generic) < 1e-6, `${mode} estimates and receipts use one fare model`);
+    }
+  }
   console.log('two 3,000-person towns, central stations');
   {
     // A main line between two towns of about 3,000 with stations in their centres, one train (loco and two coaches):
@@ -154,12 +195,16 @@ if (!arg('maps')) {
     check(load >= 0.15 && net >= 0, `a rail line between two 3,000-person towns with central stations is ${fmt(load * 100, 0)}% full and breaks even after upkeep by year three`);
     check(checkReservations(g).length === 0, 'two-town reservations consistent');
   }
+  // Full-capital payback (construction and units against the operating result): a realistic band for each style, so
+  // that a recalibration cannot pass a city railway that repays in a year or never.
+  const PAYBACK_BAND = { lightrail: [3, 8], metro: [4, URBAN_PAYBACK.metro] } as const;
   for (const mode of ['lightrail', 'metro'] as const) {
     console.log(`8000-person centre ${mode}`);
-    const g = flat(1), t = town(g, 'Dense City', 256, 256, 8000), ai = g.ais[0];
+    // (the grid's streets cross the line's corridor: a street-level line would cross one every 80 m)
+    const g = flat(1), t = town(g, 'Dense City', 256, 256, 8000, 120, 64, true), ai = g.ais[0];
     const intensity = urbanIntensity(g, { x: t.x, z: t.z, townId: t.id });
-    check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, 'rail') > 8, 'a dense centre has substantial local transit demand');
-    check(fareFor(7, 60, 1, { mode: 'rail' }) > fareFor(7, 60, 1), 'a short rail hop pays the minimum fare per boarding (any track type)');
+    check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, 'rail') > 4, 'a dense centre has substantial local transit demand');
+    check(fareFor(7, 60, 1, { mode: 'rail' }) > fareFor(7, 60, 1), 'a short rail hop pays the minimum fare (any track type)');
     check(refTime(100, 1) > refTime(100), 'congestion and parking slow the city car alternative');
     open(g, ai, mode, t);
     const line = g.lines.all().find((l) => l.kind === 'rail' && l.owner === ai.companyId);
@@ -172,6 +217,8 @@ if (!arg('maps')) {
     console.log('  trains ' + line.vehicles.map((id) => { const v = g.vehicles.get(id)!; return `${v.state} ${v.status} (${v.delivered} delivered)`; }).join(' | '));
     console.log(`  ${mode}: ${new Set(line.stops).size} stops, ${fmt(cost / 1e6, 2)}M invested, revenue ${fmt(line.incomeLast / 1e6, 2)}M, operating profit ${fmt(net / 1e6, 2)}M/year, payback ${fmt(cost / net, 1)} years`);
     check(net > 0 && net * URBAN_PAYBACK[mode] >= cost, `${mode} operates profitably and repays within ${URBAN_PAYBACK[mode]} years`);
+    const [lo, hi] = PAYBACK_BAND[mode];
+    check(net > 0 && cost / net >= lo && cost / net <= hi, `${mode} repays its full capital in ${lo}-${hi} years (${net > 0 ? fmt(cost / net, 1) : 'never'})`);
     check(checkReservations(g).length === 0, `${mode} reservations consistent`);
   }
 

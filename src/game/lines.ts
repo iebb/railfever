@@ -690,8 +690,8 @@ export class Lines {
       if (!hop) continue;
       // (they keep when they started waiting and whether they changed vehicles)
       const tr = (n: number) => (w.transfers ? (w.transfers * n) / Math.max(1, w.count) : 0);
-      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0);
-      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n)));
+      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0));
     }
   }
 

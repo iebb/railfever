@@ -14,9 +14,9 @@ import type { Hop } from './lines';
 import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, NO_TRANSFER_BONUS, type DemandSite, type FareMode } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
+import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS, RAIL_FARE } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
-import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
+import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns } from './patterns';
 
 export interface Region {
@@ -505,10 +505,36 @@ export class DemandModel {
     return [...pops].map(([r, pop]) => [r, Math.min(1, pop / Math.max(1, this.regions[r]?.pop ?? 1))]);
   }
 
-  /** Destinations of a station's passengers by OD demand (cached until routing or catchments change). */
+  /**
+   * The mode carrying a routed journey from station `from` to `dest`: rail when a rail line with vehicles carries any
+   * of its legs (whatever platforms the stations have: an unused rail platform at a bus stop adds nothing), else tram
+   * when a tram line does, else bus.
+   */
+  private journeyMode(from: number, dest: number, hop: Hop): FareMode {
+    const g = this.g;
+    let mode: FareMode = 'bus', h: Hop | undefined = hop;
+    for (let legs = 0; h && legs < 8; legs++) {
+      for (const id of h.lines ?? [h.line]) {
+        const l = g.lines.get(id);
+        if (!l || !l.vehicles.length) continue;
+        if (l.kind === 'rail') return 'rail';
+        if (l.kind === 'tram') mode = 'tram';
+      }
+      if (h.alight === dest || h.alight === from) break;
+      h = g.lines.routing.get(h.alight)?.get(dest);
+    }
+    return mode;
+  }
+
+  /**
+   * Destinations of a station's passengers by OD demand (cached for the day, until routing or catchments change).
+   * The day, the town lots and the fleet are part of the key: the urban uplift follows towns as they grow
+   * (urbanIntensity) and the services that carry each journey (journeyMode), which change without a routing or
+   * network version; a game loaded later that day works out the same weights as the one that went on.
+   */
   weights(st: Station): StationDemand {
     const g = this.g;
-    const key = g.lines.version + ':' + this.version + ':' + g.networkVersion;
+    const key = g.day + ':' + g.world.lotVersions.version + ':' + g.vehicles.map.size + ':' + g.lines.version + ':' + this.version + ':' + g.networkVersion;
     if (key !== this.cacheKey) { this.cache.clear(); this.cacheKey = key; }
     const c = this.cache.get(st.id);
     if (c) return c;
@@ -522,7 +548,6 @@ export class DemandModel {
     const n = this.regions.length, od = this.od, ld = this.ld;
     const parts: { d: number; x: number; y: number; f: number; local: number; feeder: number }[] = [];
     let local = 0, localF = 0;
-    const mode: FareMode = st.rail ? 'rail' : st.stops.some((s) => g.world.net.edges.get(s.edge)?.tram) ? 'tram' : 'bus';
     for (const [d, hop] of table) {
       const ds = g.stations.get(d);
       if (!ds || !stationActive(g, ds)) continue;
@@ -539,6 +564,8 @@ export class DemandModel {
       y /= TRIPS_PER_MONTH;
       if (!(x > 0) && !(y > 0)) continue;
       const f = this.serviceFactor(st, ds, hop);
+      // the uplift and the car feeders of the service that carries the journey, not of the platforms the station has
+      const mode = this.journeyMode(st.id, d, hop);
       parts.push({ d, x, y, f, local: sameTown ? localTripMultiplier(g, st, mode, f) * st.catchPop / Math.max(1, originPop) : 1,
         feeder: !sameTown && mode === 'rail' && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1 });
       local += x; localF += x * f;
@@ -578,16 +605,18 @@ export class DemandModel {
         walk: 'walk' in p ? p.walk : built ? walkingCatchment(g, p) : planWalkingCatchment(g, p) };
     });
     const ownStation = (id: number) => points.some((p) => 'id' in p && p.id === id);
-    const sums = new Map<number, number>();
-    for (const s of sites) for (const [bid, walk] of s.walk.buildings) sums.set(bid, (sums.get(bid) ?? 0) + walkWeight(walk.distance));
+    // per building: the sum and the best of the walking weights reaching it (the share-out's rule, Stations.computeShares)
+    const sums = new Map<number, number>(), bests = new Map<number, number>();
+    const reach = (bid: number, w: number) => { sums.set(bid, (sums.get(bid) ?? 0) + w); if (w > (bests.get(bid) ?? 0)) bests.set(bid, w); };
+    for (const s of sites) for (const [bid, walk] of s.walk.buildings) reach(bid, walkWeight(walk.distance));
     // Competing served stops share a building just as they do after construction (far-only buildings partly covered).
     for (const st of g.stations.map.values()) {
       if (ownStation(st.id) || !g.lines.stationServed(st.id)) continue;
-      for (const [bid, walk] of walkingCatchment(g, st).buildings) if (sums.has(bid)) sums.set(bid, sums.get(bid)! + walkWeight(walk.distance));
+      for (const [bid, walk] of walkingCatchment(g, st).buildings) if (sums.has(bid)) reach(bid, walkWeight(walk.distance));
     }
     for (const s of sites) for (const [bid, walk] of s.walk.buildings) {
       const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
-      const pop = b.pop * walkWeight(walk.distance) / Math.max(sums.get(bid)!, FULL_COVER_WEIGHT);
+      const pop = b.pop * (walkWeight(walk.distance) / sums.get(bid)! * coverOf(bests.get(bid)!));
       const r = this.regionOf(b); if (r < 0) continue;
       s.pop += pop; s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
     }
@@ -665,7 +694,8 @@ export class DemandModel {
       const count = arrivals * 0.3; // continuing inbound trips and the reciprocal trip to the station
       const d = Math.max(15, sites.reduce((a, s) => a + Math.hypot(s.x - near.x, s.z - near.z), 0) / sites.length);
       transfers += count; boardings += count;
-      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode: 'rail', centre: urbanIntensity(g, near) });
+      // (their journey paid the rail minimum on the main line: the city leg adds its distance fare)
+      revenue += fareFor(d, estimateLegTime(d, kmh, headway), count, { mode: 'rail', centre: urbanIntensity(g, near), railBefore: RAIL_FARE.minimum });
     }
     return { boardings, revenue, transfers, covered: sites.reduce((a, s) => a + s.pop, 0) };
   }

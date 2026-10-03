@@ -369,7 +369,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
       h('span', null, 'Speed factor'), h('span', { class: f.factor >= 1 ? 'pos' : 'neg' }, `×${f.factor.toFixed(2)}`),
       h('span', null, 'Fare per passenger'), h('span', null, `${fmtMoney(f.perPassenger)} (base ${fmtMoney(f.base)})`)),
     heads.length ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, heads.map((x) => `${pats.find((p) => p.id === x.pid)?.name ?? PATTERN_LABEL.local}: every ${minSec(x.headway)} (${plural(x.vehicles, 'vehicle')})`).join(' · ')) : null,
-    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; passengers who need no change pay ${Math.round(NO_TRANSFER_BONUS * 100)}% more.${l.kind === 'rail' ? ` Rail legs pay at least ${fmtMoney(RAIL_FARE.minimum)} before the speed factor, whatever the track type.` : ''}`));
+    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; passengers who need no change pay ${Math.round(NO_TRANSFER_BONUS * 100)}% more.${l.kind === 'rail' ? ` A rail journey pays at least ${fmtMoney(RAIL_FARE.minimum)} before the speed factor, whatever the track type, once however often its passengers change trains.` : ''}`));
 }
 
 /** Sell the player's vehicles on a line and delete it (or hand a shared line over to a partner). */

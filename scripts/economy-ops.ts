@@ -18,7 +18,7 @@ import { serialize, deserialize } from '../src/game/save';
 import { Economy, CATEGORIES, operatingCosts } from '../src/game/economy';
 import {
   refTime, speedFactor, fareFor, walkTime, tripFactor, estimateLegFare, estimateLegTime, legacyFare, simNow, NO_TRANSFER_BONUS,
-  WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MIN, fareCalibration,
+  WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MAX_SHORT, SPEED_MIN, fareCalibration,
 } from '../src/game/fares';
 import { estimateCostPerTrainKm, estimateVehicleYear, trackBasePerUnit, YEAR_S, KmCost } from '../src/game/opcosts';
 import { PASSENGER_RATE_SCALE } from '../src/game/constants';
@@ -55,12 +55,13 @@ const syn = (id: string, o: Partial<VehicleModel>): VehicleModel => ({ id, name:
   check(bus > 1.4 && train > 1.4, 'a frequent bus / train beats walking or driving: factor > 1.4');
   check(slow < 0.8, 'slower than the car: factor < 0.8');
   check(hsr > ic * 1.25, 'HSR earns clearly more than a slower intercity over the same distance');
-  check(speedFactor(150, 1) === SPEED_MAX && speedFactor(150, 1e6) === SPEED_MIN, 'factor clamped to 0.35..2.6');
+  // (the cap: a few minutes saved on a walk in town are worth less, SPEED_MAX_SHORT up to SHORT_TRIP, SPEED_MAX from 3x that)
+  check(speedFactor(1200, 1) === SPEED_MAX && speedFactor(50, 1) === SPEED_MAX_SHORT && speedFactor(150, 1e6) === SPEED_MIN, 'factor clamped to 0.35..1.8 on short trips, ..2.6 on long ones');
   // waiting counts: the same ride after a longer wait pays less
   const f1 = fareFor(150, 30 + 70, 100), f2 = fareFor(150, 300 + 70, 100), f3 = fareFor(150, 900 + 70, 100);
   console.log(`  100 pax, 1.5 km, 70 s ride: wait 30 s ${k(f1)}, 300 s ${k(f2)}, 900 s ${k(f3)}`);
   check(f1 > f2 && f2 > f3, 'longer waits, lower fares');
-  check(Math.abs(f2 / f1 - Math.pow(100 / 370, 0.55)) < 0.01, 'fare ratio = (leg time ratio)^0.55');
+  check(Math.abs(f3 / f2 - Math.pow(370 / 970, 0.55)) < 0.01, 'fare ratio = (leg time ratio)^0.55 (below the cap)');
   // demand elasticity and estimates
   check(tripFactor(100, 1000) === 2.5 && tripFactor(1e6, 100) === 0.3 && Math.abs(tripFactor(400, 400) - 1) < 1e-9, 'tripFactor (ref/time)^0.7 clamped 0.3..2.5');
   const expected = fareFor(500, estimateLegTime(500, 120, 200), 1);

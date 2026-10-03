@@ -18,7 +18,7 @@ import { Train } from '../src/game/train';
 import { depotAtEnd } from '../src/game/routing';
 import type { BuildOptions } from '../src/game/construction';
 import { roadOpts } from './lib';
-import { walkingCatchment, walkWeight, FULL_COVER_WEIGHT } from '../src/game/catchment';
+import { walkingCatchment, walkWeight, FULL_COVER_WEIGHT, coverOf } from '../src/game/catchment';
 import { flatGame, station, endNode, newTrack, runTrains, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
 
 const T0 = performance.now();
@@ -96,7 +96,9 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const dA = walkingCatchment(g, A).buildings.get(hA.id)?.distance ?? Infinity, cA = Math.min(1, walkWeight(dA) / FULL_COVER_WEIGHT);
   check(sf(hA.id).st.join() === String(A.id) && near(sf(hA.id).w[0], cA), `inside A only (and an unserved station C): all of its covered share (${fmt(cA, 3)} at ${fmt(dA, 1)} walked) to the served station A`);
   const ab = sf(hAB.id), wA = ab.w[ab.st.indexOf(A.id)], wB = ab.w[ab.st.indexOf(B.id)];
-  check(ab.st.length === 2 && near(wA + wB, 1) && wA > wB, `inside A and B: shared, the nearer A more (${fmt(wA, 2)} / ${fmt(wB, 2)})`);
+  // (covered as from its best walk, the nearer A: the two stations share that, a second one adds no coverage)
+  const near2 = Math.min(...[A, B].map((s) => walkingCatchment(g, s).buildings.get(hAB.id)?.distance ?? Infinity)), cAB = coverOf(walkWeight(near2));
+  check(ab.st.length === 2 && near(wA + wB, cAB) && wA > wB, `inside A and B: shared, the nearer A more (${fmt(wA, 2)} / ${fmt(wB, 2)} of ${fmt(cAB, 3)} covered at ${fmt(near2, 1)} walked)`);
   check(sf(hC.id).st.join() === String(C.id), 'covered by the unserved station C alone: C has it');
   check(near(A.catchPop, 10 * cA + 10 * wA) && near(S.catchSum(A, (b) => b.pop), A.catchPop), `catchment population = shares x people (${fmt(A.catchPop, 2)})`);
   const v0 = S.catchVersion;

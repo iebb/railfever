@@ -10,6 +10,8 @@ import {
   walkingCatchment, walkingPopulation, planWalkingCatchment, walkSitePop, walkLimit, FRONTAGE_REACH,
 } from '../src/game/catchment';
 import { drawCatchStreets } from '../src/ui/gameapi';
+import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { roadDepotNear } from './lib';
 import { flatGame, station, check, done } from './stationlib';
 
 const T0 = performance.now(), near = (a: number, b: number) => Math.abs(a - b) < 1e-4;
@@ -173,6 +175,28 @@ check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 
   check([...drawn.values()].some((n) => n > 0), 'UI catchment layer draws reached streets');
   drawCatchStreets({ setSegments: (key, segs) => { drawn.set(key, segs?.length ?? 0); } }, 'test', null);
   check([...drawn.values()].every((n) => n === 0), 'closing a preview clears every mode layer');
+}
+
+{
+  // Coverage follows the best walk: a second stop just as far away shares the building's coverage, it adds none
+  // (a house 26 units' walk from either stop is covered as from one stop at that distance).
+  const g = flatGame();
+  const n = (x: number, z: number) => node(g, x, z);
+  const w0 = n(20, 60), w1 = n(66, 60), w2 = n(160, 60), s0 = n(66, 110);
+  road(g, w0, w1, 'street'); road(g, w1, w2, 'street'); road(g, w1, s0, 'street');
+  const h = house(g, 64, 79, Math.PI / 2, 100);
+  const A = bus(g, 60, 60), C = bus(g, 140, 60);
+  const line = g.lines.create('road'); line.stops = [A.id, C.id];
+  const depotId = roadDepotNear(g, 140, 60, 0);
+  check(depotId >= 0 && typeof g.vehicles.buyRoad(depotId, MODEL_BY_ID.get('bus_c')!, line.id) !== 'string', 'a bus on the line');
+  g.lines.rebuild(); flush(g);
+  const one = g.stations.stationsForBuilding(h.id), cover1 = one.w.reduce((a, b) => a + b, 0);
+  const B = bus(g, 72, 60);
+  line.stops = [A.id, B.id, C.id]; g.lines.rebuild(); flush(g);
+  const two = g.stations.stationsForBuilding(h.id), cover2 = two.w.reduce((a, b) => a + b, 0);
+  const dA = walkingCatchment(g, A).buildings.get(h.id)?.distance ?? 0, dB = walkingCatchment(g, B).buildings.get(h.id)?.distance ?? 0;
+  console.log(`  a house ${dA.toFixed(1)} / ${dB.toFixed(1)} units' walk from two stops: covered ${cover1.toFixed(4)} by one, ${cover2.toFixed(4)} by both (${two.w.map((x) => x.toFixed(4)).join(' + ')})`);
+  check(dA > 21 && near(dA, dB) && cover1 < 1 && near(cover1, cover2) && two.st.length === 2 && near(two.w[0], two.w[1]), 'a second stop as far away shares the coverage of the best walk, it adds none');
 }
 
 done(T0);

@@ -15,13 +15,17 @@ import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
-import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
+import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
  * (weighted mean; fares.ts simNow), `transfers`: how many of them have changed vehicles on this journey (ops, 9j/9k).
  */
-export interface WaitGroup { line: number; alight: number; dest: number; count: number; t?: number; transfers?: number }
+export interface WaitGroup {
+  line: number; alight: number; dest: number; count: number; t?: number; transfers?: number;
+  /** the distance fares (per passenger) of the journey's rail legs so far: the rail minimum is paid once per journey */
+  rail?: number;
+}
 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
 
@@ -65,8 +69,11 @@ export const CALL_DAYS = 30;
 const CALL_MASK = 2 ** CALL_DAYS - 1;
 /** Older saves (no history): a station a vehicle has called at starts from three calls in the last 30 days. */
 const OLD_SAVE_CALLS = 1 | (1 << 10) | (1 << 20);
-/** Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). */
-export const RATING_LOST = 0.25;
+/**
+ * Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). The
+ * rating scales a station's passenger generation (as OpenTTD's does): where queues overflow, fewer set out.
+ */
+export const RATING_LOST = 0.6;
 /** Share of a station's passengers who gave up waiting rather than board (this and last month), 0..1. */
 export function lostShare(st: Station): number {
   const lost = (st.lostMonth || 0) + (st.lostLast || 0);
@@ -2229,9 +2236,9 @@ export class Stations {
       if (!hit) continue;
       const old = [...st.waiting.values()];
       st.waiting.clear(); st.waitingTotal = 0;
-      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count);
+      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
     }
-    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count);
+    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
     for (const v of g.vehicles.map.values()) {
       let hit = false;
       for (const c of v.cargo.values()) if (c.alight === b.id || c.dest === b.id || c.from === b.id) { hit = true; break; }
@@ -2242,7 +2249,10 @@ export class Stations {
           const n = { ...c, alight: re(c.alight), dest: re(c.dest), from: re(c.from) };
           const k = n.from + ':' + n.alight + ':' + n.dest;
           const o = v.cargo.get(k);
-          if (o) { o.day = (o.day * o.count + n.day * n.count) / Math.max(1, o.count + n.count); o.count += n.count; } else v.cargo.set(k, n);
+          if (o) {
+            if (o.rail || n.rail) o.rail = ((o.rail ?? 0) * o.count + (n.rail ?? 0) * n.count) / Math.max(1, o.count + n.count);
+            o.day = (o.day * o.count + n.day * n.count) / Math.max(1, o.count + n.count); o.count += n.count;
+          } else v.cargo.set(k, n);
         }
       }
       const t = v as unknown as { routeTarget?: number; atStation?: number };
@@ -2585,11 +2595,11 @@ export class Stations {
       const reaches = b && b.pop > 0 && id <= maxB
         ? [...(this.covered.get(id) ?? [])].sort((a, b) => order.get(a[0])! - order.get(b[0])!) : [];
       const anyServed = reaches.some(([sid]) => this.served.get(sid));
-      let sum = 0;
+      let sum = 0, best = 0;
       const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; }
-      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
-      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / norm); }
+      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
+      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum * cover); }
       if (!this.covered.get(id)?.size) this.covered.delete(id);
       if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
       if (!old && !rec.st.length) continue;
@@ -2657,12 +2667,12 @@ export class Stations {
       if (!b || b.pop <= 0 || id > job.maxB) continue;
       // covered was filled in station Map order, exactly as in the original share-out.
       const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
-      let sum = 0; const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; }
+      let sum = 0, best = 0; const wt: number[] = [];
+      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
       if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
       for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sid = reaches[k][0], sh = wt[k] / norm;
+        const sid = reaches[k][0], sh = wt[k] / sum * cover;
         rec.st.push(sid); rec.w.push(sh);
         let station = job.shareSt.get(sid), members = job.members.get(sid);
         if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
@@ -2697,12 +2707,12 @@ export class Stations {
     }
     for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
       const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
-      let sum = 0; const wt: number[] = [];
-      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; }
+      let sum = 0, best = 0; const wt: number[] = [];
+      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; if (v > best) best = v; }
       if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
       for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sh = wt[k] / norm, sid = reaches[k].sid, ps = stations.get(sid)!;
+        const sh = wt[k] / sum * cover, sid = reaches[k].sid, ps = stations.get(sid)!;
         rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
       }
       buildings.set(id, rec);
@@ -2770,15 +2780,21 @@ export class Stations {
    * Passengers wait at `st` for `line` to `alight` on their way to `dest`. A walking hop (WALK_LINE) takes them
    * straight to the linked station `alight`, where they arrive or wait for their next leg.
    */
-  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0) {
+  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0) {
     if (count <= 0) return;
-    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st); return; }
+    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
     const key = line + ':' + alight + ':' + dest;
-    // ops: when they started waiting (weighted mean) and how many already changed vehicles
+    // ops: when they started waiting (weighted mean), how many already changed vehicles, their rail fares so far
     const at = t ?? simNow(this.game), tr = Math.max(0, Math.min(count, transferred));
     const g = st.waiting.get(key);
-    if (g) { g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr; }
-    else st.waiting.set(key, tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at });
+    if (g) {
+      if (rail || g.rail) g.rail = ((g.rail ?? 0) * g.count + rail * count) / (g.count + count);
+      g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
+    } else {
+      const ng: WaitGroup = tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at };
+      if (rail > 0) ng.rail = rail;
+      st.waiting.set(key, ng);
+    }
     st.waitingTotal += count;
   }
 
@@ -2786,7 +2802,7 @@ export class Stations {
    * Passengers walk to the linked station `toId`: they have arrived, or wait there for their next leg (the walk
    * counts towards that leg's time).
    */
-  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station) {
+  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0) {
     const g = this.game;
     const to = this.map.get(toId);
     if (!to || depth > 4) return;
@@ -2799,7 +2815,7 @@ export class Stations {
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
     const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to)) : 0);
-    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count))));
+    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count)), rail));
   }
 
   /**
@@ -2847,7 +2863,7 @@ export class Stations {
     st.waitingTotal = 0;
     for (const g of old) {
       const hop = lines.nextHop(st.id, g.dest);
-      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0);
+      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0);
     }
   }
 

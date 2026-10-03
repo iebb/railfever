@@ -54,7 +54,7 @@ import type { RoadVehicle, RSeg } from './roadvehicle';
 import { tramUsable } from './build-ops';
 import { closestOnPolyline } from './geom';
 import { YEAR_S, estimateVehicleYear } from './opcosts';
-import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
+import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
 
 // ============================================================================ optional primitives (feature-detected)
@@ -1196,7 +1196,8 @@ class NetPlanner {
         const oldFactor = tripFactor(oldTime, refTime(d)), newFactor = tripFactor(newTime, refTime(d));
         const boardings = Math.min(trips * capacity * 0.8, Math.max(demand * oldFactor, l.passLast * 12 / Math.max(1, l.stops.length)));
         const nextBoardings = Math.min(YEAR_S / Math.max(1, nextHeadway) * capacity * 0.8, boardings + demand * Math.max(0, newFactor - oldFactor));
-        value += (fareFor(d, newTime, nextBoardings) - fareFor(d, oldTime, boardings)) * (1 + NO_TRANSFER_BONUS);
+        const ctx = { mode: l.kind === 'tram' ? 'tram' as const : 'bus' as const };
+        value += (fareFor(d, newTime, nextBoardings, ctx) - fareFor(d, oldTime, boardings, ctx)) * (1 + NO_TRANSFER_BONUS);
       }
     }
     return value;
@@ -1433,7 +1434,7 @@ class NetPlanner {
       seen.add(k);
       const added = this.townTrips(sa.townId, sb.townId) * gain;
       trips += added;
-      revenue += added * 12 * estimateLegFare(distance, 70, headway, 1, 1.3, direct, false);
+      revenue += added * 12 * estimateLegFare(distance, 70, headway, 1, 1.3, direct, false, { mode: 'rail' });
     }
     return { trips, revenue };
   }
@@ -2070,7 +2071,7 @@ class NetPlanner {
         const b = g.world.buildings.get(id);
         if (!b || b.pop <= 0) continue;
         const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
-        pop += b.pop * Math.min(1, walkWeight(at.distance) / FULL_COVER_WEIGHT) / (1 + others);
+        pop += b.pop * coverOf(walkWeight(at.distance)) / (1 + others);
       }
       return pop;
     };
@@ -2663,7 +2664,7 @@ class NetPlanner {
           const time = estimateLegTime(distance, kmh, headway, 1.3);
           const gain = hop ? Math.max(0, Math.min(0.6, (hop.cost - time + 360) / Math.max(1, hop.cost))) : 1;
           const added = this.townTrips(X.townId, Y.townId) * gain;
-          trips += added; revenue += added * 12 * estimateLegFare(distance, kmh, headway, 1, 1.3, true, false);
+          trips += added; revenue += added * 12 * estimateLegFare(distance, kmh, headway, 1, 1.3, true, false, { mode: 'rail' });
         }
         if (trips < networkOptions.throughTrips || trips <= 0) continue;
         this.considered('midconnect.demand');

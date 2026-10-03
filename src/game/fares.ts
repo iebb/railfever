@@ -16,7 +16,16 @@ import type { Station } from './stations';
  * line), tram and bus. Without a mode a leg pays the plain distance fare (legacy estimates).
  */
 export type FareMode = 'rail' | 'tram' | 'bus';
-export interface FareContext { mode?: FareMode; /** 0..1, both ends in a dense city centre */ centre?: number }
+export interface FareContext {
+  mode?: FareMode;
+  /** 0..1, both ends in a dense city centre */
+  centre?: number;
+  /**
+   * Rail: the distance fares of the journey's earlier rail legs (0: this is its first). A journey's rail legs pay
+   * their distance fares, together at least the minimum (railLegFare): splitting a trip over transfers adds none.
+   */
+  railBefore?: number;
+}
 export interface DemandSite { x: number; z: number; townId: number }
 const intensityCache = new WeakMap<Game, { key: string; values: Map<string, number> }>();
 
@@ -55,8 +64,12 @@ export const FARE_RATE = 7.0 * PASSENGER_FARE_SCALE;
 export const SHORT_HOP = 10;
 /** Long trips: the rate tapers gently beyond TAPER_FROM units (the effective distance grows ~ sqrt beyond). */
 export const TAPER_FROM = 500, TAPER_SCALE = 5000;
-/** speedFactor = clamp((refTime / legTime) ^ SPEED_EXP, SPEED_MIN, SPEED_MAX). */
-export const SPEED_EXP = 0.55, SPEED_MIN = 0.35, SPEED_MAX = 2.6;
+/**
+ * speedFactor = clamp((refTime / legTime) ^ SPEED_EXP, SPEED_MIN, cap): the cap is SPEED_MAX_SHORT on trips up to
+ * SHORT_TRIP units (a few minutes saved on a walk in town are worth less than the ratio says), rising to SPEED_MAX
+ * by SHORT_TRIP * 3 (long trips: the premium of fast and high-speed services).
+ */
+export const SPEED_EXP = 0.55, SPEED_MIN = 0.35, SPEED_MAX = 2.6, SPEED_MAX_SHORT = 1.8, SHORT_TRIP = 100;
 /** tripFactor = clamp((refTime / doorToDoor) ^ TRIP_EXP, TRIP_MIN, TRIP_MAX) (demand elasticity). */
 export const TRIP_EXP = 0.7, TRIP_MIN = 0.3, TRIP_MAX = 2.5;
 /**
@@ -110,21 +123,37 @@ export function fareCalibration(d: number): number {
   return PASSENGER_LONG_FARE_SCALE + (PASSENGER_FARE_SCALE - PASSENGER_LONG_FARE_SCALE) / (1 + (Math.max(0, d) / PASSENGER_FARE_BLEND) ** 2);
 }
 
+/** The distance fare of one passenger for a leg of straight-line distance `d` units (before the speed factor). */
+export function distanceFare(d: number): number { return FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d); }
+
+/**
+ * Base fare of a rail leg (before the speed factor): a journey's rail legs pay their distance fares, together at
+ * least RAIL_FARE.minimum. `before`: the distance fares of its earlier rail legs (0: none), so the first rail leg pays
+ * up to the minimum and a later one only what takes the journey's distance fares beyond it (the operator who carries
+ * the first rail leg collects the minimum).
+ */
+export function railLegFare(d: number, before = 0): number {
+  const b = distanceFare(d), min = RAIL_FARE.minimum;
+  return before > 0 ? Math.max(min, before + b) - Math.max(min, before) : Math.max(min, b);
+}
+
 /**
  * Base fare of one passenger for a leg of straight-line distance `d` units (before the speed factor): rail pays the
- * distance fare with a minimum per boarding (RAIL_FARE), tram and bus a boarding charge plus their distance share.
+ * distance fare with a minimum per journey (railLegFare; `railBefore`: the journey's earlier rail legs), tram and bus
+ * a boarding charge plus their distance share.
  */
-export function baseFare(d: number, mode?: FareMode): number {
-  const distance = FARE_RATE * (fareCalibration(d) / PASSENGER_FARE_SCALE) * effDist(d);
-  if (mode === 'rail') return Math.max(RAIL_FARE.minimum, distance);
+export function baseFare(d: number, mode?: FareMode, railBefore = 0): number {
+  const distance = distanceFare(d);
+  if (mode === 'rail') return railBefore > 0 ? railLegFare(d, railBefore) : Math.max(RAIL_FARE.minimum, distance);
   const road = mode && ROAD_FARES[mode];
   return road ? road.boarding + distance * road.distance : distance;
 }
 
-/** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..2.6. */
+/** Speed / time factor of a leg: (refTime / legTime) ^ 0.55, clamped to 0.35..1.8 on short trips, ..2.6 on long ones. */
 export function speedFactor(d: number, legSeconds: number, centre = 0): number {
   if (!(d > 1)) return 1;
-  return clamp(Math.pow(refTime(d, centre) / Math.max(1, legSeconds), SPEED_EXP), SPEED_MIN, SPEED_MAX);
+  const cap = SPEED_MAX_SHORT + (SPEED_MAX - SPEED_MAX_SHORT) * clamp((d - SHORT_TRIP) / (2 * SHORT_TRIP), 0, 1);
+  return clamp(Math.pow(refTime(d, centre) / Math.max(1, legSeconds), SPEED_EXP), SPEED_MIN, cap);
 }
 
 /**
@@ -133,12 +162,12 @@ export function speedFactor(d: number, legSeconds: number, centre = 0): number {
  */
 export function fareFor(distUnits: number, legSeconds: number, count: number, context: FareContext = {}): number {
   if (!(distUnits > 1) || !(count > 0)) return 0;
-  return count * baseFare(distUnits, context.mode) * speedFactor(distUnits, legSeconds, context.centre);
+  return count * baseFare(distUnits, context.mode, context.railBefore) * speedFactor(distUnits, legSeconds, context.centre);
 }
 
 /** The parts of a fare (for the UI): base per passenger, the speed factor, the alternative's time and the leg time. */
 export function fareBreakdown(distUnits: number, legSeconds: number, context: FareContext = {}): { base: number; factor: number; refSeconds: number; legSeconds: number; perPassenger: number } {
-  const base = baseFare(distUnits, context.mode), factor = speedFactor(distUnits, legSeconds, context.centre);
+  const base = baseFare(distUnits, context.mode, context.railBefore), factor = speedFactor(distUnits, legSeconds, context.centre);
   return { base, factor, refSeconds: refTime(distUnits, context.centre), legSeconds, perPassenger: base * factor };
 }
 

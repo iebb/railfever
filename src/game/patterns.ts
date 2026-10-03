@@ -868,7 +868,7 @@ function redirectWaiting(g: Game, from: number, into: number) {
     if (![...st.waiting.values()].some((w) => w.line === from)) continue;
     const old = [...st.waiting.values()];
     st.waiting.clear(); st.waitingTotal = 0;
-    for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0);
+    for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
   }
 }
 
