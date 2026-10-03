@@ -19,6 +19,7 @@ export function openMenu(ui: UI) {
     item('export', 'Export save to file', () => exportSave(ui)),
     item('import', 'Import save from file…', () => importSave(ui)),
     item('company', 'Companies', () => { win.close(); ui.openCompetitors(); }),
+    item('money', 'Finances (I)', () => { win.close(); ui.openFinances(); }),
     item('key', 'Track access', () => { win.close(); ui.openTrackAccess(); }),
     item('signal', 'Auto-signal railway', () => { win.close(); ui.openAutoSignal(); }),
     item('settings', 'Settings', () => { win.close(); openSettings(ui); }),
@@ -183,12 +184,14 @@ export function openHelp(ui: UI) {
       <li>Open <b>Rail</b> or <b>Road</b> in the dock (<kbd>2</kbd> / <kbd>6</kbd>). Click to set the start — on open ground, a track end, or onto a track to branch off.</li>
       <li>Move the mouse: the preview shows the curve, bridges (blue), tunnels (purple), crossings and buildings in the way (red). The card shows cost, length, grade, radius and speed.</li>
       <li>Click to build. Construction continues from the new end with a smooth curve; <b>right-click</b>, <kbd>Esc</kbd> or a long press ends it. You can also drag to build one section.</li>
+      <li>On touch, tap to preview the cost, then tap the same spot to confirm. A tap elsewhere moves the preview. For track, tap the start, then preview and confirm the end.</li>
       <li>Options: standard, electric or high-speed track (up to 400 km/h), <b>1–4 parallel tracks</b>, road type, the <b>end height</b> (<kbd>[</kbd> <kbd>]</kbd>, ±5 m) for bridges and tunnels, and how to cross other lines. Hold <kbd>Shift</kbd> over a track to copy it as a parallel track.</li>
     </ol>
     <h4>Getting started</h4>
     <ol>
       <li>Place a <b>train station</b> (<kbd>3</kbd>) near each of two towns — <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotates. It lines up with nearby track ends; manual rotation switches off Align to track. Its catchment follows walkable streets drawn in the transport mode’s colour.</li>
       <li>Connect the stations with track and add a <b>train depot</b> (<kbd>5</kbd>) at a free track end.</li>
+      <li>Start with single track and one-platform halts; keep cash for the train. Bridges, tunnels and demolition cost extra. Open <b>Finances</b> (<kbd>I</kbd>, the money plate or Menu) to review costs or borrow. Money warnings offer <b>Borrow</b> and <b>Open finances</b>.</li>
       <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>Rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
       <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
@@ -233,6 +236,7 @@ export function openHelp(ui: UI) {
     </ul>
     <h4>Keys</h4>
     <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotate stations / depots · <kbd>+</kbd>/<kbd>−</kbd> or <kbd>Ctrl</kbd>+wheel / pinch zoom · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance overlay · <kbd>Esc</kbd> cancel / close</p>
+    <p><kbd>I</kbd> finances · <kbd>,</kbd> slower · <kbd>.</kbd> faster (1×, 2×, 4×, 8×). <kbd>R</kbd>/<kbd>F</kbd> tilt the camera.</p>
     <p>Space / Enter activates a keyboard-focused button or control. Global shortcuts are ignored while editing text or using form controls; Esc still cancels or closes.</p>
     </div>`;
 }

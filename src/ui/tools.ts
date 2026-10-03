@@ -113,10 +113,10 @@ export class Tools {
   levelHeight = LINE_LEVEL.height.def;
   levelDepth = LINE_LEVEL.depth.def;
   roadType: 'street' | 'road' = 'road';
-  tracks = 2;
+  tracks = 1;
   /** station tools: platform track type ('auto': as the track it lines up with) and building style ('auto': by era and town) */
   stationType = 'auto';
-  stationStyle = 'auto';
+  stationStyle = 'shelter';
   /** connect tool: the point picked on the first track */
   conn: { edge: number; s: number; x: number; y: number; z: number } | null = null;
   private connPlan: { key: string; plan: ConnectionPlan } | null = null;
@@ -127,9 +127,9 @@ export class Tools {
   private elec: { key: string; ids: number[]; cost: number; changed: number; length: number; error: string | null } | null = null;
   /** remembered settings of the other tool of a pair (rail / urban rail, station / urban station) */
   private profiles = new Map<ToolId, Record<string, unknown>>([
-    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 2 }],
+    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 1 }],
     ['metro', { railType: 'metro', railLevel: 'underground', tracks: 2 }],
-    ['station', { stationType: 'auto', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.def }],
+    ['station', { stationType: 'auto', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 1, stationThrough: 0, throughMode: 'middle', stationOnLine: false, stationStyle: 'shelter', stationDepth: STATION_DEPTH.def }],
     ['metro-station', { stationType: 'metro', stationLevel: 'underground', stationLen: PLATFORM_LENGTH.metro, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.metro }],
   ]);
   /** double track: one running direction per track with crossovers before stations (right- or left-hand) */
@@ -138,7 +138,7 @@ export class Tools {
   heightOffset = 0;
   crossing: CrossingPref = 'auto';
   stationLen = DEFAULT_PLATFORM_LENGTH;
-  stationTracks = 2;
+  stationTracks = 1;
   /** station level: on the ground, on a viaduct (height above the highest ground) or underground (depth) */
   stationLevel: StationLevel = 'ground';
   stationHeight = STATION_HEIGHT.def;
@@ -184,6 +184,8 @@ export class Tools {
   private ground: THREE.Vector3 | null = null;
   private down: { x: number; y: number; button: number; ground: THREE.Vector3 | null; moved: boolean; hadStart: boolean; id: number; touch: boolean; t: number } | null = null;
   private touches = new Set<number>();
+  /** A touch placement is committed only after a second tap on this preview. */
+  private touchPreview: { point: THREE.Vector3; client: { x: number; y: number }; signature: string } | null = null;
   private shift = false;
   private parallel: { edge: number; side: number; prop: Proposal } | null = null;
   private moveDirty = false;
@@ -220,8 +222,13 @@ export class Tools {
     canvas.addEventListener('pointerdown', this.onDown);
     window.addEventListener('pointermove', this.onMove);
     window.addEventListener('pointerup', this.onUp);
-    canvas.addEventListener('pointerleave', () => { if (!this.down) { this.overMap = false; this.hideTip(); } });
-    window.addEventListener('pointercancel', (e) => { this.touches.delete(e.pointerId); if (this.down?.id === e.pointerId) this.down = null; });
+    canvas.addEventListener('pointerleave', (e) => {
+      if (!this.down && !this.touchPreview && !(e.relatedTarget instanceof Node && this.tooltip.contains(e.relatedTarget))) { this.overMap = false; this.hideTip(); }
+    });
+    window.addEventListener('pointercancel', (e) => {
+      this.touches.delete(e.pointerId);
+      if (this.down?.id === e.pointerId) { this.down = null; this.touchPreview = null; this.overMap = false; this.moveDirty = true; }
+    });
     // Alt+wheel rotates stations and depots; Ctrl+wheel / pinch always reaches camera zoom.
     window.addEventListener('wheel', this.onWheel, { capture: true, passive: false });
     const shift = (e: KeyboardEvent) => { if (e.key === 'Shift' && this.shift !== (e.type === 'keydown')) { this.shift = e.type === 'keydown'; if (this.railBuild) this.moveDirty = true; } };
@@ -295,6 +302,7 @@ export class Tools {
     this.planKey = '';
     this.planDirty = false;
     this.down = null;
+    this.touchPreview = null;
     this.dragRect = null;
     this.stationPlan = null;
     this.depotPlan = null;
@@ -319,7 +327,7 @@ export class Tools {
   }
 
   /** Re-evaluate the hover state (e.g. after options changed). */
-  refreshHover() { this.planKey = ''; this.moveDirty = true; if (this.start) this.planDirty = true; }
+  refreshHover() { this.touchPreview = null; this.planKey = ''; this.moveDirty = true; if (this.start) this.planDirty = true; }
 
   rotate(dir = 1) {
     if (this.stationTool) {
@@ -346,6 +354,7 @@ export class Tools {
 
   /** End the current chain / drag; returns false if there was nothing to cancel (caller may close windows). */
   cancel(): boolean {
+    if (this.touchPreview) { this.touchPreview = null; this.clearVisuals(); this.hideTip(); this.moveDirty = true; return true; }
     if (this.start || this.dragRect || this.down) { this.endChain(); this.sigDrag = null; this.overlay.setSignalGhosts(null); return true; }
     if (this.conn) { this.clearConn(); return true; }
     if (this.tool !== 'inspect') { this.setTool('inspect'); return true; }
@@ -371,6 +380,7 @@ export class Tools {
     this.planKey = '';
     this.planDirty = false;
     this.down = null;
+    this.touchPreview = null;
     this.dragRect = null;
     this.overlay.setProposal(null);
     this.overlay.setDemolish(null);
@@ -391,6 +401,9 @@ export class Tools {
         // a second finger: camera gesture, abandon what the first one started
         if (this.down && !this.down.hadStart && this.building) this.endChain();
         this.down = null;
+        this.touchPreview = null;
+        this.overMap = false;
+        this.hideTip();
         return;
       }
     }
@@ -398,11 +411,13 @@ export class Tools {
     this.overMap = true;
     this.shift = e.shiftKey;
     this.ground = this.pick();
+    this.moveDirty = true;
+    if (!touch) this.touchPreview = null;
     this.down = { x: e.clientX, y: e.clientY, button: e.button, ground: this.ground?.clone() ?? null, moved: false, hadStart: !!this.start, id: e.pointerId, touch, t: performance.now() };
     if (e.button !== 0) return;
     const p = this.ground;
     if (!p) return;
-    if (this.railBuild && !this.start && e.shiftKey) {
+    if (this.railBuild && !this.start && e.shiftKey && !touch) {
       this.down = null;
       this.buildParallel();
       return;
@@ -424,6 +439,7 @@ export class Tools {
   };
 
   private onMove = (e: PointerEvent) => {
+    if ((e.target as HTMLElement)?.closest?.('.tooltip')) return;
     if (e.pointerType === 'touch' && this.touches.size > 1) return;
     if (this.down && e.pointerId !== this.down.id) return;
     this.client = { x: e.clientX, y: e.clientY };
@@ -456,6 +472,43 @@ export class Tools {
     }
     const onMap = (e.target as HTMLElement) === this.canvas || !!(e.target as HTMLElement)?.closest?.('.labels');
     this.ground = this.pick();
+    if (d.touch && CONSTRUCTION.includes(this.tool)) {
+      if (!onMap || !this.ground) return;
+      this.overMap = true;
+      // The first track / connection pick only sets its start; no construction is charged.
+      if (this.building && !d.hadStart && !d.moved) { this.hover(); this.planNow(); return; }
+      if (this.tool === 'connect' && !this.conn) { this.click(e); this.moveDirty = true; return; }
+      const preview = this.touchPreview;
+      const same = preview && !d.moved && preview.signature === this.touchSignature() &&
+        Math.hypot(e.clientX - preview.client.x, e.clientY - preview.client.y) <= 16 &&
+        Math.hypot(this.ground.x - preview.point.x, this.ground.z - preview.point.z) <= 1.2;
+      if (same) {
+        // Confirm the exact world position that was quoted, allowing a little finger imprecision.
+        this.ground = preview.point.clone(); this.client = { ...preview.client };
+        d.ground = preview.point.clone();
+        this.touchPreview = null;
+        this.connAt = -Infinity;
+        this.hover();
+        if (this.building) { this.hoverSnap = this.snapAt(this.kind); this.planKey = ''; this.planNow(); }
+        if (this.tool === 'terraform') {
+          const r = terraformBrush(this.game, this.ground.x, this.ground.z, this.brushRadius, this.terraMode, this.ground.y, PLAYER);
+          if (r.error) this.ui.toast(r.error, 'bad');
+          else if (r.cost) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('build', { x: this.ground.x, z: this.ground.z, pitch: 0.8 }); }
+          this.moveDirty = true;
+          return;
+        }
+      } else {
+        // Touch drags also stop at a preview instead of spending on release.
+        this.dragRect = null;
+        if (this.terr.uHiOn) this.terr.uHiOn.value = 0;
+        this.touchPreview = { point: this.ground.clone(), client: { ...this.client }, signature: this.touchSignature() };
+        this.connAt = -Infinity;
+        this.hover();
+        if (this.building) { this.hoverSnap = this.snapAt(this.kind); this.planKey = ''; this.planNow(); }
+        this.positionTip();
+        return;
+      }
+    }
     if (this.building) {
       if (d.moved || d.hadStart) this.commitChain();
       return;
@@ -499,6 +552,14 @@ export class Tools {
     }
     this.moveDirty = true;
   };
+
+  private touchSignature(): string {
+    return JSON.stringify([this.tool, this.buildOptions(), snapKey(this.start), this.conn, this.game.networkVersion, this.game.world.heightsVersion,
+      this.stationType, this.stationStyle, this.stationLen, this.stationTracks, this.stationLevel, this.stationHeight, this.stationDepth,
+      this.stationThrough, this.throughMode, this.stationOnLine, this.stationAngle, this.autoAlign, this.relocating, this.relocatingDepot,
+      this.depotAngle, this.signalMode, this.signalKind, this.signalClass, this.signalPass, this.signalSpacing,
+      this.doubleSide, this.directional, this.rightHand, this.relevelTo, this.tramMode, this.entranceStation, this.terraMode, this.brushRadius]);
+  }
 
   private onWheel = (e: WheelEvent) => {
     if (e.ctrlKey || !e.altKey || e.target !== this.canvas) return;
@@ -657,7 +718,11 @@ export class Tools {
     if (this.moveDirty) {
       this.moveDirty = false;
       this.rect = this.canvas.getBoundingClientRect();
-      this.ground = this.overMap || this.down ? this.pick() : null;
+      this.ground = this.touchPreview && !this.down ? this.touchPreview.point.clone() : this.overMap || this.down ? this.pick() : null;
+      if (this.touchPreview && !this.down) {
+        const pos = this.project(this.ground!.x, this.ground!.y, this.ground!.z);
+        if (pos) { this.client = pos; this.touchPreview.client = { ...pos }; }
+      }
       this.hover();
     }
     if (this.planDirty && performance.now() - this.planAt >= Math.min(200, this.planMs * 2)) this.planNow();
@@ -668,7 +733,7 @@ export class Tools {
       this.ui.toast('Construction ended', 'info');
     }
     // terraform brush while the button is held
-    if (this.tool === 'terraform' && this.down?.button === 0 && this.ground) {
+    if (this.tool === 'terraform' && this.down?.button === 0 && !this.down.touch && this.ground) {
       this.brush.timer -= dt;
       if (this.brush.timer <= 0) {
         this.brush.timer = 0.12;
@@ -809,6 +874,12 @@ export class Tools {
         this.setCircle(p.x, p.z, this.brushRadius, this.terraMode === 'raise' ? 0x4ade80 : this.terraMode === 'lower' ? 0xff8a3d : 0xffb020);
         if (this.down) break;
         const h = g.world.heightAt(p.x, p.z);
+        if (this.touchPreview) {
+          const cost = Math.round(brushVolume(g.world, p.x, p.z, this.brushRadius, this.terraMode, 0.25, h, true) * 1500);
+          this.tip({ title: this.terraMode === 'level' ? 'Level ground' : this.terraMode === 'raise' ? 'Raise ground' : 'Lower ground', cost,
+            rows: [['catchment', `Radius ${this.brushRadius * 10} m · one brush stroke`]] }, 'info');
+          break;
+        }
         if (this.terraMode === 'level') {
           this.overlay.setDisc({ x: p.x, z: p.z, r: this.brushRadius, y: h + 0.03, color: 0xffb020 });
           this.tip({ title: 'Level ground', rows: [['level', `Flattens to <b>${Math.round(h * 10)} m</b> (where you press)`], ['catchment', `Radius ${this.brushRadius * 10} m`]], hint: 'Hold the button to apply' }, 'info');
@@ -2045,7 +2116,19 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ tooltip
-  private tip(c: Tip, kind: 'ok' | 'err' | 'info' = 'info') { this.showTip(tipHtml(c), kind); }
+  private tip(c: Tip, kind: 'ok' | 'err' | 'info' = 'info') {
+    const unaffordable = c.cost !== undefined && !this.game.economy.canAfford(c.cost);
+    if (unaffordable) {
+      c = { ...c, warn: c.warn?.filter((msg) => !this.ui.needsMoney(msg)),
+        err: [...(c.err ?? []).filter((msg) => !this.ui.needsMoney(msg)), `Not enough money: ${fmtMoney(c.cost!)} needed, ${fmtMoney(this.game.economy.money)} available`] };
+      kind = 'err';
+    }
+    if (this.touchPreview) c = { ...c, hint: 'Tap the same spot to confirm · tap elsewhere to move the preview' };
+    this.showTip(tipHtml(c), kind);
+    const finance = unaffordable || [...(c.err ?? []), ...(c.warn ?? [])].some((msg) => this.ui.needsMoney(msg));
+    if (finance && !this.tooltip.querySelector('.finance-actions')) this.tooltip.append(this.ui.financeActions(() => this.refreshHover()));
+    this.positionTip();
+  }
 
   private tipHtml = '';
   private tipKind = '';
