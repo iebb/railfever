@@ -42,7 +42,7 @@ const AUTO_STEPS = [1, 0.85, 0.72, 0.6, 0.5];
 /**
  * Seconds of headroom before the automatic resolution tries a step up to a level; four times longer for every time
  * the resolution had to leave that level again (a failed try, or a later slowdown), up to UP_WAIT_MAX, until a step
- * up to it has held for UP_HELD seconds.
+ * up to it or a finer level has held for UP_HELD seconds.
  */
 const UP_WAIT = 6;
 const UP_WAIT_MAX = 900;
@@ -260,9 +260,9 @@ export class Renderer {
   private lastChange = -1e9; private lastDown = -1e9;
   /** seconds of headroom seen for the next step up, and needed before taking it (see UP_WAIT) */
   private upHeadroom = 0; private upWait = UP_WAIT;
-  /** per level: how often the resolution had to leave it again since a step up to it last held */
+  /** per level: how often the resolution had to leave it again since it or a finer level last held */
   private levelDrops = AUTO_STEPS.map(() => 0);
-  /** the level a step up reached and held, and since when (its drop count is forgiven after UP_HELD seconds) */
+  /** the level reached and held, and since when (it and coarser levels are forgiven after UP_HELD seconds) */
   private heldLevel = -1; private heldSince = 0;
   /** a trial step up: the step it came from, windows left to watch it, the frame interval before it */
   private upTrial: { from: number; left: number; before: number } | null = null;
@@ -287,6 +287,8 @@ export class Renderer {
   private lastTimed = false;
   /** ambient occlusion suspension: seconds too slow at the lowest step, headroom at full resolution, back-off */
   private slowAtFloor = 0; private aoHeadroom = 0; private aoWait = 10; private aoResumedAt = -1e9;
+  /** capped device pixel ratio the controller's evidence was measured under */
+  private effectiveDPR = this.maxPR();
   private appliedPR = 0;
   /**
    * The drawing buffer (canvas) and the post targets must follow the size / resolution. Resizing a canvas clears it,
@@ -581,7 +583,6 @@ export class Renderer {
     this.shadowKey.fill(NaN);
     this.shadowKeyFar.fill(NaN);
     this.labels.visible = this.settings.labels;
-    if (this.settings.ao) this.aoSuspended = false;
     this.updateDebugEl();
   }
 
@@ -796,6 +797,8 @@ export class Renderer {
 
   frame(dt: number) {
     if (!this.game) return;
+    // a change in capped DPR invalidates evidence before the new drawing-buffer density is applied
+    if (this.maxPR() !== this.effectiveDPR) { this.resetAuto(); this.sizeDirty = true; }
     // (also a pixel ratio that changed without a resize event: window moved to another display, browser zoom)
     if (this.sizeDirty || this.targetPR() !== this.appliedPR) this.resize();
     const t0 = performance.now();
@@ -923,6 +926,7 @@ export class Renderer {
    * every step up is watched against the frame interval before it and undone when it slowed the frames (the next
    * try waits longer). Whatever this decides, changes are rate-limited (RES_GAP, RES_PER_MIN, RES_COOL) and an
    * ambiguous case keeps the current step. A new size is applied at the start of the next frame (sizeDirty).
+   * Known limits: timed CPU recovery can hold 72% instead of 85%; nonlinear GPU cost can falsely vindicate a timer.
    */
   private autoResolution(dt: number, interval: number) {
     if (this.settings.resolution !== 'auto') return;
@@ -939,8 +943,8 @@ export class Renderer {
     // a window that saw a change (targets reallocated, smoothed timings catching up) is not representative
     if (document.hidden || this.time - this.lastChange < 1.5) return;
     const t = this.time, i = this.resStep, last = AUTO_STEPS.length - 1;
-    // a step up that held long enough: that level is trusted again
-    if (this.heldLevel === i && t - this.heldSince >= UP_HELD) { this.levelDrops[i] = 0; this.heldLevel = -1; }
+    // a level that held long enough also proves the coarser levels can be trusted again
+    if (this.heldLevel === i && t - this.heldSince >= UP_HELD) { this.levelDrops.fill(0, i); this.heldLevel = -1; }
     // the GPU timer is used while it delivers fresh samples and its readings explain slow frames; a timer that
     // under-reports (frames miss 60 fps while neither its time nor the main thread accounts for it) is set aside
     let timed = !!this.gpu && fresh >= Math.max(3, n >> 2) && t >= this.gpuDistrustUntil;
@@ -963,6 +967,8 @@ export class Renderer {
     // nothing changes until the safety net allows it; pending checks and trials wait for that (with fresh evidence)
     const free = t >= this.resCalmUntil && t - (this.resChanges[this.resChanges.length - 1] ?? -1e9) >= RES_GAP &&
       this.resChanges.filter((c) => t - c < 60).length < RES_PER_MIN;
+    // reserve room for the trial and its undo at the first allowed time, within the same minute cap
+    const trialFree = free && this.resChanges.filter((c) => t + RES_GAP - c < 60).length < RES_PER_MIN - 1;
     // a trial step up is watched for two windows: if it slows the frames (beyond the interval before it, at least
     // below 60 fps) it goes back down and the next try waits longer; a GPU timer that predicted room for it is
     // wrong and set aside for a while
@@ -998,7 +1004,7 @@ export class Renderer {
       const budget = cpuBound ? Math.max(13, cpuFloor * 0.95) : 13, fit = cpuBound ? Math.max(11, cpuFloor * 0.8) : 11;
       slow = gpuMs > budget;
       if (slow && i < last && t >= this.downBlockUntil) {
-        if (!free) return;
+        if (!trialFree) return;
         let j = i + 1;
         while (j < last && at(j) > fit) j++;
         this.downCheck = { ivBefore: med, gpuBefore: gpuMs, predicted: at(j), origin: i };
@@ -1011,7 +1017,7 @@ export class Renderer {
       slow = med > 18.5 && gpuBound;
       this.slowRun = slow ? this.slowRun + 1 : 0;
       if (this.slowRun >= 2 && i < last && t >= this.downBlockUntil) {
-        if (!free) return;
+        if (!trialFree) return;
         // the step that would save one display period if the cost is in the pixels (vsync quantises the interval:
         // a smaller step could show no gain at all and pass for "not the GPU")
         const f = Math.max(0.3, (med - VSYNC) / med);
@@ -1029,7 +1035,7 @@ export class Renderer {
     this.upWait = i > 0 ? Math.min(UP_WAIT_MAX, UP_WAIT * 4 ** this.levelDrops[i - 1]) : UP_WAIT;
     if (!up) this.upHeadroom = 0;
     else if ((this.upHeadroom += win) >= this.upWait && t - this.lastDown >= 8) {
-      if (!free) return;
+      if (!trialFree) return;
       this.upTrial = { from: i, left: 2, before: med };
       this.stepTo(i - 1);
       return;
@@ -1084,7 +1090,7 @@ export class Renderer {
     this.upHeadroom = 0;
     this.resChanges.push(t);
     if (this.resChanges.length > RES_PER_MIN) this.resChanges.shift();
-    if (undo) this.resCalmUntil = t + RES_COOL;
+    if (undo) { this.resCalmUntil = t + RES_COOL; this.heldLevel = j; this.heldSince = t; }
     if (this.targetPR() !== this.appliedPR) this.sizeDirty = true;
   }
 
@@ -1095,6 +1101,7 @@ export class Renderer {
   private resetAuto() {
     this.dynAcc = 0; this.dynN = 0; this.dynSum = 0; this.dynCpu = 0; this.dynIv.length = 0; this.longMs = 0;
     this.gpuS0 = this.gpu ? this.gpu.samples : 0;
+    this.effectiveDPR = this.maxPR(); this.aoSuspended = false;
     this.upTrial = null; this.downCheck = null; this.verify = null; this.slowRun = 0; this.upHeadroom = 0; this.slowAtFloor = 0; this.aoHeadroom = 0;
     this.upWait = UP_WAIT; this.levelDrops.fill(0); this.heldLevel = -1; this.downBlockUntil = 0; this.downBackoff = DOWN_BLOCK; this.aoWait = 10;
     this.gpuOdd = 0; this.gpuDistrustUntil = 0; this.gpuDistrust = 30; this.gpuVindicatedUntil = 0; this.gpuVindicate = 60;
