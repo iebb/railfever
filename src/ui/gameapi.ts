@@ -86,14 +86,15 @@ export function planStation(g: Game, x: number, z: number, angle: number, length
 export function levelOf(p: { level?: StationLevel } | null | undefined): StationLevel { return p?.level ?? 'ground'; }
 
 /**
- * Catchment colours by mode (as --rail, --metro, --lightrail, --tram, --road); inactive areas (no road access) are
- * grey. Chosen to stay apart for colour-blind players too (delta E >= ~20 between modes under deuteranopia,
- * protanopia and tritanopia); the urban modes also get their own dash pattern (CATCH_DASH) as a second cue.
+ * Catchment colours by mode (as --rail, --tram, --road): every rail station alike, whatever its track type;
+ * inactive areas (no road access) are grey. Chosen to stay apart for colour-blind players too (delta E >= ~20
+ * between modes under deuteranopia, protanopia and tritanopia); trams also get their own dash pattern (CATCH_DASH)
+ * as a second cue.
  */
-export const CATCH_COLOR: Record<CatchMode, number> = { rail: 0x5aa9ff, metro: 0x41dfcf, lightrail: 0x9fe079, tram: 0xb25ec5, bus: 0xff8a3d };
+export const CATCH_COLOR: Record<CatchMode, number> = { rail: 0x5aa9ff, tram: 0xb25ec5, bus: 0xff8a3d };
 /** Dash pattern of each mode's catchment streets: drawn share of a period and the period in screen px (none = solid). */
 export const CATCH_DASH: Record<CatchMode, { dash: number; dashPx: number } | null> = {
-  rail: null, bus: null, metro: { dash: 0.72, dashPx: 18 }, lightrail: { dash: 0.55, dashPx: 12 }, tram: { dash: 0.4, dashPx: 7 },
+  rail: null, bus: null, tram: { dash: 0.4, dashPx: 7 },
 };
 export const CATCH_INACTIVE = 0x7a8494;
 export const catchColor = (c: CatchShape) => (c.active ? CATCH_COLOR[c.mode] : CATCH_INACTIVE);
@@ -107,7 +108,7 @@ export function catchWalkLimit(mode: CatchMode, bonus = 0): number { return CATC
 export const catchStreets = walkingCatchment;
 export const planCatchStreets = planWalkingCatchment;
 export const catchStreetPop = walkingPopulation;
-/** Independent, mode-coloured (and mode-dashed) street layers; all five are cleared when a preview/view closes. */
+/** Independent, mode-coloured (and mode-dashed) street layers; all three are cleared when a preview/view closes. */
 export function drawCatchStreets(overlay: Pick<Overlay, 'setSegments'>, key: string, walk: WalkingCatchment | null, color?: number) {
   for (const mode of Object.keys(CATCH_COLOR) as CatchMode[]) {
     const segments = walk?.segments.filter((s) => s.mode === mode) ?? null;

@@ -137,8 +137,12 @@ export interface Town {
 export const GROWTH_ACTIVE_DAYS = 90;
 /** Mean days between growth steps without public transport (about 1 % a year for a balanced town) and with the best service. */
 export const GROWTH_DAYS_UNSERVED = 100, GROWTH_DAYS_BEST = 6;
-/** Share of the residents reached by frequent service at which the reach counts fully (walking catchments are small). */
-export const GROWTH_FULL_REACH = 0.12;
+/**
+ * Share of the residents reached by frequent service at which the reach counts fully: 0.3 since the walking reach
+ * doubled (0.12 before), so a small town is not fully served by a station whose vehicles seldom call
+ * (GROWTH_MIN_CALLS of a catchment covering it whole) and coverage keeps mattering in larger towns.
+ */
+export const GROWTH_FULL_REACH = 0.3;
 /** Service frequency that counts fully: vehicles called on this share of the last 30 days (Stations.callShare; 0.05: on two). */
 export const GROWTH_FULL_CALLS = 0.05;
 /** An active station without a call in the last 30 days still counts this much (a train every ~2 months still serves a town). */

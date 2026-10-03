@@ -171,6 +171,21 @@ function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknow
   return { encoding: 'predict32-chunks', vertices: SAVE_VERTICES, treeChunk: TREE_CHUNK, treeCount: w.trees.length,
     h: c.h.map(value), lock: c.lock.map(value), trees: c.trees.map(value) };
 }
+/**
+ * Key order of a rail part in saves (as Stations.commitRail builds it). A part restored from a save gains optional keys
+ * it was saved without (a forecourt added by a later restyle, say) in another position than the running game's part
+ * had them, so parts are written in this order whatever order their object has: a loaded game saves exactly alike.
+ */
+const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffsets', 'platforms', 'edges', 'through', 'throughOffsets',
+  'throughEdges', 'width', 'throughMode', 'trackType', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
+  'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost'];
+function railPartJSON(r: object): object {
+  const src = r as Record<string, unknown>, out: Record<string, unknown> = {};
+  for (const k of RAIL_PART_KEYS) if (k in src) out[k] = src[k];
+  for (const k of Object.keys(src)) if (!(k in out)) out[k] = src[k];
+  return out;
+}
+
 /** Synchronous single-JSON form for tests/tools; autosaves use captureSave and worker encoding. */
 export function serialize(g: Game): any {
   const c = worldChunks(g.world);
@@ -373,7 +388,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
-    stations: [...g.stations.map.values()].map((s) => ({ ...s, waiting: [...s.waiting.values()] })),
+    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()] })),
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
@@ -587,8 +602,9 @@ export function deserialize(d: any): Game {
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
   }
-  // older maps: town streets ending on a bridge are cut back to the ground (9i)
-  try { g.towns.tidyBridgeEnds(); } catch (e) { console.warn('Save load: tidyBridgeEnds failed', e); }
+  // older maps: town streets ending on a bridge are cut back to the ground (9i). Current saves keep their network as
+  // saved (towns tidy their bridge ends as they grow): tidying here would make a loaded game differ from the running one.
+  if (!d.opsVersion) try { g.towns.tidyBridgeEnds(); } catch (e) { console.warn('Save load: tidyBridgeEnds failed', e); }
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;

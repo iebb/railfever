@@ -4,7 +4,7 @@
 // terrain-occluded; DOM writes only on change.
 import * as THREE from 'three';
 import type { Game } from '../game/game';
-import { TRACK_TYPES, WATER_Y } from '../game/constants';
+import { WATER_Y } from '../game/constants';
 import { svg } from '../ui/icons';
 import { uiScale } from '../ui/uiscale';
 
@@ -211,8 +211,8 @@ export class Labels {
         const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
         this.setBadges(l, bl, pins ? 5 : this.badgeMax);
       }
-      const railMode = s.rail ? TRACK_TYPES[s.rail.trackType]?.mode : undefined;
-      let icon = s.rail ? railMode === 'metro' ? 'metro' : railMode === 'lightrail' ? 'lightrail' : 'train' : 'bus';
+      // (one rail mode: every rail station has the train symbol, whatever its track type)
+      let icon = s.rail ? 'train' : 'bus';
       if (!s.rail) for (const stop of s.stops) if (world.net.edges.get(stop.edge)?.tram) { icon = 'tram'; break; }
       this.setIcon(l, icon);
       const noRoad = !!s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false;
@@ -220,7 +220,7 @@ export class Labels {
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
       let y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
-      // Underground metro symbols belong above the surface, so terrain does not bury them.
+      // Underground station symbols belong above the surface, so terrain does not bury them.
       if (compact) y = Math.max(y, Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8);
       if (pins) y -= 0.9;
       const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);

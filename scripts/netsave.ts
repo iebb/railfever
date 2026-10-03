@@ -55,6 +55,10 @@ for (const seed of seeds) {
       }
       if (any) flight++;
     }
+    // Companies can plan projects back to back for most of a run, and a save while a project is under way cannot
+    // replay exactly (loading abandons it). From day 200 until the deliberate mid-job save, hold off new projects
+    // here and in every snapshot still being compared: the same input at the same tick, so replays stay exact.
+    if (!deliberate && g.day >= 200 && g.day < end) for (const game of [g, ...replays.map((r) => r.g)]) for (const ai of game.ais) ai.state.cooldown = Math.max(ai.state.cooldown, 2);
     if (g.day >= end || g.ais.some((a) => a.busy)) continue;
     // Deliberately save a prepared job even if all the natural jobs so far fitted in one daily call.
     let forcedSave = false;

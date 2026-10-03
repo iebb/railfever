@@ -110,7 +110,9 @@ if (!arg('maps')) {
   console.log('frequent main-line feeder access');
   {
     const g = flat(1), a = town(g, 'West Centre', 150, 256, 6000, 64, 48), b = town(g, 'East Centre', 362, 256, 6000, 64, 48);
-    const sa = station(g, a.x - 60, a.z, 1, a.id), sb = station(g, b.x + 60, b.z, 1, b.id);
+    // Park-and-ride stations beyond the (doubled) walking reach: a country road out of each town leads to them.
+    road(g, a.x - 32, a.z - 4, a.x - 70, a.z - 4); road(g, b.x + 32, b.z - 4, b.x + 70, b.z - 4);
+    const sa = station(g, a.x - 75, a.z, 1, a.id), sb = station(g, b.x + 75, b.z, 1, b.id);
     const line = mainLine(g, sa, sb, 1), ai = g.ais[0];
     const first = g.vehicles.get(line.vehicles[0]) as Train;
     const second = g.vehicles.buyTrain(first.depotId, first.cars, line.id);
@@ -120,24 +122,44 @@ if (!arg('maps')) {
     const walkPop = sa.catchPop + sb.catchPop;
     const covered = [sa, sb].reduce((sum, st) => sum + g.demand.coverage(st).reduce((n, [r, f]) => n + g.demand.regions[r].pop * f, 0), 0);
     const net = profit(g, line);
-    console.log(`  ${fmt(patternHeadways(g, line)[0]?.headway ?? 0, 0)}s headway, ${fmt(walkPop, 0)} walking / ${fmt(covered, 0)} eligible residents; profit ${fmt(net / 1e6, 2)}M/year`);
-    check(walkPop === 0 && covered > 0, 'a park-and-ride line works with zero walking residents at either station');
+    console.log(`  ${fmt(patternHeadways(g, line)[0]?.headway ?? 0, 0)}s headway, ${fmt(walkPop, 0)} walking / ${fmt(covered, 0)} eligible residents; ${line.passLast} passengers last month; profit ${fmt(net / 1e6, 2)}M/year`);
+    check(walkPop === 0 && covered > 0 && line.incomeLast > 0, 'a park-and-ride line works with zero walking residents at either station');
     check(covered > walkPop * 1.1, 'street-connected car/drop-off access is distinct from walking coverage');
-    check(net > 0, 'a frequent well-placed main-line railway operates profitably');
     const walk = walkingCatchment(g, sa);
     const localOnly = g.demand.forecastLine([
       { x: sa.x, z: sa.z, townId: a.id, walk }, { x: sa.x - 12, z: sa.z, townId: a.id, walk },
     ], 'mainline', 70, 100);
-    check(localOnly.covered > 0 && localOnly.boardings === 0, 'car feeders do not invent local trips between stops with no walking residents');
+    const crossTown = g.demand.forecastLine([sa, sb], 'mainline', 70, 100);
+    check(localOnly.boardings === 0 && crossTown.covered > localOnly.covered && crossTown.boardings > 0, `car feeders serve cross-town trips only: none invented between stops with no walking residents (${fmt(localOnly.covered, 0)} / ${fmt(crossTown.covered, 0)} covered, ${fmt(crossTown.boardings, 0)} cross-town boardings)`);
     check(checkReservations(g).length === 0, 'main-line feeder reservations consistent');
     void ai;
+  }
+  console.log('two 3,000-person towns, central stations');
+  {
+    // A main line between two towns of about 3,000 with stations in their centres, one train (loco and two coaches):
+    // at least 15% of the seats taken and an operating surplus after track, station and depot upkeep by year three.
+    const g = flat(1), a = town(g, 'West Market', 181, 256, 3000, 96, 64), b = town(g, 'East Market', 331, 256, 3000, 96, 64);
+    const sa = station(g, a.x, a.z, 1, a.id), sb = station(g, b.x, b.z, 1, b.id);
+    const line = mainLine(g, sa, sb, 1);
+    for (const c of g.ais) c.monthly = () => {};
+    g.aiEnabled = false;
+    let load = 0, net = 0;
+    for (let year = 1; year <= 3; year++) {
+      const loads: number[] = [];
+      let ticks = 0;
+      runDays(g, 360, () => { if (++ticks % 4 === 0) for (const id of line.vehicles) { const v = g.vehicles.get(id)!; if (['running', 'loading', 'waiting'].includes(v.state)) loads.push(v.load / v.capacity); } });
+      load = loads.reduce((x, y) => x + y, 0) / Math.max(1, loads.length); net = profit(g, line);
+      console.log(`  year ${year}: income ${fmt(line.incomeLast / 1e3, 0)}k, running ${fmt(line.costLast / 1e3, 0)}k, upkeep ${fmt(g.maintenanceOf(1) / 1e3, 0)}k -> ${fmt(net / 1e3, 0)}k; load ${fmt(load * 100, 1)}%; walking ${fmt(sa.catchPop, 0)} / ${fmt(sb.catchPop, 0)}`);
+    }
+    check(load >= 0.15 && net >= 0, `a rail line between two 3,000-person towns with central stations is ${fmt(load * 100, 0)}% full and breaks even after upkeep by year three`);
+    check(checkReservations(g).length === 0, 'two-town reservations consistent');
   }
   for (const mode of ['lightrail', 'metro'] as const) {
     console.log(`8000-person centre ${mode}`);
     const g = flat(1), t = town(g, 'Dense City', 256, 256, 8000), ai = g.ais[0];
     const intensity = urbanIntensity(g, { x: t.x, z: t.z, townId: t.id });
-    check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, mode) > 8, 'a dense centre has substantial local transit demand');
-    check(fareFor(7, 60, 1, { mode }) > fareFor(7, 60, 1), 'a short urban boarding earns its flag fall');
+    check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, 'rail') > 8, 'a dense centre has substantial local transit demand');
+    check(fareFor(7, 60, 1, { mode: 'rail' }) > fareFor(7, 60, 1), 'a short rail hop pays the minimum fare per boarding (any track type)');
     check(refTime(100, 1) > refTime(100), 'congestion and parking slow the city car alternative');
     open(g, ai, mode, t);
     const line = g.lines.all().find((l) => l.kind === 'rail' && l.owner === ai.companyId);

@@ -15,7 +15,7 @@ import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
-import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, type WalkingCatchment } from './catchment';
+import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkWeight, FULL_COVER_WEIGHT, type WalkingCatchment } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -26,33 +26,36 @@ export interface WaitGroup { line: number; alight: number; dest: number; count: 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
 
 export type StationLevel = 'ground' | 'elevated' | 'underground';
-/** Rail station modes, from the platform track type (TRACK_TYPES[type].mode): main line, metro / subway, light rail. */
+/**
+ * Construction style of a rail station, from its platform track type (TRACK_TYPES[type].mode): main line, metro
+ * (subway style: underground with entrances, screen doors) or light rail (close-spaced halts). Only construction
+ * defaults follow it (level, platforms, building, spacing); every rail station is one transport mode, 'rail'.
+ */
 export type RailMode = 'mainline' | 'metro' | 'lightrail';
-/** Transport mode of a station: its rail mode, else 'tram' (a stop on tram tracks) or 'bus'. */
+/** Construction style of a station: its rail style, else 'tram' (a stop on tram tracks) or 'bus'. */
 export type StationMode = RailMode | 'tram' | 'bus';
-/** Catchment circle modes ('rail': main-line stations). */
-export type CatchMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus';
+/** Walking catchment modes: every rail station (any track type), tram stops, bus stops. */
+export type CatchMode = 'rail' | 'tram' | 'bus';
 /** Side platforms (outside the tracks, which keep the plain double-track spacing) or island platforms between them. */
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Nominal walking limit per mode (units, 1 = 10 m), after the 30% cut and a further 40% rail cut.
- * catchment.ts applies the street-grid allowance and measures paths from forecourts, entrances and stops.
+ * Nominal walking limit per mode (units, 1 = 10 m): twice the earlier path-based limits (rail 16.8, tram 15.4,
+ * bus 11.2). Rail is one mode: main-line, metro and light-rail stations walk alike. catchment.ts applies the
+ * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 16.8, metro: 12.6, lightrail: 10.5, tram: 15.4, bus: 11.2 };
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 33.6, tram: 30.8, bus: 22.4 };
 /** Legacy reach metadata for site scoring; passenger coverage uses catchment.ts. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */
 export const DEFAULT_PLATFORM_LENGTH = 8;
 /** Default platform length per rail mode (units): main line, metro (a 6-car EMU), light rail (two coupled LRVs). */
 export const PLATFORM_LENGTH: Record<RailMode, number> = { mainline: DEFAULT_PLATFORM_LENGTH, metro: 12, lightrail: 7 };
-/** Rail mode of a track type (unknown types: main line). */
+/** Construction style of a track type (unknown types: main line). */
 export function railModeOf(trackType?: string): RailMode {
   const m = (TRACK_TYPES[trackType ?? ''] as { mode?: RailMode } | undefined)?.mode;
   return m === 'metro' || m === 'lightrail' ? m : trackType === 'metro' || trackType === 'lightrail' ? trackType : 'mainline';
 }
-/** Catchment mode of a rail mode. */
-export const catchModeOf = (m: RailMode): CatchMode => (m === 'mainline' ? 'rail' : m);
 /** Default platform length for a station on track of this type. */
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
@@ -70,10 +73,11 @@ export function lostShare(st: Station): number {
   return lost > 0 ? lost / (lost + st.pickupMonth + st.pickupLast) : 0;
 }
 /**
- * Automatic walking links when a station is built: metro / light-rail stations link to stations of the same mode
- * only when (nearly) touching (dense lines: neighbouring stops are no interchange), to other modes within
- * `urban` (hubs: metro under a main-line station, a bus stop at the entrance); others within TRANSFER_RANGE.
- * Consecutive stops of a line are never linked automatically.
+ * Automatic walking links when a station is built, by construction style: close-spaced urban-style stations (metro
+ * / light-rail track) link to stations of the same style only when (nearly) touching (dense lines: neighbouring
+ * stops are no interchange), to other styles within `urban` (hubs: a subway-style station under a main-line
+ * station, a bus stop at the entrance); others within TRANSFER_RANGE. Consecutive stops of a line are never linked
+ * automatically.
  */
 export const AUTO_LINK_RANGE = { sameUrban: 4, urban: 10 };
 /** Auto-link range between stations of two modes (see AUTO_LINK_RANGE). */
@@ -136,7 +140,7 @@ export interface RailPart {
   width: number;
   /** where the through tracks lie */
   throughMode?: ThroughMode;
-  /** platform track type (TRACK_TYPES id): the station's mode (main line, metro, light rail) follows it */
+  /** platform track type (TRACK_TYPES id): the station's construction style (main line, metro, light rail) follows it */
   trackType: string;
   /** side platforms (outside the tracks) instead of islands between them */
   platformStyle?: PlatformStyle;
@@ -356,7 +360,7 @@ export const railPartMode = (r: RailPart): RailMode => railModeOf(r.trackType);
 
 /**
  * Catchment circles of rail platforms: along the axis (both ends and between), so the area is measured from the
- * platforms; the radius by mode (main line 'rail', metro, light rail).
+ * platforms; the radius is the rail walking limit (every rail station alike) with the building's bonus.
  */
 export function railCatchShapes(x: number, z: number, angle: number, length: number, active = true, mode: CatchMode = 'rail', bonus = 0): CatchShape[] {
   const R = CATCHMENT_RADIUS[mode] * (1 + bonus), fx = Math.sin(angle), fz = Math.cos(angle);
@@ -411,7 +415,7 @@ export interface StationOpts {
   /** platform level fixed (a station inserted into an existing line at the track's height) */
   fixedY?: number;
   /**
-   * platform track type (TRACK_TYPES id, default 'standard'): the station's mode. Metro stations default to
+   * platform track type (TRACK_TYPES id, default 'standard'): the construction style. Metro-track stations default to
    * underground (STATION_DEPTH.metro), side platforms and platform screen doors; light rail to side platforms.
    */
   trackType?: string;
@@ -1912,14 +1916,23 @@ export class Stations {
   }
 
   // ---------------------------------------------------------------- modes
-  /** Rail mode of a station from its platform track type (null: no rail part). */
+  /** Construction style of a station's rail part from its platform track type (null: no rail part). */
   railMode(st: Station): RailMode | null { return st.rail ? railModeOf(st.rail.trackType) : null; }
 
-  /** Transport mode of a station: its rail mode (main line, metro, light rail), else tram (a stop on tram tracks) or bus. */
+  /**
+   * Construction style of a station: its rail style (main line, metro, light rail), else tram (a stop on tram tracks)
+   * or bus. Every rail style is the one transport mode 'rail' (lines, catchment, fares); see catchMode.
+   */
   mode(st: Station): StationMode {
     if (st.rail) return railModeOf(st.rail.trackType);
     const net = this.game.world.net;
     return st.stops.some((p) => net.edges.get(p.edge)?.tram) ? 'tram' : 'bus';
+  }
+
+  /** Transport mode of a station: 'rail' for every rail station (any track type), else tram or bus. */
+  catchMode(st: Station): CatchMode {
+    const m = this.mode(st);
+    return m === 'tram' || m === 'bus' ? m : 'rail';
   }
 
   /** Are two stations consecutive stops of some line (any company's; vehicles go on from the last stop to the first)? */
@@ -1947,10 +1960,10 @@ export class Stations {
     const r = st.rail;
     if (r) {
       this.refreshAccess();
-      const act = st.roadAccess, cm = catchModeOf(railModeOf(r.trackType)), bonus = styleOf(r.style).catchBonus;
+      const act = st.roadAccess, R = CATCHMENT_RADIUS.rail * (1 + styleOf(r.style).catchBonus);
       if ((r.level ?? 'ground') === 'ground') {
-        for (const p of [this.forecourt(st), r.forecourt2]) if (p) out.push({ ...p, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act });
-      } else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act && this.entranceAccess(st, e) });
+        for (const p of [this.forecourt(st), r.forecourt2]) if (p) out.push({ ...p, r: R, mode: 'rail', active: act });
+      } else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: R, mode: 'rail', active: act && this.entranceAccess(st, e) });
     }
     const net = this.game.world.net;
     for (const p of st.stops) { const e = net.edges.get(p.edge); out.push({ ...stopCatchShape(p.x, p.z, !!e?.tram), active: !!e && pedestrianRoad(e) }); }
@@ -1959,14 +1972,14 @@ export class Stations {
 
   /** Planned access/reach metadata; see planWalkingCatchment for the walking preview. */
   planCatchShapes(plan: StationPlan): CatchShape[] {
-    const cm = catchModeOf(plan.mode ?? 'mainline'), bonus = styleOf(plan.style).catchBonus;
-    if (plan.level === 'ground') return [plan.forecourt, plan.forecourt2].filter((p): p is { x: number; z: number } => !!p).map((p) => ({ ...p, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess }));
-    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess && e.access }));
+    const R = CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus);
+    if (plan.level === 'ground') return [plan.forecourt, plan.forecourt2].filter((p): p is { x: number; z: number } => !!p).map((p) => ({ ...p, r: R, mode: 'rail' as const, active: plan.roadAccess }));
+    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: R, mode: 'rail' as const, active: plan.roadAccess && e.access }));
   }
 
   /** Nominal walking limit of a station, before the grid detour allowance. */
   catchmentRadius(st: Station) {
-    if (st.rail) return CATCHMENT_RADIUS[catchModeOf(railModeOf(st.rail.trackType))] * (1 + styleOf(st.rail.style).catchBonus);
+    if (st.rail) return CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail.style).catchBonus);
     return st.stops.some((p) => this.game.world.net.edges.get(p.edge)?.tram) ? CATCHMENT_RADIUS.tram : CATCHMENT_RADIUS.bus;
   }
 
@@ -1999,7 +2012,9 @@ export class Stations {
 
   /**
    * Split each reachable building among stations, preferring served stations when any is served. Weight is
-   * 1 / (1 + walking distance / 8), so a nearer station always receives more regardless of its mode's limit.
+   * 1 / (1 + walking distance / 8) (catchment.ts walkWeight), so a nearer station always receives more regardless of
+   * its mode's limit. The weights are normalised by their sum, but at least by the weight at FULL_COVER_WALK: a
+   * building only far from every station is partly covered (fewer of its residents walk that far).
    * Cached local Dijkstra results survive unrelated edits and monthly population changes. Ratings play no part;
    * identical buildings, stations and lines rebuild identical shares after loading.
    */
@@ -2082,9 +2097,9 @@ export class Stations {
       const anyServed = reaches.some(([sid]) => this.served.get(sid));
       let sum = 0;
       const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : 1 / (1 + distance / 8); wt.push(v); sum += v; }
-      const rec = { st: [] as number[], w: [] as number[] };
-      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum); }
+      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; }
+      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
+      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / norm); }
       if (!this.covered.get(id)?.size) this.covered.delete(id);
       if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
       if (!old && !rec.st.length) continue;
@@ -2153,11 +2168,11 @@ export class Stations {
       // covered was filled in station Map order, exactly as in the original share-out.
       const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
       let sum = 0; const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : 1 / (1 + distance / 8); wt.push(v); sum += v; }
+      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; }
       if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] };
+      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
       for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sid = reaches[k][0], sh = wt[k] / sum;
+        const sid = reaches[k][0], sh = wt[k] / norm;
         rec.st.push(sid); rec.w.push(sh);
         let station = job.shareSt.get(sid), members = job.members.get(sid);
         if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
@@ -2193,11 +2208,11 @@ export class Stations {
     for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
       const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
       let sum = 0; const wt: number[] = [];
-      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : 1 / (1 + r.distance / 8); wt.push(v); sum += v; }
+      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; }
       if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] };
+      const rec = { st: [] as number[], w: [] as number[] }, norm = Math.max(sum, FULL_COVER_WEIGHT);
       for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sh = wt[k] / sum, sid = reaches[k].sid, ps = stations.get(sid)!;
+        const sh = wt[k] / norm, sid = reaches[k].sid, ps = stations.get(sid)!;
         rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
       }
       buildings.set(id, rec);

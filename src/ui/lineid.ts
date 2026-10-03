@@ -1,6 +1,7 @@
 // Line identity: JR-style rail symbols (the company letter + route letter on the line colour), rail station numbering
-// badges (AS01: white rounded square with the line colour as its border), the transport mode of a line, and the
-// per-view mode / company filters of every line view (remembered in localStorage).
+// badges (AS01: white rounded square with the line colour as its border), the transport mode of a line (rail is one
+// mode: main-line, metro and light-rail track and stations are construction styles of it), and the per-view mode /
+// company filters of every line view (remembered in localStorage).
 import type { Game } from '../game/game';
 import { PLAYER } from '../game/game';
 import type { Line } from '../game/lines';
@@ -8,12 +9,10 @@ import type { Vehicle } from '../game/vehicle';
 import type { VehicleModel } from '../game/vehicle-types';
 import { h, icon, esc } from './dom';
 
-export type LineMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus' | 'coach';
-export const LINE_MODES: LineMode[] = ['rail', 'metro', 'lightrail', 'tram', 'bus', 'coach'];
+export type LineMode = 'rail' | 'tram' | 'bus' | 'coach';
+export const LINE_MODES: LineMode[] = ['rail', 'tram', 'bus', 'coach'];
 export const MODE_META: Record<LineMode, { label: string; icon: string; color: string }> = {
   rail: { label: 'Rail', icon: 'train', color: 'var(--rail)' },
-  metro: { label: 'Metro', icon: 'metro', color: 'var(--metro)' },
-  lightrail: { label: 'Light rail', icon: 'lightrail', color: 'var(--lightrail)' },
   tram: { label: 'Tram', icon: 'tram', color: 'var(--tram)' },
   bus: { label: 'Bus', icon: 'bus', color: 'var(--road)' },
   coach: { label: 'Coach', icon: 'coach', color: 'var(--coach)' },
@@ -30,8 +29,8 @@ export function inkOn(bg: string): string {
 const isCoach = (m: VehicleModel | null | undefined) => !!m && m.kind === 'bus' && /coach/.test(m.style ?? '');
 
 /**
- * Mode of a line: rail lines by the mode of most of their stations (main line, metro, light rail), road lines by
- * their vehicles (coaches: long-distance), trams.
+ * Mode of a line: every rail line is 'rail' (whatever mix of main-line, metro and light-rail track and stations it
+ * uses), road lines by their vehicles (coaches: long-distance), trams.
  */
 export function lineMode(g: Game, l: Line): LineMode {
   if (l.kind === 'tram') return 'tram';
@@ -40,27 +39,14 @@ export function lineMode(g: Game, l: Line): LineMode {
     for (const id of l.vehicles) { const v = g.vehicles.get(id) as unknown as { model?: VehicleModel | null } | undefined; if (!v) continue; if (isCoach(v.model)) c++; else b++; }
     return c > b ? 'coach' : 'bus';
   }
-  let main = 0, metro = 0, lr = 0;
-  const seen = new Set<number>();
-  for (const sid of l.stops) {
-    if (seen.has(sid)) continue;
-    seen.add(sid);
-    const st = g.stations.get(sid);
-    if (!st?.rail) continue;
-    const m = g.stations.mode(st);
-    if (m === 'metro') metro++; else if (m === 'lightrail') lr++; else main++;
-  }
-  return metro + lr > main ? (metro >= lr ? 'metro' : 'lightrail') : 'rail';
+  return 'rail';
 }
 
-/** Mode of a vehicle: its line's, else by its model (metro / light-rail units, coaches, trams). */
+/** Mode of a vehicle: its line's, else by its model (trains: rail; coaches, trams, buses). */
 export function vehicleMode(g: Game, v: Vehicle): LineMode {
   if (v.line) return lineMode(g, v.line);
   const t = v as unknown as { cars?: VehicleModel[]; model?: VehicleModel | null };
-  if (t.cars) {
-    const tr = t.cars[0]?.tracks ?? [];
-    return tr[0] === 'metro' ? 'metro' : tr[0] === 'lightrail' ? 'lightrail' : 'rail';
-  }
+  if (t.cars) return 'rail';
   return t.model?.kind === 'tram' ? 'tram' : isCoach(t.model) ? 'coach' : 'bus';
 }
 
@@ -176,7 +162,8 @@ function store(): Record<string, LineFilter> {
   return filterStore!;
 }
 
-/** The filter of a view (default: every mode, the player's lines). */
+/** The filter of a view (default: every mode, the player's lines). Modes no longer listed (the former metro and
+ * light-rail chips, now rail) are dropped from remembered filters. */
 export function getFilter(view: string, def: LineFilter['company'] = 'mine'): LineFilter {
   const s = store();
   const f = s[view];

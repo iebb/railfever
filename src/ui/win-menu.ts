@@ -8,6 +8,7 @@ import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
+import { RAIL_FARE } from '../game/constants';
 
 export function openMenu(ui: UI) {
   const win = ui.wm.open('menu', 'Menu', { width: 280, x: window.innerWidth - 300, y: 64, icon: 'menu', color: '#eef2f7' });
@@ -210,10 +211,10 @@ export function openHelp(ui: UI) {
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
     </ol>
     <h4>Walking catchments</h4>
-    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are main line ${fmtLen(walkLimit('rail') / WALK_DETOUR)}, metro ${fmtLen(walkLimit('metro') / WALK_DETOUR)}, light rail ${fmtLen(walkLimit('lightrail') / WALK_DETOUR)}, tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of main line ${fmtLen(walkLimit('rail'))}, metro ${fmtLen(walkLimit('metro'))}, light rail ${fmtLen(walkLimit('lightrail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances.</p>
+    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} (every rail station alike, on main-line, metro or light-rail track), tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of rail ${fmtLen(walkLimit('rail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances.</p>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
-      <li><b>Urban</b> (<kbd>U</kbd>) opens the metro and light-rail category. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban stations use the matching platform tracks and can have street entrances.</li>
+      <li><b>Urban</b> (<kbd>U</kbd>) opens the urban-style presets: metro or light-rail track and close-spaced stations. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban-style stations use the matching platform tracks and can have street entrances. It is all ordinary rail: the same walking reach and fares as any rail station, any rail line may stop there, and one line may run over main-line and urban track alike (through running).</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, also Rail → Connect): click a point on the first track, then point at another track to preview a connecting curve, turnouts, signals and cost. Click to build; <kbd>Esc</kbd> or right-click lets you pick the first track again. Pick outside platform and depot tracks.</li>
       <li><b>Re-level</b> (Urban → Re-level): choose <b>Lift</b>, <b>Sink</b> or <b>Ground</b>, set height or depth, then click a track or drag along your stretch. The preview shows the cost, ramps and stations that move with it. Lines and signals stay connected; bridges and tunnels cost much more than ground track.</li>
       <li><b>Electrify</b> (Rail → Electrify): click standard track, or drag along a stretch, to add overhead wire, including platform tracks. The preview shows the cost. Electric locomotives and EMUs need wire and a compatible track type; electrifying standard track keeps its 160 km/h limit.</li>
@@ -242,7 +243,7 @@ export function openHelp(ui: UI) {
       <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
       <li>Stations can be <b>ground</b>, <b>elevated</b> or <b>underground</b>. Buildings are optional at every level; a building can widen the catchment. The station’s <b>Build</b> tab offers restyling, longer platforms, up to eight platform tracks, expansion side, entrances and relocation. Connected track changes level with the Re-level tool.</li>
       <li>A station’s <b>Overview</b> shows platform occupancy and trains waiting, with an expansion recommendation and live cost. Nearby stations can be rebuilt as one station or joined into a walking-transfer complex; the merge panel explains which is possible and links to each complex part.</li>
-      <li>Fares grow with <b>distance</b> and the time saved against walking or driving, including the wait before boarding. Fast, frequent services and journeys without transfers earn more; high-speed trains also cost more energy and maintenance.</li>
+      <li>Fares grow with <b>distance</b> and the time saved against walking or driving, including the wait before boarding. Every rail leg pays at least ${fmtMoney(RAIL_FARE.minimum)} before the speed factor, whatever the track type, so short city hops pay too. Fast, frequent services and journeys without transfers earn more; high-speed trains also cost more energy and maintenance.</li>
       <li>Fast, frequent service raises station ratings — well-served towns grow faster.</li>
       <li>Double track runs one direction per track. Build single track and upgrade it later when traffic grows.</li>
       <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). With track access you can join their network with your own track and use their stations and stops.</li>

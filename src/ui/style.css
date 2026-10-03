@@ -719,7 +719,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 }
 
 /* ---------------------------------------------------------------- line identity (JR style): symbols, numbering, filters */
-:root { --metro: #2ec4b6; --lightrail: #9bd16a; --coach: #e0b04a; }
+:root { --coach: #e0b04a; }
 .lsym { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 20px; padding: 0 4px; border-radius: 5px; background: var(--c); color: var(--ink, #fff); font: 700 12px/1 var(--font-display); letter-spacing: 0.04em; flex: none; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); white-space: nowrap; }
 .lsym.sm { min-width: 22px; height: 17px; padding: 0 3px; font-size: 11px; border-radius: 4px; }
 .lsym.lg { min-width: 38px; height: 30px; padding: 0 6px; font-size: 17px; border-radius: 7px; }
@@ -1038,14 +1038,15 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 #app .win:focus-visible { outline: 2px solid rgba(255, 176, 32, 0.55); outline-offset: 1px; }
 #app .title:focus, #app .title:focus-visible { outline: none; }
 
-/* Transport-mode colours: tram, metro and light rail moved so all five catchment modes stay >= ~20 delta E apart
-   for deuteranopia, protanopia and tritanopia (tram vs rail was 3); matches CATCH_COLOR in gameapi.ts. */
-:root { --tram: #b25ec5; --metro: #41dfcf; --lightrail: #9fe079; }
+/* Transport-mode colours: tram moved so the three catchment modes (rail of every track type, tram, bus) stay
+   >= ~20 delta E apart for deuteranopia, protanopia and tritanopia (tram vs rail was 3); matches CATCH_COLOR in
+   gameapi.ts. */
+:root { --tram: #b25ec5; }
 .flag.shared { background: rgba(178, 94, 197, 0.18); color: color-mix(in srgb, var(--tram) 62%, #fff); }
 
 /* Map-view legends repeat the map's second cue. Signals: thin free, dashed reserved, wide occupied blocks; large
-   path and small block signals; diamond (two-way) and arrow (one-way) heads. Catchment: solid, dashed and dotted
-   rings like the streets. */
+   path and small block signals; diamond (two-way) and arrow (one-way) heads. Catchment: solid and dotted rings like
+   the streets. */
 .mc-row > i.mc-thin { height: 3px; }
 .mc-row > i.mc-wide { height: 7px; border-radius: 3px; }
 .mc-row > i.mc-dash { height: 5px; background: repeating-linear-gradient(90deg, var(--c) 0 5px, rgba(11, 15, 20, 0.7) 5px 8px) !important; }
@@ -1053,7 +1054,6 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .mc-row > i.mc-dot.big { width: 11px; height: 11px; margin: 0 1.5px; }
 .mc-row > i.mc-diamond { width: 9px; height: 9px; margin: 0 2px; border-radius: 1px; transform: rotate(45deg); }
 .mc-row > i.mc-arrow { width: 0; height: 0; margin: 0 1px; border-radius: 0; background: none !important; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--c); }
-.mc-row > i.mc-ring.metro, .mc-row > i.mc-ring.lightrail { border-style: dashed; }
 .mc-row > i.mc-ring.tram { border-style: dotted; }
 /* Demand: orange (unserved, dashed) → pale yellow → blue (served, solid); see servedColor in mapmodes.ts. */
 .mc-grad i {

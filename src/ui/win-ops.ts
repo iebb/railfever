@@ -8,14 +8,14 @@ import type { Line } from '../game/lines';
 import type { NEdge } from '../game/network';
 import { h, icon, add, seg, section } from './dom';
 import { fmtMoney } from '../game/economy';
-import { TRACK_TYPES } from '../game/constants';
+import { TRACK_TYPES, RAIL_FARE } from '../game/constants';
 import { Train, lineCongestion, lineOperators, LineCongestion } from '../game/train';
 import { autoSignalLine } from '../game/signals';
 import { planDoubleTrack, commitDoubleTrack, DoublePlan } from '../game/trackops';
 import { planStationUpgrade, commitStationUpgrade, stationCapacity, UpgradePlan } from '../game/stations';
 import { electrify } from '../game/build-ops';
 import { lineRoute, lineTable, patternHeadways, linePatterns, PATTERN_LABEL } from '../game/patterns';
-import { fareBreakdown, NO_TRANSFER_BONUS } from '../game/fares';
+import { fareBreakdown, stationFareContext, NO_TRANSFER_BONUS } from '../game/fares';
 import { computeLinePath } from './linepaths';
 import { fmtLen, fmtPct, TYPE_META } from './format';
 import type { PartnerPolicy } from '../game/lines';
@@ -340,7 +340,11 @@ export function sharedPanel(ui: UI, l: Line, after: () => void): HTMLElement {
 }
 
 // ------------------------------------------------------------------ fares, service, decommission
-/** Fare of a trip from one end of the line to the other: base by distance, speed factor against walking / the car. */
+/**
+ * Fare of a trip from one end of the line to the other, as vehicles charge it: base by distance (rail: one model
+ * for every track type, with a minimum per boarding; tram and bus: a boarding charge plus distance), speed factor
+ * against walking / the car.
+ */
 export function faresPanel(ui: UI, l: Line): HTMLElement | null {
   const g = ui.game;
   if (l.stops.length < 2 || !l.vehicles.length) return null;
@@ -353,7 +357,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
   try { t = lineTable(g, l).edges.find((e) => e.from === a.id && e.to === b!.id)?.cost ?? 0; } catch { t = 0; }
   if (!(t > 0)) return null;
   const d = Math.hypot(a.x - b.x, a.z - b.z);
-  const f = fareBreakdown(d, t);
+  const f = fareBreakdown(d, t, stationFareContext(g, a, b, l.kind === 'rail' ? 'rail' : l.kind === 'tram' ? 'tram' : 'bus'));
   const pats = linePatterns(l);
   let heads: { pid: number; vehicles: number; headway: number }[] = [];
   try { heads = patternHeadways(g, l); } catch { heads = []; }
@@ -365,7 +369,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
       h('span', null, 'Speed factor'), h('span', { class: f.factor >= 1 ? 'pos' : 'neg' }, `×${f.factor.toFixed(2)}`),
       h('span', null, 'Fare per passenger'), h('span', null, `${fmtMoney(f.perPassenger)} (base ${fmtMoney(f.base)})`)),
     heads.length ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, heads.map((x) => `${pats.find((p) => p.id === x.pid)?.name ?? PATTERN_LABEL.local}: every ${minSec(x.headway)} (${plural(x.vehicles, 'vehicle')})`).join(' · ')) : null,
-    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; passengers who need no change pay ${Math.round(NO_TRANSFER_BONUS * 100)}% more.`));
+    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; passengers who need no change pay ${Math.round(NO_TRANSFER_BONUS * 100)}% more.${l.kind === 'rail' ? ` Rail legs pay at least ${fmtMoney(RAIL_FARE.minimum)} before the speed factor, whatever the track type.` : ''}`));
 }
 
 /** Sell the player's vehicles on a line and delete it (or hand a shared line over to a partner). */

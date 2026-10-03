@@ -305,8 +305,9 @@ function complexParts(ui: UI, s: Station): HTMLElement | null {
     h('div', { class: 'list' }, c.parts.map((id) => {
       const p = g.stations.get(id);
       if (!p) return null;
-      const mode = g.stations.mode(p);
-      const label = mode === 'mainline' ? 'Rail' : mode === 'lightrail' ? 'Light rail' : mode === 'metro' ? 'Metro' : mode === 'tram' ? 'Tram' : 'Bus';
+      // (rail is one mode; the platform track type is the part's construction style)
+      const mode = g.stations.catchMode(p);
+      const label = mode === 'rail' ? `Rail · ${(TYPE_META[p.rail?.trackType ?? ''] ?? TYPE_META.standard).short.toLowerCase()} track` : mode === 'tram' ? 'Tram' : 'Bus';
       return h('div', { class: 'complex-part' },
         h('div', { class: 'inline wrap' }, ui.stationLink(id), id === c.main ? h('span', { class: 'flag ok' }, 'Main') : null, id === s.id ? h('span', { class: 'muted' }, '(this part)') : null, ui.ownerTag(p.owner)),
         h('div', { class: 'inline wrap muted' }, `${label}${p.rail ? ` · ${p.rail.level} · ${p.rail.tracks} platform tracks` : ''} · ${fmtInt(p.waitingTotal)} waiting`, badgeRow(g, id, Infinity, 'sm')));

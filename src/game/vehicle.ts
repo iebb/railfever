@@ -4,7 +4,7 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
-import { fareFor, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type UrbanMode } from './fares';
+import { fareFor, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS } from './constants';
@@ -153,9 +153,8 @@ export abstract class Vehicle {
       const dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
       // the leg's time: waiting at the boarding stop and riding (older saves: the ride since boarding)
       const leg = now - (c.t0 ?? c.day * DAY_SECONDS);
-      const track = from?.rail?.trackType;
-      const mode: UrbanMode | undefined = this.kind === 'road' ? (line?.kind === 'tram' ? 'tram' : 'bus')
-        : track === 'metro' || track === 'lightrail' ? track : undefined;
+      // one rail fare whatever the track or station style; road vehicles: tram or bus fares
+      const mode: FareMode = this.kind === 'road' ? (line?.kind === 'tram' ? 'tram' : 'bus') : 'rail';
       let f = fareFor(dist, leg, c.count, stationFareContext(g, from, st, mode));
       const tr = Math.min(c.count, Math.max(0, c.transfers ?? 0));
       if (c.dest === st.id && tr < c.count) f *= 1 + (NO_TRANSFER_BONUS * (c.count - tr)) / c.count;

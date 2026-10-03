@@ -1081,6 +1081,11 @@ export class AIController {
   static forceBuild = false;
   /** towns from this size get their main-line stations in the centre, underground (and cross-city links) */
   static centrePop = 5000;
+  /**
+   * towns from this size are considered for a city railway (light-rail style; subway style from centrePop): with
+   * every rail station's doubled walking reach a few stops cover a small town, where buses or trams serve better
+   */
+  static urbanPop = 4000;
   log: string[] = [];
   /** the company was bought: the controller does nothing any more */
   disposed = false;
@@ -1540,8 +1545,9 @@ export class AIController {
         opts.push({ score: score * (busLines === 0 ? 1.15 : 1) * fw(focus.road), kind: 'bus', towns: [T.id] });
       }
     }
-    // Compare affordable stages: a small light-rail opening first, or metro where the extra catchment and
-    // capacity repay the tunnels over fifteen years. Preview uses real pedestrian routes, never a town fraction.
+    // Compare affordable stages of a city railway: a small light-rail-style opening first, or a subway where the
+    // capacity repays the tunnels over fifteen years. Both are ordinary rail (one catchment, fare and forecast model;
+    // the style picks track, level, platforms and spacing). Preview uses real pedestrian routes, never a town fraction.
     if ((focus.rail > 0 || focus.tram > 0) && TRACK_TYPES.metro && TRACK_TYPES.lightrail) {
       const urbanIn = new Map<number, number>();
       for (const l of g.lines.map.values()) {
@@ -1551,7 +1557,7 @@ export class AIController {
         for (const t of towns) urbanIn.set(t, (urbanIn.get(t) ?? 0) + 1);
       }
       for (const T of g.towns.list) {
-        if (T.pop < 2500 || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
+        if (T.pop < AIController.urbanPop || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
         if (this.urbanReserved(T.id) || (urbanIn.get(T.id) ?? 0) >= (T.pop >= 6000 ? 3 : 1)) continue;
         for (const mode of ['lightrail', 'metro'] as const) {
           if (mode === 'metro' && T.pop < AIController.centrePop) continue;
@@ -1561,7 +1567,7 @@ export class AIController {
           const sites: ForecastSite[] = [];
           for (const t of layout.targets) {
             const x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
-            sites.push({ x, z, townId: T.id, walk: pointWalkingCatchment(g, x, z, mode, 0, 8) });
+            sites.push({ x, z, townId: T.id, walk: pointWalkingCatchment(g, x, z, 'rail', 0, 8) });
             yield;
           }
           const levels = mode === 'metro' ? ['underground'] : ['ground', 'elevated'];
@@ -2025,13 +2031,13 @@ export class AIController {
 
   // ---------------------------------------------------------------- one station where lines meet
   /**
-   * Share of a planned main-line station's catchment population that no existing main-line station (ours, or a
+   * Share of a planned station's catchment population that no existing rail station (any track type; ours, or a
    * network we may use) already covers: a second station in a town only pays where it serves mostly new ground.
    */
   private newCatchShare(plan: StationPlan): number {
     const g = this.game, w = g.world, me = this.companyId;
     const others = [...g.stations.map.values()]
-      .filter((st) => st.rail && railModeOf(st.rail.trackType) === 'mainline' && (st.owner === me || g.canUse(me, st.owner)) && Math.hypot(st.x - plan.x, st.z - plan.z) < 140)
+      .filter((st) => st.rail && (st.owner === me || g.canUse(me, st.owner)) && Math.hypot(st.x - plan.x, st.z - plan.z) < 140)
       .flatMap((st) => [...walkingCatchment(g, st).buildings.keys()]);
     if (!others.length) return 1;
     let tot = 0, fresh = 0;
@@ -2592,12 +2598,10 @@ export class AIController {
         if (o.linked || o.link !== null) continue;
         const st = g.stations.get(o.id);
         if (!st || (!st.rail && st.owner !== me)) continue;
-        // A pedestrian shortcut between neighbouring calls of the same urban service would route its short
-        // trips away from the trains. Complexes connect different services, including the main-line platforms.
+        // A pedestrian shortcut between neighbouring calls of the same rail service would route its short trips
+        // away from the trains. Complexes connect different services, whatever their track types.
         const from = g.stations.get(id);
-        if (from?.rail && st.rail && railModeOf(from.rail.trackType) !== 'mainline'
-          && railModeOf(from.rail.trackType) === railModeOf(st.rail.trackType)
-          && [...g.lines.map.values()].some((l) => l.stops.includes(id) && l.stops.includes(st.id))) continue;
+        if (from?.rail && st.rail && [...g.lines.map.values()].some((l) => l.stops.includes(id) && l.stops.includes(st.id))) continue;
         if (!g.stations.link(id, o.id)) { this.stats.transfers++; this.note(`walking transfer ${g.stations.get(id)?.name ?? ''} - ${st.name}`); }
       }
     } catch (e) { this.note('transfer link failed: ' + String((e as Error)?.message ?? e)); }
@@ -3391,9 +3395,14 @@ export class AIController {
     return this.game.ais.some((ai) => ai !== this && ai.project && ['metro', 'lightrail'].includes(ai.project.kind) && ai.project.towns.includes(town));
   }
 
-  /** Main-line interchanges belong to the town, irrespective of who owns or operates them. */
+  /**
+   * Main-line interchanges belong to the town, irrespective of who owns or operates them. Every rail station walks
+   * alike (walkLimit('rail')); the construction style sets the spacing: subway-style stations about three quarters
+   * of a walking reach apart, light-rail-style halts a little closer (cheaper stops, slower vehicles), never closer
+   * than platforms and turnouts allow. Neighbouring catchments overlap: the forecast shares their buildings.
+   */
   private urbanLayout(T: Town, mode: 'metro' | 'lightrail') {
-    const g = this.game, spacing = Math.max((mode === 'metro' ? 12 : 7) + TRACK_TYPES[mode].minRadius * 2 + 2, walkLimit(mode) * 1.8);
+    const g = this.game, spacing = Math.max((mode === 'metro' ? 12 : 7) + TRACK_TYPES[mode].minRadius * 2 + 2, walkLimit('rail') * (mode === 'metro' ? 0.72 : 0.6));
     const sts = [...g.stations.map.values()].filter((s) => s.townId === T.id && s.rail && railModeOf(s.rail.trackType) === 'mainline' && g.lines.stationServed(s.id));
     let pair: Station[] = [], dist = 0;
     for (const a of sts) for (const b of sts) {
@@ -3440,15 +3449,17 @@ export class AIController {
   }
 
   /**
-   * An urban railway through the core of town T: a metro (underground, 'metro' track, metro trains) or light
-   * rail ('lightrail' track at grade or on a viaduct, light-rail vehicles): two-track stations with side platforms
-   * spaced by walking reach and turnout room, double track between them, a ramp to a depot beyond one end,
-   * directional running with crossovers before the ends, signals, and a line stopping at every station.
+   * A city railway through the core of town T, built in one of the urban construction styles: subway style
+   * (underground, 'metro' track, metro units) or light-rail style ('lightrail' track at grade, on a viaduct or
+   * underground, light-rail vehicles): two-track stations with side platforms spaced by walking reach and turnout
+   * room, double track between them, a ramp to a depot beyond one end, directional running with crossovers before
+   * the ends, signals, and a line stopping at every station. The result is an ordinary rail line (main-line trains
+   * may run through onto it, its trains onto the main line).
    */
   private *urbanJob(T: Town, mode: 'metro' | 'lightrail'): Generator<void, void> {
     const g = this.game, me = this.companyId, net = g.world.net;
     const p = this.project!;
-    const what = mode === 'metro' ? 'metro' : 'light rail';
+    const what = mode === 'metro' ? 'subway-style city railway' : 'light-rail-style city railway';
     const fail = (why: string, days = 1500) => { this.note(`${what} in ${T.name} abandoned: ${why}`); this.markFailed('urban' + T.id, days); this.abandon(p); };
     this.state.phase = `planning a ${what} in ${T.name}`;
     let level: 'underground' | 'elevated' | 'ground' = mode === 'metro' ? 'underground' : 'elevated';
@@ -3653,7 +3664,7 @@ export class AIController {
     }
     const doubleEdges = [...p.edges].filter((id) => net.edges.get(id)?.station === -1);
     // a ramp up to the ground beyond the first (else the last) station, a depot at its end; the second track joins it
-    let dep = -1, rampEdges: number[] = [], depEnd = sts[plannedYard?.index ?? 0];
+    let dep = -1, depEnd = sts[plannedYard?.index ?? 0];
     if (plannedYard) {
       const outer = ends(depEnd, plannedYard.dir > 0), { x, z } = plannedYard;
       const t0 = net.nextEdge;
@@ -3664,7 +3675,6 @@ export class AIController {
         this.track(t0);
         const endNode = net.nearestNode(x, z, 0.1, 'rail', (n) => n.edges.length === 1);
         dep = endNode ? depotAtEnd(g, endNode.id, me) : -1;
-        rampEdges = [...p.edges].filter((id) => id >= t0 && net.edges.get(id)?.depot === -1);
       }
       yield;
     }
@@ -3685,28 +3695,30 @@ export class AIController {
     yield;
     let bought = 0;
     for (let i = 0; i < fleet; i++) { const t = g.vehicles.buyTrain(dep, consist, line.id); if (typeof t !== 'string') { bought++; this.stats.vehicles++; } yield; }
-    if (!bought) this.note(`no money for ${what} trains in ${T.name} yet`);
+    if (!bought) this.note(`no money for trains of the ${what} in ${T.name} yet`);
     const info: LineInfo = { kind: 'rail', towns: [T.id], depot: dep, maxVehicles: Math.max(3, sts.length), opened: g.day, double: true, urban: mode };
     this.lines.set(line.id, info);
     this.stats.lines++; this.stats.urban++; this.stats.railStations += sts.length;
     for (const st of sts) { this.linkTransfers(st.id); yield; }
-    g.postNews(`${this.name} opens a ${what} line in ${T.name} (${sts.length} stations).`, 'ai', T.x, T.z);
-    this.note(`opened ${what} ${line.name} in ${T.name}: ${sts.length} stations, ${fin.signals} signals; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.transfers)} transfers/year, ${Math.round(econ.net / 1000)}k/year forecast`);
+    const where = level === 'underground' ? 'underground' : level === 'elevated' ? 'elevated' : 'at street level';
+    g.postNews(`${this.name} opens the city rail line ${line.name} in ${T.name} (${sts.length} stations, ${where}).`, 'ai', T.x, T.z);
+    this.note(`opened ${what} ${line.name} in ${T.name} (${where}): ${sts.length} stations, ${fin.signals} signals; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.transfers)} transfers/year, ${Math.round(econ.net / 1000)}k/year forecast`);
     this.canonical(line.id);
     // through services: on along one of our electric main lines from a station near the depot end
-    yield* this.throughService(line.id, depEnd, mode, rampEdges);
+    yield* this.throughService(line.id, depEnd, mode);
   }
 
   /**
    * Through service (mutual through running, as on Fukuoka's subway and JR Chikuhi line): where one of our main
-   * lines (or an open network's) ends at a station near the urban line's end, the two are joined by track there,
-   * the main line electrified, and a through line runs commuter units from the main line on into the city.
+   * lines (or an open network's) ends at a station near the city line's end, the two are joined by track there,
+   * the main line electrified, and a through line runs commuter units from the main line on into the city. Both are
+   * ordinary rail: the units run on main-line and urban track alike, the lines become patterns of one route.
    */
-  private *throughService(urbanLine: number, end: Station, mode: 'metro' | 'lightrail', rampEdges: number[]): Generator<void, void> {
+  private *throughService(urbanLine: number, end: Station, mode: 'metro' | 'lightrail'): Generator<void, void> {
     const g = this.game, me = this.companyId, net = g.world.net;
-    const ul = g.lines.get(urbanLine);
-    const ramp = rampEdges.map((id) => net.edges.get(id)).filter((e): e is NEdge => !!e).sort((a, b) => b.len - a.len)[0];
-    if (!ul || !ramp) return;
+    const ul = g.lines.get(urbanLine), dep = this.lines.get(urbanLine)?.depot;
+    const at = dep !== undefined ? this.rampJoin(dep) : null;
+    if (!ul || !at) return;
     for (const l of g.lines.map.values()) {
       if (l.kind !== 'rail' || l.id === urbanLine || !g.canUse(me, l.owner)) continue;
       const path = linearStops(l.stops);
@@ -3717,14 +3729,17 @@ export class AIController {
         // J's free end joins the urban line's ramp (J becomes a junction station of both)
         const free = stationEnds(g, J).flatMap((e) => [e.front, e.back]).filter((id) => net.nodes.get(id)?.edges.length === 1);
         if (!free.length) continue;
-        const q = { x: 0, y: 0, z: 0 };
-        net.pointAt(ramp, ramp.len * 0.7, q);
-        const sn = findSnap(g, 'rail', q.x, q.z, 0.3);
+        const sn = findSnap(g, 'rail', at.x, at.z, 0.3);
         if (sn.kind !== 'edge') continue;
         const t0 = net.nextEdge;
-        const pj = planEdge(g, nodeSnap(g, free[0], 'rail'), sn, { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
-        yield;
-        if (!pj.ok || commitProposal(g, pj)) continue;
+        let joined = false;
+        // (whichever free platform end plans, on the city line's track: its tight curves clear the depot)
+        for (const fn of free) {
+          const pj = planEdge(g, nodeSnap(g, fn, 'rail'), sn, { kind: 'rail', type: mode, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
+          yield;
+          if (pj.ok && !commitProposal(g, pj)) { joined = true; break; }
+        }
+        if (!joined) continue;
         this.track(t0);
         yield;
         // the main line electrified (its track and stations; ours, or theirs at our cost)
@@ -3746,13 +3761,17 @@ export class AIController {
         const el = electrify(g, [...edges], me);
         if (el.error && !el.changed) this.note(`through service: ${el.error}`);
         this.stats.electrified += Math.round(el.length);
-        // the through line: the main line's stations, the junction, then the urban line's
-        const upath = linearStops(ul.stops);
-        if (!upath) return;
+        // the through line: the main line's stations, the junction, then the urban line's from the end it joins
+        const ustops = linearStops(ul.stops);
+        if (!ustops) return;
+        const upath = ustops[ustops.length - 1] === end.id ? [...ustops].reverse() : ustops;
         const mpath = termId === path[path.length - 1] ? path : [...path].reverse();
         const tl = g.lines.create('rail', me);
         tl.stops = outAndBack([...mpath, ...upath]);
-        const commuter = availableModels(g.year, 'emu').filter((m) => (m.tracks ?? [])[0] === 'electric' && (m.tracks ?? []).includes(mode)).sort((a, b) => b.capacity - a.capacity)[0];
+        // commuter units (any rail unit runs on every track type): the biggest that fits every platform of the route
+        const shortest = Math.min(...[...mpath, ...upath].map((id) => g.stations.get(id)?.rail?.length ?? 0));
+        const commuter = availableModels(g.year, 'emu').filter((m) => m.id.startsWith('emu_') && m.traction === 'electric' && m.length <= shortest - 0.4)
+          .sort((a, b) => b.capacity - a.capacity)[0] ?? this.urbanUnit(mode, shortest);
         const info = this.lines.get(urbanLine);
         if (!commuter || !info) { g.lines.delete(tl.id); return; }
         const t = g.vehicles.buyTrain(info.depot, [commuter], tl.id);
@@ -3760,7 +3779,7 @@ export class AIController {
         this.stats.vehicles++; this.stats.through++;
         this.lines.set(tl.id, { kind: 'rail', towns: [...new Set([...info.towns, g.stations.get(mpath[0])?.townId ?? -1])], depot: info.depot, maxVehicles: 2, opened: g.day });
         this.signalLine(tl.id);
-        g.postNews(`${this.name} runs through trains from ${g.stations.get(mpath[0])?.name} into the ${g.towns.list[end.townId]?.name} metro.`, 'ai', J.x, J.z);
+        g.postNews(`${this.name} runs through trains from ${g.stations.get(mpath[0])?.name} into the ${g.towns.list[end.townId]?.name} city railway.`, 'ai', J.x, J.z);
         this.note(`through service ${tl.name} (${tl.stops.length} stops)`);
         // (the city line and the main line become patterns of the through line: one line per route)
         const tid = this.canonical(tl.id), tinfo = this.lines.get(tid);
@@ -3768,6 +3787,37 @@ export class AIController {
         return;
       }
     }
+  }
+
+  /**
+   * Where a through service joins a city line's depot ramp: on the plain track out from the depot to the first switch,
+   * a third of the way along (where a tunnel ramp nears the surface) but at least 5 units out (clear of the depot
+   * building). Traced from the depot: the station throat and the double-track works split and renumber the ramp's
+   * edges after it is built.
+   */
+  private rampJoin(depotId: number): { x: number; z: number } | null {
+    const net = this.game.world.net, d = this.game.depots.get(depotId);
+    if (!d) return null;
+    const run: { e: NEdge; from: number }[] = [];
+    let node = d.node, prev = d.edge, total = 0;
+    for (let i = 0; i < 16; i++) {
+      const next = (net.nodes.get(node)?.edges ?? []).filter((id) => id !== prev);
+      const e = next.length === 1 ? net.edges.get(next[0]) : undefined;
+      if (!e || e.kind !== 'rail' || e.station >= 0 || e.depot >= 0) break;
+      run.push({ e, from: node }); total += e.len;
+      prev = e.id; node = e.a === node ? e.b : e.a;
+    }
+    let want = Math.min(total - 1, Math.max(total / 3, 5));
+    if (want < 1) return null;
+    for (const { e, from } of run) {
+      if (want <= e.len) {
+        const q = { x: 0, y: 0, z: 0 };
+        net.pointAt(e, Math.max(0.8, Math.min(e.len - 0.8, from === e.a ? want : e.len - want)), q);
+        return { x: q.x, z: q.z };
+      }
+      want -= e.len;
+    }
+    return null;
   }
 
   // ---------------------------------------------------------------- long-distance coaches

@@ -15,14 +15,20 @@ import { fmt, depotBehind, placeAndConnect, addBusStop, roadDepotNear, Train, ch
 const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
 const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
-// Measured with street walking catchments, the further 40% rail cut and the 1.25 grid allowance.
-// Four years, final full year, no AI.
+// Measured with the doubled street-walking reach (rail 336 m for every track type, bus 224 m, before the 1.25 grid
+// allowance; residents beyond 210 m partly covered), one rail fare and the town growth recalibrated for it. Four
+// years, final full year, no AI. Income / operating result, k a year, v2.5 (b7dfcc3) -> now: intercity rail 95.4 / -242
+// -> 495.3 / +160, busy bus 113.7 / +40 -> 225.7 / +151, short bus 8.7 / -25 -> 22.7 / -11, village rail 226.3 / -139
+// -> 302.6 / -71; boardings a year 46 -> 231, 231 -> 473, 59 -> 150, 70 -> 82. (The previous baseline held incomes
+// 89.1 / 100.7 / 8.8 / 207.3 and no operating results, so its profit checks compared with NaN and failed.) The
+// intercity stations sit at the town edges, where the doubled reach first takes in much of Coldden; the busy bus now
+// pays back its two buses in about 3.6 years, the intercity line its train in 9.4.
 const seed7Baseline = {
   seed: 7, results: [
-    {"name": "rail Oldwood-Coldden (104 u track)", "income": 89125.6661359764},
-    {"name": "busy bus in Oldwood (2x Metro Articulated)", "income": 100698.7020182792},
-    {"name": "short bus in Oldwood (1x City Liner)", "income": 8821.836396471499},
-    {"name": "village rail Redwell(345)-Southley(237)", "income": 207281.82900900082},
+    {"name": "rail Oldwood-Coldden (104 u track)", "income": 495250.35209041135, "net": 159993.16202841047},
+    {"name": "busy bus in Oldwood (2x Metro Articulated)", "income": 225670.58011157747, "net": 151397.7358406316},
+    {"name": "short bus in Oldwood (1x City Liner)", "income": 22679.010597900255, "net": -11123.100097258226},
+    {"name": "village rail Redwell(345)-Southley(237)", "income": 302585.1612691777, "net": -71039.67326408514},
   ],
 };
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });

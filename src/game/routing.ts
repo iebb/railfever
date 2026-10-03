@@ -1107,7 +1107,8 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
         const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
         // planning a station is the costly part (footprints, entrances, access road): one per step
         n = 16;
-        if (!plan.ok || plan.join) continue;
+        // (a station without road access has no walking catchment: no passengers, whatever the circles hold)
+        if (!plan.ok || plan.join || !plan.roadAccess) continue;
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
         if (o.accept && !o.accept(plan)) continue;
