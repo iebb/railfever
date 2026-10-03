@@ -445,6 +445,8 @@ function joinChecks() {
     if (shared) check(l.vehicles.filter((id) => g.vehicles.get(id)?.owner === other).every((id) => !l.patterns?.find((p) => p.id === g.vehicles.get(id)?.pattern)?.stops.every(Boolean)), 'join: the partner keeps its short-turn patterns');
     if (shared) check(l.operators?.includes(other) && g.lines.ownsStationOn(l, me) && g.lines.ownsStationOn(l, other), 'join: the partner remains an operator and both own a station');
     startFleet(g, l.vehicles.map((id) => g.vehicles.get(id)!));
+    // the cash test covers the same operating window as before staged dispatch existed
+    const started = g.company(me).economy.money;
     const visited = new Map(l.vehicles.map((id) => [id, new Set<number>()]));
     const until = g.day + (shared ? 360 : 200);
     while (g.day < until) {
@@ -453,7 +455,7 @@ function joinChecks() {
     }
     console.log(`  ${shared ? 'two companies' : 'own lines'}: joined ${stat(ai, 'netJoined')}, far stops visited ${[...visited.values()].map((s) => [s.has(A.id), s.has(B.id)].join('/')).join(', ')}, cash ${fmt(g.company(me).economy.money / 1e6, 2)}M`);
     check([...visited].filter(([id]) => g.vehicles.get(id)?.owner === me).every(([, s]) => s.has(A.id) && s.has(B.id)), 'join: each of our trains physically serves both far stops');
-    check(routes(g, A, B, me) && g.company(me).economy.money > cash * 0.8
+    check(routes(g, A, B, me) && g.company(me).economy.money > started - cash * 0.2
       && [...new Set([me, other])].every((id) => { const c = g.company(id); return c.economy.money > 1_000_000 && c.economy.loan <= c.economy.maxLoan && !c.defunct; }),
       'join: through trains route both ways and both companies keep healthy cash reserves');
     check(netReservations(g).length === 0, 'join: reservations remain consistent');
