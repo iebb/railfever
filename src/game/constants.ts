@@ -21,6 +21,20 @@ export const PASSENGER_FARE_SCALE = 7, PASSENGER_LONG_FARE_SCALE = 1.95;
 export const PASSENGER_FARE_BLEND = 17;
 /** Shared local gravity/coverage parameters for demand and project revenue estimates. */
 export const LOCAL_DEMAND_DISTANCE = 40, LOCAL_DEMAND_EXP = 0.85, LOCAL_SERVED_SHARE = 0.15;
+/** Urban trips use the same compressed calendar. Extra trips apply only inside large, dense towns. */
+export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, metro: 18, lightrail: 15, tram: 3, bus: 1.5 };
+/** Small unmodelled car/drop-off feeder share; bus/tram feeders are already routed as real transfers. */
+export const MAINLINE_FEEDER_SHARE = 0.08;
+/** Car/drop-off trips from uncovered street-connected districts, attracted by frequent main-line service.
+ * Walking isochrones stay unchanged. Sparse services retain just the small allowance above. */
+export const MAINLINE_FEEDERS = { share: 0.85, fullHeadway: 100, cutoffHeadway: 200, reach: 84 };
+/** Boarding charge in calibrated game money, followed by the existing distance component. */
+export const URBAN_FARES = {
+  metro: { boarding: 1700, distance: 1 }, lightrail: { boarding: 900, distance: 1 },
+  tram: { boarding: 80, distance: 0.9 }, bus: { boarding: 12, distance: 0.9 },
+};
+/** Years of operating surplus available to repay an urban project. */
+export const URBAN_PAYBACK = { metro: 15, lightrail: 9, crosscity: 15 };
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 

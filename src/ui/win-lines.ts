@@ -267,6 +267,11 @@ export function openLine(ui: UI, id: number) {
         }), setting === 'auto' ? `Now: ${loop ? 'loop' : 'out and back'}` : undefined));
       }
       if (mine) {
+        add(win.body, field('Spacing', toggle('Even spacing', l.evenSpacing !== false, (enabled) => {
+          g.lines.setEvenSpacing(l.id, enabled);
+          ui.sound('toggle', { pitch: enabled ? 1.1 : 0.9 });
+          rerender();
+        }, 'Space vehicles out at stops and depot departures')));
         add(win.body, h('div', { class: 'btns' },
           h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
           h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops before joining lines' : 'Combine two lines at a shared terminus into a through line', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),

@@ -539,6 +539,8 @@ export interface FinishOpts {
   normalise?: boolean;
   /** at a station end of the stretch, the first units are its throat (a turnout ladder): the crossovers go beyond */
   throatLength?: number;
+  /** Inline stations with turnback services must have crossovers on both sides before making track one-way. */
+  turnbackStations?: number[];
   /** diagnostics */
   log?: (s: string) => void;
 }
@@ -726,9 +728,12 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
         const v = span.get(sid);
         span.set(sid, v ? [Math.min(v[0], q.u), Math.max(v[1], q.u)] : [q.u, q.u]);
       }
-      for (const [, [s0, s1]] of span) {
-        if (s0 > lo + 3) windows.push({ edge0: s0, sgn: 1, must: false, atStart: null, label: 'before a station' });
-        if (s1 < hi - 3) windows.push({ edge0: s1, sgn: -1, must: false, atStart: null, label: 'after a station' });
+      for (const [sid, [s0, s1]] of span) {
+        const must = opts.turnbackStations?.includes(sid) ?? false;
+        // Existing throat upgrades keep their inline windows; AI pairing supplies the turnback option.
+        const th = opts.turnbackStations ? opts.throatLength ?? 0 : 0;
+        if (s0 > lo + 3) windows.push({ edge0: s0 - th, sgn: 1, must, atStart: null, label: 'before a station' });
+        if (s1 < hi - 3) windows.push({ edge0: s1 + th, sgn: -1, must, atStart: null, label: 'after a station' });
       }
     }
     // a pair right outside a station end takes about 2D + 3 units; anything beyond 2D + 8 out is on plain line

@@ -1,3 +1,5 @@
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Realistic operations (UPDATE 9j / 9k): fares with the value of time (walk / bus / train / HSR speed factors,
 // waiting, the wait cap, the no-transfer bonus), operating costs (monthly breakdown sums, HSR vs intercity per
 // train-km, energy per seat-km, a busy vs a poorly used HSR line), service patterns on a double-track line with
@@ -147,7 +149,7 @@ check(!!xp && linePatterns(L).length === 2 && patternStops(L, xp.id).every((i) =
 check(setVehiclePattern(g, ex.id, xp.id) === null && ex.pattern === xp.id, 'the HST runs the express');
 const sx = suggestExpress(g, L);
 check(!!sx && sx.stops.some((f) => !f), `suggestExpress skips something (${sx?.name})`);
-// run a year with passengers for every pair, watching stops, passing and holds
+// Observe at least two local cycles, including staged dispatch and terminus holds.
 const all = [A, B!, C!, D];
 const arrivals = new Map<number, Set<number>>(), arrN = new Map<number, number>();
 const prev = new Map<number, string>();
@@ -155,8 +157,10 @@ let exPassThrough = 0, exPassPlatform = 0, exPlatformKmh = 0, exWrongCargo = 0, 
 const holds = new Map<number, { st: number; by: string; passed: boolean }>();
 const stationEdge = (st: Station, e: number) => st.rail!.edges.includes(e) ? 'platform' : st.rail!.throughEdges.includes(e) ? 'through' : '';
 const runDays = (gg: Game, days: number, tick?: () => void) => { const d0 = gg.day; while (gg.day < d0 + days) { gg.update(0.25); tick?.(); } };
+startFleet(g, [...locals, ex]);
 let lastDay = g.day;
-runDays(g, 400, () => {
+const operatingDays = Math.max(400, Math.ceil(2 * patternHeadway(g, L, locals[0].pattern) * locals.length * 360 / YEAR_S));
+runDays(g, operatingDays, () => {
   if (g.day !== lastDay) { lastDay = g.day; for (const a of all) for (const b of all) if (a !== b) inject(g, a, b, 3); }
   for (const t of [...locals, ex]) {
     if (t.state === 'loading' && prev.get(t.id) !== 'loading') { (arrivals.get(t.id) ?? arrivals.set(t.id, new Set()).get(t.id)!).add(t.atStation); arrN.set(t.id, (arrN.get(t.id) ?? 0) + 1); }
@@ -417,3 +421,26 @@ function hsrYear(n: number, every: number, distUnits: number): { income: number;
 console.log(`(${fmt((performance.now() - T0) / 1000, 1)} s)`);
 void YEAR_S;
 done();
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
+}

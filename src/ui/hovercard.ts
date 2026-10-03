@@ -11,6 +11,8 @@ import { fmtMoney } from '../game/economy';
 import type { Train } from '../game/train';
 import type { RoadVehicle } from '../game/roadvehicle';
 import { stationBadges, badgeHtml } from './lineid';
+import { townService } from '../game/towns';
+import { onUiScale } from './uiscale';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
 
@@ -42,6 +44,8 @@ export class HoverCard {
     this.el.className = 'hovercard';
     this.el.setAttribute('aria-hidden', 'true');
     ui.root.appendChild(this.el);
+    // the interface size zooms the card's contents: measure it again and re-check what it would cover
+    onUiScale(() => { this.cw = this.el.offsetWidth; this.chh = this.el.offsetHeight; this.avoidT = 0; this.sx = NaN; });
   }
 
   get target() { return this.cur; }
@@ -138,13 +142,14 @@ export class HoverCard {
     }
     const town = g.towns.list[t.id];
     if (!town) return null;
-    const pct = town.passGenLast ? Math.min(100, Math.round((town.passTransLast / town.passGenLast) * 100)) : 0;
-    const growth = town.served === 0 ? 'slow' : town.served === 1 ? 'good' : 'fast';
+    // growth follows the town's public transport (towns.ts townService, as in the town window)
+    const sv = townService(g, town);
+    const pct = sv.stations ? Math.round(sv.transported * 100) : 0;
     return {
       color: '#eef2f7',
       html: `<div class="hc-title">${svg('towns', 16)}<span>${esc(town.name)}</span></div>` +
-        `<div class="hc-sub">${town.served ? `${town.served} active station${town.served > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
-        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${growth}</b>`)}</div>` +
+        `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
+        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}</div>` +
         `<div class="hc-hint">Click for details</div>`,
     };
   }
@@ -175,7 +180,8 @@ export class HoverCard {
       this.blocked = this.ui.hud.avoidRects().some((r) => x0 < r.right && x1 > r.left && y0 < r.bottom && y1 > r.top);
     }
     if (this.blocked) { this.hide(); return; }
-    if (Math.abs(sx - this.sx) > 0.5 || Math.abs(sy - this.sy) > 0.5) {
+    // (NaN until the first placement: a comparison with it is never true)
+    if (!Number.isFinite(this.sx) || Math.abs(sx - this.sx) > 0.5 || Math.abs(sy - this.sy) > 0.5) {
       this.sx = sx; this.sy = sy;
       this.el.style.transform = `translate3d(${sx.toFixed(1)}px, ${sy.toFixed(1)}px, 0) translate(-50%, -100%)`;
     }

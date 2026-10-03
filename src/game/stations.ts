@@ -15,7 +15,7 @@ import { autoSignalLine } from './signals';
 import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
-import { walkingCatchment, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad } from './catchment';
+import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, type WalkingCatchment } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -57,6 +57,18 @@ export const catchModeOf = (m: RailMode): CatchMode => (m === 'mainline' ? 'rail
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
 export const TRANSFER_RANGE = 14;
+/** Days of service history a station keeps (Station.callDays): its service frequency is the share of them with a call (Stations.callShare). */
+export const CALL_DAYS = 30;
+const CALL_MASK = 2 ** CALL_DAYS - 1;
+/** Older saves (no history): a station a vehicle has called at starts from three calls in the last 30 days. */
+const OLD_SAVE_CALLS = 1 | (1 << 10) | (1 << 20);
+/** Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). */
+export const RATING_LOST = 0.25;
+/** Share of a station's passengers who gave up waiting rather than board (this and last month), 0..1. */
+export function lostShare(st: Station): number {
+  const lost = (st.lostMonth || 0) + (st.lostLast || 0);
+  return lost > 0 ? lost / (lost + st.pickupMonth + st.pickupLast) : 0;
+}
 /**
  * Automatic walking links when a station is built: metro / light-rail stations link to stations of the same mode
  * only when (nearly) touching (dense lines: neighbouring stops are no interchange), to other modes within
@@ -213,6 +225,12 @@ export interface Station {
   genMonth: number; genLast: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
+  /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
+  lostMonth: number; lostLast: number;
+  /** day a vehicle last called (stopped) at the station; -1 before the first call (unlike lastPickup, not the day it was built) */
+  lastCall: number;
+  /** days of the last CALL_DAYS on which a vehicle called, bit k: k + 1 days ago (updateRatings; Stations.callShare) */
+  callDays: number;
   built: number;
   /** stations linked for walking transfers (a transfer complex), both ways */
   links: number[];
@@ -494,6 +512,31 @@ export class Stations {
   nextId = 1;
   /** network version the stations' road access was last computed at */
   private accessVersion = -1;
+  /** Structural/access edits consumed by the walking portal index. */
+  walkVersion = 0;
+  private warming = false;
+  private warmedTick = -1;
+  private warmCursor = 0;
+  private warmStations: Station[] = [];
+  private warmVersion = -1;
+  private warmCount = -1;
+
+  /** Prepare at most two station inputs per fixed tick; live shares retain their original update timing. */
+  prepareCatchmentTick() {
+    if (this.warming || this.warmedTick === this.game.tick) return;
+    this.warmedTick = this.game.tick;
+    if (!this.sharesReady || !this.catchmentInputsChanged()) return;
+    if (this.warmVersion !== this.walkVersion || this.warmCount !== this.map.size) {
+      this.warmVersion = this.walkVersion; this.warmCount = this.map.size; this.warmStations = this.all();
+    }
+    this.warming = true;
+    try {
+      for (let i = 0; i < 2 && this.warmStations.length; i++) {
+        const st = this.warmStations[this.warmCursor++ % this.warmStations.length];
+        if (this.map.get(st.id) === st) prepareWalkingCatchment(this.game, st);
+      }
+    } finally { this.warming = false; }
+  }
   constructor(private game: Game) {
     const net = game.world.net;
     net.onSplit.push((old, e1, e2, s) => {
@@ -530,7 +573,8 @@ export class Stations {
     const st: Station = {
       id: this.nextId++, name: this.stationName(x, z, town), owner, townId: town ? town.id : -1, x, z, rail: null, stops: [],
       waiting: new Map(), waitingTotal: 0, rating: 0.65, lastPickup: g.day, lastSpeed: 0,
-      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0, built: g.day,
+      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0,
+      lostMonth: 0, lostLast: 0, lastCall: -1, callDays: 0, built: g.day,
       links: [], roadAccess: true,
     };
     this.map.set(st.id, st);
@@ -1446,9 +1490,11 @@ export class Stations {
 
   /** Recompute the stations' road access after the network changed (cheap when nothing changed). */
   refreshAccess(force = false) {
+    this.game.world.syncCatchmentTerrain();
     const v = this.game.world.net.version;
     if (!force && v === this.accessVersion) return;
     this.accessVersion = v;
+    this.walkVersion++;
     let changed = walkRoadsChanged(this.game);
     for (const st of this.map.values()) {
       const a = !st.rail || this.railReachable(st);
@@ -1677,8 +1723,10 @@ export class Stations {
     // statistics
     a.genMonth += b.genMonth; a.pickupMonth += b.pickupMonth; a.arrivedMonth += b.arrivedMonth;
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
+    a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
     a.rating = Math.max(a.rating, b.rating);
+    a.lastCall = Math.max(a.lastCall, b.lastCall); a.callDays = (a.callDays | b.callDays) & CALL_MASK;
     // links
     for (const o of b.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== b.id); if (os && os !== a) this.addLink(a, os); }
     b.links = [];
@@ -1955,43 +2003,207 @@ export class Stations {
    * Cached local Dijkstra results survive unrelated edits and monthly population changes. Ratings play no part;
    * identical buildings, stations and lines rebuild identical shares after loading.
    */
-  private computeShares(maxB: number) {
+  private walkSt = new Map<number, WalkingCatchment>();
+  private covered = new Map<number, Map<number, number>>();
+  private coveredPop = new Map<number, number>();
+  private shareMembers = new Map<number, Map<number, number>>();
+  private served = new Map<number, boolean>();
+  private pendingPop = new Set<number>();
+  private catchInputs = { roads: -1, lots: -1, terrain: -1, stations: -1, served: -1 };
+
+  /** Event counters only; callers can avoid even entering the walking/share computation. */
+  catchmentInputsChanged(): boolean {
+    return !this.sharesReady || !this.sameCatchInputs(this.catchInputs);
+  }
+  private currentCatchInputs() {
     const w = this.game.world;
-    this.shareSt.clear(); this.shareB.clear();
-    this.sharesReady = true;
-    this.catchMaxB = maxB;
-    this.catchVersion++;
+    return { roads: w.net.roadVersions.version, lots: w.lotVersions.version, terrain: w.terrainVersions.version,
+      stations: this.walkVersion, served: this.game.lines.servedVersion };
+  }
+  private sameCatchInputs(p: typeof this.catchInputs) {
+    const w = this.game.world;
+    return p.roads === w.net.roadVersions.version && p.lots === w.lotVersions.version && p.terrain === w.terrainVersions.version &&
+      p.stations === this.walkVersion && p.served === this.game.lines.servedVersion;
+  }
+  get catchmentPopulationPending() { return this.pendingPop.size > 0; }
+
+  private computeShares(maxB: number) {
+    if (!this.catchmentInputsChanged() && maxB === this.catchMaxB) return;
+    const w = this.game.world, previousMaxB = this.catchMaxB, wasReady = this.sharesReady;
     refreshWalkBuildings(this.game);
-    const covered = new Map<number, { st: Station; distance: number }[]>();
-    for (const st of this.map.values()) for (const [id, walk] of walkingCatchment(this.game, st).buildings) {
-      const b = w.buildings.get(id);
-      if (!b || b.pop <= 0 || id > maxB) continue;
-      const a = covered.get(id), c = { st, distance: walk.distance };
-      if (a) a.push(c); else covered.set(id, [c]);
+    const dirty = new Set<number>(), populations = new Set<number>(), order = new Map<number, number>();
+    let servedChanged = false;
+    for (const [sid, old] of this.walkSt) if (!this.map.has(sid)) {
+      for (const id of old.buildings.keys()) { this.covered.get(id)?.delete(sid); dirty.add(id); populations.add(id); }
+      this.walkSt.delete(sid); this.served.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
     }
-    const served = new Map<number, boolean>();
-    const isServed = (s: Station) => { let v = served.get(s.id); if (v === undefined) { v = this.game.lines.stationServed(s.id); served.set(s.id, v); } return v; };
-    for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
-      const anyServed = reaches.some((r) => isServed(r.st));
+    for (const st of this.map.values()) {
+      order.set(st.id, order.size);
+      const walk = walkingCatchment(this.game, st), old = this.walkSt.get(st.id);
+      if (walk !== old) {
+        for (const [id, before] of old?.buildings ?? []) {
+          populations.add(id);
+          if (!walk.buildings.has(id)) { this.covered.get(id)?.delete(st.id); dirty.add(id); }
+          else if (walk.buildings.get(id)!.distance !== before.distance) dirty.add(id);
+        }
+        for (const [id, reach] of walk.buildings) {
+          populations.add(id);
+          if (!old?.buildings.has(id)) dirty.add(id);
+          let reaches = this.covered.get(id);
+          if (!reaches) { reaches = new Map(); this.covered.set(id, reaches); }
+          reaches.set(st.id, reach.distance);
+        }
+        this.walkSt.set(st.id, walk);
+        if (!old) this.pendingPop.add(st.id);
+      }
+      const served = this.game.lines.stationServed(st.id);
+      if (this.served.get(st.id) !== served) {
+        servedChanged = true; this.served.set(st.id, served);
+        for (const id of walk.buildings.keys()) dirty.add(id);
+      }
+    }
+    if (maxB !== previousMaxB) for (const id of this.covered.keys())
+      if ((id > previousMaxB && id <= maxB) || (id > maxB && id <= previousMaxB)) { dirty.add(id); populations.add(id); }
+    for (const id of populations) {
+      const pop = w.buildings.get(id)?.pop ?? 0, before = this.coveredPop.get(id) ?? 0;
+      if (pop !== before) {
+        if ((pop > 0) !== (before > 0)) dirty.add(id);
+        for (const sid of this.covered.get(id)?.keys() ?? []) this.pendingPop.add(sid);
+        for (const sid of this.shareB.get(id)?.st ?? []) this.pendingPop.add(sid);
+      }
+      if (this.covered.get(id)?.size) this.coveredPop.set(id, pop); else this.coveredPop.delete(id);
+    }
+    let sharesChanged = false;
+    const shareStations = new Set<number>();
+    for (const id of dirty) {
+      const b = w.buildings.get(id), old = this.shareB.get(id);
+      const reaches = b && b.pop > 0 && id <= maxB
+        ? [...(this.covered.get(id) ?? [])].sort((a, b) => order.get(a[0])! - order.get(b[0])!) : [];
+      const anyServed = reaches.some(([sid]) => this.served.get(sid));
       let sum = 0;
       const wt: number[] = [];
-      for (const r of reaches) {
-        const v = anyServed && !isServed(r.st) ? 0 : 1 / (1 + r.distance / 8);
-        wt.push(v); sum += v;
+      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : 1 / (1 + distance / 8); wt.push(v); sum += v; }
+      const rec = { st: [] as number[], w: [] as number[] };
+      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum); }
+      if (!this.covered.get(id)?.size) this.covered.delete(id);
+      if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
+      if (!old && !rec.st.length) continue;
+      sharesChanged = true;
+      for (const sid of old?.st ?? []) {
+        this.shareMembers.get(sid)?.delete(id); this.pendingPop.add(sid); shareStations.add(sid);
       }
+      if (rec.st.length) {
+        this.shareB.set(id, rec);
+        for (let k = 0; k < rec.st.length; k++) {
+          const sid = rec.st[k];
+          let members = this.shareMembers.get(sid);
+          if (!members) { members = new Map(); this.shareMembers.set(sid, members); }
+          members.set(id, rec.w[k]); this.pendingPop.add(sid); shareStations.add(sid);
+        }
+      } else this.shareB.delete(id);
+    }
+    for (const sid of shareStations) {
+      if (!this.map.has(sid)) continue;
+      // Population-only edits retain the arrays. Changed shares keep the original ascending sum order.
+      const members = [...(this.shareMembers.get(sid) ?? [])].sort((a, b) => a[0] - b[0]);
+      if (members.length) this.shareSt.set(sid, { ids: members.map((m) => m[0]), w: members.map((m) => m[1]) });
+      else this.shareSt.delete(sid);
+    }
+    this.sharesReady = true; this.catchMaxB = maxB;
+    this.catchInputs = this.currentCatchInputs();
+    if (!wasReady || sharesChanged || servedChanged || this.pendingPop.size) this.catchVersion++;
+  }
+
+  /** A cold/load computation uses a separate share buffer until every station and building is ready. */
+  private fullPreparation: {
+    inputs: { roads: number; lots: number; terrain: number; stations: number; served: number }; maxB: number; stations: Station[]; next: number; tick: number;
+    walks: Map<number, WalkingCatchment>; covered: Map<number, Map<number, number>>; pop: Map<number, number>;
+    served: Map<number, boolean>; ids?: number[]; building: number;
+    shareSt: Map<number, { ids: number[]; w: number[] }>; shareB: Map<number, { st: number[]; w: number[] }>;
+    members: Map<number, Map<number, number>>; populations: Map<number, number>;
+  } | null = null;
+  get catchmentWorkPending() { return this.fullPreparation !== null; }
+
+  private prepareFullCatchment(): boolean {
+    let job = this.fullPreparation;
+    if (!job || !this.sameCatchInputs(job.inputs)) {
+      job = { inputs: this.currentCatchInputs(), maxB: this.game.world.nextBuildingId - 1, stations: this.all(), next: 0, tick: -1,
+        walks: new Map(), covered: new Map(), pop: new Map(), served: new Map(), building: 0,
+        shareSt: new Map(), shareB: new Map(), members: new Map(), populations: new Map() };
+      this.fullPreparation = job;
+    }
+    if (job.tick === this.game.tick) return false;
+    job.tick = this.game.tick;
+    const B = this.game.world.buildings;
+    // Work budgets count entities, never elapsed milliseconds or rendered frames.
+    for (let n = 0; n < 2 && job.next < job.stations.length; n++) {
+      const st = job.stations[job.next++], walk = walkingCatchment(this.game, st);
+      job.walks.set(st.id, walk); job.served.set(st.id, this.game.lines.stationServed(st.id));
+      for (const [id, reach] of walk.buildings) {
+        let covered = job.covered.get(id);
+        if (!covered) { covered = new Map(); job.covered.set(id, covered); }
+        covered.set(st.id, reach.distance); job.pop.set(id, B.get(id)?.pop ?? 0);
+      }
+    }
+    if (job.next < job.stations.length) return false;
+    job.ids ??= [...job.covered.keys()].sort((a, b) => a - b);
+    for (let n = 0; n < 256 && job.building < job.ids.length; n++) {
+      const id = job.ids[job.building++], b = B.get(id);
+      if (!b || b.pop <= 0 || id > job.maxB) continue;
+      // covered was filled in station Map order, exactly as in the original share-out.
+      const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
+      let sum = 0; const wt: number[] = [];
+      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : 1 / (1 + distance / 8); wt.push(v); sum += v; }
       if (!(sum > 0)) continue;
       const rec = { st: [] as number[], w: [] as number[] };
-      for (let k = 0; k < reaches.length; k++) {
-        if (wt[k] <= 0) continue;
-        const sh = wt[k] / sum;
-        const stId = reaches[k].st.id;
-        rec.st.push(stId); rec.w.push(sh);
-        let ps = this.shareSt.get(stId);
-        if (!ps) { ps = { ids: [], w: [] }; this.shareSt.set(stId, ps); }
-        ps.ids.push(id); ps.w.push(sh);
+      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
+        const sid = reaches[k][0], sh = wt[k] / sum;
+        rec.st.push(sid); rec.w.push(sh);
+        let station = job.shareSt.get(sid), members = job.members.get(sid);
+        if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
+        if (!members) { members = new Map(); job.members.set(sid, members); }
+        station.ids.push(id); station.w.push(sh); members.set(id, sh);
+        job.populations.set(sid, (job.populations.get(sid) ?? 0) + b.pop * sh);
       }
-      this.shareB.set(id, rec);
+      job.shareB.set(id, rec);
     }
+    if (job.building < job.ids.length) return false;
+    // Publish all shares and populations together. Demand keeps its previous shares until this point too.
+    this.walkSt = job.walks; this.covered = job.covered; this.coveredPop = job.pop; this.served = job.served;
+    this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
+    this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
+    for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
+    this.pendingPop.clear(); this.fullPreparation = null;
+    return true;
+  }
+
+  /** Uncached, synchronous reference using the original full share-out and floating-point order. */
+  debugFullCatchment(): { stations: Map<number, { ids: number[]; w: number[]; pop: number }>; buildings: Map<number, { st: number[]; w: number[] }> } {
+    const w = this.game.world, stations = new Map<number, { ids: number[]; w: number[]; pop: number }>();
+    const buildings = new Map<number, { st: number[]; w: number[] }>(), covered = new Map<number, { sid: number; distance: number }[]>();
+    const walks = fullWalkingCatchments(this.game);
+    for (const st of this.map.values()) {
+      stations.set(st.id, { ids: [], w: [], pop: 0 });
+      for (const [id, walk] of walks.get(st.id)!.buildings) {
+        const b = w.buildings.get(id); if (!b || b.pop <= 0 || id > this.catchMaxB) continue;
+        const a = covered.get(id), c = { sid: st.id, distance: walk.distance };
+        if (a) a.push(c); else covered.set(id, [c]);
+      }
+    }
+    for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
+      const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
+      let sum = 0; const wt: number[] = [];
+      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : 1 / (1 + r.distance / 8); wt.push(v); sum += v; }
+      if (!(sum > 0)) continue;
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
+        const sh = wt[k] / sum, sid = reaches[k].sid, ps = stations.get(sid)!;
+        rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
+      }
+      buildings.set(id, rec);
+    }
+    for (const st of stations.values()) for (let i = 0; i < st.ids.length; i++) st.pop += (w.buildings.get(st.ids[i])?.pop ?? 0) * st.w[i];
+    return { stations, buildings };
   }
 
   /** The shares as last worked out (a loaded game works them out again on first use, for the same buildings). */
@@ -2029,16 +2241,24 @@ export class Stations {
    * Catchment population of every station (its shares of the buildings' people, see computeShares), after the
    * catchments, the stations, the lines serving them or the buildings change (lines.flushCatchment; monthly).
    */
-  recomputeCatchment() {
+  recomputeCatchment(slice = false): boolean {
     this.refreshAccess();
+    // Finish before daily passenger generation so slicing cannot change the simulation's RNG or demand.
+    // Direct/debug callers remain synchronous. Only a cold cache of a running/loaded game needs slices.
+    if (slice && !this.game.paused && !this.sharesReady && this.map.size >= 16 && this.game.tick > 0 &&
+      this.game.tick % this.game.ticksPerDay !== this.game.ticksPerDay - 1) return this.prepareFullCatchment();
+    this.fullPreparation = null;
     this.computeShares(this.game.world.nextBuildingId - 1);
     const B = this.game.world.buildings;
-    for (const st of this.map.values()) {
-      const sh = this.shareSt.get(st.id);
+    for (const sid of this.pendingPop) {
+      const st = this.map.get(sid); if (!st) continue;
+      const sh = this.shareSt.get(sid);
       let pop = 0;
       if (sh) for (let i = 0; i < sh.ids.length; i++) pop += (B.get(sh.ids[i])?.pop ?? 0) * sh.w[i];
       st.catchPop = pop;
     }
+    this.pendingPop.clear();
+    return true;
   }
 
   /**
@@ -2077,6 +2297,10 @@ export class Stations {
     g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count))));
   }
 
+  /**
+   * Passengers beyond the station's useful queue give up waiting: counted per station and town and month
+   * (lostMonth, Town.passLostMonth); the share who give up lowers the station's rating (updateRatings).
+   */
   trimWaiting(st: Station, max: number) {
     // The caller's legacy platform cap is a hard ceiling. People in the catchment and the size of the transfer
     // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
@@ -2094,15 +2318,21 @@ export class Stations {
     let spare = max - groups.reduce((n, x) => n + x.count, 0);
     groups.sort((a, b) => b.remainder - a.remainder);
     for (const x of groups) if (spare > 0) { x.count++; spare--; }
-    let tot = 0;
+    let tot = 0, lost = 0;
     for (const x of groups) {
       const g = x.g;
       g.count = x.count;
+      lost += x.oldCount - x.count;
       // transfers (passengers of the group who already changed) shrink with it
       if (x.transfers) g.transfers = Math.min(g.count, Math.round(x.transfers * g.count / x.oldCount));
       if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
+    if (lost > 0) {
+      st.lostMonth = (st.lostMonth || 0) + lost;
+      const town = this.game.towns.list[st.townId];
+      if (town) town.passLostMonth = (town.passLostMonth ?? 0) + lost;
+    }
   }
 
   rerouteWaiting(st: Station) {
@@ -2454,6 +2684,36 @@ export class Stations {
     }
   }
 
+  /** Service frequency: the share of the last CALL_DAYS days on which a vehicle called at the station (0..1). */
+  callShare(st: Station): number {
+    let m = st.callDays || 0, n = 0;
+    while (m) { m &= m - 1; n++; }
+    return n / CALL_DAYS;
+  }
+
+  /**
+   * Daily station ratings (game.ts): a rating moves towards a target from the days since a vehicle last called,
+   * the queue, the speed of the services and the share of passengers who gave up waiting (lostShare); a station
+   * no line serves stays at or below 50 %. Also the service history (callDays: the days a vehicle called, from lastCall).
+   */
+  updateRatings() {
+    const g = this.game;
+    for (const st of this.map.values()) {
+      const days = g.day - st.lastPickup;
+      // a vehicle called yesterday (building the station is no call: lastCall is only set by vehicles)
+      const called = st.lastCall >= 0 && g.day - st.lastCall === 1 ? 1 : 0;
+      st.callDays = (((st.callDays || 0) << 1) | called) & CALL_MASK;
+      let target = 0.33;
+      target += days <= 7 ? 0.27 : days <= 14 ? 0.18 : days <= 30 ? 0.08 : 0;
+      target += st.waitingTotal < 100 ? 0.15 : st.waitingTotal < 400 ? 0.08 : st.waitingTotal < 1200 ? 0 : -0.12;
+      target += Math.min(0.17, Math.max(0, (st.lastSpeed - 45) / 900));
+      target -= RATING_LOST * lostShare(st);
+      if (!g.lines.stationServed(st.id)) target = Math.min(target, 0.5);
+      st.rating += (target - st.rating) * 0.04;
+      st.rating = Math.max(0, Math.min(1, st.rating));
+    }
+  }
+
   /**
    * How busy a rail station's platforms are and whether it should grow (more platform tracks, through tracks
    * for trains passing without stopping, longer platforms for longer trains); null for stations without rail.
@@ -2619,6 +2879,12 @@ export class Stations {
   }
 }
 
+/** The service history of a saved station (older saves: from the day of its last pickup, if later than its building). */
+function callsOf(s: any): { lastCall: number; callDays: number } {
+  const lastCall = typeof s.lastCall === 'number' ? s.lastCall : s.lastPickup > s.built ? s.lastPickup : -1;
+  return { lastCall, callDays: typeof s.callDays === 'number' ? s.callDays : lastCall >= 0 ? OLD_SAVE_CALLS : 0 };
+}
+
 /** A station restored from a save: own copies of every array, defaults for fields older saves lack. */
 export function restoreStation(s: any): Station {
   const r = s.rail;
@@ -2637,6 +2903,9 @@ export function restoreStation(s: any): Station {
     stops: (s.stops ?? []).map((p: any) => ({ ...p })),
     links: [...(s.links ?? [])],
     roadAccess: s.roadAccess ?? true,
+    // older saves: no passengers lost yet; a station picked up from after it was built has had calls (a typical
+    // frequency, three in the last 30 days, to start from)
+    lostMonth: s.lostMonth ?? 0, lostLast: s.lostLast ?? 0, ...callsOf(s),
     onPlat: s.onPlat ? [...s.onPlat] : undefined,
     waiting: new Map(),
   };

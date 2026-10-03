@@ -12,6 +12,7 @@ import { depotSize } from './build-ops';
 import { distToRect } from './world';
 import { Heap } from './train';
 import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
+import { walkSitePop } from './catchment';
 
 
 // ============================================================================ geometry helpers
@@ -1135,9 +1136,9 @@ export function* stationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): G
   return best;
 }
 
-/** Population within a ground station's catchment if it were built at (x,z) along `angle` with platform length L. */
+/** Street-connected walking population at a prospective main-line site; signature retained for callers. */
 export function sitePop(g: Game, x: number, z: number, L: number, angle = 0): number {
-  return g.stations.popInShapes(railCatchShapes(x, z, angle, L));
+  return walkSitePop(g, x, z, 'mainline');
 }
 
 /**

@@ -1,5 +1,6 @@
 // Road vehicles: buses on lines and ambient town traffic, driving on lane curves of the road graph.
 import { Vehicle } from './vehicle';
+import { holdForSpacing, noteSpacingDeparture } from './patterns';
 import type { Game } from './game';
 import { Depot, tramUsable } from './build-ops';
 import { Curve3, curvePoint, makeCurve, NEdge } from './network';
@@ -481,6 +482,7 @@ export class RoadVehicle extends Vehicle {
     const dp: Depot | undefined = g.depots.get(this.depotId);
     if (!dp) { this.status = 'Depot missing'; return; }
     if (!this.line || this.line.stops.length < 1) { this.status = 'In depot (no line)'; return; }
+    if (g.vehicles.waitForSpacingRelease(this)) return;
     const stub = g.world.net.edges.get(dp.edge);
     if (!stub) return;
     if (g.vehicles.roadBusyNear(stub.id, stub.bez.x0, stub.bez.z0, this.length + 0.4)) { this.status = 'Waiting to leave depot'; return; }
@@ -488,9 +490,11 @@ export class RoadVehicle extends Vehicle {
     g.vehicles.noteOnRoad(this);
     this.speed = 0;
     if (!this.planRoute()) { this.seg = null; this.state = 'noroute'; }
+    else g.vehicles.noteSpacingRelease(this);
   }
 
   depart() {
+    this.queueSpacingDeparture();
     this.advanceStop();
     this.planRoute();
   }
@@ -501,6 +505,7 @@ export class RoadVehicle extends Vehicle {
     if (!st) { this.state = 'stopped'; return; }
     if (this.seg) this.seg.stopAt = undefined;
     this.state = 'loading';
+    this.resetSpacing();
     this.loadTimer = this.serveStation(st, 0.05);
     this.status = 'Loading at ' + st.name;
     void g;
@@ -529,7 +534,10 @@ export class RoadVehicle extends Vehicle {
         return;
       case 'loading':
         this.loadTimer -= dt;
-        if (this.loadTimer <= 0) this.depart();
+        if (this.loadTimer <= 0) {
+          if (holdForSpacing(this.game, this)) this.continueBoarding(dt);
+          else this.depart();
+        }
         return;
     }
     this.drive(dt);
@@ -604,6 +612,7 @@ export class RoadVehicle extends Vehicle {
     else this.speed = Math.max(vt, v - BRAKE * 1.6 * dt);
     if (this.speed < 0) this.speed = 0;
     this.pos += this.speed * dt;
+    if (this.speed > 0 && this.spacing.departureIndex >= 0) noteSpacingDeparture(g, this);
     // advance through segments
     while (this.seg && this.pos > this.seg.len) {
       if (!this.ahead.length) {

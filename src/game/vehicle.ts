@@ -4,7 +4,7 @@
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
-import { fareFor, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS } from './fares';
+import { fareFor, legacyFare, simNow, NO_TRANSFER_BONUS, WAIT_CAP_HEADWAYS, stationFareContext, type UrbanMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS } from './constants';
@@ -52,6 +52,8 @@ export abstract class Vehicle {
   delivered = 0;
   /** seconds this vehicle has held at its stop for a faster train to pass (patterns.ts holdForOvertake) */
   holdTime = 0;
+  /** Hold/boarding clocks and the stop awaiting an actual departure (persisted by save.ts). */
+  spacing = { until: -1, boardIn: 0, departureIndex: -1 };
   /**
    * Odometer for the operating costs (opcosts.ts), since the last monthly charge: seconds in service, distance
    * (units) and energy estimates (J at the wheels, dissipated braking) of the hops between stops; the sim time of
@@ -92,7 +94,8 @@ export abstract class Vehicle {
     const nl = this.line;
     if (nl && !nl.vehicles.includes(this.id)) nl.vehicles.push(this.id);
     this.stopIndex = 0;
-    g.lines.rebuild();
+    this.resetSpacing();
+    g.lines.rebuild(false);
     this.onLineChanged();
   }
 
@@ -112,6 +115,28 @@ export abstract class Vehicle {
     this.stopIndex = nextStopIndex(l, this.pattern, this.stopIndex % l.stops.length);
   }
 
+  resetSpacing() { this.spacing.until = -1; this.spacing.boardIn = 0; this.spacing.departureIndex = -1; }
+
+  restoreSpacing(d?: { until: number; boardIn: number; departureIndex?: number }) {
+    this.spacing = { until: Number.isFinite(d?.until) ? d!.until : -1, boardIn: Number.isFinite(d?.boardIn) ? d!.boardIn : 0,
+      departureIndex: Number.isInteger(d?.departureIndex) ? d!.departureIndex! : -1 };
+  }
+
+  /** Ending a dwell requests departure; the clock is committed only when the vehicle actually moves. */
+  queueSpacingDeparture() {
+    this.resetSpacing();
+    this.spacing.departureIndex = this.stopIndex;
+  }
+
+  /** Board during a hold without recording another arrival, unloading or charging fares again. */
+  continueBoarding(dt: number) {
+    this.spacing.boardIn -= dt;
+    if (this.spacing.boardIn > 0) return;
+    this.spacing.boardIn = 1;
+    const st = this.targetStation();
+    if (st) this.boardStation(st);
+  }
+
   /** Unload and load passengers at a station. Returns dwell time in seconds. */
   serveStation(st: Station, perPax: number): number {
     const g = this.game;
@@ -128,7 +153,10 @@ export abstract class Vehicle {
       const dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
       // the leg's time: waiting at the boarding stop and riding (older saves: the ride since boarding)
       const leg = now - (c.t0 ?? c.day * DAY_SECONDS);
-      let f = fareFor(dist, leg, c.count);
+      const track = from?.rail?.trackType;
+      const mode: UrbanMode | undefined = this.kind === 'road' ? (line?.kind === 'tram' ? 'tram' : 'bus')
+        : track === 'metro' || track === 'lightrail' ? track : undefined;
+      let f = fareFor(dist, leg, c.count, stationFareContext(g, from, st, mode));
       const tr = Math.min(c.count, Math.max(0, c.transfers ?? 0));
       if (c.dest === st.id && tr < c.count) f *= 1 + (NO_TRANSFER_BONUS * (c.count - tr)) / c.count;
       income += f;
@@ -153,6 +181,13 @@ export abstract class Vehicle {
       if (line) { line.incomeYear += income; }
       g.onIncome(income, this, st);
     }
+    moved += this.boardStation(st);
+    return 2.0 + moved * perPax;
+  }
+
+  /** Boarding is shared by the arrival dwell and headway holds. Returns passengers picked up. */
+  private boardStation(st: Station): number {
+    const g = this.game, now = simNow(g), line = this.line;
     // load: passengers for stops this vehicle's pattern serves (and for which it is a service worth taking)
     let picked = 0;
     if (line) {
@@ -185,11 +220,11 @@ export abstract class Vehicle {
       }
       line.passMonth += picked;
     }
-    moved += picked;
     st.pickupMonth += picked;
     st.lastPickup = g.day;
+    st.lastCall = g.day;
     st.lastSpeed = Math.max(st.lastSpeed * 0.8, this.maxSpeedKmh);
-    return 2.0 + moved * perPax;
+    return picked;
   }
 
   /** Re-target passengers whose drop-off stop is no longer served by this vehicle (line or pattern changed). */

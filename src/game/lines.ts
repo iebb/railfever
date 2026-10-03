@@ -32,6 +32,10 @@ export interface Line {
    * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
    */
   loop?: boolean;
+  /** Automatic headway regulation; absent in older saves means enabled. */
+  evenSpacing?: boolean;
+  /** Simulation-second departure clocks, separately for each service pattern (saved with the line). */
+  spacing?: Record<string, PatternSpacing>;
   /** rail route letter (the Y of station numbers XY01), unique among the owner's rail lines; see Lines.lineCode */
   code?: string;
   /**
@@ -49,6 +53,15 @@ export interface Line {
   patterns?: ServicePattern[];
 }
 
+export interface PatternSpacing {
+  /** Stop sequence and served flags these clocks belong to; route edits discard old clocks. */
+  route: string;
+  /** station + outgoing stop (direction) -> last departure */
+  departures: Record<string, { at: number; vehicle: number; recent?: number[] }>;
+  /** depot + entry stop/direction -> last successful release (different entry points are independent). */
+  released?: Record<string, number>;
+}
+
 /**
  * First leg of a passenger's journey: board `line`, alight at `alight`. When several lines (e.g. of different
  * companies sharing stations under track access) serve that leg about equally well, `lines` lists them all
@@ -60,11 +73,17 @@ export interface Hop { line: number; alight: number; cost: number; lines?: numbe
 export type PartnerPolicy = 'open' | 'invite' | 'closed';
 export const PARTNER_POLICIES: PartnerPolicy[] = ['open', 'invite', 'closed'];
 
-/** Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams. */
+/**
+ * Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams.
+ * Chosen for colour-blind players too (delta E under deuteranopia, protanopia and tritanopia): in the order pickColor
+ * hands them out (listed in that order) consecutive colours of one mode stay >= 20 apart; with modes mixed, consecutive
+ * colours of the first six lines stay >= 15 apart in every creation order. Later in long mixed sequences, and with the
+ * fallback hues used once these lists run out, closer pairs can still occur. Saved lines keep their colour.
+ */
 export const LINE_PALETTES: Record<Transport, string[]> = {
-  rail: ['#d7263d', '#1b6ec2', '#2a9d4b', '#7b2cbf', '#f08c00', '#00897b', '#c2185b', '#3949ab', '#8d6e00', '#5d4037', '#0097a7', '#6a1b9a'],
-  road: ['#ff6f61', '#42a5f5', '#8bc34a', '#ffb300', '#ab47bc', '#26a69a', '#ff8a65', '#78909c', '#ec407a', '#9ccc65', '#5c6bc0', '#ffd54f'],
-  tram: ['#e53935', '#00acc1', '#fb8c00', '#5e35b1', '#43a047', '#d81b60', '#1e88e5', '#795548', '#c0ca33', '#00897b'],
+  rail: ['#ee204b', '#0f5dbe', '#2da167', '#b8810d', '#7b04fa', '#d686bf', '#8261ff', '#8e3788', '#27670e', '#a14062', '#ad85f9', '#ff7380'],
+  road: ['#e75464', '#89a6eb', '#c5d794', '#f6cd1b', '#42e3fc', '#b67a19', '#05a886', '#a481ff', '#ffa1b8', '#94e56e', '#a9af16', '#b281c0'],
+  tram: ['#f5284b', '#24c3fe', '#b38415', '#8858ba', '#83c17e', '#ff8bb4', '#7f54ff', '#ba2b85', '#4b95f2', '#3f7627', '#d33d69', '#bd82c4'],
 };
 
 /** HSL -> '#rrggbb'. */
@@ -129,16 +148,25 @@ export class Lines {
   /** routing[s] = Map(dest -> first hop) */
   routing = new Map<number, Map<number, Hop>>();
   servedStations = new Set<number>();
+  /** Catchment weights depend on service presence, independently of routing/frequency versions. */
+  servedVersion = 0;
   /** bumped by every rebuild (routing tables changed) */
   version = 0;
-  /** station catchments need a recompute (done once per tick, see flushCatchment) */
+  /** Saved pending catchment/demand refresh (walking work is conditional; see flushCatchment). */
   catchmentDirty = false;
+  /** Keep the saved pending-refresh flag: demand regions can move while walking inputs stay fixed. */
+  markDemandSharesDirty() { this.catchmentDirty = true; }
+  /** Street invalidation saved before its pending network change was flushed. */
+  catchmentRoadsDirty = false;
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
   constructor(private game: Game) {
     // stations rebuilt, moved or merged (longer platforms, another level, a stop combined): timetables and journey
     // times read their positions, so the routing is worked out again (a saved game then loads to the same routing)
-    game.listeners?.network?.push(() => this.checkStations());
+    game.listeners?.network?.push(() => {
+      if (this.catchmentRoadsDirty) { this.catchmentRoadsDirty = false; this.catchmentDirty = true; }
+      this.checkStations();
+    });
   }
 
   /** where the stations were when the routing was last worked out */
@@ -169,7 +197,7 @@ export class Lines {
     const line: Line = {
       id, owner, name: '', color: this.pickColor(kind, owner), kind, num: this.freeNumber(kind, owner),
       stops: [], vehicles: [], passMonth: 0, passLast: 0, incomeYear: 0, incomeLast: 0, costYear: 0, costLast: 0,
-      autoName: true, autoColor: true,
+      autoName: true, autoColor: true, evenSpacing: true,
     };
     line.name = this.autoNameOf(line);
     this.autoText.set(id, line.name);
@@ -203,6 +231,14 @@ export class Lines {
     if (color === null) { l.autoColor = true; l.color = this.pickColor(l.kind, l.owner, l.id); return; }
     l.color = color;
     l.autoColor = false;
+  }
+
+  setEvenSpacing(id: number, enabled: boolean) {
+    const l = this.get(id);
+    if (!l) return;
+    l.evenSpacing = enabled;
+    delete l.spacing;
+    for (const vid of l.vehicles) this.game.vehicles.get(vid)?.resetSpacing();
   }
 
   // ---------------------------------------------------------------- automatic names and colours
@@ -521,8 +557,11 @@ export class Lines {
   }
 
   /** Recompute routing tables (Dijkstra over the line graph) and the automatic names. */
-  rebuild() {
+  rebuild(catchmentMayChange = true) {
     const stations = this.game.stations;
+    const previousServed = new Set(this.servedStations);
+    if (catchmentMayChange) stations.walkVersion++;
+    this.markDemandSharesDirty();
     this.routing.clear();
     this.servedStations.clear();
     this.version++;
@@ -597,16 +636,23 @@ export class Lines {
       this.routing.set(src, table);
     }
     for (const st of stations.all()) this.rerouteWaiting(st);
-    // served stations changed: catchments are shared out again, once for several rebuilds in a row
-    this.catchmentDirty = true;
+    const servedChanged = previousServed.size !== this.servedStations.size || [...previousServed].some((id) => !this.servedStations.has(id));
+    if (servedChanged) this.servedVersion++;
+    // flushCatchment uses the independent service/input versions to skip walking work for frequency changes.
   }
 
   /** Recompute the station catchments if routing changed since (called by the game every tick). */
   flushCatchment() {
-    if (!this.catchmentDirty) return;
+    const stations = this.game.stations;
+    if (!this.catchmentDirty) { stations.prepareCatchmentTick(); return; }
     this.catchmentDirty = false;
-    this.game.stations.recomputeCatchment();
+    // A frequency-only rebuild still refreshes demand's moving region assignment; walking work is skipped.
+    if (stations.catchmentInputsChanged() || stations.catchmentPopulationPending) {
+      stations.recomputeCatchment(true);
+      if (stations.catchmentWorkPending) { this.catchmentDirty = true; return; }
+    }
     this.game.demand.recomputeShares();
+    stations.prepareCatchmentTick();
   }
 
   /**
@@ -658,6 +704,11 @@ export class Lines {
     }
     if (typeof l.autoName !== 'boolean') l.autoName = false;
     if (typeof l.autoColor !== 'boolean') l.autoColor = false;
+    if (typeof l.evenSpacing !== 'boolean') l.evenSpacing = true;
+    if (d.spacing) l.spacing = Object.fromEntries(Object.entries(d.spacing as Record<string, PatternSpacing>).map(([pid, s]) =>
+      [pid, { ...s, departures: Object.fromEntries(Object.entries(s.departures).map(([key, dep]) =>
+        [key, { ...dep, ...(dep.recent ? { recent: [...dep.recent] } : {}) }])),
+        ...(s.released ? { released: { ...s.released } } : {}) }]));
     if (l.kind === 'rail') {
       if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
     } else {

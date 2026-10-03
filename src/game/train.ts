@@ -8,7 +8,7 @@ import { curveSpeed } from './construction';
 import { HEAVY_RAIL_TRACKS, aeroOf, auxKwOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
-import { PLATFORM_PASS_KMH, holdForOvertake } from './patterns';
+import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture } from './patterns';
 import { trackPassage } from './opcosts';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
@@ -729,6 +729,7 @@ export class Train extends Vehicle {
     const dp = g.depots.get(this.depotId);
     if (!dp) { this.status = 'Depot missing'; return; }
     if (!this.line || this.line.stops.length < 1) { this.status = 'In depot (no line)'; return; }
+    if (g.vehicles.waitForSpacingRelease(this)) return;
     for (const v of g.vehicles.trains()) {
       if (v !== this && v.segs.some((s) => s.depot === dp.id)) { this.status = 'Waiting to leave depot'; return; }
     }
@@ -743,10 +744,11 @@ export class Train extends Vehicle {
       this.pending = [];
       this.state = 'depot';
       this.status = 'Waiting for a free path out of the depot';
-    }
+    } else g.vehicles.noteSpacingRelease(this);
   }
 
   depart() {
+    this.queueSpacingDeparture();
     this.atStation = -1;
     this.advanceStop();
     if (this.planRoute(true)) {
@@ -762,6 +764,7 @@ export class Train extends Vehicle {
     const he = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
     if (st && he && he.station === st.id) {
       this.atStation = st.id;
+      this.resetSpacing();
       this.state = 'loading';
       this.loadTimer = this.serveStation(st, 0.03);
       this.status = 'Loading at ' + st.name;
@@ -790,8 +793,11 @@ export class Train extends Vehicle {
         return;
       case 'loading':
         this.loadTimer -= dt;
-        // (ops) a faster train about to pass: wait for it on this platform (bounded), then leave
-        if (this.loadTimer <= 0 && !holdForOvertake(this.game, this, dt)) this.depart();
+        // Timing-point regulation, then the existing bounded wait for a faster train to pass.
+        if (this.loadTimer <= 0) {
+          if (holdForSpacing(this.game, this)) this.continueBoarding(dt);
+          else if (!holdForOvertake(this.game, this, dt)) this.depart();
+        }
         return;
     }
     this.move(dt);
@@ -878,6 +884,7 @@ export class Train extends Vehicle {
     if (this.speed > 0.05) this.stuckTime = 0;
     else if (this.state === 'waiting') this.stuckTime += dt;
     this.headPos += mv;
+    if (mv > 0 && this.spacing.departureIndex >= 0) noteSpacingDeparture(g, this);
     while (this.headPos > this.segs[this.headSeg].len && this.headSeg < this.segs.length - 1) {
       this.headPos -= this.segs[this.headSeg].len;
       this.headSeg++;
