@@ -5,6 +5,9 @@ import { WATER_Y } from './constants';
 
 export const TERRAIN_CHUNK = 64;
 export const OBJ_CHUNK = 32;
+/** Save chunks are linear vertex ranges; renderer dirty sets can be cleared independently. */
+export const SAVE_VERTICES = 32768;
+export const SAVE_TREES = 4096;
 
 export interface Building {
   id: number;
@@ -40,12 +43,23 @@ export class World {
 
   dirtyTerrain = new Set<number>();
   dirtyObj = new Set<number>();
-  heightsVersion = 0;
+  private heightVersion = 0;
+  readonly saveHeightVersions: Uint32Array;
+  readonly saveTreeVersions: number[] = [];
+  /** Kept after removals too: legacy tree writers remove from treeGrid before calling markObj. */
+  private saveTreeRegions = new Map<number, Set<number>>();
+  get heightsVersion() { return this.heightVersion; }
+  // Bulk terrain writers (generation and town foundations) still use heightsVersion++.
+  set heightsVersion(v: number) {
+    this.heightVersion = v;
+    for (let i = 0; i < this.saveHeightVersions.length; i++) this.saveHeightVersions[i]++;
+  }
 
   constructor(size: number) {
     this.size = size;
     this.h = new Float32Array((size + 1) * (size + 1));
     this.lock = new Uint8Array((size + 1) * (size + 1));
+    this.saveHeightVersions = new Uint32Array(Math.ceil(this.h.length / SAVE_VERTICES));
     this.net = new Network(this);
   }
 
@@ -85,7 +99,8 @@ export class World {
     const i = this.vi(x, z);
     if (this.h[i] === v) return;
     this.h[i] = v;
-    this.heightsVersion++;
+    this.heightVersion++;
+    this.saveHeightVersions[Math.floor(i / SAVE_VERTICES)]++;
     const tc = Math.ceil(this.size / TERRAIN_CHUNK);
     for (let dz = -1; dz <= 0; dz++) for (let dx = -1; dx <= 0; dx++) {
       const cx = x + dx, cz = z + dz;
@@ -99,11 +114,27 @@ export class World {
     const oc = Math.ceil(this.size / OBJ_CHUNK);
     const cx = Math.max(0, Math.min(oc - 1, Math.floor(x / OBJ_CHUNK))), cz = Math.max(0, Math.min(oc - 1, Math.floor(z / OBJ_CHUNK)));
     this.dirtyObj.add(cz * oc + cx);
+    this.dirtySaveTrees(cz * oc + cx);
   }
   markObjArea(x0: number, z0: number, x1: number, z1: number) {
     const oc = Math.ceil(this.size / OBJ_CHUNK);
     for (let cz = Math.max(0, Math.floor(z0 / OBJ_CHUNK)); cz <= Math.min(oc - 1, Math.floor(z1 / OBJ_CHUNK)); cz++)
-      for (let cx = Math.max(0, Math.floor(x0 / OBJ_CHUNK)); cx <= Math.min(oc - 1, Math.floor(x1 / OBJ_CHUNK)); cx++) this.dirtyObj.add(cz * oc + cx);
+      for (let cx = Math.max(0, Math.floor(x0 / OBJ_CHUNK)); cx <= Math.min(oc - 1, Math.floor(x1 / OBJ_CHUNK)); cx++) {
+        this.dirtyObj.add(cz * oc + cx); this.dirtySaveTrees(cz * oc + cx);
+      }
+  }
+  private dirtySaveTrees(region: number) {
+    for (const chunk of this.saveTreeRegions.get(region) ?? []) this.saveTreeVersions[chunk]++;
+  }
+  /** Also used when loading trees with their saved ids, without allocating new ids. */
+  indexSavedTree(id: number, t: Tree) {
+    const oc = Math.ceil(this.size / OBJ_CHUNK), chunk = Math.floor(id / SAVE_TREES);
+    const cx = Math.max(0, Math.min(oc - 1, Math.floor(t.x / OBJ_CHUNK))), cz = Math.max(0, Math.min(oc - 1, Math.floor(t.z / OBJ_CHUNK)));
+    const key = cz * oc + cx;
+    let chunks = this.saveTreeRegions.get(key);
+    if (!chunks) this.saveTreeRegions.set(key, chunks = new Set());
+    chunks.add(chunk);
+    this.saveTreeVersions[chunk] ??= 0;
   }
 
   // ---------------------------------------------------------------- buildings
@@ -148,6 +179,8 @@ export class World {
     const id = this.freeTrees.length ? this.freeTrees.pop()! : this.trees.length;
     this.trees[id] = t;
     this.treeGrid.insert(id, t.x, t.z, t.x, t.z);
+    this.indexSavedTree(id, t);
+    this.saveTreeVersions[Math.floor(id / SAVE_TREES)]++;
     return id;
   }
   /** Remove trees within distance `r` of a point; returns count. */
@@ -157,6 +190,7 @@ export class World {
       const t = this.trees[id];
       if (!t || Math.hypot(t.x - x, t.z - z) > r) continue;
       this.trees[id] = null;
+      this.saveTreeVersions[Math.floor(id / SAVE_TREES)]++;
       this.freeTrees.push(id);
       this.treeGrid.remove(id);
       this.markObj(t.x, t.z);

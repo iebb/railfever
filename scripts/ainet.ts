@@ -1,3 +1,5 @@
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // AI rail networks after some years (v2.4, UPDATE 9f/9g/9i/9k/9l): stations per town (one station where lines meet),
 // platform tracks where traffic needs them (stations grown), connected networks per company, no unconnected
 // single tracks side by side, no dead-end stubs (none on a bridge), no mid-line crossovers, no subset / superset
@@ -309,6 +311,7 @@ function roadChecks() {
     check(!!roadRouteBetween(g, B.id, A.id, me) && l.vehicles.every((id) => g.vehicles.get(id)?.state !== 'noroute'), 'roads: the return direction and every bus still route');
     runNetworkTask(ai, 'roads');
     check(stat(ai, 'netRoads') === 1, 'roads: at most one shortcut per company per period');
+    startFleet(g, l.vehicles.map((id) => g.vehicles.get(id)!));
     const visited = new Set<number>(), shortcutIds = new Set(links.map((e) => e.id));
     let droveShortcut = false;
     for (let i = 0; i < 1200; i++) {
@@ -441,6 +444,7 @@ function joinChecks() {
     check(l.vehicles.length === (shared ? 4 : 2) && l.vehicles.filter((id) => g.vehicles.get(id)?.owner === me).every((id) => l.patterns?.find((p) => p.id === g.vehicles.get(id)?.pattern)?.stops.every(Boolean)), 'join: only our trains use the all-through pattern');
     if (shared) check(l.vehicles.filter((id) => g.vehicles.get(id)?.owner === other).every((id) => !l.patterns?.find((p) => p.id === g.vehicles.get(id)?.pattern)?.stops.every(Boolean)), 'join: the partner keeps its short-turn patterns');
     if (shared) check(l.operators?.includes(other) && g.lines.ownsStationOn(l, me) && g.lines.ownsStationOn(l, other), 'join: the partner remains an operator and both own a station');
+    startFleet(g, l.vehicles.map((id) => g.vehicles.get(id)!));
     const visited = new Map(l.vehicles.map((id) => [id, new Set<number>()]));
     const until = g.day + (shared ? 360 : 200);
     while (g.day < until) {
@@ -1062,4 +1066,27 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
   }
   console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
   process.exitCode = fails.length ? 1 : 0;
+}
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
 }

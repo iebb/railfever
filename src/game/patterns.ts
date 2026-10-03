@@ -21,6 +21,7 @@ import { outAndBack } from './lines';
 import { consistRule, findRailRoute, railNext, ruleAllows, lineCompatibility } from './train';
 import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
+import { simNow } from './fares';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -242,6 +243,7 @@ function patternsChanged(g: Game, l: Line) {
     const v = g.vehicles.get(id);
     if (!v) continue;
     if (v.pattern !== undefined && !known.has(v.pattern)) v.pattern = undefined;
+    v.resetSpacing();
     v.fixCargo();
   }
   g.lines.rebuild();
@@ -291,6 +293,7 @@ export function setVehiclePattern(g: Game, vehicleId: number, pid: number | unde
   if (!v || !l) return 'No such vehicle or it has no line';
   if (pid !== undefined && !linePatterns(l).some((p) => p.id === pid)) return 'No such pattern on ' + l.name;
   v.pattern = pid;
+  v.resetSpacing();
   v.fixCargo();
   g.lines.rebuild();
   v.onLineChanged();
@@ -330,7 +333,7 @@ function sdist(g: Game, a: number, b: number): number {
   return sa && sb ? Math.hypot(sa.x - sb.x, sa.z - sb.z) : 1e6;
 }
 
-interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[] }
+interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[]; route: string; timing: number[] }
 interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
 const tables = new WeakMap<Game, Map<number, LineTable>>();
 
@@ -371,7 +374,7 @@ export function lineTable(g: Game, l: Line): LineTable {
   const byPat = vehiclesByPattern(g, l);
   // cached until what the timetable depends on changes (not on every routing rebuild): the stops (where they are,
   // their track type), the vehicles of each pattern (their speed) and the patterns' stops
-  let key = '';
+  let key = isLoopLine(l) ? 'loop:' : 'back:';
   // (exact positions: a station rebuilt longer moves its centre by less than a unit, and the timetable reads the
   // exact distances; the town decides a road hop's speed cap)
   for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? s.x + ',' + s.z + (s.rail ? s.rail.trackType : '') + '/' + s.townId : '') + ';'; }
@@ -401,7 +404,9 @@ export function lineTable(g: Game, l: Line): LineTable {
       cycle += hop[i];
     }
     if (!(cycle > 0)) continue;
-    pats.push({ pid: p.id, flags, n: vs.length, cycle, freq: vs.length / cycle, hop });
+    const route = (isLoopLine(l) ? 'loop:' : 'back:') + l.stops.map((id, i) => flags[i] ? id : `(${id})`).join(',');
+    const timing = isLoopLine(l) ? [flags.indexOf(true)] : patternTermini(l, p.id);
+    pats.push({ pid: p.id, flags, n: vs.length, cycle, freq: vs.length / cycle, hop, route, timing });
   }
   // options per (from station, to station): (pattern, boarding index, ride time)
   const opts = new Map<string, { pid: number; a: number; ride: number; f: number }[]>();
@@ -466,6 +471,73 @@ export function patternHeadway(g: Game, l: Line, pid?: number): number {
   const id = p ? p.id : 0;
   const pt = t.pats.find((q) => q.pid === id) ?? t.pats[0];
   return pt ? pt.cycle / pt.n : 0;
+}
+
+// ------------------------------------------------------------------------------ even spacing
+/** Minimum departure gap and maximum additional dwell, as fractions of the pattern's scheduled headway. */
+export const SPACING_GAP = 0.75;
+export const SPACING_HOLD = 0.6;
+
+/** Saved clocks of the vehicle's current pattern. Route edits invalidate clocks of the old stop sequence. */
+export function spacingSchedule(g: Game, v: Vehicle) {
+  const l = v.line;
+  if (!l || l.evenSpacing === false) return null;
+  const p = patternOf(l, v.pattern), pid = p?.id ?? 0;
+  const pt = lineTable(g, l).pats.find((q) => q.pid === pid);
+  if (!pt) return null;
+  const headway = pt.cycle / pt.n; // patternHeadway, using the same cached table / resolved pattern
+  if (!(headway > 0)) return null;
+  const clocks = l.spacing ??= {};
+  let clock = clocks[pid];
+  if (!clock || clock.route !== pt.route) clock = clocks[pid] = { route: pt.route, departures: {} };
+  return { clock, headway, vehicles: pt.n, timing: pt.timing };
+}
+
+/** Termini of an out-and-back pattern, or its first served stop on a loop. */
+export function isTimingPoint(l: Line, pid: number | undefined, index: number): boolean {
+  return isLoopLine(l) ? index === patternStops(l, pid)[0] : patternTermini(l, pid).includes(index);
+}
+
+/** Same station and outgoing direction, including duplicate indices at short-turn termini. */
+function departureKey(l: Line, v: Vehicle, index = v.stopIndex): string {
+  return l.stops[index] + ':' + l.stops[nextStopIndex(l, v.pattern, index)];
+}
+
+/** Finished loading: wait briefly for a minimum gap, unless late or another vehicle needs this space. */
+export function holdForSpacing(g: Game, v: Vehicle): boolean {
+  const l = v.line;
+  if (!l) return false;
+  const schedule = spacingSchedule(g, v);
+  if (!schedule || schedule.vehicles < 2 || !schedule.timing.includes(v.stopIndex) || g.vehicles.spacingBlocked(v)) return false;
+  const now = simNow(g), prev = schedule.clock.departures[departureKey(l, v)];
+  if (!prev || prev.vehicle === v.id) return false;
+  // Street detours and junctions can make a road timetable optimistic. Balance a rolling cycle of road
+  // departures as well as enforcing the scheduled minimum; never increase the cap. Rail paths already
+  // regulate admission: stretching their cycle to include signal waits would disturb the passing-loop meets.
+  const recent = prev.recent ?? [];
+  const observed = l.kind !== 'rail' && recent.length > schedule.vehicles ? (prev.at - recent[recent.length - 1 - schedule.vehicles]) / schedule.vehicles : 0;
+  const gap = Math.max(SPACING_GAP * schedule.headway, observed);
+  if (now - prev.at >= gap) return false;
+  // The first attempted hold fixes the deadline: later departures cannot restart/extend this hold.
+  if (v.spacing.until < 0) v.spacing.until = now + SPACING_HOLD * schedule.headway;
+  if (now >= v.spacing.until) return false;
+  v.status = 'Holding for even spacing';
+  return true;
+}
+
+/** Commit a timing-point departure when it starts moving; a red signal / road queue consumes no gap. */
+export function noteSpacingDeparture(g: Game, v: Vehicle) {
+  const l = v.line;
+  const index = v.spacing.departureIndex >= 0 ? v.spacing.departureIndex : v.stopIndex;
+  if (l) {
+    const schedule = spacingSchedule(g, v);
+    if (schedule && schedule.timing.includes(index)) {
+      const key = departureKey(l, v, index), at = simNow(g);
+      const recent = [...(schedule.clock.departures[key]?.recent ?? []), at].slice(-schedule.vehicles - 1);
+      schedule.clock.departures[key] = { at, vehicle: v.id, recent };
+    }
+  }
+  v.resetSpacing();
 }
 
 /**
@@ -838,6 +910,7 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
       v.stopIndex = joinedStopIndex(keep, old, v.stopIndex, dir);
       v.lineId = keep.id;
       v.pattern = pmap.get(pid);
+      v.resetSpacing();
     }
   });
   keep.patterns = normalize(keep, list);
@@ -884,6 +957,7 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
     if (!v) continue;
     const target = b.stops[v.stopIndex % Math.max(1, b.stops.length)];
     v.lineId = a.id;
+    v.resetSpacing();
     if (!a.vehicles.includes(v.id)) a.vehicles.push(v.id);
     v.pattern = map.get(v.pattern !== undefined && map.has(v.pattern) ? v.pattern : firstB);
     const idx = a.stops.indexOf(target);

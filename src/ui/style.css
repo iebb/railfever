@@ -111,7 +111,7 @@
 .hbtn:active { transform: scale(0.95); }
 .hbtn.on { color: var(--accent); border-color: rgba(255, 176, 32, 0.45); }
 .badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: var(--accent-ink); font: 700 var(--fs-11)/18px var(--font-display); text-align: center; box-shadow: 0 0 0 2px rgba(16, 22, 31, 0.9); }
-.fps { font: 600 var(--fs-11)/1 var(--font-display); color: var(--text-3); letter-spacing: var(--tr-caps-s); margin-right: 2px; min-width: 44px; text-align: right; }
+.fps { font: 600 var(--fs-11)/1 var(--font-display); color: var(--text-3); letter-spacing: var(--tr-caps-s); margin-right: 2px; min-width: 44px; text-align: right; pointer-events: none; }
 /* volume: click mutes, hovering reveals the master slider */
 .vol { position: relative; display: flex; align-items: center; height: 40px; border-radius: 12px; padding: 0 0 0 0; transition: border-color var(--t-fast); }
 .vol .hbtn { border: 0; background: none; box-shadow: none; }
@@ -151,6 +151,7 @@
 .tc-title { font: 700 15px/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc-head .ibtn.sm { width: 30px; height: 30px; }
 .tc-head .ibtn.on { color: var(--accent); }
+.tc-head .tc-details-toggle, .tc-compact-note { display: none; }
 .tc-desc { color: var(--text-2); font-size: var(--fs-13); margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc-help { margin-top: var(--sp-1); }
 .tc-help p { margin: 0; color: var(--text-2); font-size: var(--fs-13); font-weight: 400; line-height: var(--lh); }
@@ -451,6 +452,11 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .toast.news.link { cursor: pointer; }
 .toast.news.link:hover { border-color: var(--hairline-2); background: rgba(22, 30, 42, 0.95); }
 .toast.out { opacity: 0; transform: translateY(-6px); }
+.finance-toast { flex-wrap: wrap; }
+.finance-toast > span { flex: 1; min-width: 160px; }
+.finance-actions { gap: 6px; }
+.finance-toast > .finance-actions { margin-left: auto; }
+.tooltip .finance-actions { pointer-events: auto; margin-top: 8px; }
 .news-date { font: 600 var(--fs-11)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; color: var(--text-3); white-space: nowrap; }
 .drawer { position: absolute; top: 64px; right: 10px; bottom: 92px; width: min(390px, calc(100vw - 20px)); z-index: 70; display: flex; flex-direction: column; border-radius: var(--r-l); animation: rise var(--t) var(--ease); }
 .drawer-head { display: flex; align-items: center; gap: var(--sp-2); padding: 10px 8px 10px 14px; border-bottom: 1px solid var(--hairline); font: 700 17px/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; }
@@ -578,6 +584,12 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .savechip.show { opacity: 1; transform: none; }
 .savechip.saved .ic { color: var(--pos); }
 .savechip.error { color: var(--warn); }
+.savechip.memory { color: var(--warn); }
+.storage-banner { position: absolute; z-index: 95000; top: 76px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid var(--warn); border-radius: var(--r-m); background: var(--surface-solid); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; font-size: var(--fs-13); }
+.storage-banner > .ic { color: var(--warn); flex-shrink: 0; }
+.storage-banner > span { flex: 1; }
+.storage-banner button { flex-shrink: 0; }
+@media (max-width: 640px) { .storage-banner { top: 100px; flex-wrap: wrap; width: calc(100vw - 24px); } .storage-banner > span { min-width: 190px; } }
 .ng-card { flex: 0 0 auto; width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
 /* menu and new-game card always side by side; they stack only on narrow screens */
 @media (max-width: 1040px) { .title-main { flex: 0 1 420px; } }
@@ -612,12 +624,39 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (max-width: 1100px) {
   .minimap { bottom: 96px; }
   .cat { width: 64px; }
+  .fps, .vol-slider { display: none; }
+  #app.debug-ui .fps { display: block; position: absolute; right: 0; top: 44px; }
+}
+@media (max-width: 1279px) {
+  /* A definite parent width makes the dock/tray's overflow scroll instead of clipping categories. */
+  .dockwrap { width: calc(100vw - 20px); }
+  .dock, .tray { min-width: 0; box-sizing: border-box; overflow-x: auto; touch-action: pan-x; overscroll-behavior-x: contain; }
+  .vol-slider { display: none; }
+  .toolcard { width: 288px; box-sizing: border-box; max-height: min(42vh, calc(100dvh - var(--dock-clearance, 90px) - 116px)); overflow-y: auto; }
+  .toolcard .tc-details-toggle { display: inline-flex; }
+  .toolcard:not(.expanded) .tc-secondary { display: none; }
+  .toolcard .tc-compact-note { display: block; margin-top: 4px; color: var(--text-2); font-size: var(--fs-12); overflow-wrap: anywhere; }
+  .toolcard .tc-opts { gap: 6px 8px; }
+  .toolcard .opt { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+  .toolcard .seg { max-width: 100%; flex-wrap: wrap; }
+  .toolcard .segb { padding: 0 7px; }
+  .leftcol { bottom: var(--dock-clearance, 90px); }
+  /* Bottom anchoring keeps even dragged/resized windows clear of the entire dock and tray. */
+  .win { top: auto !important; bottom: var(--dock-clearance, 90px); max-height: calc(100dvh - var(--dock-clearance, 90px) - 78px); }
+  .drawer { bottom: var(--dock-clearance, 90px); }
+}
+@media (min-width: 721px) and (max-width: 1279px) and (max-height: 768px) {
+  .has-tool-card .leftcol { width: 250px; }
+  .has-tool-card .checklist { width: 250px; }
 }
 @media (max-width: 720px) {
   .hud { top: 6px; }
   .hud-tl { left: 6px; }
   .hud-tr { right: 6px; gap: var(--sp-1); }
-  .hud-tc { top: 64px; }
+  .hud-tc { top: 60px; left: 6px; right: 6px; transform: none; align-items: center; }
+  .hud-tl { max-width: calc(100vw - 186px); }
+  .hud-tl .plate { min-width: 0; max-width: 100%; box-sizing: border-box; }
+  .hud-tr .vol, .hud-tr .hbtn[data-key="C"], .hud-tr .hbtn[data-key="K"] { display: none; }
   .plate { height: 46px; padding: 0 10px 0 6px; }
   .plate-name { max-width: 120px; }
   .plate-money { font-size: 22px; }
@@ -625,23 +664,30 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
   .fps { display: none; }
   .vol-slider { display: none; }
   .hbtn { width: 38px; height: 38px; }
-  .clock { height: 38px; }
+  .clock { height: 38px; width: 100%; max-width: 390px; box-sizing: border-box; justify-content: space-between; }
   .clock-date { min-width: 90px; font-size: 15px; }
   .spd { min-width: 32px; height: 28px; padding: 0 6px; }
   .toasts { top: 108px; }
-  .dockwrap { bottom: 6px; }
+  .dockwrap { bottom: 6px; width: calc(100vw - 12px); max-width: calc(100vw - 12px); }
   .cat { width: 60px; height: 54px; }
   .tc-desc { display: none; }
   .toolcard { left: 6px; right: 6px; width: auto; max-width: none; }
-  .minimap { left: 6px; top: 110px; bottom: auto; width: 150px; }
-  .mm-view { width: 134px; height: 134px; }
-  .checklist { left: auto; right: 6px; top: 110px; width: 250px; }
-  .mapcard { left: 6px; right: 6px; width: auto; bottom: 80px; max-height: 38vh; }
+  .leftcol { position: absolute; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; left: 6px; right: 6px; top: 112px; bottom: var(--dock-clearance, 80px); width: auto; z-index: 45; pointer-events: none; }
+  .leftcol.below-debug { top: 252px; }
+  .leftcol > * { pointer-events: auto; }
+  .leftcol > .checklist, .leftcol > .minimap, .leftcol > .mapcard { position: relative; left: auto; right: auto; top: auto; bottom: auto; flex: none; max-width: 100%; }
+  .leftcol > .checklist { width: min(286px, 100%); align-self: flex-end; flex: 0 1 auto; min-height: 46px; display: flex; flex-direction: column; }
+  .leftcol > .checklist > * { flex: none; }
+  .leftcol > .checklist > .cl-steps { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  .leftcol > .minimap { width: 180px; margin-top: auto; }
+  .mm-view { width: 164px; height: 164px; }
+  .mm-head { flex-wrap: wrap; height: auto; min-height: 36px; padding: 3px 4px 3px 8px; }
+  .leftcol > .mapcard { width: 100%; max-height: 30vh; flex: 0 1 auto; min-height: 46px; }
   .hovercard { display: none; }
-  .win { position: fixed; left: 0 !important; right: 0; top: auto !important; bottom: 0; width: auto !important; max-width: none; max-height: 72vh; border-radius: 18px 18px 0 0; animation: sheetIn var(--t) var(--ease); }
+  .win { position: fixed; left: 6px !important; right: 6px; top: auto !important; bottom: var(--dock-clearance, 80px); width: auto !important; max-width: none; max-height: min(62vh, calc(100dvh - var(--dock-clearance, 80px) - 112px)); border-radius: 18px; animation: sheetIn var(--t) var(--ease); }
   .win.closing { animation: sheetOut var(--t-fast) var(--ease-in) forwards; }
   .win-head { cursor: default; }
-  .drawer { top: 108px; bottom: 80px; right: 6px; }
+  .drawer { top: 108px; bottom: var(--dock-clearance, 80px); right: 6px; }
   .title { padding: var(--sp-4); }
   .title-row { gap: var(--sp-4); }
   .field { grid-template-columns: 96px 1fr; }
@@ -667,8 +713,9 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (max-width: 1360px) {
   .hud-tr .hbtn[data-key="M"], .hud-tr .hbtn[data-key="P"], .hud-tr .hbtn[data-key="O"] { display: none; }
 }
-@media (max-width: 880px) {
-  .hud-tc { top: 64px; }
+@media (max-width: 1100px) {
+  .hud-tc { top: 60px; }
+  .leftcol { top: 112px; }
 }
 
 /* ---------------------------------------------------------------- line identity (JR style): symbols, numbering, filters */

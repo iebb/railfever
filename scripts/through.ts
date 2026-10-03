@@ -1,3 +1,5 @@
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Urban rail between companies (v2.4): a Fukuoka-like through service (company A's metro under a town meets
 // company B's electrified suburban line at a junction station; both operators' units run through), track
 // compatibility (incompatible trains are refused / get a clear status), JR-style line codes and station numbers,
@@ -173,6 +175,7 @@ function counter(trains: Train[]) {
   const b3 = d3 >= 0 ? g.vehicles.buyTrain(d3, [M('diesel_b'), M('coach_ic')], line.id) : 'no depot';
   console.log(`  company 3 (no station): join "${j3}", train "${typeof b3 === 'string' ? b3 : 'bought'}"`);
   check(j3 !== null && typeof b3 === 'string' && !g.lines.canOperate(line, 3), 'a company without a station of the line cannot run trains on it');
+  startFleet(g, trains);
   const c = counter(trains);
   runDays(g, 360, () => c.tick());
   const v = trains.map((t) => c.visits.get(t.id) ?? 0);
@@ -225,3 +228,26 @@ function counter(trains: Train[]) {
 
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
+}
