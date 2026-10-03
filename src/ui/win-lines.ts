@@ -129,6 +129,9 @@ function intercitySuggestions(ui: UI): HTMLElement | null {
 }
 
 function newLine(ui: UI, kind: LineKind) {
+  // Release an abandoned edit's number before allocating the next line.
+  if (ui.tools.tool === 'line-edit') ui.tools.endLineEdit();
+  // Provisional until stops are added: endLineEdit removes an empty line and releases its number.
   const l = ui.game.lines.create(kind, PLAYER);
   openLine(ui, l.id);
   editLine(ui, l.id);

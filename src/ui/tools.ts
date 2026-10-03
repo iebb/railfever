@@ -20,7 +20,7 @@ import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
 import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
-import { pointWalkingCatchment, stopWalkingCatchment } from '../game/catchment';
+import { pointWalkingCatchment, stopWalkingCatchment, walkLimit } from '../game/catchment';
 import { STATION_STYLES } from '../game/station-styles';
 import { servesKind } from './win-lines';
 import { accessState, policyText, requestAccessUI } from './win-access';
@@ -50,13 +50,13 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   inspect: { name: 'Inspect', hint: 'Click stations, vehicles, depots, towns, buildings or tracks for details.' },
   rail: { name: 'Build track', hint: 'Click to start, click again to build — construction continues from the new end with a smooth curve. Right-click, Esc or a long press ends the chain. Snap onto track ends to extend, onto track to branch. Hold Shift over a track to copy it as a parallel track.' },
   road: { name: 'Build road', hint: 'Click to start, click again to build — continues from the new end. Snap onto roads to create junctions. Connect to town streets so buses can reach them.' },
-  station: { name: 'Train station', hint: 'Click to place. R / Shift+R or Ctrl+wheel rotate by 15°. Lines up with a nearby track end; connect its tracks with the track tool.' },
+  station: { name: 'Train station', hint: 'Click to place. R / Shift+R or Alt+wheel rotate by 15°. Lines up with a nearby track end; connect its tracks with the track tool.' },
   busstop: { name: 'Bus stop', hint: 'Click on a road. Next to one of your train stations it joins it (passengers transfer).' },
   tram: { name: 'Tram tracks', hint: 'Add to roads: click a road, or press and drag along streets to lay tracks with overhead wire. New road builds a road with tracks; Remove takes your tracks up.' },
   tramstop: { name: 'Tram stop', hint: 'Click on a road with tram tracks. Next to one of your stations it joins it (passengers transfer).' },
-  'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R rotates when away from roads.' },
-  'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R rotates.' },
-  'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R rotates when away from roads.' },
+  'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
+  'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R / Shift+R or Alt+wheel rotates.' },
+  'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
   signal: { name: 'Signals', hint: 'Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
   double: { name: 'Double track', hint: 'Click one of your single tracks, or drag along it, to lay a second track beside it with switches at both ends (into a free platform where a station is). Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
   entrance: { name: 'Add entrance', hint: 'Click beside a road near the station to add a street entrance (stair tower or pavilion). Every entrance brings its own catchment area.' },
@@ -64,7 +64,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
   metro: { name: 'Urban rail', hint: 'Metro and light-rail track: underground (subway), elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. Metro units and light-rail vehicles run on it; commuter EMUs run on metro and electrified track, so lines can through-run.' },
-  'metro-station': { name: 'Urban station', hint: 'Metro or light-rail station: underground by default, with street entrances; stations may be close together (~1 km). R rotates; it lines up with nearby track ends. Catchment: metro 300 m, light rail 250 m.' },
+  'metro-station': { name: 'Urban station', hint: `Metro or light-rail station: underground by default, with street entrances; stations may be close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. Walking catchment along streets: metro ${fmtLen(walkLimit('metro'))}, light rail ${fmtLen(walkLimit('lightrail'))}, before station-building bonuses.` },
   electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: standard track becomes electrified track for electric locomotives and EMUs (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
   connect: { name: 'Connect tracks', hint: 'Click a point on one track, then a point on another: a connecting curve with turnouts into both tracks is planned within the curve and grade limits, and signalled where the track is. Click to build; Esc or right-click picks the first track again.' },
   relevel: { name: 'Re-level', hint: 'Drag along a stretch of your track to lift it onto a viaduct or sink it into a tunnel in place, with ramps at both ends; stations on it go with it, lines and signals are kept.' },
@@ -113,10 +113,10 @@ export class Tools {
   levelHeight = LINE_LEVEL.height.def;
   levelDepth = LINE_LEVEL.depth.def;
   roadType: 'street' | 'road' = 'road';
-  tracks = 2;
+  tracks = 1;
   /** station tools: platform track type ('auto': as the track it lines up with) and building style ('auto': by era and town) */
   stationType = 'auto';
-  stationStyle = 'auto';
+  stationStyle = 'shelter';
   /** connect tool: the point picked on the first track */
   conn: { edge: number; s: number; x: number; y: number; z: number } | null = null;
   private connPlan: { key: string; plan: ConnectionPlan } | null = null;
@@ -127,9 +127,9 @@ export class Tools {
   private elec: { key: string; ids: number[]; cost: number; changed: number; length: number; error: string | null } | null = null;
   /** remembered settings of the other tool of a pair (rail / urban rail, station / urban station) */
   private profiles = new Map<ToolId, Record<string, unknown>>([
-    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 2 }],
+    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 1 }],
     ['metro', { railType: 'metro', railLevel: 'underground', tracks: 2 }],
-    ['station', { stationType: 'auto', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.def }],
+    ['station', { stationType: 'auto', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 1, stationThrough: 0, throughMode: 'middle', stationOnLine: false, stationStyle: 'shelter', stationDepth: STATION_DEPTH.def }],
     ['metro-station', { stationType: 'metro', stationLevel: 'underground', stationLen: PLATFORM_LENGTH.metro, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.metro }],
   ]);
   /** double track: one running direction per track with crossovers before stations (right- or left-hand) */
@@ -138,7 +138,7 @@ export class Tools {
   heightOffset = 0;
   crossing: CrossingPref = 'auto';
   stationLen = DEFAULT_PLATFORM_LENGTH;
-  stationTracks = 2;
+  stationTracks = 1;
   /** station level: on the ground, on a viaduct (height above the highest ground) or underground (depth) */
   stationLevel: StationLevel = 'ground';
   stationHeight = STATION_HEIGHT.def;
@@ -184,6 +184,8 @@ export class Tools {
   private ground: THREE.Vector3 | null = null;
   private down: { x: number; y: number; button: number; ground: THREE.Vector3 | null; moved: boolean; hadStart: boolean; id: number; touch: boolean; t: number } | null = null;
   private touches = new Set<number>();
+  /** A touch placement is committed only after a second tap on this preview. */
+  private touchPreview: { point: THREE.Vector3; client: { x: number; y: number }; signature: string } | null = null;
   private shift = false;
   private parallel: { edge: number; side: number; prop: Proposal } | null = null;
   private moveDirty = false;
@@ -220,9 +222,14 @@ export class Tools {
     canvas.addEventListener('pointerdown', this.onDown);
     window.addEventListener('pointermove', this.onMove);
     window.addEventListener('pointerup', this.onUp);
-    canvas.addEventListener('pointerleave', () => { if (!this.down) { this.overMap = false; this.hideTip(); } });
-    window.addEventListener('pointercancel', (e) => { this.touches.delete(e.pointerId); if (this.down?.id === e.pointerId) this.down = null; });
-    // Ctrl+wheel rotates stations and depots (captured before the camera zooms)
+    canvas.addEventListener('pointerleave', (e) => {
+      if (!this.down && !this.touchPreview && !(e.relatedTarget instanceof Node && this.tooltip.contains(e.relatedTarget))) { this.overMap = false; this.hideTip(); }
+    });
+    window.addEventListener('pointercancel', (e) => {
+      this.touches.delete(e.pointerId);
+      if (this.down?.id === e.pointerId) { this.down = null; this.touchPreview = null; this.overMap = false; this.moveDirty = true; }
+    });
+    // Alt+wheel rotates stations and depots; Ctrl+wheel / pinch always reaches camera zoom.
     window.addEventListener('wheel', this.onWheel, { capture: true, passive: false });
     const shift = (e: KeyboardEvent) => { if (e.key === 'Shift' && this.shift !== (e.type === 'keydown')) { this.shift = e.type === 'keydown'; if (this.railBuild) this.moveDirty = true; } };
     window.addEventListener('keydown', shift);
@@ -268,7 +275,12 @@ export class Tools {
   endLineEdit(canonicalize = true) {
     const id = this.lineEditId;
     this.lineEditId = null;
-    if (canonicalize && id != null) this.ui.onLineEdited(id);
+    if (!canonicalize || id == null) return;
+    const line = this.game.lines.map.get(id);
+    if (line?.owner === PLAYER && !line.stops.length && !line.vehicles.length) {
+      this.game.lines.delete(id); // freeNumber reuses this line's number on the next creation
+      this.ui.wm.close('line-' + id);
+    } else this.ui.onLineEdited(id);
   }
 
   setTool(t: ToolId) {
@@ -290,6 +302,7 @@ export class Tools {
     this.planKey = '';
     this.planDirty = false;
     this.down = null;
+    this.touchPreview = null;
     this.dragRect = null;
     this.stationPlan = null;
     this.depotPlan = null;
@@ -314,10 +327,17 @@ export class Tools {
   }
 
   /** Re-evaluate the hover state (e.g. after options changed). */
-  refreshHover() { this.planKey = ''; this.moveDirty = true; if (this.start) this.planDirty = true; }
+  refreshHover() { this.touchPreview = null; this.planKey = ''; this.moveDirty = true; if (this.start) this.planDirty = true; }
 
   rotate(dir = 1) {
-    if (this.stationTool) { this.stationAngle = norm(this.stationAngle + dir * 15 * DEG); if (this.autoAlign) { this.autoAlign = false; this.onToolChange(); } }
+    if (this.stationTool) {
+      this.stationAngle = norm(this.stationAngle + dir * 15 * DEG);
+      if (this.autoAlign) {
+        this.autoAlign = false;
+        this.onToolChange();
+        this.ui.toast('Align to track off: manual rotation', 'info');
+      }
+    }
     else if (this.tool === 'depot-rail' || this.tool === 'depot-road' || this.tool === 'depot-tram') this.depotAngle = norm(this.depotAngle + dir * 15 * DEG);
     else return;
     this.refreshHover();
@@ -334,6 +354,7 @@ export class Tools {
 
   /** End the current chain / drag; returns false if there was nothing to cancel (caller may close windows). */
   cancel(): boolean {
+    if (this.touchPreview) { this.touchPreview = null; this.clearVisuals(); this.hideTip(); this.moveDirty = true; return true; }
     if (this.start || this.dragRect || this.down) { this.endChain(); this.sigDrag = null; this.overlay.setSignalGhosts(null); return true; }
     if (this.conn) { this.clearConn(); return true; }
     if (this.tool !== 'inspect') { this.setTool('inspect'); return true; }
@@ -359,6 +380,7 @@ export class Tools {
     this.planKey = '';
     this.planDirty = false;
     this.down = null;
+    this.touchPreview = null;
     this.dragRect = null;
     this.overlay.setProposal(null);
     this.overlay.setDemolish(null);
@@ -379,6 +401,9 @@ export class Tools {
         // a second finger: camera gesture, abandon what the first one started
         if (this.down && !this.down.hadStart && this.building) this.endChain();
         this.down = null;
+        this.touchPreview = null;
+        this.overMap = false;
+        this.hideTip();
         return;
       }
     }
@@ -386,11 +411,13 @@ export class Tools {
     this.overMap = true;
     this.shift = e.shiftKey;
     this.ground = this.pick();
+    this.moveDirty = true;
+    if (!touch) this.touchPreview = null;
     this.down = { x: e.clientX, y: e.clientY, button: e.button, ground: this.ground?.clone() ?? null, moved: false, hadStart: !!this.start, id: e.pointerId, touch, t: performance.now() };
     if (e.button !== 0) return;
     const p = this.ground;
     if (!p) return;
-    if (this.railBuild && !this.start && e.shiftKey) {
+    if (this.railBuild && !this.start && e.shiftKey && !touch) {
       this.down = null;
       this.buildParallel();
       return;
@@ -412,6 +439,7 @@ export class Tools {
   };
 
   private onMove = (e: PointerEvent) => {
+    if ((e.target as HTMLElement)?.closest?.('.tooltip')) return;
     if (e.pointerType === 'touch' && this.touches.size > 1) return;
     if (this.down && e.pointerId !== this.down.id) return;
     this.client = { x: e.clientX, y: e.clientY };
@@ -444,6 +472,43 @@ export class Tools {
     }
     const onMap = (e.target as HTMLElement) === this.canvas || !!(e.target as HTMLElement)?.closest?.('.labels');
     this.ground = this.pick();
+    if (d.touch && CONSTRUCTION.includes(this.tool)) {
+      if (!onMap || !this.ground) return;
+      this.overMap = true;
+      // The first track / connection pick only sets its start; no construction is charged.
+      if (this.building && !d.hadStart && !d.moved) { this.hover(); this.planNow(); return; }
+      if (this.tool === 'connect' && !this.conn) { this.click(e); this.moveDirty = true; return; }
+      const preview = this.touchPreview;
+      const same = preview && !d.moved && preview.signature === this.touchSignature() &&
+        Math.hypot(e.clientX - preview.client.x, e.clientY - preview.client.y) <= 16 &&
+        Math.hypot(this.ground.x - preview.point.x, this.ground.z - preview.point.z) <= 1.2;
+      if (same) {
+        // Confirm the exact world position that was quoted, allowing a little finger imprecision.
+        this.ground = preview.point.clone(); this.client = { ...preview.client };
+        d.ground = preview.point.clone();
+        this.touchPreview = null;
+        this.connAt = -Infinity;
+        this.hover();
+        if (this.building) { this.hoverSnap = this.snapAt(this.kind); this.planKey = ''; this.planNow(); }
+        if (this.tool === 'terraform') {
+          const r = terraformBrush(this.game, this.ground.x, this.ground.z, this.brushRadius, this.terraMode, this.ground.y, PLAYER);
+          if (r.error) this.ui.toast(r.error, 'bad');
+          else if (r.cost) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('build', { x: this.ground.x, z: this.ground.z, pitch: 0.8 }); }
+          this.moveDirty = true;
+          return;
+        }
+      } else {
+        // Touch drags also stop at a preview instead of spending on release.
+        this.dragRect = null;
+        if (this.terr.uHiOn) this.terr.uHiOn.value = 0;
+        this.touchPreview = { point: this.ground.clone(), client: { ...this.client }, signature: this.touchSignature() };
+        this.connAt = -Infinity;
+        this.hover();
+        if (this.building) { this.hoverSnap = this.snapAt(this.kind); this.planKey = ''; this.planNow(); }
+        this.positionTip();
+        return;
+      }
+    }
     if (this.building) {
       if (d.moved || d.hadStart) this.commitChain();
       return;
@@ -488,12 +553,20 @@ export class Tools {
     this.moveDirty = true;
   };
 
+  private touchSignature(): string {
+    return JSON.stringify([this.tool, this.buildOptions(), snapKey(this.start), this.conn, this.game.networkVersion, this.game.world.heightsVersion,
+      this.stationType, this.stationStyle, this.stationLen, this.stationTracks, this.stationLevel, this.stationHeight, this.stationDepth,
+      this.stationThrough, this.throughMode, this.stationOnLine, this.stationAngle, this.autoAlign, this.relocating, this.relocatingDepot,
+      this.depotAngle, this.signalMode, this.signalKind, this.signalClass, this.signalPass, this.signalSpacing,
+      this.doubleSide, this.directional, this.rightHand, this.relevelTo, this.tramMode, this.entranceStation, this.terraMode, this.brushRadius]);
+  }
+
   private onWheel = (e: WheelEvent) => {
-    if (!e.ctrlKey || e.target !== this.canvas) return;
+    if (e.ctrlKey || !e.altKey || e.target !== this.canvas) return;
     if (!this.stationTool && this.tool !== 'depot-rail' && this.tool !== 'depot-road' && this.tool !== 'depot-tram') return;
     e.preventDefault();
     e.stopPropagation();
-    this.wheelAcc += e.deltaMode === 1 ? e.deltaY * 30 : e.deltaY;
+    this.wheelAcc += e.deltaMode === 1 ? e.deltaY * 30 : e.deltaMode === 2 ? e.deltaY * 300 : e.deltaY;
     while (Math.abs(this.wheelAcc) >= 40) { const s = Math.sign(this.wheelAcc); this.wheelAcc -= s * 40; this.rotate(s); }
   };
 
@@ -645,7 +718,11 @@ export class Tools {
     if (this.moveDirty) {
       this.moveDirty = false;
       this.rect = this.canvas.getBoundingClientRect();
-      this.ground = this.overMap || this.down ? this.pick() : null;
+      this.ground = this.touchPreview && !this.down ? this.touchPreview.point.clone() : this.overMap || this.down ? this.pick() : null;
+      if (this.touchPreview && !this.down) {
+        const pos = this.project(this.ground!.x, this.ground!.y, this.ground!.z);
+        if (pos) { this.client = pos; this.touchPreview.client = { ...pos }; }
+      }
       this.hover();
     }
     if (this.planDirty && performance.now() - this.planAt >= Math.min(200, this.planMs * 2)) this.planNow();
@@ -656,7 +733,7 @@ export class Tools {
       this.ui.toast('Construction ended', 'info');
     }
     // terraform brush while the button is held
-    if (this.tool === 'terraform' && this.down?.button === 0 && this.ground) {
+    if (this.tool === 'terraform' && this.down?.button === 0 && !this.down.touch && this.ground) {
       this.brush.timer -= dt;
       if (this.brush.timer <= 0) {
         this.brush.timer = 0.12;
@@ -682,7 +759,9 @@ export class Tools {
       if (now - this.dozeAt > 120) {
         this.dozeAt = now;
         const res = bulldoze(g, r.x0, r.z0, r.x1, r.z1, PLAYER, true);
-        this.tip(res.changed ? { title: 'Clear area', cost: res.cost, rows: [['bulldoze', plural(res.changed, 'object')]], err: res.error ? [res.error] : [] } : { title: 'Clear area', rows: [['info', 'Nothing to remove']] }, res.changed ? 'err' : 'info');
+        this.tip({ title: 'Clear area', cost: res.cost || undefined,
+          rows: res.changed ? [['bulldoze', plural(res.changed, 'object')]] : res.error ? [] : [['info', 'Nothing to remove']],
+          err: res.error ? [res.error] : [] }, res.changed || res.error ? 'err' : 'info');
       }
     }
   }
@@ -787,7 +866,7 @@ export class Tools {
         this.dozeAt = now;
         const r = bulldoze(g, p.x, p.z, p.x, p.z, PLAYER, true);
         if (r.changed) this.tip({ title: 'Demolish', cost: r.cost, err: r.error ? [r.error] : [], hint: 'Drag to clear an area' }, 'err');
-        else if (r.error) this.tip({ title: 'Demolish', err: [r.error] }, 'err');
+        else if (r.error) this.tip({ title: 'Demolish', cost: r.cost || undefined, err: [r.error] }, 'err');
         else this.hideTip();
         break;
       }
@@ -795,6 +874,12 @@ export class Tools {
         this.setCircle(p.x, p.z, this.brushRadius, this.terraMode === 'raise' ? 0x4ade80 : this.terraMode === 'lower' ? 0xff8a3d : 0xffb020);
         if (this.down) break;
         const h = g.world.heightAt(p.x, p.z);
+        if (this.touchPreview) {
+          const cost = Math.round(brushVolume(g.world, p.x, p.z, this.brushRadius, this.terraMode, 0.25, h, true) * 1500);
+          this.tip({ title: this.terraMode === 'level' ? 'Level ground' : this.terraMode === 'raise' ? 'Raise ground' : 'Lower ground', cost,
+            rows: [['catchment', `Radius ${this.brushRadius * 10} m · one brush stroke`]] }, 'info');
+          break;
+        }
         if (this.terraMode === 'level') {
           this.overlay.setDisc({ x: p.x, z: p.z, r: this.brushRadius, y: h + 0.03, color: 0xffb020 });
           this.tip({ title: 'Level ground', rows: [['level', `Flattens to <b>${Math.round(h * 10)} m</b> (where you press)`], ['catchment', `Radius ${this.brushRadius * 10} m`]], hint: 'Hold the button to apply' }, 'info');
@@ -1999,6 +2084,30 @@ export class Tools {
 
   private doBulldoze(x0: number, z0: number, x1: number, z1: number) {
     const g = this.game;
+    const preview = bulldoze(g, x0, z0, x1, z1, PLAYER, true);
+    if (preview.error === 'Not enough money') { this.ui.toast(preview.error, 'bad'); this.hideTip(); return; }
+    const stationLines = g.lines.all().filter((l) => l.stops.some((sid) => preview.stationIds.includes(sid)));
+    const stationEdges = new Set(preview.stationIds.flatMap((sid) => {
+      const st = g.stations.get(sid);
+      return st?.rail ? [...st.rail.edges, ...st.rail.throughEdges] : [];
+    }));
+    const vehicles = [...g.vehicles.trains(), ...g.vehicles.roads()].filter((v) =>
+      preview.depotIds.includes(v.depotId) || stationLines.some((l) => l.vehicles.includes(v.id)) ||
+      preview.stationIds.includes(v.targetStation()?.id ?? -1) || v.occupiedEdges().some((eid) => stationEdges.has(eid)));
+    const lines = g.lines.all().filter((l) => stationLines.includes(l) || vehicles.some((v) => v.lineId === l.id));
+    if (lines.length || vehicles.length) {
+      const stations = preview.stationIds.map((sid) => g.stations.get(sid)?.name).filter(Boolean);
+      const depots = preview.depotIds.map((id) => {
+        const dp = g.depots.get(id)!;
+        return `${dp.kind === 'rail' ? 'Train' : dp.kind === 'tram' ? 'Tram' : 'Bus'} depot #${id}`;
+      });
+      const some = (names: string[], n = 8) => names.length <= n ? names.join(', ') || 'None' : `${names.slice(0, n).join(', ')} and ${names.length - n} more`;
+      const message = [`Demolish ${[...stations, ...depots].join(', ')}?`,
+        `Affected lines: ${some(lines.map((l) => l.name))}`,
+        `Affected vehicles: ${some(vehicles.map((v) => v.name))}`,
+        `Demolition costs ${fmtMoney(preview.cost)}. Construction costs are not refunded.`].join('\n\n');
+      if (!confirm(message)) { this.hideTip(); return; }
+    }
     const r = bulldoze(g, x0, z0, x1, z1, PLAYER, false);
     if (r.error) this.ui.toast(r.error, 'bad');
     if (r.changed) { this.ui.floatCost(r.cost, this.client.x, this.client.y); this.ui.sound('demolish', { x: (x0 + x1) / 2, z: (z0 + z1) / 2 }); }
@@ -2007,7 +2116,19 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ tooltip
-  private tip(c: Tip, kind: 'ok' | 'err' | 'info' = 'info') { this.showTip(tipHtml(c), kind); }
+  private tip(c: Tip, kind: 'ok' | 'err' | 'info' = 'info') {
+    const unaffordable = c.cost !== undefined && !this.game.economy.canAfford(c.cost);
+    if (unaffordable) {
+      c = { ...c, warn: c.warn?.filter((msg) => !this.ui.needsMoney(msg)),
+        err: [...(c.err ?? []).filter((msg) => !this.ui.needsMoney(msg)), `Not enough money: ${fmtMoney(c.cost!)} needed, ${fmtMoney(this.game.economy.money)} available`] };
+      kind = 'err';
+    }
+    if (this.touchPreview) c = { ...c, hint: 'Tap the same spot to confirm · tap elsewhere to move the preview' };
+    this.showTip(tipHtml(c), kind);
+    const finance = unaffordable || [...(c.err ?? []), ...(c.warn ?? [])].some((msg) => this.ui.needsMoney(msg));
+    if (finance && !this.tooltip.querySelector('.finance-actions')) this.tooltip.append(this.ui.financeActions(() => this.refreshHover()));
+    this.positionTip();
+  }
 
   private tipHtml = '';
   private tipKind = '';

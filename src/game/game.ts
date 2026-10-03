@@ -949,7 +949,11 @@ export class Game {
       if (c.level < 2 || this.day - (this.congestionTold.get(l.id) ?? -1e9) < 180) continue;
       this.congestionTold.set(l.id, this.day);
       const fix = { signals: 'signals on the line', platforms: 'more platforms at the stations where trains wait', loops: 'passing loops on the single track', double: 'a second track', 'fewer-trains': 'fewer trains', none: '' }[c.suggestion];
-      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad');
+      const st = this.stations.get(l.stops[0]);
+      const p = { x: st?.x ?? this.world.size / 2, y: 0, z: st?.z ?? this.world.size / 2 };
+      const waiting = l.vehicles.map((id) => this.vehicles.get(id)).find((v) => v?.state === 'waiting');
+      waiting?.worldPos(p);
+      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad', p.x, p.z);
     }
   }
 
@@ -974,7 +978,7 @@ export class Game {
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     this.lines.catchmentDirty = true;
     this.deferCatchment = true;
-    if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');
+    if (this.economy.money < 0 && m % 3 === 2) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'info');
   }
 
   private onNewYear() {
