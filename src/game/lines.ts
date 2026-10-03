@@ -129,10 +129,14 @@ export class Lines {
   /** routing[s] = Map(dest -> first hop) */
   routing = new Map<number, Map<number, Hop>>();
   servedStations = new Set<number>();
+  /** Catchment weights depend on service presence, independently of routing/frequency versions. */
+  servedVersion = 0;
   /** bumped by every rebuild (routing tables changed) */
   version = 0;
-  /** station catchments need a recompute (done once per tick, see flushCatchment) */
+  /** Saved pending catchment/demand refresh (walking work is conditional; see flushCatchment). */
   catchmentDirty = false;
+  /** Keep the saved pending-refresh flag: demand regions can move while walking inputs stay fixed. */
+  markDemandSharesDirty() { this.catchmentDirty = true; }
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
   constructor(private game: Game) {
@@ -521,8 +525,11 @@ export class Lines {
   }
 
   /** Recompute routing tables (Dijkstra over the line graph) and the automatic names. */
-  rebuild() {
+  rebuild(catchmentMayChange = true) {
     const stations = this.game.stations;
+    const previousServed = new Set(this.servedStations);
+    if (catchmentMayChange) stations.walkVersion++;
+    this.markDemandSharesDirty();
     this.routing.clear();
     this.servedStations.clear();
     this.version++;
@@ -597,16 +604,23 @@ export class Lines {
       this.routing.set(src, table);
     }
     for (const st of stations.all()) this.rerouteWaiting(st);
-    // served stations changed: catchments are shared out again, once for several rebuilds in a row
-    this.catchmentDirty = true;
+    const servedChanged = previousServed.size !== this.servedStations.size || [...previousServed].some((id) => !this.servedStations.has(id));
+    if (servedChanged) this.servedVersion++;
+    // flushCatchment uses the independent service/input versions to skip walking work for frequency changes.
   }
 
   /** Recompute the station catchments if routing changed since (called by the game every tick). */
   flushCatchment() {
-    if (!this.catchmentDirty) return;
+    const stations = this.game.stations;
+    if (!this.catchmentDirty) { stations.prepareCatchmentTick(); return; }
     this.catchmentDirty = false;
-    this.game.stations.recomputeCatchment();
+    // A frequency-only rebuild still refreshes demand's moving region assignment; walking work is skipped.
+    if (stations.catchmentInputsChanged() || stations.catchmentPopulationPending) {
+      stations.recomputeCatchment(true);
+      if (stations.catchmentWorkPending) { this.catchmentDirty = true; return; }
+    }
     this.game.demand.recomputeShares();
+    stations.prepareCatchmentTick();
   }
 
   /**

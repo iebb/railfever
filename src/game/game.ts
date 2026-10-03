@@ -972,7 +972,8 @@ export class Game {
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
-    this.lines.catchmentDirty = true;
+    if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
+    this.lines.markDemandSharesDirty();
     this.deferCatchment = true;
     if (this.economy.money < 0) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'bad');
   }

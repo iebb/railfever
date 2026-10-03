@@ -497,7 +497,7 @@ export class Vehicles {
     const l = v.line;
     if (l) l.vehicles = l.vehicles.filter((x) => x !== id);
     this.map.delete(id);
-    g.lines.rebuild();
+    g.lines.rebuild(false);
   }
 
   /** Month end: operating costs of every vehicle (overheads, crew, energy, maintenance; opcosts.ts). */
