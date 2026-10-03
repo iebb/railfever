@@ -66,8 +66,11 @@ export function auxKwOf(m: VehicleModel): number {
   return 0;
 }
 
-/** Track types of heavy rail (locomotives and coaches) when a model lists none. */
-export const HEAVY_RAIL_TRACKS = ['standard', 'electric', 'highspeed'];
+/** Every rail track type: metro and light-rail track are rails like any other, so all rail stock may run on all of them
+ * (only the overhead wire limits electric traction, see train.ts consistRule). */
+export const ALL_RAIL_TRACKS = ['standard', 'electric', 'highspeed', 'metro', 'lightrail'];
+/** Locomotives and wagons: every rail track type. */
+export const HEAVY_RAIL_TRACKS = ALL_RAIL_TRACKS;
 
 export const MODELS: VehicleModel[] = [
   { id: 'steam_a', name: 'Pioneer 2-6-0', kind: 'loco', intro: 1880, retire: 1945, speed: 75, capacity: 0, power: 750, weight: 68, cost: 260_000, running: 42_000, length: 1.9, style: 'steam', traction: 'steam', color: 0x2b3a2f },
@@ -102,23 +105,23 @@ export const MODELS: VehicleModel[] = [
 
   // electric multiple units: whole units (length, capacity, power and price for the unit), all cars powered
   // metro: city subways and elevated lines, through-running onto electrified suburban lines
-  { id: 'metro_a', name: 'Steel Metro (4 cars)', kind: 'emu', intro: 1960, retire: 2005, speed: 80, capacity: 300, power: 1600, weight: 120, cost: 1_150_000, running: 70_000, length: 5.2, style: 'metro_steel', traction: 'electric', color: 0xb8bcc2, unitCars: 4, tracks: ['metro', 'electric'] },
-  { id: 'metro_b', name: 'Stainless Metro (6 cars)', kind: 'emu', intro: 1981, retire: 2035, speed: 100, capacity: 480, power: 2900, weight: 170, cost: 1_900_000, running: 95_000, length: 7.8, style: 'metro_stainless', traction: 'electric', color: 0xd9dde2, unitCars: 6, tracks: ['metro', 'electric'] },
-  { id: 'metro_c', name: 'Metro 2000 (6 cars)', kind: 'emu', intro: 2000, retire: 2100, speed: 110, capacity: 520, power: 3400, weight: 160, cost: 2_400_000, running: 100_000, length: 7.8, style: 'metro_modern', traction: 'electric', color: 0x2e86de, unitCars: 6, tracks: ['metro', 'electric'] },
+  { id: 'metro_a', name: 'Steel Metro (4 cars)', kind: 'emu', intro: 1960, retire: 2005, speed: 80, capacity: 300, power: 1600, weight: 120, cost: 1_150_000, running: 70_000, length: 5.2, style: 'metro_steel', traction: 'electric', color: 0xb8bcc2, unitCars: 4, tracks: ALL_RAIL_TRACKS },
+  { id: 'metro_b', name: 'Stainless Metro (6 cars)', kind: 'emu', intro: 1981, retire: 2035, speed: 100, capacity: 480, power: 2900, weight: 170, cost: 1_900_000, running: 95_000, length: 7.8, style: 'metro_stainless', traction: 'electric', color: 0xd9dde2, unitCars: 6, tracks: ALL_RAIL_TRACKS },
+  { id: 'metro_c', name: 'Metro 2000 (6 cars)', kind: 'emu', intro: 2000, retire: 2100, speed: 110, capacity: 520, power: 3400, weight: 160, cost: 2_400_000, running: 100_000, length: 7.8, style: 'metro_modern', traction: 'electric', color: 0x2e86de, unitCars: 6, tracks: ALL_RAIL_TRACKS },
   // commuter: suburban electric lines, through-running onto metro lines
-  { id: 'emu_a', name: 'Commuter EMU (4 cars)', kind: 'emu', intro: 1962, retire: 2010, speed: 110, capacity: 320, power: 1900, weight: 150, cost: 1_350_000, running: 80_000, length: 6.4, style: 'emu_60s', traction: 'electric', color: 0x6a8f3a, unitCars: 4, tracks: ['electric', 'metro'] },
-  { id: 'emu_b', name: 'Suburban EMU (6 cars)', kind: 'emu', intro: 1985, retire: 2040, speed: 120, capacity: 500, power: 3300, weight: 215, cost: 2_200_000, running: 110_000, length: 9.6, style: 'emu_80s', traction: 'electric', color: 0xf0f0ec, unitCars: 6, tracks: ['electric', 'metro'] },
-  { id: 'emu_c', name: 'Commuter EMU 2010 (6 cars)', kind: 'emu', intro: 2010, retire: 2100, speed: 130, capacity: 540, power: 3900, weight: 200, cost: 2_800_000, running: 115_000, length: 9.6, style: 'emu_modern', traction: 'electric', color: 0x1b4f72, unitCars: 6, tracks: ['electric', 'metro'] },
+  { id: 'emu_a', name: 'Commuter EMU (4 cars)', kind: 'emu', intro: 1962, retire: 2010, speed: 110, capacity: 320, power: 1900, weight: 150, cost: 1_350_000, running: 80_000, length: 6.4, style: 'emu_60s', traction: 'electric', color: 0x6a8f3a, unitCars: 4, tracks: ALL_RAIL_TRACKS },
+  { id: 'emu_b', name: 'Suburban EMU (6 cars)', kind: 'emu', intro: 1985, retire: 2040, speed: 120, capacity: 500, power: 3300, weight: 215, cost: 2_200_000, running: 110_000, length: 9.6, style: 'emu_80s', traction: 'electric', color: 0xf0f0ec, unitCars: 6, tracks: ALL_RAIL_TRACKS },
+  { id: 'emu_c', name: 'Commuter EMU 2010 (6 cars)', kind: 'emu', intro: 2010, retire: 2100, speed: 130, capacity: 540, power: 3900, weight: 200, cost: 2_800_000, running: 115_000, length: 9.6, style: 'emu_modern', traction: 'electric', color: 0x1b4f72, unitCars: 6, tracks: ALL_RAIL_TRACKS },
   // high-speed trainsets (6 cars) by era: all axles powered, streamlined; electric, on high-speed (or
   // electrified main-line) track. Power for 6 cars of their prototypes; drag low and rising little with length.
-  { id: 'hsr_a', name: 'Bullet Express 0 (6 cars)', kind: 'emu', intro: 1964, retire: 2008, speed: 210, capacity: 460, power: 4400, weight: 360, cost: 5_200_000, running: 260_000, length: 11, style: 'hsr_0', traction: 'electric', color: 0xf4f4f0, unitCars: 6, tracks: ['highspeed', 'electric'], aero: { nose: 2.0, len: 0.32 } },
-  { id: 'hsr_b', name: 'Intercity HS 270 (6 cars)', kind: 'emu', intro: 1981, retire: 2025, speed: 270, capacity: 420, power: 6300, weight: 330, cost: 6_800_000, running: 300_000, length: 11, style: 'hsr_1', traction: 'electric', color: 0xe86a1c, unitCars: 6, tracks: ['highspeed', 'electric'], aero: { nose: 1.5, len: 0.3 } },
-  { id: 'hsr_c', name: 'Velocity 300 (6 cars)', kind: 'emu', intro: 1997, retire: 2040, speed: 300, capacity: 460, power: 7000, weight: 280, cost: 8_400_000, running: 330_000, length: 11, style: 'hsr_2', traction: 'electric', color: 0x3d5a80, unitCars: 6, tracks: ['highspeed', 'electric'], aero: { nose: 1.1, len: 0.28 } },
-  { id: 'hsr_d', name: 'Velocity 350 (6 cars)', kind: 'emu', intro: 2008, retire: 2060, speed: 350, capacity: 480, power: 8800, weight: 300, cost: 10_500_000, running: 360_000, length: 11, style: 'hsr_3', traction: 'electric', color: 0xd9dde2, unitCars: 6, tracks: ['highspeed', 'electric'], aero: { nose: 0.9, len: 0.26 } },
-  { id: 'hsr_e', name: 'Velocity 400 (6 cars)', kind: 'emu', intro: 2025, retire: 2100, speed: 400, capacity: 480, power: 13000, weight: 270, cost: 13_000_000, running: 390_000, length: 11, style: 'hsr_4', traction: 'electric', color: 0xb3002d, unitCars: 6, tracks: ['highspeed', 'electric'], aero: { nose: 0.8, len: 0.24 } },
+  { id: 'hsr_a', name: 'Bullet Express 0 (6 cars)', kind: 'emu', intro: 1964, retire: 2008, speed: 210, capacity: 460, power: 4400, weight: 360, cost: 5_200_000, running: 260_000, length: 11, style: 'hsr_0', traction: 'electric', color: 0xf4f4f0, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 2.0, len: 0.32 } },
+  { id: 'hsr_b', name: 'Intercity HS 270 (6 cars)', kind: 'emu', intro: 1981, retire: 2025, speed: 270, capacity: 420, power: 6300, weight: 330, cost: 6_800_000, running: 300_000, length: 11, style: 'hsr_1', traction: 'electric', color: 0xe86a1c, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 1.5, len: 0.3 } },
+  { id: 'hsr_c', name: 'Velocity 300 (6 cars)', kind: 'emu', intro: 1997, retire: 2040, speed: 300, capacity: 460, power: 7000, weight: 280, cost: 8_400_000, running: 330_000, length: 11, style: 'hsr_2', traction: 'electric', color: 0x3d5a80, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 1.1, len: 0.28 } },
+  { id: 'hsr_d', name: 'Velocity 350 (6 cars)', kind: 'emu', intro: 2008, retire: 2060, speed: 350, capacity: 480, power: 8800, weight: 300, cost: 10_500_000, running: 360_000, length: 11, style: 'hsr_3', traction: 'electric', color: 0xd9dde2, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 0.9, len: 0.26 } },
+  { id: 'hsr_e', name: 'Velocity 400 (6 cars)', kind: 'emu', intro: 2025, retire: 2100, speed: 400, capacity: 480, power: 13000, weight: 270, cost: 13_000_000, running: 390_000, length: 11, style: 'hsr_4', traction: 'electric', color: 0xb3002d, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 0.8, len: 0.24 } },
   // light rail: articulated vehicles for light-rail track, also on metro track
-  { id: 'lrv_a', name: 'Light Rail Vehicle (2 sections)', kind: 'emu', intro: 1978, retire: 2030, speed: 80, capacity: 160, power: 600, weight: 38, cost: 900_000, running: 50_000, length: 2.8, style: 'lrv', traction: 'electric', color: 0xe67e22, unitCars: 2, sections: 2, tracks: ['lightrail', 'metro'] },
-  { id: 'lrv_b', name: 'Light Rail Vehicle (3 sections)', kind: 'emu', intro: 2000, retire: 2100, speed: 80, capacity: 240, power: 900, weight: 50, cost: 1_250_000, running: 60_000, length: 3.4, style: 'lrv_modern', traction: 'electric', color: 0x8e44ad, unitCars: 3, sections: 3, tracks: ['lightrail', 'metro'] },
+  { id: 'lrv_a', name: 'Light Rail Vehicle (2 sections)', kind: 'emu', intro: 1978, retire: 2030, speed: 80, capacity: 160, power: 600, weight: 38, cost: 900_000, running: 50_000, length: 2.8, style: 'lrv', traction: 'electric', color: 0xe67e22, unitCars: 2, sections: 2, tracks: ALL_RAIL_TRACKS },
+  { id: 'lrv_b', name: 'Light Rail Vehicle (3 sections)', kind: 'emu', intro: 2000, retire: 2100, speed: 80, capacity: 240, power: 900, weight: 50, cost: 1_250_000, running: 60_000, length: 3.4, style: 'lrv_modern', traction: 'electric', color: 0x8e44ad, unitCars: 3, sections: 3, tracks: ALL_RAIL_TRACKS },
 ];
 
 export const MODEL_BY_ID = new Map(MODELS.map((m) => [m.id, m]));

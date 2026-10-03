@@ -1,5 +1,7 @@
-// Urban rail: station modes from the platform track type (main line / metro / light rail) with their catchment
-// radii and layouts; strict catchment (only buildings inside the circles, shared out among overlapping stations,
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
+// Urban rail: construction styles from the platform track type (main line / metro / light rail) with their layouts and
+// one rail walking limit for all; strict catchment (only street-connected buildings, shared out among stations,
 // worked out alike after loading); a dense underground metro line (6 stations, ~10 units apart, platform screen
 // doors, side platforms) made directional in one go and run with trains; auto-links by mode; a junction station
 // where a metro line meets another company's electric suburban line, with through-running trains both ways.
@@ -16,6 +18,7 @@ import { Train } from '../src/game/train';
 import { depotAtEnd } from '../src/game/routing';
 import type { BuildOptions } from '../src/game/construction';
 import { roadOpts } from './lib';
+import { walkingCatchment, walkWeight, FULL_COVER_WEIGHT, coverOf } from '../src/game/catchment';
 import { flatGame, station, endNode, newTrack, runTrains, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
 
 const T0 = performance.now();
@@ -49,11 +52,11 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   console.log(`  metro plan: ${pm.ok ? 'ok' : pm.error}, ${pm.level}, depth ${fmt(pm.depth, 2)}, psd ${pm.psd}, ${pm.platformStyle}, ${pm.length * 10} m, ${pm.entrances.length} entrances, cost ${fmt(pm.cost / 1e6, 2)}M`);
   check(pm.ok && pm.mode === 'metro' && pm.level === 'underground' && pm.psd && pm.platformStyle === 'side' && pm.length === 12 && near(pm.depth, 2.2), 'metro: underground (22 m deep), platform screen doors, side platforms, 120 m platforms');
   const sm = g.stations.planCatchShapes(pm);
-  check(sm.length >= 2 && sm.every((c) => c.mode === 'metro' && c.r === CATCHMENT_RADIUS.metro && c.r === 30), `metro catchment: 300 m circles around the ${sm.length} entrances`);
+  check(sm.length >= 2 && sm.every((c) => c.mode === 'rail' && c.r === CATCHMENT_RADIUS.rail && c.r === 33.6), `metro-track station: the one rail walking limit (336 m) at the ${sm.length} entrances`);
   const pl = g.stations.planRail(120, 124, PI2, defaultPlatformLength('lightrail'), 2, 0, { trackType: 'lightrail' });
-  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 25 && c.mode === 'lightrail'), `light rail: on the ground, side platforms, 250 m catchment (${pl.error ?? 'ok'})`);
+  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 33.6 && c.mode === 'rail'), `light-rail track: on the ground, side platforms, the same 336 m rail walking limit (${pl.error ?? 'ok'})`);
   const pe = g.stations.planRail(180, 124, PI2, 8, 2, 0, { trackType: 'electric' });
-  check(pe.ok && pe.mode === 'mainline' && pe.platformStyle === 'island' && !pe.psd && pe.style === 'classic' && g.stations.planCatchShapes(pe).every((c) => Math.abs(c.r - 48) < 1e-9 && c.mode === 'rail'), `electric main line: island platform, 400 m catchment + 20% for its building (${pe.error ?? 'ok'})`);
+  check(pe.ok && pe.mode === 'mainline' && pe.platformStyle === 'island' && !pe.psd && pe.style === 'classic' && g.stations.planCatchShapes(pe).every((c) => Math.abs(c.r - 40.32) < 1e-9 && c.mode === 'rail'), `electric main line: island platform, the 336 m rail walking limit + 20% for its building (${pe.error ?? 'ok'})`);
   const built: [Station, string][] = [];
   for (const [p, tt] of [[pm, 'metro'], [pl, 'lightrail'], [pe, 'electric']] as const) {
     const id = g.stations.nextId;
@@ -62,8 +65,8 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   }
   const net = g.world.net;
   check(built.every(([st, tt]) => st.rail!.trackType === tt && st.rail!.edges.every((id) => net.edges.get(id)!.type === tt)), 'platform tracks of the station\'s track type');
-  check(built.map(([st]) => g.stations.mode(st)).join() === 'metro,lightrail,mainline', `station modes ${built.map(([st]) => g.stations.mode(st)).join(', ')}`);
-  check(built.every(([st]) => g.stations.catchmentShapes(st).every((c) => Math.abs(c.r - CATCHMENT_RADIUS[g.stations.mode(st) === 'mainline' ? 'rail' : (g.stations.mode(st) as 'metro' | 'lightrail')] * (1 + styleOf(st.rail!.style).catchBonus)) < 1e-9)), 'built stations: catchment radius by mode (and building)');
+  check(built.map(([st]) => g.stations.mode(st)).join() === 'metro,lightrail,mainline' && built.every(([st]) => g.stations.catchMode(st) === 'rail'), `construction styles ${built.map(([st]) => g.stations.mode(st)).join(', ')}, one transport mode (rail)`);
+  check(built.every(([st]) => g.stations.catchmentShapes(st).every((c) => c.mode === 'rail' && Math.abs(c.r - CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail!.style).catchBonus)) < 1e-9)), 'built stations: one rail catchment radius whatever the track type (and the building)');
   check(built[0][0].rail!.style === 'none' && built[1][0].rail!.style === 'shelter', 'no building for the metro station (street entrances), a halt for light rail');
   const g2 = deserialize(JSON.parse(JSON.stringify(serialize(g))));
   const sig = (x: Game) => JSON.stringify(x.stations.all().map((s) => [s.id, s.rail?.trackType, s.rail?.psd, s.rail?.platformStyle, s.rail?.trackOffsets, x.stations.mode(s)]));
@@ -75,8 +78,8 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   console.log('strict catchment');
   const g = flatGame(256);
   road(g, 20, 118, 236, 118);
-  const A = station(g, 80, 124, PI2, 8, 1)!, B = station(g, 140, 124, PI2, 8, 1)!, C = station(g, 40, 124, PI2, 8, 1)!;
-  const hA = house(g, 60, 141), hAB = house(g, 108, 141), hOut = house(g, 80, 176), hC = house(g, 22, 141);
+  const A = station(g, 80, 124, PI2, 8, 1)!, B = station(g, 116, 124, PI2, 8, 1)!, C = station(g, 44, 124, PI2, 8, 1)!;
+  const hA = house(g, 62, 116), hAB = house(g, 97, 116), hOut = house(g, 80, 164), hC = house(g, 32, 116);
   // A and B served (a line with a train), C not
   const lab = lineOf(g, [A, B]);
   const dAB = depotAtEnd(g, endNode(g, A, 0, false), 0);
@@ -88,21 +91,26 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const S = g.stations;
   const sf = (id: number) => S.stationsForBuilding(id);
   console.log(`  shares: hA ${JSON.stringify(sf(hA.id))}, hAB ${JSON.stringify(sf(hAB.id))}, hOut ${JSON.stringify(sf(hOut.id))}, hC ${JSON.stringify(sf(hC.id))}`);
-  check(sf(hOut.id).st.length === 0 && !S.buildingShares(A).ids.includes(hOut.id), 'a house outside every circle belongs to no station');
-  check(sf(hA.id).st.join() === String(A.id) && near(sf(hA.id).w[0], 1), 'inside A only (and an unserved station C): all of it to the served station A');
+  check(sf(hOut.id).st.length === 0 && !S.buildingShares(A).ids.includes(hOut.id), 'a house without street frontage belongs to no station');
+  // (beyond FULL_COVER_WALK a building is only partly covered: its walking weight against the weight there)
+  const dA = walkingCatchment(g, A).buildings.get(hA.id)?.distance ?? Infinity, cA = Math.min(1, walkWeight(dA) / FULL_COVER_WEIGHT);
+  check(sf(hA.id).st.join() === String(A.id) && near(sf(hA.id).w[0], cA), `inside A only (and an unserved station C): all of its covered share (${fmt(cA, 3)} at ${fmt(dA, 1)} walked) to the served station A`);
   const ab = sf(hAB.id), wA = ab.w[ab.st.indexOf(A.id)], wB = ab.w[ab.st.indexOf(B.id)];
-  check(ab.st.length === 2 && near(wA + wB, 1) && wA > wB, `inside A and B: shared, the nearer A more (${fmt(wA, 2)} / ${fmt(wB, 2)})`);
+  // (covered as from its best walk, the nearer A: the two stations share that, a second one adds no coverage)
+  const near2 = Math.min(...[A, B].map((s) => walkingCatchment(g, s).buildings.get(hAB.id)?.distance ?? Infinity)), cAB = coverOf(walkWeight(near2));
+  check(ab.st.length === 2 && near(wA + wB, cAB) && wA > wB, `inside A and B: shared, the nearer A more (${fmt(wA, 2)} / ${fmt(wB, 2)} of ${fmt(cAB, 3)} covered at ${fmt(near2, 1)} walked)`);
   check(sf(hC.id).st.join() === String(C.id), 'covered by the unserved station C alone: C has it');
-  check(near(A.catchPop, 10 + 10 * wA) && near(S.catchSum(A, (b) => b.pop), A.catchPop), `catchment population = shares x people (${fmt(A.catchPop, 2)})`);
+  check(near(A.catchPop, 10 * cA + 10 * wA) && near(S.catchSum(A, (b) => b.pop), A.catchPop), `catchment population = shares x people (${fmt(A.catchPop, 2)})`);
   const v0 = S.catchVersion;
   // a house built after the last share-out: in no share until the next one, also after loading
-  const hNew = house(g, 90, 140);
+  const hNew = house(g, 90, 116);
   const g2 = deserialize(JSON.parse(JSON.stringify(serialize(g))));
   const dump = (x: Game) => JSON.stringify([...x.stations.map.keys()].map((id) => x.stations.buildingShares(id)));
   check(dump(g2) === dump(g) && g2.stations.stationsForBuilding(hNew.id).st.length === 0 && g.stations.stationsForBuilding(hNew.id).st.length === 0, 'after loading: the same shares (the new house waits for the next share-out in both)');
   g.lines.catchmentDirty = true;
   g.lines.flushCatchment();
-  check(S.catchVersion > v0 && sf(hNew.id).st.join() === String(A.id), 'next share-out: the new house joins A');
+  const sn = sf(hNew.id);
+  check(S.catchVersion > v0 && sn.st.includes(A.id) && sn.w[sn.st.indexOf(A.id)] > 0.5, 'next share-out: the new house joins A (the nearer station, its larger share)');
 }
 
 // ------------------------------------------------------------------ 3. dense underground metro line
@@ -149,6 +157,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const trains: Train[] = [];
   for (let i = 0; i < 4; i++) { const t = g.vehicles.buyTrain(dep, [model('metro_b')], l.id); if (t instanceof Train) trains.push(t); }
   check(trains.length === 4, `4 metro trains (${trains.length})`);
+  startFleet(g, trains, 20);
   const r = runTrains(g, trains, 360);
   const counts = trains.map((t) => r.arrivals.get(t.id)?.length ?? 0);
   const seen = new Set(trains.flatMap((t) => r.arrivals.get(t.id) ?? []));
@@ -216,3 +225,26 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
 
 console.log(`(${fmt((performance.now() - T0) / 1000, 1)} s)`);
 done();
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
+}

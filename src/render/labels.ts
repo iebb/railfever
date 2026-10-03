@@ -6,9 +6,37 @@ import * as THREE from 'three';
 import type { Game } from '../game/game';
 import { WATER_Y } from '../game/constants';
 import { svg } from '../ui/icons';
+import { uiScale } from '../ui/uiscale';
 
 /** A station number badge as the UI computes it (ui/lineid.ts Badge). */
 export interface LabelBadge { code: string; prefix: string; num: string; color: string }
+
+const STATION_NAME_MAX_DIST = 170;
+/**
+ * Hysteresis of the label selection: a label shown in the last frame keeps this much priority (about 12 units of
+ * distance for a station plate) and must sink clearly behind the terrain before it is hidden, so labels that
+ * compete for a place don't trade it back and forth while the camera moves or waiting counts change.
+ */
+const LABEL_KEEP = 500;
+const OCCLUDE_KEEP = 0.4;
+// Three ordinary wheel notches: exp(100 * 0.0014) per notch (camera.ts).
+const RAIL_SYMBOL_MAX_DIST = STATION_NAME_MAX_DIST * Math.exp(3 * 100 * 0.0014);
+const RAIL_SYMBOL_FADE_DIST = STATION_NAME_MAX_DIST * Math.exp(2 * 100 * 0.0014);
+const RAIL_SYMBOL_SIZE = 28;
+/** a small numbering badge on a plate (25 px square + 2 px gap, style.css .snum.sm) and a plate showing badges */
+const BADGE_W = 27, BADGED_PLATE_H = 29;
+
+/** Normal station plates become rail-only symbols for three more zoom steps. */
+export function stationLabelMode(camDist: number, rail: boolean): 'plate' | 'symbol' | 'hidden' {
+  if (camDist < STATION_NAME_MAX_DIST) return 'plate';
+  return rail && camDist < RAIL_SYMBOL_MAX_DIST ? 'symbol' : 'hidden';
+}
+
+/** Smoothly fade the symbols over the last of those steps; no temporary objects. */
+export function railSymbolOpacity(camDist: number): number {
+  const t = Math.max(0, Math.min(1, (RAIL_SYMBOL_MAX_DIST - camDist) / (RAIL_SYMBOL_MAX_DIST - RAIL_SYMBOL_FADE_DIST)));
+  return t * t * (3 - 2 * t);
+}
 
 interface Label {
   el: HTMLDivElement;
@@ -21,11 +49,13 @@ interface Label {
   badges: HTMLSpanElement | null;
   sym: HTMLSpanElement | null;
   text: string; subText: string; markText: string; markColor: string; icoKind: string; cls: string; bg: string; chipSig: string; symText: string;
-  badgeSig: string; badgeMax: number; nBadges: number;
+  badgeData: string[]; badgeMax: number; nBadges: number;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
 }
 
-interface Cand { l: Label; x: number; y: number; z: number; prio: number; maxDist: number; scale: number; force: boolean; d: number; sx: number; sy: number; w: number; h: number }
+interface Cand { l: Label; x: number; y: number; z: number; prio: number; maxDist: number; scale: number; force: boolean; compact: boolean; opacity: number; d: number; sx: number; sy: number; w: number; h: number }
+
+function byPriority(a: Cand, b: Cand): number { return b.prio - a.prio; }
 
 function inkFor(bg: string): string {
   const c = new THREE.Color(bg);
@@ -40,7 +70,7 @@ export class Labels {
   onClickTown: (id: number) => void = () => {};
   onClickStation: (id: number) => void = () => {};
   visible = true;
-  /** stop marks of open lines: station id -> colour and stop numbers (shown in front of the name) */
+  /** stop marks of open lines: rail numbers or a colour chip (shown in front of the name) */
   marks = new Map<number, { color: string; text: string }>();
   /** maximum number of labels on screen */
   maxVisible = 60;
@@ -112,14 +142,14 @@ export class Labels {
       badges = document.createElement('span'); badges.className = 'lbl-badges';
       el.append(ico, badges, mark, name, sub, chips);
     } else if (kind === 'tag') {
-      sym = document.createElement('span'); sym.className = 'lsym sm'; sym.style.display = 'none';
+      sym = document.createElement('span'); sym.className = 'lcolor sm';
       el.append(sym, name);
     } else el.append(name, sub);
     el.addEventListener('pointerdown', (e) => { e.stopPropagation(); });
     el.addEventListener('click', (e) => { e.stopPropagation(); onClick(); });
     el.style.display = 'none';
     this.container.appendChild(el);
-    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeSig: '', badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
+    return { el, kind, name, sub, ico, mark, chips, badges, sym, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', chipSig: '', symText: '', badgeData: [], badgeMax: -1, nBadges: 0, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false };
   }
 
   /** Complex parts and merged badges, when the complexes or the badges changed. */
@@ -159,34 +189,50 @@ export class Labels {
       cands.push(this.cand(l, t.x, y, t.z, 1e5 + t.pop, townMax, 1, false, 34));
     }
     // ---- stations (one plate per transfer complex: its main station's, with everyone waiting there)
-    const stMax = camDist < 170 ? Math.max(60, camDist * 2.6) : 0;
+    const stMax = Math.max(60, camDist * 2.6);
+    const symbolOpacity = railSymbolOpacity(camDist);
     const pinMax = Math.max(400, camDist * 4);
     for (const s of game.stations.map.values()) {
-      let l = this.stations.get(s.id);
-      if (!l) { const id = s.id; l = this.make('stn', () => this.onClickStation(id)); this.stations.set(s.id, l); }
       const mk = this.marks.get(s.id);
       const isHl = this.hl === s.id;
       const main = this.complexOf?.get(s.id);
       const part = main !== undefined && main !== s.id;
       // pins: only the stations of the lines shown; other plates of a complex only when marked / selected
       if ((pins && !pins.has(s.id)) || (part && !mk && !isHl && !(pins && pins.has(s.id) && !pins.has(main!)))) continue;
+      const force = (!!mk && !pins) || isHl;
+      // Keep explicit map pins and the existing forced road plates. Rail symbols still obey the zoom band.
+      const mode = pins || (force && !s.rail) ? 'plate' : stationLabelMode(camDist, !!s.rail);
+      if (mode === 'hidden') continue;
+      const compact = mode === 'symbol';
+      let l = this.stations.get(s.id);
+      if (!l) { const id = s.id; l = this.make('stn', () => this.onClickStation(id)); this.stations.set(s.id, l); }
       const ids = !part && main !== undefined ? this.parts.get(s.id) : undefined;
       let served = game.lines.stationServed(s.id), waiting = s.waitingTotal;
-      if (ids) for (const id of ids) { if (id === s.id) continue; const o = game.stations.get(id); if (!o) continue; waiting += o.waitingTotal; if (game.lines.stationServed(id)) served = true; }
-      this.setText(l, s.name, served ? String(waiting) : '–', false);
-      this.setIcon(l, s.rail ? 'train' : s.stops.some((p) => game.world.net.edges.get(p.edge)?.tram) ? 'tram' : 'bus');
-      this.setMark(l, pins ? undefined : mk);
-      this.setChips(l, pins ? undefined : this.lineChips.get(s.id));
-      const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
-      this.setBadges(l, bl, pins ? 5 : this.badgeMax);
+      let size = s.rail ? s.rail.tracks * s.rail.length : 0;
+      let activity = s.pickupLast + s.arrivedLast;
+      if (ids) for (const id of ids) { if (id === s.id) continue; const o = game.stations.get(id); if (!o) continue; waiting += o.waitingTotal; size += o.rail ? o.rail.tracks * o.rail.length : 0; activity += o.pickupLast + o.arrivedLast; if (game.lines.stationServed(id)) served = true; }
+      if (!compact) {
+        this.setText(l, s.name, served ? String(waiting) : '–', false);
+        this.setMark(l, pins ? undefined : mk);
+        this.setChips(l, pins ? undefined : this.lineChips.get(s.id));
+        const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
+        this.setBadges(l, bl, pins ? 5 : this.badgeMax);
+      }
+      // (one rail mode: every rail station has the train symbol, whatever its track type)
+      let icon = s.rail ? 'train' : 'bus';
+      if (!s.rail) for (const stop of s.stops) if (world.net.edges.get(stop.edge)?.tram) { icon = 'tram'; break; }
+      this.setIcon(l, icon);
       const noRoad = !!s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false;
-      this.setCls(l, 'lbl stn' + (pins ? ' pin' : '') + (l.nBadges ? ' badged' : '') + (!served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad && !pins ? ' noroad' : ''));
+      this.setCls(l, 'lbl stn' + (pins ? ' pin' : '') + (compact ? ' compact' : '') + (!compact && l.nBadges ? ' badged' : '') + (!compact && !served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad && !pins && !compact ? ' noroad' : ''));
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
-      const y = (s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8) - (pins ? 0.9 : 0);
-      const force = (!!mk && !pins) || isHl;
-      const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : (served ? 2e4 : 1e4);
-      cands.push(this.cand(l, s.x, y, s.z, prio, force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force, pins ? 40 : 24));
+      let y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
+      // Underground station symbols belong above the surface, so terrain does not bury them.
+      if (compact) y = Math.max(y, Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8);
+      if (pins) y -= 0.9;
+      const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
+      // Selection raises symbol priority, but may not bypass their collisions or distance fade.
+      cands.push(this.cand(l, s.x, y, s.z, prio, compact ? stMax : force ? 3000 : pins ? pinMax : stMax, isHl ? 1.1 : 1, force && !compact, compact ? RAIL_SYMBOL_SIZE : pins ? 44 : l.nBadges ? BADGED_PLATE_H : 24, compact, compact ? symbolOpacity : 1));
     }
     // ---- line name tags (lines map)
     for (const [id, t] of this.routeTags) {
@@ -198,8 +244,8 @@ export class Labels {
         this.tags.set(id, l);
       }
       if (l.text !== t.text) { l.text = t.text; l.name.textContent = t.text; l.el.title = t.text; }
-      const code = t.code ?? '';
-      if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.style.display = code ? '' : 'none'; }
+      const code = game.lines.get(id)?.kind === 'rail' ? t.code ?? '' : '';
+      if (l.sym && l.symText !== code) { l.symText = code; l.sym.textContent = code; l.sym.className = code ? 'lsym sm' : 'lcolor sm'; }
       this.setCls(l, t.hl ? 'lbl tag hl' : 'lbl tag');
       if (l.bg !== t.color) { l.bg = t.color; l.el.style.setProperty('--c', t.color); l.el.style.setProperty('--ink', inkFor(t.color)); }
       cands.push(this.cand(l, t.x, t.y, t.z, t.hl ? 5e8 : 9e4, 5000, 1, t.hl, 20));
@@ -218,29 +264,32 @@ export class Labels {
       if (v.z > 1 || v.x < -1.1 || v.x > 1.1 || v.y < -1.1 || v.y > 1.15) continue;
       c.sx = (v.x * 0.5 + 0.5) * w;
       c.sy = (-v.y * 0.5 + 0.5) * h;
-      if (!c.force) c.prio -= c.d * (c.l.kind === 'stn' ? 40 : 2);
+      if (!c.force) c.prio -= c.d * (c.l.kind === 'stn' && !c.compact ? 40 : 2);
+      if (!c.force && c.l.shown) c.prio += LABEL_KEEP;
       cands[n++] = c;
     }
     cands.length = n;
-    cands.sort((a, b) => b.prio - a.prio);
+    cands.sort(byPriority);
     // ---- select: cap, declutter (screen rectangles), terrain occlusion
     const placed = this.placed;
     placed.length = 0;
     const keep = this.keep;
     keep.clear();
     const cap = pins ? Math.max(this.maxVisible, 90) : this.maxVisible;
+    // the interface size (Settings) zooms the labels' contents: their boxes grow with it
+    const ui = uiScale();
     for (const c of cands) {
       if (keep.size >= cap && !c.force) break;
       // never shrink below ~11 px text (smallest plate text is 12 px)
-      const s = Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2)) * c.scale;
+      const s = (c.compact ? 1 : Math.max(0.92, Math.min(1.1, 0.8 + (40 / Math.max(1, c.d)) * 0.2))) * c.scale;
       const L = c.l;
-      c.w = (L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 0) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * 23 : 12)) * s;
-      c.h *= s;
+      c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
+      c.h *= s * ui;
       const x0 = c.sx - c.w / 2, x1 = c.sx + c.w / 2, y0 = c.sy - c.h, y1 = c.sy;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 4) if (x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
-      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z)) continue;
+      if (!c.force && L.kind !== 'tag' && !pins && this.occluded(game, camera, c.x, c.y, c.z, L.shown ? OCCLUDE_KEEP : 0.05)) continue;
       placed.push(x0 - 4, y0 - 2, x1 + 4, y1 + 2);
       keep.add(L);
       this.place(c, s, w, h);
@@ -256,11 +305,11 @@ export class Labels {
   /** A candidate record (pooled: the array keeps its objects between frames). */
   private pool: Cand[] = [];
   private poolN = 0;
-  private cand(l: Label, x: number, y: number, z: number, prio: number, maxDist: number, scale: number, force: boolean, hh: number): Cand {
+  private cand(l: Label, x: number, y: number, z: number, prio: number, maxDist: number, scale: number, force: boolean, hh: number, compact = false, opacity = 1): Cand {
     if (this.cands.length === 0) this.poolN = 0;
     let c = this.pool[this.poolN];
-    if (!c) { c = { l, x, y, z, prio, maxDist, scale, force, d: 0, sx: 0, sy: 0, w: 0, h: hh }; this.pool[this.poolN] = c; }
-    else { c.l = l; c.x = x; c.y = y; c.z = z; c.prio = prio; c.maxDist = maxDist; c.scale = scale; c.force = force; c.d = 0; c.sx = 0; c.sy = 0; c.w = 0; c.h = hh; }
+    if (!c) { c = { l, x, y, z, prio, maxDist, scale, force, compact, opacity, d: 0, sx: 0, sy: 0, w: 0, h: hh }; this.pool[this.poolN] = c; }
+    else { c.l = l; c.x = x; c.y = y; c.z = z; c.prio = prio; c.maxDist = maxDist; c.scale = scale; c.force = force; c.compact = compact; c.opacity = opacity; c.d = 0; c.sx = 0; c.sy = 0; c.w = 0; c.h = hh; }
     this.poolN++;
     return c;
   }
@@ -282,8 +331,13 @@ export class Labels {
 
   private setMark(l: Label, mk: { color: string; text: string } | undefined) {
     if (!l.mark) return;
-    const t = mk ? mk.text : '';
-    if (t !== l.markText) { l.markText = t; l.mark.textContent = t; l.mark.style.display = t ? '' : 'none'; }
+    // The UI also supplies stop-order indices for unnumbered lines; draw those as colour chips.
+    const t = mk ? mk.text.split(',').filter((code) => !/^\d+$/.test(code)).join(',') : '';
+    if (t !== l.markText) { l.markText = t; l.mark.textContent = t; }
+    const cls = 'lbl-mark' + (mk && !t ? ' lcolor sm' : '');
+    if (l.mark.className !== cls) l.mark.className = cls;
+    const display = mk ? '' : 'none';
+    if (l.mark.style.display !== display) l.mark.style.display = display;
     const c = mk ? mk.color : '';
     if (c !== l.markColor) { l.markColor = c; l.mark.style.background = c; }
   }
@@ -303,21 +357,33 @@ export class Labels {
   /** Numbering badges on a plate (at most `max`, then +n); compare content rather than refreshed objects. */
   private setBadges(l: Label, list: LabelBadge[] | null, max: number) {
     if (!l.badges) return;
-    const sig = JSON.stringify((list ?? []).map((b) => [b.code, b.prefix, b.num, b.color]));
-    if (l.badgeSig === sig && l.badgeMax === max) return;
-    l.badgeSig = sig;
+    const count = list?.length ?? 0;
+    const data = l.badgeData;
+    let changed = data.length !== count * 4 || l.badgeMax !== max;
+    if (list) for (let j = 0; j < count && !changed; j++) {
+      const b = list[j], k = j * 4;
+      changed = data[k] !== b.code || data[k + 1] !== b.prefix || data[k + 2] !== b.num || data[k + 3] !== b.color;
+    }
+    if (!changed) return;
+    data.length = count * 4;
+    if (list) for (let j = 0; j < count; j++) {
+      const b = list[j], k = j * 4;
+      data[k] = b.code; data[k + 1] = b.prefix; data[k + 2] = b.num; data[k + 3] = b.color;
+    }
     l.badgeMax = max;
-    const show = list ? list.slice(0, max) : [];
-    l.nBadges = show.length + (list && list.length > max ? 1 : 0);
-    l.badges.replaceChildren(...show.map((b) => {
+    const shown = Math.min(count, max);
+    l.nBadges = shown + (count > max ? 1 : 0);
+    l.badges.replaceChildren();
+    for (let j = 0; j < shown; j++) {
+      const b = list![j];
       const e = document.createElement('span');
       e.className = 'snum sm';
       e.style.setProperty('--c', b.color);
       const i = document.createElement('i'); i.textContent = b.prefix;
       const n = document.createElement('b'); n.textContent = b.num;
       e.append(i, n);
-      return e;
-    }));
+      l.badges.appendChild(e);
+    }
     if (list && list.length > max) { const m = document.createElement('span'); m.className = 'snum-more'; m.textContent = `+${list.length - max}`; l.badges.appendChild(m); }
   }
 
@@ -339,22 +405,23 @@ export class Labels {
       l.sx = c.sx; l.sy = c.sy; l.sc = s;
       l.el.style.transform = `translate3d(${c.sx.toFixed(1)}px, ${c.sy.toFixed(1)}px, 0) translate(-50%, -100%) scale(${s.toFixed(3)})`;
     }
-    const op = c.force ? 1 : Math.round(Math.max(0, Math.min(1, (c.maxDist - c.d) / (c.maxDist * 0.25))) * 20) / 20;
+    const steps = c.compact ? 100 : 20;
+    const op = c.force ? 1 : Math.round(Math.min(c.opacity, Math.max(0, Math.min(1, (c.maxDist - c.d) / (c.maxDist * 0.25)))) * steps) / steps;
     if (op !== l.op) { l.op = op; l.el.style.opacity = String(op); }
     const z = 100000 - Math.round(c.d * 10);
     if (Math.abs(z - l.z) > 5) { l.z = z; l.el.style.zIndex = String(z); }
     void w; void h;
   }
 
-  /** Is the straight line from the camera to the point blocked by terrain? */
-  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number): boolean {
+  /** Is the straight line from the camera to the point blocked by terrain (by more than `margin`)? */
+  private occluded(game: Game, camera: THREE.Camera, x: number, y: number, z: number, margin: number): boolean {
     const wd = game.world;
     const c = camera.position;
     for (let i = 1; i < 12; i++) {
       const f = i / 12;
       const px = c.x + (x - c.x) * f, pz = c.z + (z - c.z) * f;
       if (!wd.inside(px, pz)) continue;
-      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - 0.05) return true;
+      if (c.y + (y - c.y) * f < wd.heightAt(px, pz) - margin) return true;
     }
     return false;
   }

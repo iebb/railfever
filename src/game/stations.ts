@@ -10,57 +10,81 @@ import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
-import { growThroat, throatFree, holdThroat, releaseHold } from './trackops';
+import { growThroat, throatFree, holdThroat, releaseHold, WORKS_HOLD } from './trackops';
 import { autoSignalLine } from './signals';
-import { STATION_STYLES, styleOf, CONCOURSE_PAVILION } from './station-styles';
+import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from './station-styles';
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime } from './fares';
+import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
  * (weighted mean; fares.ts simNow), `transfers`: how many of them have changed vehicles on this journey (ops, 9j/9k).
  */
-export interface WaitGroup { line: number; alight: number; dest: number; count: number; t?: number; transfers?: number }
+export interface WaitGroup {
+  line: number; alight: number; dest: number; count: number; t?: number; transfers?: number;
+  /** the distance fares (per passenger) of the journey's rail legs so far: the rail minimum is paid once per journey */
+  rail?: number;
+}
 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
 
 export type StationLevel = 'ground' | 'elevated' | 'underground';
-/** Rail station modes, from the platform track type (TRACK_TYPES[type].mode): main line, metro / subway, light rail. */
+/**
+ * Construction style of a rail station, from its platform track type (TRACK_TYPES[type].mode): main line, metro
+ * (subway style: underground with entrances, screen doors) or light rail (close-spaced halts). Only construction
+ * defaults follow it (level, platforms, building, spacing); every rail station is one transport mode, 'rail'.
+ */
 export type RailMode = 'mainline' | 'metro' | 'lightrail';
-/** Transport mode of a station: its rail mode, else 'tram' (a stop on tram tracks) or 'bus'. */
+/** Construction style of a station: its rail style, else 'tram' (a stop on tram tracks) or 'bus'. */
 export type StationMode = RailMode | 'tram' | 'bus';
-/** Catchment circle modes ('rail': main-line stations). */
-export type CatchMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus';
+/** Walking catchment modes: every rail station (any track type), tram stops, bus stops. */
+export type CatchMode = 'rail' | 'tram' | 'bus';
 /** Side platforms (outside the tracks, which keep the plain double-track spacing) or island platforms between them. */
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Catchment radius per mode (units, 1 = 10 m): main-line rail ('rail'), metro and light rail from the platforms
- * (or the entrances), tram / bus from the stop. A station draws passengers only from buildings inside its circles.
+ * Nominal walking limit per mode (units, 1 = 10 m): twice the earlier path-based limits (rail 16.8, tram 15.4,
+ * bus 11.2). Rail is one mode: main-line, metro and light-rail stations walk alike. catchment.ts applies the
+ * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 40, metro: 30, lightrail: 25, tram: 22, bus: 16 };
-/** A catchment circle; inactive ones (a rail part without road access) draw no passengers. */
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 33.6, tram: 30.8, bus: 22.4 };
+/** Legacy reach metadata for site scoring; passenger coverage uses catchment.ts. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */
 export const DEFAULT_PLATFORM_LENGTH = 8;
 /** Default platform length per rail mode (units): main line, metro (a 6-car EMU), light rail (two coupled LRVs). */
 export const PLATFORM_LENGTH: Record<RailMode, number> = { mainline: DEFAULT_PLATFORM_LENGTH, metro: 12, lightrail: 7 };
-/** Rail mode of a track type (unknown types: main line). */
+/** Construction style of a track type (unknown types: main line). */
 export function railModeOf(trackType?: string): RailMode {
   const m = (TRACK_TYPES[trackType ?? ''] as { mode?: RailMode } | undefined)?.mode;
   return m === 'metro' || m === 'lightrail' ? m : trackType === 'metro' || trackType === 'lightrail' ? trackType : 'mainline';
 }
-/** Catchment mode of a rail mode. */
-export const catchModeOf = (m: RailMode): CatchMode => (m === 'mainline' ? 'rail' : m);
 /** Default platform length for a station on track of this type. */
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
 export const TRANSFER_RANGE = 14;
+/** Days of service history a station keeps (Station.callDays): its service frequency is the share of them with a call (Stations.callShare). */
+export const CALL_DAYS = 30;
+const CALL_MASK = 2 ** CALL_DAYS - 1;
+/** Older saves (no history): a station a vehicle has called at starts from three calls in the last 30 days. */
+const OLD_SAVE_CALLS = 1 | (1 << 10) | (1 << 20);
 /**
- * Automatic walking links when a station is built: metro / light-rail stations link to stations of the same mode
- * only when (nearly) touching (dense lines: neighbouring stops are no interchange), to other modes within
- * `urban` (hubs: metro under a main-line station, a bus stop at the entrance); others within TRANSFER_RANGE.
- * Consecutive stops of a line are never linked automatically.
+ * Station rating: lowered by up to this much when every passenger gives up waiting (in proportion to lostShare). The
+ * rating scales a station's passenger generation (as OpenTTD's does): where queues overflow, fewer set out.
+ */
+export const RATING_LOST = 0.6;
+/** Share of a station's passengers who gave up waiting rather than board (this and last month), 0..1. */
+export function lostShare(st: Station): number {
+  const lost = (st.lostMonth || 0) + (st.lostLast || 0);
+  return lost > 0 ? lost / (lost + st.pickupMonth + st.pickupLast) : 0;
+}
+/**
+ * Automatic walking links when a station is built, by construction style: close-spaced urban-style stations (metro
+ * / light-rail track) link to stations of the same style only when (nearly) touching (dense lines: neighbouring
+ * stops are no interchange), to other styles within `urban` (hubs: a subway-style station under a main-line
+ * station, a bus stop at the entrance); others within TRANSFER_RANGE. Consecutive stops of a line are never linked
+ * automatically.
  */
 export const AUTO_LINK_RANGE = { sameUrban: 4, urban: 10 };
 /** Auto-link range between stations of two modes (see AUTO_LINK_RANGE). */
@@ -81,6 +105,52 @@ export const ENTRANCE_SIZE = { underground: { w: 0.7, d: 1.1 }, elevated: { w: 0
 export const ENTRANCE_COST = { underground: 90_000, elevated: 60_000 };
 /** Entrances lie within this distance of the platform area. */
 export const ENTRANCE_REACH = 25;
+
+/**
+ * Kinds of station entrance (Entrance.kind). Stations below or above the street: an entrance 'pavilion'
+ * (underground) or a stair / lift 'tower' (elevated) beside a road. Ground stations, beside the track area: a
+ * side entrance 'hall' (a small booking hall, an underpass to every platform), a 'footbridge' or an 'underpass'
+ * across the tracks (stairs to every platform and down to the street on each side where there is room), or a
+ * 'gate' at a platform end (a ramp, ticket machine and gate; an underpass where tracks lie in between).
+ */
+export type EntranceKind = 'pavilion' | 'tower' | 'hall' | 'footbridge' | 'underpass' | 'gate';
+/** The kinds of entrance a ground station can add. */
+export const GROUND_ENTRANCES: readonly EntranceKind[] = ['hall', 'footbridge', 'underpass', 'gate'];
+export interface EntranceType {
+  name: string; desc: string;
+  /** street-level structure (each landing): width along its street side, depth towards the street */
+  w: number; d: number;
+  /** price: a fixed part plus one per unit of the track area's width (ground stations: the way across) */
+  cost: number; perWidth: number;
+  /** yearly upkeep */
+  upkeep: number;
+  /** ground stations: how far the ground at the entrance may lie above or below the platforms */
+  rise: number;
+  /** footbridge / underpass: stairs down to the street on both sides of the tracks */
+  twoSided: boolean;
+}
+export const ENTRANCE_TYPES: Record<EntranceKind, EntranceType> = {
+  pavilion: { name: 'Entrance pavilion', desc: 'Stairs down to the platforms from a pavilion beside a street', w: 0.7, d: 1.1, cost: 90_000, perWidth: 0, upkeep: 4_000, rise: 0, twoSided: false },
+  tower: { name: 'Stair tower', desc: 'Stairs and a lift up to the platforms from a hall beside a street', w: 0.8, d: 0.8, cost: 60_000, perWidth: 0, upkeep: 3_000, rise: 0, twoSided: false },
+  hall: { name: 'Side entrance', desc: 'A small booking hall beside the platforms, an underpass to every platform', w: 1.1, d: 0.7, cost: 55_000, perWidth: 6_000, upkeep: 3_000, rise: 0.8, twoSided: false },
+  footbridge: { name: 'Footbridge', desc: 'A covered footbridge over the tracks: stairs to every platform and down to the street on both sides', w: 0.55, d: 0.55, cost: 30_000, perWidth: 12_000, upkeep: 2_500, rise: 1.5, twoSided: true },
+  underpass: { name: 'Underpass', desc: 'A subway under the tracks: stairs to every platform and up to the street on both sides', w: 0.6, d: 0.8, cost: 40_000, perWidth: 16_000, upkeep: 2_000, rise: 1.0, twoSided: true },
+  gate: { name: 'Platform-end gate', desc: 'A ramp, gate and ticket machine at the end of the platforms', w: 0.8, d: 0.5, cost: 18_000, perWidth: 4_000, upkeep: 1_000, rise: 0.6, twoSided: false },
+};
+/** Ground entrances: the gap between the track area and an entrance, and the least room between two of them along the platforms. */
+const ENTRANCE_GAP = 0.15, ENTRANCE_SPACING = 1.0;
+/**
+ * Along the platforms, how far a crossing's structures reach either side of where its stairs meet them: an added
+ * footbridge's deck and the stair enclosures beside it, other entrances' stair wells; the station's own footbridge
+ * (deck and stair blocks, from `own.footbridge` - 0.15 to + 0.45) and underpass stairs; and the least gap between two.
+ */
+const CROSSING_HALF = { footbridge: 0.75, stairs: 0.3, ownStairs: 0.25 }, CROSSING_GAP = 0.1;
+/** A ground entrance's stairs keep this far inside the platform ends; a gate's stairs lie this far in from its end. */
+const ENTRANCE_END = 0.7, GATE_STAIRS = 0.75;
+/** An access street ends this far in front of an entrance's street side (within the landing's road reach)... */
+const ENTRANCE_DOOR = 0.75;
+/** ...and leads to a road within this distance on the entrance's side of the tracks. */
+const ENTRANCE_STREET = 16;
 /** Underground platforms this far below the lowest ground above them (default), elevated decks this high. */
 export const STATION_DEPTH = { min: 1.5, max: 4, def: 2.6, metro: 2.2 };
 export const STATION_HEIGHT = { min: 1.2, max: 3, def: 1.5 };
@@ -100,8 +170,110 @@ interface BuildingCand { b: Rect; fc: { x: number; z: number }; fc2?: { x: numbe
 /** Cost of a walking transfer: base + per unit walked (the line graph adds its transfer penalty on top). */
 const WALK_BASE = 6, WALK_PER_UNIT = 2;
 
-/** A street-level entrance (underground pavilion / elevated stair tower); forward (sin a, cos a) faces the street. */
-export interface Entrance { x: number; z: number; angle: number }
+/**
+ * A street-level entrance (underground pavilion / elevated stair tower, or a ground station's side hall, footbridge,
+ * underpass or platform-end gate beside the track area); forward (sin a, cos a) faces the street.
+ */
+export interface Entrance {
+  x: number; z: number; angle: number;
+  /** what it is (missing: the level's own kind, as built with the station) */
+  kind?: EntranceKind;
+  /** footbridge / underpass: its stairs on the other side of the tracks (missing: one side only) */
+  far?: { x: number; z: number; angle: number };
+  /** what it cost (entrances added to a built station: they carry upkeep and asset value) */
+  cost?: number;
+}
+
+/** The kind of an entrance (older or planned ones: their level's own). */
+export function entranceKind(level: StationLevel, e: Entrance): EntranceKind {
+  if (e.kind && ENTRANCE_TYPES[e.kind]) return e.kind;
+  return level === 'elevated' ? 'tower' : level === 'underground' ? 'pavilion' : 'hall';
+}
+/** Street-level structures of an entrance: itself and, for a two-sided crossing, its stairs across the tracks. */
+export function entranceLandings(e: Entrance): { x: number; z: number; angle: number }[] { return e.far ? [e, e.far] : [e]; }
+/** A landing's rectangle. */
+export function landingRect(kind: EntranceKind, p: { x: number; z: number; angle: number }): Rect {
+  const T = ENTRANCE_TYPES[kind];
+  return { x: p.x, z: p.z, angle: p.angle, w: T.w, d: T.d };
+}
+/** A road this close to a landing's centre gives it access (as for underground entrance pavilions). */
+export function landingReach(kind: EntranceKind): number { return ENTRANCE_TYPES[kind].d / 2 + 0.9; }
+/** Where an access street to a landing ends: in front of its street side. */
+export function landingDoor(kind: EntranceKind, p: { x: number; z: number; angle: number }): { x: number; z: number } {
+  const k = ENTRANCE_TYPES[kind].d / 2 + ENTRANCE_DOOR;
+  return { x: p.x + Math.sin(p.angle) * k, z: p.z + Math.cos(p.angle) * k };
+}
+/** Price of an entrance of a kind at a station (ground stations: by the width of the track area it crosses). */
+export function entranceCost(kind: EntranceKind, r: RailPart | null): number {
+  const T = ENTRANCE_TYPES[kind];
+  return Math.round((T.cost + T.perWidth * (r && (r.level ?? 'ground') === 'ground' ? railWidth(r) : 0)) / 1000) * 1000;
+}
+/** Yearly upkeep of a station's added entrances (those built with the station are part of its own upkeep). */
+export function entranceUpkeep(r: RailPart | null): number {
+  let c = 0;
+  for (const e of r?.entrances ?? []) if (e.kind && ENTRANCE_TYPES[e.kind]) c += ENTRANCE_TYPES[e.kind].upkeep;
+  return c;
+}
+/** Ground stations: where an entrance's stairs meet the platforms, along the axis from the centre. */
+export function entranceAlong(r: RailPart, e: Entrance): number {
+  const a = (e.x - r.x) * Math.sin(r.angle) + (e.z - r.z) * Math.cos(r.angle);
+  if (entranceKind(r.level ?? 'ground', e) !== 'gate') return a;
+  return (a >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - GATE_STAIRS);
+}
+/** Ground stations: the side of the tracks an entrance stands on (+1 right of the axis, -1 left). */
+export function entranceSide(r: RailPart, e: { x: number; z: number }): 1 | -1 {
+  return (e.x - r.x) * Math.cos(r.angle) - (e.z - r.z) * Math.sin(r.angle) >= 0 ? 1 : -1;
+}
+/** Where a station's entrances stand (cache keys). */
+function entranceKey(r: RailPart): string {
+  let k = '';
+  for (const e of r.entrances ?? []) k += `${e.x},${e.z},${e.angle},${e.kind ?? ''},${e.far ? `${e.far.x},${e.far.z}` : ''};`;
+  return k;
+}
+
+/**
+ * What rebuilding a ground station in place (or merging two) does to one of its added entrances: 'stays' where it
+ * stood, 'moves' along the platforms, 'street' moves and gets a new access street, or goes: 'room' (no room beside
+ * the new track area) or 'cut' (no street reaches it there, and a new one would not be cheap).
+ */
+export type EntranceFate = 'stays' | 'moves' | 'street' | 'room' | 'cut';
+/** A rebuild's effect on a ground station's added entrances (Stations.refitEntrances, previewed by planUpgrade). */
+export interface EntranceRefit {
+  /** per entrance, in order: its kind, its fate, and whether a crossing loses its stairs across the tracks or the
+   * street there (its own side's keeps its street, or it goes) */
+  fates: { kind: EntranceKind; fate: EntranceFate; lostFar?: boolean; farCut?: boolean }[];
+  /** price of the new access streets */
+  streets: number;
+}
+/** An entrance a rebuilt station's walkers no longer reach gets a new access street up to this share of its price. */
+const ENTRANCE_RECONNECT = 0.5;
+/** Places tried along the platforms when a rebuilt station's entrance no longer fits where it stood. */
+const REFIT_SHIFTS = [0, 0.25, -0.25, 0.5, -0.5, 0.75, -0.75, 1, -1, 1.25, -1.25, 1.5, -1.5];
+
+/**
+ * Warning for a station's added entrances that a rebuild, move or re-level takes down: "Its added footbridge goes
+ * (why)", "Its 2 added entrances go (why)" (null: none). Their price leaves the station's value, their upkeep stops.
+ */
+export function entrancesGo(level: StationLevel, entrances: Entrance[], why: string): string | null {
+  const added = entrances.filter((e) => e.kind);
+  if (!added.length) return null;
+  const what = added.length === 1 ? `added ${ENTRANCE_TYPES[entranceKind(level, added[0])].name.toLowerCase()} goes` : `${added.length} added entrances go`;
+  return `Its ${what} (${why})`;
+}
+/** Warnings for what a rebuild in place does to a ground station's added entrances (see EntranceRefit). */
+export function refitWarnings(f: EntranceRefit | null | undefined): string[] {
+  const out: string[] = [];
+  for (const x of f?.fates ?? []) {
+    const n = `Its added ${ENTRANCE_TYPES[x.kind].name.toLowerCase()}`;
+    if (x.fate === 'room') out.push(`${n} goes (no room beside the new platforms)`);
+    else if (x.fate === 'cut') out.push(`${n} goes (no street reaches it beside the new platforms)`);
+    else if (x.fate === 'street') out.push(`${n} moves along the platforms and gets a new access street`);
+    if (x.fate === 'room' || x.fate === 'cut') continue;
+    if (x.lostFar) out.push(`${n} loses its stairs across the tracks`);
+    else if (x.farCut) out.push(`${n} loses its street across the tracks`);
+  }
+  return out;
+}
 
 export interface RailPart {
   x: number; z: number; y: number;
@@ -123,7 +295,7 @@ export interface RailPart {
   width: number;
   /** where the through tracks lie */
   throughMode?: ThroughMode;
-  /** platform track type (TRACK_TYPES id): the station's mode (main line, metro, light rail) follows it */
+  /** platform track type (TRACK_TYPES id): the station's construction style (main line, metro, light rail) follows it */
   trackType: string;
   /** side platforms (outside the tracks) instead of islands between them */
   platformStyle?: PlatformStyle;
@@ -212,6 +384,12 @@ export interface Station {
   genMonth: number; genLast: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
+  /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
+  lostMonth: number; lostLast: number;
+  /** day a vehicle last called (stopped) at the station; -1 before the first call (unlike lastPickup, not the day it was built) */
+  lastCall: number;
+  /** days of the last CALL_DAYS on which a vehicle called, bit k: k + 1 days ago (updateRatings; Stations.callShare) */
+  callDays: number;
   built: number;
   /** stations linked for walking transfers (a transfer complex), both ways */
   links: number[];
@@ -221,10 +399,10 @@ export interface Station {
   occ?: number; tpd?: number; ppd?: number; onPlat?: number[];
 }
 
-/** Collision rectangle of a station structure with its vertical extent (y0..y1) and what it is. */
-export interface Footprint extends Rect { y0?: number; y1?: number; part?: 'platforms' | 'building' | 'entrance' | 'deck' | 'pier' }
+/** Collision rectangle of a station structure with its vertical extent (y0..y1), what it is and (entrances) which one. */
+export interface Footprint extends Rect { y0?: number; y1?: number; part?: 'platforms' | 'building' | 'entrance' | 'deck' | 'pier'; entrance?: number }
 /** A station structure's volume (for clearance checks). */
-interface Volume extends Rect { y0: number; y1: number; part: 'platforms' | 'building' | 'entrance' | 'deck' | 'pier' }
+interface Volume extends Rect { y0: number; y1: number; part: 'platforms' | 'building' | 'entrance' | 'deck' | 'pier'; entrance?: number }
 
 /** Station names after places in town, by where the station is: core, inner streets, edge, waterside, hill. */
 const PLACE_NAMES: Record<'core' | 'inner' | 'edge' | 'water' | 'hill', string[]> = {
@@ -337,7 +515,7 @@ export const railPartMode = (r: RailPart): RailMode => railModeOf(r.trackType);
 
 /**
  * Catchment circles of rail platforms: along the axis (both ends and between), so the area is measured from the
- * platforms; the radius by mode (main line 'rail', metro, light rail).
+ * platforms; the radius is the rail walking limit (every rail station alike) with the building's bonus.
  */
 export function railCatchShapes(x: number, z: number, angle: number, length: number, active = true, mode: CatchMode = 'rail', bonus = 0): CatchShape[] {
   const R = CATCHMENT_RADIUS[mode] * (1 + bonus), fx = Math.sin(angle), fz = Math.cos(angle);
@@ -392,7 +570,7 @@ export interface StationOpts {
   /** platform level fixed (a station inserted into an existing line at the track's height) */
   fixedY?: number;
   /**
-   * platform track type (TRACK_TYPES id, default 'standard'): the station's mode. Metro stations default to
+   * platform track type (TRACK_TYPES id, default 'standard'): the construction style. Metro-track stations default to
    * underground (STATION_DEPTH.metro), side platforms and platform screen doors; light rail to side platforms.
    */
   trackType?: string;
@@ -406,6 +584,8 @@ export interface StationOpts {
   buildingEnd?: 1 | -1;
   /** ends that carry track beyond the platforms (no head building there) */
   blockedEnds?: (1 | -1)[];
+  /** rebuilding in place: the station's own added entrances, which a new building site avoids where it can */
+  avoid?: Rect[];
 }
 
 export interface StationPlan {
@@ -444,6 +624,24 @@ export interface StationPlan {
   forecourt: { x: number; z: number } | null;
   /** style 'over': the forecourt on the other side of the tracks */
   forecourt2?: { x: number; z: number } | null;
+}
+
+/** A planned extra entrance (Stations.planEntrance). */
+export interface EntrancePlan {
+  ok: boolean; error?: string;
+  /** e.g. no room for a crossing's stairs on the other side, or no road beside them */
+  warnings: string[];
+  kind: EntranceKind;
+  /** the entrance as it would be built (also on some failures: no road beside it, for the AI's estimates) */
+  entrance?: Entrance;
+  /** what it costs, its access street included */
+  cost: number;
+  /** ground: the access street to a road within reach (its cost is part of `cost`), or null */
+  access: Proposal | null;
+  /** its street-level structures and whether a road reaches each (now, or through the access street) */
+  landings: { x: number; z: number; angle: number; road: boolean }[];
+  /** no road at any landing: where an access street would start (on the planned side) */
+  door?: { x: number; z: number };
 }
 
 export interface BusStopPlan {
@@ -486,6 +684,8 @@ export interface UpgradePlan {
   rebuild: boolean;
   /** only the building changes (a station below or above the street: tracks and entrances stay) */
   restyleOnly?: boolean;
+  /** a ground station rebuilt in place: what becomes of its added entrances (new access streets are in `cost`) */
+  entrances?: EntranceRefit;
 }
 
 export class Stations {
@@ -493,9 +693,44 @@ export class Stations {
   nextId = 1;
   /** network version the stations' road access was last computed at */
   private accessVersion = -1;
+  /** Structural/access edits consumed by the walking portal index. */
+  walkVersion = 0;
+  private warming = false;
+  private warmedTick = -1;
+  private warmCursor = 0;
+  private warmStations: Station[] = [];
+  private warmVersion = -1;
+  private warmCount = -1;
+
+  /** Prepare at most two station inputs per fixed tick; live shares retain their original update timing. */
+  prepareCatchmentTick() {
+    if (this.warming || this.warmedTick === this.game.tick) return;
+    this.warmedTick = this.game.tick;
+    if (!this.sharesReady || !this.catchmentInputsChanged()) return;
+    if (this.warmVersion !== this.walkVersion || this.warmCount !== this.map.size) {
+      this.warmVersion = this.walkVersion; this.warmCount = this.map.size; this.warmStations = this.all();
+    }
+    this.warming = true;
+    try {
+      for (let i = 0; i < 2 && this.warmStations.length; i++) {
+        const st = this.warmStations[this.warmCursor++ % this.warmStations.length];
+        if (this.map.get(st.id) === st) prepareWalkingCatchment(this.game, st);
+      }
+    } finally { this.warming = false; }
+  }
   constructor(private game: Game) {
     const net = game.world.net;
     net.onSplit.push((old, e1, e2, s) => {
+      for (const h of this.holds.values()) {
+        const i = h.edges.indexOf(old.id);
+        if (i >= 0) {
+          h.edges.splice(i, 1, e1.id, e2.id);
+          if (game.vehicles.getRes(old.id) === WORKS_HOLD) {
+            game.vehicles.setRes(e1.id, WORKS_HOLD); game.vehicles.setRes(e2.id, WORKS_HOLD);
+            game.vehicles.releaseRes(old.id, WORKS_HOLD);
+          }
+        }
+      }
       for (const st of this.map.values()) {
         for (const stop of st.stops) {
           if (stop.edge !== old.id) continue;
@@ -510,6 +745,11 @@ export class Stations {
       }
     });
     net.onRemove.push((e) => {
+      for (const [sid, h] of this.holds) {
+        if (h.edges.includes(e.id)) game.vehicles.releaseRes(e.id, WORKS_HOLD);
+        h.edges = h.edges.filter((id) => id !== e.id);
+        if (!h.edges.length) this.holds.delete(sid);
+      }
       for (const st of [...this.map.values()]) {
         const before = st.stops.length;
         st.stops = st.stops.filter((p) => p.edge !== e.id);
@@ -529,7 +769,8 @@ export class Stations {
     const st: Station = {
       id: this.nextId++, name: this.stationName(x, z, town), owner, townId: town ? town.id : -1, x, z, rail: null, stops: [],
       waiting: new Map(), waitingTotal: 0, rating: 0.65, lastPickup: g.day, lastSpeed: 0,
-      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0, built: g.day,
+      catchPop: 0, genAccum: 0, genMonth: 0, genLast: 0, pickupMonth: 0, pickupLast: 0, arrivedMonth: 0, arrivedLast: 0,
+      lostMonth: 0, lostLast: 0, lastCall: -1, callDays: 0, built: g.day,
       links: [], roadAccess: true,
     };
     this.map.set(st.id, st);
@@ -605,7 +846,7 @@ export class Stations {
     const r = st.rail;
     if (!r) return;
     w.markObjArea(r.x - r.length / 2 - 3, r.z - r.length / 2 - 3, r.x + r.length / 2 + 3, r.z + r.length / 2 + 3);
-    for (const e of [...r.entrances, r.building, ...r.piers]) w.markObjArea(e.x - 2.5, e.z - 2.5, e.x + 2.5, e.z + 2.5);
+    for (const e of [...r.entrances.flatMap(entranceLandings), r.building, ...r.piers]) w.markObjArea(e.x - 2.5, e.z - 2.5, e.x + 2.5, e.z + 2.5);
     if (r.forecourt) w.markObjArea(r.forecourt.x - 2, r.forecourt.z - 2, r.forecourt.x + 2, r.forecourt.z + 2);
   }
 
@@ -619,11 +860,12 @@ export class Stations {
   /** Cached station structure volumes (planning queries hit these per sample point). */
   private structCache = new WeakMap<RailPart, { key: string; v: Volume[] }>();
 
-  private structures(st: Station): Volume[] {
-    const r = st.rail;
-    if (!r) return [];
+  private structures(st: Station): Volume[] { return st.rail ? this.structuresOf(st.rail) : []; }
+
+  /** Structure volumes of a rail part (a station's, or a planned one when previewing a rebuild). */
+  private structuresOf(r: RailPart): Volume[] {
     const b = r.building;
-    const key = `${this.game.world.heightsVersion}|${r.x}|${r.z}|${r.y}|${r.angle}|${r.length}|${r.tracks}|${r.through ?? 0}|${r.width ?? 0}|${r.level}|${b.x}|${b.z}|${b.w}|${b.d}|${(r.entrances ?? []).length}|${(r.piers ?? []).length}|${r.style ?? ''}`;
+    const key = `${this.game.world.heightsVersion}|${r.x}|${r.z}|${r.y}|${r.angle}|${r.length}|${r.tracks}|${r.through ?? 0}|${r.width ?? 0}|${r.level}|${b.x}|${b.z}|${b.w}|${b.d}|${entranceKey(r)}|${(r.piers ?? []).length}|${r.style ?? ''}`;
     const c = this.structCache.get(r);
     if (c && c.key === key) return c.v;
     const v = this.buildStructures(r);
@@ -645,6 +887,15 @@ export class Stations {
         out.push({ ...b, y0: r.y + 1.1, y1: r.y + 1.9, part: 'deck' });
         for (const sd of [1, -1]) out.push({ x: b.x + rx * off * sd, z: b.z + rz * off * sd, angle: r.angle - (Math.PI / 2) * sd, w: b.w, d: CONCOURSE_PAVILION, y0: r.y - 0.2, y1: r.y + 1.9, part: 'building' });
       } else out.push({ ...r.building, y0: r.y - 0.2, y1: r.y + styleHeight(sty), part: 'building' });
+      // added entrances beside the track area: their halls, stair towers, stair pavilions and gates (a footbridge's
+      // deck crosses within the platforms' volume, an underpass beneath it)
+      (r.entrances ?? []).forEach((e, i) => {
+        const k = entranceKind('ground', e);
+        for (const p of entranceLandings(e)) {
+          const h = w.heightAt(p.x, p.z);
+          out.push({ ...landingRect(k, p), y0: h - 0.2, y1: k === 'footbridge' ? Math.max(h + 0.5, r.y + 1.0) : h + (k === 'hall' ? 0.55 : k === 'underpass' ? 0.45 : 0.35), part: 'entrance', entrance: i });
+        }
+      });
       return out;
     }
     const out: Volume[] = [];
@@ -653,7 +904,7 @@ export class Stations {
       out.push({ ...fp, y0: r.y - 0.4, y1: r.y + 1.0, part: 'deck' });
       for (const p of r.piers ?? []) { const h = w.heightAt(p.x, p.z); out.push({ x: p.x, z: p.z, angle: r.angle, w: 0.4, d: 0.4, y0: h - 0.3, y1: r.y, part: 'pier' }); }
     }
-    for (const e of r.entrances ?? []) { const h = w.heightAt(e.x, e.z); out.push({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d, y0: h - 0.2, y1: lv === 'elevated' ? r.y + 1.0 : h + 0.6, part: 'entrance' }); }
+    (r.entrances ?? []).forEach((e, i) => { const h = w.heightAt(e.x, e.z); out.push({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d, y0: h - 0.2, y1: lv === 'elevated' ? r.y + 1.0 : h + 0.6, part: 'entrance', entrance: i }); });
     // a station building at street level (style other than none)
     const sty = styleOf(r.style);
     if (sty.placement !== 'none' && r.forecourt) { const h = w.heightAt(r.building.x, r.building.z); out.push({ ...r.building, y0: h - 0.2, y1: h + styleHeight(sty), part: 'building' }); }
@@ -804,7 +1055,12 @@ export class Stations {
         for (const q of roadPts) if (q.lon * end > length / 2 + bs.d) d = Math.min(d, Math.hypot(q.x - fc.x, q.z - fc.z));
         return d;
       };
-      const conflict = (r: Rect, h: number, dem: Set<number>) => this.rectConflict(r, y0 - 0.2, y0 + h, dem, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      // (below / above the street: never over the entrances planned beside it)
+      const keep = level === 'ground' ? [] : plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: ENTRANCE_SIZE[level].w, d: ENTRANCE_SIZE[level].d }));
+      const conflict = (r: Rect, h: number, dem: Set<number>) => keep.some((q) => rectsOverlap(r, q, 0.1)) ? 'Entrance in the way'
+        : this.rectConflict(r, y0 - 0.2, y0 + h, dem, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      /** a site over one of the station's own entrances (rebuilding in place) only when nothing else fits */
+      const over = (r: Rect) => (opts.avoid?.some((q) => rectsOverlap(r, q, 0.1)) ? 1000 : 0);
       const popOf = (dem: Set<number>) => { let p = 0; for (const id of dem) p += w.buildings.get(id)?.pop ?? 0; return p; };
       const reach = pl === 'none' ? NO_BUILDING_REACH : 0.9;
       if (pl === 'side' || pl === 'none') {
@@ -817,7 +1073,7 @@ export class Stations {
           const dem = new Set<number>();
           if (conflict(b, styleHeight(sty), dem)) continue;
           const road = Math.max(0, roadDist(fc, side) - reach);
-          cands.push({ b, fc, dem, road, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + Math.abs(k) * (pl === 'none' ? 0 : 4) + (side === -1 ? 0 : 0.3) });
+          cands.push({ b, fc, dem, road, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + Math.abs(k) * (pl === 'none' ? 0 : 4) + (side === -1 ? 0 : 0.3) + over(b) });
         }
       } else if (pl === 'over') {
         const slide = Math.max(0, length / 2 - bs.w / 2 - 0.2);
@@ -834,7 +1090,8 @@ export class Stations {
           const fR = { x: cx + rx * (bs.d / 2 + FORECOURT), z: cz + rz * (bs.d / 2 + FORECOURT) }, fL = { x: cx - rx * (bs.d / 2 + FORECOURT), z: cz - rz * (bs.d / 2 + FORECOURT) };
           const dR = roadDist(fR, 1), dL = roadDist(fL, -1);
           const road = Math.max(0, Math.min(dR, dL) - reach);
-          cands.push({ b, fc: dR <= dL ? fR : fL, fc2: dR <= dL ? fL : fR, dem, road, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + Math.abs(k) * 4 });
+          const pav = [1, -1].map((sd) => { const off = layout.width / 2 + CONCOURSE_PAVILION / 2; return { x: cx + rx * off * sd, z: cz + rz * off * sd, angle: angle - (Math.PI / 2) * sd, w: bs.w, d: CONCOURSE_PAVILION }; });
+          cands.push({ b, fc: dR <= dL ? fR : fL, fc2: dR <= dL ? fL : fR, dem, road, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + Math.abs(k) * 4 + over(pav[0]) + over(pav[1]) + over({ ...b, w: b.w + 1.2 }) });
         }
       } else {
         for (const end of opts.buildingEnd ? [opts.buildingEnd] : [-1, 1] as const) {
@@ -845,7 +1102,7 @@ export class Stations {
           if (conflict(b, styleHeight(sty), dem)) continue;
           const fc = { x: cx + fx * (bs.d / 2 + FORECOURT) * end, z: cz + fz * (bs.d / 2 + FORECOURT) * end };
           const road = Math.max(0, roadDistEnd(fc, end) - reach);
-          cands.push({ b, fc, dem, road, end, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + (end === -1 ? 0 : 0.3) });
+          cands.push({ b, fc, dem, road, end, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + (end === -1 ? 0 : 0.3) + over(b) });
         }
       }
       cands.sort((p, q) => p.score - q.score);
@@ -1018,24 +1275,29 @@ export class Stations {
    * Access street from a station forecourt to a nearby road: not through the station, and clear of the lead
    * corridors beyond both platform ends (where the line and its throat go).
    */
-  private planAccessStreet(fx: number, fz: number, plan: StationPlan, owner: number, headEnd?: number): Proposal | null {
+  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; angle: number; length: number; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH): Proposal | null {
     const g = this.game, net = g.world.net;
     const ax = Math.sin(plan.angle), az = Math.cos(plan.angle);
     const LEAD = 26, half = plan.layout.width / 2 + 1.2;
+    /** (an entrance's street: to roads on its own side of the tracks, or beyond the lead corridors) */
+    const across = (x: number, z: number) => !!side && ((x - plan.x) * az - (z - plan.z) * ax) * side < plan.layout.width / 2 + 0.3
+      && Math.abs((x - plan.x) * ax + (z - plan.z) * az) < plan.length / 2 + LEAD;
     // the lead corridors beyond the platform ends stay free for the line (not at a terminal building's end)
-    const keepOut: Rect[] = [plan.footprint, plan.building];
+    const keepOut: Rect[] = [plan.footprint, plan.building, ...extra];
     for (const end of [1, -1]) if (end !== headEnd) keepOut.push({ x: plan.x + ax * end * (plan.length / 2 + LEAD / 2), z: plan.z + az * end * (plan.length / 2 + LEAD / 2), angle: plan.angle, w: half * 2, d: LEAD });
     const blocked = (x: number, z: number, m: number) => keepOut.some((r) => distToRect(x, z, r.x, r.z, r.angle, r.w / 2, r.d / 2) < m);
+    // (an entrance's street may join a street closer than a street can be long, e.g. its old one: further along it)
+    const near = side ? 1.05 : 0;
     // candidate road points: along every road near the forecourt, nearest first, outside the keep-out areas
     const cands: { e: NEdge; s: number; d: number }[] = [];
     const p = { x: 0, y: 0, z: 0 };
-    for (const e of net.edgesNear(fx - ACCESS_REACH, fz - ACCESS_REACH, fx + ACCESS_REACH, fz + ACCESS_REACH)) {
+    for (const e of net.edgesNear(fx - reach, fz - reach, fx + reach, fz + reach)) {
       if (e.kind !== 'road' || e.depot >= 0) continue;
       let best: { s: number; d: number } | null = null;
       for (let s = 0; s <= e.len; s += Math.min(2, Math.max(0.5, e.len / 4))) {
         net.pointAt(e, s, p);
         const d = Math.hypot(p.x - fx, p.z - fz);
-        if (d > ACCESS_REACH || blocked(p.x, p.z, 0.6) || net.sectionAt(e, s) !== 'ground') continue;
+        if (d > reach || d < near || blocked(p.x, p.z, 0.6) || net.sectionAt(e, s) !== 'ground' || across(p.x, p.z)) continue;
         if (!best || d < best.d) best = { s, d };
       }
       if (best) cands.push({ e, ...best });
@@ -1048,6 +1310,8 @@ export class Stations {
       const start: Snap = { kind: 'free', x: fx, z: fz, y: g.world.heightAt(fx, fz) };
       const prop = planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
       if (!prop.ok) continue;
+      // (an entrance's street is walked: at ground level from its door, no cutting below the ground into a tunnel)
+      if (side && prop.tracks.some((t) => t.sections.length || Math.abs(t.prof[0] - start.y) > 0.3)) continue;
       const tp = prop.tracks[0];
       let hit = false;
       for (let i = 1; i <= 24 && !hit; i++) {
@@ -1096,7 +1360,7 @@ export class Stations {
   /** Is (x, z) within `r` of a road that belongs to a real road network (not just an isolated stub)? */
   private roadContact(x: number, z: number, r: number): boolean {
     const net = this.game.world.net;
-    const ne = net.nearestEdge(x, z, r, 'road', (e) => e.depot < 0);
+    const ne = net.nearestEdge(x, z, r, 'road', pedestrianRoad);
     if (!ne) return false;
     // connected: at least ~20 units of road reachable from it
     const seen = new Set<number>([ne.edge.id]);
@@ -1109,7 +1373,7 @@ export class Stations {
       for (const nid of [e.a, e.b]) for (const id of net.nodes.get(nid)?.edges ?? []) {
         if (seen.has(id)) continue;
         const f = net.edges.get(id);
-        if (f && f.kind === 'road' && f.depot < 0) { seen.add(id); queue.push(f); }
+        if (f && pedestrianRoad(f)) { seen.add(id); queue.push(f); }
       }
     }
     return len >= 20;
@@ -1240,17 +1504,7 @@ export class Stations {
     plan.layout.trackOffsets.forEach((off, i) => edges.push(lay(off, String(i), st.id)));
     plan.layout.throughOffsets.forEach((off, i) => through.push(lay(off, 'T' + i, -1)));
     const level = plan.level;
-    st.rail = {
-      x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, length: L, tracks: plan.tracks,
-      trackOffsets: plan.layout.trackOffsets, platforms: plan.layout.platforms, edges: edges.map((e) => e.id),
-      through: plan.layout.throughOffsets.length, throughOffsets: plan.layout.throughOffsets, throughEdges: through.map((e) => e.id), width: plan.layout.width, throughMode: plan.throughMode,
-      trackType: plan.trackType ?? 'standard', platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
-      style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
-      building: plan.building,
-      level, underground: level === 'underground', depth: plan.depth, height: plan.height,
-      entrances: plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle })), piers: plan.piers.map((p) => ({ ...p })),
-      forecourt: plan.forecourt ?? undefined, cost: plan.cost,
-    };
+    st.rail = this.partOf(plan, edges.map((e) => e.id), through.map((e) => e.id));
     st.x = plan.x; st.z = plan.z;
     if (level === 'ground') {
       this.levelGround(plan);
@@ -1268,6 +1522,22 @@ export class Stations {
     this.repairSite(st);
     w.markObjArea(plan.x - L - 30, plan.z - L - 30, plan.x + L + 30, plan.z + L + 30);
     this.markStation(st);
+  }
+
+  /** The rail part a plan builds, with its platform and through track edges (none: a planned part, for previews). */
+  private partOf(plan: StationPlan, edges: number[], through: number[]): RailPart {
+    const level = plan.level;
+    return {
+      x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, length: plan.length, tracks: plan.tracks,
+      trackOffsets: plan.layout.trackOffsets, platforms: plan.layout.platforms, edges,
+      through: plan.layout.throughOffsets.length, throughOffsets: plan.layout.throughOffsets, throughEdges: through, width: plan.layout.width, throughMode: plan.throughMode,
+      trackType: plan.trackType ?? 'standard', platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
+      style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
+      building: plan.building,
+      level, underground: level === 'underground', depth: plan.depth, height: plan.height,
+      entrances: plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle })), piers: plan.piers.map((p) => ({ ...p })),
+      forecourt: plan.forecourt ?? undefined, cost: plan.cost,
+    };
   }
 
   /** Flatten the ground under a small street-level structure. */
@@ -1339,6 +1609,8 @@ export class Stations {
     const st = this.map.get(id);
     if (!st) return null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) if (g.vehicles.isEdgeBusy(eid)) return 'Train in the station';
+    const hold = this.holds.get(id);
+    if (hold) { releaseHold(g, hold.edges); this.holds.delete(id); }
     const site = st.rail ? { x: st.x, z: st.z, rail: st.rail } : null;
     if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) g.world.net.removeEdge(eid);
     this.markStation(st);
@@ -1352,20 +1624,29 @@ export class Stations {
 
   // ---------------------------------------------------------------- entrances and road access
   /**
-   * Plan an extra entrance for an underground / elevated station near (x, z): beside a road (snapped to its
-   * sidewalk, facing the street), within ENTRANCE_REACH of the platforms. Returns the site and cost, or the reason.
+   * Plan an extra entrance for a station near (x, z). Below / above the street: an entrance pavilion / stair tower
+   * beside a road (snapped to its sidewalk, facing the street) within ENTRANCE_REACH of the platforms. Ground
+   * stations: an entrance of `kind` (default a side hall) beside the track area on the side of (x, z), at its
+   * position along the platforms (a gate at the nearer platform end); a footbridge or underpass also gets stairs on
+   * the other side of the tracks where there is room. Nothing may be in the way (tracks, roads, buildings, other
+   * structures); a road must reach one of its landings, else an access street is planned from the door on the
+   * clicked side to a road within reach (`street: false`: none is planned, the plan fails with `door` set). Pure.
    */
-  planEntrance(stationId: number, x: number, z: number, owner: number): { ok: boolean; error?: string; entrance?: Entrance; cost: number } {
+  planEntrance(stationId: number, x: number, z: number, owner: number, kind?: EntranceKind, o: { street?: boolean } = {}): EntrancePlan {
     const g = this.game, net = g.world.net;
     const st = this.map.get(stationId);
     const r = st?.rail;
-    if (!st || !r) return { ok: false, error: 'No such rail station', cost: 0 };
-    if (st.owner !== owner) return { ok: false, error: 'Not your station', cost: 0 };
+    const lv0 = r?.level ?? 'ground';
+    const none = (error: string, k: EntranceKind = lv0 === 'elevated' ? 'tower' : lv0 === 'underground' ? 'pavilion' : 'hall'): EntrancePlan => ({ ok: false, error, warnings: [], kind: k, cost: 0, access: null, landings: [] });
+    if (!st || !r) return none('No such rail station');
+    if (st.owner !== owner) return none('Not your station');
     const lv = r.level ?? 'ground';
-    if (lv === 'ground') return { ok: false, error: 'Ground stations are entered through their building', cost: 0 };
+    if (lv === 'ground') return this.planGroundEntrance(st, x, z, owner, kind, o);
+    // below / above the street: a pavilion or stair tower beside a road
+    const k: EntranceKind = lv === 'elevated' ? 'tower' : 'pavilion';
     const sz = ENTRANCE_SIZE[lv];
     const ne = net.nearestEdge(x, z, 3, 'road', (e) => e.depot < 0);
-    if (!ne) return { ok: false, error: 'Entrances go beside a road', cost: 0 };
+    if (!ne) return none('Entrances go beside a road', k);
     const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
     net.pointAt(ne.edge, ne.s, p, d);
     const l = Math.hypot(d.x, d.z) || 1, nx = -d.z / l, nz = d.x / l;
@@ -1373,57 +1654,314 @@ export class Stations {
     const off = net.halfWidth(ne.edge) + sz.d / 2 + 0.06;
     const ex = p.x + nx * off * side, ez = p.z + nz * off * side, ang = angleOf(-nx * side, -nz * side);
     const fp = this.platformRect(st)!;
-    if (distToRect(ex, ez, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) > ENTRANCE_REACH) return { ok: false, error: `Too far from the platforms (max ${ENTRANCE_REACH * 10} m)`, cost: 0 };
-    if (r.entrances.some((q) => Math.hypot(q.x - ex, q.z - ez) < 3)) return { ok: false, error: 'Another entrance is too close', cost: 0 };
+    if (distToRect(ex, ez, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) > ENTRANCE_REACH) return none(`Too far from the platforms (max ${ENTRANCE_REACH * 10} m)`, k);
+    if (r.entrances.some((q) => Math.hypot(q.x - ex, q.z - ez) < 3)) return none('Another entrance is too close', k);
+    // the station's own street-level structures first (entranceFree ignores the station): its hall, its forecourt,
+    // its entrances and an elevated deck's piers
+    const own = this.ownStreetError(st, { x: ex, z: ez, angle: ang, w: sz.w, d: sz.d });
+    if (own) return none(own, k);
     const dem = this.entranceFree(lv, ex, ez, ang, fp, ne.edge.id, st.id);
-    if (!dem || dem.length) return { ok: false, error: 'Something is in the way', cost: 0 };
-    return { ok: true, entrance: { x: ex, z: ez, angle: ang }, cost: ENTRANCE_COST[lv] };
+    if (!dem || dem.length) return none('Something is in the way', k);
+    const cost = entranceCost(k, r);
+    return { ok: true, warnings: [], kind: k, entrance: { x: ex, z: ez, angle: ang, kind: k, cost }, cost, access: null, landings: [{ x: ex, z: ez, angle: ang, road: true }] };
   }
 
-  /** Add an entrance to an underground / elevated station (see planEntrance). Null = OK, else the reason. */
-  addEntrance(stationId: number, x: number, z: number, owner: number): string | null {
-    const g = this.game;
-    const pl = this.planEntrance(stationId, x, z, owner);
-    if (!pl.ok || !pl.entrance) return pl.error ?? 'Cannot build here';
-    if (!g.company(owner).economy.spend(pl.cost, 'construction')) return 'Not enough money';
-    const st = this.map.get(stationId)!;
-    st.rail!.entrances.push(pl.entrance);
-    const lv = st.rail!.level as 'underground' | 'elevated', sz = ENTRANCE_SIZE[lv];
-    this.padGround({ x: pl.entrance.x, z: pl.entrance.z, angle: pl.entrance.angle, w: sz.w, d: sz.d });
-    this.repairSite(st);
-    g.world.removeTreesNear(pl.entrance.x, pl.entrance.z, 1.2);
-    g.world.markObjArea(pl.entrance.x - 3, pl.entrance.z - 3, pl.entrance.x + 3, pl.entrance.z + 3);
-    this.accessVersion = -1;
-    this.game.lines.catchmentDirty = true;
+  /** Why a structure at street level would stand on a station's own hall, forecourt, entrance or viaduct pier (null: clear). */
+  private ownStreetError(st: Station, rect: Rect): string | null {
+    const r = st.rail!;
+    for (const f of this.structures(st)) {
+      if ((f.part === 'building' || f.part === 'entrance' || f.part === 'pier') && rectsOverlap(rect, f, 0.1))
+        return f.part === 'building' ? 'The station hall is in the way' : f.part === 'pier' ? 'A viaduct pier is in the way' : 'Another entrance is in the way';
+    }
+    if (styleOf(r.style).placement !== 'none') for (const f of [r.forecourt, r.forecourt2]) {
+      if (f && distToRect(f.x, f.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < 0.6) return 'In front of the station hall';
+    }
     return null;
   }
 
-  /** Remove an entrance (a station keeps at least one). */
-  removeEntrance(stationId: number, index: number, owner: number): string | null {
+  /** A ground station's entrance (see planEntrance). */
+  private planGroundEntrance(st: Station, x: number, z: number, owner: number, kind: EntranceKind | undefined, o: { street?: boolean }): EntrancePlan {
+    const r = st.rail!;
+    const k: EntranceKind = kind ?? 'hall';
+    const bad = (error: string, extra: Partial<EntrancePlan> = {}): EntrancePlan => ({ ok: false, error, warnings: [], kind: k, cost: 0, access: null, landings: [], ...extra });
+    if (!GROUND_ENTRANCES.includes(k)) return bad(`A ${ENTRANCE_TYPES[k]?.name.toLowerCase() ?? 'street entrance'} is for stations below or above the street`);
+    const T = ENTRANCE_TYPES[k];
+    const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
+    const lat = (x - r.x) * rx + (z - r.z) * rz, lon = (x - r.x) * fx + (z - r.z) * fz;
+    if (Math.abs(lon) > r.length / 2 + 8 || Math.abs(lat) > railWidth(r) / 2 + 12) return bad('Too far from the platforms');
+    const side: 1 | -1 = lat >= 0 ? 1 : -1;
+    const { along, near, far } = this.groundSites(r, k, side, lon);
+    const err = this.stairsError(r, k, along) ?? this.landingError(st, k, near);
+    if (err) return bad(err, { landings: [{ ...near, road: false }] });
+    const both = T.twoSided && !this.landingError(st, k, far);
+    const landings = both ? [near, far] : [near];
+    const road = landings.map((p) => this.landingOnStreet(k, p));
+    const own = entranceCost(k, r);
+    const entrance: Entrance = { x: near.x, z: near.z, angle: near.angle, kind: k, ...(both ? { far } : {}), cost: own };
+    const warnings: string[] = [];
+    if (T.twoSided && !both) warnings.push('No room for stairs on the other side of the tracks');
+    let access: Proposal | null = null;
+    if (!road.some(Boolean)) {
+      const door = landingDoor(k, near);
+      const marks = landings.map((p) => ({ ...p, road: false }));
+      if (o.street === false) return bad('No road beside the entrance', { entrance, door, landings: marks, cost: own });
+      const fp = this.platformRect(st)!;
+      access = this.planAccessStreet(door.x, door.z, { x: r.x, z: r.z, angle: r.angle, length: r.length, layout: { width: railWidth(r) }, footprint: fp, building: r.building }, owner, undefined, landings.map((p) => landingRect(k, p)), side, ENTRANCE_STREET);
+      if (!access) return bad(`No road within reach on this side (up to ${ENTRANCE_STREET * 10} m)`, { entrance, door, landings: marks, cost: own });
+      road[0] = true;
+    } else if (both && !road[0]) warnings.push('No road beside the stairs on this side');
+    else if (both && !road[1]) warnings.push('No road beside the stairs across the tracks');
+    return { ok: true, warnings, kind: k, entrance, cost: own + (access?.cost ?? 0), access, landings: landings.map((p, i) => ({ ...p, road: road[i] })), ...(access ? { door: landingDoor(k, near) } : {}) };
+  }
+
+  /** A ground entrance's sites beside the track area: on `side`, at `lon` along the axis (a gate: at the nearer platform end). */
+  private groundSites(r: RailPart, kind: EntranceKind, side: 1 | -1, lon: number) {
+    const T = ENTRANCE_TYPES[kind], fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
+    const lim = Math.max(0, r.length / 2 - ENTRANCE_END), off = railWidth(r) / 2 + T.d / 2 + ENTRANCE_GAP;
+    const along = kind === 'gate' ? (lon >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - T.w / 2 - 0.1) : Math.max(-lim, Math.min(lim, lon));
+    const site = (sd: number) => ({ x: r.x + rx * off * sd + fx * along, z: r.z + rz * off * sd + fz * along, angle: angleOf(rx * sd, rz * sd) });
+    return { along, near: site(side), far: site(-side) };
+  }
+
+  /**
+   * Ground stations: why an entrance with its stairs at `along` would clash with another crossing: added entrances,
+   * the station's own footbridge and underpass stairs (station-styles.ts stationCrossings, as drawn), a concourse or a
+   * train shed (null: it fits).
+   */
+  private stairsError(r: RailPart, kind: EntranceKind, along: number): string | null {
+    const a = kind === 'gate' ? (along >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - GATE_STAIRS) : along;
+    const half = kind === 'footbridge' ? CROSSING_HALF.footbridge : CROSSING_HALF.stairs;
+    const clash = (lo: number, hi: number) => a + half + CROSSING_GAP > lo && a - half - CROSSING_GAP < hi;
+    for (const e of r.entrances) {
+      const x = entranceAlong(r, e), h = entranceKind('ground', e) === 'footbridge' ? CROSSING_HALF.footbridge : CROSSING_HALF.stairs;
+      if (Math.abs(x - a) < ENTRANCE_SPACING || clash(x - h, x + h)) return 'Too close to the stairs of another entrance';
+    }
+    const own = stationCrossings(r);
+    if (own.footbridge !== null && clash(own.footbridge - 0.15, own.footbridge + 0.45)) return 'The station\u2019s own footbridge is in the way';
+    for (const q of own.stairs) if (clash(q.along - CROSSING_HALF.ownStairs, q.along + CROSSING_HALF.ownStairs)) return 'Too close to the station\u2019s own stairs';
+    const pl = styleOf(r.style).placement, b = r.building, a0 = (b.x - r.x) * Math.sin(r.angle) + (b.z - r.z) * Math.cos(r.angle);
+    if (pl === 'over' && Math.abs(a - a0) < b.w / 2 + 0.5) return 'The concourse is in the way';
+    // a terminal's train shed covers the platforms from its head building (as build-stations.ts draws it)
+    if (pl === 'end' && kind === 'footbridge' && a * (a0 >= 0 ? 1 : -1) > r.length / 2 - Math.min(r.length * 0.72, r.length - 0.6) - 0.4) return 'The train shed is in the way (an underpass fits)';
+    return null;
+  }
+
+  /**
+   * Can a ground entrance's landing stand at `p`? Level, dry ground near the platforms' height, clear of the station's
+   * own structures and forecourts (of rail part `r`: the station's, or a planned one), of buildings, tracks, roads,
+   * other stations and depots. Null if it can, else the reason.
+   */
+  private landingError(st: Station, kind: EntranceKind, p: { x: number; z: number; angle: number }, r: RailPart = st.rail!): string | null {
+    const w = this.game.world, T = ENTRANCE_TYPES[kind];
+    const rect = landingRect(kind, p);
+    if (!w.inside(p.x, p.z, 3)) return 'Too close to the map edge';
+    const fxa = Math.sin(p.angle), fza = Math.cos(p.angle), rxa = fza, rza = -fxa;
+    let mn = Infinity, mx = -Infinity, sum = 0;
+    for (const [a, b] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [0, 0]]) {
+      const h = w.heightAt(p.x + rxa * T.w * a + fxa * T.d * b, p.z + rza * T.w * a + fza * T.d * b);
+      mn = Math.min(mn, h); mx = Math.max(mx, h); sum += h;
+    }
+    if (mn < WATER_Y + 0.15) return 'Water in the way';
+    if (mx - mn > 0.6) return 'The ground is too uneven here';
+    if (Math.abs(sum / 5 - r.y) > T.rise) return 'The ground lies too far above or below the platforms';
+    for (const f of this.structuresOf(r)) if (rectsOverlap(rect, f, 0.1)) return f.part === 'entrance' ? 'Another entrance is in the way' : 'The station is in the way';
+    for (const f of [this.forecourtOf(r), r.forecourt2]) if (f && distToRect(f.x, f.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < 0.6) return 'In front of the station building';
+    return this.rectConflict(rect, mn - 0.2, kind === 'footbridge' ? Math.max(mx + 0.5, r.y + 1.0) : mx + 0.6, null, { groundEdges: true, ignoreStation: st.id });
+  }
+
+  /**
+   * After a ground station's rail part was rebuilt in place or merged: its added entrances beside the new track area
+   * (`part`: a planned one, previewing), each on its side of the tracks as near as it fits to where it stood along
+   * the platforms (the station's own crossings may have moved with it). One a street reached still reaches one: a
+   * place a street reaches comes first (with both landings of a crossing that had them), else a short access street
+   * from the nearest place, where that costs at most ENTRANCE_RECONNECT of its price and demolishes nothing; else it
+   * goes, as one without room does (its price leaves the station's value, its upkeep stops). Fills the part's
+   * entrances; unless previewing, builds the streets, grounds the moved landings, and notes the player's losses in
+   * the news (`what` the station went through).
+   */
+  private refitEntrances(st: Station, old: Entrance[], o: { part?: RailPart; preview?: boolean; what?: string } = {}): EntranceRefit {
+    const g = this.game, out: EntranceRefit = { fates: [], streets: 0 };
+    const r = o.part ?? st.rail, commit = !o.preview;
+    if (!r || (r.level ?? 'ground') !== 'ground') return out;
+    r.entrances = [];
+    const fx = Math.sin(r.angle), fz = Math.cos(r.angle), width = railWidth(r);
+    const site = { x: r.x, z: r.z, angle: r.angle, length: r.length, layout: { width }, footprint: { x: r.x, z: r.z, angle: r.angle, w: width, d: r.length }, building: r.building };
+    type Fit = ReturnType<Stations['groundSites']> & { both: boolean; access: [boolean, boolean]; shift: number };
+    for (const e of old) {
+      const k = entranceKind('ground', e);
+      const go = (fate: 'room' | 'cut') => {
+        out.fates.push({ kind: k, fate });
+        if (commit && typeof r.cost === 'number') r.cost = Math.max(0, r.cost - (e.cost ?? 0));
+      };
+      if (!GROUND_ENTRANCES.includes(k)) { go('room'); continue; }
+      const lon = (e.x - r.x) * fx + (e.z - r.z) * fz, side = entranceSide(r, e);
+      // The landing a street reached (its own side's first: where its walkers come from) must still reach one; the
+      // other one keeps its street, and a crossing both landings, where they can.
+      const hadNear = this.landingOnStreet(k, e), hadFar = !!e.far && this.landingOnStreet(k, e.far);
+      const ess = hadNear ? 0 : hadFar ? 1 : -1;
+      const lostEss = (f: Fit) => ess >= 0 && !f.access[ess as 0 | 1], farCut = (f: Fit) => ess === 0 && hadFar && !f.access[1];
+      const rank = (f: Fit) => (lostEss(f) ? 4 : 0) + (farCut(f) ? 2 : 0) + (e.far && !f.both ? 1 : 0);
+      const fits: Fit[] = [], tried = new Set<number>();
+      let best: Fit | null = null;
+      for (const shift of k === 'gate' ? [0] : REFIT_SHIFTS) {
+        const sites = this.groundSites(r, k, side, lon + shift);
+        const at = Math.round(sites.along * 1000);
+        if (tried.has(at)) continue;
+        tried.add(at);
+        if (this.stairsError(r, k, sites.along) || this.landingError(st, k, sites.near, r)) continue;
+        const both = !!e.far && !this.landingError(st, k, sites.far, r);
+        const f: Fit = { ...sites, both, access: [this.landingOnStreet(k, sites.near), both && this.landingOnStreet(k, sites.far)], shift };
+        fits.push(f);
+        if (!best || rank(f) < rank(best)) best = f;
+        if (rank(f) === 0) break;
+      }
+      if (!best) { go('room'); continue; }
+      let street: Proposal | null = null;
+      if (lostEss(best)) {
+        // no street reaches that landing where the entrance fits: a short access street from its street side (on
+        // its side of the tracks), from the nearest place first
+        const price = e.cost ?? entranceCost(k, r);
+        const others = r.entrances.flatMap((q) => entranceLandings(q).map((p) => landingRect(entranceKind('ground', q), p)));
+        for (const f of [...fits].sort((a, b) => rank(a) - rank(b))) {
+          if (ess === 1 && !f.both) continue;
+          const lands = f.both ? [f.near, f.far] : [f.near], door = landingDoor(k, lands[ess]);
+          const prop = this.planAccessStreet(door.x, door.z, site, st.owner, undefined, [...others, ...lands.map((p) => landingRect(k, p))], ess ? -side : side, ENTRANCE_STREET);
+          if (prop && !prop.demolish.length && prop.cost <= price * ENTRANCE_RECONNECT) { street = prop; best = f; break; }
+        }
+        if (!street || (commit && commitProposal(g, street))) { go('cut'); continue; }
+        out.streets += street.cost;
+      }
+      const { near, far, both } = best;
+      const ne: Entrance = { x: near.x, z: near.z, angle: near.angle, kind: k, ...(both ? { far } : {}), ...(e.cost !== undefined ? { cost: e.cost } : {}) };
+      r.entrances.push(ne);
+      out.fates.push({ kind: k, fate: street ? 'street' : best.shift === 0 ? 'stays' : 'moves', ...(e.far && !both ? { lostFar: true } : farCut(best) ? { farCut: true } : {}) });
+      if (commit) {
+        const T = ENTRANCE_TYPES[k];
+        for (const p of entranceLandings(ne)) {
+          this.padGround(landingRect(k, p));
+          g.world.removeTreesNear(p.x, p.z, Math.hypot(T.w, T.d) / 2 + 0.6);
+          g.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
+        }
+      }
+    }
+    if (commit) {
+      if (r.entrances.length) this.repairSite(st);
+      const gone = out.fates.filter((f) => f.fate === 'room' || f.fate === 'cut');
+      if (gone.length && !g.company(st.owner).ai) {
+        const why = gone.every((f) => f.fate === 'cut') ? 'no street reaches it beside the new platforms' : gone.every((f) => f.fate === 'room') ? 'no room beside the new platforms' : 'no room or no street beside the new platforms';
+        g.postNews(`${st.name} ${o.what ?? 'rebuilt'}: ${gone.length === 1 ? `its ${ENTRANCE_TYPES[gone[0].kind].name.toLowerCase()} was` : `${gone.length} of its entrances were`} taken down (${gone.length === 1 ? why : why.replace(' it ', ' them ')}).`, 'bad', st.x, st.z);
+      }
+    }
+    return out;
+  }
+
+  /** What rebuilding a ground station as `plan` (in place, still on the ground) would do to its added entrances. Pure. */
+  previewRefit(st: Station, plan: StationPlan): EntranceRefit | null {
+    const r = st.rail;
+    if (!r || (r.level ?? 'ground') !== 'ground' || plan.level !== 'ground' || !r.entrances.length) return null;
+    return this.refitEntrances(st, r.entrances, { part: this.partOf(plan, [], []), preview: true });
+  }
+
+  /** Build a planned entrance (planEntrance; the AI's evaluated plans). Null = OK, else the reason. */
+  commitEntrance(stationId: number, pl: EntrancePlan, owner: number): string | null {
+    const g = this.game;
+    if (!pl.ok || !pl.entrance) return pl.error ?? 'Cannot build here';
+    const st = this.map.get(stationId), r = st?.rail;
+    if (!st || !r) return 'No such rail station';
+    if (st.owner !== owner) return 'Not your station';
+    const co = g.company(owner);
+    if (!co.economy.canAfford(pl.cost)) return 'Not enough money';
+    if (pl.access) { const err = commitProposal(g, pl.access); if (err) return err; }
+    co.economy.spend(pl.cost - (pl.access?.cost ?? 0), 'construction');
+    const e: Entrance = { ...pl.entrance, ...(pl.entrance.far ? { far: { ...pl.entrance.far } } : {}) };
+    r.entrances.push(e);
+    if (typeof r.cost === 'number') r.cost += e.cost ?? 0;
+    const k = entranceKind(r.level ?? 'ground', e), T = ENTRANCE_TYPES[k];
+    for (const p of entranceLandings(e)) {
+      this.padGround(landingRect(k, p));
+      g.world.removeTreesNear(p.x, p.z, Math.hypot(T.w, T.d) / 2 + 0.6);
+      g.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
+    }
+    this.repairSite(st);
+    this.accessVersion = -1;
+    g.lines.catchmentDirty = true;
+    return null;
+  }
+
+  /** Add an entrance to a station (see planEntrance). Null = OK, else the reason. */
+  addEntrance(stationId: number, x: number, z: number, owner: number, kind?: EntranceKind): string | null {
+    return this.commitEntrance(stationId, this.planEntrance(stationId, x, z, owner, kind), owner);
+  }
+
+  /** Why an entrance cannot be removed (null: it can; a station below or above the street keeps at least one). */
+  removeEntranceError(stationId: number, index: number, owner: number): string | null {
     const st = this.map.get(stationId);
     const r = st?.rail;
     if (!st || !r || !r.entrances[index]) return 'No such entrance';
     if (st.owner !== owner) return 'Not your station';
-    if (r.entrances.length <= 1) return 'A station needs at least one entrance';
+    if ((r.level ?? 'ground') !== 'ground' && r.entrances.length <= 1) return 'A station needs at least one entrance';
+    return null;
+  }
+
+  /** Remove an entrance (a station below or above the street keeps at least one). Null = OK, else the reason. */
+  removeEntrance(stationId: number, index: number, owner: number): string | null {
+    const err = this.removeEntranceError(stationId, index, owner);
+    if (err) return err;
+    const r = this.map.get(stationId)!.rail!;
     const [e] = r.entrances.splice(index, 1);
-    if (index === 0 && r.entrances[0]) { const lv = r.level as 'underground' | 'elevated', sz = ENTRANCE_SIZE[lv]; r.building = { x: r.entrances[0].x, z: r.entrances[0].z, angle: r.entrances[0].angle, w: sz.w, d: sz.d }; }
-    this.game.world.markObjArea(e.x - 3, e.z - 3, e.x + 3, e.z + 3);
+    const lv = r.level ?? 'ground';
+    // (an entrance-only station's first entrance stands for its building)
+    if (lv !== 'ground' && index === 0 && r.entrances[0] && (styleOf(r.style).placement === 'none' || !r.forecourt)) { const sz = ENTRANCE_SIZE[lv]; r.building = { x: r.entrances[0].x, z: r.entrances[0].z, angle: r.entrances[0].angle, w: sz.w, d: sz.d }; }
+    if (typeof r.cost === 'number' && e.cost) r.cost = Math.max(0, r.cost - e.cost);
+    for (const p of entranceLandings(e)) this.game.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
     this.accessVersion = -1;
     this.game.lines.catchmentDirty = true;
     return null;
   }
 
-  /** Does an entrance touch a road (street side)? */
+  /**
+   * The nearest point of a street a pedestrian may use within `maxD` of (x, z) on one side of a ground station's
+   * tracks (or beyond its platform ends' lead corridors): where an entrance's access street would lead. Pure.
+   */
+  sideRoad(stationId: number, x: number, z: number, side: 1 | -1, maxD: number): { x: number; z: number; d: number } | null {
+    const r = this.map.get(stationId)?.rail, net = this.game.world.net;
+    if (!r) return null;
+    const ax = Math.sin(r.angle), az = Math.cos(r.angle), width = railWidth(r);
+    let best: { x: number; z: number; d: number } | null = null;
+    const p = { x: 0, y: 0, z: 0 };
+    for (const e of net.edgesNear(x - maxD, z - maxD, x + maxD, z + maxD)) {
+      if (!pedestrianRoad(e)) continue;
+      for (let s = 0; s <= e.len; s += Math.min(1, Math.max(0.25, e.len / 8))) {
+        net.pointAt(e, s, p);
+        const d = Math.hypot(p.x - x, p.z - z);
+        if (d > maxD || net.sectionAt(e, s) !== 'ground' || (best && (d > best.d || (d === best.d && (p.x > best.x || (p.x === best.x && p.z >= best.z)))))) continue;
+        if (((p.x - r.x) * az - (p.z - r.z) * ax) * side < width / 2 + 0.3 && Math.abs((p.x - r.x) * ax + (p.z - r.z) * az) < r.length / 2 + 26) continue;
+        best = { x: p.x, z: p.z, d };
+      }
+    }
+    return best;
+  }
+
+  /** Does an entrance touch a road (street side; a two-sided crossing: on either side)? */
   entranceAccess(st: Station, e: Entrance): boolean {
     const lv = st.rail?.level ?? 'ground';
-    if (lv === 'ground') return false;
-    return this.roadContact(e.x, e.z, ENTRANCE_SIZE[lv].d / 2 + 0.9);
+    if (lv !== 'ground') return this.roadContact(e.x, e.z, ENTRANCE_SIZE[lv].d / 2 + 0.9);
+    const k = entranceKind(lv, e);
+    return entranceLandings(e).some((p) => this.landingOnStreet(k, p));
+  }
+
+  /** Does a street reach a ground entrance's landing (the walking catchment can start there)? */
+  private landingOnStreet(kind: EntranceKind, p: { x: number; z: number }): boolean {
+    const reach = landingReach(kind);
+    return this.roadContact(p.x, p.z, reach) && walkableStreetNear(this.game, p.x, p.z, reach);
   }
 
   /** The street side of a ground station's building (where the access road ends). */
-  forecourt(st: Station): { x: number; z: number } | null {
-    const r = st.rail;
-    if (!r || (r.level ?? 'ground') !== 'ground') return null;
+  forecourt(st: Station): { x: number; z: number } | null { return st.rail ? this.forecourtOf(st.rail) : null; }
+
+  /** The street side of a ground rail part's building (a station's, or a planned one). */
+  private forecourtOf(r: RailPart): { x: number; z: number } | null {
+    if ((r.level ?? 'ground') !== 'ground') return null;
     if (r.forecourt) return r.forecourt;
     const b = r.building, fx = Math.sin(b.angle), fz = Math.cos(b.angle);
     return { x: b.x - fx * (b.d / 2 + FORECOURT), z: b.z - fz * (b.d / 2 + FORECOURT) };
@@ -1433,10 +1971,11 @@ export class Stations {
   private railReachable(st: Station): boolean {
     const r = st.rail;
     if (!r) return false;
-    if (st.stops.length) return true;
+    if (st.stops.some((s) => { const e = this.game.world.net.edges.get(s.edge); return !!e && pedestrianRoad(e); })) return true;
     if ((r.level ?? 'ground') === 'ground') {
       const f = this.forecourt(st), reach = styleOf(r.style).placement === 'none' ? NO_BUILDING_REACH : 0.9;
-      return (!!f && this.roadContact(f.x, f.z, reach)) || (!!r.forecourt2 && this.roadContact(r.forecourt2.x, r.forecourt2.z, reach));
+      return (!!f && this.roadContact(f.x, f.z, reach)) || (!!r.forecourt2 && this.roadContact(r.forecourt2.x, r.forecourt2.z, reach))
+        || r.entrances.some((e) => this.entranceAccess(st, e));
     }
     // below / above the street: an entrance on a street, or the street-level building's forecourt
     if (styleOf(r.style).placement !== 'none' && r.forecourt && this.roadContact(r.forecourt.x, r.forecourt.z, 0.9)) return true;
@@ -1445,10 +1984,12 @@ export class Stations {
 
   /** Recompute the stations' road access after the network changed (cheap when nothing changed). */
   refreshAccess(force = false) {
+    this.game.world.syncCatchmentTerrain();
     const v = this.game.world.net.version;
     if (!force && v === this.accessVersion) return;
     this.accessVersion = v;
-    let changed = false;
+    this.walkVersion++;
+    let changed = walkRoadsChanged(this.game);
     for (const st of this.map.values()) {
       const a = !st.rail || this.railReachable(st);
       if (a !== st.roadAccess) { st.roadAccess = a; changed = true; }
@@ -1676,8 +2217,10 @@ export class Stations {
     // statistics
     a.genMonth += b.genMonth; a.pickupMonth += b.pickupMonth; a.arrivedMonth += b.arrivedMonth;
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
+    a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
     a.rating = Math.max(a.rating, b.rating);
+    a.lastCall = Math.max(a.lastCall, b.lastCall); a.callDays = (a.callDays | b.callDays) & CALL_MASK;
     // links
     for (const o of b.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== b.id); if (os && os !== a) this.addLink(a, os); }
     b.links = [];
@@ -1693,9 +2236,9 @@ export class Stations {
       if (!hit) continue;
       const old = [...st.waiting.values()];
       st.waiting.clear(); st.waitingTotal = 0;
-      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count);
+      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
     }
-    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count);
+    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, undefined, 0, w.rail ?? 0);
     for (const v of g.vehicles.map.values()) {
       let hit = false;
       for (const c of v.cargo.values()) if (c.alight === b.id || c.dest === b.id || c.from === b.id) { hit = true; break; }
@@ -1706,7 +2249,10 @@ export class Stations {
           const n = { ...c, alight: re(c.alight), dest: re(c.dest), from: re(c.from) };
           const k = n.from + ':' + n.alight + ':' + n.dest;
           const o = v.cargo.get(k);
-          if (o) { o.day = (o.day * o.count + n.day * n.count) / Math.max(1, o.count + n.count); o.count += n.count; } else v.cargo.set(k, n);
+          if (o) {
+            if (o.rail || n.rail) o.rail = ((o.rail ?? 0) * o.count + (n.rail ?? 0) * n.count) / Math.max(1, o.count + n.count);
+            o.day = (o.day * o.count + n.day * n.count) / Math.max(1, o.count + n.count); o.count += n.count;
+          } else v.cargo.set(k, n);
         }
       }
       const t = v as unknown as { routeTarget?: number; atStation?: number };
@@ -1852,25 +2398,37 @@ export class Stations {
     A.throughOffsets = all.filter((t) => t.through).map((t) => t.lat - cl).sort((p, q) => p - q);
     A.platforms = [...aPlat, ...bPlat].map((p) => ({ off: p.lat - cl, w: p.w, from: p.u0 - cu, to: p.u1 - cu })).sort((p, q) => p.off - q.off);
     A.width = L1 - L0 + 0.6;
-    A.entrances = [...A.entrances, ...B.entrances];
+    const entrances = [...A.entrances, ...B.entrances];
+    A.entrances = entrances;
     A.piers = [...A.piers, ...B.piers];
     A.cost = (A.cost ?? 0) + (B.cost ?? 0);
     for (const id of A.edges) { const e = net.edges.get(id); if (e && e.station !== a.id) { e.station = a.id; net.markEdge(e); } }
     a.x = A.x; a.z = A.z;
     b.rail = null;
+    // a ground station's added entrances: beside the united track area where they still fit and a street reaches them
+    if ((A.level ?? 'ground') === 'ground' && entrances.length) { this.refitEntrances(a, entrances, { what: 'merged' }); this.markStation(a); }
     this.absorb(a, b);
     return null;
   }
 
   // ---------------------------------------------------------------- modes
-  /** Rail mode of a station from its platform track type (null: no rail part). */
+  /** Construction style of a station's rail part from its platform track type (null: no rail part). */
   railMode(st: Station): RailMode | null { return st.rail ? railModeOf(st.rail.trackType) : null; }
 
-  /** Transport mode of a station: its rail mode (main line, metro, light rail), else tram (a stop on tram tracks) or bus. */
+  /**
+   * Construction style of a station: its rail style (main line, metro, light rail), else tram (a stop on tram tracks)
+   * or bus. Every rail style is the one transport mode 'rail' (lines, catchment, fares); see catchMode.
+   */
   mode(st: Station): StationMode {
     if (st.rail) return railModeOf(st.rail.trackType);
     const net = this.game.world.net;
     return st.stops.some((p) => net.edges.get(p.edge)?.tram) ? 'tram' : 'bus';
+  }
+
+  /** Transport mode of a station: 'rail' for every rail station (any track type), else tram or bus. */
+  catchMode(st: Station): CatchMode {
+    const m = this.mode(st);
+    return m === 'tram' || m === 'bus' ? m : 'rail';
   }
 
   /** Are two stations consecutive stops of some line (any company's; vehicles go on from the last stop to the first)? */
@@ -1890,38 +2448,42 @@ export class Stations {
 
   // ---------------------------------------------------------------- catchment & passengers
   /**
-   * Catchment circles of a station: rail along the platforms (ground) or around the entrances (elevated /
-   * underground) with the radius of its mode (main line, metro, light rail), tram and bus stops around the stop.
-   * Only active ones (with road access) unless `all`.
+   * Legacy access/reach metadata for AI scoring. Actual passenger coverage and UI use walkingCatchment.
+   * Only access points connected to streets are active; `r` is the nominal walking limit.
    */
   catchmentShapes(st: Station, all = false): CatchShape[] {
     const out: CatchShape[] = [];
     const r = st.rail;
     if (r) {
       this.refreshAccess();
-      const act = st.roadAccess, cm = catchModeOf(railModeOf(r.trackType)), bonus = styleOf(r.style).catchBonus;
-      if ((r.level ?? 'ground') === 'ground') out.push(...railCatchShapes(r.x, r.z, r.angle, r.length, act, cm, bonus));
-      else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: act });
+      const act = st.roadAccess, R = CATCHMENT_RADIUS.rail * (1 + styleOf(r.style).catchBonus);
+      if ((r.level ?? 'ground') === 'ground') {
+        for (const p of [this.forecourt(st), r.forecourt2]) if (p) out.push({ ...p, r: R, mode: 'rail', active: act });
+        for (const e of r.entrances) {
+          const k = entranceKind('ground', e);
+          for (const p of entranceLandings(e)) out.push({ x: p.x, z: p.z, r: R, mode: 'rail', active: act && this.landingOnStreet(k, p) });
+        }
+      } else for (const e of r.entrances) out.push({ x: e.x, z: e.z, r: R, mode: 'rail', active: act && this.entranceAccess(st, e) });
     }
     const net = this.game.world.net;
-    for (const p of st.stops) out.push(stopCatchShape(p.x, p.z, !!net.edges.get(p.edge)?.tram));
+    for (const p of st.stops) { const e = net.edges.get(p.edge); out.push({ ...stopCatchShape(p.x, p.z, !!e?.tram), active: !!e && pedestrianRoad(e) }); }
     return all ? out : out.filter((c) => c.active);
   }
 
-  /** Catchment circles a planned rail station would have (inactive without road access). */
+  /** Planned access/reach metadata; see planWalkingCatchment for the walking preview. */
   planCatchShapes(plan: StationPlan): CatchShape[] {
-    const cm = catchModeOf(plan.mode ?? 'mainline'), bonus = styleOf(plan.style).catchBonus;
-    if (plan.level === 'ground') return railCatchShapes(plan.x, plan.z, plan.angle, plan.length, plan.roadAccess, cm, bonus);
-    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS[cm] * (1 + bonus), mode: cm, active: plan.roadAccess }));
+    const R = CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus);
+    if (plan.level === 'ground') return [plan.forecourt, plan.forecourt2].filter((p): p is { x: number; z: number } => !!p).map((p) => ({ ...p, r: R, mode: 'rail' as const, active: plan.roadAccess }));
+    return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: R, mode: 'rail' as const, active: plan.roadAccess && e.access }));
   }
 
-  /** Largest catchment radius of a station (rail: from the centre over the platforms; a building widens it, see catchBonus). */
+  /** Nominal walking limit of a station, before the grid detour allowance. */
   catchmentRadius(st: Station) {
-    if (st.rail) return CATCHMENT_RADIUS[catchModeOf(railModeOf(st.rail.trackType))] * (1 + styleOf(st.rail.style).catchBonus) + st.rail.length / 2;
+    if (st.rail) return CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail.style).catchBonus);
     return st.stops.some((p) => this.game.world.net.edges.get(p.edge)?.tram) ? CATCHMENT_RADIUS.tram : CATCHMENT_RADIUS.bus;
   }
 
-  /** Residents within a set of catchment circles (each building counted once). */
+  /** Legacy circular AI site estimate (routing.ts migrates separately); never used for passenger coverage. */
   popInShapes(shapes: { x: number; z: number; r: number }[]): number {
     const w = this.game.world;
     const seen = new Set<number>();
@@ -1936,13 +2498,7 @@ export class Stations {
 
   /** Buildings within the (active) catchment of a station. */
   catchmentBuildings(st: Station): number[] {
-    const w = this.game.world;
-    const out = new Set<number>();
-    for (const c of this.catchmentShapes(st)) for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
-      const b = w.buildings.get(id);
-      if (b && Math.hypot(b.x - c.x, b.z - c.z) <= c.r) out.add(id);
-    }
-    return [...out];
+    return [...walkingCatchment(this.game, st).buildings.keys()];
   }
 
   /** Exact catchment: per station its buildings and shares, per building its stations and shares (see computeShares). */
@@ -1955,67 +2511,214 @@ export class Stations {
   catchMaxB = 0;
 
   /**
-   * Share out every building with people among the stations whose (active) catchment circles hold it: only served
-   * stations when any of them is served; nearer stations take more (weight 1 at a circle's centre down to 0.25 at
-   * its rim, the station's best circle counting). The shares of a building sum to 1. Building-major over a coarse
-   * grid of the circles (much cheaper than querying the building grid per station). Ratings play no part, so the
-   * same buildings, stations and lines give the same shares (a loaded game rebuilds them exactly).
+   * Split each reachable building among stations, preferring served stations when any is served. Weight is
+   * 1 / (1 + walking distance / 8) (catchment.ts walkWeight), so a nearer station always receives more regardless of
+   * its mode's limit. The weights are normalised by their sum, but at least by the weight at FULL_COVER_WALK: a
+   * building only far from every station is partly covered (fewer of its residents walk that far).
+   * Cached local Dijkstra results survive unrelated edits and monthly population changes. Ratings play no part;
+   * identical buildings, stations and lines rebuild identical shares after loading.
    */
-  private computeShares(maxB: number) {
+  private walkSt = new Map<number, WalkingCatchment>();
+  private covered = new Map<number, Map<number, number>>();
+  private coveredPop = new Map<number, number>();
+  private shareMembers = new Map<number, Map<number, number>>();
+  private served = new Map<number, boolean>();
+  private pendingPop = new Set<number>();
+  private catchInputs = { roads: -1, lots: -1, terrain: -1, stations: -1, served: -1 };
+
+  /** Event counters only; callers can avoid even entering the walking/share computation. */
+  catchmentInputsChanged(): boolean {
+    return !this.sharesReady || !this.sameCatchInputs(this.catchInputs);
+  }
+  private currentCatchInputs() {
     const w = this.game.world;
-    this.shareSt.clear(); this.shareB.clear();
-    this.sharesReady = true;
-    this.catchMaxB = maxB;
-    this.catchVersion++;
-    const circles: { st: Station; x: number; z: number; r: number }[] = [];
-    for (const st of this.map.values()) for (const c of this.catchmentShapes(st)) circles.push({ st, x: c.x, z: c.z, r: c.r });
-    if (!circles.length) return;
-    const C = 32, key = (cx: number, cz: number) => cx * 4096 + cz;
-    const cells = new Map<number, number[]>();
-    circles.forEach((c, i) => {
-      for (let cz = Math.floor((c.z - c.r) / C); cz <= Math.floor((c.z + c.r) / C); cz++) for (let cx = Math.floor((c.x - c.r) / C); cx <= Math.floor((c.x + c.r) / C); cx++) {
-        const k = key(cx, cz);
-        const a = cells.get(k);
-        if (a) a.push(i); else cells.set(k, [i]);
-      }
-    });
-    const served = new Map<number, boolean>();
-    const isServed = (s: Station) => { let v = served.get(s.id); if (v === undefined) { v = this.game.lines.stationServed(s.id); served.set(s.id, v); } return v; };
-    const sts: Station[] = [], q: number[] = [];
-    for (const b of w.buildings.values()) {
-      if (b.pop <= 0 || b.id > maxB) continue;
-      const idx = cells.get(key(Math.floor(b.x / C), Math.floor(b.z / C)));
-      if (!idx) continue;
-      sts.length = 0; q.length = 0;
-      let anyServed = false;
-      for (const i of idx) {
-        const c = circles[i];
-        const d2 = (b.x - c.x) * (b.x - c.x) + (b.z - c.z) * (b.z - c.z);
-        if (d2 > c.r * c.r) continue;
-        const rel = Math.sqrt(d2) / c.r, k = sts.indexOf(c.st);
-        if (k >= 0) { if (rel < q[k]) q[k] = rel; continue; }
-        sts.push(c.st); q.push(rel);
-        if (isServed(c.st)) anyServed = true;
-      }
-      if (!sts.length) continue;
-      let sum = 0;
-      const wt: number[] = [];
-      for (let k = 0; k < sts.length; k++) {
-        const v = anyServed && !isServed(sts[k]) ? 0 : 1 - 0.75 * q[k] * q[k];
-        wt.push(v); sum += v;
-      }
-      if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] };
-      for (let k = 0; k < sts.length; k++) {
-        if (wt[k] <= 0) continue;
-        const sh = wt[k] / sum;
-        rec.st.push(sts[k].id); rec.w.push(sh);
-        let ps = this.shareSt.get(sts[k].id);
-        if (!ps) { ps = { ids: [], w: [] }; this.shareSt.set(sts[k].id, ps); }
-        ps.ids.push(b.id); ps.w.push(sh);
-      }
-      this.shareB.set(b.id, rec);
+    return { roads: w.net.roadVersions.version, lots: w.lotVersions.version, terrain: w.terrainVersions.version,
+      stations: this.walkVersion, served: this.game.lines.servedVersion };
+  }
+  private sameCatchInputs(p: typeof this.catchInputs) {
+    const w = this.game.world;
+    return p.roads === w.net.roadVersions.version && p.lots === w.lotVersions.version && p.terrain === w.terrainVersions.version &&
+      p.stations === this.walkVersion && p.served === this.game.lines.servedVersion;
+  }
+  get catchmentPopulationPending() { return this.pendingPop.size > 0; }
+
+  private computeShares(maxB: number) {
+    if (!this.catchmentInputsChanged() && maxB === this.catchMaxB) return;
+    const w = this.game.world, previousMaxB = this.catchMaxB, wasReady = this.sharesReady;
+    refreshWalkBuildings(this.game);
+    const dirty = new Set<number>(), populations = new Set<number>(), order = new Map<number, number>();
+    let servedChanged = false;
+    for (const [sid, old] of this.walkSt) if (!this.map.has(sid)) {
+      for (const id of old.buildings.keys()) { this.covered.get(id)?.delete(sid); dirty.add(id); populations.add(id); }
+      this.walkSt.delete(sid); this.served.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
     }
+    for (const st of this.map.values()) {
+      order.set(st.id, order.size);
+      const walk = walkingCatchment(this.game, st), old = this.walkSt.get(st.id);
+      if (walk !== old) {
+        for (const [id, before] of old?.buildings ?? []) {
+          populations.add(id);
+          if (!walk.buildings.has(id)) { this.covered.get(id)?.delete(st.id); dirty.add(id); }
+          else if (walk.buildings.get(id)!.distance !== before.distance) dirty.add(id);
+        }
+        for (const [id, reach] of walk.buildings) {
+          populations.add(id);
+          if (!old?.buildings.has(id)) dirty.add(id);
+          let reaches = this.covered.get(id);
+          if (!reaches) { reaches = new Map(); this.covered.set(id, reaches); }
+          reaches.set(st.id, reach.distance);
+        }
+        this.walkSt.set(st.id, walk);
+        if (!old) this.pendingPop.add(st.id);
+      }
+      const served = this.game.lines.stationServed(st.id);
+      if (this.served.get(st.id) !== served) {
+        servedChanged = true; this.served.set(st.id, served);
+        for (const id of walk.buildings.keys()) dirty.add(id);
+      }
+    }
+    if (maxB !== previousMaxB) for (const id of this.covered.keys())
+      if ((id > previousMaxB && id <= maxB) || (id > maxB && id <= previousMaxB)) { dirty.add(id); populations.add(id); }
+    for (const id of populations) {
+      const pop = w.buildings.get(id)?.pop ?? 0, before = this.coveredPop.get(id) ?? 0;
+      if (pop !== before) {
+        if ((pop > 0) !== (before > 0)) dirty.add(id);
+        for (const sid of this.covered.get(id)?.keys() ?? []) this.pendingPop.add(sid);
+        for (const sid of this.shareB.get(id)?.st ?? []) this.pendingPop.add(sid);
+      }
+      if (this.covered.get(id)?.size) this.coveredPop.set(id, pop); else this.coveredPop.delete(id);
+    }
+    let sharesChanged = false;
+    const shareStations = new Set<number>();
+    for (const id of dirty) {
+      const b = w.buildings.get(id), old = this.shareB.get(id);
+      const reaches = b && b.pop > 0 && id <= maxB
+        ? [...(this.covered.get(id) ?? [])].sort((a, b) => order.get(a[0])! - order.get(b[0])!) : [];
+      const anyServed = reaches.some(([sid]) => this.served.get(sid));
+      let sum = 0, best = 0;
+      const wt: number[] = [];
+      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
+      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum * cover); }
+      if (!this.covered.get(id)?.size) this.covered.delete(id);
+      if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
+      if (!old && !rec.st.length) continue;
+      sharesChanged = true;
+      for (const sid of old?.st ?? []) {
+        this.shareMembers.get(sid)?.delete(id); this.pendingPop.add(sid); shareStations.add(sid);
+      }
+      if (rec.st.length) {
+        this.shareB.set(id, rec);
+        for (let k = 0; k < rec.st.length; k++) {
+          const sid = rec.st[k];
+          let members = this.shareMembers.get(sid);
+          if (!members) { members = new Map(); this.shareMembers.set(sid, members); }
+          members.set(id, rec.w[k]); this.pendingPop.add(sid); shareStations.add(sid);
+        }
+      } else this.shareB.delete(id);
+    }
+    for (const sid of shareStations) {
+      if (!this.map.has(sid)) continue;
+      // Population-only edits retain the arrays. Changed shares keep the original ascending sum order.
+      const members = [...(this.shareMembers.get(sid) ?? [])].sort((a, b) => a[0] - b[0]);
+      if (members.length) this.shareSt.set(sid, { ids: members.map((m) => m[0]), w: members.map((m) => m[1]) });
+      else this.shareSt.delete(sid);
+    }
+    this.sharesReady = true; this.catchMaxB = maxB;
+    this.catchInputs = this.currentCatchInputs();
+    if (!wasReady || sharesChanged || servedChanged || this.pendingPop.size) this.catchVersion++;
+  }
+
+  /** A cold/load computation uses a separate share buffer until every station and building is ready. */
+  private fullPreparation: {
+    inputs: { roads: number; lots: number; terrain: number; stations: number; served: number }; maxB: number; stations: Station[]; next: number; tick: number;
+    walks: Map<number, WalkingCatchment>; covered: Map<number, Map<number, number>>; pop: Map<number, number>;
+    served: Map<number, boolean>; ids?: number[]; building: number;
+    shareSt: Map<number, { ids: number[]; w: number[] }>; shareB: Map<number, { st: number[]; w: number[] }>;
+    members: Map<number, Map<number, number>>; populations: Map<number, number>;
+  } | null = null;
+  get catchmentWorkPending() { return this.fullPreparation !== null; }
+
+  private prepareFullCatchment(): boolean {
+    let job = this.fullPreparation;
+    if (!job || !this.sameCatchInputs(job.inputs)) {
+      job = { inputs: this.currentCatchInputs(), maxB: this.game.world.nextBuildingId - 1, stations: this.all(), next: 0, tick: -1,
+        walks: new Map(), covered: new Map(), pop: new Map(), served: new Map(), building: 0,
+        shareSt: new Map(), shareB: new Map(), members: new Map(), populations: new Map() };
+      this.fullPreparation = job;
+    }
+    if (job.tick === this.game.tick) return false;
+    job.tick = this.game.tick;
+    const B = this.game.world.buildings;
+    // Work budgets count entities, never elapsed milliseconds or rendered frames.
+    for (let n = 0; n < 2 && job.next < job.stations.length; n++) {
+      const st = job.stations[job.next++], walk = walkingCatchment(this.game, st);
+      job.walks.set(st.id, walk); job.served.set(st.id, this.game.lines.stationServed(st.id));
+      for (const [id, reach] of walk.buildings) {
+        let covered = job.covered.get(id);
+        if (!covered) { covered = new Map(); job.covered.set(id, covered); }
+        covered.set(st.id, reach.distance); job.pop.set(id, B.get(id)?.pop ?? 0);
+      }
+    }
+    if (job.next < job.stations.length) return false;
+    job.ids ??= [...job.covered.keys()].sort((a, b) => a - b);
+    for (let n = 0; n < 256 && job.building < job.ids.length; n++) {
+      const id = job.ids[job.building++], b = B.get(id);
+      if (!b || b.pop <= 0 || id > job.maxB) continue;
+      // covered was filled in station Map order, exactly as in the original share-out.
+      const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
+      let sum = 0, best = 0; const wt: number[] = [];
+      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
+      if (!(sum > 0)) continue;
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
+      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
+        const sid = reaches[k][0], sh = wt[k] / sum * cover;
+        rec.st.push(sid); rec.w.push(sh);
+        let station = job.shareSt.get(sid), members = job.members.get(sid);
+        if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
+        if (!members) { members = new Map(); job.members.set(sid, members); }
+        station.ids.push(id); station.w.push(sh); members.set(id, sh);
+        job.populations.set(sid, (job.populations.get(sid) ?? 0) + b.pop * sh);
+      }
+      job.shareB.set(id, rec);
+    }
+    if (job.building < job.ids.length) return false;
+    // Publish all shares and populations together. Demand keeps its previous shares until this point too.
+    this.walkSt = job.walks; this.covered = job.covered; this.coveredPop = job.pop; this.served = job.served;
+    this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
+    this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
+    for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
+    this.pendingPop.clear(); this.fullPreparation = null;
+    return true;
+  }
+
+  /** Uncached, synchronous reference using the original full share-out and floating-point order. */
+  debugFullCatchment(): { stations: Map<number, { ids: number[]; w: number[]; pop: number }>; buildings: Map<number, { st: number[]; w: number[] }> } {
+    const w = this.game.world, stations = new Map<number, { ids: number[]; w: number[]; pop: number }>();
+    const buildings = new Map<number, { st: number[]; w: number[] }>(), covered = new Map<number, { sid: number; distance: number }[]>();
+    const walks = fullWalkingCatchments(this.game);
+    for (const st of this.map.values()) {
+      stations.set(st.id, { ids: [], w: [], pop: 0 });
+      for (const [id, walk] of walks.get(st.id)!.buildings) {
+        const b = w.buildings.get(id); if (!b || b.pop <= 0 || id > this.catchMaxB) continue;
+        const a = covered.get(id), c = { sid: st.id, distance: walk.distance };
+        if (a) a.push(c); else covered.set(id, [c]);
+      }
+    }
+    for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
+      const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
+      let sum = 0, best = 0; const wt: number[] = [];
+      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; if (v > best) best = v; }
+      if (!(sum > 0)) continue;
+      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
+      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
+        const sh = wt[k] / sum * cover, sid = reaches[k].sid, ps = stations.get(sid)!;
+        rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
+      }
+      buildings.set(id, rec);
+    }
+    for (const st of stations.values()) for (let i = 0; i < st.ids.length; i++) st.pop += (w.buildings.get(st.ids[i])?.pop ?? 0) * st.w[i];
+    return { stations, buildings };
   }
 
   /** The shares as last worked out (a loaded game works them out again on first use, for the same buildings). */
@@ -2025,9 +2728,9 @@ export class Stations {
   }
 
   /**
-   * Exact catchment of a station: the buildings inside its (active) circles and the share of each building's
-   * people it serves (parallel arrays; a building in several stations' circles is split among them, see
-   * computeShares). Passenger generation and attraction both go by these: nothing beyond the circles. Updated
+   * Exact catchment of a station: buildings reachable on foot and the share of each building's people it
+   * serves (parallel arrays; overlapping walking catchments split the population, see computeShares).
+   * Passenger generation and attraction both use these shares. Updated
    * with the catchment (lines.flushCatchment); read-only.
    */
   buildingShares(st: Station | number): { ids: number[]; w: number[] } {
@@ -2053,31 +2756,45 @@ export class Stations {
    * Catchment population of every station (its shares of the buildings' people, see computeShares), after the
    * catchments, the stations, the lines serving them or the buildings change (lines.flushCatchment; monthly).
    */
-  recomputeCatchment() {
+  recomputeCatchment(slice = false): boolean {
     this.refreshAccess();
+    // Finish before daily passenger generation so slicing cannot change the simulation's RNG or demand.
+    // Direct/debug callers remain synchronous. Only a cold cache of a running/loaded game needs slices.
+    if (slice && !this.game.paused && !this.sharesReady && this.map.size >= 16 && this.game.tick > 0 &&
+      this.game.tick % this.game.ticksPerDay !== this.game.ticksPerDay - 1) return this.prepareFullCatchment();
+    this.fullPreparation = null;
     this.computeShares(this.game.world.nextBuildingId - 1);
     const B = this.game.world.buildings;
-    for (const st of this.map.values()) {
-      const sh = this.shareSt.get(st.id);
+    for (const sid of this.pendingPop) {
+      const st = this.map.get(sid); if (!st) continue;
+      const sh = this.shareSt.get(sid);
       let pop = 0;
       if (sh) for (let i = 0; i < sh.ids.length; i++) pop += (B.get(sh.ids[i])?.pop ?? 0) * sh.w[i];
       st.catchPop = pop;
     }
+    this.pendingPop.clear();
+    return true;
   }
 
   /**
    * Passengers wait at `st` for `line` to `alight` on their way to `dest`. A walking hop (WALK_LINE) takes them
    * straight to the linked station `alight`, where they arrive or wait for their next leg.
    */
-  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0) {
+  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0) {
     if (count <= 0) return;
-    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st); return; }
+    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
     const key = line + ':' + alight + ':' + dest;
-    // ops: when they started waiting (weighted mean) and how many already changed vehicles
+    // ops: when they started waiting (weighted mean), how many already changed vehicles, their rail fares so far
     const at = t ?? simNow(this.game), tr = Math.max(0, Math.min(count, transferred));
     const g = st.waiting.get(key);
-    if (g) { g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr; }
-    else st.waiting.set(key, tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at });
+    if (g) {
+      if (rail || g.rail) g.rail = ((g.rail ?? 0) * g.count + rail * count) / (g.count + count);
+      g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
+    } else {
+      const ng: WaitGroup = tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at };
+      if (rail > 0) ng.rail = rail;
+      st.waiting.set(key, ng);
+    }
     st.waitingTotal += count;
   }
 
@@ -2085,7 +2802,7 @@ export class Stations {
    * Passengers walk to the linked station `toId`: they have arrived, or wait there for their next leg (the walk
    * counts towards that leg's time).
    */
-  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station) {
+  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0) {
     const g = this.game;
     const to = this.map.get(toId);
     if (!to || depth > 4) return;
@@ -2098,9 +2815,13 @@ export class Stations {
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
     const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to)) : 0);
-    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count))));
+    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.min(n, Math.round((transferred * n) / count)), rail));
   }
 
+  /**
+   * Passengers beyond the station's useful queue give up waiting: counted per station and town and month
+   * (lostMonth, Town.passLostMonth); the share who give up lowers the station's rating (updateRatings).
+   */
   trimWaiting(st: Station, max: number) {
     // The caller's legacy platform cap is a hard ceiling. People in the catchment and the size of the transfer
     // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
@@ -2118,15 +2839,21 @@ export class Stations {
     let spare = max - groups.reduce((n, x) => n + x.count, 0);
     groups.sort((a, b) => b.remainder - a.remainder);
     for (const x of groups) if (spare > 0) { x.count++; spare--; }
-    let tot = 0;
+    let tot = 0, lost = 0;
     for (const x of groups) {
       const g = x.g;
       g.count = x.count;
+      lost += x.oldCount - x.count;
       // transfers (passengers of the group who already changed) shrink with it
       if (x.transfers) g.transfers = Math.min(g.count, Math.round(x.transfers * g.count / x.oldCount));
       if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
+    if (lost > 0) {
+      st.lostMonth = (st.lostMonth || 0) + lost;
+      const town = this.game.towns.list[st.townId];
+      if (town) town.passLostMonth = (town.passLostMonth ?? 0) + lost;
+    }
   }
 
   rerouteWaiting(st: Station) {
@@ -2136,7 +2863,7 @@ export class Stations {
     st.waitingTotal = 0;
     for (const g of old) {
       const hop = lines.nextHop(st.id, g.dest);
-      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0);
+      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0);
     }
   }
 
@@ -2187,16 +2914,26 @@ export class Stations {
     const blockedEnds = ([[connected[0], 1], [connected[1], -1]] as [boolean, 1 | -1][]).filter(([c]) => c).map(([, e]) => e);
     const rebuild = (lv: StationLevel) => {
       if (connected[0] || connected[1]) return bad(lv !== (r.level ?? 'ground') ? 'The level of a connected station cannot be changed' : 'The tracks of a connected station cannot be rearranged like that');
-      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style });
-      return { ok: plan.ok, error: plan.error, warnings: plan.warnings, station: st.id, cost: plan.cost + 20000, length: L2, tracks: T2, through: Th2, plan, delta: [0, 0] as [number, number], keep: [], cuts: [], rebuild: true };
+      const ground = lv === 'ground' && (r.level ?? 'ground') === 'ground';
+      const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
+      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid });
+      // still on the ground: its added entrances stay beside the new platforms where they fit; at another level they go
+      const fit = plan.ok && ground ? this.previewRefit(st, plan) : null;
+      const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt anew');
+      const warnings = [...plan.warnings, ...refitWarnings(fit), ...(gone ? [gone] : [])];
+      return { ok: plan.ok, error: plan.error, warnings, station: st.id, cost: plan.cost + 20000 + (fit?.streets ?? 0), length: L2, tracks: T2, through: Th2, plan, delta: [0, 0] as [number, number], keep: [], cuts: [], rebuild: true, ...(fit ? { entrances: fit } : {}) };
     };
     if (level !== (r.level ?? 'ground')) return rebuild(level);
     if (level !== 'ground' && L2 === r.length && T2 === r.tracks && Th2 === Th0 && style !== styleOf(r.style).id) {
       // a new building at street level for a station below or above the street (tracks and entrances stay)
       const ign = new Set<number>([...r.edges, ...r.throughEdges, ...ends.flatMap((t) => [...t[0].approach, ...t[1].approach])]);
-      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style });
+      const sz = ENTRANCE_SIZE[level];
+      const kept = r.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d }));
+      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid: kept });
       if (!p2.ok) return bad(p2.error ?? 'No room for the building');
       if (p2.style !== style) return bad('No room for a station building at street level here');
+      // (its entrances stay: the new building must not stand on them)
+      if (kept.some((q) => rectsOverlap(p2.building, q, 0.1))) return bad('No room for a station building at street level beside its entrances');
       let cost = Math.max(0, restyle);
       for (const id of p2.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
       return { ok: true, warnings: p2.warnings, station: st.id, cost: Math.round(cost + (p2.access?.cost ?? 0)), length: r.length, tracks: r.tracks, through: Th0, plan: p2, delta: [0, 0], keep: [], cuts: [], rebuild: false, restyleOnly: true };
@@ -2286,7 +3023,8 @@ export class Stations {
         cuts.push(cut);
       }
     }
-    const plan = this.planRail(cx, cz, r.angle, L2, T2, st.owner, { ignoreStation: st.id, ignoreEdges, through: Th2, throughMode: mode, fixedY: r.y, level: r.level ?? 'ground', trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, blockedEnds });
+    const avoid = (r.level ?? 'ground') === 'ground' ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
+    const plan = this.planRail(cx, cz, r.angle, L2, T2, st.owner, { ignoreStation: st.id, ignoreEdges, through: Th2, throughMode: mode, fixedY: r.y, level: r.level ?? 'ground', trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, blockedEnds, avoid });
     if (!plan.ok) return bad(plan.error ?? 'Cannot build');
     plan.join = null;
     const extra = Math.max(0, (T2 + Th2 * 0.7) * L2 - (r.tracks + (r.through ?? 0) * 0.7) * r.length);
@@ -2294,7 +3032,10 @@ export class Stations {
     for (const id of plan.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
     const warnings = [...plan.warnings];
     if (T2 + Th2 > r.tracks + (r.through ?? 0) && ends.some((t) => t[0].approach.length || t[1].approach.length)) warnings.push('New tracks get turnouts onto the neighbouring track where there is room');
-    return { ok: true, warnings, station: st.id, cost: Math.max(0, Math.round(cost)), length: L2, tracks: T2, through: Th2, plan, delta: [dF, dB], keep: sh.keys, cuts, rebuild: false };
+    // its added entrances beside the new track area: where they still fit and a street still reaches them
+    const fit = this.previewRefit(st, plan);
+    if (fit) { cost += fit.streets; warnings.push(...refitWarnings(fit)); }
+    return { ok: true, warnings, station: st.id, cost: Math.max(0, Math.round(cost)), length: L2, tracks: T2, through: Th2, plan, delta: [dF, dB], keep: sh.keys, cuts, rebuild: false, ...(fit ? { entrances: fit } : {}) };
   }
 
   /**
@@ -2308,7 +3049,18 @@ export class Stations {
     const r = st?.rail;
     if (!st || !r) return 'No such rail station';
     if (!up.plan) return up.error ?? 'Cannot rebuild';
-    if (up.rebuild) return this.relocate(st.id, up.plan, up.cost);
+    if (up.rebuild) {
+      // rebuilt anew on its site: still on the ground, its added entrances stay beside the platforms where they fit
+      const old = r.entrances, keep = (r.level ?? 'ground') === 'ground' && up.plan.level === 'ground';
+      const err = this.relocate(st.id, up.plan, up.cost - (up.entrances?.streets ?? 0));
+      if (!err && keep && old.length) {
+        const nr = st.rail!;
+        if (typeof nr.cost === 'number') nr.cost += old.reduce((c, e) => c + (e.cost ?? 0), 0);
+        this.refitEntrances(st, old);
+        this.markStation(st);
+      }
+      return err;
+    }
     if (up.restyleOnly) {
       const co = g.company(st.owner);
       if (!co.economy.canAfford(up.cost)) return 'Not enough money';
@@ -2354,7 +3106,8 @@ export class Stations {
     if (hold) { releaseHold(g, hold.edges); this.holds.delete(st.id); }
     const co = g.company(st.owner);
     if (!co.economy.canAfford(up.cost)) return 'Not enough money';
-    co.economy.spend(up.cost - (up.plan.access?.cost ?? 0), 'construction');
+    // (new access streets to added entrances are paid as they are built)
+    co.economy.spend(up.cost - (up.plan.access?.cost ?? 0) - (up.entrances?.streets ?? 0), 'construction');
     const plan = up.plan;
     const signalled = this.signalledNear(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
@@ -2382,8 +3135,11 @@ export class Stations {
     for (const eid of [...r.edges, ...r.throughEdges]) net.removeEdge(eid);
     this.markStation(st);
     st.rail = null;
-    this.buildRailPart(st, { ...plan, cost: (r.cost ?? 0) + up.cost }, st.owner, reuse);
+    this.buildRailPart(st, { ...plan, cost: (r.cost ?? 0) + up.cost - (up.entrances?.streets ?? 0) }, st.owner, reuse);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
+    // the added entrances of a ground station stay beside the new track area where they still fit and a street still
+    // reaches them (a short new access street where needed), else they go
+    if ((r.level ?? 'ground') === 'ground' && r.entrances.length) { this.refitEntrances(st, r.entrances); this.markStation(st); }
     // new tracks at connected ends: turnout ladders onto the neighbouring tracks' approaches (crossovers in the way
     // are laid again beyond them); the throat signals again
     growThroat(g, st.id, st.owner);
@@ -2443,8 +3199,26 @@ export class Stations {
     return out.sort((p, q) => p.lat - q.lat).map((q) => q.ids);
   }
 
-  /** Station works waiting for a free throat: track held so no train enters (see commitUpgrade). Not saved. */
+  /** Station works waiting for a free throat: track held so no train enters (see commitUpgrade). */
   private holds = new Map<number, { edges: number[]; until: number }>();
+
+  heldForWorks(edge: number): boolean {
+    return [...this.holds].some(([sid, h]) => this.map.has(sid) && h.until > this.game.day && h.edges.includes(edge));
+  }
+  saveWorks(): [number, { edges: number[]; until: number }][] {
+    return [...this.holds].map(([sid, h]): [number, typeof h] => [sid, { edges: [...h.edges], until: h.until }]).sort((a, b) => a[0] - b[0]);
+  }
+  loadWorks(holds: ReturnType<Stations['saveWorks']>) {
+    for (const h of this.holds.values()) releaseHold(this.game, h.edges);
+    this.holds.clear();
+    for (const [sid, h] of holds) {
+      if (!this.map.has(sid)) continue;
+      const edges = h.edges.filter((id) => this.game.world.net.edges.has(id));
+      if (!edges.length) continue;
+      this.holds.set(sid, { edges, until: h.until });
+      for (const id of edges) this.game.vehicles.setRes(id, WORKS_HOLD);
+    }
+  }
 
   /**
    * Daily platform sampling for the capacity figures (game.ts, once a day): occupied platform tracks, trains
@@ -2475,6 +3249,36 @@ export class Stations {
       st.tpd = (st.tpd ?? 0) * (1 - K) + calls * K;
       st.ppd = (st.ppd ?? 0) * (1 - K) + passes * K;
       st.onPlat = here;
+    }
+  }
+
+  /** Service frequency: the share of the last CALL_DAYS days on which a vehicle called at the station (0..1). */
+  callShare(st: Station): number {
+    let m = st.callDays || 0, n = 0;
+    while (m) { m &= m - 1; n++; }
+    return n / CALL_DAYS;
+  }
+
+  /**
+   * Daily station ratings (game.ts): a rating moves towards a target from the days since a vehicle last called,
+   * the queue, the speed of the services and the share of passengers who gave up waiting (lostShare); a station
+   * no line serves stays at or below 50 %. Also the service history (callDays: the days a vehicle called, from lastCall).
+   */
+  updateRatings() {
+    const g = this.game;
+    for (const st of this.map.values()) {
+      const days = g.day - st.lastPickup;
+      // a vehicle called yesterday (building the station is no call: lastCall is only set by vehicles)
+      const called = st.lastCall >= 0 && g.day - st.lastCall === 1 ? 1 : 0;
+      st.callDays = (((st.callDays || 0) << 1) | called) & CALL_MASK;
+      let target = 0.33;
+      target += days <= 7 ? 0.27 : days <= 14 ? 0.18 : days <= 30 ? 0.08 : 0;
+      target += st.waitingTotal < 100 ? 0.15 : st.waitingTotal < 400 ? 0.08 : st.waitingTotal < 1200 ? 0 : -0.12;
+      target += Math.min(0.17, Math.max(0, (st.lastSpeed - 45) / 900));
+      target -= RATING_LOST * lostShare(st);
+      if (!g.lines.stationServed(st.id)) target = Math.min(target, 0.5);
+      st.rating += (target - st.rating) * 0.04;
+      st.rating = Math.max(0, Math.min(1, st.rating));
     }
   }
 
@@ -2529,16 +3333,21 @@ export class Stations {
     if (!st || !r) return;
     this.markStation(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
+    // added entrances: a ground station staying on the ground keeps them beside its platforms where they still fit
+    // (refitEntrances); at another level they go (planRelevel warns), their price leaving the station's value
+    const added = r.entrances.filter((e) => e.kind), keep = (r.level ?? 'ground') === 'ground' && plan.level === 'ground';
+    const addedCost = added.reduce((c, e) => c + (e.cost ?? 0), 0);
     r.level = plan.level; r.underground = plan.level === 'underground'; r.y = plan.y; r.depth = plan.depth; r.height = plan.height;
     r.entrances = plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle }));
     r.piers = plan.piers.map((p) => ({ ...p }));
     r.style = plan.style; r.building = plan.building;
     r.forecourt = plan.forecourt ?? undefined; r.forecourt2 = plan.forecourt2 ?? undefined;
-    r.cost = Math.round((r.cost ?? 0) * 0.7 + plan.cost);
+    r.cost = Math.round(Math.max(0, (r.cost ?? 0) - addedCost) * 0.7 + plan.cost) + (keep ? addedCost : 0);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     if (plan.level === 'ground') this.levelGround(plan);
     else for (const f of this.footprints(st)) if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
     this.repairSite(st);
+    if (keep && added.length) this.refitEntrances(st, added, { what: 're-levelled' });
     this.markStation(st);
     this.accessVersion = -1;
     g.lines.catchmentDirty = true;
@@ -2643,6 +3452,12 @@ export class Stations {
   }
 }
 
+/** The service history of a saved station (older saves: from the day of its last pickup, if later than its building). */
+function callsOf(s: any): { lastCall: number; callDays: number } {
+  const lastCall = typeof s.lastCall === 'number' ? s.lastCall : s.lastPickup > s.built ? s.lastPickup : -1;
+  return { lastCall, callDays: typeof s.callDays === 'number' ? s.callDays : lastCall >= 0 ? OLD_SAVE_CALLS : 0 };
+}
+
 /** A station restored from a save: own copies of every array, defaults for fields older saves lack. */
 export function restoreStation(s: any): Station {
   const r = s.rail;
@@ -2655,13 +3470,17 @@ export function restoreStation(s: any): Station {
       trackType: r.trackType ?? 'standard', platformStyle: r.platformStyle ?? 'island', psd: !!r.psd,
       style: r.style && STATION_STYLES[r.style] ? r.style : 'classic', forecourt2: r.forecourt2 ? { ...r.forecourt2 } : undefined,
       level: lv, underground: lv === 'underground', depth: r.depth ?? 0, height: r.height ?? 0,
-      entrances: (r.entrances ?? []).map((e: any) => ({ ...e })), piers: (r.piers ?? []).map((p: any) => ({ ...p })),
+      entrances: (r.entrances ?? []).map((e: any) => ({ ...e, ...(e.far ? { far: { ...e.far } } : {}) })), piers: (r.piers ?? []).map((p: any) => ({ ...p })),
       forecourt: r.forecourt ? { ...r.forecourt } : undefined,
     } : null,
     stops: (s.stops ?? []).map((p: any) => ({ ...p })),
     links: [...(s.links ?? [])],
     roadAccess: s.roadAccess ?? true,
-    onPlat: s.onPlat ? [...s.onPlat] : undefined,
+    // older saves: no passengers lost yet; a station picked up from after it was built has had calls (a typical
+    // frequency, three in the last 30 days, to start from)
+    lostMonth: s.lostMonth ?? 0, lostLast: s.lostLast ?? 0, ...callsOf(s),
+    // (no key before the first daily sampling: that adds its figures in the original's order)
+    ...(s.onPlat ? { onPlat: [...s.onPlat] } : {}),
     waiting: new Map(),
   };
 }

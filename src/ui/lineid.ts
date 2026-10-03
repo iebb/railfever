@@ -1,6 +1,7 @@
-// Line identity, JR style: line symbols (the company letter + route letter on the line colour), station numbering
-// badges (AS01: white rounded square with the line colour as its border), the transport mode of a line, and the
-// per-view mode / company filters of every line view (remembered in localStorage).
+// Line identity: JR-style rail symbols (the company letter + route letter on the line colour), rail station numbering
+// badges (AS01: white rounded square with the line colour as its border), the transport mode of a line (rail is one
+// mode: main-line, metro and light-rail track and stations are construction styles of it), and the per-view mode /
+// company filters of every line view (remembered in localStorage).
 import type { Game } from '../game/game';
 import { PLAYER } from '../game/game';
 import type { Line } from '../game/lines';
@@ -8,12 +9,10 @@ import type { Vehicle } from '../game/vehicle';
 import type { VehicleModel } from '../game/vehicle-types';
 import { h, icon, esc } from './dom';
 
-export type LineMode = 'rail' | 'metro' | 'lightrail' | 'tram' | 'bus' | 'coach';
-export const LINE_MODES: LineMode[] = ['rail', 'metro', 'lightrail', 'tram', 'bus', 'coach'];
+export type LineMode = 'rail' | 'tram' | 'bus' | 'coach';
+export const LINE_MODES: LineMode[] = ['rail', 'tram', 'bus', 'coach'];
 export const MODE_META: Record<LineMode, { label: string; icon: string; color: string }> = {
   rail: { label: 'Rail', icon: 'train', color: 'var(--rail)' },
-  metro: { label: 'Metro', icon: 'metro', color: 'var(--metro)' },
-  lightrail: { label: 'Light rail', icon: 'lightrail', color: 'var(--lightrail)' },
   tram: { label: 'Tram', icon: 'tram', color: 'var(--tram)' },
   bus: { label: 'Bus', icon: 'bus', color: 'var(--road)' },
   coach: { label: 'Coach', icon: 'coach', color: 'var(--coach)' },
@@ -30,8 +29,8 @@ export function inkOn(bg: string): string {
 const isCoach = (m: VehicleModel | null | undefined) => !!m && m.kind === 'bus' && /coach/.test(m.style ?? '');
 
 /**
- * Mode of a line: rail lines by the mode of most of their stations (main line, metro, light rail), road lines by
- * their vehicles (coaches: long-distance), trams.
+ * Mode of a line: every rail line is 'rail' (whatever mix of main-line, metro and light-rail track and stations it
+ * uses), road lines by their vehicles (coaches: long-distance), trams.
  */
 export function lineMode(g: Game, l: Line): LineMode {
   if (l.kind === 'tram') return 'tram';
@@ -40,41 +39,31 @@ export function lineMode(g: Game, l: Line): LineMode {
     for (const id of l.vehicles) { const v = g.vehicles.get(id) as unknown as { model?: VehicleModel | null } | undefined; if (!v) continue; if (isCoach(v.model)) c++; else b++; }
     return c > b ? 'coach' : 'bus';
   }
-  let main = 0, metro = 0, lr = 0;
-  const seen = new Set<number>();
-  for (const sid of l.stops) {
-    if (seen.has(sid)) continue;
-    seen.add(sid);
-    const st = g.stations.get(sid);
-    if (!st?.rail) continue;
-    const m = g.stations.mode(st);
-    if (m === 'metro') metro++; else if (m === 'lightrail') lr++; else main++;
-  }
-  return metro + lr > main ? (metro >= lr ? 'metro' : 'lightrail') : 'rail';
+  return 'rail';
 }
 
-/** Mode of a vehicle: its line's, else by its model (metro / light-rail units, coaches, trams). */
+/** Mode of a vehicle: its line's, else by its model (trains: rail; coaches, trams, buses). */
 export function vehicleMode(g: Game, v: Vehicle): LineMode {
   if (v.line) return lineMode(g, v.line);
   const t = v as unknown as { cars?: VehicleModel[]; model?: VehicleModel | null };
-  if (t.cars) {
-    const tr = t.cars[0]?.tracks ?? [];
-    return tr[0] === 'metro' ? 'metro' : tr[0] === 'lightrail' ? 'lightrail' : 'rail';
-  }
+  if (t.cars) return 'rail';
   return t.model?.kind === 'tram' ? 'tram' : isCoach(t.model) ? 'coach' : 'bus';
 }
 
 // ------------------------------------------------------------------ symbols and badges
-/** The line's symbol text: company letter + route letter (Lines.lineCode), or a mode letter and number. */
+/** A rail line's symbol text: company letter + route letter (Lines.lineCode), or R + number; '' for other modes. */
 export function lineCodeOf(g: Game, l: Line): string {
+  if (l.kind !== 'rail') return '';
   const fn = (g.lines as unknown as { lineCode?: (id: number) => string }).lineCode;
   const c = fn ? fn.call(g.lines, l.id) : '';
-  return c && !c.includes('?') ? c : (l.kind === 'rail' ? 'R' : l.kind === 'tram' ? 'T' : 'B') + l.num;
+  return c && !c.includes('?') ? c : 'R' + l.num;
 }
 
-/** JR-style line symbol: a rounded square in the line colour with the white (or dark) code. */
+/** Rail: JR-style code symbol. Other modes: a plain chip in the line colour, paired with the name by callers. */
 export function lineSymbol(g: Game, l: Line, size: '' | 'sm' | 'lg' = ''): HTMLElement {
-  return h('span', { class: 'lsym' + (size ? ' ' + size : ''), style: `--c:${l.color};--ink:${inkOn(l.color)}`, 'aria-label': `Line ${lineCodeOf(g, l)}` }, lineCodeOf(g, l));
+  if (l.kind !== 'rail') return h('span', { class: 'lcolor' + (size ? ' ' + size : ''), style: `--c:${l.color}`, 'aria-label': l.name });
+  const code = lineCodeOf(g, l);
+  return h('span', { class: 'lsym' + (size ? ' ' + size : ''), style: `--c:${l.color};--ink:${inkOn(l.color)}`, 'aria-label': `Line ${code}` }, code);
 }
 
 /** Symbol + name of a line as one clickable chip (lists, station windows). */
@@ -107,7 +96,7 @@ interface BadgeCache { ver: number; n: number; stations: number; t: number; map:
 const badgeCaches = new WeakMap<Game, BadgeCache>();
 
 /**
- * Station numbering badges of every station (one per serving line, in line order), cached: rebuilt when the line
+ * Rail station numbering badges of every station (one per serving rail line, in line order), cached: rebuilt when the line
  * network changes, and every few seconds for colour changes. One map read per station afterwards.
  */
 export function allBadges(g: Game): Map<number, Badge[]> {
@@ -117,7 +106,7 @@ export function allBadges(g: Game): Map<number, Badge[]> {
   const map = new Map<number, Badge[]>();
   const L = g.lines as unknown as { stationCode?: (l: number, s: number) => string; routeCode?: (l: Line) => string };
   if (L.stationCode && L.routeCode) {
-    const lines = [...g.lines.map.values()].filter((l) => l.stops.length > 0).sort((a, b) => a.id - b.id);
+    const lines = [...g.lines.map.values()].filter((l) => l.kind === 'rail' && l.stops.length > 0).sort((a, b) => a.id - b.id);
     for (const l of lines) {
       const route = L.routeCode.call(g.lines, l);
       for (const sid of new Set(l.stops)) {
@@ -173,7 +162,8 @@ function store(): Record<string, LineFilter> {
   return filterStore!;
 }
 
-/** The filter of a view (default: every mode, the player's lines). */
+/** The filter of a view (default: every mode, the player's lines). Modes no longer listed (the former metro and
+ * light-rail chips, now rail) are dropped from remembered filters. */
 export function getFilter(view: string, def: LineFilter['company'] = 'mine'): LineFilter {
   const s = store();
   const f = s[view];

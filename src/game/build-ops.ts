@@ -186,12 +186,22 @@ export class Depots {
     return null;
   }
 
-  remove(id: number): string | null {
+  /** The same blockers are used by demolition previews and removal. */
+  removeError(id: number): string | null {
     const g = this.game;
     const dp = this.map.get(id);
     if (!dp) return null;
     if (g.vehicles.all().some((v) => (v as any).depotId === id && !(v as any).onMap)) return 'Vehicles are in the depot';
     if (g.vehicles.isEdgeBusy(dp.edge)) return 'Vehicle in the way';
+    return null;
+  }
+
+  remove(id: number): string | null {
+    const g = this.game;
+    const dp = this.map.get(id);
+    if (!dp) return null;
+    const err = this.removeError(id);
+    if (err) return err;
     g.world.net.removeEdge(dp.edge);
     this.map.delete(id);
     recomputeLocks(g.world, dp.x - 4, dp.z - 4, dp.x + 4, dp.z + 4);
@@ -249,7 +259,14 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
 
 // ------------------------------------------------------------------ demolition
 
-export interface BulldozeResult { cost: number; error: string | null; changed: number }
+/** Demolition charge for one station entrance. */
+const ENTRANCE_DEMOLITION = 5000;
+
+export interface BulldozeResult {
+  cost: number; error: string | null; changed: number;
+  /** Owned structures hit by the selection, for the UI's demolition confirmation. */
+  stationIds: number[]; depotIds: number[];
+}
 
 /** Remove objects at a point (radius) or in a rectangle. */
 export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number, owner: number, dryRun: boolean): BulldozeResult {
@@ -258,24 +275,49 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
   if (x0 > x1) [x0, x1] = [x1, x0];
   if (z0 > z1) [z0, z1] = [z1, z0];
   const point = x1 - x0 < 0.01 && z1 - z0 < 0.01;
-  const res: BulldozeResult = { cost: 0, error: null, changed: 0 };
+  const res: BulldozeResult = { cost: 0, error: null, changed: 0, stationIds: [], depotIds: [] };
+  const removals: { cost: number; remove: () => string | null }[] = [];
+  const planRemoval = (cost: number, remove: () => string | null) => {
+    res.cost += cost; res.changed++;
+    removals.push({ cost, remove });
+  };
   const inArea = (x: number, z: number, pad: number) => x >= x0 - pad && x <= x1 + pad && z >= z0 - pad && z <= z1 + pad;
+  // Through tracks belong to their station too, even when their edge.station is -1.
+  const stationEdges = new Set(g.stations.all().flatMap((st) => st.rail ? [...st.rail.edges, ...st.rail.throughEdges] : []));
+  // Freeze the selection before removing structures; a point must not hit a second, newly exposed edge.
+  const edges = point ? (() => { const ne = net.nearestEdge(x0, z0, 0.9); return ne ? [ne.edge] : []; })()
+    : net.edgesNear(x0, z0, x1, z1).filter((e) => { const geo = net.geo(e); for (let i = 0; i < geo.n; i++) if (inArea(geo.pts[i * 3], geo.pts[i * 3 + 2], 0)) return true; return false; });
   // stations
+  let structureHit = false;
   for (const st of g.stations.all()) {
-    const hit = g.stations.footprints(st).some((f) => point ? distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1 : inArea(f.x, f.z, 0)) ||
-      st.stops.some((p) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
-    if (!hit) continue;
+    const parts = g.stations.footprints(st).filter((f) => point ? distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1 : inArea(f.x, f.z, 0));
+    const stopHit = st.stops.some((p) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
+    if (!parts.length && !stopHit) continue;
+    if (parts.some((f) => f.part !== 'platforms')) structureHit = true;
     if (st.owner !== owner) { res.error = 'Owned by another company'; continue; }
-    res.cost += 20000; res.changed++;
-    if (dryRun) continue;
-    if (st.rail && (point ? g.stations.footprints(st).some((f) => distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1) : true)) {
-      const err = g.stations.removeStation(st.id);
-      if (err) res.error = err;
-    } else {
-      for (let i = st.stops.length - 1; i >= 0; i--) {
-        const p = st.stops[i];
-        if (point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0)) g.stations.removeStop(st, i);
+    // only entrances hit: they go and the station stays (a station below or above the street keeps one: its
+    // last entrance takes the whole station, as before)
+    const doors = [...new Set(parts.map((f) => f.entrance ?? -1))].sort((a, b) => b - a);
+    const r = st.rail;
+    if (r && !stopHit && parts.every((f) => f.part === 'entrance' && f.entrance !== undefined) && ((r.level ?? 'ground') === 'ground' || doors.length < r.entrances.length)) {
+      for (const i of doors) {
+        const err = g.stations.removeEntranceError(st.id, i, owner);
+        if (err) { res.error = err; continue; }
+        planRemoval(ENTRANCE_DEMOLITION, () => g.stations.removeEntrance(st.id, i, owner));
       }
+      continue;
+    }
+    res.stationIds.push(st.id);
+    if (st.rail && (point ? g.stations.footprints(st).some((f) => distToRect(x0, z0, f.x, f.z, f.angle, f.w / 2, f.d / 2) < 0.1) : true)) {
+      // Matches Stations.removeStation's blocker without changing stations.ts.
+      if ([...st.rail.edges, ...st.rail.throughEdges].some((eid) => g.vehicles.isEdgeBusy(eid))) { res.error = 'Train in the station'; continue; }
+      planRemoval(20000, () => g.stations.removeStation(st.id));
+    } else {
+      const stops = st.stops.map((p, i) => ({ p, i })).filter(({ p }) => point ? Math.hypot(p.x - x0, p.z - z0) < 0.6 : inArea(p.x, p.z, 0));
+      planRemoval(20000, () => {
+        for (const { i } of stops.reverse()) g.stations.removeStop(st, i);
+        return null;
+      });
     }
   }
   // depots
@@ -284,42 +326,53 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
     const hit = point ? distToRect(x0, z0, dp.x, dp.z, dp.angle, sz.w / 2, sz.d / 2) < 0.1 : inArea(dp.x, dp.z, 0);
     if (!hit) continue;
     if (dp.owner !== owner) { res.error = 'Owned by another company'; continue; }
-    res.cost += 15000; res.changed++;
-    if (!dryRun) { const err = g.depots.remove(dp.id); if (err) res.error = err; }
+    res.depotIds.push(dp.id);
+    const err = g.depots.removeError(dp.id);
+    if (err) { res.error = err; continue; }
+    planRemoval(15000, () => g.depots.remove(dp.id));
   }
-  // edges
-  const edges = point ? (() => { const ne = net.nearestEdge(x0, z0, 0.9); return ne ? [ne.edge] : []; })()
-    : net.edgesNear(x0, z0, x1, z1).filter((e) => { const geo = net.geo(e); for (let i = 0; i < geo.n; i++) if (inArea(geo.pts[i * 3], geo.pts[i * 3 + 2], 0)) return true; return false; });
+  // edges (a click on a station building or entrance takes that, not the street beside it)
   const removed: NEdge[] = [];
-  for (const e of edges) {
-    if (e.station >= 0 || e.depot >= 0) continue;
+  for (const e of point && structureHit ? [] : edges) {
+    if (e.station >= 0 || e.depot >= 0 || stationEdges.has(e.id)) continue;
     if (e.owner >= 0 && e.owner !== owner) { res.error = 'Owned by another company'; continue; }
     if (e.tram && (e.tramOwner ?? -1) >= 0 && e.tramOwner !== owner) { res.error = 'Tram tracks of another company'; continue; }
     if (g.vehicles.isEdgeBusy(e.id)) { res.error = 'Vehicle in the way'; continue; }
-    res.cost += (e.kind === 'rail' ? 400 : 250) * e.len; res.changed++;
-    if (!dryRun) removed.push(e);
+    planRemoval((e.kind === 'rail' ? 400 : 250) * e.len, () => { removed.push(e); return null; });
   }
   // buildings (point only, or all in area)
   const blds = point ? w.buildingsNear(x0, z0, 4).filter((b) => distToRect(x0, z0, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.05)
     : [...w.buildings.values()].filter((b) => inArea(b.x, b.z, 0));
   for (const b of blds) {
-    res.cost += 6000 + b.pop * 2500; res.changed++;
-    if (!dryRun) g.towns.demolishBuilding(b.id);
+    planRemoval(6000 + b.pop * 2500, () => { g.towns.demolishBuilding(b.id); return null; });
   }
   // trees in area
   if (!point) {
     let n = 0;
     for (const id of w.treeGrid.query(x0, z0, x1, z1)) { const t = w.trees[id]; if (t && inArea(t.x, t.z, 0)) n++; }
-    res.cost += n * 250;
-    if (n) res.changed++;
-    if (!dryRun && n) {
+    if (n) planRemoval(n * 250, () => {
       for (const id of w.treeGrid.query(x0, z0, x1, z1)) {
         const t = w.trees[id];
         if (t && inArea(t.x, t.z, 0)) { w.trees[id] = null; w.freeTrees.push(id); w.treeGrid.remove(id); w.markObj(t.x, t.z); }
       }
-    }
+      return null;
+    });
   }
-  if (!dryRun && removed.length) {
+  // Validate the whole selection, then execute only those removals that were priced above.
+  const economy = g.company(owner).economy;
+  if (res.cost > 0 && !economy.canAfford(res.cost)) {
+    res.error = 'Not enough money'; res.changed = 0;
+    if (!dryRun) res.cost = 0;
+    return res;
+  }
+  if (dryRun) return res;
+  res.cost = 0; res.changed = 0;
+  for (const op of removals) {
+    const err = op.remove();
+    if (err) { res.error = err; continue; }
+    res.cost += op.cost; res.changed++;
+  }
+  if (removed.length) {
     let bx0 = Infinity, bz0 = Infinity, bx1 = -Infinity, bz1 = -Infinity;
     for (const e of removed) {
       const b = net.grid.box(e.id);
@@ -329,7 +382,7 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
     recomputeLocks(w, bx0, bz0, bx1, bz1);
     g.onNetworkChanged();
   }
-  if (!dryRun && res.cost > 0) g.company(owner).economy.spend(res.cost, 'construction', true);
+  if (res.cost > 0) economy.spend(res.cost, 'construction');
   return res;
 }
 

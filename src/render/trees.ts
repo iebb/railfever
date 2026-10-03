@@ -1,4 +1,4 @@
-// Instanced trees, 1 unit = 10 m. Five near species (150–400 triangles) and two cheap far shapes.
+// Instanced trees, 1 unit = 10 m. Five near species and four-triangle crossed cards in two far buckets.
 // Shrubs reuse the broadleaf bucket with squat transforms: no extra materials, groups or draw calls.
 import * as THREE from 'three';
 import { GeoBuilder } from './geo';
@@ -6,10 +6,21 @@ import { hash2 } from '../game/rng';
 import { WATER_Y } from '../game/constants';
 import { pointInRect } from '../game/world';
 import type { World } from '../game/world';
+import { applyClouds } from './clouds';
 
 /** Variant ids: 0 oak/beech, 1 birch, 2 poplar, 3 spruce, 4 pine. */
 export const TREE_VARIANTS = 5;
 export const IMPOSTOR_KINDS = 2;
+/** Half-width of the near/card dither band; also used by CPU bucket selection. */
+export const TREE_FADE = 10;
+/** Shared main-camera position, including the near trees' shadow-material LOD selection. */
+export const treeCameraUniform = { value: new THREE.Vector3() };
+const smooth = (a: number, b: number, v: number) => { const t = clamp01((v - a) / (b - a)); return t * t * (3 - 2 * t); };
+/** Nested hash subsets: half beyond 400, quarter beyond 840, eighth in extreme whole-map views. */
+export function treeDensity(distance: number) {
+  return 1 - 0.5 * smooth(320, 400, distance) - 0.25 * smooth(720, 840, distance) - 0.125 * smooth(1100, 1320, distance);
+}
+const ATLAS_COLS = 8, TILE_W = 128, TILE_H = 256, PAD = 4;
 
 const srgb = (c: number): [number, number, number] => [
   ((c >> 16) & 255) / 255, ((c >> 8) & 255) / 255, (c & 255) / 255,
@@ -228,59 +239,99 @@ export function createTreeGeometries(): THREE.BufferGeometry[] {
 
 export function impostorKind(variant: number): number { return variant === 3 || variant === 4 ? 1 : 0; }
 
-/** Far crown: a broad, flat underside, straight sides and a domed top. Never a bicone / diamond. */
-export function createImpostorGeometries(): THREE.BufferGeometry[] {
-  const out: THREE.BufferGeometry[] = [];
-  let b = new GeoBuilder();
-  limb(b, 0, 0, 0, 0, 0.85, 0, 0.072, 0.035, 0x665547, 3);
-  const n = 6, base = b.vertexCount;
-  for (let ring = 0; ring < 2; ring++) for (let k = 0; k < n; k++) {
-    const angle = k / n * Math.PI * 2, c = Math.cos(angle), s = Math.sin(angle);
-    const y = ring ? 1.2 : 0.56, radius = ring ? 0.55 : 0.44;
-    const ny = ring ? 0.3 : -0.22, len = Math.hypot(1, ny);
-    b.color(0xffffff, ring ? 0.98 : 0.81); surface(b, 1);
-    b.vertex(c * radius, y, s * radius, c / len, ny / len, s / len);
+/** Two double-sided cards; species and the two orthogonal views come from a shared startup atlas. */
+let startupAtlas: ReturnType<typeof createTreeAtlas> | undefined;
+export function createImpostorGeometries(near?: THREE.BufferGeometry[]): THREE.BufferGeometry[] {
+  if (!startupAtlas) {
+    const models = near ?? createTreeGeometries(); startupAtlas = createTreeAtlas(models);
+    if (!near) models.forEach((g) => g.dispose());
   }
-  b.color(0xffffff); surface(b, 1);
-  const apex = b.vertex(-0.035, 1.65, 0.02, 0, 1, 0);
-  for (let k = 0; k < n; k++) {
-    const a = base + k, next = base + (k + 1) % n;
-    b.idx.push(a, a + n, next, next, a + n, next + n, a + n, apex, next + n);
-  }
-  const bottom = b.vertexCount;
-  for (let k = 0; k < n; k++) {
-    const p = (base + k) * 3;
-    b.color(0xffffff, 0.75); surface(b, 1);
-    b.vertex(b.pos[p], b.pos[p + 1], b.pos[p + 2], 0, -1, 0);
-  }
-  for (let k = 1; k < n - 1; k++) b.idx.push(bottom, bottom + k, bottom + k + 1);
-  out.push(b.build()); // 6 trunk + 12 sides + 6 top + 4 underside = 28.
-  b = new GeoBuilder();
-  limb(b, 0, 0, 0, 0, 0.88, 0, 0.06, 0.025, 0x695542, 3);
-  // Three overlapping, capped cones with exposed brown trunk. Each is six triangles.
-  for (const [y0, y1, radius, phase] of [
-    [0.34, 1.21, 0.51, 0.2], [0.91, 1.7, 0.36, 0.55], [1.44, 2.04, 0.21, 0.2],
-  ]) {
-    const start = b.vertexCount, slope = radius / (y1 - y0), len = Math.hypot(1, slope);
-    b.color(0xffffff, 0.97 + y1 * 0.01); surface(b, 1);
-    const top = b.vertex(0, y1, 0, 0, 1, 0);
-    for (let k = 0; k < 4; k++) {
-      const angle = k / 4 * Math.PI * 2 + phase, c = Math.cos(angle), s = Math.sin(angle);
-      b.color(0xffffff, 0.78 + y0 * 0.08); surface(b, 1);
-      b.vertex(c * radius, y0, s * radius, c / len, slope / len, s / len);
+  return ['broadleaf-far', 'conifer-far'].map((name) => {
+    const b = new GeoBuilder(true), half = 0.5 * TILE_W / (TILE_W - 2 * PAD);
+    const bottom = -PAD / (TILE_H - 2 * PAD), top = 1 - bottom;
+    for (let view = 0; view < 2; view++) {
+      const base = b.vertexCount;
+      for (const [x, y, u, v] of [[-half, bottom, 0, 0], [half, bottom, 1, 0], [half, top, 1, 1], [-half, top, 0, 1]]) {
+        surface(b, 1); b.attr('aTreeView', 1, view);
+        b.vertex(view ? 0 : x, y, view ? -x : 0, view, 0, 1 - view, u, v);
+      }
+      b.idx.push(base, base + 1, base + 2, base, base + 2, base + 3);
     }
-    for (let k = 0; k < 4; k++) b.idx.push(top, start + 1 + (k + 1) % 4, start + 1 + k);
-    const under = b.vertexCount;
-    for (let k = 0; k < 4; k++) {
-      const p = (start + k + 1) * 3;
-      b.color(0xffffff, 0.73); surface(b, 1);
-      b.vertex(b.pos[p], y0, b.pos[p + 2], 0, -1, 0);
-    }
-    b.idx.push(under, under + 1, under + 2, under, under + 2, under + 3);
+    const g = b.build(); g.name = name; g.userData.treeAtlas = startupAtlas; return g;
+  });
+}
+
+const profiles = new WeakMap<THREE.BufferGeometry, { width: number; height: number }>();
+function profile(g: THREE.BufferGeometry) {
+  let p = profiles.get(g);
+  if (!p) {
+    g.computeBoundingBox(); const b = g.boundingBox!;
+    p = { width: 2 * Math.max(Math.abs(b.min.x), Math.abs(b.max.x), Math.abs(b.min.z), Math.abs(b.max.z)), height: b.max.y };
+    profiles.set(g, p);
   }
-  out.push(b.build()); // 6 trunk + 3 * 6 cone = 24.
-  out[0].name = 'broadleaf-far'; out[1].name = 'conifer-far';
-  return out;
+  return p;
+}
+
+/** CPU orthographic rasterization of the near models: no DOM, extra renderer, or GPU readback. */
+export function createTreeAtlas(geos: THREE.BufferGeometry[]): { color: THREE.DataTexture; normal: THREE.DataTexture } {
+  const width = ATLAS_COLS * TILE_W, height = 2 * TILE_H;
+  const rgba = new Uint8Array(width * height * 4), normals = new Uint8Array(rgba.length);
+  const encode = (v: number) => Math.round(clamp01(v <= 0.0031308 ? v * 12.92 : 1.055 * v ** (1 / 2.4) - 0.055) * 255);
+  for (let species = 0; species < geos.length; species++) {
+    const g = geos[species], p = g.getAttribute('position'), c = g.getAttribute('color');
+    const n = g.getAttribute('normal'), flags = g.getAttribute('aTreeSurface'), ix = g.index!, bounds = profile(g);
+    for (let view = 0; view < 2; view++) {
+      const depth = new Float32Array(TILE_W * TILE_H).fill(-Infinity);
+      for (let tri = 0; tri < ix.count; tri += 3) {
+        const ids = [ix.getX(tri), ix.getX(tri + 1), ix.getX(tri + 2)];
+        const x = ids.map((i) => PAD + (0.5 + (view ? -p.getZ(i) : p.getX(i)) / bounds.width) * (TILE_W - 2 * PAD));
+        const y = ids.map((i) => PAD + p.getY(i) / bounds.height * (TILE_H - 2 * PAD));
+        const z = ids.map((i) => view ? p.getX(i) : p.getZ(i));
+        const area = (x[1] - x[0]) * (y[2] - y[0]) - (y[1] - y[0]) * (x[2] - x[0]);
+        if (Math.abs(area) < 1e-8) continue;
+        for (let py = Math.max(PAD, Math.floor(Math.min(...y))); py < Math.min(TILE_H - PAD, Math.ceil(Math.max(...y))); py++) {
+          for (let px = Math.max(PAD, Math.floor(Math.min(...x))); px < Math.min(TILE_W - PAD, Math.ceil(Math.max(...x))); px++) {
+            const a = ((x[1] - px - 0.5) * (y[2] - py - 0.5) - (y[1] - py - 0.5) * (x[2] - px - 0.5)) / area;
+            const b = ((x[2] - px - 0.5) * (y[0] - py - 0.5) - (y[2] - py - 0.5) * (x[0] - px - 0.5)) / area, d = 1 - a - b;
+            if (a < 0 || b < 0 || d < 0) continue;
+            const zi = a * z[0] + b * z[1] + d * z[2], local = py * TILE_W + px;
+            if (zi < depth[local]) continue;
+            depth[local] = zi;
+            const weights = [a, b, d], target = ((view * TILE_H + py) * width + species * TILE_W + px) * 4;
+            const mix = (attr: THREE.BufferAttribute | THREE.InterleavedBufferAttribute, channel: number) =>
+              ids.reduce((sum, id, k) => sum + attr.getComponent(id, channel) * weights[k], 0);
+            // Normals are expressed in the card's normalized coordinates; the instance undoes this scale.
+            const nn = [mix(n, 0) * bounds.width, mix(n, 1) * bounds.height, mix(n, 2) * bounds.width];
+            const length = Math.hypot(...nn) || 1;
+            for (let k = 0; k < 3; k++) { rgba[target + k] = encode(mix(c, k)); normals[target + k] = Math.round((nn[k] / length * 0.5 + 0.5) * 255); }
+            rgba[target + 3] = 255; normals[target + 3] = Math.round(clamp01(mix(flags, 0)) * 255);
+          }
+        }
+      }
+      // Dilate RGB/normal into transparent texels: bilinear/mipmap edges stay green instead of black.
+      for (let pass = 0; pass < PAD; pass++) {
+        const old = normals.slice();
+        for (let py = 0; py < TILE_H; py++) for (let px = 0; px < TILE_W; px++) {
+          const i = ((view * TILE_H + py) * width + species * TILE_W + px) * 4;
+          if (old[i] || old[i + 1] || old[i + 2]) continue;
+          for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+            const nx = px + dx, ny = py + dy;
+            if (nx < 0 || nx >= TILE_W || ny < 0 || ny >= TILE_H) continue;
+            const j = i + (dy * width + dx) * 4;
+            if (!old[j] && !old[j + 1] && !old[j + 2]) continue;
+            rgba.set(rgba.subarray(j, j + 3), i); normals.set(old.subarray(j, j + 4), i); break;
+          }
+        }
+      }
+    }
+  }
+  const texture = (data: Uint8Array<ArrayBuffer>, srgb: boolean) => {
+    const t = new THREE.DataTexture(data, width, height);
+    t.magFilter = THREE.LinearFilter; t.minFilter = THREE.LinearMipmapLinearFilter; t.generateMipmaps = true;
+    if (srgb) t.colorSpace = THREE.SRGBColorSpace;
+    t.needsUpdate = true; return t;
+  };
+  return { color: texture(rgba, true), normal: texture(normals, false) };
 }
 
 export interface TreeInstance {
@@ -353,23 +404,20 @@ export function forestTreeInstances(list: TreeInstance[], world: World): TreeIns
 
 const matrix = new THREE.Matrix4(), quaternion = new THREE.Quaternion(), euler = new THREE.Euler();
 const position = new THREE.Vector3(), scale = new THREE.Vector3(), color = new THREE.Color();
-const IMP_SCALE: [number, number, number][] = [
-  [1.08, 1.02, 1.08], [0.73, 1.19, 0.73], [0.47, 1.30, 0.47], [1, 1, 1], [1.02, 0.97, 1.02],
-];
 
 function variantOf(t: TreeInstance, variants = TREE_VARIANTS) {
   return Number.isInteger(t.type) && t.type >= 0 && t.type < variants ? t.type : 0;
 }
 
 /** Same anchored lean and independent aspect variation in both LODs (not correlated with brightness). */
-function transformOf(t: TreeInstance, far: boolean) {
+function transformOf(t: TreeInstance, far: boolean, bounds?: { width: number; height: number }) {
   const hx = Math.floor(t.x * 64), hz = Math.floor(t.z * 64), v = variantOf(t);
   const lean = t.shrub ? 0.022 : v === 2 ? 0.026 : 0.045;
   euler.set((hash2(hx, hz, 811) - 0.5) * 2 * lean, t.rot,
     (hash2(hx, hz, 821) - 0.5) * 2 * lean, 'YXZ');
   quaternion.setFromEuler(euler);
   position.set(t.x, t.y, t.z);
-  const sc = far ? IMP_SCALE[v] : [1, 1, 1];
+  const sc = far ? [bounds!.width, bounds!.height, bounds!.width] : [1, 1, 1];
   scale.set(t.s * sc[0] * (0.92 + hash2(hx, hz, 823) * 0.16),
     t.s * sc[1] * (t.shrub ? 0.47 : 0.94 + hash2(hx, hz, 827) * 0.12),
     t.s * sc[2] * (0.94 + hash2(hx, hz, 829) * 0.12));
@@ -397,52 +445,47 @@ export function nearTreeData(list: TreeInstance[], variants: number): { m: Float
   return { m, c };
 }
 
-/** Area-weighted foliage colour, excluding bark. Cache by geometry, never by variant id across worlds. */
-const foliageAverages = new WeakMap<THREE.BufferGeometry, THREE.Color>();
-function foliageColour(g: THREE.BufferGeometry): THREE.Color {
-  const cached = foliageAverages.get(g);
-  if (cached) return cached;
-  const p = g.getAttribute('position'), c = g.getAttribute('color'), flags = g.getAttribute('aTreeSurface');
-  const index = g.index!;
-  let red = 0, green = 0, blue = 0, area = 0;
-  for (let i = 0; i < index.count; i += 3) {
-    const a = index.getX(i), b = index.getX(i + 1), d = index.getX(i + 2);
-    if (flags.getX(a) < 0.5 || flags.getX(b) < 0.5 || flags.getX(d) < 0.5) continue;
-    const ux = p.getX(b) - p.getX(a), uy = p.getY(b) - p.getY(a), uz = p.getZ(b) - p.getZ(a);
-    const vx = p.getX(d) - p.getX(a), vy = p.getY(d) - p.getY(a), vz = p.getZ(d) - p.getZ(a);
-    const weight = Math.hypot(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx);
-    red += (c.getX(a) + c.getX(b) + c.getX(d)) / 3 * weight;
-    green += (c.getY(a) + c.getY(b) + c.getY(d)) / 3 * weight;
-    blue += (c.getZ(a) + c.getZ(b) + c.getZ(d)) / 3 * weight;
-    area += weight;
-  }
-  const average = new THREE.Color(red / (area || 1), green / (area || 1), blue / (area || 1));
-  foliageAverages.set(g, average);
-  return average;
-}
-
-/** Far instance colour compensates for the shape's own AO, keeping the near/far palette consistent. */
-export function impostorData(list: TreeInstance[], geos: THREE.BufferGeometry[], imps: THREE.BufferGeometry[]):
-  { m: Float32Array[]; c: Float32Array[] } {
+/** Species atlas selection stays per instance, retaining the existing two far draw buckets. */
+export function impostorData(list: TreeInstance[], geos: THREE.BufferGeometry[], _imps: THREE.BufferGeometry[]):
+  { m: Float32Array[]; c: Float32Array[]; v: Float32Array[]; rank: Float32Array[] } {
   const counts = new Array<number>(IMPOSTOR_KINDS).fill(0);
   for (const t of list) counts[impostorKind(variantOf(t, geos.length))]++;
   const m = counts.map((n) => new Float32Array(n * 16)), c = counts.map((n) => new Float32Array(n * 3));
-  const offsets = counts.map(() => 0);
+  const v = counts.map((n) => new Float32Array(n)), rank = counts.map((n) => new Float32Array(n)), offsets = counts.map(() => 0);
   for (const t of list) {
-    const v = variantOf(t, geos.length), kind = impostorKind(v), i = offsets[kind]++;
-    transformOf(t, true); matrix.toArray(m[kind], i * 16);
-    tintOf(t, color);
-    const crown = foliageColour(geos[v]), shade = foliageColour(imps[kind]);
-    c[kind][i * 3] = crown.r * color.r / shade.r;
-    c[kind][i * 3 + 1] = crown.g * color.g / shade.g;
-    c[kind][i * 3 + 2] = crown.b * color.b / shade.b;
+    const species = variantOf(t, geos.length), kind = impostorKind(species), i = offsets[kind]++;
+    transformOf(t, true, profile(geos[species])); matrix.toArray(m[kind], i * 16);
+    tintOf(t, color); color.toArray(c[kind], i * 3); v[kind][i] = species;
+    rank[kind][i] = hash2(Math.floor(t.x * 64), Math.floor(t.z * 64), 853);
   }
-  return { m, c };
+  return { m, c, v, rank };
+}
+
+/** Complementary, opaque dithering preserves depth/shadows and needs no extra passes. */
+function treeLod(shader: THREE.WebGLProgramParametersWithUniforms, far: boolean) {
+  shader.uniforms.uRfTreeCamera = treeCameraUniform;
+  if (!shader.uniforms.uTreeDist) shader.uniforms.uTreeDist = { value: 80 };
+  if (!shader.vertexShader.includes('uniform float uTreeDist;'))
+    shader.vertexShader = shader.vertexShader.replace('#include <common>', '#include <common>\nuniform float uTreeDist;');
+  // Expand the inherited hard split to the two ends of the dither band.
+  shader.vertexShader = shader.vertexShader
+    .replace('> uTreeDist)', `> (uTreeDist + ${TREE_FADE.toFixed(1)}))`)
+    .replace('< uTreeDist)', `< (uTreeDist - ${TREE_FADE.toFixed(1)}))`)
+    .replaceAll('distance(cameraPosition,', 'distance(uRfTreeCamera,')
+    .replace('#include <common>', '#include <common>\nuniform vec3 uRfTreeCamera; varying float vRfTreeFade;')
+    .replace('#include <begin_vertex>', `#include <begin_vertex>
+float rfDistance = distance(uRfTreeCamera, (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz);
+vRfTreeFade = smoothstep(uTreeDist - ${TREE_FADE.toFixed(1)}, uTreeDist + ${TREE_FADE.toFixed(1)}, rfDistance);`);
+  shader.fragmentShader = shader.fragmentShader
+    .replace('#include <common>', '#include <common>\nvarying float vRfTreeFade;')
+    .replace('#include <alphatest_fragment>', `#include <alphatest_fragment>
+float rfDither = fract(52.9829189 * fract(dot(floor(gl_FragCoord.xy), vec2(0.06711056, 0.00583715))));
+if (rfDither ${far ? '>=' : '<'} vRfTreeFade) discard;`);
 }
 
 /**
  * Own tree materials, shared across every region. Inherit the caller's wind, uTreeDist, clouds and
- * shadow-fade hooks / uniform references. No textures, DOM/canvas dependency, or extra draw passes.
+ * shadow-fade hooks / uniform references. The far atlas adds no draw passes or DOM dependency.
  */
 const treeMaterials = new WeakMap<THREE.Material, (THREE.MeshStandardMaterial | undefined)[]>();
 function treeMaterial(source: THREE.Material, far: boolean): THREE.MeshStandardMaterial {
@@ -455,9 +498,33 @@ function treeMaterial(source: THREE.Material, far: boolean): THREE.MeshStandardM
   material.name = far ? 'railfever-tree-far' : 'railfever-tree-near';
   material.vertexColors = true; material.flatShading = false;
   material.roughness = 0.96; material.metalness = 0;
+  if (far) { material.map = startupAtlas!.color; material.alphaTest = 0.4; material.side = THREE.DoubleSide; }
   const inherited = source.onBeforeCompile.bind(source), inheritedKey = source.customProgramCacheKey();
   material.onBeforeCompile = (shader, renderer) => {
     inherited(shader, renderer);
+    treeLod(shader, far);
+    if (far) {
+      shader.uniforms.uRfTreeNormal = { value: startupAtlas!.normal };
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', '#include <common>\nattribute float aTreeVariant; attribute float aTreeRank; attribute float aTreeView; varying mat3 vRfTreeNormalMatrix; varying float vRfTreeKeep; varying float vRfTreeView;')
+        .replace('#include <uv_vertex>', `#include <uv_vertex>
+vMapUv = vec2((aTreeVariant + uv.x) / ${ATLAS_COLS.toFixed(1)}, (aTreeView + uv.y) / 2.0);
+vRfTreeView = aTreeView;
+float rfDist = distance(uRfTreeCamera, (modelMatrix * vec4(instanceMatrix[3].xyz, 1.0)).xyz);
+float rfDensity = 1.0 - 0.5 * smoothstep(320.0, 400.0, rfDist) - 0.25 * smoothstep(720.0, 840.0, rfDist) - 0.125 * smoothstep(1100.0, 1320.0, rfDist);
+vRfTreeKeep = rfDensity >= 1.0 ? 1.0 : clamp((rfDensity - aTreeRank) / 0.03 + 0.5, 0.0, 1.0);
+mat3 rfIm = mat3(instanceMatrix);
+rfIm[0] /= dot(rfIm[0], rfIm[0]); rfIm[1] /= dot(rfIm[1], rfIm[1]); rfIm[2] /= dot(rfIm[2], rfIm[2]);
+vRfTreeNormalMatrix = normalMatrix * rfIm;`);
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', '#include <common>\nuniform sampler2D uRfTreeNormal; varying mat3 vRfTreeNormalMatrix; varying float vRfTreeKeep; varying float vRfTreeView;')
+        .replace('#include <map_fragment>', '#include <map_fragment>\nvec4 rfTreeNormal = texture2D(uRfTreeNormal, vMapUv);')
+        .replace('#include <alphatest_fragment>', '#include <alphatest_fragment>\nif (fract(52.9829189 * fract(dot(floor(gl_FragCoord.xy) + 17.0, vec2(0.06711056, 0.00583715)))) >= vRfTreeKeep) discard;')
+        .replace('#include <normal_fragment_begin>', `#include <normal_fragment_begin>
+vec3 rfAtlasNormal = rfTreeNormal.xyz * 2.0 - 1.0;
+if (!gl_FrontFacing) rfAtlasNormal *= mix(vec3(1.0, 1.0, -1.0), vec3(-1.0, 1.0, 1.0), vRfTreeView);
+normal = normalize(vRfTreeNormalMatrix * rfAtlasNormal);`);
+    }
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', [
         '#include <common>',
@@ -479,7 +546,7 @@ function treeMaterial(source: THREE.Material, far: boolean): THREE.MeshStandardM
       .replace('#include <color_fragment>', [
         '#include <color_fragment>',
         // Bark keeps its own brown / pale albedo instead of being multiplied by green far-crown tint.
-        'diffuseColor.rgb /= mix(max(vRfTreeTint, vec3(0.001)), vec3(1.0), vRfTreeSurface.x);',
+        `diffuseColor.rgb /= mix(max(vRfTreeTint, vec3(0.001)), vec3(1.0), ${far ? 'rfTreeNormal.a' : 'vRfTreeSurface.x'});`,
         ...(far ? [] : [
           'float rfDetail = 1.0 - smoothstep(0.025, 0.12, length(fwidth(vRfTreeLocal)));',
           'float rfFleck = sin(vRfTreeLocal.x * 61.0 + sin(vRfTreeLocal.y * 43.0)) * sin(vRfTreeLocal.z * 57.0 - vRfTreeLocal.y * 37.0);',
@@ -492,16 +559,36 @@ function treeMaterial(source: THREE.Material, far: boolean): THREE.MeshStandardM
         ]),
       ].join('\n'));
   };
-  material.customProgramCacheKey = () => inheritedKey + '|organic-trees-v1-' + kind;
+  material.customProgramCacheKey = () => inheritedKey + '|organic-trees-v2-' + kind;
+  if (far) applyClouds(material);
   cache[kind] = material;
   return material;
 }
 
 function treeMesh(geo: THREE.BufferGeometry, source: THREE.Material, capacity: number, far: boolean): THREE.InstancedMesh {
-  const count = Math.max(1, capacity), mesh = new THREE.InstancedMesh(geo, treeMaterial(source, far), count);
+  const count = Math.max(1, capacity), instanceGeo = far ? geo.clone() : geo;
+  if (far) {
+    instanceGeo.setAttribute('aTreeVariant', new THREE.InstancedBufferAttribute(new Float32Array(count), 1));
+    instanceGeo.setAttribute('aTreeRank', new THREE.InstancedBufferAttribute(new Float32Array(count), 1));
+  }
+  const mesh = new THREE.InstancedMesh(instanceGeo, treeMaterial(source, far), count);
+  if (far) mesh.addEventListener('dispose', () => instanceGeo.dispose());
   mesh.instanceColor = new THREE.InstancedBufferAttribute(new Float32Array(count * 3), 3);
   mesh.count = 0; mesh.castShadow = !far; mesh.receiveShadow = true; mesh.matrixAutoUpdate = false;
+  if (!far) mesh.customDepthMaterial = treeDepthMaterial(source);
   return mesh;
+}
+
+const treeDepthMaterials = new WeakMap<THREE.Material, THREE.MeshDepthMaterial>();
+function treeDepthMaterial(source: THREE.Material) {
+  let mat = treeDepthMaterials.get(source);
+  if (!mat) {
+    mat = new THREE.MeshDepthMaterial({ depthPacking: THREE.RGBADepthPacking });
+    mat.onBeforeCompile = (shader, renderer) => { source.onBeforeCompile(shader, renderer); treeLod(shader, false); };
+    mat.customProgramCacheKey = () => source.customProgramCacheKey() + '|tree-depth-v2';
+    treeDepthMaterials.set(source, mat);
+  }
+  return mat;
 }
 
 /** Existing mesh factories and distance-based LOD interface are unchanged. */

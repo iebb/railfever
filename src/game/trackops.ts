@@ -9,7 +9,7 @@ import type { NEdge, Section } from './network';
 import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions, structureFactor } from './construction';
 import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
 import type { DepotPlan } from './build-ops';
-import { stationLayout, defaultPlatformLength, railModeOf } from './stations';
+import { stationLayout, defaultPlatformLength, railModeOf, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
@@ -433,17 +433,14 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
     queue.shift();
   }
   plan.points = pts;
-  // plan every segment between temporary nodes (removed again)
-  const tmp = pts.map((p) => net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, owner).id);
-  try {
+  // Plan every segment with exact node directions, without consuming IDs or changing the network version.
+  net.withTemporaryNodes('rail', pts.map((p) => ({ x: p.x, y: p.y, z: p.z, dx: -p.tx, dz: -p.tz })), owner, (tmp) => {
     for (let k = 0; k + 1 < pts.length; k++) {
-      const prop = planEdge(g, nodeSnapOf(g, tmp[k]), nodeSnapOf(g, tmp[k + 1]), railOpts(owner, { type: lineType(g, plan.steps) }));
+      const prop = planEdge(g, nodeSnapOf(g, tmp[k].id), nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps) }));
       plan.proposals.push(prop);
       if (!prop.ok) fail(`New track (${m10(pts[k].u)}-${m10(pts[k + 1].u)} m of ${m10(U)} m): ${prop.errors[0] ?? 'cannot build'}`);
     }
-  } finally {
-    for (const id of tmp) net.removeNode(id);
-  }
+  });
   const conn = (e: DoubleEnd, inner: number) => {
     const o = offAt(inner);
     if (e.kind === 'platform') { const m = net.nodes.get(e.node)!; return connectS(g, owner, { x: m.x, z: m.z, y: m.y, tx: o.tx, tz: o.tz, node: e.node }, o, chainSet, true).cost; }
@@ -542,6 +539,8 @@ export interface FinishOpts {
   normalise?: boolean;
   /** at a station end of the stretch, the first units are its throat (a turnout ladder): the crossovers go beyond */
   throatLength?: number;
+  /** Inline stations with turnback services must have crossovers on both sides before making track one-way. */
+  turnbackStations?: number[];
   /** diagnostics */
   log?: (s: string) => void;
 }
@@ -729,9 +728,12 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
         const v = span.get(sid);
         span.set(sid, v ? [Math.min(v[0], q.u), Math.max(v[1], q.u)] : [q.u, q.u]);
       }
-      for (const [, [s0, s1]] of span) {
-        if (s0 > lo + 3) windows.push({ edge0: s0, sgn: 1, must: false, atStart: null, label: 'before a station' });
-        if (s1 < hi - 3) windows.push({ edge0: s1, sgn: -1, must: false, atStart: null, label: 'after a station' });
+      for (const [sid, [s0, s1]] of span) {
+        const must = opts.turnbackStations?.includes(sid) ?? false;
+        // Existing throat upgrades keep their inline windows; AI pairing supplies the turnback option.
+        const th = opts.turnbackStations ? opts.throatLength ?? 0 : 0;
+        if (s0 > lo + 3) windows.push({ edge0: s0 - th, sgn: 1, must, atStart: null, label: 'before a station' });
+        if (s1 < hi - 3) windows.push({ edge0: s1 + th, sgn: -1, must, atStart: null, label: 'after a station' });
       }
     }
     // a pair right outside a station end takes about 2D + 3 units; anything beyond 2D + 8 out is on plain line
@@ -1466,8 +1468,9 @@ export interface RelevelPlan {
   edges: { id: number; prof: Float32Array; sections: Section[] }[];
   /** new node heights (the stretch's outer ends keep theirs: the ramps start there) */
   nodes: { id: number; y: number }[];
-  /** stations on the stretch, rebuilt at the new level in place (tracks kept): their plans */
-  stations: { id: number; plan: StationPlan }[];
+  /** stations on the stretch, rebuilt at the new level in place (tracks kept): their plans (and the price of new
+   * access streets to added entrances of a ground station staying on the ground, paid as they are built) */
+  stations: { id: number; plan: StationPlan; streets?: number }[];
   /** level crossings / diamonds on the stretch that become under- or overpasses */
   crossings: number[];
   /** ramp length at each outer end of the stretch (units) */
@@ -1516,14 +1519,21 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
   const stY = new Map<number, number>();
   for (const sid of stations) {
     const st = g.stations.get(sid)!, r = st.rail!;
+    // (a ground station staying on the ground keeps its added entrances where they still fit: the building avoids them)
+    const ground = level === 'ground' && (r.level ?? 'ground') === 'ground';
+    const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
     const sp = g.stations.planRail(r.x, r.z, r.angle, r.length, r.tracks, owner, {
       level, ignoreStation: sid, ignoreEdges: set, through: r.through ?? 0, throughMode: r.throughMode, trackType: r.trackType,
-      platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth,
+      platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth, avoid,
     });
     if (!sp.ok) return fail(`${st.name}: ${sp.error ?? 'cannot be rebuilt at that level'}`);
-    plan.stations.push({ id: sid, plan: sp });
+    // its added entrances: beside the platforms where they fit and a street reaches them (ground), else they go
+    const fit = ground ? g.stations.previewRefit(st, sp) : null;
+    const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt at the new level');
+    for (const w of [...refitWarnings(fit), ...(gone ? [gone] : [])]) plan.warnings.push(`${st.name}: ${w[0].toLowerCase()}${w.slice(1)}`);
+    plan.stations.push({ id: sid, plan: sp, ...(fit?.streets ? { streets: fit.streets } : {}) });
     stY.set(sid, sp.y);
-    plan.cost += Math.max(0, sp.cost - (r.cost ?? 0) * 0.3);
+    plan.cost += Math.max(0, sp.cost - (r.cost ?? 0) * 0.3) + (fit?.streets ?? 0);
   }
   // the stretch's nodes: outer ends (track continues beyond, or nothing: a dead end) and inner ones
   const nodesOf = new Map<number, number[]>();
@@ -1658,7 +1668,8 @@ export function commitRelevel(g: Game, plan: RelevelPlan, opts: { waitForTrains?
   if (opts.waitForTrains && plan.edges.some((x) => g.vehicles.isEdgeBusy(x.id))) return 'busy';
   const eco = g.company(plan.owner).economy;
   if (!eco.canAfford(plan.cost)) return 'Not enough money';
-  eco.spend(plan.cost, 'construction');
+  // (new access streets to stations' added entrances are paid as they are built)
+  eco.spend(plan.cost - plan.stations.reduce((c, s) => c + (s.streets ?? 0), 0), 'construction');
   for (const n of plan.nodes) { const node = net.nodes.get(n.id); if (node) node.y = n.y; }
   const ground: NEdge[] = [];
   for (const x of plan.edges) {

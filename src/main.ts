@@ -1,9 +1,9 @@
 import './ui/style.css';
 import * as THREE from 'three';
-import { Game, NewGameOptions } from './game/game';
+import { Game, MAX_FRAME_SECONDS, NewGameOptions } from './game/game';
 import { Renderer } from './render/renderer';
 import { UI } from './ui/ui';
-import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot } from './game/save';
+import { saveToSlot, listSlots, loadFromSlot, slotsReady, backupSlot, captureSave, encodeSnapshot, saveIncompatibility } from './game/save';
 import { loadFonts } from './ui/fonts';
 import { defaultTowns, DEFAULT_MAP_SIZE } from './ui/title';
 import { aiConfigsFor, MAX_AI } from './ui/gameapi';
@@ -28,13 +28,15 @@ let game: Game | null = null;
 const AUTOSAVE_EVERY = 60;
 let autosaveTimer = 0;
 let saving = false;
+let pendingAutosave: Promise<void> | null = null;
+let switching = false;
 let autosaveNeedsBackup = false;
 /** the current world has been played (title closed, or started from "New game") */
 let played = false;
 
 const ui = new UI(app, renderer, {
   newGame: (opts) => newGame(opts),
-  setGame: (g) => setGame(g),
+  setGame: (g) => switchGame('load', async () => g),
 });
 
 function showLoading(text: string) {
@@ -50,11 +52,15 @@ function afterPaint(fn: () => void) {
   Promise.race([fontsReady, timeout]).then(() => requestAnimationFrame(() => setTimeout(fn, 20)));
 }
 
-function setGame(g: Game) {
+function setGame(g: Game, hasPlayed = false) {
   game = g;
-  played = false;
+  played = hasPlayed;
   renderer.setGame(g);
   ui.setGame(g);
+  renderer.controls.followPosition = (out) => {
+    const v = ui.following === null ? undefined : g.vehicles.get(ui.following);
+    return v ? g.vehicles.renderWorldPos(v, out) : false;
+  };
   try { audio.setGame(g); } catch (e) { console.warn('audio setGame failed', e); }
   // focus the camera on the biggest town
   const big = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
@@ -62,39 +68,60 @@ function setGame(g: Game) {
   else renderer.controls.jumpTo(g.world.size / 2, g.world.size / 2, 60);
   autosaveTimer = 0;
   (window as unknown as { __rf: unknown }).__rf = { game: g, renderer, ui };
+  // Pay for the first immutable snapshot under the loading screen, before any minute autosave.
+  encodeSnapshot(captureSave(g)).catch((e) => console.warn('Save preparation failed', e));
 }
 
 /** Loading text for generating a world of the given size. */
 const genText = (size: number) => (size >= 1024 ? 'Generating a large world… this takes a few seconds' : 'Generating world…');
 
-function newGame(opts: NewGameOptions) {
-  showLoading(genText(opts.size));
-  afterPaint(() => {
-    try {
-      setGame(Game.create(opts));
-      played = true;
-    } catch (e) {
-      console.error(e);
-      ui.toast('World generation failed: ' + (e as Error).message, 'bad');
-    }
-    hideLoading();
+function newGame(opts: NewGameOptions): Promise<boolean> {
+  return switchGame('new', async () => {
+    showLoading(genText(opts.size));
+    await new Promise<void>((r) => afterPaint(r));
+    return Game.create(opts);
   });
+}
+
+async function switchGame(kind: 'new' | 'load', next: () => Promise<Game>): Promise<boolean> {
+  if (switching) return false;
+  const current = game, keep = !!current && played;
+  if (keep && !confirm((kind === 'new' ? 'Start a new game?' : 'Load another game?') + " Your current game will be kept as 'Autosave (previous game)'.")) return false;
+  switching = true;
+  const paused = current?.paused;
+  if (current) current.paused = true;
+  try {
+    showLoading(keep ? 'Keeping your current game…' : 'Loading…');
+    // A hide/timer save already in flight must finish before the switch and next game's autosave.
+    await pendingAutosave;
+    if (keep) await saveToSlot(current!, 'autosave-previous', 'Autosave (previous game)');
+    setGame(await next(), true);
+    return true;
+  } catch (e) {
+    console.error(e);
+    ui.toast('Could not switch games: ' + (e as Error).message, 'bad');
+    return false;
+  } finally {
+    if (current && game === current) current.paused = paused!;
+    switching = false; hideLoading();
+  }
 }
 
 // ------------------------------------------------------------------ autosave (IndexedDB)
 // Every minute of play, when the page is hidden and when it is left; never two saves at once, never while the
 // title screen shows a world nobody has played yet (a fresh map must not replace the player's autosave).
-async function autosave(reason: string) {
-  if (!game || saving) return;
-  if (ui.titleOpen && !played) return;
+function autosave(reason: string) {
+  if (!game || saving || switching || !played) return;
   saving = true;
   ui.hud.showSave('saving');
-  try {
-    if (autosaveNeedsBackup) { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
-    await saveToSlot(game, 'autosave', 'Autosave'); ui.hud.showSave('saved');
-  } catch (e) { console.warn('autosave failed (' + reason + ')', e); ui.hud.showSave('error'); }
-  saving = false;
-  autosaveTimer = 0;
+  const current = game;
+  pendingAutosave = (async () => {
+    try {
+      if (autosaveNeedsBackup) { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
+      await saveToSlot(current, 'autosave', 'Autosave'); ui.hud.showSave('saved');
+    } catch (e) { console.warn('autosave failed (' + reason + ')', e); ui.hud.showSave('error'); }
+    finally { saving = false; autosaveTimer = 0; pendingAutosave = null; }
+  })();
 }
 document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') autosave('hidden'); });
 window.addEventListener('pagehide', () => { autosave('pagehide'); });
@@ -102,7 +129,8 @@ window.addEventListener('pagehide', () => { autosave('pagehide'); });
 let last = performance.now();
 const focusV = new THREE.Vector3();
 function loop(now: number) {
-  const dt = Math.min(0.1, Math.max(0, (now - last) / 1000));
+  const wallDt = Math.max(0, (now - last) / 1000);
+  const dt = Math.min(MAX_FRAME_SECONDS, wallDt);
   last = now;
   if (game) {
     const t0 = performance.now();
@@ -117,8 +145,11 @@ function loop(now: number) {
       renderer.frame(dt);
     } catch (e) { console.error(e); }
     try { ui.update(dt); } catch (e) { console.error(e); }
+    renderer.loopMs = performance.now() - t0;
     try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
-    if (ui.titleOpen) { if (!played) autosaveTimer = 0; } else played = true;
+    // Opening Load from the preview title does not turn that preview into a played game.
+    if (!ui.titleOpen && !game.paused && !ui.wm.get('saveload') && !switching) played = true;
+    if (!played) autosaveTimer = 0;
     if (!game.paused) autosaveTimer += dt;
     if (autosaveTimer > AUTOSAVE_EVERY) { autosaveTimer = 0; autosave('timer'); }
   }
@@ -145,12 +176,13 @@ async function boot() {
   let resumed = false;
   if (auto) {
     showLoading('Loading your game…');
-    try { setGame(await loadFromSlot('autosave')); resumed = true; } catch (e) {
+    try { setGame(await loadFromSlot('autosave'), true); resumed = true; } catch (e) {
       console.error(e);
       autosaveNeedsBackup = true;
       try { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
       catch (backupError) { console.warn('Could not back up the failed autosave', backupError); }
-      ui.toast('Could not load the autosave — here is a new map', 'bad');
+      const why = saveIncompatibility(auto);
+      ui.toast(why ? `${why} Here is a new map; the old autosave is kept as 'Autosave (failed to load)'.` : 'Could not load the autosave — here is a new map', 'bad');
     }
   }
   if (!game) {

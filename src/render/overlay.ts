@@ -16,12 +16,18 @@ export interface Ring { x: number; z: number; r: number }
 /** Line route display (screen space): width in px, lateral offset in px (or per vertex: `lanes`, one array per
  *  curve), opacity, animated direction chevrons, draw order among routes. */
 export interface LinePathOpts { width?: number; offset?: number; lanes?: ArrayLike<number>[]; lift?: number; opacity?: number; chevrons?: boolean; order?: number }
-/** Desire line between two points (screen space): width in px, colour, alpha, apex height (world units). */
-export interface Arc { ax: number; az: number; bx: number; bz: number; w: number; color: number; h: number; alpha?: number }
+/** Desire line between two points (screen space): width in px, colour, alpha, apex height (world units), dashes (see RibbonPoly). */
+export interface Arc { ax: number; az: number; bx: number; bz: number; w: number; color: number; h: number; alpha?: number; dash?: number }
 /** Catchment circle: centre, radius, colour (fill and outline). */
 export interface CatchCircle { x: number; z: number; r: number; color: number }
-/** A polyline for screen-space ribbons: points (xyz), colour, alpha, width (px), lateral lane offset(s) (px). */
-export interface RibbonPoly { pts: ArrayLike<number>; color: number | string; alpha?: number; width?: number; lane?: number | ArrayLike<number> }
+/**
+ * A polyline for screen-space ribbons: points (xyz), colour, alpha, width (px), lateral lane offset(s) (px), and a
+ * dash pattern as the drawn share of each dash period (0 or 1 = solid) — a second cue beside the colour. `dist0`:
+ * distance along the line at the first point, so short pieces of one street continue each other's dashes.
+ */
+export interface RibbonPoly { pts: ArrayLike<number>; color: number | string; alpha?: number; width?: number; lane?: number | ArrayLike<number>; dash?: number; dist0?: number }
+/** Dash pattern of a ribbon layer: drawn share of each period (0 = solid) and the period in screen px. */
+export interface DashOpts { dash?: number; dashPx?: number }
 /** Town ring for the demand view: radius, share (0..1) drawn as a progress arc, colour of the arc. */
 export interface ShareRing { x: number; z: number; r: number; frac: number; color: number }
 
@@ -155,24 +161,30 @@ attribute float aSide;
 attribute float aLane;
 attribute float aWidth;
 attribute float aDist;
+attribute float aDash;
 attribute vec4 aColor;
 varying vec4 vColor;
 varying float vAcross;
 varying float vDist;
 varying float vHalf;
 varying float vCore;
+varying float vDash;
+varying float vPerPx;
 void main() {
   vec4 p0 = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
   vec4 p1 = projectionMatrix * modelViewMatrix * vec4(position + aDir * 0.2, 1.0);
   vec2 d = (p1.xy / p1.w - p0.xy / p0.w) * uRes;
   float L = length(d);
+  // world units per screen pixel along the line here (perspective and foreshortening: 0.2 units span L / 2 px),
+  // so dashes keep a constant length on screen even where the line runs away from the camera
+  vPerPx = p1.w > 0.0 ? 0.4 / max(L, 1e-4) : 1e4;
   d = L > 1e-6 ? d / L : vec2(1.0, 0.0);
   vec2 n = vec2(-d.y, d.x);
   float core = aWidth * uWidthMul * 0.5;
   float hw = core + uCase;
   p0.xy += n * ((aLane + aSide * hw) * 2.0 / uRes) * p0.w;
   gl_Position = p0;
-  vColor = aColor; vAcross = aSide; vDist = aDist; vHalf = hw; vCore = core;
+  vColor = aColor; vAcross = aSide; vDist = aDist; vHalf = hw; vCore = core; vDash = aDash;
 }`;
 const RIBBON_FS = `
 uniform vec3 uCaseColor;
@@ -182,15 +194,29 @@ uniform float uChev;
 uniform float uTime;
 uniform float uPeriod;
 uniform float uPeriodPx;
+uniform float uDash;
+uniform float uDashPx;
 varying vec4 vColor;
 varying float vAcross;
 varying float vDist;
 varying float vHalf;
 varying float vCore;
+varying float vDash;
+varying float vPerPx;
+float dashGap(float s, float on) { return smoothstep(on - 0.05, on, s) * (1.0 - smoothstep(0.95, 1.0, s)); }
 void main() {
   float px = abs(vAcross) * vHalf;
   float outer = 1.0 - smoothstep(vHalf - 1.0, vHalf, px);
   float inner = 1.0 - smoothstep(vCore - 0.5, vCore + 0.5, px);
+  // dashes: the gaps show the dark casing, so a dashed line still reads as one line. The period is about uDashPx
+  // on screen at any distance: two world-anchored periods a power of two apart, blended by the zoom level.
+  float dOn = vDash > 0.001 ? vDash : uDash;
+  if (dOn > 0.001 && dOn < 0.999) {
+    float lv = log2(max(uDashPx * vPerPx, 1e-4));
+    float l0 = floor(lv), per = exp2(l0);
+    float gap = mix(dashGap(fract(vDist / per), dOn), dashGap(fract(vDist / (2.0 * per)), dOn), lv - l0);
+    inner *= 1.0 - gap;
+  }
   vec3 c = mix(uCaseColor, vColor.rgb, inner);
   if (uChev > 0.0) {
     float s = fract(vDist / uPeriod + px / uPeriodPx - uTime * 0.6);
@@ -218,6 +244,7 @@ class ScreenRibbon {
         uRes: RIB.uRes, uTime: RIB.uTime, uWidthMul: { value: 1 }, uCase: { value: 1.5 },
         uCaseColor: { value: new THREE.Color(0x0b0f14) }, uCaseAlpha: { value: 0.8 }, uOpacity: { value: 0.9 },
         uChev: { value: 0 }, uPeriod: { value: 1 }, uPeriodPx: { value: 30 },
+        uDash: { value: 0 }, uDashPx: { value: 14 },
       },
       vertexShader: RIBBON_VS, fragmentShader: RIBBON_FS,
       transparent: true, depthTest: false, depthWrite: false, side: THREE.DoubleSide, fog: false, toneMapped: false,
@@ -230,17 +257,20 @@ class ScreenRibbon {
       r.getSize(tmpV2);
       if (tmpV2.x > 0 && tmpV2.y > 0) RIB.uRes.value.copy(tmpV2);
       const pc = cam as THREE.PerspectiveCamera;
-      if (this.mat.uniforms.uChev.value > 0 && pc.isPerspectiveCamera) {
+      const u = this.mat.uniforms;
+      if (u.uChev.value > 0 && pc.isPerspectiveCamera) {
         const d = Math.max(1, tmpV3.copy(this.center).distanceTo(pc.position));
         const perPx = (2 * d * Math.tan((pc.fov * Math.PI) / 360)) / Math.max(1, RIB.uRes.value.y);
-        this.mat.uniforms.uPeriod.value = this.mat.uniforms.uPeriodPx.value * perPx;
+        u.uPeriod.value = u.uPeriodPx.value * perPx;
       }
     };
     group.add(this.mesh);
   }
 
-  set style(o: { width?: number; opacity?: number; chevrons?: boolean; casing?: number; caseAlpha?: number; order?: number }) {
+  set style(o: { width?: number; opacity?: number; chevrons?: boolean; casing?: number; caseAlpha?: number; order?: number } & DashOpts) {
     const u = this.mat.uniforms;
+    if (o.dash !== undefined) u.uDash.value = o.dash;
+    if (o.dashPx !== undefined) u.uDashPx.value = o.dashPx;
     if (o.width !== undefined) u.uWidthMul.value = o.width;
     if (o.opacity !== undefined) u.uOpacity.value = o.opacity;
     if (o.chevrons !== undefined) u.uChev.value = o.chevrons ? 1 : 0;
@@ -256,7 +286,7 @@ class ScreenRibbon {
     const old = this.mesh.geometry;
     if (!nv) { this.mesh.visible = false; return; }
     const pos = new Float32Array(nv * 3), dir = new Float32Array(nv * 3), side = new Float32Array(nv), lane = new Float32Array(nv);
-    const wid = new Float32Array(nv), dist = new Float32Array(nv), colr = new Float32Array(nv * 4);
+    const wid = new Float32Array(nv), dist = new Float32Array(nv), colr = new Float32Array(nv * 4), dash = new Float32Array(nv);
     const idx = nv > 65535 ? new Uint32Array(ni) : new Uint16Array(ni);
     const c = new THREE.Color();
     let v = 0, k = 0, cx = 0, cy = 0, cz = 0, cn = 0;
@@ -264,8 +294,8 @@ class ScreenRibbon {
       const P = p.pts, n = P.length / 3;
       if (n < 2) continue;
       c.set(p.color as THREE.ColorRepresentation);
-      const al = p.alpha ?? 1, w = p.width ?? 1, ln = p.lane ?? 0;
-      let acc = 0, tx = 1, ty = 0, tz = 0;
+      const al = p.alpha ?? 1, w = p.width ?? 1, ln = p.lane ?? 0, ds = p.dash ?? 0;
+      let acc = p.dist0 ?? 0, tx = 1, ty = 0, tz = 0;
       for (let i = 0; i < n; i++) {
         // tangent from the nearest distinct neighbours (polylines may repeat points where edges meet)
         let a = i, b = i;
@@ -279,7 +309,7 @@ class ScreenRibbon {
         for (let sd = -1; sd <= 1; sd += 2) {
           pos[v * 3] = P[i * 3]; pos[v * 3 + 1] = P[i * 3 + 1]; pos[v * 3 + 2] = P[i * 3 + 2];
           dir[v * 3] = tx; dir[v * 3 + 1] = ty; dir[v * 3 + 2] = tz;
-          side[v] = sd; lane[v] = li; wid[v] = w; dist[v] = acc;
+          side[v] = sd; lane[v] = li; wid[v] = w; dist[v] = acc; dash[v] = ds;
           colr[v * 4] = c.r; colr[v * 4 + 1] = c.g; colr[v * 4 + 2] = c.b; colr[v * 4 + 3] = al;
           v++;
         }
@@ -298,6 +328,7 @@ class ScreenRibbon {
     g.setAttribute('aLane', new THREE.BufferAttribute(lane, 1));
     g.setAttribute('aWidth', new THREE.BufferAttribute(wid, 1));
     g.setAttribute('aDist', new THREE.BufferAttribute(dist, 1));
+    g.setAttribute('aDash', new THREE.BufferAttribute(dash, 1));
     g.setAttribute('aColor', new THREE.BufferAttribute(colr, 4));
     g.setIndex(new THREE.BufferAttribute(idx, 1));
     this.mesh.geometry = g;
@@ -672,7 +703,7 @@ export class Overlay {
         pts[i * 3 + 1] = ya + (yb - ya) * t + 4 * a.h * t * (1 - t);
         pts[i * 3 + 2] = a.az + (a.bz - a.az) * t;
       }
-      polys.push({ pts, color: a.color, alpha: a.alpha ?? 0.9, width: a.w });
+      polys.push({ pts, color: a.color, alpha: a.alpha ?? 0.9, width: a.w, dash: a.dash });
     }
     this.arcs.set(polys);
   }
@@ -681,13 +712,13 @@ export class Overlay {
    * Planned signals: a post with an arrow head pointing the way trains may pass (two-way: a diamond); signals
    * already there are drawn grey.
    */
-  setSignalGhosts(spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color?: number }[] | null) {
+  setSignalGhosts(spots: { x: number; y: number; z: number; dx: number; dz: number; existing: boolean; twoWay: boolean; color?: number; size?: number }[] | null) {
     if (!spots || !spots.length) { this.sigs.set(null); return; }
     const b = this.buf.clear();
     for (const s of spots) {
       const l = Math.hypot(s.dx, s.dz) || 1, fx = s.dx / l, fz = s.dz / l, rx = fz, rz = -fx;
       const c = col(s.color ?? (s.existing ? 0x9aa5b4 : 0xffb020)).clone();
-      const y = s.y + 0.35, k = 0.5;
+      const y = s.y + 0.35, k = 0.5 * (s.size ?? 1);
       // post beside the track
       boxRect(b, s.x + rx * 0.55, s.z + rz * 0.55, Math.atan2(fx, fz), 0.12, 0.12, s.y, s.y + 0.9, c);
       if (s.twoWay) {
@@ -702,31 +733,35 @@ export class Overlay {
 
   /**
    * Coloured track layers in screen space (e.g. signal blocks by occupancy): each layer is a set of polylines
-   * (xyz) drawn with its colour and width (px), later layers on top. Null clears them.
+   * (xyz) drawn with its colour and width (px), optionally dashed, later layers on top. Null clears them.
    */
-  setTrackLayers(layers: { pts: Float32Array[]; color: number; width: number }[] | null) {
+  setTrackLayers(layers: ({ pts: Float32Array[]; color: number; width: number } & DashOpts)[] | null) {
     const n = layers?.length ?? 0;
     while (this.trackLayers.length < n) this.trackLayers.push(new ScreenRibbon(this.group, 46 + this.trackLayers.length));
     this.trackLayers.forEach((r, i) => {
       const L = layers?.[i];
       if (!L || !L.pts.length) { r.set(null); return; }
-      r.style = { width: L.width, opacity: 0.95, casing: 1, caseAlpha: 0.6, chevrons: false };
+      r.style = { width: L.width, opacity: 0.95, casing: 1, caseAlpha: 0.6, chevrons: false, dash: L.dash ?? 0, dashPx: L.dashPx ?? 14 };
       r.set(L.pts.map((pts) => ({ pts, color: L.color })));
     });
   }
 
-  /** Straight guide segments (e.g. the throat connections of a station inserted into a line), keyed layers. */
-  setSegments(key: string, segs: { x0: number; z0: number; x1: number; z1: number }[] | null, color = 0xffd84a) {
+  /**
+   * Straight guide segments (e.g. the throat connections of a station inserted into a line, walking catchments),
+   * keyed layers, optionally dashed; `s0` = distance along the street at the segment's start keeps dashes running on.
+   */
+  setSegments(key: string, segs: { x0: number; z0: number; x1: number; z1: number; s0?: number }[] | null, color = 0xffd84a, o: DashOpts = {}) {
     let r = this.segLayers.get(key);
     if (!segs || !segs.length) { r?.set(null); return; }
     if (!r) { r = new ScreenRibbon(this.group, 53); r.style = { width: 3, opacity: 0.95, casing: 1, caseAlpha: 0.6, chevrons: false }; this.segLayers.set(key, r); }
+    r.style = { dash: o.dash ?? 0, dashPx: o.dashPx ?? 14 };
     const w = this.game.world;
     const y = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y) + 0.4;
     r.set(segs.map((q) => {
       const n = Math.max(2, Math.ceil(Math.hypot(q.x1 - q.x0, q.z1 - q.z0) / 2) + 1);
       const pts = new Float32Array(n * 3);
       for (let i = 0; i < n; i++) { const t = i / (n - 1), x = q.x0 + (q.x1 - q.x0) * t, z = q.z0 + (q.z1 - q.z0) * t; pts[i * 3] = x; pts[i * 3 + 1] = y(x, z); pts[i * 3 + 2] = z; }
-      return { pts, color };
+      return { pts, color, dist0: q.s0 ?? 0 };
     }));
   }
 

@@ -23,6 +23,8 @@ export interface Line {
   num: number;
   /** the name follows the stops until the line is renamed (Lines.rename) */
   autoName: boolean;
+  /** A joined line retains its automatic name; its numeric prefix still follows company renumbering. */
+  joinedName?: string;
   /** the colour was picked automatically (until Lines.setColor) */
   autoColor: boolean;
   /**
@@ -30,7 +32,11 @@ export interface Line {
    * leads on). Unset: a loop when the stops are 3+ different stations (see Lines.isLoop).
    */
   loop?: boolean;
-  /** route letter (the Y of station numbers XY01), unique among the owner's lines; see Lines.lineCode */
+  /** Automatic headway regulation; absent in older saves means enabled. */
+  evenSpacing?: boolean;
+  /** Simulation-second departure clocks, separately for each service pattern (saved with the line). */
+  spacing?: Record<string, PatternSpacing>;
+  /** rail route letter (the Y of station numbers XY01), unique among the owner's rail lines; see Lines.lineCode */
   code?: string;
   /**
    * shared lines: the owner is the lead operator; `operators` are the other companies that run vehicles on the
@@ -38,13 +44,22 @@ export interface Line {
    */
   operators?: number[];
   partners?: PartnerPolicy;
-  /** station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
+  /** rail station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
   numbers?: [number, number][];
   /**
    * service patterns (patterns.ts): locals, rapids, expresses and short-turns of the line, per stop whether they
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+}
+
+export interface PatternSpacing {
+  /** Stop sequence and served flags these clocks belong to; route edits discard old clocks. */
+  route: string;
+  /** station + outgoing stop (direction) -> last departure */
+  departures: Record<string, { at: number; vehicle: number; recent?: number[] }>;
+  /** depot + entry stop/direction -> last successful release (different entry points are independent). */
+  released?: Record<string, number>;
 }
 
 /**
@@ -58,11 +73,17 @@ export interface Hop { line: number; alight: number; cost: number; lines?: numbe
 export type PartnerPolicy = 'open' | 'invite' | 'closed';
 export const PARTNER_POLICIES: PartnerPolicy[] = ['open', 'invite', 'closed'];
 
-/** Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams. */
+/**
+ * Automatic line colours per transport mode: strong colours for rail, lighter ones for buses, vivid ones for trams.
+ * Chosen for colour-blind players too (delta E under deuteranopia, protanopia and tritanopia): in the order pickColor
+ * hands them out (listed in that order) consecutive colours of one mode stay >= 20 apart; with modes mixed, consecutive
+ * colours of the first six lines stay >= 15 apart in every creation order. Later in long mixed sequences, and with the
+ * fallback hues used once these lists run out, closer pairs can still occur. Saved lines keep their colour.
+ */
 export const LINE_PALETTES: Record<Transport, string[]> = {
-  rail: ['#d7263d', '#1b6ec2', '#2a9d4b', '#7b2cbf', '#f08c00', '#00897b', '#c2185b', '#3949ab', '#8d6e00', '#5d4037', '#0097a7', '#6a1b9a'],
-  road: ['#ff6f61', '#42a5f5', '#8bc34a', '#ffb300', '#ab47bc', '#26a69a', '#ff8a65', '#78909c', '#ec407a', '#9ccc65', '#5c6bc0', '#ffd54f'],
-  tram: ['#e53935', '#00acc1', '#fb8c00', '#5e35b1', '#43a047', '#d81b60', '#1e88e5', '#795548', '#c0ca33', '#00897b'],
+  rail: ['#ee204b', '#0f5dbe', '#2da167', '#b8810d', '#7b04fa', '#d686bf', '#8261ff', '#8e3788', '#27670e', '#a14062', '#ad85f9', '#ff7380'],
+  road: ['#e75464', '#89a6eb', '#c5d794', '#f6cd1b', '#42e3fc', '#b67a19', '#05a886', '#a481ff', '#ffa1b8', '#94e56e', '#a9af16', '#b281c0'],
+  tram: ['#f5284b', '#24c3fe', '#b38415', '#8858ba', '#83c17e', '#ff8bb4', '#7f54ff', '#ba2b85', '#4b95f2', '#3f7627', '#d33d69', '#bd82c4'],
 };
 
 /** HSL -> '#rrggbb'. */
@@ -127,16 +148,25 @@ export class Lines {
   /** routing[s] = Map(dest -> first hop) */
   routing = new Map<number, Map<number, Hop>>();
   servedStations = new Set<number>();
+  /** Catchment weights depend on service presence, independently of routing/frequency versions. */
+  servedVersion = 0;
   /** bumped by every rebuild (routing tables changed) */
   version = 0;
-  /** station catchments need a recompute (done once per tick, see flushCatchment) */
+  /** Saved pending catchment/demand refresh (walking work is conditional; see flushCatchment). */
   catchmentDirty = false;
+  /** Keep the saved pending-refresh flag: demand regions can move while walking inputs stay fixed. */
+  markDemandSharesDirty() { this.catchmentDirty = true; }
+  /** Street invalidation saved before its pending network change was flushed. */
+  catchmentRoadsDirty = false;
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
   constructor(private game: Game) {
     // stations rebuilt, moved or merged (longer platforms, another level, a stop combined): timetables and journey
     // times read their positions, so the routing is worked out again (a saved game then loads to the same routing)
-    game.listeners?.network?.push(() => this.checkStations());
+    game.listeners?.network?.push(() => {
+      if (this.catchmentRoadsDirty) { this.catchmentRoadsDirty = false; this.catchmentDirty = true; }
+      this.checkStations();
+    });
   }
 
   /** where the stations were when the routing was last worked out */
@@ -150,18 +180,24 @@ export class Lines {
     if (!first && this.map.size) this.rebuild();
   }
 
-  /** lines merged into another as a service pattern (patterns.ts canonicalizeLines): old id -> line and pattern */
+  /** Lines merged or joined in patterns.ts: old id -> surviving line and the old service's pattern. */
   redirect = new Map<number, { line: number; pattern: number }>();
   /** A line by id (the id of a line merged into another leads to that line). */
   get(id: number) { const l = this.map.get(id); if (l) return l; const r = this.redirect.get(id); return r ? this.map.get(r.line) : undefined; }
   all() { return [...this.map.values()]; }
+
+  /** Redirect a removed line and its earlier aliases, remapping their services to the surviving patterns. */
+  redirectLine(from: number, into: number, pattern: number, patterns: ReadonlyMap<number, number>) {
+    for (const [id, r] of this.redirect) if (r.line === from) this.redirect.set(id, { line: into, pattern: patterns.get(r.pattern) ?? pattern });
+    this.redirect.set(from, { line: into, pattern });
+  }
 
   create(kind: Transport, owner = 0): Line {
     const id = this.nextId++;
     const line: Line = {
       id, owner, name: '', color: this.pickColor(kind, owner), kind, num: this.freeNumber(kind, owner),
       stops: [], vehicles: [], passMonth: 0, passLast: 0, incomeYear: 0, incomeLast: 0, costYear: 0, costLast: 0,
-      autoName: true, autoColor: true,
+      autoName: true, autoColor: true, evenSpacing: true,
     };
     line.name = this.autoNameOf(line);
     this.autoText.set(id, line.name);
@@ -181,6 +217,7 @@ export class Lines {
   rename(id: number, name: string) {
     const l = this.map.get(id);
     if (!l) return;
+    delete l.joinedName;
     const n = name.trim().slice(0, 48);
     if (!n) { l.autoName = true; l.name = this.autoNameOf(l); this.autoText.set(id, l.name); return; }
     l.name = n;
@@ -194,6 +231,14 @@ export class Lines {
     if (color === null) { l.autoColor = true; l.color = this.pickColor(l.kind, l.owner, l.id); return; }
     l.color = color;
     l.autoColor = false;
+  }
+
+  setEvenSpacing(id: number, enabled: boolean) {
+    const l = this.get(id);
+    if (!l) return;
+    l.evenSpacing = enabled;
+    delete l.spacing;
+    for (const vid of l.vehicles) this.game.vehicles.get(vid)?.resetSpacing();
   }
 
   // ---------------------------------------------------------------- automatic names and colours
@@ -232,14 +277,15 @@ export class Lines {
   /** The company letter (Company.code). */
   companyCode(owner: number): string { return this.game.company(owner).code ?? '?'; }
 
-  /** The route letter of a line, given one if it has none yet (unique among its owner's lines). */
+  /** The route letter of a rail line, assigned if absent (unique among its owner's rail lines); '' for other modes. */
   routeCode(l: Line): string {
+    if (l.kind !== 'rail') return '';
     if (l.code && !this.codeTaken(l.code, l.owner, l.id)) return l.code;
     l.code = this.freeCode(l);
     return l.code;
   }
   private codeTaken(code: string, owner: number, except: number): boolean {
-    for (const o of this.map.values()) if (o.id !== except && o.owner === owner && o.code === code) return true;
+    for (const o of this.map.values()) if (o.kind === 'rail' && o.id !== except && o.owner === owner && o.code === code) return true;
     return false;
   }
   /** A free route letter: from the names of its first terminus (and the line name), else the first free one. */
@@ -252,17 +298,18 @@ export class Lines {
     return '?';
   }
 
-  /** The line's symbol: company letter + route letter, e.g. 'AS' (unique in the game). */
+  /** A rail line's symbol: company letter + route letter, e.g. 'AS' (unique in the game); '' for other modes. */
   lineCode(id: number): string {
     const l = this.map.get(id);
-    return l ? this.companyCode(l.owner) + this.routeCode(l) : '';
+    return l?.kind === 'rail' ? this.companyCode(l.owner) + this.routeCode(l) : '';
   }
 
   /** Stations of a line in route order (out-and-back lines from one end to the other; else in stop order). */
   routeStations(l: Line): number[] { return linearStops(l.stops) ?? [...new Set(l.stops)]; }
 
-  /** Numbers for the line's stations: kept where they have one, the next free numbers for new ones. */
+  /** Numbers for a rail line's stations: kept where they have one, the next free numbers for new ones. */
   private ensureNumbers(l: Line): Map<number, number> {
+    if (l.kind !== 'rail') return new Map();
     const route = this.routeStations(l), inRoute = new Set(route);
     const m = new Map((l.numbers ?? []).filter(([sid]) => inRoute.has(sid)));
     let next = 1;
@@ -274,38 +321,38 @@ export class Lines {
 
   /**
    * A station's number on a line, JR style: the station owner's company letter, the route letter and the number,
-   * e.g. 'AS01' (through services: another company's stations on the route carry its letter). '' if not a stop.
+   * e.g. 'AS01' (through services: another company's stations on the route carry its letter). '' for non-rail or non-stops.
    */
   stationCode(lineId: number, stationId: number): string {
     const l = this.map.get(lineId), st = this.game.stations.get(stationId);
-    if (!l || !st || !l.stops.includes(stationId)) return '';
+    if (!l || l.kind !== 'rail' || !st || !l.stops.includes(stationId)) return '';
     const n = this.ensureNumbers(l).get(stationId);
     return n === undefined ? '' : this.companyCode(st.owner >= 0 ? st.owner : l.owner) + this.routeCode(l) + String(n).padStart(2, '0');
   }
 
-  /** All numbers of a station (one per line stopping there; interchanges have several), with their lines. */
+  /** All rail numbers of a station (one per rail line stopping there; interchanges have several), with their lines. */
   stationCodeEntries(stationId: number): { line: number; code: string }[] {
     const out: { line: number; code: string }[] = [];
-    for (const l of this.map.values()) if (l.stops.includes(stationId)) { const c = this.stationCode(l.id, stationId); if (c) out.push({ line: l.id, code: c }); }
+    for (const l of this.map.values()) if (l.kind === 'rail' && l.stops.includes(stationId)) { const c = this.stationCode(l.id, stationId); if (c) out.push({ line: l.id, code: c }); }
     return out;
   }
   stationCodes(stationId: number): string[] { return [...new Set(this.stationCodeEntries(stationId).map((e) => e.code))]; }
 
-  /** Number the line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
+  /** Number a rail line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
   renumber(lineId: number) {
     const l = this.map.get(lineId);
-    if (!l) return;
+    if (!l || l.kind !== 'rail') return;
     l.numbers = this.routeStations(l).map((sid, i) => [sid, i + 1] as [number, number]);
   }
 
   /**
-   * Through service: line `lineId` continues the route of line `fromId` (another company's, say): it takes its
+   * Through service: rail line `lineId` continues the route of rail line `fromId` (another company's, say): it takes its
    * route letter (where its owner has no other route with that letter) and its station numbers, and numbers its
    * further stations on from there (A's stations AS01…AS07, then B's BS08…).
    */
   inheritRoute(lineId: number, fromId: number) {
     const l = this.map.get(lineId), f = this.map.get(fromId);
-    if (!l || !f || l === f) return;
+    if (!l || !f || l.kind !== 'rail' || f.kind !== 'rail' || l === f) return;
     const code = this.routeCode(f);
     if (!this.codeTaken(code, l.owner, l.id)) l.code = code;
     const fm = this.ensureNumbers(f);
@@ -330,6 +377,7 @@ export class Lines {
 
   /** Automatic name from the mode and the stops, e.g. "R1 Chalthorpe – Whitewell", "Bus 3 Chalthorpe: Central – North". */
   autoNameOf(l: Line): string {
+    if (l.joinedName) return l.joinedName.replace(/^(RE?|Bus |Tram )\d+/, (_, prefix: string) => prefix + l.num);
     const g = this.game;
     const sts: Station[] = [];
     for (const id of l.stops) { const s = g.stations.get(id); if (s && !sts.includes(s)) sts.push(s); }
@@ -372,7 +420,7 @@ export class Lines {
     l.owner = owner;
     if (l.operators) l.operators = l.operators.filter((o) => o !== owner);
     l.num = this.freeNumber(l.kind, owner, l.id);
-    if (l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
+    if (l.kind === 'rail' && l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
     if (l.autoColor) {
       let clash = false;
       for (const o of this.map.values()) if (o !== l && colorDistance(o.color, l.color) < 12) { clash = true; break; }
@@ -509,13 +557,16 @@ export class Lines {
   }
 
   /** Recompute routing tables (Dijkstra over the line graph) and the automatic names. */
-  rebuild() {
+  rebuild(catchmentMayChange = true) {
     const stations = this.game.stations;
+    const previousServed = new Set(this.servedStations);
+    if (catchmentMayChange) stations.walkVersion++;
+    this.markDemandSharesDirty();
     this.routing.clear();
     this.servedStations.clear();
     this.version++;
     this.refreshNames();
-    for (const l of this.map.values()) if (l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
+    for (const l of this.map.values()) if (l.kind === 'rail' && l.stops.length) { this.routeCode(l); this.ensureNumbers(l); }
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
@@ -585,16 +636,23 @@ export class Lines {
       this.routing.set(src, table);
     }
     for (const st of stations.all()) this.rerouteWaiting(st);
-    // served stations changed: catchments are shared out again, once for several rebuilds in a row
-    this.catchmentDirty = true;
+    const servedChanged = previousServed.size !== this.servedStations.size || [...previousServed].some((id) => !this.servedStations.has(id));
+    if (servedChanged) this.servedVersion++;
+    // flushCatchment uses the independent service/input versions to skip walking work for frequency changes.
   }
 
   /** Recompute the station catchments if routing changed since (called by the game every tick). */
   flushCatchment() {
-    if (!this.catchmentDirty) return;
+    const stations = this.game.stations;
+    if (!this.catchmentDirty) { stations.prepareCatchmentTick(); return; }
     this.catchmentDirty = false;
-    this.game.stations.recomputeCatchment();
+    // A frequency-only rebuild still refreshes demand's moving region assignment; walking work is skipped.
+    if (stations.catchmentInputsChanged() || stations.catchmentPopulationPending) {
+      stations.recomputeCatchment(true);
+      if (stations.catchmentWorkPending) { this.catchmentDirty = true; return; }
+    }
     this.game.demand.recomputeShares();
+    stations.prepareCatchmentTick();
   }
 
   /**
@@ -632,8 +690,8 @@ export class Lines {
       if (!hop) continue;
       // (they keep when they started waiting and whether they changed vehicles)
       const tr = (n: number) => (w.transfers ? (w.transfers * n) / Math.max(1, w.count) : 0);
-      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0);
-      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n)));
+      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0));
     }
   }
 
@@ -646,7 +704,17 @@ export class Lines {
     }
     if (typeof l.autoName !== 'boolean') l.autoName = false;
     if (typeof l.autoColor !== 'boolean') l.autoColor = false;
-    if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
+    if (typeof l.evenSpacing !== 'boolean') l.evenSpacing = true;
+    if (d.spacing) l.spacing = Object.fromEntries(Object.entries(d.spacing as Record<string, PatternSpacing>).map(([pid, s]) =>
+      [pid, { ...s, departures: Object.fromEntries(Object.entries(s.departures).map(([key, dep]) =>
+        [key, { ...dep, ...(dep.recent ? { recent: [...dep.recent] } : {}) }])),
+        ...(s.released ? { released: { ...s.released } } : {}) }]));
+    if (l.kind === 'rail') {
+      if (Array.isArray(d.numbers)) l.numbers = d.numbers.map((x: [number, number]) => [x[0], x[1]] as [number, number]);
+    } else {
+      delete l.code;
+      delete l.numbers;
+    }
     if (Array.isArray(d.operators)) l.operators = [...d.operators];
     if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));
     return l;

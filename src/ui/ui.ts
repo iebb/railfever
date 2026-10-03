@@ -3,6 +3,7 @@ import * as THREE from 'three';
 import type { Game, NewGameOptions, News } from '../game/game';
 import { PLAYER } from '../game/game';
 import type { Renderer } from '../render/renderer';
+import { shortcutBlocked } from '../render/camera';
 import { WindowManager } from './windows';
 import { Tools, ToolId, Hit } from './tools';
 import { h, icon } from './dom';
@@ -14,12 +15,13 @@ import { Minimap } from './minimap';
 import { computeLinePath } from './linepaths';
 import { Hud } from './hud';
 import { newsDate, fmtCompact } from './format';
-import { audio, Sfx, PlayOpts } from '../audio/engine';
+import { audio, cashPitch, Sfx, PlayOpts } from '../audio/engine';
+import { fmtMoney } from '../game/economy';
 import { UiTips } from './tips';
 import { HoverCard } from './hovercard';
 import { Checklist } from './checklist';
 import { MapModes } from './mapmodes';
-import { catchShapes, catchColor } from './gameapi';
+import { catchStreets, drawCatchStreets } from './gameapi';
 import { canonicalizeLines, MergeNotice } from '../game/patterns';
 import { allBadges } from './lineid';
 import { TOOL_META } from './hud';
@@ -68,6 +70,7 @@ export class UI {
   private lastNewsSfx = 0;
   reduceTransparency = false;
   catchmentStation = -1;
+  private catchmentSig = '';
   private linePathSig = new Map<number, string>();
   lineBroken = new Map<number, [number, number][]>();
   following: number | null = null;
@@ -75,6 +78,8 @@ export class UI {
   /** left column holding the checklist, the map view card and the minimap */
   leftCol!: HTMLDivElement;
   private lastDebug: boolean | null = null;
+  private compactPanels = false;
+  private restoreMinimap = false;
 
   constructor(public root: HTMLElement, public renderer: Renderer, public app: AppHooks) {
     this.loadPrefs();
@@ -86,7 +91,7 @@ export class UI {
     this.hoverCard = new HoverCard(this);
     this.checklist = new Checklist(this);
     this.mapModes = new MapModes(this);
-    this.mapModes.onChange = () => { this.linePathSig.clear(); this.marksSig = ''; this.hud.syncMapButtons(); this.checklist.setAutoCollapse(this.mapModes.mode !== 'none'); };
+    this.mapModes.onChange = () => { this.linePathSig.clear(); this.marksSig = ''; this.hud.syncMapButtons(); this.syncCompactPanels(); };
     // left column: checklist, map view card and minimap flow top to bottom without overlapping
     this.leftCol = h('div', { class: 'leftcol' });
     root.appendChild(this.leftCol);
@@ -96,8 +101,12 @@ export class UI {
     this.floatLayer = h('div', { class: 'floats' });
     root.appendChild(this.floatLayer);
     window.addEventListener('keydown', this.onKey);
+    window.addEventListener('resize', () => this.syncCompactPanels());
     // generic UI sounds: clicks on controls and switch toggles (specific actions play their own sound)
     root.addEventListener('click', (e) => {
+      // Pointer activation must not retain keyboard focus and swallow the next shortcut.
+      const button = (e.target as HTMLElement | null)?.closest<HTMLElement>('button, [role="button"]');
+      if (e.detail > 0 && button === document.activeElement) button?.blur();
       const el = (e.target as HTMLElement | null)?.closest?.('button, .model, .row.link, tr.clickable, .chip, .swatch.big') as HTMLElement | null;
       if (!el || (el as HTMLButtonElement).disabled) return;
       const sfx = el.dataset?.sfx;
@@ -165,25 +174,42 @@ export class UI {
     this.sound(sp === 0 ? 'pause' : 'speed', { pitch: sp === 0 ? (this.game.paused ? 0.8 : 1.2) : 0.85 + sp * 0.05 });
   }
 
+  /** Free map space while a tool is open; restore the player's minimap choice afterwards. */
+  syncCompactPanels() {
+    if (!this.tools || !this.minimap || !this.checklist) return;
+    const compact = window.innerWidth < 1280 && (window.innerHeight <= 768 || window.innerWidth <= 720) && this.tools.tool !== 'inspect';
+    this.checklist.setAutoCollapse(this.mapModes.mode !== 'none' || compact);
+    if (compact === this.compactPanels) return;
+    this.compactPanels = compact;
+    if (compact) { this.restoreMinimap = this.minimap.visible; if (this.minimap.visible) this.minimap.toggle(); }
+    else if (this.restoreMinimap && !this.minimap.visible) this.minimap.toggle();
+  }
+
   private onKey = (e: KeyboardEvent) => {
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
-    if (!this.game || e.metaKey || e.ctrlKey || this.titleOpen) return;
+    if (!this.game || this.titleOpen) return;
     const k = e.key;
     const T = this.tools;
-    const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
-    if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
-    // urban rail category, connect tracks; lines map display (lines / stations with their numbers)
-    if (k === 'u' || k === 'U') { T.setTool(TOOL_META[T.tool].cat === 'urban' ? 'inspect' : 'metro'); return; }
-    if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
-    if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === 'Escape') {
       if (T.cancel()) return;
       if (this.mapModes.mode !== 'none') { this.mapModes.set('none'); return; }
       if (!this.wm.closeTop()) this.hud.closeNews();
       return;
     }
+    if (shortcutBlocked(e) || e.metaKey || e.ctrlKey) return;
+    const map: Record<string, ToolId> = { '1': 'inspect', '2': 'rail', '3': 'station', '4': 'signal', '5': 'depot-rail', '6': 'road', '7': 'busstop', '8': 'depot-road', '9': 'bulldoze', '0': 'terraform' };
+    if (map[k]) { T.setTool(T.tool === map[k] && k !== '1' ? 'inspect' : map[k]); return; }
+    // urban rail category, connect tracks; lines map display (lines / stations with their numbers)
+    if (k === 'u' || k === 'U') { T.setTool(TOOL_META[T.tool].cat === 'urban' ? 'inspect' : 'metro'); return; }
+    if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
+    if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
+    if (k === ',' || k === '.') {
+      e.preventDefault();
+      const speeds = [1, 2, 4, 8];
+      const index = Math.max(0, speeds.indexOf(this.game.speed));
+      this.setSpeed(speeds[Math.max(0, Math.min(speeds.length - 1, index + (k === '.' ? 1 : -1)))]);
+      return;
+    }
     if ((k === 'r' || k === 'R') && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
       T.rotate(e.shiftKey ? -1 : 1);
       this.hud.onToolChange();
@@ -201,8 +227,10 @@ export class UI {
     else if (lk === 't') this.openTowns();
     else if (lk === 'c') this.openCompetitors();
     else if (lk === 'k') this.openTrackAccess();
+    else if (lk === 'i') this.openFinances();
     else if (lk === 'n') this.hud.toggleNews();
     else if (lk === 'm') this.mapModes.toggle('lines');
+    else if (lk === 'h') this.minimap.toggle();
     else if (lk === 'p') this.mapModes.toggle('demand');
     else if (lk === 'o') this.mapModes.toggle('catchment');
     else if (k === 'F1') { e.preventDefault(); this.openHelp(); }
@@ -239,7 +267,7 @@ export class UI {
     }
     if (this.floats.length) this.updateFloats(dt);
     const dbg = !!(this.renderer.settings as unknown as { debug?: boolean }).debug;
-    if (dbg !== this.lastDebug) { this.lastDebug = dbg; this.leftCol.classList.toggle('below-debug', dbg); }
+    if (dbg !== this.lastDebug) { this.lastDebug = dbg; this.leftCol.classList.toggle('below-debug', dbg); this.root.classList.toggle('debug-ui', dbg); }
     this.minimap.update(dt);
     this.hoverCard.update(dt);
     this.checklist.update(dt);
@@ -254,6 +282,7 @@ export class UI {
       else if (!('follow' in cam)) { const p = { x: 0, y: 0, z: 0 }; if (v.worldPos(p)) this.renderer.controls.jumpTo(p.x, p.z); }
     }
     if (this.catchmentStation >= 0 && (!g.stations.get(this.catchmentStation) || !this.wm.get('station-' + this.catchmentStation))) this.setCatchment(-1);
+    else if (this.catchmentStation >= 0 && this.catchmentSig !== `${g.world.net.version}:${g.stations.catchVersion}`) this.setCatchment(this.catchmentStation);
     this.highlightLabel(this.tools.hoverStation ?? (this.catchmentStation >= 0 ? this.catchmentStation : null));
   }
 
@@ -378,7 +407,9 @@ export class UI {
 
   toast(msg: string, kind: 'info' | 'good' | 'bad' = 'info') {
     const el = h('div', { class: 'toast ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg));
-    this.pushToast(el, 3200);
+    const finance = this.needsMoney(msg);
+    if (finance) { el.classList.add('finance-toast'); el.append(this.financeActions(() => el.remove())); }
+    this.pushToast(el, finance ? 12000 : 3200);
     if (kind === 'bad') this.sound('error');
   }
 
@@ -387,9 +418,33 @@ export class UI {
     const game = this.game;
     const el = h('div', { class: 'toast link ' + kind }, icon(kind === 'bad' ? 'warning' : kind === 'good' ? 'check' : 'info', 17), h('span', null, msg),
       h('button', { class: 'btn sm toast-btn', onclick: (e: Event) => { e.stopPropagation(); el.remove(); if (this.game === game) fn(); } }, label));
+    if (this.needsMoney(msg)) { el.classList.add('finance-toast'); el.append(this.financeActions(() => el.remove())); }
     this.pushToast(el, 9000);
     if (kind === 'bad') this.sound('error');
   }
+
+  needsMoney(msg: string) { return /not enough money|can(?:not|'t) afford/i.test(msg); }
+
+  /** One loan step, using the same limit and operation as the Finances window. */
+  borrowLoan(): boolean {
+    const e = this.game.economy;
+    if (!e.borrow()) { this.toast('Maximum loan reached', 'bad'); return false; }
+    this.sound('cash', { pitch: cashPitch(e.loanStep) });
+    this.tools.refreshHover();
+    this.wm.refreshAll();
+    this.toast(`Borrowed ${fmtMoney(e.loanStep)}`, 'good');
+    return true;
+  }
+
+  financeActions(onAction: () => void = () => {}): HTMLDivElement {
+    const game = this.game, e = game.economy;
+    return h('div', { class: 'finance-actions inline wrap' },
+      h('button', { class: 'btn sm', disabled: e.loan + e.loanStep > e.maxLoan, 'data-sfx': 'none', 'data-tip': e.loan + e.loanStep > e.maxLoan ? 'Maximum loan reached' : undefined,
+        onclick: (event: Event) => { event.stopPropagation(); if (this.game === game && this.borrowLoan()) onAction(); } }, `Borrow ${fmtMoney(e.loanStep)}`),
+      h('button', { class: 'btn sm', onclick: (event: Event) => { event.stopPropagation(); if (this.game === game) { this.openFinances(); onAction(); } } }, 'Open finances'));
+  }
+
+  isDebtNews(n: News) { return n.text.startsWith('Warning: your company is in debt.'); }
 
   private pushToast(el: HTMLElement, ms: number) {
     this.toastBox.appendChild(el);
@@ -400,6 +455,14 @@ export class UI {
 
   private onNews(n: News) {
     this.hud.onNews(n);
+    if (this.isDebtNews(n)) {
+      if (!this.titleOpen) this.sound('notify', { volume: 0.35 });
+      const game = this.game;
+      const el = h('button', { class: 'toast news info link', 'data-sfx': 'none', onclick: () => { if (this.game === game) this.openFinances(); } },
+        h('span', { class: 'news-date' }, newsDate(game, n)), h('span', null, n.text), h('b', { class: 'toast-act' }, 'Open finances'));
+      this.pushToast(el, 9000);
+      return;
+    }
     // requests for access to the player's network: always shown, click to review
     const request = n.text.includes('requests access to your tracks');
     if (request) {
@@ -465,10 +528,11 @@ export class UI {
   setCatchment(id: number) {
     const g = this.game;
     this.catchmentStation = id;
+    this.catchmentSig = `${g.world.net.version}:${g.stations.catchVersion}`;
     const st = id >= 0 ? g.stations.get(id) : undefined;
-    if (!st) { this.renderer.overlay.setCatchments('sel', null); return; }
+    if (!st) { drawCatchStreets(this.renderer.overlay, 'sel', null); return; }
     const group = g.stations.complex(st.id).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x);
-    this.renderer.overlay.setCatchments('sel', group.flatMap((s) => catchShapes(g, s, true)).map((c) => ({ x: c.x, z: c.z, r: c.r, color: catchColor(c) })));
+    drawCatchStreets(this.renderer.overlay, 'sel', { segments: group.flatMap((s) => catchStreets(g, s).segments), buildings: new Map() });
   }
 
   /** Open the info window for a picked object. */
@@ -500,7 +564,7 @@ export class UI {
   addStopToLine(lineId: number, stationId: number) { lines.addStopToLine(this, lineId, stationId); }
   openVehicles() { lines.openVehicles(this); }
   openTowns() { lines.openTowns(this); }
-  openFinances() { company.openFinances(this); }
+  openFinances() { this.checklist.financesSeen(); company.openFinances(this); }
   openCompetitors() { company.openCompetitors(this); }
   openTrackAccess() { access.openTrackAccess(this); }
   /** Auto-signal a line, a stretch of track or (no argument) all of the player's railway, with a preview. */

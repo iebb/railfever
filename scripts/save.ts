@@ -5,6 +5,7 @@ import { gzipSync } from 'node:zlib';
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { networkPlanner, runNetworkTask } from '../src/game/ai-network';
 import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busStopSites, addBusStop, roadDepotNear, checkReservations, checkNaN, Train } from './lib';
 
 const seed = Number(process.argv[2] ?? 7);
@@ -32,12 +33,15 @@ check(g.requestAccess(0, g.ais[1].companyId) === 'granted', 'access agreement si
 g.setAccessPolicy(0, 'ask');
 check(g.requestAccess(g.ais[0].companyId, 0, 'test') === 'pending', 'a pending request to the player (saved too)');
 g.lines.rename(line.id, 'Main Line');
-// run ~8 months, then save at a moment when no AI project is half-built (jobs are not persisted)
-while (g.day < 200 || g.ais.some((a) => a.busy)) g.update(0.25);
+// Construction projects are not persisted; network jobs are saved and must replay mid-job.
+const busy = () => g.ais.some((a) => a.busy);
+while (g.day < 200 || busy()) g.update(0.25);
 g.economy.money += 80_000_000;
 const bought = g.ais[1].companyId;
 check(g.buyCompany(0, bought) === null, 'player buys an AI company');
-while (g.day < 240 || g.ais.some((a) => a.busy)) g.update(0.25);
+while (g.day < 240 || busy()) g.update(0.25);
+if (!g.ais.some((a) => networkPlanner(a)?.task)) runNetworkTask(g.ais[0], 'decommission', 1);
+check(g.ais.some((a) => !!networkPlanner(a)?.task), 'deliberately save during a network job');
 const t0 = performance.now();
 const data = serialize(g);
 const json = JSON.stringify(data);
@@ -70,9 +74,11 @@ if (json2 !== json) {
 }
 check(json2 === json, `re-serialized save identical (${json.length} vs ${json2.length} chars)`);
 let errors = 0;
-for (let d = 0; d < 360 * 16; d++) {
-  try { g.update(0.125); g2.update(0.125); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 5).join('\n')); break; }
-  if (d % 1440 === 0) { const a = sig(g), b = sig(g2); console.log(`  ${g.dateString()}: money ${a.money.map((m) => fmt(m / 1e6, 2)).join('/')} vs ${b.money.map((m) => fmt(m / 1e6, 2)).join('/')}, delivered ${a.delivered} vs ${b.delivered}, pop ${a.pop} vs ${b.pop}`); }
+const replayStart = g.day;
+while (g.day < replayStart + 360) {
+  try { g.stepTick(); g2.stepTick(); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 5).join('\n')); break; }
+  if (g.day === replayStart + 120 && g.tick % g.ticksPerDay === 0)
+    check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(g2)), 'mid-job save replays exactly for 120 days with stepTick');
 }
 const a = sig(g), b = sig(g2);
 console.log(`after a year: original ${JSON.stringify({ ...a, states: undefined })}\n              loaded   ${JSON.stringify({ ...b, states: undefined })}`);

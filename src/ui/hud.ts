@@ -9,12 +9,16 @@ import { h, icon, clear, seg, stepper, kbd, toggle, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES, LINE_LEVEL, ELECTRIFY } from '../game/constants';
 import { structureFactor } from '../game/construction';
-import { fmtDate, fmtHeight, newsDate, fmtPct, TYPE_META } from './format';
+import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct, TYPE_META } from './format';
+import { walkLimit } from '../game/catchment';
 import type { StationLevel } from './gameapi';
 import { stationStyles, catchBonusOf } from './gameapi';
-import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf } from '../game/stations';
+import { STATION_HEIGHT, STATION_DEPTH, PLATFORM_LENGTH, railModeOf, GROUND_ENTRANCES, ENTRANCE_TYPES, entranceCost } from '../game/stations';
+import type { EntranceKind } from '../game/stations';
 import { styleOf } from '../game/station-styles';
 import { audio } from '../audio/engine';
+import { onStorageMode, storageMode } from '../game/storage';
+import { exportSave } from './win-menu';
 
 interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
 
@@ -22,7 +26,7 @@ interface Cat { id: string; label: string; icon: string; color: string; tip: str
 const CATS: Cat[] = [
   { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
   { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, double track, signals, depot, electrify, connect', keys: '2 4 5 J', tools: ['rail', 'double', 'signal', 'depot-rail', 'electrify', 'connect'] },
-  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--metro)', tip: 'Urban rail: metro and light-rail track, stations, lift / sink track', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
+  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'Urban-style rail presets: subway and light-rail track and close-spaced stations, lift / sink track. Ordinary rail: any train and any rail line may use them', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
   { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
   { id: 'tram', label: 'Tram', icon: 'tram', color: 'var(--tram)', tip: 'Tram: tracks, stops, depot', keys: '', tools: ['tram', 'tramstop', 'depot-tram'] },
   { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
@@ -48,9 +52,9 @@ export const TOOL_META: Record<ToolId, { icon: string; key: string; cat: string;
   'line-edit': { icon: 'lines', key: '', cat: 'lines', color: 'var(--accent)' },
   double: { icon: 'parallel', key: '', cat: 'rail', color: 'var(--rail)' },
   entrance: { icon: 'entrance', key: '', cat: 'stations', color: 'var(--station)' },
-  metro: { icon: 'metro', key: 'U', cat: 'urban', color: 'var(--metro)' },
-  'metro-station': { icon: 'station', key: '', cat: 'urban', color: 'var(--metro)' },
-  relevel: { icon: 'relevel', key: '', cat: 'urban', color: 'var(--metro)' },
+  metro: { icon: 'metro', key: 'U', cat: 'urban', color: 'var(--rail)' },
+  'metro-station': { icon: 'station', key: '', cat: 'urban', color: 'var(--rail)' },
+  relevel: { icon: 'relevel', key: '', cat: 'urban', color: 'var(--rail)' },
   electrify: { icon: 'bolt', key: '', cat: 'rail', color: 'var(--rail)' },
   connect: { icon: 'connect', key: 'J', cat: 'rail', color: 'var(--rail)' },
 };
@@ -71,7 +75,7 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   'depot-tram': 'Click next to a road with tram tracks.',
   signal: 'Click to add or cycle a signal · drag along a track to place block signals.',
   double: 'Click or drag along one of your single tracks to double it.',
-  entrance: 'Click beside a road near the station.',
+  entrance: 'Click beside the tracks (ground station) or a road near the station.',
   bulldoze: 'Click to remove, drag to clear an area.',
   terraform: 'Hold the button to reshape the ground.',
   'line-edit': 'Click stations to add them as stops.',
@@ -88,8 +92,8 @@ const TRAY_TIP: Partial<Record<ToolId, string>> = {
   double: 'Upgrade to double track: lay a second track beside one of yours, with switches at both ends.',
   electrify: 'Electrify: overhead wire turns standard track into electrified track for electric locomotives and EMUs.',
   connect: 'Connect tracks: a curve with turnouts from one track into another (junctions, through running).',
-  metro: 'Urban track: metro and light rail, underground (subway), elevated or on the ground.',
-  'metro-station': 'Urban station: metro and light-rail stations, underground by default, close together.',
+  metro: 'Urban-style track preset: metro or light-rail track, underground (subway), elevated or on the ground. Ordinary rail for every train and line.',
+  'metro-station': 'Urban-style station preset: metro or light-rail platforms, underground by default, close together. Same walking reach and fares as every rail station.',
   relevel: 'Re-level: lift a stretch of your track onto a viaduct or sink it into a tunnel, in place.',
 };
 const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', double: 'Double', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop', entrance: 'Entrance', metro: 'Urban track', 'metro-station': 'Station', relevel: 'Re-level', electrify: 'Electrify', connect: 'Connect' };
@@ -98,7 +102,7 @@ const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 
 const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   rail: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'height'], [['Shift'], 'parallel copy']],
   road: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'height']],
-  station: [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Ctrl', 'Wheel'], 'rotate']],
+  station: [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Alt', 'Wheel'], 'rotate']],
   busstop: [[['Click'], 'on a road']],
   'depot-rail': [[['Click'], 'place'], [['R'], 'rotate']],
   'depot-road': [[['Click'], 'next to a road'], [['R'], 'rotate']],
@@ -107,12 +111,12 @@ const KEYS: Partial<Record<ToolId, [string[], string][]>> = {
   'depot-tram': [[['Click'], 'next to tram tracks'], [['R'], 'rotate']],
   signal: [[['Click'], 'add / cycle signal'], [['Drag'], 'block signals along a track'], [['Right-click'], 'remove']],
   double: [[['Click'], 'one track'], [['Drag'], 'along the line'], [['Esc'], 'cancel']],
-  entrance: [[['Click'], 'beside a road'], [['Esc'], 'done']],
+  entrance: [[['Click'], 'beside the tracks or a road'], [['Esc'], 'done']],
   bulldoze: [[['Click'], 'remove'], [['Drag'], 'clear area']],
   terraform: [[['Hold'], 'apply brush']],
   'line-edit': [[['Click'], 'add station'], [['Esc'], 'done']],
   metro: [[['Click'], 'start / build'], [['Esc'], 'end chain'], [['[', ']'], 'end height'], [['Shift'], 'parallel copy']],
-  'metro-station': [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Ctrl', 'Wheel'], 'rotate']],
+  'metro-station': [[['Click'], 'place'], [['R'], 'rotate'], [['Shift', 'R'], 'back'], [['Alt', 'Wheel'], 'rotate']],
   electrify: [[['Click'], 'one track'], [['Drag'], 'along the line'], [['Esc'], 'cancel']],
   connect: [[['Click'], 'first track'], [['Click'], 'second track'], [['Esc'], 'pick again']],
   relevel: [[['Click'], 'one track'], [['Drag'], 'along a stretch'], [['Esc'], 'cancel']],
@@ -141,6 +145,8 @@ export class Hud {
   private wrap: HTMLDivElement;
   /** long help of the tool card expanded */
   helpOpen = false;
+  /** Small-screen tool details are folded until the player asks for them. */
+  private detailsOpen = false;
   private catBtns = new Map<string, HTMLButtonElement>();
   private vol: HTMLDivElement;
   private volBtn: HTMLButtonElement;
@@ -148,6 +154,8 @@ export class Hud {
   private prevTool: ToolId | undefined;
   private mapBtns: Record<string, HTMLButtonElement> = {};
   private saveEl: HTMLSpanElement;
+  private storageBanner: HTMLElement | null = null;
+  private storageDismissed = false;
   /** track tool: offer 3 and 4 parallel tracks too */
   private moreTracks = false;
   private accessBtn: HTMLButtonElement;
@@ -171,7 +179,7 @@ export class Hud {
     this.plateName = h('span', { class: 'plate-name' });
     this.plateMoney = h('span', { class: 'plate-money' });
     this.plateDelta = h('span', { class: 'plate-delta' });
-    const plate = h('button', { class: 'plate chrome', 'data-tip': 'Finances', 'aria-label': 'Finances', onclick: () => ui.openFinances() },
+    const plate = h('button', { class: 'plate chrome', 'data-tip': 'Finances', 'data-key': 'I', 'aria-label': 'Finances', onclick: () => ui.openFinances() },
       this.plateChip, h('span', { class: 'plate-txt' }, this.plateName, this.plateMoney), this.plateDelta);
     R.appendChild(h('div', { class: 'hud hud-tl' }, plate));
     // clock & speed
@@ -238,15 +246,30 @@ export class Hud {
     // the options card lives at the bottom right, clear of the build area and the minimap
     R.appendChild(this.card);
     window.addEventListener('resize', () => this.placeCard());
+    onStorageMode((mode) => {
+      if (mode !== 'memory') return;
+      this.showSave('memory');
+      if (this.storageBanner || this.storageDismissed) return;
+      this.storageBanner = h('div', { class: 'storage-banner', role: 'status', 'aria-live': 'polite' },
+        icon('warning', 18), h('span', null, "Saves won't survive a reload in this browser mode — use Export to keep your game"),
+        h('button', { class: 'btn sm', onclick: () => exportSave(this.ui) }, 'Export'),
+        h('button', { class: 'ibtn sm', 'aria-label': 'Dismiss storage notice', onclick: () => {
+          this.storageDismissed = true; this.storageBanner?.remove(); this.storageBanner = null;
+        } }, icon('close', 16)));
+      R.appendChild(this.storageBanner);
+    });
   }
 
   /** Small autosave indicator under the clock: "Saving…", then "Saved" (fades), or "Save failed". */
-  showSave(state: 'saving' | 'saved' | 'error') {
+  showSave(state: 'saving' | 'saved' | 'error' | 'memory') {
+    if (state === 'saved' && storageMode() === 'memory') state = 'memory';
     const el = this.saveEl;
     clearTimeout(this.saveHide);
     el.className = 'savechip show ' + state;
-    el.replaceChildren(icon(state === 'error' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : 'Autosave failed');
-    if (state !== 'saving') this.saveHide = window.setTimeout(() => { el.classList.remove('show'); }, state === 'error' ? 5000 : 1600);
+    el.replaceChildren(icon(state === 'error' || state === 'memory' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : state === 'memory' ? 'Session only — use Export' : 'Autosave failed');
+    if (state !== 'saving' && state !== 'memory') this.saveHide = window.setTimeout(() => {
+      if (storageMode() === 'memory') this.showSave('memory'); else el.classList.remove('show');
+    }, state === 'error' ? 5000 : 1600);
   }
 
   /** Highlight the active map view button. */
@@ -277,6 +300,9 @@ export class Hud {
   }
 
   setGame(g: Game) {
+    clearTimeout(this.saveHide);
+    if (storageMode() === 'memory') this.showSave('memory');
+    else { this.saveEl.className = 'savechip'; this.saveEl.replaceChildren(); }
     this.unread = 0;
     this.prevTool = undefined;
     this.syncVol();
@@ -375,7 +401,11 @@ export class Hud {
     const body = h('div', { class: 'drawer-body' });
     for (const n of [...g.news].reverse()) {
       const row = h('div', { class: 'news-row ' + n.kind }, h('i'), h('div', null, h('span', { class: 'news-date' }, newsDate(g, n)), n.text));
-      if (n.x !== undefined) { row.classList.add('link'); row.addEventListener('click', () => this.ui.centerOn(n.x!, n.z!)); }
+      if (this.ui.isDebtNews(n)) {
+        row.classList.add('link'); row.setAttribute('role', 'button'); row.tabIndex = 0;
+        row.addEventListener('click', () => this.ui.openFinances());
+        row.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.ui.openFinances(); } });
+      } else if (n.x !== undefined) { row.classList.add('link'); row.addEventListener('click', () => this.ui.centerOn(n.x!, n.z!)); }
       body.appendChild(row);
     }
     if (!g.news.length) body.appendChild(h('div', { class: 'pad' }, 'No news yet.'));
@@ -422,8 +452,11 @@ export class Hud {
 
   /** Keep the tool card above the dock and tray (bottom right; full width on phones). */
   private placeCard() {
-    if (this.card.style.display === 'none') return;
     const H = window.innerHeight;
+    const dockTop = this.wrap.getBoundingClientRect().top;
+    if (dockTop > 0 && dockTop < H) this.ui.root.style.setProperty('--dock-clearance', `${Math.ceil(H - dockTop + 8)}px`);
+    this.ui.syncCompactPanels();
+    if (this.card.style.display === 'none') return;
     let top = this.dock.getBoundingClientRect().top;
     if (this.trayEl.style.display !== 'none') {
       // lift above the tray only where they would collide (narrow screens)
@@ -490,7 +523,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Station tools: a new platform track type (urban: platform length and level follow the type's defaults). */
@@ -543,10 +576,12 @@ export class Hud {
     const t = T.tool;
     this.sCard = this.cardSig();
     const card = this.card;
-    if (t === 'inspect') { card.style.display = 'none'; return; }
+    this.ui.root.classList.toggle('has-tool-card', t !== 'inspect');
+    if (t === 'inspect') { card.style.display = 'none'; this.placeCard(); return; }
     const meta = TOOL_META[t];
     clear(card);
     card.style.display = '';
+    card.classList.toggle('expanded', this.detailsOpen);
     card.style.setProperty('--c', meta.color);
     const redo = () => { T.refreshHover(); this.renderCard(); };
     const opt = (label: string, ...ctrl: (Node | null)[]) => h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, label), ...ctrl.filter((x): x is Node => !!x));
@@ -575,7 +610,7 @@ export class Hud {
         ['auto', 'Auto', 'Choose a permitted crossing for the terrain and track type'],
         ['over', 'Overpass', 'Build above the line being crossed'],
         ['under', 'Underpass', 'Build below the line being crossed'],
-        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and reserved light rail need an overpass or underpass'],
+        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and light-rail track need an overpass or underpass'],
       ], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'electrify') {
@@ -599,7 +634,12 @@ export class Hud {
       if (T.directional) opts.push(opt('Run on', seg<string>([['right', 'Right'], ['left', 'Left']], T.rightHand ? 'right' : 'left', (v) => { T.rightHand = v === 'right'; redo(); })));
     } else if (t === 'entrance') {
       const st = T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation) : undefined;
-      opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, st?.name ?? '—'), h('span', { class: 'muted' }, st?.rail ? `${st.rail.entrances.length} entrance${st.rail.entrances.length === 1 ? '' : 's'}` : ''));
+      const r = st?.rail;
+      opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, st?.name ?? '—'), h('span', { class: 'muted' }, r ? `${r.entrances.length} entrance${r.entrances.length === 1 ? '' : 's'}` : ''));
+      if (r?.level === 'ground') {
+        const label: Record<string, string> = { hall: 'Side hall', footbridge: 'Footbridge', underpass: 'Underpass', gate: 'End gate' };
+        opts.push(opt('Type', seg<EntranceKind>(GROUND_ENTRANCES.map((k) => [k, label[k], `${ENTRANCE_TYPES[k].desc} · ${fmtMoney(entranceCost(k, r))} · upkeep ${fmtMoney(ENTRANCE_TYPES[k].upkeep)} a year`]), T.entranceKind, (v) => { T.entranceKind = v; redo(); })));
+      }
       opts.push(h('button', { class: 'btn sm primary', onclick: () => { const id = T.entranceStation; T.setTool('inspect'); if (id != null) this.ui.openStation(id); } }, icon('check', 14), 'Done'));
     } else if (T.stationTool) {
       if (T.relocating != null) {
@@ -609,7 +649,7 @@ export class Hud {
       const onLine = T.stationOnLine && T.relocating == null;
       if (!onLine) {
         const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', 'Metro platforms: 300 m catchment, platform screen doors, underground by default'], ['lightrail', 'Light rail', 'Light-rail platforms: 250 m catchment']]
+          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`]]
           : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
         if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
         opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));
@@ -640,15 +680,26 @@ export class Hud {
       opts.push(h('button', { class: 'btn sm primary', onclick: () => T.setTool('inspect') }, icon('check', 14), 'Done'));
     }
     const keys = KEYS[t] ?? [];
+    // Keep the everyday controls visible; fold the rest only inside the small-screen media query.
+    const primary = T.stationTool ? ['Length', 'Tracks', 'Rotate'] : T.railBuild ? ['Tracks'] : t === 'signal' ? ['Mode', 'Type'] : [];
+    const fold = T.stationTool || T.building || t === 'signal' || t === 'double' || t === 'relevel';
+    if (fold) for (const option of opts) {
+      const label = option.querySelector('.opt-l')?.textContent ?? '';
+      option.classList.toggle('tc-secondary', !option.classList.contains('typepick') && !primary.includes(label) && !option.classList.contains('btn'));
+    }
     const help = this.helpOpen
       ? h('div', { class: 'tc-help' }, h('p', null, TOOL_INFO[t].hint), keys.length ? h('div', { class: 'tc-keys' }, keys.map(([ks, what]) => h('span', null, ks.map((k) => kbd(k)), what))) : null)
       : h('div', { class: 'tc-desc', title: TOOL_INFO[t].hint }, TOOL_SHORT[t] ?? TOOL_INFO[t].hint);
     const warnings = T.constructionWarnings;
     add(card,
       h('div', { class: 'tc-head' }, h('span', { class: 'tc-dot' }), h('span', { class: 'tc-title' }, TOOL_INFO[t].name),
+        fold ? h('button', { class: 'ibtn sm tc-details-toggle', 'data-tip': this.detailsOpen ? 'Collapse details' : 'More options',
+          'aria-label': this.detailsOpen ? 'Collapse tool details' : 'Expand tool details', 'aria-expanded': String(this.detailsOpen),
+          onclick: () => { this.detailsOpen = !this.detailsOpen; this.renderCard(); } }, icon(this.detailsOpen ? 'chevd' : 'chevr', 16)) : null,
         h('button', { class: 'ibtn sm' + (this.helpOpen ? ' on' : ''), 'data-tip': this.helpOpen ? 'Hide help' : 'Help & keys', 'aria-label': 'Help', 'aria-expanded': this.helpOpen ? 'true' : 'false', onclick: () => { this.helpOpen = !this.helpOpen; this.renderCard(); } }, icon('help', 16)),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close tool', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close tool', onclick: () => T.setTool('inspect') }, icon('close', 16))),
       help,
+      T.stationTool ? h('div', { class: 'tc-compact-note' }, `${T.stationTracks} platform track${T.stationTracks === 1 ? '' : 's'} · ${T.stationLen * 10} m · ${T.stationLevel} · ${T.stationStyle === 'auto' ? 'auto building' : STYLE_SHORT[T.stationStyle] ?? T.stationStyle}`) : null,
       opts.length ? h('div', { class: 'tc-opts' }, opts) : null,
       warnings.length ? h('div', { class: 'tc-warnings', role: 'status', 'aria-live': 'polite' }, warnings.map((w) => h('div', { class: 'tc-warning' }, icon('warning', 14), h('span', null, w)))) : null,
     );

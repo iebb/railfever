@@ -22,7 +22,10 @@ const loco = MODEL_BY_ID.get('diesel_b')!, coach = MODEL_BY_ID.get('coach_ic')!;
 
 // ------------------------------------------------------------------ 1. single-track line between two towns
 const e0 = net.nextEdge;
-const pair = placeAndConnect(g, 60, 150, 0)!;
+// The passenger checks need a served population under today's demand calibration. Tiny villages can
+// legitimately produce no intercity train passengers in two years (seed 11), even on a working railway.
+const quiet = new Set(g.towns.list.filter((t) => t.pop < 500).map((t) => t.id));
+const pair = (placeAndConnect(g, 60, 150, 0, quiet) ?? placeAndConnect(g, 150, 240, 0, quiet))!;
 check(pair, 'station pair placed and connected');
 const { A, B, TA, TB, con } = pair;
 console.log(`rail: ${TA.name} (${TA.pop}) <-> ${TB.name} (${TB.pop}), ${fmt(Math.hypot(TA.x - TB.x, TA.z - TB.z))} units`);
@@ -57,22 +60,28 @@ let dbl = { ok: false, signals: 0, crossovers: 0, len: 0 };
 let dblDepot = -1, dblLine = -1;
 const eDbl = net.nextEdge;
 {
-  const used = new Set([TA.id, TB.id]);
-  for (let attempt = 0; attempt < 4 && !dbl.ok; attempt++) {
-    const pr2 = placeStationPair(g, 70, 200, 0, used);
+  const used = new Set([TA.id, TB.id, ...quiet]);
+  // Reduced catchments choose different sites. A failed corridor rules out that pair, not both towns.
+  const tried = new Set<string>();
+  for (let attempt = 0; attempt < 12 && !dbl.ok; attempt++) {
+    const pr2 = placeStationPair(g, 70, 300, 0, used, 16, tried);
     if (!pr2) break;
-    used.add(pr2.TA.id); used.add(pr2.TB.id);
+    tried.add(pr2.TA.id + ':' + pr2.TB.id);
     console.log(`double track: ${pr2.TA.name} <-> ${pr2.TB.name}`);
     const eTry = net.nextEdge;
     dbl = connectDouble(g, pr2.A, pr2.B, 0);
     if (!dbl.ok) { removeEdges(g, newRailEdges(g, eTry), 0); g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id); continue; }
     console.log(`  crossovers ${dbl.crossovers}, signals ${dbl.signals}`);
     const dep2 = depotBehind(g, pr2.A, pr2.B, 0);
-    if (dbl.ok && dep2 > 0) {
-      const l2 = g.lines.create('rail', 0);
-      l2.stops = [pr2.A.id, pr2.B.id];
-      dblDepot = dep2; dblLine = l2.id;
+    if (dep2 <= 0) {
+      removeEdges(g, newRailEdges(g, eTry), 0);
+      g.stations.removeStation(pr2.A.id); g.stations.removeStation(pr2.B.id);
+      dbl.ok = false;
+      continue;
     }
+    const l2 = g.lines.create('rail', 0);
+    l2.stops = [pr2.A.id, pr2.B.id];
+    dblDepot = dep2; dblLine = l2.id;
   }
 }
 check(dbl.ok && dbl.crossovers === 2 && dbl.signals >= 2, 'double track with crossovers and signals');
@@ -346,10 +355,13 @@ let errors = 0, nanMsg: string | null = null;
 const T1 = performance.now();
 const days = 720, startDay = g.day;
 let lastLog = -1;
+// passengers generated at the two stations over the run (a small station may go a month or two without any)
+let genA = 0, genB = 0, genMonthNo = Math.floor(g.day / 30);
 const cr = levelCrossing > 0 ? net.crossings.get(levelCrossing) : undefined;
 const pv = { x: 0, y: 0, z: 0 };
 while (g.day < startDay + days) {
   try { g.update(0.25); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 6).join('\n')); if (errors > 3) break; }
+  if (Math.floor(g.day / 30) !== genMonthNo) { genMonthNo = Math.floor(g.day / 30); genA += A.genLast; genB += B.genLast; }
   for (const t of [train, ...dTrains]) {
     if (!(t instanceof Train)) continue;
     if (t.state === 'loading' && lastAt.get(t.id) !== t.atStation) {
@@ -404,7 +416,7 @@ const arr = (t: Train | undefined) => (t ? [...(arrivals.get(t.id)?.values() ?? 
 check(errors === 0, 'no exceptions');
 check(!nanMsg, 'no NaN positions ' + (nanMsg ?? ''));
 check(arr(train).length === 2 && arr(train).every((n) => n >= 3), `train served both stations repeatedly (${arr(train).join('/')})`);
-check(A.genLast + A.genMonth > 0 && B.genLast + B.genMonth > 0, 'passengers generated');
+check(genA + A.genMonth > 0 && genB + B.genMonth > 0, `passengers generated (${genA + A.genMonth} / ${genB + B.genMonth})`);
 check(train.delivered > 0, `train delivered passengers (${train.delivered})`);
 check(line.incomeYear + line.incomeLast > 0, 'rail line income > 0');
 check(busArr >= 4 && (bus?.delivered ?? 0) > 0, `town bus served its stops (${busArr} stops, ${bus?.delivered} delivered)`);

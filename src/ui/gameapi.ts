@@ -11,6 +11,9 @@ import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, Station
 import { CATCHMENT_RADIUS } from '../game/stations';
 import { STATION_STYLES, stylesFor, defaultStationStyle } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
+import { walkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
+import type { WalkingCatchment } from '../game/catchment';
+import type { Overlay } from '../render/overlay';
 
 export type { AIConfig };
 export { AI_PRESETS };
@@ -82,15 +85,36 @@ export function planStation(g: Game, x: number, z: number, angle: number, length
 /** Level of a planned or built station part. */
 export function levelOf(p: { level?: StationLevel } | null | undefined): StationLevel { return p?.level ?? 'ground'; }
 
-/** Catchment colours by mode (as --rail, --tram, --road); inactive areas (no road access) are grey. */
-export const CATCH_COLOR: Record<CatchMode, number> = { rail: 0x5aa9ff, metro: 0x2ec4b6, lightrail: 0x9bd16a, tram: 0xc084fc, bus: 0xff8a3d };
+/**
+ * Catchment colours by mode (as --rail, --tram, --road): every rail station alike, whatever its track type;
+ * inactive areas (no road access) are grey. Chosen to stay apart for colour-blind players too (delta E >= ~20
+ * between modes under deuteranopia, protanopia and tritanopia); trams also get their own dash pattern (CATCH_DASH)
+ * as a second cue.
+ */
+export const CATCH_COLOR: Record<CatchMode, number> = { rail: 0x5aa9ff, tram: 0xb25ec5, bus: 0xff8a3d };
+/** Dash pattern of each mode's catchment streets: drawn share of a period and the period in screen px (none = solid). */
+export const CATCH_DASH: Record<CatchMode, { dash: number; dashPx: number } | null> = {
+  rail: null, bus: null, tram: { dash: 0.4, dashPx: 7 },
+};
 export const CATCH_INACTIVE = 0x7a8494;
 export const catchColor = (c: CatchShape) => (c.active ? CATCH_COLOR[c.mode] : CATCH_INACTIVE);
 
-/** Catchment circles of a station (all: also the inactive ones of a station without road access). */
+/** Legacy station access/reach metadata. Street overlays use catchStreets. */
 export function catchShapes(g: Game, st: Station, all = false): CatchShape[] { return g.stations.catchmentShapes(st, all); }
-/** Catchment radius of a mode. */
+/** Nominal walking limit of a mode, before the street-grid allowance. */
 export function catchRadius(mode: CatchMode): number { return CATCHMENT_RADIUS[mode]; }
+/** Actual walking budget, including the grid detour calibration and the building style. */
+export function catchWalkLimit(mode: CatchMode, bonus = 0): number { return CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR; }
+export const catchStreets = walkingCatchment;
+export const planCatchStreets = planWalkingCatchment;
+export const catchStreetPop = walkingPopulation;
+/** Independent, mode-coloured (and mode-dashed) street layers; all three are cleared when a preview/view closes. */
+export function drawCatchStreets(overlay: Pick<Overlay, 'setSegments'>, key: string, walk: WalkingCatchment | null, color?: number) {
+  for (const mode of Object.keys(CATCH_COLOR) as CatchMode[]) {
+    const segments = walk?.segments.filter((s) => s.mode === mode) ?? null;
+    overlay.setSegments(`catch:${key}:${mode}`, segments, color ?? CATCH_COLOR[mode], CATCH_DASH[mode] ?? {});
+  }
+}
 
 /** Stations linked with `st` for walking transfers. */
 export function stationLinks(_g: Game, st: Station): number[] { return st.links ?? []; }
@@ -102,7 +126,7 @@ export function optional<T>(obj: unknown, name: string): T | undefined {
   return v === undefined || v === null ? undefined : (v as T);
 }
 
-/** Catchment radius bonus of a station building style (UPDATE 9m `catchBonus`, e.g. 0.2 = +20% reach; 0 until it lands). */
+/** Walking-limit bonus of a station building style (e.g. 0.2 = +20% reach). */
 export function catchBonusOf(styleId?: string): number {
   const s = styleId ? STATION_STYLES[styleId] : undefined;
   const b = optional<number>(s, 'catchBonus');
@@ -110,7 +134,7 @@ export function catchBonusOf(styleId?: string): number {
 }
 
 /**
- * Catchment circles of a planned station with its building style's bonus: the game's shapes, their radius scaled by
+ * Legacy access metadata of a planned station with its building style's bonus: reach scaled by
  * (1 + catchBonus) where the planner has not applied it yet (works before and after the bonus lands).
  */
 export function planCatchShapes(g: Game, plan: StationPlan): CatchShape[] {

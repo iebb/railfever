@@ -16,6 +16,12 @@ import type { Station } from './stations';
 import { TRACK_TYPES, UNIT_M } from './constants';
 import { consistOf, hopEstimate } from './opcosts';
 import type { VehicleModel } from './vehicle-types';
+import type { NEdge } from './network';
+import { outAndBack } from './lines';
+import { consistRule, findRailRoute, railNext, ruleAllows, lineCompatibility } from './train';
+import type { Cont, TrackRule } from './train';
+import { tramUsable } from './build-ops';
+import { simNow } from './fares';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -237,6 +243,7 @@ function patternsChanged(g: Game, l: Line) {
     const v = g.vehicles.get(id);
     if (!v) continue;
     if (v.pattern !== undefined && !known.has(v.pattern)) v.pattern = undefined;
+    v.resetSpacing();
     v.fixCargo();
   }
   g.lines.rebuild();
@@ -286,6 +293,7 @@ export function setVehiclePattern(g: Game, vehicleId: number, pid: number | unde
   if (!v || !l) return 'No such vehicle or it has no line';
   if (pid !== undefined && !linePatterns(l).some((p) => p.id === pid)) return 'No such pattern on ' + l.name;
   v.pattern = pid;
+  v.resetSpacing();
   v.fixCargo();
   g.lines.rebuild();
   v.onLineChanged();
@@ -325,7 +333,7 @@ function sdist(g: Game, a: number, b: number): number {
   return sa && sb ? Math.hypot(sa.x - sb.x, sa.z - sb.z) : 1e6;
 }
 
-interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[] }
+interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[]; route: string; timing: number[] }
 interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
 const tables = new WeakMap<Game, Map<number, LineTable>>();
 
@@ -366,11 +374,20 @@ export function lineTable(g: Game, l: Line): LineTable {
   const byPat = vehiclesByPattern(g, l);
   // cached until what the timetable depends on changes (not on every routing rebuild): the stops (where they are,
   // their track type), the vehicles of each pattern (their speed) and the patterns' stops
-  let key = '';
+  let key = isLoopLine(l) ? 'loop:' : 'back:';
   // (exact positions: a station rebuilt longer moves its centre by less than a unit, and the timetable reads the
   // exact distances; the town decides a road hop's speed cap)
   for (const id of l.stops) { const s = g.stations.get(id); key += id + '@' + (s ? s.x + ',' + s.z + (s.rail ? s.rail.trackType : '') + '/' + s.townId : '') + ';'; }
-  for (const [p, vs] of byPat) { key += '|' + p + ':'; for (const v of vs) key += v.id + '/' + v.maxSpeedKmh + '.'; }
+  for (const [p, vs] of byPat) {
+    key += '|' + p + ':';
+    for (const v of vs) {
+      const stock = v as unknown as { cars?: VehicleModel[]; model?: VehicleModel | null };
+      // Editing a consist changes its acceleration and loaded mass without changing its top speed. Sort
+      // model ids so a train reversing at a terminus still has the same timetable key.
+      const models = stock.cars ?? (stock.model ? [stock.model] : []);
+      key += v.id + '/' + v.maxSpeedKmh + '/' + models.map((m) => m.id).sort().join(',') + '.';
+    }
+  }
   for (const p of l.patterns ?? []) { key += '|' + p.id + ':'; for (const x of servedFlags(l, p)) key += x ? '1' : '0'; }
   if (hit && hit.key === key) { hit.ver = g.lines.version; hit.stops = l.stops; hit.nv = l.vehicles.length; return hit; }
   const n = l.stops.length;
@@ -396,7 +413,9 @@ export function lineTable(g: Game, l: Line): LineTable {
       cycle += hop[i];
     }
     if (!(cycle > 0)) continue;
-    pats.push({ pid: p.id, flags, n: vs.length, cycle, freq: vs.length / cycle, hop });
+    const route = (isLoopLine(l) ? 'loop:' : 'back:') + l.stops.map((id, i) => flags[i] ? id : `(${id})`).join(',');
+    const timing = isLoopLine(l) ? [flags.indexOf(true)] : patternTermini(l, p.id);
+    pats.push({ pid: p.id, flags, n: vs.length, cycle, freq: vs.length / cycle, hop, route, timing });
   }
   // options per (from station, to station): (pattern, boarding index, ride time)
   const opts = new Map<string, { pid: number; a: number; ride: number; f: number }[]>();
@@ -461,6 +480,73 @@ export function patternHeadway(g: Game, l: Line, pid?: number): number {
   const id = p ? p.id : 0;
   const pt = t.pats.find((q) => q.pid === id) ?? t.pats[0];
   return pt ? pt.cycle / pt.n : 0;
+}
+
+// ------------------------------------------------------------------------------ even spacing
+/** Minimum departure gap and maximum additional dwell, as fractions of the pattern's scheduled headway. */
+export const SPACING_GAP = 0.75;
+export const SPACING_HOLD = 0.6;
+
+/** Saved clocks of the vehicle's current pattern. Route edits invalidate clocks of the old stop sequence. */
+export function spacingSchedule(g: Game, v: Vehicle) {
+  const l = v.line;
+  if (!l || l.evenSpacing === false) return null;
+  const p = patternOf(l, v.pattern), pid = p?.id ?? 0;
+  const pt = lineTable(g, l).pats.find((q) => q.pid === pid);
+  if (!pt) return null;
+  const headway = pt.cycle / pt.n; // patternHeadway, using the same cached table / resolved pattern
+  if (!(headway > 0)) return null;
+  const clocks = l.spacing ??= {};
+  let clock = clocks[pid];
+  if (!clock || clock.route !== pt.route) clock = clocks[pid] = { route: pt.route, departures: {} };
+  return { clock, headway, vehicles: pt.n, timing: pt.timing };
+}
+
+/** Termini of an out-and-back pattern, or its first served stop on a loop. */
+export function isTimingPoint(l: Line, pid: number | undefined, index: number): boolean {
+  return isLoopLine(l) ? index === patternStops(l, pid)[0] : patternTermini(l, pid).includes(index);
+}
+
+/** Same station and outgoing direction, including duplicate indices at short-turn termini. */
+function departureKey(l: Line, v: Vehicle, index = v.stopIndex): string {
+  return l.stops[index] + ':' + l.stops[nextStopIndex(l, v.pattern, index)];
+}
+
+/** Finished loading: wait briefly for a minimum gap, unless late or another vehicle needs this space. */
+export function holdForSpacing(g: Game, v: Vehicle): boolean {
+  const l = v.line;
+  if (!l) return false;
+  const schedule = spacingSchedule(g, v);
+  if (!schedule || schedule.vehicles < 2 || !schedule.timing.includes(v.stopIndex) || g.vehicles.spacingBlocked(v)) return false;
+  const now = simNow(g), prev = schedule.clock.departures[departureKey(l, v)];
+  if (!prev || prev.vehicle === v.id) return false;
+  // Street detours and junctions can make a road timetable optimistic. Balance a rolling cycle of road
+  // departures as well as enforcing the scheduled minimum; never increase the cap. Rail paths already
+  // regulate admission: stretching their cycle to include signal waits would disturb the passing-loop meets.
+  const recent = prev.recent ?? [];
+  const observed = l.kind !== 'rail' && recent.length > schedule.vehicles ? (prev.at - recent[recent.length - 1 - schedule.vehicles]) / schedule.vehicles : 0;
+  const gap = Math.max(SPACING_GAP * schedule.headway, observed);
+  if (now - prev.at >= gap) return false;
+  // The first attempted hold fixes the deadline: later departures cannot restart/extend this hold.
+  if (v.spacing.until < 0) v.spacing.until = now + SPACING_HOLD * schedule.headway;
+  if (now >= v.spacing.until) return false;
+  v.status = 'Holding for even spacing';
+  return true;
+}
+
+/** Commit a timing-point departure when it starts moving; a red signal / road queue consumes no gap. */
+export function noteSpacingDeparture(g: Game, v: Vehicle) {
+  const l = v.line;
+  const index = v.spacing.departureIndex >= 0 ? v.spacing.departureIndex : v.stopIndex;
+  if (l) {
+    const schedule = spacingSchedule(g, v);
+    if (schedule && schedule.timing.includes(index)) {
+      const key = departureKey(l, v, index), at = simNow(g);
+      const recent = [...(schedule.clock.departures[key]?.recent ?? []), at].slice(-schedule.vehicles - 1);
+      schedule.clock.departures[key] = { at, vehicle: v.id, recent };
+    }
+  }
+  v.resetSpacing();
 }
 
 /**
@@ -630,6 +716,231 @@ function mapFlags(a: Line, b: Line, bFlags: boolean[], dir: 1 | -1): boolean[] {
 
 export interface MergeNotice { from: number; into: number; pattern: number; text: string }
 
+/** The preview is the route from end to end; Line.stops also includes the return calls (outAndBack). */
+export type LineJoinCheck =
+  | { ok: false; junction: number | null; reason: string }
+  | { ok: true; junction: number; reason: null; route: number[]; into: number; from: number };
+export interface JoinNotice extends MergeNotice { line: Line; junction: number }
+export interface JoinOptions {
+  /** Default: continue the surviving numbers when extending its end; renumber when extending its start. */
+  renumber?: boolean;
+  /** Post the notice to the news feed (default true). */
+  notify?: boolean;
+}
+
+/** A read-only routing view of a proposed line, without changing the game's lines, ids or routing version. */
+function joinPreviewGame(g: Game, l: Line): Game {
+  const preview = Object.create(g) as Game;
+  preview.lines = Object.create(g.lines);
+  preview.lines.get = (id: number) => id === l.id ? l : g.lines.get(id);
+  return preview;
+}
+
+/**
+ * Follow successive calls from the platform reached by the previous hop. Testing each station pair separately
+ * would incorrectly join two disconnected platform tracks carrying the same station id. Reversing at a
+ * platform, including past its starter signal, is allowed just as it is in Train.planRoute.
+ */
+function railJoinRoute(g: Game, route: number[], owner: number, rule: TrackRule | null): string | null {
+  const first = g.stations.get(route[0]), net = g.world.net;
+  let at: Cont[] = [];
+  for (const eid of first?.rail?.edges ?? []) {
+    const edge = net.edges.get(eid);
+    if (edge && g.canUse(owner, edge.owner) && ruleAllows(rule, edge)) for (const dir of [1, -1]) at.push({ edge, dir });
+  }
+  for (let i = 1; i < route.length; i++) {
+    const arrived = new Map<string, Cont>();
+    for (const c of at) {
+      for (const dir of [c.dir, -c.dir]) {
+        const start = railNext(g, c.edge, dir, owner, false, rule, dir !== c.dir);
+        const r = findRailRoute(g, start, route[i], owner, -1, 40000, false, rule);
+        const last = r?.conts[r.conts.length - 1];
+        if (last) arrived.set(last.edge.id + ':' + last.dir, last);
+      }
+    }
+    if (!arrived.size) return `${g.stations.get(route[i - 1])?.name ?? '?'} → ${g.stations.get(route[i])?.name ?? '?'}`;
+    at = [...arrived.values()];
+  }
+  return null;
+}
+
+/**
+ * Road routing allows U-turns, so reachability is an undirected walk of the usable road edges. Carry only
+ * reachable stop edges across each call: disconnected stops sharing a station id cannot bridge networks.
+ * Keep the vehicle class out of this module's imports (Vehicle itself imports the pattern helpers).
+ */
+function roadJoinRoute(g: Game, route: number[], l: Line, owner: number): string | null {
+  const net = g.world.net;
+  const allow = (e: NEdge) => e.kind === 'road' && (l.kind !== 'tram' || tramUsable(g, e, owner));
+  const stops = (sid: number) => (g.stations.get(sid)?.stops ?? []).map((p) => net.edges.get(p.edge)).filter((e): e is NEdge => !!e && allow(e));
+  let at = stops(route[0]);
+  for (let i = 1; i < route.length; i++) {
+    const reached = new Set(at.map((e) => e.id)), open = [...at];
+    for (let k = 0; k < open.length && k < 40000; k++) {
+      for (const node of [open[k].a, open[k].b]) for (const eid of net.nodes.get(node)?.edges ?? []) {
+        const e = net.edges.get(eid);
+        if (!e || e.depot >= 0 || reached.has(eid) || !allow(e)) continue;
+        reached.add(eid); open.push(e);
+      }
+    }
+    at = stops(route[i]).filter((e) => reached.has(e.id));
+    if (!at.length) return `${g.stations.get(route[i - 1])?.name ?? '?'} → ${g.stations.get(route[i])?.name ?? '?'}`;
+  }
+  return null;
+}
+
+/**
+ * May two end-to-end lines become one through line? Accepts line objects or ids. This is a pure preview;
+ * access, track rules and continuity are checked for every operator and every distinct train consist.
+ */
+export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJoinCheck {
+  const la = typeof a === 'number' ? g.lines.get(a) : g.lines.map.get(a.id);
+  const lb = typeof b === 'number' ? g.lines.get(b) : g.lines.map.get(b.id);
+  let junction: number | null = null;
+  const no = (reason: string): LineJoinCheck => ({ ok: false, junction, reason });
+  if (!la || !lb) return no('No such line');
+  if (la === lb) return no('Choose two different lines');
+  if (la.kind !== lb.kind) return no('Lines must have the same transport kind (rail, road or tram)');
+  const ra = lineRoute(la), rb = lineRoute(lb);
+  if (la.loop === true || lb.loop === true || ra.loop || rb.loop) return no('Loop lines have no termini to join');
+  if ([ra, rb].some((r) => r.stations.length < 2 || new Set(r.stations).size !== r.stations.length)) return no('Each line needs a route between two distinct termini');
+  const ends = [ra.stations[0], ra.stations[ra.stations.length - 1]];
+  const shared = ends.filter((s) => s === rb.stations[0] || s === rb.stations[rb.stations.length - 1]);
+  if (!shared.length) return no('Lines do not share a terminus station');
+  junction = shared[0];
+  if (shared.length > 1) return no('Lines share both termini; combine them as service patterns instead');
+  if (ra.stations.some((s) => s !== junction && rb.stations.includes(s))) return no('Lines overlap beyond their junction; join lines that meet only at a terminus');
+  // The longer route survives; equal lengths keep the older line. Keep its original direction too.
+  const keepA = ra.stations.length > rb.stations.length || (ra.stations.length === rb.stations.length && la.id < lb.id);
+  const keep = keepA ? la : lb, drop = keepA ? lb : la;
+  const kr = keepA ? ra.stations : rb.stations, dr = keepA ? rb.stations : ra.stations;
+  const atEnd = kr[kr.length - 1] === junction;
+  const other = (atEnd ? dr[0] === junction : dr[dr.length - 1] === junction) ? [...dr] : [...dr].reverse();
+  const route = atEnd ? [...kr, ...other.slice(1)] : [...other.slice(0, -1), ...kr];
+  const operators = [...new Set([...g.lines.operatorsOf(keep), ...g.lines.operatorsOf(drop)])];
+  const proposed: Line = { ...keep, stops: outAndBack(route), loop: false, vehicles: [...keep.vehicles, ...drop.vehicles] };
+  for (const owner of operators) {
+    const co = g.companies[owner];
+    if (!co || co.defunct) return no('An operator no longer exists');
+    if (!g.lines.ownsStationOn(proposed, owner)) return no(`${co.name} owns no station on the joined line; each operator must own a station`);
+    for (const sid of route) {
+      const st = g.stations.get(sid);
+      if (!st) return no('A station on the route no longer exists');
+      if (!g.canUse(owner, st.owner)) return no(`${co.name} has no access to ${st.name} (${g.company(st.owner).name})`);
+    }
+    for (const otherOwner of operators) if (!g.canUse(owner, otherOwner)) return no(`${co.name} has no track access to ${g.company(otherOwner).name}'s network`);
+  }
+  const rules = new Map<string, { owner: number; rule: TrackRule | null; cars?: VehicleModel[] }>();
+  for (const owner of operators) rules.set(owner + ':any', { owner, rule: null });
+  for (const vid of proposed.vehicles) {
+    const v = g.vehicles.get(vid);
+    if (!v) continue;
+    if (!operators.includes(v.owner)) return no(`${g.company(v.owner).name} is not an operator of either line`);
+    if (v.kind !== 'train' || proposed.kind !== 'rail') continue;
+    const cars = (v as Train).cars, rule = consistRule(cars);
+    const key = v.owner + ':' + (rule.types === null ? '*' : [...rule.types].sort().join(',')) + ':' + rule.wire;
+    rules.set(key, { owner: v.owner, rule, cars });
+  }
+  const jname = g.stations.get(junction)?.name ?? '?';
+  for (const { owner, rule, cars } of rules.values()) {
+    if (cars) {
+      const why = lineCompatibility(joinPreviewGame(g, { ...proposed, owner }), proposed.id, cars);
+      if (why) return no(why);
+    }
+    for (const stations of [route, [...route].reverse()]) {
+      const gap = proposed.kind === 'rail' ? railJoinRoute(g, stations, owner, rule) : roadJoinRoute(g, stations, proposed, owner);
+      if (gap) return no(`No ${proposed.kind === 'rail' ? 'track' : proposed.kind === 'tram' ? 'tram track' : 'road'} continuity through ${jname}: ${gap}${cars ? ` (${cars[0]?.name ?? 'train'} cannot run through)` : ''}`);
+    }
+  }
+  return { ok: true, junction, reason: null, route, into: keep.id, from: drop.id };
+}
+
+/** Current/previous accounting periods are the line's history; keep both when combining services. */
+function mergeLineStats(a: Line, b: Line) {
+  a.passMonth += b.passMonth; a.passLast += b.passLast;
+  a.incomeYear += b.incomeYear; a.incomeLast += b.incomeLast;
+  a.costYear += b.costYear; a.costLast += b.costLast;
+}
+
+/** Move waiting groups off a removed line, retaining their waiting times and transfer counts. */
+function redirectWaiting(g: Game, from: number, into: number) {
+  for (const st of g.stations.map.values()) {
+    if (![...st.waiting.values()].some((w) => w.line === from)) continue;
+    const old = [...st.waiting.values()];
+    st.waiting.clear(); st.waitingTotal = 0;
+    for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+  }
+}
+
+/** Map a vehicle's current call, preserving the return direction at repeated interior stations. */
+function joinedStopIndex(joined: Line, old: Line, idx: number, dir: 1 | -1): number {
+  const r = lineRoute(joined), o = lineRoute(old);
+  const i = ((idx % old.stops.length) + old.stops.length) % old.stops.length;
+  const p = r.stations.indexOf(old.stops[i]);
+  if (p < 0) return 0;
+  const out = o.turn <= 0 || i <= o.turn;
+  return r.turn > 0 && p > 0 && p < r.turn && (dir > 0 ? !out : out) ? joined.stops.length - p : p;
+}
+
+/**
+ * Join at a shared terminus. Existing services become short-turn patterns, with an all-through local first
+ * for new vehicles. Returns the surviving line and a notice, or an explanation without changing the game.
+ */
+export function joinLines(g: Game, a: Line | number, b: Line | number, opts: JoinOptions = {}): JoinNotice | string {
+  const check = canJoinLines(g, a, b);
+  if (!check.ok) return check.reason;
+  const keep = g.lines.map.get(check.into)!, drop = g.lines.map.get(check.from)!;
+  const oldKeep: Line = { ...keep, stops: [...keep.stops] };
+  const sources = [oldKeep, drop];
+  const oldPatterns = sources.map((l) => linePatterns(l).map((p) => ({ ...p, stops: [...servedFlags(l, l.patterns?.length ? p : null)], ids: [...l.stops] })));
+  g.lines.routeCode(keep);
+  const renumber = opts.renumber ?? (lineRoute(oldKeep).stations[0] === check.junction);
+  // A join keeps the visible name, even when that name used to follow the termini automatically.
+  if (keep.autoName) keep.joinedName = keep.name;
+  keep.stops = outAndBack(check.route);
+  keep.loop = false;
+  let nextId = oldPatterns[0].reduce((m, p) => Math.max(m, p.id + 1), 0);
+  const through: ServicePattern = { id: nextId++, name: 'Local (through)', kind: 'local', stops: keep.stops.map(() => true), ids: [...keep.stops] };
+  const list = [through], maps: Map<number, number>[] = [];
+  sources.forEach((old, k) => {
+    const dir = subsequence(check.route, lineRoute(old).stations, false) as 1 | -1;
+    const pmap = new Map<number, number>();
+    for (const p of oldPatterns[k]) {
+      const flags = mapFlags(keep, old, p.stops, dir);
+      const id = k === 0 ? p.id : nextId++;
+      list.push({ id, name: patternName(g, keep, flags, p.kind), kind: p.kind, stops: flags, ids: [...keep.stops] });
+      pmap.set(p.id, id);
+    }
+    maps.push(pmap);
+    for (const vid of old.vehicles) {
+      const v = g.vehicles.get(vid);
+      if (!v) continue;
+      const pid = v.pattern !== undefined && pmap.has(v.pattern) ? v.pattern : oldPatterns[k][0].id;
+      v.stopIndex = joinedStopIndex(keep, old, v.stopIndex, dir);
+      v.lineId = keep.id;
+      v.pattern = pmap.get(pid);
+      v.resetSpacing();
+    }
+  });
+  keep.patterns = normalize(keep, list);
+  keep.vehicles = [...new Set([...oldKeep.vehicles, ...drop.vehicles])];
+  const operators = [...new Set([...g.lines.operatorsOf(oldKeep), ...g.lines.operatorsOf(drop)])].filter((o) => o !== keep.owner);
+  if (operators.length) keep.operators = operators;
+  mergeLineStats(keep, drop);
+  redirectWaiting(g, drop.id, keep.id);
+  const pid = maps[1].get(oldPatterns[1][0].id)!;
+  g.lines.map.delete(drop.id);
+  g.lines.redirectLine(drop.id, keep.id, pid, maps[1]);
+  if (renumber) g.lines.renumber(keep.id);
+  g.lines.rebuild();
+  for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged();
+  const junction = g.stations.get(check.junction)!;
+  const notice: JoinNotice = { from: drop.id, into: keep.id, pattern: pid, line: keep, junction: check.junction,
+    text: `${drop.name} joined with ${keep.name} at ${junction.name}: one through line, with the existing services kept as short-turns` };
+  if (opts.notify !== false) g.postNews(notice.text, 'info', junction.x, junction.z);
+  return notice;
+}
+
 /** Merge line `b` into line `a` as service pattern(s) (b's route inside a's). */
 function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
   const bp = linePatterns(b);
@@ -655,6 +966,7 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
     if (!v) continue;
     const target = b.stops[v.stopIndex % Math.max(1, b.stops.length)];
     v.lineId = a.id;
+    v.resetSpacing();
     if (!a.vehicles.includes(v.id)) a.vehicles.push(v.id);
     v.pattern = map.get(v.pattern !== undefined && map.has(v.pattern) ? v.pattern : firstB);
     const idx = a.stops.indexOf(target);
@@ -667,20 +979,12 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
     ops.delete(a.owner);
     if (ops.size) a.operators = [...ops];
   }
-  a.passMonth += b.passMonth; a.passLast += b.passLast;
-  a.incomeYear += b.incomeYear; a.incomeLast += b.incomeLast;
-  a.costYear += b.costYear; a.costLast += b.costLast;
-  for (const st of g.stations.map.values()) {
-    if (![...st.waiting.values()].some((w) => w.line === b.id)) continue;
-    const old = [...st.waiting.values()];
-    st.waiting.clear(); st.waitingTotal = 0;
-    for (const w of old) g.stations.addWaiting(st, w.line === b.id ? a.id : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0);
-  }
+  mergeLineStats(a, b);
+  redirectWaiting(g, b.id, a.id);
   const pid = map.get(firstB) ?? 0;
   g.lines.map.delete(b.id);
   // ids of b (and of lines merged into b before) now lead to a, with the pattern b's vehicles run
-  g.lines.redirect.set(b.id, { line: a.id, pattern: pid });
-  for (const [k, v] of g.lines.redirect) if (v.line === b.id) g.lines.redirect.set(k, { line: a.id, pattern: map.get(v.pattern) ?? pid });
+  g.lines.redirectLine(b.id, a.id, pid, map);
   const pn = a.patterns.find((p) => p.id === pid)?.name ?? 'a pattern';
   return { from: b.id, into: a.id, pattern: pid, text: `${b.name} merged into ${a.name} as a service pattern (${pn})` };
 }

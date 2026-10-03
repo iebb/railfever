@@ -1,3 +1,5 @@
+import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
+import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Urban rail between companies (v2.4): a Fukuoka-like through service (company A's metro under a town meets
 // company B's electrified suburban line at a junction station; both operators' units run through), track
 // compatibility (incompatible trains are refused / get a clear status), JR-style line codes and station numbers,
@@ -89,8 +91,9 @@ function counter(trains: Train[]) {
   const ops = lineOperators(g, la.id);
   console.log(`  ${la.name} operators: ${ops.map((o) => `${g.company(o.owner).name} ${fmt(o.share * 100, 0)}%`).join(', ')}`);
   check(ops.length === 2 && ops.some((o) => o.owner === B && o.share > 0.2), 'lineOperators: the through line runs on both companies\' track');
-  // compatibility: diesel trains may not enter the metro; metro and commuter units run through
-  check(lineCompatibility(g, la.id, [M('diesel_b'), M('coach_ic')]) !== null, 'a diesel train is refused for the through line: ' + lineCompatibility(g, la.id, [M('diesel_b'), M('coach_ic')]));
+  // compatibility: metro and light-rail track are rails like any other (only electric traction needs wire), so
+  // diesel, metro and commuter stock all suit the electrified through lines
+  check(lineCompatibility(g, la.id, [M('diesel_b'), M('coach_ic')]) === null, 'a diesel train may run on the metro through line: ' + lineCompatibility(g, la.id, [M('diesel_b'), M('coach_ic')]));
   check(lineCompatibility(g, la.id, [M('metro_b')]) === null && lineCompatibility(g, lb.id, [M('emu_b')]) === null, 'metro and commuter units suit the through lines');
   const trains: Train[] = [];
   for (const [d, l, m] of [[dA, la, 'metro_b'], [dA, la, 'metro_b'], [dB, lb, 'emu_b'], [dB, lb, 'emu_b']] as [number, typeof la, string][]) {
@@ -114,9 +117,9 @@ function counter(trains: Train[]) {
   const codeA = g.lines.stationCode(la.id, Ms[0].id), codeS2 = g.lines.stationCode(lb.id, S2.id), codeJ = g.lines.stationCodes(J.id);
   console.log(`  numbering: ${g.lines.lineCode(la.id)} / ${g.lines.lineCode(lb.id)}: ${Ms[0].name} ${codeA}, J ${codeJ.join(' ')}, S2 ${codeS2}`);
   check(/^[A-Z][A-Z0-9]+01$/.test(codeA) && codeS2.startsWith(g.company(B).code!) && codeS2.slice(1, -2) === codeA.slice(1, -2), 'through service: B\'s stations continue A\'s route letter with B\'s company letter');
-  // an incompatible train bought anyway: a clear status
-  const bad = g.vehicles.buyTrain(dB, [M('diesel_b'), M('coach_ic')], la.id);
-  if (bad instanceof Train) { runDays(g, 12); console.log(`  diesel on the metro line: ${bad.status}`); check(bad.state === 'noroute' && /compatible/i.test(bad.status), 'the diesel train reports no compatible route'); }
+  // a diesel train on the metro line runs like any other rail stock
+  const dsl = g.vehicles.buyTrain(dB, [M('diesel_b'), M('coach_ic')], la.id);
+  if (dsl instanceof Train) { runDays(g, 12); console.log(`  diesel on the metro line: ${dsl.status}`); check(dsl.state !== 'noroute', 'the diesel train finds a route on the metro line'); }
   // save round trip
   const json = JSON.stringify(serialize(g));
   check(JSON.stringify(serialize(deserialize(JSON.parse(json)))) === json, 'save round trip exact');
@@ -172,6 +175,7 @@ function counter(trains: Train[]) {
   const b3 = d3 >= 0 ? g.vehicles.buyTrain(d3, [M('diesel_b'), M('coach_ic')], line.id) : 'no depot';
   console.log(`  company 3 (no station): join "${j3}", train "${typeof b3 === 'string' ? b3 : 'bought'}"`);
   check(j3 !== null && typeof b3 === 'string' && !g.lines.canOperate(line, 3), 'a company without a station of the line cannot run trains on it');
+  startFleet(g, trains);
   const c = counter(trains);
   runDays(g, 360, () => c.tick());
   const v = trains.map((t) => c.visits.get(t.id) ?? 0);
@@ -218,9 +222,32 @@ function counter(trains: Train[]) {
   while (g.day < 720) g.update(0.25);
   const st = g.ais.map((a) => a.stats);
   const urbanLines = g.lines.all().filter((l) => l.kind === 'rail' && l.owner > 0 && l.stops.some((sid) => { const s2 = g.stations.get(sid); return !!s2?.rail && (s2.rail.trackType === 'metro' || s2.rail.trackType === 'lightrail'); }));
-  console.log(`  2 years (${fmt((performance.now() - t0) / 1000, 0)} s): urban lines ${urbanLines.map((l) => `${l.name} (${new Set(l.stops).size} stations)`).join(', ') || 'none'}; stats urban ${st.map((x) => x.urban).join('/')}, through ${st.map((x) => x.through).join('/')}; ${g.ais.map((a) => a.log.filter((x) => /metro|light rail|through/.test(x)).slice(-3).join(' | ')).join(' || ')}`);
+  console.log(`  2 years (${fmt((performance.now() - t0) / 1000, 0)} s): urban lines ${urbanLines.map((l) => `${l.name} (${new Set(l.stops).size} stations)`).join(', ') || 'none'}; stats urban ${st.map((x) => x.urban).join('/')}, through ${st.map((x) => x.through).join('/')}; ${g.ais.map((a) => a.log.filter((x) => /metro|light rail|city railway|through/.test(x)).slice(-3).join(' | ')).join(' || ')}`);
   check(urbanLines.length >= 1, 'the AI opened an urban railway (metro or light rail)');
 }
 
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
+
+/** Finish staged dispatch before measuring a full operating period; bound and check the startup too. */
+function startFleet(g: Game, vs: StartupVehicle[], maxWaitDays = Infinity) {
+  const cycles = vs.map((v) => {
+    const l = v.line;
+    return l ? startupTable(g, l).pats.find((p) => p.pid === (startupPattern(l, v.pattern)?.id ?? 0))?.cycle ?? 0 : 0;
+  });
+  const budget = 2 * Math.max(...cycles);
+  const deadline = g.tick + Math.ceil(budget / g.tickSeconds), waiting = new Map<number, number>();
+  let worstWait = 0, blockedHold = false;
+  while (g.tick < deadline && vs.some((v) => v.opLastSt < 0)) {
+    g.stepTick();
+    for (const v of vs) {
+      if (v.state === 'waiting' || v.state === 'noroute') {
+        const start = waiting.get(v.id) ?? g.day; waiting.set(v.id, start);
+        worstWait = Math.max(worstWait, g.day - start);
+      } else waiting.delete(v.id);
+      blockedHold ||= v.status === 'Holding for even spacing' && g.vehicles.spacingBlocked(v);
+    }
+  }
+  check(vs.every((v) => v.opLastSt >= 0), 'the whole fleet starts serving within two estimated cycles');
+  check(worstWait < maxWaitDays && !blockedHold, 'startup preserves path-wait and platform safety limits');
+}

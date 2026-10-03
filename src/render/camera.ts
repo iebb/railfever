@@ -4,6 +4,15 @@ import { World, pointInRect } from '../game/world';
 import { WATER_Y } from '../game/constants';
 import { FLOOR_H } from '../game/towns';
 
+/** Leave editing and keyboard-focused controls to their native keyboard handling. Esc stays global. */
+export function shortcutBlocked(e: KeyboardEvent): boolean {
+  if (e.key === 'Escape') return false;
+  const target = e.target instanceof HTMLElement ? e.target : null;
+  if (target?.isContentEditable || target?.closest('input, textarea, select')) return true;
+  const control = target?.closest('button, a[href], [role="button"], [role="tab"], [role="checkbox"], [role="radio"], [role="switch"], [role="slider"]');
+  return !!control?.matches(':focus-visible');
+}
+
 export class CameraController {
   target = new THREE.Vector3(128, 0, 128);
   distance = 60;
@@ -12,6 +21,8 @@ export class CameraController {
   private cur = { tx: 128, ty: 0, tz: 128, d: 60, yaw: Math.PI * 0.25, pitch: 0.8 };
   keys = new Set<string>();
   follow: (() => THREE.Vector3 | null) | null = null;
+  /** Optional render pose supplied by the game for the UI's followed vehicle. */
+  followPosition: ((out: THREE.Vector3) => boolean) | null = null;
   private drag: { mode: 'pan' | 'rotate'; x: number; y: number } | null = null;
   minDist = 1.5;
   maxDist = 700;
@@ -34,9 +45,10 @@ export class CameraController {
     window.addEventListener('pointermove', this.onMove);
     window.addEventListener('pointerup', this.onUp);
     window.addEventListener('pointercancel', this.onUp);
-    window.addEventListener('keydown', this.onKey);
+    window.addEventListener('keydown', this.onKey, { capture: true });
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', () => this.keys.clear());
+    window.addEventListener('focusin', () => this.keys.clear());
     dom.addEventListener('contextmenu', (e) => e.preventDefault());
     dom.style.touchAction = 'none';
   }
@@ -142,8 +154,11 @@ export class CameraController {
   };
 
   private onKey = (e: KeyboardEvent) => {
-    const tag = (e.target as HTMLElement)?.tagName;
-    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (shortcutBlocked(e)) {
+      // The renderer's F3 handler is on window in the bubble phase.
+      if (e.key === 'F3') e.stopImmediatePropagation();
+      return;
+    }
     if (e.ctrlKey || e.metaKey) return;
     this.keys.add(e.key.toLowerCase());
   };
@@ -189,7 +204,10 @@ export class CameraController {
     if (!this.world) { cam.position.set(this.target.x, 50, this.target.z + 50); cam.lookAt(this.target); return; }
     if (this.follow) {
       const p = this.follow();
-      if (p) { this.target.x = p.x; this.target.z = p.z; this.clampTarget(); } else this.follow = null;
+      if (p) {
+        this.followPosition?.(p);
+        this.target.x = p.x; this.target.z = p.z; this.clampTarget();
+      } else this.follow = null;
     }
     this.target.y = this.ground(this.target.x, this.target.z);
     // smoothing

@@ -111,7 +111,7 @@
 .hbtn:active { transform: scale(0.95); }
 .hbtn.on { color: var(--accent); border-color: rgba(255, 176, 32, 0.45); }
 .badge { position: absolute; top: -5px; right: -5px; min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; background: var(--accent); color: var(--accent-ink); font: 700 var(--fs-11)/18px var(--font-display); text-align: center; box-shadow: 0 0 0 2px rgba(16, 22, 31, 0.9); }
-.fps { font: 600 var(--fs-11)/1 var(--font-display); color: var(--text-3); letter-spacing: var(--tr-caps-s); margin-right: 2px; min-width: 44px; text-align: right; }
+.fps { font: 600 var(--fs-11)/1 var(--font-display); color: var(--text-3); letter-spacing: var(--tr-caps-s); margin-right: 2px; min-width: 44px; text-align: right; pointer-events: none; }
 /* volume: click mutes, hovering reveals the master slider */
 .vol { position: relative; display: flex; align-items: center; height: 40px; border-radius: 12px; padding: 0 0 0 0; transition: border-color var(--t-fast); }
 .vol .hbtn { border: 0; background: none; box-shadow: none; }
@@ -151,6 +151,7 @@
 .tc-title { font: 700 15px/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc-head .ibtn.sm { width: 30px; height: 30px; }
 .tc-head .ibtn.on { color: var(--accent); }
+.tc-head .tc-details-toggle, .tc-compact-note { display: none; }
 .tc-desc { color: var(--text-2); font-size: var(--fs-13); margin: 2px 0 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tc-help { margin-top: var(--sp-1); }
 .tc-help p { margin: 0; color: var(--text-2); font-size: var(--fs-13); font-weight: 400; line-height: var(--lh); }
@@ -451,6 +452,11 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .toast.news.link { cursor: pointer; }
 .toast.news.link:hover { border-color: var(--hairline-2); background: rgba(22, 30, 42, 0.95); }
 .toast.out { opacity: 0; transform: translateY(-6px); }
+.finance-toast { flex-wrap: wrap; }
+.finance-toast > span { flex: 1; min-width: 160px; }
+.finance-actions { gap: 6px; }
+.finance-toast > .finance-actions { margin-left: auto; }
+.tooltip .finance-actions { pointer-events: auto; margin-top: 8px; }
 .news-date { font: 600 var(--fs-11)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; color: var(--text-3); white-space: nowrap; }
 .drawer { position: absolute; top: 64px; right: 10px; bottom: 92px; width: min(390px, calc(100vw - 20px)); z-index: 70; display: flex; flex-direction: column; border-radius: var(--r-l); animation: rise var(--t) var(--ease); }
 .drawer-head { display: flex; align-items: center; gap: var(--sp-2); padding: 10px 8px 10px 14px; border-bottom: 1px solid var(--hairline); font: 700 17px/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; }
@@ -559,8 +565,8 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .title { position: absolute; inset: 0; z-index: 90000; display: flex; padding: var(--sp-6); overflow: auto; pointer-events: auto; background: radial-gradient(ellipse at 30% 40%, rgba(10, 14, 20, 0.35), rgba(8, 11, 16, 0.82)); -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 .title * { pointer-events: auto; }
 /* safe centring: content wraps instead of overflowing off-screen */
-.title-row { margin: auto; display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 28px; max-width: 100%; }
-.title-main { display: flex; flex-direction: column; gap: 22px; min-width: min(300px, 100%); max-width: 420px; animation: fadeIn 0.3s var(--ease); }
+.title-row { margin: auto; display: flex; flex-wrap: nowrap; align-items: center; justify-content: center; gap: 28px; width: 100%; max-width: 100%; }
+.title-main { display: flex; flex-direction: column; gap: 22px; flex: 0 0 420px; min-width: min(280px, 100%); max-width: 420px; animation: fadeIn 0.3s var(--ease); }
 .wordmark { font: 700 clamp(56px, 9vw, 104px)/0.86 var(--font-display); letter-spacing: 0.035em; color: #fff; text-shadow: 0 4px 30px rgba(0, 0, 0, 0.5); }
 .wordmark span { color: var(--accent); }
 .motif { display: block; width: 100%; max-width: 380px; height: auto; margin-top: -6px; }
@@ -578,7 +584,16 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .savechip.show { opacity: 1; transform: none; }
 .savechip.saved .ic { color: var(--pos); }
 .savechip.error { color: var(--warn); }
-.ng-card { width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
+.savechip.memory { color: var(--warn); }
+.storage-banner { position: absolute; z-index: 95000; top: 76px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid var(--warn); border-radius: var(--r-m); background: var(--surface-solid); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; font-size: var(--fs-13); }
+.storage-banner > .ic { color: var(--warn); flex-shrink: 0; }
+.storage-banner > span { flex: 1; }
+.storage-banner button { flex-shrink: 0; }
+@media (max-width: 640px) { .storage-banner { top: 100px; flex-wrap: wrap; width: calc(100vw - 24px); } .storage-banner > span { min-width: 190px; } }
+.ng-card { flex: 0 0 auto; width: min(470px, 100%); padding: var(--sp-4) 18px 18px; border-radius: 18px; animation: rise var(--t) var(--ease); }
+/* menu and new-game card always side by side; they stack only on narrow screens */
+@media (max-width: 1040px) { .title-main { flex: 0 1 420px; } }
+@media (max-width: 760px) { .title-row { flex-wrap: wrap; } .title-main { flex: 1 1 100%; } }
 .ng-title { font: 700 var(--fs-24)/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; margin-bottom: var(--sp-2); }
 .ai-chips { display: flex; gap: 5px; flex-wrap: wrap; }
 .ai-chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px 0 7px; border-radius: 6px; background: var(--raised); font: 600 var(--fs-12)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; }
@@ -609,12 +624,39 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (max-width: 1100px) {
   .minimap { bottom: 96px; }
   .cat { width: 64px; }
+  .fps, .vol-slider { display: none; }
+  #app.debug-ui .fps { display: block; position: absolute; right: 0; top: 44px; }
+}
+@media (max-width: 1279px) {
+  /* A definite parent width makes the dock/tray's overflow scroll instead of clipping categories. */
+  .dockwrap { width: calc(100vw - 20px); }
+  .dock, .tray { min-width: 0; box-sizing: border-box; overflow-x: auto; touch-action: pan-x; overscroll-behavior-x: contain; }
+  .vol-slider { display: none; }
+  .toolcard { width: calc(288px * var(--uis, 1)); box-sizing: border-box; max-height: min(42vh, calc(100dvh - var(--dock-clearance, 90px) - 116px * var(--uis, 1))); overflow-y: auto; }
+  .toolcard .tc-details-toggle { display: inline-flex; }
+  .toolcard:not(.expanded) .tc-secondary { display: none; }
+  .toolcard .tc-compact-note { display: block; margin-top: 4px; color: var(--text-2); font-size: var(--fs-12); overflow-wrap: anywhere; }
+  .toolcard .tc-opts { gap: 6px 8px; }
+  .toolcard .opt { flex-wrap: wrap; min-width: 0; max-width: 100%; }
+  .toolcard .seg { max-width: 100%; flex-wrap: wrap; }
+  .toolcard .segb { padding: 0 7px; }
+  .leftcol { bottom: var(--dock-clearance, 90px); }
+  /* Bottom anchoring keeps even dragged/resized windows clear of the entire dock and tray. */
+  .win { top: auto !important; bottom: var(--dock-clearance, 90px); max-height: calc(100dvh - var(--dock-clearance, 90px) - 78px); }
+  .drawer { bottom: var(--dock-clearance, 90px); }
+}
+@media (min-width: 721px) and (max-width: 1279px) and (max-height: 768px) {
+  .has-tool-card .leftcol { width: 250px; }
+  .has-tool-card .checklist { width: 250px; }
 }
 @media (max-width: 720px) {
   .hud { top: 6px; }
   .hud-tl { left: 6px; }
   .hud-tr { right: 6px; gap: var(--sp-1); }
-  .hud-tc { top: 64px; }
+  .hud-tc { top: 60px; left: 6px; right: 6px; transform: none; align-items: center; }
+  .hud-tl { max-width: calc(100vw - 186px); }
+  .hud-tl .plate { min-width: 0; max-width: 100%; box-sizing: border-box; }
+  .hud-tr .vol, .hud-tr .hbtn[data-key="C"], .hud-tr .hbtn[data-key="K"] { display: none; }
   .plate { height: 46px; padding: 0 10px 0 6px; }
   .plate-name { max-width: 120px; }
   .plate-money { font-size: 22px; }
@@ -622,23 +664,30 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
   .fps { display: none; }
   .vol-slider { display: none; }
   .hbtn { width: 38px; height: 38px; }
-  .clock { height: 38px; }
+  .clock { height: 38px; width: 100%; max-width: 390px; box-sizing: border-box; justify-content: space-between; }
   .clock-date { min-width: 90px; font-size: 15px; }
   .spd { min-width: 32px; height: 28px; padding: 0 6px; }
   .toasts { top: 108px; }
-  .dockwrap { bottom: 6px; }
+  .dockwrap { bottom: 6px; width: calc(100vw - 12px); max-width: calc(100vw - 12px); }
   .cat { width: 60px; height: 54px; }
   .tc-desc { display: none; }
   .toolcard { left: 6px; right: 6px; width: auto; max-width: none; }
-  .minimap { left: 6px; top: 110px; bottom: auto; width: 150px; }
-  .mm-view { width: 134px; height: 134px; }
-  .checklist { left: auto; right: 6px; top: 110px; width: 250px; }
-  .mapcard { left: 6px; right: 6px; width: auto; bottom: 80px; max-height: 38vh; }
+  .leftcol { position: absolute; display: flex; flex-direction: column; align-items: flex-start; gap: 6px; left: 6px; right: 6px; top: 112px; bottom: var(--dock-clearance, 80px); width: auto; z-index: 45; pointer-events: none; }
+  .leftcol.below-debug { top: 252px; }
+  .leftcol > * { pointer-events: auto; }
+  .leftcol > .checklist, .leftcol > .minimap, .leftcol > .mapcard { position: relative; left: auto; right: auto; top: auto; bottom: auto; flex: none; max-width: 100%; }
+  .leftcol > .checklist { width: min(286px, 100%); align-self: flex-end; flex: 0 1 auto; min-height: 46px; display: flex; flex-direction: column; }
+  .leftcol > .checklist > * { flex: none; }
+  .leftcol > .checklist > .cl-steps { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  .leftcol > .minimap { width: 180px; margin-top: auto; }
+  .mm-view { width: 164px; height: 164px; }
+  .mm-head { flex-wrap: wrap; height: auto; min-height: 36px; padding: 3px 4px 3px 8px; }
+  .leftcol > .mapcard { width: 100%; max-height: 30vh; flex: 0 1 auto; min-height: 46px; }
   .hovercard { display: none; }
-  .win { position: fixed; left: 0 !important; right: 0; top: auto !important; bottom: 0; width: auto !important; max-width: none; max-height: 72vh; border-radius: 18px 18px 0 0; animation: sheetIn var(--t) var(--ease); }
+  .win { position: fixed; left: 6px !important; right: 6px; top: auto !important; bottom: var(--dock-clearance, 80px); width: auto !important; max-width: none; max-height: min(62vh, calc(100dvh - var(--dock-clearance, 80px) - 112px)); border-radius: 18px; animation: sheetIn var(--t) var(--ease); }
   .win.closing { animation: sheetOut var(--t-fast) var(--ease-in) forwards; }
   .win-head { cursor: default; }
-  .drawer { top: 108px; bottom: 80px; right: 6px; }
+  .drawer { top: 108px; bottom: var(--dock-clearance, 80px); right: 6px; }
   .title { padding: var(--sp-4); }
   .title-row { gap: var(--sp-4); }
   .field { grid-template-columns: 96px 1fr; }
@@ -664,12 +713,13 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 @media (max-width: 1360px) {
   .hud-tr .hbtn[data-key="M"], .hud-tr .hbtn[data-key="P"], .hud-tr .hbtn[data-key="O"] { display: none; }
 }
-@media (max-width: 880px) {
-  .hud-tc { top: 64px; }
+@media (max-width: 1100px) {
+  .hud-tc { top: 60px; }
+  .leftcol { top: 112px; }
 }
 
 /* ---------------------------------------------------------------- line identity (JR style): symbols, numbering, filters */
-:root { --metro: #2ec4b6; --lightrail: #9bd16a; --coach: #e0b04a; }
+:root { --coach: #e0b04a; }
 .lsym { display: inline-flex; align-items: center; justify-content: center; min-width: 26px; height: 20px; padding: 0 4px; border-radius: 5px; background: var(--c); color: var(--ink, #fff); font: 700 12px/1 var(--font-display); letter-spacing: 0.04em; flex: none; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); white-space: nowrap; }
 .lsym.sm { min-width: 22px; height: 17px; padding: 0 3px; font-size: 11px; border-radius: 4px; }
 .lsym.lg { min-width: 38px; height: 30px; padding: 0 6px; font-size: 17px; border-radius: 7px; }
@@ -898,4 +948,117 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 }
 @media (max-width: 420px) {
   .share-trades { grid-template-columns: 1fr; }
+}
+
+/* Rail symbols beyond the station-name zoom range; keep the plate DOM for zooming back in. */
+.lbl.stn.compact { width: 28px; height: 28px; padding: 4px; box-sizing: border-box; border-radius: 8px; }
+.lbl.stn.compact .lbl-ico { flex: none; background: none; }
+.lbl.stn.compact .lbl-ico .ic { width: 18px; height: 18px; }
+.lbl.stn.compact .lbl-name,
+.lbl.stn.compact .lbl-wait,
+.lbl.stn.compact .lbl-mark,
+.lbl.stn.compact .lbl-chips,
+.lbl.stn.compact .lbl-badges { display: none; }
+
+/* Joining lines: candidates, a complete route and the shared terminus before confirmation. */
+.linejoin-note { margin: 8px 0; font-size: var(--fs-12); line-height: 1.5; overflow-wrap: anywhere; }
+.linejoin-choices { display: grid; gap: 6px; }
+.linejoin-choice { display: flex; align-items: center; gap: 8px; width: 100%; min-width: 0; padding: 10px; border: 1px solid var(--hairline); border-radius: var(--r); background: var(--raised); color: inherit; text-align: left; cursor: pointer; }
+.linejoin-choice:hover, .linejoin-choice.on { border-color: var(--accent); background: var(--accent-soft); }
+.linejoin-choice-text { display: grid; gap: 3px; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.linejoin-choice-text > .muted { font-size: var(--fs-12); }
+.linejoin-route { margin: 8px 0 12px 18px; padding-left: 20px; border-left: 3px solid var(--linejoin-color); }
+.linejoin-route li { padding: 6px 4px; overflow-wrap: anywhere; }
+.linejoin-route li > .flag { margin-left: 8px; }
+.linejoin-route .junction { font-weight: 600; }
+.linejoin-reason { display: grid; gap: 4px; padding: 8px 10px; font-size: var(--fs-12); line-height: 1.4; overflow-wrap: anywhere; }
+.linejoin-info .btns .btn { height: auto; min-height: 34px; white-space: normal; }
+@media (min-width: 721px) {
+  .linejoin-info { max-height: min(620px, calc(100vh - 200px)); }
+}
+
+/* Unnumbered bus, coach and tram lines retain their colour identity. */
+.lcolor { display: inline-block; width: 14px; height: 20px; border-radius: 4px; background: var(--c); flex: none; vertical-align: middle; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.18); }
+.lcolor.sm { width: 10px; height: 17px; border-radius: 3px; }
+.lcolor.lg { width: 28px; height: 30px; border-radius: 7px; }
+.lbl.tag .lcolor { margin: -1px 5px -1px -4px; box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.85); }
+.lbl.stn .lbl-mark.lcolor { width: 10px; height: 17px; padding: 0; flex: none; }
+.list.stops .row > .lcolor { flex: none !important; }
+
+/* ================================================================ accessibility
+   Interface size, minimum text sizes, focus rings, colour-blind-safe mode colours and the second cues of the map
+   views' legends. Kept in one block. */
+
+/* Interface size (Settings → Interface; src/ui/uiscale.ts sets --uis and data-uis on <html>): CSS zoom lays the HUD,
+   the left column, toasts, news, windows and the title screen out again at 90–130 % (sharp text, no transform).
+   Lengths in vw / vh inside a zoomed box are zoomed too, so those limits are divided by --uis. Boxes placed by
+   script (windows, tool card, cursor tooltip, hints, hover card, map labels) keep their own box and zoom contents. */
+:root { --uis: 1; }
+#app .hud, #app .dockwrap, #app .leftcol, #app .toasts, #app .drawer, #app .title { zoom: var(--uis); }
+#app .dockwrap { max-width: calc((100vw - 20px) / var(--uis)); }
+#app .toasts { width: min(540px, calc((100vw - 20px) / var(--uis))); }
+#app .drawer { width: min(390px, calc((100vw - 20px) / var(--uis))); }
+#app .win > *, #app .toolcard > *, #app .tooltip > *, #app .uitip > *, #app .hovercard > *, #app .labels .lbl > * { zoom: var(--uis); }
+#app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
+@media (min-width: 1280px) { #app .toolcard { width: calc(356px * var(--uis)); max-height: calc(100dvh - var(--dock-clearance, 90px) - 116px * var(--uis)); } }
+#app .tooltip { min-width: calc(160px * var(--uis)); max-width: calc(300px * var(--uis)); padding: calc(10px * var(--uis)) calc(12px * var(--uis)); }
+#app .uitip { gap: calc(8px * var(--uis)); padding: calc(6px * var(--uis)) calc(9px * var(--uis)) calc(6px * var(--uis)) calc(11px * var(--uis)); font-size: calc(var(--fs-13) * var(--uis)); max-width: calc(300px * var(--uis)); }
+#app .hovercard { min-width: calc(170px * var(--uis)); max-width: calc(260px * var(--uis)); padding: calc(9px * var(--uis)) calc(11px * var(--uis)) calc(10px * var(--uis)); }
+#app .lbl.tag { max-width: calc(170px * var(--uis)); }
+#app .lbl.stn.compact { width: calc(28px * var(--uis)); height: calc(28px * var(--uis)); padding: calc(4px * var(--uis)); }
+#app .float { font-size: calc(var(--fs-16) * var(--uis)); }
+#app .float.income { font-size: calc(18px * var(--uis)); }
+/* the top bar needs more room at larger sizes: the map buttons go (as below 1360 px), and the clock moves under the
+   bar (toasts below it) wherever it would cover the action buttons (about 1110 px of unscaled width) */
+@media (max-width: 1560px) { :root[data-uis="115"] .hud-tr .hbtn[data-key="M"], :root[data-uis="115"] .hud-tr .hbtn[data-key="P"], :root[data-uis="115"] .hud-tr .hbtn[data-key="O"] { display: none; } }
+@media (max-width: 1770px) { :root[data-uis="130"] .hud-tr .hbtn[data-key="M"], :root[data-uis="130"] .hud-tr .hbtn[data-key="P"], :root[data-uis="130"] .hud-tr .hbtn[data-key="O"] { display: none; } }
+@media (max-width: 1280px) { :root[data-uis="115"] .hud-tc { top: 64px; } :root[data-uis="115"] .toasts, :root[data-uis="115"] .leftcol:not(.below-debug) { top: 112px; } }
+@media (max-width: 1445px) { :root[data-uis="130"] .hud-tc { top: 64px; } :root[data-uis="130"] .toasts, :root[data-uis="130"] .leftcol:not(.below-debug) { top: 112px; } }
+/* title screen: menu and new-game card side by side only while they fit (as the 1040 / 920 / 760 px rules above) */
+@media (max-width: 1196px) { :root[data-uis="115"] .title-main { flex: 0 1 420px; } }
+@media (max-width: 1352px) { :root[data-uis="130"] .title-main { flex: 0 1 420px; } }
+@media (max-width: 1058px) { :root[data-uis="115"] .title.card-open .title-main { display: none; } }
+@media (max-width: 1196px) { :root[data-uis="130"] .title.card-open .title-main { display: none; } }
+@media (max-width: 874px) { :root[data-uis="115"] .title-row { flex-wrap: wrap; } :root[data-uis="115"] .title-main { flex: 1 1 100%; } }
+@media (max-width: 988px) { :root[data-uis="130"] .title-row { flex-wrap: wrap; } :root[data-uis="130"] .title-main { flex: 1 1 100%; } }
+
+/* the interface-size buttons share the settings field evenly */
+.seg.uiscale { display: flex; width: 100%; }
+.seg.uiscale .segb { flex: 1; justify-content: center; padding: 0 4px; }
+
+/* Smallest text at 100 %: numbering badges have 10 px letters (were 7.5 and 9 px) in slightly larger squares. */
+.snum { width: 29px; height: 29px; }
+.snum i { font-size: 10px; }
+.snum.sm { width: 25px; height: 25px; }
+.snum.sm i { font-size: 10px; }
+.snum.sm b { font-size: 11px; }
+
+/* Windows and the title screen take the focus when they open (Tab continues with their controls): a quiet ring
+   around a keyboard-focused window, none around the whole title screen. */
+#app .win:focus-visible { outline: 2px solid rgba(255, 176, 32, 0.55); outline-offset: 1px; }
+#app .title:focus, #app .title:focus-visible { outline: none; }
+
+/* Transport-mode colours: tram moved so the three catchment modes (rail of every track type, tram, bus) stay
+   >= ~20 delta E apart for deuteranopia, protanopia and tritanopia (tram vs rail was 3); matches CATCH_COLOR in
+   gameapi.ts. */
+:root { --tram: #b25ec5; }
+.flag.shared { background: rgba(178, 94, 197, 0.18); color: color-mix(in srgb, var(--tram) 62%, #fff); }
+
+/* Map-view legends repeat the map's second cue. Signals: thin free, dashed reserved, wide occupied blocks; large
+   path and small block signals; diamond (two-way) and arrow (one-way) heads. Catchment: solid and dotted rings like
+   the streets. */
+.mc-row > i.mc-thin { height: 3px; }
+.mc-row > i.mc-wide { height: 7px; border-radius: 3px; }
+.mc-row > i.mc-dash { height: 5px; background: repeating-linear-gradient(90deg, var(--c) 0 5px, rgba(11, 15, 20, 0.7) 5px 8px) !important; }
+.mc-row > i.mc-dot { width: 8px; height: 8px; margin: 0 3px; border-radius: 50%; }
+.mc-row > i.mc-dot.big { width: 11px; height: 11px; margin: 0 1.5px; }
+.mc-row > i.mc-diamond { width: 9px; height: 9px; margin: 0 2px; border-radius: 1px; transform: rotate(45deg); }
+.mc-row > i.mc-arrow { width: 0; height: 0; margin: 0 1px; border-radius: 0; background: none !important; border-left: 6px solid transparent; border-right: 6px solid transparent; border-bottom: 10px solid var(--c); }
+.mc-row > i.mc-ring.tram { border-style: dotted; }
+/* Demand: orange (unserved, dashed) → pale yellow → blue (served, solid); see servedColor in mapmodes.ts. */
+.mc-grad i {
+  height: 7px; background: linear-gradient(90deg, #ff7a2f, #ffe08a, #5ea8ff);
+  -webkit-mask-image: linear-gradient(90deg, transparent 50%, #000 78%), repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 8px);
+  mask-image: linear-gradient(90deg, transparent 50%, #000 78%), repeating-linear-gradient(90deg, #000 0 5px, transparent 5px 8px);
+  -webkit-mask-composite: source-over; mask-composite: add;
 }

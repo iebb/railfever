@@ -1,4 +1,4 @@
-// Stations: catchment radii per mode, road access (access streets, no passengers without), underground stations
+// Stations: walking catchment limits per mode, road access (access streets, no passengers without), underground stations
 // (entrances, a tunnel line with a train), elevated stations (viaduct, a bridge line with a train), level costs,
 // merging a bus stop into a rail station, linked stations with walking transfers, names for a 30-station town,
 // rebuilding a station with more and longer platforms while its line runs, relocating, and the save round trip.
@@ -109,8 +109,9 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const sh = g.stations.catchmentShapes(S);
   // (a station building draws people from further away: +20% for the classic one)
   const RB = CATCHMENT_RADIUS.rail * (1 + styleOf(S.rail!.style).catchBonus);
-  check(S.rail!.style === 'classic' && Math.abs(RB - 48) < 1e-9, 'a classic station building widens the 400 m catchment by 20%');
-  check(sh.length === 3 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(Math.max(...sh.map((c) => c.x)) - 132) < 0.01, 'rail: 3 circles along the platforms (ends and centre)');
+  check(S.rail!.style === 'classic' && Math.abs(RB - 40.32) < 1e-9, 'a classic station building extends the 336 m rail walking limit by 20%');
+  const sf = g.stations.forecourt(S)!;
+  check(sh.length === 1 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(sh[0].x - sf.x) < 0.01 && Math.abs(sh[0].z - sf.z) < 0.01, 'ground rail access starts at the forecourt');
   const busId = g.stations.nextId;
   check(!g.stations.commitBusStop(50, 100, 0), 'bus stop built');
   const bus = g.stations.get(busId)!;
@@ -122,11 +123,10 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const tram = g.stations.get(tramId)!;
   const rb = g.stations.catchmentShapes(bus)[0], rt = g.stations.catchmentShapes(tram)[0];
   console.log(`  radii: rail ${sh[0].r}, tram ${rt?.r} (${rt?.mode}), bus ${rb?.r} (${rb?.mode})`);
-  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, 'tram and bus radii, rail > tram > bus');
-  // measured from the platforms: a house 46 beyond a platform end is in, one 55 from every circle is out
-  const hin = house(g, 132 + 46, 104), hout = house(g, 128, 104 + 55), hside = house(g, 128, 104 + 47);
+  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 22.4 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 30.8 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '224 m bus and 308 m tram radii (twice the earlier path limits), rail > tram > bus');
+  const hin = house(g, 138, 98), hout = house(g, 128, 144), hside = house(g, 128, 98);
   const cb = new Set(g.stations.catchmentBuildings(S));
-  check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'catchment measured from the platform area');
+  check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'street-front homes within the forecourt walking budget are covered');
   // no road access: no catchment
   const plan = g.stations.planRail(128, 170, Math.PI / 2, 8, 2, 0);
   console.log(`  far from roads: ok ${plan.ok}, access ${plan.roadAccess}, warning "${plan.warnings[0] ?? ''}"`);
@@ -136,12 +136,13 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const N = g.stations.get(nid)!;
   for (let i = 0; i < 6; i++) house(g, 120 + i * 3, 176);
   g.stations.recomputeCatchment();
-  check(!N.roadAccess && !g.stations.hasAccess(N) && g.stations.catchmentShapes(N).length === 0 && g.stations.catchmentShapes(N, true).length === 3 && N.catchPop === 0, 'no road access: no active catchment, no catchment population');
+  check(!N.roadAccess && !g.stations.hasAccess(N) && g.stations.catchmentShapes(N).length === 0 && g.stations.catchmentShapes(N, true).length === 1 && N.catchPop === 0, 'no road access: no active catchment, no catchment population');
   // a road to the forecourt gives access (out from the building, past the platform end, to the road)
   const fc = g.stations.forecourt(N)!;
   const out = Math.sign(fc.z - N.rail!.z) || 1;
   build(g, free(g, fc.x, fc.z), free(g, fc.x + 14, fc.z + out * 3), roadOpts(0, 'road'), 'to the forecourt');
   build(g, findSnap(g, 'road', fc.x + 14, fc.z + out * 3), findSnap(g, 'road', fc.x + 14, 100), roadOpts(0, 'road', { straight: true }), 'link');
+  house(g, fc.x + 8, fc.z + out * (3 * 8 / 14 + 2));
   g.update(0.01);
   g.stations.recomputeCatchment();
   check(N.roadAccess && N.catchPop > 0, `a road reaching the forecourt gives access (pop ${fmt(N.catchPop, 0)})`);
@@ -180,7 +181,7 @@ let saveGame: Game | null = null;
   const pe = U.rail!.edges.map((id) => net.edges.get(id)!);
   check(pe.every((e) => e.sections.length === 1 && e.sections[0].type === 'tunnel' && e.sections[0].s0 === 0 && e.sections[0].s1 >= e.len - 1e-6), 'platform tracks: full-length tunnel sections');
   check(U.rail!.y < g.world.heightAt(60, 128.5) - 1.5 && U.roadAccess, 'below the surface, with road access through its entrances');
-  check(g.stations.catchmentShapes(U).length === U.rail!.entrances.length, 'catchment circles around the entrances');
+  check(g.stations.catchmentShapes(U).length === U.rail!.entrances.length, 'walking access at every connected entrance');
   // a street right across the top of the station
   check(!!road(g, 58, 110, 58, 147), 'a street can cross over the underground station');
   // a tunnel line from the platform ends to a ground station

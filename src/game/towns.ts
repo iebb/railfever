@@ -112,6 +112,9 @@ export interface Town {
   nextGrowthDay: number;
   hasChurch: boolean;
   passGenMonth: number; passTransMonth: number; passGenLast: number; passTransLast: number;
+  /** passengers who gave up waiting at the town's stations this / last month (Stations.trimWaiting; old saves: none) */
+  passLostMonth?: number; passLostLast?: number;
+  /** active stations near the town at its last growth step (see townService) */
   served: number;
   /** street grid (towns from old saves get one on their next growth step) */
   grid?: TownGrid;
@@ -120,6 +123,87 @@ export interface Town {
   /** size by which the town claims land against its neighbours (planned size, then its population) */
   claim?: number;
 }
+
+// ---------------------------------------------------------------- growth by public transport service
+/**
+ * How often a town grows follows its public transport, roughly as in OpenTTD: the stations near it that vehicles
+ * called at recently (active stations), the share of its residents within their walking catchment weighted by how
+ * often vehicles call (reach), the share of their passengers transported rather than giving up waiting, and the
+ * stations' ratings. A town without public transport still grows, slowly. The growth step itself (lots, streets,
+ * densification) is Towns.growStep; this only sets how often a town takes its steps (scripts/growth.ts: over 20
+ * years well-served towns grow about 1.6-2.5x, poorly served ones 1.3-1.6x, towns without service 1.1-1.3x).
+ */
+/** A station near a town is active when a line serves it and a vehicle called within this many days (v2 calendar; building it is no call). */
+export const GROWTH_ACTIVE_DAYS = 90;
+/** Mean days between growth steps without public transport (about 1 % a year for a balanced town) and with the best service. */
+export const GROWTH_DAYS_UNSERVED = 100, GROWTH_DAYS_BEST = 6;
+/**
+ * Share of the residents reached by frequent service at which the reach counts fully: 0.3 since the walking reach
+ * doubled (0.12 before), so a small town is not fully served by a station whose vehicles seldom call
+ * (GROWTH_MIN_CALLS of a catchment covering it whole) and coverage keeps mattering in larger towns.
+ */
+export const GROWTH_FULL_REACH = 0.3;
+/** Service frequency that counts fully: vehicles called on this share of the last 30 days (Stations.callShare; 0.05: on two). */
+export const GROWTH_FULL_CALLS = 0.05;
+/** An active station without a call in the last 30 days still counts this much (a train every ~2 months still serves a town). */
+export const GROWTH_MIN_CALLS = 0.15;
+/** Station ratings from this (by catchment) count fully; lower ones slow growth. */
+export const GROWTH_FULL_RATING = 0.7;
+/** Growth speed labels by service score (index: score below 0.01, 0.2, 0.4, 0.6, else). */
+const GROWTH_LABELS = ['slow', 'moderate', 'good', 'fast', 'very fast'];
+
+/** A town's public transport and what it does for its growth (townService). */
+export interface TownService {
+  /** active stations near the town */
+  stations: number;
+  /** share of the residents in the walking catchment of the active stations (0..1) */
+  coverage: number;
+  /** that share weighted by how often vehicles called in the last 30 days (GROWTH_MIN_CALLS .. 1 from GROWTH_FULL_CALLS; 0..1) */
+  reach: number;
+  /** share of the passengers at the active stations who boarded rather than gave up waiting, this and last month (0..1) */
+  transported: number;
+  /** mean rating of the active stations (by their catchment) */
+  rating: number;
+  /** 0 (no service) .. 1 (frequent service for enough of the town, nobody left behind, good ratings) */
+  score: number;
+  /** how many times as often as a town without public transport the town takes its growth steps */
+  speed: number;
+  /** 'slow' .. 'very fast' */
+  label: string;
+}
+
+/**
+ * A town's public transport service and growth speed (Towns.daily schedules growth steps by it; the town window
+ * shows it): score = reach (up to GROWTH_FULL_REACH) x (0.3 + 0.7 transported) x (0.4 + 0.6 rating, up to
+ * GROWTH_FULL_RATING); the speed goes from 1 (no service) to GROWTH_DAYS_UNSERVED / GROWTH_DAYS_BEST (score 1). Each
+ * active station reaches its catchment by how often vehicles called in the last 30 days (Stations.callShare), from
+ * GROWTH_MIN_CALLS (none) to fully (GROWTH_FULL_CALLS).
+ */
+export function townService(g: Game, town: Town): TownService {
+  let stations = 0, catchPop = 0, reached = 0, rated = 0, boarded = 0, lost = 0;
+  const R = town.radius + 10;
+  for (const st of g.stations.map.values()) {
+    if (st.lastCall < 0 || g.day - st.lastCall > GROWTH_ACTIVE_DAYS || !g.lines.stationServed(st.id)) continue;
+    if (Math.hypot(st.x - town.x, st.z - town.z) > R) continue;
+    stations++;
+    catchPop += st.catchPop;
+    reached += st.catchPop * (GROWTH_MIN_CALLS + (1 - GROWTH_MIN_CALLS) * Math.min(1, g.stations.callShare(st) / GROWTH_FULL_CALLS));
+    rated += st.catchPop * st.rating;
+    boarded += st.pickupMonth + st.pickupLast;
+    lost += (st.lostMonth || 0) + (st.lostLast || 0);
+  }
+  const pop = Math.max(1, town.pop);
+  const coverage = Math.min(1, catchPop / pop), reach = Math.min(1, reached / pop);
+  const rating = catchPop > 0 ? rated / catchPop : 0;
+  const transported = boarded + lost > 0 ? boarded / (boarded + lost) : 1;
+  const score = stations ? Math.min(1, reach / GROWTH_FULL_REACH) * (0.3 + 0.7 * transported) * (0.4 + 0.6 * Math.min(1, rating / GROWTH_FULL_RATING)) : 0;
+  const speed = 1 + (GROWTH_DAYS_UNSERVED / GROWTH_DAYS_BEST - 1) * score;
+  const label = GROWTH_LABELS[score < 0.01 ? 0 : score < 0.2 ? 1 : score < 0.4 ? 2 : score < 0.6 ? 3 : 4];
+  return { stations, coverage, reach, transported, rating, score, speed, label };
+}
+
+/** Town traffic (ambient cars): about one car per TRAFFIC_PER_CAR inhabitants, between TRAFFIC_MIN and TRAFFIC_MAX cars on the map. */
+export const TRAFFIC_PER_CAR = 150, TRAFFIC_MIN = 120, TRAFFIC_MAX = 900;
 
 const TOWN_OPTS = (): BuildOptions => ({ kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner: -1, town: true });
 /** Towns grade their streets into the slopes: cuttings and banks up to this deep / high (9i). */
@@ -267,6 +351,17 @@ export class Towns {
 
   profileOf(town: Town): ProfileSpec { return GROWTH_PROFILES[town.profile ?? 'balanced'] ?? GROWTH_PROFILES.balanced; }
 
+  /**
+   * Town traffic on the map (Vehicles.manageAmbient): how many cars, and how many inhabitants each town has per car
+   * (TRAFFIC_PER_CAR; more once the map reaches TRAFFIC_MAX cars, fewer up to TRAFFIC_MIN cars, but at least 100).
+   */
+  traffic(): { cars: number; perCar: number } {
+    let pop = 0;
+    for (const t of this.list) pop += t.pop;
+    const cars = Math.max(TRAFFIC_MIN, Math.min(TRAFFIC_MAX, Math.round(pop / TRAFFIC_PER_CAR)));
+    return { cars, perCar: Math.max(100, pop / cars) };
+  }
+
   // ---------------------------------------------------------------- generation
   generate(count: number, seed: number, cityFraction = 0.17) {
     const w = this.world;
@@ -342,7 +437,7 @@ export class Towns {
       const town: Town = {
         id: this.list.length, name: townName(rng, used), x: site.x, z: site.z, angle: 0,
         pop: 0, buildings: new Set(), radius: 4, nextGrowthDay: rng.int(30), hasChurch: false,
-        passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, served: 0,
+        passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, passLostMonth: 0, passLostLast: 0, served: 0,
       };
       this.list.push(town);
       // fewer but larger towns (9g): every tier 35 % larger than before
@@ -413,6 +508,8 @@ export class Towns {
       w.h[k] = h + (base - h) * wgt;
     }
     w.heightsVersion++;
+    w.terrainVersions.bump([cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1]);
+    w.frontageTerrainVersions.bump([cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1]);
   }
 
   /** Flattest direction around a point (valleys, coasts), how anisotropic the ground is and whether water is near. */
@@ -1570,6 +1667,28 @@ export class Towns {
   maxRadius(town: Town) { return 11 + Math.sqrt(Math.max(100, town.pop)) * 0.68; }
   /** Radius within which new lots and streets may appear (compact core, or the existing built-up area). */
   growthRadius(town: Town) { const m = this.maxRadius(town); return Math.max(m * 1.15, Math.min(town.radius - 2.5, m * 1.5)); }
+
+  /**
+   * Daily (game.ts): towns due to grow take their growth steps and schedule the next ones by their public transport
+   * (townService: about every GROWTH_DAYS_UNSERVED days without, down to GROWTH_DAYS_BEST with the best service).
+   */
+  daily() {
+    const g = this.game;
+    for (const town of this.list) {
+      if (g.day < town.nextGrowthDay) continue;
+      const sv = townService(g, town);
+      town.served = sv.stations;
+      town.nextGrowthDay = g.day + Math.round((GROWTH_DAYS_UNSERVED / sv.speed) * (0.7 + g.rng.next() * 0.6));
+      // big towns take more steps (each step is paced to their size: growStep)
+      const steps = 1 + Math.floor(town.pop / 2500);
+      const before = town.pop;
+      for (let i = 0; i < steps; i++) this.growStep(town, g.rng, g.day);
+      this.recomputePop(town);
+      if (Math.floor(before / 1000) < Math.floor(town.pop / 1000) && town.pop >= 2000) {
+        g.postNews(`${town.name} is booming: population passes ${Math.floor(town.pop / 1000) * 1000}!`, 'good', town.x, town.z);
+      }
+    }
+  }
 
   /** One growth step: frontage lots, a new street at the edge, or densification. */
   growStep(town: Town, rng: RNG, day: number, plannedPop = town.pop): boolean {
