@@ -1866,7 +1866,7 @@ export class AIController {
   }
 
   // ---------------------------------------------------------------- stations: room to grow
-  /** day each of our stations may next be looked at for growth (not saved: looked at again after loading) */
+  /** day each of our stations may next be looked at for growth (saved, so a loaded game decides as the original) */
   private stationCare = new Map<number, number>();
 
   /** Directions lines leave a station in (neighbouring stops more than ~35 degrees apart as seen from it). */
@@ -4120,7 +4120,7 @@ export class AIController {
       config: this.config,
       state: {
         ...this.state, rng: this.rng.state, failed: [...this.failed], stats: this.stats, lines: [...this.lines],
-        project: this.project, lastAcq: this.lastAcq, tram, relengthen: this.relengthen,
+        project: this.project, lastAcq: this.lastAcq, tram, relengthen: this.relengthen, stationCare: [...this.stationCare].sort((x, y) => x[0] - y[0]),
       },
     };
   }
@@ -4136,6 +4136,7 @@ export class AIController {
     if (s.stats) this.stats = { ...this.stats, ...s.stats };
     if (Array.isArray(s.lines)) this.lines = new Map(s.lines);
     if (typeof s.lastAcq === 'number') this.lastAcq = s.lastAcq;
+    if (Array.isArray(s.stationCare)) this.stationCare = new Map(s.stationCare);
     if (Array.isArray(s.relengthen)) this.relengthen = s.relengthen.map((q: [number, number, string[]]) => [q[0], q[1], [...q[2]]]);
     // an interrupted project is cleaned up (jobs are not persisted)
     if (s.project) {

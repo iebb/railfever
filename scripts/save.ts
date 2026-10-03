@@ -5,6 +5,7 @@ import { gzipSync } from 'node:zlib';
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { networkPlanner } from '../src/game/ai-network';
 import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busStopSites, addBusStop, roadDepotNear, checkReservations, checkNaN, Train } from './lib';
 
 const seed = Number(process.argv[2] ?? 7);
@@ -32,12 +33,13 @@ check(g.requestAccess(0, g.ais[1].companyId) === 'granted', 'access agreement si
 g.setAccessPolicy(0, 'ask');
 check(g.requestAccess(g.ais[0].companyId, 0, 'test') === 'pending', 'a pending request to the player (saved too)');
 g.lines.rename(line.id, 'Main Line');
-// run ~8 months, then save at a moment when no AI project is half-built (jobs are not persisted)
-while (g.day < 200 || g.ais.some((a) => a.busy)) g.update(0.25);
+// run ~8 months, then save at a moment when no AI project or network task is half-done (jobs are not persisted)
+const busy = () => g.ais.some((a) => a.busy || !!networkPlanner(a)?.task);
+while (g.day < 200 || busy()) g.update(0.25);
 g.economy.money += 80_000_000;
 const bought = g.ais[1].companyId;
 check(g.buyCompany(0, bought) === null, 'player buys an AI company');
-while (g.day < 240 || g.ais.some((a) => a.busy)) g.update(0.25);
+while (g.day < 240 || busy()) g.update(0.25);
 const t0 = performance.now();
 const data = serialize(g);
 const json = JSON.stringify(data);

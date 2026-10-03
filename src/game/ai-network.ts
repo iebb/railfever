@@ -747,7 +747,8 @@ class NetPlanner {
       const p = { x: 0, y: 0, z: 0 };
       for (let s = 2; s < e.len - 2; s += 5) { net.pointAt(e, s, p); add({ ...p, kind: 'edge', edge: e.id, s }); if (++work % 32 === 0) yield; }
       for (const nid of [e.a, e.b]) {
-        const n = net.nodes.get(nid)!;
+        const n = net.nodes.get(nid);
+        if (!n) continue;
         add({ kind: 'node', node: nid, x: n.x, y: n.y, z: n.z });
         if (Math.hypot(n.x - st.x, n.z - st.z) <= R) queue.push(...n.edges.filter((x) => !seen.has(x)));
       }
@@ -843,8 +844,9 @@ class NetPlanner {
       const capacity = vs.reduce((s, v) => s + v.capacity, 0) / vs.length;
       const costKm = vs.reduce((s, v) => s + estimateCostPerTrainKm([v.model!], kmh, this.g.year, 0.5).variable, 0) / vs.length;
       for (let i = 0; i < legs.length; i++) {
-        const h = legs[i], r = after[i], A = this.g.stations.get(h.a)!, B = this.g.stations.get(h.b)!;
-        if (r.length >= h.before.length - 1 || r.seconds >= h.before.seconds) continue;
+        // stations can be taken up while this budgeted job sleeps between steps
+        const h = legs[i], r = after[i], A = this.g.stations.get(h.a), B = this.g.stations.get(h.b);
+        if (!A || !B || r.length >= h.before.length - 1 || r.seconds >= h.before.seconds) continue;
         const d = Math.hypot(A.x - B.x, A.z - B.z);
         // Share the town-pair forecast among our services and directions, rather than counting all its
         // passengers again for each line using the corridor. Observed boardings can exceed that forecast.
@@ -862,7 +864,9 @@ class NetPlanner {
     const g = this.g, services = yield* this.roadServices();
     const candidates = new Map<string, { a: number; b: number; tram: boolean; before: RoadHop; kmh: number; loop: boolean }>();
     for (const s of services) for (const h of s.legs) {
-      const A = g.stations.get(h.a)!, B = g.stations.get(h.b)!, d = Math.hypot(A.x - B.x, A.z - B.z);
+      const A = g.stations.get(h.a), B = g.stations.get(h.b);
+      if (!A || !B) continue;
+      const d = Math.hypot(A.x - B.x, A.z - B.z);
       const tram = s.line.kind === 'tram', key = `road${Math.min(h.a, h.b)}:${Math.max(h.a, h.b)}:${tram}`;
       if (d > 1 && h.before.length > d * 1.5 && h.before.length - d > 15 && !this.cared(key) && !candidates.has(key)) {
         candidates.set(key, { ...h, tram, kmh: s.kmh, loop: g.lines.isLoop(s.line) });
@@ -924,7 +928,7 @@ class NetPlanner {
           return;
         }
         this.compensate(fresh.demolish, demolished);
-        for (const s of services) for (const v of s.vehicles) v.onLineChanged();
+        for (const s of services) for (const v of s.vehicles) if (g.vehicles.get(v.id) === v) v.onLineChanged();
         this.careFor('roads:period', 120);
         this.bump('netRoads'); this.bump('netRoadUnitsSaved', before.length - after.length);
         this.note(`road shortcut ${A.name} – ${B.name}: driven ${Math.round(before.length)} -> ${Math.round(after.length)} u, ${Math.round(total / 1000)}k, ${(total / annual).toFixed(1)} years payback`);
