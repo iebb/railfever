@@ -5,9 +5,49 @@ import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
   closestOnPolyline,
 } from './geom';
-import { NEdge, NNode, Section, profAt } from './network';
+import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
+import { SpatialGrid } from './spatial';
 import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
+
+const crossingGrids = new WeakMap<EdgeGeo, SpatialGrid>();
+const pointBounds = new WeakMap<EdgeGeo, Float64Array>();
+/** Ordered 32-sample ranges that can contain a point within reach. Bounds use the exact sampled geometry. */
+export function geometryPointRanges(geo: EdgeGeo, x: number, z: number, reach: number): number[] | undefined {
+  if (geo.n < 128) return undefined;
+  let bounds = pointBounds.get(geo);
+  if (!bounds) {
+    bounds = new Float64Array(Math.ceil(geo.n / 32) * 4);
+    for (let i = 0; i < geo.n; i += 32) {
+      const k = (i / 32) * 4;
+      bounds[k] = bounds[k + 1] = Infinity; bounds[k + 2] = bounds[k + 3] = -Infinity;
+      for (let j = i; j < Math.min(geo.n, i + 32); j++) {
+        bounds[k] = Math.min(bounds[k], geo.pts[j * 3]); bounds[k + 1] = Math.min(bounds[k + 1], geo.pts[j * 3 + 2]);
+        bounds[k + 2] = Math.max(bounds[k + 2], geo.pts[j * 3]); bounds[k + 3] = Math.max(bounds[k + 3], geo.pts[j * 3 + 2]);
+      }
+    }
+    pointBounds.set(geo, bounds);
+  }
+  const ranges: number[] = [], pad = reach + 1e-8;
+  for (let k = 0; k < bounds.length; k += 4) {
+    if (x < bounds[k] - pad || z < bounds[k + 1] - pad || x > bounds[k + 2] + pad || z > bounds[k + 3] + pad) continue;
+    ranges.push(k / 4 * 32);
+  }
+  return ranges;
+}
+/** Ordered candidate segments, using the versioned geometry as the cache key. Short edges need no index. */
+export function crossingSegments(geo: EdgeGeo, ax: number, az: number, bx: number, bz: number): number[] | undefined {
+  if (geo.n < 128) return undefined;
+  let grid = crossingGrids.get(geo);
+  if (!grid) {
+    grid = new SpatialGrid(4);
+    const p = geo.pts;
+    for (let j = 0; j < geo.n - 1; j++) grid.insert(j, Math.min(p[j * 3], p[j * 3 + 3]), Math.min(p[j * 3 + 2], p[j * 3 + 5]), Math.max(p[j * 3], p[j * 3 + 3]), Math.max(p[j * 3 + 2], p[j * 3 + 5]));
+    crossingGrids.set(geo, grid);
+  }
+  const pad = 1e-8;
+  return grid.query(Math.min(ax, bx) - pad, Math.min(az, bz) - pad, Math.max(ax, bx) + pad, Math.max(az, bz) + pad).sort((a, b) => a - b);
+}
 
 export interface Snap {
   kind: 'free' | 'node' | 'edge';
@@ -665,7 +705,12 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       const ge = net.geo(e);
       for (let i = 0; i < K - 1; i++) {
         const ax = pts[i * 2], az = pts[i * 2 + 1], bx = pts[i * 2 + 2], bz = pts[i * 2 + 3];
-        for (let j = 0; j < ge.n - 1; j++) {
+        const xlo = Math.min(ax, bx) - 1e-8, xhi = Math.max(ax, bx) + 1e-8, zlo = Math.min(az, bz) - 1e-8, zhi = Math.max(az, bz) + 1e-8;
+        const ids = crossingSegments(ge, ax, az, bx, bz);
+        for (let k = 0, count = ids?.length ?? ge.n - 1; k < count; k++) {
+          const j = ids ? ids[k] : k;
+          if (ge.pts[j * 3] < xlo && ge.pts[j * 3 + 3] < xlo || ge.pts[j * 3] > xhi && ge.pts[j * 3 + 3] > xhi
+            || ge.pts[j * 3 + 2] < zlo && ge.pts[j * 3 + 5] < zlo || ge.pts[j * 3 + 2] > zhi && ge.pts[j * 3 + 5] > zhi) continue;
           const r = segIntersect(ax, az, bx, bz, ge.pts[j * 3], ge.pts[j * 3 + 2], ge.pts[j * 3 + 3], ge.pts[j * 3 + 5]);
           if (!r) continue;
           const sNew = Math.min(i * 0.5, tab.len) + 0.5 * r[0];
@@ -851,9 +896,14 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
         for (const e of net.edgesNear(p.x - hw - 1, p.z - hw - 1, p.x + hw + 1, p.z + hw + 1)) {
           if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
           const ge = net.geo(e);
-          let best = Infinity, bi = 0;
-          for (let j = 0; j < ge.n; j++) { const d = Math.hypot(ge.pts[j * 3] - p.x, ge.pts[j * 3 + 2] - p.z); if (d < best) { best = d; bi = j; } }
           const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.06 : hw + net.halfWidth(e) - 0.08;
+          const ranges = geometryPointRanges(ge, p.x, p.z, need);
+          let best = Infinity, bi = 0;
+          for (const start of ranges ?? [0]) for (let j = start, end = ranges ? Math.min(ge.n, start + 32) : ge.n; j < end; j++) {
+            const dx = ge.pts[j * 3] - p.x, dz = ge.pts[j * 3 + 2] - p.z;
+            if (Math.abs(dx) > need + 1e-8 || Math.abs(dz) > need + 1e-8) continue;
+            const d = Math.hypot(dx, dz); if (d < best) { best = d; bi = j; }
+          }
           if (best < need) {
             const dy = Math.abs(ge.pts[bi * 3 + 1] - yy);
             if (dy < RAIL.clearance) { fail(e.kind === 'rail' ? 'Too close to existing track' : 'Too close to existing road'); }

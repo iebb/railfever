@@ -5,7 +5,7 @@
 import type { Game, AccessPolicy } from './game';
 import type { Town } from './towns';
 import type { Station, StationPlan } from './stations';
-import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf } from './stations';
+import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf, stationLayout } from './stations';
 import { defaultStationStyle } from './station-styles';
 import { finishDoubleTrack, DoublePlan, DoubleEnd, DoubleResult, FinishOpts, Step } from './trackops';
 import { electrify } from './build-ops';
@@ -33,14 +33,56 @@ import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
 import { networkDaily } from './ai-network';
 import {
-  OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside,
+  OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
 } from './routing';
 
 export * from './routing';
 
 // Corridor expansions are independent of the slice size; keep terrain probes in short batches too.
-const AI_ROUTE_WORK = 64;
+const AI_ROUTE_WORK = 1024;
+const AI_SITE_WORK = 64;
+// At eight units/day this leaves six days of the 60-day planning target for choosing a project.
+const AI_RAIL_PLAN_UNITS = 432;
+
+interface AISiteEvaluation { plan: StationPlan | null; caught?: number }
+const aiSiteMemo = new WeakMap<Game, { version: string; sites: Map<string, AISiteEvaluation>; pop: Map<string, number> }>();
+function aiSites(g: Game) {
+  const w = g.world;
+  const version = `${w.net.version}:${w.heightsVersion}:${w.lotVersions.version}:${g.stations.walkVersion}:${g.lines.version}:${g.networkVersion}:${g.depots.nextId}`;
+  let c = aiSiteMemo.get(g);
+  if (!c || c.version !== version) {
+    c = { version, sites: new Map(), pop: new Map() }; aiSiteMemo.set(g, c);
+  }
+  return c;
+}
+
+/** The exact ground-platform terrain rejection in planRail, before its building/access-road searches. */
+function aiSiteTerrain(g: Game, x: number, z: number, fx: number, fz: number, length: number, width: number): boolean {
+  let mn = Infinity, mx = -Infinity, sum = 0, cnt = 0;
+  for (let a = -0.5; a <= 0.5; a += 0.125) for (let b = -0.5; b <= 0.5; b += 0.25) {
+    const px = x + fx * length * a + fz * width * b, pz = z + fz * length * a - fx * width * b;
+    if (!g.world.inside(px, pz, 2)) return false;
+    const h = g.world.heightAt(px, pz);
+    if (h < 0.1) return false;
+    sum += h; cnt++; mn = Math.min(mn, h); mx = Math.max(mx, h);
+    if (mx - mn > 3) return false;
+  }
+  return Math.max(0.3, sum / cnt) - 0.1 >= DRY_MIN - 0.005;
+}
+
+/** Dense streets and long country roads make the station's forecourt search heavier. Charge by geometry,
+ * never measured time, so those plans get a unit of their own on every machine and with warm caches. */
+function aiSiteEffort(g: Game, x: number, z: number, length: number): number {
+  const r = length / 2 + 40;
+  let roads = 0;
+  for (const e of g.world.net.edgesNear(x - r, z - r, x + r, z + r)) {
+    if (e.kind !== 'road' || e.depot >= 0) continue;
+    roads += e.len;
+    if (roads >= 200) return 2;
+  }
+  return 1;
+}
 
 /** AI variants of the routing jobs: identical choices, with pauses inside segment retries and site scoring. */
 function aiTerrRef(g: Game, x: number, z: number, tx: number, tz: number, tracks: number): number {
@@ -179,7 +221,7 @@ function* aiChainGen(g: Game, startNode: number, way: OPoint[], opts: BuildOptio
       if (goalNode !== null) for (const id of nodeSnap(g, goalNode, opts.kind).group ?? [goalNode]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
       for (const id of nodeSnap(g, cur, opts.kind).group ?? [cur]) for (const e of net.nodes.get(id)?.edges ?? []) ex.add(e);
       yield;
-      const np = chainProfile(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex, false, undefined, opts.type);
+      const np = yield* chainProfileGen(g, [a, ...way.slice(i)], opts.tracks, n.y, yEnd, opts.kind, ex, false, undefined, opts.type, 256);
       if (!np) { res.error = 'Too steep: the route left its planned heights'; log?.(`re-plan of heights failed at waypoint ${i}`); return res; }
       prof = np;
     }
@@ -215,7 +257,8 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
   const front = o.front ?? 16, back = o.back ?? 9;
   let best: StationPlan | null = null, bestScore = Infinity;
   const maxR = o.maxR ?? town.radius + 14;
-  let n = 0, bestR = Infinity;
+  let n = 0, plans = 0, bestR = Infinity;
+  const width = stationLayout(o.tracks).width;
   for (let r = 4; r <= maxR; r += 3) {
     if (o.quick && o.prefY === undefined && r > bestR + 9) break;
     for (const da of [0, 0.25, -0.25, 0.5, -0.5, 0.8, -0.8, 1.2, -1.2]) {
@@ -226,11 +269,12 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
       const dirP = Math.atan2(toward.x - x, toward.z - z);
       for (const aa of [0, 0.15, -0.15, 0.35, -0.35]) {
         // short steps: a pause after a few plans (quick rejections count little)
-        if ((n += 1) >= 8) { n = 0; yield; }
+        if ((n += 1) >= AI_SITE_WORK) { n = 0; plans = 0; yield; }
         const ang = dirA + aa;
         const off = Math.abs(Math.atan2(Math.sin(ang - dirP), Math.cos(ang - dirP)));
         if (off > 0.75) continue;
         const fx = Math.sin(ang), fz = Math.cos(ang);
+        if (!aiSiteTerrain(g, x, z, fx, fz, o.length, width)) continue;
         // cheap rejections before the full plan: a street or track across the platform, a blocked throat
         let blocked = false;
         for (const t of [-0.5, -0.25, 0, 0.25, 0.5]) if (g.world.net.nearestEdge(x + fx * o.length * t, z + fz * o.length * t, 1.1)) { blocked = true; break; }
@@ -238,10 +282,24 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
         if (blocked || !corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, 0.5 + 0.25 * (o.tracks - 1))) continue;
         // the caller's condition on the site first (planning the station is costly)
         if (o.accept && !o.accept({ x, z, angle: ang, length: o.length } as StationPlan)) continue;
-        const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
-        // planning a station is the costly part (footprints, entrances, access road): one per step
-        n = 8;
-        if (!plan.ok || plan.join || !stationAccessSafe(plan)) continue;
+        // Charge the same work on a hit: a loaded game has cold derived caches but identical ticks.
+        const effort = aiSiteEffort(g, x, z, o.length);
+        if (plans + effort > 2) { n = 0; plans = 0; yield; }
+        const cache = aiSites(g), key = `${x}:${z}:${ang}:${o.length}:${o.tracks}:${o.owner}`;
+        let evaluation = cache.sites.get(key);
+        if (!evaluation) {
+          const plan = g.stations.planRail(x, z, ang, o.length, o.tracks, o.owner);
+          // Rejected previews often contain a full access proposal. Retain just the rejection; keep the
+          // useful-site cache bounded so profiling does not trade cheap re-evaluations for GC pauses.
+          evaluation = { plan: plan.ok && !plan.join && stationAccessSafe(plan) ? plan : null };
+          if (cache.sites.size >= 256) cache.sites.clear();
+          cache.sites.set(key, evaluation);
+        }
+        const plan = evaluation.plan;
+        n += 8;
+        plans += effort;
+        if (plans >= 2 || n >= AI_SITE_WORK) { n = 0; plans = 0; yield; }
+        if (!plan) continue;
         const hw = plan.layout.width / 2;
         if (!corridorFree(g, x, z, fx, fz, o.length / 2 + 0.5, o.length / 2 + front, hw)) continue;
         if (o.accept && !o.accept(plan)) continue;
@@ -255,17 +313,25 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
           g.world.net.pointAt(ne.edge, ne.s, q, d);
           if (Math.abs(d.x * fx + d.z * fz) / (Math.hypot(d.x, d.z) || 1) > 0.8) alongside++;
         }
-        // (counting the catchment is costly too: a step of its own)
-        yield;
-        n = 0;
+        // Site population does not depend on platform angle. Cache it across the five orientations.
         // people in the station's catchment (the access road comes with it), those within a short walk of the
         // platforms counting double (central sites on the levelled town ground connect best)
-        const pop = walkingPopulation(g, planWalkingCatchment(g, plan)) + walkSitePop(g, x, z, 'mainline') * 0.25;
+        planningProbe.observe?.('station catchment', true);
+        // Revalidate the memo after a yield/network edit; the chosen site is always replanned before commit.
+        const scoreCache = aiSites(g), pointKey = `${x}:${z}`;
+        const caught = evaluation.caught !== undefined && scoreCache === cache ? evaluation.caught : walkingPopulation(g, planWalkingCatchment(g, plan));
+        if (scoreCache === cache) evaluation.caught = caught;
+        planningProbe.observe?.('station catchment', false);
+        planningProbe.observe?.('walkSitePop', true);
+        let pointPop = scoreCache.pop.get(pointKey);
+        if (pointPop === undefined) { pointPop = walkSitePop(g, x, z, 'mainline'); scoreCache.pop.set(pointKey, pointPop); }
+        const pop = caught + pointPop * 0.25;
+        planningProbe.observe?.('walkSitePop', false);
         // A covered resident's recurring trips matter more than a small saving on a remote station site.
         let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 8 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
         if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
-        yield;
+        if ((n += 8) >= AI_SITE_WORK) { n = 0; plans = 0; yield; }
       }
     }
   }
@@ -2163,6 +2229,25 @@ export class AIController {
    * short trains. A line ending at the hub is extended to B (through trains) instead of a new line.
    */
   private *railJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true): Generator<void, void> {
+    const p = this.project!, job = this.railPlanJob(A, B, hubId, type, centre);
+    let units = 0;
+    try {
+      while (true) {
+        const r = job.next();
+        if (r.done) return;
+        if (!p.built && ++units >= AI_RAIL_PLAN_UNITS) {
+          const key = (type === 'highspeed' ? 'hsr' : '') + this.pairKey(A.id, B.id);
+          this.note(`railway ${A.name}-${B.name} abandoned: planning work limit (${units} units)`);
+          this.markFailed(key, 1800);
+          this.abandon(p);
+          return;
+        }
+        yield;
+      }
+    } finally { job.return(undefined); }
+  }
+
+  private *railPlanJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true): Generator<void, void> {
     const g = this.game, owner = this.companyId, net = g.world.net;
     const p = this.project!;
     // A high-speed railway uses main-line stations where they can take it, and dedicated HSR track between them.
@@ -2267,14 +2352,14 @@ export class AIController {
         const W = this.mergePoint(J, frontA);
         if (!W) continue;
         yield;
-        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, retries: 2, parallel: 3 }, AI_ROUTE_WORK);
+        const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, retries: 2, parallel: 3, sliced: true }, AI_ROUTE_WORK);
         if (typeof pj !== 'string') { plan = pj; join = { S, J }; break; }
       }
       if (!join && hs) return fail(`no junction into ${S.name}`, 720);
       if (!join) this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`);
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
-    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, retries: 3, parallel: 3 }, AI_ROUTE_WORK);
+    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
     // (an underground centre station the line cannot reach, or pay for: the railway with stations on the ground)
     const ground = function* (self: AIController, why: string): Generator<void, void> { self.note(`${what} ${A.name}-${B.name}: underground station dropped (${why})`); yield* self.railJob(A, B, hubId, type, false); };
     if (typeof plan === 'string') { if (underground) return yield* ground(this, plan); return fail(plan, plan.startsWith('route runs') ? 720 : 900); }
@@ -2376,7 +2461,7 @@ export class AIController {
     if (join) for (const id of join.J.chain) exclude.add(id);
     const yB = join ? join.J.y : stB.rail.y;
     if (!prof || Math.abs(stA.rail.y - pr.a.y) > 1e-6 || (!join && Math.abs(stB.rail.y - pr.b.y) > 1e-6)) {
-      prof = chainProfile(g, [start, ...way], tracks, stA.rail.y, yB, 'rail', exclude, false, undefined, type);
+      prof = yield* chainProfileGen(g, [start, ...way], tracks, stA.rail.y, yB, 'rail', exclude, false, undefined, type, 256);
       if (!prof) return fail('too steep');
       yield;
     }

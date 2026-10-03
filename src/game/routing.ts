@@ -6,7 +6,7 @@ import type { Town } from './towns';
 import { railCatchShapes, type Station, type StationPlan } from './stations';
 import type { NNode, NEdge } from './network';
 import { NetKind, RAIL, TRACK_TYPES, ROAD_TYPES, WATER_Y } from './constants';
-import { planEdge, commitProposal, findSnap, freeSide, fitCurve, curveSpeed, structureFactor, BuildOptions, Snap, Proposal } from './construction';
+import { planEdge, commitProposal, findSnap, freeSide, fitCurve, curveSpeed, structureFactor, crossingSegments, geometryPointRanges, BuildOptions, Snap, Proposal } from './construction';
 import { recomputeLocks, EARTHWORKS } from './terraform';
 import { depotSize } from './build-ops';
 import { distToRect } from './world';
@@ -14,6 +14,22 @@ import { Heap } from './train';
 import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { walkSitePop } from './catchment';
 
+/** Optional headless profiling observer. Never consulted by the planner's decisions or work schedule. */
+export const planningProbe: { observe?: (stage: string, begin: boolean, work?: number) => void } = {};
+
+/** Observe individual units, including generators that pause in a costly sub-step. */
+export function* planningGen<T>(stage: string, job: Generator<void, T>): Generator<void, T> {
+  try {
+    while (true) {
+      planningProbe.observe?.(stage, true);
+      let r: IteratorResult<void, T>;
+      try { r = job.next(); }
+      finally { planningProbe.observe?.(stage, false); }
+      if (r.done) return r.value;
+      yield;
+    }
+  } finally { job.return(undefined as T); }
+}
 
 // ============================================================================ geometry helpers
 
@@ -96,6 +112,21 @@ export interface CorridorOpts {
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
 const MIN_RUN = 2;
 
+interface CorridorGrid { version: string; info: Uint8Array; height: Float32Array }
+const corridorGrids = new WeakMap<Game, Map<number, CorridorGrid>>();
+/** Terrain/lock probes are shared by retries. Endpoint-specific keep-outs remain private to a search. */
+function corridorGrid(g: Game, cell: number, n: number): CorridorGrid {
+  let grids = corridorGrids.get(g);
+  if (!grids) { grids = new Map(); corridorGrids.set(g, grids); }
+  const w = g.world, version = `${w.heightsVersion}:${w.net.version}:${w.lotVersions.version}`;
+  let grid = grids.get(cell);
+  if (!grid || grid.version !== version) {
+    grid = { version, info: new Uint8Array(n * n), height: new Float32Array(n * n) };
+    grids.set(cell, grid);
+  }
+  return grid;
+}
+
 function nearestDir(tx: number, tz: number) {
   let bd = 0, bv = -2;
   DIRS.forEach(([dx, dz], i) => { const v = (dx * tx + dz * tz) / Math.hypot(dx, dz); if (v > bv) { bv = v; bd = i; } });
@@ -174,21 +205,28 @@ export class CorridorSearch {
     const w = this.g.world;
     const C = this.C;
     const cx = (v % this.n) * C, cz = Math.floor(v / this.n) * C;
-    let f = 1, hs = 0, hn = 0, water = 0;
-    const r = Math.ceil(C / 2);
-    for (let z = cz - r; z <= cz + r; z++) for (let x = cx - r; x <= cx + r; x++) {
-      if (x < 0 || z < 0 || x > w.size || z > w.size) continue;
-      const k = w.vi(x, z);
-      const h = w.h[k];
-      hs += h; hn++;
-      if (h < WATER_Y + 0.05) water++;
-      if (Math.abs(x - cx) <= 1 && Math.abs(z - cz) <= 1) {
-        if (w.lock[k] & 2) f |= 4;
-        if (w.lock[k] & 1) f |= 8;
+    const grid = corridorGrid(this.g, C, this.n);
+    let f = grid.info[v];
+    if (!f) {
+      f = 1;
+      let hs = 0, hn = 0, water = 0;
+      const r = Math.ceil(C / 2);
+      for (let z = cz - r; z <= cz + r; z++) for (let x = cx - r; x <= cx + r; x++) {
+        if (x < 0 || z < 0 || x > w.size || z > w.size) continue;
+        const k = w.vi(x, z);
+        const h = w.h[k];
+        hs += h; hn++;
+        if (h < WATER_Y + 0.05) water++;
+        if (Math.abs(x - cx) <= 1 && Math.abs(z - cz) <= 1) {
+          if (w.lock[k] & 2) f |= 4;
+          if (w.lock[k] & 1) f |= 8;
+        }
       }
+      grid.height[v] = hn ? hs / hn : 0;
+      if (water * 2 > hn) f |= 2;
+      grid.info[v] = f;
     }
-    this.hgt[v] = hn ? hs / hn : 0;
-    if (water * 2 > hn) f |= 2;
+    this.hgt[v] = grid.height[v];
     if (!w.inside(cx, cz, 5)) f |= 16;
     for (const fb of this.forbid) {
       if (Math.abs(cx - fb.x) > fb.r || Math.abs(cz - fb.z) > fb.r) continue;
@@ -205,6 +243,13 @@ export class CorridorSearch {
 
   /** Run up to `budget` expansions; returns the state. */
   step(budget: number): 'running' | 'done' | 'failed' {
+    planningProbe.observe?.('corridor', true);
+    const before = this.expanded;
+    try { return this.expand(budget); }
+    finally { planningProbe.observe?.('corridor', false, this.expanded - before); }
+  }
+
+  private expand(budget: number): 'running' | 'done' | 'failed' {
     if (this.state !== 'running') return this.state;
     const n = this.n, C = this.C;
     const railGrade = this.opts.type ? (TRACK_TYPES[this.opts.type] ?? TRACK_TYPES.standard).maxGrade * 0.85 : 0.03;
@@ -592,8 +637,17 @@ export function routeCurveSpeed(way: OPoint[], type: string, maxSpeed: number): 
  * Roads cross roads over/under unless `roadJunctions` (country roads meeting at level junctions).
  */
 export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard'): ChainProfile | null {
+  return runGen(chainProfileGen(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type));
+}
+
+/** Identical sampling, crossing order and height solutions, with deterministic optional pauses. */
+export function* chainProfileGen(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', step = 0): Generator<void, ChainProfile | null> {
+  return yield* planningGen('terrain fit', chainProfileWork(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, step));
+}
+
+function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number>, roadJunctions: boolean, diag: { crossings: P2[] } | undefined, type: string, slice: number): Generator<void, ChainProfile | null> {
   const xs: number[] = [], zs: number[] = [], ss: number[] = [], tr: number[] = [];
-  let acc = 0;
+  let acc = 0, work = 0;
   // HSR clearances are tight: sample the same circular pieces the builder will use, rather than a Hermite
   // approximation that can put a road crossing on the other side of a waypoint.
   if (type === 'highspeed') way = way.flatMap((b, i) => i ? chainPieces(way[i - 1], b).slice(1) : [b]);
@@ -613,6 +667,7 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
       if (xs.length) acc += Math.hypot(x - xs[xs.length - 1], z - zs[zs.length - 1]);
       xs.push(x); zs.push(z); ss.push(acc);
       tr.push(terrRef(g, x, z, a.tx, a.tz, tracks));
+      if (slice && ++work >= slice) { work = 0; yield; }
     }
   }
   const n = xs.length;
@@ -625,6 +680,7 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
     desired.push(sum / cnt);
     lo.push(tr[i] < WATER_Y + 0.05 ? WATER_Y + 0.95 : -1e9);
     hi.push(1e9);
+    if (slice && ++work >= slice) { work = 0; yield; }
   }
   lo[0] = hi[0] = y0; lo[n - 1] = hi[n - 1] = y1;
   const step = ss.map((v, i) => (i ? v - ss[i - 1] : 0));
@@ -637,26 +693,32 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
   for (let i = 0; i < n; i++) { bx0 = Math.min(bx0, xs[i]); bx1 = Math.max(bx1, xs[i]); bz0 = Math.min(bz0, zs[i]); bz1 = Math.max(bz1, zs[i]); }
   const cr: { i: number; sc: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; span: number; edge: number }[] = [];
   for (const e of net.edgesNear(bx0 - 1, bz0 - 1, bx1 + 1, bz1 + 1)) {
-    if (exclude.has(e.id)) continue;
-    const box = net.grid.box(e.id);
-    if (!box) continue;
-    const ge = net.geo(e);
-    for (let i = 0; i < n - 1; i++) {
-      const ax = xs[i], az = zs[i], bx = xs[i + 1], bz = zs[i + 1];
-      if (Math.max(ax, bx) < box[0] || Math.min(ax, bx) > box[2] || Math.max(az, bz) < box[1] || Math.min(az, bz) > box[3]) continue;
-      for (let j = 0; j < ge.n - 1; j++) {
-        const r = segIntersect(ax, az, bx, bz, ge.pts[j * 3], ge.pts[j * 3 + 2], ge.pts[j * 3 + 3], ge.pts[j * 3 + 5]);
-        if (!r) continue;
-        const sOld = ge.cum[j] + (ge.cum[j + 1] - ge.cum[j]) * r[1];
-        const ang = angleBetween(bx - ax, bz - az, ge.pts[j * 3 + 3] - ge.pts[j * 3], ge.pts[j * 3 + 5] - ge.pts[j * 3 + 2]);
-        const sec = net.sectionAt(e, sOld);
-        cr.push({
-          i: r[0] < 0.5 ? i : i + 1, sc: ss[i] + (ss[i + 1] - ss[i]) * r[0], x: ax + (bx - ax) * r[0], z: az + (bz - az) * r[0], yo: net.heightAtS(e, sOld),
-          levelOk: type !== 'highspeed' && e.type !== 'highspeed' && Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road' && !roadJunctions),
-          tunnel: sec === 'tunnel', span: (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(ang)) + 0.3, edge: e.id,
-        });
+    planningProbe.observe?.('crossings', true);
+    try {
+      if (exclude.has(e.id)) continue;
+      const box = net.grid.box(e.id);
+      if (!box) continue;
+      const ge = net.geo(e);
+      for (let i = 0; i < n - 1; i++) {
+        const ax = xs[i], az = zs[i], bx = xs[i + 1], bz = zs[i + 1];
+        if (Math.max(ax, bx) < box[0] || Math.min(ax, bx) > box[2] || Math.max(az, bz) < box[1] || Math.min(az, bz) > box[3]) continue;
+        const ids = crossingSegments(ge, ax, az, bx, bz);
+        for (let k = 0, count = ids?.length ?? ge.n - 1; k < count; k++) {
+          const j = ids ? ids[k] : k;
+          const r = segIntersect(ax, az, bx, bz, ge.pts[j * 3], ge.pts[j * 3 + 2], ge.pts[j * 3 + 3], ge.pts[j * 3 + 5]);
+          if (!r) continue;
+          const sOld = ge.cum[j] + (ge.cum[j + 1] - ge.cum[j]) * r[1];
+          const ang = angleBetween(bx - ax, bz - az, ge.pts[j * 3 + 3] - ge.pts[j * 3], ge.pts[j * 3 + 5] - ge.pts[j * 3 + 2]);
+          const sec = net.sectionAt(e, sOld);
+          cr.push({
+            i: r[0] < 0.5 ? i : i + 1, sc: ss[i] + (ss[i + 1] - ss[i]) * r[0], x: ax + (bx - ax) * r[0], z: az + (bz - az) * r[0], yo: net.heightAtS(e, sOld),
+            levelOk: type !== 'highspeed' && e.type !== 'highspeed' && Math.min(ang, Math.PI - ang) > 0.45 && sec === 'ground' && e.depot < 0 && e.station < 0 && !(kind === 'rail' && e.kind === 'rail') && !(kind === 'road' && e.kind === 'road' && !roadJunctions),
+            tunnel: sec === 'tunnel', span: (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(ang)) + 0.3, edge: e.id,
+          });
+        }
       }
-    }
+    } finally { planningProbe.observe?.('crossings', false); }
+    if (slice && (work += 32) >= slice) { work = 0; yield; }
   }
   const crossings: ChainProfile['crossings'] = [];
   if (cr.length) {
@@ -690,7 +752,11 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
       cr.forEach((_, j) => { const next: Mode[][] = []; for (const cb of combos) for (const m of [base[j], ...alts[j]]) next.push([...cb, m]); combos.splice(0, combos.length, ...next); });
       const changes = (cb: Mode[]) => cb.reduce((a, m, j) => a + (m !== base[j] ? 1 : 0), 0);
       combos.sort((a, b) => changes(a) - changes(b));
-      for (const cb of combos.slice(1, 250)) { const r = solve(cb); if (r) { sol = r; modes = cb; break; } }
+      let solves = 0;
+      for (const cb of combos.slice(1, 250)) {
+        const r = solve(cb); if (r) { sol = r; modes = cb; break; }
+        if (slice && ++solves % 8 === 0) yield;
+      }
     }
     if (!sol) { if (diag) diag.crossings = cr.map((c) => ({ x: c.x, z: c.z })); return null; }
     y = sol;
@@ -747,8 +813,9 @@ export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tr
       if (prof.crossings.some((c) => c.edge === e.id && Math.hypot(c.x - x, c.z - z) < 3)) continue;
       const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.02 : hw + net.halfWidth(e);
       const ge = net.geo(e);
+      const ranges = geometryPointRanges(ge, x, z, need);
       let best = Infinity, bi = 0;
-      for (let j = 0; j < ge.n; j++) { const d = (ge.pts[j * 3] - x) ** 2 + (ge.pts[j * 3 + 2] - z) ** 2; if (d < best) { best = d; bi = j; } }
+      for (const start of ranges ?? [0]) for (let j = start, end = ranges ? Math.min(ge.n, start + 32) : ge.n; j < end; j++) { const d = (ge.pts[j * 3] - x) ** 2 + (ge.pts[j * 3 + 2] - z) ** 2; if (d < best) { best = d; bi = j; } }
       if (Math.sqrt(best) < need && Math.abs(ge.pts[bi * 3 + 1] - prof.y[i]) < RAIL.clearance) return { x, z };
     }
   }
@@ -775,6 +842,8 @@ export interface RouteOpts {
   type?: string;
   /** Legal slower curves within the station approach, rather than the trunk's speed target. */
   approachR?: number; approachLength?: number;
+  /** AI-only work slicing; synchronous callers keep their original schedule. */
+  sliced?: boolean;
 }
 export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; expanded: number }
 
@@ -800,7 +869,9 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
       path = cs.path; expanded = cs.expanded;
     }
     if (!path) return why || 'no corridor';
+    planningProbe.observe?.('alignment', true);
     const al = alignCorridor(path, from, to, o.rmax, o.rgood);
+    planningProbe.observe?.('alignment', false);
     const way = [...al.way, ...(o.post ?? [])];
     const fullWay = [...(o.pre ?? []), ...way];
     const curveHit = o.type === 'highspeed' ? curveConflict(fullWay, minR, approachR, o.approachLength ?? 0) : null;
@@ -815,7 +886,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     }
     yield;
     const diag = { crossings: [] as P2[] };
-    const prof = chainProfile(g, fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag, o.type);
+    const prof = yield* chainProfileGen(g, fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, diag, o.type, o.sliced ? 256 : 0);
     if (!prof) {
       why = 'too steep';
       const add = diag.crossings.filter((p) => !nearEnds(p));
@@ -824,7 +895,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
       continue;
     }
     yield;
-    const hit = o.type === 'highspeed' ? yield* routeConflictGen(g, prof, o.kind, o.tracks, o.exclude, 40, true) : routeConflictAt(g, prof, o.kind, o.tracks, o.exclude);
+    const hit = yield* planningGen('conflicts', routeConflictGen(g, prof, o.kind, o.tracks, o.exclude, o.sliced || o.type === 'highspeed' ? 40 : 0, o.type === 'highspeed'));
     if (hit) {
       why = 'route runs along other tracks or roads';
       if (nearEnds(hit, 3)) { if (attempt < 0) continue; return why; }
