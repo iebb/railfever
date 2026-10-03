@@ -1,5 +1,8 @@
 name: Deploy to GitHub Pages
 
+# The site is built from main at the root and, when the preview branch exists, from preview at
+# /preview/ (a preview of the latest working build, published before the full feature tests).
+# Pushing preview dispatches this workflow on main (preview.yml), because only main may deploy.
 on:
   push:
     branches: [main]
@@ -19,16 +22,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: main
+          path: main
       - uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
-      - run: npm ci
-      - run: npm run build
+          cache-dependency-path: main/package-lock.json
+      - name: Build main
+        working-directory: main
+        run: |
+          npm ci
+          npm run build
+      - name: Check out preview
+        id: preview
+        continue-on-error: true
+        uses: actions/checkout@v7
+        with:
+          ref: preview
+          path: preview
+      - name: Build preview
+        if: steps.preview.outcome == 'success'
+        continue-on-error: true
+        working-directory: preview
+        run: |
+          npm ci
+          npm run build
+      - name: Assemble site
+        run: |
+          mkdir -p site
+          cp -R main/dist/. site/
+          if [ -f preview/dist/index.html ]; then
+            mkdir -p site/preview
+            cp -R preview/dist/. site/preview/
+          fi
       - uses: actions/configure-pages@v6
       - uses: actions/upload-pages-artifact@v5
         with:
-          path: dist
+          path: site
   deploy:
     needs: build
     runs-on: ubuntu-latest
