@@ -290,7 +290,7 @@ export class MapModes {
   }
 
   // ------------------------------------------------------------------ signal blocks
-  /** Your railway in signal blocks coloured by occupancy, with the signals (diamonds: path, arrows: block). */
+  /** Your railway in signal blocks coloured by occupancy, with the signals (diamonds: two-way, arrows: one-way). */
   private updateSignals(dt: number) {
     this.blockT -= dt;
     if (this.blockT > 0) return;

@@ -632,7 +632,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
   .dockwrap { width: calc(100vw - 20px); }
   .dock, .tray { min-width: 0; box-sizing: border-box; overflow-x: auto; touch-action: pan-x; overscroll-behavior-x: contain; }
   .vol-slider { display: none; }
-  .toolcard { width: 288px; box-sizing: border-box; max-height: min(42vh, calc(100dvh - var(--dock-clearance, 90px) - 116px)); overflow-y: auto; }
+  .toolcard { width: calc(288px * var(--uis, 1)); box-sizing: border-box; max-height: min(42vh, calc(100dvh - var(--dock-clearance, 90px) - 116px * var(--uis, 1))); overflow-y: auto; }
   .toolcard .tc-details-toggle { display: inline-flex; }
   .toolcard:not(.expanded) .tc-secondary { display: none; }
   .toolcard .tc-compact-note { display: block; margin-top: 4px; color: var(--text-2); font-size: var(--fs-12); overflow-wrap: anywhere; }
@@ -999,8 +999,8 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 #app .toasts { width: min(540px, calc((100vw - 20px) / var(--uis))); }
 #app .drawer { width: min(390px, calc((100vw - 20px) / var(--uis))); }
 #app .win > *, #app .toolcard > *, #app .tooltip > *, #app .uitip > *, #app .hovercard > *, #app .labels .lbl > * { zoom: var(--uis); }
-#app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); max-height: calc(100vh - 220px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
-@media (min-width: 721px) { #app .toolcard { width: calc(356px * var(--uis)); } }
+#app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
+@media (min-width: 1280px) { #app .toolcard { width: calc(356px * var(--uis)); max-height: calc(100dvh - var(--dock-clearance, 90px) - 116px * var(--uis)); } }
 #app .tooltip { min-width: calc(160px * var(--uis)); max-width: calc(300px * var(--uis)); padding: calc(10px * var(--uis)) calc(12px * var(--uis)); }
 #app .uitip { gap: calc(8px * var(--uis)); padding: calc(6px * var(--uis)) calc(9px * var(--uis)) calc(6px * var(--uis)) calc(11px * var(--uis)); font-size: calc(var(--fs-13) * var(--uis)); max-width: calc(300px * var(--uis)); }
 #app .hovercard { min-width: calc(170px * var(--uis)); max-width: calc(260px * var(--uis)); padding: calc(9px * var(--uis)) calc(11px * var(--uis)) calc(10px * var(--uis)); }
@@ -1012,8 +1012,8 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
    bar (toasts below it) wherever it would cover the action buttons (about 1110 px of unscaled width) */
 @media (max-width: 1560px) { :root[data-uis="115"] .hud-tr .hbtn[data-key="M"], :root[data-uis="115"] .hud-tr .hbtn[data-key="P"], :root[data-uis="115"] .hud-tr .hbtn[data-key="O"] { display: none; } }
 @media (max-width: 1770px) { :root[data-uis="130"] .hud-tr .hbtn[data-key="M"], :root[data-uis="130"] .hud-tr .hbtn[data-key="P"], :root[data-uis="130"] .hud-tr .hbtn[data-key="O"] { display: none; } }
-@media (max-width: 1280px) { :root[data-uis="115"] .hud-tc { top: 64px; } :root[data-uis="115"] .toasts { top: 112px; } }
-@media (max-width: 1445px) { :root[data-uis="130"] .hud-tc { top: 64px; } :root[data-uis="130"] .toasts { top: 112px; } }
+@media (max-width: 1280px) { :root[data-uis="115"] .hud-tc { top: 64px; } :root[data-uis="115"] .toasts, :root[data-uis="115"] .leftcol:not(.below-debug) { top: 112px; } }
+@media (max-width: 1445px) { :root[data-uis="130"] .hud-tc { top: 64px; } :root[data-uis="130"] .toasts, :root[data-uis="130"] .leftcol:not(.below-debug) { top: 112px; } }
 /* title screen: menu and new-game card side by side only while they fit (as the 1040 / 920 / 760 px rules above) */
 @media (max-width: 1196px) { :root[data-uis="115"] .title-main { flex: 0 1 420px; } }
 @media (max-width: 1352px) { :root[data-uis="130"] .title-main { flex: 0 1 420px; } }
