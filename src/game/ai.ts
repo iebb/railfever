@@ -33,6 +33,7 @@ import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
 import { networkDaily } from './ai-network';
 import { RailPolicy } from './ai-rail';
+import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1086,6 +1087,8 @@ export interface LineInfo {
   express?: number; expressLook?: number;
   /** rail: day the line was electrified (its trains may then be electric), or minus the day it was last looked at */
   electric?: number;
+  /** rail mail: day of the last annual van review */
+  mailLook?: number;
 }
 
 /** A place on a station's approach track where a new line can join it (see approachJunctions). */
@@ -1133,6 +1136,7 @@ const BUS_MIN_POP = 1500;
  */
 export class AIController {
   readonly railPolicy: RailPolicy;
+  readonly mailPolicy: MailPolicy;
   state: AIState = { phase: 'idle', cooldown: 10, projects: 0 };
   stats: AIStats = {
     railStations: 0, busStops: 0, track: 0, road: 0, bridges: 0, tunnels: 0, lines: 0, vehicles: 0, failed: 0, spent: 0, sold: 0, trams: 0, shared: 0, acquired: 0,
@@ -1185,6 +1189,7 @@ export class AIController {
 
   constructor(public game: Game, public companyId: number, config?: Partial<AIConfig>) {
     this.railPolicy = new RailPolicy(this);
+    this.mailPolicy = new MailPolicy(this);
     this.cfg = normalizeAIConfig(config);
     this.rng = new RNG((game.options.seed * 977 + companyId * 7919) >>> 0);
     this.state.cooldown = Math.round((12 + companyId * 9) / this.config.activeness);
@@ -1308,7 +1313,9 @@ export class AIController {
    * the step (the final tick ends at TICKS_PER_DAY).
    */
   work(t0: number, t1: number) {
-    if (this.disposed || !this.job) return;
+    if (this.disposed) return;
+    this.mailPolicy.step();
+    if (!this.job) return;
     const n = this.budget, phase = (this.companyId * 37) % 100, perDay = this.game.ticksPerDay;
     const allowance = (tick: number) => Math.floor((tick * n * 100 + phase * perDay) / (perDay * 100));
     let units = allowance(t1) - allowance(t0);
@@ -1529,9 +1536,10 @@ export class AIController {
           const sv = this.serviceYear(models, fleet, d, len);
           yield;
           const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway);
-          const revenue = forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) * share(A.id, B.id) * (1 - 0.5 * overlap);
-          const outlay = infrastructure + fleet * models.reduce((s, m) => s + m.cost, 0);
-          if (outlay <= avail) score = Math.max(score, roi(revenue, sv.running + sv.trackUpkeep + 60_000, outlay));
+          const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
+          const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap);
+          const outlay = infrastructure + fleet * (models.reduce((s, m) => s + m.cost, 0) + mail.price);
+          if (outlay <= avail) score = Math.max(score, roi(revenue, sv.running + mail.yearly + sv.trackUpkeep + 60_000, outlay));
         }
         score *= Math.max(0.05, 1 - 1.4 * overlap);
         // towns where railways keep failing (no station site in a dense centre, crowded corridors): try others
@@ -2427,9 +2435,11 @@ export class AIController {
     const opening = (fleet: number) => {
       const sv = this.serviceYear(cars, fleet, dist, len, type, 0.4, speedCap);
       const forecast = g.demand.forecastLine([hub ?? pr.a, hubB ?? join?.S ?? pr.b], 'mainline', sv.kmh, sv.headway);
-      const income = forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) * (1 - alongside);
+      const mail = projectMail(g, [hub ?? pr.a, hubB ?? join?.S ?? pr.b], cars, fleet, sv.kmh, sv.headway,
+        Math.min(PLATFORM, hub ? lenA : PLATFORM, hubB ? lenB : join ? join.S.rail!.length : PLATFORM));
+      const income = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * (1 - alongside);
       const maint = sv.trackUpkeep + (hub ? 0 : 40_000) + (hubB || join ? 0 : 40_000) + 12_000 + est * 0.01;
-      return { sv, forecast, income, maint, net: income - sv.running - maint, total: infrastructure + trainCost * fleet };
+      return { sv, forecast, income, maint, mail, net: income - sv.running - mail.yearly - maint, total: infrastructure + (trainCost + mail.price) * fleet };
     };
     let service = opening(nTrains);
     yield;
@@ -2447,13 +2457,13 @@ export class AIController {
     // longer payback
     // (trains grow to the length of platforms rebuilt to 12 units where passengers pile up; fares with the value of
     // time, running costs and track upkeep from the fares / opcosts estimates; carrying what the demand gives)
-    const { sv, forecast, income, maint } = service;
-    const running = sv.running;
+    const { sv, forecast, income, maint, mail } = service;
+    const running = sv.running + mail.yearly;
     const k = (x: number) => `${Math.round(x / 1000)}k`;
     // Conventional railway civil works are long-lived: amortise them over 22–67 years according to risk,
     // with a separate 3% capital/interest allowance. HSR retains its existing investment threshold.
     const amortisation = hs ? 0.075 - 0.05 * this.config.risk : 0.045 - 0.03 * this.config.risk;
-    const need = (total - trainCost * nTrains) * amortisation + total * 0.03;
+    const need = (total - (trainCost + mail.price) * nTrains) * amortisation + total * 0.03;
     if (income - running - maint < need && !AIController.forceBuild) { if (underground) return yield* ground(this, 'not paying'); return fail(`not profitable (${k(income - running - maint)} a year on ${k(total)}, ${k(need)} needed; ${Math.round(forecast.covered)} covered, ${Math.round(sv.headway)}s headway)`, 1500); }
     // ---- build
     this.state.phase = `building railway ${hub ? hub.name : A.name} - ${B.name}`;
@@ -2645,10 +2655,10 @@ export class AIController {
     yield;
     // (building may have cost more than planned: borrow for the trains; a line still without one gets its first
     // train later, see manage, rather than the railway being lost)
-    this.borrowFor(trainCost * nTrains + 300_000);
+    this.borrowFor((trainCost + mail.price) * nTrains + 300_000);
     let bought = 0;
     for (let i = 0; i < nTrains; i++) {
-      const t = g.vehicles.buyTrain(dep, cars, line.id);
+      const t = g.vehicles.buyTrain(dep, this.mailPolicy.openingCars(line, mail.cars), line.id);
       if (typeof t !== 'string') { bought++; this.stats.vehicles++; }
       yield;
     }
@@ -4316,6 +4326,7 @@ export class AIController {
         continue;
       }
       if (info.kind === 'rail') {
+        this.mailPolicy.manage(l, info);
         const close = this.railPolicy.review(l);
         if (close && info.joined) {
           this.railPolicy.event(l, 'closed', 'left after five losing years and staged cuts');
@@ -4408,6 +4419,7 @@ export class AIController {
    * with more coaches (a current locomotive). True while some train is still short (no trains are added then).
    */
   private lengthenTrain(l: Line, info: LineInfo, trains: Train[], waiting: number): boolean {
+    if (this.mailPolicy.hasPending(trains)) return true;
     const g = this.game;
     let platform = Infinity, span = 0;
     const s0 = g.stations.get(l.stops[0]);
@@ -4422,8 +4434,8 @@ export class AIController {
       // (passenger coaches: mail vans are another cargo's room)
       const n = t.cars.filter((c) => c.kind === 'wagon' && !carriesMail(c)).length;
       const want = Math.min(5, n + (waiting > t.capacity * 4 ? 2 : 1));
-      const cars = pickTrain(g.year, platform, span * 1.2, want, (info.electric ?? -1) > 0);
-      if (!cars || cars.length - 1 <= n) { if (n < 5) atPlatform++; continue; }
+      const cars = keepMailVans(t, pickTrain(g.year, platform - mailVanLength(t), span * 1.2, want, (info.electric ?? -1) > 0), platform);
+      if (!cars || cars.filter((c) => c.kind === 'wagon' && !carriesMail(c)).length <= n) { if (n < 5) atPlatform++; continue; }
       short = true;
       // replaced by a longer one when it next stands at a platform (see replaceTrains)
       if (!this.relengthen.some((q) => q[0] === t.id)) this.relengthen.push([t.id, info.depot, cars.map((c) => c.id)]);
@@ -4458,6 +4470,7 @@ export class AIController {
 
   /** Trains waiting to be replaced by longer ones: replaced when they stand at a platform. */
   private replaceTrains() {
+    this.mailPolicy.step();
     const g = this.game;
     for (let i = this.relengthen.length - 1; i >= 0; i--) {
       const [tid, dep, ids] = this.relengthen[i];
@@ -4466,17 +4479,20 @@ export class AIController {
       if (!(t instanceof Train) || !l || l.owner !== this.companyId || !g.depots.get(dep)) { this.relengthen.splice(i, 1); continue; }
       if (t.state !== 'loading') continue;
       this.relengthen.splice(i, 1);
-      const cars = ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m);
+      const platform = Math.min(...l.stops.map((id) => g.stations.get(id)?.rail?.length ?? 0));
+      const cars = keepMailVans(t, ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m), platform);
+      if (!cars || cars.reduce((s, c) => s + c.capacity, 0) <= t.capacity) continue;
       const cost = cars.reduce((a, c) => a + c.cost, 0);
       if (cars.length < 2 || this.available() < cost - g.vehicles.resaleValue(t) + 500_000 || !this.borrowFor(cost)) continue;
       if (this.railPolicy.account(l).step > 0 || this.railPolicy.deepTrouble) continue;
       const nt = g.vehicles.buyTrain(dep, cars, l.id);
       if (typeof nt === 'string') continue;
+      this.mailPolicy.replaced(t, nt);
       nt.pattern = t.pattern;
       const name = t.name;
       g.vehicles.sell(t.id);
       this.stats.vehicles++; this.stats.sold++;
-      this.note(`lengthened ${name} to ${cars.length - 1} coaches on ${l.name}`);
+      this.note(`lengthened ${name} to ${cars.filter((c) => c.capacity > 0).length} coaches on ${l.name}`);
     }
   }
 
@@ -4738,6 +4754,7 @@ export class AIController {
         project: this.project, lastAcq: this.lastAcq, tram, relengthen: this.relengthen, stationCare: [...this.stationCare].sort((x, y) => x[0] - y[0]),
         accessCare: [...this.accessCare].sort((x, y) => x[0] - y[0]),
         rail: this.railPolicy.save(),
+        ...this.mailPolicy.save(),
       },
     };
   }
@@ -4758,6 +4775,7 @@ export class AIController {
     if (s.stats) this.stats = { ...this.stats, ...s.stats };
     if (Array.isArray(s.lines)) this.lines = new Map(s.lines);
     this.railPolicy.load(s.rail);
+    this.mailPolicy.load(s);
     if (typeof s.lastAcq === 'number') this.lastAcq = s.lastAcq;
     if (Array.isArray(s.stationCare)) this.stationCare = new Map(s.stationCare);
     if (Array.isArray(s.accessCare)) this.accessCare = new Map(s.accessCare);
