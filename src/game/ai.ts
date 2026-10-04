@@ -2625,9 +2625,10 @@ export class AIController {
     const initialTraffic = { revenue: service.income, boardings: service.forecast.boardings, seats: service.sv.seats,
       trains: forecastFleet, headway: service.sv.headway * nTrains / forecastFleet, kmh: service.sv.kmh, blockLength: len, risk: this.config.risk, junctionTraffic };
     const choice = initialTrackChoice(initialTraffic, extra.cost, extra.upkeep);
-    // Reserve the full opening fleet before buying capacity. The pair's incremental recovered fares must
-    // repay its real upkeep and capital; it cannot consume the train budget or rescue a losing service.
-    const initialBudget = choice.double && service.total + extra.cost < this.available() ? extra.cost : 0;
+    // Reprice the pair after the formation is built: the standalone quote can overstate its actual cost.
+    // The construction callback still reserves the full opening fleet, and the pair must repay its own
+    // upkeep and capital; it cannot consume the train budget or rescue a losing service.
+    const initialBudget = choice.double ? extra.cost : 0;
     const total = service.total;
     if (total > this.available()) { if (underground) return yield* ground(this, 'too expensive'); return fail('too expensive', 360); }
     yield;

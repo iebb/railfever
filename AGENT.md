@@ -15,7 +15,7 @@ Railfever is a Transport Fever / OpenTTD style transport game built with TypeScr
 ## AI and UI
 
 - Guide AI behaviour through costs, revenues, forecasts, financing and opportunity search. Do not force lines, set city-line quotas or add style-dependent trip bonuses.
-- Forecasts must use the same fares and transfer rules as actual operations. Each transfer multiplies journey income by 0.9.
+- Forecasts must use the same fares and transfer rules as actual operations. Passenger legs apply a 0.9 factor for each prior vehicle change and for a change at that leg’s end; later changes do not retroactively discount earlier legs. Mail applies 0.9 per change to the whole journey. Preserve the capped distance-fare history used for the rail minimum.
 - Prefer capacity works when their recovered surplus pays for construction and upkeep. Shared services must consider all operators' traffic and delays.
 - Keep UI copy terse: labels, useful numbers and short functional tooltips. Preserve feature meaning when resolving conflicts with trimmed strings.
 

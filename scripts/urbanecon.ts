@@ -5,17 +5,17 @@ import { AIController } from '../src/game/ai';
 import { Train } from '../src/game/train';
 import { Vehicle } from '../src/game/vehicle';
 import type { Town } from '../src/game/towns';
-import type { Station } from '../src/game/stations';
-import type { Line } from '../src/game/lines';
+import { WALK_LINE, type Station } from '../src/game/stations';
+import type { Line, RouteEdge } from '../src/game/lines';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { bezLine } from '../src/game/geom';
-import { outAndBack, linearStops } from '../src/game/lines';
+import { outAndBack, linearStops, routeTables } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
-import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime } from '../src/game/fares';
-import { localTripMultiplier } from '../src/game/demand';
-import { URBAN_PAYBACK } from '../src/game/constants';
+import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime, distanceFare, simNow, TRANSFER_FARE_FACTOR } from '../src/game/fares';
+import { localTripMultiplier, forecastTransferJourney } from '../src/game/demand';
+import { URBAN_PAYBACK, RAIL_FARE } from '../src/game/constants';
 import { patternHeadways } from '../src/game/patterns';
 import { walkingCatchment } from '../src/game/catchment';
 import { serialize, deserialize } from '../src/game/save';
@@ -116,6 +116,48 @@ function profit(g: Game, l: Line) {
 }
 
 if (!arg('maps')) {
+  console.log('multi-transfer city fares follow passenger receipts');
+  {
+    // Bus → regional train → city train, using the production router and walking interchanges.
+    // Two adjacent urban hops represent passengers staying on the same train after a retargeted stop.
+    const edges = new Map<number, RouteEdge[]>(), city = -2, bus = 10, regional = 11;
+    const link = (a: number, b: number, line: number) => {
+      for (const [from, to] of [[a, b], [b, a]]) {
+        const es = edges.get(from) ?? []; es.push({ to, line, cost: line === WALK_LINE ? 4 : 60 }); edges.set(from, es);
+      }
+    };
+    link(0, 1, bus); link(1, 2, WALK_LINE); link(2, 3, regional); link(3, 4, WALK_LINE);
+    link(4, 6, city); link(6, 5, city);
+    const tables = routeTables(edges, edges.keys()), rail = (line: number) => line !== bus;
+    const x = [-20, 20, 24, 124, 140, 200, 170], railFare = (a: number, b: number) => distanceFare(Math.abs(x[b] - x[a]));
+    const incoming = forecastTransferJourney(tables, 0, 5, city, rail, railFare), outgoing = forecastTransferJourney(tables, 5, 0, city, rail, railFare);
+    check(incoming.length === 1 && incoming[0].from === 4 && incoming[0].to === 5 && incoming[0].railBefore === RAIL_FARE.minimum
+      && incoming[0].changes === 2, 'two incoming vehicle changes discount the complete urban ride by 0.9²');
+    check(outgoing.length === 1 && outgoing[0].railBefore === 0 && outgoing[0].changes === 1,
+      'an outgoing urban leg pays 0.9; later changes do not retroactively reduce its fare');
+    const shortIncoming = forecastTransferJourney(tables, 0, 5, city, rail, () => distanceFare(4));
+    check(shortIncoming.length === 1 && shortIncoming[0].railBefore > 0 && shortIncoming[0].railBefore < RAIL_FARE.minimum,
+      'a short prior rail ride preserves its actual distance fare towards the journey minimum');
+    check(forecastTransferJourney(tables, 4, 5, city, rail, railFare).length === 0, 'staying aboard one urban train is not a transfer journey');
+    const broken = new Map(tables); broken.delete(3);
+    check(forecastTransferJourney(broken, 5, 0, city, rail, railFare).length === 0, 'a traced urban ride with no onward route to the destination earns no forecast transfers');
+    const g = flat(0), start = station(g, 140, 256, 0, -1), end = station(g, 200, 256, 0, -1), final = station(g, 260, 256, 0, -1);
+    const seconds = 120;
+    for (const [name, journey, from, to, dest, before] of [
+      ['incoming', incoming, start, end, end, 2], ['outgoing', outgoing, end, start, final, 0],
+      ['short prior rail', shortIncoming, start, end, end, 2],
+    ] as const) {
+      const leg = journey[0]; if (!leg) continue;
+      const v = new Train(g, -1, [M('emu_b')], -1);
+      v.cargo.set('fare-test', { from: from.id, alight: to.id, dest: dest.id, count: 1, day: g.day,
+        t0: simNow(g) - seconds, transfers: before, rail: leg.railBefore }); v.load = 1;
+      v.serveStation(to, 0.2);
+      const estimate = fareFor(60, seconds, 1, { mode: 'rail', railBefore: leg.railBefore })
+        * Math.pow(TRANSFER_FARE_FACTOR, leg.changes);
+      check(v.incomeYear > 0 && Math.abs(v.incomeYear - estimate) < 1e-8,
+        `${name} multi-transfer forecast agrees with the actual booked passenger fare`);
+    }
+  }
   console.log('frequent main-line feeder access');
   {
     const g = flat(1), a = town(g, 'West Centre', 150, 256, 6000, 64, 48), b = town(g, 'East Centre', 362, 256, 6000, 64, 48);

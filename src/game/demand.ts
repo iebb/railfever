@@ -11,10 +11,10 @@ import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
 import { WALK_LINE, PLATFORM_LENGTH, stationLayout } from './stations';
 import { routeGraph, routeTables, type Hop } from './lines';
-import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, transferWalkTime, TRANSFER_FARE_FACTOR, type DemandSite, type FareMode } from './fares';
+import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, distanceFare, railHistory, transferWalkTime, TRANSFER_FARE_FACTOR, type DemandSite, type FareMode } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
-import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS, RAIL_FARE } from './constants';
+import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns } from './patterns';
@@ -85,6 +85,36 @@ const feederQuality = (headway: number) => Math.max(0, Math.min(1,
   (MAINLINE_FEEDERS.cutoffHeadway - headway) / (MAINLINE_FEEDERS.cutoffHeadway - MAINLINE_FEEDERS.fullHeadway)));
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
 interface FeederPool { pop: number; regions: Map<number, number> }
+
+/** City rides of a complete routed transfer journey, with the fare history of each boarding. */
+export function forecastTransferJourney(tables: Map<number, Map<number, Hop>>, from: number, destination: number,
+  cityLine: number, isRail: (line: number) => boolean, railFare: (from: number, to: number) => number
+): { from: number; to: number; railBefore: number; changes: number }[] {
+  const rides: { line: number; from: number; to: number }[] = [], seen = new Set<number>();
+  let at = from, aboard = false;
+  while (at !== destination && !seen.has(at)) {
+    seen.add(at);
+    const hop = tables.get(at)?.get(destination); if (!hop) break;
+    if (hop.line === WALK_LINE) aboard = false;
+    else {
+      const last = rides[rides.length - 1];
+      // Consecutive hops on one vehicle keep their original boarding and fare history (Vehicle.serveStation).
+      if (aboard && last?.line === hop.line) last.to = hop.alight;
+      else rides.push({ line: hop.line, from: at, to: hop.alight });
+      aboard = true;
+    }
+    at = hop.alight;
+  }
+  if (at !== destination || rides.length < 2) return [];
+  let railBefore = 0;
+  return rides.flatMap((ride, before) => {
+    const history = railBefore;
+    if (isRail(ride.line)) railBefore = railHistory(railBefore + railFare(ride.from, ride.to));
+    return ride.line === cityLine ? [{ from: ride.from, to: ride.to, railBefore: history,
+      // Passenger receipts apply changes already made and the change at this leg's end, not later changes.
+      changes: before + (ride.to !== destination ? 1 : 0) }] : [];
+  });
+}
 
 /** Residents and jobs of a building. */
 function residentsJobs(b: Building): [number, number] {
@@ -805,26 +835,23 @@ export class DemandModel {
       for (const part of parts) {
         const j = indices.get(part.to);
         if (i === undefined ? j === undefined : j !== undefined || g.stations.get(part.to)?.townId === townId) continue;
-        let at = from, priorRail = false, rode = false, leg: { from: number; to: number; priorRail: boolean } | undefined;
-        const seen = new Set<number>();
-        for (let h = 0; h < 12 && at !== part.to && !seen.has(at); h++) {
-          seen.add(at); const hop = tables.get(at)?.get(part.to); if (!hop) break;
-          if (hop.line === proposed) {
-            // Incoming needs a previous ride; outgoing will change onto the regional service afterwards.
-            if (i !== undefined || rode) leg = { from: at, to: hop.alight, priorRail };
-            break;
-          }
-          if (hop.line !== WALK_LINE) { rode = true; priorRail ||= g.lines.get(hop.line)?.kind === 'rail'; }
-          at = hop.alight;
-        }
-        if (!leg) continue;
-        const a = indices.get(leg.from), b = indices.get(leg.to); if (a === undefined || b === undefined) continue;
+        const legs = forecastTransferJourney(tables, from, part.to, proposed,
+          (line) => line === proposed || g.lines.get(line)?.kind === 'rail', (a, b) => {
+            const from = indices.has(a) ? sites[indices.get(a)!] : g.stations.get(a);
+            const to = indices.has(b) ? sites[indices.get(b)!] : g.stations.get(b);
+            return from && to ? distanceFare(Math.hypot(from.x - to.x, from.z - to.z)) : 0;
+          });
         const passengers = pop * TRIPS_PER_MONTH * 12 * (part.x * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)))
           * (1 + MAINLINE_FEEDER_SHARE);
-        const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);
-        count += passengers;
-        revenue += fareFor(d, estimateLegTime(d, kmh, headway, 1.05), passengers,
-          { mode: 'rail', centre: urbanIntensity(g, sites[a]), ...(leg.priorRail ? { railBefore: RAIL_FARE.minimum } : {}) }) * TRANSFER_FARE_FACTOR;
+        for (const leg of legs) {
+          const a = indices.get(leg.from), b = indices.get(leg.to); if (a === undefined || b === undefined) continue;
+          const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);
+          count += passengers;
+          revenue += fareFor(d, estimateLegTime(d, kmh, headway, 1.05), passengers,
+            { mode: 'rail', centre: Math.min(urbanIntensity(g, sites[a]), urbanIntensity(g, sites[b])),
+              railBefore: leg.railBefore })
+            * Math.pow(TRANSFER_FARE_FACTOR, leg.changes);
+        }
       }
     }
     return { boardings: count, revenue };

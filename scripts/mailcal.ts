@@ -18,7 +18,7 @@
 //    are only reported): 20-70% of their passenger income together; vans 0.33-2.5x the coaches' load each, within
 //    +-50% on average. Each line: 10-100% of its passenger income where its coaches run at least 10% full (below
 //    that, a few passengers set the share, not the mail); every line earns 0.5-1.5x as much per mail unit as per
-//    passenger boarding (mail priced like the passengers it travels with).
+//    passenger fare paid in the same year (mail priced like the passengers it travels with).
 // Mail scales with MAIL_PER_PAX (constants.ts): prints the range of it that every target allows, and its middle (the AI
 // lines only roughly: their vans follow their forecasts). MAIL_FEEDER.share sets the networks against the single lines.
 // npx esbuild scripts/mailcal.ts --bundle --platform=node --format=esm --outfile=$S/mailcal.mjs && node $S/mailcal.mjs [seeds] [years] [--ai=5,7,11,23,51,61] [--aiyears=5] [--part=all|single|ai] [--json=path]
@@ -28,6 +28,8 @@ import { MODEL_BY_ID, type VehicleModel } from '../src/game/vehicle-types';
 import { MAIL_PER_PAX } from '../src/game/constants';
 import { mailQueueCap } from '../src/game/mail';
 import { mailVans } from '../src/game/ai-mail';
+import type { CargoGroup, MailGroup } from '../src/game/vehicle';
+import { WALK_LINE } from '../src/game/stations';
 import { fails, check, fmt, placeAndConnect, depotBehind, Train } from './lib';
 
 if (!process.argv[1]?.endsWith('mailcal.mjs')) throw new Error('bundle this test as mailcal.mjs');
@@ -48,7 +50,7 @@ const VAN_MEAN: Band = [0.4, 1.5], VAN_ROUTE: Band = [0.33, 2], AI_VAN_MEAN: Ban
 const MIN_COACH_LOAD = 0.05;
 /** The per-line share band needs a real passenger service: coaches at least this full (else nearly empty coaches set it). */
 const LINE_SHARE_LOAD = 0.1;
-/** Income per mail unit loaded / income per passenger boarding, on every AI line with vans. */
+/** Income per paid mail leg / income per paid passenger leg, on every AI line with vans. */
 const AI_UNIT_PRICE: Band = [0.5, 1.5];
 /** The share of its posted mail a route may lose (queues overflowing, no route). */
 const MAX_LOST = 0.05;
@@ -63,7 +65,7 @@ interface Result {
 const results: Result[] = [];
 interface AiResult {
   seed: number; line: string; trains: number; vans: number; pax: number; mail: number; share: number; vanLoad: number; coachLoad: number; ratio: number;
-  boardings: number; units: number;
+  boardings: number; units: number; paidPassengers: number; paidMail: number;
 }
 const aiResults: AiResult[] = [];
 /** Income per passenger boarding and per mail unit loaded, and mail units per boarding. */
@@ -128,11 +130,66 @@ if (part !== 'ai') for (const year of [1950, 2000]) for (const seed of seeds) {
   check(r.maxQueue <= r.cap, `${tag}: mail queues stay under their cap (${r.maxQueue} <= ${r.cap})`);
 }
 
+/** Observe fare booking without changing simulation or pricing. Cargo is captured by recordStop before unloading;
+ * onIncome runs after the fare has been booked. Previous mail legs are paid on the delivering call as well. */
+function paidUnits(g: Game, fromDay: number, toDay: number) {
+  type Paid = { passengers: number; mail: number; paxIncome: number; mailIncome: number };
+  const totals = new Map<number, Paid>();
+  const entry = (id: number) => { const v = totals.get(id) ?? { passengers: 0, mail: 0, paxIncome: 0, mailIncome: 0 }; totals.set(id, v); return v; };
+  type Call = { cargo: Set<CargoGroup>; mail: MailGroup[]; delivered: number; income: Map<number, number>; observed: boolean };
+  const calls = new Map<number, Call>(), record = g.recordStop.bind(g), income = g.onIncome.bind(g);
+  let incomplete = 0;
+  g.recordStop = (v, st) => {
+    record(v, st);
+    if (g.day < fromDay || g.day >= toDay) return;
+    const mail = [...v.mailCargo.values()].filter(c => {
+      if (c.alight !== st.id) return false;
+      if (c.dest === st.id) return true;
+      const hop = g.lines.mailNextHop(st.id, c.dest);
+      return hop?.line === WALK_LINE && hop.alight === c.dest;
+    });
+    calls.set(v.id, { cargo: new Set(v.cargo.values()), mail, delivered: v.mailDelivered,
+      income: new Map(g.lines.all().map(l => [l.id, l.mail?.incomeYear ?? 0])), observed: false });
+  };
+  g.onIncome = (amount, v, st) => {
+    income(amount, v, st);
+    if (g.day < fromDay || g.day >= toDay) return;
+    const call = calls.get(v.id), line = v.line;
+    if (!call) { incomplete++; return; }
+    if (v.mailDelivered === call.delivered) {
+      if (line?.kind !== 'rail' || line.owner <= 0) return;
+      const aboard = new Set(v.cargo.values());
+      const count = [...call.cargo].filter(c => !aboard.has(c)).reduce((n, c) => n + c.count, 0);
+      entry(line.id).passengers += count; entry(line.id).paxIncome += amount;
+      call.cargo = aboard;
+      return;
+    }
+    if (call.observed) return;
+    call.observed = true;
+    if (call.mail.reduce((n, c) => n + c.count, 0) !== v.mailDelivered - call.delivered) incomplete++;
+    const add = (id: number, count: number) => { const l = g.lines.get(id); if (l?.kind === 'rail' && l.owner > 0) entry(l.id).mail += count; };
+    for (const c of call.mail) {
+      const from = g.stations.get(c.from), dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
+      if (line && dist > 0) add(line.id, c.count);
+      for (const leg of c.legs) if (leg[3] > 0) add(leg[1], c.count);
+    }
+    for (const l of g.lines.all()) if (l.kind === 'rail' && l.owner > 0) {
+      entry(l.id).mailIncome += (l.mail?.incomeYear ?? 0) - (call.income.get(l.id) ?? 0);
+    }
+  };
+  const get = (id: number) => [...totals].filter(([key]) => g.lines.get(key)?.id === id).reduce((out, [, p]) => ({
+    passengers: out.passengers + p.passengers, mail: out.mail + p.mail,
+    paxIncome: out.paxIncome + p.paxIncome, mailIncome: out.mailIncome + p.mailIncome,
+  }), { passengers: 0, mail: 0, paxIncome: 0, mailIncome: 0 });
+  return { get, complete: () => incomplete === 0 };
+}
+
 // ---- AI networks: every AI line with vans over the last year
 if (part !== 'single') for (const seed of aiSeeds) {
   const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1950,
     aiConfigs: Array.from({ length: 2 }, () => ({ focus: { rail: 2.5, road: 1.2, tram: 0.5 } })) });
   g.aiAcquisitions = false;
+  const paid = paidUnits(g, (AI_YEARS - 1) * 360, AI_YEARS * 360);
   const loads = new Map<number, { van: number; coach: number; n: number }>(), volume = new Map<number, { boardings: number; units: number }>();
   for (let d = 0; d < AI_YEARS * 360; d++) {
     for (let k = 0; k < TICKS_PER_DAY; k++) {
@@ -159,13 +216,20 @@ if (part !== 'single') for (const seed of aiSeeds) {
       seed, line: l.name, trains: trains.length, vans: trains.reduce((n, t) => n + mailVans(t).length, 0), pax, mail, share: pax > 0 ? mail / pax : 0,
       vanLoad: e.van / e.n, coachLoad: e.coach / e.n, ratio: e.coach > 0 ? e.van / e.coach : 0,
       boardings: volume.get(l.id)?.boardings ?? 0, units: volume.get(l.id)?.units ?? 0,
+      paidPassengers: paid.get(l.id).passengers, paidMail: paid.get(l.id).mail,
     };
     aiResults.push(r);
     const served = r.coachLoad >= MIN_COACH_LOAD;
     console.log(`AI seed ${seed} ${r.line}: ${r.trains} trains, ${r.vans} vans; passengers ${fmt(pax / 1000, 1)}k, mail ${fmt(mail / 1000, 1)}k (${pct(r.share)}); loads van ${pct(r.vanLoad)} coaches ${pct(r.coachLoad)} (x${fmt(r.ratio, 2)}); ${perUnit(r)}${served ? '' : ' (coaches nearly empty: not weighed)'}`);
-    if (r.units > 0 && r.boardings > 0) {
-      const price = (r.mail / r.units) / (r.pax / r.boardings);
-      check(within(price, AI_UNIT_PRICE), `AI seed ${seed} ${r.line}: income per mail unit ${ratioBand(AI_UNIT_PRICE)}x that per passenger boarding (x${fmt(price, 2)})`);
+    const receipts = paid.get(l.id);
+    const close = (a: number, b: number) => Math.abs(a - b) <= 1e-6 * Math.max(1, Math.abs(b));
+    check(paid.complete() && !!receipts && close(receipts.paxIncome, pax) && close(receipts.mailIncome, mail),
+      `AI seed ${seed} ${r.line}: paid units cover the same annual passenger and mail receipts`);
+    if (r.paidMail > 0 && r.paidPassengers > 0) {
+      const price = (r.mail / r.paidMail) / (r.pax / r.paidPassengers);
+      const old = (r.mail / Math.max(1, r.units)) / (r.pax / Math.max(1, r.boardings));
+      console.log(`  paid passengers ${r.paidPassengers}, paid mail legs ${r.paidMail}; per paid passenger ${fmt(r.pax / r.paidPassengers, 0)}, per paid mail leg ${fmt(r.mail / r.paidMail, 0)}; price x${fmt(price, 3)} (boarding/loading cohorts x${fmt(old, 3)})`);
+      check(within(price, AI_UNIT_PRICE), `AI seed ${seed} ${r.line}: income per paid mail leg ${ratioBand(AI_UNIT_PRICE)}x that per paid passenger leg (x${fmt(price, 2)})`);
     }
     if (!served) continue;
     if (r.coachLoad >= LINE_SHARE_LOAD) check(within(r.share, AI_LINE), `AI seed ${seed} ${r.line}: mail ${pct(r.share)} of passenger income within ${band(AI_LINE)}%`);
