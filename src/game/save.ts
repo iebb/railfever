@@ -388,6 +388,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
       nextNode: net.nextNode, nextEdge: net.nextEdge, nextCrossing: net.nextCrossing,
       // changes the vehicles have not taken in yet (flushed at the start of the next update)
       dirtyNodes: [...net.dirtyNodes], dirtyEdges: [...net.dirtyEdges],
+      railSections: g.railSections.toJSON(),
     },
     networkDirty: !!(g as any).networkDirty,
     // A street edit still awaiting its network flush must invalidate catchments at that flush, not on load.
@@ -527,6 +528,8 @@ export function deserialize(d: any): Game {
   g.stations.nextId = d.stationsNextId;
   for (const dp of d.depots as Depot[]) g.depots.map.set(dp.id, { ...dp });
   g.depots.nextId = d.depotsNextId;
+  // Metadata only: station through tracks and final infrastructure owners exist before legacy adoption.
+  g.railSections.load(d.net.railSections);
   for (const l of d.lines as Line[]) g.lines.map.set(l.id, Lines.restore(l));
   g.lines.nextId = d.linesNextId;
   for (const [k, r] of (d.linesRedirect ?? []) as [number, { line: number; pattern: number }][]) g.lines.redirect.set(k, { line: r.line, pattern: r.pattern });

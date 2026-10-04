@@ -371,7 +371,9 @@ export function loadNetwork(g: Game, data?: NetworkSave): void {
     const st = g.stations.get(sid), r = st?.rail;
     if (st && r) {
       const record = r as unknown as Record<string, unknown>;
-      st.rail = Object.fromEntries(keys.map((key) => [key, record[key]])) as unknown as NonNullable<Station['rail']>;
+      // Legacy key-order hints must retain O's restored station mode.
+      const restoredKeys = keys.includes('mode') ? keys : [...keys, 'mode'];
+      st.rail = Object.fromEntries(restoredKeys.map((key) => [key, record[key]])) as unknown as NonNullable<Station['rail']>;
     }
   }
   // Road-change detection compares warm walking entries with later street edits. Rebuild those derived

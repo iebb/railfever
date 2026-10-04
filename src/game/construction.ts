@@ -9,6 +9,7 @@ import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
 import { SpatialGrid } from './spatial';
 import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
+import type { RailAlignment } from './rail-section-types';
 
 const crossingGrids = new WeakMap<EdgeGeo, SpatialGrid>();
 const pointBounds = new WeakMap<EdgeGeo, Float64Array>();
@@ -122,6 +123,9 @@ export interface Proposal {
   demolish: number[];
   trees: number;
   cost: number;
+  /** Original authoring alignment; never reconstructed by averaging the physical tracks. */
+  railAlignment?: RailAlignment;
+  railOffsets?: number[];
   stats: {
     len: number; maxGrade: number; minRadius: number; bridges: number; tunnels: number; speed: number;
     /** rail: what sharing the formation saves (further tracks built together, or beside an existing track) */
@@ -502,7 +506,7 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
 
 // ------------------------------------------------------------------------------------ planning
 
-export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): Proposal {
+export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, exact?: { bez: Bez; prof: Float32Array; shared?: boolean }): Proposal {
   const w = g.world;
   const net = w.net;
   if (opts.kind === 'rail') {
@@ -553,7 +557,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const chx = fb.x - fa.x, chz = fb.z - fa.z, chl = Math.hypot(chx, chz);
   if (fa.fixed && (fa.tx * chx + fa.tz * chz) / chl < -0.2) fail('Target is behind the track direction');
   if (fb.fixed && (fb.tx * chx + fb.tz * chz) / chl < -0.2) fail('Cannot join from this direction');
-  const centreBez = fitCurve(fa, fb);
+  const centreBez = exact?.bez ?? fitCurve(fa, fb);
   const minR = bezMinRadius(centreBez, 48);
   prop.stats.minRadius = minR;
   prop.stats.speed = kind === 'rail' ? Math.min((TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(minR, opts.type)) : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).speed;
@@ -688,6 +692,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   // over water: a deck above it, or (underground) a tunnel below the bed
   for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push(level === 'underground' ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
 
+  // Section members validate their already-mapped profile without moving it to fit local terrain.
+  if (exact) for (let i = 0; i < M; i++) cons.push({ i, kind: 'eq', v: profAt(exact.prof, L, sArr[i]) });
   let sol = solveProfile(desired, ds, cons, grade);
   if (!sol.ok) { fail('Too steep: make the route longer or change the height'); }
 
@@ -791,6 +797,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   prop.crossings = crossings;
   const y = sol.y;
+  if (kind === 'rail') {
+    prop.railAlignment = { length: L, pieces: [{ u0: 0, u1: L, bez: { ...centreBez }, prof: Array.from(y, (v) => Math.fround(v)) }] };
+    prop.railOffsets = offsets.slice();
+  }
 
   // ---- grade statistics
   for (let i = 1; i < M; i++) if (ds[i] > 0.01) prop.stats.maxGrade = Math.max(prop.stats.maxGrade, Math.abs(y[i] - y[i - 1]) / ds[i]);
@@ -999,7 +1009,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
           prem = structureFactor(kind, sec, sec === 'bridge' ? y - t : t - y) - 1;
         }
         full += per * ds * (1 + prem);
-        const shared = kind === 'rail' && (ti > 0 || beside![ti][i] === 1);
+        const shared = kind === 'rail' && (exact?.shared || ti > 0 || beside![ti][i] === 1);
         const base = per * ds * (shared ? S.materials : 1), extra = per * ds * prem * (shared ? S.structures : 1);
         cost += base + extra;
         if (sec === 'bridge') split.bridges += base + extra; else if (sec === 'tunnel') split.tunnels += base + extra; else split.track += base;
@@ -1014,7 +1024,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       const v = Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2) * 900 * fm;
       const k = b0 ? Math.min(b0.length - 1, Math.floor((sArr[i] / L) * b0.length)) : 0;
       full += v * N;
-      const ev = kind === 'rail' ? v * ((b0 && b0[k] ? S.earthworks : 1) + S.earthworks * (N - 1)) : v;
+      const ev = kind === 'rail' ? v * ((exact?.shared || b0 && b0[k] ? S.earthworks : 1) + S.earthworks * (N - 1)) : v;
       cost += ev;
       split.earthworks += ev;
     }

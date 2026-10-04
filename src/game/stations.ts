@@ -3404,6 +3404,14 @@ export class Stations {
   // ---------------------------------------------------------------- passing through (service patterns)
   private throughOf = new Map<number, number>();
   private throughOfVersion = -1;
+  /** Pure attachment lookup, including through tracks whose physical station tag is -1. */
+  railAttachment(edgeId: number): { station: number; role: 'platform' | 'through' } | undefined {
+    for (const st of this.map.values()) if (st.rail) {
+      if (st.rail.edges.includes(edgeId)) return { station: st.id, role: 'platform' };
+      if (st.rail.throughEdges.includes(edgeId)) return { station: st.id, role: 'through' };
+    }
+    return undefined;
+  }
   /** The station whose through track (no platform) an edge is, or -1. */
   throughStationOf(edgeId: number): number {
     const net = this.game.world.net;

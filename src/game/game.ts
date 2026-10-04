@@ -21,6 +21,7 @@ import { DemandModel, GEN_RATE } from './demand';
 import { resolveDeadlocks, lineCongestion } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
+import { RailSections } from './rail-sections';
 
 export interface NewGameOptions {
   size: number;
@@ -98,6 +99,7 @@ export class Game {
   world: World;
   towns: Towns;
   stations: Stations;
+  railSections: RailSections;
   depots: Depots;
   lines: Lines;
   vehicles: Vehicles;
@@ -187,6 +189,7 @@ export class Game {
     this.rng = new RNG(opts.seed * 101 + 7);
     this.towns = new Towns(this);
     this.stations = new Stations(this);
+    this.railSections = new RailSections(this);
     this.depots = new Depots(this);
     this.lines = new Lines(this);
     this.vehicles = new Vehicles(this);
@@ -765,6 +768,7 @@ export class Game {
     this.assetCache.clear();
     this.lostSince.clear();
     this.lines.rebuild();
+    this.railSections.reconcile();
     this.onNetworkChanged();
     this.postNews(price !== undefined
       ? `${b.name} buys ${t.name} for $${(price / 1e6).toFixed(2)}M and takes over its network.`
@@ -794,7 +798,7 @@ export class Game {
     }
   }
 
-  onNetworkChanged() { this.networkDirty = true; this.networkVersion++; }
+  onNetworkChanged() { this.railSections.reconcile(false); this.networkDirty = true; this.networkVersion++; }
 
   // ------------------------------------------------------------ simulation
   update(dtReal: number) {
@@ -822,6 +826,7 @@ export class Game {
   /** Apply pending network changes to vehicles (normally done at the start of a tick). */
   flushNetworkChanges() {
     if (!this.networkDirty) return;
+    this.railSections.reconcile();
     this.networkDirty = false;
     this.vehicles.onNetworkChanged();
     // lost vehicles re-plan at once, the others are staggered over the next ticks (no hitch)
