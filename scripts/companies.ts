@@ -480,7 +480,11 @@ g.aiAcquisitions = true;
     console.log(`  re-serialized JSON differs at ${i}: ...${json.slice(Math.max(0, i - 120), i + 60)}...\n  vs ...${json2.slice(Math.max(0, i - 120), i + 60)}...`);
   }
   check(json2 === json, 'save round trip: identical re-serialization');
-  check(JSON.stringify(g2.access) === JSON.stringify(g.access) && g2.canUse(PLAYER, railCo.id), 'agreements and fees restored');
+  // Congestion investment changes company values: the rail company may also have been acquired above.
+  // Access follows its infrastructure to the buyer, so check the current owner rather than a defunct ID.
+  let railOwner = railCo.id;
+  while (g.company(railOwner).defunct && g.company(railOwner).boughtBy !== undefined) railOwner = g.company(railOwner).boughtBy!;
+  check(JSON.stringify(g2.access) === JSON.stringify(g.access) && g2.canUse(PLAYER, railOwner), 'agreements and fees restored for the railway\'s current owner');
   check(g2.accessMultiplier(PLAYER) === 2.5 && g2.accessMultiplier(g.ais[0].companyId) === 1.5, 'access multipliers restored');
   console.log('  defunct: ' + g.companies.filter((c) => c.defunct).map((c) => `${c.name} (bought by ${g.company(c.boughtBy ?? -1).name})`).join(', '));
   check(g2.companies.filter((c) => c.defunct).length >= 2 && g2.companies.every((c, i) => !!c.defunct === !!g.companies[i].defunct && c.boughtBy === g.companies[i].boughtBy), 'defunct companies restored');

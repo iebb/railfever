@@ -220,7 +220,7 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
   const under = net.nearestEdge(x, z, 1.0, 'rail');
   const n = net.nearestNode(x, z, 0.8, 'rail', (nn) => nn.edges.length === 2 && (!under || nn.edges.includes(under.edge.id) || Math.hypot(nn.x - x, nn.z - z) < 0.2));
   if (n && n.signal) {
-    if (n.owner !== owner) return 'Not your track';
+    for (const id of n.edges) { const e = net.edges.get(id); const err = e && g.trackUpgradeError(owner, e.owner); if (err) return err; }
     n.signal = (n.signal + 1) % 4;
     // cycled by hand: a plain signal (not passable from behind); removed: no kind left behind
     delete n.signalPass;
@@ -234,7 +234,8 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
   if (!ne) return 'Click on a track';
   const e = ne.edge;
   if (e.station >= 0 || e.depot >= 0) return 'Cannot place signals in stations or depots';
-  if (e.owner !== owner) return 'Not your track';
+  const access = g.trackUpgradeError(owner, e.owner);
+  if (access) return access;
   let node = n && Math.hypot(n.x - x, n.z - z) < 0.8 ? n : null;
   if (!node) {
     if (ne.s < 1 || ne.s > e.len - 1) {
@@ -448,7 +449,8 @@ export function electrify(g: Game, edgeIds: number[], owner: number, dryRun = fa
   for (const id of new Set(edgeIds)) {
     const e = net.edges.get(id);
     if (!e || e.kind !== 'rail' || e.depot >= 0 || e.type !== ELECTRIFY.from) continue;
-    if (!g.canUse(owner, e.owner)) { res.error = 'Track of another company: needs track access'; continue; }
+    const access = g.trackUpgradeError(owner, e.owner);
+    if (access) { res.error = access; continue; }
     res.cost += ELECTRIFY.costPerUnit * e.len; res.length += e.len; res.changed++;
     todo.push(e);
   }

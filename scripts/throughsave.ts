@@ -13,7 +13,8 @@ import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import type { Line } from '../src/game/lines';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { bezLine } from '../src/game/geom';
+import { bezLine, arcTable, bezPoint, tAtS } from '../src/game/geom';
+import { profAt } from '../src/game/network';
 import { outAndBack } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
@@ -145,7 +146,18 @@ if (process.argv.includes('--regression')) {
   check(!differ.length, `games saved at ${replays.length} ticks around the through service replay 30 days exactly (${differ.length ? 'differ: ' + differ.join(',') : 'identical'})`);
   const t = [...g.vehicles.trains()].find((v) => v.cars[0]?.id.startsWith('emu_'));
   check(!!t && lineCompatibility(g, t.lineId!, t.cars) === null, 'the through unit runs its whole route');
-  check([...geometry].every(([id, geo]) => { const e = g.world.net.edges.get(id); return !!e && JSON.stringify({ bez: e.bez, prof: [...e.prof], a: e.a, b: e.b }) === geo; }), 'the main line keeps all its track');
+  // Complete doubling can split the original main for turnouts and signals. Its IDs may change, but every
+  // original rail must still exist at the same position/height and belong to the same company.
+  check([...geometry].every(([id, geo]) => {
+    const e = g.world.net.edges.get(id);
+    if (e?.owner === 1 && JSON.stringify({ bez: e.bez, prof: [...e.prof], a: e.a, b: e.b }) === geo) return true;
+    const old = JSON.parse(geo), tab = arcTable(old.bez), profile = Float32Array.from(old.prof);
+    for (let s = 0; s <= tab.len; s += 0.5) {
+      const p = bezPoint(old.bez, tAtS(tab, s)), near = g.world.net.nearestEdge(p.x, p.z, 0.004, 'rail', (q) => q.owner === 1);
+      if (!near || Math.abs(g.world.net.heightAtS(near.edge, near.s) - profAt(profile, tab.len, s)) > 0.004) return false;
+    }
+    return true;
+  }), 'the main line keeps all its rail geometry and ownership through upgrade splits');
   const cityStations = [...g.stations.map.values()].filter((s) => s.rail?.trackType === 'metro').length;
   check(cityStations === 5, `the city railway keeps its five stations (${cityStations})`);
 }

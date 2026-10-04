@@ -411,6 +411,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
     // vehicles still to re-plan after the last network change (a few per tick), and lost-vehicle news timers
     replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
+    ...((g as any).congestionTold?.size ? { congestionTold: [...(g as any).congestionTold.entries()] } : {}),
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };
@@ -613,6 +614,7 @@ export function deserialize(d: any): Game {
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
   if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
+  if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }

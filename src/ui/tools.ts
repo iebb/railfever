@@ -2,7 +2,7 @@
 // preview), stations, depots, signals, demolition, terraforming and object queries.
 import * as THREE from 'three';
 import type { UI } from './ui';
-import { PLAYER } from '../game/game';
+import { PLAYER, type Game } from '../game/game';
 import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions, curveSpeed, levelCrossingAllowed } from '../game/construction';
 import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable, electrify } from '../game/build-ops';
 import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING, SIGNAL_COST } from '../game/signals';
@@ -59,8 +59,8 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
   'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R / Shift+R or Alt+wheel rotates.' },
   'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
-  signal: { name: 'Signals', hint: 'Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
-  double: { name: 'Double track', hint: 'Click one of your single tracks, or drag along it, to lay a second track beside it with switches at both ends (into a free platform where a station is). Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
+  signal: { name: 'Signals', hint: 'Use your track or another company’s track with access. Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
+  double: { name: 'Double track', hint: 'Click a single track you own or have access to, or drag along it, to lay a second track beside it, continuing into companion platforms and through junctions. Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
   entrance: { name: 'Add entrance', hint: 'Add an entrance: beside a road near an underground or elevated station (pavilion or stair tower); beside the tracks of a ground station, on either side (a side entrance, a footbridge or underpass to both sides, or a gate at a platform end). Every entrance brings its own catchment area.' },
   bulldoze: { name: 'Demolish', hint: 'Click to remove an object, or drag a rectangle to clear an area. Other companies’ property is protected.' },
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
@@ -918,24 +918,24 @@ export class Tools {
       const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
       ov.setMarker('hover0', n ? n : null, 'signal', 0xff5a5f);
       ov.setHoverEdge(n ? n.edges : null, 0xff5a5f);
-      this.tip(n ? (n.owner === PLAYER ? { title: 'Remove signal', rows: [['signal', SIGNAL_NAMES[n.signal]]], hint: 'Drag along a track to remove a series' } : { title: 'Signal', err: [`Belongs to ${g.company(n.owner).name}`] }) : { title: 'Remove signals', rows: [['info', 'Point at a signal, or drag along a track']] }, n && n.owner === PLAYER ? 'err' : 'info');
+      this.tip(n ? (g.canUse(PLAYER, n.owner) ? { title: 'Remove signal', rows: [['signal', SIGNAL_NAMES[n.signal]]], hint: 'Drag along a track to remove a series' } : { title: 'Signal', err: [`Track of ${g.company(n.owner).name}: needs track access`] }) : { title: 'Remove signals', rows: [['info', 'Point at a signal, or drag along a track']] }, n && g.canUse(PLAYER, n.owner) ? 'err' : 'info');
       return;
     }
     const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
     if (n) {
-      ov.setMarker('hover0', n, 'signal', n.owner === PLAYER ? 0xffb020 : 0xff5a4a);
+      ov.setMarker('hover0', n, 'signal', g.canUse(PLAYER, n.owner) ? 0xffb020 : 0xff5a4a);
       ov.setHoverEdge(n.edges, 0xffb020);
-      if (n.owner !== PLAYER) this.tip({ title: 'Signal', err: [`Belongs to ${g.company(n.owner).name}`] }, 'err');
+      if (!g.canUse(PLAYER, n.owner)) this.tip({ title: 'Signal', err: [`Track of ${g.company(n.owner).name}: needs track access`] }, 'err');
       else this.tip({ title: 'Change signal', rows: [['signal', `${SIGNAL_NAMES[n.signal]} → <b>${SIGNAL_NAMES[(n.signal + 1) % 4]}</b>`]] }, 'info');
       return;
     }
     const ne = net.nearestEdge(p.x, p.z, 1.0, 'rail');
-    if (!ne) { ov.setMarker('hover0', null); ov.setHoverEdge(null); this.tip({ title: 'Signals', rows: [['info', 'Point at one of your tracks']] }, 'info'); return; }
+    if (!ne) { ov.setMarker('hover0', null); ov.setHoverEdge(null); this.tip({ title: 'Signals', rows: [['info', 'Point at a track you own or have access to']] }, 'info'); return; }
     const e = ne.edge;
     const q = { x: 0, y: 0, z: 0 };
     let err = '';
     if (e.station >= 0 || e.depot >= 0) err = 'Not inside stations or depots';
-    else if (e.owner !== PLAYER) err = `Track owned by ${g.company(e.owner).name}`;
+    else if (!g.canUse(PLAYER, e.owner)) err = `Track of ${g.company(e.owner).name}: needs track access`;
     else if (ne.s < 1 || ne.s > e.len - 1) {
       const end = net.nodes.get(ne.s < 1 ? e.a : e.b)!;
       if (end.edges.length !== 2) err = 'Signals need plain track (not at a switch or track end)';
@@ -988,7 +988,7 @@ export class Tools {
       if (t.id >= 0) card.set(t); else card.set(null);
     } else card.set(null);
     if (!hit) { this.hideTip(); return; }
-    const own = (o: number): [string, string][] => (o === PLAYER ? [] : [['company', o < 0 ? 'Town' : esc(g.company(o).name)]]);
+    const own = (o: number): [string, string][] => [['company', o < 0 ? 'Town' : esc(g.company(o).name) + (o === PLAYER ? ' (you)' : '')]];
     if (hit.kind === 'station') {
       const st = g.stations.get(hit.id)!;
       this.hoverStation = st.id;
@@ -1038,7 +1038,7 @@ export class Tools {
     const d = this.down!.ground!;
     if (!this.sigDrag) {
       const ne = net.nearestEdge(d.x, d.z, 1.4, 'rail', (e) => e.station < 0 && e.depot < 0);
-      if (!ne || ne.edge.owner !== PLAYER) { ov.setSignalGhosts(null); this.tip({ title: 'Block signals', err: [ne ? `Track of ${g.company(ne.edge.owner).name}` : 'Start the drag on one of your tracks'] }, 'err'); return; }
+      if (!ne || !g.canUse(PLAYER, ne.edge.owner)) { ov.setSignalGhosts(null); this.tip({ title: 'Block signals', err: [ne ? `Track of ${g.company(ne.edge.owner).name}: needs track access` : 'Start the drag on a track you may use'] }, 'err'); return; }
       this.sigDrag = { edge: ne.edge.id, s0: ne.s, dir: 1, len: 0 };
     }
     const sd = this.sigDrag;
@@ -1063,10 +1063,10 @@ export class Tools {
     });
     ov.setSignalGhosts(ghosts);
     const fresh = lay.spots.filter((sp) => !sp.signal).length;
-    const STOP: Record<string, string> = { switch: 'stops at a switch', station: 'stops at a station', depot: 'stops at a depot', foreign: 'stops at another company\u2019s track', end: 'stops at the track end', loop: 'the loop is closed' };
+    const STOP: Record<string, string> = { switch: 'stops at a switch', station: 'stops at a station', depot: 'stops at a depot', foreign: 'track access needed beyond here', end: 'stops at the track end', loop: 'the loop is closed' };
     this.tip({
       title: `${this.signalKind === 'oneway' ? 'One-way' : 'Two-way'} ${this.signalClass} signals`, cost: lay.cost,
-      rows: [['signal', `<b>${lay.spots.length}</b> signal${lay.spots.length === 1 ? '' : 's'}${fresh < lay.spots.length ? ` (${fresh} new)` : ''} every ${fmtLen(this.signalSpacing)}`], ['length', `${fmtLen(lay.length)}${STOP[lay.stop] ? ' · ' + STOP[lay.stop] : ''}`]],
+      rows: [['company', `Owned by ${esc(g.company(e.owner).name)} · you pay for signals`], ['signal', `<b>${lay.spots.length}</b> signal${lay.spots.length === 1 ? '' : 's'}${fresh < lay.spots.length ? ` (${fresh} new)` : ''} every ${fmtLen(this.signalSpacing)}`], ['length', `${fmtLen(lay.length)}${STOP[lay.stop] ? ' · ' + STOP[lay.stop] : ''}`]],
       err: lay.spots.length ? [] : ['No room for signals here'], warn: g.economy.canAfford(lay.cost) ? [] : ['Not enough money'], hint: 'Release to place',
     }, lay.spots.length ? 'ok' : 'err');
   }
@@ -1096,7 +1096,7 @@ export class Tools {
     const g = this.game, net = g.world.net;
     const n = net.nearestNode(x, z, 0.9, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
     if (!n) return;
-    if (n.owner !== PLAYER) { this.ui.toast(`Signal of ${g.company(n.owner).name}`, 'bad'); return; }
+    if (!g.canUse(PLAYER, n.owner)) { this.ui.toast(`Track of ${g.company(n.owner).name}: needs track access`, 'bad'); return; }
     const e = net.edges.get(n.edges[0]);
     if (!e) return;
     const err = setSignal(g, e.id, e.a === n.id ? 0 : e.len, 'none', true, PLAYER);
@@ -1105,22 +1105,22 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ double track
-  /** Own single track for doubling: the edge under the cursor, or the track from the press point to it. */
+  /** Accessible single track for doubling: the edge under the cursor, or the track from the press point to it. */
   private hoverDouble(p: THREE.Vector3) {
     const g = this.game, net = g.world.net, ov = this.overlay;
-    const ok = (e: NEdge) => e.owner === PLAYER && e.station < 0 && e.depot < 0;
+    const ok = (e: NEdge) => g.canUse(PLAYER, e.owner) && e.station < 0 && e.depot < 0;
     const cur = net.nearestEdge(p.x, p.z, 1.4, 'rail', ok);
     let chain: number[] = [];
     const d = this.down;
     if (d && d.button === 0 && d.moved && d.ground) {
       const st = net.nearestEdge(d.ground.x, d.ground.z, 1.4, 'rail', ok);
-      if (st) chain = cur && cur.edge.id !== st.edge.id ? railChain(g, st.edge.id, cur.edge.id) ?? [st.edge.id] : [st.edge.id];
+      if (st) chain = cur && cur.edge.id !== st.edge.id ? railChain(g, st.edge.id, cur.edge.id, 200, ok) ?? [st.edge.id] : [st.edge.id];
     } else if (cur) chain = [cur.edge.id];
     if (!chain.length) {
       this.dbl = null;
       ov.setProposal(null); ov.setHoverEdge(null); ov.setMarker('start', null); ov.setMarker('hover0', null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title: 'Double track', err: [other.edge.owner !== PLAYER ? `Track of ${g.company(other.edge.owner).name}` : other.edge.station >= 0 ? 'Not inside stations' : 'Not on depot tracks'] } : { title: 'Double track', rows: [['parallel', 'Point at one of your single tracks, or drag along it']] }, other ? 'err' : 'info');
+      this.tip(other ? { title: 'Double track', err: [!g.canUse(PLAYER, other.edge.owner) ? `Track of ${g.company(other.edge.owner).name}: needs track access` : other.edge.station >= 0 ? 'Not inside stations' : 'Not on depot tracks'] } : { title: 'Double track', rows: [['parallel', 'Point at a single track you own or have access to, or drag along it']] }, other ? 'err' : 'info');
       return;
     }
     const key = `${chain.join(',')}|${this.doubleSide}|${g.networkVersion}`;
@@ -1141,8 +1141,9 @@ export class Tools {
     const y = (q: { x: number; z: number; y: number }) => ({ x: q.x, y: q.y, z: q.z });
     ov.setMarker('start', a ? y(a) : null, 'node', pl.ok ? 0x5ff07a : 0xff5a4a);
     ov.setMarker('hover0', b ? y(b) : null, 'node', pl.ok ? 0x5ff07a : 0xff5a4a);
-    const endText = (e: DoublePlan['start']) => (e.kind === 'platform' ? 'into a free platform' : 'switch');
+    const endText = (e: DoublePlan['start']) => (e.kind === 'platform' ? 'into a platform' : e.kind === 'track' ? 'into the other junction track' : 'switch');
     const rows: [string, string][] = [
+      ['company', `Owned by <b>${esc(g.company(net.edges.get(chain[0])!.owner).name)}</b> · you pay construction; upkeep shared by use`],
       ['length', `<b>${fmtLen(pl.length)}</b> of new track${chain.length > 1 ? ` along ${chain.length} sections` : ''}`],
       ['parallel', `${pl.side > 0 ? 'Right' : 'Left'} side${this.dbl.flipped ? ' (the other side is blocked)' : ''}`],
       ['rail', `Ends: ${endText(pl.start)} · ${endText(pl.end)}`],
@@ -2096,7 +2097,7 @@ export class Tools {
         if (this.signalMode === 'remove') { this.removeSignalAt(p.x, p.z); break; }
         const net = g.world.net;
         const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
-        if (n && n.owner !== PLAYER) { this.ui.toast(`Signal of ${g.company(n.owner).name}`, 'bad'); return; }
+        if (n && !g.canUse(PLAYER, n.owner)) { this.ui.toast(`Track of ${g.company(n.owner).name}: needs track access`, 'bad'); return; }
         let err: string | null;
         if (n) err = toggleSignal(g, p.x, p.z, PLAYER); // an existing signal: cycle it
         else {
@@ -2214,8 +2215,8 @@ function accessOwnerOf(g: { companies: { id: number; name: string; defunct?: boo
   return co && co.id !== PLAYER ? co.id : null;
 }
 
-/** Own rail edges reachable from some edges within a distance along the track (for signalling a stretch). */
-function trackAround(g: { world: { net: { edges: Map<number, NEdge>; nodes: Map<number, NNode> } } }, from: number[], reach: number): number[] {
+/** Accessible rail edges reachable within a distance along the track (for signalling a stretch). */
+function trackAround(g: Game, from: number[], reach: number): number[] {
   const net = g.world.net;
   const dist = new Map<number, number>(from.map((id) => [id, 0]));
   const queue = [...from];
@@ -2225,7 +2226,7 @@ function trackAround(g: { world: { net: { edges: Map<number, NEdge>; nodes: Map<
     if (!e || d0 > reach) continue;
     for (const nid of [e.a, e.b]) for (const nx of net.nodes.get(nid)?.edges ?? []) {
       const f = net.edges.get(nx);
-      if (!f || f.kind !== 'rail' || f.owner !== PLAYER || dist.has(nx)) continue;
+      if (!f || f.kind !== 'rail' || g.trackUpgradeError(PLAYER, f.owner) || dist.has(nx)) continue;
       dist.set(nx, d0 + e.len);
       queue.push(nx);
     }

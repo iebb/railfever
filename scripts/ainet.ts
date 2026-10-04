@@ -448,6 +448,8 @@ function joinChecks() {
     startFleet(g, l.vehicles.map((id) => g.vehicles.get(id)!));
     // the cash test covers the same operating window as before staged dispatch existed
     const started = g.company(me).economy.money;
+    const capital = () => g.company(me).economy.thisYear.construction + g.company(me).economy.yearTotals.reduce((s, y) => s + y.v.construction, 0);
+    const capitalBefore = capital();
     const visited = new Map(l.vehicles.map((id) => [id, new Set<number>()]));
     const until = g.day + (shared ? 360 : 200);
     while (g.day < until) {
@@ -456,7 +458,10 @@ function joinChecks() {
     }
     console.log(`  ${shared ? 'two companies' : 'own lines'}: joined ${stat(ai, 'netJoined')}, far stops visited ${[...visited.values()].map((s) => [s.has(A.id), s.has(B.id)].join('/')).join(', ')}, cash ${fmt(g.company(me).economy.money / 1e6, 2)}M`);
     check([...visited].filter(([id]) => g.vehicles.get(id)?.owner === me).every(([, s]) => s.has(A.id) && s.has(B.id)), 'join: each of our trains physically serves both far stops');
-    check(routes(g, A, B, me) && g.company(me).economy.money > started - cash * 0.2
+    // Shared services now fund congestion works too. Count that capital separately from this operating-loss
+    // ceiling; the actual cash reserve and loan limits below still apply after paying for every upgrade.
+    const invested = Math.max(0, capitalBefore - capital());
+    check(routes(g, A, B, me) && g.company(me).economy.money + invested > started - cash * 0.2
       && [...new Set([me, other])].every((id) => { const c = g.company(id); return c.economy.money > 1_000_000 && c.economy.loan <= c.economy.maxLoan && !c.defunct; }),
       'join: through trains route both ways and both companies keep healthy cash reserves');
     check(netReservations(g).length === 0, 'join: reservations remain consistent');

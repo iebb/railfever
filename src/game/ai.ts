@@ -35,6 +35,7 @@ import { networkDaily, scheduleNetworkTask, XLINK_REACH } from './ai-network';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail';
 import { offloadMail } from './mail';
+import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn } from './dualtrack';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1076,6 +1077,12 @@ export interface LineInfo {
   shared?: number;
   /** rail: upgraded to double track with block signals; day of the last failed upgrade */
   double?: boolean; upgradeFailed?: number;
+  /** Geometric failure permits a congestion cut; cash/occupied track only defers the upgrade. Saved for retries. */
+  doubleImpossible?: boolean; upgradeRetry?: number;
+  /** Physically paired legs whose crossovers/signals need another attempt. */
+  doubleFinish?: number[];
+  /** Observed annual congestion loss supporting completion of temporary loops; ages out with demand changes. */
+  doubleValue?: number; doubleSince?: number;
   /** rail: passing loops laid on the open line (where the whole track could not be doubled) */
   loops?: number;
   /** rail: towns along the line where a station on the track could not be planned */
@@ -1117,6 +1124,7 @@ export interface AIState {
   corridor?: [number, number];
   /** a through service being planned after a city railway opened (resumed after loading: AIController.throughJob) */
   through?: ThroughJob;
+  doubleJob?: DoubleJob;
 }
 
 /** The through-service follow-up of a city railway: its line, the station at its depot end, its style, the cursor. */
@@ -1160,8 +1168,6 @@ export class AIController {
   /** (profiling) the best options of the last project choice */
   lastOptions: { kind: string; towns: number[]; score: number }[] = [];
   static slowMs = 8;
-  /** railways between towns with sqrt(popA * popB) at least this get their second track when they open */
-  static trunkPop = 4500;
   /** tests: build forced projects even when the estimate says they would not pay */
   static forceBuild = false;
   /** towns from this size get their main-line stations in the centre, underground (and cross-city links) */
@@ -1381,7 +1387,7 @@ export class AIController {
    */
   upgradeLine(lineId: number): boolean {
     const l = this.game.lines.get(lineId), info = this.lines.get(lineId);
-    if (!l || !info || info.kind !== 'rail' || info.double || info.loops || info.shared !== undefined) return false;
+    if (!l || !info || info.kind !== 'rail' || info.double || this.job) return false;
     const job = this.doubleGen(l, info);
     while (!job.next().done) { /* run to the end */ }
     return !!info.double || !!info.loops;
@@ -1749,8 +1755,13 @@ export class AIController {
 
   /** Cancel both running work and the saved cursor, even when generator/project cleanup throws. */
   private cancelJob() {
+    const double = this.state.doubleJob;
     try { this.job?.return(undefined); if (this.project) this.abandon(this.project); }
-    finally { this.project = null; this.job = null; delete this.state.through; }
+    finally {
+      const info = double ? this.lines.get(double.line) : undefined;
+      if (info && double?.finishFailed?.length) info.doubleFinish = [...new Set(double.finishFailed)];
+      this.project = null; this.job = null; delete this.state.through; delete this.state.doubleJob;
+    }
   }
 
   /** Remove what an unfinished project built. */
@@ -1928,12 +1939,19 @@ export class AIController {
 
   /**
    * Trains stuck or waiting long on one of our railway lines: a step of the response each month while it lasts —
-   * signals (block signals, path signals before junctions, starters), then passing loops / a second track on the
-   * single-track stretches, then one train fewer. True if it acted (nothing else for the line this month).
+   * signals and platforms, then a complete second track valued against recoverable passenger income. Loops
+   * are temporary; a cut follows completion or a demonstrated geometric failure, never a cash deferral.
    */
   private relieveCongestion(l: Line, info: LineInfo): boolean {
     const g = this.game, me = this.companyId;
     const c = lineCongestion(g, l.id);
+    if (!info.double && (info.loops || info.doubleValue) && !this.job && g.day >= (info.upgradeRetry ?? 0)) {
+      const recent = (info.doubleValue ?? 0) * Math.max(0, 1 - (g.day - (info.doubleSince ?? g.day)) / 720);
+      const value = Math.max(recent, congestionReturn(g, l));
+      // Loops may relieve the immediate wait. Complete their formation when the still-recent loss estimate
+      // pays for its remaining pieces, rather than requiring the congestion detector to fire again.
+      if (value > 0 && this.available() > 500_000) { this.startDouble(l, info, value); return true; }
+    }
     if (c.level < 2) { if (c.level === 0) info.congestion = undefined; return false; }
     if (g.day - (info.congestionDay ?? -1e9) < 30) return false;
     info.congestionDay = g.day;
@@ -1946,18 +1964,20 @@ export class AIController {
     }
     // trains held for a platform: their station grows first
     if (this.growLineStations(l, true)) { this.note(`${l.name} congested: a station rebuilt bigger`); return true; }
-    if (step < 2 && !info.double && !this.job && this.available() > 2_000_000) {
+    if (info.double && !lineIsDouble(g, l, me)) { info.double = false; info.doubleImpossible = false; }
+    if (!info.double && !this.job && g.day >= (info.upgradeRetry ?? 0)) {
       info.congestion = 2;
       info.upgradeFailed = undefined;
-      // loops / a second track, as for a busy line (doubleGen tries both sides, keeps what it can)
-      if (!info.loops || c.suggestion === 'double') {
-        this.project = { kind: 'double', towns: [...info.towns], stations: [], edges: [], depots: [], line: -1, started: g.day, built: true };
-        info.loops = undefined;
-        this.job = this.doubleGen(l, info);
+      const value = congestionReturn(g, l);
+      // Recovery of fares and waiting/lost passengers pays for the second track. Low cash is a deferral,
+      // never evidence that the railway cannot be doubled.
+      if (value > 0 && this.available() > 500_000) {
+        this.startDouble(l, info, value);
         this.note(`${l.name} congested: second track`);
         return true;
       }
     }
+    if (!info.double && (!info.doubleImpossible || this.state.doubleJob?.line === l.id)) return true;
     // still stuck: one train fewer (the newest of ours), and no more than that from now on
     const ours = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train && v.owner === me);
     if (ours.length > 1 && this.railPolicy.fewer(l, 1, 'fewer trains for congestion')) {
@@ -2219,8 +2239,8 @@ export class AIController {
             if (net.sectionAt(e, sAt) !== 'ground') continue;
             const dx = toward.x - P.x, dz = toward.z - P.z, dl = Math.hypot(dx, dz) || 1;
             if ((tx * dx + tz * dz) / dl < 0.5) continue;
-            // single track only (a double track would need a flat or flying junction across the other one)
-            if (net.edgesNear(P.x - 2, P.z - 2, P.x + 2, P.z + 2).some((o) => o.id !== e!.id && o.kind === 'rail' && !chain.includes(o.id) && net.nearestEdge(P.x, P.z, 2, 'rail', (q) => q.id === o.id))) continue;
+            // A branch can join a directional pair: its second lead and reserved diamond are built by doubleGen.
+            if (net.edgesNear(P.x - 2, P.z - 2, P.x + 2, P.z + 2).some((o) => o.id !== e!.id && o.kind === 'rail' && !chain.includes(o.id) && !!g.trackUpgradeError(this.companyId, o.owner) && net.nearestEdge(P.x, P.z, 2, 'rail', (q) => q.id === o.id))) continue;
             out.push({ edge: e.id, s: sAt, x: P.x, z: P.z, y: P.y, tx, tz, owner: e.owner, chain: [...chain], dist: dist + s0 });
           }
           dist += e.len;
@@ -2560,11 +2580,12 @@ export class AIController {
     }
     this.stats.track += res.built; this.stats.bridges += res.bridges; this.stats.tunnels += res.tunnels;
     yield;
-    // ---- a trunk line between big towns gets its second track at once (into the free platforms, directional with
-    // block signals); else, or where that fails, passing loops at the stations
-    // (a high-speed line opens on one track with passing at its stations: a second track right at the platforms
-    // leaves no room for the other platforms' turnouts; it is doubled as traffic grows)
-    const trunk = !hub && !join && !hs && Math.sqrt(A.pop * B.pop) >= AIController.trunkPop && this.available() > est + 1_000_000;
+    // ---- forecast demand and occupation of the single track can justify a directional second track at once,
+    // including branches and high-speed routes. Otherwise the station ladders provide passing places.
+    const excessDemand = Math.max(0, forecast.boardings - sv.seats) / Math.max(1, forecast.boardings);
+    const congestionRisk = Math.min(0.65, nTrains * len / Math.max(50, sv.headway * sv.kmh / 36));
+    const trunk = income * Math.max(excessDemand, congestionRisk) * (6 + 12 * this.config.risk) > est
+      && this.available() > est + 1_000_000;
     let early: { line: Line; info: LineInfo } | null = null;
     if (trunk) {
       const line = g.lines.create('rail', owner);
@@ -2579,8 +2600,7 @@ export class AIController {
       this.state.phase = `building railway ${A.name} - ${B.name}`;
     }
     // ---- passing loops: the other platform tracks join the main line a little way out
-    // (also on a line doubled at once: its second track begins beyond the throats, so the other platforms join the
-    // line here too)
+    // Platforms still unused after a complete double upgrade join its approach by the usual turnout ladder.
     for (const [st, ends] of (join ? [[stA, fAs]] : [[stA, fAs], [stB, fBs]]) as [Station, number[]][]) {
       const n0 = net.nodes.get(ends[0]);
       if (!n0) continue;
@@ -3906,7 +3926,7 @@ export class AIController {
     const out: { line: number; term: number; node: number }[] = [];
     if (!end || !g.lines.get(t.line)) return out;
     for (const l of g.lines.map.values()) {
-      if (l.kind !== 'rail' || l.id === t.line || !g.canUse(me, l.owner)) continue;
+      if (l.kind !== 'rail' || l.id === t.line || g.trackUpgradeError(me, l.owner)) continue;
       const path = linearStops(l.stops);
       if (!path) continue;
       for (const term of [path[0], path[path.length - 1]]) {
@@ -3976,7 +3996,15 @@ export class AIController {
     this.note(`through service ${tl.name} (${tl.stops.length} stops)`);
     // (the city line and the main line become patterns of the through line: one line per route)
     const tid = this.canonical(tl.id), tinfo = this.lines.get(tid);
-    if (tinfo) tinfo.urban ??= t.mode;
+    if (tinfo) {
+      tinfo.urban ??= t.mode;
+      const through = g.lines.get(tid)!;
+      tinfo.double = lineIsDouble(g, through, me);
+      // A single connector between two busy services becomes their shared bottleneck. Its forecast share of
+      // annual receipts values an immediate complete upgrade, using the same saved job as a congestion fix.
+      const recovery = Math.max(congestionReturn(g, through), (ul.incomeLast + l.incomeLast) * 0.2);
+      if (!tinfo.double && recovery * (6 + 12 * this.config.risk) > pj.cost * 2 && this.available() > pj.cost * 2 + 500_000) this.startDouble(through, tinfo, recovery);
+    }
     return true;
   }
 
@@ -4376,8 +4404,8 @@ export class AIController {
           if (vs.length) continue;
         }
       }
-      // trains stuck on our railways: signals, passing loops, double track, fewer trains (in that order)
-      if (info.kind === 'rail' && info.shared === undefined && this.relieveCongestion(l, info)) continue;
+      // Signals/platforms, full doubling (or temporary loops), then fewer trains after a proved limitation.
+      if (info.kind === 'rail' && this.relieveCongestion(l, info)) continue;
       // an express pattern on a long line of uneven demand (every other train passes the quieter stations)
       if (info.kind === 'rail' && info.shared === undefined && !info.joined && !info.urban && info.express === undefined && vs.length >= 3 && g.day - info.opened > 360
         && (info.expressLook ?? 0) < new Set(l.stops).size && this.addExpress(l, info, vs)) continue;
@@ -4428,9 +4456,8 @@ export class AIController {
       // (urban lines run their units as they are; main lines lengthen their trains first)
       if (info.kind === 'rail' && !info.urban && vs.every((v) => v instanceof Train && v.cars.some((m) => m.kind === 'loco')) && this.lengthenTrain(l, info, vs as Train[], waiting)) continue;
       // a single-track railway full of trains: lay the second track (block signals, more trains)
-      if (info.kind === 'rail' && !info.double && !info.loops && info.shared === undefined && vs.length >= info.maxVehicles && g.day - (info.upgradeFailed ?? -1e9) > 720 && !this.job) {
-        this.project = { kind: 'double', towns: [...info.towns], stations: [], edges: [], depots: [], line: -1, started: g.day, built: true };
-        this.job = this.doubleGen(l, info);
+      if (info.kind === 'rail' && !info.double && vs.length >= info.maxVehicles && g.day >= (info.upgradeRetry ?? 0) && g.day - (info.upgradeFailed ?? -1e9) > 180 && !this.job) {
+        this.startDouble(l, info, congestionReturn(g, l));
         continue;
       }
       const fleet = () => info.kind === 'bus' ? Math.min(Math.round(info.maxVehicles * grow), l.stops.length * 2)
@@ -4462,6 +4489,16 @@ export class AIController {
       if (!this.job && this.rng.chance(0.35 * act)) this.addIntermediateStation();
       this.considerAcquisition();
     }
+  }
+
+  /** Install the cursor before the generator's first tick, so a save immediately after scheduling also resumes. */
+  private startDouble(l: Line, info: LineInfo, value: number) {
+    this.game.stations.refreshAccess();
+    this.project = { kind: 'double', towns: [...info.towns], stations: [], edges: [], depots: [], line: -1, started: this.game.day, built: true };
+    this.state.doubleJob = { ...newDoubleJob(l, this.state.phase), returnValue: value, finishFailed: info.doubleFinish ? [...info.doubleFinish] : undefined };
+    info.upgradeFailed = this.game.day;
+    if (info.doubleValue === undefined && value > 0) { info.doubleValue = value; info.doubleSince = this.game.day; }
+    this.job = this.doubleGen(l, info);
   }
 
   /**
@@ -4570,12 +4607,42 @@ export class AIController {
   }
 
   /**
-   * Upgrade a busy single-track railway (trackops): a second track beside the whole main line (one-way running
-   * with block signals, crossovers before the stations), else passing loops on the stretches where a parallel
-   * track fits (steep curves, structures, nearby track and roads leave single-track gaps); more trains may then
-   * run. A job: plans and builds in steps (each plan built in the next step).
+   * Complete a busy railway, including approaches and junctions. Each station leg's construction is atomic;
+   * its cursor, costs and unresolved finishing work survive a save between fixed work ticks. Clear parts of a
+   * blocked formation get temporary loops and are retried with the remaining legs.
    */
   private *doubleGen(l: Line, info: LineInfo): Generator<void, void> {
+    const g = this.game, me = this.companyId;
+    const resuming = !!this.state.doubleJob;
+    const cursor = this.state.doubleJob ??= newDoubleJob(l, this.state.phase);
+    if (!resuming && info.doubleFinish) cursor.finishFailed = [...info.doubleFinish];
+    if (!resuming) info.upgradeFailed = g.day;
+    this.state.phase = `doubling ${l.name}`;
+    const embedded = this.project?.kind !== 'double';
+    const worth = (cost: number) => AIController.forceBuild || (embedded && !l.vehicles.length)
+      || cost + (cursor.spent ?? 0) <= Math.max(cursor.returnValue ?? 0, congestionReturn(g, l)) * (6 + 12 * this.config.risk);
+    const fund = (cost: number) => this.available() >= cost * 1.15 + 500_000 && this.borrowFor(cost);
+    while (!doubleJobStep(g, cursor, me, fund, worth)) {
+      if (!embedded) yield;
+    }
+    info.doubleFinish = cursor.finishFailed?.length ? [...new Set(cursor.finishFailed)] : undefined;
+    info.double = lineIsDouble(g, l, me) && !info.doubleFinish;
+    if (info.double) { info.doubleValue = undefined; info.doubleSince = undefined; cursor.error = ''; }
+    info.doubleImpossible = !info.double && cursor.blocked && !cursor.deferred;
+    info.upgradeRetry = info.double ? undefined : g.day + (cursor.deferred ? 30 : 180);
+    if (cursor.built) {
+      this.stats.doubled++; this.stats.trackDouble += cursor.length; this.stats.signals += cursor.signals;
+      if (!info.double) { info.loops = (info.loops ?? 0) + cursor.built; this.stats.loops += cursor.built; }
+      else info.loops = undefined;
+      info.maxVehicles = Math.max(info.maxVehicles, info.double ? 4 : 3);
+      g.postNews(info.double ? `${this.name} doubles the full track of ${l.name}, including its approaches and junctions.` : `${this.name} upgrades part of ${l.name}; the remaining single track will be retried.`, 'ai');
+    }
+    this.note(`${l.name}: ${info.double ? 'fully double' : 'second track deferred'} (${cursor.built} stretches, ${cursor.signals} signals${cursor.error ? ', ' + cursor.error : ''})`);
+    this.state.phase = cursor.phase;
+    delete this.state.doubleJob;
+  }
+
+  private *legacyDoubleGen(l: Line, info: LineInfo): Generator<void, void> {
     const g = this.game, me = this.companyId, net = g.world.net;
     info.upgradeFailed = g.day;
     const m = this.mainTrack(l);
@@ -4826,14 +4893,19 @@ export class AIController {
     if (Array.isArray(s.failed)) this.failed = new Map(s.failed);
     if (s.stats) this.stats = { ...this.stats, ...s.stats };
     if (Array.isArray(s.lines)) this.lines = new Map(s.lines);
+    if (s.project?.kind === 'double' && s.doubleJob && this.lines.has(s.doubleJob.line) && this.game.lines.get(s.doubleJob.line)) {
+      this.state.doubleJob = { ...s.doubleJob, stops: [...s.doubleJob.stops], ...(s.doubleJob.legs ? { legs: s.doubleJob.legs.map(([a, b]: [number, number]) => [a, b] as [number, number]) } : {}), ...(s.doubleJob.finishFailed ? { finishFailed: [...s.doubleJob.finishFailed] } : {}) };
+      this.project = { ...s.project, built: true, edges: [], stations: [], depots: [] };
+      this.job = this.doubleGen(this.game.lines.get(s.doubleJob.line)!, this.lines.get(s.doubleJob.line)!);
+    }
     this.railPolicy.load(s.rail);
     this.mailPolicy.load(s);
     if (typeof s.lastAcq === 'number') this.lastAcq = s.lastAcq;
     if (Array.isArray(s.stationCare)) this.stationCare = new Map(s.stationCare);
     if (Array.isArray(s.accessCare)) this.accessCare = new Map(s.accessCare);
     if (Array.isArray(s.relengthen)) this.relengthen = s.relengthen.map((q: [number, number, string[]]) => [q[0], q[1], [...q[2]]]);
-    // an interrupted project is cleaned up (jobs are not persisted)
-    if (s.project) {
+    // Other interrupted projects retain 2.7's cleanup; a saved double-track cursor resumes above.
+    if (s.project && !this.state.doubleJob) {
       const p: Project = {
         kind: s.project.kind, towns: s.project.towns ?? [], stations: s.project.stations ?? [], edges: s.project.edges ?? [], depots: s.project.depots ?? [],
         line: s.project.line ?? -1, started: s.project.started ?? 0, access: s.project.access ?? -1, joint: s.project.joint,
