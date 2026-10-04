@@ -21,6 +21,7 @@ import { DemandModel, GEN_RATE } from './demand';
 import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
+import { observeRailCapacity } from './ai-capacity';
 
 export interface NewGameOptions {
   size: number;
@@ -915,6 +916,8 @@ export class Game {
     // station ratings (and service frequency), then town growth paced by the towns' public transport (towns.ts)
     this.stations.updateRatings();
     this.towns.daily();
+    // capacity-integration: measure every operator before any of them makes today's fleet decision.
+    if (this.aiEnabled) observeRailCapacity(this);
     // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
     if (this.aiEnabled) for (const ai of [...this.ais]) {
       ai.daily();

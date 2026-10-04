@@ -8,6 +8,7 @@ import type { ServicePattern } from './patterns';
 import { lineGraph, lineTable, mailFleet, TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
 import { transferWalkTime } from './fares';
 import type { RNG } from './rng';
+import type { RailCapacityState } from './ai-capacity';
 import { rerouteMail, type LineMail } from './mail';
 
 export interface Line {
@@ -38,6 +39,8 @@ export interface Line {
   evenSpacing?: boolean;
   /** Simulation-second departure clocks, separately for each service pattern (saved with the line). */
   spacing?: Record<string, PatternSpacing>;
+  // capacity-integration: observed corridor economics, saved with the line; absent in older saves.
+  capacity?: RailCapacityState;
   /** rail route letter (the Y of station numbers XY01), unique among the owner's rail lines; see Lines.lineCode */
   code?: string;
   /**
