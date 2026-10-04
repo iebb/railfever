@@ -131,15 +131,21 @@ if (isMain) {
   g.lines.rebuild();
   for (const vid of line.vehicles) g.vehicles.get(vid)?.onLineChanged();
   const f0 = { pPaid: total(P, 'trackFees'), qEarned: total(Q, 'trackIncome') };
-  let sawAI = 0, sawDetour = 0;
-  for (let d = 0; d < 120; d++) { run(1); if (onAI(pt)) sawAI++; if (onDetour(pt)) sawDetour++; }
   const agr = g.agreement(PLAYER, ai)!;
+  let sawAI = 0, sawDetour = 0, billedShare = Infinity;
+  // Clear the route reserved before access changed, then observe two complete service cycles.
+  // Curves now share one speed model; its phase at day 40 must not decide the access result.
+  for (let d = 0; d < 180 && !(pt.state === 'loading' && pt.atStation === A); d++) run(1);
+  for (let d = 0; d < 270; d++) {
+    run(1); if (onAI(pt)) sawAI++; if (onDetour(pt)) sawDetour++;
+    if (agr.paidLastMonth > 0) billedShare = Math.min(billedShare, agr.usageShareLastMonth);
+  }
   console.log(`  with access: days on AI track ${sawAI}, on detour ${sawDetour}; player paid ${fmt(-(total(P, 'trackFees') - f0.pPaid), 0)}, AI earned ${fmt(total(Q, 'trackIncome') - f0.qEarned, 0)}, agreement: paid ${fmt(agr.paidTotal, 0)}, last month ${fmt(agr.paidLastMonth, 0)} at usage share ${fmt(agr.usageShareLastMonth * 100, 0)}%; ${pt.status}`);
   check(sawAI > 20, 'player train uses the AI track');
   check(total(P, 'trackFees') < f0.pPaid && total(Q, 'trackIncome') > f0.qEarned, 'fees flow from the player to the AI');
   check(Math.abs((f0.pPaid - total(P, 'trackFees')) - (total(Q, 'trackIncome') - f0.qEarned)) < 1, 'fees paid = fees earned');
   check(agr.paidTotal > 0 && Math.abs(agr.paidTotal - (f0.pPaid - total(P, 'trackFees'))) < 1, 'agreement records the fees');
-  check(agr.usageShareLastMonth > 0.9, 'the idle owner: the player carries (nearly) all the traffic on the AI items it used');
+  check(Number.isFinite(billedShare) && billedShare > 0.9, 'the idle owner: the player carries (nearly) all the traffic in every billed month');
   check(Math.abs(g.accessEarnings(ai).total - agr.paidTotal) < 1, 'owner earnings recorded');
   check(g.stations.get(E)!.lastPickup > 0 || pt.delivered > 0, 'train served the AI station');
   check(sawAI > sawDetour, 'with access the short way over AI track is preferred');
@@ -283,7 +289,8 @@ if (isMain) {
   for (const vid of aiLine.vehicles) g.vehicles.get(vid)?.onLineChanged();
   const n0 = g.requestsTo(PLAYER).length, d0 = at.delivered, f2 = { pEarned: total(P, 'trackIncome'), qPaid: total(Q, 'trackFees') };
   const visited = new Set<number>();
-  for (let k = 0; k < 1200; k++) { g.update(0.25); if (at.atStation >= 0) visited.add(at.atStation); }
+  // Include depot/route recovery and at least a full out-and-back cycle under curve limits.
+  for (const until = g.day + 300; g.day < until;) { g.update(0.25); if (at.atStation >= 0) visited.add(at.atStation); }
   const ag = g.agreement(ai, PLAYER);
   console.log(`  open access: AI train served ${[...visited].map((id) => g.stations.get(id)?.name).join(', ')} (${at.status}); agreement ${!!ag} (paid ${fmt(ag?.paidTotal ?? 0, 0)}); player earned ${fmt(total(P, 'trackIncome') - f2.pEarned, 0)}`);
   check(g.requestsTo(PLAYER).length === n0 && !!ag, 'open: no request; an agreement made on first use');

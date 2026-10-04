@@ -119,7 +119,9 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
     if (x === 0 || z === 0 || x === w.size || z === w.size) continue;
     const cur = w.h[k];
     let nv: number;
-    if (a.lo > a.hi) nv = a.tnear;
+    // Steep rail profiles can cross a grid cell at several heights. Keep every corner below the
+    // lowest running height, so interpolated terrain cannot bury the common track's 7% grades.
+    if (a.lo > a.hi) nv = rail && a.core ? a.hi : a.tnear;
     else if (a.core) nv = Math.min(a.hi, Math.max(a.lo, cur));
     else nv = roundMax(roundMin(cur, a.hi, r), a.lo, r);
     // where formations meet at different heights the vertex goes to the nearer one; a rail formation takes

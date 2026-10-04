@@ -629,7 +629,7 @@ export class MapModes {
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
           inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
-        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (tram dashed). Every rail station has the same reach, whatever its track type. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
+        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (tram dashed). Walking reach belongs to the station. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
     );
   }
 

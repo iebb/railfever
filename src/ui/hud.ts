@@ -4,12 +4,12 @@ import type { UI } from './ui';
 import type { Game, News } from '../game/game';
 import { PLAYER } from '../game/game';
 import type { ToolId, LineLevel } from './tools';
-import { TOOL_INFO, MAIN_TYPES, URBAN_TYPES } from './tools';
+import { TOOL_INFO } from './tools';
 import { h, icon, clear, seg, stepper, kbd, toggle, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES, LINE_LEVEL, ELECTRIFY } from '../game/constants';
 import { structureFactor } from '../game/construction';
-import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct, TYPE_META } from './format';
+import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct } from './format';
 import { walkLimit } from '../game/catchment';
 import type { StationLevel } from './gameapi';
 import { stationStyles, catchBonusOf } from './gameapi';
@@ -26,7 +26,7 @@ interface Cat { id: string; label: string; icon: string; color: string; tip: str
 const CATS: Cat[] = [
   { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
   { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, double track, signals, depot, electrify, connect', keys: '2 4 5 J', tools: ['rail', 'double', 'signal', 'depot-rail', 'electrify', 'connect'] },
-  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'Urban-style rail presets: subway and light-rail track and close-spaced stations, lift / sink track. Ordinary rail: any train and any rail line may use them', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
+  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'City railway and station presets: double track with overhead wire, metro or light-rail station styles, lift / sink track', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
   { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
   { id: 'tram', label: 'Tram', icon: 'tram', color: 'var(--tram)', tip: 'Tram: tracks, stops, depot', keys: '', tools: ['tram', 'tramstop', 'depot-tram'] },
   { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
@@ -90,10 +90,10 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
 const TRAY_TIP: Partial<Record<ToolId, string>> = {
   signal: 'Signals split track into blocks so several trains can run on a line. Two-way: trains pass in both directions (single track with passing loops). One-way: block signals for double track — trains only enter from the signal side. Drag along a track to place a series.',
   double: 'Upgrade to double track: lay a second track beside one of yours, with switches at both ends.',
-  electrify: 'Electrify: overhead wire turns standard track into electrified track for electric locomotives and EMUs.',
+  electrify: 'Add overhead wire for electric locomotives, EMUs, metro and light-rail units.',
   connect: 'Connect tracks: a curve with turnouts from one track into another (junctions, through running).',
-  metro: 'Urban-style track preset: metro or light-rail track, underground (subway), elevated or on the ground. Ordinary rail for every train and line.',
-  'metro-station': 'Urban-style station preset: metro or light-rail platforms, underground by default, close together. Same walking reach and fares as every rail station.',
+  metro: 'City railway preset: underground double track with overhead wire. Level and track count can be adjusted.',
+  'metro-station': 'Metro or light-rail station style, independent of the track. Underground by default, with street entrances.',
   relevel: 'Re-level: lift a stretch of your track onto a viaduct or sink it into a tunnel, in place.',
 };
 const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', double: 'Double', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop', entrance: 'Entrance', metro: 'Urban track', 'metro-station': 'Station', relevel: 'Re-level', electrify: 'Electrify', connect: 'Connect' };
@@ -523,10 +523,10 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.proposal?.opts.type, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
-  /** Station tools: a new platform track type (urban: platform length and level follow the type's defaults). */
+  /** Station tools: platform length and level follow the selected station style's defaults. */
   private setStationType(v: string) {
     const T = this.ui.tools;
     const prev = T.stationType;
@@ -589,11 +589,8 @@ export class Hud {
     if (t === 'tram') opts.push(opt('Mode', seg([['add', 'Add to roads', 'Lay tracks in existing roads'], ['build', 'New road', 'Build a new road with tracks'], ['remove', 'Remove', 'Take your tracks up']], T.tramMode, (v) => { T.tramMode = v; T.resetChain(); redo(); })));
     if (T.railBuild || t === 'road' || (t === 'tram' && T.tramMode === 'build')) {
       if (T.railBuild) {
-        const types = t === 'metro' ? URBAN_TYPES : MAIN_TYPES;
-        if (!types.includes(T.railType)) T.railType = types[0];
-        opts.push(typePicker(types, T.railType, (v) => { T.railType = v; redo(); }));
         opts.push(this.levelOpts(T.railLevel, T.levelHeight, T.levelDepth, (lv) => { T.railLevel = lv; redo(); }, (hh) => { T.levelHeight = hh; redo(); }, (d) => { T.levelDepth = d; redo(); }));
-        opts.push(typeSpec(T.railType, T.railLevel, T.levelHeight, T.levelDepth));
+        opts.push(typeSpec(T.proposal?.opts.type ?? T.railType, T.railLevel, T.levelHeight, T.levelDepth));
         const many = this.moreTracks || T.tracks > 2;
         opts.push(opt('Tracks', seg<number>(many ? [[1, 'Single'], [2, 'Double'], [3, '3'], [4, '4']] : [[1, 'Single', 'One track — upgrade to double later'], [2, 'Double', 'Two parallel tracks: trains pass each other']], T.tracks, (v) => { T.tracks = v; redo(); }),
           many ? null : h('button', { class: 'ibtn sm', 'data-tip': 'More tracks (3–4)', 'aria-label': 'More tracks', onclick: () => { this.moreTracks = true; this.renderCard(); } }, icon('plus', 14))));
@@ -607,17 +604,17 @@ export class Hud {
       opts.push(opt('End', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: raised ends make bridges, lowered ends cuttings and tunnels ( [ / ] or PgUp / PgDn )')));
       // elevated / underground lines cross everything over / under by themselves
       if (!T.railBuild || T.railLevel === 'ground') opts.push(opt('Cross', seg([
-        ['auto', 'Auto', 'Choose a permitted crossing for the terrain and track type'],
+        ['auto', 'Auto', 'Choose a crossing for the terrain and speed'],
         ['over', 'Overpass', 'Build above the line being crossed'],
         ['under', 'Underpass', 'Build below the line being crossed'],
-        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and light-rail track need an overpass or underpass'],
+        ['level', 'Level', 'Road level crossing: trains slow to at most 160 km/h'],
       ], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'electrify') {
-      opts.push(h('div', { class: 'tc-spec' }, icon('bolt', 14), h('span', null, 'Overhead wire ', h('b', null, `${fmtMoney(ELECTRIFY.costPerUnit * 100)}/km`), ' · standard → electrified track (160 km/h)')));
+      opts.push(h('div', { class: 'tc-spec' }, icon('bolt', 14), h('span', null, 'Overhead wire ', h('b', null, `${fmtMoney(ELECTRIFY.costPerUnit * 100)}/km`), ' · for electric locomotives, EMUs, metro and light rail')));
     } else if (t === 'connect') {
       const a = T.conn ? this.ui.game.world.net.edges.get(T.conn.edge) : undefined;
-      if (a) opts.push(h('span', { class: 'chip', style: `--c:${TYPE_META[a.type]?.color ?? 'var(--rail)'}` }, `First: ${(TRACK_TYPES[a.type] ?? TRACK_TYPES.standard).name.replace(/ \(electrified\)$/, '')}`), h('button', { class: 'btn sm', 'data-key': 'Esc', onclick: () => T.clearConn() }, icon('close', 14), 'Pick again'));
+      if (a) opts.push(h('span', { class: 'muted' }, 'First track selected'), h('button', { class: 'btn sm', 'data-key': 'Esc', onclick: () => T.clearConn() }, icon('close', 14), 'Pick again'));
       else opts.push(h('span', { class: 'muted' }, 'Pick the first track'));
     } else if (t === 'relevel') {
       opts.push(this.levelOpts(T.relevelTo, T.levelHeight, T.levelDepth, (lv) => { T.relevelTo = lv; redo(); }, (hh) => { T.levelHeight = hh; redo(); }, (d) => { T.levelDepth = d; redo(); }, ['Ground', 'Lift', 'Sink']));
@@ -647,12 +644,9 @@ export class Hud {
         opts.push(h('span', { class: 'chip', style: '--c:var(--station)' }, icon('move', 13), `Moving ${st?.name ?? 'station'}`), h('button', { class: 'btn sm', onclick: () => T.setTool('inspect') }, 'Cancel'));
       }
       const onLine = T.stationOnLine && T.relocating == null;
-      if (!onLine) {
-        const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`]]
-          : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
-        if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
-        opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));
+      if (t === 'metro-station') {
+        const styles: [string, string, string?][] = [['metro', 'Metro', 'Side platforms with screen doors, underground by default'], ['lightrail', 'Light rail', 'Short side platforms with a shelter, on the ground by default']];
+        opts.push(opt('Station style', seg(styles, T.stationType, (v) => { this.setStationType(v); redo(); })));
       }
       opts.push(opt('Level', seg<StationLevel>([['ground', onLine ? 'As the line' : 'Ground', onLine ? 'On the ground, on a bridge or in a tunnel like the line there' : undefined], ['elevated', 'Elevated', 'On a viaduct: little land used, costs extra'], ['underground', 'Underground', 'Below ground: only entrances on the surface, costs extra']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
       if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(STATION_HEIGHT.min, +(T.stationHeight - 0.3).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(STATION_HEIGHT.max, +(T.stationHeight + 0.3).toFixed(1)); redo(); }, 'Deck height above the highest ground beneath')));
@@ -710,19 +704,7 @@ export class Hud {
 /** Short names of the building styles (style picker). */
 const STYLE_SHORT: Record<string, string> = { none: 'None', shelter: 'Halt', classic: 'Building', brick: 'Brick', modern: 'Modern', concourse: 'Concourse', terminal: 'Terminal' };
 
-/** Track type picker: one button per type with its design speed (details in the tip). */
-function typePicker(types: string[], value: string, onPick: (v: string) => void): HTMLElement {
-  return h('div', { class: 'typepick', role: 'radiogroup', 'aria-label': 'Track type', style: `grid-template-columns:repeat(${types.length}, minmax(0, 1fr))` }, types.map((id) => {
-    const tt = TRACK_TYPES[id], m = TYPE_META[id] ?? { short: tt.name, color: '#9aa5b4' };
-    return h('button', {
-      class: 'tpb' + (id === value ? ' on' : ''), style: `--c:${m.color}`, role: 'radio', 'aria-checked': id === value ? 'true' : 'false', 'aria-label': tt.name,
-      'data-tip': `${tt.name} · ${tt.speed} km/h · min. radius ${tt.minRadius * 10} m · max. grade ${fmtPct(tt.maxGrade, 1)} · ${fmtMoney(tt.costPerUnit * 100)}/km${tt.electrified ? ' · overhead wire' : ''}`,
-      onclick: () => onPick(id),
-    }, h('i'), h('b', null, m.short), h('small', null, `${tt.speed} km/h`));
-  }));
-}
-
-/** One line on the chosen type: curve and grade limits, wire, and the cost per km at the level. */
+/** Unified track limits, wire state and estimated cost per km at the level. */
 function typeSpec(type: string, level: LineLevel, height: number, depth: number): HTMLElement {
   const tt = TRACK_TYPES[type] ?? TRACK_TYPES.standard;
   const c = typeCostKm(type, level, height, depth);

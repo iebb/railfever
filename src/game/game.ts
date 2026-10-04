@@ -540,7 +540,7 @@ export class Game {
 
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
-    // (ops) base upkeep by track type (high-speed ~3x standard); wear by train passages is billed on top monthly
+    // (ops) base upkeep including overhead wire; wear by train passages is billed on top monthly
     return trackMaintenance(e);
   }
   /**

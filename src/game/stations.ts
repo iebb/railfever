@@ -2,7 +2,7 @@
 // bus / tram stops on road edges, catchment areas per mode, road access and entrances, transfer complexes
 // (stations merged into one, or linked for walking transfers), station names, and rebuilding / relocating.
 import type { Game } from './game';
-import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES } from './constants';
+import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
 import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
@@ -35,7 +35,7 @@ export interface Rect { x: number; z: number; angle: number; w: number; d: numbe
 
 export type StationLevel = 'ground' | 'elevated' | 'underground';
 /**
- * Construction style of a rail station, from its platform track type (TRACK_TYPES[type].mode): main line, metro
+ * Construction style of a rail station, independent of overhead wire: main line, metro
  * (subway style: underground with entrances, screen doors) or light rail (close-spaced halts). Only construction
  * defaults follow it (level, platforms, building, spacing); every rail station is one transport mode, 'rail'.
  */
@@ -59,10 +59,9 @@ export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; 
 export const DEFAULT_PLATFORM_LENGTH = 8;
 /** Default platform length per rail mode (units): main line, metro (a 6-car EMU), light rail (two coupled LRVs). */
 export const PLATFORM_LENGTH: Record<RailMode, number> = { mainline: DEFAULT_PLATFORM_LENGTH, metro: 12, lightrail: 7 };
-/** Construction style of a track type (unknown types: main line). */
+/** Legacy track style (also accepts a station mode); unknown ids mean main line. */
 export function railModeOf(trackType?: string): RailMode {
-  const m = (TRACK_TYPES[trackType ?? ''] as { mode?: RailMode } | undefined)?.mode;
-  return m === 'metro' || m === 'lightrail' ? m : trackType === 'metro' || trackType === 'lightrail' ? trackType : 'mainline';
+  return trackType === 'metro' || trackType === 'lightrail' ? trackType : 'mainline';
 }
 /** Default platform length for a station on track of this type. */
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
@@ -299,8 +298,10 @@ export interface RailPart {
   width: number;
   /** where the through tracks lie */
   throughMode?: ThroughMode;
-  /** platform track type (TRACK_TYPES id): the station's construction style (main line, metro, light rail) follows it */
+  /** Platform wire state (standard / electric). */
   trackType: string;
+  /** Station construction style; older saves fall back to their legacy track type. */
+  mode?: RailMode;
   /** side platforms (outside the tracks) instead of islands between them */
   platformStyle?: PlatformStyle;
   /** platform screen doors (metro stations by default) */
@@ -517,7 +518,7 @@ export function railLayout(r: RailPart): StationLayout {
 }
 
 /** Rail mode of a built station part. */
-export const railPartMode = (r: RailPart): RailMode => railModeOf(r.trackType);
+export const railPartMode = (r: RailPart): RailMode => r.mode === 'mainline' || r.mode === 'metro' || r.mode === 'lightrail' ? r.mode : railModeOf(r.trackType);
 
 /**
  * Catchment circles of rail platforms: along the axis (both ends and between), so the area is measured from the
@@ -576,10 +577,11 @@ export interface StationOpts {
   /** platform level fixed (a station inserted into an existing line at the track's height) */
   fixedY?: number;
   /**
-   * platform track type (TRACK_TYPES id, default 'standard'): the construction style. Metro-track stations default to
-   * underground (STATION_DEPTH.metro), side platforms and platform screen doors; light rail to side platforms.
+   * Platform wire state (default standard). Legacy metro / lightrail ids also supply a style when mode is absent.
    */
   trackType?: string;
+  /** Station construction style: metro defaults to underground with screen doors, light rail to side platforms. */
+  mode?: RailMode;
   /** side or island platforms (default: side for metro / light rail without through tracks, else island) */
   platformStyle?: PlatformStyle;
   /** platform screen doors (default: metro) */
@@ -603,7 +605,7 @@ export interface StationPlan {
   length: number; tracks: number;
   /** through tracks (no platform) and where they lie */
   through: number; throughMode: ThroughMode;
-  /** platform track type, the station mode it gives, platform style and screen doors */
+  /** platform wire state, independent station mode, platform style and screen doors */
   trackType: string; mode: RailMode; platformStyle: PlatformStyle; psd: boolean;
   /** building style id (STATION_STYLES) */
   style: string;
@@ -989,8 +991,8 @@ export class Stations {
    */
   planRail(x: number, z: number, angle: number, length: number, tracks: number, owner: number, opts: StationOpts = {}): StationPlan {
     const g = this.game, w = g.world;
-    const trackType = opts.trackType && TRACK_TYPES[opts.trackType] ? opts.trackType : 'standard';
-    const rmode = railModeOf(trackType);
+    const rmode = opts.mode ?? railModeOf(opts.trackType);
+    const trackType = trackTypeOf(opts.trackType);
     const level: StationLevel = opts.level ?? (opts.underground || rmode === 'metro' ? 'underground' : 'ground');
     const through = Math.max(0, Math.min(2, Math.round(opts.through ?? 0))), throughMode = opts.throughMode ?? 'middle';
     const platformStyle: PlatformStyle = opts.platformStyle ?? (rmode !== 'mainline' && !through ? 'side' : 'island');
@@ -1537,7 +1539,7 @@ export class Stations {
       x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, length: plan.length, tracks: plan.tracks,
       trackOffsets: plan.layout.trackOffsets, platforms: plan.layout.platforms, edges,
       through: plan.layout.throughOffsets.length, throughOffsets: plan.layout.throughOffsets, throughEdges: through, width: plan.layout.width, throughMode: plan.throughMode,
-      trackType: plan.trackType ?? 'standard', platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
+      trackType: trackTypeOf(plan.trackType), mode: plan.mode ?? railModeOf(plan.trackType), platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
       style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
       building: plan.building,
       level, underground: level === 'underground', depth: plan.depth, height: plan.height,
@@ -2411,15 +2413,15 @@ export class Stations {
   }
 
   // ---------------------------------------------------------------- modes
-  /** Construction style of a station's rail part from its platform track type (null: no rail part). */
-  railMode(st: Station): RailMode | null { return st.rail ? railModeOf(st.rail.trackType) : null; }
+  /** Construction style of a station's rail part (legacy track type fallback; null: no rail part). */
+  railMode(st: Station): RailMode | null { return st.rail ? railPartMode(st.rail) : null; }
 
   /**
    * Construction style of a station: its rail style (main line, metro, light rail), else tram (a stop on tram tracks)
    * or bus. Every rail style is the one transport mode 'rail' (lines, catchment, fares); see catchMode.
    */
   mode(st: Station): StationMode {
-    if (st.rail) return railModeOf(st.rail.trackType);
+    if (st.rail) return railPartMode(st.rail);
     const net = this.game.world.net;
     return st.stops.some((p) => net.edges.get(p.edge)?.tram) ? 'tram' : 'bus';
   }
@@ -2946,7 +2948,7 @@ export class Stations {
       if (connected[0] || connected[1]) return bad(lv !== (r.level ?? 'ground') ? 'The level of a connected station cannot be changed' : 'The tracks of a connected station cannot be rearranged like that');
       const ground = lv === 'ground' && (r.level ?? 'ground') === 'ground';
       const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
-      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid });
+      const plan = this.planRail(r.x, r.z, r.angle, L2, T2, st.owner, { level: lv, height: o.height, depth: o.depth, ignoreStation: st.id, through: Th2, throughMode: mode, trackType: r.trackType, mode: railPartMode(r), platformStyle: r.platformStyle, psd: r.psd, style, avoid });
       // still on the ground: its added entrances stay beside the new platforms where they fit; at another level they go
       const fit = plan.ok && ground ? this.previewRefit(st, plan) : null;
       const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt anew');
@@ -2959,7 +2961,7 @@ export class Stations {
       const ign = new Set<number>([...r.edges, ...r.throughEdges, ...ends.flatMap((t) => [...t[0].approach, ...t[1].approach])]);
       const sz = ENTRANCE_SIZE[level];
       const kept = r.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d }));
-      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, avoid: kept });
+      const p2 = this.planRail(r.x, r.z, r.angle, r.length, r.tracks, st.owner, { level, fixedY: r.y, ignoreStation: st.id, ignoreEdges: ign, through: Th0, throughMode: r.throughMode, trackType: r.trackType, mode: railPartMode(r), platformStyle: r.platformStyle, psd: r.psd, style, avoid: kept });
       if (!p2.ok) return bad(p2.error ?? 'No room for the building');
       if (p2.style !== style) return bad('No room for a station building at street level here');
       // (its entrances stay: the new building must not stand on them)
@@ -3054,7 +3056,7 @@ export class Stations {
       }
     }
     const avoid = (r.level ?? 'ground') === 'ground' ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
-    const plan = this.planRail(cx, cz, r.angle, L2, T2, st.owner, { ignoreStation: st.id, ignoreEdges, through: Th2, throughMode: mode, fixedY: r.y, level: r.level ?? 'ground', trackType: r.trackType, platformStyle: r.platformStyle, psd: r.psd, style, blockedEnds, avoid });
+    const plan = this.planRail(cx, cz, r.angle, L2, T2, st.owner, { ignoreStation: st.id, ignoreEdges, through: Th2, throughMode: mode, fixedY: r.y, level: r.level ?? 'ground', trackType: r.trackType, mode: railPartMode(r), platformStyle: r.platformStyle, psd: r.psd, style, blockedEnds, avoid });
     if (!plan.ok) return bad(plan.error ?? 'Cannot build');
     plan.join = null;
     const extra = Math.max(0, (T2 + Th2 * 0.7) * L2 - (r.tracks + (r.through ?? 0) * 0.7) * r.length);
@@ -3497,7 +3499,7 @@ export function restoreStation(s: any): Station {
     rail: r ? {
       ...r, edges: [...r.edges], trackOffsets: [...(r.trackOffsets ?? [])], platforms: (r.platforms ?? []).map((p: any) => ({ ...p })), building: { ...r.building },
       through: r.through ?? 0, throughOffsets: [...(r.throughOffsets ?? [])], throughEdges: [...(r.throughEdges ?? [])], width: r.width ?? stationLayout(r.tracks, r.through ?? 0).width,
-      trackType: r.trackType ?? 'standard', platformStyle: r.platformStyle ?? 'island', psd: !!r.psd,
+      trackType: trackTypeOf(r.trackType), mode: railPartMode(r), platformStyle: r.platformStyle ?? 'island', psd: !!r.psd,
       style: r.style && STATION_STYLES[r.style] ? r.style : 'classic', forecourt2: r.forecourt2 ? { ...r.forecourt2 } : undefined,
       level: lv, underground: lv === 'underground', depth: r.depth ?? 0, height: r.height ?? 0,
       entrances: (r.entrances ?? []).map((e: any) => ({ ...e, ...(e.far ? { far: { ...e.far } } : {}) })), piers: (r.piers ?? []).map((p: any) => ({ ...p })),

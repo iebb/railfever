@@ -1,3 +1,5 @@
+import { trackTypeOf } from '../src/game/constants';
+import { railModeOf } from '../src/game/stations';
 // Rail-only route codes, station badges, stable through numbering and migration of old non-rail codes.
 // Bundle with esbuild for Node, as with through.ts.
 import { Game, PLAYER } from '../src/game/game';
@@ -17,7 +19,7 @@ check(!!build(g, free(g, 20, 106), free(g, 350, 106), roadOpts(PLAYER, 'street',
 const stations = ['standard', 'metro', 'lightrail'].map((trackType, i) => {
   const id = g.stations.nextId;
   const owner = i === 2 ? 1 : PLAYER;
-  const plan = g.stations.planRail(60 + i * 90, 100, Math.PI / 2, 10, 2, owner, { trackType, level: 'ground', style: 'none' });
+  const plan = g.stations.planRail(60 + i * 90, 100, Math.PI / 2, 10, 2, owner, { trackType: trackTypeOf(trackType), mode: railModeOf(trackType), level: 'ground', style: 'none' });
   const err = plan.ok ? g.stations.commitRail(plan, owner) : plan.error;
   if (err) throw new Error(err);
   return g.stations.get(id)!;

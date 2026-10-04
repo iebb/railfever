@@ -106,7 +106,7 @@ const hsr400 = MODEL_BY_ID.get('hsr_e') ? [M('hsr_e')] : [syn('x_hsr400', { kind
   check(r3 > 1.6 && r3 < 2.6, 'a 300 km/h HSR costs ~2x an electric intercity per train-km');
   check(r4 > 2.8 && r4 < 4.3, 'a 400 km/h HSR ~3-4x');
   check(e > 0.55 && e < 0.85, 'energy per seat-km +60-80% at 400 vs 300 km/h');
-  check(trackBasePerUnit('highspeed') >= 2.9 * trackBasePerUnit('standard'), `high-speed track upkeep ~3x standard (${fmt(trackBasePerUnit('highspeed'), 0)} vs ${fmt(trackBasePerUnit('standard'), 0)} per unit and year)`);
+  check(trackBasePerUnit('highspeed') === trackBasePerUnit('electric') && trackBasePerUnit('electric') > trackBasePerUnit('standard'), `common track upkeep, with wire maintenance (${fmt(trackBasePerUnit('electric'), 0)} vs ${fmt(trackBasePerUnit('standard'), 0)} per unit and year)`);
   // a typical year keeps the old balance: diesel intercity, bus
   const y1 = estimateVehicleYear([M('diesel_b'), M('coach_ic'), M('coach_ic'), M('coach_ic')], 120, 1980), y2 = estimateVehicleYear([M('bus_c')], 25, 1990);
   console.log(`  typical year: diesel IC ${k(y1.total)} (running said 114k; ${fmt(y1.km, 1)} km), articulated bus ${k(y2.total)} (said 32k)`);
@@ -420,14 +420,14 @@ console.log('HSR economics');
 function hsrYear(n: number, every: number, distUnits: number): { income: number; vehicles: number; track: number; wear: number; profit: number; pax: number; trains: number } {
   const h = flatGame(Math.max(384, distUnits + 160));
   const x0 = 60, z = 120;
-  const P = station(h, x0, z, Math.PI / 2, 12, 2, 0, { trackType: 'highspeed' })!, Q = station(h, x0 + distUnits, z, Math.PI / 2, 12, 2, 0, { trackType: 'highspeed' })!;
+  const P = station(h, x0, z, Math.PI / 2, 12, 2, 0, { trackType: 'electric' })!, Q = station(h, x0 + distUnits, z, Math.PI / 2, 12, 2, 0, { trackType: 'electric' })!;
   const ee = h.world.net.nextEdge;
-  build(h, nodeSnap(h, endNode(h, P, 0, true), 'rail'), nodeSnap(h, endNode(h, Q, 0, false), 'rail'), railOpts(0, 2, { type: 'highspeed' }), 'HSR');
+  build(h, nodeSnap(h, endNode(h, P, 0, true), 'rail'), nodeSnap(h, endNode(h, Q, 0, false), 'rail'), railOpts(0, 2, { type: 'electric' }), 'HSR');
   finishDoubleTrack(h, newTrack(h, ee), 0);
   autoSignalNetwork(h, 0);
   const dp = depotFor(h, P, Q);
-  // the depot connection is ordinary track: high-speed units need high-speed (electrified) track
-  for (const e of h.world.net.edges.values()) if (e.kind === 'rail' && e.type === 'standard') e.type = 'highspeed';
+  // high-speed units need overhead wire on the depot connection too
+  for (const e of h.world.net.edges.values()) if (e.kind === 'rail' && e.type === 'standard') e.type = 'electric';
   const l = h.lines.create('rail', 0);
   l.stops = [P.id, Q.id];
   const trains = [h.vehicles.buyTrain(dp, hsr300, l.id)].filter((t): t is Train => t instanceof Train);

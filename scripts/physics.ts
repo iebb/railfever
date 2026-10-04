@@ -27,11 +27,11 @@ for (const v of [100, 160, 200, 250, 300, 350, 400]) {
 }
 check(Math.abs(brakeDistance(160 * KMH_TO_UPS) * 10 - (44.44 ** 2) / 1.4) < 5, 'from 160 km/h at 0.7 m/s2: ~1.41 km');
 check(brakeDistance(400 * KMH_TO_UPS) * 10 > 10_500 && brakeDistance(400 * KMH_TO_UPS) * 10 < 12_500, 'from 400 km/h: 10.5-12.5 km');
-console.log('curve speeds with cant: 4.1 sqrt(R[m]) conventional, 4.3 sqrt(R[m]) high-speed');
+console.log('curve speeds with cant: 4.3 sqrt(R[m]) on all track');
 for (const R of [30, 100, 490, 870]) console.log(`  R ${R * 10} m: conventional ${fmt(curveSpeed(R, 'standard'), 0)} km/h, high-speed ${fmt(curveSpeed(R, 'highspeed'), 0)} km/h`);
 check(Math.abs(curveSpeed(490, 'highspeed') - 301) < 2 && Math.abs(curveSpeed(870, 'highspeed') - 401) < 2, 'high-speed: 300 km/h at R 4.9 km, 400 km/h at R 8.7 km');
-check(Math.abs(curveSpeed(100, 'standard') - 129.7) < 1, 'conventional: 130 km/h at R 1 km');
-check(TRACK_TYPES.highspeed.speed === 400 && TRACK_TYPES.highspeed.costPerUnit > TRACK_TYPES.electric.costPerUnit * 2 && TRACK_TYPES.highspeed.maintPerUnit >= TRACK_TYPES.standard.maintPerUnit * 3, 'high-speed track: 400 km/h, dearer to build and maintain');
+check(Math.abs(curveSpeed(100, 'standard') - 136) < 1, 'all track: 136 km/h at R 1 km');
+check(TRACK_TYPES.highspeed.speed === 400 && TRACK_TYPES.highspeed === TRACK_TYPES.electric && TRACK_TYPES.standard.speed === 400, '400 km/h cap on unified track; legacy high-speed alias has the same wired costs');
 // aerodynamics: per train, not per mass
 const aeroOfTrain = (cars: VehicleModel[]) => aeroOf(cars[0]).nose + cars.reduce((a, c) => a + aeroOf(c).len * c.length, 0);
 {
@@ -65,7 +65,7 @@ const aeroOfTrain = (cars: VehicleModel[]) => aeroOf(cars[0]).nose + cars.reduce
 
 // ---- 3. long straight fixtures: real network / stations / reservations, a small terrain allocation.
 // The approach extends beyond the terrain boundary; headless train geometry does not need a 40 km square map.
-function straight(cars: VehicleModel[], type = 'highspeed', red = false, km = LINE_KM) {
+function straight(cars: VehicleModel[], type = 'electric', red = false, km = LINE_KM) {
   const g = flatGame(256);
   g.economy.money = 1e12;
   const A = station(g, 60, 128, Math.PI / 2, 24, 1, 0, { trackType: type })!;
@@ -181,9 +181,9 @@ console.log(`runs on a ${LINE_KM} km straight (unloaded):`);
 const runs = {
   loco: run([M('diesel_b'), ...Array(6).fill(M('coach_ic'))], 'standard', 'diesel IC'),
   emu: run([M('emu_b')], 'electric', 'suburban EMU'),
-  hsrA: run([M('hsr_a')], 'highspeed', 'HSR 1964'),
-  hsrC: run([M('hsr_c')], 'highspeed', 'HSR 1997'),
-  hsrE: run([M('hsr_e')], 'highspeed', 'HSR 2025'),
+  hsrA: run([M('hsr_a')], 'electric', 'HSR 1964'),
+  hsrC: run([M('hsr_c')], 'electric', 'HSR 1997'),
+  hsrE: run([M('hsr_e')], 'electric', 'HSR 2025'),
 };
 check(runs.emu.t100 > 25 && runs.emu.t100 < 70, `suburban EMU: realistic 0-100 (${fmt(runs.emu.t100, 1)} s)`);
 check(runs.loco.t100 > 40 && runs.loco.t100 < 150, `diesel IC: realistic 0-100 (${fmt(runs.loco.t100, 1)} s)`);
@@ -196,7 +196,7 @@ check(runs.hsrE.brakeKm >= need * 0.95 && runs.hsrE.brakeKm <= need * 1.05,
 
 // ---- 4. equal-distance cruise energy: the SAME set at 300 and 400 km/h, without start/stop energy.
 const cruise = (kmh: number) => {
-  const { t } = straight([{ ...M('hsr_e'), speed: kmh }], 'highspeed', false, 80);
+  const { t } = straight([{ ...M('hsr_e'), speed: kmh }], 'electric', false, 80);
   t.speed = kmh * KMH_TO_UPS;
   const seconds = 3600 / kmh; // 1 km at this speed
   let elapsed = 0;
@@ -217,7 +217,7 @@ check(e400.source / e300.source >= 1.6 && e400.source / e300.source <= 1.8, '400
 
 // ---- 5. a red block signal: accelerate to 400, stop on the reserved side, wait, then continue on green.
 {
-  const { g, t, B, blocked } = straight([M('hsr_e')], 'highspeed', true);
+  const { g, t, B, blocked } = straight([M('hsr_e')], 'electric', true);
   let peak = 0, reached = false, overrun = 0, brake = 0;
   for (let i = 0; i < 1800 / DT; i++) {
     const v0 = t.speedKmh;
@@ -270,7 +270,7 @@ check(e400.source / e300.source >= 1.6 && e400.source / e300.source <= 1.8, '400
 // a curve's speed limit on a track segment
 {
   const g = flatGame(512);
-  for (const type of ['standard', 'highspeed']) {
+  for (const type of ['standard', 'electric']) {
     const z0 = type === 'standard' ? 100 : 300;
     const p0 = planEdge(g, free(g, 60, z0), free(g, 160, z0), railOpts(0, 1, { type }));
     if (!p0.ok || commitProposal(g, p0)) { check(false, `${type} straight`); continue; }

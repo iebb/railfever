@@ -30,11 +30,10 @@ const G = WSCALE.GRAVEL;
 /** Track (ballast bed + rails) along a run. `bridge`: narrower bed without the embankment skirt. */
 export function trackRun(ctx: ChunkCtx, e: NEdge, run: Smp[], bridge: boolean) {
   const yo = bedOffset(e);
-  const conc = e.type === 'highspeed';
   const T = RAIL.bedTop, top = -0.004;
   const W = ctx.w;
   W.cast = 0;
-  W.use(conc ? WC.BALLAST_CONC : WC.BALLAST_WOOD, 0xffffff);
+  W.use(WC.BALLAST_WOOD, 0xffffff);
   sweep(W, run, [[-T, top, 0.01], [T, top, 0.99]], BALLAST_PERIOD, yo);
   W.use(WC.GRAVEL, BALLAST);
   if (bridge) {

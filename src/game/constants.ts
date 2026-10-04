@@ -118,28 +118,31 @@ export interface TrackType {
   maintPerUnit: number;
   /** overhead wire: electric traction needs it */
   electrified: boolean;
-  /**
-   * construction style (stations take theirs from their platform track: level, platforms, building, spacing).
-   * Every style is rail: any rail line may use it, with one catchment and fare model.
-   */
+  /** @deprecated Station construction style belongs to RailPart.mode. */
   mode: 'mainline' | 'metro' | 'lightrail';
-  /** earthworks of its formation relative to heavy rail (light rail: narrower and lighter) */
+  /** earthworks of the common rail formation */
   formation: number;
 }
 
 /**
- * Track types. `standard` is unelectrified; `electric` is the same main-line track with overhead wire (what
- * `electrify` turns standard track into); `metro` is electrified urban-style track (tighter curves, steeper grades,
- * ~100 km/h), `lightrail` light electrified track (tight curves, steep grades, a light formation). All are rail:
- * every rail vehicle runs on all of them (electric traction needs the wire) and one line may mix them.
+ * One physical track: tight city curves and grades are legal; geometry and the train determine speed.
+ * The two ids record only overhead wire. Old ids are aliases for compatibility with saves and other branches.
  */
+const TRACK: TrackType = { id: 'standard', name: 'Track', speed: 400, maxGrade: 0.07, minRadius: 3, costPerUnit: 7500, maintPerUnit: 300, electrified: false, mode: 'mainline', formation: 1 };
+const WIRED_TRACK: TrackType = { ...TRACK, id: 'electric', electrified: true, costPerUnit: 10000, maintPerUnit: 380 };
 export const TRACK_TYPES: Record<string, TrackType> = {
-  standard: { id: 'standard', name: 'Standard track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 7500, maintPerUnit: 300, electrified: false, mode: 'mainline', formation: 1 },
-  electric: { id: 'electric', name: 'Electrified track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 10000, maintPerUnit: 380, electrified: true, mode: 'mainline', formation: 1 },
-  highspeed: { id: 'highspeed', name: 'High-speed track (electrified)', speed: 400, maxGrade: 0.03, minRadius: 40, costPerUnit: 22000, maintPerUnit: 900, electrified: true, mode: 'mainline', formation: 1.1 },
-  metro: { id: 'metro', name: 'Metro track (electrified)', speed: 100, maxGrade: 0.045, minRadius: 8, costPerUnit: 9500, maintPerUnit: 400, electrified: true, mode: 'metro', formation: 0.9 },
-  lightrail: { id: 'lightrail', name: 'Light rail track (electrified)', speed: 80, maxGrade: 0.07, minRadius: 3, costPerUnit: 6500, maintPerUnit: 260, electrified: true, mode: 'lightrail', formation: 0.6 },
+  standard: TRACK,
+  electric: WIRED_TRACK,
+  /** @deprecated Use electric; high speed is a geometry choice. */
+  highspeed: WIRED_TRACK,
+  /** @deprecated Use electric and RailPart.mode = 'metro'. */
+  metro: WIRED_TRACK,
+  /** @deprecated Use electric and RailPart.mode = 'lightrail'. */
+  lightrail: WIRED_TRACK,
 };
+
+/** Canonical wire state of a rail type, including legacy ids. */
+export function trackTypeOf(type?: string): string { return (TRACK_TYPES[type ?? ''] ?? TRACK_TYPES.standard).id; }
 
 /** Overhead wire for existing track (`electrify`): standard -> electric, per unit of track. */
 export const ELECTRIFY = { costPerUnit: 2500, from: 'standard', to: 'electric' };

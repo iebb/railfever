@@ -11,10 +11,10 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, entranceAlong, railWidth, entrancesGo } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, railPartMode, type RailMode, entranceAlong, railWidth, entrancesGo } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { fmtMoney } from '../game/economy';
-import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM } from '../game/constants';
+import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM, trackTypeOf } from '../game/constants';
 import { CROSS_LABEL, MarkerKind } from '../render/overlay';
 import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
@@ -39,9 +39,9 @@ const PROFILE_KEYS = {
   station: ['stationType', 'stationLevel', 'stationLen', 'stationTracks', 'stationThrough', 'throughMode', 'stationOnLine', 'stationStyle', 'stationHeight', 'stationDepth'],
 } as const;
 const profileKind = (t: ToolId): keyof typeof PROFILE_KEYS | null => (t === 'rail' || t === 'metro' ? 'rail' : t === 'station' || t === 'metro-station' ? 'station' : null);
-/** Track types offered by the main-line and the urban track tools. */
-export const MAIN_TYPES = ['standard', 'electric', 'highspeed', 'metro', 'lightrail'].filter((t) => !!TRACK_TYPES[t]);
-export const URBAN_TYPES = ['metro', 'lightrail'].filter((t) => !!TRACK_TYPES[t]);
+/** @deprecated Wire states of the two presets; there is no track picker. */
+export const MAIN_TYPES = ['standard'];
+export const URBAN_TYPES = ['electric'];
 /** Level of an edge from its structures: a full-length bridge (elevated) or tunnel (underground), else ground. */
 export function edgeLevel(e: NEdge): LineLevel {
   for (const s of e.sections) if (s.s1 - s.s0 >= e.len * 0.9) return s.type === 'bridge' ? 'elevated' : 'underground';
@@ -65,9 +65,9 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   bulldoze: { name: 'Demolish', hint: 'Click to remove an object, or drag a rectangle to clear an area. Other companies’ property is protected.' },
   terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
-  metro: { name: 'Urban-style track', hint: 'A preset for city railways: metro track (subway style) or light-rail track, underground, elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. It is ordinary rail: every train may run on it (electric ones under the wire it carries) and one rail line may mix it with main-line track, so services through-run.' },
-  'metro-station': { name: 'Urban-style station', hint: `A preset for city stations on metro or light-rail track: underground by default with street entrances, side platforms, close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. An ordinary rail station: any rail line may stop here, with the same walking reach (${fmtLen(walkLimit('rail'))} along streets, before station-building bonuses) and fares as every rail station.` },
-  electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: standard track becomes electrified track for electric locomotives and EMUs (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
+  metro: { name: 'Urban-style track', hint: 'A city railway preset: double track with overhead wire, underground by default; it can also be elevated or on the ground. Click to start, click to build — construction continues from the new end. It is ordinary rail: every train may run on it (electric ones under the wire it carries) and one rail line may mix it with main-line track, so services through-run.' },
+  'metro-station': { name: 'Urban-style station', hint: `A preset for metro or light-rail station styles: underground by default with street entrances, side platforms, close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. An ordinary rail station: any rail line may stop here, with the same walking reach (${fmtLen(walkLimit('rail'))} along streets, before station-building bonuses) and fares as every rail station.` },
+  electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: electric locomotives, EMUs, metro and light-rail units can run (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
   connect: { name: 'Connect tracks', hint: 'Click a point on one track, then a point on another: a connecting curve with turnouts into both tracks is planned within the curve and grade limits, and signalled where the track is. Click to build; Esc or right-click picks the first track again.' },
   relevel: { name: 'Re-level', hint: 'Drag along a stretch of your track to lift it onto a viaduct or sink it into a tunnel in place, with ramps at both ends; stations on it go with it, lines and signals are kept.' },
 };
@@ -109,15 +109,15 @@ const snapKey = (s: Snap | null) => (s ? `${s.kind}:${s.node ?? ''}:${s.edge ?? 
 export class Tools {
   tool: ToolId = 'inspect';
   // ---- construction options (edited by the options panel)
-  /** track type (TRACK_TYPES id) and build level of the track tools; viaduct height / tunnel depth (LINE_LEVEL) */
+  /** Wire state and build level of the track presets; viaduct height / tunnel depth (LINE_LEVEL). */
   railType = 'standard';
   railLevel: LineLevel = 'ground';
   levelHeight = LINE_LEVEL.height.def;
   levelDepth = LINE_LEVEL.depth.def;
   roadType: 'street' | 'road' = 'road';
   tracks = 1;
-  /** station tools: platform track type ('auto': as the track it lines up with) and building style ('auto': by era and town) */
-  stationType = 'auto';
+  /** Station construction mode and building style ('auto': by era and town). */
+  stationType = 'mainline';
   stationStyle = 'shelter';
   /** connect tool: the point picked on the first track */
   conn: { edge: number; s: number; x: number; y: number; z: number } | null = null;
@@ -130,8 +130,8 @@ export class Tools {
   /** remembered settings of the other tool of a pair (rail / urban rail, station / urban station) */
   private profiles = new Map<ToolId, Record<string, unknown>>([
     ['rail', { railType: 'standard', railLevel: 'ground', tracks: 1 }],
-    ['metro', { railType: 'metro', railLevel: 'underground', tracks: 2 }],
-    ['station', { stationType: 'auto', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 1, stationThrough: 0, throughMode: 'middle', stationOnLine: false, stationStyle: 'shelter', stationDepth: STATION_DEPTH.def }],
+    ['metro', { railType: 'electric', railLevel: 'underground', tracks: 2 }],
+    ['station', { stationType: 'mainline', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 1, stationThrough: 0, throughMode: 'middle', stationOnLine: false, stationStyle: 'shelter', stationDepth: STATION_DEPTH.def }],
     ['metro-station', { stationType: 'metro', stationLevel: 'underground', stationLen: PLATFORM_LENGTH.metro, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.metro }],
   ]);
   /** double track: one running direction per track with crossovers before stations (right- or left-hand) */
@@ -826,7 +826,7 @@ export class Tools {
         const reach = Math.round(catchWalkLimit('rail', bonus) * 10);
         const tt = TRACK_TYPES[pl.trackType];
         const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
-        if (tt) rows.push(['rail', `${esc(tt.name)}${pl.psd ? ' · platform doors' : ''}`]);
+        if (tt) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
         const sty = STATION_STYLES[pl.style];
         if (sty) rows.push(['station', `${esc(sty.name)}${bonus ? ` · <b>+${Math.round(bonus * 100)}%</b> reach` : ''}`]);
         if (lv === 'elevated') rows.push(['bridge', `Elevated · deck <b>${Math.round(pl.height * 10)} m</b> up · ${plural(pl.entrances.length, 'stair tower')}`]);
@@ -842,7 +842,7 @@ export class Tools {
         if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access — this station won\u2019t attract passengers');
         if (pl.ok && pl.demolish.length) warn.push(`Demolishes ${plural(pl.demolish.length, 'building')}`);
         if (pl.ok && !g.economy.canAfford(pl.cost) && !warn.includes('Not enough money')) warn.push('Not enough money');
-        // (one kind of rail station: the track type row names the construction style)
+        // (one kind of rail station: the part keeps its construction style)
         const title = moving ? `Move ${esc(moving.name)}` : lv === 'elevated' ? 'Elevated station' : lv === 'underground' ? 'Underground station' : 'Train station';
         this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn, hint: moving ? 'Click to move the station here · Esc cancels' : undefined }, pl.ok ? 'ok' : 'err');
         break;
@@ -1021,7 +1021,7 @@ export class Tools {
       ov.setHoverEdge(e.id, 0xffb020);
       const name = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).name : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).name;
       const tramRow: [string, string][] = e.tram ? [['tram', `tram tracks${e.tramOwner !== undefined && e.tramOwner !== PLAYER ? ' · ' + esc(g.company(e.tramOwner).name) : ''}`]] : [];
-      this.tip({ title: esc(name), rows: [...own(e.owner), ['length', fmtLen(e.len) + (e.sections.length ? ' · ' + e.sections.map((s) => s.type).join(', ') : '')], ...tramRow] }, 'info');
+      this.tip({ title: esc(name), rows: [...own(e.owner), ['length', fmtLen(e.len) + (e.sections.length ? ' · ' + e.sections.map((s) => s.type).join(', ') : '')], ...(e.kind === 'rail' ? [['bolt', TRACK_TYPES[e.type]?.electrified ? 'Overhead wire' : 'No overhead wire'] as [string, string]] : []), ...tramRow] }, 'info');
     } else if (hit.kind === 'building') {
       const b = g.world.buildings.get(hit.id)!;
       ov.setFootprints([{ x: b.x, z: b.z, angle: b.angle, w: b.w, d: b.d, color: 0xffb020, lift: 0.08 }]);
@@ -1207,8 +1207,8 @@ export class Tools {
     let len = 0;
     for (const id of ids) len += net.edges.get(id)?.len ?? 0;
     const rows: [string, string][] = [['length', `<b>${fmtLen(r.length)}</b> of track to wire${ids.length > 1 ? ` · ${ids.length} sections` : ''}`]];
-    if (r.changed && len - r.length > 0.5) rows.push(['check', `${fmtLen(len - r.length)} electrified already (or not standard track)`]);
-    rows.push(['bolt', 'Standard → electrified track: electric locomotives and EMUs can run']);
+    if (r.changed && len - r.length > 0.5) rows.push(['check', `${fmtLen(len - r.length)} has overhead wire already (or is not rail)`]);
+    rows.push(['bolt', 'Overhead wire: electric locomotives, EMUs, metro and light-rail units can run']);
     const ownerOf = ids.map((id) => net.edges.get(id)?.owner ?? PLAYER).find((o) => o !== PLAYER && o >= 0);
     if (ownerOf !== undefined) rows.push(['company', `Track of ${esc(g.company(ownerOf).name)} — stays theirs, you pay the wire`]);
     this.tip({
@@ -1414,9 +1414,9 @@ export class Tools {
       return;
     }
     const s = Math.round(ne.s * 2) / 2;
-    const key = `${ne.edge.id}|${s}|${this.stationLen}|${this.stationTracks}|${this.stationThrough}|${this.throughMode}|${this.stationLevel}|${g.networkVersion}`;
+    const key = `${ne.edge.id}|${s}|${this.stationLen}|${this.stationTracks}|${this.stationThrough}|${this.throughMode}|${this.stationType}|${this.stationLevel}|${g.networkVersion}`;
     if (this.onTrack?.key !== key) {
-      const plan = planStationOnTrack(g, ne.edge.id, s, { length: this.stationLen, tracks: this.stationTracks, through: this.stationThrough, throughMode: this.throughMode, level: this.stationLevel === 'ground' ? undefined : this.stationLevel }, PLAYER);
+      const plan = planStationOnTrack(g, ne.edge.id, s, { length: this.stationLen, tracks: this.stationTracks, through: this.stationThrough, throughMode: this.throughMode, mode: this.stationMode(), level: this.stationLevel === 'ground' ? undefined : this.stationLevel }, PLAYER);
       this.onTrack = { key, plan, edge: ne.edge.id };
     }
     const pl = this.onTrack.plan, st = pl.station;
@@ -1523,19 +1523,13 @@ export class Tools {
     u.uCircleColor?.value.setHex(color);
   }
 
-  /**
-   * Platform track type of a planned station: the chosen one, else ('auto') the type of the track it lines up with,
-   * else the main-line track tool's type (main line only).
-   */
+  /** Platform wires follow a connected line; the urban station preset always carries wires. */
   stationTrackType(near?: string): string {
-    if (this.stationType !== 'auto' && TRACK_TYPES[this.stationType]) return this.stationType;
     const moving = this.relocating != null ? this.game.stations.get(this.relocating)?.rail : null;
-    if (moving && TRACK_TYPES[moving.trackType]) return moving.trackType;
-    if (near && TRACK_TYPES[near] && (this.tool !== 'station' || TRACK_TYPES[near].mode === 'mainline')) return near;
-    if (this.tool === 'metro-station') return 'metro';
-    const rt = (this.profiles.get('rail')?.railType as string | undefined) ?? 'standard';
-    return TRACK_TYPES[rt]?.mode === 'mainline' ? rt : 'standard';
+    return trackTypeOf(moving?.trackType ?? (this.tool === 'metro-station' ? 'electric' : near));
   }
+
+  stationMode(): RailMode { return railModeOf(this.stationType); }
 
   /** Building style of a planned station: the chosen one where it can be built, else the automatic one. */
   stationStyleFor(x: number, z: number, type: string): string {
@@ -1544,15 +1538,15 @@ export class Tools {
     // Existing buildings can be moved after their style has stopped being sold.
     if (moving && this.stationStyle === (moving.style ?? 'classic') && lv === moving.level && this.stationTracks === moving.tracks && STATION_STYLES[this.stationStyle]) return this.stationStyle;
     if (this.stationStyle !== 'auto' && stationStyles(lv, this.stationTracks, year).some((s) => s.id === this.stationStyle)) return this.stationStyle;
-    return autoStationStyle(this.game, x, z, this.stationTracks, lv, railModeOf(type));
+    return autoStationStyle(this.game, x, z, this.stationTracks, lv, this.stationMode());
   }
 
-  /** Plan a station at the current options (track type, level, height / depth, building style). */
+  /** Plan a station at the current options (station style, level, height / depth, building style). */
   private planStation(x: number, z: number, angle: number, near?: string): StationPlan {
     const lv = this.stationLevel;
     const type = this.stationTrackType(near);
     return planStation(this.game, x, z, angle, this.stationLen, this.stationTracks, PLAYER, { level: lv, height: this.stationHeight, depth: this.stationDepth },
-      { through: this.stationThrough, throughMode: this.throughMode, trackType: type, style: this.stationStyleFor(x, z, type), ...(this.relocating != null ? { ignoreStation: this.relocating } : {}) });
+      { through: this.stationThrough, throughMode: this.throughMode, trackType: type, mode: this.stationMode(), style: this.stationStyleFor(x, z, type), ...(this.relocating != null ? { ignoreStation: this.relocating } : {}) });
   }
 
   private coveredPop(x: number, z: number, r: number): number {
@@ -1798,7 +1792,7 @@ export class Tools {
     const st = p.stats;
     const rows: [string, string][] = [];
     rows.push(['length', `<b>${fmtLen(st.len / N)}</b>${N > 1 ? ` × ${N} tracks` : ''}`]);
-    const speed = p.opts.kind === 'rail' ? Math.min((TRACK_TYPES[p.opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(st.minRadius, p.opts.type)) : st.speed;
+    const speed = st.speed;
     rows.push(['speed', `<b>${Math.round(speed)}</b> km/h`]);
     if (p.opts.kind === 'rail') rows.push([p.opts.level === 'elevated' ? 'bridge' : p.opts.level === 'underground' ? 'tunnel' : 'rail', typeLevelText(p.opts)]);
     rows.push(['grade', `grade <b>${(st.maxGrade * 100).toFixed(1)}%</b>`]);
@@ -2273,13 +2267,13 @@ function linkNames(g: { stations: { get(id: number): { name: string } | undefine
 
 function norm(a: number) { a %= Math.PI * 2; return a < 0 ? a + Math.PI * 2 : a; }
 
-/** Track type and build level of track options, for tooltips ("Metro track · underground, 22 m deep"). */
+/** Track wire state and build level, for construction tooltips. */
 export function typeLevelText(o: BuildOptions): string {
   const tt = TRACK_TYPES[o.type] ?? TRACK_TYPES.standard;
-  const name = tt.name.replace(/ \(electrified\)$/, '');
+  const name = `Track${tt.electrified ? ' · overhead wire' : ''}`;
   if (o.level === 'elevated') return `${esc(name)} · elevated, <b>${Math.round((o.levelHeight ?? LINE_LEVEL.height.def) * 10)} m</b> up`;
   if (o.level === 'underground') return `${esc(name)} · underground, <b>${Math.round((o.levelDepth ?? LINE_LEVEL.depth.def) * 10)} m</b> deep`;
-  return `${esc(name)}${tt.electrified ? ' · electrified' : ''}`;
+  return esc(name);
 }
 
 /** Preview of a re-level plan as a proposal ghost: the stretch's edges with their new heights and structures. */

@@ -87,7 +87,7 @@ function primitives() {
   }
   const from: OPoint = { x: 24, z: 24, tx: 0, tz: 1 }, to: OPoint = { x: 160, z: 168, tx: 0, tz: 1 };
   const way = [from, to];
-  for (const type of ['standard', 'highspeed']) for (const tracks of [1, 2]) {
+  for (const type of ['standard', 'electric']) for (const tracks of [1, 2]) {
     const expected = JSON.stringify(chainProfile(g, way, tracks, 3, 3, 'rail', new Set(), false, undefined, type));
     for (const step of [1, 256]) check(JSON.stringify(runGen(chainProfileGen(g, way, tracks, 3, 3, 'rail', new Set(), false, undefined, type, step))) === expected, `${type}/${tracks}: identical sliced terrain/crossing fit`);
   }

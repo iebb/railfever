@@ -1,3 +1,4 @@
+import { railPartMode } from '../src/game/stations';
 // The AI's through service (a city railway joined to a main line that ends beside its depot end), saved and loaded:
 // the city railway is a finished project before the through service is planned; the through service is a follow-up
 // job saved with the company (its cursor) and built within one work unit or not at all. A game saved at every tick
@@ -146,7 +147,7 @@ if (process.argv.includes('--regression')) {
   const t = [...g.vehicles.trains()].find((v) => v.cars[0]?.id.startsWith('emu_'));
   check(!!t && lineCompatibility(g, t.lineId!, t.cars) === null, 'the through unit runs its whole route');
   check([...geometry].every(([id, geo]) => { const e = g.world.net.edges.get(id); return !!e && JSON.stringify({ bez: e.bez, prof: [...e.prof], a: e.a, b: e.b }) === geo; }), 'the main line keeps all its track');
-  const cityStations = [...g.stations.map.values()].filter((s) => s.rail?.trackType === 'metro').length;
+  const cityStations = [...g.stations.map.values()].filter((s) => s.rail && railPartMode(s.rail) === 'metro').length;
   check(cityStations === 5, `the city railway keeps its five stations (${cityStations})`);
 }
 
@@ -183,8 +184,8 @@ if (process.argv.includes('--regression')) {
     return net.addEdge('rail', a.id, b.id, bezLine(x0, z0, x1, z1), new Float32Array(Math.ceil(Math.hypot(x1 - x0, z1 - z0)) + 1).fill(y), [], type, 1);
   };
   const crossing = edge(110, 50, 110, 150, 8, 'electric');
-  const stub = edge(95, 100, 100, 100, 4, 'metro'); stub.depot = 1;
-  const ramp = edge(100, 100, 130, 100, 4, 'metro');
+  const stub = edge(95, 100, 100, 100, 4, 'electric'); stub.depot = 1;
+  const ramp = edge(100, 100, 130, 100, 4, 'electric');
   g.depots.map.set(1, { id: 1, kind: 'rail', owner: 1, node: stub.b, edge: stub.id, x: 95, z: 100, y: 4, angle: 0 });
   const ai = g.ais[0] as AnyAI;
   const at = ai.rampJoin(1);
@@ -195,10 +196,11 @@ if (process.argv.includes('--regression')) {
   const approach = edge(50, 70, 80, 70, 8, 'electric');
   ai.project = { kind: 'metro', towns: [], stations: [], edges: [], depots: [], line: -1, started: 0 };
   const e0 = net.nextEdge;
-  const plan = planEdge(g, nodeSnap(g, approach.b, 'rail'), resnap, { kind: 'rail', type: 'metro', tracks: 1, heightOffset: 0, crossing: 'auto', owner: 1 });
+  const plan = planEdge(g, nodeSnap(g, approach.b, 'rail'), resnap, { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: 1 });
   check(plan.ok && !commitProposal(g, plan), `works that split the older crossing (${plan.errors?.join('; ') ?? 'ok'})`);
   ai.track(e0);
-  const pieces = [...net.edges.values()].filter((e) => e.type === 'electric' && e.id >= e0).map((e) => e.id);
+  // Identify the older crossing by its geometry: new works have the same physical track and wires.
+  const pieces = [...net.edges.values()].filter((e) => e.id >= e0 && e.bez.x0 === 110 && e.bez.x3 === 110).map((e) => e.id);
   const laid = ai.project.edges.length;
   ai.abandon(ai.project);
   check(pieces.length >= 2 && pieces.every((id: number) => net.edges.has(id)) && laid > 0, `abandoning the works removes their own ${laid} edges and leaves the ${pieces.length} halves of the older crossing`);
