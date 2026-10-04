@@ -272,7 +272,9 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     let lo = 0, hi = tab.t.length - 1;
     while (hi - lo > 1) { const m = (lo + hi) >> 1; if (tab.t[m] <= c.u) lo = m; else hi = m; }
     const s = tab.s[lo] + (tab.s[hi] - tab.s[lo]) * (c.u - tab.t[lo]) / Math.max(1e-9, tab.t[hi] - tab.t[lo]);
-    net.crossings.set(net.nextCrossing, { id: net.nextCrossing++, kind: 'diamond', e1: e.id, s1: s, e2: c.edge, s2: c.s, x: c.x, z: c.z });
+    const crossing = { id: net.nextCrossing++, kind: 'diamond' as const, e1: e.id, s1: s, e2: c.edge, s2: c.s, x: c.x, z: c.z };
+    net.crossings.set(crossing.id, crossing);
+    g.vehicles.onCrossingAdded(crossing);
   }
   applyEarthworks(w, [e]);
   for (let i = 0; i <= 8; i++) {
@@ -635,6 +637,19 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
     const access = g.trackUpgradeError(owner, e.owner);
     if (access) { res.error = access; return res; }
   }
+  // Reused companion rail and endpoint leads can have different owners from the main formation.
+  // Check them before any split: rollback deliberately preserves splits of pre-existing track.
+  for (const q of [...(plan.reuse ?? []), ...[plan.start, plan.end].map((e) => e.kind === 'platform' ? { kind: 'node' as const, node: e.node } : e.snap)]) {
+    if (!q) continue;
+    const ids = q.kind === 'node' ? net.nodes.get(q.node!)?.edges : q.edge !== undefined && net.edges.has(q.edge) ? [q.edge] : undefined;
+    if (!ids?.length) { res.error = 'The track changed, plan again'; return res; }
+    for (const id of ids) {
+      const e = net.edges.get(id);
+      if (e?.kind !== 'rail') continue;
+      const access = g.trackUpgradeError(owner, e.owner);
+      if (access) { res.error = access; return res; }
+    }
+  }
   for (const e of [plan.start, plan.end]) if (e.kind === 'platform' && (!net.nodes.has(e.node) || (!plan.complete && net.nodes.get(e.node)?.edges.length !== 1))) { res.error = 'The track changed, plan again'; return res; }
   const money0 = eco.money, e0 = net.nextEdge, c0 = net.nextCrossing;
   const main = plan.steps.map((s) => ({ ...s }));
@@ -656,10 +671,11 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
     const nodes = pts.map((p, k) => {
       const reuse = plan.reuse?.[k];
       if (reuse) {
-        const n = net.nearestNode(p.x, p.z, 0.08, 'rail', (n) => n.edges.some((id) => retained.has(id)));
+        const n = net.nearestNode(p.x, p.z, 0.08, 'rail', (n) => n.edges.some((id) => retained.has(id)) && n.edges.every((id) => !g.trackUpgradeError(owner, net.edges.get(id)!.owner)));
         if (n) return n.id;
-        const e = net.nearestEdge(p.x, p.z, 0.08, 'rail', (e) => retained.has(e.id) && !main.some((s) => s.edge === e.id));
+        const e = net.nearestEdge(p.x, p.z, 0.08, 'rail', (e) => retained.has(e.id) && !main.some((s) => s.edge === e.id) && !g.trackUpgradeError(owner, e.owner));
         if (e) return net.splitEdge(e.edge.id, e.s)?.node.id ?? -1;
+        return -1;
       }
       const sample = sampleAt(original, p.u);
       return net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, net.edges.get(sample.edge)!.owner).id;

@@ -1132,7 +1132,9 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
         if (!nE) continue;
         const rail = nE.kind === 'rail' ? nE : oe, road = nE.kind === 'rail' ? oe : nE;
         const sRail = rail === nE ? nl.s : old.s, sRoad = road === nE ? nl.s : old.s;
-        net.crossings.set(net.nextCrossing, { id: net.nextCrossing++, kind: c.mode, e1: rail.id, s1: sRail, e2: road.id, s2: sRoad, x: c.x, z: c.z });
+        const crossing = { id: net.nextCrossing++, kind: c.mode, e1: rail.id, s1: sRail, e2: road.id, s2: sRoad, x: c.x, z: c.z };
+        net.crossings.set(crossing.id, crossing);
+        g.vehicles.onCrossingAdded(crossing);
         net.markEdge(nE);
       } else if (c.mode === 'junction') {
         const sNew = locate(ne.id, c.sNew);

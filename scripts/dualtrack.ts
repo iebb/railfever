@@ -330,4 +330,45 @@ scenario('15. a circular service also doubles its closing leg', () => {
   check(upgradeRoute(g, C.id, A.id, 1).every((id) => trackIsDouble(g, id, 1)), 'the closing leg has no single approach or junction piece');
 });
 
+scenario('16. revoked access cannot split reused companion rail', () => {
+  const f = fixture(PLAYER, false), { g } = f, net = g.world.net;
+  const route = upgradeRoute(g, f.A.id, f.B.id, PLAYER), e = net.edges.get(route[0])!;
+  const start = net.nodes.get(e.a)!, end = net.nodes.get(e.b)!, z = start.z - RAIL.spacing;
+  const a = net.addNode('rail', start.x + 35, 3, z, 1, 0, 2), b = net.addNode('rail', end.x - 35, 3, z, -1, 0, 2);
+  net.addEdge('rail', a.id, b.id, bezLine(a.x, z, b.x, z), new Float32Array(Math.ceil((b.x - a.x) / PSTEP) + 1).fill(3), [], 'standard', 2);
+  g.setAccessPolicy(2, 'auto-approve'); g.requestAccess(PLAYER, 2); g.onNetworkChanged();
+  const pl = planDoubleTrack(g, route, -1, PLAYER);
+  check(pl.ok && !!pl.reuse?.some(Boolean), 'preview reuses the rival companion track');
+  g.endAccess(PLAYER, 2);
+  const before = JSON.stringify(serialize(g)), r = commitDoubleTrack(g, pl);
+  check(/track access/.test(r.error ?? '') && JSON.stringify(serialize(g)) === before, 'revoked companion rights reject before any rail split, charge or ID change');
+});
+
+scenario('17. an occupied new diamond is protected before save/load', () => {
+  const f = fixture(), { g } = f, net = g.world.net;
+  const C = station(g, 270, 75, Math.PI * 0.75, 12, 2, 1)!;
+  check(!!build(g, findSnap(g, 'rail', 160, 191.51, 0.5), nodeSnap(g, endNode(g, C, 1, false), 'rail'), railOpts(1), 'occupied branch'), 'branch built');
+  connectStationThroat(g, C.id, 1);
+  const l = g.lines.create('rail', 1); l.stops = [f.A.id, C.id];
+  const main = upgradeRoute(g, f.A.id, f.B.id, 1), mainSet = new Set(main);
+  const e = upgradeRoute(g, f.A.id, C.id, 1).map((id) => net.edges.get(id)!).filter((e) => !mainSet.has(e.id)).sort((a, b) => b.len - a.len)[0];
+  const t = g.vehicles.buyTrain(f.dep, loco(), l.id) as Train;
+  t.releaseAll(); t.segs = [makeSeg(g, e, 1)]; t.headSeg = 0; t.headPos = e.len / 2; t.state = 'stopped'; t.routeTarget = C.id;
+  g.vehicles.setRes(e.id, t.id);
+  const plans = [-1, 1].map((s) => planDoubleTrack(g, main, s as -1 | 1, 1));
+  const pl = plans.find((p) => p.ok && p.proposals.some((q) => q.crossings.some((c) => c.mode === 'diamond' && c.edge === e.id)));
+  check(!!pl, 'complete upgrade crosses the occupied branch');
+  if (!pl) return;
+  check(!commitDoubleTrack(g, pl).error, 'upgrade commits beside the occupied branch');
+  const c = [...net.crossings.values()].find((c) => c.e1 === e.id || c.e2 === e.id)!;
+  check(!!c && t.segs.some((s) => s.res.includes(CROSS_BASE + c.id)) && g.vehicles.getRes(CROSS_BASE + c.id) === t.id, 'cached path and live reservation include the new diamond');
+  if (!c) return;
+  const rival = g.vehicles.buyTrain(f.dep, loco(), f.l.id) as Train;
+  rival.releaseAll(); rival.pending = [makeSeg(g, net.edges.get(c.e1 === e.id ? c.e2 : c.e1)!, 1)]; rival.state = 'waiting';
+  const h = deserialize(serialize(g));
+  check(!(rival as any).tryExtend() && !(h.vehicles.get(rival.id) as any).tryExtend(), 'conflicting train is blocked both live and after load');
+  for (let i = 0; i < 80; i++) { g.stepTick(); h.stepTick(); }
+  check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(h)), 'occupied diamond replays exactly');
+});
+
 done();

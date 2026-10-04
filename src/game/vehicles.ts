@@ -5,7 +5,7 @@ import { Train, CROSS_BASE, lineCompatibility, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
-import { curvePoint, type NEdge } from './network';
+import { curvePoint, type NEdge, type Crossing } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 import { spacingSchedule } from './patterns';
@@ -236,6 +236,18 @@ export class Vehicles {
       else if (v instanceof RoadVehicle && v.seg && v.occupiedEdges().includes(e.id)) v.returnToDepot('Returned to depot (road removed)');
     }
     this.ambient = this.ambient.filter((a) => !a.seg || !a.occupiedEdges().includes(e.id));
+  }
+
+  /** Construction can add a crossing to an already reserved edge without splitting it. */
+  onCrossingAdded(c: Crossing) {
+    const resource = CROSS_BASE + c.id;
+    for (const t of this.trains()) {
+      for (const list of [t.segs, t.pending]) for (const s of list) {
+        if (s.e !== c.e1 && s.e !== c.e2) continue;
+        if (!s.res.includes(resource)) s.res.push(resource);
+        if (list === t.segs) this.setRes(resource, t.id);
+      }
+    }
   }
 
   /** After construction: refresh geometry, drop stale look-ahead. */
