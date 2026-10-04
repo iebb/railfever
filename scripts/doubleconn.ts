@@ -3,7 +3,7 @@
 import { writeFileSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { Game } from '../src/game/game';
-import { Train, lineCongestion } from '../src/game/train';
+import { Train, lineCongestion, depotServes } from '../src/game/train';
 import { initialTrackChoice, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { lineIsDouble, trackIsDouble, upgradeRoute } from '../src/game/dualtrack';
 import { planDoubleTrack, commitDoubleTrack, planConnection, commitConnection, connectStationThroat } from '../src/game/trackops';
@@ -38,6 +38,9 @@ function fixtures() {
   const built = layInitialDoubleTrack(f.g, upgradeRoute(f.g, f.A.id, f.B.id, 1), 1, traffic, () => true);
   check(built.built && lineIsDouble(f.g, f.l, 1), 'busy formation opens fully double with both platforms connected');
   console.log(`  second rail ${Math.round(built.cost)}, recovered ${Math.round(built.choice?.recovered ?? 0)}/year`);
+
+  openingCleanup();
+  failedOpening();
 
   console.log('Connector between directional pairs');
   const g = Game.create({ size: 384, seed: 5, towns: 0, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 1 });
@@ -113,17 +116,117 @@ function fixtures() {
   midconnectReplay();
 }
 
+/** A registered draft is cleaned up; a usable opening is kept even before the first train purchase. */
+function openingCleanup() {
+  console.log('Interrupted railway openings');
+  const draft = fixture(), ai = draft.g.ais[0] as any;
+  ai.lines.set(draft.l.id, { kind: 'rail', towns: [], depot: -1, maxVehicles: 2, opened: draft.g.day });
+  const project = { kind: 'rail', towns: [], line: draft.l.id, started: draft.g.day,
+    edges: upgradeRoute(draft.g, draft.A.id, draft.B.id, 1), stations: [draft.A.id, draft.B.id], depots: [] };
+  ai.abandon(project);
+  check(!draft.g.lines.get(draft.l.id) && !ai.lines.has(draft.l.id)
+    && !draft.g.stations.get(draft.A.id) && !draft.g.stations.get(draft.B.id),
+    'failed depot draft leaves no empty managed line or unfinished stations');
+
+  const ready = fixture(); connectStationThroat(ready.g, ready.A.id, 1); connectStationThroat(ready.g, ready.B.id, 1);
+  const dp = depotFor(ready.g, ready.A, ready.B, 1), owner = ready.g.ais[0] as any;
+  check(dp >= 0 && depotServes(ready.g, ready.g.depots.get(dp)!, ready.A.id, ready.B.id) >= 0,
+    'completed opening has a depot that actually serves both stops');
+  owner.abandon({ kind: 'rail', towns: [], line: ready.l.id, started: ready.g.day,
+    edges: upgradeRoute(ready.g, ready.A.id, ready.B.id, 1), stations: [ready.A.id, ready.B.id], depots: [dp] });
+  check(!!ready.g.lines.get(ready.l.id) && !!ready.g.depots.get(dp) && ready.l.vehicles.length === 0,
+    'completed opening with only project depot provenance survives before its first train');
+  owner.lines.set(ready.l.id, { kind: 'rail', towns: [], depot: dp, maxVehicles: 2, opened: ready.g.day });
+  owner.abandon({ kind: 'rail', towns: [], line: ready.l.id, started: ready.g.day, edges: [], stations: [], depots: [] });
+  check(!!ready.g.lines.get(ready.l.id) && !!ready.g.depots.get(dp), 'managed completed opening also survives interruption');
+  const train = ready.g.vehicles.buyTrain(dp, loco(), ready.l.id);
+  check(typeof train !== 'string', 'retained opening can buy and dispatch its first train');
+  owner.lines.delete(ready.l.id);
+  owner.abandon({ kind: 'rail', towns: [], line: ready.l.id, started: ready.g.day, edges: [], stations: [], depots: [] });
+  check(!!ready.g.lines.get(ready.l.id) && typeof train !== 'string' && !!ready.g.vehicles.get(train.id),
+    'an existing running service survives even without draft depot metadata');
+}
+
+/** Exercise the real opening job when no depot builder can supply a usable site. */
+function failedOpening() {
+  const g = Game.create({ size: 512, seed: 11, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
+  g.aiAcquisitions = false;
+  const ai = g.ais[0] as any;
+  ai.depotNearLine = ai.depotSwitch = function* () { return -1; };
+  while (g.day < 720 && !ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations'))) g.stepTick();
+  check(ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations')),
+    'natural railway job reaches a failed depot opening');
+  check(ai.stats.doubled === 0 && ![...ai.lines.values()].some((info: any) => info.kind === 'rail')
+    && !g.lines.all().some(l => l.owner === ai.companyId && l.kind === 'rail'),
+    'failed depot opening pays no initial pair and retains no phantom railway');
+}
+
+/** Observe actual funded AI openings, without constraining generic shared-service connector works. */
+function openingObserver(g: Game) {
+  let funded = 0, viable = true, failed = 0, cleaned = true, normalized = true;
+  const pending: number[] = [];
+  for (const controller of g.ais) {
+    const ai = controller as any, note = ai.note.bind(ai);
+    ai.note = (text: string) => {
+      if (text.includes('double from opening')) {
+        funded++;
+        const line = g.lines.get(ai.project?.line ?? -1), info = ai.lines.get(line?.id ?? -1);
+        const depot = g.depots.get(info?.depot ?? -1), stops = [...new Set<number>(line?.stops ?? [])];
+        const okay = !!line && !line.vehicles.length && !!depot && depot.owner === ai.companyId
+          && stops.length === 2 && depotServes(g, depot, stops[0], stops[1]) >= 0
+          && stops.every(id => { const st = g.stations.get(id); return !!st && g.stations.hasAccess(st); });
+        viable &&= okay;
+        const saved = serialize(g), loaded = deserialize(JSON.parse(JSON.stringify(saved)));
+        normalized &&= JSON.stringify(saved.lines) === JSON.stringify(serialize(loaded).lines);
+        if (!okay) console.log(`  opening diagnostic ${JSON.stringify({ day: g.day, owner: ai.companyId, text, line: line?.id, depot: info?.depot, first: depot ? depotServes(g, depot, stops[0], stops[1]) : -1, access: stops.map(id => { const st=g.stations.get(id); return st && g.stations.hasAccess(st); }) })}`);
+      }
+      if (text.includes('abandoned: no depot site') || text.includes('abandoned: depot no longer serves')) {
+        failed++;
+        if (ai.project?.line >= 0) pending.push(ai.project.line);
+      }
+      note(text);
+    };
+  }
+  return {
+    tick() { for (const id of pending.splice(0)) cleaned &&= !g.lines.get(id) && !g.ais.some(ai => ai.lines.has(id)); },
+    verdict(label: string) {
+      check(viable, `${label}: every funded initial pair has a serving own depot and accessible stops before trains`);
+      check(cleaned, `${label}: failed depot openings leave no draft service to upgrade`);
+      check(normalized, `${label}: line metadata round trips before the first train purchase`);
+      console.log(`  ${label}: ${funded} funded pairs, ${failed} failed depot openings`);
+      return funded;
+    },
+  };
+}
+
+/** Target the two naturally generated worlds which previously paid for phantom initial pairs. */
+function openingNatural() {
+  let funded = 0;
+  for (const [size, seed] of [[512, 11], [768, 51]]) {
+    const g = Game.create({ size, seed, towns: Math.round(size / 38), hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
+    g.aiAcquisitions = false;
+    const observation = openingObserver(g);
+    while (g.day < 720) { g.stepTick(); observation.tick(); }
+    funded += observation.verdict(`natural ${size}/${seed}`);
+    console.log(`  books ${g.ais.map(ai => { const e = g.company(ai.companyId).economy; return `${ai.companyId}: ${Math.round(e.money)} cash/${e.loan} debt`; }).join('; ')}`);
+    check(!g.ais.some(ai => ai.log.some(s => /error:/.test(s))), `${size}/${seed}: no AI errors`);
+  }
+  check(funded > 0, 'affected natural worlds exercise funded initial-pair decisions');
+}
+
 /** A pending curve-search cursor survives saving through its completion, with normal train traffic. */
 function midconnectReplay() {
   const g = Game.create({ size: 512, seed: 23, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
   g.aiAcquisitions = false;
+  const observation = openingObserver(g);
   let saved = false;
   while (g.day < 1200) {
-    g.stepTick();
+    g.stepTick(); observation.tick();
     const idle = g.ais.every(ai => !(ai as any).job && !(ai as any).project);
     if (idle && g.ais.some(ai => networkPlanner(ai)?.task === 'midconnect')
       && saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect))) { saved = true; break; }
   }
+  observation.verdict('midconnect natural opening');
   check(saved, 'natural map exercises a saved midconnect search without unrelated construction');
   if (!saved) return;
   for (const ai of g.ais) ai.state.cooldown = 1e9;
@@ -235,6 +338,8 @@ async function surveys() {
     console.log(`COMPARE congestion ${sum(base, 'congestion')} -> ${sum(out, 'congestion')}; raw held ${sum(base, 'held')} -> ${sum(out, 'held')} (${sum(out, 'held') > sum(base, 'held') ? 'original raw-count gate failed' : 'raw count did not increase'}); sustained ${sum(base, 'sustainedHeld')} -> ${sum(out, 'sustainedHeld')}; waiting share ${waitingShare(base)} -> ${waitingShare(out)}; cashflow ${sum(base, 'profit')} -> ${sum(out, 'profit')}`);
   }
 }
-if (!process.argv.includes('--survey-only')) fixtures();
-if (!process.argv.includes('--fixtures-only')) await surveys();
+if (process.argv.includes('--opening-failure-only')) failedOpening();
+else if (process.argv.includes('--opening-only')) openingNatural();
+else if (!process.argv.includes('--survey-only')) fixtures();
+if (!process.argv.includes('--fixtures-only') && !process.argv.includes('--opening-only') && !process.argv.includes('--opening-failure-only')) await surveys();
 done();

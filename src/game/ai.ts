@@ -1865,9 +1865,16 @@ export class AIController {
     delete this.state.through;
     const g = this.game;
     if (p.kind === 'tram') { this.tram?.cleanup(); return; }
-    // A completed railway survives interrupted works, including the interval before its first train is bought.
+    // A usable railway survives interruption before its first train is bought; registering a two-stop draft
+    // alone does not complete it. Otherwise a failed depot search leaves an empty line attracting upgrades.
     const live = p.line >= 0 ? g.lines.get(p.line) : undefined;
-    if (live?.kind === 'rail' && new Set(live.stops).size >= 2) {
+    const stops = live ? [...new Set(live.stops)] : [];
+    const depots = [this.lines.get(live?.id ?? -1)?.depot ?? -1, ...p.depots];
+    const ready = stops.length >= 2 && depots.some(id => {
+      const depot = g.depots.get(id);
+      return !!depot && depotServes(g, depot, stops[0], stops[1]) >= 0;
+    });
+    if (live?.kind === 'rail' && stops.length >= 2 && (live.vehicles.length > 0 || ready)) {
       this.adoptLines(true);
       this.note(`kept ${live.name} after interrupted works`);
       return;
@@ -2713,20 +2720,66 @@ export class AIController {
     }
     this.stats.track += res.built; this.stats.bridges += res.bridges; this.stats.tunnels += res.tunnels;
     yield;
+    // ---- depot: one of ours that serves both stations, else on a siding off the new line (station ends stay
+    // free for extensions), else behind a station. A depot serves the line when its trains reach one station and
+    // go on from there to the other (trains leave a siding one way and turn at the first station; a depot behind a
+    // platform track that leads nowhere else would strand them): one that does not is taken up again
+    const d0 = net.nextEdge;
+    let dep = -1, first = -1;
+    for (const d of g.depots.map.values()) {
+      if (d.owner !== owner || d.kind !== 'rail') continue;
+      const f = depotServes(g, d, stA.id, stB.id, hs ? cars : undefined);
+      yield;
+      if (f >= 0) { dep = d.id; first = f; break; }
+    }
+    const ownDepot = dep < 0;
+    const take = (id: number): boolean => {
+      if (id < 0) return false;
+      const d = g.depots.get(id), f = d ? depotServes(g, d, stA.id, stB.id, hs ? cars : undefined) : -1;
+      if (f >= 0) { dep = id; first = f; return true; }
+      this.removeDepotBranch(id);
+      return false;
+    };
+    // A terminal yard feeds either running track after pairing. An interior single-track siding can face
+    // against the pair's eventual one-way direction, so prefer the terminal yard for an initial pair.
+    if (initialBudget) for (const [st, o] of [[stA, stB], [stB, stA]] as [Station, Station][]) if (dep < 0)
+      take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
+    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    this.track(d0);
+    if (dep < 0) return fail('no depot site that serves both stations', 720);
+    if (ownDepot) p.depots.push(dep);
+    const dp = g.depots.get(dep)!;
+    yield;
+    // The opening must have a usable depot and access before optional capacity spending. A two-stop draft
+    // is not a service: paying for its second track cannot rescue a formation from which no train can depart.
+    for (const st of [stA, stB]) {
+      if (st.owner === owner && !g.stations.hasAccess(st)) { yield* this.roadAccessGen(st); yield; }
+      if (!g.stations.hasAccess(st)) return fail(`no road access at ${st.name}`, 720);
+    }
     // ---- Lay the economic initial pair before any train enters the formation. Reprice the actual geometry,
     // including both junction leads, rather than exempting an unopened line from an upgrade-return gate.
     let initiallyDoubled = false;
     let early: { line: Line; info: LineInfo } | null = null;
-    if (initialBudget) {
+    const pairRoute = upgradeRoute(g, stA.id, stB.id, owner), pairing = new Set(pairRoute);
+    const stub = net.edges.get(dp.edge);
+    // A departure must reach a platform without travelling along the formation whose running direction
+    // will change. Complete endpoint junctions then feed either track; a facing interior siding stays single.
+    const pairDepot = !!stub && [stA.id, stB.id].some(id => {
+      const path = findRailRoute(g, [{ edge: stub, dir: 1 }], id, owner, -1);
+      return !!path && path.conts.every(c => !pairing.has(c.edge.id));
+    });
+    if (initialBudget && pairDepot) {
       const line = g.lines.create('rail', owner);
       line.stops = [stA.id, stB.id];
       p.line = line.id;
-      const info: LineInfo = { kind: 'rail', towns: [A.id, B.id], depot: -1, maxVehicles: 2, opened: g.day,
+      const info: LineInfo = { kind: 'rail', towns: [A.id, B.id], depot: dep, maxVehicles: 2, opened: g.day,
         upgradeFailed: g.day };
       this.lines.set(line.id, info);
       early = { line, info };
+      g.lines.rebuild();
       const t0 = net.nextEdge;
-      const result = layInitialDoubleTrack(g, upgradeRoute(g, stA.id, stB.id, owner), owner, initialTraffic,
+      const result = layInitialDoubleTrack(g, pairRoute, owner, initialTraffic,
         cost => cost <= initialBudget * 1.2 && this.available() >= cost + (trainCost + mail.price) * nTrains + 300_000 && this.borrowFor(cost));
       initiallyDoubled = result.built;
       if (result.built) {
@@ -2771,33 +2824,9 @@ export class AIController {
       }
     }
     yield;
-    // ---- depot: one of ours that serves both stations, else on a siding off the new line (station ends stay
-    // free for extensions), else behind a station. A depot serves the line when its trains reach one station and
-    // go on from there to the other (trains leave a siding one way and turn at the first station; a depot behind a
-    // platform track that leads nowhere else would strand them): one that does not is taken up again
-    const d0 = net.nextEdge;
-    let dep = -1, first = -1;
-    for (const d of g.depots.map.values()) {
-      if (d.owner !== owner || d.kind !== 'rail') continue;
-      const f = depotServes(g, d, stA.id, stB.id, hs ? cars : undefined);
-      yield;
-      if (f >= 0) { dep = d.id; first = f; break; }
-    }
-    const ownDepot = dep < 0;
-    const take = (id: number): boolean => {
-      if (id < 0) return false;
-      const d = g.depots.get(id), f = d ? depotServes(g, d, stA.id, stB.id, hs ? cars : undefined) : -1;
-      if (f >= 0) { dep = id; first = f; return true; }
-      this.removeDepotBranch(id);
-      return false;
-    };
-    for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
-    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
-    this.track(d0);
-    if (dep < 0) return fail('no depot site that serves both stations', 720);
-    if (ownDepot) p.depots.push(dep);
-    const dp = g.depots.get(dep)!;
-    yield;
+    // Pair junctions and passing loops may change the directed departure path. Revalidate it before trains.
+    first = depotServes(g, dp, stA.id, stB.id, hs ? cars : undefined);
+    if (first < 0) return fail('depot no longer serves both stations', 720);
     // Track crossings and the depot approach can alter the station's access street after its platforms
     // were committed. Prove access again on the finished geometry before opening a passenger service.
     for (const st of [stA, stB]) {
