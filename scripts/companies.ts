@@ -153,13 +153,20 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     ai.state.cooldown = Math.max(ai.state.cooldown, 400);
     const n0 = l.vehicles.length, v0 = g.vehicles.get(l.vehicles[0])!;
     const grow = Math.sqrt(ai.config.activeness);
-    // at its limit and paying well
-    info.maxVehicles = Math.max(1, Math.floor(n0 / grow)); info.lastSold = -1e9;
+    // Match the policy's rounded fleet cap. Flooring the inverse put four vehicles above a cap of three.
+    info.maxVehicles = Math.max(1, Math.round(n0 / grow)); info.lastSold = -1e9;
+    const policyHard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
+    const policyCap = Math.min(Math.round(info.maxVehicles * grow), policyHard);
+    check(policyCap === n0 && n0 < policyHard, `crowded growth starts exactly at its rounded fleet cap (${n0} of ${policyCap}, hard ${policyHard})`);
     const m0 = info.maxVehicles;
     g.company(l.owner).economy.money += 50_000_000;
     // (at the decision instant: queues are trimmed before monthly management; last month's riders who gave up)
     const crowd = () => {
       l.incomeLast = l.costLast * 2 + 1_000_000;
+      // The profitable-line fixture needs matching annual fleet books: line-only income leaves the
+      // ageing vehicle loss-sale stage active before crowded capacity can be considered.
+      const profit = (l.incomeLast - l.costLast) / l.vehicles.length;
+      for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) v.profitLast = profit; }
       for (const sid of new Set(l.stops)) {
         const st = g.stations.get(sid)!, other = l.stops.find((x) => x !== sid)!;
         g.stations.addWaiting(st, l.id, other, other, 20);
