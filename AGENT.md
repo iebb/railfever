@@ -11,12 +11,15 @@ Railfever is a Transport Fever / OpenTTD style transport game built with TypeScr
 - UI getters and opening windows must not alter simulation state.
 - Track is one physical rail type; overhead wires are an attribute. Metro, light rail and main line are station styles. Preserve styles and platform metadata per station part when merging interchanges.
 - In-city metro and light-rail stations have half walking reach. Underground subways avoid surface demolition; growing lines can extend and gain intermediate stops.
+- Station construction on existing rail must support other companies' tracks while preserving ownership and access rights. Curved stations must use the actual track and platform geometry in construction, clearance, rendering, routing and saves.
 
 ## AI and UI
 
 - Guide AI behaviour through costs, revenues, forecasts, financing and opportunity search. Do not force lines, set city-line quotas or add style-dependent trip bonuses.
+- Prefer extendable rail trunks and branches serving town centres, including elevated or underground sections when their additional revenue pays for them. Compare extensions and reuse of existing corridors before opening a separate point-to-point line.
 - Forecasts must use the same fares and transfer rules as actual operations. Passenger legs apply a 0.9 factor for each prior vehicle change and for a change at that leg’s end; later changes do not retroactively discount earlier legs. Mail applies 0.9 per change to the whole journey. Preserve the capped distance-fare history used for the rail minimum.
 - Prefer capacity works when their recovered surplus pays for construction and upkeep. Shared services must consider all operators' traffic and delays.
+- Assign suitable platforms when creating routes and coordinate services sharing a station to reduce interference. Assignments must remain valid after line and station edits without bypassing reservations or train clearance.
 - Keep UI copy terse: labels, useful numbers and short functional tooltips. Preserve feature meaning when resolving conflicts with trimmed strings.
 
 ## Working together

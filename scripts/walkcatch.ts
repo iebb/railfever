@@ -108,6 +108,45 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
 }
 
 {
+  console.log('clean saves retain incremental catchment timing with sixteen stations');
+  const g = flatGame(256);
+  g.aiEnabled = false; g.vehicles.ambientEnabled = false;
+  road(g, node(g, 16, 60), node(g, 240, 60));
+  const stops = Array.from({ length: 16 }, (_, i) => bus(g, 25 + i * 13, 60));
+  g.day = 1;
+  g.stations.recomputeCatchment(); g.flushNetworkChanges(); g.lines.flushCatchment();
+  const horizon = g.stations.catchMaxB, oldPop = stops[2].catchPop;
+  check(horizon === 0, 'zero is a real historical horizon when the last share-out contained no buildings');
+  // A lot can exist beyond the last share-out. Loading must retain the saved horizon and populations.
+  const b = house(g, 60, 58);
+  const pending = house(g, 64, 58);
+  const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+  check(!g.lines.catchmentDirty && JSON.stringify(serialize(loaded)) === data, 'sixteen-station clean save round trip is exact');
+  check(loaded.stations.catchMaxB === horizon && loaded.stations.get(stops[2].id)!.catchPop === oldPop,
+    'clean load preserves historical building horizon and catchment populations');
+  // Do not read buildingShares before this trigger: a getter would hide the cold-cache replay regression.
+  for (const w of [g, loaded]) {
+    const building = w.world.buildings.get(b.id)!;
+    building.pop += 8; w.world.touchBuilding(building);
+    w.lines.markDemandSharesDirty(); w.stepTick();
+  }
+  check(!g.lines.catchmentDirty && !loaded.lines.catchmentDirty && loaded.stations.catchMaxB === pending.id,
+    'the first live invalidation commits immediately in both original and loaded games');
+  check(JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)), 'first incremental invalidation after a clean load is byte-identical');
+  for (let i = 0; i < 2 * g.ticksPerDay; i++) { g.stepTick(); loaded.stepTick(); }
+  check(JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)), 'sixteen-station clean save continues exactly for two days');
+
+  const building = g.world.buildings.get(b.id)!;
+  building.pop += 10; g.world.touchBuilding(building); g.lines.markDemandSharesDirty();
+  const dirtyData = JSON.stringify(serialize(g)), dirty = deserialize(JSON.parse(dirtyData));
+  check(dirty.lines.catchmentDirty && JSON.stringify(serialize(dirty)) === dirtyData,
+    'a pending dirty save preserves its populations and pending refresh on immediate round trip');
+  dirty.lines.flushCatchment();
+  check(dirty.lines.catchmentDirty && dirty.stations.catchmentWorkPending,
+    'a dirty load retains bounded cold catchment preparation rather than applying its pending work on load');
+}
+
+{
   console.log('pedestrian exclusions and station-complex passages');
   const g = flatGame(128);
   ROAD_TYPES.nofoot = { ...ROAD_TYPES.road, id: 'nofoot', pedestrians: false };

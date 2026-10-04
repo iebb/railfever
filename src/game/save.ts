@@ -634,12 +634,12 @@ export function deserialize(d: any): Game {
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
   try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
-  // Walking caches also track which street edits must dirty catchments. Restore those dependencies now;
-  // leaving them cold would skip a recompute in the loaded game. A pending share-out does this next tick,
-  // including its road-access refresh; don't apply those changes early while loading. Prime with saved access.
+  // Restore a clean save's derived walking dependencies and shares at the saved building horizon. A cold share
+  // cache would slice the next live invalidation while the running game's warm cache commits it immediately.
+  // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion;
   S.accessVersion = net.version;
-  if (!d.catchmentDirty) for (const st of g.stations.map.values()) g.stations.catchmentBuildings(st);
+  if (!d.catchmentDirty) g.stations.restoreCatchmentShares(d.catchMaxB);
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {

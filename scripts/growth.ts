@@ -4,14 +4,15 @@
 // are counted per year (and checked against the stations' and towns' own counters).
 // npx esbuild scripts/growth.ts --bundle --platform=node --format=esm --outfile=$S/growth.mjs && node $S/growth.mjs [seeds] [years] [size]
 //   [--ai=3] [--year=1950] [--out=runs.json: dump the monthly samples] [--report=runs.json,...: report earlier dumps only]
+//   [--check-report: run checks on dumps] [--legacy-activity: compare the original 30-day cohort]
 import { readFileSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
 import type { Station } from '../src/game/stations';
-import { townService } from '../src/game/towns';
+import { townService, GROWTH_ACTIVE_DAYS } from '../src/game/towns';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { fails, check, fmt, busStopSites, addBusStop, roadDepotNear } from './lib';
 
-/** Monthly sample of a town: active stations (a vehicle called this month), their catchment, passengers, service. */
+/** Monthly sample: stations called this month and active for growth, catchments, passengers and service. */
 interface Month { pop: number; act: number; act90: number; catch: number; gen: number; trans: number; lost: number; boarded: number; rating: number; calls: number; score?: number; speed?: number }
 interface TownLog { id: number; name: string; profile: string; pop0: number; months: Month[] }
 interface Year { year: number; gen: number; lost: number; ms: number; ticks: number; ambient: number; vehicles: number; pop: number }
@@ -20,8 +21,8 @@ type Cls = 'well served' | 'poorly served' | 'unserved';
 
 /**
  * Classes by the service a town had over the run (fixed, so older runs dumped with --out compare alike): unserved
- * with an active station in under 5 % of the months (essentially no service: a town served now and then, e.g. 23 of
- * 240 months by coaches, grows from that service and is poorly served), well served with one in at least half of
+ * with a station active under GROWTH_ACTIVE_DAYS in under 5 % of the months (essentially no service: a town served
+ * now and then, e.g. 23 of 240 months by coaches, grows from that service and is poorly served), well served with one in at least half of
  * them and a service level (below) of at least 0.08, else poorly served.
  */
 const UNSERVED_MONTHS = 0.05, WELL_MONTHS = 0.5, WELL_SERVICE = 0.08;
@@ -40,6 +41,8 @@ const opt = (k: string) => argv.find((a) => a.startsWith(`--${k}=`))?.slice(k.le
 const seeds = (pos[0] ?? '7,23').split(',').map(Number);
 const YEARS = Number(pos[1] ?? 20), SIZE = Number(pos[2] ?? 768), NAI = Number(opt('ai') ?? 3);
 const START = Number(opt('year') ?? 1950);
+// Diagnostic comparison with the original 30-day activity cohort; normal checks follow townService.
+const legacyActivity = argv.includes('--legacy-activity');
 const defaultTowns = (size: number) => Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2)));
 
 /** One seed: AI companies build their networks; monthly samples of every town. */
@@ -82,7 +85,7 @@ function simulate(seed: number): Run {
       let act = 0, act90 = 0, cp = 0, rt = 0, cl = 0, boarded = 0;
       for (const st of g.stations.map.values()) {
         if (!g.lines.stationServed(st.id) || Math.hypot(st.x - town.x, st.z - town.z) > town.radius + 10) continue;
-        if (st.lastCall >= 0 && g.day - st.lastCall <= 90) act90++;
+        if (st.lastCall >= 0 && g.day - st.lastCall <= GROWTH_ACTIVE_DAYS) act90++;
         const c30 = calls.get(st.id) ?? 0;
         if (c30 <= 0) continue;
         act++; cp += st.catchPop; rt += st.rating * st.catchPop; cl += c30 * st.catchPop; boarded += st.pickupLast;
@@ -136,14 +139,21 @@ function historyChecks() {
   const at30 = g.stations.callShare(s0);
   day();
   const at31 = g.stations.callShare(s0);
+  const active31 = townService(g, town).stations;
   check(full === 1 && Math.abs(at30 - 1 / 30) < 1e-9 && at31 === 0,
     `service frequency: share of the last 30 days with a call (${fmt(full, 3)}; 30 days after the last call ${fmt(at30, 3)}, 31 days ${fmt(at31, 3)})`);
+  while (g.day < lastCall + GROWTH_ACTIVE_DAYS) day();
+  const active90 = townService(g, town).stations;
+  day();
+  const expired = townService(g, town);
+  check(active31 === 1 && active90 === 1 && expired.stations === 0 && expired.speed === 1,
+    `growth service remains active through ${GROWTH_ACTIVE_DAYS} days and expires after ${GROWTH_ACTIVE_DAYS + 1} (${active31}; ${active90}; ${expired.stations})`);
 }
 
 /**
  * A town's service over the run: the share of its residents near stations a vehicle called at each month, times the
  * share of passengers who did not give up waiting (months without passengers: all), averaged over the months; and
- * the share of the months with an active station.
+ * the share of the months with a station active under the production GROWTH_ACTIVE_DAYS window.
  */
 function service(L: TownLog): { level: number; active: number; coverage: number; transported: number } {
   let level = 0, active = 0, coverage = 0, gen = 0, lost = 0;
@@ -151,7 +161,7 @@ function service(L: TownLog): { level: number; active: number; coverage: number;
     const c = m.pop > 0 ? Math.min(1, m.catch / m.pop) : 0;
     const T = m.gen > 0 ? Math.max(0, Math.min(1, 1 - m.lost / m.gen)) : 1;
     level += c * T; coverage += c; gen += m.gen; lost += m.lost;
-    if (m.act > 0) active++;
+    if ((legacyActivity ? m.act : m.act90) > 0) active++;
   }
   const n = Math.max(1, L.months.length);
   return { level: level / n, active: active / n, coverage: coverage / n, transported: gen > 0 ? Math.max(0, 1 - lost / gen) : 1 };
@@ -169,7 +179,7 @@ function fmtK(n: number) { return n >= 10000 ? `${fmt(n / 1000, 0)}k` : String(n
 /** The towns by class with their growth, the class means against the targets, and the passengers who gave up. */
 function report(runs: Run[], checks: boolean) {
   const by = new Map<Cls, number[]>();
-  console.log('\ntowns (active: months with a station a vehicle called at; near: residents near those stations; service: near x transported)');
+  console.log(`\ntowns (active: ${legacyActivity ? 'legacy 30-day calls' : `production ${GROWTH_ACTIVE_DAYS}-day history`}; near: residents near stations called at this month; service: near x transported)`);
   console.log('  seed town                 profile       pop ->    pop  growth  active  near  transp.  service  speed  class');
   for (const r of runs) {
     const rows = r.towns.map((L) => ({ L, s: service(L), end: L.months[L.months.length - 1]?.pop ?? L.pop0 })).sort((a, b) => b.s.level - a.s.level);
@@ -224,12 +234,13 @@ function report(runs: Run[], checks: boolean) {
   if (p !== undefined && u !== undefined) check(p > u, 'poorly served towns grow faster than unserved ones');
 }
 
-// --report=a.json,b.json: only the report of earlier runs (dumped with --out), without the checks
+// --report=a.json,b.json: report earlier dumps; --check-report also runs history and report assertions.
 const reportOnly = opt('report');
-if (!reportOnly) historyChecks();
+const checkReport = argv.includes('--check-report');
+if (!reportOnly || checkReport) historyChecks();
 const runs: Run[] = reportOnly ? reportOnly.split(',').flatMap((f) => JSON.parse(readFileSync(f, 'utf8')) as Run[]) : seeds.map(simulate);
 const out = opt('out');
 if (out && !reportOnly) writeFileSync(out, JSON.stringify(runs));
-report(runs, !reportOnly);
+report(runs, !reportOnly || checkReport);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

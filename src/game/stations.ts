@@ -2865,6 +2865,12 @@ export class Stations {
     this.computeShares(this.catchMaxB > 0 ? this.catchMaxB : this.game.world.nextBuildingId - 1);
   }
 
+  /** Rebuild a clean save's derived shares at its saved horizon; its populations remain saved state. */
+  restoreCatchmentShares(maxB = this.game.world.nextBuildingId - 1) {
+    this.computeShares(maxB);
+    this.pendingPop.clear();
+  }
+
   /**
    * Exact catchment of a station: buildings reachable on foot and the share of each building's people it
    * serves (parallel arrays; overlapping walking catchments split the population, see computeShares).
