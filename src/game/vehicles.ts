@@ -12,6 +12,7 @@ import { spacingSchedule } from './patterns';
 import { simNow } from './fares';
 import { offloadMail } from './mail';
 import type { Station } from './stations';
+import { sharedRailSpacing } from './rail-headways';
 
 /** Cars added and removed between two consists (by model, as multisets). */
 export function consistDiff(from: VehicleModel[], to: VehicleModel[]): { added: VehicleModel[]; removed: VehicleModel[] } {
@@ -364,8 +365,10 @@ export class Vehicles {
 
   /** A depot's releases into the same pattern/direction are staggered; failed exits consume no slot. */
   waitForSpacingRelease(v: Vehicle): boolean {
-    const s = spacingSchedule(this.game, v);
-    const released = s?.clock.released?.[this.spacingReleaseKey(v)];
+    v.targetStation();
+    // capacity-integration: depots of different companies feeding the same approach share its departure slots.
+    const shared = sharedRailSpacing(this.game, v), s = shared ?? spacingSchedule(this.game, v);
+    const released = s?.clock.released?.[shared?.key ?? this.spacingReleaseKey(v)];
     if (s && s.vehicles >= 2 && released !== undefined && simNow(this.game) - released < s.headway) {
       v.status = 'Waiting to depart (spacing)';
       return true;
@@ -375,8 +378,8 @@ export class Vehicles {
 
   noteSpacingRelease(v: Vehicle) {
     v.resetSpacing(); // returning to a depot cancels any unfinished station departure
-    const s = spacingSchedule(this.game, v);
-    if (s) (s.clock.released ??= {})[this.spacingReleaseKey(v)] = simNow(this.game);
+    const shared = sharedRailSpacing(this.game, v), s = shared ?? spacingSchedule(this.game, v);
+    if (s) (s.clock.released ??= {})[shared?.key ?? this.spacingReleaseKey(v)] = simNow(this.game);
   }
 
   /** May v enter connector c (no conflicting vehicle inside the junction)? */

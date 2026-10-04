@@ -46,6 +46,9 @@ import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
 import * as Trackops from './trackops';
 import * as StationsMod from './stations';
 import * as Patterns from './patterns';
+// capacity-integration: through-service stock respects the same corridor bid as monthly fleet management.
+import { sharedTrainAllowed, priceSharedProject } from './ai-capacity';
+import { railCapacityOptions } from './rail-capacity-options';
 import { autoSignalLine } from './signals';
 import { findRailRoute, railNext, platformWaits, depotReaches, lineCongestion, trackAllows, lineCompatibility } from './train';
 import type { Train } from './train';
@@ -173,7 +176,10 @@ export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, 
  * must newly cover.
  */
 // These gates were calibrated at the old passenger rate. Money limits remain in game money.
-export const networkOptions = { enabled: true, throughTrips: 25 * PASSENGER_RATE_SCALE, interchangeTrips: 45 * PASSENGER_RATE_SCALE, insertPop: PASSENGER_RATE_SCALE,
+export const networkOptions = {
+  // capacity-integration: disabling network cooperation also disables its bids, fleet review and shared clocks.
+  get enabled() { return railCapacityOptions.enabled; }, set enabled(value: boolean) { railCapacityOptions.enabled = value; },
+  throughTrips: 25 * PASSENGER_RATE_SCALE, interchangeTrips: 45 * PASSENGER_RATE_SCALE, insertPop: PASSENGER_RATE_SCALE,
   /** trips a month a cross-company direct service must carry (xlink) */
   xlinkTrips: 10 * PASSENGER_RATE_SCALE,
   /** tests and calibration: link the best curve found whatever its economics or the partner's view (as AIController.forceBuild) */
@@ -3368,7 +3374,12 @@ class NetPlanner {
     const routes = path.slice(1).every((sid, i) => routeBetween(g, path[i], sid, me) && routeBetween(g, sid, path[i], me));
     const why = !routes ? 'no way through the curve both ways' : lineCompatibility(g, l.id, cars);
     let bought = 0;
-    if (!why) for (let i = 0; i < econ.trains; i++) { if (typeof g.vehicles.buyTrain(depot.id, cars, l.id) !== 'string') bought++; }
+    // capacity-integration: the link's newly connected OD fares are its bid, including feeder journeys.
+    priceSharedProject(g, l, { revenue: econ.value.revenue, boardings: econ.value.trips * 12, kmh: econ.kmh, headway: econ.headway });
+    if (!why) for (let i = 0; i < econ.trains; i++) {
+      if (!forced && !sharedTrainAllowed(g, l, me, cars)) break;
+      if (typeof g.vehicles.buyTrain(depot.id, cars, l.id) !== 'string') bought++;
+    }
     if (why || !bought) {
       for (const vid of [...l.vehicles]) g.vehicles.sell(vid);
       g.lines.delete(l.id);
@@ -3667,6 +3678,7 @@ class NetPlanner {
     const counted = (x: Line) => x === l || new Set(l.stops.filter((sid) => x.stops.includes(sid))).size >= 2;
     if (lines.some((x) => this.xlinkRoom(x) - (counted(x) ? 0 : l.vehicles.length) < 1)) { this.considered('xlink.partner.room'); return false; }
     if (!this.canSpend(cost * 1.2 + 150_000, 0.3)) { this.considered('xlink.partner.funds'); return false; }
+    if (!networkOptions.xlinkForce && !sharedTrainAllowed(g, l, me, cars)) { this.considered('xlink.partner.capacityValue'); return false; }
     const t = g.vehicles.buyTrain(depot.id, cars, l.id);
     if (typeof t === 'string') { this.considered('xlink.partner.train'); return false; }
     this.managed()?.set(l.id, { kind: 'rail', towns: [...new Set(path.map((sid) => g.stations.get(sid)?.townId ?? -1).filter((x) => x >= 0))],

@@ -23,6 +23,7 @@ import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
 import { simNow } from './fares';
 import { redirectMail, mergeLineMail } from './mail';
+import { sharedRailSpacing } from './rail-headways';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -552,9 +553,11 @@ function departureKey(l: Line, v: Vehicle, index = v.stopIndex): string {
 export function holdForSpacing(g: Game, v: Vehicle): boolean {
   const l = v.line;
   if (!l) return false;
-  const schedule = spacingSchedule(g, v);
-  if (!schedule || schedule.vehicles < 2 || !schedule.timing.includes(v.stopIndex) || g.vehicles.spacingBlocked(v)) return false;
-  const now = simNow(g), prev = schedule.clock.departures[departureKey(l, v)];
+  const local = spacingSchedule(g, v);
+  // capacity-integration: different companies' patterns/lines use one timetable on the shared approach.
+  const shared = sharedRailSpacing(g, v), schedule = shared ?? local;
+  if (!schedule || schedule.vehicles < 2 || (!shared && !local?.timing.includes(v.stopIndex)) || g.vehicles.spacingBlocked(v)) return false;
+  const now = simNow(g), prev = schedule.clock.departures[shared?.key ?? departureKey(l, v)];
   if (!prev || prev.vehicle === v.id) return false;
   // Street detours and junctions can make a road timetable optimistic. Balance a rolling cycle of road
   // departures as well as enforcing the scheduled minimum; never increase the cap. Rail paths already
@@ -581,6 +584,9 @@ export function noteSpacingDeparture(g: Game, v: Vehicle) {
       const recent = [...(schedule.clock.departures[key]?.recent ?? []), at].slice(-schedule.vehicles - 1);
       schedule.clock.departures[key] = { at, vehicle: v.id, recent };
     }
+    // capacity-integration: a red signal consumes no slot; only a real departure updates the corridor clock.
+    const shared = sharedRailSpacing(g, v, index);
+    if (shared) shared.clock.departures[shared.key] = { at: simNow(g), vehicle: v.id };
   }
   v.resetSpacing();
 }

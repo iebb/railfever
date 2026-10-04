@@ -31,11 +31,14 @@ import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
-import { networkDaily, scheduleNetworkTask, XLINK_REACH } from './ai-network';
+import { networkDaily, scheduleNetworkTask, networkOptions, XLINK_REACH } from './ai-network';
 import { planSubwayYard, buildSubwayYard, surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail';
 import { offloadMail } from './mail';
+// capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
+import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
+import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1342,6 +1345,7 @@ export class AIController {
     this.checkConfig();
     try {
       this.railPolicy.daily();
+      if (networkOptions.enabled) this.manageSharedCapacity();
       if (this.cooperationReserved()) return;
       if (this.railPolicy.deepTrouble) this.recoverCash();
       if (this.relengthen.length) this.replaceTrains();
@@ -1375,11 +1379,12 @@ export class AIController {
   work(t0: number, t1: number) {
     if (this.disposed) return;
     this.mailPolicy.step();
-    if (!this.job) return;
     const n = this.budget, phase = (this.companyId * 37) % 100, perDay = this.game.ticksPerDay;
     const allowance = (tick: number) => Math.floor((tick * n * 100 + phase * perDay) / (perDay * 100));
     let units = allowance(t1) - allowance(t0);
     try {
+      // capacity-integration: saved corridor works get one construction unit, also while no project is running.
+      if (units > 0 && networkOptions.enabled && !this.cooperationReserved() && sharedCapacityWork(this)) units--;
       for (; units > 0 && this.job; units--) {
         const t0 = AIController.profile ? performance.now() : 0;
         const active: Generator<void, void> = this.job;
@@ -1986,6 +1991,8 @@ export class AIController {
    * single-track stretches, then one train fewer. True if it acted (nothing else for the line this month).
    */
   private relieveCongestion(l: Line, info: LineInfo): boolean {
+    // capacity-integration: partners and the lead use the same corridor response, even after canonical merges.
+    if (usesSharedRail(this.game, l)) return this.relieveSharedCapacity(l);
     const g = this.game, me = this.companyId;
     const c = lineCongestion(g, l.id);
     if (c.level < 2) { if (c.level === 0) info.congestion = undefined; return false; }
@@ -2023,11 +2030,34 @@ export class AIController {
     return false;
   }
 
+  // capacity-integration: each operator honours the same agreement; the worst marginal train leaves first.
+  private manageSharedCapacity() {
+    const g = this.game, me = this.companyId;
+    for (const l of [...g.lines.map.values()].sort((a, b) => a.id - b.id)) {
+      if (!l.vehicles.some(id => g.vehicles.get(id)?.owner === me) || !usesSharedRail(g, l)) continue;
+      const plan = sharedCapacityPlan(g, l), cut = plan.withdraw[0];
+      if (!cut || cut.owner !== me || plan.lines.some(id => g.lines.get(id)?.capacity?.withdrawn === g.day)) continue;
+      const t = g.vehicles.get(cut.train);
+      if (!(t instanceof Train)) continue;
+      g.vehicles.sell(t.id); this.stats.sold++;
+      for (const id of plan.lines) { const s = g.lines.get(id)?.capacity; if (s) s.withdrawn = g.day; }
+      const info = this.lines.get(cut.line); if (info) info.lastSold = g.day;
+      this.note(`${l.name}: withdrew ${t.name} (${Math.round(cut.value / 1000)}k/year including shared delays)`);
+    }
+  }
+
+  private relieveSharedCapacity(l: Line): boolean { return relieveSharedCapacity(this, l); }
+
+  // capacity-integration: use the company's ordinary credit/reserve calculation for corridor works.
+  capacityFunds(cost: number): boolean { return this.borrowFor(cost); }
+
   /**
    * How many trains a line can take, all operators together: ours from its settings; another company's by its
    * stations (passing places) on single track.
    */
   lineCapacity(l: Line): number {
+    // capacity-integration: the physical corridor and every operator's economic bid determine the shared plan.
+    if (usesSharedRail(this.game, l)) return sharedCapacityPlan(this.game, l).limit;
     const own = this.lines.get(l.id);
     if (own && own.shared === undefined) return own.maxVehicles;
     const g = this.game;
@@ -3110,6 +3140,8 @@ export class AIController {
       line.stops = ra ? [a, b] : [b, a];
       p.line = line.id;
     }
+    // capacity-integration: a shared-service entrant bids for a path before buying its train.
+    if (!sharedTrainAllowed(g, line, me, cars)) { if (joined) g.lines.leave(line.id, me); return fail('shared paths would lose money', 360); }
     const t = g.vehicles.buyTrain(dep, cars, line.id);
     if (typeof t === 'string') { if (joined) g.lines.leave(line.id, me); return fail('could not buy a train: ' + t, 360); }
     this.stats.vehicles++;
@@ -4478,15 +4510,18 @@ export class AIController {
   private adoptLines(includeProject = false) {
     const g = this.game, me = this.companyId;
     for (const l of g.lines.map.values()) {
-      if (l.owner !== me || this.lines.has(l.id) || (!includeProject && this.project?.line === l.id)) continue;
-      const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is NonNullable<typeof v> => !!v);
+      // capacity-integration: canonicalisation can move our stock to another company's line.
+      if (this.lines.has(l.id) || (!includeProject && this.project?.line === l.id)) continue;
+      const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is NonNullable<typeof v> => !!v && v.owner === me);
+      if (l.owner !== me && !vs.length) continue;
       const dep = vs.length ? (vs[0] as Train | RoadVehicle).depotId : l.kind === 'rail'
         ? [...g.depots.map.values()].find((d) => d.owner === me && d.kind === 'rail' && l.stops.some((sid) => depotReaches(g, d, sid)))?.id ?? -1 : -1;
       if (dep === undefined || dep < 0 || !g.depots.get(dep)) continue;
       const towns = [...new Set(l.stops.map((s) => g.stations.get(s)?.townId ?? -1).filter((t) => t >= 0))];
       const kind = l.kind === 'rail' ? 'rail' : l.kind === 'tram' ? 'tram' : 'bus';
       this.lines.set(l.id, { kind, towns, depot: dep, maxVehicles: kind === 'rail' ? Math.max(1, vs.length) : kind === 'tram' ? Math.max(4, vs.length) : Math.max(5, vs.length),
-        opened: this.railPolicy.accounts.get(l.id)?.opened ?? (vs.length ? Math.min(...vs.map((v) => v.boughtDay)) : g.day) });
+        opened: this.railPolicy.accounts.get(l.id)?.opened ?? (vs.length ? Math.min(...vs.map((v) => v.boughtDay)) : g.day),
+        ...(l.owner !== me ? { joined: true, shared: l.owner } : {}) });
     }
   }
 
@@ -4543,7 +4578,7 @@ export class AIController {
         }
       }
       // trains stuck on our railways: signals, passing loops, double track, fewer trains (in that order)
-      if (info.kind === 'rail' && info.shared === undefined && this.relieveCongestion(l, info)) continue;
+      if (info.kind === 'rail' && this.relieveCongestion(l, info)) continue;
       // an express pattern on a long line of uneven demand (every other train passes the quieter stations)
       if (info.kind === 'rail' && info.shared === undefined && !info.joined && !info.urban && info.express === undefined && vs.length >= 3 && g.day - info.opened > 360
         && (info.expressLook ?? 0) < new Set(l.stops).size && this.addExpress(l, info, vs)) continue;
@@ -4560,7 +4595,7 @@ export class AIController {
         const unit = info.urban ? this.urbanUnit(info.urban, platform) : null;
         const cars = info.urban ? (unit ? [unit] : null) : pickTrain(g.year, platform, span * 1.3, 2);
         const cost = cars ? cars.reduce((a, c) => a + c.cost, 0) : Infinity;
-        if (cars && this.available() > cost + 300_000 && this.borrowFor(cost)) {
+        if (cars && sharedTrainAllowed(g, l, this.companyId, cars) && this.available() > cost + 300_000 && this.borrowFor(cost)) {
           const t = g.vehicles.buyTrain(info.depot, cars, lid);
           if (typeof t !== 'string') { this.stats.vehicles++; this.note(`first train on ${l.name}`); }
         }
@@ -4594,7 +4629,7 @@ export class AIController {
       // (urban lines run their units as they are; main lines lengthen their trains first)
       if (info.kind === 'rail' && !info.urban && vs.every((v) => v instanceof Train && v.cars.some((m) => m.kind === 'loco')) && this.lengthenTrain(l, info, vs as Train[], waiting)) continue;
       // a single-track railway full of trains: lay the second track (block signals, more trains)
-      if (info.kind === 'rail' && !info.double && !info.loops && info.shared === undefined && vs.length >= info.maxVehicles && g.day - (info.upgradeFailed ?? -1e9) > 720 && !this.job) {
+      if (info.kind === 'rail' && !usesSharedRail(g, l) && !info.double && !info.loops && info.shared === undefined && vs.length >= info.maxVehicles && g.day - (info.upgradeFailed ?? -1e9) > 720 && !this.job) {
         this.project = { kind: 'double', towns: [...info.towns], stations: [], edges: [], depots: [], line: -1, started: g.day, built: true };
         this.job = this.doubleGen(l, info);
         continue;
@@ -4608,9 +4643,11 @@ export class AIController {
       const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
       if (info.kind !== 'rail' && l.vehicles.length >= maxV && maxV < hard && gaveUp >= 2 * v0.capacity && l.incomeLast > l.costLast * 2) { info.maxVehicles++; maxV = fleet(); }
       // all operators' vehicles count towards what the line can take (no over-saturation of one track)
-      const cap = info.joined ? this.lineCapacity(l) : maxV;
+      const cap = info.joined || (info.kind === 'rail' && usesSharedRail(g, l)) ? this.lineCapacity(l) : maxV;
       if (l.vehicles.length >= cap || this.available() < v0.value * 1.5) continue;
       if (info.kind === 'rail' && v0 instanceof Train) {
+        // capacity-integration: an extra train pays its congestion bill to all operators, including ourselves.
+        if (!sharedTrainAllowed(g, l, this.companyId, v0.cars, v0.pattern)) continue;
         // a further train on a single track: signals first (starters, passing loops), so trains wait instead of meeting head-on
         if (!info.double && info.shared === undefined) this.signalLine(lid);
         const t = g.vehicles.buyTrain(info.depot, [...v0.cars].sort((a, b) => (a.kind === 'loco' ? -1 : 0) - (b.kind === 'loco' ? -1 : 0)), lid);
@@ -4652,6 +4689,8 @@ export class AIController {
       const want = Math.min(5, n + (waiting > t.capacity * 4 ? 2 : 1));
       const cars = keepMailVans(t, pickTrain(g.year, platform - mailVanLength(t), span * 1.2, want, (info.electric ?? -1) > 0), platform);
       if (!cars || cars.filter((c) => c.kind === 'wagon' && !carriesMail(c)).length <= n) { if (n < 5) atPlatform++; continue; }
+      // capacity-integration: longer trains use the paid path better, provided the extra coaches earn their cost.
+      if (marginalSharedConsist(g, l, t, cars) <= 0) continue;
       short = true;
       // replaced by a longer one when it next stands at a platform (see replaceTrains)
       if (!this.relengthen.some((q) => q[0] === t.id)) this.relengthen.push([t.id, info.depot, cars.map((c) => c.id)]);
@@ -4692,12 +4731,13 @@ export class AIController {
       const [tid, dep, ids] = this.relengthen[i];
       const t = g.vehicles.get(tid);
       const l = t?.line;
-      if (!(t instanceof Train) || !l || l.owner !== this.companyId || !g.depots.get(dep)) { this.relengthen.splice(i, 1); continue; }
+      if (!(t instanceof Train) || !l || t.owner !== this.companyId || !g.lines.canOperate(l, this.companyId) || !g.depots.get(dep)) { this.relengthen.splice(i, 1); continue; }
       if (t.state !== 'loading') continue;
       this.relengthen.splice(i, 1);
       const platform = Math.min(...l.stops.map((id) => g.stations.get(id)?.rail?.length ?? 0));
       const cars = keepMailVans(t, ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m), platform);
       if (!cars || cars.reduce((s, c) => s + c.capacity, 0) <= t.capacity) continue;
+      if (marginalSharedConsist(g, l, t, cars) <= 0) continue;
       const cost = cars.reduce((a, c) => a + c.cost, 0);
       if (cars.length < 2 || this.available() < cost - g.vehicles.resaleValue(t) + 500_000 || !this.borrowFor(cost)) continue;
       if (this.railPolicy.account(l).step > 0 || this.railPolicy.deepTrouble) continue;

@@ -246,7 +246,8 @@ export interface RouteResult { conts: Cont[]; cost: number }
  * A* over (edge, direction) to any platform edge of the target station. With `exit`, tracks the owner may not
  * use are allowed at a high cost (only to get off them).
  */
-export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null): RouteResult | null {
+// capacity-integration: economic corridor routes use topology, independent of transient train reservations.
+export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null, ignoreOccupancy = false): RouteResult | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.rail) return null;
@@ -263,7 +264,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
   const cost = (e: NEdge) => {
     let c = e.len;
     const r = V.getRes(e.id);
-    if (r && r !== selfId) c += 40;
+    if (!ignoreOccupancy && r && r !== selfId) c += 40;
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
