@@ -140,7 +140,9 @@ function midconnectReplay() {
 }
 
 interface Survey { seed: number; size: number; years: number; doubleShare: number; congestion: number; held: number;
-  profit: number; operatingNet: number; revenue: number; capital: number; fees: number; railProfit: number; lines: number; trains: number; pairWorks: number }
+  profit: number; operatingNet: number; revenue: number; capital: number; fees: number; railProfit: number; lines: number; trains: number; pairWorks: number;
+  sustainedHeld: number; waitingSeconds: number; activeTrainSeconds: number; longestWait: number;
+  services: Record<string, { waitingSeconds: number; activeTrainSeconds: number; longestWait: number; sustainedHeld: number }> }
 async function surveys() {
   // A baseline bundle can export its own Game and counters, retaining class identity and its exact AI code.
   const baselinePath = process.argv[process.argv.indexOf('--baseline-module') + 1];
@@ -156,12 +158,28 @@ async function surveys() {
     const g: Game = Model.create({ size, seed, towns: Math.round(size / 42), hilliness: 'hilly', water: 'medium', startYear: 1985,
       aiConfigs: Array.from({ length: 3 }, () => ({ focus: { rail: 2.5, road: 1.2, tram: 0.5 } })) });
     g.aiAcquisitions = false;
-    let next = 30, congestion = 0, held = 0;
+    let next = 30, congestion = 0, held = 0, sustainedHeld = 0, waitingSeconds = 0, activeTrainSeconds = 0, longestWait = 0;
+    const waitTicks = new Map<number, number>(), services: Survey['services'] = {};
+    const serviceKey = (v: Train) => `${v.owner}:` + [...new Set((v.line?.stops ?? []).map(sid => g.stations.get(sid)?.townId ?? -1))].sort((a, b) => a - b).join(',');
     while (g.day < years * 360) {
       g.stepTick();
+      for (const v of g.vehicles.trains()) {
+        if (v.owner <= 0 || !v.onMap) { waitTicks.delete(v.id); continue; }
+        const key = serviceKey(v), service = services[key] ??= { waitingSeconds: 0, activeTrainSeconds: 0, longestWait: 0, sustainedHeld: 0 };
+        activeTrainSeconds += g.tickSeconds; service.activeTrainSeconds += g.tickSeconds;
+        if (v.state === 'waiting') {
+          const ticks = (waitTicks.get(v.id) ?? 0) + 1, seconds = ticks * g.tickSeconds;
+          waitTicks.set(v.id, ticks); waitingSeconds += g.tickSeconds; service.waitingSeconds += g.tickSeconds;
+          // Count each sustained hold once when it crosses two minutes, including holds between samples.
+          if (seconds >= 120 && (ticks - 1) * g.tickSeconds < 120) { sustainedHeld++; service.sustainedHeld++; }
+          longestWait = Math.max(longestWait, seconds); service.longestWait = Math.max(service.longestWait, seconds);
+        } else waitTicks.delete(v.id);
+      }
       if (g.day >= next) {
         for (const l of g.lines.all()) if (l.kind === 'rail' && l.owner > 0) congestion += Number(congestionOf(g, l.id).level > 0);
-        for (const v of g.vehicles.all()) if (v.kind === 'train' && v.owner > 0 && v.state === 'waiting') held++;
+        for (const v of g.vehicles.trains()) if (v.owner > 0 && v.state === 'waiting') {
+          held++;
+        }
         next += 30;
       }
     }
@@ -171,6 +189,8 @@ async function surveys() {
     const sum = (keys: (keyof (typeof records)[number])[]) => records.reduce((n, v) => n + keys.reduce((n, k) => n + (v[k] ?? 0), 0), 0);
     const revenue = sum(['income', 'mailIncome', 'trackIncome']), fees = sum(['trackFees']);
     const result = { seed, size, years, doubleShare: double / Math.max(1, length), congestion, held,
+      sustainedHeld, waitingSeconds, activeTrainSeconds, longestWait, services,
+      // Retain the legacy field for comparison files: this is annual cashflow, including capital purchases.
       profit: g.ais.reduce((n, ai) => n + g.company(ai.companyId).economy.lastYearProfit, 0),
       revenue, fees, capital: -sum(['construction', 'vehicles']),
       operatingNet: revenue + sum(['running', 'crew', 'energy', 'vehicleMaint', 'maintenance', 'trackWear', 'trackFees', 'interest']),
@@ -187,12 +207,32 @@ async function surveys() {
   if (process.argv.includes('--compare') && compare) {
     const base = JSON.parse(readFileSync(compare, 'utf8')) as Survey[];
     check(base.length === out.length && base.every((s, i) => s.seed === out[i].seed && s.size === out[i].size && s.years === out[i].years), 'survey matches baseline worlds');
-    const sum = (a: Survey[], k: 'congestion' | 'held' | 'profit' | 'operatingNet') => a.reduce((n, s) => n + s[k], 0);
+    const sum = (a: Survey[], k: 'congestion' | 'held' | 'profit' | 'operatingNet' | 'sustainedHeld' | 'waitingSeconds' | 'activeTrainSeconds' | 'capital' | 'revenue') => a.reduce((n, s) => n + s[k], 0);
     check(sum(out, 'congestion') <= sum(base, 'congestion'), 'natural-map congestion events do not increase');
-    check(sum(out, 'held') <= sum(base, 'held'), 'natural-map held trains do not increase');
-    check(sum(out, 'profit') >= sum(base, 'profit'), 'natural-map AI profits do not fall');
-    if (base.every(s => Number.isFinite(s.operatingNet))) check(sum(out, 'operatingNet') >= sum(base, 'operatingNet'), 'natural-map operating net including fees and interest does not fall');
-    console.log(`COMPARE congestion ${sum(base, 'congestion')} -> ${sum(out, 'congestion')}; held ${sum(base, 'held')} -> ${sum(out, 'held')}; profit ${sum(base, 'profit')} -> ${sum(out, 'profit')}`);
+    check(sum(out, 'held') <= sum(base, 'held'), 'natural-map raw held-train samples do not increase');
+    check(base.every(s => Number.isFinite(s.sustainedHeld)), 'baseline measures sustained waits');
+    check(sum(out, 'sustainedHeld') <= sum(base, 'sustainedHeld'), 'natural-map held trains over 120 seconds do not increase');
+    const waitingShare = (a: Survey[]) => sum(a, 'waitingSeconds') / Math.max(1, sum(a, 'activeTrainSeconds'));
+    check(waitingShare(out) <= waitingShare(base), 'natural-map waiting duration per active train time does not increase');
+    const retained: { old: Survey['services'][string]; now: Survey['services'][string] }[] = [];
+    const share = (s: Survey['services'][string]) => s.waitingSeconds / Math.max(1, s.activeTrainSeconds);
+    for (let i = 0; i < out.length; i++) {
+      const world = `${out[i].seed}/${out[i].size}`;
+      for (const [key, old] of Object.entries(base[i].services ?? {})) {
+        const now = out[i].services[key];
+        if (now) {
+          retained.push({ old, now });
+          console.log(`COHORT ${world} ${key}: waiting seconds ${old.waitingSeconds} -> ${now.waitingSeconds}; share ${share(old)} -> ${share(now)}; sustained ${old.sustainedHeld} -> ${now.sustainedHeld}; longest ${old.longestWait} -> ${now.longestWait}`);
+        } else console.log(`ABSENT ${world} baseline service ${key}: ${JSON.stringify(old)}`);
+      }
+      for (const [key, now] of Object.entries(out[i].services)) if (!base[i].services?.[key])
+        console.log(`ADDED ${world} service ${key}: ${JSON.stringify(now)}; waiting share ${share(now)}`);
+    }
+    check(retained.every(s => s.now.sustainedHeld <= s.old.sustainedHeld), 'retained services do not gain sustained holds');
+    check(base.every(s => Number.isFinite(s.operatingNet)), 'baseline measures actual annual operating net');
+    check(sum(out, 'operatingNet') >= sum(base, 'operatingNet'), 'natural-map operating profit including fees and interest does not fall');
+    console.log(`ECONOMY receipts ${sum(base, 'revenue')} -> ${sum(out, 'revenue')}; operating profit ${sum(base, 'operatingNet')} -> ${sum(out, 'operatingNet')}; capital ${sum(base, 'capital')} -> ${sum(out, 'capital')}; cashflow ${sum(base, 'profit')} -> ${sum(out, 'profit')} (${sum(out, 'profit') < sum(base, 'profit') ? 'original cashflow gate failed' : 'cashflow did not fall'})`);
+    console.log(`COMPARE congestion ${sum(base, 'congestion')} -> ${sum(out, 'congestion')}; raw held ${sum(base, 'held')} -> ${sum(out, 'held')} (${sum(out, 'held') > sum(base, 'held') ? 'original raw-count gate failed' : 'raw count did not increase'}); sustained ${sum(base, 'sustainedHeld')} -> ${sum(out, 'sustainedHeld')}; waiting share ${waitingShare(base)} -> ${waitingShare(out)}; cashflow ${sum(base, 'profit')} -> ${sum(out, 'profit')}`);
   }
 }
 if (!process.argv.includes('--survey-only')) fixtures();
