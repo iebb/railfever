@@ -180,7 +180,7 @@ function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknow
  */
 const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffsets', 'platforms', 'edges', 'through', 'throughOffsets',
   'throughEdges', 'width', 'throughMode', 'trackType', 'mode', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
-  'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost'];
+  'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost', 'alignment', 'groups', 'native'];
 /**
  * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
  * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike.
@@ -633,13 +633,14 @@ export function deserialize(d: any): Game {
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
-  try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
+  // Saved platform preferences are restored verbatim; loading routing tables is not a route edit.
+  try { g.lines.rebuild(true, false); } catch (e) { console.warn('Save load: rebuild failed', e); }
   // Restore a clean save's derived walking dependencies and shares at the saved building horizon. A cold share
   // cache would slice the next live invalidation while the running game's warm cache commits it immediately.
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion;
   S.accessVersion = net.version;
-  if (!d.catchmentDirty) g.stations.restoreCatchmentShares(d.catchMaxB);
+  if (!d.catchmentDirty) g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentRoadsDirty);
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {

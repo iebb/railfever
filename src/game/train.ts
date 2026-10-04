@@ -10,6 +10,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
 import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, stopsAt } from './patterns';
 import { trackPassage } from './opcosts';
+import { platformPreference } from './rail-platforms';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
 export const CROSS_BASE = 50_000_000;
@@ -246,18 +247,44 @@ export class Heap {
 }
 
 export interface RouteResult { conts: Cont[]; cost: number }
+/** A platform preference never overrides physical routing, signals or reservations. */
+export interface RailRouteTarget {
+  group?: number; preferred?: number; length?: number; direction?: 1 | -1;
+  /** Contiguous target-platform path already held before the route's initial frontier. */
+  prefix?: { edge: number; dir: number; length: number };
+}
 
 /**
  * A* over (edge, direction) to any platform edge of the target station. With `exit`, tracks the owner may not
  * use are allowed at a high cost (only to get off them).
  */
 // capacity-integration: economic corridor routes use topology, independent of transient train reservations.
-export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null, ignoreOccupancy = false): RouteResult | null {
+export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null, ignoreOccupancy = false, platform: RailRouteTarget = {}): RouteResult | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.rail) return null;
   const tx = st.rail.x, tz = st.rail.z;
   const V = g.vehicles;
+  // Stop at the arrival end of the entire physical platform, even when it was split into several edges.
+  const ends = new Map<number, number>();
+  const platformSteps = new Map<number, { remaining: number; previous?: { edge: number; dir: number } }>();
+  for (const group of g.stations.railTrackGroups(st)) {
+    if (platform.group !== undefined && group.id !== platform.group || group.length + 1e-6 < (platform.length ?? 0) + 0.05) continue;
+    if (group.steps.some(s => { const e = net.edges.get(s.edge); return !e || !ruleAllows(rule, e) || !exit && !g.canUse(owner, e.owner); })) continue;
+    const first = group.steps[0], last = group.steps[group.steps.length - 1];
+    for (const direction of [1, -1]) {
+      if (platform.direction !== undefined && platform.direction !== direction) continue;
+      const ordered = direction === 1 ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+      let remaining = group.length;
+      ordered.forEach((step, i) => {
+        platformSteps.set(step.edge * 2 + (step.dir > 0 ? 1 : 0), { remaining, previous: ordered[i - 1] });
+        remaining -= net.edges.get(step.edge)!.len;
+      });
+      const end = ordered[ordered.length - 1];
+      ends.set(end.edge * 2 + (end.dir > 0 ? 1 : 0), group.id);
+    }
+  }
+  if (!ends.size) return null;
   const NE: number[] = [], ND: number[] = [], NG: number[] = [], NP: number[] = [];
   const best = new Map<number, number>();
   const heap = new Heap();
@@ -266,37 +293,48 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     const n = net.nodes.get(d > 0 ? e.b : e.a)!;
     return Math.hypot(n.x - tx, n.z - tz) * 0.98;
   };
-  const cost = (e: NEdge) => {
+  const cost = (e: NEdge, d: number) => {
     let c = e.len;
     const r = V.getRes(e.id);
     if (!ignoreOccupancy && r && r !== selfId) c += 40;
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
+    // Prefer the saved platform, but a reserved platform costs more than a legal free alternative.
+    const group = ends.get(key(e.id, d));
+    if (group !== undefined && platform.preferred !== undefined && group !== platform.preferred) c += 12;
     return c;
   };
   const push = (e: NEdge, d: number, gc: number, parent: number) => {
     const k = key(e.id, d);
+    const p = platformSteps.get(k);
+    if (p && (platform.length ?? 0) > 0) {
+      const prev = p.previous;
+      const continued = prev && parent >= 0 && NE[parent] === prev.edge && ND[parent] === prev.dir;
+      const prefix = parent < 0 && prev && platform.prefix?.edge === prev.edge && platform.prefix.dir === prev.dir ? platform.prefix.length : 0;
+      // A junction into a late platform fragment is only a valid arrival if the actual remaining path fits.
+      if (!continued && p.remaining + prefix + 1e-6 < platform.length! + 0.05) return;
+    }
     if ((best.get(k) ?? Infinity) <= gc) return;
     best.set(k, gc);
     NE.push(e.id); ND.push(d); NG.push(gc); NP.push(parent);
     heap.push(NE.length - 1, gc + heur(e, d));
   };
-  for (const s of start) push(s.edge, s.dir, cost(s.edge), -1);
+  for (const s of start) push(s.edge, s.dir, cost(s.edge, s.dir), -1);
   let n = 0;
   while (heap.size) {
     const i = heap.pop();
     const e = net.edges.get(NE[i])!;
     const d = ND[i];
     if ((best.get(key(e.id, d)) ?? Infinity) < NG[i]) continue;
-    if (e.station === target) {
+    if (ends.has(key(e.id, d))) {
       const conts: Cont[] = [];
       for (let j = i; j >= 0; j = NP[j]) conts.push({ edge: net.edges.get(NE[j])!, dir: ND[j] });
       conts.reverse();
       return { conts, cost: NG[i] };
     }
     if (++n > maxExpand) break;
-    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
+    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge, c.dir), i);
   }
   return null;
 }
@@ -455,6 +493,40 @@ export class Train extends Vehicle {
     return out;
   }
 
+  /** Pure validation of the platform behind the head, including any released fragments a longer consist needs. */
+  platformResizePath(length: number, rule: TrackRule | null = this.rule): TSeg[] | null {
+    const g = this.game, st = g.stations.get(this.atStation), head = this.segs[this.headSeg];
+    if (!st || !head || this.state !== 'loading') return null;
+    const group = g.stations.railTrackGroups(st).find(q => q.steps.some(s => s.edge === head.e));
+    if (!group) return null;
+    const headStep = group.steps.find(s => s.edge === head.e)!;
+    const ordered = headStep.dir === head.dir ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+    const at = ordered.findIndex(s => s.edge === head.e && s.dir === head.dir);
+    let begin = at, room = this.headPos;
+    while (room < length + 0.05 && begin > 0) room += g.world.net.edges.get(ordered[--begin].edge)?.len ?? 0;
+    if (room + 1e-6 < length + 0.05) return null;
+    let cursor = at;
+    for (let i = this.headSeg; i >= 0 && cursor >= begin; i--, cursor--) {
+      const expected = ordered[cursor], actual = this.segs[i];
+      // An approach joining in the middle cannot be replaced by a different platform path behind the body.
+      if (actual.e !== expected.edge || actual.dir !== expected.dir) return null;
+    }
+    const wanted = ordered.slice(begin, at + 1).map(s => {
+      const e = g.world.net.edges.get(s.edge);
+      return e && g.canUse(this.owner, e.owner) && ruleAllows(rule, e) ? makeSeg(g, e, s.dir) : null;
+    });
+    if (wanted.some(s => !s)) return null;
+    for (const s of wanted) for (const r of s!.res) { const held = g.vehicles.getRes(r); if (held && held !== this.id) return null; }
+    const missing = cursor >= begin ? wanted.slice(0, cursor - begin + 1) as TSeg[] : [];
+    return missing;
+  }
+
+  /** Called only after the paid consist edit was validated; extend the actual reserved body path atomically. */
+  reservePlatformResize(path: TSeg[]) {
+    for (const s of path) for (const r of s.res) this.game.vehicles.setRes(r, this.id);
+    this.segs.unshift(...path); this.headSeg += path.length;
+  }
+
   // ---------------------------------------------------------------- reservation
   private startsAtSignal(s: TSeg): boolean {
     if (s.e < 0) return false;
@@ -489,7 +561,11 @@ export class Train extends Vehicle {
   }
 
   private extensionEnd(): number {
-    for (let k = 1; k < this.pending.length; k++) if (this.startsAtSignal(this.pending[k])) return k;
+    const st = this.game.stations.get(this.routeTarget), last = this.pending[this.pending.length - 1];
+    const platform = st && last ? this.game.stations.railTrackGroups(st).find(q => q.steps.some(s => s.edge === last.e)) : undefined;
+    const edges = new Set(platform?.steps.map(s => s.edge));
+    for (let k = 1; k < this.pending.length; k++) if (this.startsAtSignal(this.pending[k])
+      && !(edges.has(this.pending[k - 1].e) && edges.has(this.pending[k].e))) return k;
     return this.pending.length;
   }
 
@@ -504,7 +580,7 @@ export class Train extends Vehicle {
   scanBlockers(c: BlockerCursor, budget: number, add: (id: number) => void): number {
     const g = this.game, clear = this.backoff ? new Set(this.backoff.clear) : null;
     if (this.backoff && c.phase === 'path') c.phase = 'hold';
-    const block = c.phase === 'hold' ? [] : this.guardedBlock(this.pending[0]);
+    const reservationEnd = this.extensionEnd();
     let work = 0;
     while (work < budget && c.phase !== 'done') {
       work++;
@@ -527,14 +603,17 @@ export class Train extends Vehicle {
         if (r === undefined) { c.segment++; c.resource = 0; continue; }
       } else if (c.phase === 'path') {
         const s = this.pending[c.segment];
-        if (!s || (c.resource === 0 && c.segment > 0 && this.startsAtSignal(s))) {
-          c.phase = 'block'; c.resource = 0; continue;
+        if (!s || (c.resource === 0 && c.segment >= reservationEnd)) {
+          c.phase = 'block'; c.train = c.resource = 0; continue;
         }
         r = s.res[c.resource++];
         if (r === undefined) { c.segment++; c.resource = 0; continue; }
       } else {
-        r = block[c.resource++];
-        if (r === undefined) { c.phase = 'done'; continue; }
+        // Internal block guards remain authoritative when a complete platform is reserved at once.
+        const s = this.pending[c.train];
+        if (!s || c.train >= reservationEnd) { c.phase = 'done'; continue; }
+        r = this.guardedBlock(s)[c.resource++];
+        if (r === undefined) { c.train++; c.resource = 0; continue; }
       }
       const id = g.vehicles.getRes(r);
       if (id && id !== this.id) add(id);
@@ -545,10 +624,10 @@ export class Train extends Vehicle {
   /** Reserve pending segments up to the next signal (a block signal: once its whole block is free). */
   private tryExtend(): boolean {
     if (!this.pending.length) return false;
-    if (!this.blockFree()) return false;
     const V = this.game.vehicles;
     const j = this.extensionEnd();
     for (let k = 0; k < j; k++) {
+      if (!this.blockFree(this.pending[k])) return false;
       for (const r of this.pending[k].res) {
         const o = V.getRes(r);
         if (o !== 0 && o !== this.id) { this.blockedBy = o; return false; }
@@ -835,9 +914,21 @@ export class Train extends Vehicle {
     if (!target.rail) { this.state = 'noroute'; this.status = target.name + ' has no platforms'; return false; }
     this.routeTarget = target.id;
     const rule = this.rule;
+    const platform: RailRouteTarget = { preferred: this.line ? platformPreference(this.line, this.pattern, this.stopIndex)?.group : undefined, length: this.length };
     const last = this.segs[this.segs.length - 1];
+    const group = last && g.stations.railTrackGroups(target).find(q => q.steps.some(s => s.edge === last.e));
+    if (group) {
+      const step = group.steps.find(s => s.edge === last.e)!;
+      const ordered = step.dir === last.dir ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+      let j = ordered.findIndex(s => s.edge === last.e), length = 0;
+      for (let i = this.segs.length - 1; i >= 0 && j >= 0; i--, j--) {
+        if (this.segs[i].e !== ordered[j].edge || this.segs[i].dir !== ordered[j].dir) break;
+        length += this.segs[i].len;
+      }
+      platform.prefix = { edge: last.e, dir: last.dir, length };
+    }
     const fr = last ? frontier(g, last, this.owner, false, rule) : [];
-    let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id, 60000, false, rule) : null;
+    let fwd = fr.length ? findRailRoute(g, fr, target.id, this.owner, this.id, 60000, false, rule, false, platform) : null;
     let rev: RouteResult | null = null;
     const canTurn = allowReverse && this.speed < 0.01 && this.segs.length && this.headSeg === this.segs.length - 1;
     // turning at a station (a terminus, or a short-turn pattern on double track): back off the platform past the
@@ -848,18 +939,18 @@ export class Train extends Vehicle {
       const ts = this.segs[tail.seg];
       if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
         const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, rule, turnAtPlatform(ts));
-        if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, false, rule);
+        if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, false, rule, false, platform);
       }
     }
     if (!fwd && !rev && this.onForeignTrack()) {
       // caught on tracks we may no longer use (an access agreement ended): find the way off them
       const fx = last ? frontier(g, last, this.owner, true, rule) : [];
-      fwd = fx.length ? findRailRoute(g, fx, target.id, this.owner, this.id, 60000, true, rule) : null;
+      fwd = fx.length ? findRailRoute(g, fx, target.id, this.owner, this.id, 60000, true, rule, false, platform) : null;
       if (!fwd && canTurn) {
         const ts = this.segs[this.tailInfo().seg];
         if (ts.e >= 0 && g.world.net.edges.get(ts.e)) {
           const rf = frontier(g, { ...ts, dir: -ts.dir }, this.owner, true, rule, turnAtPlatform(ts));
-          if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true, rule);
+          if (rf.length) rev = findRailRoute(g, rf, target.id, this.owner, this.id, 60000, true, rule, false, platform);
         }
       }
     }
@@ -910,7 +1001,7 @@ export class Train extends Vehicle {
     const g = this.game;
     const target = this.targetStation();
     const last = this.segs[this.segs.length - 1];
-    if (target && !this.pending.length && last && last.e >= 0 && g.world.net.edges.get(last.e)?.station === target.id) {
+    if (target && !this.pending.length && last && this.platformEnd(target.id, last)) {
       this.routeTarget = target.id;
       if (this.state === 'noroute' || this.state === 'stopped') { this.state = 'running'; this.status = 'Heading to ' + target.name; }
       return;
@@ -969,7 +1060,7 @@ export class Train extends Vehicle {
     const st = g.stations.get(this.routeTarget);
     const head = this.segs[this.headSeg];
     const he = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
-    if (st && he && he.station === st.id) {
+    if (st && he && this.platformEnd(st.id, head)) {
       this.atStation = st.id;
       this.resetSpacing();
       this.state = 'loading';
@@ -978,6 +1069,14 @@ export class Train extends Vehicle {
     } else {
       this.planRoute(true);
     }
+  }
+
+  private platformEnd(station: number, seg: TSeg): boolean {
+    const st = this.game.stations.get(station);
+    return !!st && this.game.stations.railTrackGroups(st).some(q => {
+      const last = q.steps[q.steps.length - 1], first = q.steps[0];
+      return seg.e === last.edge && seg.dir === last.dir || seg.e === first.edge && seg.dir === -first.dir;
+    });
   }
 
   // ---------------------------------------------------------------- update

@@ -291,7 +291,7 @@ export function openHelp(ui: UI) {
       <li>Block: directional double track; single track: signals at passing loops.</li>
       <li><b>Signal blocks</b> view: free / reserved / occupied.</li>
       <li><b>Through</b>: 1–2 platform-free tracks, between side platforms or outside islands.</li>
-      <li><b>On a line</b>: insert into your track; trains keep running; add stop to lines.</li>
+      <li><b>On a line</b>: build on existing track with access rights; platforms follow bends; busy sites wait.</li>
       <li>Station → Build: connect open track ends.</li>
       <li><b>Loop</b> / Out and back / Auto: 3+ distinct stops loop one way; map shows direction.</li>
       <li>Rail → <b>Double</b>: click / drag single track; end switches to free platforms.</li>

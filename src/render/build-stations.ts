@@ -19,6 +19,7 @@ import { DAYS_PER_MONTH, MONTHS_PER_YEAR, WATER_Y } from '../game/constants';
 import { distToRect } from '../game/world';
 import { RAIL_TOP_Y } from './build-rail';
 import { lampPost, drapeBox } from './build-road';
+import { stationPose, stationLocal } from '../game/station-geometry';
 
 /** Platform top above the station's track profile. */
 export const PLATFORM_Y = RAIL_TOP_Y + 0.08;
@@ -114,7 +115,7 @@ function sceneOf(ctx: ChunkCtx, st: Station, r: RailPart, color: number): Statio
   return {
     ctx, st, r, color, sty, level: stationLevelOf(r), fx, fz, rx, rz,
     y: r.y, PY: r.y + PLATFORM_Y, L: r.length, width: railWidth(r),
-    at: (off, along) => [r.x + rx * off + fx * along, r.z + rz * off + fz * along],
+    at: (off, along) => { const p = stationPose(r, off, along); return [p.x, p.z]; },
     headEnd, modern: modernStation(ctx, st), seed: st.id * 7 + 3,
   };
 }
@@ -149,6 +150,7 @@ export function buildStation(ctx: ChunkCtx, st: Station, color: number) {
   if (!r) return;
   const s = sceneOf(ctx, st, r, color);
   const B = stationBuilder(r.style);
+  if (r.alignment) { nativeStation(ctx, st, r, color, s, B); return; }
   if (s.level === 'underground') { undergroundStation(ctx, st, r as RailPartX, color); if (s.sty.placement !== 'none') B.street(s); return; }
   if (s.level === 'elevated') { elevatedStation(ctx, st, r as RailPartX, color, B.canopy === 'shed' ? 'classic' : B.canopy); if (s.sty.placement !== 'none') B.street(s); return; }
   // added entrances: built by the chunk that owns their street-side structure
@@ -157,6 +159,84 @@ export function buildStation(ctx: ChunkCtx, st: Station, color: number) {
   platformsAndCanopies(ctx, r, color, B.canopy, s.headEnd);
   if (B.access === 'auto') platformAccess(s);
   B.ground(s);
+}
+
+/** A slab swept over the actual track curves; paving, decks and roofs share the same geometry. */
+function curvedSlab(W: WB, r: RailPart, off: number, width: number, from: number, to: number, bottom: number, top: number, ramp = false) {
+  const n = Math.max(1, Math.ceil((to - from) / 0.3));
+  const height = (a: number, p: ReturnType<typeof stationPose>) => p.y + (ramp
+    ? bottom + 0.012 + (top - bottom - 0.012) * Math.min(1, Math.max(0, Math.min(a - from, to - a) / 0.4)) : top);
+  for (let i = 0; i < n; i++) {
+    const a = from + (to - from) * i / n, b = from + (to - from) * (i + 1) / n;
+    const p = stationPose(r, off - width / 2, a), q = stationPose(r, off + width / 2, a);
+    const t = stationPose(r, off + width / 2, b), u = stationPose(r, off - width / 2, b);
+    const hp = height(a, p), hq = height(a, q), ht = height(b, t), hu = height(b, u);
+    W.ttri(p.x, hp, p.z, 0, a, q.x, hq, q.z, width, a, t.x, ht, t.z, width, b, 0, 1, 0);
+    W.ttri(p.x, hp, p.z, 0, a, t.x, ht, t.z, width, b, u.x, hu, u.z, 0, b, 0, 1, 0);
+    W.twall(p.x, p.z, u.x, u.z, p.y + bottom, hp, u.y + bottom, hu, -p.fz, p.fx, WSCALE.CONCRETE, a);
+    W.twall(q.x, q.z, t.x, t.z, q.y + bottom, hq, t.y + bottom, ht, q.fz, -q.fx, WSCALE.CONCRETE, a);
+    if (i === 0) W.twall(p.x, p.z, q.x, q.z, p.y + bottom, hp, q.y + bottom, hq, -p.fx, -p.fz, WSCALE.CONCRETE);
+    if (i === n - 1) W.twall(u.x, u.z, t.x, t.z, u.y + bottom, hu, t.y + bottom, ht, u.fx, u.fz, WSCALE.CONCRETE);
+  }
+}
+
+/** Native platforms, screen doors and fit-out retain each physical track's curve and arc correspondence. */
+function nativeStation(ctx: ChunkCtx, st: Station, r: RailPart, color: number, scene: StationScene, B: StationBuilder) {
+  const W = ctx.w, D = ctx.d, level = stationLevelOf(r), width = railWidth(r), from = -r.length / 2 + 0.05, to = r.length / 2 - 0.05;
+  if (level === 'ground') for (const e of r.entrances) if (inChunk(ctx, e.x, e.z)) groundEntrance(scene, e);
+  if (level === 'underground') {
+    for (const e of r.entrances) if (inChunk(ctx, e.x, e.z)) entrancePavilion(ctx, st, e, color, scene.modern);
+    if (scene.sty.placement !== 'none') B.street(scene);
+  }
+  if (level === 'elevated') {
+    for (const e of r.entrances) if (inChunk(ctx, e.x, e.z)) liftTower(ctx, st, r, e, color, width / 2 + 0.16, r.y - 0.25, r.y + PLATFORM_Y);
+    for (const p of r.piers) if (inChunk(ctx, p.x, p.z)) {
+      const h = ctx.game.world.heightAt(p.x, p.z), a = stationLocal(r, p.x, p.z).along, top = stationPose(r, 0, a).y - 0.25;
+      W.use(WC.CONCRETE, 0xb4b0a7, 1); W.box(p.x, h - 0.2, p.z, 0.4, Math.max(0.1, top - h + 0.2), 0.4);
+    }
+    if (scene.sty.placement !== 'none') B.street(scene);
+  }
+  if (!inChunk(ctx, r.x, r.z)) return;
+  if (level === 'elevated') {
+    W.use(WC.CONCRETE, 0xbab6ae, 1); curvedSlab(W, r, 0, width + 0.32, from, to, -0.25, -0.05);
+    for (const side of [-1, 1]) {
+      W.use(WC.CONCRETE, 0xc4c0b8, 1); curvedSlab(W, r, side * (width / 2 + 0.13), 0.04, from, to, -0.05, PLATFORM_Y + 0.1);
+      W.use(WC.PLAIN, color, 1); curvedSlab(W, r, side * (width / 2 + 0.162), 0.008, from, to, -0.20, -0.165);
+    }
+  }
+  for (const p of r.platforms) {
+    const [a0, a1] = platRange(r, p), lo = a0 + 0.05, hi = a1 - 0.05;
+    W.use(WC.PLATFORM, 0xd2cec6, 0); curvedSlab(W, r, p.off, p.w, lo, hi, -0.2, PLATFORM_Y, true);
+    for (const side of [-1, 1]) {
+      const edge = p.off + side * (p.w / 2 - 0.02);
+      W.use(WC.PLAIN, 0xeceae4, 0); curvedSlab(W, r, edge, 0.04, lo + 0.4, hi - 0.4, PLATFORM_Y, PLATFORM_Y + 0.003);
+      W.use(WC.PLAIN, 0xe8c230, 0); curvedSlab(W, r, p.off + side * (p.w / 2 - 0.075), 0.012, lo + 0.4, hi - 0.4, PLATFORM_Y, PLATFORM_Y + 0.003);
+      const track = r.trackOffsets.reduce((best, off) => Math.abs(off - edge) < Math.abs(best - edge) ? off : best, Infinity);
+      if (r.psd && Math.abs(track - edge) < 0.4) {
+        W.use(WC.PLAIN, 0x9fb8c6, 1); curvedSlab(W, r, edge - side * 0.01, 0.018, lo + 0.4, hi - 0.4, PLATFORM_Y, PLATFORM_Y + 0.32);
+        for (let a = lo + 0.4; a < hi - 0.4; a += 0.7) { const q = stationPose(r, edge - side * 0.01, a); D.use(WC.METAL, color); D.box(q.x, q.y + PLATFORM_Y, q.z, 0.026, 0.34, 0.026, q.fx, q.fz); }
+      }
+    }
+    const CL = canopyLength(B.canopy, hi - lo, r.length), mid = (hi + lo) / 2;
+    if (CL > 0.1 && B.canopy !== 'shed') {
+      if (B.canopy === 'shelter') {
+        const q = stationPose(r, p.off, mid);
+        canopy(ctx, B.canopy, (off, along) => { const v = stationPose(r, off, along); return [v.x, v.z]; }, p.off, mid, p.w, CL, q.y + PLATFORM_Y, q.fx, q.fz, color);
+      } else {
+        W.use(WC.ROOF_FLAT, 0x7b848a, 1); curvedSlab(W, r, p.off, Math.max(0.2, p.w - 0.04), mid - CL / 2, mid + CL / 2, PLATFORM_Y + 0.43, PLATFORM_Y + 0.46);
+        for (let a = mid - CL / 2 + 0.15; a <= mid + CL / 2 - 0.15; a += 1.2) {
+          const q = stationPose(r, p.off, a); D.use(WC.METAL, 0x6d757b); D.box(q.x, q.y + PLATFORM_Y, q.z, 0.025, 0.43, 0.025, q.fx, q.fz);
+        }
+      }
+    }
+    for (const a of [lo + 0.7, hi - 0.7]) {
+      const q = stationPose(r, p.off, a); lampPost(ctx, q.x, q.y + PLATFORM_Y, q.z, q.fx, q.fz, 0.42, 0);
+      D.use(WC.METAL, 0x50565b); D.cylinder(q.x, q.y + PLATFORM_Y, q.z, 0.008, 0.26, 4);
+      boardText(D, q.x, q.y + PLATFORM_Y + 0.2, q.z, q.fz, -q.fx, 0.24, 0.06, color);
+    }
+  }
+  if (B.access === 'auto') platformAccess(scene);
+  if (level === 'ground') B.ground(scene);
 }
 
 /** Along-axis extent of a platform (merged stations: partial platforms). */
@@ -311,7 +391,8 @@ function platformAccess(s: StationScene) {
   for (const q of own.stairs) {
     const p = r.platforms[q.platform];
     const [ux, uz] = s.at(p.off, q.along);
-    stairWell(W, D, ux, PY, uz, fx, fz, Math.min(0.2, p.w - 0.34), 0.42, 0.06);
+    const pose = stationPose(r, p.off, q.along);
+    stairWell(W, D, ux, r.alignment ? pose.y + PLATFORM_Y : PY, uz, pose.fx, pose.fz, Math.min(0.2, p.w - 0.34), 0.42, 0.06);
   }
   if (own.footbridge === null) return;
   // footbridge across all platforms (beyond the canopies), stairs down onto each
@@ -508,10 +589,11 @@ function noneGround(s: StationScene) {
  * each side (entrances, forecourts on both sides) and stair enclosures down to every platform.
  */
 function concourseGround(s: StationScene) {
-  const { ctx, r, fx, fz, rx, rz, width, PY } = s;
+  const { ctx, r, width, PY } = s;
   const W = ctx.w, D = ctx.d, fac = ctx.fac;
   const b = r.building, CP = CONCOURSE_PAVILION;
-  const along0 = (b.x - r.x) * fx + (b.z - r.z) * fz;
+  const along0 = stationLocal(r, b.x, b.z).along;
+  const pose = stationPose(r, 0, along0), fx = pose.fx, fz = pose.fz, rx = fz, rz = -fx;
   const bw = Math.max(1.2, b.w);
   const FL = s.y + 1.12, TOP = s.y + 1.7;
   const [cx, cz] = s.at(0, along0);
@@ -825,7 +907,7 @@ function entranceLook(s: StationScene): EntranceLook {
 }
 
 /** Lateral offset of a point from the station axis (right positive). */
-const latOf = (s: StationScene, x: number, z: number) => (x - s.r.x) * s.rx + (z - s.r.z) * s.rz;
+const latOf = (s: StationScene, x: number, z: number) => stationLocal(s.r, x, z).off;
 
 /**
  * Where an entrance's stairs go on a platform near `a` (along the axis): clear of the station's own underpass
@@ -850,7 +932,8 @@ function platformStairwells(s: StationScene, a: number) {
     const at = stairSpot(s, p, a, 0.42);
     if (at === null) continue;
     const [ux, uz] = s.at(p.off, at);
-    stairWell(s.ctx.w, s.ctx.d, ux, s.PY, uz, s.fx, s.fz, sw, 0.42, 0.06);
+    const pose = stationPose(s.r, p.off, at);
+    stairWell(s.ctx.w, s.ctx.d, ux, s.r.alignment ? pose.y + PLATFORM_Y : s.PY, uz, pose.fx, pose.fz, sw, 0.42, 0.06);
   }
 }
 
@@ -871,6 +954,7 @@ function entranceSign(s: StationScene, x: number, y: number, z: number, nx: numb
 function groundEntrance(s: StationScene, e: Entrance) {
   const k = entranceKind('ground', e);
   const a = entranceAlong(s.r, e);
+  if (s.r.alignment) { const p = stationPose(s.r, 0, a); s = { ...s, fx: p.fx, fz: p.fz, rx: p.fz, rz: -p.fx, y: p.y, PY: p.y + PLATFORM_Y }; }
   const seed = s.st.id * 53 + Math.round(Math.abs(e.x * 7 + e.z * 13));
   if (k === 'footbridge') footbridgeEntrance(s, e, a, seed);
   else if (k === 'underpass') { for (const p of entranceLandings(e)) subwayStairs(s, p); platformStairwells(s, a); }
@@ -1249,7 +1333,8 @@ function elevatedStation(ctx: ChunkCtx, st: Station, r: RailPartX, color: number
 /** Stair / lift tower from an entrance hall at street level up to the elevated platforms. */
 function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance, color: number, half: number, bot: number, PY: number) {
   const W = ctx.w, D = ctx.d, fac = ctx.fac;
-  const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
+  const local = stationLocal(r, en.x, en.z), pose = stationPose(r, 0, local.along);
+  const fx = pose.fx, fz = pose.fz, rx = fz, rz = -fx;
   const efx = Math.sin(en.angle), efz = Math.cos(en.angle);
   const seed = st.id * 41 + Math.round(Math.abs(en.x * 5 + en.z * 11));
   const modern = modernStation(ctx, st);
@@ -1267,7 +1352,7 @@ function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance
   roundel(ctx, en.x + efx * (HD / 2 + 0.03) + efz * (HW / 2 - 0.06), g + HH + 0.1, en.z + efz * (HD / 2 + 0.03) - efx * (HW / 2 - 0.06), efx, efz, 0.055, color);
   frontPaving(ctx, [en.x + efx * HD / 2, en.z + efz * HD / 2], efx, efz, HW + 0.08, g - 0.004, 0.14);
   // where is the tower relative to the deck?
-  const lat = (en.x - r.x) * rx + (en.z - r.z) * rz, al = (en.x - r.x) * fx + (en.z - r.z) * fz;
+  const lat = local.off, al = local.along;
   const under = Math.abs(lat) < half + 0.12 && Math.abs(al) < r.length / 2 + 0.05;
   const SW = 0.32;
   const sx = en.x - efx * 0.05, sz = en.z - efz * 0.05;
@@ -1276,7 +1361,7 @@ function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance
     fac.boxWalls(sx, g + HH, sz, SW, SW, Math.max(0.05, bot - (g + HH)), fx, fz, FC.CONCRETE_PLAIN, -1, 0xd6d2ca, seed + 1, { floorH: 0.3 });
     const pl = r.platforms.find((p) => Math.abs(lat - p.off) < p.w / 2);
     if (pl) {
-      const [kx, kz] = [r.x + rx * pl.off + fx * al, r.z + rz * pl.off + fz * al];
+      const pt = stationPose(r, pl.off, al), kx = pt.x, kz = pt.z;
       const kw = Math.min(0.3, pl.w - 0.2);
       fac.boxWalls(kx, PY, kz, kw, 0.42, 0.3, fx, fz, FC.GLASS, -1, 0xffffff, seed + 2, { floorH: 0.3, skipFront: true });
       roofFlat(W, kx, PY + 0.3, kz, kw + 0.04, 0.46, fx, fz, 0x8c8a86);
@@ -1291,7 +1376,7 @@ function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance
   roofFlat(W, sx, g + HH + TH, sz, SW + 0.04, SW + 0.04, efx, efz, 0x7c7a76);
   const sg = lat >= 0 ? 1 : -1;
   const alc = Math.max(-r.length / 2 + 0.3, Math.min(r.length / 2 - 0.3, al));
-  const tx = r.x + rx * sg * half + fx * alc, tz = r.z + rz * sg * half + fz * alc;
+  const target = stationPose(r, sg * half, alc), tx = target.x, tz = target.z;
   const dx = tx - sx, dz = tz - sz, dl = Math.hypot(dx, dz);
   if (dl > SW / 2 + 0.05) {
     const ux = dx / dl, uz = dz / dl;

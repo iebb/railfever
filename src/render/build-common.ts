@@ -8,6 +8,7 @@ import type { TreeInstance } from './trees';
 import type { RailPart } from '../game/stations';
 import type { Drape } from './build-drape';
 import { railWidth } from '../game/stations';
+import { stationPose, stationLocal } from '../game/station-geometry';
 import { styleOf } from '../game/station-styles';
 
 /**
@@ -72,6 +73,11 @@ export interface StationFrame {
 }
 
 export function stationFrame(r: RailPart): StationFrame {
+  if (r.alignment) {
+    const p = buildingPose(r), f = r.forecourt;
+    const cd = 0.7;
+    return { ...p, cx: f?.x ?? p.bx + p.ex * (p.BD / 2 + cd / 2), cz: f?.z ?? p.bz + p.ez * (p.BD / 2 + cd / 2), cw: p.BL + 0.4, cd };
+  }
   const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
   const b = r.building;
   const bfx = Math.sin(b.angle), bfz = Math.cos(b.angle), brx = bfz, brz = -bfx;
@@ -100,8 +106,8 @@ export function buildingPose(r: RailPart): BuildingPose {
   let ex: number, ez: number;
   if (r.forecourt && Math.hypot(r.forecourt.x - b.x, r.forecourt.z - b.z) > 1e-3) { ex = r.forecourt.x - b.x; ez = r.forecourt.z - b.z; }
   else {
-    const rx = Math.cos(r.angle), rz = -Math.sin(r.angle);
-    const side = ((b.x - r.x) * rx + (b.z - r.z) * rz) >= 0 ? 1 : -1;
+    const local = stationLocal(r, b.x, b.z), pose = stationPose(r, 0, local.along), rx = pose.fz, rz = -pose.fx;
+    const side = local.off >= 0 ? 1 : -1;
     ex = rx * side; ez = rz * side;
   }
   const l = Math.hypot(ex, ez) || 1;
@@ -138,7 +144,7 @@ export function forecourtRects(r: RailPart): ForecourtRect[] {
   const sty = styleOf(r.style), b = r.building;
   if (sty.placement === 'over') {
     // pavilions on both sides of the tracks: their outer faces are the rect's ends across
-    const rx = Math.cos(r.angle), rz = -Math.sin(r.angle);
+    const pose = stationPose(r, 0, stationLocal(r, b.x, b.z).along), rx = pose.fz, rz = -pose.fx;
     for (const fc of [r.forecourt, r.forecourt2]) {
       if (!fc) continue;
       const sd = ((fc.x - b.x) * rx + (fc.z - b.z) * rz) >= 0 ? 1 : -1;

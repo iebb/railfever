@@ -2,6 +2,7 @@
 import * as THREE from 'three';
 import type { Game } from '../game/game';
 import type { Proposal, CrossingPlan } from '../game/construction';
+import { stationPose, stationStripRects } from '../game/station-geometry';
 import type { StationPlan } from '../game/stations';
 import type { DepotPlan, DepotKind } from '../game/build-ops';
 import { depotSize, depotVolume, UNDERGROUND_DEPOT } from '../game/build-ops';
@@ -615,15 +616,30 @@ export class Overlay {
     const w = this.game.world;
     const gy = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y);
     const base = col(pl.ok ? C.ok : C.bad).clone();
-    if (level === 'underground') boxRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y - 0.6, y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+    if (pl.alignment) {
+      for (const f of stationStripRects(pl, 0, pl.layout.width)) {
+        const p = stationPose(pl, 0, 0);
+        if (level === 'underground') boxRect(b, f.x, f.z, f.angle, f.w, f.d, p.y - 0.6, p.y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+        else flatRect(b, f.x, f.z, f.angle, f.w, f.d, p.y + 0.02, base);
+      }
+    } else if (level === 'underground') boxRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y - 0.6, y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
     else flatRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y + 0.02, base);
     const cp = col(pl.ok ? 0xd9f7e2 : 0xffd2cc).clone();
-    for (const p of pl.layout.platforms) flatRect(b, pl.x + rx * p.off, pl.z + rz * p.off, pl.angle, p.w, pl.length * 0.96, y + 0.1, cp);
+    const strip = (off: number, width: number, length: number, lift: number, c: THREE.Color) => {
+      if (!pl.alignment) { flatRect(b, pl.x + rx * off, pl.z + rz * off, pl.angle, width, length, y + lift, c); return; }
+      const n = Math.max(1, Math.ceil(length / 0.3));
+      for (let i = 0; i < n; i++) {
+        const a = -length / 2 + length * i / n, z = -length / 2 + length * (i + 1) / n;
+        const p = stationPose(pl, off - width / 2, a), q = stationPose(pl, off + width / 2, a), r = stationPose(pl, off + width / 2, z), s = stationPose(pl, off - width / 2, z);
+        b.quad(p.x, p.y + lift, p.z, q.x, q.y + lift, q.z, r.x, r.y + lift, r.z, s.x, s.y + lift, s.z, c);
+      }
+    };
+    for (const p of pl.layout.platforms) strip(p.off, p.w, pl.length * 0.96, 0.1, cp);
     const ct = col(pl.ok ? 0x1d4f30 : 0x6e1d1d).clone();
-    for (const o of pl.layout.trackOffsets) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.16, pl.length, y + 0.05, ct);
+    for (const o of pl.layout.trackOffsets) strip(o, 0.16, pl.length, 0.05, ct);
     // through tracks (no platform) run the full length and a little beyond
     const cth = col(pl.ok ? 0x4fc3ff : 0xff9a8a).clone();
-    for (const o of pl.layout.throughOffsets ?? []) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.2, pl.length + 1.2, y + 0.06, cth);
+    for (const o of pl.layout.throughOffsets ?? []) strip(o, 0.2, pl.alignment ? pl.length : pl.length + 1.2, 0.06, cth);
     // street-level access: the station building, or entrance pavilions / stair towers (red: no road beside it)
     const ce = col(pl.ok ? 0xf3e7c4 : 0xffb3a8).clone(), cno = col(0xff8a7a).clone();
     if (level === 'ground') { const bd = pl.building; flatRect(b, bd.x, bd.z, bd.angle, bd.w, bd.d, y + 0.3, ce); }
@@ -684,8 +700,7 @@ export class Overlay {
     for (const st of g.stations.map.values()) {
       const r = st.rail;
       if (!r || (r.level ?? 'ground') !== 'underground') continue;
-      const q = g.stations.undergroundBox(st)!;
-      boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(r.depth ?? 2));
+      for (const q of g.stations.undergroundBoxes(st)) boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(r.depth ?? 2));
     }
     for (const d of g.depots.map.values()) {
       if (d.level !== 'underground') continue;

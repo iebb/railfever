@@ -24,6 +24,7 @@ import { tramUsable } from './build-ops';
 import { simNow } from './fares';
 import { redirectMail, mergeLineMail } from './mail';
 import { sharedRailSpacing } from './rail-headways';
+import { inheritPlatformPreferences } from './rail-platforms';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -965,6 +966,7 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
     }
   });
   keep.patterns = normalize(keep, list);
+  inheritPlatformPreferences(keep, oldKeep, maps[0]);
   keep.vehicles = [...new Set([...oldKeep.vehicles, ...drop.vehicles])];
   const operators = [...new Set([...g.lines.operatorsOf(oldKeep), ...g.lines.operatorsOf(drop)])].filter((o) => o !== keep.owner);
   if (operators.length) keep.operators = operators;

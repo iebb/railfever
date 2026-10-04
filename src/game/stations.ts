@@ -20,6 +20,9 @@ import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refre
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
+import { stationPose, stationLocal, stationStripRects } from './station-geometry';
+import type { RailStationAlignment, RailTrackGroup, RailTrackStep, StationGeometry } from './station-geometry';
+export type { RailTrackGroup, RailTrackStep } from './station-geometry';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -264,13 +267,13 @@ export function entranceUpkeep(r: RailPart | null): number {
 }
 /** Ground stations: where an entrance's stairs meet the platforms, along the axis from the centre. */
 export function entranceAlong(r: RailPart, e: Entrance): number {
-  const a = (e.x - r.x) * Math.sin(r.angle) + (e.z - r.z) * Math.cos(r.angle);
+  const a = stationLocal(r, e.x, e.z).along;
   if (entranceKind(r.level ?? 'ground', e) !== 'gate') return a;
   return (a >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - GATE_STAIRS);
 }
 /** Ground stations: the side of the tracks an entrance stands on (+1 right of the axis, -1 left). */
 export function entranceSide(r: RailPart, e: { x: number; z: number }): 1 | -1 {
-  return (e.x - r.x) * Math.cos(r.angle) - (e.z - r.z) * Math.sin(r.angle) >= 0 ? 1 : -1;
+  return stationLocal(r, e.x, e.z).off >= 0 ? 1 : -1;
 }
 /** Where a station's entrances stand (cache keys). */
 function entranceKey(r: RailPart): string {
@@ -339,6 +342,11 @@ export interface RailPart {
   through: number;
   throughOffsets: number[];
   throughEdges: number[];
+  /** Mounted on retained rail: exact geometry and stable physical platform/through groups. */
+  alignment?: RailStationAlignment;
+  groups?: RailTrackGroup[];
+  /** Removing the facility leaves the inherited running rail in place. */
+  native?: boolean;
   /** width of the track area (platform and through tracks) */
   width: number;
   /** where the through tracks lie */
@@ -607,6 +615,9 @@ function rectGap(a: Rect, b: Rect): number {
 const angleOf = (fx: number, fz: number) => Math.atan2(fx, fz);
 
 export interface StationOpts {
+  /** Internal existing-track adapter: retain the real formation instead of laying a free station. */
+  alignment?: RailStationAlignment;
+  layout?: StationLayout;
   /** 'ground' (default), 'elevated' (viaduct) or 'underground' */
   level?: StationLevel;
   /** alias of level 'underground' */
@@ -666,6 +677,7 @@ export interface StationPlan {
   /** underground depth / elevated height (0 on the ground) */
   depth: number; height: number;
   layout: StationLayout;
+  alignment?: RailStationAlignment;
   footprint: Rect;
   building: Rect;
   /** underground / elevated: street-level entrances (with road access or not) */
@@ -799,6 +811,15 @@ export class Stations {
           if (stop.s < s) stop.edge = e1.id; else { stop.edge = e2.id; stop.s -= s; }
         }
         if (st.rail) {
+          for (const group of st.rail.groups ?? []) {
+            const k = group.steps.findIndex((q) => q.edge === old.id);
+            if (k < 0) continue;
+            const dir = group.steps[k].dir;
+            group.steps.splice(k, 1, ...(dir > 0
+              ? [{ edge: e1.id, dir: 1 as const }, { edge: e2.id, dir: 1 as const }]
+              : [{ edge: e2.id, dir: -1 as const }, { edge: e1.id, dir: -1 as const }]));
+            group.length += e1.len + e2.len - old.len;
+          }
           const i = st.rail.edges.indexOf(old.id);
           if (i >= 0) st.rail.edges.splice(i, 1, e1.id, e2.id);
           const j = st.rail.throughEdges.indexOf(old.id);
@@ -815,7 +836,13 @@ export class Stations {
       for (const st of [...this.map.values()]) {
         const before = st.stops.length;
         st.stops = st.stops.filter((p) => p.edge !== e.id);
-        if (st.rail) { st.rail.edges = st.rail.edges.filter((x) => x !== e.id); st.rail.throughEdges = st.rail.throughEdges.filter((x) => x !== e.id); }
+        if (st.rail) {
+          st.rail.edges = st.rail.edges.filter((x) => x !== e.id); st.rail.throughEdges = st.rail.throughEdges.filter((x) => x !== e.id);
+          for (const group of st.rail.groups ?? []) {
+            group.steps = group.steps.filter((q) => q.edge !== e.id);
+            group.length = group.steps.reduce((s, q) => s + (net.edges.get(q.edge)?.len ?? 0), 0);
+          }
+        }
         if (st.stops.length !== before && !st.stops.length && !st.rail) this.deleteStation(st.id);
       }
     });
@@ -940,13 +967,14 @@ export class Stations {
     // Platforms stop 50 cm inside each end node; buffers also sit inside it. Keep the throat outside this
     // rectangle free for connecting track and short depot stubs (earthwork skirts are not structures).
     const fp = { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: Math.max(0, r.length - 0.1) };
+    const areas = r.alignment ? stationStripRects(r, 0, railWidth(r), -r.length / 2 + 0.05, r.length / 2 - 0.05) : [fp];
     if (lv === 'ground') {
-      const sty = styleOf(r.style), out: Volume[] = [{ ...fp, y0: r.y - 0.3, y1: r.y + 1.0, part: 'platforms' }];
+      const sty = styleOf(r.style), out: Volume[] = areas.map((f) => ({ ...f, y0: r.y - 0.3 - (r.alignment ? 0.15 : 0), y1: r.y + 1.0 + (r.alignment ? 0.15 : 0), part: 'platforms' }));
       if (sty.placement === 'over') {
         // the concourse over the tracks, a pavilion on each side
-        const b = r.building, rx = Math.cos(r.angle), rz = -Math.sin(r.angle), off = railWidth(r) / 2 + CONCOURSE_PAVILION / 2;
+        const b = r.building, local = stationLocal(r, b.x, b.z), pose = stationPose(r, 0, local.along), rx = pose.fz, rz = -pose.fx, off = railWidth(r) / 2 + CONCOURSE_PAVILION / 2;
         out.push({ ...b, y0: r.y + 1.1, y1: r.y + 1.9, part: 'deck' });
-        for (const sd of [1, -1]) out.push({ x: b.x + rx * off * sd, z: b.z + rz * off * sd, angle: r.angle - (Math.PI / 2) * sd, w: b.w, d: CONCOURSE_PAVILION, y0: r.y - 0.2, y1: r.y + 1.9, part: 'building' });
+        for (const sd of [1, -1]) out.push({ x: b.x + rx * off * sd, z: b.z + rz * off * sd, angle: pose.angle - (Math.PI / 2) * sd, w: b.w, d: CONCOURSE_PAVILION, y0: r.y - 0.2, y1: r.y + 1.9, part: 'building' });
       } else out.push({ ...r.building, y0: r.y - 0.2, y1: r.y + styleHeight(sty), part: 'building' });
       // added entrances beside the track area: their halls, stair towers, stair pavilions and gates (a footbridge's
       // deck crosses within the platforms' volume, an underpass beneath it)
@@ -962,7 +990,7 @@ export class Stations {
     const out: Volume[] = [];
     const sz = ENTRANCE_SIZE[lv];
     if (lv === 'elevated') {
-      out.push({ ...fp, y0: r.y - 0.4, y1: r.y + 1.0, part: 'deck' });
+      out.push(...areas.map((f): Volume => ({ ...f, y0: r.y - 0.4 - (r.alignment ? 0.15 : 0), y1: r.y + 1.0 + (r.alignment ? 0.15 : 0), part: 'deck' })));
       for (const p of r.piers ?? []) { const h = w.heightAt(p.x, p.z); out.push({ x: p.x, z: p.z, angle: r.angle, w: 0.4, d: 0.4, y0: h - 0.3, y1: r.y, part: 'pier' }); }
     }
     (r.entrances ?? []).forEach((e, i) => { const h = w.heightAt(e.x, e.z); out.push({ x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d, y0: h - 0.2, y1: lv === 'elevated' ? r.y + 1.0 : h + 0.6, part: 'entrance', entrance: i }); });
@@ -977,7 +1005,7 @@ export class Stations {
     const r = st.rail;
     if (!r) return [];
     const out = this.structures(st).slice();
-    if ((r.level ?? 'ground') === 'underground') out.push({ ...this.undergroundBox(st)!, part: 'platforms' });
+    if ((r.level ?? 'ground') === 'underground') out.push(...this.undergroundBoxes(st).map((f): Volume => ({ ...f, part: 'platforms' })));
     return out;
   }
 
@@ -986,6 +1014,13 @@ export class Stations {
     const r = st.rail;
     if (!r || r.level !== 'underground') return null;
     return { ...undergroundStationVolume({ x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length }, r.y), station: st.id };
+  }
+
+  /** Actual swept underground boxes; legacy straight stations still have their original one box. */
+  undergroundBoxes(st: Station) {
+    const r = st.rail;
+    if (!r || r.level !== 'underground') return [];
+    return stationStripRects(r, 0, railWidth(r)).map((f) => ({ ...undergroundStationVolume(f, r.y), station: st.id }));
   }
 
   /**
@@ -999,7 +1034,7 @@ export class Stations {
       if (!rl || (rl.level ?? 'ground') !== 'underground') continue;
       const wd = railWidth(rl);
       if (Math.hypot(rl.x - x, rl.z - z) > Math.hypot(rl.length, wd) / 2 + r) continue;
-      out.push(this.undergroundBox(st)!);
+      out.push(...this.undergroundBoxes(st));
     }
     return out;
   }
@@ -1076,14 +1111,17 @@ export class Stations {
     const through = Math.max(0, Math.min(2, Math.round(opts.through ?? 0))), throughMode = opts.throughMode ?? 'middle';
     const platformStyle: PlatformStyle = opts.platformStyle ?? (rmode !== 'mainline' && !through ? 'side' : 'island');
     const psd = opts.psd ?? rmode === 'metro';
-    const layout = stationLayout(tracks, through, throughMode, platformStyle);
+    const layout = opts.layout ?? stationLayout(tracks, through, throughMode, platformStyle);
     const fx = Math.sin(angle), fz = Math.cos(angle);
     const footprint: Rect = { x, z, angle, w: layout.width, d: length };
+    const shape = { x, z, y: opts.fixedY ?? 0, angle, length, alignment: opts.alignment };
+    const pose = (off: number, along: number) => stationPose(shape, off, along);
+    const areas = stationStripRects(shape, 0, layout.width);
     // the building: optional at every level (none: street entrances / platform ramps); a light-rail stop a halt
     let sty: StationBuildingStyle = styleOf(opts.style ?? (level !== 'ground' ? 'none' : rmode === 'lightrail' ? 'shelter' : 'classic'));
     const plan: StationPlan = {
       ok: true, warnings: [], x, z, y: 0, angle, length, tracks, through, throughMode, trackType, mode: rmode, platformStyle, psd, style: sty.id,
-      level, underground: level === 'underground', depth: 0, height: 0, layout, footprint,
+      level, underground: level === 'underground', depth: 0, height: 0, layout, footprint, ...(opts.alignment ? { alignment: opts.alignment } : {}),
       building: { x, z, angle, w: 0, d: 0 }, entrances: [], piers: [], demolish: [], cost: 0, join: null, links: [], access: null, roadAccess: false, forecourt: null,
     };
     // a metro / light-rail station in town walks half as far (CITY_STATION; rebuilding or moving a station keeps its
@@ -1100,7 +1138,7 @@ export class Stations {
     const rx = fz, rz = -fx;
     let sum = 0, cnt = 0, mn = Infinity, mx = -Infinity, wet = false;
     for (let a = -0.5; a <= 0.5; a += 0.125) for (let b = -0.5; b <= 0.5; b += 0.25) {
-      const px = x + fx * length * a + rx * layout.width * b, pz = z + fz * length * a + rz * layout.width * b;
+      const pt = pose(layout.width * b, length * a), px = pt.x, pz = pt.z;
       if (!w.inside(px, pz, 2)) failp('Too close to the map edge');
       const h = w.heightAt(px, pz);
       if (h < 0.1) wet = true;
@@ -1109,8 +1147,12 @@ export class Stations {
     const demolish = new Set<number>();
     // Platforms, tracks and access. Buildings and screen doors are fit-out, not extra excavation
     // or viaduct structure, so their prices stay outside the civil multiplier.
-    const base = (tracks + through * 0.7) * length * 9000 + 120000;
-    const doors = psd ? tracks * length * 2500 : 0;
+    const physical = opts.alignment?.tracks;
+    const platformLength = physical ? physical.filter((t) => layout.trackOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : tracks * length;
+    const throughLength = physical ? physical.filter((t) => layout.throughOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : through * length;
+    // Retained running rail (including its existing civil structure) is not the facility payer's asset.
+    const base = (platformLength + throughLength * 0.7) * (physical ? 1500 : 9000) + 120000;
+    const doors = psd ? platformLength * 2500 : 0;
     const civil = base - BUILDING_BASE;
     const fixed = opts.fixedY;
     const ign = opts.ignoreStation;
@@ -1131,7 +1173,8 @@ export class Stations {
             w.net.pointAt(e, Math.min(sv, e.len), p);
             const dx = p.x - x, dz = p.z - z;
             if (dx * dx + dz * dz > R * R) continue;
-            roadPts.push({ x: p.x, z: p.z, lat: dx * rx + dz * rz, lon: dx * fx + dz * fz });
+            const local = stationLocal(shape, p.x, p.z);
+            roadPts.push({ x: p.x, z: p.z, lat: local.off, lon: local.along });
           }
         }
       }
@@ -1160,9 +1203,9 @@ export class Stations {
         const slide = Math.max(0, length / 2 - bs.w / 2 - 0.2);
         for (const side of opts.buildingSide ? [opts.buildingSide] : [-1, 1] as const) for (const k of pl === 'none' ? [1, -1] : [0, 1, -1, 0.5, -0.5]) {
           const off = layout.width / 2 + bs.d / 2 + 0.15, along = slide * k;
-          const bx = x + rx * off * side + fx * along, bz = z + rz * off * side + fz * along;
-          const b: Rect = { x: bx, z: bz, angle: angle - (Math.PI / 2) * side, w: bs.w, d: bs.d };
-          const fc = { x: bx + rx * (bs.d / 2 + FORECOURT) * side, z: bz + rz * (bs.d / 2 + FORECOURT) * side };
+          const pt = pose(off * side, along), bx = pt.x, bz = pt.z;
+          const b: Rect = { x: bx, z: bz, angle: pt.angle - (Math.PI / 2) * side, w: bs.w, d: bs.d };
+          const fc = { x: bx + pt.fz * (bs.d / 2 + FORECOURT) * side, z: bz - pt.fx * (bs.d / 2 + FORECOURT) * side };
           const dem = new Set<number>();
           if (conflict(b, styleHeight(sty), dem)) continue;
           const road = Math.max(0, roadDist(fc, side) - reach);
@@ -1171,19 +1214,19 @@ export class Stations {
       } else if (pl === 'over') {
         const slide = Math.max(0, length / 2 - bs.w / 2 - 0.2);
         for (const k of [0, 0.5, -0.5, 1, -1]) {
-          const along = slide * k, cx = x + fx * along, cz = z + fz * along;
-          const b: Rect = { x: cx, z: cz, angle: angle - Math.PI / 2, w: bs.w, d: bs.d };
+          const along = slide * k, pt = pose(0, along), cx = pt.x, cz = pt.z, prx = pt.fz, prz = -pt.fx;
+          const b: Rect = { x: cx, z: cz, angle: pt.angle - Math.PI / 2, w: bs.w, d: bs.d };
           const dem = new Set<number>();
           let blocked = false;
           for (const sd of [1, -1]) {
             const off = layout.width / 2 + CONCOURSE_PAVILION / 2;
-            if (conflict({ x: cx + rx * off * sd, z: cz + rz * off * sd, angle: angle - (Math.PI / 2) * sd, w: bs.w, d: CONCOURSE_PAVILION }, styleHeight(sty), dem)) blocked = true;
+            if (conflict({ x: cx + prx * off * sd, z: cz + prz * off * sd, angle: pt.angle - (Math.PI / 2) * sd, w: bs.w, d: CONCOURSE_PAVILION }, styleHeight(sty), dem)) blocked = true;
           }
           if (blocked) continue;
-          const fR = { x: cx + rx * (bs.d / 2 + FORECOURT), z: cz + rz * (bs.d / 2 + FORECOURT) }, fL = { x: cx - rx * (bs.d / 2 + FORECOURT), z: cz - rz * (bs.d / 2 + FORECOURT) };
+          const fR = { x: cx + prx * (bs.d / 2 + FORECOURT), z: cz + prz * (bs.d / 2 + FORECOURT) }, fL = { x: cx - prx * (bs.d / 2 + FORECOURT), z: cz - prz * (bs.d / 2 + FORECOURT) };
           const dR = roadDist(fR, 1), dL = roadDist(fL, -1);
           const road = Math.max(0, Math.min(dR, dL) - reach);
-          const pav = [1, -1].map((sd) => { const off = layout.width / 2 + CONCOURSE_PAVILION / 2; return { x: cx + rx * off * sd, z: cz + rz * off * sd, angle: angle - (Math.PI / 2) * sd, w: bs.w, d: CONCOURSE_PAVILION }; });
+          const pav = [1, -1].map((sd) => { const off = layout.width / 2 + CONCOURSE_PAVILION / 2; return { x: cx + prx * off * sd, z: cz + prz * off * sd, angle: pt.angle - (Math.PI / 2) * sd, w: bs.w, d: CONCOURSE_PAVILION }; });
           cands.push({ b, fc: dR <= dL ? fR : fL, fc2: dR <= dL ? fL : fR, dem, road, score: popOf(dem) + dem.size * 3 + Math.min(road, ACCESS_REACH * 1.5) * 3 + Math.abs(k) * 4 + over(pav[0]) + over(pav[1]) + over({ ...b, w: b.w + 1.2 }) });
         }
       } else {
@@ -1211,7 +1254,7 @@ export class Stations {
       plan.y = fixed ?? Math.max(0.3, sum / cnt);
       if (plan.y - 0.1 < DRY_MIN - 0.005) failp('Below water line: raise or go underground');
       if (fixed === undefined ? mx - mn > 3 : Math.max(mx - fixed, fixed - mn) > 3.5) failp('Ground is too uneven');
-      const err = this.rectConflict(footprint, plan.y - 0.3, plan.y + 1.0, demolish, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      const err = areas.map((f) => this.rectConflict(f, plan.y - 0.3 - (opts.alignment ? 0.15 : 0), plan.y + 1.0 + (opts.alignment ? 0.15 : 0), demolish, { groundEdges: true, ignoreStation: ign, ignoreEdges: opts.ignoreEdges })).find(Boolean);
       if (err) failp(err);
       // the building beside the platforms (either side, centred or towards an end) where its forecourt is
       // closest to a road on its own side of the tracks (or beyond the platform ends' lead corridors), with
@@ -1223,8 +1266,7 @@ export class Stations {
       plan.depth = Math.max(STATION_DEPTH.min, Math.min(STATION_DEPTH.max, opts.depth ?? (rmode === 'metro' ? STATION_DEPTH.metro : STATION_DEPTH.def)));
       plan.y = mn - plan.depth;
       if (fixed !== undefined) { plan.y = fixed; plan.depth = mn - fixed; if (plan.depth < STATION_DEPTH.min - 0.4) failp('Too shallow for underground station'); }
-      const volume = undergroundStationVolume(footprint, plan.y);
-      const err = this.rectConflict(volume, volume.y0, volume.y1, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      const err = areas.map((f) => { const volume = undergroundStationVolume(f, plan.y); return this.rectConflict(volume, volume.y0 - (opts.alignment ? 0.15 : 0), volume.y1 + (opts.alignment ? 0.15 : 0), null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges }); }).find(Boolean);
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
       const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
       // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
@@ -1236,13 +1278,13 @@ export class Stations {
       const R = Math.hypot(footprint.w, footprint.d) / 2 + 1;
       for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) {
         const b = w.buildings.get(id);
-        if (b && rectsOverlap(footprint, b, 0.1)) top = Math.max(top, b.y + b.floors * FLOOR_H + 0.95);
+        if (b && areas.some((f) => rectsOverlap(f, b, 0.1))) top = Math.max(top, b.y + b.floors * FLOOR_H + 0.95);
       }
       for (const e of w.net.edgesNear(x - R, z - R, x + R, z + R)) {
         if (opts.ignoreEdges?.has(e.id) || ign !== undefined && e.station === ign) continue;
         const geo = w.net.geo(e), hw = w.net.halfWidth(e);
         for (let i = 0; i < geo.n; i++) {
-          if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, footprint.w / 2, footprint.d / 2) >= hw) continue;
+          if (!areas.some((f) => distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], f.x, f.z, f.angle, f.w / 2, f.d / 2) < hw)) continue;
           const ey = geo.pts[i * 3 + 1];
           if (ey < top + 0.5) top = Math.max(top, ey + RAIL.clearance + 0.3);
         }
@@ -1251,9 +1293,9 @@ export class Stations {
       plan.y = top;
       if (top - mx > 5.2) failp('Deck would exceed 50 m above ground');
       plan.height = top - mx;
-      const err = this.rectConflict(footprint, plan.y - 0.4, plan.y + 1.0, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      const err = areas.map((f) => this.rectConflict(f, plan.y - 0.4, plan.y + 1.0, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges })).find(Boolean);
       if (err) failp(err === 'Building in the way' ? 'Tall building in the way' : err);
-      const pr = this.viaductPiers(footprint, layout.width, demolish, ign, opts.ignoreEdges);
+      const pr = opts.alignment ? this.curvedPiers(shape, layout.width, demolish, ign, opts.ignoreEdges) : this.viaductPiers(footprint, layout.width, demolish, ign, opts.ignoreEdges);
       if (pr.error) failp(pr.error);
       plan.piers = pr.piers;
       const k = Math.min(1, Math.max(0, (plan.height - STATION_HEIGHT.min) / 1.8));
@@ -1263,7 +1305,7 @@ export class Stations {
     plan.cost += doors;
     if (level !== 'ground') {
       const want = opts.entrances ?? (length >= 20 ? 4 : length >= 13 ? 3 : 2);
-      const sites = this.entranceSites(level, footprint, want, [], ign);
+      const sites = opts.alignment ? this.curvedEntranceSites(level, shape, layout.width, want, ign) : this.entranceSites(level, footprint, want, [], ign);
       if (!sites.length) failp('No room for station entrances');
       plan.entrances = sites.map((s) => ({ x: s.x, z: s.z, angle: s.angle, access: s.access }));
       for (const s of sites) for (const id of s.demolish) demolish.add(id);
@@ -1281,8 +1323,8 @@ export class Stations {
     }
     // transfer complex: an own stop-only station within walking range is joined, other own stations are linked
     // (by mode: dense metro / light-rail neighbours are no interchange; never consecutive stops of a line)
-    const cand = this.nearOwn(owner, (o) => this.gapToArea(o, footprint), ign);
-    const rects = level === 'ground' ? [footprint, plan.building] : [footprint, ...plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: ENTRANCE_SIZE[level].w, d: ENTRANCE_SIZE[level].d }))];
+    const cand = this.nearOwn(owner, (o) => Math.min(...areas.map((f) => this.gapToArea(o, f))), ign);
+    const rects = level === 'ground' ? [...areas, plan.building] : [...areas, ...plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle, w: ENTRANCE_SIZE[level].w, d: ENTRANCE_SIZE[level].d }))];
     for (const c of cand) {
       const close = !c.st.rail && c.st.stops.some((q) => rects.some((f) => distToRect(q.x, q.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN));
       if (!plan.join && close) plan.join = c.st;
@@ -1328,7 +1370,7 @@ export class Stations {
       // cleared when it is regraded, including outside the platform rectangle and along through tracks.
       const reach = 0.32 + EARTHWORKS.corePad + 1.42;
       for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
-        const px = x + rx * off + fx * s, pz = z + rz * off + fz * s;
+        const pt = pose(off, s), px = pt.x, pz = pt.z;
         if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
         for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) demolish.add(b.id);
       }
@@ -1355,7 +1397,7 @@ export class Stations {
   /** Walking gap from a station's platforms / stops to a rectangle. */
   private gapToArea(st: Station, rect: Rect): number {
     let d = Infinity;
-    if (st.rail) d = rectGap(this.platformRect(st)!, rect);
+    if (st.rail) d = Math.min(...this.platformAreas(st).map((f) => rectGap(f, rect)));
     for (const p of st.stops) d = Math.min(d, distToRect(p.x, p.z, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2));
     return d;
   }
@@ -1366,20 +1408,30 @@ export class Stations {
     return r ? { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length } : null;
   }
 
+  platformAreas(st: Station): Rect[] {
+    return st.rail ? stationStripRects(st.rail, 0, railWidth(st.rail)) : [];
+  }
+
   /**
    * Access street from a station forecourt to a nearby road: not through the station, and clear of the lead
    * corridors beyond both platform ends (where the line and its throat go).
    */
-  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; angle: number; length: number; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH): Proposal | null {
+  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; y?: number; angle: number; length: number; alignment?: RailStationAlignment; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH): Proposal | null {
     const g = this.game, net = g.world.net;
     const ax = Math.sin(plan.angle), az = Math.cos(plan.angle);
     const LEAD = 26, half = plan.layout.width / 2 + 1.2;
     /** (an entrance's street: to roads on its own side of the tracks, or beyond the lead corridors) */
-    const across = (x: number, z: number) => !!side && ((x - plan.x) * az - (z - plan.z) * ax) * side < plan.layout.width / 2 + 0.3
-      && Math.abs((x - plan.x) * ax + (z - plan.z) * az) < plan.length / 2 + LEAD;
+    const shape = { ...plan, y: plan.y ?? 0 };
+    const across = (x: number, z: number) => {
+      const p = stationLocal(shape, x, z);
+      return !!side && p.off * side < plan.layout.width / 2 + 0.3 && Math.abs(p.along) < plan.length / 2 + LEAD;
+    };
     // the lead corridors beyond the platform ends stay free for the line (not at a terminal building's end)
-    const keepOut: Rect[] = [plan.footprint, plan.building, ...extra];
-    for (const end of [1, -1]) if (end !== headEnd) keepOut.push({ x: plan.x + ax * end * (plan.length / 2 + LEAD / 2), z: plan.z + az * end * (plan.length / 2 + LEAD / 2), angle: plan.angle, w: half * 2, d: LEAD });
+    const keepOut: Rect[] = [...(plan.alignment ? stationStripRects(shape, 0, plan.layout.width) : [plan.footprint]), plan.building, ...extra];
+    for (const end of [1, -1]) if (end !== headEnd) {
+      const p = stationPose(shape, 0, end * plan.length / 2);
+      keepOut.push({ x: p.x + p.fx * end * LEAD / 2, z: p.z + p.fz * end * LEAD / 2, angle: p.angle, w: half * 2, d: LEAD });
+    }
     const blocked = (x: number, z: number, m: number) => keepOut.some((r) => distToRect(x, z, r.x, r.z, r.angle, r.w / 2, r.d / 2) < m);
     // (an entrance's street may join a street closer than a street can be long, e.g. its old one: further along it)
     const near = side ? 1.05 : 0;
@@ -1448,6 +1500,35 @@ export class Stations {
         break;
       }
       if (!placed && (k === 0 || k === rows - 1)) return { piers, error: 'Roads or tracks block viaduct piers' };
+    }
+    return { piers };
+  }
+
+  private curvedPiers(r: StationGeometry, width: number, demolish: Set<number>, ignore?: number, ignoreEdges?: Set<number>) {
+    const net = this.game.world.net, piers: { x: number; z: number }[] = [];
+    const rows = Math.max(2, Math.ceil((r.length - 0.8) / 6) + 1), lats = width >= 1.3 ? [-(width / 2 - 0.35), width / 2 - 0.35] : [0];
+    const clear = (x: number, z: number) => {
+      for (const e of net.edgesNear(x - 1.5, z - 1.5, x + 1.5, z + 1.5)) {
+        if (ignoreEdges?.has(e.id) || ignore !== undefined && e.station === ignore) continue;
+        const geo = net.geo(e), hw = net.halfWidth(e);
+        for (let i = 0; i < geo.n; i++) if (Math.hypot(geo.pts[i * 3] - x, geo.pts[i * 3 + 2] - z) < hw + 0.3) return false;
+      }
+      return true;
+    };
+    for (let i = 0; i < rows; i++) {
+      const along = -r.length / 2 + 0.4 + (r.length - 0.8) * i / (rows - 1);
+      let found = false;
+      for (const shift of [0, 0.5, -0.5, 1, -1, 1.5, -1.5, 2, -2]) {
+        const a = Math.max(-r.length / 2 + 0.3, Math.min(r.length / 2 - 0.3, along + shift));
+        const cols = lats.map((off) => stationPose(r, off, a));
+        if (!cols.every((p) => clear(p.x, p.z))) continue;
+        for (const p of cols) {
+          piers.push({ x: p.x, z: p.z });
+          for (const b of this.game.world.buildingsNear(p.x, p.z, 1)) if (distToRect(p.x, p.z, b.x, b.z, b.angle, b.w / 2 + 0.25, b.d / 2 + 0.25) <= 0) demolish.add(b.id);
+        }
+        found = true; break;
+      }
+      if (!found && (i === 0 || i === rows - 1)) return { piers, error: 'Roads or tracks block viaduct piers' };
     }
     return { piers };
   }
@@ -1535,6 +1616,20 @@ export class Stations {
     return chosen;
   }
 
+  private curvedEntranceSites(level: 'underground' | 'elevated', r: StationGeometry, width: number, want: number, ignore?: number) {
+    const out: (Entrance & { access: boolean; demolish: number[] })[] = [], area = stationStripRects(r, 0, width);
+    for (const along of [-r.length / 2 + 0.7, r.length / 2 - 0.7, 0]) {
+      const p = stationPose(r, 0, along), fp = { x: p.x, z: p.z, angle: p.angle, w: width, d: Math.min(1.4, r.length) };
+      for (const e of this.entranceSites(level, fp, 2, out, ignore)) {
+        const sz = ENTRANCE_SIZE[level], rect = { x: e.x, z: e.z, angle: e.angle, w: sz.w, d: sz.d };
+        if (level === 'elevated' && area.some((f) => rectsOverlap(rect, f, 0.05))) continue;
+        if (out.every((q) => Math.hypot(q.x - e.x, q.z - e.z) >= 4)) out.push(e);
+        if (out.length >= want) return out;
+      }
+    }
+    return out;
+  }
+
   /** Can an entrance stand at (x, z)? Returns the buildings it replaces (small houses only) or null. */
   private entranceFree(level: 'underground' | 'elevated', x: number, z: number, angle: number, fp: Rect, road: number, ignore?: number): number[] | null {
     const w = this.game.world;
@@ -1574,6 +1669,37 @@ export class Stations {
     g.onNetworkChanged();
     g.lines.rebuild();
     return null;
+  }
+
+  /** Attach a preflighted facility to retained rail. Never lay, remove, rewire or transfer its running tracks. */
+  commitNativeRail(plan: StationPlan, owner: number, groups: RailTrackGroup[], accessCommitted = false): { error: string | null; station: number } {
+    const g = this.game, net = g.world.net, eco = g.company(owner).economy;
+    if (!plan.ok || !plan.alignment) return { error: plan.error ?? 'No retained station geometry', station: -1 };
+    if (!eco.canAfford(plan.cost - (accessCommitted ? plan.access?.cost ?? 0 : 0))) return { error: 'Not enough money', station: -1 };
+    // The access proposal was checked against the complete swept station keep-out area.
+    if (plan.access && !accessCommitted) { const err = commitProposal(g, plan.access); if (err) return { error: err, station: -1 }; }
+    eco.spend(plan.cost - (plan.access?.cost ?? 0), 'construction');
+    for (const id of plan.demolish) g.towns.demolishBuilding(id);
+    const st = plan.join && this.map.get(plan.join.id) === plan.join ? plan.join : this.create(plan.x, plan.z, owner);
+    const edges = groups.filter((q) => !q.through).flatMap((q) => q.steps.map((s) => s.edge));
+    const through = groups.filter((q) => q.through).flatMap((q) => q.steps.map((s) => s.edge));
+    st.rail = { ...this.partOf(plan, edges, through), native: true, groups: groups.map((q) => ({ ...q, steps: q.steps.map((s) => ({ ...s })) })) };
+    st.x = plan.x; st.z = plan.z;
+    if (planWalkScale(plan) !== 1) st.city = true; else delete st.city;
+    for (const q of groups) for (const step of q.steps) {
+      const e = net.edges.get(step.edge)!;
+      e.station = q.through ? -1 : st.id; net.touchEdge(e);
+    }
+    if (plan.level === 'ground') this.levelGround(plan);
+    for (const f of this.footprints(st)) {
+      if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
+      g.world.removeTreesNear(f.x, f.z, Math.hypot(f.w, f.d) / 2 + 0.3);
+    }
+    this.repairSite(st);
+    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    this.markStation(st); this.accessVersion = -1;
+    g.onNetworkChanged(); g.lines.rebuild();
+    return { error: null, station: st.id };
   }
 
   /** Lay the platform edges of a plan for station `st` and shape the site. */
@@ -1631,6 +1757,7 @@ export class Stations {
       trackType: trackTypeOf(plan.trackType), mode: plan.mode ?? railModeOf(plan.trackType), platformStyle: plan.platformStyle ?? 'island', psd: !!plan.psd,
       style: plan.style ?? 'classic', forecourt2: plan.forecourt2 ?? undefined,
       building: plan.building,
+      ...(plan.alignment ? { alignment: plan.alignment } : {}),
       level, underground: level === 'underground', depth: plan.depth, height: plan.height,
       entrances: plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle })), piers: plan.piers.map((p) => ({ ...p })),
       forecourt: plan.forecourt ?? undefined, cost: plan.cost,
@@ -1679,7 +1806,7 @@ export class Stations {
 
   private levelGround(plan: StationPlan) {
     const w = this.game.world;
-    const rects = [plan.footprint, plan.building];
+    const rects = plan.alignment ? [...stationStripRects(plan, 0, plan.layout.width), plan.building] : [plan.footprint, plan.building];
     const R = Math.hypot(plan.footprint.w, plan.footprint.d) / 2 + 6;
     for (let z = Math.floor(plan.z - R); z <= Math.ceil(plan.z + R); z++) for (let x = Math.floor(plan.x - R); x <= Math.ceil(plan.x + R); x++) {
       if (x < 1 || z < 1 || x >= w.size || z >= w.size) continue;
@@ -1709,7 +1836,10 @@ export class Stations {
     const hold = this.holds.get(id);
     if (hold) { releaseHold(g, hold.edges); this.holds.delete(id); }
     const site = st.rail ? { x: st.x, z: st.z, rail: st.rail } : null;
-    if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) g.world.net.removeEdge(eid);
+    if (st.rail) for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) {
+      if (st.rail.native) { const e = g.world.net.edges.get(eid); if (e && e.station === st.id) { e.station = -1; g.world.net.touchEdge(e); } }
+      else g.world.net.removeEdge(eid);
+    }
     this.markStation(st);
     st.rail = null;
     this.deleteStation(id);
@@ -1751,13 +1881,14 @@ export class Stations {
     const off = net.halfWidth(ne.edge) + sz.d / 2 + 0.06;
     const ex = p.x + nx * off * side, ez = p.z + nz * off * side, ang = angleOf(-nx * side, -nz * side);
     const fp = this.platformRect(st)!;
-    if (distToRect(ex, ez, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) > ENTRANCE_REACH) return none(`Too far from platforms · max ${ENTRANCE_REACH * 10} m`, k);
+    if (this.platformAreas(st).every((f) => distToRect(ex, ez, f.x, f.z, f.angle, f.w / 2, f.d / 2) > ENTRANCE_REACH)) return none(`Too far from platforms · max ${ENTRANCE_REACH * 10} m`, k);
     if (r.entrances.some((q) => Math.hypot(q.x - ex, q.z - ez) < 3)) return none('Another entrance is too close', k);
     // the station's own street-level structures first (entranceFree ignores the station): its hall, its forecourt,
     // its entrances and an elevated deck's piers
     const own = this.ownStreetError(st, { x: ex, z: ez, angle: ang, w: sz.w, d: sz.d });
     if (own) return none(own, k);
-    const dem = this.entranceFree(lv, ex, ez, ang, fp, ne.edge.id, st.id);
+    if (lv === 'elevated' && this.platformAreas(st).some((f) => rectsOverlap({ x: ex, z: ez, angle: ang, w: sz.w, d: sz.d }, f, 0.15))) return none('Entrance overlaps the station deck', k);
+    const dem = this.entranceFree(lv, ex, ez, ang, r.alignment ? { ...fp, w: 0, d: 0 } : fp, ne.edge.id, st.id);
     if (!dem || dem.length) return none('Something is in the way', k);
     const cost = entranceCost(k, r);
     return { ok: true, warnings: [], kind: k, entrance: { x: ex, z: ez, angle: ang, kind: k, cost }, cost, access: null, landings: [{ x: ex, z: ez, angle: ang, road: true }] };
@@ -1784,7 +1915,7 @@ export class Stations {
     if (!GROUND_ENTRANCES.includes(k)) return bad(`${ENTRANCE_TYPES[k]?.name.toLowerCase() ?? 'street entrance'} needs an elevated or underground station`);
     const T = ENTRANCE_TYPES[k];
     const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
-    const lat = (x - r.x) * rx + (z - r.z) * rz, lon = (x - r.x) * fx + (z - r.z) * fz;
+    const local = stationLocal(r, x, z), lat = local.off, lon = local.along;
     if (Math.abs(lon) > r.length / 2 + 8 || Math.abs(lat) > railWidth(r) / 2 + 12) return bad('Too far from the platforms');
     const side: 1 | -1 = lat >= 0 ? 1 : -1;
     const { along, near, far } = this.groundSites(r, k, side, lon);
@@ -1803,7 +1934,7 @@ export class Stations {
       const marks = landings.map((p) => ({ ...p, road: false }));
       if (o.street === false) return bad('No road beside the entrance', { entrance, door, landings: marks, cost: own });
       const fp = this.platformRect(st)!;
-      access = this.planAccessStreet(door.x, door.z, { x: r.x, z: r.z, angle: r.angle, length: r.length, layout: { width: railWidth(r) }, footprint: fp, building: r.building }, owner, undefined, landings.map((p) => landingRect(k, p)), side, ENTRANCE_STREET);
+      access = this.planAccessStreet(door.x, door.z, { x: r.x, z: r.z, y: r.y, angle: r.angle, length: r.length, alignment: r.alignment, layout: { width: railWidth(r) }, footprint: fp, building: r.building }, owner, undefined, landings.map((p) => landingRect(k, p)), side, ENTRANCE_STREET);
       if (!access) return bad(`No road on this side within ${ENTRANCE_STREET * 10} m`, { entrance, door, landings: marks, cost: own });
       road[0] = true;
     } else if (both && !road[0]) warnings.push('No road beside stairs on this side');
@@ -1816,7 +1947,7 @@ export class Stations {
     const T = ENTRANCE_TYPES[kind], fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
     const lim = Math.max(0, r.length / 2 - ENTRANCE_END), off = railWidth(r) / 2 + T.d / 2 + ENTRANCE_GAP;
     const along = kind === 'gate' ? (lon >= 0 ? 1 : -1) * Math.max(0, r.length / 2 - T.w / 2 - 0.1) : Math.max(-lim, Math.min(lim, lon));
-    const site = (sd: number) => ({ x: r.x + rx * off * sd + fx * along, z: r.z + rz * off * sd + fz * along, angle: angleOf(rx * sd, rz * sd) });
+    const site = (sd: number) => { const p = stationPose(r, off * sd, along); return { x: p.x, z: p.z, angle: angleOf(p.fz * sd, -p.fx * sd) }; };
     return { along, near: site(side), far: site(-side) };
   }
 
@@ -2145,7 +2276,7 @@ export class Stations {
     const pt: Rect = { x: p.x, z: p.z, angle: 0, w: 0, d: 0 };
     const near = this.nearOwn(owner, (o) => this.gapToArea(o, pt));
     // within 80 m of an own rail station's platforms / building / entrances: the stop becomes part of it
-    for (const c of near) if (c.st.rail && [this.platformRect(c.st)!, ...this.footprints(c.st)].some((f) => distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN)) { join = c.st; break; }
+    for (const c of near) if (c.st.rail && [...this.platformAreas(c.st), ...this.footprints(c.st)].some((f) => distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN)) { join = c.st; break; }
     if (!join) for (const c of near) if (!c.st.rail && c.st.stops.some((q) => Math.hypot(q.x - p.x, q.z - p.z) < 3)) { join = c.st; break; }
     for (const c of near) if (c.st !== join && c.gap <= autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st))) links.push(c.st);
     return { ok: true, edge: e, s: ne.s, px: p.x, pz: p.z, cost: 30000, join, links, mode: e.tram ? 'tram' : 'bus' };
@@ -2189,13 +2320,13 @@ export class Stations {
   /** Walking distance between the platform areas / stops of two stations (0 when they overlap). */
   gap(a: Station, b: Station): number {
     let d = Infinity;
-    const ra = this.platformRect(a), rb = this.platformRect(b);
-    if (ra && rb) d = rectGap(ra, rb);
+    const ra = this.platformAreas(a), rb = this.platformAreas(b);
+    for (const p of ra) for (const q of rb) d = Math.min(d, rectGap(p, q));
     for (const p of a.stops) {
-      if (rb) d = Math.min(d, distToRect(p.x, p.z, rb.x, rb.z, rb.angle, rb.w / 2, rb.d / 2));
+      for (const q of rb) d = Math.min(d, distToRect(p.x, p.z, q.x, q.z, q.angle, q.w / 2, q.d / 2));
       for (const q of b.stops) d = Math.min(d, Math.hypot(p.x - q.x, p.z - q.z));
     }
-    if (ra) for (const q of b.stops) d = Math.min(d, distToRect(q.x, q.z, ra.x, ra.z, ra.angle, ra.w / 2, ra.d / 2));
+    for (const p of ra) for (const q of b.stops) d = Math.min(d, distToRect(q.x, q.z, p.x, p.z, p.angle, p.w / 2, p.d / 2));
     return d;
   }
 
@@ -2404,6 +2535,7 @@ export class Stations {
     if (a === b) return 'The same station';
     const A = a.rail, B = b.rail;
     if (!A || !B) return 'Not two rail stations';
+    if (A.native || B.native) return 'Retained track platforms: link as an interchange';
     if (a.owner !== b.owner) return 'Merge requires the same owner';
     // (stations of two types, main line / metro / light rail by railPartMode, each keep their own part, style and
     // walking reach: they merge as one interchange, a transfer complex shown as one station, never as one rail part)
@@ -2865,10 +2997,10 @@ export class Stations {
     this.computeShares(this.catchMaxB > 0 ? this.catchMaxB : this.game.world.nextBuildingId - 1);
   }
 
-  /** Rebuild a clean save's derived shares at its saved horizon; its populations remain saved state. */
-  restoreCatchmentShares(maxB = this.game.world.nextBuildingId - 1) {
+  /** Rebuild derived shares at the saved horizon; a pending road edit still owes a population refresh. */
+  restoreCatchmentShares(maxB = this.game.world.nextBuildingId - 1, populationPending = false) {
     this.computeShares(maxB);
-    this.pendingPop.clear();
+    if (!populationPending) this.pendingPop.clear();
   }
 
   /**
@@ -3058,6 +3190,7 @@ export class Stations {
     const r = st?.rail;
     const bad = (error: string): UpgradePlan => ({ ok: false, error, warnings: [], station: stationId, cost: 0, length: r?.length ?? 0, tracks: r?.tracks ?? 0, through: r?.through ?? 0, plan: null, delta: [0, 0], keep: [], cuts: [], rebuild: false });
     if (!st || !r) return bad('No such rail station');
+    if (r.native) return bad('Retained track station: geometry-preserving rebuild required');
     const Th0 = r.through ?? 0;
     const L2 = Math.max(4, Math.min(60, o.length ?? r.length)), T2 = Math.max(r.tracks, Math.min(8, o.tracks ?? r.tracks)), Th2 = Math.max(Th0, Math.min(2, o.through ?? Th0));
     const level = o.level ?? r.level ?? 'ground';
@@ -3228,6 +3361,7 @@ export class Stations {
     const st = this.map.get(up.station);
     const r = st?.rail;
     if (!st || !r) return 'No such rail station';
+    if (r.native) return 'Retained-track stations need geometry-preserving works';
     if (!up.plan) return up.error ?? 'Cannot rebuild';
     if (up.rebuild) {
       // rebuilt anew on its site: still on the ground, its added entrances stay beside the platforms where they fit
@@ -3340,6 +3474,7 @@ export class Stations {
   trackEnds(st: Station, withThrough = false): { front: number; back: number; edge: number; through: boolean }[] {
     const net = this.game.world.net, r = st.rail;
     if (!r) return [];
+    if (r.groups) return this.railTrackGroups(st, withThrough).map((t) => ({ front: t.front, back: t.back, edge: t.steps[0].edge, through: t.through }));
     const fx = Math.sin(r.angle), fz = Math.cos(r.angle), rx = fz, rz = -fx;
     const out: { front: number; back: number; edge: number; through: boolean; lat: number }[] = [];
     const add = (eid: number, through: boolean) => {
@@ -3363,11 +3498,66 @@ export class Stations {
     return merged.map(({ front, back, edge, through }) => ({ front, back, edge, through }));
   }
 
+  /** Ordered physical tracks, with stable native identities; legacy chains are derived without saving or mutating. */
+  railTrackGroups(st: Station, withThrough = false): RailTrackGroup[] {
+    const r = st.rail, net = this.game.world.net;
+    if (!r) return [];
+    if (r.groups) return r.groups.flatMap((q): RailTrackGroup[] => {
+      if ((!withThrough && q.through) || !q.steps.length) return [];
+      let node = q.back, length = 0;
+      const seen = new Set<number>(), members = q.through ? r.throughEdges : r.edges;
+      for (const s of q.steps) {
+        const e = net.edges.get(s.edge);
+        if (!e || e.kind !== 'rail' || seen.has(e.id) || !members.includes(e.id)
+          || (s.dir !== 1 && s.dir !== -1) || (s.dir > 0 ? e.a : e.b) !== node) return [];
+        seen.add(e.id); node = s.dir > 0 ? e.b : e.a; length += e.len;
+      }
+      // A broken or truncated physical platform is unavailable, never a sum across disconnected pieces.
+      if (node !== q.front) return [];
+      return [{ ...q, steps: q.steps.map((s) => ({ ...s })), length }];
+    });
+    const out: RailTrackGroup[] = [];
+    for (const through of withThrough ? [false, true] : [false]) {
+      const remaining = new Set((through ? r.throughEdges : r.edges).filter((id) => net.edges.has(id)));
+      while (remaining.size) {
+        const seed = remaining.values().next().value!, ids = new Set<number>(), todo = [seed];
+        while (todo.length) {
+          const id = todo.pop()!;
+          if (!remaining.delete(id)) continue;
+          ids.add(id);
+          const e = net.edges.get(id)!;
+          for (const nid of [e.a, e.b]) for (const next of net.nodes.get(nid)?.edges ?? []) if (remaining.has(next)) todo.push(next);
+        }
+        const nodes = new Map<number, number[]>();
+        for (const id of ids) { const e = net.edges.get(id)!; for (const nid of [e.a, e.b]) nodes.set(nid, [...(nodes.get(nid) ?? []), id]); }
+        const ends = [...nodes].filter(([, e]) => e.length === 1).map(([id]) => id);
+        if (ends.length !== 2) continue;
+        const along = (id: number) => { const n = net.nodes.get(id)!; return (n.x - r.x) * Math.sin(r.angle) + (n.z - r.z) * Math.cos(r.angle); };
+        ends.sort((a, b) => along(a) - along(b));
+        const steps: RailTrackStep[] = [], seen = new Set<number>();
+        let node = ends[0];
+        while (node !== ends[1]) {
+          const id = nodes.get(node)?.find((e) => !seen.has(e));
+          if (id === undefined) break;
+          seen.add(id); const e = net.edges.get(id)!;
+          const dir = e.a === node ? 1 : -1;
+          steps.push({ edge: id, dir }); node = dir > 0 ? e.b : e.a;
+        }
+        if (node !== ends[1] || !steps.length) continue;
+        const a = net.nodes.get(ends[0])!, b = net.nodes.get(ends[1])!;
+        const offset = ((a.x + b.x) / 2 - r.x) * Math.cos(r.angle) - ((a.z + b.z) / 2 - r.z) * Math.sin(r.angle);
+        out.push({ id: steps[0].edge, through, offset, steps, back: ends[0], front: ends[1], length: steps.reduce((n, s) => n + net.edges.get(s.edge)!.len, 0) });
+      }
+    }
+    return out.sort((a, b) => a.offset - b.offset || a.id - b.id);
+  }
+
   // ---------------------------------------------------------------- capacity
   /** Edges of each station track (platform tracks, then through tracks when asked), grouped by lateral offset. */
   private trackGroups(st: Station, withThrough = false): number[][] {
     const r = st.rail, net = this.game.world.net;
     if (!r) return [];
+    if (r.groups) return this.railTrackGroups(st, withThrough).map((q) => q.steps.map((s) => s.edge));
     const ca = Math.cos(r.angle), sa = Math.sin(r.angle);
     const out: { lat: number; ids: number[] }[] = [];
     for (const id of withThrough ? [...r.edges, ...r.throughEdges] : r.edges) {
@@ -3512,7 +3702,7 @@ export class Stations {
   relevelInPlace(stationId: number, plan: StationPlan) {
     const g = this.game;
     const st = this.map.get(stationId), r = st?.rail;
-    if (!st || !r) return;
+    if (!st || !r || r.native) return;
     this.markStation(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     // added entrances: a ground station staying on the ground keeps them beside its platforms where they still fit
@@ -3592,7 +3782,8 @@ export class Stations {
       if (!away(nx, ox).some((e) => net.signalFor(nx, net.sideAt(e, nx.id)) >= 0)) continue;
       const pieces = t.through ? r.throughEdges : r.edges;
       const lat = (id: number) => { const e = net.edges.get(id); if (!e) return NaN; const a = net.nodes.get(e.a)!; return (a.x - r.x) * Math.cos(r.angle) - (a.z - r.z) * Math.sin(r.angle); };
-      const l0 = lat(t.edge), mine = pieces.filter((id) => Math.abs(lat(id) - l0) < 0.05);
+      const l0 = lat(t.edge), group = r.groups?.find((q) => q.steps.some((s) => s.edge === t.edge));
+      const mine = group ? group.steps.map((s) => s.edge) : pieces.filter((id) => Math.abs(lat(id) - l0) < 0.05);
       out.push({ edge: t.edge, edges: mine, entry, exit, through: t.through, free: !mine.some((id) => V.isEdgeBusy(id)) });
     }
     return out.sort((a, b) => Number(b.through) - Number(a.through) || Number(b.free) - Number(a.free));
@@ -3612,6 +3803,7 @@ export class Stations {
     const g = this.game, net = g.world.net;
     const st = this.map.get(stationId);
     if (!st || !st.rail) return 'No such rail station';
+    if (st.rail.native) return 'Retained-track stations cannot be moved off their running tracks';
     if (!plan.ok) return plan.error ?? 'Cannot build';
     for (const eid of [...st.rail.edges, ...st.rail.throughEdges]) if (g.vehicles.isEdgeBusy(eid)) return 'busy';
     const total = cost ?? plan.cost + 20000;
@@ -3647,7 +3839,9 @@ export function restoreStation(s: any): Station {
   return {
     ...s,
     rail: r ? {
-      ...r, edges: [...r.edges], trackOffsets: [...(r.trackOffsets ?? [])], platforms: (r.platforms ?? []).map((p: any) => ({ ...p })), building: { ...r.building },
+      ...r, ...(r.alignment ? { alignment: { tracks: r.alignment.tracks.map((t: any) => ({ ...t, pieces: t.pieces.map((p: any) => ({ ...p, curve: { ...p.curve }, profile: [...p.profile] })), knots: t.knots.map((k: any) => ({ ...k })) })) } } : {}),
+      ...(r.groups ? { groups: r.groups.map((q: any) => ({ ...q, steps: q.steps.map((p: any) => ({ ...p })) })) } : {}),
+      edges: [...r.edges], trackOffsets: [...(r.trackOffsets ?? [])], platforms: (r.platforms ?? []).map((p: any) => ({ ...p })), building: { ...r.building },
       through: r.through ?? 0, throughOffsets: [...(r.throughOffsets ?? [])], throughEdges: [...(r.throughEdges ?? [])], width: r.width ?? stationLayout(r.tracks, r.through ?? 0).width,
       trackType: trackTypeOf(r.trackType), mode: railPartMode(r), platformStyle: r.platformStyle ?? 'island', psd: !!r.psd,
       style: r.style && STATION_STYLES[r.style] ? r.style : 'classic', forecourt2: r.forecourt2 ? { ...r.forecourt2 } : undefined,

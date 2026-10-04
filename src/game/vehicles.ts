@@ -1,7 +1,7 @@
 // Vehicle manager: ownership, reservations, spatial hash, purchases, recomposition and ambient traffic.
 import type { Game } from './game';
 import { Vehicle } from './vehicle';
-import { Train, CROSS_BASE, lineCompatibility, type TSeg } from './train';
+import { Train, CROSS_BASE, lineCompatibility, consistRule, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
@@ -602,7 +602,7 @@ export class Vehicles {
       if (t.state !== 'loading' || t.atStation < 0) return 'Stop train in depot or at a platform';
       const head = t.segs[t.headSeg], e = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
       const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
-      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'Train does not fit on this platform';
+      if (!e || e.station !== t.atStation || t.platformResizePath(len, consistRule(cars)) === null) return 'Train does not fit on a clear compatible platform';
     }
     if (t.lineId != null) { const why = lineCompatibility(g, t.lineId, cars); if (why) return why; }
     const { added } = consistDiff(t.cars, cars);
@@ -622,11 +622,13 @@ export class Vehicles {
     const err = this.recomposeError(t, cars);
     if (err) return err;
     const g = this.game, eco = g.company(t.owner).economy;
+    const platformPath = t.onMap ? t.platformResizePath(cars.reduce((n, c) => n + c.length + 0.1, 0), consistRule(cars)) : [];
     const { added, removed } = consistDiff(t.cars, cars);
     const cost = added.reduce((s, c) => s + c.cost, 0), price = removed.reduce((s, c) => s + c.cost, 0);
     const refund = price > 0 && t.value > 0 ? this.resaleValue(t) * price / t.value : 0;
     if (cost > 0 && !eco.spend(cost, 'vehicles')) return 'Not enough money';
     if (refund > 0) eco.earn(refund, 'vehicles');
+    if (platformPath) t.reservePlatformResize(platformPath);
     t.value += cost - price;
     // the new consist the way round the train stands (its locomotive at the end it was at)
     t.cars = t.runsBackward ? [...cars].reverse() : [...cars];

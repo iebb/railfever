@@ -2,6 +2,7 @@
 import { World } from './world';
 import { Towns } from './towns';
 import { Stations, entranceUpkeep, lostShare, STATION_UPKEEP_FACTOR } from './stations';
+import { stationPlatformLength } from './station-geometry';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
 import { Depots, depotValue, depotUpkeep } from './build-ops';
@@ -556,7 +557,7 @@ export class Game {
    * station costs twice a ground one, an underground one four times; entrances added later by their kind.
    */
   stationMaintenance(st: Station): number {
-    return (st.rail ? (20000 + st.rail.tracks * st.rail.length * 500) * (STATION_UPKEEP_FACTOR[st.rail.level] ?? 1) + entranceUpkeep(st.rail) : 0) + st.stops.length * 3000;
+    return (st.rail ? (20000 + stationPlatformLength(st.rail) * 500) * (STATION_UPKEEP_FACTOR[st.rail.level] ?? 1) + entranceUpkeep(st.rail) : 0) + st.stops.length * 3000;
   }
 
   /**
@@ -626,7 +627,7 @@ export class Game {
     const a: CompanyAssets = { track: 0, road: 0, tram: 0, stations: 0, depots: 0, vehicles: 0, total: 0 };
     for (const e of this.world.net.edges.values()) {
       if (e.tram && e.tramOwner === id && e.depot < 0) a.tram += e.len * TRAM.costPerUnit;
-      if (e.owner !== id || e.station >= 0 || e.depot >= 0) continue;
+      if (e.owner !== id || e.depot >= 0 || e.station >= 0 && !this.stations.get(e.station)?.rail?.native) continue;
       const per = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).costPerUnit;
       let v = per * e.len;
       for (const s of e.sections) v += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 8 : 5);

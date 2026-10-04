@@ -1423,20 +1423,20 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ stations inserted into a line
-  /** Preview of a through station cut into one of your tracks at the cursor (planStationOnTrack). */
+  /** Preview a station facility on permissible existing running track. */
   private hoverStationOnLine(p: THREE.Vector3) {
     const g = this.game, net = g.world.net, ov = this.overlay;
     const ne = net.nearestEdge(p.x, p.z, 1.6, 'rail', (e) => e.station < 0 && e.depot < 0);
-    if (!ne || ne.edge.owner !== PLAYER) {
+    if (!ne) {
       this.onTrack = null;
       ov.setStationGhost(null); ov.setSegments('throat', null); drawCatchStreets(ov, 'hover', null);
-      this.tip(ne ? { title: 'Station on the line', err: [`Track of ${g.company(ne.edge.owner).name}`] } : { title: 'Station on the line', rows: [['station', 'Point at your track to insert a station']] }, ne ? 'err' : 'info');
+      this.tip({ title: 'Station on the line', rows: [['station', 'Point at existing track to add platforms']] }, 'info');
       return;
     }
     const s = Math.round(ne.s * 2) / 2;
-    const key = `${ne.edge.id}|${s}|${this.stationLen}|${this.stationTracks}|${this.stationThrough}|${this.throughMode}|${this.stationType}|${this.stationLevel}|${g.networkVersion}`;
+    const key = `${ne.edge.id}|${s}|${this.stationLen}|${this.stationTracks}|${this.stationThrough}|${this.throughMode}|${this.stationType}|${this.stationStyle}|${this.stationLevel}|${g.networkVersion}|${g.world.heightsVersion}|${g.world.lotVersions.version}|${g.stations.walkVersion}|${g.canUse(PLAYER, ne.edge.owner)}`;
     if (this.onTrack?.key !== key) {
-      const plan = planStationOnTrack(g, ne.edge.id, s, { length: this.stationLen, tracks: this.stationTracks, through: this.stationThrough, throughMode: this.throughMode, mode: this.stationMode(), level: this.stationLevel === 'ground' ? undefined : this.stationLevel }, PLAYER);
+      const plan = planStationOnTrack(g, ne.edge.id, s, { length: this.stationLen, tracks: this.stationTracks, through: this.stationThrough, throughMode: this.throughMode, mode: this.stationMode(), style: this.stationStyleFor(p.x, p.z, ne.edge.type), reuseTrack: true, level: this.stationLevel === 'ground' ? undefined : this.stationLevel }, PLAYER);
       this.onTrack = { key, plan, edge: ne.edge.id };
     }
     const pl = this.onTrack.plan, st = pl.station;
@@ -1448,16 +1448,16 @@ export class Tools {
     const rows: [string, string][] = [];
     if (st) {
       rows.push(['station', `${plural(st.tracks, 'platform track')}${st.through ? ` + ${st.through} through` : ''} × ${st.length * 10} m`]);
-      rows.push(['rail', `cuts the ${pl.mains.length > 1 ? 'double' : 'single'} track; ${plural(pl.throat.length, 'throat connection')}`]);
+      rows.push(['rail', pl.native ? `running track retained · ${g.company(ne.edge.owner).name}` : `cuts the ${pl.mains.length > 1 ? 'double' : 'single'} track; ${plural(pl.throat.length, 'throat connection')}`]);
       if (st.level !== 'ground') rows.push([st.level === 'elevated' ? 'bridge' : 'tunnel', st.level === 'elevated' ? 'elevated with the line' : 'underground with the line']);
       rows.push(['people', `<b>${catchStreetPop(g, planCatchStreets(g, st)).toLocaleString('en-US')}</b> residents in walking reach`]);
     }
-    this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click: build; trains keep running' : 'Platforms need straight, level track' }, pl.ok ? 'ok' : 'err');
+    this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click: build; busy sites wait' : 'Platforms need near-level, continuous track and clearance' }, pl.ok ? 'ok' : 'err');
   }
 
   private commitStationOnLine(e: PointerEvent) {
     const g = this.game, ot = this.onTrack;
-    if (!ot || !ot.plan.ok) { this.ui.toast(ot?.plan.error ?? 'Point at one of your tracks', 'bad'); return; }
+    if (!ot || !ot.plan.ok) { this.ui.toast(ot?.plan.error ?? 'Point at existing track', 'bad'); return; }
     // lines running over the cut stretch (to offer signalling them afterwards)
     const cut = new Set(ot.plan.mains.flatMap((m) => m.steps.map((x) => x.edge)));
     const lines = g.lines.all().filter((l) => l.owner === PLAYER && l.kind === 'rail' && computeLinePath(g, l).edges.some((arr) => Array.from(arr).some((se) => cut.has(Math.abs(se) - 1))));

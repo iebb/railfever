@@ -23,6 +23,7 @@ import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, shar
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
 import { stopsWithInserted, replaceLineStops, type StopPlace } from '../game/line-edit';
+import { platformChoices, platformPreference, setPlatformPreference } from '../game/rail-platforms';
 
 /** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
 const insertPlace = new Map<number, StopPlace>();
@@ -280,6 +281,26 @@ export function openLine(ui: UI, id: number) {
             h('button', { class: 'ibtn sm', 'data-tip': 'Move stop up', 'aria-label': 'Move stop up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Move stop down', 'aria-label': 'Move stop down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
+        if (l.kind === 'rail' && st?.rail) {
+          const groups = g.stations.railTrackGroups(st);
+          const controls = linePatterns(l).filter(p => p.stops[i] !== false).map(p => {
+            const choice = platformPreference(l, p.id, i), available = platformChoices(g, l, p.id, i);
+            const number = (group: number) => groups.findIndex(q => q.id === group) + 1;
+            const select = h('select', { class: 'input sm', disabled: !mine,
+              'aria-label': `${p.name} platform preference at ${st.name}`,
+              title: 'Preferred platform; trains may use a legal free alternative',
+              onchange: (e: Event) => {
+                const value = (e.target as HTMLSelectElement).value;
+                const error = setPlatformPreference(g, l, p.id, i, value === 'auto' ? null : Number(value));
+                if (error) ui.toast(error, 'bad');
+                ui.onLineEdited(l.id); rerender();
+              } },
+              h('option', { value: 'auto', selected: !choice?.manual }, choice ? `Auto · P${number(choice.group)}` : 'Auto'),
+              available.map(q => h('option', { value: q.id, selected: choice?.manual && choice.group === q.id }, `P${number(q.id)}`)));
+            return field((l.patterns?.length ?? 0) > 1 ? `${p.name} platform` : 'Platform preference', select);
+          });
+          if (controls.length) list.appendChild(h('div', { class: 'pad' }, controls));
+        }
       });
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops.'));
       const loop = g.lines.isLoop(l);

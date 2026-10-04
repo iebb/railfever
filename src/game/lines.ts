@@ -10,6 +10,14 @@ import { transferWalkTime } from './fares';
 import type { RNG } from './rng';
 import type { RailCapacityState } from './ai-capacity';
 import { rerouteMail, type LineMail } from './mail';
+import { reconcilePlatforms, inheritPlatformPreferences } from './rail-platforms';
+
+/** Preferred physical platform for a served pattern/stop occurrence; indices are remapped on explicit edits. */
+export interface RailPlatformCall {
+  pattern: number; stop: number; station: number; occurrence: number; group: number;
+  /** Physical endpoints also identify a legacy group after an edge split. */
+  back: number; front: number; manual?: boolean;
+}
 
 export interface Line {
   id: number;
@@ -58,6 +66,7 @@ export interface Line {
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+  platforms?: RailPlatformCall[];
   /** City-growth calibration by operator and pattern; cumulative passenger receipts and comparable forecast periods. */
   growth?: Record<string, GrowthObservation>;
   /** mail carried (loaded) this / last month and its income this / last year (a part of incomeYear); from the line's first mail on */
@@ -319,6 +328,7 @@ export class Lines {
     game.listeners?.network?.push(() => {
       if (this.catchmentRoadsDirty) { this.catchmentRoadsDirty = false; this.catchmentDirty = true; }
       this.checkStations();
+      reconcilePlatforms(this.game);
     });
   }
 
@@ -342,6 +352,7 @@ export class Lines {
   /** Redirect a removed line and its earlier aliases, remapping their services to the surviving patterns. */
   redirectLine(from: number, into: number, pattern: number, patterns: ReadonlyMap<number, number>, source?: Line) {
     const target = this.map.get(into);
+    if (source && target) inheritPlatformPreferences(target, source, patterns);
     if (source?.kind === 'rail' && target?.kind === 'rail') this.linkRouteFamily(source, target);
     for (const [id, r] of this.redirect) if (r.line === from) this.redirect.set(id, { line: into, pattern: patterns.get(r.pattern) ?? pattern });
     this.redirect.set(from, { line: into, pattern });
@@ -869,7 +880,7 @@ export class Lines {
   }
 
   /** Recompute routing tables (Dijkstra over the line graph) and the automatic names. */
-  rebuild(catchmentMayChange = true) {
+  rebuild(catchmentMayChange = true, allocatePlatforms = true) {
     const stations = this.game.stations;
     const previousServed = new Set(this.servedStations);
     if (catchmentMayChange) stations.walkVersion++;
@@ -880,6 +891,7 @@ export class Lines {
     this.refreshNames();
     // Also migrate empty/provisional lines: opening one must never be the event that gives it a code.
     this.rebuildNumbers();
+    if (allocatePlatforms) reconcilePlatforms(this.game);
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
@@ -1049,6 +1061,7 @@ export class Lines {
     }
     if (Array.isArray(d.operators)) l.operators = [...d.operators];
     if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));
+    if (Array.isArray(d.platforms)) l.platforms = d.platforms.map((p: RailPlatformCall) => ({ ...p }));
     return l;
   }
 }

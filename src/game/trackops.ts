@@ -11,6 +11,8 @@ import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
 import type { DepotPlan } from './build-ops';
 import { stationLayout, defaultPlatformLength, railModeOf, railPartMode, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
+import { planNativeStationOnTrack, commitNativeStationOnTrack } from './station-on-track';
+import type { NativeStationPlan } from './station-on-track';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
 export interface Step { edge: number; dir: number }
@@ -1484,6 +1486,8 @@ export function throatCrossovers(g: Game, stationId: number, end: 'front' | 'bac
 export const ladderReach = (n: number) => 4 + 7 * Math.max(1, n);
 
 export interface OnTrackOpts {
+  /** Keep the running rail in place and mount compact station surfaces on its true alignment. */
+  reuseTrack?: boolean;
   /** platform length (default: by station style, see defaultPlatformLength) */
   length?: number;
   /** platform tracks (default: 1 on single track, 2 on double track) */
@@ -1504,6 +1508,7 @@ export interface OnTrackOpts {
 }
 
 export interface OnTrackPlan {
+  native?: NativeStationPlan;
   ok: boolean;
   error?: string;
   warnings: string[];
@@ -1561,7 +1566,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
   const fail = (m: string) => { plan.ok = false; plan.error = m; return plan; };
   const e = net.edges.get(edgeId);
   if (!e || e.kind !== 'rail') return fail('No track here');
-  if (e.owner !== owner) return fail('Not your track');
+  if (o.reuseTrack || e.owner !== owner) return planNativeStationOnTrack(g, edgeId, s, o, owner);
   if (e.station >= 0 || e.depot >= 0) return fail('Already a station or depot track');
   const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(o.mode ?? e.type)));
   const reach = L / 2 + 30;
@@ -1602,7 +1607,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
       const p = sampleAt(S, c.u + d);
       if (Math.abs(p.u - (c.u + d)) > 0.01) return fail(`Needs ${Math.round((L + 1) * 10)} m of plain track`);
       const lat = latOf(p.x, p.z) - latOf(c.x, c.z);
-      if (Math.abs(lat) > 0.15) return fail(`Curve: platforms need ${Math.round(L * 10)} m straight track`);
+      if (Math.abs(lat) > 0.15) return planNativeStationOnTrack(g, edgeId, s, o, owner);
       if (Math.abs(p.y - yc) > 0.15) return fail('Grade: platforms need level track');
     }
   }
@@ -1666,6 +1671,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
  * platform or through tracks); lines may then add the stop. Returns the new station's id, or the reason.
  */
 export function commitStationOnTrack(g: Game, plan: OnTrackPlan): { error: string | null; station: number } {
+  if (plan.native) return commitNativeStationOnTrack(g, plan);
   const net = g.world.net;
   const owner = plan.owner;
   if (!plan.ok || !plan.station) return { error: plan.error ?? 'Cannot build', station: -1 };
@@ -1792,6 +1798,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
       return !!e && cont(e.a) && cont(e.b);
     });
     if (!inline) continue;
+    if (st.rail.native) return fail(`${st.name}: retained track station needs geometry-preserving re-level`);
     stations.add(st.id);
     for (const id of ids) set.add(id);
   }
