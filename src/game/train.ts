@@ -302,6 +302,8 @@ export class Train extends Vehicle {
   failCount = 0;
   /** game seconds standing while waiting for a free path (since it last moved; congestion and deadlocks) */
   stuckTime = 0;
+  /** A reserved retreat, followed by a hold until the other trains clear the yielded track. */
+  backoff: { waitFor: number[]; clear: number[] } | null = null;
   /** current gradient under the train (for UI) */
   grade = 0;
   // energy accounting (physics, UPDATE 9j; opcosts.ts reads and resets them monthly)
@@ -463,13 +465,37 @@ export class Train extends Vehicle {
     return true;
   }
 
+  private extensionEnd(): number {
+    for (let k = 1; k < this.pending.length; k++) if (this.startsAtSignal(this.pending[k])) return k;
+    return this.pending.length;
+  }
+
+  /** All current blockers, including crossings and the branches guarded by a block signal. */
+  blockingTrains(): number[] {
+    const g = this.game, net = g.world.net, ids = new Set<number>();
+    if (this.backoff) {
+      const clear = new Set(this.backoff.clear);
+      return this.backoff.waitFor.filter(id => {
+        const t = g.vehicles.get(id);
+        return t instanceof Train && [...t.segs, ...t.pending].some(s => s.res.some(r => clear.has(r)));
+      });
+    }
+    const add = (r: number) => { const id = g.vehicles.getRes(r); if (id && id !== this.id) ids.add(id); };
+    for (const s of this.pending.slice(0, this.extensionEnd())) for (const r of s.res) add(r);
+    const s = this.pending[0], e = s && net.edges.get(s.e);
+    const n = e && net.nodes.get(s.dir > 0 ? e.a : e.b);
+    if (e && n?.signal && n.signalKind === 'block' && net.signalFor(n, net.sideAt(e, n.id)) > 0) {
+      for (const r of blockEdges(g, e.id, n.id)) add(r);
+    }
+    return [...ids].sort((a, b) => a - b);
+  }
+
   /** Reserve pending segments up to the next signal (a block signal: once its whole block is free). */
   private tryExtend(): boolean {
     if (!this.pending.length) return false;
     if (!this.blockFree()) return false;
     const V = this.game.vehicles;
-    let j = this.pending.length;
-    for (let k = 1; k < this.pending.length; k++) if (this.startsAtSignal(this.pending[k])) { j = k; break; }
+    const j = this.extensionEnd();
     for (let k = 0; k < j; k++) {
       for (const r of this.pending[k].res) {
         const o = V.getRes(r);
@@ -515,6 +541,7 @@ export class Train extends Vehicle {
     for (const s of this.segs) for (const r of s.res) V.releaseRes(r, this.id);
     this.segs = [];
     this.pending = [];
+    this.backoff = null;
   }
 
   // ---------------------------------------------------------------- network changes
@@ -617,39 +644,116 @@ export class Train extends Vehicle {
   private reverseTrain(): boolean {
     if (!this.segs.length) return false;
     const tail = this.tailInfo();
-    for (let i = tail.seg; i <= this.headSeg; i++) if (this.segs[i].e < 0) return false;
     this.releaseAhead();
     const R: TSeg[] = [];
     const net = this.game.world.net;
     for (let i = this.headSeg; i >= tail.seg; i--) {
-      const e = net.edges.get(this.segs[i].e);
+      const s = this.segs[i];
+      if (s.e < 0) { R.push({ ...s, dir: -s.dir }); continue; }
+      const e = net.edges.get(s.e);
       if (!e) return false;
-      R.push(makeSeg(this.game, e, -this.segs[i].dir));
+      R.push(makeSeg(this.game, e, -s.dir));
     }
     for (let i = 0; i < tail.seg; i++) this.release(this.segs[i], R);
     this.segs = R;
     this.headSeg = R.length - 1;
     this.headPos = R[R.length - 1].len - tail.pos;
-    this.cars.reverse();
+    this.cars = [...this.cars].reverse();
     this.reversed = !this.reversed;
     return true;
   }
 
-  /**
-   * Break a deadlock this train is part of: drop what it reserved ahead and take another way to its target,
-   * turning back where it can (true if it found one).
-   */
-  breakDeadlock(): boolean {
-    if (!this.segs.length || this.state !== 'waiting' || this.headSeg !== this.segs.length - 1) return false;
-    this.pending = [];
-    const before = this.reversed;
-    this.forceTurn = true;
-    const ok = this.planRoute(true);
-    this.forceTurn = false;
-    if (ok) { this.state = 'waiting'; this.waitTime = 0; this.stuckTime = 0; }
-    return ok && this.reversed !== before;
+  /** Find a free refuge, independently of the service stop (including a further refuge after yielding). */
+  private refuge(others: Train[], backwards: boolean, blockers?: Set<number>): TSeg[] | null {
+    const g = this.game, net = g.world.net, start = this.segs[backwards ? this.tailInfo().seg : this.headSeg];
+    if (start.e < 0) return backwards ? [] : null;
+    const body = new Set(this.occupiedEdges());
+    const wanted = new Set<number>();
+    for (const t of others) for (const s of t.pending) {
+      for (const r of s.res) wanted.add(r);
+      const e = net.edges.get(s.e), n = e && net.nodes.get(s.dir > 0 ? e.a : e.b);
+      if (e && n?.signal && n.signalKind === 'block' && net.signalFor(n, net.sideAt(e, n.id)) > 0) {
+        for (const r of blockEdges(g, e.id, n.id)) wanted.add(r);
+      }
+    }
+    const free = (s: TSeg) => {
+      let ok = true;
+      for (const r of s.res) {
+        const id = g.vehicles.getRes(r);
+        if (id && id !== this.id) { blockers?.add(id); ok = false; }
+      }
+      return ok;
+    };
+    const depotTrains = g.vehicles.trains().filter(t => t !== this && t.segs.some(s => s.depot !== undefined));
+    const busyDepots = new Set(depotTrains.flatMap(t => t.segs.flatMap(s => s.depot === undefined ? [] : [s.depot])));
+    const segs: TSeg[] = [], parents: number[] = [], costs: number[] = [];
+    const best = new Map<number, number>(), heap = new Heap();
+    const push = (s: TSeg, parent: number) => {
+      if (body.has(s.e) || !free(s)) return;
+      const cost = (parent < 0 ? 0 : costs[parent]) + s.len, key = s.e * 2 + (s.dir > 0 ? 1 : 0);
+      if ((best.get(key) ?? Infinity) <= cost) return;
+      best.set(key, cost); segs.push(s); parents.push(parent); costs.push(cost); heap.push(segs.length - 1, cost);
+    };
+    const next = (s: TSeg, parent: number) => {
+      const e = net.edges.get(s.e);
+      if (!e) return;
+      // A controlled retreat may pass a signal backwards. The whole retreat is reserved before moving.
+      for (const c of net.nextRail(e, s.dir)) {
+        if (!g.canUse(this.owner, c.edge.owner) || !ruleAllows(this.rule, c.edge)) continue;
+        if (c.edge.depot >= 0) {
+          if (c.dir > 0) continue;
+          if (busyDepots.has(c.edge.depot)) {
+            for (const t of depotTrains) if (t.segs.some(s => s.depot === c.edge.depot)) blockers?.add(t.id);
+            continue;
+          }
+        }
+        push(makeSeg(g, c.edge, c.dir), parent);
+      }
+    };
+    next({ ...start, dir: backwards ? -start.dir : start.dir }, -1);
+    for (let expanded = 0; heap.size && expanded < 60000; expanded++) {
+      const i = heap.pop(), s = segs[i];
+      if (costs[i] > best.get(s.e * 2 + (s.dir > 0 ? 1 : 0))!) continue;
+      const e = net.edges.get(s.e)!;
+      const depot = e.depot >= 0 && !busyDepots.has(e.depot) && s.dir < 0 ? g.depots.get(e.depot) : undefined;
+      // At the end the entire body must fit off the track the other trains need, not just its new head.
+      const passingPlace = e.station >= 0
+        ? !!g.stations.get(e.station)?.rail?.edges.some(id => {
+          const alt = net.edges.get(id);
+          return alt && id !== e.id && [alt.a, alt.b].some(n => net.nodes.get(n)!.edges.length > 1);
+        })
+        : twinTrack(g, e);
+      if (depot || (passingPlace && s.len >= this.length + GAP && !s.res.some(r => wanted.has(r)))) {
+        const path: TSeg[] = [];
+        for (let j = i; j >= 0; j = parents[j]) path.push(segs[j]);
+        path.reverse();
+        if (depot) path.push({ ...virtualDepotSeg(g, depot, this.length + 0.3), dir: -1 });
+        return path;
+      }
+      next(s, i);
+    }
+    return null;
   }
-  private forceTurn = false;
+
+  /** Reserve a physical retreat before reversing. A failed attempt leaves the wait age and route intact. */
+  breakDeadlock(others = this.game.vehicles.trains().filter(t => t !== this && t.state === 'waiting'), blockers?: Set<number>): boolean {
+    if (!this.segs.length || this.state !== 'waiting' || this.speed > 0.01) return false;
+    let reverse = true, path = this.refuge(others, true, blockers);
+    if (!path) { reverse = false; path = this.refuge(others, false, blockers); }
+    if (!path) return false;
+    const clear = [...new Set([...this.segs, ...path.slice(0, -1)].flatMap(s => s.res))];
+    if (reverse) { if (!this.reverseTrain()) return false; }
+    else this.releaseAhead();
+    for (const s of path) for (const r of s.res) this.game.vehicles.setRes(r, this.id);
+    this.segs.push(...path);
+    this.pending = [];
+    this.backoff = { waitFor: others.map(t => t.id), clear };
+    this.blockedBy = 0;
+    this.state = 'running';
+    this.status = reverse ? 'Backing off to free the path' : 'Moving aside to free the path';
+    this.waitTime = 0;
+    return true;
+  }
 
   private planRoute(allowReverse: boolean): boolean {
     const g = this.game;
@@ -706,7 +810,7 @@ export class Train extends Vehicle {
     // a loop line keeps circulating: turning back only where the way ahead leads nowhere
     const loop = !!this.line && g.lines.isLoop(this.line);
     let route = fwd;
-    if (rev && (!fwd || this.forceTurn || (!loop && rev.cost + penalty < fwd.cost))) {
+    if (rev && (!fwd || (!loop && rev.cost + penalty < fwd.cost))) {
       if (this.reverseTrain()) route = rev;
     }
     if (!route) { this.state = 'noroute'; return false; }
@@ -718,6 +822,7 @@ export class Train extends Vehicle {
 
   onLineChanged() {
     this.fixCargo();
+    if (this.backoff) return;
     if (!this.onMap) { this.state = 'depot'; this.retryTimer = 0; return; }
     if (this.state === 'loading') return;
     this.atStation = -1;
@@ -767,6 +872,19 @@ export class Train extends Vehicle {
 
   private arrive() {
     const g = this.game;
+    if (this.backoff) {
+      this.state = 'waiting';
+      this.status = 'Waiting for the yielded path to clear';
+      if (this.segs[this.headSeg].e < 0) {
+        // The whole train is inside an accessible depot, after traversing the stub and virtual track.
+        const backoff = this.backoff;
+        const depot = g.depots.get(this.segs[this.headSeg].depot!);
+        if (depot) { this.depotId = depot.id; this.homeX = depot.x; this.homeZ = depot.z; }
+        this.releaseAll(); this.backoff = backoff;
+        this.state = 'depot';
+      }
+      return;
+    }
     const st = g.stations.get(this.routeTarget);
     const head = this.segs[this.headSeg];
     const he = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
@@ -785,6 +903,20 @@ export class Train extends Vehicle {
   update(dt: number) {
     this.stateTime += dt;
     if (this.segs.length) this.account(dt);
+    if (this.backoff && (!this.onMap || (this.speed === 0 && this.distToEnd() < 0.02))) {
+      const clear = new Set(this.backoff.clear);
+      if (this.backoff.waitFor.some(id => {
+        const t = this.game.vehicles.get(id);
+        return t instanceof Train && [...t.segs, ...t.pending].some(s => s.res.some(r => clear.has(r)));
+      })) { this.stuckTime += dt; return; }
+      this.backoff = null;
+      if (!this.onMap) { this.state = 'depot'; this.retryTimer = 0; }
+      else {
+        const target = this.targetStation(), head = this.segs[this.headSeg];
+        if (target && this.game.world.net.edges.get(head.e)?.station === target.id) { this.routeTarget = target.id; this.arrive(); }
+        else this.planRoute(true);
+      }
+    }
     switch (this.state) {
       case 'depot':
       case 'noroute':
@@ -1063,28 +1195,58 @@ export function platformWaits(g: Game, minWait = 10): Map<number, PlatformWait> 
   return out;
 }
 
-/** Trains in circles of mutual waiting (each waits for the next one's reserved track): the circles. */
+/** Strongly connected groups in the complete wait graph (all owners, all reservation dependencies). */
 export function deadlockCycles(g: Game, minWait = 20): Train[][] {
   const by = new Map<number, Train>();
-  for (const t of g.vehicles.trains()) if (t.state === 'waiting' && t.blockedBy && t.stuckTime >= minWait) by.set(t.id, t);
-  const out: Train[][] = [], done = new Set<number>();
+  for (const t of g.vehicles.trains()) if (t.state === 'waiting' && t.stuckTime >= minWait) by.set(t.id, t);
+  const edges = new Map<number, number[]>(), back = new Map<number, number[]>();
+  for (const t of by.values()) {
+    const ids = t.blockingTrains().filter(id => by.has(id));
+    edges.set(t.id, ids);
+    for (const id of ids) { const prev = back.get(id) ?? []; prev.push(t.id); back.set(id, prev); }
+  }
+  const done = new Set<number>(), finish: number[] = [];
   for (const t of by.values()) {
     if (done.has(t.id)) continue;
-    const path: Train[] = [], seen = new Map<number, number>();
-    let cur: Train | undefined = t;
-    while (cur && !seen.has(cur.id) && !done.has(cur.id)) { seen.set(cur.id, path.length); path.push(cur); cur = by.get(cur.blockedBy); }
-    if (cur && seen.has(cur.id)) out.push(path.slice(seen.get(cur.id)));
-    for (const x of path) done.add(x.id);
+    const stack: [number, number][] = [[t.id, 0]];
+    done.add(t.id);
+    while (stack.length) {
+      const top = stack[stack.length - 1], next = edges.get(top[0])!;
+      if (top[1] === next.length) { finish.push(top[0]); stack.pop(); continue; }
+      const id = next[top[1]++];
+      if (!done.has(id)) { done.add(id); stack.push([id, 0]); }
+    }
+  }
+  done.clear();
+  const out: Train[][] = [];
+  while (finish.length) {
+    const id = finish.pop()!;
+    if (done.has(id)) continue;
+    const stack = [id], group: Train[] = [];
+    done.add(id);
+    while (stack.length) {
+      const cur = stack.pop()!; group.push(by.get(cur)!);
+      for (const prev of back.get(cur) ?? []) if (!done.has(prev)) { done.add(prev); stack.push(prev); }
+    }
+    if (group.length > 1) out.push(group.sort((a, b) => a.id - b.id));
   }
   return out;
 }
 
-/** Break each deadlock: the train that waited longest takes another way (turning back); true if any moved. */
+/** Break each deadlock, clearing a following train first if it occupies the cycle's retreat path. */
 export function resolveDeadlocks(g: Game, minWait = 40): boolean {
   let any = false;
   for (const cyc of deadlockCycles(g, minWait)) {
     const order = [...cyc].sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id);
-    for (const t of order) if (t.breakDeadlock()) { any = true; break; }
+    const queued = new Set(order.map(t => t.id));
+    for (let i = 0; i < order.length; i++) {
+      const t = order[i], blockers = new Set<number>();
+      if (t.breakDeadlock(cyc.filter(x => x !== t), blockers)) { any = true; break; }
+      const following = [...blockers].map(id => g.vehicles.get(id))
+        .filter((v): v is Train => v instanceof Train && v.state === 'waiting' && !queued.has(v.id))
+        .sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id);
+      for (const v of following) { queued.add(v.id); order.push(v); }
+    }
   }
   return any;
 }

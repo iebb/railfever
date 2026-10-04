@@ -329,10 +329,11 @@ function restoreBase(g: Game, v: Vehicle, d: any) {
 function trainOf(t: Train) {
   return {
     ...baseOf(t), type: 'train', cars: t.cars.map((c) => c.id), depotId: t.depotId,
-    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
+    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len, s.depot] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
     pending: t.pending.map((s) => [s.e, s.dir]), speed: t.speed, waitTime: t.waitTime, retryTimer: t.retryTimer,
     loadTimer: t.loadTimer, routeTarget: t.routeTarget, atStation: t.atStation, reversed: t.reversed, blockedBy: t.blockedBy,
     failCount: t.failCount, stuckTime: t.stuckTime, grade: t.grade,
+    backoff: t.backoff ? { waitFor: [...t.backoff.waitFor], clear: [...t.backoff.clear] } : null,
   };
 }
 
@@ -411,6 +412,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
     // vehicles still to re-plan after the last network change (a few per tick), and lost-vehicle news timers
     replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
+    congestionTold: [...((g as any).congestionTold ?? new Map()).entries()],
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };
@@ -537,10 +539,10 @@ export function deserialize(d: any): Game {
   const V = g.vehicles;
   const tseg = (x: number[], t: Train): TSeg | null => {
     if (x[0] < 0) {
-      const dp = g.depots.get(t.depotId);
+      const dp = g.depots.get(x[3] ?? t.depotId);
       const sg = dp ? depotSeg(g, dp, x[2] ?? t.length + 0.3) : null;
       // keep the saved length exactly (rebuilding the curve can differ in the last bit)
-      if (sg && typeof x[2] === 'number') sg.len = x[2];
+      if (sg) { sg.dir = x[1]; if (typeof x[2] === 'number') sg.len = x[2]; }
       return sg;
     }
     const e = net.edges.get(x[0]);
@@ -586,6 +588,7 @@ export function deserialize(d: any): Game {
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;
       t.stuckTime = vd.stuckTime ?? 0; t.grade = vd.grade ?? 0;
+      t.backoff = vd.backoff ? { waitFor: [...vd.backoff.waitFor], clear: [...vd.backoff.clear] } : null;
       const segs: TSeg[] = [];
       let ok = true;
       for (const x of vd.segs as number[][]) { const s = tseg(x, t); if (!s) { ok = false; break; } segs.push(s); }
@@ -613,6 +616,7 @@ export function deserialize(d: any): Game {
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
   if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
+  if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
