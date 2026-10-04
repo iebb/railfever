@@ -273,6 +273,11 @@ export class Game {
   canUse(user: number, owner: number): boolean {
     return owner === user || owner < 0 || this.accessKeys.has(user * 4096 + owner) || (this.openNet[owner] === 1 && user >= 0 && !this.blockedKeys.has(owner * 4096 + user));
   }
+  /** Upgrades are paid by the user, retained by the infrastructure owner. AI never alters player rail. */
+  trackUpgradeError(user: number, owner: number): string | null {
+    if (user !== PLAYER && owner === PLAYER) return 'AI companies cannot upgrade the player\'s track';
+    return this.canUse(user, owner) ? null : `Track of ${this.company(owner).name}: needs track access`;
+  }
   hasAccess(user: number, owner: number): boolean { return this.accessKeys.has(user * 4096 + owner); }
   agreement(user: number, owner: number): AccessAgreement | undefined { return this.access.find((a) => a.user === user && a.owner === owner); }
   /** Agreements of a company: networks it uses, and companies using its network. */

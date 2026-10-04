@@ -66,6 +66,12 @@ export interface BuildOptions {
   heightOffset: number;
   crossing: 'auto' | 'over' | 'under' | 'level';
   owner: number;
+  /** An access-funded upgrade: the builder pays, this company retains the added infrastructure. */
+  infrastructureOwner?: number;
+  /** Flat junction upgrades may cross at the shallow angle of an existing turnout. */
+  junctionUpgrade?: boolean;
+  /** Clearance around diamonds in neighbouring pieces of a complete junction plan. */
+  junctionWindows?: { edge: number; x: number; z: number; r: number }[];
   /** towns build for free and never demolish */
   town?: boolean;
   /** roads: straight segment with free ends (no tangent continuity at dead ends), e.g. grid streets */
@@ -699,6 +705,24 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const e = net.edges.get(id);
     if (e) for (const nid of [e.a, e.b]) for (const x of net.nodes.get(nid)?.edges ?? []) switchSet.add(x);
   }
+  if (opts.junctionUpgrade) {
+    // Signals split an approach into short pieces. A turnout's clearance window follows the whole approach,
+    // rather than ending after one such piece; actual intersections still become reserved diamonds below.
+    const seen = new Map<number, number>(), queue = [...exclude].flatMap((id) => {
+      const e = net.edges.get(id); return e ? [e.a, e.b].map((node) => ({ node, len: 0 })) : [];
+    });
+    while (queue.length) {
+      const q = queue.shift()!;
+      if (q.len > SWITCH_ZONE || (seen.get(q.node) ?? Infinity) <= q.len) continue;
+      seen.set(q.node, q.len);
+      for (const id of net.nodes.get(q.node)?.edges ?? []) {
+        const e = net.edges.get(id)!;
+        if (e.kind !== 'rail' || e.station >= 0 || e.depot >= 0) continue;
+        switchSet.add(id);
+        queue.push({ node: e.a === q.node ? e.b : e.a, len: q.len + e.len });
+      }
+    }
+  }
   const hwNew = halfWidthOf(opts) + spread;
   const crossings: CrossingPlan[] = [];
   prop.tracks.forEach((tp, ti) => {
@@ -740,8 +764,9 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const secOld = net.sectionAt(e, c.sOld);
     let mode: CrossingPlan['mode'];
     // at grade (a diamond with switches) only across one's own or usable track, else over or under it
-    const levelOk = c.angle > 0.4 && secOld === 'ground' && e.depot < 0 && e.station < 0
+    const levelOk = c.angle > (opts.junctionUpgrade && kind === 'rail' && e.kind === 'rail' ? 0.025 : 0.4) && secOld === 'ground' && e.depot < 0 && e.station < 0
       && !(kind === 'rail' && e.kind === 'rail' && e.owner >= 0 && e.owner !== opts.owner && !opts.town && !g.canUse(opts.owner, e.owner))
+      && !(opts.infrastructureOwner !== undefined && e.kind === 'rail' && g.trackUpgradeError(opts.owner, e.owner))
       // Fast alignments request grade separation; the physical track is the same.
       && (kind === e.kind || (opts.designSpeed ?? 0) <= 160 && levelCrossingAllowed(kind === 'rail' ? opts.type : e.type));
     const levelMode: CrossingPlan['mode'] = kind === 'rail' ? (e.kind === 'rail' ? 'diamond' : 'level') : e.kind === 'rail' ? 'level' : 'junction';
@@ -859,7 +884,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const demolish = new Set<number>();
   let trees = 0, wallUnits = 0, wallArea = 0;
   const hw = halfWidthOf(opts);
-  const crossWin = (ti: number, s: number) => crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < 2.5);
+  const crossWin = (ti: number, s: number) => crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < (opts.junctionUpgrade && c.mode === 'diamond' ? 1 + RAIL.spacing / Math.max(0.025, Math.sin(c.angle)) : 2.5));
   prop.tracks.forEach((tp, ti) => {
     const tab = arcTable(tp.bez);
     const K = Math.max(2, Math.ceil(tab.len / 0.5) + 1);
@@ -902,6 +927,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       if (!nearEnd && !crossWin(ti, s)) {
         for (const e of net.edgesNear(p.x - hw - 1, p.z - hw - 1, p.x + hw + 1, p.z + hw + 1)) {
           if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
+          if (opts.junctionUpgrade && opts.junctionWindows?.some((c) => c.edge === e.id && Math.hypot(p.x - c.x, p.z - c.z) < c.r)) continue;
           const ge = net.geo(e);
           const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.06 : hw + net.halfWidth(e) - 0.08;
           const ranges = geometryPointRanges(ge, p.x, p.z, need);
@@ -1034,6 +1060,17 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   const w = g.world;
   const net = w.net;
   const opts = prop.opts;
+  if (opts.infrastructureOwner !== undefined) {
+    const err = g.trackUpgradeError(opts.owner, opts.infrastructureOwner);
+    if (err) return err;
+    for (const c of prop.crossings) {
+      const e = net.edges.get(c.edge);
+      if (e?.kind === 'rail' && (c.mode === 'diamond' || c.mode === 'under')) {
+        const err = g.trackUpgradeError(opts.owner, e.owner);
+        if (err) return err;
+      }
+    }
+  }
   const co = opts.town ? null : g.company(opts.owner);
   if (co && !co.economy.canAfford(prop.cost)) return 'Not enough money';
   // vehicles on edges we must split?
@@ -1063,16 +1100,16 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
       const st = tp.start.kind === 'edge' ? { ...tp.start, ...(() => { const l = locate(tp.start.edge!, tp.start.s!); return { edge: l.id, s: l.s }; })() } : tp.start;
       const ta = { x: tp.bez.x1 - tp.bez.x0, z: tp.bez.z1 - tp.bez.z0 };
       const tla = Math.hypot(ta.x, ta.z) || 1;
-      const na = resolveNode(g, st, opts.kind, tp.bez.x0, tp.bez.z0, tp.prof[0], ta.x / tla, ta.z / tla, opts.owner);
+      const na = resolveNode(g, st, opts.kind, tp.bez.x0, tp.bez.z0, tp.prof[0], ta.x / tla, ta.z / tla, opts.infrastructureOwner ?? opts.owner);
       const en = tp.end.kind === 'edge' ? { ...tp.end, ...(() => { const l = locate(tp.end.edge!, tp.end.s!); return { edge: l.id, s: l.s }; })() } : tp.end;
       const tb = { x: tp.bez.x3 - tp.bez.x2, z: tp.bez.z3 - tp.bez.z2 };
       const tlb = Math.hypot(tb.x, tb.z) || 1;
-      const nb = resolveNode(g, en, opts.kind, tp.bez.x3, tp.bez.z3, tp.prof[tp.prof.length - 1], tb.x / tlb, tb.z / tlb, opts.owner);
+      const nb = resolveNode(g, en, opts.kind, tp.bez.x3, tp.bez.z3, tp.prof[tp.prof.length - 1], tb.x / tlb, tb.z / tlb, opts.infrastructureOwner ?? opts.owner);
       if (!na || !nb) return 'Network changed, try again';
       const bez = { ...tp.bez, x0: na.x, z0: na.z, x3: nb.x, z3: nb.z };
       const prof = tp.prof.slice();
       prof[0] = na.y; prof[prof.length - 1] = nb.y;
-      created.push(net.addEdge(opts.kind, na.id, nb.id, bez, prof, tp.sections, opts.type, opts.owner, opts.tram && opts.kind === 'road' ? { tram: true, tramOwner: opts.owner } : {}));
+      created.push(net.addEdge(opts.kind, na.id, nb.id, bez, prof, tp.sections, opts.type, opts.infrastructureOwner ?? opts.owner, opts.tram && opts.kind === 'road' ? { tram: true, tramOwner: opts.owner } : {}));
     }
     // crossings
     for (const c of prop.crossings) {
