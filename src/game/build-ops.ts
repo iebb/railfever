@@ -58,6 +58,12 @@ export function depotUpkeep(d: Depot): number { return d.level === 'underground'
 
 export function depotSize(kind: DepotKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : kind === 'tram' ? { w: 2.0, d: 3.9 } : { w: 1.8, d: 1.6 }; }
 
+/** Actual occupied volume, shared by depot, station and track placement and the underground view. */
+export function depotVolume(d: Pick<Depot, 'kind' | 'x' | 'z' | 'y' | 'angle' | 'level'>) {
+  const sz = depotSize(d.kind), under = d.level === 'underground';
+  return { x: d.x, z: d.z, angle: d.angle, ...sz, y0: d.y + (under ? UNDERGROUND_DEPOT.y0 : -0.2), y1: d.y + (under ? UNDERGROUND_DEPOT.y1 : 1.0) };
+}
+
 /** Network kind of a depot's track (tram depots sit on roads). */
 export const depotNetKind = (kind: DepotKind): NetKind => (kind === 'rail' ? 'rail' : 'road');
 
@@ -96,7 +102,7 @@ export class Depots {
       if (d.level !== 'underground') continue;
       const sz = depotSize(d.kind);
       if (Math.hypot(d.x - x, d.z - z) > r + Math.hypot(sz.w, sz.d) / 2) continue;
-      out.push({ x: d.x, z: d.z, angle: d.angle, w: sz.w, d: sz.d, y0: d.y + UNDERGROUND_DEPOT.y0, y1: d.y + UNDERGROUND_DEPOT.y1, depot: d.id });
+      out.push({ ...depotVolume(d), depot: d.id });
     }
     return out;
   }
@@ -176,9 +182,9 @@ export class Depots {
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
     for (const d of this.map.values()) {
       // (an underground depot well below the pad stays clear of it)
-      if (d.level === 'underground' && d.y + UNDERGROUND_DEPOT.y1 + 0.5 < plan.y) continue;
-      const s2 = depotSize(d.kind);
-      if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way');
+      const v = depotVolume(d), pad = depotVolume({ kind, ...plan });
+      if (v.y1 <= pad.y0 || v.y0 >= pad.y1) continue;
+      if (rectsOverlap(rect, v, 0.1)) failp('Depot in the way');
     }
     plan.cost += Math.round((mx - mn) * 20000);
     if (kind !== 'rail' && plan.ok) {
@@ -213,8 +219,7 @@ export class Depots {
     plan.y = node ? node.y : atY ?? mn - Math.max(U.depth.min, Math.min(U.depth.max, depth ?? U.depth.def));
     plan.depth = Math.max(0, mn - plan.y);
     if (mn - (plan.y + U.y1) < U.cover) failp(SHALLOW_DEPOT);
-    const y0 = plan.y + U.y0, y1 = plan.y + U.y1;
-    const rect = { x: plan.x, z: plan.z, angle: plan.angle, w: sz.w, d: sz.d };
+    const rect = depotVolume({ kind: 'rail', ...plan }), { y0, y1 } = rect;
     const R = Math.hypot(sz.w, sz.d) / 2 + 1;
     // tracks, roads and tunnels at its depth (the track it joins and the tracks beside it at that end excepted)
     const siblings = new Set(plan.snapNode >= 0 ? nodeGroup(g, plan.snapNode) : []);
@@ -235,9 +240,8 @@ export class Depots {
       if (q.y1 > y0 && q.y0 < y1 && rectsOverlap(rect, q, 0)) failp('Underground station in the way');
     }
     for (const d of this.map.values()) {
-      const s2 = depotSize(d.kind);
-      const dy0 = d.level === 'underground' ? d.y + U.y0 : d.y - 0.2, dy1 = d.level === 'underground' ? d.y + U.y1 : d.y + 1.0;
-      if (dy1 > y0 && dy0 < y1 && rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way');
+      const v = depotVolume(d);
+      if (v.y1 > y0 && v.y0 < y1 && rectsOverlap(rect, v, 0.1)) failp('Depot in the way');
     }
     plan.cost = Math.round(U.base + U.perDepth * plan.depth);
     return plan;

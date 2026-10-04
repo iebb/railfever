@@ -4,7 +4,7 @@ import type { Game } from '../game/game';
 import type { Proposal, CrossingPlan } from '../game/construction';
 import type { StationPlan } from '../game/stations';
 import type { DepotPlan, DepotKind } from '../game/build-ops';
-import { depotSize, UNDERGROUND_DEPOT } from '../game/build-ops';
+import { depotSize, depotVolume, UNDERGROUND_DEPOT } from '../game/build-ops';
 import { arcTable, tAtS, bezPoint } from '../game/geom';
 import { profAt } from '../game/network';
 import { ROAD_TYPES, WATER_Y, NetKind } from '../game/constants';
@@ -683,12 +683,13 @@ export class Overlay {
     for (const st of g.stations.map.values()) {
       const r = st.rail;
       if (!r || (r.level ?? 'ground') !== 'underground') continue;
-      for (const q of g.stations.undergroundNear(r.x, r.z, 0.1)) if (q.station === st.id) boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(r.depth ?? 2));
+      const q = g.stations.undergroundBox(st)!;
+      boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(r.depth ?? 2));
     }
     for (const d of g.depots.map.values()) {
       if (d.level !== 'underground') continue;
-      const sz = depotSize(d.kind);
-      boxRect(b, d.x, d.z, d.angle, sz.w, sz.d, d.y + UNDERGROUND_DEPOT.y0, d.y + UNDERGROUND_DEPOT.y1, shade(d.depth ?? 2));
+      const q = depotVolume(d);
+      boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(d.depth ?? 2));
     }
     this.under.set(b);
   }
