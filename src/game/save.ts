@@ -505,6 +505,7 @@ export function deserialize(d: any): Game {
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;
     const town = { ...rest, buildings: new Set<number>(t.buildings) } as Town;
+    if (t.mail) town.mail = { ...t.mail };
     g.towns.restoreCache(town, growth);
     return town;
   });

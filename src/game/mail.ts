@@ -153,9 +153,9 @@ function cargoGroup(alight: number, dest: number, count: number, from: number, j
   return { alight, dest, count, from, o: j.o, od: j.od, p: j.p, c: j.c, legs: j.legs.map((l): MailLeg => [l[0], l[1], l[2], l[3]]) };
 }
 
-/** The owner a share of receipts goes to: the vehicle's, else the line's, else the leg's (a bought company: its buyer). */
+/** Receipts go to the vehicle's owner, else the recorded operator (a bought company: its buyer); the line is a legacy fallback. */
 function payee(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number): number {
-  let who = v ? v.owner : line ? line.owner : owner;
+  let who = v ? v.owner : g.companies[owner] ? owner : line ? line.owner : owner;
   for (let k = 0; k < 8 && g.companies[who]?.defunct && g.companies[who].boughtBy !== undefined; k++) who = g.companies[who].boughtBy!;
   return who;
 }

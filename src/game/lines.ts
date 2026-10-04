@@ -859,6 +859,7 @@ export class Lines {
   /** Normalise a line restored from a save (older saves lack the naming state). */
   static restore(d: any): Line {
     const l: Line = { ...d, stops: [...(d.stops ?? [])], vehicles: [...(d.vehicles ?? [])] };
+    if (d.mail) l.mail = { ...d.mail };
     if (typeof l.num !== 'number') {
       const m = /(\d+)\s*$/.exec(String(l.name ?? ''));
       l.num = m ? Number(m[1]) : l.id;

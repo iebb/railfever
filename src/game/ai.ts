@@ -34,6 +34,7 @@ import { TramPlanner } from './ai-tram';
 import { networkDaily, scheduleNetworkTask, XLINK_REACH } from './ai-network';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail';
+import { offloadMail } from './mail';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -4538,6 +4539,8 @@ export class AIController {
       this.mailPolicy.replaced(t, nt);
       nt.pattern = t.pattern;
       const name = t.name;
+      // The replacement starts at its depot: mail aboard waits here with its journey intact.
+      if (t.mailLoad > 0) offloadMail(g, t, t.mailLoad, g.stations.get(t.atStation) ?? null);
       g.vehicles.sell(t.id);
       this.stats.vehicles++; this.stats.sold++;
       this.note(`lengthened ${name} to ${cars.filter((c) => c.capacity > 0).length} coaches on ${l.name}`);

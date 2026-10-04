@@ -33,12 +33,14 @@ function offloadPassengers(g: Game, v: Vehicle, count: number, st: Station | nul
   for (const [k, c] of [...v.cargo]) {
     if (left <= 0) break;
     const n = Math.min(left, c.count);
+    const transfers = c.count > 0 ? (c.transfers ?? 0) * n / c.count : 0;
     c.count -= n; v.load -= n; left -= n;
+    if (c.transfers) c.transfers = Math.max(0, c.transfers - transfers);
     if (c.count <= 0) v.cargo.delete(k);
     if (!st) continue;
     if (c.dest === st.id) { st.arrivedMonth += n; continue; }
     const hop = g.lines.nextHop(st.id, c.dest);
-    if (hop) g.lines.distribute(hop, n, (line, q) => g.stations.addWaiting(st, line, hop.alight, c.dest, q, 0, c.t0, 0, c.rail ?? 0));
+    if (hop) g.lines.distribute(hop, n, (line, q) => g.stations.addWaiting(st, line, hop.alight, c.dest, q, 0, c.t0, transfers * q / n, c.rail ?? 0));
   }
   if (v.load < 1e-9) v.load = 0;
 }
