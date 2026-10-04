@@ -54,7 +54,7 @@ The speed factor, which compares a leg's time with walking or driving, is capped
 
 Tram and bus receipts are a boarding charge (80 and 12) plus 90% of the old distance component. AI forecasts, project and improvement estimates, vehicle receipts and the line fares panel use the same context. Dense-centre trips add parking time and reduce car speed. Walking remains the reference for very short journeys.
 
-Changes of vehicle cost income (release 2.7): each one takes 10% off the fare of the leg ending in it and of every later leg (`TRANSFER_FARE_FACTOR`, 0.9). Legs are still paid one at a time, each to its operator: a leg after k changes pays 0.9^k, one 0.9 more when its passengers change at its end. A journey with one change earns exactly 10% less than the same legs without a change, whatever their lengths; with two changes 10–19% less (16% for three equal legs). This replaces the 20% bonus direct journeys earned; every fare is 1.2 times its old base (`FARE_LEVEL`), so a direct journey pays what it did. Waiting and cargo groups never mix passengers with different changes so far, just as they never mix rail fare histories: `fareGroupKey` adds the change class (0, 1, 2, 3 or more; the last pays its mean, within 0.2% of the exact fares for three and four changes). Older saves counted the passengers who had changed rather than their changes; read as one change each, a mixed group pays its mean (0.9^0.5 for half, within 0.2% of the exact split). AI forecasts price a journey with a change at 0.9 on every leg, and the cross-company link task values today's journeys across two networks the same way.
+Changes of vehicle cost income (release 2.7): each one takes 10% off the fare of the leg ending in it and of every later leg (`TRANSFER_FARE_FACTOR`, 0.9). Legs are still paid one at a time, each to its operator: a leg after k changes pays 0.9^k, one 0.9 more when its passengers change at its end. A journey with one change earns exactly 10% less than the same legs without a change, whatever their lengths; with two changes 10–19% less (16% for three equal legs). This replaces the 20% bonus direct journeys earned; every fare is 1.2 times its old base (`FARE_LEVEL`), so a direct journey pays what it did. Waiting and cargo groups never mix passengers with different changes so far, just as they never mix rail fare histories: `fareGroupKey` adds the change class (0, 1, 2, 3 or more; the last pays its mean, within 0.2% of the exact fares for three and four changes). Older saves counted the passengers who had changed rather than their changes; read as one change each, a mixed group pays its mean (0.9^0.5 for half, within 0.2% of the exact split), and keeps it when its queue is trimmed: every group stays under the key its own fields give, as a loaded game keys it. Passengers whose next leg is the vehicle they are on (a line extended past their drop-off) stay aboard: no fare until they leave it, and no change of vehicle. AI forecasts price a journey with a change at 0.9 on every leg, and the cross-company link task values today's journeys across two networks the same way.
 
 A station's rating scales its passenger generation, and passengers who give up waiting lower it by up to 0.6 (`RATING_LOST`; 0.25 before). The share who gave up this and last month also reduces the station's generation directly, as OpenTTD's ratings do: where vehicles leave people behind, fewer set out.
 
@@ -208,28 +208,28 @@ Release 2.7 combines the 70% walking limits with the transfer rule above (every 
 
 The economy controls are unchanged (direct journeys pay what they did): intercity 490.7k income, 55.0-year full-capital payback; busy bus 175.8k, 6.7 years; village rail −133.2k. The urban fixtures, the two-town line (27.0% load, +690k in year three) and the seed-11 tiny village (136 passengers in two years) are unchanged too. The split-journey exploit check reads 1.47 times the direct ride against 1.41 by the distance fares alone.
 
-Growth, 20 years on 768 maps (seeds 7 and 23 are the test's; 5 and 11 a second sample). "Merged" is 2.7 before the capacity rule and the memo fix:
+Growth, 20 years on 768 maps (seeds 7 and 23 are the test's; 5 and 11 a second sample). "Merged" is 2.7 before the capacity rule and the memo fix; "Calibrated" adds them; "Release 2.7" adds the validation fixes (riders staying aboard, change classes kept when queues are trimmed, links that demolish nothing and pay the partner):
 
-| Growth class, seeds 7 / 23 | 70% walking limits | Merged | Release 2.7 | Target |
+| Growth class, seeds 7 / 23 | 70% walking limits | Merged | Calibrated | Release 2.7 | Target |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Well served | 1.96× (19 towns) | 1.96× (18) | 1.96× (19) | 1.94× (19) | 1.6–2.5× |
+| Poorly served | 1.43× (6) | 1.49× (7) | 1.58× (6) | 1.60× (6) | 1.3–1.6× |
+| Unserved | 1.14× (1) | 1.21× (1) | 1.23× (1) | 1.55× (1) | 1.1–1.3× |
+
+| Growth class, seeds 5 / 11 | 70% walking limits | Merged | Calibrated | Release 2.7 |
 | --- | ---: | ---: | ---: | ---: |
-| Well served | 1.96× (19 towns) | 1.96× (18) | 1.96× (19) | 1.6–2.5× |
-| Poorly served | 1.43× (6) | 1.49× (7) | 1.58× (6) | 1.3–1.6× |
-| Unserved | 1.14× (1) | 1.21× (1) | 1.23× (1) | 1.1–1.3× |
+| Well served | 1.64× (16) | 1.64× (15) | 1.67× (16) | 1.60× (16) |
+| Poorly served | 1.51× (7) | 1.46× (7) | 1.51× (8) | 1.58× (5) |
+| Unserved | 1.24× (3) | 1.20× (4) | 1.14× (2) | 1.20× (5) |
 
-| Growth class, seeds 5 / 11 | 70% walking limits | Merged | Release 2.7 |
-| --- | ---: | ---: | ---: |
-| Well served | 1.64× (16) | 1.64× (15) | 1.67× (16) |
-| Poorly served | 1.51× (7) | 1.46× (7) | 1.51× (8) |
-| Unserved | 1.24× (3) | 1.20× (4) | 1.14× (2) |
+| Passengers who gave up, run / final year | 70% walking limits | Merged | Calibrated | Release 2.7 |
+| --- | ---: | ---: | ---: | ---: |
+| Seed 7 | 24% / 29% | 27% / 36% | 23% / 30% | 23% / 32% |
+| Seed 23 | 13% / 24% | 14% / 18% | 12% / 17% | 13% / 17% |
+| Seed 5 | 19% / 24% | 20% / 25% | 19% / 24% | 20% / 23% |
+| Seed 11 | 13% / 17% | 10% / 11% | 10% / 11% | 10% / 11% |
 
-| Passengers who gave up, run / final year | 70% walking limits | Merged | Release 2.7 |
-| --- | ---: | ---: | ---: |
-| Seed 7 | 24% / 29% | 27% / 36% | 23% / 30% |
-| Seed 23 | 13% / 24% | 14% / 18% | 12% / 17% |
-| Seed 5 | 19% / 24% | 20% / 25% | 19% / 24% |
-| Seed 11 | 13% / 17% | 10% / 11% | 10% / 11% |
-
-In the merged build seed 7's final year passed the 35% ceiling: a third company was bought three years earlier than before, and the profitable trams above stayed capped. Letting the fleet follow riders who give up by a single vehicle-load a month brought seed 7 to 19% / 29% but raised the poorly served class to 1.73× (two small towns gained service late in the run: Oakmoor 268 → 766 residents, Hayhaven 242 → 437); two vehicle-loads, as adopted, keeps every class and ceiling inside its unchanged target on both samples. Over the four seeds the poorly served class grows 1.47× before release 2.7 and 1.54× with it.
+In the merged build seed 7's final year passed the 35% ceiling: a third company was bought three years earlier than before, and the profitable trams above stayed capped. Letting the fleet follow riders who give up by a single vehicle-load a month brought seed 7 to 19% / 29% but raised the poorly served class to 1.73× (two small towns gained service late in the run: Oakmoor 268 → 766 residents, Hayhaven 242 → 437); two vehicle-loads, as adopted, kept every class and ceiling inside its target on both samples. With the validation fixes the one unserved town of seeds 7 and 23, Hayhaven, is a boundary case: unserved until a coach line reached it late in 1966 (242 → 301 residents, 1.24×), then served by three coach lines of two companies (301 → 374) in 23 of the 240 months, one month short of the 10% that makes a town poorly served; its 1.55× is the class mean. Over the four seeds the classes grow 1.78× (well served, 35 towns), 1.59× (poorly served, 11) and 1.25× (unserved, 6), each inside its target.
 
 Catchment timing uses Node 20.18.2, seed 23, a 768 map and three AI companies. The five-year runs use `--timing-only --cpu`, excluding allocations from the independent reference comparison.
 

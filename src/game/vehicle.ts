@@ -182,8 +182,18 @@ export abstract class Vehicle {
     g.recordStop(this, st);
     // odometer (the hop just run, with the load it carried)
     noteServe(g, this, st.id, st.x, st.z);
+    // passengers whose next leg is this vehicle's own onward run stay aboard (a line edit or a new pattern left a stale
+    // drop-off here): no fare yet and no change of vehicle, their clocks and fare history kept
+    let stay: ((alight: number) => boolean) | null = null, retargeted = false;
     for (const [k, c] of this.cargo) {
       if (c.alight !== st.id) continue;
+      if (c.dest !== st.id && line) {
+        const hop = g.lines.nextHop(st.id, c.dest);
+        if (hop && (hop.line === line.id || hop.lines?.includes(line.id))) {
+          stay ??= boarding(g, line, this.pattern, this.stopIndex, st.id);
+          if (stay(hop.alight)) { c.alight = hop.alight; retargeted = true; continue; }
+        }
+      }
       const from = g.stations.get(c.from);
       const dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
       // the leg's time: waiting at the boarding stop and riding (older saves: the ride since boarding)
@@ -214,6 +224,7 @@ export abstract class Vehicle {
       this.load -= c.count;
       this.cargo.delete(k);
     }
+    if (retargeted) this.cargo = cargoGroups(this.cargo.values());
     if (income > 0) {
       g.company(this.owner).economy.earn(income, 'income');
       this.profitYear += income;
@@ -243,6 +254,8 @@ export abstract class Vehicle {
       // the wait a leg counts: at most WAIT_CAP_HEADWAYS of this service's headway (a backlog is lost demand)
       const hw = patternHeadway(g, line, this.pattern);
       const earliest = hw > 0 ? now - WAIT_CAP_HEADWAYS * hw : -Infinity;
+      // (groups stay under their canonical keys, waiting and aboard, as a game loaded from a save keys them)
+      let partial = false, stale = false;
       for (const [k, wg] of st.waiting) {
         if (wg.line !== line.id) continue;
         const room = this.capacity - this.load;
@@ -254,7 +267,7 @@ export abstract class Vehicle {
         wg.count -= take;
         if (wg.transfers) wg.transfers = Math.max(0, wg.transfers - tr);
         st.waitingTotal -= take;
-        if (wg.count <= 0) st.waiting.delete(k);
+        if (wg.count <= 0) st.waiting.delete(k); else partial = true;
         const ck = fareGroupKey(st.id, wg.alight, wg.dest, wg.rail ?? 0, changeClass(tr, take));
         const cg = this.cargo.get(ck);
         if (cg) {
@@ -262,11 +275,14 @@ export abstract class Vehicle {
           cg.t0 = ((cg.t0 ?? now) * cg.count + t0 * take) / (cg.count + take);
           cg.transfers = (cg.transfers ?? 0) + tr;
           cg.count += take;
+          if (fareGroupKey(cg.from, cg.alight, cg.dest, cg.rail ?? 0, changeClass(cg.transfers, cg.count)) !== ck) stale = true;
         } else this.cargo.set(ck, wg.rail ? { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr, rail: wg.rail }
           : { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr });
         this.load += take;
         picked += take;
       }
+      if (partial) g.stations.rekeyWaiting(st);
+      if (stale) this.cargo = cargoGroups(this.cargo.values());
       line.passMonth += picked;
     }
     st.pickupMonth += picked;

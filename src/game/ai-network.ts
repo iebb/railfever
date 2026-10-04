@@ -876,14 +876,20 @@ class NetPlanner {
 
   /** May the company spend on its network now? (its money rules: cash plus credit, loan and losses in bounds) */
   private mayBuild(): boolean {
-    if (this.ai.railPolicy.deepTrouble) return false;
+    const why = this.buildBar();
+    if (why && why !== 'trouble') this.considered('build.' + why);
+    return !why;
+  }
+  /** What bars spending on the network now, if anything (mayBuild without its diagnostics). */
+  private buildBar(): 'trouble' | 'cash' | 'loan' | 'loss' | null {
+    if (this.ai.railPolicy.deepTrouble) return 'trouble';
     const e = this.eco, c = this.ai.config;
-    if (this.networkBudget() < 750_000) { this.considered('build.cash'); return false; }
-    if (e.loan > e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2)) { this.considered('build.loan'); return false; }
+    if (this.networkBudget() < 750_000) return 'cash';
+    if (e.loan > e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2)) return 'loan';
     // Opening a railway is a capital outlay, not a recurring loss that should bar useful improvements.
     const v = e.yearTotals[e.yearTotals.length - 1]?.v;
-    if (v && e.lastYearProfit - v.construction - v.vehicles < -1_500_000 * (0.5 + c.risk)) { this.considered('build.loss'); return false; }
-    return true;
+    if (v && e.lastYearProfit - v.construction - v.vehicles < -1_500_000 * (0.5 + c.risk)) return 'loss';
+    return null;
   }
   /** Borrow in steps (as ai.ts) until `amount` is there. */
   private borrowFor(amount: number): boolean {
@@ -1029,11 +1035,13 @@ class NetPlanner {
 
   /** A crossing beneath existing ground infrastructure can rebuild it as a bridge. Public streets
    * are available for junctions; company infrastructure needs its owner's consent, including taps. */
-  private proposalConsent(p: Proposal): boolean {
+  private proposalConsent(p: Proposal, planned = false): boolean {
     const net = this.g.world.net;
     const node = (id: number) => {
       const n = net.nodes.get(id);
-      return !!n && (n.kind === 'road' && n.owner < 0 || this.agrees(n.owner));
+      // (`planned`: a plan's own nodes, not built yet, need no one's consent)
+      if (!n) return planned;
+      return n.kind === 'road' && n.owner < 0 || this.agrees(n.owner);
     };
     const edge = (id: number) => {
       const e = net.edges.get(id);
@@ -1940,7 +1948,7 @@ class NetPlanner {
   }
 
   /** Planned growth of a station (smaller steps when the full one does not fit); null when it cannot grow now. */
-  private grow(st: Station, want: { tracks: number; through: number; length: number }, why: string): 'done' | 'busy' | 'no' {
+  private grow(st: Station, want: { tracks: number; through: number; length: number }, why: string, demolish = true): 'done' | 'busy' | 'no' {
     const g = this.g, r = st.rail!;
     if (!this.mayAlter([...r.edges, ...r.throughEdges, ...this.approachOf(st, 80)])) return 'no';
     const now0 = { tracks: r.tracks, through: r.through ?? 0, length: r.length };
@@ -1954,9 +1962,10 @@ class NetPlanner {
       const q = steps[i];
       let plan = planStationUpgrade(g, st.id, { ...q, side: 'auto' });
       // uneven ground beside the station: graded to the platform level once, then planned again (9i)
-      if (!plan.ok && !graded && /uneven/i.test(plan.error ?? '')) { graded = true; if (this.grade(st)) { plan = planStationUpgrade(g, st.id, { ...q, side: 'auto' }); } }
+      // (not where nothing may be demolished: grading clears the ground)
+      if (!plan.ok && demolish && !graded && /uneven/i.test(plan.error ?? '')) { graded = true; if (this.grade(st)) { plan = planStationUpgrade(g, st.id, { ...q, side: 'auto' }); } }
       if (!plan.ok) { this.considered('grow.site'); continue; }
-      if (plan.plan && !this.demolitionOk(plan.plan.demolish)) continue;
+      if (plan.plan && (demolish ? !this.demolitionOk(plan.plan.demolish) : plan.plan.demolish.length > 0)) continue;
       if (!this.canSpend(plan.cost * 1.2 + 300_000, 0.4)) { this.considered('grow.funds'); continue; }
       const dem = plan.plan ? [...plan.plan.demolish] : [];
       const err = commitStationUpgrade(g, plan);
@@ -3000,7 +3009,9 @@ class NetPlanner {
    * average speed for the consist, then for one or two trains of ours the riders' value (xlinkValue), our running
    * costs, the curve's upkeep and the fees for the partner's stations and track; the better fleet. `owner`: the
    * partner's view under open access, its fee income less the later legs it stops carrying, plus the best of its
-   * mutual option (one through train of its own: a share of the riders, its running costs, our fees).
+   * mutual option (one through train of its own: a share of the riders, its running costs, our fees) where it could
+   * run one: room left on both lines' track beside our trains (`maxTrains`: the room less one), and the partner's
+   * money rules, a consist and a depot of its own for the route (throughTrainPossible).
    */
   private xlinkEconomics(a: Line, b: Line, left: number[], right: number[], d: number, cars: VehicleModel[], A: { edge: NEdge; leg: number }[], B: { edge: NEdge; leg: number }[], maxTrains = 2, jx?: number, jz?: number) {
     const g = this.g, pa = this.pathOf(a)!, pb = this.pathOf(b)!;
@@ -3018,6 +3029,7 @@ class NetPlanner {
     // riders a train carries a year: both ways, four fifths of its seats each run (more riders wait for later trains)
     const perTrain = cars.reduce((s, m) => s + m.capacity, 0) * 0.8 * 2 * YEAR_S / Math.max(1, cycle);
     let best: { trains: number; net: number; value: ReturnType<NetPlanner['xlinkValue']>; revenue: number; carried: number; fees: number; running: number; owner: number; headway: number } | null = null;
+    const partner = this.plannerOf(b.owner), partnerTrain = !!partner && partner.throughTrainPossible([...left, ...right], [...aLegs, ...bLegs]);
     for (const trains of [1, 2].filter((n) => n <= Math.max(1, maxTrains))) {
       const headway = cycle / trains, value = this.xlinkValue(left, right, kmh, headway, jx, jz);
       // (riders beyond the trains' seats stay with today's journeys)
@@ -3029,7 +3041,8 @@ class NetPlanner {
       // the partner: fees in, the later legs it no longer carries out, and its option of one through train of its own
       const theirFees = this.xlinkFees(this.me, left, aLegs.map((p) => p.edge), 1, trains);
       const more = riders > 0 ? Math.min(1, perTrain * (trains + 1) / riders) : 0;
-      const option = value.revenue * more / (trains + 1) - year.total - theirFees - this.xlinkNeed(0, trainCost);
+      // (no option where its train could not run: no room beside ours, or no money, consist or depot for it)
+      const option = partnerTrain && trains <= maxTrains ? value.revenue * more / (trains + 1) - year.total - theirFees - this.xlinkNeed(0, trainCost) : 0;
       const owner = fees - value.theirLeg * carried + Math.max(0, option);
       if (!best || net - this.xlinkNeed(0, trains * trainCost) > best.net - this.xlinkNeed(0, best.trains * trainCost)) best = { trains, net, value, revenue, carried, fees, running, owner, headway };
     }
@@ -3179,7 +3192,8 @@ class NetPlanner {
     if (!ea || !eb || ea.edge.id === eb.edge.id) return null;
     const plan = Trackops.planConnection(g, ea.edge.id, ea.s, eb.edge.id, eb.s, this.me, { dirA: ea.dir, dirB: eb.dir, search: 2 });
     if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) return null;
-    if (plan.proposal && (!this.proposalConsent(plan.proposal) || !this.demolitionOk(plan.proposal.demolish))) return null;
+    // (no demolition: a link given up takes up its track and refunds the works, but cannot rebuild a house)
+    if (plan.proposal && (!this.proposalConsent(plan.proposal) || plan.proposal.demolish.length > 0)) return null;
     return plan;
   }
 
@@ -3282,18 +3296,19 @@ class NetPlanner {
     if (!forced && (econ.value.trips < networkOptions.xlinkTrips || econ.net <= this.xlinkNeed(works, econ.trains * econ.trainCost))) { this.considered('xlink.payback'); return; }
     // the owner agrees when its fees and its share of the direct riders make up for the later legs it no longer carries
     if (!forced && econ.owner < 0) { this.considered('xlink.consent'); return; }
-    const ends = [path[0], path[path.length - 1]].map((sid) => g.stations.get(sid));
-    for (const st of ends) {
-      if (!st?.rail) { this.considered('xlink.changed'); return; }
-      const turning = this.linesAt(st.id).length + 1;
-      if (st.rail.tracks < Math.min(2, turning) && this.grow(st, { tracks: 2, through: st.rail.through ?? 0, length: st.rail.length }, 'direct services across') !== 'done') { this.considered('xlink.platforms'); return; }
-    }
     const depots = [...g.depots.map.values()].filter((d) => d.owner === me && d.kind === 'rail')
       .sort((x, y) => Number(y.id === this.managed()?.get(a.id)?.depot) - Number(x.id === this.managed()?.get(a.id)?.depot) || x.id - y.id);
     const depot = depots.find((d) => left.some((sid) => depotReaches(g, d, sid, cars)));
     if (!depot) { this.considered('xlink.depot'); return; }
+    // (platforms where the direct trains turn: grown without demolition, which a link given up could not rebuild)
+    const ends = [path[0], path[path.length - 1]].map((sid) => g.stations.get(sid));
+    for (const st of ends) {
+      if (!st?.rail) { this.considered('xlink.changed'); return; }
+      const turning = this.linesAt(st.id).length + 1;
+      if (st.rail.tracks < Math.min(2, turning) && this.grow(st, { tracks: 2, through: st.rail.through ?? 0, length: st.rail.length }, 'direct services across', false) !== 'done') { this.considered('xlink.platforms'); return; }
+    }
     if (!this.canSpend(capital * 1.2 + 150_000, 0.35)) { this.considered('xlink.funds'); return; }
-    const money = this.eco.money;
+    const money = this.eco.money, crossings0 = new Set(net.crossings.keys());
     // (signals as they were: a rolled-back loop leaves no one-way signal on single track)
     const signals = new Map([...net.nodes].map(([id, n]) => [id, { signal: n.signal, kind: n.signalKind, pass: n.signalPass }]));
     // the curve; where it joins directional double track, a crossover at the junction for the return movement (as
@@ -3311,6 +3326,13 @@ class NetPlanner {
         }
         if (!result.error && sideA === 'loop' && !this.xlinkLoop(a, plan.turnouts[0].x, plan.turnouts[0].z, left[left.length - 1])) return { ...result, error: 'no room for a passing loop on ' + a.name };
         if (!result.error && sideB === 'loop' && !this.xlinkLoop(b, plan.turnouts[1].x, plan.turnouts[1].z, right[0])) return { ...result, error: 'no room for a passing loop on ' + b.name };
+        // nothing built crosses track or a road at grade unless its owner agrees (never the player's), whatever the
+        // pieces became when built (crossovers, the loops' end connections)
+        if (!result.error) for (const [cid, c] of net.crossings) {
+          if (crossings0.has(cid)) continue;
+          if ([c.e1, c.e2].some((id) => { const e = net.edges.get(id); return !!e && e.owner >= 0 && !this.agrees(e.owner); }))
+            return { ...result, error: 'it would cross track without its owner\'s consent' };
+        }
         return result;
       } finally { net.onSplit.splice(net.onSplit.indexOf(split), 1); }
     });
@@ -3509,10 +3531,13 @@ class NetPlanner {
     net.onSplit.push(split);
     let built = false;
     try {
+      // every piece, as planned and as built (commitDoubleTrack's fallbacks), crosses only with its owner's consent, never
+      // the player's track at grade, and demolishes nothing (a rollback could not rebuild it)
+      const consent = (prop: Proposal, planned = false) => this.proposalConsent(prop, planned) && prop.demolish.length === 0;
       for (const side of [1, -1] as const) {
         const plan = Trackops.planDoubleTrack(g, pick.map((e) => e.id), side, this.me);
-        if (!plan.ok || !this.mayAlter(plan.steps.map((st) => st.edge))) continue;
-        if (!Trackops.commitDoubleTrack(g, plan, true).error) { built = true; break; }
+        if (!plan.ok || !this.mayAlter(plan.steps.map((st) => st.edge)) || !plan.proposals.every((prop) => consent(prop, true))) continue;
+        if (!Trackops.commitDoubleTrack(g, plan, true, {}, consent).error) { built = true; break; }
       }
     } finally {
       net.onSplit.splice(net.onSplit.indexOf(split), 1);
@@ -3565,6 +3590,31 @@ class NetPlanner {
         this.bump('netLinesMerged');
       }
     } catch (e) { this.note('line merge failed: ' + String((e as Error)?.message ?? e)); }
+  }
+
+  /** The network planner of company `owner` (an AI company's; null for the player or a company gone). */
+  private plannerOf(owner: number): NetPlanner | null {
+    const ai = this.g.ais.find((x) => x.companyId === owner && !x.disposed);
+    if (!ai) return null;
+    let p = planners.get(ai);
+    if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
+    return p;
+  }
+
+  /**
+   * Could this company put one through train of its own on a direct service over `path` (`legs` its track), as
+   * offerThrough would? Its money rules (without borrowing yet), a consist of its own or the year's that fits, a depot
+   * reaching one of its stations on the route. The economics and the room are the caller's.
+   */
+  private throughTrainPossible(path: number[], legs: { edge: NEdge }[]): boolean {
+    const g = this.g, me = this.me, e = this.eco;
+    if (this.buildBar()) return false;
+    const credit = Math.max(0, e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2) - e.loan);
+    const cars = this.xlinkStock(g.lines.all().filter((x) => x.kind === 'rail' && x.owner === me), path, legs);
+    if (!cars) return false;
+    const cost = cars.reduce((s, m) => s + m.cost, 0) * 1.2 + 150_000;
+    if (cost > Math.max(0, this.networkBudget()) * 0.3 || e.money + credit < cost) return false;
+    return [...g.depots.map.values()].some((d) => d.owner === me && d.kind === 'rail' && path.some((sid) => g.stations.get(sid)?.owner === me && depotReaches(g, d, sid, cars)));
   }
 
   /**

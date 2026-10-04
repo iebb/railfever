@@ -119,6 +119,53 @@ function regressions() {
       'a journey with one change earns x0.9 on both legs: 10% less than the same legs without a change');
   }
 
+  // An older save's mixed group keeps its change class when its queue is trimmed (rounded totals moved it into another
+  // class under its old key): the running game and the same game loaded from a save, which keys every group afresh,
+  // must merge later arrivals and board alike.
+  {
+    const { g, ids, stations } = fareFixture(), { t, l } = fareTrain(g, [ids[0], ids[1]]);
+    g.lines.rebuild();
+    g.stations.addWaiting(stations[0], l.id, ids[1], ids[1], 3, 0, simNow(g) - 40, 1, RAIL_FARE.minimum);
+    const data = serialize(g); data.game = '2.6.1';
+    const live = deserialize(JSON.parse(JSON.stringify(data))), st = live.stations.get(ids[0])!;
+    live.stations.trimWaiting(st, 2);
+    const loaded = deserialize(JSON.parse(JSON.stringify(serialize(live))));
+    for (const game of [live, loaded]) game.stations.addWaiting(game.stations.get(st.id)!, l.id, ids[1], ids[1], 2, 0, simNow(game) - 40, 2, RAIL_FARE.minimum);
+    check(st.waitingTotal === 4 && JSON.stringify(serialize(live)) === JSON.stringify(serialize(loaded)),
+      'a trimmed legacy queue keeps its change class: later arrivals merge alike in the running and the loaded game');
+    const boarded = [live, loaded].map((game) => {
+      const train = game.vehicles.get(t.id)!;
+      train.load = train.capacity - 1;
+      train.cargo.set('other-riders', { from: ids[0], alight: ids[4], dest: ids[4], count: train.load, day: game.day, t0: simNow(game) });
+      train.stopIndex = 0; train.serveStation(game.stations.get(st.id)!, 0);
+      return [...train.cargo.values()].find((c) => c.alight === ids[1])?.transfers;
+    });
+    console.log(`trimmed legacy queue: partial boarding records ${boarded.join(' / ')} changes (running / loaded)`);
+    check(boarded[0] !== undefined && boarded[0] === boarded[1] && JSON.stringify(serialize(live)) === JSON.stringify(serialize(loaded)),
+      'partial boarding from it records the same changes, and the games stay identical');
+  }
+  // A line extended past a passenger's drop-off: whoever this train takes on towards their destination stays aboard
+  // (no fare yet, no change of vehicle, the clock and history kept) and pays the whole ride there as a direct journey.
+  {
+    const { g, ids, stations } = fareFixture(), { t, l } = fareTrain(g, [ids[0], ids[2]]), second = fareTrain(g, [ids[2], ids[4]]);
+    g.lines.rebuild();
+    const now = simNow(g);
+    t.cargo.set('rider', { from: ids[0], alight: ids[2], dest: ids[4], count: 1, day: g.day, t0: now - 40, transfers: 0 }); t.load = 1;
+    l.stops = [ids[0], ids[2], ids[4], ids[2]]; t.stopIndex = 1;
+    g.lines.delete(second.l.id); t.onLineChanged(); g.lines.rebuild();
+    const before = t.incomeYear;
+    t.serveStation(stations[2], 0);
+    const aboard = [...t.cargo.values()];
+    check(t.incomeYear === before && t.load === 1 && aboard.length === 1 && aboard[0].alight === ids[4] && !aboard[0].transfers && aboard[0].from === ids[0] && aboard[0].t0 === now - 40,
+      'a passenger whose journey this train continues stays aboard: no fare yet, no change of vehicle, the clock kept');
+    t.stopIndex = 2;
+    const mid = t.incomeYear;
+    t.serveStation(stations[4], 0);
+    const whole = fareFor(Math.hypot(stations[0].x - stations[4].x, stations[0].z - stations[4].z), 40, 1, { mode: 'rail' });
+    console.log(`staying aboard: whole ride ${t.incomeYear - mid} against ${whole}`);
+    check(Math.abs(t.incomeYear - mid - whole) < 1e-8, 'they pay the whole ride at their destination, as a direct journey');
+  }
+
   // Partial boarding and rail -> road -> rail transfers retain both cohorts' per-passenger histories.
   {
     const { g, ids, stations } = fareFixture(), first = fareTrain(g, [ids[0], ids[1]]), last = fareTrain(g, [ids[2], ids[3]]);

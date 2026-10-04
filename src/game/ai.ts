@@ -4439,7 +4439,8 @@ export class AIController {
       // a bus or tram line at its fleet limit, earning over twice its costs, whose riders gave up waiting by two
       // vehicle-loads or more last month: one vehicle more allowed (its stops still bound the fleet, and the street trams
       // run in). Profitable trams capped at five lost a thousand passengers a year at one stop (growth.ts, seed 7).
-      if (info.kind !== 'rail' && l.vehicles.length >= maxV && gaveUp >= 2 * v0.capacity && l.incomeLast > l.costLast * 2) { info.maxVehicles++; maxV = fleet(); }
+      const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
+      if (info.kind !== 'rail' && l.vehicles.length >= maxV && maxV < hard && gaveUp >= 2 * v0.capacity && l.incomeLast > l.costLast * 2) { info.maxVehicles++; maxV = fleet(); }
       // all operators' vehicles count towards what the line can take (no over-saturation of one track)
       const cap = info.joined ? this.lineCapacity(l) : maxV;
       if (l.vehicles.length >= cap || this.available() < v0.value * 1.5) continue;

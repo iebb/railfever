@@ -215,25 +215,38 @@ check(ex.delivered > 0 && locals.every((t) => t.delivered > 0), 'every pattern c
   check(slowLeg < quick * 0.5, 'a slow journey pays much less');
   check(Math.abs(changed / quick - 0.9) < 1e-6 && Math.abs(twice / quick - 0.81) < 1e-6 && Math.abs(thrice / quick - 0.729) < 1e-6,
     `the leg after one transfer pays x${TRANSFER_FARE_FACTOR}, after two x0.81, after three x0.729`);
-  // changing vehicles adds one change each: 100 passengers with one change so far alight at B for D (two changes then)
-  t.cargo.clear(); t.load = 0;
+  // changing vehicles adds one change each: 100 passengers with one change so far reach B on a train that ends there (a
+  // line A-B) and change to the locals for D, two changes then (a train going on to D keeps them aboard: no change)
+  const M = g.lines.create('rail', 0); M.stops = outAndBack([A.id, B!.id]);
+  const feeder = new Train(g, g.vehicles.nextId++, [...t.cars], -1);
+  feeder.lineId = M.id; feeder.state = 'stopped'; g.vehicles.map.set(feeder.id, feeder); M.vehicles.push(feeder.id);
+  g.lines.rebuild();
   B!.waiting.clear(); B!.waitingTotal = 0;
-  t.cargo.set('y', { alight: B!.id, dest: D.id, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
-  t.stopIndex = L.stops.indexOf(B!.id);
-  t.serveStation(B!, 0);
-  const onward = [...B!.waiting.values(), ...t.cargo.values()].filter((w) => w.dest === D.id && (!('from' in w) || w.from === B!.id));
+  feeder.cargo.set('y', { alight: B!.id, dest: D.id, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 }); feeder.load = 100;
+  feeder.stopIndex = M.stops.indexOf(B!.id);
+  feeder.serveStation(B!, 0);
+  const onward = [...B!.waiting.values()].filter((w) => w.dest === D.id);
   const people = onward.reduce((n, w) => n + w.count, 0), changes = onward.reduce((n, w) => n + (w.transfers ?? 0), 0);
-  check(people === 100 && Math.abs(changes / people - 2) < 1e-9, `a second change of vehicle is counted (${people} passengers, ${changes} changes)`);
+  check(people === 100 && Math.abs(changes / people - 2) < 1e-9 && onward.every((w) => w.line === L.id), `a second change of vehicle is counted (${people} passengers, ${changes} changes)`);
   // the leg ending in a change pays x0.9 more: after one earlier change, x0.81 (a one-change journey: x0.9 on both legs)
   const legTo = (dest: number) => {
-    t.cargo.clear(); t.load = 100; B!.waiting.clear(); B!.waitingTotal = 0;
-    t.cargo.set('z', { alight: B!.id, dest, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
-    t.stopIndex = L.stops.indexOf(B!.id);
-    const m0 = g.economy.money; t.serveStation(B!, 0); return g.economy.money - m0;
+    feeder.cargo.clear(); feeder.load = 100; B!.waiting.clear(); B!.waitingTotal = 0;
+    feeder.cargo.set('z', { alight: B!.id, dest, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
+    feeder.stopIndex = M.stops.indexOf(B!.id);
+    const m0 = g.economy.money; feeder.serveStation(B!, 0); return g.economy.money - m0;
   };
   const ending = legTo(B!.id), changing = legTo(D.id);
   console.log(`  100 pax A->B after one change: arriving ${k(ending)}, changing again at B ${k(changing)}`);
   check(ending > 0 && Math.abs(changing / ending - TRANSFER_FARE_FACTOR) < 1e-6, 'the leg ending in a change pays x0.9 more (x0.81 after one earlier change)');
+  // on the locals, which go on to D, the same passengers stay aboard: no fare at B, no change
+  t.cargo.clear(); t.load = 100; B!.waiting.clear(); B!.waitingTotal = 0;
+  t.cargo.set('w', { alight: B!.id, dest: D.id, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
+  t.stopIndex = L.stops.indexOf(B!.id);
+  const m1 = g.economy.money; t.serveStation(B!, 0);
+  const kept = [...t.cargo.values()].find((c) => c.from === A.id);
+  check(g.economy.money === m1 && kept?.count === 100 && kept.alight === D.id && kept.transfers === 100 && !B!.waiting.size,
+    'passengers whose next leg is the same train stay aboard at B (no fare, no change)');
+  feeder.cargo.clear(); feeder.load = 0; M.vehicles = []; g.vehicles.map.delete(feeder.id); g.lines.delete(M.id);
   t.cargo.clear(); t.load = 0; B!.waiting.clear(); B!.waitingTotal = 0;
   // boarding: the wait counted is at most WAIT_CAP_HEADWAYS of the service's headway (B: only the locals stop)
   t.cargo.clear(); t.load = 0;

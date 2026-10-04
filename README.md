@@ -56,7 +56,7 @@ URL parameters for quick starts: `?seed=123&size=512&towns=12&terrain=hilly&wate
 - Urban networks include underground metros, elevated/light-rail lines and cross-city links, with through services where compatible.
 - Network building includes station growth, pairing single tracks, signalled junctions, interchange and infill stations, consolidation of nearby termini, and decommissioning unprofitable routes. Construction can include building demolition and terraforming.
 - Congestion response adds signals, passing loops, double track or platforms. Companies join shared lines instead of duplicating routes.
-- Companies with open track access link their networks: new lines share a neighbour's station, and where two companies' railways run side by side a connecting curve (with passing loops on single track) carries direct trains across both when the riders pay for it, the owner earning access fees and invited to run trains too; otherwise a walking transfer links their stations. AI companies never alter the player's track.
+- Companies with open track access link their networks: new lines share a neighbour's station, and where two companies' railways run side by side a connecting curve (with passing loops on single track) carries direct trains across both when the riders pay for it and the owner agrees: its access fees and its own through trains, where they fit, must make up for the riders it loses. Links demolish nothing; otherwise a walking transfer links the stations. AI companies never alter the player's track or cross it at grade.
 - AI construction can be switched off in the Companies window or the settings; their vehicles keep running.
 
 **Passengers and economy**

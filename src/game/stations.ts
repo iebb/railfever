@@ -2844,11 +2844,13 @@ export class Stations {
       const g = x.g;
       g.count = x.count;
       lost += x.oldCount - x.count;
-      // transfers (the group's changes of vehicle so far) shrink with it
-      if (x.transfers) g.transfers = Math.round(x.transfers * g.count / x.oldCount);
+      // transfers (the group's changes of vehicle so far) shrink with it, the changes per passenger kept as they were
+      // (rounded totals moved a mixed group of older saves into another change class without re-keying it)
+      if (x.transfers) g.transfers = x.transfers * g.count / x.oldCount;
       if (g.count <= 0) st.waiting.delete(x.key); else tot += g.count;
     }
     st.waitingTotal = tot;
+    this.rekeyWaiting(st);
     if (lost > 0) {
       st.lostMonth = (st.lostMonth || 0) + lost;
       const town = this.game.towns.list[st.townId];
@@ -2862,6 +2864,27 @@ export class Stations {
   trimMail(st: Station) { trimMail(this.game, st); }
   /** Mail re-routed after the routing changed (mail.ts rerouteMail; Lines.rebuild does this for every station). */
   rerouteMail(st: Station) { rerouteMail(this.game, st); }
+  /**
+   * Keep a station's waiting groups under their canonical keys (fareGroupKey of their own fields): a group whose change
+   * class moved (passengers left it, floating-point at a class boundary) joins the group of its class, in order. A game
+   * loaded from a save keys every group afresh, so the running game must too, or later arrivals would merge differently.
+   */
+  rekeyWaiting(st: Station) {
+    const canonical = (w: WaitGroup) => fareGroupKey(w.line, w.alight, w.dest, w.rail ?? 0, changeClass(w.transfers, w.count));
+    let stale = false;
+    for (const [k, w] of st.waiting) if (canonical(w) !== k) { stale = true; break; }
+    if (!stale) return;
+    const old = [...st.waiting.values()];
+    st.waiting.clear();
+    for (const w of old) {
+      const key = canonical(w), g = st.waiting.get(key);
+      if (!g) { st.waiting.set(key, w); continue; }
+      const n = g.count + w.count;
+      if (g.t !== undefined || w.t !== undefined) g.t = ((g.t ?? w.t!) * g.count + (w.t ?? g.t!) * w.count) / n;
+      if (g.transfers || w.transfers) g.transfers = (g.transfers ?? 0) + (w.transfers ?? 0);
+      g.count = n;
+    }
+  }
 
   rerouteWaiting(st: Station) {
     const lines = this.game.lines;

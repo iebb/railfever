@@ -463,9 +463,10 @@ export interface DoubleResult {
 
 /**
  * Build a planned second track (see planDoubleTrack); everything built is removed again (and refunded) if a piece
- * fails. Then, unless `finish` is false, the pair is made directional with finishDoubleTrack.
+ * fails. Then, unless `finish` is false, the pair is made directional with finishDoubleTrack. `consent`: whether a
+ * piece as it will be built (crossings, demolitions; after any fallback crossing mode) may be built at all.
  */
-export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts: FinishOpts = {}): DoubleResult {
+export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts: FinishOpts = {}, consent?: (p: Proposal) => boolean): DoubleResult {
   const net = g.world.net;
   const owner = plan.owner;
   const res: DoubleResult = { error: null, cost: 0, edges: [], signals: 0, crossovers: 0 };
@@ -494,7 +495,7 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       let ok = false;
       for (const extra of [{}, { crossing: 'level' as const }, { crossing: 'over' as const }, { crossing: 'under' as const }]) {
         const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, plan.steps), ...extra }));
-        if (!prop.ok || commitProposal(g, prop)) continue;
+        if (!prop.ok || (consent && !consent(prop)) || commitProposal(g, prop)) continue;
         ok = true;
         break;
       }
