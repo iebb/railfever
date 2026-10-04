@@ -141,9 +141,17 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   const dirtyData = JSON.stringify(serialize(g)), dirty = deserialize(JSON.parse(dirtyData));
   check(dirty.lines.catchmentDirty && JSON.stringify(serialize(dirty)) === dirtyData,
     'a pending dirty save preserves its populations and pending refresh on immediate round trip');
-  dirty.lines.flushCatchment();
-  check(dirty.lines.catchmentDirty && dirty.stations.catchmentWorkPending,
-    'a dirty load retains bounded cold catchment preparation rather than applying its pending work on load');
+  // This established original has warm shares even while the population refresh is pending. Loading must
+  // preserve its next-tick publication; disposable walking caches cannot introduce a cold-work delay.
+  g.stepTick(); dirty.stepTick();
+  check(!g.lines.catchmentDirty && !dirty.lines.catchmentDirty && !dirty.stations.catchmentWorkPending,
+    'a dirty load commits its pending refresh on the same tick as the warm original');
+  let exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(dirty));
+  for (let i = 1; i < 640; i++) {
+    g.stepTick(); dirty.stepTick();
+    exact &&= JSON.stringify(serialize(g)) === JSON.stringify(serialize(dirty));
+  }
+  check(exact, 'pending dirty population refresh continues byte-identically for every one of 640 ticks');
 }
 
 {

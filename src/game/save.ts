@@ -635,12 +635,12 @@ export function deserialize(d: any): Game {
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
   // Saved platform preferences are restored verbatim; loading routing tables is not a route edit.
   try { g.lines.rebuild(true, false); } catch (e) { console.warn('Save load: rebuild failed', e); }
-  // Restore a clean save's derived walking dependencies and shares at the saved building horizon. A cold share
-  // cache would slice the next live invalidation while the running game's warm cache commits it immediately.
+  // Restore derived walking dependencies and shares at the saved building horizon. A cold share cache would
+  // slice a pending refresh while the running game's warm cache commits it immediately.
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion;
   S.accessVersion = net.version;
-  if (!d.catchmentDirty) g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentRoadsDirty);
+  g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty);
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {

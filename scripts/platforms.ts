@@ -55,9 +55,17 @@ check(reverse?.conts.at(-1)?.edge.id === firstSplit.e1.id, 'reverse stop reaches
 check(!findRailRoute(g, railNext(g, ae, 1, 0), B.id, 0, -1, 60000, false, null, true, { length: 30 }), 'long consist cannot be routed to a platform that does not fit it');
 check(!findRailRoute(g, [{ edge: split.e2, dir: 1 }], B.id, 0, -1, 60000, false, null, true, { length: 5 }), 'a junction into the short final fragment cannot claim the full platform length');
 const allIncoming = A.rail!.groups!.flatMap(q => { const end = q.steps.at(-1)!; return railNext(g, g.world.net.edges.get(end.edge)!, end.dir, 0); });
+const equalCosts = B.rail!.groups!.map(q => findRailRoute(g, allIncoming, B.id, 0, -1, 60000, false, null, true, { group: q.id, length: 5 })!.cost);
+check(Math.abs(equalCosts[0]-equalCosts[1]) < 1e-4, 'parallel platform arrivals are genuine geometry ties even after a platform split');
+for (const q of B.rail!.groups!) {
+  const tie = findRailRoute(g, allIncoming, B.id, 0, -1, 60000, false, null, true, { preferred: q.id, length: 5 });
+  check(q.steps.some(s => s.edge === tie?.conts.at(-1)?.edge.id), 'Auto retains a useful saved preference between equivalent direct arrivals');
+}
 g.vehicles.setRes(split.e2.id, -99);
 const alternate = findRailRoute(g, allIncoming, B.id, 0, -1, 60000, false, null, false, { preferred: oldGroup, length: 5 });
 check(alternate?.conts.at(-1)?.edge.id === B.rail!.groups![1].steps.at(-1)!.edge, 'a busy preferred platform yields to a reachable legal free platform');
+const manualAlternate = findRailRoute(g, allIncoming, B.id, 0, -1, 60000, false, null, false, { preferred: oldGroup, manual: true, length: 5 });
+check(manualAlternate?.conts.at(-1)?.edge.id === B.rail!.groups![1].steps.at(-1)!.edge, 'a busy manual preference also yields to the legal free platform');
 g.vehicles.releaseRes(split.e2.id, -99);
 
 const t0 = g.vehicles.buyTrain(depA, loco(), local.id) as Train;
@@ -156,6 +164,13 @@ check(!local.platforms?.some(p => p.group === deletedGroup.id), 'removed physica
   const forward = platformPreference(outward, 0, 2)!.group, backward = platformPreference(outward, 0, 6)!.group;
   check(forward !== backward && platformPreference(inward, 0, 2)?.group === backward && platformPreference(inward, 0, 6)?.group === forward,
     'opposing routes use the direct directional platforms before spreading onto crossover detours');
+  const incoming = d.stations.railTrackGroups(b).flatMap(q => { const last = q.steps.at(-1)!; return railNext(d, d.world.net.edges.get(last.edge)!, last.dir, 0); });
+  const actualAuto = findRailRoute(d, incoming, junction.id, 0, -1, 60000, false, null, false, { preferred: backward });
+  const actualManual = findRailRoute(d, incoming, junction.id, 0, -1, 60000, false, null, false, { preferred: backward, manual: true });
+  const directGroup = d.stations.railTrackGroups(junction).find(q => q.id === forward)!;
+  const manualGroup = d.stations.railTrackGroups(junction).find(q => q.id === backward)!;
+  check(directGroup.steps.some(s => s.edge === actualAuto?.conts.at(-1)?.edge.id), 'Auto cannot force a crossover detour from the train actual incoming direction');
+  check(manualGroup.steps.some(s => s.edge === actualManual?.conts.at(-1)?.edge.id), 'a legal explicit manual preference still accepts its modest crossover detour');
   check(!setPlatformPreference(d, inward, 0, 2, forward), 'a reachable crossover remains a legal manual preference');
   reconcilePlatforms(d, true);
   check(platformPreference(inward, 0, 2)?.manual && platformPreference(inward, 0, 2)?.group === forward, 'explicit Auto improvement preserves a valid manual crossover preference');

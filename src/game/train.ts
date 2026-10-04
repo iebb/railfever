@@ -250,6 +250,8 @@ export interface RouteResult { conts: Cont[]; cost: number }
 /** A platform preference never overrides physical routing, signals or reservations. */
 export interface RailRouteTarget {
   group?: number; preferred?: number; length?: number; direction?: 1 | -1;
+  /** Auto breaks geometry ties; an explicit manual preference accepts a modest legal detour. */
+  manual?: boolean;
   /** Contiguous target-platform path already held before the route's initial frontier. */
   prefix?: { edge: number; dir: number; length: number };
 }
@@ -302,7 +304,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
     // Prefer the saved platform, but a reserved platform costs more than a legal free alternative.
     const group = ends.get(key(e.id, d));
-    if (group !== undefined && platform.preferred !== undefined && group !== platform.preferred) c += 12;
+    if (group !== undefined && platform.preferred !== undefined && group !== platform.preferred) c += platform.manual ? 12 : 1e-4;
     return c;
   };
   const push = (e: NEdge, d: number, gc: number, parent: number) => {
@@ -914,7 +916,8 @@ export class Train extends Vehicle {
     if (!target.rail) { this.state = 'noroute'; this.status = target.name + ' has no platforms'; return false; }
     this.routeTarget = target.id;
     const rule = this.rule;
-    const platform: RailRouteTarget = { preferred: this.line ? platformPreference(this.line, this.pattern, this.stopIndex)?.group : undefined, length: this.length };
+    const savedPlatform = this.line ? platformPreference(this.line, this.pattern, this.stopIndex) : undefined;
+    const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length };
     const last = this.segs[this.segs.length - 1];
     const group = last && g.stations.railTrackGroups(target).find(q => q.steps.some(s => s.edge === last.e));
     if (group) {

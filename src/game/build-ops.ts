@@ -111,8 +111,8 @@ export class Depots {
    * Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. Tram depots connect to tram tracks.
    * Rail depots: `level` 'auto' (default) builds underground off a track end in a tunnel (an underground station's
    * platform end too), on the surface otherwise; 'underground' places one at `depth` below the ground (or at the
-   * height of the track end it snaps to, or at `y`). `snap: false`: no snapping (planning a depot for a track end
-   * that is not built yet).
+   * height of the track end it snaps to, or at `y`). `snap: false`: no snapping. A finite explicit rail `y`
+   * previews a not-yet-built surface endpoint using the same terrain tolerance as a snapped rail depot.
    */
   plan(kind: DepotKind, x: number, z: number, angle: number, owner: number, opts: { level?: DepotLevel; depth?: number; y?: number; snap?: boolean } = {}): DepotPlan {
     const g = this.game;
@@ -156,10 +156,11 @@ export class Depots {
     }
     // a rail depot on a track end takes the track's height; a road depot its door's (the street it opens onto
     // starts there), within the ground under it
-    plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : kind === 'rail' ? mx : Math.max(mn, Math.min(mx, w.heightAt(exitX, exitZ)));
+    const plannedRailHeight = kind === 'rail' && opts.snap === false && Number.isFinite(opts.y) ? opts.y : undefined;
+    plan.y = snapNode >= 0 ? net.nodes.get(snapNode)!.y : plannedRailHeight ?? (kind === 'rail' ? mx : Math.max(mn, Math.min(mx, w.heightAt(exitX, exitZ))));
     if (mn < 0.2) failp('Cannot build on water');
     // a depot on a track end takes the track's height and is levelled on commit
-    if (snapNode >= 0 ? Math.max(mx - plan.y, plan.y - mn) > 2.5 : mx - mn > 1.5) failp('Ground is too steep');
+    if (snapNode >= 0 || plannedRailHeight !== undefined ? Math.max(mx - plan.y, plan.y - mn) > 2.5 : mx - mn > 1.5) failp('Ground is too steep');
     const rect = { x, z, angle, w: sz.w, d: sz.d };
     const R = Math.hypot(sz.w, sz.d) / 2 + 1;
     for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) { plan.demolish.push(id); plan.cost += demolitionCost(g, b); } }

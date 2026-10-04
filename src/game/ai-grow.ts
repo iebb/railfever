@@ -22,7 +22,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
-import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf } from './constants';
+import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf, RAIL, ROAD_TYPES } from './constants';
 import { onwardCentres } from './ai-urban';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
@@ -30,7 +30,13 @@ import { linearStops, outAndBack } from './lines';
 import { depotFits, depotAtEnd, nodeSnap, nodeAt, stationEnds } from './routing';
 import { findRailRoute, railNext, depotServes, consistRule } from './train';
 import { marginalSharedTrain } from './ai-capacity';
-import { endTangent } from './geom';
+import { endTangent, arcTable, tAtS, bezPoint } from './geom';
+import { profAt } from './network';
+import { distToRect } from './world';
+import { SpatialGrid } from './spatial';
+import { rectsOverlap } from './towns';
+import { EARTHWORKS } from './terraform';
+import { depotSize, depotUpkeep, UNDERGROUND_DEPOT } from './build-ops';
 import { finishDoubleTrack, planDoubleTrackFinish, doubleTrackCrossoverGap, planStationOnTrack, commitStationOnTrack } from './trackops';
 import { linePatterns, patternHeadways } from './patterns';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
@@ -248,11 +254,13 @@ function branchClear(g: Game, st: Station, t: TerminusEnd, k: number, fork: numb
 
 /** A yard planned at a terminus (planTerminusYard): its head, the fork and the depot's place, and the works' price. */
 export interface YardPlan { station: number; end: 'front' | 'back'; head: number; fx: number; fz: number; y: number; x: number; z: number; cost: number;
+  /** Native base upkeep of the yard tracks and depot, and track length subject to wear. */
+  upkeep: number; track: number;
   /** city-integration: an underground depot off the fork instead of a ramp (wip/subway) */
   under?: SubwayYard }
 
 /** A level tail at an underground terminus obeys the same full-bore cover rule as its onward links. */
-function yardTail(g: Game, head: number, fx: number, fz: number, y: number, opts: BuildOptions, r: NonNullable<Station['rail']>): Proposal {
+function yardTail(g: Game, head: number, fx: number, fz: number, y: number, opts: BuildOptions, r: Pick<NonNullable<Station['rail']>, 'level' | 'depth'>): Proposal {
   const n = g.world.net.nodes.get(head)!;
   if (r.level !== 'underground') return planEdge(g, nodeSnap(g, head, 'rail'), { kind: 'free', x: fx, z: fz, y },
     { ...opts, heightOffset: y - g.world.heightAt(fx, fz) || 1e-3 });
@@ -275,13 +283,24 @@ function yardTail(g: Game, head: number, fx: number, fz: number, y: number, opts
  */
 export function planTerminusYard(g: Game, owner: number, st: Station, end: 'front' | 'back', heads: number[] | null,
   ok: (p: Proposal) => boolean, ignore?: BuildOptions['ignore']): YardPlan | null {
-  const net = g.world.net, r = st.rail;
+  const r = st.rail;
   if (!r) return null;
   const t = terminusOf(g, st, end, owner);
   if (!t || !t.heads.length) return null;
+  return planYardAt(g, owner, st.id, { ...r, mode: railPartMode(r) }, t, lineTrackAt(g, st).type, heads, ok, ignore);
+}
+
+/** Shared native yard search for real and prospective platform heads. Temporary heads never become assets. */
+function planYardAt(g: Game, owner: number, station: number, r: Pick<NonNullable<Station['rail']>, 'level' | 'depth' | 'edges' | 'mode'>,
+  t: TerminusEnd, type: string, heads: number[] | null, ok: (p: Proposal) => boolean, ignore?: BuildOptions['ignore'],
+  depotClear: (x: number, z: number, y: number, angle: number, under: boolean) => boolean = () => true): YardPlan | null {
+  const net = g.world.net, end = t.end;
+  if (ignore && ([...ignore.edges].some(id => { const e = net.edges.get(id);
+    return !!e && (e.kind !== 'rail' || e.owner !== owner || g.vehicles.isEdgeBusy(id));
+  }) || [...ignore.depots ?? []].some(id => g.depots.get(id)?.owner !== owner || depotBusy(g, id)))) return null;
   const level = (r.level ?? 'ground') as StationLevel, ramp = rampLength(level), lx = -t.uz, lz = t.ux;
   let under: YardPlan | null = null;
-  const opts: BuildOptions = { kind: 'rail', type: lineTrackAt(g, st).type, tracks: 1, heightOffset: 0, crossing: 'auto', owner, ...(ignore ? { ignore } : {}) };
+  const opts: BuildOptions = { kind: 'rail', type, tracks: 1, heightOffset: 0, crossing: 'auto', owner, ...(ignore ? { ignore } : {}) };
   for (const k of [0, t.heads.length - 1]) {
     const head = t.heads[k], n = net.nodes.get(head);
     if (!n || (heads && !heads.includes(head)) || (k > 0 && t.heads.length === 1)) continue;
@@ -294,8 +313,20 @@ export function planTerminusYard(g: Game, owner: number, st: Station, end: 'fron
     // city-integration: an underground line's depot may stay underground, a cavern off the fork (wip/subway)
     if (SUBWAY && level === 'underground' && !under) for (const lat of [8, 12]) {
       const yp = SUBWAY.planSubwayYard(g, { x: fx, y: n.y, z: fz, dx: t.ux, dz: t.uz }, owner, { type: opts.type, depth: r.depth, lat: lat * side });
-      if (yp.ok) { under = { station: st.id, end, head, fx, fz, y: n.y, x: yp.x, z: yp.z, cost: Math.round(tp.cost + yp.cost), under: yp }; break; }
+      if (yp.ok) {
+        const { stub, fits } = net.withTemporaryNodes('rail', [{ x: fx, y: n.y, z: fz, dx: t.ux, dz: t.uz }], owner, ns => {
+          const q = planEdge(g, nodeSnap(g, ns[0].id, 'rail'), { kind: 'free', x: yp.x, z: yp.z, y: 0 }, SUBWAY.subwayOpts(type, 1, owner, yp.depth));
+          return { stub: q, fits: q.ok && ok(q) };
+        });
+        if (!fits) continue;
+        const tangent = endTangent(stub.tracks[0].bez);
+        if (!depotClear(yp.x + tangent.x * 2.15, yp.z + tangent.z * 2.15, yp.y, Math.atan2(-tangent.x, -tangent.z), true)) continue;
+        under = { station, end, head, fx, fz, y: n.y, x: yp.x, z: yp.z, cost: Math.round(tp.cost + yp.cost), under: yp,
+          track: tp.stats.len + stub.stats.len, upkeep: proposalUpkeep(tp) + proposalUpkeep(stub) + UNDERGROUND_DEPOT.upkeep }; break;
+      }
     }
+    // A subway keeps its depot underground; a light-rail line may compare a native surface ramp.
+    if (level === 'underground' && r.mode === 'metro') continue;
     for (const kf of [1, 1.25, 0.85, 1.5, 2]) for (const lat of [12, 24, 36]) {
       const x = fx + t.ux * ramp * kf + lx * lat * side, z = fz + t.uz * ramp * kf + lz * lat * side;
       if (!g.world.inside(x, z, 8)) continue;
@@ -307,13 +338,90 @@ export function planTerminusYard(g: Game, owner: number, st: Station, end: 'fron
       if (!fits) continue;
       const e = pr.tracks[0], tangent = endTangent(e.bez), y = e.prof[e.prof.length - 1];
       if (!depotFits(g, x, z, -tangent.x, -tangent.z, owner, 0, y)) continue;
-      const dp = g.depots.plan('rail', x + tangent.x * 2.15, z + tangent.z * 2.15, Math.atan2(-tangent.x, -tangent.z), owner);
-      if (!dp.ok) continue;
-      const plan: YardPlan = { station: st.id, end, head, fx, fz, y: n.y, x, z, cost: Math.round(pr.cost + tp.cost + dp.cost) };
+      const dp = g.depots.plan('rail', x + tangent.x * 2.15, z + tangent.z * 2.15, Math.atan2(-tangent.x, -tangent.z), owner, { snap: false, y });
+      if (!dp.ok || !depotClear(dp.x, dp.z, y, dp.angle, false)) continue;
+      const plan: YardPlan = { station, end, head, fx, fz, y: n.y, x, z, cost: Math.round(pr.cost + tp.cost + dp.cost),
+        track: pr.stats.len + tp.stats.len, upkeep: proposalUpkeep(pr) + proposalUpkeep(tp) + 12000 };
       return under && under.cost <= plan.cost ? under : plan;
     }
   }
   return under;
+}
+
+/** Native track base upkeep, including each actual bridge/tunnel section. */
+function proposalUpkeep(p: Proposal): number {
+  return p.tracks.reduce((sum, t) => sum + trackBasePerUnit(p.opts.type) * (t.len
+    + t.sections.reduce((a, s) => a + (s.s1 - s.s0) * (s.type === 'tunnel' ? 4 : 3), 0)), 0);
+}
+
+/** Pure yard preview at a planned station, using the same outer heads, ramp and cavern search as commit. */
+export function planProspectiveTerminusYard(g: Game, owner: number, station: StationPlan, end: 'front' | 'back',
+  ok: (p: Proposal) => boolean, stations: readonly StationPlan[] = [station], links: readonly Proposal[] = [],
+  ignore?: BuildOptions['ignore']): YardPlan | null {
+  const sg = end === 'front' ? 1 : -1, fx = Math.sin(station.angle), fz = Math.cos(station.angle);
+  const ux = fx * sg, uz = fz * sg;
+  const points = station.layout.trackOffsets.map(off => ({ x: station.x + fz * off + ux * station.length / 2,
+    y: station.y, z: station.z - fx * off + uz * station.length / 2, dx: fx, dz: fz }));
+  const samples = (p: Proposal) => p.tracks.flatMap(t => {
+    const tab = arcTable(t.bez), out: { x: number; y: number; z: number; kind: 'rail' | 'road'; hw: number; section: string }[] = [];
+    const rt = ROAD_TYPES[p.opts.type] ?? ROAD_TYPES.road;
+    for (let s = 0; s < t.len + 0.25; s += 0.25) {
+      const a = Math.min(s, t.len), q = bezPoint(t.bez, tAtS(tab, a));
+      out.push({ ...q, y: profAt(t.prof, t.len, a), kind: p.opts.kind, hw: p.opts.kind === 'rail' ? 0.32 : rt.half + rt.sidewalk,
+        section: t.sections.find(s => a >= s.s0 && a <= s.s1)?.type ?? 'ground' });
+    }
+    return out;
+  });
+  const occupied = [...links, ...stations.flatMap(p => p.access ? [p.access] : [])].flatMap(samples), grid = new SpatialGrid(4);
+  occupied.forEach((p, id) => grid.insert(id, p.x, p.z, p.x, p.z));
+  const clearanceRadius = occupied.reduce((r, p) => Math.max(r, p.kind === 'rail' ? RAIL.spacing - 0.06 : 0.32 + p.hw - 0.08), 0);
+  // Platform ends are legal connections. Beyond them the native platform and all prospective links remain obstacles.
+  const clearPoint = (q: { x: number; y: number; z: number }) => {
+    for (const p of stations) {
+      const dx = q.x - p.x, dz = q.z - p.z, ax = Math.sin(p.angle), az = Math.cos(p.angle);
+      if (Math.abs(q.y - p.y) < RAIL.clearance && Math.abs(dx * ax + dz * az) < p.length / 2 - 0.01
+        && Math.abs(dx * az - dz * ax) < p.layout.width / 2 + 0.32) return false;
+      const ground = g.world.heightAt(p.x, p.z), b = p.building;
+      if (b.w > 0 && b.d > 0 && q.y > ground - 0.2 && q.y < ground + 2.4
+        && distToRect(q.x, q.z, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.4) return false;
+      for (const pier of p.piers) if (Math.hypot(q.x - pier.x, q.z - pier.z) < 0.5 && q.y < p.y) return false;
+      if (p.level !== 'underground') for (const e of p.entrances) if (Math.hypot(q.x - e.x, q.z - e.z) < 1.1
+        && q.y < g.world.heightAt(e.x, e.z) + 2.4) return false;
+    }
+    return !grid.query(q.x - clearanceRadius, q.z - clearanceRadius, q.x + clearanceRadius, q.z + clearanceRadius).some(id => {
+      const p = occupied[id], need = p.kind === 'rail' ? RAIL.spacing - 0.06 : 0.32 + p.hw - 0.08;
+      return Math.hypot(q.x - p.x, q.z - p.z) < need && Math.abs(q.y - p.y) < RAIL.clearance;
+    });
+  };
+  const clear = (p: Proposal) => ok(p) && samples(p).every(clearPoint);
+  const depotClear = (x: number, z: number, y: number, angle: number, under: boolean) => {
+    const sz = depotSize('rail'), rect = { x, z, angle, ...sz };
+    const y0 = y + UNDERGROUND_DEPOT.y0, y1 = y + UNDERGROUND_DEPOT.y1;
+    // Native depot collision tests compare complete edge samples with the whole oriented footprint,
+    // not a few footprint points which could miss a narrow track between its rows.
+    for (const p of occupied) {
+      const d = distToRect(p.x, p.z, x, z, angle, sz.w / 2, sz.d / 2);
+      if (under) {
+        if (d < p.hw - 0.05 && p.y + (p.kind === 'rail' ? 0.5 : 0.45) > y0 && p.y - 0.1 < y1) return false;
+      } else {
+        if (p.section === 'tunnel' && p.y + 1 < y - 0.3) continue;
+        if (d < p.hw - 0.1 || (p.kind === 'rail' && p.section === 'ground'
+          && d < p.hw + EARTHWORKS.corePad && Math.abs(p.y - y) > 0.3)) return false;
+      }
+    }
+    for (const p of stations) {
+      if ((!under || Math.abs(p.y - y) < RAIL.clearance + 1) && rectsOverlap(rect, p.footprint, 0.02)) return false;
+      if (!under && p.building.w > 0 && rectsOverlap(rect, p.building, 0.02)) return false;
+      if (!under) for (const e of p.entrances) if (distToRect(e.x, e.z, x, z, angle, sz.w / 2, sz.d / 2) < 1.1) return false;
+    }
+    return true;
+  };
+  return g.world.net.withTemporaryNodes('rail', points, owner, nodes => {
+    const ordered = nodes.map(n => ({ n, lat: (n.x - station.x) * -uz + (n.z - station.z) * ux })).sort((a, b) => a.lat - b.lat);
+    const t: TerminusEnd = { station: -1, end, ux, uz, heads: ordered.map(p => p.n.id), lat: ordered.map(p => p.lat),
+      kind: 'free', root: -1, fork: -1, tail: 0, lead: [], depots: [] };
+    return planYardAt(g, owner, -1, { level: station.level, depth: station.depth, edges: [], mode: station.mode }, t, trackTypeOf(station.trackType), null, clear, ignore, depotClear);
+  });
 }
 
 /** Build a planned yard (the tail, the ramp, the depot); the depot id, or -1 with nothing left behind (works refunded). */
@@ -324,16 +432,31 @@ export function buildTerminusYard(g: Game, owner: number, y: YardPlan, ok: (p: P
   if (!st?.rail || !n) return -1;
   const opts: BuildOptions = { kind: 'rail', type: lineTrackAt(g, st).type, tracks: 1, heightOffset: 0, crossing: 'auto', owner };
   const tp = yardTail(g, y.head, y.fx, y.fz, y.y, opts, st.rail);
-  if (!tp.ok || !ok(tp) || commitProposal(g, tp)) return undo();
+  if (!tp.ok || !ok(tp)) return -1;
+  // Quote every native component before spending. Tail earthworks must not silently reprice the ramp/depot.
+  const planned = net.withTemporaryNodes('rail', [{ x: y.fx, y: y.y, z: y.fz,
+    dx: (y.fx - n.x) / TAIL, dz: (y.fz - n.z) / TAIL }], owner, ns => {
+    const pr = planEdge(g, nodeSnap(g, ns[0].id, 'rail'),
+      { kind: 'free', x: y.x, z: y.z, y: y.under ? 0 : g.world.heightAt(y.x, y.z) },
+      y.under ? SUBWAY.subwayOpts(opts.type, 1, owner, y.under.depth) : opts);
+    if (!pr.ok || !ok(pr)) return null;
+    const t = pr.tracks[0], tangent = endTangent(t.bez), height = t.prof[t.prof.length - 1];
+    const dp = g.depots.plan('rail', y.x + tangent.x * 2.15, y.z + tangent.z * 2.15,
+      Math.atan2(-tangent.x, -tangent.z), owner, { snap: false, y: height, ...(y.under ? { level: 'underground' } : {}) });
+    return dp.ok ? { pr, dp } : null;
+  });
+  if (!planned || !eco.canAfford(tp.cost + planned.pr.cost + planned.dp.cost)) return -1;
+  if (commitProposal(g, tp)) return undo();
   const fork = nodeAt(g, 'rail', y.fx, y.fz);
   if (!fork) return undo();
-  // city-integration: the cavern off the fork (wip/subway's buildSubwayYard: from the tail's free end)
-  if (y.under) { const id = SUBWAY ? SUBWAY.buildSubwayYard(g, fork.id, y.under, owner, opts.type) : -1; return id >= 0 ? id : undo(); }
-  const pr = planEdge(g, nodeSnap(g, fork.id, 'rail'), { kind: 'free', x: y.x, z: y.z, y: g.world.heightAt(y.x, y.z) }, opts);
-  if (!pr.ok || !ok(pr) || commitProposal(g, pr)) return undo();
-  const endNode = net.nearestNode(y.x, y.z, 0.1, 'rail', (q) => q.edges.length === 1);
-  const id = endNode ? depotAtEnd(g, endNode.id, owner) : -1;
-  return id >= 0 ? id : undo();
+  // Only the preview-local fork ID changes. Geometry, profile, consent and the native price remain quoted.
+  for (const t of planned.pr.tracks) t.start = { ...t.start, node: fork.id, group: [fork.id] };
+  if (commitProposal(g, planned.pr)) return undo();
+  const endNode = net.nearestNode(y.x, y.z, 0.1, 'rail', q => q.edges.length === 1);
+  if (!endNode) return undo();
+  planned.dp.snapNode = endNode.id;
+  const id = g.depots.nextId;
+  return g.depots.commit('rail', planned.dp, owner) ? undo() : id;
 }
 
 /** Is a vehicle on its way out of a depot (on its track, or entering the line from it)? */
@@ -553,7 +676,7 @@ interface ExtPlan {
   works: number;
   /** double track laid (units) */
   track: number;
-  /** Separate crossover base upkeep and arc length, including their native bridge/tunnel sections. */
+  /** Added ancillary track upkeep/length: native crossovers and a replacement depot yard, net of old yard upkeep. */
   crossoverUpkeep: number;
   crossoverTrack: number;
   demolish: number[];
@@ -583,12 +706,6 @@ function spurIgnore(g: Game, spur: number[], depots: number[]): NonNullable<Buil
   return { edges, depots: new Set(depots) };
 }
 
-/** What a yard (tail, ramp, depot) at a new terminus costs, about (planTerminusYard's works). */
-function yardEstimate(track: LineTrack, level: StationLevel): number {
-  const per = track.costPerUnit;
-  return Math.round((TAIL + rampLength(level) * 1.2) * per * (level === 'underground' ? 5 : level === 'elevated' ? 3.5 : 1.3) + 110_000);
-}
-
 /**
  * Plan an extension of a line beyond its terminus T (`te`, its end facing outward): `n` new stations at the line's
  * spacing, the first link bending by `turn`, at `level`; double track from the platform ends (a free end, or a depot
@@ -609,7 +726,7 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
   if (te.depots.length) {
     let lead = 0;
     for (const id of te.lead) lead += net.edges.get(id)?.len ?? 0;
-    works += yardEstimate(track, level) + 15000 + lead * 400;
+    works += 15000 + lead * 400;
   }
   // the start of the new double track: two nodes level with each other beyond the platform ends
   const a0 = te.kind === 'tail' ? te.tail : 0;
@@ -683,6 +800,7 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
   }
   // the links, each from the last station's outer end (the terminus's start nodes first) to the next one's inner end
   let laid = 0, crossoverUpkeep = 0, crossoverTrack = 0;
+  const links: Proposal[] = [];
   for (let i = 0; i < plans.length; i++) {
     const p = plans[i], ux = Math.sin(p.angle), uz = Math.cos(p.angle), rx = uz, rz = -ux;
     // (inner end nodes of the next station: track order; planEdge takes an end group right to left)
@@ -708,12 +826,23 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     });
     if (!pj.ok) return pj.errors[0] ?? 'track';
     if (!h.consent(pj, true) || !h.demolitionOk(pj.demolish)) return 'track consent';
+    links.push(pj);
     const fin = planDoubleTrackFinish(g, pj, me, plans);
     if (fin.error) return fin.error;
     works += pj.cost + fin.cost + compensation(g, pj.demolish);
     crossoverUpkeep += fin.upkeep!; crossoverTrack += fin.track!;
     demolish.push(...pj.demolish);
     laid += pj.stats.len / 2;
+  }
+  if (te.depots.length) {
+    const yard = planProspectiveTerminusYard(g, me, plans[plans.length - 1], 'front', p => h.consent(p, true) && h.demolitionOk(p.demolish), plans, links, ignore);
+    if (!yard) return 'no yard at new terminus';
+    works += yard.cost;
+    // The old yard is taken up in the same successful atomic move. Its upkeep is no longer payable.
+    const oldUpkeep = te.lead.reduce((sum, id) => sum + (net.edges.get(id) ? g.edgeMaintenance(net.edges.get(id)!) : 0), 0)
+      + te.depots.reduce((sum, id) => sum + (g.depots.get(id) ? depotUpkeep(g.depots.get(id)!) : 0), 0);
+    crossoverUpkeep += yard.upkeep - oldUpkeep;
+    crossoverTrack += yard.track;
   }
   if (te.kind === 'tail') works += te.tail * track.costPerUnit * (LEVEL_TRACK[lv0] ?? 1);
   return { stations: plans, works: Math.round(works), track: laid, crossoverUpkeep, crossoverTrack, demolish, level };
@@ -1444,7 +1573,10 @@ export function* growTask(h: GrowHost, item: { ids: number[]; grow?: GrowCursor 
   if (best.fleet && !cursor.made) {
     const built = buildFleet(h, l, path, o);
     if (built === 'busy') retryBusy('busy');
-    else finish(360, 'build');
+    else if (built) {
+      // A paid capacity action refreshes its accounts on a native quarter, then reviews uncovered districts.
+      finish(90, 'build'); scheduleNetworkTask(h.ai, 'extend', 90);
+    } else finish(360, 'build');
     yield; return;
   }
   if (o.kind === 'fill') { finish(360, 'build'); buildFill(h, l, path, o); yield; return; }

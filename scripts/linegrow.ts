@@ -10,7 +10,7 @@ import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import type { Line } from '../src/game/lines';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { bezLine } from '../src/game/geom';
+import { bezLine, bezPoint, bezDeriv } from '../src/game/geom';
 import { outAndBack, linearStops } from '../src/game/lines';
 import { stationEnds, nodeSnap, depotAtEnd, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat, finishDoubleTrack, planStationOnTrack, commitStationOnTrack } from '../src/game/trackops';
@@ -18,8 +18,9 @@ import { autoSignalLine } from '../src/game/signals';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { serialize, deserialize } from '../src/game/save';
 import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask, networkDaily } from '../src/game/ai-network';
-import { terminusOf, outerEnd, planTerminusYard, buildTerminusYard, cityStationSpacing, lineTrackAt } from '../src/game/ai-grow';
+import { terminusOf, outerEnd, planTerminusYard, planProspectiveTerminusYard, buildTerminusYard, cityStationSpacing, lineTrackAt } from '../src/game/ai-grow';
 import { Train } from '../src/game/train';
+import { depotUpkeep } from '../src/game/build-ops';
 import { patternHeadways, addPattern, setVehiclePattern, linePatterns } from '../src/game/patterns';
 import { stopsWithInserted, replaceLineStops, type StopPlace } from '../src/game/line-edit';
 import { check, fails, fmt, checkReservations } from './lib';
@@ -415,16 +416,27 @@ if (run('busy')) {
       &&state?.next.find(([task])=>task==='extend')?.[1]===sg.day+15,
       'busy: a selected busy option retains both fifteen-day deadlines rather than a year');
     sg.aiEnabled=copy.aiEnabled=true;
-    let exact=true;
-    for(let k=0;k<640;k++) {sg.stepTick();copy.stepTick();exact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy));}
+    let exact=true, quarter=false;
+    const paidQuarter=()=>{
+      if(quarter||!sa.log.some(s=>/fleet-only investment/.test(s)))return;
+      const state=serialize(sg).aiNetwork?.companies.find(([id])=>id===sa.companyId)?.[1];
+      quarter=state?.care.find(([key])=>key==='grow'+selected.line.id)?.[1]===sg.day+90
+        &&state?.next.find(([task])=>task==='extend')?.[1]===sg.day+90;
+    };
+    for(let k=0;k<640;k++) {sg.stepTick();copy.stepTick();paidQuarter();exact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy));}
     check(exact,'busy: selected-option retry and resulting fleet replay exactly for 640 ticks');
     for(let day=0;day<60&&!sa.log.some(s=>/fleet-only investment/.test(s));day++) {
-      runDays(sg,1);runDays(copy,1);
+      runDays(sg,1,paidQuarter);runDays(copy,1);
       check(JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy)),
         'busy: saved retry remains exact through its next affordable fleet review');
     }
     check(sa.log.some(s=>/fleet-only investment/.test(s)),
       'busy: the retry executes a genuinely profitable fleet action once the approach clears');
+    check(quarter,'busy: only the actual paid fleet action saves both quarterly review deadlines');
+    const paidSave=JSON.stringify(serialize(sg)),paidCopy=deserialize(JSON.parse(paidSave));
+    let paidExact=JSON.stringify(serialize(paidCopy))===paidSave;
+    for(let k=0;k<640;k++){sg.stepTick();paidCopy.stepTick();paidExact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(paidCopy));}
+    check(paidExact,'busy: paid quarterly care and network deadline replay exactly for 640 ticks');
   }
 }
 
@@ -450,6 +462,162 @@ if (run('infill')) {
   const seen = calls(g, line, 240);
   check(!!st && seen.has(st.id), 'infill: trains call there');
   check(checkReservations(g).length === 0, 'infill: reservations consistent');
+}
+
+if (run('yardheight')) {
+  console.log('yardheight: prospective native depots use the actual planned rail endpoint on nonflat ground');
+  const {g,me}=flat(),net=g.world.net;
+  for(let z=250;z<=262;z++)for(let x=119;x<=127;x++)g.world.setVertex(x,z,4+(x-119)*.04);
+  const a=net.addNode('rail',100,4,256,1,0,me),b=net.addNode('rail',120,4,256,-1,0,me);
+  const edge=planEdge(g,nodeSnap(g,a.id,'rail'),nodeSnap(g,b.id,'rail'),
+    {kind:'rail',type:'electric',tracks:1,heightOffset:0,crossing:'auto',owner:me});
+  check(edge.ok&&!commitProposal(g,edge),'yardheight: the real level rail endpoint commits on its native formation');
+  const args=['rail',122.15,256,-Math.PI/2,me] as const;
+  const data=JSON.stringify(serialize(g));
+  const prospective=deserialize(JSON.parse(data));
+  // A prospective endpoint's incoming track is not an existing clearance obstacle. Retain the exact
+  // shaped terrain in this comparison world while omitting that one already-validated incoming rail.
+  for(const id of [...prospective.world.net.edges.keys()])prospective.world.net.removeEdge(id);
+  const preview=prospective.depots.plan(...args,{snap:false,y:4}),actual=g.depots.plan(...args);
+  const legacy=prospective.depots.plan(...args,{snap:false});
+  check(preview.ok&&actual.ok&&preview.y===4&&actual.y===4&&preview.cost===actual.cost,
+    'yardheight: nonflat native preview and snapped depot agree on rail height and price');
+  check(legacy.y>preview.y,'yardheight: default unsnapped planning retains its terrain height');
+  check(JSON.stringify(serialize(g))===data,'yardheight: endpoint height preview and comparison are pure');
+  const before=g.company(me).economy.thisYear.construction;preview.snapNode=b.id;
+  check(!g.depots.commit('rail',preview,me)&&g.depots.get(g.depots.nextId-1)?.y===4
+    &&before-g.company(me).economy.thisYear.construction===preview.cost,
+    'yardheight: committed native depot uses the exact preview height and paid price');
+  const {g:steep,me:owner}=flat();
+  const high=steep.depots.plan('rail',180,256,0,owner,{snap:false,y:1});
+  check(!high.ok&&high.error==='Ground is too steep','yardheight: a planned surface endpoint beyond the native terrain tolerance rejects');
+}
+
+if (run('yardclearance')) {
+  console.log('yardclearance: prospective native widths and the candidate depot level match real collision checks');
+  for (const level of ['ground', 'underground'] as const) {
+    const { g, me } = flat(), net = g.world.net;
+    const p = g.stations.planRail(328, 256, Math.PI / 2, 7, 2, me,
+      { trackType: 'electric', mode: 'lightrail', level, style: 'none', depth: 2.2 });
+    // This light-rail operator permits the native surface ramp but declines a short cavern branch.
+    // A metro continues to use the separate strict underground opening/growth checks.
+    const ok = (q: ReturnType<typeof planEdge>) => q.demolish.length === 0
+      && (level !== 'underground' || q.stats.len <= 5 || q.stats.len > 20);
+    const seen: ReturnType<typeof planEdge>[] = [];
+    const quote = planProspectiveTerminusYard(g, me, p, 'front', q => { if (ok(q)) seen.push(q); return ok(q); });
+    check(p.ok && !!quote && !quote.under, 'yardclearance: a native surface yard exists at the planned light-rail terminus');
+    if (!quote) continue;
+    const ramp = seen.find(q => q.tracks.some(t => Math.hypot(t.end.x - quote.x, t.end.z - quote.z) < 0.01))!;
+    const t = ramp.tracks[0], data = JSON.stringify(serialize(g));
+    if (level === 'underground') {
+      const metro = g.stations.planRail(328, 256, Math.PI / 2, 7, 2, me,
+        { trackType: 'electric', mode: 'metro', level, style: 'none', depth: 2.2 });
+      check(metro.ok && !planProspectiveTerminusYard(g, me, metro, 'front', ok),
+        'yardclearance: a subway refuses a surface depot when its cavern consent is absent');
+      const metroWorld = deserialize(JSON.parse(data)), mid = metroWorld.stations.nextId;
+      check(!metroWorld.stations.commitRail(metro, me)
+        && !planTerminusYard(metroWorld, me, metroWorld.stations.get(mid)!, 'front', null, ok),
+        'yardclearance: the real subway terminus retains the same strict underground depot rule');
+      const d = bezDeriv(t.bez, 1), l = Math.hypot(d.x, d.z), x = quote.x + d.x / l * 2.15, z = quote.z + d.z / l * 2.15;
+      // This native viaduct clears the underground volume but crosses the surface depot building.
+      const block = planEdge(g, { kind: 'free', x: x - 1, z, y: 4 }, { kind: 'free', x: x + 1, z, y: 4 },
+        { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 1.5, crossing: 'auto', owner: me });
+      const altered = planProspectiveTerminusYard(g, me, p, 'front', ok, [p], [block]);
+      check(block.ok && (!altered || [altered.x, altered.z].join() !== [quote.x, quote.z].join()),
+        'yardclearance: an underground terminus uses surface clearance for its actual surface depot candidate');
+      const native = deserialize(JSON.parse(data));
+      check(!commitProposal(native, block), 'yardclearance: the surface obstruction is legal native viaduct');
+      const dp = native.depots.plan('rail', x, z, Math.atan2(-d.x / l, -d.z / l), me, { snap: false, y: 4 });
+      check(!dp.ok && dp.error === 'Track or road in the way', 'yardclearance: native surface depot rejects the same above-track obstruction');
+    } else {
+      const c = bezPoint(t.bez, 0.5), d = bezDeriv(t.bez, 0.5), l = Math.hypot(d.x, d.z), ux = d.x / l, uz = d.z / l;
+      for (const [kind, type, shift, legal] of [['road', 'street', 0.71, false], ['rail', 'electric', 0.5, true]] as const) {
+        const x = c.x - uz * shift, z = c.z + ux * shift;
+        const block = planEdge(g, { kind: 'free', x: x - ux * 4, z: z - uz * 4, y: 4 },
+          { kind: 'free', x: x + ux * 4, z: z + uz * 4, y: 4 },
+          { kind, type, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
+        const altered = planProspectiveTerminusYard(g, me, p, 'front', ok, [p], [block]);
+        const same = !!altered && [altered.x, altered.z].join() === [quote.x, quote.z].join();
+        check(block.ok && same === legal, `yardclearance: ${kind} uses its actual native horizontal clearance`);
+        const native = deserialize(JSON.parse(data));
+        check(!commitProposal(native, block), `yardclearance: the neighbouring ${kind} commits natively`);
+        const actual = native.world.net.withTemporaryNodes('rail', [{ x: quote.fx, y: quote.y, z: quote.fz, dx: 1, dz: 0 }], me,
+          ns => planEdge(native, nodeSnap(native, ns[0].id, 'rail'), { kind: 'free', x: quote.x, z: quote.z, y: 4 }, ramp.opts));
+        check(actual.ok === legal && (legal || actual.errors.includes('Too close to existing road')),
+          `yardclearance: the real ${kind} neighbour independently yields the same ramp feasibility`);
+      }
+    }
+    check(JSON.stringify(serialize(g)) === data, 'yardclearance: candidate-level and width previews preserve the entire saved state');
+  }
+}
+
+if (run('yardquote')) {
+  console.log('yardquote: native prospective depot search rejects the blocked terminus before spending');
+  for (const [x, level, nonflat] of [[293, 'ground', false], [328, 'ground', false], [328, 'elevated', false], [328, 'underground', false], [328, 'ground', true]] as const) {
+    const { g, me } = presholm('east', 'old', 2, 4500);
+    if(nonflat)g.world.setVertex(345,242,4.4);
+    const p = g.stations.planRail(x, 256, Math.PI / 2, 7, 2, me, { trackType: 'electric', mode: 'lightrail', level, style: 'shelter', depth: 2.2, height: 1.5 });
+    check(p.ok, `yardquote: unchanged district permits the platform at ${x}`);
+    if (!p.ok) continue;
+    const consent = (world: Game) => (q: ReturnType<typeof planEdge>) => q.demolish.length === 0
+      && q.tracks.every(t => [t.start, t.end].every(s => s.kind !== 'node' || world.world.net.nodes.has(s.node!)));
+    const ok = consent(g);
+    const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+    const quote = planProspectiveTerminusYard(g, me, p, 'front', ok);
+    const replay = planProspectiveTerminusYard(loaded, me, p, 'front', consent(loaded));
+    check(JSON.stringify(serialize(g)) === data && JSON.stringify(serialize(loaded)) === data,
+      `yardquote: ${level} ${x} preview preserves allocators, terrain, assets, funds and exact saved state`);
+    check(JSON.stringify(quote) === JSON.stringify(replay), `yardquote: ${level} ${x} native quote is exact after loading`);
+    console.log(`  terminus ${level} ${x}: ${quote ? JSON.stringify(quote) : 'no legal yard'}`);
+    if (x === 293) { check(!quote, 'yardquote: the blocked first terminus has no paid depot plan'); continue; }
+    check(!!quote, 'yardquote: the genuine two-stop terminus has a legal priced yard');
+    if (!quote) continue;
+    if(level==='ground'&&!nonflat) {
+      // A short native link can cross between a sparse depot-footprint sampling grid's rows.
+      const block=planEdge(g,{kind:'free',x:344.17049,z:242.90041,y:4},{kind:'free',x:346.43279,z:242.48566,y:4},
+        {kind:'rail',type:'electric',tracks:1,heightOffset:0,crossing:'auto',owner:me});
+      check(block.ok,'yardquote: the narrow prospective depot obstruction is itself legal native rail');
+      const altered=planProspectiveTerminusYard(g,me,p,'front',ok,[p],[block]);
+      check(!altered||[altered.x,altered.z].join()!==[quote.x,quote.z].join(),
+        'yardquote: a native link crossing between footprint rows excludes the whole original depot rectangle');
+      check(JSON.stringify(serialize(g))===data,'yardquote: prospective obstruction rejection remains pure');
+      const obstructed=deserialize(JSON.parse(data));
+      check(!commitProposal(obstructed,block),'yardquote: the obstruction commits through the native rail planner');
+      const native=obstructed.depots.plan('rail',345.11230,241.66025,0.18132,me,{snap:false});
+      check(!native.ok&&native.error==='Track or road in the way','yardquote: native committed clearance independently rejects that footprint');
+    }
+    const id = g.stations.nextId;
+    check(!g.stations.commitRail(p, me), 'yardquote: native platform commits');
+    const st = g.stations.get(id)!;
+    const real = planTerminusYard(g, me, st, 'front', null, ok);
+    check(!!real && [real.fx, real.fz, real.y, real.x, real.z].join() === [quote.fx, quote.fz, quote.y, quote.x, quote.z].join() && quote.cost >= real.cost,
+      'yardquote: committed platform uses the same heads, ramp and depot with a conservative native quote');
+    if (!real) continue;
+    const eco = g.company(me).economy, cash = eco.money;
+    eco.money = 0;
+    const poor = JSON.stringify(serialize(g));
+    check(buildTerminusYard(g, me, real, ok) < 0 && JSON.stringify(serialize(g)) === poor,
+      'yardquote: insufficient funds reject every yard component before spending or allocating');
+    eco.money = cash;
+    const rejected = JSON.stringify(serialize(g));
+    check(buildTerminusYard(g, me, real, q => ok(q) && q.stats.len <= 5) < 0 && JSON.stringify(serialize(g)) === rejected,
+      'yardquote: ramp consent rejection leaves the tail, depot and paid assets untouched');
+    const continuation = deserialize(JSON.parse(rejected));
+    const before = eco.thisYear.construction, e0 = g.world.net.nextEdge;
+    const depot = buildTerminusYard(g, me, real, ok);
+    const replayDepot = buildTerminusYard(continuation, me, real, consent(continuation));
+    let exact = replayDepot === depot && JSON.stringify(serialize(g)) === JSON.stringify(serialize(continuation));
+    for (let tick = 0; tick < 640; tick++) { g.stepTick(); continuation.stepTick(); exact &&= JSON.stringify(serialize(g)) === JSON.stringify(serialize(continuation)); }
+    check(exact, 'yardquote: actual native construction and service replay exactly for 640 ticks');
+    const actual = before - g.company(me).economy.thisYear.construction;
+    const edges = [...g.world.net.edges.values()].filter(e => e.id >= e0 && e.depot < 0);
+    check(depot >= 0 && g.depots.get(depot)?.y===g.world.net.nodes.get(g.depots.get(depot)!.node)?.y,
+      'yardquote: actual depot sits at its attached rail endpoint height, including nonflat ground');
+    check(depot >= 0 && Math.abs(actual - real.cost) < 1 && quote.cost >= actual, `yardquote: actual yard exactly pays its native component quote (${fmt(actual)} / ${real.cost}; prospective ${quote.cost})`);
+    check(Math.abs(edges.reduce((sum, e) => sum + g.edgeMaintenance(e), 0) + depotUpkeep(g.depots.get(depot)!) - quote.upkeep) < 1,
+      'yardquote: native yard track and depot upkeep match the actual assets');
+    check(checkReservations(g).length === 0, 'yardquote: native construction preserves reservations');
+  }
 }
 
 if (run('relocate')) {
