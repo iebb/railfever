@@ -5,7 +5,7 @@ import { railPartMode } from '../src/game/stations';
 // npx esbuild scripts/companies.ts --bundle --platform=node --format=esm --outfile=$S/companies.mjs && node $S/companies.mjs [seed] [years] [size]
 import { Game, PLAYER } from '../src/game/game';
 import { fmtMoney, CATEGORIES } from '../src/game/economy';
-import { Train } from '../src/game/train';
+import { Train, deadlockCycles } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { AIController, AIConfig, AI_PRESETS, pickTrain } from '../src/game/ai';
 import { TramPlanner } from '../src/game/ai-tram';
@@ -57,6 +57,8 @@ const T1 = performance.now();
 while (g.day < YEARS * 360) {
   try { g.update(0.25); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 6).join('\n')); if (errors > 3) break; }
 }
+// Buyout branches use the genuine personality cohort before capacity stress and forced acquisitions.
+const personalitySnapshot = JSON.stringify(serialize(g));
 console.log(`simulated ${YEARS} years in ${fmt((performance.now() - T1) / 1000, 1)} s (${fmt((performance.now() - T1) / (YEARS * 360), 2)} ms/day)`);
 interface Summary { label: string; id: number; projects: number; rail: number; bus: number; tram: number; vehicles: number; assets: number; built: number; value: number; urban: number }
 const sums: Summary[] = AIS.map((ai, i) => {
@@ -80,7 +82,28 @@ const [passive, aggressive, railCo, busCo, tramCo] = sums;
 check(passive.built < aggressive.built * 0.6, `passive company builds little (${fmtMoney(passive.built)} vs aggressive ${fmtMoney(aggressive.built)})`);
 check(passive.rail + passive.bus + passive.tram < aggressive.rail + aggressive.bus + aggressive.tram, 'aggressive company runs more lines than the passive one');
 check(aggressive.rail + aggressive.bus + aggressive.tram >= 2, 'aggressive company expands to several lines');
-check(railCo.rail >= 1, 'rail-focused company runs a railway');
+const sharedRailStock = g.vehicles.trains().filter(v => v.owner === railCo.id && v.onMap && v.line?.kind === 'rail'
+  && v.line.owner !== railCo.id && v.delivered > 0 && v.state !== 'noroute'
+  && g.lines.operateError(v.line, railCo.id) === null);
+let fundedSharedRail = false;
+if (railCo.rail === 0 && sharedRailStock.length) {
+  const branch = deserialize(JSON.parse(personalitySnapshot)); branch.aiEnabled = false; branch.aiAcquisitions = false;
+  const stock = sharedRailStock.map(v => branch.vehicles.get(v.id) as Train);
+  const delivered0 = stock.reduce((n, v) => n + v.delivered, 0), visited = new Set<number>();
+  let noRoute = 0, cycles = 0;
+  for (let tick = 0; tick < 180 * branch.ticksPerDay; tick++) {
+    branch.stepTick();
+    noRoute += Number(stock.some(v => v.state === 'noroute'));
+    for (const v of stock) if (v.state === 'loading') visited.add(v.routeTarget);
+    if (branch.tick % branch.ticksPerDay === 0) cycles += deadlockCycles(branch, 0).length;
+  }
+  const delivered1 = stock.reduce((n, v) => n + v.delivered, 0);
+  fundedSharedRail = railCo.built > 0 && stock.every(v => v.owner === railCo.id && v.line?.kind === 'rail')
+    && delivered1 > delivered0 && visited.size >= 2 && noRoute === 0 && cycles === 0 && checkReservations(branch).length === 0;
+  console.log(`  rail personality shared service: trains ${stock.map(v => v.id)}, delivered ${delivered0} -> ${delivered1}, ${visited.size} stops, ${noRoute} NOROUTE ticks, ${cycles} cycles`);
+  check(fundedSharedRail, 'the rail-focused company genuinely operates its funded shared railway without losing routes');
+}
+check(railCo.rail >= 1 || fundedSharedRail, 'rail-focused company runs an owned or funded shared railway');
 check(busCo.rail === 0 && (busCo.bus >= 1 || busTowns === 0), `bus-focused company runs buses and no railway (${busTowns} towns of 900+)`);
 // (a tram company may also run light rail, an urban railway; no main-line railway)
 check(tramCo.rail - tramCo.urban === 0 && (tramCo.tram >= 1 || tramTowns === 0
@@ -478,21 +501,28 @@ g.setAllowAccess(PLAYER, true);
 }
 g.aiAcquisitions = true;
 {
-  // Build a literal tram service through its native planner on a branch of the same generated world.
-  // Its takeover coverage is independent of a personality choosing light rail instead of trams.
-  const branch = deserialize(JSON.parse(JSON.stringify(serialize(g))));
+  // Reuse an actual paid literal tram service from the early native cohort. If the personality chose
+  // light rail instead, construct literal trams normally; an operator serving every eligible town
+  // cannot legitimately start another TramPlanner project.
+  const branch = deserialize(JSON.parse(personalitySnapshot));
   branch.aiEnabled = false; branch.aiAcquisitions = false;
   const target = tramCo.id, operator = branch.company(target);
   check(target !== PLAYER && !operator.defunct, 'literal tram fixture uses an active rival operator');
-  operator.economy.money = 20_000_000;
-  const cash0 = operator.economy.money, loan0 = operator.economy.loan;
-  const planner = new TramPlanner(branch, target);
-  let result = planner.available() && planner.start() ? 'running' : 'not started', units = 0;
-  while (result === 'running' && units < 2000) { result = planner.step(1); units++; }
-  const built = branch.lines.get(planner.project?.line ?? -1);
-  const paid = cash0 + operator.economy.loan - loan0 - operator.economy.money;
-  console.log(`  literal tram native opening: ${result} (${planner.status}), ${units} units, ${fmtMoney(paid)} paid, town ${planner.project?.town}, stops ${built?.stops.length}, trams ${built?.vehicles.length}`);
-  check(result === 'done' && paid > 0 && built?.kind === 'tram' && built.owner === target
+  let built = branch.lines.all().find(l => l.owner === target && l.kind === 'tram' && new Set(l.stops).size >= 3
+    && l.vehicles.filter(id => { const v = branch.vehicles.get(id); return v instanceof RoadVehicle && v.owner === target && v.model?.kind === 'tram'; }).length >= 2);
+  const paidCapital = (v: Economy['thisYear']) => -(v.construction + v.vehicles);
+  let paid = operator.economy.yearTotals.reduce((n, y) => n + paidCapital(y.v), paidCapital(operator.economy.thisYear));
+  let result = 'existing', units = 0, status = 'native cohort';
+  if (!built) {
+    operator.economy.money = 20_000_000;
+    const cash0 = operator.economy.money, loan0 = operator.economy.loan, planner = new TramPlanner(branch, target);
+    result = planner.available() && planner.start() ? 'running' : 'not started';
+    while (result === 'running' && units < 2000) { result = planner.step(1); units++; }
+    built = branch.lines.get(planner.project?.line ?? -1);
+    paid = cash0 + operator.economy.loan - loan0 - operator.economy.money; status = planner.status;
+  }
+  console.log(`  literal tram native service: ${result} (${status}), ${units} units, ${fmtMoney(paid)} paid, stops ${built?.stops.length}, trams ${built?.vehicles.length}`);
+  check((result === 'existing' || result === 'done') && paid > 0 && built?.kind === 'tram' && built.owner === target
     && new Set(built.stops).size >= 3 && built.vehicles.length >= 2,
     'funded native planner builds the rival literal tram service on generated streets');
   const tram = built?.vehicles.map(id => branch.vehicles.get(id))

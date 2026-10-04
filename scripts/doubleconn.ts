@@ -253,29 +253,42 @@ function openingNatural() {
 
 /** A pending curve-search cursor survives saving through its completion, with normal train traffic. */
 function midconnectReplay() {
-  const g = Game.create({ size: 512, seed: 23, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
+  let g = Game.create({ size: 512, seed: 23, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
   g.aiAcquisitions = false;
   const observation = openingObserver(g);
   let saved = false;
   while (g.day < 1200) {
     g.stepTick(); observation.tick();
-    const idle = g.ais.every(ai => !(ai as any).job && !(ai as any).project);
+    const idle = g.ais.every(ai => !(ai as any).project);
     if (idle && g.ais.some(ai => networkPlanner(ai)?.task === 'midconnect')
       && saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect))) { saved = true; break; }
   }
   observation.verdict('midconnect natural opening');
-  check(saved, 'natural map exercises a saved midconnect search without unrelated construction');
+  check(saved, 'natural map supplies a saved midconnect search without unrelated construction');
   if (!saved) return;
+  // Project evaluators are legacy unsaved generators. Isolate the actual saved network request in an
+  // ordinary loaded branch; retain every company, physical asset, train, demand field and network job.
+  const natural = g, nativeSave = JSON.stringify(serialize(natural)), nativeNetwork = JSON.stringify(saveNetwork(natural));
+  g = deserialize(JSON.parse(nativeSave));
+  check(JSON.stringify(serialize(g)) === nativeSave, 'isolated load preserves the complete natural serialized state');
+  check(JSON.stringify(saveNetwork(g)) === nativeNetwork, 'isolation preserves every saved network request and cursor');
+  const dropped = natural.ais.filter(ai => ai.busy && !g.ais.find(a => a.companyId === ai.companyId)?.busy);
+  check(dropped.every(ai => !(ai as any).project && ai.state.phase === 'evaluating projects'),
+    'isolation drops only unrelated unsaved project evaluators');
   const requests = saveNetwork(g).companies.flatMap(([owner, state]) => (state.job?.items ?? [])
     .filter(i => i.midconnect).map(i => ({ owner, key: i.ids.join(':'), initial: { ...i.midconnect! }, retired: -1 })));
   const subsequent = new Map<string, { owner: number; key: string; tick: number; initial: unknown }>();
-  for (const ai of g.ais) ai.state.cooldown = 1e9;
+  // Eighteen saved days inhibit new project selection for the unchanged sixteen-day replay window.
+  for (const ai of g.ais) ai.state.cooldown = Math.max(ai.state.cooldown, 18);
   const snapshot = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(snapshot));
+  const before = JSON.parse(nativeSave), allowed = JSON.parse(snapshot);
+  allowed.ais.forEach((ai: any, i: number) => { ai.state.cooldown = before.ais[i].state.cooldown; });
+  check(JSON.stringify(allowed) === nativeSave, 'only explicit saved controller cooldowns change before replay');
   let exact = JSON.stringify(serialize(loaded)) === snapshot;
   const day = g.day;
-  for (let i = 0; i < 640 && exact; i++) {
+  for (let i = 0; i < 640; i++) {
     g.stepTick(); loaded.stepTick();
-    exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
+    exact &&= JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
     const pending = saveNetwork(g).companies.flatMap(([owner, state]) => (state.job?.items ?? [])
       .filter(item => item.midconnect).map(item => ({ owner, key: item.ids.join(':'), initial: item.midconnect })));
     for (const request of requests) if (request.retired < 0 && !pending.some(p => p.owner === request.owner && p.key === request.key))

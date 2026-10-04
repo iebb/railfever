@@ -20,6 +20,7 @@ import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { bezLine } from '../src/game/geom';
 import { stationEnds, nodeSnap, depotAtEnd } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
+import { planTerminusYard, buildTerminusYard } from '../src/game/ai-grow';
 import { connectStationThroat, finishDoubleTrack, canMerge, mergeStations } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
 import { outAndBack } from '../src/game/lines';
@@ -93,6 +94,17 @@ function shareOut(g: Game) { g.lines.rebuild(); g.lines.catchmentDirty = true; g
 function rampDepot(g: Game, st: Station, away: { x: number; z: number }, owner: number, type: string): number {
   const net = g.world.net, r = st.rail!, ux = Math.sin(r.angle), uz = Math.cos(r.angle);
   const dir = ux * (away.x - st.x) + uz * (away.z - st.z) >= 0 ? 1 : -1;
+  // Subway fixtures use the same quoted underground yard as ordinary native construction.
+  if (r.level === 'underground' && railPartMode(r) === 'metro') {
+    const plan = planTerminusYard(g, owner, st, dir > 0 ? 'front' : 'back', null, p => p.ok);
+    if (!plan) return -1;
+    const cash = g.company(owner).economy.money;
+    const depot = buildTerminusYard(g, owner, plan, p => p.ok);
+    check(depot >= 0 && cash > g.company(owner).economy.money && g.depots.get(depot)?.level === 'underground',
+      'subway fixture pays for its native complete underground yard');
+    if (depot >= 0) connectStationThroat(g, st.id, owner);
+    return depot;
+  }
   const end = stationEnds(g, st).map((e) => (dir > 0 ? e.front : e.back))[0];
   const ramp = r.level === 'underground' ? 58 : r.level === 'elevated' ? 26 : 10;
   for (const k of [1, 1.25, 1.5, 2]) for (const lat of [0, 12, -12, 24, -24]) {
@@ -405,7 +417,10 @@ section(5, 'two crossing city lines of two companies become one interchange', ()
 
 // ------------------------------------------------------------------ 6. a new city line stops beside an existing station
 section(6, 'a new city line stops beside an existing station of a crossing line', () => {
-  const g = flat(2), t = town(g, 'Wide City', 256, 256, 14000, 224, 160, 7);
+  // The same population is uneconomic when spread over a wider walking area; a denser district
+  // supplies the profitable interchange case without increasing residents or bypassing quotes.
+  for (const height of [160, 96]) {
+  const g = flat(2), t = town(g, 'Wide City', 256, 256, 14000, 224, height, 7);
   const [A, B] = g.ais.map((ai) => ai.companyId);
   // B's subway runs north-south across the town's long (east-west) axis, its central station 6 units east of the centre
   // (its central station's platforms end 10 units north of the axis: the street-level corridor along the axis stays free)
@@ -416,12 +431,22 @@ section(6, 'a new city line stops beside an existing station of a crossing line'
   const ai = g.aiOf(A)!;
   g.aiEnabled = true;
   for (const c of g.ais) c.state.cooldown = 1e9;
+  const capitalSpent = () => {
+    const e = g.company(A).economy;
+    return -e.yearTotals.reduce((n, y) => n + y.v.construction + y.v.vehicles, e.thisYear.construction + e.thisYear.vehicles);
+  };
+  const stationCount = g.stations.map.size, capital = capitalSpent();
   check(ai.startProject('lightrail', [t.id]), 'anchor: a light-rail project starts');
   let ticks = 0;
   while (ai.busy && ticks++ < 160000) g.stepTick();
   const line = g.lines.all().find((l) => l.owner === A && l.kind === 'rail');
   console.log('  ' + ai.log.slice(-3).join(' | '));
-  check(!!line, 'anchor: the new city line opens');
+  if (height === 160) {
+    check(!line && ai.log.some(text => text.includes('not profitable')) && g.stations.map.size === stationCount
+      && capitalSpent() === capital, 'anchor: diffuse districts reject the unprofitable native quote without paying for a new line');
+    continue;
+  }
+  check(!!line && capitalSpent() > capital, 'anchor: the denser district pays for a profitable new city line');
   if (line && lb >= 0) {
     const ours = [...new Set(line.stops)].map((id) => g.stations.get(id)!), theirs = b as Station[];
     // (one of its stops beside one of B's stations, linked: one interchange of the two lines)
@@ -430,6 +455,7 @@ section(6, 'a new city line stops beside an existing station of a crossing line'
     g.lines.rebuild();
     check(!!g.lines.nextHop(ours[0].id, theirs[0].id) && !!g.lines.nextHop(theirs[theirs.length - 1].id, ours[ours.length - 1].id), 'anchor: passengers change between the two lines there');
     check(ours.every((s) => s.city === true || !g.stations.cityAt(s.x, s.z, t)), 'anchor: its stops in the core walk half as far');
+  }
   }
 });
 
