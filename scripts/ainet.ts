@@ -1305,7 +1305,8 @@ function stateChecks() {
   timers.companies[0][1].demand = { day: 119, nt: 2, P: [0, 1 / 3, Math.PI, 0] };
   loadNetwork(g, timers);
   const state = saveNetwork(g), data = JSON.parse(JSON.stringify(serialize(g))), loaded = deserialize(data);
-  check(state.companies[0][1].next.length === 16 && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
+  check(state.companies[0][1].next.length === 17 && state.companies[0][1].next.some(([task]) => task === 'citylink')
+    && state.companies[0][1].care.length > 0 && state.companies[0][1].sizes.length > 0
     && state.companies[0][1].retire.length > 0, 'save: schedules, cooldowns, station changes and removal grace are populated');
   check(state.companies[0][1].sizes[0][1].day === 120, 'save: station growth cooldown retains the day of the actual change');
   check(JSON.stringify(state) === JSON.stringify(saveNetwork(loaded)), 'save: planner fields round-trip exactly through JSON');
