@@ -16,6 +16,11 @@ export interface VehicleModel {
   retire: number;
   speed: number;     // km/h
   capacity: number;  // passengers (emu: the whole unit)
+  /**
+   * Room for mail in units of MAIL_UNIT_T (0.1 t; emu: the whole unit). Mail vans (wagons), mail vans and trucks
+   * (road), postbuses (seats and a mail compartment) and the postal multiple unit carry mail; none: no mail.
+   */
+  mail?: number;
   power: number;     // kW (emu: the whole unit)
   weight: number;    // tonnes (emu: the whole unit)
   cost: number;      // emu: the whole unit
@@ -84,6 +89,10 @@ export const MODELS: VehicleModel[] = [
   { id: 'coach_steel', name: 'Steel Coach', kind: 'wagon', intro: 1935, retire: 1995, speed: 150, capacity: 56, power: 0, weight: 32, cost: 110_000, running: 9_000, length: 2.3, style: 'coach_steel', traction: 'none', color: 0x2e5e3e },
   { id: 'coach_ic', name: 'InterCity Coach', kind: 'wagon', intro: 1975, retire: 2060, speed: 200, capacity: 64, power: 0, weight: 35, cost: 175_000, running: 12_000, length: 2.6, style: 'coach_ic', traction: 'none', color: 0xf2f2f2 },
   { id: 'coach_hs', name: 'Velocity Coach', kind: 'wagon', intro: 1998, retire: 2100, speed: 300, capacity: 72, power: 0, weight: 38, cost: 260_000, running: 16_000, length: 2.5, style: 'coach_hs', traction: 'none', color: 0xeeeeee },
+  // mail vans: coupled behind the locomotive, ahead of the coaches (a train may run with vans only: a mail train)
+  { id: 'van_wood', name: 'Wooden Mail Van', kind: 'wagon', intro: 1870, retire: 1955, speed: 100, capacity: 0, mail: 40, power: 0, weight: 20, cost: 50_000, running: 5_000, length: 1.7, style: 'van_wood', traction: 'none', color: 0x7b2a24 },
+  { id: 'van_steel', name: 'Steel Mail Van', kind: 'wagon', intro: 1935, retire: 1995, speed: 150, capacity: 0, mail: 60, power: 0, weight: 28, cost: 95_000, running: 7_500, length: 2.3, style: 'van_steel', traction: 'none', color: 0x8c2a2a },
+  { id: 'van_ic', name: 'InterCity Mail Van', kind: 'wagon', intro: 1975, retire: 2060, speed: 200, capacity: 0, mail: 80, power: 0, weight: 32, cost: 150_000, running: 10_000, length: 2.6, style: 'van_ic', traction: 'none', color: 0xc8202c },
 
   { id: 'bus_a', name: 'Classic Omnibus', kind: 'bus', intro: 1920, retire: 1975, speed: 55, capacity: 30, power: 60, weight: 6, cost: 90_000, running: 14_000, length: 1.0, style: 'bus_old', traction: 'diesel', color: 0xc0392b },
   { id: 'bus_b', name: 'City Liner', kind: 'bus', intro: 1958, retire: 2010, speed: 75, capacity: 45, power: 150, weight: 10, cost: 145_000, running: 20_000, length: 1.2, style: 'bus', traction: 'diesel', color: 0x2d7dd2 },
@@ -95,6 +104,13 @@ export const MODELS: VehicleModel[] = [
   { id: 'coach_b', name: 'Highway Cruiser', kind: 'bus', intro: 1960, retire: 2005, speed: 100, capacity: 45, power: 210, weight: 12, cost: 240_000, running: 30_000, length: 1.25, style: 'coach', traction: 'diesel', color: 0x3a6ea5 },
   { id: 'coach_c', name: 'Express Liner', kind: 'bus', intro: 1990, retire: 2050, speed: 110, capacity: 50, power: 290, weight: 14, cost: 340_000, running: 35_000, length: 1.3, style: 'coach', traction: 'diesel', color: 0xd35400 },
   { id: 'coach_d', name: 'Skyline Express', kind: 'bus', intro: 2010, retire: 2100, speed: 120, capacity: 55, power: 340, weight: 15, cost: 430_000, running: 39_000, length: 1.4, style: 'coach', traction: 'diesel', color: 0x6c3483 },
+  // mail by road: mail vans and trucks (mail only), and postbuses (seats and a mail compartment) on rural routes
+  { id: 'mailvan_a', name: 'Post Van', kind: 'bus', intro: 1920, retire: 1965, speed: 55, capacity: 0, mail: 8, power: 40, weight: 2.5, cost: 55_000, running: 8_000, length: 0.8, style: 'bus_old', traction: 'diesel', color: 0xb3261e },
+  { id: 'mailtruck_b', name: 'Mail Truck', kind: 'bus', intro: 1955, retire: 2005, speed: 80, capacity: 0, mail: 30, power: 110, weight: 6, cost: 110_000, running: 14_000, length: 1.0, style: 'bus', traction: 'diesel', color: 0xc0392b },
+  { id: 'mailtruck_c', name: 'Parcels Truck', kind: 'bus', intro: 1990, retire: 2100, speed: 90, capacity: 0, mail: 40, power: 180, weight: 8, cost: 160_000, running: 18_000, length: 1.15, style: 'bus', traction: 'diesel', color: 0xd4202a },
+  { id: 'mailvan_d', name: 'e-Post Van', kind: 'bus', intro: 2015, retire: 2100, speed: 90, capacity: 0, mail: 10, power: 90, weight: 3.5, cost: 95_000, running: 8_000, length: 0.65, style: 'bus_modern', traction: 'electric', color: 0xe8b80c },
+  { id: 'postbus_a', name: 'Alpine Postbus', kind: 'bus', intro: 1925, retire: 1985, speed: 70, capacity: 24, mail: 5, power: 75, weight: 6, cost: 120_000, running: 17_000, length: 1.0, style: 'coach', traction: 'diesel', color: 0xf2c200 },
+  { id: 'postbus_b', name: 'Postbus', kind: 'bus', intro: 1980, retire: 2100, speed: 100, capacity: 40, mail: 10, power: 220, weight: 12, cost: 260_000, running: 30_000, length: 1.25, style: 'coach', traction: 'diesel', color: 0xf6c700 },
 
   // trams: run on road edges with tram tracks (edge.tram), bought at tram depots; styles for the renderer
   { id: 'tram_a', name: 'Electric Streetcar', kind: 'tram', intro: 1890, retire: 1955, speed: 40, capacity: 48, power: 60, weight: 14, cost: 130_000, running: 15_000, length: 1.6, style: 'tram_early', traction: 'electric', color: 0x9b2d20, sections: 1 },
@@ -112,6 +128,8 @@ export const MODELS: VehicleModel[] = [
   { id: 'emu_a', name: 'Commuter EMU (4 cars)', kind: 'emu', intro: 1962, retire: 2010, speed: 110, capacity: 320, power: 1900, weight: 150, cost: 1_350_000, running: 80_000, length: 6.4, style: 'emu_60s', traction: 'electric', color: 0x6a8f3a, unitCars: 4, tracks: ALL_RAIL_TRACKS },
   { id: 'emu_b', name: 'Suburban EMU (6 cars)', kind: 'emu', intro: 1985, retire: 2040, speed: 120, capacity: 500, power: 3300, weight: 215, cost: 2_200_000, running: 110_000, length: 9.6, style: 'emu_80s', traction: 'electric', color: 0xf0f0ec, unitCars: 6, tracks: ALL_RAIL_TRACKS },
   { id: 'emu_c', name: 'Commuter EMU 2010 (6 cars)', kind: 'emu', intro: 2010, retire: 2100, speed: 130, capacity: 540, power: 3900, weight: 200, cost: 2_800_000, running: 115_000, length: 9.6, style: 'emu_modern', traction: 'electric', color: 0x1b4f72, unitCars: 6, tracks: ALL_RAIL_TRACKS },
+  // postal multiple unit: four powered parcels cars, mail only (main-line electric, 160 km/h)
+  { id: 'mail_emu', name: 'Postal EMU (4 cars)', kind: 'emu', intro: 1995, retire: 2100, speed: 160, capacity: 0, mail: 160, power: 2400, weight: 155, cost: 1_700_000, running: 85_000, length: 6.4, style: 'emu_80s', traction: 'electric', color: 0xc8202c, unitCars: 4, tracks: ALL_RAIL_TRACKS },
   // high-speed trainsets (6 cars) by era: all axles powered, streamlined; electric, on high-speed (or
   // electrified main-line) track. Power for 6 cars of their prototypes; drag low and rising little with length.
   { id: 'hsr_a', name: 'Bullet Express 0 (6 cars)', kind: 'emu', intro: 1964, retire: 2008, speed: 210, capacity: 460, power: 4400, weight: 360, cost: 5_200_000, running: 260_000, length: 11, style: 'hsr_0', traction: 'electric', color: 0xf4f4f0, unitCars: 6, tracks: ALL_RAIL_TRACKS, aero: { nose: 2.0, len: 0.32 } },
@@ -126,9 +144,21 @@ export const MODELS: VehicleModel[] = [
 
 export const MODEL_BY_ID = new Map(MODELS.map((m) => [m.id, m]));
 
-export function availableModels(year: number, kind: ModelKind): VehicleModel[] {
-  return MODELS.filter((m) => m.kind === kind && m.intro <= year && m.retire >= year);
+/**
+ * Models of a kind in service in `year`, in catalogue order. `mail`: false leaves out every model with room for mail
+ * (vans, mail trucks, postbuses, the postal unit: passenger choices such as the AI's and the composer's defaults), true
+ * lists only those; omitted: all.
+ */
+export function availableModels(year: number, kind: ModelKind, mail?: boolean): VehicleModel[] {
+  return MODELS.filter((m) => m.kind === kind && m.intro <= year && m.retire >= year && (mail === undefined || carriesMail(m) === mail));
 }
+
+/** Room for mail (units of MAIL_UNIT_T; 0: none). */
+export function mailRoom(m: VehicleModel): number { return m.mail ?? 0; }
+/** Does the model carry mail? */
+export function carriesMail(m: VehicleModel): boolean { return (m.mail ?? 0) > 0; }
+/** A mail-only model: room for mail and no seats (mail vans and trucks, the postal unit). */
+export function mailOnlyModel(m: VehicleModel): boolean { return m.capacity === 0 && (m.mail ?? 0) > 0; }
 
 /** Track types a rail model may run on (its own list, or heavy rail). */
 export function modelTracks(m: VehicleModel): string[] { return m.tracks ?? HEAVY_RAIL_TRACKS; }

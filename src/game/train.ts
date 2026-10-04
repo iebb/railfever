@@ -3,7 +3,7 @@ import { Vehicle } from './vehicle';
 import type { Game } from './game';
 import type { Depot } from './build-ops';
 import { Curve3, curvePoint, makeCurve, NEdge, NNode } from './network';
-import { KMH_TO_UPS, TRACK_TYPES } from './constants';
+import { KMH_TO_UPS, TRACK_TYPES, MAIL_UNIT_T } from './constants';
 import { curveSpeed } from './construction';
 import { HEAVY_RAIL_TRACKS, aeroOf, auxKwOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
@@ -335,14 +335,22 @@ export class Train extends Vehicle {
   }
 
   get length() { let l = 0; for (const c of this.cars) l += c.length + GAP; return l; }
+  /**
+   * The cars as the train is made up (locomotive first), whichever way round it runs now: `cars` lists them from the
+   * end that leads (AI trains may share one array: the locomotive's end tells, not `reversed`).
+   */
+  get madeUp(): VehicleModel[] { return this.runsBackward ? [...this.cars].reverse() : [...this.cars]; }
+  /** Does the locomotive stand at the tail (the train runs with its cars in reverse of how it was made up)? */
+  get runsBackward(): boolean { const c = this.cars; return c.length > 1 && c[0].kind !== 'loco' && c[c.length - 1].kind === 'loco'; }
   get capacity() { let c = 0; for (const m of this.cars) c += m.capacity; return c; }
+  get mailCapacity() { let c = 0; for (const m of this.cars) c += m.mail ?? 0; return c; }
   get maxSpeedKmh() { let v = Infinity; for (const m of this.cars) v = Math.min(v, m.speed); return v; }
   get maxSpeed() { return this.maxSpeedKmh * KMH_TO_UPS; }
   get speedKmh() { return this.speed / KMH_TO_UPS; }
   get runningCost() { let c = 0; for (const m of this.cars) c += m.running; return c; }
   get onMap() { return this.segs.length > 0; }
   get power() { let p = 0; for (const m of this.cars) p += m.power; return p; }
-  get mass() { let w = 0; for (const m of this.cars) w += m.weight; return w + this.load * 0.075; }
+  get mass() { let w = 0; for (const m of this.cars) w += m.weight; w += this.load * 0.075; return this.mailLoad ? w + this.mailLoad * MAIL_UNIT_T : w; }
 
   private physKey: unknown[] = [];
   private physCache = { aero: 0, aux: 0, driven: 0, accel: 1 };

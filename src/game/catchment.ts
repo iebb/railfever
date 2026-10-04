@@ -514,6 +514,22 @@ class WalkingCache {
 
 const caches = new WeakMap<Game, WalkingCache>();
 function cache(g: Game): WalkingCache { let c = caches.get(g); if (!c) { c = new WalkingCache(g); caches.set(g, c); } return c; }
+// Read-only geometry has its own cache: observing an edit must not consume the simulation's road-dirty trigger.
+const viewCaches = new WeakMap<Game, WalkingCache>();
+function viewCache(g: Game): WalkingCache {
+  let c = viewCaches.get(g);
+  if (!c) { c = new WalkingCache(g); viewCaches.set(g, c); }
+  return c;
+}
+/** Current walking geometry without refreshing saved access or simulation dependencies; optionally omit an entrance. */
+export function readWalkingCatchment(g: Game, st: Station, without = -1): WalkingCatchment {
+  const c = viewCache(g);
+  if (without >= 0) {
+    const points = stationAccess(g, st, without);
+    return c.calculate(`without:${st.id}:${without}`, points, true, { id: st.id, points });
+  }
+  return c.calculate(`station:${st.id}`, c.access(st));
+}
 /** Prepare local caches once for a share update; unchanged regions and station paths survive. */
 export function refreshWalkBuildings(g: Game) { cache(g).refreshBuildings(); }
 export function walkRoadsChanged(g: Game): boolean { return cache(g).roadsChanged(); }
@@ -538,7 +554,7 @@ export function walkingCatchmentWithout(g: Game, st: Station, entrance: number):
  * between these points. Each point snaps to a road within `reach`; `legScale` stretches that walk (a street still to be built
  * rarely runs straight) and `leg` is walked before it.
  */
-export function extraAccessCatchment(g: Game, st: Station, points: { x: number; z: number; reach: number; leg?: number; legScale?: number }[]): WalkingCatchment {
+export function extraAccessCatchment(g: Game, st: Station, points: { x: number; z: number; reach: number; leg?: number; legScale?: number }[], readOnly = false): WalkingCatchment {
   const r = st.rail;
   if (!r) return EMPTY;
   const mode: CatchMode = 'rail', limit = walkLimit(mode, styleOf(r.style).catchBonus), sources: Access[] = [];
@@ -546,15 +562,19 @@ export function extraAccessCatchment(g: Game, st: Station, points: { x: number; 
     const q = snapRoad(g, p.x, p.z, p.reach);
     if (q) sources.push({ ...q, leg: q.leg * (p.legScale ?? 1) + (p.leg ?? 0), mode, limit });
   }
-  return cache(g).calculate(`extra:${st.id}:${sources.map((q) => `${q.edge}:${q.s}:${q.leg}`).join('|')}`, sources, true, { id: st.id, points: sources });
+  return (readOnly ? viewCache(g) : cache(g)).calculate(`extra:${st.id}:${sources.map((q) => `${q.edge}:${q.s}:${q.leg}`).join('|')}`, sources, true, { id: st.id, points: sources });
 }
 /** One entrance's own walking catchment (what its landings reach on their own). */
-export function entranceCatchment(g: Game, st: Station, entrance: number): WalkingCatchment {
+export function entranceCatchment(g: Game, st: Station, entrance: number, readOnly = false): WalkingCatchment {
   const r = st.rail, e = r?.entrances[entrance];
   if (!r || !e) return EMPTY;
   const level = r.level ?? 'ground', k = entranceKind(level, e);
   const reach = level === 'ground' ? landingReach(k) : ENTRANCE_SIZE[level].d / 2 + 0.9;
-  return extraAccessCatchment(g, st, entranceLandings(e).map((p) => ({ x: p.x, z: p.z, reach })));
+  return extraAccessCatchment(g, st, entranceLandings(e).map((p) => ({ x: p.x, z: p.z, reach })), readOnly);
+}
+/** An entrance's geometry for passive views, isolated from the simulation's walking dependencies. */
+export function readEntranceCatchment(g: Game, st: Station, entrance: number): WalkingCatchment {
+  return entranceCatchment(g, st, entrance, true);
 }
 /**
  * Walking catchment of a planned entrance on its own: its landings on a road, or the end of its access street. The

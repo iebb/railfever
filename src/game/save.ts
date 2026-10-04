@@ -24,6 +24,7 @@ import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 import { walkRoadsChanged } from './catchment';
+import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
 const VERSION = 3;
 /** Save formats this build reads (v2: older single-record saves). */
@@ -297,6 +298,8 @@ function baseOf(v: Vehicle) {
     pattern: v.pattern ?? null, holdTime: v.holdTime, ops: [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt], opLast: v.opLast,
     phys: physOf(v),
     spacing: v.spacing,
+    // mail aboard and delivered (only once the vehicle has carried mail: other saves are as before)
+    ...(v.mailCargo.size || v.mailLoad || v.mailDelivered ? { mail: [...v.mailCargo.values()].map((c) => ({ ...c })), mailLoad: v.mailLoad, mailDelivered: v.mailDelivered } : {}),
   };
 }
 /** Energy counters a train's physics keeps between the monthly charges (if it has them). */
@@ -304,7 +307,7 @@ function physOf(v: Vehicle): number[] | null {
   const p = v as unknown as { tractionJ?: number; regenJ?: number; auxJ?: number; km?: number; hours?: number };
   return typeof p.tractionJ === 'number' ? [p.tractionJ, p.regenJ ?? 0, p.auxJ ?? 0, p.km ?? 0, p.hours ?? 0] : null;
 }
-function restoreBase(v: Vehicle, d: any) {
+function restoreBase(g: Game, v: Vehicle, d: any) {
   v.owner = d.owner; v.name = d.name; v.lineId = d.lineId; v.stopIndex = d.stopIndex; restoreCargo(v, d.cargo ?? []);
   v.load = d.load; v.state = d.state; v.status = d.status; v.profitYear = d.profitYear; v.profitLast = d.profitLast;
   v.incomeYear = d.incomeYear; v.boughtDay = d.boughtDay; v.value = d.value; v.stateTime = d.stateTime ?? 0;
@@ -315,6 +318,8 @@ function restoreBase(v: Vehicle, d: any) {
   if (Array.isArray(d.ops)) [v.opSec, v.opDist, v.opJ, v.opBrakeJ, v.opMark, v.opLastSt] = (d.ops as number[]).map((x) => Number(x) || 0);
   else v.opMark = -1;
   v.opLast = d.opLast ? { ...d.opLast } : null;
+  if (Array.isArray(d.mail)) restoreMail(g, v, d.mail);
+  v.mailLoad = Number(d.mailLoad) || 0; v.mailDelivered = Number(d.mailDelivered) || 0;
   if (Array.isArray(d.phys)) {
     const p = v as unknown as Record<string, number>;
     ['tractionJ', 'regenJ', 'auxJ', 'km', 'hours'].forEach((k, i) => { p[k] = Number(d.phys[i]) || 0; });
@@ -389,7 +394,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
-    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON) })),
+    stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON),
+      ...(s.mail ? { mail: stationMailJSON(s.mail) } : {}) })),
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
@@ -397,6 +403,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     lines: [...g.lines.map.values()], linesNextId: g.lines.nextId,
     // ops: line ids merged into others as service patterns; this month's track wear; save format of the ops data
     linesRedirect: [...g.lines.redirect], ops: saveOps(g), opsVersion: 1,
+    // mail's random stream (once mail has used it)
+    ...(g.mail.toJSON() ? { mail: g.mail.toJSON() } : {}),
     vehicles: [...g.vehicles.map.values()].map((v) => (v instanceof Train ? trainOf(v) : roadOf(v as RoadVehicle))),
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
@@ -497,6 +505,7 @@ export function deserialize(d: any): Game {
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;
     const town = { ...rest, buildings: new Set<number>(t.buildings) } as Town;
+    if (t.mail) town.mail = { ...t.mail };
     g.towns.restoreCache(town, growth);
     return town;
   });
@@ -507,6 +516,10 @@ export function deserialize(d: any): Game {
     if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
     for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
+    if (s.mail) {
+      st.mail = restoreStationMail(s.mail);
+      restoreMailQueue(g, st, s.mail.waiting ?? []);
+    }
     g.stations.map.set(st.id, st);
   }
   g.stations.nextId = d.stationsNextId;
@@ -516,6 +529,7 @@ export function deserialize(d: any): Game {
   g.lines.nextId = d.linesNextId;
   for (const [k, r] of (d.linesRedirect ?? []) as [number, { line: number; pattern: number }][]) g.lines.redirect.set(k, { line: r.line, pattern: r.pattern });
   try { loadOps(g, d.ops); } catch (e) { console.warn('Save load: loadOps failed', e); }
+  g.mail.load(d.mail);
   g.firstArrival = new Set(d.firstArrival ?? []);
   g.news = (d.news ?? []).map((n: any) => ({ ...n }));
 
@@ -545,7 +559,7 @@ export function deserialize(d: any): Game {
   const makeRoad = (vd: any): RoadVehicle => {
     const model = vd.model ? MODEL_BY_ID.get(vd.model) ?? null : null;
     const r = new RoadVehicle(g, vd.id, model, vd.depotId, !!vd.ambient, 1);
-    restoreBase(r, vd);
+    restoreBase(g, r, vd);
     r.rng.state = vd.rng; r.style = vd.style; r.tint = vd.tint; r.cruise = vd.cruise; r.ttl = vd.ttl;
     r.speed = vd.speed; r.loadTimer = vd.loadTimer; r.retryTimer = vd.retryTimer; r.junctionWait = vd.junctionWait; r.stuck = vd.stuck;
     r.grade = vd.grade ?? 0; r.gradeTimer = vd.gradeTimer ?? 0; r.retryWait = vd.retryWait ?? 2; r.needsReplan = !!vd.needsReplan;
@@ -567,7 +581,7 @@ export function deserialize(d: any): Game {
     if (vd.type === 'train') {
       const cars = (vd.cars as string[]).map((id) => MODEL_BY_ID.get(id)).filter((m): m is NonNullable<typeof m> => !!m);
       const t = new Train(g, vd.id, cars, vd.depotId);
-      restoreBase(t, vd);
+      restoreBase(g, t, vd);
       t.speed = vd.speed; t.waitTime = vd.waitTime ?? 0; t.retryTimer = vd.retryTimer ?? 0; t.loadTimer = vd.loadTimer ?? 0;
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;

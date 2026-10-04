@@ -58,6 +58,12 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
   let heads: { pid: number; vehicles: number; headway: number }[] = [];
   try { heads = patternHeadways(g, l); } catch { heads = []; }
   const byPat = vehiclesByPattern(g, l);
+  // mail-only vehicles (vehiclesByPattern counts passenger vehicles by default) run apart: their own count and
+  // spacing, the pattern's cycle in the mail table over the mail-only vehicles (patterns.ts spacingSchedule)
+  const mailOnly = new Map<number, number>();
+  for (const [pid, vs] of vehiclesByPattern(g, l, 'mail')) { const n = vs.filter((v) => v.mailOnly).length; if (n) mailOnly.set(pid, n); }
+  let mailHeads: { pid: number; cycle: number }[] = [];
+  if (mailOnly.size) try { mailHeads = patternHeadways(g, l, 'mail'); } catch { mailHeads = []; }
   const apply = (list: ServicePattern[]) => { const err = setPatterns(g, l.id, list); if (err) ui.toast(err, 'bad'); else ui.sound('toggle', { pitch: 1.05 }); after(); };
   const toggle = (j: number, row: number) => {
     const list = copyPatterns(l);
@@ -82,12 +88,14 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
   const head = h('tr', null, h('th', { class: 'st' }, 'Station'), patterns.map((p, j) => {
     const hw = heads.find((x) => x.pid === p.id);
     const n = byPat.get(p.id)?.length ?? 0;
+    const mo = mailOnly.get(p.id) ?? 0, mc = mailHeads.find((x) => x.pid === p.id)?.cycle ?? 0;
     const next = PATTERN_KINDS[(PATTERN_KINDS.indexOf(p.kind) + 1) % PATTERN_KINDS.length];
     const kindCtl = mine
       ? h('button', { class: 'pk ' + p.kind, 'data-tip': `${p.name} — click for ${PATTERN_LABEL[next]}`, 'aria-label': `${p.name}: change kind`, onclick: () => setKind(j, next) }, KIND_SHORT[p.kind])
       : patBadge(p.kind, p.name);
     return h('th', null, h('span', { class: 'svh ' + p.kind }, kindCtl,
-      h('small', { 'data-tip': p.name }, n ? `${n} · ${hw ? minSec(hw.headway) : '—'}` : 'no vehicles'),
+      h('small', { 'data-tip': p.name }, n ? `${n} · ${hw ? minSec(hw.headway) : '—'}` : mo ? null : 'no vehicles'),
+      mo ? h('small', { class: 'svh-mail', 'data-tip': `${mo} mail-only vehicle${mo > 1 ? 's' : ''}${mc > 0 ? `, every ${minSec(mc / mo)}` : ''}` }, icon('mail', 11), `${mo} · ${mc > 0 ? minSec(mc / mo) : '—'}`) : null,
       mine && patterns.length > 1 ? h('button', { class: 'ibtn sm', style: 'width:22px;height:20px', 'data-tip': `Remove ${p.name} (its vehicles run ${patterns[j === 0 ? 1 : 0].name})`, 'aria-label': 'Remove service', onclick: () => { const err = removePattern(g, l.id, p.id); if (err) ui.toast(err, 'bad'); else ui.sound('demolish', { pitch: 1.4 }); after(); } }, icon('close', 12)) : null));
   }));
   const rows = stations.map((sid, k) => {
@@ -128,7 +136,7 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
   // vehicles by pattern (assignment)
   if (patterns.length > 1 && l.vehicles.length) {
     add(body, section('Vehicles per service'), h('div', { class: 'list' }, l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Vehicle => !!v).map((v) =>
-      h('div', { class: 'row' }, h('span', null, v.name, v.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(v.owner).name}`) : null), patternSelect(ui, l, v, after)))));
+      h('div', { class: 'row' }, h('span', { class: 'inline' }, v.name, v.mailOnly ? h('span', { class: 'muted', 'data-tip': 'Mail only' }, icon('mail', 12)) : null, v.owner !== PLAYER ? h('span', { class: 'muted' }, ` · ${g.company(v.owner).name}`) : null), patternSelect(ui, l, v, after)))));
   }
 }
 

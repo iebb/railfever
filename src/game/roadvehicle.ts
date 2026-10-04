@@ -4,7 +4,7 @@ import { holdForSpacing, noteSpacingDeparture } from './patterns';
 import type { Game } from './game';
 import { Depot, tramUsable } from './build-ops';
 import { Curve3, curvePoint, makeCurve, NEdge } from './network';
-import { KMH_TO_UPS, ROAD_TYPES } from './constants';
+import { KMH_TO_UPS, ROAD_TYPES, MAIL_UNIT_T } from './constants';
 import { curveSpeed } from './construction';
 import type { VehicleModel } from './vehicle-types';
 import { closestOnPolyline, segIntersect, Vec3Like } from './geom';
@@ -278,6 +278,7 @@ export class RoadVehicle extends Vehicle {
     return (e: NEdge) => tramUsable(g, e, owner);
   }
   get capacity() { return this.model?.capacity ?? 0; }
+  get mailCapacity() { return this.model?.mail ?? 0; }
   get maxSpeedKmh() { return this.model?.speed ?? 60; }
   get maxSpeed() { return this.cruise; }
   get speedKmh() { return this.speed / KMH_TO_UPS; }
@@ -605,7 +606,7 @@ export class RoadVehicle extends Vehicle {
       this.pointBehind(this.length, B);
       this.grade = this.length > 0.1 ? (A.y - B.y) / this.length : 0;
     }
-    const P = this.model ? this.model.power : 80, M = this.model ? this.model.weight + this.load * 0.075 : 1.4;
+    const P = this.model ? this.model.power : 80, M = this.model ? this.model.weight + this.load * 0.075 + (this.mailLoad ? this.mailLoad * MAIL_UNIT_T : 0) : 1.4;
     const tract = Math.min(1.6, P / (M * Math.max(3, v * 10)));
     const acc = (tract - 0.02) / 10 - G * this.grade;
     if (v < vt) this.speed = Math.min(vt, v + Math.max(acc, 0.01) * dt);

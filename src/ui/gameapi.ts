@@ -7,11 +7,12 @@ import { LINE_PALETTES } from '../game/lines';
 import type { LineKind } from '../game/constants';
 import { AIConfig, DEFAULT_AI_CONFIG, AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import type { DemandView, DemandTown, DemandPair } from '../game/demand';
+import type { MailView } from '../game/mail-view';
 import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, StationOpts, RailMode } from '../game/stations';
 import { CATCHMENT_RADIUS } from '../game/stations';
 import { STATION_STYLES, stylesFor, defaultStationStyle } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
-import { walkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
+import { readWalkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
 import type { WalkingCatchment } from '../game/catchment';
 import type { Overlay } from '../render/overlay';
 
@@ -26,6 +27,21 @@ export function townDemandShare(v: DemandView, t: DemandTown): number {
   let pot = t.local, car = t.local * t.localServed;
   for (const p of v.pairs) if (p.a === t.id || p.b === t.id) { pot += p.potential; car += p.potential * p.served; }
   return pot > 0 ? car / pot : 0;
+}
+
+/** Mail map volumes already use tonnes; retain a decimal for small town flows. */
+export const fmtMailTonnes = (t: number) => t.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 });
+
+/** Town-pair data for the existing demand minimap; mail has no local trips or district choropleth. */
+export function mailDemandView(v: MailView): DemandView {
+  return {
+    towns: v.towns.map((t) => ({
+      id: t.id, x: t.x, z: t.z, pop: t.pop, potential: t.potential, served: t.share, stations: t.stations,
+      generated: 0, transported: 0, local: 0, localServed: 0,
+    })),
+    pairs: v.pairs.map((p) => ({ a: p.a, b: p.b, dist: p.dist, potential: p.potential, served: p.share, mine: 0 })),
+    regions: [], flows: [], maxPotential: v.maxPotential,
+  };
 }
 
 // ------------------------------------------------------------------ lines
@@ -105,7 +121,7 @@ export function catchShapes(g: Game, st: Station, all = false): CatchShape[] { r
 export function catchRadius(mode: CatchMode): number { return CATCHMENT_RADIUS[mode]; }
 /** Actual walking budget, including the grid detour calibration and the building style. */
 export function catchWalkLimit(mode: CatchMode, bonus = 0): number { return CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR; }
-export const catchStreets = walkingCatchment;
+export const catchStreets = readWalkingCatchment;
 export const planCatchStreets = planWalkingCatchment;
 export const catchStreetPop = walkingPopulation;
 /** Independent, mode-coloured (and mode-dashed) street layers; all three are cleared when a preview/view closes. */

@@ -13,7 +13,8 @@ import type { Game } from '../game/game';
 import { availableModels } from '../game/vehicle-types';
 import { findDepot } from './win-info';
 import { chart } from './charts';
-import { fmtPct, fmtMult, KIND_META } from './format';
+import { fmtPct, fmtMult, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail } from './format';
+import type { Vehicle } from '../game/vehicle';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
 import { demandView } from '../game/demand';
@@ -21,6 +22,17 @@ import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, mode
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
+
+/**
+ * A vehicle's load in lists (compact): passengers "12/56", mail only "2.4/6 t", both "12/56 · 2.4 t" (the mail part
+ * muted; it may wrap under the passengers in a narrow table).
+ */
+function loadText(v: Vehicle): Node | string {
+  const room = v.mailCapacity;
+  if (room <= 0) return `${v.load}/${v.capacity}`;
+  if (v.capacity <= 0) return `${tonnes(v.mailLoad)}/${tonnes(room)}\u00a0t`;
+  return h('span', { class: 'loadmix', 'data-tip': `Mail: ${fmtMailLoad(v.mailLoad, room)}` }, `${v.load}/${v.capacity}`, h('span', { class: 'muted' }, ` ·\u00a0${tonnes(v.mailLoad)}\u00a0t`));
+}
 
 /** Does the station offer stops for this transport mode? */
 export function servesKind(g: Game, st: Station, kind: LineKind): boolean {
@@ -52,7 +64,9 @@ export function openLines(ui: UI) {
       add(win.body, h('div', { class: 'pad' }, all.some((l) => l.owner === PLAYER || f.company !== 'mine') ? 'No lines match the filter.' : 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'), sugg);
       return;
     }
-    const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Line'), h('th', { class: 'r' }, 'Stops'), h('th', { class: 'r' }, 'Veh.'), h('th', { class: 'r' }, 'Pax/mo'), h('th', { class: 'r' }, 'Profit (yr)')));
+    // lines with mail show "pax · mail t" last month
+    const anyMail = lines.some((l) => lineCarriesMail(g, l));
+    const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Line'), h('th', { class: 'r' }, 'Stops'), h('th', { class: 'r' }, 'Veh.'), h('th', { class: 'r', 'data-tip': anyMail ? 'Passengers · mail (tonnes) last month' : undefined }, anyMail ? 'Pax · mail/mo' : 'Pax/mo'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const l of lines) {
       const profit = l.incomeYear - l.costYear;
       const cong = congestionOf(g, l.id);
@@ -64,7 +78,8 @@ export function openLines(ui: UI) {
           (l.patterns?.length ?? 0) > 1 ? h('span', { class: 'flag shared', 'data-tip': linePatterns(l).map((p) => p.name).join(' · ') }, `${l.patterns!.length} services`) : null,
           cong && cong.level >= 2 ? h('span', { class: 'neg', 'data-tip': cong.level >= 3 ? 'Trains stuck' : 'Congested' }, icon('warning', 14)) : null,
           l.owner !== PLAYER ? h('span', { class: 'muted' }, `${partner ? 'partner · ' : ''}${g.company(l.owner).name}`) : (l.operators?.length ? h('span', { class: 'flag shared' }, 'shared') : null))),
-        h('td', { class: 'r' }, String(l.stops.length)), h('td', { class: 'r' }, String(l.vehicles.length)), h('td', { class: 'r' }, fmtInt(l.passLast)),
+        h('td', { class: 'r' }, String(l.stops.length)), h('td', { class: 'r' }, String(l.vehicles.length)),
+        h('td', { class: 'r' }, fmtInt(l.passLast), lineCarriesMail(g, l) ? h('span', { class: 'muted' }, ` · ${fmtMail(l.mail?.last ?? 0)}`) : null),
         h('td', { class: 'r ' + (profit < 0 ? 'neg' : 'pos') }, fmtMoney(profit))));
     }
     win.body.appendChild(tbl);
@@ -224,10 +239,12 @@ export function openLine(ui: UI, id: number) {
         customColor(l.autoColor || linePalette(l.kind).some((c) => c.toLowerCase() === l.color.toLowerCase()) ? null : l.color, l.color, (c) => { setLineColor(g, l, c); palette = false; ui.sound('click', { pitch: 1.15 }); changed(); }),
         h('button', { class: 'pal auto' + (l.autoColor ? ' on' : ''), 'data-tip': 'Automatic colour', 'aria-label': 'Automatic colour', 'data-sfx': 'none', onclick: () => { setLineColor(g, l, null); palette = false; ui.sound('click'); changed(); } }, 'A')));
     }
+    const carriesMail = lineCarriesMail(g, l);
     add(win.body, h('div', { class: 'tiles' },
       tile(String(l.stops.length), 'Stops'),
       tile(String(l.vehicles.length), meta.vehicles),
-      tile(fmtInt(l.passLast), 'Pax last month'),
+      // mail loaded last month under the passengers (lines that carry mail)
+      tile(fmtInt(l.passLast), 'Pax last month', '', carriesMail ? h('div', { class: 'tile-mail', 'data-tip': 'Mail loaded last month' }, icon('mail', 13), `${fmtMail(l.mail?.last ?? 0)} mail`) : null),
       tile(fmtMoney(profit), 'Profit this year', profit < 0 ? 'neg' : 'pos')));
     const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
     if (win.tab === 'stops') {
@@ -293,7 +310,7 @@ export function openLine(ui: UI, id: number) {
           v.owner !== PLAYER ? ui.ownerTag(v.owner) : null,
           ps ? h('span', { onclick: (e: Event) => e.stopPropagation() }, ps) : null,
           h('span', { class: 'muted' }, v.status),
-          h('span', { class: 'num' }, `${v.load}/${v.capacity}`)));
+          h('span', { class: 'num' }, loadText(v))));
       }
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles on this line.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
@@ -302,11 +319,19 @@ export function openLine(ui: UI, id: number) {
         l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER) ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
       add(win.body, sharedPanel(ui, l, rerender));
     } else {
+      // load factors now (on board / room) of the passengers and of the mail
+      let cap = 0, load = 0, room = 0, mail = 0;
+      for (const vid of l.vehicles) { const v = g.vehicles.get(vid); if (v) { cap += v.capacity; load += v.load; room += v.mailCapacity; mail += v.mailLoad; } }
+      const lm = l.mail;
       add(win.body,
         ui.kv('Income this year', fmtMoneyFull(l.incomeYear)),
+        // (a part of the income above)
+        carriesMail ? ui.kv('Mail income this year', h('span', { 'data-tip': `Part of the income above: mail pays by distance and how fast it arrives${lm?.incomeLast ? ` · last year ${fmtMoneyFull(lm.incomeLast)}` : ''}` }, fmtMoneyFull(lm?.incomeYear ?? 0))) : null,
         ui.kv('Running costs this year', fmtMoneyFull(l.costYear)),
         ui.kv('Profit last year', h('span', { class: l.incomeLast - l.costLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(l.incomeLast - l.costLast))),
-        ui.kv('Load factor', (() => { let cap = 0, load = 0; for (const vid of l.vehicles) { const v = g.vehicles.get(vid); if (v) { cap += v.capacity; load += v.load; } } return cap ? fmtPct(load / cap) : '—'; })()),
+        ui.kv('Load factor', cap ? fmtPct(load / cap) : '—'),
+        carriesMail ? ui.kv('Mail load factor', h('span', { 'data-tip': `${fmtMailLoad(mail, room)} on board now` }, room ? fmtPct(mail / room) : '—')) : null,
+        carriesMail ? ui.kv('Mail last month', `${fmtMail(lm?.last ?? 0)} loaded`) : null,
         faresPanel(ui, l));
       const losing = l.incomeLast - l.costLast < 0 && profit < 0 && l.vehicles.length > 0;
       if (mine && losing) add(win.body, h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Losing money'), h('div', null, 'Last year and this year so far. Faster or more frequent service, express services or a longer route can help; else decommission it.'))));
@@ -391,7 +416,8 @@ function cloneLast(ui: UI, l: Line) {
   const dId = (v as Train | RoadVehicle).depotId;
   const dp = g.depots.get(dId)?.owner === PLAYER ? dId : findDepot(ui, l.kind, l);
   if (dp == null) { ui.toast('No depot available', 'bad'); return; }
-  const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.reversed ? [...v.cars].reverse() : [...v.cars], l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
+  // (as made up: locomotive, mail vans, coaches, whichever way round the original stands)
+  const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.madeUp, l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
   if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('purchase'); }
 }
 
@@ -418,7 +444,7 @@ export function openVehicles(ui: UI) {
         h('td', { class: 'ellip' }, v.owner !== PLAYER ? h('span', { class: 'swatch', style: `background:${g.company(v.owner).color}` }) : null, v.name),
         h('td', { class: 'ellip' }, v.line ? h('span', { class: 'inline', style: 'gap:6px' }, lineSymbol(g, v.line, 'sm'), h('span', { class: 'ltag-n' }, v.line.name)) : '—'),
         h('td', { class: 'ellip ' + (v.state === 'noroute' || v.state === 'stopped' ? 'neg' : 'muted') }, v.status),
-        h('td', { class: 'r' }, `${v.load}/${v.capacity}`),
+        h('td', { class: 'r' }, loadText(v)),
         h('td', { class: 'r ' + (v.profitYear < 0 ? 'neg' : 'pos') }, fmtMoney(v.profitYear))));
     }
     add(win.body, tbl);

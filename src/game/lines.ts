@@ -1,12 +1,14 @@
-// Lines (ordered stop lists), their automatic names and colours, and passenger routing across the line network.
+// Lines (ordered stop lists), their automatic names and colours, and passenger and mail routing across the line network.
 import type { Game } from './game';
-import type { LineKind as Transport } from './constants';
+import type { LineKind as Transport, Cargo } from './constants';
 import type { Station } from './stations';
 import { WALK_LINE } from './stations';
 import type { Town } from './towns';
 import type { ServicePattern } from './patterns';
-import { lineGraph, TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
+import { lineGraph, lineTable, mailFleet, TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
 import { transferWalkTime } from './fares';
+import type { RNG } from './rng';
+import { rerouteMail, type LineMail } from './mail';
 
 export interface Line {
   id: number;
@@ -51,6 +53,8 @@ export interface Line {
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+  /** mail carried (loaded) this / last month and its income this / last year (a part of incomeYear); from the line's first mail on */
+  mail?: LineMail;
 }
 
 export interface PatternSpacing {
@@ -68,6 +72,130 @@ export interface PatternSpacing {
  * (`line` first) and passengers are spread over them by frequency (see Lines.distribute).
  */
 export interface Hop { line: number; alight: number; cost: number; lines?: number[] }
+/** An edge of the routing graph: to station `to` riding `line` (WALK_LINE: walking a transfer link), `cost` sim seconds. */
+export interface RouteEdge { to: number; line: number; cost: number }
+
+function addEdge(edges: Map<number, RouteEdge[]>, from: number, e: RouteEdge) {
+  let arr = edges.get(from);
+  if (!arr) { arr = []; edges.set(from, arr); }
+  arr.push(e);
+}
+
+/**
+ * Open list of the routing Dijkstra: a binary heap ordered by (cost, insertion order). It pops exactly in the order
+ * a stable sort of the list by cost would (the former open.sort + shift), so the tables are the same, in O(log n).
+ */
+class RouteHeap {
+  private cost: number[] = []; private seq: number[] = []; private node: number[] = [];
+  private n = 0; private next = 0;
+  get size() { return this.n; }
+  clear() { this.n = 0; this.next = 0; }
+  private less(i: number, j: number) { const a = this.cost[i], b = this.cost[j]; return a < b || (a === b && this.seq[i] < this.seq[j]); }
+  private swap(i: number, j: number) {
+    const c = this.cost[i], s = this.seq[i], v = this.node[i];
+    this.cost[i] = this.cost[j]; this.seq[i] = this.seq[j]; this.node[i] = this.node[j];
+    this.cost[j] = c; this.seq[j] = s; this.node[j] = v;
+  }
+  push(cost: number, node: number) {
+    let i = this.n++;
+    this.cost[i] = cost; this.seq[i] = this.next++; this.node[i] = node;
+    while (i > 0) { const p = (i - 1) >> 1; if (!this.less(i, p)) break; this.swap(i, p); i = p; }
+  }
+  /** The cheapest entry's cost (before pop). */
+  top(): number { return this.cost[0]; }
+  pop(): number {
+    const top = this.node[0], last = --this.n;
+    if (last > 0) {
+      this.cost[0] = this.cost[last]; this.seq[0] = this.seq[last]; this.node[0] = this.node[last];
+      let i = 0;
+      for (;;) {
+        const l = 2 * i + 1, r = l + 1;
+        let m = i;
+        if (l < last && this.less(l, m)) m = l;
+        if (r < last && this.less(r, m)) m = r;
+        if (m === i) break;
+        this.swap(i, m); i = m;
+      }
+    }
+    return top;
+  }
+}
+
+/**
+ * First hops of the cheapest journeys from `src` over the routing graph (Dijkstra; transfers cost
+ * TRANSFER_PENALTY_S, plus PLATFORM_CHANGE_S unless walked): Map(dest -> hop) for every station reached riding a line.
+ */
+function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap): Map<number, Hop> {
+  const table = new Map<number, Hop>();
+  const best = new Map<number, number>([[src, 0]]);
+  const first = new Map<number, { line: number; alight: number }>();
+  // did the best path ride a line? (stations reached on foot only are no destinations) Did it arrive on foot?
+  const rode = new Map<number, boolean>([[src, false]]);
+  const walked = new Map<number, boolean>([[src, false]]);
+  open.clear();
+  open.push(0, src);
+  while (open.size) {
+    const c = open.top(), u = open.pop();
+    if (c > (best.get(u) ?? Infinity)) continue;
+    for (const e of edges.get(u) ?? []) {
+      // boarding again after a ride: a transfer (penalty, plus changing platforms unless they walked here)
+      const transfer = e.line !== WALK_LINE && rode.get(u) ? TRANSFER_PENALTY_S + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
+      const nc = c + e.cost + transfer;
+      if (nc < (best.get(e.to) ?? Infinity)) {
+        best.set(e.to, nc);
+        first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
+        rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
+        walked.set(e.to, e.line === WALK_LINE);
+        open.push(nc, e.to);
+      }
+    }
+  }
+  // lines serving the same first leg about as well as the best one (parallel lines share the passengers)
+  const legs = new Map<number, { line: number; cost: number }[]>();
+  for (const e of edges.get(src) ?? []) {
+    let a = legs.get(e.to);
+    if (!a) { a = []; legs.set(e.to, a); }
+    const o = a.find((x) => x.line === e.line);
+    if (o) o.cost = Math.min(o.cost, e.cost); else a.push({ line: e.line, cost: e.cost });
+  }
+  for (const [d, f] of first) {
+    if (d === src || !rode.get(d)) continue;
+    const hop: Hop = { line: f.line, alight: f.alight, cost: best.get(d)! };
+    const leg = legs.get(f.alight);
+    if (leg && leg.length > 1) {
+      const own = leg.find((x) => x.line === f.line);
+      const lim = (own ? own.cost : Math.min(...leg.map((x) => x.cost))) * 1.15 + 10;
+      const alt = leg.filter((x) => x.line !== f.line && x.cost <= lim).map((x) => x.line);
+      if (alt.length) hop.lines = [f.line, ...alt];
+    }
+    table.set(d, hop);
+  }
+  return table;
+}
+
+/** Routing tables from each source over a routing graph: Map(source -> Map(dest -> first hop)), filled into `out`. */
+export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>()): Map<number, Map<number, Hop>> {
+  const open = new RouteHeap();
+  for (const src of sources) out.set(src, routeFrom(edges, src, open));
+  return out;
+}
+
+/** The passenger or mail routing graph of the lines as they are (their tables; walking links), and the stations served. */
+export function routeGraph(g: Game, cargo: Cargo = 'pax'): { edges: Map<number, RouteEdge[]>; served: Set<number> } {
+  const edges = new Map<number, RouteEdge[]>(), served = new Set<number>();
+  for (const l of g.lines.map.values()) {
+    if (l.stops.length < 2 || l.vehicles.length === 0 || (cargo === 'mail' && mailFleet(g, l) === 'none')) continue;
+    const lg = lineGraph(g, l, cargo);
+    for (const s of lg.served) served.add(s);
+    for (const e of lg.edges) addEdge(edges, e.from, { to: e.to, line: l.id, cost: e.cost });
+  }
+  const stations = g.stations;
+  for (const wl of stations.walkLinks()) {
+    const sa = stations.get(wl.from), sb = stations.get(wl.to);
+    addEdge(edges, wl.from, { to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 });
+  }
+  return { edges, served };
+}
 
 /** Who may join a line as a further operator: anyone ('open'), companies the lead adds ('invite'), nobody. */
 export type PartnerPolicy = 'open' | 'invite' | 'closed';
@@ -148,6 +276,15 @@ export class Lines {
   /** routing[s] = Map(dest -> first hop) */
   routing = new Map<number, Map<number, Hop>>();
   servedStations = new Set<number>();
+  /**
+   * Mail routing over the lines with vehicles that carry mail (and walking links): mailRouting[s] = Map(dest -> first
+   * hop). Where every line of a transfer complex carries mail on every vehicle, the passenger table itself.
+   */
+  mailRouting = new Map<number, Map<number, Hop>>();
+  /** stations a line with vehicles carrying mail calls at (Lines.mailServed) */
+  mailStations = new Set<number>();
+  /** some vehicle on a line carries mail only (passenger shares then count only the vehicles with seats) */
+  private mailOnlyFleet = false;
   /** Catchment weights depend on service presence, independently of routing/frequency versions. */
   servedVersion = 0;
   /** bumped by every rebuild (routing tables changed) */
@@ -477,6 +614,10 @@ export class Lines {
   }
 
   stationServed(id: number) { return this.servedStations.has(id); }
+  /** Does a line with vehicles carrying mail call at the station? */
+  mailServed(id: number) { return this.mailStations.has(id); }
+  /** Is there any mail service (mail routing) at all? */
+  get mailActive() { return this.mailRouting.size > 0; }
 
   linesAt(stationId: number): Line[] {
     return [...this.map.values()].filter((l) => l.stops.includes(stationId));
@@ -560,6 +701,10 @@ export class Lines {
   nextHop(from: number, dest: number): Hop | undefined {
     return this.routing.get(from)?.get(dest);
   }
+  /** First hop of mail from station `from` to `dest` (mail routing). */
+  mailNextHop(from: number, dest: number): Hop | undefined {
+    return this.mailRouting.get(from)?.get(dest);
+  }
 
   /** Recompute routing tables (Dijkstra over the line graph) and the automatic names. */
   rebuild(catchmentMayChange = true) {
@@ -579,72 +724,31 @@ export class Lines {
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
-    const edges = new Map<number, { to: number; line: number; cost: number }[]>();
+    const g = this.game, edges = new Map<number, RouteEdge[]>(), mailLines: Line[] = [];
+    this.mailOnlyFleet = false;
     for (const l of this.map.values()) {
       if (l.stops.length < 2 || l.vehicles.length === 0) continue;
-      const lg = lineGraph(this.game, l);
+      const lg = lineGraph(g, l);
       for (const s of lg.served) this.servedStations.add(s);
-      for (const e of lg.edges) {
-        let arr = edges.get(e.from);
-        if (!arr) { arr = []; edges.set(e.from, arr); }
-        arr.push({ to: e.to, line: l.id, cost: e.cost });
-      }
+      for (const e of lg.edges) addEdge(edges, e.from, { to: e.to, line: l.id, cost: e.cost });
+      const mf = mailFleet(g, l);
+      if (mf !== 'none') mailLines.push(l);
+      if (mf === 'some' && l.vehicles.some((id) => g.vehicles.get(id)?.mailOnly)) this.mailOnlyFleet = true;
     }
     // walking transfers between linked stations of a transfer complex (Stations.walkLinks): the walk's time
+    const walks: [number, RouteEdge][] = [];
     for (const wl of stations.walkLinks()) {
-      let arr = edges.get(wl.from);
-      if (!arr) { arr = []; edges.set(wl.from, arr); }
       const sa = stations.get(wl.from), sb = stations.get(wl.to);
-      arr.push({ to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 });
+      const e: RouteEdge = { to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 };
+      addEdge(edges, wl.from, e);
+      walks.push([wl.from, e]);
     }
-    for (const src of edges.keys()) {
-      const table = new Map<number, Hop>();
-      const best = new Map<number, number>([[src, 0]]);
-      const first = new Map<number, { line: number; alight: number }>();
-      // did the best path ride a line? (stations reached on foot only are no destinations) Did it arrive on foot?
-      const rode = new Map<number, boolean>([[src, false]]);
-      const walked = new Map<number, boolean>([[src, false]]);
-      const open: [number, number][] = [[0, src]];
-      while (open.length) {
-        open.sort((a, b) => a[0] - b[0]);
-        const [c, u] = open.shift()!;
-        if (c > (best.get(u) ?? Infinity)) continue;
-        for (const e of edges.get(u) ?? []) {
-          // boarding again after a ride: a transfer (penalty, plus changing platforms unless they walked here)
-          const transfer = e.line !== WALK_LINE && rode.get(u) ? TRANSFER_PENALTY_S + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
-          const nc = c + e.cost + transfer;
-          if (nc < (best.get(e.to) ?? Infinity)) {
-            best.set(e.to, nc);
-            first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
-            rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
-            walked.set(e.to, e.line === WALK_LINE);
-            open.push([nc, e.to]);
-          }
-        }
-      }
-      // lines serving the same first leg about as well as the best one (parallel lines share the passengers)
-      const legs = new Map<number, { line: number; cost: number }[]>();
-      for (const e of edges.get(src) ?? []) {
-        let a = legs.get(e.to);
-        if (!a) { a = []; legs.set(e.to, a); }
-        const o = a.find((x) => x.line === e.line);
-        if (o) o.cost = Math.min(o.cost, e.cost); else a.push({ line: e.line, cost: e.cost });
-      }
-      for (const [d, f] of first) {
-        if (d === src || !rode.get(d)) continue;
-        const hop: Hop = { line: f.line, alight: f.alight, cost: best.get(d)! };
-        const leg = legs.get(f.alight);
-        if (leg && leg.length > 1) {
-          const own = leg.find((x) => x.line === f.line);
-          const lim = (own ? own.cost : Math.min(...leg.map((x) => x.cost))) * 1.15 + 10;
-          const alt = leg.filter((x) => x.line !== f.line && x.cost <= lim).map((x) => x.line);
-          if (alt.length) hop.lines = [f.line, ...alt];
-        }
-        table.set(d, hop);
-      }
-      this.routing.set(src, table);
-    }
-    for (const st of stations.all()) this.rerouteWaiting(st);
+    routeTables(edges, edges.keys(), this.routing);
+    this.mailRoutes(mailLines, edges, walks);
+    const all = stations.all();
+    for (const st of all) this.rerouteWaiting(st);
+    // mail keeps its line where it still is a good first leg; mail without a route any more is lost
+    for (const st of all) if (st.mail?.waiting.size) rerouteMail(g, st);
     const servedChanged = previousServed.size !== this.servedStations.size || [...previousServed].some((id) => !this.servedStations.has(id));
     if (servedChanged) this.servedVersion++;
     // flushCatchment uses the independent service/input versions to skip walking work for frequency changes.
@@ -665,14 +769,71 @@ export class Lines {
   }
 
   /**
-   * Hand `count` passengers taking `hop` to its line(s): parallel lines get shares by their number of
-   * vehicles (frequency), rounded at random.
+   * Mail routing (rebuild): the lines with vehicles carrying mail and the walking links. A transfer complex (connected
+   * part of the network) where every line carries mail on every vehicle routes mail as passengers: its stations share
+   * the passenger tables (the same Map objects); elsewhere a Dijkstra over the mail lines from their stations.
    */
-  distribute(hop: Hop, count: number, add: (line: number, n: number) => void) {
+  private mailRoutes(mailLines: Line[], edges: Map<number, RouteEdge[]>, walks: [number, RouteEdge][]) {
+    this.mailRouting.clear();
+    this.mailStations.clear();
+    if (!mailLines.length) return;
+    const g = this.game, medges = new Map<number, RouteEdge[]>(), own = new Set<number>(), carrying = new Set<number>();
+    for (const l of mailLines) {
+      const t = lineTable(g, l, 'mail');
+      carrying.add(l.id);
+      if (t !== lineTable(g, l)) own.add(l.id);
+      for (const s of t.served) this.mailStations.add(s);
+      for (const e of t.edges) addEdge(medges, e.from, { to: e.to, line: l.id, cost: e.cost });
+    }
+    for (const [from, e] of walks) addEdge(medges, from, e);
+    // connected parts over both graphs (union-find on station ids)
+    const parent = new Map<number, number>();
+    const find = (x: number): number => {
+      let r = x;
+      for (let p = parent.get(r); p !== undefined && p !== r; p = parent.get(r)) r = p;
+      for (let y = x; y !== r;) { const p = parent.get(y)!; parent.set(y, r); y = p; }
+      return r;
+    };
+    const union = (a: number, b: number) => { const ra = find(a), rb = find(b); if (ra !== rb) parent.set(rb, ra); };
+    for (const [from, arr] of edges) for (const e of arr) union(from, e.to);
+    for (const [from, arr] of medges) for (const e of arr) union(from, e.to);
+    // parts with mail service, and parts that need a mail Dijkstra of their own (a line without mail, or a mail fleet
+    // that differs from the passenger fleet)
+    const served = new Set<number>(), apart = new Set<number>();
+    for (const [from, arr] of medges) for (const e of arr) if (e.line !== WALK_LINE) { served.add(find(from)); if (own.has(e.line)) apart.add(find(from)); }
+    for (const [from, arr] of edges) for (const e of arr) if (e.line !== WALK_LINE && !carrying.has(e.line)) apart.add(find(from));
+    const open = new RouteHeap();
+    for (const src of medges.keys()) {
+      const root = find(src);
+      if (!served.has(root)) continue;
+      const shared = apart.has(root) ? undefined : this.routing.get(src);
+      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open));
+    }
+  }
+
+  /** Vehicles of a line that carry a cargo (passengers: all but the mail-only ones). */
+  fleetSize(id: number, cargo: Cargo = 'pax'): number {
+    const l = this.map.get(id);
+    if (!l) return 0;
+    if (cargo === 'pax') {
+      let n = l.vehicles.length;
+      if (this.mailOnlyFleet) for (const vid of l.vehicles) if (this.game.vehicles.get(vid)?.mailOnly) n--;
+      return n;
+    }
+    let n = 0;
+    for (const vid of l.vehicles) if (this.game.vehicles.get(vid)?.carries('mail')) n++;
+    return n;
+  }
+
+  /**
+   * Hand `count` passengers (or units of mail, `cargo`) taking `hop` to its line(s): parallel lines get shares by
+   * their number of vehicles carrying the cargo (frequency), rounded at random (`rng`: mail draws on its own).
+   */
+  distribute(hop: Hop, count: number, add: (line: number, n: number) => void, cargo: Cargo = 'pax', rng: RNG = this.game.rng) {
     if (count <= 0) return;
     const ls = hop.lines;
     if (!ls || ls.length < 2) { add(hop.line, count); return; }
-    const w = ls.map((id) => Math.max(1, this.map.get(id)?.vehicles.length ?? 0));
+    const w = ls.map((id) => Math.max(1, this.fleetSize(id, cargo)));
     const W = w.reduce((a, b) => a + b, 0);
     let left = count;
     for (let i = 0; i < ls.length && left > 0; i++) {
@@ -680,7 +841,7 @@ export class Lines {
       if (i < ls.length - 1) {
         const share = (count * w[i]) / W;
         k = Math.floor(share);
-        if (this.game.rng.next() < share - k) k++;
+        if (rng.next() < share - k) k++;
         k = Math.min(k, left);
       }
       if (k > 0) { add(ls[i], k); left -= k; }
@@ -707,6 +868,7 @@ export class Lines {
   /** Normalise a line restored from a save (older saves lack the naming state). */
   static restore(d: any): Line {
     const l: Line = { ...d, stops: [...(d.stops ?? [])], vehicles: [...(d.vehicles ?? [])] };
+    if (d.mail) l.mail = { ...d.mail };
     if (typeof l.num !== 'number') {
       const m = /(\d+)\s*$/.exec(String(l.name ?? ''));
       l.num = m ? Number(m[1]) : l.id;

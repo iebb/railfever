@@ -4,7 +4,7 @@ import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import { WATER_Y } from '../game/constants';
 import { esc, svg } from './dom';
-import { fmtMult } from './format';
+import { fmtMult, tonnes, stationShowsMail } from './format';
 import { accessState } from './win-access';
 import type { Game } from '../game/game';
 import { fmtMoney } from '../game/economy';
@@ -109,7 +109,9 @@ export class HoverCard {
         html: `<div class="hc-title">${svg(s.rail ? 'station' : s.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}</div>` +
           (badges ? `<div class="hc-badges" aria-label="Station numbers">${badges}</div>` : '') +
-          `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}</div>` +
+          `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}` +
+          // mail waiting (stations that handle mail; never tram stops)
+          `${stationShowsMail(g, s) ? stat('mail', `<b>${tonnes(s.mail?.total ?? 0)}</b> t mail`) : ''}</div>` +
           `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access — no passengers</span>' : 'Click for details'}</div>`,
       };
     }
@@ -118,12 +120,15 @@ export class HoverCard {
       if (!v) return null;
       const co = g.company(v.owner);
       const rail = v.kind === 'train';
-      const model = rail ? (v as Train).cars[0]?.name : (v as RoadVehicle).model?.name;
+      const model = rail ? (v as Train).madeUp[0]?.name : (v as RoadVehicle).model?.name;
+      // passengers (unless mail only) and the mail load of vehicles with room for mail
+      const room = v.mailCapacity;
       return {
         color: v.line?.color ?? co.color,
-        html: `<div class="hc-title">${svg(rail ? 'train' : 'bus', 16)}<span>${esc(v.name)}</span></div>` +
+        html: `<div class="hc-title">${svg(rail ? 'train' : v.mailOnly ? 'mail' : 'bus', 16)}<span>${esc(v.name)}</span></div>` +
           `<div class="hc-sub">${esc(v.line ? v.line.name : 'No line')} · ${esc(model ?? '')}${v.owner !== PLAYER ? ' · ' + esc(co.name) : ''}</div>` +
-          `<div class="hc-stats">${stat('speed', `<b>${Math.round(v.speedKmh)}</b> km/h`)}${stat('people', `<b>${v.load}</b>/${v.capacity}`)}${stat('coin', `<b>${fmtMoney(v.profitYear)}</b>/yr`)}</div>` +
+          `<div class="hc-stats">${stat('speed', `<b>${Math.round(v.speedKmh)}</b> km/h`)}${v.capacity > 0 || room <= 0 ? stat('people', `<b>${v.load}</b>/${v.capacity}`) : ''}` +
+          `${room > 0 ? stat('mail', `<b>${tonnes(v.mailLoad)}</b>/${tonnes(room)} t`) : ''}${stat('coin', `<b>${fmtMoney(v.profitYear)}</b>/yr`)}</div>` +
           `<div class="hc-hint">${esc(v.status)}</div>`,
       };
     }
@@ -149,7 +154,8 @@ export class HoverCard {
       color: '#eef2f7',
       html: `<div class="hc-title">${svg('towns', 16)}<span>${esc(town.name)}</span></div>` +
         `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
-        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}</div>` +
+        `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}` +
+        `${town.mail ? stat('mail', `<b>${tonnes(town.mail.postedLast)}</b> t mail posted/mo`) : ''}</div>` +
         `<div class="hc-hint">Click for details</div>`,
     };
   }

@@ -243,7 +243,15 @@ function loBody(color: number, roof: number, L: number, W: number, y0: number, y
 
 // ------------------------------------------------------------------------------------ rail vehicles
 
-function coach(style: string, color: number, L: number): ModelGeo {
+/** Post yellow of the mail vans' bands and emblems (rail and road). */
+const POST_YELLOW = 0xf2c200;
+
+/**
+ * Coach of an era (style coach_wood / _steel / _ic / _hs). `van`: the mail van of that era: the same body without
+ * passenger windows, with sliding loading doors, a post-yellow band (lining on the wooden van) and emblem; small
+ * windows only where the mail was sorted on board (wood, steel).
+ */
+function coach(style: string, color: number, L: number, van = false): ModelGeo {
   const m = new MB(), gb = m.gb, gl = m.gl;
   const hl = L / 2 - 0.02, W = RAIL_W, hw = W / 2;
   const wood = style === 'coach_wood', steel = style === 'coach_steel', ic = style === 'coach_ic', hs = style === 'coach_hs';
@@ -256,11 +264,12 @@ function coach(style: string, color: number, L: number): ModelGeo {
   gb.color(roofCol);
   prism(gb, -hl + 0.01, hl - 0.01, roofProfile(hw - 0.003, yE - 0.001, yE + 0.004, yT, wood ? 0.6 : 0.45), 0.7);
   if (wood) {
-    // clerestory with small windows
+    // clerestory with small windows (the travelling post office: a plain clerestory, roof lamps)
     gb.color(0x34312e);
     gb.box(0, yT - 0.005, 0, 0.13, 0.035, hl * 2 - 0.3);
     gl.color(0xffffff);
-    for (const sx of [-1, 1]) for (let z = -hl + 0.2; z < hl - 0.2; z += 0.1) gl.quad(sx * 0.0655, yT + 0.008, z + (sx > 0 ? 0.06 : 0), sx * 0.0655, yT + 0.008, z + (sx > 0 ? 0 : 0.06), sx * 0.0655, yT + 0.024, z + (sx > 0 ? 0 : 0.06), sx * 0.0655, yT + 0.024, z + (sx > 0 ? 0.06 : 0));
+    if (!van) for (const sx of [-1, 1]) for (let z = -hl + 0.2; z < hl - 0.2; z += 0.1) gl.quad(sx * 0.0655, yT + 0.008, z + (sx > 0 ? 0.06 : 0), sx * 0.0655, yT + 0.008, z + (sx > 0 ? 0 : 0.06), sx * 0.0655, yT + 0.024, z + (sx > 0 ? 0 : 0.06), sx * 0.0655, yT + 0.024, z + (sx > 0 ? 0.06 : 0));
+    else { gb.color(0x6a6560); for (let z = -hl + 0.3; z < hl - 0.2; z += 0.36) gb.cylinder(0, yT + 0.03, z, 0.014, 0.02, 6); }
     // panelling: dark beading and a lining stripe
     gb.color(0x5a2a16);
     for (let z = -hl + 0.12; z < hl - 0.05; z += 0.12) { gb.box(hw + 0.001, y0 + 0.01, z, 0.003, yE - y0 - 0.02, 0.01); gb.box(-hw - 0.001, y0 + 0.01, z, 0.003, yE - y0 - 0.02, 0.01); }
@@ -274,12 +283,12 @@ function coach(style: string, color: number, L: number): ModelGeo {
     gb.tube(0.07, 0.1, -hl + 0.3, 0.07, 0.04, -0.2, 0.006, 4); gb.tube(0.07, 0.04, -0.2, 0.07, 0.04, 0.2, 0.006, 4); gb.tube(0.07, 0.04, 0.2, 0.07, 0.1, hl - 0.3, 0.006, 4);
     gb.tube(-0.07, 0.1, -hl + 0.3, -0.07, 0.04, -0.2, 0.006, 4); gb.tube(-0.07, 0.04, -0.2, -0.07, 0.04, 0.2, 0.006, 4); gb.tube(-0.07, 0.04, 0.2, -0.07, 0.1, hl - 0.3, 0.006, 4);
   }
-  if (steel) {
+  if (steel && !van) {
     gb.color(0xd8c690);
     gb.box(0, 0.218, 0, W + 0.005, 0.012, hl * 2 - 0.02);
     gb.box(0, 0.338, 0, W + 0.005, 0.012, hl * 2 - 0.02);
   }
-  if (ic) {
+  if (ic && !van) {
     gb.color(0xc0392b);
     gb.box(0, 0.2, 0, W + 0.005, 0.024, hl * 2 - 0.02);
     gb.color(0x8e2a20);
@@ -288,6 +297,16 @@ function coach(style: string, color: number, L: number): ModelGeo {
     gb.color(0x8f9499);
     gb.box(0, yT - 0.006, hl * 0.55, 0.15, 0.022, 0.32);
     gb.box(0, yT - 0.006, -hl * 0.55, 0.15, 0.022, 0.32);
+  }
+  if (van && !wood) {
+    // post-yellow band with a dark pinstripe below, along the whole van (wood keeps its gold lining)
+    gb.color(POST_YELLOW);
+    gb.box(0, ic || hs ? 0.2 : 0.214, 0, W + 0.005, ic || hs ? 0.03 : 0.024, hl * 2 - 0.02);
+    gb.color(0x1f1f1f);
+    gb.box(0, ic || hs ? 0.191 : 0.205, 0, W + 0.005, 0.006, hl * 2 - 0.02);
+    // roof vents (no air conditioning)
+    gb.color(ic || hs ? 0x8f9499 : 0x3d4043);
+    for (const z of [hl * 0.5, -hl * 0.5]) gb.box(0, yT - 0.006, z, 0.08, 0.018, 0.12);
   }
   if (hs) {
     gb.color(0x1f5fa8);
@@ -305,28 +324,59 @@ function coach(style: string, color: number, L: number): ModelGeo {
   gb.color(0x1b1b1b);
   if (!wood) { gb.box(0, 0.13, hl + 0.012, 0.15, 0.25, 0.025); gb.box(0, 0.13, -hl - 0.012, 0.15, 0.25, 0.025); }
   if (!hs) { buffers(gb, hl, 1); buffers(gb, -hl, -1); }
-  // doors near the ends (darker, with door windows)
-  gb.color(color, 0.78);
-  const dz = hl - (wood ? 0.07 : 0.12);
-  for (const z of [dz, -dz]) for (const sx of [-1, 1]) gb.box(sx * (hw + 0.001), y0 + 0.01, z, 0.003, yE - y0 - 0.03, 0.08);
-  gl.color(0xffffff);
-  for (const z of [dz, -dz]) for (const sx of [-1, 1]) {
-    const x = sx * (hw + 0.004), a = z - 0.025, b = z + 0.025, ya = 0.26, yb = 0.33;
-    if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
-  }
-  // passenger windows
   const wy0 = hs ? 0.235 : 0.24, wy1 = hs ? 0.335 : 0.33;
-  const pitch = wood ? 0.085 : ic || hs ? 0.2 : 0.14;
-  const span = hl * 2 - (wood ? 0.3 : 0.44);
-  const segs = Math.max(3, Math.round(span / pitch));
-  windowBand(gl, -span / 2, span / 2, wy0, wy1, hw + 0.002, segs, wood ? 0.025 : ic || hs ? 0.03 : 0.035);
-  // end windows
-  endWindow(gl, hl + 0.001, 0.26, 0.33, 0.03, false, 0.09); endWindow(gl, hl + 0.001, 0.26, 0.33, 0.03, false, -0.09);
-  endWindow(gl, -hl - 0.001, 0.26, 0.33, 0.03, true, 0.09); endWindow(gl, -hl - 0.001, 0.26, 0.33, 0.03, true, -0.09);
+  if (van) {
+    // sliding loading doors (two a side, on their top rails), small windows where the mail was sorted, an emblem
+    const dw = ic || hs ? 0.13 : 0.15, dzs = [hl * 0.42, -hl * 0.42], dy1 = yE - (ic || hs ? 0.02 : 0.035);
+    for (const z of dzs) for (const sx of [-1, 1]) {
+      gb.color(color, 0.8);
+      gb.box(sx * (hw + 0.002), y0 + 0.012, z, 0.004, dy1 - y0 - 0.012, dw);
+      gb.color(0x1a1a1a);
+      gb.box(sx * (hw + 0.0042), y0 + 0.012, z, 0.002, dy1 - y0 - 0.012, 0.004);
+      if (!(ic || hs)) gb.box(sx * (hw + 0.005), dy1 + 0.004, z, 0.006, 0.008, dw * 2 + 0.03);
+      gb.color(0x9a9a9a);
+      gb.box(sx * (hw + 0.0045), 0.2, z + dw * 0.32, 0.003, 0.04, 0.008);
+      gb.box(sx * (hw + 0.0045), 0.2, z - dw * 0.32, 0.003, 0.04, 0.008);
+    }
+    if (!(ic || hs)) {
+      gl.color(0xffffff);
+      for (const z of [0.07, -0.07]) for (const sx of [-1, 1]) {
+        const x = sx * (hw + 0.002), a = z - 0.03, b = z + 0.03, ya = 0.27, yb = 0.325;
+        if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
+      }
+      gb.color(0x2a2a2a);
+      for (const z of [0.07, -0.07]) for (const sx of [-1, 1]) gb.box(sx * (hw + 0.0035), 0.296, z, 0.002, 0.004, 0.06);
+    }
+    // post emblem between the doors: a yellow roundel (gold on the wooden van)
+    for (const sx of [-1, 1]) {
+      gb.color(wood ? 0xd9b98c : POST_YELLOW);
+      discX(gb, sx * (hw + 0.0045), ic || hs ? 0.285 : 0.17, ic || hs ? 0 : hl * 0.7, 0.024, sx, 12);
+      gb.color(0x1f1f1f);
+      discX(gb, sx * (hw + 0.0055), ic || hs ? 0.285 : 0.17, ic || hs ? 0 : hl * 0.7, 0.011, sx, 10);
+    }
+  } else {
+    // doors near the ends (darker, with door windows)
+    gb.color(color, 0.78);
+    const dz = hl - (wood ? 0.07 : 0.12);
+    for (const z of [dz, -dz]) for (const sx of [-1, 1]) gb.box(sx * (hw + 0.001), y0 + 0.01, z, 0.003, yE - y0 - 0.03, 0.08);
+    gl.color(0xffffff);
+    for (const z of [dz, -dz]) for (const sx of [-1, 1]) {
+      const x = sx * (hw + 0.004), a = z - 0.025, b = z + 0.025, ya = 0.26, yb = 0.33;
+      if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
+    }
+    // passenger windows
+    const pitch = wood ? 0.085 : ic || hs ? 0.2 : 0.14;
+    const span = hl * 2 - (wood ? 0.3 : 0.44);
+    const segs = Math.max(3, Math.round(span / pitch));
+    windowBand(gl, -span / 2, span / 2, wy0, wy1, hw + 0.002, segs, wood ? 0.025 : ic || hs ? 0.03 : 0.035);
+    // end windows
+    endWindow(gl, hl + 0.001, 0.26, 0.33, 0.03, false, 0.09); endWindow(gl, hl + 0.001, 0.26, 0.33, 0.03, false, -0.09);
+    endWindow(gl, -hl - 0.001, 0.26, 0.33, 0.03, true, 0.09); endWindow(gl, -hl - 0.001, 0.26, 0.33, 0.03, true, -0.09);
+  }
   const g = m.build();
   const lamps: [number, number, number][] = [[0.1, 0.16, 0], [-0.1, 0.16, 0]];
   return {
-    ...g, length: L, lo: loBody(color, roofCol, L, W, y0, yE, yT, [wy0, wy1]),
+    ...g, length: L, lo: loBody(color, roofCol, L, W, y0, yE, yT, van ? null : [wy0, wy1]),
     front: lamps.map(([x, y]) => [x, y, hl + 0.01]), rear: lamps.map(([x, y]) => [x, y, -hl - 0.01]),
     bogies: [L * BOGIE_F, -L * BOGIE_F], bogieKind: 'b2',
   };
@@ -616,6 +666,199 @@ function bus(style: string, color: number, L: number): ModelGeo {
     front: [[0.085, fy, hl + 0.01], [-0.085, fy, hl + 0.01]], rear: [[0.095, y0 + 0.058, -hl - 0.01], [-0.095, y0 + 0.058, -hl - 0.01]],
     bogies: [], bogieKind: 'b2',
   };
+}
+
+// ------------------------------------------------------------------------------------ mail vans and trucks
+
+/** Road mail-only bodies: a 1920s-60s bonneted post van, a 1960s-90s cab-over mail truck, a modern parcels truck, an electric post van. */
+export type RoadMailStyle = 'postvan_old' | 'mailtruck' | 'mailtruck_modern' | 'postvan_e';
+
+/**
+ * Body of a road vehicle that carries mail only (the catalogue gives mail vans and trucks bus styles): by size, era and
+ * traction. Null for every other model (buses, coaches, postbuses with seats, trams, rail).
+ */
+export function roadMailStyle(m: { kind: string; capacity: number; mail?: number; intro: number; length: number; traction: string }): RoadMailStyle | null {
+  if (m.kind !== 'bus' || m.capacity > 0 || !((m.mail ?? 0) > 0)) return null;
+  if (m.length < 0.9) return m.traction === 'electric' || m.intro >= 2000 ? 'postvan_e' : 'postvan_old';
+  return m.intro >= 1985 ? 'mailtruck_modern' : 'mailtruck';
+}
+
+/** Post emblem on both sides at (y, z): a roundel in `ring` with a dark (or `core`) centre. */
+function postEmblem(gb: GeoBuilder, x: number, y: number, z: number, r: number, ring: number, core = 0x1f1f1f) {
+  for (const sx of [-1, 1]) {
+    gb.color(ring); discX(gb, sx * x, y, z, r, sx, 12);
+    gb.color(core); discX(gb, sx * (x + 0.001), y, z, r * 0.45, sx, 10);
+  }
+}
+
+/**
+ * Road mail vans and trucks in post livery (the model colour: post red, or yellow for the electric van) with a
+ * post-yellow band or lining and emblem; windowless load boxes, glazed cabs. Same frame as the buses: +z forward,
+ * origin on the road at the vehicle's centre.
+ */
+function roadMail(style: RoadMailStyle, color: number, L: number): ModelGeo {
+  const m = new MB(), gb = m.gb, gl = m.gl;
+  const hl = L / 2 - 0.005;
+  const lo = new MB(), lg = lo.gb;
+  let front: [number, number, number][], rear: [number, number, number][];
+  if (style === 'postvan_old') {
+    // bonnet, a short cab with a black roof, a taller rounded van body; black wings and running boards, gold lining
+    const W = 0.21, hw = W / 2, y0 = 0.055, bon = 0.15, cab = 0.15;
+    const zB = hl - bon, zC = zB - cab, r = 0.045, axF = hl - 0.1, axR = -hl + 0.2;
+    gb.color(color);
+    prism(gb, -hl, zC - 0.004, roofProfile(hw + 0.005, y0, 0.27, 0.3, 0.72), 0.6);
+    prism(gb, zC, zB, [[-hw, y0], [hw, y0], [hw, 0.235], [-hw, 0.235]], 0.2);
+    gb.color(0x1c1c1c);
+    prism(gb, zC - 0.002, zB + 0.004, roofProfile(hw + 0.002, 0.234, 0.238, 0.258, 0.7), 0.7);
+    gb.color(color, 0.92);
+    prism(gb, zB, hl - 0.012, [[-0.08, 0.06], [0.08, 0.06], [0.08, 0.16], [0.055, 0.185], [-0.055, 0.185], [-0.08, 0.16]], 0.5);
+    // radiator, bumper, round lamps on the wings
+    gb.color(0xb9b9b4); gb.box(0, 0.065, hl - 0.012, 0.13, 0.11, 0.012);
+    gb.color(0x2a2a2a); for (let i = -3; i <= 3; i++) gb.box(i * 0.016, 0.075, hl - 0.004, 0.004, 0.09, 0.004);
+    gb.color(0x1a1a1a); gb.box(0, 0.04, hl + 0.004, W * 0.9, 0.02, 0.014); gb.box(0, 0.04, -hl - 0.004, W * 0.9, 0.02, 0.014);
+    for (const sx of [-1, 1]) {
+      // wings over the front wheels and the running board back to the van body
+      gb.color(0x161616);
+      gb.box(sx * (hw - 0.01), 0.088, axF, 0.04, 0.014, 0.15);
+      gb.box(sx * (hw - 0.005), 0.062, (axF - 0.075 + zC) / 2, 0.03, 0.008, axF - 0.075 - zC);
+      gb.box(sx * (hw - 0.002), 0.09, axR, 0.03, 0.012, 0.14);
+      gb.color(0xc9c9c4); disc(gb, sx * 0.07, 0.135, hl - 0.03, 0.019, 1, 10);
+      gb.color(0xfff1c4); disc(gb, sx * 0.07, 0.135, hl - 0.029, 0.014, 1, 10);
+    }
+    // gold lining and the emblem on the van body, rear doors
+    gb.color(0xd9b98c);
+    gb.box(0, 0.105, (-hl + zC) / 2, W + 0.012, 0.006, zC + hl - 0.03);
+    gb.box(0, 0.245, (-hl + zC) / 2, W + 0.012, 0.006, zC + hl - 0.03);
+    postEmblem(gb, hw + 0.007, 0.175, (-hl + zC) / 2, 0.026, 0xd9b98c, color);
+    gb.color(0x1a1a1a);
+    gb.box(0, y0 + 0.01, -hl - 0.002, 0.004, 0.2, 0.004);
+    gb.color(0x9a9a9a); for (const sx of [-1, 1]) gb.box(sx * 0.014, 0.16, -hl - 0.003, 0.006, 0.03, 0.004);
+    // cab glazing: windscreen above the bonnet, door windows
+    endWindow(gl, zB + 0.002, 0.19, 0.228, hw - 0.018);
+    windowBand(gl, zC + 0.025, zB - 0.02, 0.165, 0.226, hw + 0.002, 1, 0);
+    gb.color(0xb02a20); for (const sx of [-1, 1]) gb.box(sx * 0.085, 0.07, -hl - 0.004, 0.022, 0.02, 0.004);
+    axle(gb, axF, r, hw - 0.02, 0.026, 0x161616, 12, 0x8a8a8a);
+    axle(gb, axR, r, hw - 0.018, 0.03, 0x161616, 12, 0x8a8a8a);
+    front = [[0.07, 0.135, hl + 0.005], [-0.07, 0.135, hl + 0.005]];
+    rear = [[0.085, 0.08, -hl - 0.008], [-0.085, 0.08, -hl - 0.008]];
+    lg.color(color); lg.box(0, y0, (-hl + zC) / 2, W + 0.01, 0.245, zC + hl); lg.box(0, y0, (zC + zB) / 2, W, 0.18, cab); lg.box(0, 0.06, (zB + hl) / 2, 0.16, 0.12, bon);
+    lg.color(0x161616); lg.box(0, 0, axF, W, 0.09, 0.1); lg.box(0, 0, axR, W, 0.09, 0.1);
+    endWindow(lo.gl, zB + 0.002, 0.19, 0.228, hw - 0.018);
+  } else if (style === 'mailtruck') {
+    // cab-over truck: flat cab with a white roof cap, tall box with a post-yellow band, roller shutter at the back
+    const W = 0.24, hw = W / 2, y0 = 0.06, cab = 0.17, zC = hl - cab, r = 0.05, axF = hl - 0.11, axR = -hl + 0.26;
+    gb.color(color);
+    prism(gb, zC, hl, roofProfile(hw, y0, 0.272, 0.29, 0.8), 0.5);
+    gb.color(0xf0f0ec);
+    prism(gb, zC + 0.01, hl - 0.004, roofProfile(hw - 0.004, 0.272, 0.276, 0.296, 0.8), 0.6);
+    gb.color(color);
+    prism(gb, -hl, zC - 0.012, [[-hw - 0.004, 0.085], [hw + 0.004, 0.085], [hw + 0.004, 0.345], [-hw - 0.004, 0.345]], 0.2);
+    gb.color(color, 0.85);
+    gb.box(0, 0.345, (-hl + zC - 0.012) / 2, W + 0.004, 0.006, zC - 0.012 + hl - 0.004);
+    gb.color(POST_YELLOW);
+    gb.box(0, 0.19, (-hl + zC - 0.012) / 2, W + 0.012, 0.035, zC - 0.012 + hl - 0.01);
+    gb.color(0x1f1f1f);
+    gb.box(0, 0.182, (-hl + zC - 0.012) / 2, W + 0.012, 0.006, zC - 0.012 + hl - 0.01);
+    postEmblem(gb, hw + 0.007, 0.28, (-hl + zC) / 2, 0.03, POST_YELLOW);
+    // chassis, fuel tank, wheel arches
+    gb.color(0x222222);
+    gb.box(0, 0.04, -0.02, W * 0.7, 0.045, L - 0.3);
+    gb.color(0x3a3a3a); gb.box(hw - 0.02, 0.045, (axF + axR) / 2 + 0.05, 0.04, 0.04, 0.16);
+    // cab front: windscreen, grille, bumper, mirrors; door windows
+    gb.color(0x161616); gb.box(0, 0.165, hl + 0.0005, W - 0.02, 0.105, 0.003);
+    gl.color(0xffffff);
+    endWindow(gl, hl + 0.003, 0.172, 0.262, 0.054, false, 0.057); endWindow(gl, hl + 0.003, 0.172, 0.262, 0.054, false, -0.057);
+    gb.color(0x2a2a2a); for (let i = 0; i < 4; i++) gb.box(0, 0.085 + i * 0.016, hl + 0.002, W * 0.55, 0.006, 0.004);
+    gb.color(0xd8d8d4); gb.box(0, y0 - 0.02, hl + 0.006, W - 0.006, 0.028, 0.014);
+    windowBand(gl, zC + 0.03, hl - 0.03, 0.17, 0.255, hw + 0.002, 1, 0);
+    gb.color(0x1e1e1e);
+    for (const sx of [-1, 1]) { gb.tube(sx * (hw - 0.004), 0.24, hl - 0.03, sx * (hw + 0.028), 0.245, hl + 0.004, 0.004, 4); gb.box(sx * (hw + 0.03), 0.19, hl + 0.006, 0.01, 0.055, 0.008); }
+    // roller shutter at the back, lamps
+    gb.color(0x8c8c88); gb.box(0, 0.095, -hl - 0.001, W - 0.03, 0.235, 0.002);
+    gb.color(0x5a5a58); for (let y = 0.105; y < 0.32; y += 0.022) gb.box(0, y, -hl - 0.0025, W - 0.03, 0.003, 0.002);
+    gb.color(0x1a1a1a); gb.box(0, 0.045, -hl - 0.004, W - 0.01, 0.03, 0.012);
+    gb.color(0xfff6c8); for (const sx of [-1, 1]) gb.box(sx * 0.085, 0.072, hl + 0.002, 0.04, 0.022, 0.006);
+    gb.color(0xb02a20); for (const sx of [-1, 1]) gb.box(sx * 0.095, 0.08, -hl - 0.005, 0.03, 0.03, 0.004);
+    axle(gb, axF, r, hw - 0.024, 0.034, 0x151515, 12, 0x9a9da0);
+    axle(gb, axR, r, hw - 0.03, 0.05, 0x151515, 12, 0x9a9da0);
+    front = [[0.085, 0.083, hl + 0.008], [-0.085, 0.083, hl + 0.008]];
+    rear = [[0.095, 0.095, -hl - 0.01], [-0.095, 0.095, -hl - 0.01]];
+    lg.color(color); lg.box(0, y0, hl - cab / 2, W, 0.23, cab); lg.box(0, 0.085, (-hl + zC - 0.012) / 2, W + 0.008, 0.26, zC - 0.012 + hl);
+    lg.color(POST_YELLOW); lg.box(0, 0.19, (-hl + zC - 0.012) / 2, W + 0.012, 0.035, zC - 0.012 + hl);
+    lg.color(0x161616); lg.box(0, 0, axF, W - 0.01, 0.1, 0.11); lg.box(0, 0, axR, W - 0.01, 0.1, 0.11);
+    endWindow(lo.gl, hl + 0.003, 0.172, 0.262, hw - 0.02);
+  } else if (style === 'mailtruck_modern') {
+    // modern cab-over: panoramic windscreen, roof fairing up to the tall box, side skirts, broad yellow band
+    const W = 0.25, hw = W / 2, y0 = 0.07, cab = 0.2, zC = hl - cab, r = 0.052, axF = hl - 0.13, axR = -hl + 0.3;
+    gb.color(color);
+    prism(gb, zC, hl - 0.012, roofProfile(hw, y0, 0.295, 0.31, 0.85), 0.5);
+    taper(gb, hl - 0.012, hl, y0, W, 0.24, W - 0.012, 0.22);
+    // roof fairing rising from the cab roof to the box top
+    gb.color(color, 0.92);
+    taper(gb, zC + 0.01, hl - 0.06, 0.305, W - 0.03, 0.075, W - 0.06, 0.01);
+    gb.color(color);
+    prism(gb, -hl, zC - 0.012, [[-hw - 0.004, 0.09], [hw + 0.004, 0.09], [hw + 0.004, 0.375], [-hw - 0.004, 0.375]], 0.2);
+    gb.color(POST_YELLOW);
+    gb.box(0, 0.105, (-hl + zC - 0.012) / 2, W + 0.012, 0.075, zC - 0.012 + hl - 0.01);
+    gb.color(0xf4f4f0);
+    gb.box(0, 0.186, (-hl + zC - 0.012) / 2, W + 0.012, 0.008, zC - 0.012 + hl - 0.01);
+    postEmblem(gb, hw + 0.007, 0.29, (-hl + zC) / 2 + 0.05, 0.035, POST_YELLOW);
+    // side skirts between the axles, bumpers, wheel arches
+    gb.color(0x2b2e31);
+    for (const sx of [-1, 1]) gb.box(sx * (hw - 0.004), 0.03, (axF + axR) / 2 + 0.02, 0.01, 0.06, axF - axR - 0.2);
+    gb.box(0, 0.025, hl + 0.004, W - 0.004, 0.05, 0.014);
+    gb.box(0, 0.035, -hl - 0.004, W - 0.01, 0.03, 0.012);
+    arches(gb, hw, [axF], r, y0);
+    // windscreen in a black surround, door windows, mirrors on arms
+    gb.color(0x14181b); gb.box(0, 0.165, hl + 0.0005, W - 0.012, 0.13, 0.003);
+    gl.color(0xffffff); endWindow(gl, hl + 0.0025, 0.172, 0.285, hw - 0.012);
+    windowBand(gl, zC + 0.03, hl - 0.035, 0.175, 0.28, hw + 0.002, 1, 0);
+    gb.color(0x1e2124);
+    for (const sx of [-1, 1]) { gb.tube(sx * (hw - 0.01), 0.29, hl - 0.04, sx * (hw + 0.03), 0.28, hl + 0.01, 0.0045, 4); gb.box(sx * (hw + 0.032), 0.205, hl + 0.012, 0.012, 0.07, 0.01); }
+    // grille, LED lamps; rear doors
+    gb.color(0x1b1f22); gb.box(0, 0.085, hl + 0.002, W * 0.5, 0.06, 0.003);
+    gb.color(0xfff6c8); for (const sx of [-1, 1]) gb.box(sx * 0.092, 0.075, hl + 0.003, 0.05, 0.018, 0.004);
+    gb.color(0x1a1a1a); gb.box(0, 0.095, -hl - 0.0015, 0.004, 0.275, 0.003);
+    gb.color(0xb8bcc0); for (const sx of [-1, 1]) gb.box(sx * 0.018, 0.22, -hl - 0.003, 0.006, 0.05, 0.004);
+    gb.color(0xb02a20); for (const sx of [-1, 1]) gb.box(sx * (hw - 0.02), 0.06, -hl - 0.003, 0.018, 0.08, 0.004);
+    axle(gb, axF, r, hw - 0.022, 0.034, 0x151515, 12, 0xb8bcc0);
+    axle(gb, axR, r, hw - 0.03, 0.05, 0x151515, 12, 0xb8bcc0);
+    front = [[0.092, 0.084, hl + 0.01], [-0.092, 0.084, hl + 0.01]];
+    rear = [[hw - 0.02, 0.1, -hl - 0.01], [-hw + 0.02, 0.1, -hl - 0.01]];
+    lg.color(color); lg.box(0, y0, hl - cab / 2, W, 0.24, cab); lg.box(0, 0.09, (-hl + zC - 0.012) / 2, W + 0.008, 0.285, zC - 0.012 + hl);
+    lg.color(POST_YELLOW); lg.box(0, 0.105, (-hl + zC - 0.012) / 2, W + 0.012, 0.075, zC - 0.012 + hl);
+    lg.color(0x161616); lg.box(0, 0, axF, W - 0.01, 0.1, 0.11); lg.box(0, 0, axR, W - 0.01, 0.1, 0.11);
+    endWindow(lo.gl, hl + 0.0025, 0.172, 0.285, hw - 0.012);
+  } else {
+    // electric post van: tall box body to the roof, short bonnet, raked windscreen, black sills and bumpers
+    const W = 0.205, hw = W / 2, y0 = 0.04, yB = 0.135, yE = 0.262, zB = hl - 0.17, zF = hl - 0.075, r = 0.038, axF = hl - 0.11, axR = -hl + 0.13;
+    gb.color(color);
+    prism(gb, -hl, zB, roofProfile(hw, y0, yE, yE + 0.012, 0.85), 0.5);
+    rakedFront(gb, hw, y0, yB, yE, zB, zF);
+    taper(gb, zF, hl, y0, W, yB - y0, W - 0.02, yB - y0 - 0.03);
+    gb.color(0x1f2124);
+    gb.box(0, y0 - 0.005, 0, W + 0.006, 0.04, L - 0.012);
+    gb.box(0, y0 - 0.005, hl - 0.004, W - 0.004, 0.05, 0.014);
+    gb.box(0, y0 - 0.005, -hl + 0.004, W - 0.004, 0.05, 0.014);
+    arches(gb, hw, [axF, axR], r, y0 + 0.03);
+    // windscreen and door windows (none on the load box); rear doors; emblem
+    gb.color(0x14181b); onSlope(gb, -hw, hw, yB, yE, yB, yE, zB, zF, 0);
+    gl.color(0xffffff); onSlope(gl, -hw + 0.01, hw - 0.01, yB + 0.008, yE - 0.008, yB, yE, zB, zF, 0.0015);
+    windowBand(gl, zB - 0.11, zB - 0.012, 0.15, 0.245, hw + 0.002, 1, 0);
+    gb.color(0x14181b); gb.box(0, y0 + 0.04, -hl - 0.001, 0.003, 0.2, 0.002);
+    postEmblem(gb, hw + 0.002, 0.19, -0.04, 0.03, 0x1f1f1f, color);
+    gb.color(0xeef6ff); for (const sx of [-1, 1]) gb.box(sx * 0.07, 0.1, hl - 0.004, 0.045, 0.016, 0.008);
+    gb.color(0xb02a20); for (const sx of [-1, 1]) gb.box(sx * (hw - 0.015), 0.15, -hl - 0.002, 0.016, 0.07, 0.004);
+    axle(gb, axF, r, hw - 0.02, 0.026, 0x151515, 12, 0xb8bcc0);
+    axle(gb, axR, r, hw - 0.02, 0.026, 0x151515, 12, 0xb8bcc0);
+    front = [[0.07, 0.108, hl + 0.006], [-0.07, 0.108, hl + 0.006]];
+    rear = [[hw - 0.015, 0.185, -hl - 0.008], [-hw + 0.015, 0.185, -hl - 0.008]];
+    lg.color(color); lg.box(0, y0, (zF - hl) / 2, W, yE - y0, zF + hl); lg.box(0, y0, (zF + hl) / 2, W - 0.02, yB - y0 - 0.02, hl - zF);
+    lg.color(0x1f2124); lg.box(0, 0, 0, W + 0.006, y0 + 0.035, L - 0.02);
+    onSlope(lo.gl, -hw + 0.01, hw - 0.01, yB + 0.008, yE - 0.008, yB, yE, zB, zF, 0.0015);
+  }
+  const g = m.build();
+  return { ...g, length: L, lo: lo.build(), front, rear, bogies: [], bogieKind: 'b2' };
 }
 
 // ------------------------------------------------------------------------------------ long-distance coaches
@@ -1292,6 +1535,8 @@ interface EmuSpec {
   pitch: number;
   skirt: boolean;
   hsr: boolean;
+  /** postal unit: no side windows, two wide loading doors a car, a post-yellow band */
+  van?: boolean;
 }
 const hs = (cab: CabKind, nose: number, bands: [number, number][]): EmuSpec => ({
   W: 0.3, y0: 0.075, yE: 0.36, yT: 0.405, flat: 0.5, doors: 1, doorW: 0.075, stainless: false, bands, cab, nose,
@@ -1304,6 +1549,8 @@ const EMU: Record<string, EmuSpec> = {
   emu_60s: { W: 0.285, y0: 0.11, yE: 0.36, yT: 0.405, flat: 0.6, doors: 4, doorW: 0.12, stainless: false, bands: [[0.205, 0.218]], cab: 'flat3', nose: 0, roof: 0x5d6064, equip: 'vent', win: [0.24, 0.33], pitch: 0.12, skirt: false, hsr: false },
   emu_80s: { W: 0.29, y0: 0.105, yE: 0.365, yT: 0.405, flat: 0.75, doors: 4, doorW: 0.12, stainless: true, bands: [[0.198, 0.226]], cab: 'mask', nose: 0, roof: 0x8d9296, equip: 'ac', win: [0.235, 0.335], pitch: 0.15, skirt: false, hsr: false },
   emu_modern: { W: 0.295, y0: 0.1, yE: 0.37, yT: 0.405, flat: 0.8, doors: 4, doorW: 0.13, stainless: true, bands: [[0.342, 0.36], [0.2, 0.222]], cab: 'wrap', nose: 0.09, roof: 0xa9aeb3, equip: 'ac', win: [0.225, 0.335], pitch: 0, skirt: true, hsr: false },
+  // the postal unit (mail only): painted in the model colour, the operator's band, windowless parcels cars
+  emu_post: { W: 0.29, y0: 0.105, yE: 0.365, yT: 0.405, flat: 0.75, doors: 2, doorW: 0.17, stainless: false, bands: [[0.3, 0.322]], cab: 'mask', nose: 0, roof: 0x8d9296, equip: 'smooth', win: [0.235, 0.335], pitch: 0.15, skirt: true, hsr: false, van: true },
   hsr_0: hs('round', 0.36, [[0.205, 0.238], [0.09, 0.104]]),
   hsr_1: hs('wedge', 0.5, [[0.205, 0.232], [0.18, 0.19]]),
   hsr_2: hs('duck', 0.66, [[0.2, 0.225], [0.17, 0.178]]),
@@ -1396,19 +1643,32 @@ function emuCar(style: string, role: EmuRole, len: number, panto: boolean): Mode
   else for (let i = 0; i < sp.doors; i++) doorZ.push(d0 + ((d1 - d0) * (i + 0.5)) / sp.doors);
   gb.color(0x1b1d20);
   for (const z of doorZ) for (const sx of [-1, 1]) gb.box(sx * (hw + 0.0015), y0 + 0.012, z, 0.003, sp.win[1] - y0 + 0.004, sp.doorW + 0.008);
-  gl.color(0xffffff);
-  for (const z of doorZ) for (const sx of [-1, 1]) {
-    // two door leaves, glazed above waist height
-    for (const k of [-1, 1]) {
-      const a = z + (k < 0 ? -sp.doorW / 2 + 0.004 : 0.004), b = z + (k < 0 ? -0.004 : sp.doorW / 2 - 0.004);
-      const x = sx * (hw + 0.0035), ya = sp.win[0] - 0.01, yb = sp.win[1] - 0.004;
-      if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
+  if (sp.van) {
+    // windowless loading doors: two painted leaves with a dark joint, handles
+    m.paint(true); gb.color(0xd8d8d8);
+    for (const z of doorZ) for (const sx of [-1, 1]) for (const k of [-1, 1]) gb.box(sx * (hw + 0.0032), y0 + 0.016, z + k * (sp.doorW / 4 + 0.001), 0.002, sp.win[1] - y0 - 0.004, sp.doorW / 2 - 0.006);
+    m.paint(false);
+    gb.color(0x9a9a9a);
+    for (const z of doorZ) for (const sx of [-1, 1]) for (const k of [-1, 1]) gb.box(sx * (hw + 0.0045), 0.2, z + k * 0.012, 0.002, 0.04, 0.006);
+    // post-yellow band along the car, and an emblem between the doors
+    gb.color(POST_YELLOW);
+    gb.box(0, 0.17, (zr + zf) / 2, W + 0.006, 0.024, zf - zr - 0.01);
+    postEmblem(gb, hw + 0.004, 0.27, (zr + zf) / 2, 0.026, POST_YELLOW);
+  } else {
+    gl.color(0xffffff);
+    for (const z of doorZ) for (const sx of [-1, 1]) {
+      // two door leaves, glazed above waist height
+      for (const k of [-1, 1]) {
+        const a = z + (k < 0 ? -sp.doorW / 2 + 0.004 : 0.004), b = z + (k < 0 ? -0.004 : sp.doorW / 2 - 0.004);
+        const x = sx * (hw + 0.0035), ya = sp.win[0] - 0.01, yb = sp.win[1] - 0.004;
+        if (sx > 0) gl.quad(x, ya, b, x, ya, a, x, yb, a, x, yb, b); else gl.quad(x, ya, a, x, ya, b, x, yb, b, x, yb, a);
+      }
     }
   }
-  // window runs between the doors (flush glazing on a black band, or separate windows)
+  // window runs between the doors (flush glazing on a black band, or separate windows; none on a postal car)
   const runs: [number, number][] = [];
   const edges = [zr + (cabR || sp.doors === 1 ? 0.07 : 0.04), ...doorZ.flatMap((z) => [z - sp.doorW / 2 - 0.025, z + sp.doorW / 2 + 0.025]).sort((a, b) => a - b), zf - (cabF ? (noseL > 0 ? 0.04 : 0.1) : 0.04)];
-  for (let i = 0; i + 1 < edges.length; i += 2) if (edges[i + 1] - edges[i] > 0.05) runs.push([edges[i], edges[i + 1]]);
+  if (!sp.van) for (let i = 0; i + 1 < edges.length; i += 2) if (edges[i + 1] - edges[i] > 0.05) runs.push([edges[i], edges[i + 1]]);
   const [wy0, wy1] = sp.win;
   if (sp.pitch === 0) {
     gb.color(0x14181b);
@@ -1517,7 +1777,8 @@ function emuCar(style: string, role: EmuRole, len: number, panto: boolean): Mode
   lg.color(sp.roof);
   lg.box(0, yE, (zr + zf) / 2, W * 0.86, yT - yE, zf - zr - 0.02);
   if (panto) { lg.color(0x3c3f42); lg.box(0, yT, role === 'cab' ? zr + 0.25 : zf - 0.25, 0.16, 0.12, 0.03); }
-  windowBand(lb.gl, zr + 0.06, zf - 0.06, wy0, wy1, hw + 0.002, 1, 0);
+  if (sp.van) { lg.color(POST_YELLOW); lg.box(0, 0.17, (zr + zf) / 2, W + 0.006, 0.024, zf - zr - 0.01); }
+  else windowBand(lb.gl, zr + 0.06, zf - 0.06, wy0, wy1, hw + 0.002, 1, 0);
   if (cabF && noseL <= 0) endWindow(lb.gl, hl + 0.002, wy0, wy1, hw - 0.025);
   return { ...g, lo: lb.build(), length: len, front, rear, bogies: [len * BOGIE_F, -len * BOGIE_F], bogieKind: 'b2' };
 }
@@ -1545,6 +1806,9 @@ export function getModel(style: string, color: number, length: number): ModelGeo
     case 'hst': m = streamliner(color, 0x1d3f8a, length, 0.45, false); break;
     case 'bullet': m = streamliner(color, 0x1f5fa8, length, 0.85, true); break;
     case 'coach_wood': case 'coach_steel': case 'coach_ic': case 'coach_hs': m = coach(style, color, length); break;
+    // mail vans: the coach of their era without passenger windows (loading doors, post-yellow band, emblem)
+    case 'van_wood': case 'van_steel': case 'van_ic': m = coach(style.replace('van_', 'coach_'), color, length, true); break;
+    case 'postvan_old': case 'mailtruck': case 'mailtruck_modern': case 'postvan_e': m = roadMail(style, color, length); break;
     default: m = bus(style, color, length); break;
   }
   cache.set(key, m);

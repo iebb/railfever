@@ -454,6 +454,27 @@ export class DemandModel {
     return { ...st, quality: this.mainlineFrequency(st), access };
   }
 
+  /**
+   * Buildings within `reach` units of a railway station by road from its forecourts and entrances, with their
+   * distances: the car feeders' geometry (feederPools), for the mail feeders (mail.ts). Reads the network only (the
+   * walks are cached geometry): the passenger demand is untouched.
+   */
+  feederReach(st: Station, reach: number): Map<number, number> {
+    const r = st.rail, forecourt = this.g.stations.forecourt(st);
+    return this.feederReachAt(st, [forecourt, r?.forecourt2, ...(r?.entrances ?? [])].filter((p): p is { x: number; z: number } => !!p), reach);
+  }
+
+  /** feederReach of a site with these road accesses (a planned station: its access street's ends; none: the site). */
+  feederReachAt(site: { x: number; z: number }, access: { x: number; z: number }[] | undefined, reach: number): Map<number, number> {
+    const buildings = new Map<number, number>();
+    for (const p of access?.length ? access : [site]) {
+      const leg = Math.hypot(p.x - site.x, p.z - site.z), left = reach - leg;
+      if (left <= 0) continue;
+      for (const [bid, distance] of this.feederWalk(p.x, p.z, left)) buildings.set(bid, Math.min(buildings.get(bid) ?? Infinity, distance + leg));
+    }
+    return buildings;
+  }
+
   /** Walking residents plus separately claimed car feeders, including park-and-ride with no walking lots. */
   generationPopulation(st: Station): number {
     this.refreshFeeders();

@@ -16,11 +16,13 @@ import { cashPitch } from '../audio/engine';
 /** Share funding, repurchases and distributions are shown separately from operating profit. */
 const OPERATING = PROFIT_CATEGORIES;
 /** Rows hidden while they are zero in every column. */
-const OPTIONAL = new Set<Category>(['trackIncome', 'trackFees']);
+const OPTIONAL = new Set<Category>(['mailIncome', 'trackIncome', 'trackFees']);
 const valueOf = (v: Partial<Record<Category, number>>, k: Category) => typeof v[k] === 'number' && isFinite(v[k]!) ? v[k]! : 0;
 const recordSum = (v: Partial<Record<Category, number>>) => OPERATING.reduce((a, k) => a + valueOf(v, k), 0);
 const monthSum = (m: MonthRecord) => recordSum(m.v);
 const financeLabel = (k: Category) => k === 'running' ? 'Overheads / legacy running' : CATEGORY_LABEL[k];
+/** Mail income line: envelope white, dashed (apart from the blue, green and yellow series for colour-blind players too; --mail in style.css). */
+const MAIL_COLOR = '#f8fafc';
 const COST_COLORS: Partial<Record<Category, string>> = {
   energy: '#ffc857', crew: '#8fc3ff', vehicleMaint: '#c792ea', running: '#a4afbf',
   maintenance: '#4ade80', trackWear: '#ff8c69', trackFees: '#2ec4b6',
@@ -69,12 +71,17 @@ export function openFinances(ui: UI) {
       add(win.body, section('Monthly profit & income', `${ms.length} months`));
       if (!ms.length) add(win.body, h('div', { class: 'pad' }, 'The chart fills up month by month.'));
       else {
+        // mail income (a part of the income) as its own dashed line once there is any
+        const mail = ms.some((m) => valueOf(m.v, 'mailIncome'));
         add(win.body, chart([
           { values: ms.map(monthSum), color: '#4ade80', kind: 'bar', label: 'Profit' },
-          { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
+          { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'mailIncome') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
           { values: ms.map((m) => operatingCosts(m.v)), color: '#ffc857', label: 'Operating costs' },
+          ...(mail ? [{ values: ms.map((m) => valueOf(m.v, 'mailIncome')), color: MAIL_COLOR, label: 'Mail income', dash: [5, 3] }] : []),
         ], { w: 548, h: 170, labels: monthLabels(e, 24) }),
-        h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'), h('span', { style: '--c:#ffc857' }, h('i'), 'Vehicle costs, upkeep, wear & fees')),
+        h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'),
+          mail ? h('span', { class: 'lg-dash', style: `--c:${MAIL_COLOR}` }, h('i'), 'of which mail') : null,
+          h('span', { style: '--c:#ffc857' }, h('i'), 'Vehicle costs, upkeep, wear & fees')),
         section('Monthly operating cost breakdown'),
         chart(OPERATING_COSTS.map((k) => ({ values: ms.map((m) => -valueOf(m.v, k)), color: COST_COLORS[k] ?? '#a4afbf', label: financeLabel(k) })), { w: 548, h: 170, labels: monthLabels(e, 24) }),
         h('div', { class: 'legend' }, OPERATING_COSTS.map((k) => h('span', { style: `--c:${COST_COLORS[k] ?? '#a4afbf'}` }, h('i'), financeLabel(k)))),
@@ -86,7 +93,7 @@ export function openFinances(ui: UI) {
         const tbl = h('table', { class: 'tbl fin' }, h('tr', null, h('th', null, 'Year'), h('th', null, 'Income'), h('th', null, 'Costs'), h('th', null, 'Profit')));
         for (const y of [...years].reverse()) {
           const p = recordSum(y.v);
-          const inc = valueOf(y.v, 'income') + valueOf(y.v, 'trackIncome');
+          const inc = valueOf(y.v, 'income') + valueOf(y.v, 'mailIncome') + valueOf(y.v, 'trackIncome');
           tbl.appendChild(h('tr', null, h('td', null, String(y.year)), h('td', { class: 'pos' }, fmtMoney(inc)), h('td', { class: 'neg' }, fmtMoney(p - inc)), h('td', { class: p < 0 ? 'neg' : 'pos' }, fmtMoney(p))));
         }
         add(win.body, h('div', { class: 'finance-table' }, tbl));

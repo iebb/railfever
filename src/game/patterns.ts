@@ -13,7 +13,7 @@ import type { Line } from './lines';
 import type { Vehicle } from './vehicle';
 import type { Train, TSeg } from './train';
 import type { Station } from './stations';
-import { TRACK_TYPES, UNIT_M } from './constants';
+import { TRACK_TYPES, UNIT_M, type Cargo } from './constants';
 import { consistOf, hopEstimate } from './opcosts';
 import type { VehicleModel } from './vehicle-types';
 import type { NEdge } from './network';
@@ -22,6 +22,7 @@ import { consistRule, findRailRoute, railNext, ruleAllows, lineCompatibility } f
 import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
 import { simNow } from './fares';
+import { redirectMail, mergeLineMail } from './mail';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -206,13 +207,16 @@ export function patternName(g: Game, l: Line, flags: boolean[], kind?: PatternKi
   return `${PATTERN_LABEL[kd]} ${nm(st[0])} – ${nm(st[st.length - 1])}`;
 }
 
-/** The vehicles of a line by pattern id (vehicles without a known pattern run the first). */
-export function vehiclesByPattern(g: Game, l: Line): Map<number, Vehicle[]> {
+/**
+ * The vehicles of a line that carry `cargo`, by pattern id (vehicles without a known pattern run the first).
+ * Passengers: every vehicle but the mail-only ones (Vehicle.carries).
+ */
+export function vehiclesByPattern(g: Game, l: Line, cargo: Cargo = 'pax'): Map<number, Vehicle[]> {
   const ps = linePatterns(l);
   const out = new Map<number, Vehicle[]>(ps.map((p) => [p.id, []]));
   for (const id of l.vehicles) {
     const v = g.vehicles.get(id);
-    if (!v) continue;
+    if (!v || !v.carries(cargo)) continue;
     const pid = v.pattern !== undefined && out.has(v.pattern) ? v.pattern : ps[0].id;
     out.get(pid)!.push(v);
   }
@@ -334,8 +338,25 @@ function sdist(g: Game, a: number, b: number): number {
 }
 
 interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[]; route: string; timing: number[] }
-interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
+export interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
+/** Cached line tables: passengers, and mail where the line's mail fleet differs from its passenger fleet. */
 const tables = new WeakMap<Game, Map<number, LineTable>>();
+const mailTables = new WeakMap<Game, Map<number, LineTable>>();
+
+/**
+ * Which of a line's vehicles carry mail: 'none', 'all' (every vehicle carries passengers and mail: the mail table
+ * is the passenger table) or 'some' (a mail fleet of its own: mixed and mail-only vehicles alongside passenger ones).
+ */
+export function mailFleet(g: Game, l: Line): 'none' | 'all' | 'some' {
+  let mail = 0, both = 0, n = 0;
+  for (const id of l.vehicles) {
+    const v = g.vehicles.get(id);
+    if (!v) continue;
+    n++;
+    if (v.carries('mail')) { mail++; if (v.carries('pax')) both++; }
+  }
+  return !mail ? 'none' : both === n ? 'all' : 'some';
+}
 
 /** Speed cap (km/h) of a hop between two stations: the faster platform track type (rail), street / road (road). */
 function hopCap(g: Game, l: Line, a: number, b: number): number {
@@ -360,18 +381,21 @@ function slowest(vs: Vehicle[]): VehicleModel[] {
 }
 
 /**
- * Timetables, routing edges and boarding rules of a line (cached per routing version): per running pattern the
- * time from each served stop to the next (running time of the hop from the vehicles' physics, at most the track /
- * road speed, plus the dwell), its cycle and frequency; per pair of stations the expected journey time (half the
- * combined headway of the services worth taking plus the ride) and the services worth taking (attractive set).
+ * Timetables, routing edges and boarding rules of a line for a cargo (cached per routing version): per running
+ * pattern the time from each served stop to the next (running time of the hop from the physics of the vehicles that
+ * carry the cargo, at most the track / road speed, plus the dwell), its cycle and frequency; per pair of stations the
+ * expected journey time (half the combined headway of the services worth taking plus the ride) and the services worth
+ * taking (attractive set). Mail: the passenger table itself when every vehicle carries both (mailFleet 'all').
  */
-export function lineTable(g: Game, l: Line): LineTable {
-  let m = tables.get(g);
-  if (!m) { m = new Map(); tables.set(g, m); }
+export function lineTable(g: Game, l: Line, cargo: Cargo = 'pax'): LineTable {
+  if (cargo === 'mail' && mailFleet(g, l) === 'all') return lineTable(g, l);
+  const cache = cargo === 'mail' ? mailTables : tables;
+  let m = cache.get(g);
+  if (!m) { m = new Map(); cache.set(g, m); }
   const hit = m.get(l.id);
   // between routing rebuilds (stop and vehicle edits rebuild): the same table
   if (hit && hit.ver === g.lines.version && hit.stops === l.stops && hit.nv === l.vehicles.length) return hit;
-  const byPat = vehiclesByPattern(g, l);
+  const byPat = vehiclesByPattern(g, l, cargo);
   // cached until what the timetable depends on changes (not on every routing rebuild): the stops (where they are,
   // their track type), the vehicles of each pattern (their speed) and the patterns' stops
   let key = isLoopLine(l) ? 'loop:' : 'back:';
@@ -462,20 +486,20 @@ export function lineTable(g: Game, l: Line): LineTable {
   return t;
 }
 
-/** Routing edges of a line (expected journey times in sim seconds) and the stations its running patterns serve. */
-export function lineGraph(g: Game, l: Line): { edges: { from: number; to: number; cost: number }[]; served: Set<number> } {
-  const t = lineTable(g, l);
+/** Routing edges of a line for a cargo (expected journey times in sim seconds) and the stations its running patterns serve. */
+export function lineGraph(g: Game, l: Line, cargo: Cargo = 'pax'): { edges: { from: number; to: number; cost: number }[]; served: Set<number> } {
+  const t = lineTable(g, l, cargo);
   return { edges: t.edges, served: t.served };
 }
 
-/** Headway (s) of each running pattern of a line: cycle time / vehicles. */
-export function patternHeadways(g: Game, l: Line): { pid: number; vehicles: number; cycle: number; headway: number }[] {
-  return lineTable(g, l).pats.map((p) => ({ pid: p.pid, vehicles: p.n, cycle: p.cycle, headway: p.cycle / p.n }));
+/** Headway (s) of each running pattern of a line for a cargo: cycle time / the vehicles carrying it. */
+export function patternHeadways(g: Game, l: Line, cargo: Cargo = 'pax'): { pid: number; vehicles: number; cycle: number; headway: number }[] {
+  return lineTable(g, l, cargo).pats.map((p) => ({ pid: p.pid, vehicles: p.n, cycle: p.cycle, headway: p.cycle / p.n }));
 }
 
-/** Scheduled headway (s) of a pattern of a line (cycle time / its vehicles); 0 when it does not run. */
-export function patternHeadway(g: Game, l: Line, pid?: number): number {
-  const t = lineTable(g, l);
+/** Scheduled headway (s) of a pattern of a line for a cargo (cycle time / its vehicles); 0 when it does not run. */
+export function patternHeadway(g: Game, l: Line, pid?: number, cargo: Cargo = 'pax'): number {
+  const t = lineTable(g, l, cargo);
   const p = patternOf(l, pid);
   const id = p ? p.id : 0;
   const pt = t.pats.find((q) => q.pid === id) ?? t.pats[0];
@@ -487,19 +511,31 @@ export function patternHeadway(g: Game, l: Line, pid?: number): number {
 export const SPACING_GAP = 0.75;
 export const SPACING_HOLD = 0.6;
 
-/** Saved clocks of the vehicle's current pattern. Route edits invalidate clocks of the old stop sequence. */
+/**
+ * Saved clocks of the vehicle's current pattern. Route edits invalidate clocks of the old stop sequence. Vehicles are
+ * spaced by role: passenger (and mixed) vehicles among themselves, mail-only ones among themselves (clock key
+ * 'm' + pattern id, the pattern's cycle in the mail table over its mail-only vehicles).
+ */
 export function spacingSchedule(g: Game, v: Vehicle) {
   const l = v.line;
   if (!l || l.evenSpacing === false) return null;
   const p = patternOf(l, v.pattern), pid = p?.id ?? 0;
-  const pt = lineTable(g, l).pats.find((q) => q.pid === pid);
+  const mailOnly = v.mailOnly;
+  const pt = lineTable(g, l, mailOnly ? 'mail' : 'pax').pats.find((q) => q.pid === pid);
   if (!pt) return null;
-  const headway = pt.cycle / pt.n; // patternHeadway, using the same cached table / resolved pattern
+  let n = pt.n;
+  if (mailOnly) {
+    n = 0;
+    for (const o of vehiclesByPattern(g, l, 'mail').get(pid) ?? []) if (o.mailOnly) n++;
+    if (!n) return null;
+  }
+  const headway = pt.cycle / n; // patternHeadway, using the same cached table / resolved pattern
   if (!(headway > 0)) return null;
   const clocks = l.spacing ??= {};
-  let clock = clocks[pid];
-  if (!clock || clock.route !== pt.route) clock = clocks[pid] = { route: pt.route, departures: {} };
-  return { clock, headway, vehicles: pt.n, timing: pt.timing };
+  const key = mailOnly ? 'm' + pid : pid;
+  let clock = clocks[key];
+  if (!clock || clock.route !== pt.route) clock = clocks[key] = { route: pt.route, departures: {} };
+  return { clock, headway, vehicles: n, timing: pt.timing };
 }
 
 /** Termini of an out-and-back pattern, or its first served stop on a loop. */
@@ -554,7 +590,7 @@ export function noteSpacingDeparture(g: Game, v: Vehicle) {
  * passengers heading for `alight` board? Its pattern must stop there, and it must be among the services worth
  * taking from here (waiting for a faster service can be better). Built once per stop.
  */
-export function boarding(g: Game, l: Line, pid: number | undefined, idx: number, stationId: number): (alight: number) => boolean {
+export function boarding(g: Game, l: Line, pid: number | undefined, idx: number, stationId: number, cargo: Cargo = 'pax'): (alight: number) => boolean {
   const n = l.stops.length;
   if (!n) return () => false;
   const p = patternOf(l, pid);
@@ -571,7 +607,7 @@ export function boarding(g: Game, l: Line, pid: number | undefined, idx: number,
     if (l.stops[i] === stationId) here.push(i);
     break;
   }
-  const t = lineTable(g, l);
+  const t = lineTable(g, l, cargo);
   const known = t.pats.some((q) => q.pid === id);
   const serves = new Set<number>();
   l.stops.forEach((s, i) => { if (f[i]) serves.add(s); });
@@ -860,9 +896,10 @@ function mergeLineStats(a: Line, b: Line) {
   a.passMonth += b.passMonth; a.passLast += b.passLast;
   a.incomeYear += b.incomeYear; a.incomeLast += b.incomeLast;
   a.costYear += b.costYear; a.costLast += b.costLast;
+  if (b.mail) mergeLineMail(a, b);
 }
 
-/** Move waiting groups off a removed line, retaining their waiting times and transfer counts. */
+/** Move waiting groups (passengers and mail) off a removed line, retaining their waiting times and transfer counts. */
 function redirectWaiting(g: Game, from: number, into: number) {
   for (const st of g.stations.map.values()) {
     if (![...st.waiting.values()].some((w) => w.line === from)) continue;
@@ -870,6 +907,7 @@ function redirectWaiting(g: Game, from: number, into: number) {
     st.waiting.clear(); st.waitingTotal = 0;
     for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
   }
+  redirectMail(g, from, into);
 }
 
 /** Map a vehicle's current call, preserving the return direction at repeated interior stations. */

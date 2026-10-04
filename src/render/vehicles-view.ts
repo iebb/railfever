@@ -8,7 +8,8 @@ import { laneTrim } from '../game/roadvehicle';
 import { ROAD_DRAPE } from './terrain';
 import type { VehicleModel } from '../game/vehicle-types';
 import { Materials } from './materials';
-import { getModel, getCarModel, bogieModel, ModelGeo, getTramSection, tramSections, tramRoles, TramRole, TRAM_GAP, isRoadCoach, coachEra, getRoadCoach, getEmuCar, EMU_GAP, EmuRole, lrvStyle } from './vehicle-models';
+import { getModel, getCarModel, bogieModel, ModelGeo, getTramSection, tramSections, tramRoles, TramRole, TRAM_GAP, isRoadCoach, coachEra, getRoadCoach, getEmuCar, EMU_GAP, EmuRole, lrvStyle, roadMailStyle } from './vehicle-models';
+import { carriesMail, mailOnlyModel } from '../game/vehicle-types';
 import { applyClouds } from './clouds';
 import { srgbToLinear } from './geo';
 import { RAIL } from '../game/constants';
@@ -448,7 +449,9 @@ vRfGlass = step(2.5, aPaint);`);
   private model(m: VehicleModel): ModelGeo {
     let g = this.models.get(m);
     if (!g) {
-      g = isRoadCoach(m) ? getRoadCoach(coachEra(m.style, m.intro), m.length) : getModel(m.style, m.color, m.length);
+      // road mail vans and trucks have bodies of their own (the catalogue lists bus styles for them)
+      const mail = roadMailStyle(m);
+      g = mail ? getModel(mail, m.color, m.length) : isRoadCoach(m) ? getRoadCoach(coachEra(m.style, m.intro), m.length) : getModel(m.style, m.color, m.length);
       this.models.set(m, g);
     }
     return g;
@@ -667,7 +670,8 @@ vRfGlass = step(2.5, aPaint);`);
     if (!sl.geo) {
       sl.geo = !sl.emu ? this.model(sl.m)
         : sl.lrv ? getTramSection(sl.lrv, sl.role as TramRole, sl.len)
-        : getEmuCar(sl.m.style, sl.role as EmuRole, sl.len, sl.panto);
+        // (the postal unit: windowless parcels cars)
+        : getEmuCar(mailOnlyModel(sl.m) ? 'emu_post' : sl.m.style, sl.role as EmuRole, sl.len, sl.panto);
     }
     return sl.geo;
   }
@@ -687,11 +691,13 @@ vRfGlass = step(2.5, aPaint);`);
    */
   private coachLivery(b: Batch, o: number, m: VehicleModel, owner: number) {
     const mc = this.lin(m.color), cream = this.lin(0xf3efe6), main = this.tmpMain;
-    for (let i = 0; i < 3; i++) main[i] = mc[i] * 0.28 + cream[i] * 0.72;
-    const acc = this.lin(this.game ? this.game.company(owner).color : '#e8a33d');
-    // perceived lightness (CIE L*) of body and livery too close: charcoal body
+    // postbuses keep their post-yellow body (the model colour); other coaches a light neutral tinted by it
+    const post = carriesMail(m);
+    for (let i = 0; i < 3; i++) main[i] = post ? mc[i] : mc[i] * 0.28 + cream[i] * 0.72;
+    let acc = this.lin(this.game ? this.game.company(owner).color : '#e8a33d');
+    // perceived lightness (CIE L*) of body and livery too close: charcoal body (a postbus: charcoal stripes instead)
     const Ls = (c: Float32Array) => 116 * Math.cbrt(0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]) - 16;
-    if (Math.abs(Ls(main) - Ls(acc)) < 20) main.set(this.lin(0x2e3438));
+    if (Math.abs(Ls(main) - Ls(acc)) < 20) { if (post) acc = this.lin(0x2e3438); else main.set(this.lin(0x2e3438)); }
     const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
     c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
     a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
@@ -845,6 +851,8 @@ vRfGlass = step(2.5, aPaint);`);
     for (const p of this.batches.values()) { p.hi.dispose(); p.lo.dispose(); }
     this.batches.clear();
     this.bogies.b2.dispose(); this.bogies.b3.dispose();
+    // Bogie geometry is created for this view, unlike the shared cached vehicle models.
+    this.bogies.b2.geo.dispose(); this.bogies.b3.geo.dispose();
     this.smoke.geo.dispose();
     this.lights.geo.dispose();
     this.paintMat.dispose();
