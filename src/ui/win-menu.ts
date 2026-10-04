@@ -207,7 +207,7 @@ export function openHelp(ui: UI) {
       <li>Blue: bridges · purple: tunnels · red: buildings in the way.</li>
       <li>Click: build / continue; drag: one section; right-click / <kbd>Esc</kbd> / long press: end.</li>
       <li>Touch: tap start, end to preview, same spot to build; elsewhere: move preview.</li>
-      <li>Standard / electric / high-speed track: up to 400 km/h; 1–4 parallel tracks.</li>
+      <li>One track type: curves and grades set speed, up to 400 km/h; 1–4 parallel tracks.</li>
       <li>Road type, crossing mode and end height: <kbd>[</kbd>/<kbd>]</kbd>, ±5 m for bridges / tunnels.</li>
       <li><kbd>Shift</kbd> over track: parallel copy.</li>
     </ol>
@@ -233,17 +233,17 @@ export function openHelp(ui: UI) {
     </ul>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
-      <li><b>Urban</b> (<kbd>U</kbd>): metro / light rail; ground / elevated / underground; height / depth.</li>
-      <li>Urban stations: matching track, close spacing, optional street entrances.</li>
+      <li><b>Urban</b> (<kbd>U</kbd>): double track with wire; metro / light-rail station styles; ground / elevated / underground.</li>
+      <li>Urban stations: close spacing, optional street entrances.</li>
       <li>Any train / rail line: urban + main-line through running; equal fares and reach.</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, Rail → Connect): two points → curve, turnouts, signals, cost.</li>
       <li>Click: build; <kbd>Esc</kbd> / right-click: restart; turnouts outside platforms / depots.</li>
       <li>Urban → <b>Re-level</b>: Lift / Sink / Ground; height / depth; click / drag your track.</li>
       <li>Ramps included; stations move; lines / signals stay; structures cost extra.</li>
-      <li><b>Electrify</b> (Rail): click / drag standard track; platform tracks included.</li>
-      <li>Electric locos / EMUs: wire + compatible track; standard remains 160 km/h.</li>
+      <li><b>Electrify</b> (Rail): click / drag track; platform tracks included; new track inherits wire.</li>
+      <li>Electric locos, EMUs, metro and light-rail units need wire; wire doesn't change speed.</li>
       <li><b>Multiple units</b>: EMUs / light rail; price and capacity per complete unit.</li>
-      <li><b>Units</b> couples sets; check track badges and compatibility before buying.</li>
+      <li><b>Units</b> couples sets; check the wire requirement before buying.</li>
     </ul>
     <h4>Lines, demand and companies</h4>
     <ul>
@@ -306,7 +306,7 @@ export function openHelp(ui: UI) {
       <li>Merge panel: nearby stations → rebuild as one or link for walking transfers.</li>
       <li>Fares: distance, time saved versus walking / driving, including wait.</li>
       <li>Rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before speed factor, once per journey.</li>
-      <li>Equal rail fares on all track types; short trips earn a smaller speed premium.</li>
+      <li>Equal rail fares for every station style; short trips earn a smaller speed premium.</li>
       <li>Speed, frequency and direct journeys raise fares.</li>
       <li>Each transfer: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on that leg and all later legs.</li>
       <li>High-speed trains cost more energy and maintenance.</li>

@@ -230,7 +230,7 @@ export function openLine(ui: UI, id: number) {
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
     if (route?.through || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
-      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Multiple operators’ networks or track types' }, 'Through service') : null,
+      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Across operators’ networks' }, 'Through service') : null,
       nPat > 1 ? h('span', { class: 'flag shared' }, `${nPat} services`) : null,
       nOps ? h('span', { class: 'flag shared', 'data-tip': g.lines.operatorsOf(l).map((o) => g.company(o).name).join(' · ') }, `Shared · ${nOps + 1} operators`) : null));
     if (palette && mine) {

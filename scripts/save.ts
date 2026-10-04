@@ -180,8 +180,14 @@ let errors = 0;
 const replayStart = g.day;
 while (g.day < replayStart + 360) {
   try { g.stepTick(); g2.stepTick(); } catch (e) { errors++; console.log('EXCEPTION', (e as Error).stack?.split('\n').slice(0, 5).join('\n')); break; }
-  if (g.day === replayStart + 120 && g.tick % g.ticksPerDay === 0)
-    check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(g2)), 'mid-job save replays exactly for 120 days with stepTick');
+  if (g.day === replayStart + 120 && g.tick % g.ticksPerDay === 0) {
+    const a = JSON.stringify(serialize(g)), b = JSON.stringify(serialize(g2));
+    if (a !== b) {
+      let at = 0; while (a[at] === b[at]) at++;
+      console.log(`  replay differs at ${at}: ${a.slice(Math.max(0, at - 100), at + 160)}\n  loaded: ${b.slice(Math.max(0, at - 100), at + 160)}`);
+    }
+    check(a === b, 'mid-job save replays exactly for 120 days with stepTick');
+  }
 }
 const a = sig(g), b = sig(g2);
 console.log(`after a year: original ${JSON.stringify({ ...a, states: undefined })}\n              loaded   ${JSON.stringify({ ...b, states: undefined })}`);

@@ -65,7 +65,7 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   console.log('underground entrances and unconnected access');
   const g = flatGame(128);
   road(g, node(g, 16, 52), node(g, 112, 52)); road(g, node(g, 16, 76), node(g, 112, 76));
-  const S = station(g, 64, 64, Math.PI / 2, 12, 2, 0, { trackType: 'metro' })!;
+  const S = station(g, 64, 64, Math.PI / 2, 12, 2, 0, { trackType: 'electric', mode: 'metro' })!;
   if (!S) throw new Error('metro fixture');
   S.rail!.entrances = [{ x: 54, z: 52.8, angle: Math.PI }, { x: 80, z: 76.8, angle: Math.PI }, { x: 30, z: 65, angle: 0 }];
   const a = house(g, 58, 50), b = house(g, 84, 74), platform = house(g, 64, 63);

@@ -8,6 +8,7 @@ import type { Line } from '../game/lines';
 import type { NEdge } from '../game/network';
 import { h, icon, add, seg, section } from './dom';
 import { fmtMoney } from '../game/economy';
+import { railPartMode } from '../game/stations';
 import { TRACK_TYPES, RAIL_FARE } from '../game/constants';
 import { Train, lineCongestion, lineOperators, LineCongestion } from '../game/train';
 import { autoSignalLine } from '../game/signals';
@@ -17,7 +18,7 @@ import { electrify } from '../game/build-ops';
 import { lineRoute, lineTable, patternHeadways, linePatterns, PATTERN_LABEL } from '../game/patterns';
 import { fareBreakdown, stationFareContext, TRANSFER_FARE_FACTOR, FARE_LEVEL } from '../game/fares';
 import { computeLinePath } from './linepaths';
-import { fmtLen, fmtPct, TYPE_META } from './format';
+import { fmtLen, fmtPct } from './format';
 import type { PartnerPolicy } from '../game/lines';
 
 // ------------------------------------------------------------------ small cache (per game; keyed results)
@@ -233,7 +234,7 @@ export function routeInfo(g: Game, l: Line, fresh = false): RouteInfo | null {
       if (e.type === 'standard') standard.push(id);
     }
     for (const sid of l.stops) for (const id of g.stations.get(sid)?.rail?.edges ?? []) { const e = net.edges.get(id); if (e?.type === 'standard' && !standard.includes(id)) standard.push(id); }
-    const modes = new Set([...types.keys()].map((t) => TRACK_TYPES[t]?.mode ?? 'mainline'));
+    const modes = new Set(l.stops.map((id) => { const r = g.stations.get(id)?.rail; return r ? railPartMode(r) : 'mainline'; }));
     return { owners, types, standard, through: owners.length > 1 || modes.size > 1 };
   }, fresh ? 0 : Infinity, fresh ? 0 : 1000);
 }
@@ -249,8 +250,8 @@ export function routePanel(ui: UI, l: Line): HTMLElement | null {
     section(r.through ? 'Through service' : 'Route', r.owners.length > 1 ? `${r.owners.length} operators' track` : fmtLen(total)),
     h('div', { class: 'opbar', role: 'img', 'aria-label': 'Track owners along the route' }, r.owners.map((o) => h('i', { style: `flex:${Math.max(0.02, o.share)};--c:${own(o.owner).color}`, 'data-tip': `${own(o.owner).name}: ${fmtLen(o.distance)} (${fmtPct(o.share)})` }))),
     h('div', { class: 'legend' }, r.owners.map((o) => h('span', { style: `--c:${own(o.owner).color}` }, h('i'), `${own(o.owner).name} ${fmtPct(o.share)}`))),
-    r.types.size ? h('div', { class: 'ttypes', style: 'margin-top:6px' }, [...r.types].sort((a, b) => b[1] - a[1]).map(([t, len]) => h('span', { class: 'ttype', style: `--c:${TYPE_META[t]?.color ?? '#9aa5b4'}` }, h('i'), `${TYPE_META[t]?.short ?? t} ${fmtLen(len)}`))) : null,
-    r.through ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Through running across networks / track types · track fees by usage share') : null);
+    r.types.size ? h('div', { class: 'muted', style: 'margin-top:6px' }, `Wire: ${fmtLen([...r.types].reduce((n, [t, len]) => n + (TRACK_TYPES[t]?.electrified ? len : 0), 0))} of ${fmtLen(total)}`) : null,
+    r.through ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Through running across networks · track fees by usage share') : null);
 }
 
 /** Vehicles of the line that find no route their track types allow, with "electrify the line" where wire is missing. */
@@ -371,7 +372,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
       h('span', null, 'Speed factor'), h('span', { class: f.factor >= 1 ? 'pos' : 'neg' }, `×${f.factor.toFixed(2)}`),
       h('span', null, 'Fare per passenger'), h('span', null, `${fmtMoney(f.perPassenger)} (base ${fmtMoney(f.base)})`)),
     heads.length ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, heads.map((x) => `${pats.find((p) => p.id === x.pid)?.name ?? PATTERN_LABEL.local}: every ${minSec(x.headway)} (${plural(x.vehicles, 'vehicle')})`).join(' · ')) : null,
-    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Speed and frequency raise fares · transfers: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on this and later legs${l.kind === 'rail' ? ` · rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)}: all track types, before speed factor, once per journey` : ''}`));
+    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Speed and frequency raise fares · transfers: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on this and later legs${l.kind === 'rail' ? ` · rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before speed factor, once per journey` : ''}`));
 }
 
 /** Sell the player's vehicles on a line and delete it (or hand a shared line over to a partner). */

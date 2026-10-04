@@ -439,7 +439,7 @@ export interface ElectrifyResult {
 /**
  * Overhead wire for standard track: standard -> electric (ELECTRIFY.costPerUnit per unit of track, platform
  * tracks included). One's own track, or another company's that one may use (it stays theirs; the electrifying
- * company pays). Electrified, metro, light-rail and high-speed track is left alone.
+ * company pays). Track already carrying wire is left alone.
  */
 export function electrify(g: Game, edgeIds: number[], owner: number, dryRun = false): ElectrifyResult {
   const net = g.world.net;
@@ -457,6 +457,7 @@ export function electrify(g: Game, edgeIds: number[], owner: number, dryRun = fa
   if (dryRun) return res;
   if (!g.company(owner).economy.spend(res.cost, 'construction')) return { cost: res.cost, changed: 0, length: 0, error: 'Not enough money' };
   for (const e of todo) { e.type = ELECTRIFY.to; net.touchEdge(e); }
+  for (const st of g.stations.map.values()) if (st.rail?.edges.length && [...st.rail.edges, ...st.rail.throughEdges].every((id) => net.edges.get(id)?.type === ELECTRIFY.to)) st.rail.trackType = ELECTRIFY.to;
   g.onNetworkChanged();
   return res;
 }

@@ -1,11 +1,13 @@
+import { makeSeg } from '../src/game/train';
+import { KMH_TO_UPS } from '../src/game/constants';
 // Towns and the terrain / railways (UPDATE 9e(e), 9g, 9i, 9k):
 //  A. hilly growth: no town street ends on a bridge (after generation and a 10-year run), town streets bridge only
 //     strictly inside, building lots are levelled (plinths), towns grow; the terrain still fits the network.
-//  B. a railway through a town: the town keeps growing across it — level crossings on conventional track,
-//     street bridges (or nothing) over high-speed track, never a level crossing on high-speed / metro track.
+//  B. a railway through a town: the town keeps growing across the common track, with street bridges or safe
+//     level crossings limited to 160 km/h, with or without wires.
 // npx esbuild scripts/townfit.ts --bundle --platform=node --format=esm --outfile=$S/townfit.mjs && node $S/townfit.mjs [seeds] [years]
 import { Game } from '../src/game/game';
-import { planEdge, commitProposal, levelCrossingAllowed } from '../src/game/construction';
+import { planEdge, commitProposal } from '../src/game/construction';
 import { BUILDING_TYPES } from '../src/game/towns';
 import { terrainFit, fitLine, noteStations, Sites } from './terrainfit';
 import { fails, check } from './lib';
@@ -67,11 +69,12 @@ for (const seed of seeds) {
   check(pl1.over <= Math.max(3, pl1.n * 0.05) && pl1.worst < 0.3, `seed ${seed}: new lots levelled: plinths over 1.2 m on at most 5 %, none over 3 m (${pl1.over}/${pl1.n}, worst ${(pl1.worst * 10).toFixed(1)} m)`);
   const fit = terrainFit(g, undefined, sites);
   console.log(`  terrain fit: ${fitLine(fit)}`);
+  if (fit.covered) console.log('  misfits: ' + fit.examples.join('; '));
   check(fit.covered === 0 && fit.floating <= fit.samples * 0.001, `seed ${seed}: the terrain fits the network after ${YEARS} years of growth (${fit.covered} covered, ${fit.floating} floating)`);
 }
 
 // ---------------------------------------------------------------- B. railways through a town
-for (const type of ['standard', 'highspeed']) {
+for (const type of ['standard', 'electric']) {
   const g = Game.create({ size: 256, seed: 3, towns: 1, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 0 });
   g.economy.money = 1e9;
   const town = g.towns.list[0], net = g.world.net;
@@ -82,7 +85,8 @@ for (const type of ['standard', 'highspeed']) {
   // as far as the map allows, up to 60 each way
   const reach = (sg: number) => { let t = 0; while (t < 60 && g.world.inside(cx + ux * (t + 1) * sg, cz + uz * (t + 1) * sg, 10)) t++; return t * sg; };
   const ends = [reach(-1), reach(1)].map((t) => ({ kind: 'free' as const, x: cx + ux * t, z: cz + uz * t, y: 0 }));
-  const p = planEdge(g, ends[0], ends[1], { kind: 'rail', type, tracks: 2, heightOffset: 0, crossing: 'auto', owner: 0, straight: true });
+  // A gentle main-line alignment remains a geometry choice, identical with and without wire.
+  const p = planEdge(g, ends[0], ends[1], { kind: 'rail', type, tracks: 2, heightOffset: 0, crossing: 'auto', designGrade: 0.035, owner: 0, straight: true });
   if (!p.ok) { console.log(`  ${type}: cannot build the test line: ${p.errors.join(', ')}`); check(false, `${type}: test line built`); continue; }
   const e0 = net.nextEdge;
   check(commitProposal(g, p) === null, `${type}: test line built`);
@@ -104,7 +108,8 @@ for (const type of ['standard', 'highspeed']) {
     const e1 = net.edges.get(c.e1), e2 = net.edges.get(c.e2);
     if (!e1 || !e2 || c.kind !== 'level') continue;
     if (e2.owner === -1) level++;
-    if (!levelCrossingAllowed(e1.type)) levelHs++;
+    const rail = e1.kind === 'rail' ? e1 : e2;
+    if (rail.kind === 'rail' && makeSeg(g, rail, 1).limit / KMH_TO_UPS > 160 + 1e-9) levelHs++;
   }
   const p1 = { x: 0, y: 0, z: 0 };
   for (const e of net.edges.values()) {
@@ -115,10 +120,9 @@ for (const type of ['standard', 'highspeed']) {
       if (net.edgesNear(p1.x - 1, p1.z - 1, p1.x + 1, p1.z + 1).some((r) => r.kind === 'rail' && net.nearestEdge(p1.x, p1.z, 1.2, 'rail', (k) => k.id === r.id))) over++;
     }
   }
-  console.log(`${type} line through ${town.name}: pop ${pop0} -> ${town.pop}; buildings beyond the line ${b0.far} -> ${b1.far}, this side ${b0.near} -> ${b1.near}; town level crossings ${level} (on high-speed / metro / light rail: ${levelHs}), street bridges over the line ${over}; crossings ${crossings0} -> ${net.crossings.size}`);
-  check(levelHs === 0, `${type}: no level crossing on high-speed, metro or light-rail track (${levelHs})`);
-  if (type === 'standard') check(level + over > 0 && b1.far > b0.far + 5, `${type}: the town grows across the line (level crossings ${level}, bridges ${over}, buildings beyond ${b0.far} -> ${b1.far})`);
-  else check(b1.far > b0.far || over > 0 || b0.far === 0, `${type}: the town still grows beyond the line or bridges it (bridges ${over}, buildings beyond ${b0.far} -> ${b1.far})`);
+  console.log(`${type} line through ${town.name}: pop ${pop0} -> ${town.pop}; buildings beyond the line ${b0.far} -> ${b1.far}, this side ${b0.near} -> ${b1.near}; town level crossings ${level} (above the crossing speed limit: ${levelHs}), street bridges over the line ${over}; crossings ${crossings0} -> ${net.crossings.size}`);
+  check(levelHs === 0, `${type}: all level crossings slow trains to 160 km/h (${levelHs})`);
+  check(level + over > 0 && b1.far > b0.far + 5, `${type}: the town grows across the line (level crossings ${level}, bridges ${over}, buildings beyond ${b0.far} -> ${b1.far})`);
 }
 
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');

@@ -100,10 +100,10 @@ export class Checklist {
     return [
       { id: 'budget', title: 'Keep money for a train', hint: this.budget(), action: ['Budget noted', () => { this.done.add('budget'); this.sig = ''; this.timer = 0; }] },
       { id: 'stations', title: 'Build two train stations', hint: 'One-platform halts near two towns; avoid streets and houses.', action: this.tool('station', 'Station tool') },
-      { id: 'track', title: 'Connect them with track', hint: 'Single track between platform ends; check the preview cost.', action: this.tool('rail', 'Track tool') },
+      { id: 'track', title: 'Connect them with track', hint: 'Single track between platform ends; check the preview cost. Wire continues from wired track.', action: this.tool('rail', 'Track tool') },
       { id: 'depot', title: 'Add a train depot', hint: 'At a free track end.', action: this.tool('depot-rail', 'Depot tool') },
       { id: 'line', title: 'Create a rail line', hint: 'Lines → Rail line, then click both stations.', action: ['Open lines', () => this.ui.openLines()] },
-      { id: 'train', title: 'Buy a train for the line', hint: 'Line window → Add train, or open a depot; check the selected line.' },
+      { id: 'train', title: 'Buy a train for the line', hint: 'Line window → Add train, or open a depot; check the selected line. Electric trains need wire: Electrify.' },
       { id: 'delivery', title: 'Deliver the first passengers', hint: 'Assign a train and let it run.' },
     ];
   }

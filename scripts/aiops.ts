@@ -1,3 +1,4 @@
+import { railPartMode } from '../src/game/stations';
 // AI operations (v2.4, UPDATE 9j / 9k, companies): route evaluation with the fares / opcosts estimates, the
 // near-parallel rule between high-speed and conventional track, high-speed railways, express patterns on lines of
 // uneven demand, underground city-centre stations in big towns, cross-city links, and the demand model's trip
@@ -95,7 +96,7 @@ if (want('parallel')) {
   const conv = parallelRailAt(railField(g, 'conventional'), 250, 208, 1, 0), hsr = parallelRailAt(railField(g, 'highspeed'), 250, 208, 1, 0);
   const oc = corridorOverlap(g, 100, 208, 400, 208, 12, 'conventional'), oh = corridorOverlap(g, 100, 208, 400, 208, 12, 'highspeed');
   console.log(`  beside it: conventional ${conv} (overlap ${fmt(oc * 100, 0)}%), high-speed ${hsr} (overlap ${fmt(oh * 100, 0)}%)`);
-  check(conv && oc > 0.8 && !hsr && oh === 0, 'a high-speed line may run beside conventional rail (and the other way round), not conventional beside conventional');
+  check(conv && oc > 0.8 && hsr && Math.abs(oh - oc) < 1e-9, 'all planners see the same physical railway and the same corridor overlap');
   void net;
 }
 
@@ -130,7 +131,7 @@ if (want('hsr')) {
     const sts = l ? [...new Set(l.stops)].map((s) => g.stations.get(s)!) : [];
     const trains = (l?.vehicles ?? []).map((id) => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train);
     void A; void B;
-    check(!!l && sts.every((s) => s.rail?.trackType === 'highspeed') && trains.length >= 1 && trains.every((t) => t.cars[0].id.startsWith('hsr')), 'the AI opens a high-speed railway (high-speed platforms, HSR units)');
+    check(!!l && sts.every((s) => s.rail?.trackType === 'electric' && railPartMode(s.rail) === 'mainline') && trains.length >= 1 && trains.every((t) => t.cars[0].id.startsWith('hsr')), 'the AI opens a high-speed railway (wired platforms, wide curves, HSR units)');
     if (l) {
       const c = arrivals(trains);
       let top = 0;

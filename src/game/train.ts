@@ -89,7 +89,11 @@ export function makeSeg(g: Game, e: NEdge, dir: number): TSeg {
   // (ops) a platform track is passed at reduced speed; non-stopping trains prefer the through tracks
   if (e.station >= 0) kmh = Math.min(kmh, PLATFORM_PASS_KMH);
   const res = [e.id];
-  for (const c of net.crossings.values()) if (c.e1 === e.id || c.e2 === e.id) res.push(CROSS_BASE + c.id);
+  for (const c of net.crossings.values()) if (c.e1 === e.id || c.e2 === e.id) {
+    res.push(CROSS_BASE + c.id);
+    const other = net.edges.get(c.e1 === e.id ? c.e2 : c.e1);
+    if (other?.kind === 'road') kmh = Math.min(kmh, 160);
+  }
   const tunnels: [number, number][] = [];
   for (const s of e.sections) if (s.type === 'tunnel') tunnels.push(dir > 0 ? [s.s0, s.s1] : [e.len - s.s1, e.len - s.s0]);
   return { e: e.id, dir, curve: geo, len: e.len, res, limit: kmh * KMH_TO_UPS, tunnels };
@@ -118,7 +122,8 @@ export interface TrackRule { types: Set<string> | null; wire: boolean }
 export function consistRule(cars: VehicleModel[]): TrackRule {
   let types: Set<string> | null = null, wire = false;
   for (const m of cars) {
-    const allowed: string[] | null = m.tracks ?? (m.kind === 'loco' || m.kind === 'wagon' ? HEAVY_RAIL_TRACKS : null);
+    const legacy = m.tracks ?? (m.kind === 'loco' || m.kind === 'wagon' ? HEAVY_RAIL_TRACKS : null);
+    const allowed = legacy?.flatMap((type) => TRACK_TYPES[type] ? ['standard', 'electric'] : [type]) ?? null;
     if (allowed) types = types ? new Set([...types].filter((t: string) => allowed.includes(t))) : new Set(allowed);
     if (m.traction === 'electric') wire = true;
   }
@@ -128,7 +133,7 @@ export function consistRule(cars: VehicleModel[]): TrackRule {
 /** May a consist with this rule run on the edge? (depot tracks: always) */
 export function ruleAllows(rule: TrackRule | null | undefined, e: NEdge): boolean {
   if (!rule || e.depot >= 0) return true;
-  if (rule.types && !rule.types.has(e.type)) return false;
+  if (rule.types && !rule.types.has(TRACK_TYPES[e.type]?.id ?? e.type)) return false;
   return !rule.wire || !!TRACK_TYPES[e.type]?.electrified;
 }
 
@@ -697,7 +702,7 @@ export class Train extends Vehicle {
           any = findRailRoute(g, frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, null, turnAtPlatform(ts)), target.id, this.owner, this.id, 20000);
         }
       }
-      this.status = any ? `No compatible route to ${target.name}: ${rule.wire ? 'needs electrified track' : `needs ${[...rule.types!].join('/')} track`}` : 'No route to ' + target.name;
+      this.status = any ? `No compatible route to ${target.name}: ${rule.wire ? 'needs overhead wire' : 'needs rail'}` : 'No route to ' + target.name;
       if (++this.failCount >= 3 && this.line && this.line.stops.length > 1) { this.advanceStop(); this.failCount = 0; }
       return false;
     }
@@ -972,7 +977,7 @@ export function lineCompatibility(g: Game, lineId: number, cars: VehicleModel[])
       if (!e || !ruleAllows(rule, e)) continue;
       if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, e, d, l.owner, false, rule), b.id, l.owner, -1, 40000, false, rule))) { ok = true; break; }
     }
-    if (!ok) return `${cars[0]?.name ?? 'This train'}: ${a.name} → ${b.name} needs ${rule.wire ? 'electrified ' : ''}${rule.types ? [...rule.types].join(' / ') : ''} track`;
+    if (!ok) return `${cars[0]?.name ?? 'This train'}: ${a.name} → ${b.name}: ${rule.wire ? 'needs overhead wire' : 'no rail connection'}`;
   }
   return null;
 }

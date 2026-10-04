@@ -1,3 +1,4 @@
+import { railPartMode } from '../src/game/stations';
 // Companies: AI configurations (activeness / focus / risk) over three years, a player buyout of an AI company
 // and an AI buying another one, automatic line names and colours, the demand model, and a save round trip of
 // the company state (configs, access agreements and fees, defunct companies, line naming).
@@ -61,7 +62,7 @@ const sums: Summary[] = AIS.map((ai, i) => {
     label: CONFIGS[i].label, id, projects: ai.state.projects, rail: lines.filter((l) => l.kind === 'rail').length, bus: lines.filter((l) => l.kind === 'road').length,
     tram: lines.filter((l) => l.kind === 'tram').length, vehicles: g.vehicles.all().filter((v) => v.owner === id).length,
     // (urban railways: metro / light rail lines, all of whose stations are urban)
-    urban: lines.filter((l) => l.kind === 'rail' && l.stops.every((sid) => { const st = g.stations.get(sid); return !!st?.rail && st.rail.trackType !== undefined && ['metro', 'lightrail'].includes(st.rail.trackType); })).length,
+    urban: lines.filter((l) => l.kind === 'rail' && l.stops.every((sid) => { const st = g.stations.get(sid); return !!st?.rail && railPartMode(st.rail) !== 'mainline'; })).length,
     assets: g.companyAssets(id).total, built: spent('construction') + spent('vehicles'), value: g.companyValue(id),
   };
 });
@@ -240,6 +241,7 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
         g.aiEnabled = aiEnabled;
         const del1 = l.vehicles.reduce((a, id) => a + (g.vehicles.get(id)?.delivered ?? 0), 0);
         const lost = l.vehicles.map((id) => g.vehicles.get(id)).filter((v) => v && v.state === 'noroute');
+        if (lost.length) console.log('  trains without route: ' + JSON.stringify(lost.map((v) => { const t = v as Train; return { id: t.id, status: t.status, cars: t.cars.map((m) => m.id), stop: t.stopIndex, target: t.routeTarget, segs: t.segs.map((s) => [s.e, s.dir]), pending: t.pending.map((s) => [s.e, s.dir]) }; })));
         console.log(`  double track: ${done}; ${signals} signals on the company's track; ${l.vehicles.length} trains delivered ${del0} -> ${del1} in 120 days, ${lost.length} without route`);
         // (passengers delivered meanwhile: by the trains running all along, and by any put on since; a train sold or
         // lengthened into a new one takes its own count along)

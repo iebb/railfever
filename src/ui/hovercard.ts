@@ -1,3 +1,4 @@
+import { railPartMode } from '../game/stations';
 // In-world hover card (inspect mode): name + key stats, anchored above the station, vehicle, depot or town.
 import * as THREE from 'three';
 import type { UI } from './ui';
@@ -107,7 +108,7 @@ export class HoverCard {
       return {
         color: co.color,
         html: `<div class="hc-title">${svg(s.rail ? 'station' : s.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
-          `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}</div>` +
+          `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}${s.rail ? ' · ' + (railPartMode(s.rail) === 'mainline' ? 'Train station' : railPartMode(s.rail) === 'metro' ? 'Metro station' : 'Light-rail station') : ''}</div>` +
           (badges ? `<div class="hc-badges" aria-label="Station numbers">${badges}</div>` : '') +
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}` +
           // mail waiting (stations that handle mail; never tram stops)

@@ -9,7 +9,7 @@ import type { NEdge, Section } from './network';
 import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions, structureFactor } from './construction';
 import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
 import type { DepotPlan } from './build-ops';
-import { stationLayout, defaultPlatformLength, railModeOf, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
+import { stationLayout, defaultPlatformLength, railModeOf, railPartMode, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
@@ -140,14 +140,14 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   const net = g.world.net, w = g.world;
   const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
   if (L < 2) return { error: 'too short', cost: 0 };
-  // the track type of what it connects (plain track first): metro / light rail allow tighter turnouts
+  // the wire state of what it connects (plain track first)
   const typeAt = (q: SPt): string | undefined => {
     if (q.edge !== undefined) return net.edges.get(q.edge)?.type;
     const n = q.node !== undefined ? net.nodes.get(q.node) : undefined;
     const es = (n?.edges ?? []).map((id) => net.edges.get(id)!).filter(Boolean);
-    return (es.find((e) => e.station < 0 && e.depot < 0) ?? es[0])?.type;
+    return (es.find((e) => TRACK_TYPES[e.type]?.electrified) ?? es.find((e) => e.station < 0 && e.depot < 0) ?? es[0])?.type;
   };
-  const ttype = type ?? typeAt(b) ?? typeAt(a) ?? 'standard';
+  const ttype = [type, typeAt(a), typeAt(b)].some((t) => t && TRACK_TYPES[t]?.electrified) ? 'electric' : type ?? typeAt(b) ?? typeAt(a) ?? 'standard';
   const tt = TRACK_TYPES[ttype] ?? TRACK_TYPES.standard;
   const sa = a.tx * dx + a.tz * dz >= 0 ? 1 : -1, sb = b.tx * dx + b.tz * dz >= 0 ? 1 : -1;
   const bez = bezFromTangents(a.x, a.z, a.tx * sa, a.tz * sa, b.x, b.z, b.tx * sb, b.tz * sb, L * 0.38, L * 0.38);
@@ -669,7 +669,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     // way: trains on either track reach every platform, turn back or overtake there), before stations and depots
     // beyond its ends ('always', pairing two lines' tracks: at every end where the tracks part), at both ends of
     // inline stations where there is room; none on plain line between stations
-    // crossover length: by the lateral distance and the track type's curve limit (metro / light rail: shorter)
+    // crossover length: by the lateral distance and the common curve limit
     const minR = (TRACK_TYPES[lineType(g, A)] ?? TRACK_TYPES.standard).minRadius;
     const D = Math.max(5, Math.min(12, Math.sqrt(60 * lat * Math.min(1, minR / 12)) + 2));
     /** crossover zones in A's distance (atStart: at the start / end of the stretch; null: beside an inline station) */
@@ -936,7 +936,7 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
   if (!st || !st.rail) return res;
   if (!g.canUse(owner, st.owner)) { res.failed.push(`${st.name} belongs to ${g.company(st.owner).name} (no track access)`); return res; }
   const r = st.rail;
-  const outs = railModeOf(r.trackType) === 'mainline' ? [8, 10, 12, 15, 18, 22, 26, 30, 34] : [4, 5, 6, 8, 10, 12, 15, 18, 22, 26];
+  const outs = railPartMode(r) === 'mainline' ? [8, 10, 12, 15, 18, 22, 26, 30, 34] : [4, 5, 6, 8, 10, 12, 15, 18, 22, 26];
   for (const end of ['front', 'back'] as const) {
     const sg = end === 'front' ? 1 : -1, ax = Math.sin(r.angle) * sg, az = Math.cos(r.angle) * sg;
     const own = new Set([...r.edges, ...r.throughEdges]);
@@ -1210,7 +1210,7 @@ export function throatCrossovers(g: Game, stationId: number, end: 'front' | 'bac
 export const ladderReach = (n: number) => 4 + 7 * Math.max(1, n);
 
 export interface OnTrackOpts {
-  /** platform length (default: by the line's track type, see defaultPlatformLength) */
+  /** platform length (default: by station style, see defaultPlatformLength) */
   length?: number;
   /** platform tracks (default: 1 on single track, 2 on double track) */
   tracks?: number;
@@ -1219,7 +1219,9 @@ export interface OnTrackOpts {
   throughMode?: ThroughMode;
   /** default: from the line there (ground, a bridge: elevated, a tunnel: underground) */
   level?: StationLevel;
-  /** default: side platforms on metro / light-rail lines without through tracks, else island platforms */
+  /** Station style (default mainline), independent of the line's wire state. */
+  mode?: import('./stations').RailMode;
+  /** default: side platforms for metro / light-rail stations without through tracks, else islands */
   platformStyle?: PlatformStyle;
   /** platform screen doors (default: metro lines) */
   psd?: boolean;
@@ -1287,7 +1289,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
   if (!e || e.kind !== 'rail') return fail('No track here');
   if (e.owner !== owner) return fail('Not your track');
   if (e.station >= 0 || e.depot >= 0) return fail('Already a station or depot track');
-  const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(e.type)));
+  const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(o.mode ?? e.type)));
   const reach = L / 2 + 30;
   const A = plainAround(g, e, owner, reach);
   const SA = sampleSteps(g, A.steps);
@@ -1332,7 +1334,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
   }
   const lv: StationLevel = o.level ?? (net.sectionAt(e, s) === 'tunnel' ? 'underground' : net.sectionAt(e, s) === 'bridge' ? 'elevated' : 'ground');
   const P = Math.max(1, Math.min(8, o.tracks ?? (B ? 2 : 1))), T = Math.max(0, Math.min(2, o.through ?? 0));
-  const style: PlatformStyle = o.platformStyle ?? (railModeOf(e.type) !== 'mainline' && !T ? 'side' : 'island');
+  const style: PlatformStyle = o.platformStyle ?? ((o.mode ?? railModeOf(e.type)) !== 'mainline' && !T ? 'side' : 'island');
   const lay = stationLayout(P, T, o.throughMode ?? 'middle', style);
   const all = [...lay.trackOffsets, ...lay.throughOffsets].sort((a, b) => a - b);
   // feeds: each station track from the nearest line track; every line track feeds at least one
@@ -1357,7 +1359,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
     for (const q2 of S) if (q2.u > cut[0] - 1 && q2.u < cut[1] + 1) ignore.add(q2.edge);
   }
   // the station itself, at the line's height
-  const st = g.stations.planRail(cx, cz, Math.atan2(fx, fz), L, P, owner, { level: lv, fixedY: yc, through: T, throughMode: o.throughMode ?? 'middle', ignoreEdges: ignore, trackType: e.type, platformStyle: style, psd: o.psd, style: o.style, blockedEnds: [1, -1] });
+  const st = g.stations.planRail(cx, cz, Math.atan2(fx, fz), L, P, owner, { level: lv, fixedY: yc, through: T, throughMode: o.throughMode ?? 'middle', ignoreEdges: ignore, trackType: e.type, mode: o.mode, platformStyle: style, psd: o.psd, style: o.style, blockedEnds: [1, -1] });
   plan.station = st;
   if (!st.ok) return fail(st.error ?? 'Cannot build the station here');
   plan.warnings.push(...st.warnings);
@@ -1416,8 +1418,15 @@ export function commitStationOnTrack(g: Game, plan: OnTrackPlan): { error: strin
         ids[end] = node;
       }
       // take up the old track between the cut nodes
-      const S = sampleSteps(g, mn.steps);
-      const inside = [...new Set(S.filter((q) => q.u > mn.cut[0] + 0.05 && q.u < mn.cut[1] - 0.05).map((q) => q.edge))];
+      // The cuts may snap to an edge end: use the cut nodes, rather than approximate sample distances,
+      // so an outside approach is never taken up with the platforms.
+      const inside: number[] = [];
+      let between = false;
+      for (const step of mn.steps) {
+        if (startNode(g, step) === ids[0]) between = true;
+        if (between) inside.push(step.edge);
+        if (between && endNode(g, step) === ids[1]) break;
+      }
       let len = 0;
       for (const id of inside) { const e = net.edges.get(id); if (e) { len += e.len; net.removeEdge(id); } }
       eco.spend(len * 400, 'construction', true);
@@ -1524,7 +1533,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
     const ground = level === 'ground' && (r.level ?? 'ground') === 'ground';
     const avoid = ground ? r.entrances.flatMap((e) => entranceLandings(e).map((p) => landingRect(entranceKind('ground', e), p))) : undefined;
     const sp = g.stations.planRail(r.x, r.z, r.angle, r.length, r.tracks, owner, {
-      level, ignoreStation: sid, ignoreEdges: set, through: r.through ?? 0, throughMode: r.throughMode, trackType: r.trackType,
+      level, ignoreStation: sid, ignoreEdges: set, through: r.through ?? 0, throughMode: r.throughMode, trackType: r.trackType, mode: railPartMode(r),
       platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth, avoid,
     });
     if (!sp.ok) return fail(`${st.name}: ${sp.error ?? 'cannot be rebuilt at that level'}`);

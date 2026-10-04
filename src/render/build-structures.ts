@@ -1,5 +1,5 @@
 // Bridges (girder, steel truss, stone viaduct, concrete arch; piers, abutments) and tunnel portals.
-import { RAIL, ROAD_TYPES, TRACK_TYPES } from '../game/constants';
+import { RAIL, ROAD_TYPES } from '../game/constants';
 import type { NEdge } from '../game/network';
 import { closestOnPolyline } from '../game/geom';
 import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk, EARTHWORK_TINT } from './build-common';
@@ -141,7 +141,7 @@ function computeStyle(ctx: ChunkCtx, e: NEdge, s0: number, s1: number): BridgeSt
   let st: BridgeStyle = 'girder';
   if (e.kind === 'rail') {
     if (water && L >= 9) st = 'truss';
-    else if (L >= 8 && med >= 2.0) st = (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified ? 'arch' : 'viaduct';
+    else if (L >= 8 && med >= 2.0) st = 'viaduct';
   } else if (water) st = L >= 10 ? 'tiedarch' : 'viaduct';
   else if (L >= 12 && med >= 2.4) st = 'arch';
   if (st === 'viaduct' || st === 'arch') {
@@ -769,7 +769,7 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
   const ox = p.tx * out, oz = p.tz * out; // outward
   const lx = p.lx, lz = p.lz;
   const y = p.y;
-  const modern = !rail || (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified;
+  const modern = !rail;
   const cell = modern ? WC.CONCRETE : WC.STONE, sc = modern ? WSCALE.CONCRETE : WSCALE.STONE;
   const tone = modern ? CONCRETE : STONE, dark = modern ? CONCRETE_DARK : STONE_DARK;
   const light = modern ? 0xd6d2ca : 0xd2c4ad;
