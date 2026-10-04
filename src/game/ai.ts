@@ -5,7 +5,7 @@
 import type { Game, AccessPolicy } from './game';
 import type { Town } from './towns';
 import type { Station, StationPlan } from './stations';
-import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf, railPartMode, stationLayout, CITY_WALK_SCALE } from './stations';
+import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf, railPartMode, stationLayout, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { defaultStationStyle } from './station-styles';
 import { finishDoubleTrack, DoublePlan, DoubleEnd, DoubleResult, FinishOpts, Step } from './trackops';
 import { electrify } from './build-ops';
@@ -14,9 +14,9 @@ import * as Trackops from './trackops';
 import type { NEdge, Section } from './network';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
-import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK } from './constants';
+import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, ELECTRIFY } from './constants';
 import { distToRect } from './world';
-import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed } from './construction';
+import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
 import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongestion, lineCompatibility } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
@@ -1183,7 +1183,7 @@ export class AIController {
   /** towns from this size get their main-line stations in the centre, underground (and cross-city links) */
   static centrePop = 5000;
   /**
-   * towns from this size are considered for a city railway (light-rail style; subway style from centrePop): with
+   * towns from this size are considered for a city railway (both styles priced by their forecasts): with
    * every rail station's doubled walking reach a few stops cover a small town, where buses or trams serve better
    */
   static urbanPop = 4000;
@@ -1538,7 +1538,8 @@ export class AIController {
         const hubA = this.hubFor(A, B), hubB = hubA ? null : this.hubFor(B, A);
         const hub = hubA ?? hubB;
         const len = d * 1.3, L = aiPlatformLength(A.pop, B.pop, g.year);
-        const infrastructure = len * 13_000 + (hub ? 1 : 2) * (2 * L * 9000 + 120_000);
+        const trackCost = len * 13_000;
+        const infrastructure = trackCost + (hub ? 1 : 2) * (2 * L * 9000 + 120_000) + 260_000;
         // a corridor alongside existing rail (any owner) mostly shares that line's passengers and its valley:
         // revenue shared, and the project marked down hard (reusing the line is the better option, see shareOptions)
         const overlap = corridorOverlap(g, A.x, A.z, B.x, B.z, Math.min(30, d / 4));
@@ -1548,7 +1549,16 @@ export class AIController {
         yield;
         const sites: ForecastSite[] = [];
         for (const t of [A, B]) {
-          sites.push({ x: t.x, z: t.z, townId: t.id, walk: pointWalkingCatchment(g, t.x, t.z, 'rail', 0, 8) });
+          const h = t === A ? hubA : hubB;
+          if (h) {
+            sites.push({ x: h.x, z: h.z, townId: t.id, length: h.rail!.length, tracks: h.rail!.tracks, walk: walkingCatchment(g, h) });
+          } else {
+            // A ground platform and its leads need space on the approaching side of town.
+            // A centre point overstates the walks before a station site has been proved.
+            const other = t === A ? B : A, off = Math.min(t.radius / 4, L / 2 + LEAD);
+            const x = t.x + (other.x - t.x) * off / d, z = t.z + (other.z - t.z) * off / d;
+            sites.push({ x, z, townId: t.id, length: L, tracks: 2, walk: pointWalkingCatchment(g, x, z, 'rail', 0, 8) });
+          }
           yield;
         }
         let score = 0;
@@ -1559,7 +1569,15 @@ export class AIController {
           const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
           const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap);
           const outlay = infrastructure + fleet * (models.reduce((s, m) => s + m.cost, 0) + mail.price);
-          if (outlay <= avail) score = Math.max(score, roi(revenue, sv.running + mail.yearly + sv.trackUpkeep + 60_000, outlay));
+          if (outlay <= avail) {
+            // Conventional civil works have the same long life used by the detailed opening forecast.
+            // Rank surplus after the same capital allowance as the opening gate. Otherwise ideal
+            // centre walks can keep speculative rail ahead of services that can actually open.
+            const amortisation = 0.045 - 0.03 * this.config.risk;
+            const years = 1 / (0.03 + amortisation), capital = outlay * 0.03 + infrastructure * amortisation;
+            const upkeep = (hub ? 1 : 2) * (20_000 + 2 * L * 500) + 12_000 + trackCost * 0.01;
+            score = Math.max(score, roi(revenue, sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital, outlay) * years / 9);
+          }
         }
         score *= Math.max(0.05, 1 - 1.4 * overlap);
         // towns where railways keep failing (no station site in a dense centre, crowded corridors): try others
@@ -1672,30 +1690,17 @@ export class AIController {
         if (T.pop < AIController.urbanPop || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
         if (this.urbanReserved(T.id) || (urbanIn.get(T.id) ?? 0) >= (T.pop >= 6000 ? 3 : 1)) continue;
         for (const mode of ['lightrail', 'metro'] as const) {
-          if (mode === 'metro' && T.pop < AIController.centrePop) continue;
+          // Price each construction style independently. A failed surface proposal says little
+          // about a subway, and population alone does not decide whether its investment pays.
+          if (this.isFailed('urban' + mode + T.id)) continue;
           yield;
-          const layout = this.urbanLayout(T, mode, yield* this.urbanStep(T, mode)), unit = this.urbanUnit(mode, mode === 'metro' ? 12 : 7);
+          const layout = yield* this.urbanStep(T, mode), unit = this.urbanUnit(mode, this.urbanPlatform(mode));
           if (!unit) continue;
-          const sites: ForecastSite[] = [];
-          for (const t of layout.targets) {
-            const x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
-            // (an in-city stop walks half as far from its entrances, as the station built there would)
-            sites.push({ x, z, townId: T.id, walk: stopSiteWalkingCatchment(g, x, z, layout.angle, mode === 'metro' ? 12 : 7, 'rail', g.stations.cityAt(x, z, T) ? CITY_WALK_SCALE : 1) });
-            yield;
-          }
-          const levels = mode === 'metro' ? ['underground'] : ['ground', 'elevated'];
-          let score = 0;
-          for (const level of levels) {
-            // Selection values the affordable opening stage; the job subsequently proves the actual sites,
-            // grades, crossings and structure costs before any construction or borrowing.
-            yield;
-            const econ = this.urbanEconomics(sites, mode, level, [unit], 2);
-            if (econ.total * 1.05 > avail || econ.net * URBAN_PAYBACK[mode] < econ.total) continue;
-            // Compare the return over the accepted investment horizon (against a 4.5-year reference: with one rail
-            // fare for city hops, a city railway's yearly return is modest, its life long). Using an annual-only
-            // ranking crowded out viable city rail with cheap coaches until too little of the horizon remained.
-            score = Math.max(score, roi(econ.forecast.revenue, econ.yearly, econ.total) * URBAN_PAYBACK[mode] / 4.5);
-          }
+          // Reuse the stage's planned entrances and costs. Replacing them with point sites here loses
+          // walkers and can reject a profitable alignment before the detailed job gets to prove it.
+          const econ = layout.quote;
+          if (!econ || econ.total * 1.05 > avail || econ.net * URBAN_PAYBACK[mode] < econ.total) continue;
+          const score = roi(econ.forecast.revenue, econ.yearly, econ.total) * URBAN_PAYBACK[mode] / 4.5;
           if (score > 0) opts.push({ score: score * Math.max(fw(focus.rail), fw(focus.tram)), kind: mode, towns: [T.id] });
         }
       }
@@ -3307,7 +3312,7 @@ export class AIController {
     const tunnelType = electric ? 'electric' : 'standard';
     const cost = (centre?.cost ?? 2_000_000) + len * TRACK_TYPES[tunnelType].costPerUnit * 8.5 + 100_000;
     const revenue = Math.max(0, combined.revenue - old[0] - old[1]);
-    const yearly = len * trackBasePerUnit(tunnelType) * 5 + 6 * (20_000 + 2 * (centre?.length ?? 12) * 500) + 50_000;
+    const yearly = len * trackBasePerUnit(tunnelType) * 5 + STATION_UPKEEP_FACTOR.underground * (20_000 + 2 * (centre?.length ?? 12) * 500) + 50_000;
     const net = revenue - yearly;
     const gainA = partner ? combined.revenue * share - old[0] - yearly * share : net;
     const gainB = partner ? combined.revenue * (1 - share) - old[1] - yearly * (1 - share) : 0;
@@ -3541,6 +3546,12 @@ export class AIController {
     return pool.sort((a, b) => b.capacity / b.cost - a.capacity / a.cost)[0] ?? null;
   }
 
+  /** Buy platform space for the opening consist, with room at its ends. Longer trains can extend it later. */
+  private urbanPlatform(mode: 'metro' | 'lightrail'): number {
+    const unit = this.urbanUnit(mode, mode === 'metro' ? 12 : 7);
+    return Math.max(7, Math.ceil((unit?.length ?? 6) + 1));
+  }
+
   /** Is a station (of another level for a metro: only an underground one) in the way between two points? */
   private stationOnTheWay(ax: number, az: number, bx: number, bz: number, level: string): boolean {
     const g = this.game, L = Math.hypot(bx - ax, bz - az);
@@ -3580,13 +3591,13 @@ export class AIController {
    * of a walking reach apart, light-rail-style halts a little closer (cheaper stops, slower vehicles), never closer
    * than platforms and turnouts allow. Neighbouring catchments overlap: the forecast shares their buildings.
    */
-  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number) {
+  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number, stopsWanted = 5, platform = mode === 'metro' ? 12 : 7) {
     // A light-rail terminus needs two crossover diagonals and their clearances between platforms. The walking
     // reach may shrink, but the 18-unit throat cannot: shorter gaps leave both tracks two-way and trains blocked.
-    const end = (mode === 'metro' ? 12 : 7) + Math.max((mode === 'metro' ? 8 : 3) * 2 + 2, mode === 'lightrail' ? 18 : 0);
+    const end = platform + Math.max(TRACK_TYPES.electric.minRadius * 2 + 2, 18);
     const g = this.game, spacing = Math.max(end, walkLimit('rail') * (mode === 'metro' ? 0.72 : 0.6));
     // in-city stops walk half as far: between the end stations they stand closer together (CITY_SPACING)
-    const mid = Math.max((mode === 'metro' ? 12 : 7) + 6, walkLimit('rail') * CITY_WALK_SCALE * CITY_SPACING[mode]);
+    const mid = Math.max(platform + 6, walkLimit('rail') * CITY_WALK_SCALE * CITY_SPACING[mode]);
     const sts = [...g.stations.map.values()].filter((s) => s.townId === T.id && s.rail && railPartMode(s.rail) === 'mainline' && g.lines.stationServed(s.id));
     let pair: Station[] = [], dist = 0;
     for (const a of sts) for (const b of sts) {
@@ -3600,14 +3611,20 @@ export class AIController {
     const z = (pair.length ? (pair[0].z + pair[1].z) / 2 : T.z) + Math.sin(angle) * offset;
     // Open a three/four-stop stage when capital is tight; extensions can follow retained operating profit.
     const city = g.stations.cityAt(x, z, T), step = stepWanted ?? (city ? mid : spacing);
-    const maxStops = mode === 'lightrail' ? this.available() < 11_000_000 ? 3 : this.available() < 15_000_000 ? 4 : 5 : 5;
+    const maxStops = stopsWanted;
     // (about one and a half town radii long: the end gaps keep the throat, the stops between are `step` apart)
     const count = Math.max(3, Math.min(maxStops, 3 + Math.round(Math.max(0, T.radius * 1.5 - spacing * 2) / step)));
-    const L = pair.length ? dist + spacing * 2 : spacing * 2 + step * (count - 3);
-    const targets = pair.length ? [-dist / 2 - spacing, -dist / 2, dist / 2, dist / 2 + spacing]
+    const stagedPair = pair.length && stopsWanted < 5;
+    const L = pair.length ? stagedPair ? Math.max(dist, spacing * 2 + step * (stopsWanted - 3)) : dist + spacing * 2
+      : spacing * 2 + step * (count - 3);
+    const targets = stagedPair ? [-L / 2, ...Array.from({ length: stopsWanted - 2 }, (_, i) =>
+      stopsWanted === 3 ? 0 : -L / 2 + spacing + (L - spacing * 2) * i / (stopsWanted - 3)), L / 2]
+      : pair.length ? [-dist / 2 - spacing, -dist / 2, dist / 2, dist / 2 + spacing]
       : [-L / 2, ...Array.from({ length: count - 2 }, (_, i) => -L / 2 + spacing + step * i), L / 2];
-    if (pair.length) for (let t = -dist / 2 + step; t < dist / 2 - step * 0.65; t += step) targets.push(t);
-    return { x, z, angle, spacing, step, end, L, targets: targets.sort((a, b) => a - b), interchanges: pair };
+    // A paired corridor can open between its interchanges before extending beyond them. The old pair
+    // branch ignored the requested stage count, so every smaller quote still bought the full line.
+    if (pair.length && !stagedPair) for (let t = -dist / 2 + step; t < dist / 2 - step * 0.65; t += step) targets.push(t);
+    return { x, z, angle, spacing, step, end, L, platform, targets: targets.sort((a, b) => a - b), interchanges: pair };
   }
 
   /**
@@ -3617,24 +3634,62 @@ export class AIController {
    * company can pay for. Closer stops reach more of a town whose stations walk half as far, but every stop costs its
    * building and upkeep: a subway's deep stations may not pay for it.
    */
-  private *urbanStep(T: Town, mode: 'metro' | 'lightrail'): Generator<void, number> {
-    const g = this.game, close = this.urbanLayout(T, mode), unit = this.urbanUnit(mode, mode === 'metro' ? 12 : 7);
-    if (!unit || close.step >= close.spacing) return close.step;
-    const level = mode === 'metro' ? 'underground' : 'elevated';
+  private *urbanStep(T: Town, mode: 'metro' | 'lightrail', maxStops = 5): Generator<void, ReturnType<AIController['urbanLayout']> & { quote?: ReturnType<AIController['urbanEconomics']> }> {
+    const g = this.game, close = this.urbanLayout(T, mode, undefined, maxStops), unit = this.urbanUnit(mode, this.urbanPlatform(mode));
+    if (!unit) return close;
     // (in work units: a walk per stop, a forecast per spacing)
-    const value = function* (self: AIController, layout: { x: number; z: number; angle: number; targets: number[] }): Generator<void, number> {
-      const sites: ForecastSite[] = [];
+    const value = function* (self: AIController, layout: ReturnType<AIController['urbanLayout']>, level: 'ground' | 'elevated' | 'underground') {
+      const sites: (StationPlan | ForecastSite)[] = [], length = layout.platform;
       for (const t of layout.targets) {
         const x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
-        sites.push({ x, z, townId: T.id, walk: stopSiteWalkingCatchment(g, x, z, layout.angle, mode === 'metro' ? 12 : 7, 'rail', g.stations.cityAt(x, z, T) ? CITY_WALK_SCALE : 1) });
-        yield;
+        let plan: StationPlan | undefined;
+        // Use the entrances that can actually be built, including a small site adjustment as in the
+        // detailed search. Ideal street points can underestimate a five-stop line and prefer four.
+        for (const d of [0, 1.5, -1.5, 3, -3]) {
+          const px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
+          const p = g.stations.planRail(px, pz, layout.angle, length, 2, self.companyId,
+            { trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
+              ...(level !== 'ground' && g.stations.cityAt(px, pz, T) ? { entrances: CITY_ENTRANCES } : {}) });
+          yield;
+          if (p.ok && !p.join?.rail) { plan = p; break; }
+        }
+        const scale = g.stations.cityAt(x, z, T) ? CITY_WALK_SCALE : 1;
+        sites.push(plan ?? { x, z, townId: T.id, length, tracks: 2,
+          // An unproven surface stop has one street access. Four assumed stair entrances can
+          // make an unbuildable full surface line crowd out a viable smaller viaduct or subway.
+          walk: level === 'ground' ? pointWalkingCatchment(g, x, z, 'rail', scale - 1, 1.6)
+            : stopSiteWalkingCatchment(g, x, z, layout.angle, length, 'rail', scale) });
       }
       const e = self.urbanEconomics(sites, mode, level, [unit], 2);
       yield;
-      return e.total < self.available() ? e.net / Math.max(1, e.total) : -Infinity;
+      return { quote: e, ret: e.total * 1.05 < self.available() ? e.net / Math.max(1, e.total) : -Infinity };
     };
-    const wide = yield* value(this, this.urbanLayout(T, mode, close.spacing)), near = yield* value(this, close);
-    return wide > near ? close.spacing : close.step;
+    let best: ReturnType<AIController['urbanLayout']> & { quote?: ReturnType<AIController['urbanEconomics']> } = close, bestReturn = -Infinity;
+    const seen = new Set<string>();
+    // Both station styles can open in stages. Compare their actual walking forecasts and shared civil
+    // works instead of excluding every subway until a company can fund five deep stations at once.
+    for (const count of [5, 4, 3].filter((n) => n <= maxStops)) {
+      let stage = best, stageReturn = -Infinity;
+      for (const platform of new Set([close.platform, this.urbanPlatform(mode)])) {
+        const base = this.urbanLayout(T, mode, undefined, count, platform);
+        for (const step of new Set([base.step, base.spacing])) {
+          const layout = this.urbanLayout(T, mode, step, count, platform), key = platform + ':' + layout.targets.join(',');
+          if (seen.has(key)) continue;
+          seen.add(key);
+          // Surface light rail remains an affordable opening where real ground entrances reach
+          // enough walkers. Quoting only a viaduct hid these projects before the job could try them.
+          for (const level of mode === 'metro' ? ['underground'] as const : ['ground', 'elevated'] as const) {
+            const { ret, quote } = yield* value(this, layout, level);
+            if (ret > stageReturn) { stage = { ...layout, quote }; stageReturn = ret; }
+            if (ret > bestReturn) { best = { ...layout, quote }; bestReturn = ret; }
+          }
+        }
+      }
+      // Retain the town's full opening footprint when it is affordable and repays; otherwise quote
+      // a smaller stage. The detailed search still has to prove its sites and its entire investment.
+      if (stageReturn * URBAN_PAYBACK[mode] >= 1) return stage;
+    }
+    return best;
   }
 
   /**
@@ -3677,25 +3732,35 @@ export class AIController {
     // Longer city lines need more trains to retain the short headway that makes their local trips attractive.
     const f0 = Math.max(fleet, Math.min(4, Math.ceil(2 * hop * Math.max(1, points.length - 1) / 120)));
     const ramp = level === 'underground' ? 58 : level === 'elevated' ? 26 : 10;
-    const sf = level === 'underground' ? 6 : level === 'elevated' ? 3 : 1;
+    const sf = level === 'underground' ? 4.5 : level === 'elevated' ? 3 : 1;
+    const upkeepFactor = STATION_UPKEEP_FACTOR[level as keyof typeof STATION_UPKEEP_FACTOR] ?? 1;
     const tf = level === 'underground' ? 5 : level === 'elevated' ? 4 : 1;
-    const platform = mode === 'metro' ? 12 : 7;
+    const platform = points[0]?.length ?? this.urbanPlatform(mode);
     const stationCost = points.reduce((a, p) => a + ('cost' in p ? p.cost : (2 * platform * 9000 + 120_000) * sf), 0);
-    const works = stationCost + (connectionCost ?? len * 2 * type.costPerUnit * (level === 'underground' ? 8.5 : level === 'elevated' ? 4.5 : 1.5))
+    // Stations already buy their platform tracks. Civil works connect their ends, not their centres.
+    const linkLength = points.slice(1).reduce((a, p, i) => a + Math.max(0,
+      Math.hypot(p.x - points[i].x, p.z - points[i].z) - ((p.length ?? platform) + (points[i].length ?? platform)) / 2), 0);
+    const structure = level === 'underground' ? structureFactor('rail', 'tunnel', 2.2) : level === 'elevated' ? structureFactor('rail', 'bridge', 1.5) : 1;
+    const doubleCost = 1 + SHARED_TRACK.materials + (structure - 1) * (1 + SHARED_TRACK.structures);
+    const works = stationCost + (connectionCost ?? linkLength * (TRACK_TYPES.standard.costPerUnit * doubleCost + 2 * ELECTRIFY.costPerUnit))
       + (yardCost ?? ramp * type.costPerUnit * 3 + 250_000);
     // (citycatch: where the stops' queues fill between trains, as at close city stops that each reach fewer walkers,
     // a train or two more carries more of them: the fleet that repays best over the accepted horizon)
     let best: { total: number; yearly: number; net: number; forecast: ReturnType<Game['demand']['forecastLine']>; headway: number; fleet: number } | null = null;
-    for (let f = f0; f <= f0 + 2; f++) {
+    // A frequent mature fleet is an option, not an opening bill: compare smaller fleets too and
+    // retain the best return the company can fund. Six trains must not hide a viable two-train metro.
+    for (let f = fleet; f <= f0 + 2; f++) {
       const headway = 2 * hop * Math.max(1, points.length - 1) / f;
       const forecast = g.demand.forecastLine(points, mode, kmh, headway);
       const capacity = f * yr.trips * cars.reduce((a, m) => a + m.capacity, 0) * 0.7;
       forecast.revenue *= Math.min(1, capacity / Math.max(1, forecast.boardings));
       const total = works + f * cars.reduce((a, m) => a + m.cost, 0);
       const yearly = f * yr.total + (len * 2 + ramp) * (trackBasePerUnit('electric') * tf + f * yr.trackWearPerUnit)
-        + points.length * (20000 + 2 * platform * 500) * sf + 12000;
+        + points.length * (20000 + 2 * platform * 500) * upkeepFactor + 12000;
       const e = { total, yearly, net: forecast.revenue - yearly, forecast, headway, fleet: f };
-      if (!best || e.net * URBAN_PAYBACK[mode] - e.total > best.net * URBAN_PAYBACK[mode] - best.total) best = e;
+      const affordable = total * 1.05 <= this.available(), bestAffordable = best && best.total * 1.05 <= this.available();
+      if (!best || (affordable && !bestAffordable) || (affordable === bestAffordable
+        && e.net * URBAN_PAYBACK[mode] - e.total > best.net * URBAN_PAYBACK[mode] - best.total)) best = e;
       // (a train more only pays while the queues still fill)
       if (forecast.boardings <= 0) break;
     }
@@ -3710,20 +3775,28 @@ export class AIController {
    * the ends, signals, and a line stopping at every station. The result is an ordinary rail line (main-line trains
    * may run through onto it, its trains onto the main line).
    */
-  private *urbanJob(T: Town, mode: 'metro' | 'lightrail'): Generator<void, void> {
+  private *urbanJob(T: Town, mode: 'metro' | 'lightrail', maxStops = 5): Generator<void, void> {
     const g = this.game, me = this.companyId, net = g.world.net;
     const p = this.project!;
     const what = mode === 'metro' ? 'subway-style city railway' : 'light-rail-style city railway';
-    const fail = (why: string, days = 1500) => { this.note(`${what} in ${T.name} abandoned: ${why}`); this.markFailed('urban' + T.id, days); this.abandon(p); };
+    const fail = (why: string, days = 1500) => { this.note(`${what} in ${T.name} abandoned: ${why}`); this.markFailed('urban' + mode + T.id, days); this.abandon(p); };
     this.state.phase = `planning a ${what} in ${T.name}`;
     let level: 'underground' | 'elevated' | 'ground' = mode === 'metro' ? 'underground' : 'elevated';
     if (this.urbanReserved(T.id)) return fail('another urban project is being built', 60);
-    const layout = this.urbanLayout(T, mode, yield* this.urbanStep(T, mode));
+    const layout = yield* this.urbanStep(T, mode, maxStops);
     const linkRejects = new Map<string, number>(), siteRejects = new Map<string, number>();
     const rejectSite = (why: string) => { siteRejects.set(why, (siteRejects.get(why) ?? 0) + 1); return null; };
-    const PL = mode === 'metro' ? 12 : 7, SP = layout.spacing, L = layout.L;
+    const PL = layout.platform, SP = layout.spacing, L = layout.L;
     const n = layout.targets.length;
-    const designGrade = mode === 'metro' ? 0.045 : 0.07;
+    // A cheap surface quote can need a viaduct or tunnel once the entire route and depot
+    // are proved. Price a smaller opening before rejecting the town; nothing is built yet.
+    const retry = function* (self: AIController, why: string, days = 1500): Generator<void, void> {
+      if (maxStops > 3 && n > 3) yield* self.urbanJob(T, mode, Math.min(maxStops - 1, n - 1));
+      else fail(why, days);
+    };
+    // Both station styles use the same urban railway and electric units. A leftover subway-only
+    // grade limit rejected hilly alignments that the common track and its trains can run.
+    const designGrade = TRACK_TYPES.electric.maxGrade;
     const grade = designGrade * 0.8;
     // the axis: the town's long axis first, then turns of it (the most even ground first); the stations walk along
     // it from one end, each about SP beyond the last where a site works (on the axis: the line stays straight,
@@ -3835,10 +3908,11 @@ export class AIController {
       return null;
     };
     let plans: StationPlan[] = [], angle = a0, tries = 0, bestReturn = -Infinity, connectionCost: number | undefined, plannedYard: UrbanYard | undefined;
-    const walks = (lv: typeof level, na: number, lats: number[]) => angles.slice(0, na).flatMap(({ a }) => lats.map((lat) => ({ a, lat, lv })));
+    const walks = (lv: typeof level, na: number, lats: number[]) => lats.flatMap((lat) => angles.slice(0, na).map(({ a }) => ({ a, lat, lv })));
     const lats = layout.interchanges.length ? [0, 2, -2] : [0, 5, -5, 10, -10, 15, -15];
+    // Cover the axes before spending the remaining search budget on lateral offsets of one axis.
     const cands = mode === 'metro' ? walks('underground', 6, layout.interchanges.length ? lats : [0, 5, -5, 10, -10])
-      : angles.slice(0, 6).flatMap(({ a }, i) => lats.flatMap((lat) =>
+      : lats.flatMap((lat) => angles.slice(0, 6).flatMap(({ a }, i) =>
         (i < 3 ? ['ground', 'elevated', 'underground'] as const : ['underground'] as const).map((lv) => ({ a, lat, lv }))));
     search: for (const { a, lat, lv } of cands) {
       // (beside an existing station of the town: that alignment with a stop at the station too, the better return wins)
@@ -3887,14 +3961,14 @@ export class AIController {
       if (accepted) break search;
     }
     const u = { x: Math.sin(angle), z: Math.cos(angle) };
-    if (plans.length < Math.min(4, n)) return fail('no station sites' + ([...linkRejects, ...siteRejects].length ? ` (${[...linkRejects, ...siteRejects].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([why, n]) => `${why}: ${n}`).join('; ')})` : ''));
-    if (layout.interchanges.some((s) => !plans.some((q) => Math.hypot(q.x - s.x, q.z - s.z) < 14))) return fail('no walking interchange at both main-line stations', 360);
+    if (plans.length < Math.min(4, n)) return yield* retry(this, 'no station sites' + ([...linkRejects, ...siteRejects].length ? ` (${[...linkRejects, ...siteRejects].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([why, n]) => `${why}: ${n}`).join('; ')})` : ''));
+    if (layout.interchanges.some((s) => !plans.some((q) => Math.hypot(q.x - s.x, q.z - s.z) < 14))) return yield* retry(this, 'no walking interchange at both main-line stations', 360);
     const unit = this.urbanUnit(mode, PL);
     if (!unit) return fail('no vehicles');
     const consist = [unit];
     const econ = this.urbanEconomics(plans, mode, level, consist, 2, connectionCost, plannedYard?.cost), total = econ.total, fleet = econ.fleet;
-    if (!AIController.forceBuild && econ.net * URBAN_PAYBACK[mode] < total) return fail(`not profitable (${Math.round(econ.net / 1000)}k/year on ${Math.round(total / 1000)}k over ${URBAN_PAYBACK[mode]} years; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.boardings)} boardings, ${Math.round(econ.forecast.revenue / 1000)}k revenue)`, 360);
-    if (total > this.available() || !this.borrowFor(total)) return fail('too expensive', 720);
+    if (!AIController.forceBuild && econ.net * URBAN_PAYBACK[mode] < total) return yield* retry(this, `not profitable (${Math.round(econ.net / 1000)}k/year on ${Math.round(total / 1000)}k over ${URBAN_PAYBACK[mode]} years)`, 360);
+    if (total > this.available() || !this.borrowFor(total)) return yield* retry(this, 'too expensive', 720);
     this.state.phase = `building a ${what} in ${T.name}`;
     p.built = true;
     // stations
@@ -4548,11 +4622,21 @@ export class AIController {
       const fleet = () => info.kind === 'bus' ? Math.min(Math.round(info.maxVehicles * grow), l.stops.length * 2)
         : info.kind === 'tram' ? Math.min(Math.round(info.maxVehicles * grow), 2 + l.stops.length) : info.maxVehicles;
       let maxV = fleet();
-      // a bus or tram line at its fleet limit, earning over twice its costs, whose riders gave up waiting by two
-      // vehicle-loads or more last month: one vehicle more allowed (its stops still bound the fleet, and the street trams
-      // run in). Profitable trams capped at five lost a thousand passengers a year at one stop (growth.ts, seed 7).
+      // Price added road capacity with a vehicle of the current year. Repeating an old small model
+      // leaves profitable lines crowded even after larger buses or articulated trams are available.
+      const roadModel = v0 instanceof RoadVehicle && v0.model && v0.capacity > 0 ? info.kind === 'tram'
+        ? availableModels(g.year, 'tram').sort((a, b) => b.capacity / (b.cost + modelYearCost(b, g.year) * 8)
+          - a.capacity / (a.cost + modelYearCost(a, g.year) * 8))[0] ?? v0.model
+        : (v0.model.style === 'coach' ? pickCoach(g.year) : pickBus(g.year,
+          Math.max(...info.towns.map((id) => g.towns.list[id]?.pop ?? 3000), 3000))) ?? v0.model : null;
+      // Lost riders can fund another vehicle before losses reach two whole vehicle-loads in one
+      // month. Compare their observed fare yield with operating cost and the same eight-year
+      // vehicle horizon used in model selection; the street's fleet ceiling still applies.
       const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
-      if (info.kind !== 'rail' && l.vehicles.length >= maxV && maxV < hard && gaveUp >= 2 * v0.capacity && l.incomeLast > l.costLast * 2) { info.maxVehicles++; maxV = fleet(); }
+      const extraRevenue = gaveUp * Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / Math.max(1, l.passLast);
+      const extraRunning = Math.max(l.costLast / Math.max(1, l.vehicles.length), roadModel ? modelYearCost(roadModel, g.year) : 0);
+      if (roadModel && l.vehicles.length >= maxV && maxV < hard && gaveUp > 0
+        && extraRevenue > extraRunning + roadModel.cost / 8) { info.maxVehicles++; maxV = fleet(); }
       // all operators' vehicles count towards what the line can take (no over-saturation of one track)
       const cap = info.joined ? this.lineCapacity(l) : maxV;
       if (l.vehicles.length >= cap || this.available() < v0.value * 1.5) continue;
@@ -4562,7 +4646,7 @@ export class AIController {
         const t = g.vehicles.buyTrain(info.depot, [...v0.cars].sort((a, b) => (a.kind === 'loco' ? -1 : 0) - (b.kind === 'loco' ? -1 : 0)), lid);
         if (typeof t !== 'string') { this.stats.vehicles++; this.note(`added a train to ${l.name}`); }
       } else if (v0 instanceof RoadVehicle && v0.model) {
-        const model = v0.model;
+        const model = roadModel ?? v0.model;
         if (!this.borrowFor(model.cost)) continue;
         const b = g.vehicles.buyRoad(info.depot, model, lid);
         if (typeof b !== 'string') { this.stats.vehicles++; this.note(`added a ${info.kind === 'tram' ? 'tram' : 'bus'} to ${l.name}`); }

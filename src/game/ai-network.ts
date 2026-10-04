@@ -39,7 +39,7 @@ import type { NEdge, NNode } from './network';
 import type { Line } from './lines';
 import type { Economy } from './economy';
 import type { Proposal, BuildOptions, Snap } from './construction';
-import { railModeOf, railPartMode, PLATFORM_LENGTH, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide, TRANSFER_RANGE, railWalkScale, CITY_WALK_SCALE } from './stations';
+import { railModeOf, railPartMode, PLATFORM_LENGTH, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide, TRANSFER_RANGE, railWalkScale, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
 import * as Trackops from './trackops';
 import * as StationsMod from './stations';
@@ -4198,6 +4198,8 @@ class NetPlanner {
     if (B.owner === me && this.fleet(B).ours.length) options.push({ l: B, to: near.a });
     for (const { l, to } of options) {
       const own = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((s): s is Station => !!s?.rail);
+      const nearest = own.reduce<Station | undefined>((best, st) => !best || Math.hypot(st.x - to.x, st.z - to.z) < Math.hypot(best.x - to.x, best.z - to.z) ? st : best, undefined);
+      const mode = nearest ? railPartMode(nearest.rail!) : 'mainline';
       const L = Math.max(4, this.platformFor(l)), route = [...new Set(this.pairsOf(l).flatMap(([a, b]) => this.route(a, b, l.owner) ?? []))];
       const spots = this.spotsNear(route, to.x, to.z, CITY_LINK_GAP + L / 2 + 4).slice(0, 14);
       if (!spots.length) { this.considered('citylink.noTrack'); continue; }
@@ -4207,10 +4209,10 @@ class NetPlanner {
       const accept = (p: OnTrackPlanLike) => {
         const st = p.station as StationPlan | null;
         if (!st || this.planGap(st, to) > CITY_LINK_GAP || own.some((o) => Math.hypot(o.x - st.x, o.z - st.z) < st.length + 6)) return false;
-        const upkeep = (20_000 + st.tracks * st.length * 500) * (st.level === 'underground' ? 6 : st.level === 'elevated' ? 3 : 1);
+        const upkeep = (20_000 + st.tracks * st.length * 500) * STATION_UPKEEP_FACTOR[st.level];
         return (value.revenue - upkeep) * CITY_LINK_YEARS >= p.cost;
       };
-      const id = yield* this.insertAt(spots, L, `no interchange stop beside ${to.name}`, Math.max(0, value.revenue * CITY_LINK_YEARS), { accept, tracks: 2 });
+      const id = yield* this.insertAt(spots, L, `no interchange stop beside ${to.name}`, Math.max(0, value.revenue * CITY_LINK_YEARS), { accept, tracks: 2, mode });
       if (id === -2) { this.careFor(`cl${aid}:${bid}`, 15); return; }
       if (id < 0) continue;
       const st = g.stations.get(id)!;

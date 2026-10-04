@@ -156,7 +156,7 @@ function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number
     const daily = pops[i] * mailGenRate() * mailEra(g.year) * townMailFactor(g.towns.list[T]?.pop ?? 0)
       * (0.2 + ('mail' in p ? p.mail?.rating ?? 0.65 : 0.65));
     const units = parts.map((x) => daily * YEAR * x.w * k), total = units.reduce((a, b) => a + b, 0);
-    const tracks = 'id' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks : 2, stops = 'id' in p ? p.stops.length : 0;
+    const tracks = 'id' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks ?? 2 : 2, stops = 'id' in p ? p.stops.length : 0;
     const room = (YEAR_SECONDS / headway) * Math.min(capacity, mailQueueCapOf(pops[i], tracks, stops));
     const fit = Math.min(1, room / Math.max(1, total));
     revenue += parts.reduce((s, x, k) => s + units[k] * x.fare, 0) * fit;

@@ -233,7 +233,7 @@ function fullSet(town: Town, day: number): Set<number> {
 }
 
 /** A town's own streets, recomputed when the network or the towns' land claims changed (transient). */
-const streetCache = new WeakMap<Town, { v: number; claims: number; list: NEdge[] }>();
+const streetCache = new WeakMap<Town, { v: number; claims: number; radius: number; list: NEdge[] }>();
 /**
  * Lattice segments known to be built / lattice points known to have a node, valid for one network version
  * (a town's own new street keeps the cache: it only adds its own segment).
@@ -1716,13 +1716,17 @@ export class Towns {
     if (day > 0 && (town.claim === undefined || Math.abs(town.pop - town.claim) > town.claim * 0.15)) town.claim = town.pop;
     const claims = this.claimsKey();
     let sc = streetCache.get(town);
-    if (!sc || sc.v !== net.version || sc.claims !== claims) {
+    // A new peripheral lot can widen the query without changing the road network or land claim.
+    // Running games must select the same streets with a warm or freshly loaded cache. Generation
+    // keeps its established seed sequence; its day-zero growth has no save/load continuation.
+    const radius = day > 0 ? town.radius : 0;
+    if (!sc || sc.v !== net.version || sc.claims !== claims || sc.radius !== radius) {
       const list = this.streets(town).filter((e) => {
         if (e.type !== 'street' && !this.onGrid(g, e)) return false;
         const geo = net.geo(e), k = Math.floor(geo.n / 2) * 3;
         return this.owner(geo.pts[k], geo.pts[k + 2]) === town;
       });
-      sc = { v: net.version, claims, list };
+      sc = { v: net.version, claims, radius, list };
       streetCache.set(town, sc);
     }
     const streets = sc.list;

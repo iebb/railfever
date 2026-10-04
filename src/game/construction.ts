@@ -1,6 +1,6 @@
 // Free-form construction planner for tracks and roads.
 import type { Game } from './game';
-import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL, trackTypeOf } from './constants';
+import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL, trackTypeOf, ELECTRIFY } from './constants';
 import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
   closestOnPolyline,
@@ -129,17 +129,16 @@ export interface Proposal {
 
 /**
  * Structure cost per unit as a multiple of the bare track (or road) cost per unit (UPDATE 9k: realistic ratios
- * against ground track with its usual earthworks, about 1.25x bare track): viaducts and bridges by deck height
- * above the ground or river bed (rail 4.5x low .. 6.3x from 50 m up = 3.6 .. 5x ground track; roads 3.5x ..
- * 5x); tunnels by depth of the track below the surface: shallow cut-and-cover boxes (rail 5.2x down to 10 m ..
- * 7.5x at 20 m = 4.2 .. 6x; roads 4x .. 6x) and bored tunnels deeper than 20 m (rail 8.5x .. 12x from 80 m =
- * 6.8 .. 9.6x; roads 6.5x .. 9x).
+ * against ground track with its usual earthworks, about 1.25x bare track). Rail bridges cost 3.8–5.6x,
+ * shallow tunnels 4.5–6.5x and deep tunnels 6.5–9.7x. These common civil prices let short city services
+ * repay the same track as conventional trains; neither station mode nor wire changes the multiplier.
+ * Roads retain their bridge 3.5–5x, shallow tunnel 4–6x and deep tunnel 6.5–9x prices.
  */
 export function structureFactor(kind: NetKind, type: 'bridge' | 'tunnel', h: number): number {
-  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 4.5 + 1.8 * k : 3.5 + 1.5 * k; }
-  if (h < 2) { const k = Math.min(1, Math.max(0, h - 1)); return kind === 'rail' ? 5.2 + 2.3 * k : 4 + 2 * k; }
+  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 3.8 + 1.8 * k : 3.5 + 1.5 * k; }
+  if (h < 2) { const k = Math.min(1, Math.max(0, h - 1)); return kind === 'rail' ? 4.5 + 2 * k : 4 + 2 * k; }
   const k = Math.min(6, h - 2) / 6;
-  return kind === 'rail' ? 8.5 + 3.5 * k : 6.5 + 2.5 * k;
+  return kind === 'rail' ? 6.5 + 3.2 * k : 6.5 + 2.5 * k;
 }
 
 /**
@@ -755,10 +754,20 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     else if (Math.abs(yn - yo) < 0.35 && levelOk) mode = levelMode;
     else mode = yn >= yo ? 'over' : 'under';
     if (secOld === 'tunnel' && level === 'ground') mode = yn >= yo ? 'over' : 'under';
+    // Auto crossings must share a feasible profile. A ramp out of a tunnel can reach the street's
+    // height in the initial profile while a preceding underpass still requires cover beneath it.
+    // Prove each choice against the earlier crossings before switching from underpass to level.
+    const constraint = (m: CrossingPlan['mode']): Constraint => m === 'over' ? { i: ci, kind: 'ge', v: yo + RAIL.clearance }
+      : m === 'under' ? { i: ci, kind: 'le', v: yo - RAIL.clearance } : { i: ci, kind: 'eq', v: yo };
+    if (opts.crossing === 'auto' && level === 'ground') {
+      const choices = [...new Set([mode, ...(levelOk ? [levelMode] : []), 'under', 'over'] as CrossingPlan['mode'][])];
+      for (const choice of choices) {
+        const trial = solveProfile(desired, ds, [...cons, constraint(choice)], grade);
+        if (trial.ok) { mode = choice; sol = trial; break; }
+      }
+    }
     c.mode = mode;
-    if (mode === 'over') cons.push({ i: ci, kind: 'ge', v: yo + RAIL.clearance });
-    else if (mode === 'under') cons.push({ i: ci, kind: 'le', v: yo - RAIL.clearance });
-    else cons.push({ i: ci, kind: 'eq', v: yo });
+    cons.push(constraint(mode));
   }
   if (crossings.length) {
     sol = solveProfile(desired, ds, cons, grade);
@@ -953,7 +962,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   // same height), share the formation: materials 60 %, structures and earthworks 30 % (SHARED_TRACK)
   let cost = 0;
   if (!opts.town) {
-    const per = kind === 'rail' ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).costPerUnit;
+    const per = kind === 'rail' ? TRACK_TYPES.standard.costPerUnit : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).costPerUnit;
+    const wire = kind === 'rail' && TRACK_TYPES[opts.type]?.electrified ? ELECTRIFY.costPerUnit : 0;
     const beside = kind === 'rail' ? besideExisting(g, prop) : null;
     const S = SHARED_TRACK;
     const split = { track: 0, bridges: 0, tunnels: 0, earthworks: 0, other: 0 };
@@ -972,9 +982,11 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
           const y = profAt(tp.prof, tp.len, sm), t = w.heightAt(q.x, q.z);
           prem = structureFactor(kind, sec, sec === 'bridge' ? y - t : t - y) - 1;
         }
-        full += per * ds * (1 + prem);
+        full += (per * (1 + prem) + wire) * ds;
         const shared = kind === 'rail' && (ti > 0 || beside![ti][i] === 1);
-        const base = per * ds * (shared ? S.materials : 1), extra = per * ds * prem * (shared ? S.structures : 1);
+        // Wire is an attribute of each track, priced like electrifying it later. It neither excavates
+        // a second tunnel nor receives a formation discount beside the first track.
+        const base = (per * (shared ? S.materials : 1) + wire) * ds, extra = per * ds * prem * (shared ? S.structures : 1);
         cost += base + extra;
         if (sec === 'bridge') split.bridges += base + extra; else if (sec === 'tunnel') split.tunnels += base + extra; else split.track += base;
       }

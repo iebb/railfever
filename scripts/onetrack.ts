@@ -131,6 +131,20 @@ e.type = 'standard';
 const bare = planEdge(g, from, free(g, 130, 50), input);
 e.type = 'electric';
 check(Math.abs(extension.cost - bare.cost - extension.stats.len * ELECTRIFY.costPerUnit) <= 1, 'preview includes the exact wire price');
+for (const level of ['elevated', 'underground'] as const) for (const tracks of [1, 2]) {
+  const a = free(g, 40, 160), b = free(g, 130, 160);
+  const opts = railOpts(0, tracks, { level, levelHeight: 1.5, levelDepth: 2.2 });
+  const plain = planEdge(g, a, b, { ...opts, type: 'standard' }), wired = planEdge(g, a, b, { ...opts, type: 'electric' });
+  check(plain.ok && wired.ok && Math.abs(wired.cost - plain.cost - wired.stats.len * ELECTRIFY.costPerUnit) <= 1,
+    `${level} ${tracks} tracks: wire pays only its own length, without civil multipliers or formation discounts`);
+}
+for (const level of ['ground', 'elevated', 'underground'] as const) {
+  const opts = { mode: 'mainline' as const, trackType: 'electric', style: 'none', level, depth: 2.2, height: 1.5 };
+  const plain = g.stations.planRail(230, 160, 0, 12, 2, 0, { ...opts, psd: false });
+  const doors = g.stations.planRail(230, 160, 0, 12, 2, 0, { ...opts, psd: true });
+  check(plain.ok && doors.ok && Math.abs(doors.cost - plain.cost - 12 * 2 * 2500) <= 1,
+    `${level}: screen doors buy fit-out without a civil multiplier`);
+}
 check(!commitProposal(g, extension) && [...net.edges.values()].every((e) => e.type === 'electric'), 'committed extension carries its preview wire');
 const join = planEdge(g, free(g, 210, 50), nodeSnap(g, e.b, 'rail'), input);
 check(join.opts.type === 'electric', 'wire is inherited from the destination too');

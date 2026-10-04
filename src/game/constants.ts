@@ -47,10 +47,10 @@ export const RAIL_FARE = { minimum: 550 };
 /** Tram and bus fares: a boarding charge in calibrated game money, followed by the scaled distance component. */
 export const ROAD_FARES = { tram: { boarding: 80, distance: 0.9 }, bus: { boarding: 12, distance: 0.9 } };
 /**
- * Years of operating surplus available to repay an urban rail project, by construction style: subway-style tunnels
- * and cross-city links amortise longer than light-rail-style surface or viaduct lines.
+ * Years of operating surplus available to repay common railway works: twelve for light rail;
+ * subway and cross-city construction retain fifteen for their larger civil investment.
  */
-export const URBAN_PAYBACK = { metro: 15, lightrail: 9, crosscity: 15 };
+export const URBAN_PAYBACK = { metro: 15, lightrail: 12, crosscity: 15 };
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 

@@ -34,6 +34,8 @@ export interface WaitGroup {
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
 
 export type StationLevel = 'ground' | 'elevated' | 'underground';
+/** Platform upkeep by level, independent of station style and overhead wire. */
+export const STATION_UPKEEP_FACTOR = { ground: 1, elevated: 2, underground: 4 };
 /**
  * Construction style of a rail station, independent of overhead wire: main line, metro
  * (subway style: underground with entrances, screen doors) or light rail (close-spaced halts). Only construction
@@ -1037,7 +1039,10 @@ export class Stations {
    */
   planRail(x: number, z: number, angle: number, length: number, tracks: number, owner: number, opts: StationOpts = {}): StationPlan {
     const g = this.game, w = g.world;
-    const rmode = opts.mode ?? railModeOf(opts.trackType);
+    const self = opts.ignoreStation !== undefined ? this.map.get(opts.ignoreStation) : undefined;
+    // Rebuilds supply the saved wire id; it no longer identifies the station's construction mode.
+    const rmode = opts.mode ?? (self?.rail && (opts.trackType === undefined || trackTypeOf(opts.trackType) === opts.trackType)
+      ? railPartMode(self.rail) : railModeOf(opts.trackType));
     const trackType = trackTypeOf(opts.trackType);
     const level: StationLevel = opts.level ?? (opts.underground || rmode === 'metro' ? 'underground' : 'ground');
     const through = Math.max(0, Math.min(2, Math.round(opts.through ?? 0))), throughMode = opts.throughMode ?? 'middle';
@@ -1056,7 +1061,6 @@ export class Stations {
     // a metro / light-rail station in town walks half as far (CITY_STATION; rebuilding or moving a station keeps its
     // standing until its town no longer holds it, as the month-end decision does)
     if (rmode !== 'mainline') {
-      const self = opts.ignoreStation !== undefined ? this.map.get(opts.ignoreStation) : undefined;
       if (this.cityAt(x, z, self ? g.towns.list[self.townId] : g.towns.nearest(x, z), self?.city)) plan.city = true;
     }
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
@@ -1075,9 +1079,10 @@ export class Stations {
       sum += h; cnt++; mn = Math.min(mn, h); mx = Math.max(mx, h);
     }
     const demolish = new Set<number>();
-    // Platforms, tracks, access and screen doors. The passenger building is priced separately from the civil
-    // works, so the structure multiplier does not also multiply a street-level building's cost.
-    const base = (tracks + through * 0.7) * length * 9000 + 120000 + (psd ? tracks * length * 2500 : 0);
+    // Platforms, tracks and access. Buildings and screen doors are fit-out, not extra excavation
+    // or viaduct structure, so their prices stay outside the civil multiplier.
+    const base = (tracks + through * 0.7) * length * 9000 + 120000;
+    const doors = psd ? tracks * length * 2500 : 0;
     const civil = base - BUILDING_BASE;
     const fixed = opts.fixedY;
     const ign = opts.ignoreStation;
@@ -1194,7 +1199,7 @@ export class Stations {
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
       const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
       // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
-      plan.cost = civil * (4.5 + 1.5 * k);
+      plan.cost = civil * (3.8 + 1.5 * k);
     } else {
       // elevated: the deck clears the ground, buildings, roads and tracks beneath
       plan.height = Math.max(STATION_HEIGHT.min, Math.min(STATION_HEIGHT.max, opts.height ?? STATION_HEIGHT.def));
@@ -1226,6 +1231,7 @@ export class Stations {
       // Deck, columns and elevated access, plus the towers below: roughly 3-4x a ground station.
       plan.cost = civil * (3.4 + 0.5 * k);
     }
+    plan.cost += doors;
     if (level !== 'ground') {
       const want = opts.entrances ?? (length >= 20 ? 4 : length >= 13 ? 3 : 2);
       const sites = this.entranceSites(level, footprint, want, [], ign);

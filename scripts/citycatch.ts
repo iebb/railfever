@@ -244,6 +244,11 @@ section(1, 'in-city metro and light-rail stations walk half as far', () => {
       return near(sh.w[sh.st.indexOf(st.id)], a / (a + b) * cover, 1e-9) && near(sh.w[sh.st.indexOf(main.id)], b / (a + b) * cover, 1e-9);
     });
     check(both.length > 0 && ok, `type-neutral shares: ${both.length} buildings reached by an in-city metro stop and a main-line station split by their physical walks alone`);
+    const points = [200, 320].map((x) => g.stations.planRail(x, 258, Math.PI / 2, 7, 2, 0,
+      { mode: 'metro', trackType: 'electric', level: 'underground', style: 'none', entrances: 4 }));
+    const forecasts = ['mainline', 'metro', 'lightrail'].map((mode) => g.demand.forecastLine(points, mode as 'mainline' | 'metro' | 'lightrail', 35, 900));
+    check(points.every((p) => p.ok) && forecasts[0].boardings > 0 && forecasts.every((f) => JSON.stringify(f) === JSON.stringify(forecasts[0])),
+      'identical platforms and walkers: the forecast earns identical trips and revenue for every rail style, including sparse queues');
   }
 });
 

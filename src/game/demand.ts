@@ -80,7 +80,7 @@ export function localTripMultiplier(g: Game, site: DemandSite, mode: FareMode, q
 const localCapture = (local: number, localF: number) => local > 0
   ? (0.6 + 0.4 * Math.min(1, local / LOCAL_SERVED_SHARE)) * Math.max(0.6, Math.min(1.6, localF / local)) : 0;
 export interface ServiceForecast { boardings: number; revenue: number; covered: number; transfers: number }
-export interface ForecastSite extends DemandSite { walk: WalkingCatchment }
+export interface ForecastSite extends DemandSite { walk: WalkingCatchment; length?: number; tracks?: number }
 const feederQuality = (headway: number) => Math.max(0, Math.min(1,
   (MAINLINE_FEEDERS.cutoffHeadway - headway) / (MAINLINE_FEEDERS.cutoffHeadway - MAINLINE_FEEDERS.fullHeadway)));
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
@@ -621,7 +621,7 @@ export class DemandModel {
    * feeder pool too; a city line's (every stop in one town) transfer demand is the arrivals at the town's other served
    * rail stations continuing to these districts, not another population pool.
    */
-  forecastLine(points: (StationPlan | Station | ForecastSite)[], style: RailMode, kmh: number, headway: number): ServiceForecast {
+  forecastLine(points: (StationPlan | Station | ForecastSite)[], _style: RailMode, kmh: number, headway: number): ServiceForecast {
     const g = this.g;
     if (!this.regions.length) this.rebuild();
     const n = this.regions.length;
@@ -669,7 +669,6 @@ export class DemandModel {
         for (const [r, pop] of pools[i].regions) s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
       });
     }
-    const platform = PLATFORM_LENGTH[style] ?? PLATFORM_LENGTH.mainline;
     let boardings = 0, revenue = 0, transfers = 0;
     for (let i = 0; i < sites.length; i++) {
       const s = sites[i]; if (!s.pop) continue;
@@ -704,7 +703,10 @@ export class DemandModel {
       // Stations.trimWaiting (walking residents and platform space), with one call per cycle at termini and two in
       // the middle, for every rail stop (a busy city stop on a through line as on a city line).
       const sum = wanted.reduce((a, c) => a + c, 0);
-      const queue = Math.min(300, 12 + walking[i].pop * 0.035 + 2 * platform * 0.75);
+      const p = points[i];
+      const length = 'rail' in p ? p.rail?.length ?? 0 : 'length' in p ? p.length ?? PLATFORM_LENGTH.mainline : PLATFORM_LENGTH.mainline;
+      const tracks = 'rail' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks ?? 2 : 2;
+      const queue = Math.min(300, 12 + walking[i].pop * 0.035 + tracks * length * 0.75);
       const slots = queue * (360 * DAY_SECONDS) / Math.max(1, headway) * (i === 0 || i === sites.length - 1 ? 1 : 2);
       const capture = Math.min(1, slots / Math.max(1, sum));
       for (let j = 0; j < parts.length; j++) {

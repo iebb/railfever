@@ -977,7 +977,7 @@ export function lineCompatibility(g: Game, lineId: number, cars: VehicleModel[])
       if (!e || !ruleAllows(rule, e)) continue;
       if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, e, d, l.owner, false, rule), b.id, l.owner, -1, 40000, false, rule))) { ok = true; break; }
     }
-    if (!ok) return `${cars[0]?.name ?? 'This train'}: ${a.name} → ${b.name}: ${rule.wire ? 'needs overhead wire' : 'no rail connection'}`;
+    if (!ok) return `${cars[0]?.name ?? 'This train'}: ${a.name} → ${b.name}: ${rule.wire ? 'unwired track' : 'no rail connection'}`;
   }
   return null;
 }

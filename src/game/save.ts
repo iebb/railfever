@@ -507,6 +507,9 @@ export function deserialize(d: any): Game {
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;
     const town = { ...rest, buildings: new Set<number>(t.buildings) } as Town;
+    // Direct in-memory round trips must own their mutable street-planning arrays too.
+    // Sharing a grid lets one game's failed-street search alter the other's next growth step.
+    if (t.grid) town.grid = structuredClone(t.grid);
     if (t.mail) town.mail = { ...t.mail };
     g.towns.restoreCache(town, growth);
     return town;
