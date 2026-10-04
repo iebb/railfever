@@ -1086,6 +1086,8 @@ interface Project {
   depots: number[];
   line: number;
   started: number;
+  /** Completed selection survey; construction proves its sites, yard, fleet and economics again. */
+  urbanLayout?: UrbanLayout;
   /** share: the network owner whose access agreement this project signed (-1: none) */
   access?: number;
   /** construction started (a failure then cost money; failed plans are retried sooner) */
@@ -1100,6 +1102,8 @@ interface UrbanTask {
   town: number; mode: 'metro' | 'lightrail';
   layout: UrbanLayout;
   maxStops?: number; skipped?: boolean;
+  /** A rejected selection layout retries the ordinary full survey before any construction. */
+  fromHandoff?: boolean;
   candidates: { a: number; lat: number; lv: UrbanLevel; trim?: boolean; targets?: number[] }[];
   stage: 'sites' | 'links' | 'yardUnder' | 'yardRamp' | 'evaluate' | 'approve' | 'stations' | 'buildLinks' | 'buildTail' | 'buildYard' | 'throat' | 'finish' | 'line' | 'fleet' | 'transfers' | 'open';
   candidate: number; target: number; offset: number; tries: number; previous: number;
@@ -1589,7 +1593,7 @@ export class AIController {
     }
     // every option is scored by its expected return: yearly revenue from the regional OD demand at distance-based
     // fares, minus running costs and upkeep, over the outlay (focus and network effects on top)
-    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number }[] = [];
+    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; urbanLayout?: UrbanLayout }[] = [];
     const D = yield* this.townDemand();
     // fares with the value of time (fares.ts): ~60% of the top speed on average, waiting half the headway (by
     // default a service about as often as its one-way run takes)
@@ -1608,7 +1612,7 @@ export class AIController {
       const townFails = this.railTownFailures();
       const rivals = this.rivalRailPairs();
       const T = g.towns.list;
-      for (let i = 0; i < T.length; i++) for (let j = i + 1; j < T.length; j++) {
+      railPairs: for (let i = 0; i < T.length; i++) for (let j = i + 1; j < T.length; j++) {
         const A = T[i], B = T[j];
         if (A.pop < 250 || B.pop < 250 || Math.abs(A.x - B.x) > 250 || Math.abs(A.z - B.z) > 250) continue;
         const d = Math.hypot(A.x - B.x, A.z - B.z);
@@ -1619,6 +1623,8 @@ export class AIController {
         if (rivals.has(this.pairKey(A.id, B.id)) && trips < 250) continue;
         const hubA = this.hubFor(A, B), hubB = hubA ? null : this.hubFor(B, A);
         const hub = hubA ?? hubB;
+        const hubRails = [hubA?.rail, hubB?.rail], hubOwners = [hubA?.owner, hubB?.owner];
+        const hubsLive = () => [hubA, hubB].every((st, k) => !st || this.railHubLive(st, hubRails[k], hubOwners[k]));
         const len = d * 1.3, L = aiPlatformLength(A.pop, B.pop, g.year);
         const trackCost = len * 13_000;
         const infrastructure = trackCost + (hub ? 1 : 2) * (2 * L * 9000 + 120_000) + 260_000;
@@ -1629,6 +1635,7 @@ export class AIController {
         // and the track's upkeep), carrying what the demand gives
         const models = pickTrain(g.year, L, len, openingCoaches(A.pop, B.pop)) ?? railModels;
         yield;
+        if (!hubsLive()) continue railPairs;
         const sites: ForecastSite[] = [];
         for (const t of [A, B]) {
           const h = t === A ? hubA : hubB;
@@ -1642,11 +1649,13 @@ export class AIController {
             sites.push({ x, z, townId: t.id, length: L, tracks: 2, walk: pointWalkingCatchment(g, x, z, 'rail', 0, 8) });
           }
           yield;
+          if (!hubsLive()) continue railPairs;
         }
         let score = 0;
         for (const fleet of [1, 2]) {
           const sv = this.serviceYear(models, fleet, d, len);
           yield;
+          if (!hubsLive()) continue railPairs;
           const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway);
           const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
           const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap);
@@ -1789,7 +1798,12 @@ export class AIController {
           const years = urbanPayback(mode, this.eco.interestRate);
           if (!econ || econ.total * 1.05 > this.urbanAvailable() || econ.net * years < econ.total) continue;
           const score = roi(econ.forecast.revenue, econ.yearly + econ.total / years, econ.total) * years / 4.5;
-          if (score > 0) opts.push({ score: score * Math.max(fw(focus.rail), fw(focus.tram)), kind: mode, towns: [T.id] });
+          if (score > 0) {
+            const { quote: _, ...handoff } = layout;
+            opts.push({ score: score * Math.max(fw(focus.rail), fw(focus.tram)), kind: mode, towns: [T.id],
+              urbanLayout: { ...handoff, targets: [...handoff.targets], interchanges: handoff.interchanges.map(s => s.id),
+                ...(handoff.towns ? { towns: [...handoff.towns] } : {}) } });
+          }
         }
       }
     }
@@ -1834,7 +1848,8 @@ export class AIController {
       return;
     }
     const towns = pick.towns.map((id) => g.towns.list[id]);
-    this.project = { kind: pick.kind, towns: pick.towns, stations: [], edges: [], depots: [], line: -1, started: g.day };
+    this.project = { kind: pick.kind, towns: pick.towns, stations: [], edges: [], depots: [], line: -1, started: g.day,
+      ...(pick.urbanLayout ? { urbanLayout: pick.urbanLayout } : {}) };
     // a railway starts at the hub, else at the bigger town
     const railEnds = pick.kind !== 'rail' || pick.hub !== undefined || towns[0].pop >= towns[1].pop ? towns : [towns[1], towns[0]];
     this.job = pick.kind === 'rail' ? this.railJob(railEnds[0], railEnds[1], pick.hub ?? -1)
@@ -1957,6 +1972,12 @@ export class AIController {
     const g = this.game, me = this.companyId, co = g.companies[other];
     return other === me || (other > 0 && !!co?.ai && !co.defunct && g.accessPolicy(me) === 'open' && g.accessPolicy(other) === 'open'
       && g.canUse(me, other) && g.canUse(other, me));
+  }
+
+  /** A yielded planner may have kept an object replaced, merged or rebuilt by another controller. */
+  private railHubLive(st: Station, rail = st.rail, owner = st.owner, access = true): boolean {
+    return this.game.stations.get(st.id) === st && !!st.rail && st.rail === rail && st.owner === owner
+      && this.agrees(st.owner) && (!access || this.game.stations.hasAccess(st));
   }
 
   /** Stations (in order, ending at `st`) of another company's railway line that ends at `st` (out and back), and that line. */
@@ -2447,10 +2468,17 @@ export class AIController {
    * short trains. A line ending at the hub is extended to B (through trains) instead of a new line.
    */
   private *railJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true): Generator<void, void> {
-    const p = this.project!, job = this.railPlanJob(A, B, hubId, type, centre);
+    const p = this.project!;
+    let hubsLive = () => true;
+    const job = this.railPlanJob(A, B, hubId, type, centre, check => { hubsLive = check; });
     let units = 0;
     try {
       while (true) {
+        if (!hubsLive()) {
+          const key = (type === 'highspeed' || p.kind === 'hsr' ? 'hsr' : '') + this.pairKey(A.id, B.id);
+          this.note(`railway ${A.name}-${B.name} abandoned: station or track access changed while planning`);
+          this.markFailed(key, 360); this.abandon(p); return;
+        }
         const r = job.next();
         if (r.done) return;
         if (!p.built && ++units >= AI_RAIL_PLAN_UNITS) {
@@ -2465,8 +2493,12 @@ export class AIController {
     } finally { job.return(undefined); }
   }
 
-  private *railPlanJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true): Generator<void, void> {
+  private *railPlanJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true,
+    register?: (check: () => boolean) => void): Generator<void, void> {
     const g = this.game, owner = this.companyId, net = g.world.net;
+    const watched = new Map<Station, { rail: Station['rail']; owner: number; access: boolean }>();
+    const watch = (st: Station | null | undefined, access = true) => { if (st && !watched.has(st)) watched.set(st, { rail: st.rail, owner: st.owner, access }); };
+    register?.(() => [...watched].every(([st, before]) => this.railHubLive(st, before.rail, before.owner, before.access)));
     const p = this.project!;
     // A high-speed railway uses main-line stations where they can take it, and wide curves with shallow grades between them.
     const hs = type === 'highspeed' || p.kind === 'hsr', hsUnit = hs ? this.hsrUnit() : null;
@@ -2476,8 +2508,10 @@ export class AIController {
     // (the hub may have changed since the project was chosen: no platforms, no hub)
     const hub0 = hubId >= 0 ? g.stations.get(hubId) ?? null : hs ? this.hubFor(A, B) : null;
     const hub = hub0?.rail && (!hs || railPartMode(hub0.rail) === 'mainline' && hub0.rail.length >= (hsUnit?.length ?? Infinity) + 0.4) ? hub0 : null;
+    watch(hub);
     this.state.phase = hub ? `planning a railway ${hub.name} - ${B.name}` : `planning ${what} ${A.name} - ${B.name}`;
     const fail = (why: string, days = 900) => { this.note(`${what} ${A.name}-${B.name} abandoned: ${why}`); this.markFailed(key, days); this.abandon(p); };
+    if (hub && !this.railHubLive(hub)) return fail('station or track access changed while planning', 360);
     if (hs && !hsUnit) return fail('no high-speed trains yet', 1800);
     const PLATFORM = hs ? Math.max(12, Math.ceil(hsUnit!.length + 1)) : aiPlatformLength(A.pop, B.pop, g.year), ST = 2, tracks = 1;
     const grade = (hs ? 0.03 : 0.035) * 0.8;
@@ -2492,11 +2526,13 @@ export class AIController {
     // free takes the line too, rather than a second station in the town
     const hb = this.hubFor(B, hub ?? A);
     let hubB = hb && hb !== hub && hb.rail && railPartMode(hb.rail) === 'mainline' && (!hs || hb.rail.length >= hsUnit!.length + 0.4) ? hb : null;
+    watch(hubB);
+    if (hubB && !this.railHubLive(hubB)) return fail('station or track access changed while planning', 360);
     if (hub && hub.rail) {
       const pa = asPlan(hub);
       if (hubB && reach(pa, asPlan(hubB)) && leadsMeet(pa, asPlan(hubB), LEAD)) pr = { a: pa, b: asPlan(hubB) };
       else {
-        hubB = null;
+        hubB = null; if (hb) watched.delete(hb);
         const pb = yield* aiStationSiteGen(g, B, pa, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(pa, q, LEAD), quick: true });
         if (pb && reach(pa, pb)) pr = { a: pa, b: pb };
       }
@@ -2505,7 +2541,7 @@ export class AIController {
       const pa = yield* aiStationSiteGen(g, A, pb, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(q, pb, LEAD), quick: true });
       if (pa && reach(pa, pb)) pr = { a: pa, b: pb };
     }
-    if (!pr && !hub) { hubB = null; pr = yield* aiRailPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true }); }
+    if (!pr && !hub) { hubB = null; if (hb) watched.delete(hb); pr = yield* aiRailPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true }); }
     if (!pr) return fail('no station sites');
     if (hs && !hub) {
       const existingA = this.townStation(A, pr.a);
@@ -2616,6 +2652,7 @@ export class AIController {
     // where a junction fits, whatever share of the new site's catchment it covers)
     const duplicate = !!S && S.owner !== owner && Math.hypot(S.x - pr.b.x, S.z - pr.b.z) - (S.rail!.length + PLATFORM) / 2 <= XLINK_REACH;
     if (S && (this.newCatchShare(pr.b) < 0.6 || duplicate)) {
+      watch(S);
       if (hs && S.rail!.length < hsUnit!.length + 0.4) return fail('existing station platforms too short', 720);
       for (const J of this.approachJunctions(S, frontA).slice(0, 4)) {
         if (J.owner !== owner && !this.agrees(J.owner)) continue;
@@ -2623,10 +2660,10 @@ export class AIController {
         if (!W) continue;
         yield;
         const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 2, parallel: 3, sliced: true }, AI_ROUTE_WORK);
-        if (typeof pj !== 'string') { plan = pj; join = { S, J }; break; }
+        if (typeof pj !== 'string') { plan = pj; join = { S, J }; watch(S); break; }
       }
       if (!join && hs) return fail(`no junction into ${S.name}`, 720);
-      if (!join) this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`);
+      if (!join) { watched.delete(S); this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`); }
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
     if (!join && !preferredRoute) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
@@ -2728,6 +2765,7 @@ export class AIController {
     }
     const stA = hub ?? g.stations.get(built.get(pr.a) ?? -1), stB = hubB ?? join?.S ?? g.stations.get(built.get(pr.b) ?? -1);
     if (!stA?.rail || !stB?.rail) return fail('station gone', 360);
+    watch(stA, false); watch(stB, false);
     const facing = (st: Station, o: Station) => { const r = st.rail!; return Math.sin(r.angle) * (o.x - st.x) + Math.cos(r.angle) * (o.z - st.z) > 0; };
     // the main line leaves from the platform track with the other one on the same side (travelling A -> B) at both
     // stations, so that a second track can later run straight into the free platforms at both ends
@@ -4142,6 +4180,18 @@ export class AIController {
     return best!;
   }
 
+  /** Selection hands off only its numerical layout. Changed geometry and prices are never reused. */
+  private urbanHandoffLayout(hint: UrbanLayout | undefined, maxStops: number) {
+    const g = this.game;
+    if (!hint || ![hint.x, hint.z, hint.angle, hint.spacing, hint.step, hint.end, hint.L, hint.platform].every(Number.isFinite)
+      || hint.platform <= 0 || hint.targets.length < 3 || hint.targets.length > maxStops
+      || !hint.targets.every((t, i) => Number.isFinite(t) && (!i || t > hint.targets[i - 1]))
+      || hint.interchanges.some(id => { const st = g.stations.get(id); return !st?.rail || (st.owner !== this.companyId && !g.canUse(this.companyId, st.owner)); })
+      || hint.towns?.some(id => !g.towns.list[id])) return null;
+    return { ...hint, targets: [...hint.targets], interchanges: hint.interchanges.map(id => g.stations.get(id)!),
+      ...(hint.towns ? { towns: [...hint.towns] } : {}) };
+  }
+
   /**
    * A city railway through the core of town T, built in one of the urban construction styles: subway style
    * (underground, metro units) or light-rail style (at grade, on a viaduct or
@@ -4159,7 +4209,9 @@ export class AIController {
       this.state.phase = `planning a ${what} in ${T.name}`;
       if (this.urbanReserved(T.id)) return fail('another urban project is being built', 60);
       maxStops = this.urbanSurvey?.maxStops ?? maxStops;
-      const layout = yield* this.urbanStep(T, mode, maxStops, true), L = layout.L;
+      const handoff = !this.urbanSurvey ? this.urbanHandoffLayout(p.urbanLayout, maxStops) : null;
+      delete p.urbanLayout;
+      const layout = handoff ?? (yield* this.urbanStep(T, mode, maxStops, true)), L = layout.L;
       this.urbanSurvey = null;
       const range = (a: number) => { let mn = Infinity, mx = -Infinity; for (let t = -L / 2 - 8; t <= L / 2 + 8; t += 3) { const h = g.world.heightAt(layout.x + Math.sin(a) * t, layout.z + Math.cos(a) * t); mn = Math.min(mn, h); mx = Math.max(mx, h); } return mx - mn; };
       const through = (layout.towns?.length ?? 0) > 1;
@@ -4180,7 +4232,7 @@ export class AIController {
         .map((targets) => ({ ...c, targets: [...targets] })));
       candidates.splice(0, candidates.length, ...variants);
       p.towns = layout.towns ? [T.id, ...layout.towns.filter(id => id !== T.id)] : [T.id];
-      this.urbanTask = { town: T.id, mode, maxStops, layout: { ...layout, interchanges: layout.interchanges.map((s) => s.id) }, candidates,
+      this.urbanTask = { town: T.id, mode, maxStops, ...(handoff ? { fromHandoff: true } : {}), layout: { ...layout, interchanges: layout.interchanges.map((s) => s.id) }, candidates,
         stage: 'sites', candidate: 0, target: 0, offset: 0, tries: 0, previous: -1e9, got: [], link: 0, links: 0, yardAt: 0, yard: null,
         plans: [], angle: layout.angle, level: mode === 'metro' ? 'underground' : 'elevated', bestReturn: -1e30, bestPays: false, paid: false, alignment: '', more: 2,
         siteRejects: [], linkRejects: [], at: 0, stations: [], doubleEdges: [], depot: -1, end: -1, bought: 0 };
@@ -4190,7 +4242,10 @@ export class AIController {
     const designGrade = TRACK_TYPES.electric.maxGrade;
     const retry = function* (self: AIController, why: string, days = 1500): Generator<void, void> {
       const count = task.maxStops ?? maxStops;
-      if (count > 3 && n > 3 && !p.built) { self.urbanTask = null; yield* self.urbanJob(T, mode, Math.min(count - 1, n - 1)); }
+      if (task.fromHandoff && !p.built) {
+        self.urbanTask = null; self.urbanSurvey = null;
+        yield* self.urbanJob(T, mode, count);
+      } else if (count > 3 && n > 3 && !p.built) { self.urbanTask = null; yield* self.urbanJob(T, mode, Math.min(count - 1, n - 1)); }
       else fail(why, days);
     };
     const ground = (x: number, z: number) => g.world.heightAt(x, z);

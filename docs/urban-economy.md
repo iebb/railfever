@@ -1,26 +1,23 @@
 # Urban rail economics
 
-Rail is one transport mode. Main-line, metro and light-rail track and stations are construction styles of it. The style sets:
+Rail is one transport mode with one physical track type. Overhead wires are an attribute; electric traction requires them. Main-line, metro and light rail are station styles that set platform, entrance and building defaults. Any rail line may mix these styles. Track geometry and rolling stock determine usable speeds.
 
-- track speed, curves, grades and cost
-- electrification and clearance
-- station defaults: underground with street entrances and screen doors, elevated decks, halts and spacing
-
-Every rail vehicle runs on every track type, though electric traction needs the wire. Any rail line may stop at any rail station, and one line may mix the styles. Lines, numbering, codes, colours, catchments, fares, local demand and forecasts treat every rail line alike. The Urban tools are presets for the urban construction styles.
+The Urban tools provide construction presets. City rail search compares extendable routes through occupied districts and nearby town centres, including ground, elevated and underground sections. A project must pay for its complete stations, tracks, yard, fleet, maintenance and borrowing costs. Metro construction and its depots stay underground.
 
 The passenger calendar remains at a 0.1 scale. Covered residents now make 20% more trips: the local base rate is 0.0102 per game day before that scale, and the long-distance monthly rate is 0.0144, preserving their balance. Fares are in calibrated game money: the boarding charges and the rail minimum are not literal real-world ticket prices. The main-line and high-speed distance fare curves are unchanged.
 
 ## Walking reach
 
-Passengers walk along streets from forecourts, entrances and stops. Every walking limit is 70% of the release-2.6 value. All rail stations share one limit, whatever their track type:
+Passengers walk along streets from forecourts, entrances and stops. Every walking limit is 70% of the release-2.6 value. Main-line rail stations use the full rail limit. Metro and light-rail stations inside towns use half that limit:
 
 | Mode | Limit | Along streets |
 | --- | ---: | ---: |
-| Rail, every station whatever its track type | 23.52 units | 294 m |
+| Main-line rail (and rail outside towns) | 23.52 units | 294 m |
+| Metro / light rail inside towns | 11.76 units | 147 m |
 | Tram | 21.56 units | 269.5 m (270 m in labels) |
 | Bus | 15.68 units | 196 m |
 
-The street distance includes the 1.25 street-grid allowance. Building bonuses extend all three limits as before. Labels and help text take the limits from `walkLimit`.
+The street distance includes the 1.25 street-grid allowance. Building bonuses extend these limits as before. Labels and help text take the limits from `walkLimit`.
 
 A building with a station within `FULL_COVER_WALK` (14.7 units, 147 m along streets) is fully covered. Further out, coverage falls with the walking weight `1 / (1 + d / 5.6)`, the same weight that shares buildings between stations. The weight's distance scale also falls by 30%, from 8 to 5.6 units, so both full coverage and the entire taper keep their shape at 70% of the old distances: about 0.8 coverage at a bus stop's limit and 0.6 at a rail station's.
 
