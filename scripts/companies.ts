@@ -9,7 +9,7 @@ import { Train } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { AIController, AIConfig, AI_PRESETS, pickTrain } from '../src/game/ai';
 import { TramPlanner } from '../src/game/ai-tram';
-import { colorDistance, LINE_PALETTES } from '../src/game/lines';
+import { colorDistance, LINE_PALETTES, type Line } from '../src/game/lines';
 import { demandView, stationDemand } from '../src/game/demand';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
@@ -18,6 +18,11 @@ import type { Economy, Category } from '../src/game/economy';
 import { fails, check, fmt, checkReservations, checkNaN, placeAndConnect, depotBehind } from './lib';
 
 const seed = Number(process.argv[2] ?? 5), YEARS = Number(process.argv[3] ?? 3), SIZE = Number(process.argv[4] ?? 512);
+// Tram personalities may choose native light rail when its full investment quote pays better.
+// A station-style label alone is insufficient: the actual service must use light-rail units too.
+const isLightRail = (world: Game, l: Line) => l.kind === 'rail' && l.stops.length >= 2 && l.vehicles.length > 0
+  && l.stops.every(sid => { const st = world.stations.get(sid); return !!st?.rail && railPartMode(st.rail) === 'lightrail'; })
+  && l.vehicles.every(id => { const v = world.vehicles.get(id); return v instanceof Train && v.cars.length > 0 && v.cars.every(m => m.id.startsWith('lrv_')); });
 const CONFIGS: { label: string; cfg: Partial<AIConfig> }[] = [
   { label: 'passive', cfg: { activeness: 0.25, risk: 0.1 } },
   { label: 'aggressive', cfg: { activeness: 2, risk: 0.9, startMoney: 8_000_000 } },
@@ -78,7 +83,9 @@ check(aggressive.rail + aggressive.bus + aggressive.tram >= 2, 'aggressive compa
 check(railCo.rail >= 1, 'rail-focused company runs a railway');
 check(busCo.rail === 0 && (busCo.bus >= 1 || busTowns === 0), `bus-focused company runs buses and no railway (${busTowns} towns of 900+)`);
 // (a tram company may also run light rail, an urban railway; no main-line railway)
-check(tramCo.rail - tramCo.urban === 0 && (tramCo.tram >= 1 || tramTowns === 0), `tram-focused company runs trams, no main-line railway (${tramTowns} towns of ${TramPlanner.minPop}+)`);
+check(tramCo.rail - tramCo.urban === 0 && (tramCo.tram >= 1 || tramTowns === 0
+  || g.lines.all().some(l => l.owner === tramCo.id && isLightRail(g, l))),
+  `tram-focused company runs trams or native light rail, no main-line railway (${tramTowns} towns of ${TramPlanner.minPop}+)`);
 check(IDS.every((id) => !g.company(id).defunct), 'no buyouts while acquisitions are off');
 check(AIS.every((ai) => ai.state.phase !== 'consolidating' || g.company(ai.companyId).economy.loan > 0), 'sane AI states');
 for (const [i] of sums.entries()) check(aiTime[i].t / Math.max(1, aiTime[i].n) < 4, `${sums[i].label}: AI time per day < 4 ms`);
@@ -144,9 +151,15 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     pick = ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! }))
       .find(({ l, info }) => l && info && l.kind !== 'rail' && l.owner === ai.companyId && l.vehicles.length > 0 && new Set(l.stops).size >= 2
         // (a line whose stops all belong to others now takes no more vehicles of ours: lines.ts operateError)
-        && g.lines.operateError(l, ai.companyId) === null);
+        && g.lines.operateError(l, ai.companyId) === null
+        // Some fleets have no integer inverse of the rounded activeness cap (two at sqrt(2), for example).
+        // Select an existing service that really starts at its rounded cap, with room below its stop limit.
+        && (() => { const n = l.vehicles.length, grow = Math.sqrt(ai.config.activeness);
+          const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
+          return n < hard && Math.round(Math.max(1, Math.round(n / grow)) * grow) === n; })());
     if (pick) break;
   }
+  check(!!pick, 'crowded growth has an existing bus or tram fleet with an exact rounded cap below its stop limit');
   if (!pick) console.log('  (no AI bus or tram line to crowd)');
   else {
     const { ai, l, info } = pick;
@@ -465,6 +478,66 @@ g.setAllowAccess(PLAYER, true);
 }
 g.aiAcquisitions = true;
 {
+  // Build a literal tram service through its native planner on a branch of the same generated world.
+  // Its takeover coverage is independent of a personality choosing light rail instead of trams.
+  const branch = deserialize(JSON.parse(JSON.stringify(serialize(g))));
+  branch.aiEnabled = false; branch.aiAcquisitions = false;
+  const target = tramCo.id, operator = branch.company(target);
+  check(target !== PLAYER && !operator.defunct, 'literal tram fixture uses an active rival operator');
+  operator.economy.money = 20_000_000;
+  const cash0 = operator.economy.money, loan0 = operator.economy.loan;
+  const planner = new TramPlanner(branch, target);
+  let result = planner.available() && planner.start() ? 'running' : 'not started', units = 0;
+  while (result === 'running' && units < 2000) { result = planner.step(1); units++; }
+  const built = branch.lines.get(planner.project?.line ?? -1);
+  const paid = cash0 + operator.economy.loan - loan0 - operator.economy.money;
+  console.log(`  literal tram native opening: ${result} (${planner.status}), ${units} units, ${fmtMoney(paid)} paid, town ${planner.project?.town}, stops ${built?.stops.length}, trams ${built?.vehicles.length}`);
+  check(result === 'done' && paid > 0 && built?.kind === 'tram' && built.owner === target
+    && new Set(built.stops).size >= 3 && built.vehicles.length >= 2,
+    'funded native planner builds the rival literal tram service on generated streets');
+  const tram = built?.vehicles.map(id => branch.vehicles.get(id))
+    .find(v => v instanceof RoadVehicle && v.owner === target && v.model?.kind === 'tram');
+  check(!!tram, 'literal tram takeover starts with an existing rival tram service');
+  if (tram) {
+    const stock = branch.vehicles.all().filter((v): v is RoadVehicle => v.owner === target && v instanceof RoadVehicle && v.model?.kind === 'tram');
+    const lines = [...new Set(stock.map(v => v.lineId))].map(id => id === null ? undefined : branch.lines.get(id)).filter((l): l is Line => !!l);
+    const preBuyStops = new Set<number>();
+    let preBuyRoutes = true;
+    for (let tick = 0; tick < 200 * branch.ticksPerDay; tick++) {
+      branch.stepTick();
+      preBuyRoutes &&= stock.every(v => v.owner === target && v.state !== 'noroute');
+      for (const v of stock) if (v.state === 'loading') { const st = v.targetStation(); if (st) preBuyStops.add(st.id); }
+    }
+    const delivered0 = stock.reduce((sum, v) => sum + v.delivered, 0);
+    console.log(`  literal trams before takeover: ${delivered0} delivered, ${preBuyStops.size} stops visited`);
+    check(preBuyRoutes && delivered0 > 0 && preBuyStops.size >= 2 && checkReservations(branch).length === 0,
+      'native rival trams genuinely deliver passengers at successive stops before takeover');
+    branch.economy.money = 1e9;
+    check(branch.buyCompany(PLAYER, target) === null, 'player buys the existing literal tram operator through native buyCompany');
+    check(stock.every(v => v.owner === PLAYER) && lines.every(l => l.owner === PLAYER), 'literal trams and their lines transfer to the player');
+    const saved = JSON.stringify(serialize(branch)), replay = deserialize(JSON.parse(saved));
+    let exact = JSON.stringify(serialize(replay)) === saved, routes = true, reservations = true;
+    const diagnose = (tick: number, a: string, b: string) => { let i = 0; while (i < a.length && a[i] === b[i]) i++;
+      console.log(`  literal tram replay differs at tick ${tick}, byte ${i}: ${a.slice(Math.max(0, i - 80), i + 100)} vs ${b.slice(Math.max(0, i - 80), i + 100)}`); };
+    if (!exact) diagnose(-1, saved, JSON.stringify(serialize(replay)));
+    const visited = new Set<number>();
+    for (let tick = 0; tick < 640; tick++) {
+      branch.stepTick(); replay.stepTick();
+      const a = JSON.stringify(serialize(branch)), b = JSON.stringify(serialize(replay));
+      if (exact && a !== b) diagnose(tick, a, b);
+      exact &&= a === b;
+      routes &&= stock.every(v => v.owner === PLAYER && v.state !== 'noroute');
+      reservations &&= checkReservations(branch).length === 0 && checkReservations(replay).length === 0;
+      for (const v of stock) if (v.state === 'loading') { const st = v.targetStation(); if (st) visited.add(st.id); }
+    }
+    const delivered1 = stock.reduce((sum, v) => sum + v.delivered, 0);
+    console.log(`  literal tram buyout branch: owner ${target}, ${stock.length} trams, delivered ${delivered0} -> ${delivered1}, ${visited.size} stops visited in 640 ticks`);
+    check(routes && reservations, 'all bought literal trams retain their routes and consistent reservations');
+    check(delivered1 > delivered0 && visited.size >= 2, 'bought literal trams deliver passengers and visit successive stops');
+    check(exact, 'literal tram takeover and every subsequent full save replay exactly for 640 ticks');
+  }
+}
+{
   // an AI buys another AI and runs its lines
   const buyer = aggressive.id, target = tramCo.id;
   g.company(buyer).economy.money = 5e8;
@@ -477,7 +550,8 @@ g.aiAcquisitions = true;
   // (a bought line the buyer has joined into one of its own since is looked after as that line: lines.get follows the join)
   check(tl.every((id) => { const l = g.lines.get(id); return !!l && ctl.managedLines().includes(l.id); }), 'the buyer AI manages the bought lines');
   check(tv.every((v) => v.owner === buyer && v.state !== 'noroute'), 'bought trams keep running');
-  check(tv.some((v) => v instanceof RoadVehicle && v.model?.kind === 'tram') || !tl.length, 'trams among the bought vehicles');
+  check(tv.some((v) => v instanceof RoadVehicle && v.model?.kind === 'tram') || !tl.length
+    || tl.some(id => { const l = g.lines.get(id); return !!l && isLightRail(g, l); }), 'trams or native light-rail units among the bought vehicles');
 }
 
 // ------------------------------------------------------------------ 6. save round trip of the company state
