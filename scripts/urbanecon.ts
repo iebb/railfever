@@ -274,7 +274,11 @@ if (!arg('maps')) {
 
   for (const owner of [3, 1]) {
     console.log(`${owner === 3 ? 'third company' : 'terminus owner'} urban interchange line`);
-    const { g, C, a, b } = termini(3, 20000), ai = g.aiOf(owner)!;
+    // (citycatch: in-city subway stations walk half as far. The terminus owner's subway was sized at the old reach and
+    // barely repaid at baseline (2.72M forecast against 2.61M needed); in this city's 140 m unbuilt corridor its
+    // half-reach stations reach too little of 20,000 residents, and the AI rightly declines. The behaviour under test,
+    // a subway serving both main-line termini through walking interchanges, needs a city where one pays: 26,000.)
+    const { g, C, a, b } = termini(3, owner === 1 ? 26000 : 20000), ai = g.aiOf(owner)!;
     if (owner === 3) open(g, g.aiOf(1)!, 'crosscity', C);
     open(g, ai, 'metro', C);
     const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.trackType === 'metro'));

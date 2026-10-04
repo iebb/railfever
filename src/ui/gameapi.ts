@@ -9,7 +9,7 @@ import { AIConfig, DEFAULT_AI_CONFIG, AI_PRESETS, normalizeAIConfig } from '../g
 import type { DemandView, DemandTown, DemandPair } from '../game/demand';
 import type { MailView } from '../game/mail-view';
 import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, StationOpts, RailMode } from '../game/stations';
-import { CATCHMENT_RADIUS } from '../game/stations';
+import { CATCHMENT_RADIUS, CITY_WALK_SCALE, railWalkScale, planWalkScale, railPartMode } from '../game/stations';
 import { STATION_STYLES, stylesFor, defaultStationStyle } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
 import { walkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
@@ -121,6 +121,31 @@ export function catchShapes(g: Game, st: Station, all = false): CatchShape[] { r
 export function catchRadius(mode: CatchMode): number { return CATCHMENT_RADIUS[mode]; }
 /** Actual walking budget, including the grid detour calibration and the building style. */
 export function catchWalkLimit(mode: CatchMode, bonus = 0): number { return CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR; }
+/** Share of the rail reach an in-city metro / light-rail station walks (stations.ts CITY_WALK_SCALE). */
+export const CITY_REACH = CITY_WALK_SCALE;
+/**
+ * A station's walking budget along streets (units): a rail station's with its building's bonus and its walking scale
+ * (an in-city metro / light-rail station walks half as far), else its tram or bus stops'.
+ */
+export function stationWalkLimit(g: Game, st: Station): number {
+  if (st.rail) return catchWalkLimit('rail', catchBonusOf(st.rail.style)) * railWalkScale(st);
+  return catchWalkLimit(st.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tram' : 'bus');
+}
+/** A planned rail station's walking budget along streets (units): its building's bonus and walking scale (planWalkScale). */
+export function planWalkLimit(plan: StationPlan): number { return catchWalkLimit('rail', catchBonusOf(plan.style)) * planWalkScale(plan); }
+/** Does the station walk half as far, as an in-city metro / light-rail station? */
+export function stationInCity(st: Station): boolean { return railWalkScale(st) !== 1; }
+/**
+ * Why a rail station walks as far as it does, for windows and cards: 'in-city light rail: half the rail reach',
+ * 'light rail out of town: the full rail reach', or null for main-line stations and stops.
+ */
+export function cityReachNote(st: Station): string | null {
+  if (!st.rail) return null;
+  const m = railPartMode(st.rail);
+  if (m === 'mainline') return null;
+  const what = m === 'metro' ? 'metro' : 'light-rail';
+  return stationInCity(st) ? `in-city ${what} station: half the rail reach` : `${what} station out of town: the full rail reach`;
+}
 export const catchStreets = walkingCatchment;
 export const planCatchStreets = planWalkingCatchment;
 export const catchStreetPop = walkingPopulation;

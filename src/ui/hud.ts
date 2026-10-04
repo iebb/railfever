@@ -649,7 +649,7 @@ export class Hud {
       const onLine = T.stationOnLine && T.relocating == null;
       if (!onLine) {
         const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`]]
+          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station, half that in a town's core`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station, half that in a town's core`]]
           : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
         if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
         opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));

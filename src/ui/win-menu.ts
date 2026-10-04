@@ -8,6 +8,7 @@ import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
+import { CITY_STATION, CITY_WALK_SCALE } from '../game/stations';
 import { RAIL_FARE } from '../game/constants';
 import { FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../game/fares';
 
@@ -212,10 +213,10 @@ export function openHelp(ui: UI) {
       <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
     </ol>
     <h4>Walking catchments</h4>
-    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} (every rail station alike, on main-line, metro or light-rail track), tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of rail ${fmtLen(walkLimit('rail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances.</p>
+    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} (on main-line, metro or light-rail track alike; metro- and light-rail-style stations within the core of a town of ${CITY_STATION.pop.toLocaleString('en-US')}+ walk half as far, ${fmtLen(walkLimit('rail') * CITY_WALK_SCALE / WALK_DETOUR)}: city stops lie close together), tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of rail ${fmtLen(walkLimit('rail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances. A station's window and hover card show its walking reach.</p>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
-      <li><b>Urban</b> (<kbd>U</kbd>) opens the urban-style presets: metro or light-rail track and close-spaced stations. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban-style stations use the matching platform tracks and can have street entrances. It is all ordinary rail: the same walking reach and fares as any rail station, any rail line may stop there, and one line may run over main-line and urban track alike (through running).</li>
+      <li><b>Urban</b> (<kbd>U</kbd>) opens the urban-style presets: metro or light-rail track and close-spaced stations. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban-style stations use the matching platform tracks and can have street entrances. It is all ordinary rail: the same fares as any rail station (in a town's core the stations walk half as far), any rail line may stop there, and one line may run over main-line and urban track alike (through running).</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, also Rail → Connect): click a point on the first track, then point at another track to preview a connecting curve, turnouts, signals and cost. Click to build; <kbd>Esc</kbd> or right-click lets you pick the first track again. Pick outside platform and depot tracks.</li>
       <li><b>Re-level</b> (Urban → Re-level): choose <b>Lift</b>, <b>Sink</b> or <b>Ground</b>, set height or depth, then click a track or drag along your stretch. The preview shows the cost, ramps and stations that move with it. Lines and signals stay connected; bridges and tunnels cost much more than ground track.</li>
       <li><b>Electrify</b> (Rail → Electrify): click standard track, or drag along a stretch, to add overhead wire, including platform tracks. The preview shows the cost. Electric locomotives and EMUs need wire and a compatible track type; electrifying standard track keeps its 160 km/h limit.</li>

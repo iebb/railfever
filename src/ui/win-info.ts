@@ -18,9 +18,9 @@ import { cashPitch } from '../audio/engine';
 import type { LineKind } from '../game/constants';
 import { KIND_META } from './format';
 import { demandView, stationDemand } from '../game/demand';
-import { townDemandShare } from './gameapi';
+import { townDemandShare, stationWalkLimit, cityReachNote } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
-import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind } from '../game/stations';
+import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind, CITY_STATION } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { walkingCatchment, walkingCatchmentWithout, entranceCatchment } from '../game/catchment';
 import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
@@ -98,6 +98,9 @@ export function openStation(ui: UI, id: number) {
         s.rail ? ui.kv('Level', s.rail.level === 'elevated' ? `Elevated · ${Math.round(s.rail.height * 10)} m` : s.rail.level === 'underground' ? `Underground · ${Math.round(s.rail.depth * 10)} m deep` : 'Ground') : null,
         s.rail ? ui.kv('Building style', h('span', { class: 'inline wrap' }, `${styleOf(s.rail.style).name} · +${fmtPct(styleOf(s.rail.style).catchBonus)} walking reach`,
           mine ? h('button', { class: 'btn sm', onclick: () => { win.tab = 'build'; rerender(); } }, 'Restyle…') : null)) : null,
+        // how far people walk to it along streets: an in-city metro / light-rail station half as far as other rail stations
+        ui.kv('Walking reach', h('span', { 'data-tip': `People walk this far along streets to the station's forecourt, entrances and stops. Metro- and light-rail-style stations in a town of ${fmtInt(CITY_STATION.pop)}+ residents, within its built-up core, walk half as far as other rail stations: city stops lie close together. The Catchment button shows the streets reached.` },
+          `${fmtInt(Math.round(stationWalkLimit(g, s) * 10))} m along streets${cityReachNote(s) ? ` · ${cityReachNote(s)}` : ''}`)),
         s.rail ? ui.kv('Road access', s.roadAccess ? h('span', { class: 'pos' }, s.rail.level === 'ground' ? 'Connected to the street' : 'Entrances on the street') : h('span', { class: 'neg' }, 'None — no passengers')) : null,
         mine && s.rail && !s.roadAccess ? h('div', { class: 'warn' }, icon('warning', 16),
           h('span', null, s.rail.level === 'ground' ? 'This station won\u2019t attract passengers until its forecourt or an entrance is connected to a street. ' : 'None of its entrances is beside a road: add one next to a street. ',

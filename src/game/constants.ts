@@ -24,9 +24,11 @@ export const LOCAL_DEMAND_DISTANCE = 40, LOCAL_DEMAND_EXP = 0.85, LOCAL_SERVED_S
 /**
  * Urban trips use the same compressed calendar. Extra local trips apply only inside large, dense towns, by the mode
  * that carries the journey (demand.ts journeyMode): rail is one mode (main-line, metro and light-rail track alike),
- * then tram and bus. Rail twice the tram: faster and more frequent, not a different kind of trip.
+ * then tram and bus. Rail three times the tram: faster and more frequent, not a different kind of trip (12 since in-
+ * city metro and light-rail stops walk half as far, from 8: the same for every rail station in a dense centre, so a
+ * city railway of closer stops still repays; scripts/citycatch.ts, urbanecon.ts).
  */
-export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 8, tram: 4, bus: 2 };
+export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 12, tram: 4, bus: 2 };
 /** Small unmodelled car/drop-off feeder share of cross-town rail trips; bus/tram feeders are routed as real transfers. */
 export const MAINLINE_FEEDER_SHARE = 0.08;
 /**
