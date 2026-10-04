@@ -31,7 +31,7 @@ function settleWorks(ai: AIController, value: WorksReturn, quoted: number, spent
   if (contributions > 0) ai.game.company(ai.companyId).economy.spend(-contributions, 'construction', true);
 }
 
-// capacity-integration: replace only these two calls when double-track works support access rights.
+// Track upgrades enforce access rights and keep each existing infrastructure title.
 export function planCapacityTrackUpgrade(g: Game, edges: number[], side: 1 | -1, payer: number): DoublePlan {
   return planDoubleTrack(g, edges, side, payer);
 }
@@ -44,7 +44,10 @@ export function relieveSharedCapacity(ai: AIController, l: Line): boolean {
   const g = ai.game, me = ai.companyId;
   const agreement = sharedCapacityPlan(g, l), s = l.capacity!;
   if (s.works || g.day - (s.tried ?? -1e9) < 30) return !!s.works;
-  const resources = agreement.resources.filter(r => r.owners.includes(me));
+  const resources = agreement.resources.filter(r => r.edges.some(id => {
+    const e = g.world.net.edges.get(id);
+    return e && !g.trackUpgradeError(me, e.owner);
+  }));
   if (!resources.length) return false;
   const waiting = l.vehicles.map(id => g.vehicles.get(id)).some(t => t?.state === 'waiting' && (t as { stuckTime?: number }).stuckTime! > 30);
   let queue = 0;
@@ -85,8 +88,8 @@ export function relieveSharedCapacity(ai: AIController, l: Line): boolean {
   // Work on the longest shared single-track bottleneck first. Full double track, then a shorter loop if the
   // geometry will not take the whole chain. Three/four platform tracks remain useful on a doubled corridor.
   const track = resources.filter(r => r.kind === 'single').map(r => ({ ...r,
-    edges: r.edges.filter(id => g.world.net.edges.get(id)?.owner === me),
-    length: r.edges.reduce((n, id) => n + (g.world.net.edges.get(id)?.owner === me ? g.world.net.edges.get(id)!.len : 0), 0) }))
+    edges: r.edges.filter(id => { const e = g.world.net.edges.get(id); return e && !g.trackUpgradeError(me, e.owner); }),
+    length: r.edges.reduce((n, id) => { const e = g.world.net.edges.get(id); return n + (e && !g.trackUpgradeError(me, e.owner) ? e.len : 0); }, 0) }))
     .filter(r => r.edges.length)
     .sort((a, b) => b.length - a.length || a.id - b.id)[0];
   if (!track) return false;
@@ -100,7 +103,7 @@ export function sharedCapacityWork(ai: AIController): boolean {
   const l = [...g.lines.map.values()].sort((a, b) => a.id - b.id).find(x => x.capacity?.works?.owner === me);
   if (!l) return false;
   const s = l.capacity!, task = s.works!;
-  const edges = task.edges.filter(id => g.world.net.edges.get(id)?.owner === me);
+  const edges = task.edges.filter(id => { const e = g.world.net.edges.get(id); return e && !g.trackUpgradeError(me, e.owner); });
   if (edges.length !== task.edges.length) { delete s.works; return true; }
   const plan = planCapacityTrackUpgrade(g, edges, task.side, me);
   if (plan.ok) {

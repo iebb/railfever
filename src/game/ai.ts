@@ -14,7 +14,7 @@ import * as Trackops from './trackops';
 import type { NEdge, Section } from './network';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
-import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, ELECTRIFY } from './constants';
+import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, ELECTRIFY, trackTypeOf } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
 import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongestion, lineCompatibility } from './train';
@@ -1122,7 +1122,7 @@ interface UrbanLayout {
 }
 type UrbanQuote = UrbanLayout & { quote?: ReturnType<AIController['urbanEconomics']> };
 interface UrbanSurvey {
-  maxStops: number; trials: { layout: UrbanLayout; level: UrbanLevel; count: number }[];
+  maxStops: number; unit: string; trials: { layout: UrbanLayout; level: UrbanLevel; count: number }[];
   trial: number; site: number; offset: number; sites: (StationPlan | ForecastSite)[];
   best: UrbanQuote; stageBest: UrbanQuote; bestReturn: number; stageReturn: number; stageCount: number;
 }
@@ -1133,7 +1133,8 @@ function saveTaskProposal(p: Proposal) {
   return { ...p, tracks: p.tracks.map((t) => ({ ...t, prof: [...t.prof] })) };
 }
 function loadTaskProposal(p: ReturnType<typeof saveTaskProposal>): Proposal {
-  return { ...p, tracks: p.tracks.map((t) => ({ ...t, prof: Float32Array.from(t.prof) })) };
+  return { ...p, opts: p.opts.kind === 'rail' ? { ...p.opts, type: trackTypeOf(p.opts.type) } : { ...p.opts },
+    tracks: p.tracks.map((t) => ({ ...t, prof: Float32Array.from(t.prof) })) };
 }
 function saveTaskStation(p: StationPlan) {
   const { buildingCands: _, ...plain } = p as StationPlan & { buildingCands?: unknown };
@@ -1142,7 +1143,11 @@ function saveTaskStation(p: StationPlan) {
 function loadTaskStation(g: Game, p: ReturnType<typeof saveTaskStation>): StationPlan {
   // A stop removed while planning can leave a stale reference; retain its id just as the running plan does.
   const ref = (id: number) => g.stations.get(id) ?? { id } as Station;
-  return { ...p, join: p.join === null ? null : ref(p.join),
+  const mode = p.mode ?? railModeOf(p.trackType), trackType = trackTypeOf(p.trackType);
+  // Pending v29 plans also migrate their legacy style track, before they lay any platform edges.
+  const city = trackType !== p.trackType && p.city === undefined && mode !== 'mainline'
+    && g.stations.cityAt(p.x, p.z, g.towns.nearest(p.x, p.z));
+  return { ...p, trackType, mode, ...(city ? { city: true } : {}), join: p.join === null ? null : ref(p.join),
     links: p.links.map(ref), access: p.access ? loadTaskProposal(p.access) : null };
 }
 
@@ -3765,7 +3770,10 @@ export class AIController {
    * building and upkeep: a subway's deep stations may not pay for it.
    */
   private *urbanStep(T: Town, mode: 'metro' | 'lightrail', maxStops = 5, saved = false): Generator<void, ReturnType<AIController['urbanLayout']> & { quote?: ReturnType<AIController['urbanEconomics']> }> {
-    const g = this.game, close = this.urbanLayout(T, mode, undefined, maxStops), unit = this.urbanUnit(mode, this.urbanPlatform(mode));
+    const g = this.game, close = this.urbanLayout(T, mode, undefined, maxStops);
+    // A model introduced while this survey is pending must not change its quotes only after loading.
+    const unit = (saved && this.urbanSurvey?.unit ? MODEL_BY_ID.get(this.urbanSurvey.unit) : undefined)
+      ?? this.urbanUnit(mode, this.urbanPlatform(mode));
     if (!unit) return close;
     const plain = (layout: ReturnType<AIController['urbanLayout']>): UrbanLayout => ({ ...layout, interchanges: layout.interchanges.map((s) => s.id) });
     const restore = (layout: UrbanQuote) => ({ ...layout, interchanges: layout.interchanges.map((id) => g.stations.get(id)).filter((s): s is Station => !!s) });
@@ -3783,7 +3791,7 @@ export class AIController {
           }
         }
       }
-      return { maxStops, trials, trial: 0, site: 0, offset: 0, sites: [], best: plain(close), stageBest: plain(close),
+      return { maxStops, unit: unit.id, trials, trial: 0, site: 0, offset: 0, sites: [], best: plain(close), stageBest: plain(close),
         bestReturn: -1e30, stageReturn: -1e30, stageCount: trials[0]?.count ?? maxStops };
     };
     const cursor = saved ? this.urbanSurvey ??= fresh() : fresh();
@@ -3911,9 +3919,9 @@ export class AIController {
 
   /**
    * A city railway through the core of town T, built in one of the urban construction styles: subway style
-   * (underground, 'metro' track, metro units) or light-rail style ('lightrail' track at grade, on a viaduct or
+   * (underground, metro units) or light-rail style (at grade, on a viaduct or
    * underground, light-rail vehicles): two-track stations with side platforms spaced by walking reach and turnout
-   * room, double track between them, a ramp to a depot beyond one end, directional running with crossovers before
+   * room, wired double track between them, a tail with a ramp or cavern depot, directional running with crossovers before
    * the ends, signals, and a line stopping at every station. The result is an ordinary rail line (main-line trains
    * may run through onto it, its trains onto the main line).
    */

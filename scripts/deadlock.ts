@@ -72,7 +72,9 @@ function depotFixture(block: boolean, starters = true) {
   if (!A || !C) throw new Error('depot fixture stations');
   check(!!build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, C, 0, false), 'rail'), railOpts(0), 'single track'), 'depot fixture single track built');
   check(g.requestAccess(1, 0) === 'granted', 'depot operator has track access');
-  for (const st of [A, C]) check(connectStationThroat(g, st.id, st.owner).connected === 1, 'depot fixture passing platform connected');
+  // The player builds this shared fixture: AI operators may use player rail but cannot alter it.
+  check(g.requestAccess(0, 1) === 'granted', 'player fixture builder has access to the partner station');
+  for (const st of [A, C]) check(connectStationThroat(g, st.id, 0).connected === 1, 'depot fixture passing platform connected');
   const ne = net.nearestEdge(135, 128.225, 0.5, 'rail')!;
   const siding = buildDepotOnLine(g, ne.edge.id, ne.s, 1), home = depotFor(g, A, C, 0);
   check(siding >= 0 && home >= 0, 'a siding depot and a station depot built');

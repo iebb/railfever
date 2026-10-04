@@ -112,6 +112,31 @@ function fixtures() {
   relieveSharedCapacity(platforms.g.aiOf(1)!, platforms.l);
   check(platforms.A.rail!.tracks > 2, 'profitable platform congestion adds more than two platform tracks');
 
+  console.log('partner-funded track works retain titles and require upgrade rights');
+  for (const rights of ['open', 'closed', 'player'] as const) {
+    const f = fixture(30_000_000, 3);
+    f.l.capacity!.delay = 100;
+    const resource = sharedCapacityPlan(f.g, f.l).resources.find(r => r.kind === 'single')!;
+    const edges = resource.edges.filter(id => f.g.world.net.edges.get(id)?.owner === 1);
+    if (rights === 'closed') f.g.setAccessPolicy(1, 'ask');
+    if (rights === 'player') {
+      f.g.setAccessPolicy(0, 'open');
+      for (const id of edges) f.g.world.net.edges.get(id)!.owner = 0;
+      f.g.onNetworkChanged();
+    }
+    const before = f.g.world.net.nextEdge, money = f.g.company(2).economy.money;
+    f.l.capacity!.works = { day: f.g.day, owner: 2, edges, side: 1 };
+    for (let i = 0; i < 6 && f.l.capacity?.works; i++) sharedCapacityWork(f.g.aiOf(2)!);
+    if (rights === 'open') {
+      check(f.g.aiOf(2)!.stats.doubled > 0, 'an authorised partner funds profitable second-track works');
+      const made = [...f.g.world.net.edges.values()].filter(e => e.id >= before && e.kind === 'rail' && e.station < 0 && e.depot < 0);
+      check(made.length > 0 && made.every(e => e.owner === 1), 'partner-funded formation retains the infrastructure owner');
+    } else {
+      check(f.g.world.net.nextEdge === before && f.g.company(2).economy.money === money,
+        rights === 'closed' ? 'withdrawn access cancels saved works before construction or payment' : 'AI capacity works preserve player rail');
+    }
+  }
+
   console.log('shared headways across separate companies/lines, and saved works');
   const f = fixture();
   const other = f.g.lines.create('rail', 2); other.stops = [...f.l.stops];

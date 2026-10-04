@@ -10,7 +10,7 @@ import { patternOf, patternStops, patternHeadways, nextStopIndex } from './patte
 import { fareFor, estimateLegTime, tripFactor, refTime } from './fares';
 import { estimateVehicleYear, YEAR_S, trackBasePerUnit } from './opcosts';
 import { KMH_TO_UPS, TRACK_TYPES, RAIL } from './constants';
-import { railModeOf } from './stations';
+import { railPartMode } from './stations';
 import { railCapacityOptions } from './rail-capacity-options';
 
 export interface RailCapacityState {
@@ -153,7 +153,7 @@ function demand(g: Game, l: Line, cycle: number) {
   let distance = 1;
   for (const a of sites) for (const b of sites) distance = Math.max(distance, Math.hypot(a!.x - b!.x, a!.z - b!.z));
   const trains = fleet(g, l), kmh = Math.max(20, Math.min(100, ...trains.map(t => t.maxSpeedKmh * 0.6)));
-  const forecast = g.demand.forecastLine(sites as NonNullable<typeof sites[number]>[], railModeOf(sites[0]?.rail?.trackType ?? 'standard'), kmh, cycle / Math.max(1, trains.length));
+  const forecast = g.demand.forecastLine(sites as NonNullable<typeof sites[number]>[], sites[0]?.rail ? railPartMode(sites[0].rail) : 'mainline', kmh, cycle / Math.max(1, trains.length));
   const ride = estimateLegTime(distance, kmh, 0), seconds = estimateLegTime(distance, kmh, cycle / Math.max(1, trains.length));
   const fare = fareFor(distance, seconds, 1, { mode: 'rail' });
   let lost = 0;

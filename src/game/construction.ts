@@ -374,7 +374,7 @@ export function curveSpeed(radius: number, trackType?: string): number {
 
 // ------------------------------------------------------------------------------------ snapping
 
-/** Parallel siblings of a rail end node: other free ends side by side with the same direction
+/** Parallel siblings of a rail end node: other free ends side by side at the same height and direction
  *  (standard spacing on plain track, wider spacing at station throats). */
 export function nodeGroup(g: Game, nodeId: number): number[] {
   const net = g.world.net;
@@ -387,7 +387,7 @@ export function nodeGroup(g: Game, nodeId: number): number[] {
   for (const id of net.nodeGrid.query(n.x - 6, n.z - 6, n.x + 6, n.z + 6)) {
     if (id === n.id) continue;
     const m = net.nodes.get(id)!;
-    if (m.kind !== 'rail' || Math.abs(m.dx * n.dx + m.dz * n.dz) < 0.995) continue;
+    if (m.kind !== 'rail' || Math.abs(m.y - n.y) > 0.1 || Math.abs(m.dx * n.dx + m.dz * n.dz) < 0.995) continue;
     const dx = m.x - n.x, dz = m.z - n.z;
     const along = dx * n.dx + dz * n.dz, lat = dx * rx + dz * rz;
     if (Math.abs(along) > 0.2 || Math.abs(lat) < 0.3) continue;
