@@ -4,7 +4,8 @@ import * as THREE from 'three';
 import type { UI } from './ui';
 import { PLAYER, type Game } from '../game/game';
 import { findSnap, planEdge, commitProposal, Snap, Proposal, BuildOptions, curveSpeed, levelCrossingAllowed } from '../game/construction';
-import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable, electrify } from '../game/build-ops';
+import { toggleSignal, bulldoze, terraformBrush, depotSize, DepotPlan, DepotKind, addTramTracks, removeTramTracks, roadPath, tramUsable, electrify, UNDERGROUND_DEPOT } from '../game/build-ops';
+import { demolitionTotal } from '../game/demolition';
 import { setSignal, signalsAlong, autoSignals, clearSignalsAlong, SIGNAL_SPACING, SIGNAL_COST } from '../game/signals';
 import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot, DoublePlan, planStationOnTrack, commitStationOnTrack, OnTrackPlan, planConnection, commitConnection, ConnectionPlan, planRelevel, commitRelevel, RelevelPlan } from '../game/trackops';
 import { openAutoSignal } from './win-signals';
@@ -35,7 +36,7 @@ export type LineLevel = 'ground' | 'elevated' | 'underground';
 
 /** Tools with their own remembered settings: the main-line and urban track tools, the two station tools. */
 const PROFILE_KEYS = {
-  rail: ['railType', 'railLevel', 'tracks', 'levelHeight', 'levelDepth'],
+  rail: ['railType', 'railLevel', 'tracks', 'levelHeight', 'levelDepth', 'subwayOnly'],
   station: ['stationType', 'stationLevel', 'stationLen', 'stationTracks', 'stationThrough', 'throughMode', 'stationOnLine', 'stationStyle', 'stationHeight', 'stationDepth'],
 } as const;
 const profileKind = (t: ToolId): keyof typeof PROFILE_KEYS | null => (t === 'rail' || t === 'metro' ? 'rail' : t === 'station' || t === 'metro-station' ? 'station' : null);
@@ -57,7 +58,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   tram: { name: 'Tram tracks', hint: 'Click or drag along roads; New road: road with wire; Remove: your tracks.' },
   tramstop: { name: 'Tram stop', hint: 'On tram tracks; joins your nearby station for transfers.' },
   'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
-  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end; otherwise connect with track; R / Shift+R / Alt+wheel rotates.' },
+  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end (underground at a tunnel end); otherwise connect with track; R / Shift+R / Alt+wheel rotates.' },
   'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
   signal: { name: 'Signals', hint: 'Own or accessible track · click: two-way → one-way → reversed → none; drag: series facing drag; right-click / Remove: remove.' },
   double: { name: 'Double track', hint: 'Own or accessible single track → second track through platforms and junctions; directional: signals and station crossovers.' },
@@ -114,6 +115,12 @@ export class Tools {
   railLevel: LineLevel = 'ground';
   levelHeight = LINE_LEVEL.height.def;
   levelDepth = LINE_LEVEL.depth.def;
+  /** underground level: stay underground the whole way (a subway: no ramps or portals; BuildOptions.subway) */
+  subwayOnly = false;
+  /** train depot tool: 'auto' (underground off a track end in a tunnel, else on the surface) or always underground */
+  depotLevel: 'auto' | 'underground' = 'auto';
+  /** train depot tool, underground: depth below the ground when not snapped to a track end */
+  depotDepth = UNDERGROUND_DEPOT.depth.def;
   roadType: 'street' | 'road' = 'road';
   tracks = 1;
   /** Station construction mode and building style ('auto': by era and town). */
@@ -129,8 +136,8 @@ export class Tools {
   private elec: { key: string; ids: number[]; cost: number; changed: number; length: number; error: string | null } | null = null;
   /** remembered settings of the other tool of a pair (rail / urban rail, station / urban station) */
   private profiles = new Map<ToolId, Record<string, unknown>>([
-    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 1 }],
-    ['metro', { railType: 'electric', railLevel: 'underground', tracks: 2 }],
+    ['rail', { railType: 'standard', railLevel: 'ground', tracks: 1, subwayOnly: false }],
+    ['metro', { railType: 'electric', railLevel: 'underground', tracks: 2, subwayOnly: true }],
     ['station', { stationType: 'mainline', stationLevel: 'ground', stationLen: DEFAULT_PLATFORM_LENGTH, stationTracks: 1, stationThrough: 0, throughMode: 'middle', stationOnLine: false, stationStyle: 'shelter', stationDepth: STATION_DEPTH.def }],
     ['metro-station', { stationType: 'metro', stationLevel: 'underground', stationLen: PLATFORM_LENGTH.metro, stationTracks: 2, stationThrough: 0, stationOnLine: false, stationStyle: 'auto', stationDepth: STATION_DEPTH.metro }],
   ]);
@@ -250,6 +257,11 @@ export class Tools {
   get kind(): NetKind { return this.tool === 'road' || this.tool === 'tram' ? 'road' : 'rail'; }
   /** a track tool (main line or urban rail) */
   get railBuild() { return this.tool === 'rail' || this.tool === 'metro'; }
+  /** Building below ground (underground track, stations or re-levelling, train depots): show what is down there. */
+  get undergroundView(): boolean {
+    return (this.railBuild && this.railLevel === 'underground') || (this.stationTool && this.stationLevel === 'underground')
+      || this.tool === 'depot-rail' || (this.tool === 'relevel' && this.relevelTo === 'underground');
+  }
   /** a station tool (main line or urban) */
   get stationTool() { return this.tool === 'station' || this.tool === 'metro-station'; }
   get building() { return this.railBuild || this.tool === 'road' || (this.tool === 'tram' && this.tramMode === 'build'); }
@@ -264,6 +276,7 @@ export class Tools {
     const rail = this.railBuild;
     const o: BuildOptions = { kind: rail ? 'rail' : 'road', type: rail ? this.railType : this.roadType, tracks: rail ? this.tracks : 1, heightOffset: this.heightOffset, crossing: this.crossing, owner: PLAYER, tram: this.tool === 'tram' || undefined };
     if (rail && this.railLevel !== 'ground') { o.level = this.railLevel; o.levelHeight = this.levelHeight; o.levelDepth = this.levelDepth; }
+    if (rail && this.railLevel === 'underground' && this.subwayOnly) o.subway = true;
     return o;
   }
 
@@ -735,6 +748,7 @@ export class Tools {
       this.hover();
     }
     if (this.planDirty && performance.now() - this.planAt >= Math.min(200, this.planMs * 2)) this.planNow();
+    this.overlay.setUnderground(this.undergroundView);
     // long press (touch) ends a construction chain
     const d = this.down;
     if (d && d.touch && !d.moved && performance.now() - d.t > 650 && (this.start || this.dragRect)) {
@@ -862,7 +876,10 @@ export class Tools {
         const how = pl.snapNode >= 0 ? 'Connects to the track end' : kind !== 'rail' && pos.road ? (kind === 'tram' ? 'Connects to the tram tracks' : 'Connects to the road') : kind === 'rail' ? 'Connect it with track afterwards' : kind === 'tram' ? 'Beside a road with tram tracks' : 'Place it next to a road';
         const nd = pl.demolish?.length ?? 0;
         const movingDepot = this.relocatingDepot != null ? g.depots.get(this.relocatingDepot) : undefined;
-        this.tip({ title: movingDepot ? 'Move depot' : kind === 'rail' ? 'Train depot' : kind === 'tram' ? 'Tram depot' : 'Bus depot', hint: movingDepot ? 'Click: move depot and vehicles; Esc: cancel' : undefined, cost: pl.ok ? pl.cost : undefined, rows: [[pl.snapNode >= 0 || pos.road ? 'check' : 'info', how]], err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn: [...(nd ? [`Demolishes ${plural(nd, 'building')}`] : []), ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])] }, pl.ok ? 'ok' : 'err');
+        const under = pl.level === 'underground';
+        const rows: [string, string][] = [[pl.snapNode >= 0 || pos.road ? 'check' : 'info', how]];
+        if (under) rows.push(['tunnel', `Underground, <b>${Math.round((pl.depth ?? 0) * 10)} m</b> deep · vents only, no demolition`]);
+        this.tip({ title: movingDepot ? 'Move depot' : kind === 'rail' ? (under ? 'Underground train depot' : 'Train depot') : kind === 'tram' ? 'Tram depot' : 'Bus depot', hint: movingDepot ? 'Click: move depot and vehicles; Esc: cancel' : undefined, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn: [...(nd ? [`Demolishes ${plural(nd, 'building')}`] : []), ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])] }, pl.ok ? 'ok' : 'err');
         break;
       }
       case 'signal': this.hoverSignal(p); break;
@@ -1613,7 +1630,7 @@ export class Tools {
   private planDepot(kind: DepotKind, px: number, pz: number): DepotPlan {
     const g = this.game;
     const pos = this.depotPlacement(kind, px, pz);
-    const pl = g.depots.plan(kind, pos.x, pos.z, pos.angle, PLAYER);
+    const pl = g.depots.plan(kind, pos.x, pos.z, pos.angle, PLAYER, kind === 'rail' ? { level: this.depotLevel, depth: this.depotDepth } : {});
     if (pl.snapNode >= 0) {
       const n = g.world.net.nodes.get(pl.snapNode);
       if (n && n.owner !== PLAYER && pl.ok) { pl.ok = false; pl.error = `Track owned by ${g.company(n.owner).name}`; }
@@ -1775,7 +1792,7 @@ export class Tools {
   private retainingWallCost(p: Proposal): number | undefined {
     if (p.stats.walls === undefined || !p.stats.costSplit) return undefined;
     let other = p.trees * 250;
-    for (const id of p.demolish) { const b = this.game.world.buildings.get(id); if (b) other += 6000 + b.pop * 2500; }
+    other += p.stats.costSplit.demolition ?? demolitionTotal(this.game, p.demolish);
     for (const c of p.crossings) if (c.mode === 'level' || c.mode === 'diamond') other += 15000;
     if (p.opts.tram && p.opts.kind === 'road') for (const tp of p.tracks) other += TRAM.costPerUnit * tp.len;
     return Math.max(0, Math.round(p.stats.costSplit.other - other));
@@ -1814,10 +1831,13 @@ export class Tools {
       const cs = st.costSplit, parts: string[] = [];
       if (cs.track) parts.push(`track ${fmtMoney(cs.track)}`);
       if (cs.earthworks) parts.push(`earthworks ${fmtMoney(cs.earthworks)}`);
-      const other = cs.other - (this.retainingWallCost(p) ?? 0);
+      if (cs.demolition) parts.push(`demolition ${fmtMoney(cs.demolition)}`);
+      const other = cs.other - (cs.demolition ?? 0) - (this.retainingWallCost(p) ?? 0);
       if (other > 0) parts.push(`other ${fmtMoney(other)}`);
-      if (parts.length > 1 || cs.bridges || cs.tunnels) rows.push(['coin', parts.join(' · ')]);
+      if (parts.length > 1 || (parts.length && (cs.bridges || cs.tunnels))) rows.push(['coin', parts.join(' · ')]);
     }
+    // tunnels under buildings: what a line on the ground here would have demolished
+    if (st.avoided && st.avoided.buildings > 0) rows.push(['check', `Underground: keeps <b>${plural(st.avoided.buildings, 'building')}</b> a ground line would demolish (saves ${fmtMoney(st.avoided.cost)} demolition)`]);
     if (p.crossings.length) {
       const m = new Map<string, number>();
       for (const c of p.crossings) m.set(CROSS_LABEL[c.mode], (m.get(CROSS_LABEL[c.mode]) ?? 0) + 1);
@@ -2275,7 +2295,7 @@ export function typeLevelText(o: BuildOptions): string {
   const tt = TRACK_TYPES[o.type] ?? TRACK_TYPES.standard;
   const name = `Track${tt.electrified ? ' · overhead wire' : ''}`;
   if (o.level === 'elevated') return `${esc(name)} · elevated, <b>${Math.round((o.levelHeight ?? LINE_LEVEL.height.def) * 10)} m</b> up`;
-  if (o.level === 'underground') return `${esc(name)} · underground, <b>${Math.round((o.levelDepth ?? LINE_LEVEL.depth.def) * 10)} m</b> deep`;
+  if (o.level === 'underground') return `${esc(name)} · ${o.subway ? 'subway, no portals' : 'underground'}, <b>${Math.round((o.levelDepth ?? LINE_LEVEL.depth.def) * 10)} m</b> deep`;
   return esc(name);
 }
 

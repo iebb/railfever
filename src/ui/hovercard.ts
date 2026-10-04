@@ -87,7 +87,8 @@ export class HoverCard {
     if (t.kind === 'depot') {
       const d = g.depots.get(t.id);
       if (!d) return null;
-      p.x = d.x; p.y = d.y + 1.6; p.z = d.z;
+      // (an underground depot: above the street over it)
+      p.x = d.x; p.y = (d.level === 'underground' ? Math.max(w.heightAt(d.x, d.z), WATER_Y) : d.y) + 1.6; p.z = d.z;
       return p;
     }
     const town = g.towns.list[t.id];
@@ -143,7 +144,7 @@ export class HoverCard {
       const n = g.vehicles.all().filter((v) => (v as Train | RoadVehicle).depotId === d.id).length;
       return {
         color: co.color,
-        html: `<div class="hc-title">${svg(d.kind === 'rail' ? 'depot' : 'garage', 16)}<span>${d.kind === 'rail' ? 'Train depot' : 'Bus depot'}</span></div>` +
+        html: `<div class="hc-title">${svg(d.kind === 'rail' ? 'depot' : 'garage', 16)}<span>${d.kind === 'rail' ? (d.level === 'underground' ? 'Underground train depot' : 'Train depot') : 'Bus depot'}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}</div>` +
           `<div class="hc-stats">${stat('vehicles', `<b>${n}</b> vehicle${n === 1 ? '' : 's'}`)}</div>` +
           `<div class="hc-hint">${d.owner === PLAYER ? 'Buy vehicles' : 'Details'}</div>`,

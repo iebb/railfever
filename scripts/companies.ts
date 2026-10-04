@@ -134,16 +134,22 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
 
 {
   // riders giving up waiting on a profitable bus or tram line at its fleet limit: the limit rises and a vehicle is added
-  type Info = { kind: string; maxVehicles: number; lastSold?: number };
-  const pick = AIS.flatMap((ai) => g.company(ai.companyId).defunct ? [] : ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! })))
-    .find(({ ai, l, info }) => l && info && l.kind !== 'rail' && l.owner === ai.companyId && l.vehicles.length > 0 && new Set(l.stops).size >= 2
-      // (a line whose stops all belong to others now takes no more vehicles of ours: lines.ts operateError)
-      && g.lines.operateError(l, ai.companyId) === null);
+  type Info = { kind: string; depot: number; maxVehicles: number; lastSold?: number };
+  let pick: { ai: AIController; l: NonNullable<ReturnType<typeof g.lines.get>>; info: Info } | undefined;
+  for (const ai of AIS) {
+    if (g.company(ai.companyId).defunct) continue;
+    // Finish the project before selecting a line for capacity management.
+    for (let d = g.day + 720; ai.busy && g.day < d;) g.update(0.25);
+    if (ai.busy) continue;
+    pick = ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! }))
+      .find(({ l, info }) => l && info && l.kind !== 'rail' && l.owner === ai.companyId && l.vehicles.length > 0 && new Set(l.stops).size >= 2
+        // (a line whose stops all belong to others now takes no more vehicles of ours: lines.ts operateError)
+        && g.lines.operateError(l, ai.companyId) === null);
+    if (pick) break;
+  }
   if (!pick) console.log('  (no AI bus or tram line to crowd)');
   else {
     const { ai, l, info } = pick;
-    // (a project of its own holds money back: let it finish, then none meanwhile)
-    for (let d = g.day + 720; ai.busy && g.day < d;) g.update(0.25);
     ai.state.cooldown = Math.max(ai.state.cooldown, 400);
     const n0 = l.vehicles.length, v0 = g.vehicles.get(l.vehicles[0])!;
     const grow = Math.sqrt(ai.config.activeness);
@@ -461,7 +467,8 @@ g.aiAcquisitions = true;
   check(err === null, 'AI buys AI' + (err ? ': ' + err : ''));
   runDays(31);
   const ctl = g.ais.find((a) => a.companyId === buyer)!;
-  check(tl.every((id) => ctl.managedLines().includes(id)), 'the buyer AI manages the bought lines');
+  // (a bought line the buyer has joined into one of its own since is looked after as that line: lines.get follows the join)
+  check(tl.every((id) => { const l = g.lines.get(id); return !!l && ctl.managedLines().includes(l.id); }), 'the buyer AI manages the bought lines');
   check(tv.every((v) => v.owner === buyer && v.state !== 'noroute'), 'bought trams keep running');
   check(tv.some((v) => v instanceof RoadVehicle && v.model?.kind === 'tram') || !tl.length, 'trams among the bought vehicles');
 }

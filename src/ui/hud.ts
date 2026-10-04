@@ -8,6 +8,7 @@ import { TOOL_INFO } from './tools';
 import { h, icon, clear, seg, stepper, kbd, toggle, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { TRACK_TYPES, ROAD_TYPES, LINE_LEVEL, ELECTRIFY } from '../game/constants';
+import { UNDERGROUND_DEPOT } from '../game/build-ops';
 import { structureFactor } from '../game/construction';
 import { fmtDate, fmtHeight, fmtLen, newsDate, fmtPct } from './format';
 import { walkLimit } from '../game/catchment';
@@ -68,7 +69,7 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   road: 'Click: start / build; continue from the new end.',
   station: 'Auto-aligns with nearby track ends.',
   busstop: 'Click on a road to place a stop.',
-  'depot-rail': 'Snaps to a free track end.',
+  'depot-rail': 'Snaps to a free track end; underground at a tunnel end.',
   'depot-road': 'Roadside: connects automatically.',
   tram: 'Road tracks: click or drag along streets.',
   tramstop: 'Click on a road with tram tracks.',
@@ -192,7 +193,7 @@ export class Hud {
       sp.appendChild(b);
     }
     this.saveEl = h('span', { class: 'savechip', role: 'status', 'aria-live': 'polite' });
-    R.appendChild(h('div', { class: 'hud hud-tc' }, h('div', { class: 'clock chrome' }, this.dateEl, sp), this.saveEl));
+    R.appendChild(h('div', { class: 'hud hud-tc' }, h('div', { class: 'clock chrome' }, this.dateEl, sp)));
     // actions
     this.fpsEl = h('span', { class: 'fps' });
     this.badge = h('span', { class: 'badge' });
@@ -216,6 +217,7 @@ export class Hud {
     this.mapBtns.signals = h('button', { class: 'hbtn chrome', 'data-tip': 'Signal blocks', 'data-sfx': 'none', 'aria-label': 'Signal blocks', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('signals') }, icon('signal', 19));
     this.mapBtns.catchment = h('button', { class: 'hbtn chrome', 'data-tip': 'Catchment areas', 'data-key': 'O', 'data-sfx': 'none', 'aria-label': 'Catchment areas', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('catchment') }, icon('catchment', 19));
     R.appendChild(h('div', { class: 'hud hud-tr' },
+      this.saveEl,
       this.fpsEl,
       this.mapBtns.lines,
       this.mapBtns.demand,
@@ -523,7 +525,7 @@ export class Hud {
   private cardSig() {
     const T = this.ui.tools;
     const line = T.lineEditId != null ? this.ui.game.lines.get(T.lineEditId) : null;
-    return [T.tool, T.tramMode, T.railType, T.proposal?.opts.type, T.railLevel, T.levelHeight, T.levelDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
+    return [T.tool, T.tramMode, T.railType, T.proposal?.opts.type, T.railLevel, T.levelHeight, T.levelDepth, T.subwayOnly, T.depotLevel, T.depotDepth, T.stationType, T.stationStyle, T.conn ? T.conn.edge : -1, T.relevelTo, this.ui.game.year, T.roadType, T.tracks, this.moreTracks, T.directional, T.rightHand, T.signalMode, T.signalKind, T.signalSpacing, T.signalClass, T.signalPass, T.stationThrough, T.throughMode, T.stationOnLine, T.doubleSide, T.relocating, T.relocatingDepot, T.entranceStation, T.entranceKind, T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation)?.rail?.entrances.length : -1, T.heightOffset, T.crossing, T.stationLen, T.stationTracks, T.stationLevel, T.stationHeight, T.stationDepth, Math.round(T.stationAngle * 100), T.autoAlign, T.terraMode, T.brushRadius, !!T.start, T.constructionWarnings.join('\n'), line ? line.name + line.stops.length + line.color : ''].join('|');
   }
 
   /** Station tools: platform length and level follow the selected station style's defaults. */
@@ -590,6 +592,7 @@ export class Hud {
     if (T.railBuild || t === 'road' || (t === 'tram' && T.tramMode === 'build')) {
       if (T.railBuild) {
         opts.push(this.levelOpts(T.railLevel, T.levelHeight, T.levelDepth, (lv) => { T.railLevel = lv; redo(); }, (hh) => { T.levelHeight = hh; redo(); }, (d) => { T.levelDepth = d; redo(); }));
+        if (T.railLevel === 'underground') opts.push(toggle('Stay underground', T.subwayOnly, (v) => { T.subwayOnly = v; redo(); }, 'A subway: tunnel the whole way at this depth, no ramps or portals (joins only underground track)'));
         opts.push(typeSpec(T.proposal?.opts.type ?? T.railType, T.railLevel, T.levelHeight, T.levelDepth));
         const many = this.moreTracks || T.tracks > 2;
         opts.push(opt('Tracks', seg<number>(many ? [[1, 'Single'], [2, 'Double'], [3, '3'], [4, '4']] : [[1, 'Single', 'Upgrade to double later'], [2, 'Double', 'Parallel tracks for passing']], T.tracks, (v) => { T.tracks = v; redo(); }),
@@ -661,6 +664,11 @@ export class Hud {
       opts.push(toggle('Align to track', T.autoAlign, (v) => { T.autoAlign = v; redo(); }));
     } else if (t === 'depot-rail' || t === 'depot-road' || t === 'depot-tram') {
       if (T.relocatingDepot != null) opts.push(h('span', { class: 'chip', style: `--c:${TOOL_META[t].color}` }, icon('move', 13), 'Moving depot'), h('button', { class: 'btn sm', onclick: () => T.setTool('inspect') }, 'Cancel'));
+      if (t === 'depot-rail') {
+        const D = UNDERGROUND_DEPOT.depth, step = (v: number, d: number) => Math.max(D.min, Math.min(D.max, Math.round((v + d) * 100) / 100));
+        opts.push(opt('Level', seg<'auto' | 'underground'>([['auto', 'Auto', 'On the surface, or underground at the end of a tunnel (no building at street level)'], ['underground', 'Underground', 'Always underground: off a tunnel end, or at this depth to connect later']], T.depotLevel, (v) => { T.depotLevel = v; redo(); }),
+          T.depotLevel === 'underground' ? stepper(`${Math.round(T.depotDepth * 10)} m`, () => { T.depotDepth = step(T.depotDepth, -0.25); redo(); }, () => { T.depotDepth = step(T.depotDepth, 0.25); redo(); }, 'Depth below the ground (a depot on a track end takes its height)') : null));
+      }
       opts.push(opt('Rotate', h('div', { class: 'inline' }, h('button', { class: 'ibtn sm', 'data-tip': 'Rotate left', 'data-key': 'Shift R', 'aria-label': 'Rotate left', onclick: () => T.rotate(-1) }, icon('rotl', 16)), h('button', { class: 'ibtn sm', 'data-tip': 'Rotate right', 'data-key': 'R', 'aria-label': 'Rotate right', onclick: () => T.rotate(1) }, icon('rotr', 16)))));
     } else if (t === 'terraform') {
       opts.push(opt('Mode', seg([['raise', 'Raise'], ['lower', 'Lower'], ['level', 'Level']], T.terraMode, (v) => { T.terraMode = v; redo(); this.renderTray(); })));

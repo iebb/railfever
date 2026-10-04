@@ -4,7 +4,7 @@ import { Towns } from './towns';
 import { Stations, entranceUpkeep, lostShare, STATION_UPKEEP_FACTOR } from './stations';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
-import { Depots } from './build-ops';
+import { Depots, depotValue, depotUpkeep } from './build-ops';
 import { Economy, Company, COMPANY_COLORS } from './economy';
 import { Shares, SHARE_COUNT } from './shares';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
@@ -18,7 +18,7 @@ import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
-import { resolveDeadlocks, lineCongestion } from './train';
+import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 
@@ -171,6 +171,8 @@ export class Game {
     network: [] as (() => void)[],
   };
   networkVersion = 0;
+  /** In-progress deterministic wait-graph work, included in saves. */
+  deadlockScan: DeadlockScan | null = null;
   private networkDirty = false;
   private lostSince = new Map<number, number>();
   /** day each congested player line was last reported */
@@ -635,7 +637,7 @@ export class Game {
       if (st.rail) a.stations += st.rail.cost ?? (st.rail.tracks * st.rail.length * 9000 + 120000) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1);
       a.stations += st.stops.length * 30000;
     }
-    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += d.kind === 'rail' ? 90000 : d.kind === 'road' ? 60000 : 120000;
+    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += depotValue(d);
     a.track *= INFRA_DEPRECIATION; a.road *= INFRA_DEPRECIATION; a.tram *= INFRA_DEPRECIATION;
     a.stations *= INFRA_DEPRECIATION; a.depots *= INFRA_DEPRECIATION;
     for (const v of this.vehicles.map.values()) if (v.owner === id) a.vehicles += this.vehicles.resaleValue(v);
@@ -844,8 +846,10 @@ export class Game {
     this.tick++;
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
-      // trains in a circle of mutual waiting: one of them takes another way (every few days)
-      if (this.day % 3 === 0) resolveDeadlocks(this);
+    }
+    // Start a complete scan every three days and finish it in bounded fixed-tick slices.
+    if (this.deadlockScan || (this.tick % TICKS_PER_DAY === 0 && this.day % 3 === 0)) resolveDeadlocks(this, 40, DEADLOCK_WORK);
+    if (this.tick % TICKS_PER_DAY === 0) {
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
@@ -926,7 +930,7 @@ export class Game {
       if (e.owner === owner) c += this.edgeMaintenance(e);
     }
     for (const st of this.stations.map.values()) if (st.owner === owner) c += this.stationMaintenance(st);
-    for (const d of this.depots.map.values()) if (d.owner === owner) c += d.kind === 'rail' ? 12000 : d.kind === 'road' ? 6000 : 9000;
+    for (const d of this.depots.map.values()) if (d.owner === owner) c += depotUpkeep(d);
     return c;
   }
 

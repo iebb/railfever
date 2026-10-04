@@ -1,5 +1,9 @@
 // Title screen over the live (blurred) world: wordmark, main actions and the new-game card.
 import { GAME_VERSION } from '../game/version';
+
+declare const __BUILD__: string | undefined;
+/** The build's short commit (Vite define; absent in headless bundles). */
+const BUILD = typeof __BUILD__ === 'string' ? __BUILD__ : '';
 import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
@@ -82,8 +86,10 @@ export function showTitle(o: TitleOpts) {
       btn('plus', 'New game', '', () => openCard()),
       btn('save', 'Load game', '', () => { close(false); openSaveLoad(ui, 'load'); }),
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
-    h('div', { class: 'title-foot' }, `Railfever v${GAME_VERSION}${/\/preview\//.test(location.pathname) ? ' preview' : ''} · offline in your browser`),
+    h('div', { class: 'title-foot' }, 'Offline in your browser'),
   );
+  const preview = /\/preview\//.test(location.pathname);
+  root.append(h('div', { class: 'title-ver', title: BUILD ? `Build ${BUILD}` : undefined }, `v${GAME_VERSION}${preview ? ` preview${BUILD ? ` · ${BUILD}` : ''}` : ''}`));
   row.appendChild(main);
   root.appendChild(row);
   ui.root.appendChild(root);

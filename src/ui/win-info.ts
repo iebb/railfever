@@ -41,7 +41,7 @@ export function vehicleKind(v: Vehicle): LineKind {
   if (v.kind === 'train') return 'rail';
   return (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road';
 }
-const depotTitle = (k: string) => (k === 'rail' ? 'Train depot' : k === 'tram' ? 'Tram depot' : 'Bus depot');
+const depotTitle = (k: string, underground = false) => (k === 'rail' ? (underground ? 'Underground train depot' : 'Train depot') : k === 'tram' ? 'Tram depot' : 'Bus depot');
 const depotIcon = (k: string) => (k === 'rail' ? 'depot' : k === 'tram' ? 'tramdepot' : 'garage');
 const hex = (c: number) => '#' + c.toString(16).padStart(6, '0');
 
@@ -861,7 +861,7 @@ export function openDepot(ui: UI, depotId: number) {
   const dp = g.depots.get(depotId);
   if (!dp) return;
   if (dp.owner === PLAYER) { openPurchase(ui, dp.kind as LineKind, depotId, null); return; }
-  const win = ui.wm.open('depot-' + depotId, depotTitle(dp.kind), { width: 340, icon: depotIcon(dp.kind), color: g.company(dp.owner).color, sub: g.company(dp.owner).name });
+  const win = ui.wm.open('depot-' + depotId, depotTitle(dp.kind, dp.level === 'underground'), { width: 340, icon: depotIcon(dp.kind), color: g.company(dp.owner).color, sub: g.company(dp.owner).name });
   const here = g.vehicles.all().filter((v) => (v as Train | RoadVehicle).depotId === depotId);
   add(win.body, 
     h('div', { class: 'tiles' }, tile(String(here.length), 'Vehicles')),

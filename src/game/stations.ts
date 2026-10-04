@@ -18,6 +18,8 @@ import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from
 import { cargoGroups } from './vehicle';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
+import { demolitionCost, demolitionTotal } from './demolition';
+import { depotVolume } from './build-ops';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -32,6 +34,9 @@ export interface WaitGroup {
 }
 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
+
+/** Occupied platform box, used for prospective and existing underground stations alike. */
+function undergroundStationVolume(rect: Rect, y: number) { return { ...rect, y0: y - 0.4, y1: y + 1.1 }; }
 
 export type StationLevel = 'ground' | 'elevated' | 'underground';
 /** Platform upkeep by level, independent of station style and overhead wire. */
@@ -739,7 +744,7 @@ export interface UpgradePlan {
   cuts: { end: 0 | 1; rank: number; node: number; remove: number[]; edge: number; s: number; fromA: boolean; at: number }[];
   /** whole rebuild through relocation (level change of an unconnected station) */
   rebuild: boolean;
-  /** only the building changes (a station below or above the street: tracks and entrances stay) */
+  /** only the building changes: existing track stays, ground entrances are refitted where needed */
   restyleOnly?: boolean;
   /** a ground station rebuilt in place: what becomes of its added entrances (new access streets are in `cost`) */
   entrances?: EntranceRefit;
@@ -972,7 +977,30 @@ export class Stations {
     const r = st.rail;
     if (!r) return [];
     const out = this.structures(st).slice();
-    if ((r.level ?? 'ground') === 'underground') out.push({ x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length, y0: r.y - 0.4, y1: r.y + 1.1, part: 'platforms' });
+    if ((r.level ?? 'ground') === 'underground') out.push({ ...this.undergroundBox(st)!, part: 'platforms' });
+    return out;
+  }
+
+  /** The actual station box, used by every underground planner and drawn once per view rebuild. */
+  undergroundBox(st: Station) {
+    const r = st.rail;
+    if (!r || r.level !== 'underground') return null;
+    return { ...undergroundStationVolume({ x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length }, r.y), station: st.id };
+  }
+
+  /**
+   * Underground station boxes (platforms and tracks below ground, as `volumes`) within r of (x, z): tunnels and
+   * underground depots keep clear of them (construction.ts, build-ops.ts).
+   */
+  undergroundNear(x: number, z: number, r: number): { x: number; z: number; angle: number; w: number; d: number; y0: number; y1: number; station: number }[] {
+    const out: { x: number; z: number; angle: number; w: number; d: number; y0: number; y1: number; station: number }[] = [];
+    for (const st of this.map.values()) {
+      const rl = st.rail;
+      if (!rl || (rl.level ?? 'ground') !== 'underground') continue;
+      const wd = railWidth(rl);
+      if (Math.hypot(rl.x - x, rl.z - z) > Math.hypot(rl.length, wd) / 2 + r) continue;
+      out.push(this.undergroundBox(st)!);
+    }
     return out;
   }
 
@@ -1024,8 +1052,8 @@ export class Stations {
       for (const f of this.volumes(st)) if (f.y1 > y0 && f.y0 < y1 && rectsOverlap(rect, f, 0)) return 'Station in the way';
     }
     for (const d of g.depots.near(rect.x, rect.z, R)) {
-      const sz = d.kind === 'rail' ? { w: 1.5, d: 4.2 } : d.kind === 'tram' ? { w: 2.0, d: 3.9 } : { w: 1.8, d: 1.6 };
-      if (d.y + 1.0 > y0 && d.y - 0.2 < y1 && rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: sz.w, d: sz.d }, 0)) return 'Depot in the way';
+      const v = depotVolume(d);
+      if (v.y1 > y0 && v.y0 < y1 && rectsOverlap(rect, v, 0)) return 'Depot in the way';
     }
     return null;
   }
@@ -1195,7 +1223,8 @@ export class Stations {
       plan.depth = Math.max(STATION_DEPTH.min, Math.min(STATION_DEPTH.max, opts.depth ?? (rmode === 'metro' ? STATION_DEPTH.metro : STATION_DEPTH.def)));
       plan.y = mn - plan.depth;
       if (fixed !== undefined) { plan.y = fixed; plan.depth = mn - fixed; if (plan.depth < STATION_DEPTH.min - 0.4) failp('Too shallow for underground station'); }
-      const err = this.rectConflict(footprint, plan.y - 0.4, plan.y + 1.1, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
+      const volume = undergroundStationVolume(footprint, plan.y);
+      const err = this.rectConflict(volume, volume.y0, volume.y1, null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges });
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
       const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
       // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
@@ -1305,7 +1334,7 @@ export class Stations {
       }
     }
     plan.demolish = [...demolish];
-    for (const id of plan.demolish) { const b = w.buildings.get(id); if (b) plan.cost += 6000 + b.pop * 2500; }
+    for (const id of plan.demolish) { const b = w.buildings.get(id); if (b) plan.cost += demolitionCost(g, b); }
     if (plan.join) plan.roadAccess = true;
     if (!plan.roadAccess && plan.ok) plan.warnings.push(level === 'ground' ? 'No road in reach: no passengers' : 'No roadside entrance: no passengers');
     plan.cost = Math.round(plan.cost);
@@ -3075,7 +3104,7 @@ export class Stations {
       // (its entrances stay: the new building must not stand on them)
       if (kept.some((q) => rectsOverlap(p2.building, q, 0.1))) return bad('No room for street-level building beside entrances');
       let cost = Math.max(0, restyle);
-      for (const id of p2.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
+      cost += demolitionTotal(g, p2.demolish);
       return { ok: true, warnings: p2.warnings, station: st.id, cost: Math.round(cost + (p2.access?.cost ?? 0)), length: r.length, tracks: r.tracks, through: Th0, plan: p2, delta: [0, 0], keep: [], cuts: [], rebuild: false, restyleOnly: true };
     }
     if (level !== 'ground') return bad('In-place extensions need ground stations');
@@ -3104,7 +3133,12 @@ export class Stations {
     let firstErr = '';
     for (const [dF, dB] of splits) for (const sh of ordered) {
       const res = this.tryUpgrade(st, L2, T2, Th2, mode, dF, dB, sh, order, ends, style, restyle, blockedEnds);
-      if (res.ok) return res;
+      if (res.ok) {
+        // A new ground-level building does not replace unchanged platform track or its electrification.
+        if (L2 === r.length && T2 === r.tracks && Th2 === Th0 && style !== styleOf(r.style).id
+          && !res.cuts.length && res.delta.every((d) => Math.abs(d) < 1e-6)) res.restyleOnly = true;
+        return res;
+      }
       if (!firstErr) firstErr = res.error ? (kMax > 0 && sideOf(sh.k) !== 'both' ? `${res.error} (new tracks on the ${sideOf(sh.k)})` : res.error) : '';
     }
     return bad(firstErr || 'Cannot rebuild the station');
@@ -3169,7 +3203,7 @@ export class Stations {
     plan.join = null;
     const extra = Math.max(0, (T2 + Th2 * 0.7) * L2 - (r.tracks + (r.through ?? 0) * 0.7) * r.length);
     let cost = extra * 9000 + 60000 + restyle + (plan.access?.cost ?? 0);
-    for (const id of plan.demolish) cost += 6000 + (g.world.buildings.get(id)?.pop ?? 0) * 2500;
+    cost += demolitionTotal(g, plan.demolish);
     const warnings = [...plan.warnings];
     if (T2 + Th2 > r.tracks + (r.through ?? 0) && ends.some((t) => t[0].approach.length || t[1].approach.length)) warnings.push('New tracks get turnouts to neighbours where space permits');
     // its added entrances beside the new track area: where they still fit and a street still reaches them
@@ -3204,12 +3238,14 @@ export class Stations {
     if (up.restyleOnly) {
       const co = g.company(st.owner);
       if (!co.economy.canAfford(up.cost)) return 'Not enough money';
-      co.economy.spend(up.cost - (up.plan.access?.cost ?? 0), 'construction');
+      co.economy.spend(up.cost - (up.plan.access?.cost ?? 0) - (up.entrances?.streets ?? 0), 'construction');
       for (const id of up.plan.demolish) g.towns.demolishBuilding(id);
       this.markStation(st);
       r.style = up.plan.style; r.building = up.plan.style === 'none' ? r.building : up.plan.building;
       r.forecourt = up.plan.style === 'none' ? undefined : up.plan.forecourt ?? undefined; r.forecourt2 = up.plan.forecourt2 ?? undefined;
+      if ((r.level ?? 'ground') === 'ground' && typeof r.cost === 'number') r.cost += up.cost - (up.entrances?.streets ?? 0);
       if (up.plan.access && up.plan.access.ok) commitProposal(g, up.plan.access);
+      if ((r.level ?? 'ground') === 'ground' && r.entrances.length) this.refitEntrances(st, r.entrances);
       for (const f of this.footprints(st)) if (f.part === 'entrance' || f.part === 'building') this.padGround(f);
       this.repairSite(st);
       this.markStation(st);

@@ -46,15 +46,26 @@ export interface Line {
    */
   operators?: number[];
   partners?: PartnerPolicy;
-  /** rail station numbers along the route: [station id, number]; stable (see Lines.stationCode / renumber) */
+  /** Saved route-family identity (the base line's id). Unrelated companies may reuse a route letter. */
+  routeFamily?: number;
+  /** rail station numbers in route order: [station id, number]; rebuilt together with the route family */
   numbers?: [number, number][];
   /**
    * service patterns (patterns.ts): locals, rapids, expresses and short-turns of the line, per stop whether they
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+  /** City-growth calibration by operator and pattern; cumulative passenger receipts and comparable forecast periods. */
+  growth?: Record<string, GrowthObservation>;
   /** mail carried (loaded) this / last month and its income this / last year (a part of incomeYear); from the line's first mail on */
   mail?: LineMail;
+}
+
+export interface GrowthObservation {
+  day: number; signature: string; forecast: number;
+  counter: number; atCounter: number;
+  expected: number; receipts: number; rate: number; days: number;
+  priorExpected: number; priorReceipts: number;
 }
 
 export interface PatternSpacing {
@@ -297,6 +308,8 @@ export class Lines {
   catchmentRoadsDirty = false;
   /** the automatic name last given to each line (a name changed by direct assignment is kept as the player's) */
   private autoText = new Map<number, string>();
+  /** Model-only cache: a load starts cold, migrating old numbering before any UI reads it. */
+  private numberSignatures = new Map<string, string>();
   constructor(private game: Game) {
     // stations rebuilt, moved or merged (longer platforms, another level, a stop combined): timetables and journey
     // times read their positions, so the routing is worked out again (a saved game then loads to the same routing)
@@ -324,7 +337,9 @@ export class Lines {
   all() { return [...this.map.values()]; }
 
   /** Redirect a removed line and its earlier aliases, remapping their services to the surviving patterns. */
-  redirectLine(from: number, into: number, pattern: number, patterns: ReadonlyMap<number, number>) {
+  redirectLine(from: number, into: number, pattern: number, patterns: ReadonlyMap<number, number>, source?: Line) {
+    const target = this.map.get(into);
+    if (source?.kind === 'rail' && target?.kind === 'rail') this.linkRouteFamily(source, target);
     for (const [id, r] of this.redirect) if (r.line === from) this.redirect.set(id, { line: into, pattern: patterns.get(r.pattern) ?? pattern });
     this.redirect.set(from, { line: into, pattern });
   }
@@ -338,6 +353,7 @@ export class Lines {
     };
     line.name = this.autoNameOf(line);
     this.ensureCode(line);
+    if (kind === 'rail') line.routeFamily = id;
     this.autoText.set(id, line.name);
     this.map.set(id, line);
     return line;
@@ -449,16 +465,167 @@ export class Lines {
   /** Stations of a line in route order (out-and-back lines from one end to the other; else in stop order). */
   routeStations(l: Line): number[] { return linearStops(l.stops) ?? [...new Set(l.stops)]; }
 
-  /** Numbers for a rail line's stations: kept where they have one, the next free numbers for new ones. */
-  private ensureNumbers(l: Line): Map<number, number> {
-    if (l.kind !== 'rail') return new Map();
-    const route = this.routeStations(l), inRoute = new Set(route);
-    const m = new Map((l.numbers ?? []).filter(([sid]) => inRoute.has(sid)));
-    let next = 1;
-    for (const v of m.values()) next = Math.max(next, v + 1);
-    for (const sid of route) if (!m.has(sid)) m.set(sid, next++);
-    l.numbers = route.map((sid) => [sid, m.get(sid)!] as [number, number]);
-    return m;
+  /**
+   * Legacy saves have no family links. Infer them only between different owners with the same route letter
+   * and a shared station carrying the same old number; equal letters alone do not imply a through service.
+   * Persist the result, so later edits/loads never guess again. The oldest member is the inferred base.
+   */
+  private migrateRouteFamilies() {
+    const legacy = this.all().filter((l) => l.kind === 'rail' && l.routeFamily === undefined).sort((a, b) => a.id - b.id);
+    const parent = new Map(legacy.map((l) => [l.id, l.id]));
+    const root = (id: number): number => { while (parent.get(id) !== id) id = parent.get(id)!; return id; };
+    for (let i = 0; i < legacy.length; i++) for (let j = i + 1; j < legacy.length; j++) {
+      const a = legacy[i], b = legacy[j];
+      if (!a.code || a.code !== b.code || a.owner === b.owner) continue;
+      const bm = new Map(b.numbers);
+      if (!a.numbers?.some(([s, n]) => a.stops.includes(s) && b.stops.includes(s) && bm.get(s) === n)) continue;
+      const x = root(a.id), y = root(b.id);
+      parent.set(Math.max(x, y), Math.min(x, y));
+    }
+    for (const l of legacy) l.routeFamily = root(l.id);
+  }
+
+  /** Adopt a base family's letter and identity; collisions retain independent routes, one letter per owner. */
+  private linkRouteFamily(source: Line, base: Line) {
+    this.migrateRouteFamilies();
+    const code = this.ensureCode(base), family = base.routeFamily ?? base.id;
+    const oldFamily = source.routeFamily ?? source.id, oldCode = source.code;
+    const members = this.all().filter((l) => l.kind === 'rail' && (l === source || (l.routeFamily === oldFamily && l.code === oldCode)))
+      .sort((a, b) => a.id - b.id);
+    for (const l of members) {
+      if (l !== base && this.codeTaken(code, l.owner, l.id)) continue;
+      l.code = code;
+      l.routeFamily = family;
+    }
+  }
+
+  /** Renumber only families whose membership, letter, shape or stop sequence changed (including empty routes). */
+  private rebuildNumbers() {
+    this.migrateRouteFamilies();
+    const families = new Map<string, Line[]>();
+    for (const l of this.all().sort((a, b) => a.id - b.id)) {
+      if (l.kind !== 'rail') continue;
+      this.ensureCode(l);
+      const key = `${l.routeFamily}:${l.code}`;
+      const members = families.get(key) ?? [];
+      members.push(l); families.set(key, members);
+    }
+    for (const [key, members] of families) {
+      const sig = JSON.stringify(members.map((l) => [l.id, l.owner, l.loop ?? null, l.stops]));
+      if (this.numberSignatures.get(key) === sig) continue;
+      this.numberFamily(members);
+      this.numberSignatures.set(key, sig);
+    }
+    for (const key of this.numberSignatures.keys()) if (!families.has(key)) this.numberSignatures.delete(key);
+  }
+
+  /**
+   * Family order: the longest through continuation is the spine (ties: oldest id), oriented with its private
+   * tail after the base. Without a continuation use the base's stored order. Align the base and then the other
+   * members (longest, then oldest) with that spine; an attachment at its start precedes it, at its end follows it.
+   * Out-and-back routes use the outward path; loops keep their first stop as the cut and their stored direction.
+   *
+   * Consecutive stations become precedence edges. Try both directions of non-loops, backtracking earlier
+   * orientation choices if necessary, so a feasible monotonic family order wins over the preferred direction.
+   * Branches can require gaps: topologically number all distinct family stations 1…N, breaking ties by first
+   * appearance in the spine/base/member order. If neither direction fits (incompatible crossings/loops), retain
+   * earlier routes' constraints and omit only edges that would create a cycle. Shared stations still agree.
+   * This changes numbering direction, never the stops, service patterns, vehicle direction or RNG state.
+   */
+  private numberFamily(members: Line[]) {
+    const routes = new Map(members.map((l) => [l.id, this.routeStations(l)]));
+    const base = members.find((l) => l.id === l.routeFamily) ?? members[0], baseStops = new Set(routes.get(base.id)!);
+    const byLength = (a: Line, b: Line) => routes.get(b.id)!.length - routes.get(a.id)!.length || a.id - b.id;
+    const spine = members.filter((l) => l !== base && routes.get(l.id)!.some((s) => !baseStops.has(s))).sort(byLength)[0] ?? base;
+    const order = [spine, ...(base !== spine ? [base] : []), ...members.filter((l) => l !== spine && l !== base).sort(byLength)];
+    let edges = new Map<number, Set<number>>(), rank = new Map<number, number>(), covered = new Set<number>();
+    const reaches = (from: number, to: number): boolean => {
+      const todo = [from], seen = new Set<number>();
+      while (todo.length) {
+        const s = todo.pop()!;
+        if (s === to) return true;
+        if (seen.has(s)) continue;
+        seen.add(s); todo.push(...edges.get(s)!);
+      }
+      return false;
+    };
+    const addPath = (path: number[], partial = false): boolean => {
+      const added: [number, number][] = [];
+      for (let i = 1; i < path.length; i++) {
+        const a = path[i - 1], b = path[i];
+        if (edges.get(a)!.has(b)) continue;
+        if (reaches(b, a)) {
+          if (partial) continue;
+          for (const [x, y] of added) edges.get(x)!.delete(y);
+          return false;
+        }
+        edges.get(a)!.add(b); added.push([a, b]);
+      }
+      return true;
+    };
+    const sorted = (): number[] => {
+      const degree = new Map([...edges.keys()].map((s) => [s, 0]));
+      for (const next of edges.values()) for (const s of next) degree.set(s, degree.get(s)! + 1);
+      const ready = [...degree.keys()].filter((s) => !degree.get(s)), out: number[] = [];
+      while (ready.length) {
+        ready.sort((a, b) => rank.get(a)! - rank.get(b)! || a - b);
+        const s = ready.shift()!; out.push(s);
+        for (const next of edges.get(s)!) {
+          degree.set(next, degree.get(next)! - 1);
+          if (!degree.get(next)) ready.push(next);
+        }
+      }
+      return out;
+    };
+    const preferredPath = (l: Line): number[] => {
+      let path = routes.get(l.id)!;
+      const loop = this.isLoop(l);
+      if (l === spine && l !== base && !loop) {
+        const first = path.findIndex((s) => baseStops.has(s));
+        if (first > 0 && baseStops.has(path[path.length - 1])) path = [...path].reverse();
+      } else if (!loop && covered.size) {
+        const existing = sorted().filter((s) => covered.has(s)), shared = path.filter((s) => covered.has(s));
+        if (shared.length > 1 && existing.indexOf(shared[0]) > existing.indexOf(shared[shared.length - 1])) path = [...path].reverse();
+        else if (shared.length === 1) {
+          const s = shared[0];
+          if ((s === existing[0] && path[0] === s) || (s === existing[existing.length - 1] && path[path.length - 1] === s)) path = [...path].reverse();
+        }
+      }
+      return path;
+    };
+    const include = (path: number[]) => {
+      for (const s of path) if (!rank.has(s)) { rank.set(s, rank.size); edges.set(s, new Set()); }
+    };
+    const copyEdges = () => new Map([...edges].map(([s, next]) => [s, new Set(next)]));
+    const orient = (i: number): boolean => {
+      if (i === order.length) return true;
+      const l = order[i], path = preferredPath(l);
+      const oldEdges = copyEdges(), oldRank = new Map(rank), oldCovered = new Set(covered);
+      for (const candidate of this.isLoop(l) ? [path] : [path, [...path].reverse()]) {
+        include(candidate);
+        if (addPath(candidate)) {
+          for (const s of candidate) covered.add(s);
+          if (orient(i + 1)) return true;
+        }
+        edges = new Map([...oldEdges].map(([s, next]) => [s, new Set(next)]));
+        rank = new Map(oldRank); covered = new Set(oldCovered);
+      }
+      return false;
+    };
+    if (!orient(0)) {
+      // No orientation satisfies every route: retain the deterministic spine/base/member priorities.
+      for (const l of order) {
+        const path = preferredPath(l); include(path);
+        if (!addPath(path) && (this.isLoop(l) || !addPath([...path].reverse()))) addPath(path, true);
+        for (const s of path) covered.add(s);
+      }
+    }
+    const numbers = new Map(sorted().map((s, i) => [s, i + 1]));
+    for (const l of members) {
+      const next: [number, number][] = routes.get(l.id)!.map((s) => [s, numbers.get(s)!]);
+      if (!next.length && !l.numbers) continue; // empty provisional lines have no station numbers yet
+      if (!l.numbers || next.length !== l.numbers.length || next.some(([s, n], i) => l.numbers![i][0] !== s || l.numbers![i][1] !== n)) l.numbers = next;
+    }
   }
 
   /**
@@ -480,32 +647,24 @@ export class Lines {
   }
   stationCodes(stationId: number): string[] { return [...new Set(this.stationCodeEntries(stationId).map((e) => e.code))]; }
 
-  /** Number a rail line's stations afresh, 1… in route order (explicit request only: codes are stable otherwise). */
+  /** Explicitly refresh numbering, including the rail line's entire through-service family. */
   renumber(lineId: number) {
-    const l = this.map.get(lineId);
+    const l = this.get(lineId);
     if (!l || l.kind !== 'rail') return;
-    l.numbers = this.routeStations(l).map((sid, i) => [sid, i + 1] as [number, number]);
+    this.numberSignatures.clear();
+    this.rebuildNumbers();
   }
 
   /**
    * Through service: rail line `lineId` continues the route of rail line `fromId` (another company's, say): it takes its
-   * route letter (where its owner has no other route with that letter) and its station numbers, and numbers its
-   * further stations on from there (A's stations AS01…AS07, then B's BS08…).
+   * route letter (where its owner has no other route with that letter). Their saved family link makes every stop
+   * edit renumber all members together (A's stations AS01…AS07, then B's BS08…).
    */
   inheritRoute(lineId: number, fromId: number) {
-    const l = this.map.get(lineId), f = this.map.get(fromId);
+    const l = this.get(lineId), f = this.get(fromId);
     if (!l || !f || l.kind !== 'rail' || f.kind !== 'rail' || l === f) return;
-    const code = this.ensureCode(f);
-    if (!this.codeTaken(code, l.owner, l.id)) l.code = code;
-    const fm = this.ensureNumbers(f);
-    const route = this.routeStations(l);
-    let next = 1;
-    for (const v of fm.values()) next = Math.max(next, v + 1);
-    // the shared stations keep their numbers; the line's own ones continue (from the end of the shared part)
-    const shared = route.filter((sid) => fm.has(sid));
-    const own = route.filter((sid) => !fm.has(sid));
-    if (shared.length && route.indexOf(shared[0]) > 0) own.reverse();
-    l.numbers = [...shared.map((sid) => [sid, fm.get(sid)!] as [number, number]), ...own.map((sid) => [sid, next++] as [number, number])];
+    if (!this.codeTaken(this.ensureCode(f), l.owner, l.id)) this.linkRouteFamily(l, f);
+    this.rebuildNumbers();
   }
 
   /** Express rail line: long (> 2 km between the ends) or run with fast trains. */
@@ -717,10 +876,7 @@ export class Lines {
     this.version++;
     this.refreshNames();
     // Also migrate empty/provisional lines: opening one must never be the event that gives it a code.
-    for (const l of this.map.values()) if (l.kind === 'rail') {
-      this.ensureCode(l);
-      if (l.stops.length) this.ensureNumbers(l);
-    }
+    this.rebuildNumbers();
     // edges: from -> [{to, line, cost}]
     // costs are expected journey times (sim seconds; ops, patterns.ts): per line and pair of its stations half the
     // combined headway of the services worth taking plus the ride (service patterns: expresses, short-turns)
@@ -869,6 +1025,7 @@ export class Lines {
   static restore(d: any): Line {
     const l: Line = { ...d, stops: [...(d.stops ?? [])], vehicles: [...(d.vehicles ?? [])] };
     if (d.mail) l.mail = { ...d.mail };
+    if (d.growth) l.growth = Object.fromEntries(Object.entries(d.growth as Record<string, GrowthObservation>).map(([key, p]) => [key, { ...p }]));
     if (typeof l.num !== 'number') {
       const m = /(\d+)\s*$/.exec(String(l.name ?? ''));
       l.num = m ? Number(m[1]) : l.id;
@@ -885,6 +1042,7 @@ export class Lines {
     } else {
       delete l.code;
       delete l.numbers;
+      delete l.routeFamily;
     }
     if (Array.isArray(d.operators)) l.operators = [...d.operators];
     if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));

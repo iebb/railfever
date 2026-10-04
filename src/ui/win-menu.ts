@@ -235,6 +235,8 @@ export function openHelp(ui: UI) {
     <h4>Urban rail &amp; network tools</h4>
     <ul>
       <li><b>Urban</b> (<kbd>U</kbd>): double track with wire; metro / light-rail station styles; ground / elevated / underground.</li>
+      <li><b>Stay underground</b>: all tunnel, no portals, no demolition. Depot at a tunnel end: underground, vents only.</li>
+      <li>Building below ground shows tunnels, underground stations and depots by depth.</li>
       <li>Urban stations: close spacing, optional street entrances.</li>
       <li>Any train / rail line: urban + main-line through running; equal fares.</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, Rail → Connect): two points → curve, turnouts, signals, cost.</li>

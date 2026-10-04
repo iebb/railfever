@@ -329,10 +329,11 @@ function restoreBase(g: Game, v: Vehicle, d: any) {
 function trainOf(t: Train) {
   return {
     ...baseOf(t), type: 'train', cars: t.cars.map((c) => c.id), depotId: t.depotId,
-    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
+    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len, s.depot] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
     pending: t.pending.map((s) => [s.e, s.dir]), speed: t.speed, waitTime: t.waitTime, retryTimer: t.retryTimer,
     loadTimer: t.loadTimer, routeTarget: t.routeTarget, atStation: t.atStation, reversed: t.reversed, blockedBy: t.blockedBy,
     failCount: t.failCount, stuckTime: t.stuckTime, grade: t.grade,
+    backoff: t.backoff ? { waitFor: [...t.backoff.waitFor], clear: [...t.backoff.clear] } : null,
   };
 }
 
@@ -372,6 +373,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     ...g.saveCompanies(),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
+    ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
     world: {
       ...world, size: w.size, freeTrees: w.freeTrees.slice(),
       buildings: buildingRecords(w, binaryProfiles), nextBuildingId: w.nextBuildingId,
@@ -478,7 +480,7 @@ export function deserialize(d: any): Game {
     net.nodeGrid.insert(nn.id, nn.x, nn.z, nn.x, nn.z);
   }
   for (const ed of d.net.edges as any[]) {
-    const e: NEdge = { ...ed, bez: { ...ed.bez }, prof: f32dec(ed.prof), sections: (ed.sections as Section[]).map((s) => ({ ...s })) };
+    const e: NEdge = { ...ed, bez: { ...ed.bez }, prof: f32dec(ed.prof), sections: ((ed.sections ?? []) as Section[]).map((s) => ({ ...s })) };
     if (e.kind === 'rail') e.type = trackTypeOf(e.type);
     net.edges.set(e.id, e);
     const geo = net.geo(e);
@@ -500,6 +502,7 @@ export function deserialize(d: any): Game {
     (d.day ?? 0) * TICKS_PER_DAY + Math.min(TICKS_PER_DAY - 1, Math.max(0, Math.floor((d.dayFrac ?? 0) * TICKS_PER_DAY + 1e-6))));
   g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
+  g.deadlockScan = d.deadlockScan ? structuredClone(d.deadlockScan) : null;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);
   g.shares.load(d.shares);
@@ -542,10 +545,10 @@ export function deserialize(d: any): Game {
   const V = g.vehicles;
   const tseg = (x: number[], t: Train): TSeg | null => {
     if (x[0] < 0) {
-      const dp = g.depots.get(t.depotId);
+      const dp = g.depots.get(x[3] ?? t.depotId);
       const sg = dp ? depotSeg(g, dp, x[2] ?? t.length + 0.3) : null;
       // keep the saved length exactly (rebuilding the curve can differ in the last bit)
-      if (sg && typeof x[2] === 'number') sg.len = x[2];
+      if (sg) { sg.dir = x[1]; if (typeof x[2] === 'number') sg.len = x[2]; }
       return sg;
     }
     const e = net.edges.get(x[0]);
@@ -591,6 +594,7 @@ export function deserialize(d: any): Game {
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;
       t.stuckTime = vd.stuckTime ?? 0; t.grade = vd.grade ?? 0;
+      t.backoff = vd.backoff ? { waitFor: [...vd.backoff.waitFor], clear: [...vd.backoff.clear] } : null;
       const segs: TSeg[] = [];
       let ok = true;
       for (const x of vd.segs as number[][]) { const s = tseg(x, t); if (!s) { ok = false; break; } segs.push(s); }
