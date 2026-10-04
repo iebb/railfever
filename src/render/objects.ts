@@ -20,6 +20,7 @@ import { buildRailEdge, buildRailNode } from './build-rail';
 import { buildRoadEdge, buildRoadNode, buildBusStops, buildCrossing } from './build-road';
 import { buildStation, buildDepot } from './build-stations';
 import { portalKeepouts, inKeepout, Keepout } from './build-structures';
+import { buildSectionStructures, sectionPortalKeepouts } from './build-section-structures';
 import { buildBuilding, FacadeBuilder } from './build-buildings';
 import { createTreeGeometries, createImpostorGeometries, IMPOSTOR_KINDS, makeTreeMesh, nearTreeData, makeImpostorMesh, impostorData, treeVariant, TreeInstance, forestTreeInstances, TREE_FADE, treeDensity, treeCameraUniform } from './trees';
 
@@ -561,6 +562,7 @@ export class ObjectsView {
       } catch (err) { console.warn('objects: node build failed', node.id, err); }
     }
     try {
+      buildSectionStructures(ctx);
       for (const c of net.crossings.values()) buildCrossing(ctx, c);
       for (const st of g.stations.map.values()) {
         const color = hexToInt(g.company(st.owner).color);
@@ -599,6 +601,7 @@ export class ObjectsView {
     }
     // no trees on tunnel portals, their wing walls or galleries
     const keep: Keepout[] = [];
+    sectionPortalKeepouts(ctx, keep);
     for (const id of net.grid.query(x0 - 8, z0 - 8, x1 + 8, z1 + 8)) {
       const e = net.edges.get(id);
       if (e && e.sections.some((q) => q.type === 'tunnel')) portalKeepouts(ctx, e, keep);

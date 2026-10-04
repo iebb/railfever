@@ -8,29 +8,33 @@
  * side: right/left/both/auto; positive offsets are right of the stable reference direction. Auto compares
  * complete quotes, right first on ties. Slot IDs are allocated in lateral order and never renumbered.
  * Plans expose symbolic additions, retained/removal IDs, correspondence and the complete quoted cost.
+ * diff.additions[].pieces[].sections maps civil intervals to physical s; diff.structures holds shared civil
+ * drafts with symbolic/existing IDs, paid width, support/portal plans, expansion cost and yearly upkeep.
  * Commit checks dependencies, rights, cash and occupation/reservations again, applies the diff in slot/
  * reference order, charges once and emits one network change. Exceptional failures restore object identity,
  * map/adjacency order, allocators, caches, reservations, economies, terrain/locks and dirty state.
- * Stage 2 supports open ground spans. Connected ends, stations, depots, crossings, shared structures and
- * directional signal changes return errors; no half-junctions, work queues or player controls are installed.
+ * Stage 4 supports open ground/elevated/underground spans and grade-separated crossings. Shared civil
+ * drafts hold retained width, one expansion quote/upkeep bill, support and portal plans. Connected ends,
+ * stations, depots, at-grade crossings and directional signal changes return errors; no half-junctions,
+ * work queues or player controls are installed.
  * Unadopted legacy edges have a read-only view; explicit RailSections.adoptUnassigned() follows final ownership.
  */
 import type { Game } from './game';
 import type { NEdge } from './network';
 import { planEdge, type Snap, type BuildOptions } from './construction';
-import { RAIL, TRACK_TYPES, trackTypeOf } from './constants';
-import { COSTS } from './economy';
+import { RAIL, TRACK_TYPES, LINE_LEVEL, trackTypeOf } from './constants';
 import { arcTable, bezPoint, bezDeriv, tAtS, type V2 } from './geom';
 import { applyEarthworks, recomputeLocks } from './terraform';
 import { alignmentOf, offsetRailAlignment, type RailOffsetPiece } from './rail-offsets';
 import type { RailAlignment, RailSection, RailSlot, TrackCount, SectionTraffic } from './rail-section-types';
+import { memberSections, planRailStructures, sectionSpans, lockRailStructures, railRemovalCost, type CivilSpan, type RailStructureDraft } from './rail-structures';
 
 export type RailSectionSide = 'auto' | 'right' | 'left' | 'both';
 export interface RailSectionBuildOptions extends BuildOptions { tangents?: { start: V2; end: V2 } }
 export interface SectionCountOptions { side?: RailSectionSide; user?: number; traffic?: SectionTraffic['policy'] }
 export interface RailSectionDiff {
   retained: number[];
-  additions: { offset: number; pieces: RailOffsetPiece[] }[];
+  additions: { offset: number; pieces: (RailOffsetPiece & { sections: import('./network').Section[] })[] }[];
   removedSlots: number[];
   removedEdges: number[];
   demolish: number[];
@@ -38,6 +42,7 @@ export interface RailSectionDiff {
   /** Stage 2 never splits or changes a retained edge/signal. Later stages extend this diff. */
   splits: { edge: number; s: number }[];
   signals: { node: number; signal: number }[];
+  structures: RailStructureDraft[];
 }
 export interface RailSectionPlan {
   ok: boolean;
@@ -75,7 +80,7 @@ function seal(g: Game, p: RailSectionPlan, intent: Intent): RailSectionPlan {
 function empty(g: Game, count: TrackCount, user: number, owner: number, type: string, section: number | null, side: RailSectionSide): RailSectionPlan {
   return { ok: true, cost: 0, payer: user, infrastructureOwner: owner, section, count, side, type,
     alignment: { length: 0, pieces: [] }, traffic: { policy: 'two-way', signals: [] },
-    diff: { retained: [], additions: [], removedSlots: [], removedEdges: [], demolish: [], trees: [], splits: [], signals: [] } };
+    diff: { retained: [], additions: [], removedSlots: [], removedEdges: [], demolish: [], trees: [], splits: [], signals: [], structures: [] } };
 }
 function fail(p: RailSectionPlan, error: string) { p.ok = false; p.error = error; return p; }
 function validCount(n: number): n is TrackCount { return Number.isInteger(n) && n >= 1 && n <= 4; }
@@ -92,14 +97,15 @@ export function planRailSection(g: Game, start: Snap, end: Snap, opts: RailSecti
   if (rights) return seal(g, fail(p, rights), intent);
   if (opts.town) return seal(g, fail(p, 'Company rail only'), intent);
   for (const sn of [start, end]) if (sn.kind !== 'free') return seal(g, fail(p, 'Connected end: stage 3'), intent);
-  if (opts.level && opts.level !== 'ground') return seal(g, fail(p, 'Structures: stage 4'), intent);
   const seedOpts = { ...opts, tracks: 1, type: p.type };
+  const levelOff = opts.level === 'elevated' ? Math.max(LINE_LEVEL.height.min, Math.min(LINE_LEVEL.height.max, opts.levelHeight ?? LINE_LEVEL.height.def))
+    : opts.level === 'underground' ? -Math.max(LINE_LEVEL.depth.min, Math.min(LINE_LEVEL.depth.max, opts.levelDepth ?? LINE_LEVEL.depth.def)) : 0;
   const seedPlan = (options: BuildOptions) => opts.tangents ? g.world.net.withTemporaryNodes('rail', [
-      { ...start, dx: opts.tangents.start.x, dz: opts.tangents.start.z },
-      { ...end, y: end.y + opts.heightOffset, dx: -opts.tangents.end.x, dz: -opts.tangents.end.z },
+      { ...start, y: start.y + levelOff, dx: opts.tangents.start.x, dz: opts.tangents.start.z },
+      { ...end, y: end.y + levelOff + opts.heightOffset, dx: -opts.tangents.end.x, dz: -opts.tangents.end.z },
     ], owner, ([a, b]) => planEdge(g, { ...start, kind: 'node', node: a.id }, { ...end, kind: 'node', node: b.id }, options)) : planEdge(g, start, end, options);
   let seed = seedPlan(seedOpts);
-  if (!seed.ok || seed.crossings.length || seed.tracks[0]?.sections.length) return seal(g, fail(p, seed.errors[0] ?? (seed.crossings.length ? 'Crossings: stage 3' : 'Structures: stage 4')), intent);
+  if (!seed.ok || seed.crossings.some((c) => c.mode !== 'over' && c.mode !== 'under')) return seal(g, fail(p, seed.errors[0] ?? 'Crossings: stage 3'), intent);
   p.alignment = seed.railAlignment ?? alignmentOf(seed.tracks[0].bez, seed.tracks[0].prof);
   const offsets = Array.from({ length: count }, (_, i) => (i - (count - 1) / 2) * RAIL.spacing);
   if (count > 1) {
@@ -111,11 +117,11 @@ export function planRailSection(g: Game, start: Snap, end: Snap, opts: RailSecti
         for (let i = 1; i < piece.knots.length; i++) ratio = Math.min(ratio, (piece.knots[i][1] - piece.knots[i - 1][1]) / (piece.knots[i][0] - piece.knots[i - 1][0]));
       }
       seed = seedPlan({ ...seedOpts, designGrade: Math.min(TRACK_TYPES[p.type].maxGrade, opts.designGrade ?? Infinity) * ratio * 0.995 });
-      if (!seed.ok || seed.crossings.length || seed.tracks[0].sections.length) throw new Error(seed.errors[0] ?? 'Structures: stage 4');
+      if (!seed.ok || seed.crossings.some((c) => c.mode !== 'over' && c.mode !== 'under')) throw new Error(seed.errors[0] ?? 'Crossings: stage 3');
       p.alignment = seed.railAlignment!;
     } catch (e) { return seal(g, fail(p, (e as Error).message), intent); }
   }
-  fillAdditions(g, p, offsets, opts);
+  fillAdditions(g, p, offsets, opts, seed.tracks[0].sections.map((s) => ({ u0: s.s0, u1: s.s1, type: s.type })));
   return seal(g, p, intent);
 }
 
@@ -134,6 +140,9 @@ export function planSectionCount(g: Game, sectionId: number, count: TrackCount, 
   const error = plainSpanError(g, s);
   if (error) return seal(g, fail(p, error), intent);
   if (opts.traffic === 'auto' || opts.traffic && opts.traffic !== s.traffic.policy) return seal(g, fail(p, 'Signals: stage 3'), intent);
+  let spans: CivilSpan[];
+  try { spans = sectionSpans(g, s); } catch (e) { return seal(g, fail(p, (e as Error).message), intent); }
+  for (const id of s.structures) { const err = g.trackUpgradeError(user, g.railSections.structures.get(id)!.owner); if (err && count >= s.count) return seal(g, fail(p, err), intent); }
   if (count === s.count) { p.diff.retained = s.slots.flatMap((s) => s.steps.map((q) => q.edge)); return seal(g, p, intent); }
   if (count < s.count) {
     const remaining = [...s.slots];
@@ -147,10 +156,11 @@ export function planSectionCount(g: Game, sectionId: number, count: TrackCount, 
     for (const id of p.diff.removedEdges) {
       if (g.vehicles.isEdgeBusy(id)) return seal(g, fail(p, 'Track occupied'), intent);
       if (g.vehicles.getRes(id) || g.stations.heldForWorks(id)) return seal(g, fail(p, 'Track reserved'), intent);
-      p.cost += g.world.net.edges.get(id)!.len * COSTS.removeRail;
+      p.cost += railRemovalCost(g.world.net.edges.get(id)!.len);
     }
     if (count === 1 && remaining[0].steps.some((q) => { const e = g.world.net.edges.get(q.edge)!; return [e.a, e.b].some((id) => { const n = g.world.net.nodes.get(id)!; return n.signal >= 2 && !n.signalPass; }); })) return seal(g, fail(p, 'Direction change: stage 3'), intent);
     p.cost = Math.round(p.cost);
+    try { p.diff.structures = planRailStructures(g, s.alignment, spans, remaining.map((q) => q.offset), p.type, s); } catch (e) { fail(p, (e as Error).message); }
     return seal(g, p, intent);
   }
   p.diff.retained = s.slots.flatMap((s) => s.steps.map((q) => q.edge));
@@ -163,11 +173,11 @@ export function planSectionCount(g: Game, sectionId: number, count: TrackCount, 
   const buildOpts: BuildOptions = { kind: 'rail', type: p.type, tracks: 1, heightOffset: 0, crossing: 'auto', owner: user, infrastructureOwner: s.owner };
   if (side === 'auto') {
     const right = copy(p), left = copy(p); right.side = 'right'; left.side = 'left';
-    fillAdditions(g, right, offsets('right'), buildOpts); fillAdditions(g, left, offsets('left'), buildOpts);
+    fillAdditions(g, right, offsets('right'), buildOpts, spans); fillAdditions(g, left, offsets('left'), buildOpts, spans);
     const best = right.ok && (!left.ok || right.cost <= left.cost) ? right : left.ok ? left : right;
     return seal(g, best, intent);
   }
-  fillAdditions(g, p, offsets(side), buildOpts);
+  fillAdditions(g, p, offsets(side), buildOpts, spans);
   return seal(g, p, intent);
 }
 
@@ -184,7 +194,6 @@ function plainSpanError(g: Game, s: RailSection): string | null {
     if (!e || e.owner !== s.owner || trackTypeOf(e.type) !== s.type) return 'Section changed';
     if (e.station >= 0 || g.stations.railAttachment(e.id)) return 'Station track: stage 3';
     if (e.depot >= 0) return 'Depot track: stage 3';
-    if (e.sections.length || s.structures.length) return 'Structures: stage 4';
     for (const id of [e.a, e.b]) {
       const node = net.nodes.get(id);
       if (!node || node.edges.some((id) => !all.has(id)) || node.edges.length > 2) return 'Manual connection: stage 3';
@@ -195,17 +204,16 @@ function plainSpanError(g: Game, s: RailSection): string | null {
   return null;
 }
 
-function fillAdditions(g: Game, p: RailSectionPlan, offsets: number[], opts: BuildOptions) {
+function fillAdditions(g: Game, p: RailSectionPlan, offsets: number[], opts: BuildOptions, spans: CivilSpan[]) {
   try {
     const tt = TRACK_TYPES[p.type], buildings = new Set<number>(), trees = new Set<number>();
     for (let slot = 0; slot < offsets.length; slot++) {
-      const pieces = offsetRailAlignment(p.alignment, offsets[slot], tt.minRadius, Math.min(tt.maxGrade, opts.designGrade ?? Infinity));
+      const pieces = offsetRailAlignment(p.alignment, offsets[slot], tt.minRadius, Math.min(tt.maxGrade, opts.designGrade ?? Infinity)).map((piece) => ({ ...piece, sections: memberSections({ ...piece, dir: 1 }, spans) }));
       for (const piece of pieces) {
         const start: Snap = { kind: 'free', x: piece.bez.x0, z: piece.bez.z0, y: piece.prof[0] }, end: Snap = { kind: 'free', x: piece.bez.x3, z: piece.bez.z3, y: piece.prof.at(-1)! };
-        const proposal = planEdge(g, start, end, { ...opts, tracks: 1, type: p.type, heightOffset: 0 }, { bez: piece.bez, prof: piece.prof, shared: p.section !== null || slot > 0 });
+        const proposal = planEdge(g, start, end, { ...opts, tracks: 1, type: p.type, heightOffset: 0 }, { bez: piece.bez, prof: piece.prof, sections: piece.sections, separateCivil: true, shared: p.section !== null || slot > 0 });
         if (!proposal.ok) throw new Error(proposal.errors[0]);
-        if (proposal.crossings.length) throw new Error('Crossings: stage 3');
-        if (proposal.tracks[0].sections.length) throw new Error('Structures: stage 4');
+        if (proposal.crossings.some((c) => c.mode !== 'over' && c.mode !== 'under')) throw new Error('Crossings: stage 3');
         // Deduplicate trees/buildings across members and refined pieces; charge each removal once.
         p.cost += proposal.cost - proposal.trees * 250;
         for (const id of proposal.demolish) {
@@ -223,6 +231,9 @@ function fillAdditions(g: Game, p: RailSectionPlan, offsets: number[], opts: Bui
       p.diff.additions.push({ offset: offsets[slot], pieces });
     }
     p.diff.demolish = [...buildings].sort((a, b) => a - b); p.diff.trees = [...trees].sort((a, b) => a - b);
+    const old = p.section === null ? undefined : g.railSections.get(p.section);
+    p.diff.structures = planRailStructures(g, p.alignment, spans, [...(old?.slots.map((q) => q.offset) ?? []), ...offsets].sort((a, b) => a - b), p.type, old, p.diff.additions);
+    for (const structure of p.diff.structures) { structure.owner = p.infrastructureOwner; p.cost += structure.cost; }
     for (const id of p.diff.demolish) p.cost += 6000 + g.world.buildings.get(id)!.pop * 2500;
     p.cost = Math.round(p.cost + trees.size * 250);
   } catch (e) { fail(p, (e as Error).message); }
@@ -261,7 +272,7 @@ class RailMutationJournal {
   rollback() { for (let i = this.undo.length - 1; i >= 0; i--) this.undo[i](); }
 }
 
-/** ID order: additions sorted by offset, then each piece's start/end node and edge, then saved section. */
+/** ID order: additions by offset, each piece's start/end node and edge, saved section, then civil spans by u. */
 export function commitRailSectionPlan(g: Game, p: RailSectionPlan): RailSectionCommit {
   const result = (error: string): RailSectionCommit => ({ error, cost: 0 });
   if (!p.ok) return result(p.error ?? 'Cannot build');
@@ -272,6 +283,11 @@ export function commitRailSectionPlan(g: Game, p: RailSectionPlan): RailSectionC
   const old = p.section === null ? undefined : g.railSections.get(p.section);
   const rights = old && p.count < old.count ? p.payer !== old.owner ? 'Owner required' : null : g.trackUpgradeError(p.payer, p.infrastructureOwner);
   if (rights) return result(rights);
+  for (const draft of p.diff.structures) {
+    if (draft.owner !== p.infrastructureOwner) return result('Structure changed');
+    const error = old && p.count < old.count ? p.payer !== draft.owner ? 'Owner required' : null : g.trackUpgradeError(p.payer, draft.owner);
+    if (error) return result(error);
+  }
   if (old) { const err = plainSpanError(g, old); if (err) return result(err); }
   for (const id of p.diff.removedEdges) {
     if (g.vehicles.isEdgeBusy(id)) return result('Track occupied');
@@ -295,7 +311,7 @@ export function commitRailSectionPlan(g: Game, p: RailSectionPlan): RailSectionC
           const a = bezDeriv(piece.bez, 0), b = bezDeriv(piece.bez, 1), la = Math.hypot(a.x, a.z), lb = Math.hypot(b.x, b.z);
           if (node === undefined) node = net.addNode('rail', piece.bez.x0, piece.prof[0], piece.bez.z0, a.x / la, a.z / la, p.infrastructureOwner).id;
           const end = net.addNode('rail', piece.bez.x3, piece.prof.at(-1)!, piece.bez.z3, b.x / lb, b.z / lb, p.infrastructureOwner);
-          const e = net.addEdge('rail', node, end.id, { ...piece.bez }, piece.prof.slice(), [], p.type, p.infrastructureOwner);
+          const e = net.addEdge('rail', node, end.id, { ...piece.bez }, piece.prof.slice(), copy(piece.sections), p.type, p.infrastructureOwner);
           created.push(e); slot.steps.push({ edge: e.id, dir: 1, u0: piece.u0, u1: piece.u1, knots: copy(piece.knots) }); node = end.id;
         }
         slots.push(slot);
@@ -307,6 +323,16 @@ export function commitRailSectionPlan(g: Game, p: RailSectionPlan): RailSectionC
         g.railSections.version++; g.railSections.updateEnds(old); g.railSections.rebuildIndexes();
       } else section = g.railSections.register({ owner: p.infrastructureOwner, type: p.type, count: p.count, alignment: p.alignment,
         slots, traffic: p.traffic, structures: [], origin: 'authored' });
+      for (const draft of p.diff.structures) {
+        const { structure, cost, ...fields } = draft;
+        // Strip IDs copied from an existing draft; membership follows the committed stable slots.
+        const id = structure ?? g.railSections.nextStructure++;
+        const record = { ...fields, id, section: section!.id, slots: slots.map((q) => q.id) };
+        g.railSections.structures.set(id, record);
+        if (!section!.structures.includes(id)) section!.structures.push(id);
+      }
+      g.railSections.rebuildIndexes();
+      for (const id of section!.structures) g.railSections.markStructure(g.railSections.structures.get(id)!);
       for (const id of p.diff.trees) {
         const t = w.trees[id]; if (t) w.removeTreesNear(t.x, t.z, 0.000001);
       }
@@ -314,6 +340,7 @@ export function commitRailSectionPlan(g: Game, p: RailSectionPlan): RailSectionC
       if (p.diff.removedEdges.length) {
         for (const b of removedBounds) recomputeLocks(w, b[0] - 3, b[1] - 3, b[2] + 3, b[3] + 3);
       }
+      if (section!.structures.length) lockRailStructures(g);
       g.railSections.validate();
       if (!eco.spend(p.cost, 'construction')) throw new Error('Not enough money');
     });

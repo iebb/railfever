@@ -3,6 +3,8 @@
 // underground station, a metro shuttle between underground stations, electrification of standard track, which
 // vehicles may use which track (EMUs, electric traction), and a save round trip.
 // npx esbuild scripts/levels.ts --bundle --platform=node --format=esm --outfile=$S/levels.mjs && node $S/levels.mjs [seed]
+import { scenario } from './sectionlib';
+import { verticalCounts } from './section-structurelib';
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, Proposal } from '../src/game/construction';
 import { electrify } from '../src/game/build-ops';
@@ -244,5 +246,6 @@ check(electrify(h, std.map((e) => e.id), 0, true).error !== null, 'already elect
     check(a === b, 'save round trip keeps track types, levels and EMU trains');
   }
 }
+scenario('shared curved vertical formations grow without level drift and replay exactly',verticalCounts);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

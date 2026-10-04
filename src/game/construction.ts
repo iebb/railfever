@@ -506,7 +506,7 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
 
 // ------------------------------------------------------------------------------------ planning
 
-export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, exact?: { bez: Bez; prof: Float32Array; shared?: boolean }): Proposal {
+export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, exact?: { bez: Bez; prof: Float32Array; shared?: boolean; sections?: Section[]; separateCivil?: boolean }): Proposal {
   const w = g.world;
   const net = w.net;
   if (opts.kind === 'rail') {
@@ -690,7 +690,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, ex
   if (fb.y !== null) cons.push({ i: M - 1, kind: 'eq', v: fb.y });
   else { desired[M - 1] = endY!; if (opts.heightOffset) cons.push({ i: M - 1, kind: 'eq', v: endY! }); }
   // over water: a deck above it, or (underground) a tunnel below the bed
-  for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push(level === 'underground' ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
+  for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push((exact?.sections?.some((s) => s.type === 'tunnel' && sArr[i] >= s.s0 && sArr[i] <= s.s1) || level === 'underground') ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
 
   // Section members validate their already-mapped profile without moving it to fit local terrain.
   if (exact) for (let i = 0; i < M; i++) cons.push({ i, kind: 'eq', v: profAt(exact.prof, L, sArr[i]) });
@@ -877,6 +877,12 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, ex
     centreSections.push({ s0, s1, type: r.t === 1 ? 'bridge' : 'tunnel' });
     if (r.t === 1) prop.stats.bridges++; else prop.stats.tunnels++;
   }
+  if (exact?.sections) {
+    centreSections.splice(0, centreSections.length, ...exact.sections.map((s) => ({ ...s })));
+    for (let i = 0; i < M; i++) { const sec = centreSections.find((s) => sArr[i] >= s.s0 && sArr[i] <= s.s1); type[i] = sec?.type === 'bridge' ? 1 : sec?.type === 'tunnel' ? 2 : 0; }
+    prop.stats.bridges = centreSections.filter((s) => s.type === 'bridge').length;
+    prop.stats.tunnels = centreSections.filter((s) => s.type === 'tunnel').length;
+  }
   // bridges starting at a snapped node must not cut into station/depot edges
   // per-track profiles and sections
   for (const tp of prop.tracks) {
@@ -1003,7 +1009,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, ex
         let sec: 'bridge' | 'tunnel' | null = null;
         for (const x of tp.sections) if (sm >= x.s0 && sm <= x.s1) sec = x.type;
         let prem = 0;
-        if (sec) {
+        if (sec && !exact?.separateCivil) {
           bezPoint(tp.bez, tAtS(tab, sm), q);
           const y = profAt(tp.prof, tp.len, sm), t = w.heightAt(q.x, q.z);
           prem = structureFactor(kind, sec, sec === 'bridge' ? y - t : t - y) - 1;

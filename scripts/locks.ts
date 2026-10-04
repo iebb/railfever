@@ -1,5 +1,6 @@
 // Building-lock ownership after demolition (bundle with esbuild, run with node).
 // npx esbuild scripts/locks.ts --bundle --platform=node --format=esm --outfile=$S/locks.mjs && node $S/locks.mjs
+import { civilLocks } from './section-structurelib';
 import assert from 'node:assert/strict';
 import { Game } from '../src/game/game';
 import { bulldoze } from '../src/game/build-ops';
@@ -109,4 +110,5 @@ const lots = [
 blockTest('rotated margins', lots, [0, 1]);
 blockTest('reverse removal', lots, [2, 1, 0]);
 blockTest('world border', lots.map((b) => ({ ...b, x: b.x - 10, z: b.z - 10 })), [0]);
+civilLocks();
 console.log('ALL CHECKS PASSED');

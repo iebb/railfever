@@ -2,6 +2,8 @@
 // step of a construction fuzz, the terrain never covers rails (roads are draped on the terrain) and never
 // leaves rails or roads floating on ground sections. Reports counts by cause.
 // npx esbuild scripts/terrain-fit.ts --bundle --platform=node --format=esm --outfile=$S/terrain-fit.mjs && node $S/terrain-fit.mjs [seeds] [years] [steps]
+import { scenario, flatGame as sectionFlatGame, authored as groundSection } from './sectionlib';
+import { planSectionCount, commitRailSectionPlan } from '../src/game/rail-section-ops';
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, findSnap } from '../src/game/construction';
 import { bulldoze, terraformBrush } from '../src/game/build-ops';
@@ -91,5 +93,9 @@ for (const seed of seeds) {
   check(bad === 0, `fuzz: the terrain fits after every step (${bad} steps with misfits)`);
   check(badSt === 0, `fuzz: station sites fit after every step (${badSt} steps; stations.ts)`);
 }
+scenario('shared ground formation grows and shrinks without covering or floating retained rails',()=>{
+  const g=sectionFlatGame(160),s=groundSection(g,1,true);
+  for(const count of [4,2,3] as const){const p=planSectionCount(g,s.id,count,{side:'right'});if(!p.ok)throw new Error(p.error);const r=commitRailSectionPlan(g,p);if(r.error)throw new Error(r.error);const fit=terrainFit(g);if(fit.covered||fit.floating)throw new Error(fitLine(fit));}
+});
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

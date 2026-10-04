@@ -2,6 +2,7 @@
 import { RAIL, ROAD_TYPES } from '../game/constants';
 import type { NEdge } from '../game/network';
 import { closestOnPolyline } from '../game/geom';
+import { railUAtS, railSAtU } from '../game/rail-section-types';
 import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk, EARTHWORK_TINT } from './build-common';
 import { WB } from './build-mesh';
 import { WC, WSCALE } from './textures';
@@ -23,11 +24,25 @@ export function parallelGroup(ctx: ChunkCtx, e: NEdge, s: number, pred?: (f: NEd
   const out: Nb[] = [];
   if (e.kind !== 'rail') return out;
   const net = ctx.game.world.net;
+  const member = ctx.game.railSections.membership(e.id);
+  if (member) {
+    const section = ctx.game.railSections.get(member.section)!, u = railUAtS(member.step, s), slot = section.slots.find((q) => q.id === member.slot)!;
+    const structure = ctx.game.railSections.structureAt(e.id, s);
+    for (const other of section.slots) {
+      if (other.id === slot.id || structure && !structure.slots.includes(other.id)) continue;
+      const step = other.steps.find((q) => u >= q.u0 - 1e-6 && u <= q.u1 + 1e-6); if (!step) continue;
+      const edge = net.edges.get(step.edge)!, at = railSAtU(step, u);
+      if (!pred || pred(edge, at)) out.push({ edge, s: at, off: (other.offset - slot.offset) * member.step.dir });
+    }
+    return out;
+  }
   const p = sampleAt(net.geo(e), s);
   for (const side of [-1, 1]) for (let k = 1; k <= 3; k++) {
     const off = side * k * RAIL.spacing;
-    const ne = net.nearestEdge(p.x + p.lx * off, p.z + p.lz * off, 0.14, 'rail', (f) => f.id !== e.id);
+    const ne = net.nearestEdge(p.x + p.lx * off, p.z + p.lz * off, 0.14, 'rail', (f) => f.id !== e.id && !ctx.game.railSections.membership(f.id));
     if (!ne) break;
+    const attachment = ctx.game.stations.railAttachment(e.id), otherAttachment = ctx.game.stations.railAttachment(ne.edge.id);
+    if (ne.edge.owner !== e.owner || ne.edge.type !== e.type || ne.edge.station !== e.station || ne.edge.depot !== e.depot || attachment?.station !== otherAttachment?.station) break;
     const q = sampleAt(net.geo(ne.edge), ne.s);
     if (Math.abs(q.tx * p.tx + q.tz * p.tz) < 0.95 || Math.abs(q.y - p.y) > 0.3) break;
     if (pred && !pred(ne.edge, ne.s)) break;
@@ -624,6 +639,7 @@ export function buildPortals(ctx: ChunkCtx, e: NEdge) {
   const net = ctx.game.world.net;
   for (const sec of e.sections) {
     if (sec.type !== 'tunnel' || sec.s1 - sec.s0 < 0.05) continue;
+    if (ctx.game.railSections.structureAt(e.id, (sec.s0 + sec.s1) / 2)) continue;
     for (const [s, out] of [[sec.s0, -1], [sec.s1, 1]] as [number, number][]) {
       const atEnd = out < 0 ? s <= 0.05 : s >= e.len - 0.05;
       if (atEnd && (continuesAt(ctx, e, out < 0 ? e.a : e.b, 'tunnel') || buriedEnd(ctx, e, out < 0 ? e.a : e.b))) continue;
@@ -710,6 +726,7 @@ export function portalKeepouts(ctx: ChunkCtx, e: NEdge, out: Keepout[]) {
   const net = ctx.game.world.net;
   for (const sec of e.sections) {
     if (sec.type !== 'tunnel' || sec.s1 - sec.s0 < 0.05) continue;
+    if (ctx.game.railSections.structureAt(e.id, (sec.s0 + sec.s1) / 2)) continue;
     for (const [s, o] of [[sec.s0, -1], [sec.s1, 1]] as [number, number][]) {
       const atEnd = o < 0 ? s <= 0.05 : s >= e.len - 0.05;
       if (atEnd && (continuesAt(ctx, e, o < 0 ? e.a : e.b, 'tunnel') || buriedEnd(ctx, e, o < 0 ? e.a : e.b))) continue;

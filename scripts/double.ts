@@ -3,6 +3,8 @@
 // track with a tunnel and a bridge (2 trains in opposite directions), bridges at a station throat (every platform
 // reachable from both tracks), save round trip and moving a depot.
 // npx esbuild scripts/double.ts --bundle --platform=node --format=esm --outfile=$S/double.mjs && node $S/double.mjs
+import { scenario } from './sectionlib';
+import { legacyCivil } from './section-structurelib';
 import { serialize, deserialize } from '../src/game/save';
 import { setSignal, autoSignals, signalsAlong, clearSignalsAlong } from '../src/game/signals';
 import { planDoubleTrack, commitDoubleTrack, finishDoubleTrack, relocateDepot } from '../src/game/trackops';
@@ -222,5 +224,6 @@ if (saved) {
   void before;
 }
 
+scenario('saved parallel structures preserve legacy bills and unequal signal splits',legacyCivil);
 console.log(`(${fmt((performance.now() - T0) / 1000, 1)} s)`);
 done();

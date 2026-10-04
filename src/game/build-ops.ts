@@ -1,5 +1,6 @@
 // Depots, signals, demolition and terraforming.
 import type { Game } from './game';
+import { railRemovalCost } from './rail-structures';
 import { NetKind, RAIL, TRAM, ROAD_TYPES, ELECTRIFY } from './constants';
 import { bezLine } from './geom';
 import { NEdge } from './network';
@@ -339,7 +340,7 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
     if (e.owner >= 0 && e.owner !== owner) { res.error = 'Owned by another company'; continue; }
     if (e.tram && (e.tramOwner ?? -1) >= 0 && e.tramOwner !== owner) { res.error = 'Tram tracks of another company'; continue; }
     if (g.vehicles.isEdgeBusy(e.id)) { res.error = 'Vehicle in the way'; continue; }
-    planRemoval((e.kind === 'rail' ? 400 : 250) * e.len, () => { removed.push(e); return null; });
+    planRemoval(e.kind === 'rail' ? railRemovalCost(e.len) : 250 * e.len, () => { removed.push(e); return null; });
   }
   // buildings (point only, or all in area)
   const blds = point ? w.buildingsNear(x0, z0, 4).filter((b) => distToRect(x0, z0, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.05)

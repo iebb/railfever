@@ -155,6 +155,7 @@ export class Network {
   /** listeners for structural changes (stations, vehicles, renderer) */
   onSplit: ((old: NEdge, e1: NEdge, e2: NEdge, s: number) => void)[] = [];
   onRemove: ((e: NEdge) => void)[] = [];
+  onGeometryChanged: ((e: NEdge) => void)[] = [];
 
   constructor(public world: World) {}
 
@@ -267,6 +268,7 @@ export class Network {
       this.roadVersions.bump(box); this.frontageRoadVersions.bump(box);
     }
     this.markEdge(e);
+    for (const listener of this.onGeometryChanged) listener(e);
   }
 
   removeEdge(id: number) {

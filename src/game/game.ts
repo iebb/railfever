@@ -19,7 +19,8 @@ import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
 import { resolveDeadlocks, lineCongestion } from './train';
-import { trackMaintenance, billTrackWear } from './opcosts';
+import { billTrackWear } from './opcosts';
+import { sharedTrackMaintenance } from './rail-structures';
 import { MailModel } from './mail';
 import { RailSections } from './rail-sections';
 
@@ -549,7 +550,7 @@ export class Game {
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
     // (ops) base upkeep including overhead wire; wear by train passages is billed on top monthly
-    return trackMaintenance(e);
+    return sharedTrackMaintenance(this, e);
   }
   /**
    * Yearly maintenance of a station (platforms and stops; the platform tracks count as edges): an elevated

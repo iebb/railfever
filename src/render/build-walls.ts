@@ -49,6 +49,8 @@ export function buildRetainingWalls(ctx: ChunkCtx, e: NEdge) {
   const town = e.kind === 'road' ? e.owner < 0 : false;
   const concrete = town || ctx.game.year >= 1950 || w.buildingsNear((ctx.x0 + ctx.x1) / 2, (ctx.z0 + ctx.z1) / 2, 18).length > 6;
   for (const sg of [-1, 1]) {
+    const member = ctx.game.railSections.membership(e.id), section = member && ctx.game.railSections.get(member.section);
+    if (member && section) { const index = section.slots.findIndex((s) => s.id === member.slot), side = sg * member.step.dir; if (side < 0 ? index > 0 : index < section.slots.length - 1) continue; }
     const A: (WallAt | null)[] = S.map((p) => (p ? scan(ctx, p, sg, hw) : null));
     smooth(A);
     emit(ctx, S, A, sg, concrete);

@@ -51,15 +51,28 @@ export interface RailJunction {
   crossings: number[];
   signals: number[];
 }
-/** Reserved for shared civil works; no groups are inferred or billed in stages 1–2. */
+/** A civil span, not a routing/reservation resource. Width and upkeep survive count reductions. */
 export interface RailStructure {
   id: number;
+  version: number;
   owner: number;
   section: number;
   u0: number;
   u1: number;
   slots: number[];
   type: 'bridge' | 'tunnel';
+  /** Outside limits relative to the stable section alignment (including deck/lining). */
+  lo: number;
+  hi: number;
+  capacityOffsets: number[];
+  style: 'girder' | 'truss' | 'bore';
+  supports: { u: number; offset: number; kind: 'pier' | 'abutment' }[];
+  portals: [boolean, boolean];
+  clearance: { above: number; below: number };
+  civilCost: number;
+  maintenance: number;
+  /** Exact live civil bills on adoption; discarded on a real width edit. */
+  legacyShares?: { offset: number; maintenance: number }[];
 }
 export interface RailSectionsSave {
   schema: 1;
@@ -71,6 +84,8 @@ export interface RailSectionsSave {
   sections: RailSection[];
   junctions: RailJunction[];
   structures: RailStructure[];
+  /** Absent in stages 1–2; upgraded without changing the physical graph. */
+  civilSchema?: 1;
 }
 export interface RailMembership { section: number; slot: number; step: RailStep }
 

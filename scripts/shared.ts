@@ -1,6 +1,8 @@
 // Shared networks: joining another company's track needs track access; the joined pieces stay the owner's,
 // the new track is the builder's; without access tracks cross over or under, never at grade. Same for trams.
 // npx esbuild scripts/shared.ts --bundle --platform=node --format=esm --outfile=$S/shared.mjs && node $S/shared.mjs
+import { scenario } from './sectionlib';
+import { sharedCivilRights } from './section-structurelib';
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, findSnap } from '../src/game/construction';
 import { fails, check, free, railOpts, roadOpts } from './lib';
@@ -48,5 +50,6 @@ const t1 = tj();
 check(!g.canUse(0, 1) ? !t1.ok && t1.errors.some((e) => e.includes('needs track access')) : t1.ok, `tram tracks: joining needs access (${t1.errors.join(', ')})`);
 const road = planEdge(g, free(g, 70, 240), findSnap(g, 'road', 70, 200, 1), roadOpts(0));
 check(road.ok, `a plain road may join their road (${road.errors.join(', ')})`);
+scenario('accessible widening retains the infrastructure owner for rails and civil works',sharedCivilRights);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

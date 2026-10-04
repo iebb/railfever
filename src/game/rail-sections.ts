@@ -5,6 +5,8 @@ import { profAt } from './network';
 import { RAIL, PSTEP, trackTypeOf } from './constants';
 import { arcTable, bezPoint, bezDeriv, bezReverse, tAtS, startTangent } from './geom';
 import { alignmentHeight, closestRailT, sAtT } from './rail-offsets';
+import { SpatialGrid } from './spatial';
+import { adoptRailStructures, slotSpans, structureBounds, lockRailStructures, validateRailStructures, partitionCivilBills } from './rail-structures';
 import {
   railUAtS, type RailAlignment, type RailSection, type RailSlot, type RailStep, type RailPortRef,
   type RailJunction, type RailStructure, type RailMembership, type RailSectionsSave, type TrackCount,
@@ -21,6 +23,7 @@ export class RailSections {
   /** Rebuilt, never saved. Physical edge membership is unique. */
   byEdge = new Map<number, RailMembership>();
   connectorJunction = new Map<number, number>();
+  structureGrid = new SpatialGrid(32);
   nextSection = 1;
   nextSlot = 1;
   nextJunction = 1;
@@ -32,6 +35,11 @@ export class RailSections {
 
   constructor(private game: Game) {
     const net = game.world.net;
+    game.world.repairCivilLocks = (x0, z0, x1, z1) => lockRailStructures(game, [x0, z0, x1, z1]);
+    net.onGeometryChanged.push((e) => {
+      const m = this.byEdge.get(e.id), s = m && this.get(m.section);
+      if (s) for (const id of s.structures) this.markStructure(this.structures.get(id)!);
+    });
     net.onSplit.push((old, e1, e2, s) => this.split(old, e1, e2, s));
     net.onRemove.push((e) => {
       if (this.suspended) return;
@@ -44,6 +52,19 @@ export class RailSections {
 
   get(id: number) { return this.sections.get(id); }
   membership(edge: number) { return this.byEdge.get(edge); }
+  structureAt(edge: number, at: number): RailStructure | undefined {
+    const m = this.byEdge.get(edge); if (!m) return undefined;
+    const s = this.get(m.section)!, u = railUAtS(m.step, at);
+    return s.structures.map((id) => this.structures.get(id)!).find((st) => st.slots.includes(m.slot) && u >= st.u0 - 1e-5 && u <= st.u1 + 1e-5);
+  }
+  structuresNear(x0: number, z0: number, x1: number, z1: number): RailStructure[] {
+    return this.structureGrid.query(x0, z0, x1, z1).map((id) => this.structures.get(id)!).filter(Boolean);
+  }
+  markStructure(st: RailStructure) {
+    const s = this.get(st.section); if (!s) return;
+    this.game.world.markObjArea(...structureBounds(s, st));
+    for (const slot of s.slots) if (st.slots.includes(slot.id)) for (const q of slot.steps) this.game.world.net.dirtyEdges.add(q.edge);
+  }
 
   /** Unadopted legacy construction remains a pure singleton view until an explicit adoption boundary. */
   viewForEdge(id: number): RailSection | undefined {
@@ -70,6 +91,7 @@ export class RailSections {
 
   rebuildIndexes() {
     this.byEdge.clear(); this.connectorJunction.clear();
+    this.structureGrid.clear();
     for (const s of this.sections.values()) for (const slot of s.slots) for (const step of slot.steps) {
       if (this.byEdge.has(step.edge)) throw new Error('Duplicate rail membership');
       this.byEdge.set(step.edge, { section: s.id, slot: slot.id, step });
@@ -78,6 +100,7 @@ export class RailSections {
       if (this.byEdge.has(id) || this.connectorJunction.has(id)) throw new Error('Duplicate rail connector');
       this.connectorJunction.set(id, j.id);
     }
+    for (const st of this.structures.values()) { const s = this.get(st.section); if (s) this.structureGrid.insert(st.id, ...structureBounds(s, st)); }
   }
 
   /** Called at completed mutation boundaries, never by a view or a serializer. No orphan auto-adoption. */
@@ -115,9 +138,14 @@ export class RailSections {
       // Joint-network adapters temporarily borrow ownership. Only the later flush or explicit buyout
       // boundary may record a changed owner; synchronous construction notifications leave it alone.
       if (!finalOwnership && [...owners].some((owner) => owner !== s.owner)) continue;
+      if (!invalid && s.structures.length) for (const slot of s.slots) {
+        const actual = slotSpans(this.game, slot), expected = s.structures.map((id) => this.structures.get(id)!).filter((st) => st.slots.includes(slot.id)).sort((a, b) => a.u0 - b.u0);
+        if (actual.length !== expected.length || actual.some((q, i) => q.type !== expected[i].type || Math.abs(q.u0 - expected[i].u0) > 0.08 || Math.abs(q.u1 - expected[i].u1) > 0.08)) invalid = true;
+      }
       if (invalid || owners.size !== 1 || types.size !== 1) { this.fallback(s.id); continue; }
       const owner = [...owners][0];
       if (owner !== s.owner) { s.owner = owner; s.version++; this.version++; }
+      for (const id of s.structures) { const st = this.structures.get(id)!; if (st.owner !== owner) { st.owner = owner; st.version++; } }
       const type = [...types][0];
       if (type !== s.type) { s.type = type; s.version++; this.version++; }
       const manualSignal = s.slots.some((slot) => slot.steps.some((q) => {
@@ -132,6 +160,7 @@ export class RailSections {
       const before = JSON.stringify(s.ends);
       this.updateEnds(s);
       if (JSON.stringify(s.ends) !== before) { s.version++; this.version++; }
+      if (!s.structures.length) adoptRailStructures(this.game, s);
     }
     this.refreshJunctionPorts(); this.rebuildIndexes();
   }
@@ -164,6 +193,7 @@ export class RailSections {
       ref.count = ref.slots.length as TrackCount;
       if (use.some((m) => m.chain.steps.some(({ e }) => [e.a, e.b].some((id) => this.game.world.net.nodes.get(id)?.signal)))) ref.traffic.policy = 'custom';
       this.sections.set(ref.id, ref);
+      adoptRailStructures(this.game, ref);
       for (const m of use) done.add(m.chain);
       this.updateEnds(ref); this.version++;
     }
@@ -172,7 +202,7 @@ export class RailSections {
 
   toJSON(): RailSectionsSave | unknown {
     if (this.unsupported !== undefined) return copy(this.unsupported);
-    return copy({ schema: 1, version: this.version, nextSection: this.nextSection, nextSlot: this.nextSlot,
+    return copy({ schema: 1, civilSchema: 1, version: this.version, nextSection: this.nextSection, nextSlot: this.nextSlot,
       nextJunction: this.nextJunction, nextStructure: this.nextStructure, sections: [...this.sections.values()],
       junctions: [...this.junctions.values()], structures: [...this.structures.values()] } satisfies RailSectionsSave);
   }
@@ -182,7 +212,7 @@ export class RailSections {
     this.sections.clear(); this.junctions.clear(); this.structures.clear(); this.byEdge.clear(); this.connectorJunction.clear();
     this.unsupported = undefined; this.compatibilityError = null;
     if (!payload) { this.adoptUnassigned(); return; }
-    if (payload.schema !== 1) {
+    if (payload.schema !== 1 || payload.civilSchema !== undefined && payload.civilSchema !== 1) {
       this.unsupported = copy(payload); this.compatibilityError = 'Unsupported rail section schema'; return;
     }
     const d = copy(payload) as RailSectionsSave;
@@ -199,6 +229,7 @@ export class RailSections {
       this[key] = d[key];
     }
     this.version = d.version ?? 0;
+    if (d.civilSchema === undefined) for (const s of this.sections.values()) adoptRailStructures(this.game, s);
     this.validate(); this.rebuildIndexes();
   }
 
@@ -235,6 +266,7 @@ export class RailSections {
     }
     for (const j of this.junctions.values()) if (j.id >= this.nextJunction || j.nodes.some((n) => !net.nodes.has(n)) || j.ports.some((p) => !this.sections.has(p.section)) || j.connectors.some((e) => !net.edges.has(e))) throw new Error('Invalid rail junction');
     for (const st of this.structures.values()) if (st.id >= this.nextStructure || !this.sections.has(st.section)) throw new Error('Invalid rail structure');
+    validateRailStructures(this.game);
   }
 
   private plain(e: NEdge) { return e.kind === 'rail' && e.station < 0 && e.depot < 0 && !this.game.stations.railAttachment(e.id); }
@@ -347,14 +379,22 @@ export class RailSections {
   /** Conservative repair: invalidate the old grouping and adopt valid remaining chains as singletons. */
   private fallback(id: number, excluded = new Set<number>()) {
     const s = this.sections.get(id); if (!s) return;
+    const civil = s.structures.map((id) => this.structures.get(id)!);
+    for (const st of civil) { this.markStructure(st); this.structures.delete(st.id); }
     const ids = new Set(s.slots.flatMap((slot) => slot.steps.map((q) => q.edge)).filter((id) => !excluded.has(id) && !!this.game.world.net.edges.get(id) && this.plain(this.game.world.net.edges.get(id)!)));
     this.sections.delete(id);
+    const replacements: RailSection[] = [];
     for (const c of this.chains(ids)) {
       const r = this.record(c.steps, this.nextSection++, this.nextSlot++);
       if (excluded.size) r.owner = s.owner;
       this.sections.set(r.id, r); this.updateEnds(r);
+      adoptRailStructures(this.game, r); replacements.push(r);
     }
+    // Generic destructive edits partition the old bill over the surviving civil fragments. Planned count
+    // edits never enter fallback and keep the original wide structure identity/capacity instead.
+    partitionCivilBills(this.game, s, civil, replacements);
     this.version++; this.refreshJunctionPorts(); this.rebuildIndexes();
+    for (const st of civil) lockRailStructures(this.game, structureBounds(s, st));
   }
 
   private split(old: NEdge, e1: NEdge, e2: NEdge, s: number) {
@@ -371,6 +411,7 @@ export class RailSections {
       return { edge: e.id, dir: q.dir, u0, u1, knots };
     };
     slot.steps.splice(slot.steps.indexOf(q), 1, fragment(a, q.u0, u), fragment(b, u, q.u1));
+    for (const id of section.structures) { const st = this.structures.get(id)!; st.version++; this.markStructure(st); }
     section.version++; this.version++; this.rebuildIndexes();
   }
 }

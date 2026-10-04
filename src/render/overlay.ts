@@ -1,5 +1,7 @@
 // Construction previews (ghost tracks, footprints), snap markers, hover highlights and line routes.
 import * as THREE from 'three';
+import type { RailSectionPlan } from '../game/rail-section-ops';
+import { formationAt } from '../game/rail-structures';
 import type { Game } from '../game/game';
 import type { Proposal, CrossingPlan } from '../game/construction';
 import type { StationPlan } from '../game/stations';
@@ -498,6 +500,34 @@ export class Overlay {
       m.position.set(c.x, profAt(tp.prof, tp.len, c.sNew) + 0.08, c.z);
       m.visible = true;
     });
+  }
+
+  /** Stage-5 adapter: real member ribbons plus the saved-width civil ghost, without graph mutation. */
+  setRailSectionPlan(p: RailSectionPlan | null) {
+    for (const m of this.crossPool) m.visible = false;
+    if (!p || !p.alignment.pieces.length) { this.ghost.set(null); return; }
+    const b = this.buf.clear(), rail = new THREE.Color(p.ok ? C.ok : C.bad), civil = new THREE.Color(p.ok ? C.okBridge : C.badBridge);
+    const old = p.section === null ? undefined : this.game.railSections.get(p.section);
+    const offsets = [...(old?.slots.filter((s) => !p.diff.removedSlots.includes(s.id)).map((s) => s.offset) ?? []), ...p.diff.additions.map((s) => s.offset)];
+    const samples = (u0: number, u1: number, offset = 0) => {
+      const n = Math.max(2, Math.ceil((u1 - u0) / 0.5) + 1), pts = new Float32Array(n * 3);
+      for (let i = 0; i < n; i++) { const q = formationAt(p.alignment, u0 + (u1 - u0) * i / (n - 1), offset); pts.set([q.x, q.y, q.z], i * 3); }
+      return { n, pts };
+    };
+    for (const off of offsets) { const q = samples(0, p.alignment.length, off); ribbon(b, q.pts, q.n, 0.17, 0.04, () => rail); }
+    for (const st of p.diff.structures) {
+      const q = samples(st.u0, st.u1, (st.lo + st.hi) / 2);
+      ribbon(b, q.pts, q.n, (st.hi - st.lo) / 2, st.type === 'bridge' ? -0.04 : st.clearance.above, () => civil);
+      for (const support of st.supports) {
+        const at = formationAt(p.alignment, support.u, support.offset), gy = this.game.world.heightAt(at.x, at.z);
+        wall(b, at.x - 0.1, at.z, at.x + 0.1, at.z, gy, at.y - st.clearance.below, civil);
+      }
+      for (const end of [0, 1] as const) if (st.portals[end]) {
+        const at = formationAt(p.alignment, end ? st.u1 : st.u0);
+        wall(b, at.x + at.lx * st.lo, at.z + at.lz * st.lo, at.x + at.lx * st.hi, at.z + at.lz * st.hi, at.y + st.clearance.above - 0.1, at.y + st.clearance.above, civil);
+      }
+    }
+    this.ghost.set(b);
   }
 
   /** Bridge piers (every ~3 units down to the ground / water) and tunnel portal frames. */

@@ -1,6 +1,8 @@
 // Structures: a railway through a hill (tunnel) and across a valley (bridge) on synthetic terrain; a train
 // runs through both, is hidden inside the tunnel, and follows the deck height on the bridge.
 // npx esbuild scripts/tunnel.ts --bundle --platform=node --format=esm --outfile=$S/tunnel.mjs && node $S/tunnel.mjs
+import { scenario } from './sectionlib';
+import { portalBoundaries } from './section-structurelib';
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { Train } from '../src/game/train';
@@ -52,5 +54,6 @@ console.log(`  train: ${arrivals} stops, hidden in tunnel ${hidden} ticks, on th
 check(arrivals >= 3, 'train shuttles through the structures');
 check(hidden > 0, 'train hidden inside the tunnel');
 check(onBridge > 0, 'train ran on the bridge deck');
+scenario('shared tunnel portals survive unequal splits and two-to-four growth',portalBoundaries);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

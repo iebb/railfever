@@ -341,11 +341,16 @@ export function trackBasePerUnit(type: string): number {
   return per * TRACK_BASE_SHARE;
 }
 
+/** Live civil premium, used both by old edge bills and metadata-only shared-structure adoption. */
+export function railCivilMaintenance(type: string, units: number, structure: 'bridge' | 'tunnel'): number {
+  return units * trackBasePerUnit(type) * (structure === 'tunnel' ? 4 : 3);
+}
+
 /** Yearly base maintenance of a rail or road edge (rail: wire state, structures 3x / tunnels 4x on top; without wear). */
 export function trackMaintenance(e: NEdge): number {
   const per = e.kind === 'rail' ? trackBasePerUnit(e.type) : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).maintPerUnit;
   let c = e.len * per;
-  for (const s of e.sections) c += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
+  for (const s of e.sections) c += e.kind === 'rail' ? railCivilMaintenance(e.type, s.s1 - s.s0, s.type) : (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 4 : 3);
   return c;
 }
 

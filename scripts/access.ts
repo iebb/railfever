@@ -7,6 +7,8 @@
 // the player's stations A and D pays the player. Ending access drops E from the player's line and the player's
 // train re-routes over its own (longer) detour. Also: re-plan without access, fee accounting, reservations.
 // npx esbuild scripts/access.ts --bundle --platform=node --format=esm --outfile=$S/access.mjs && node $S/access.mjs
+import { scenario } from './sectionlib';
+import { sharedCivilAccess } from './section-structurelib';
 import { Game, PLAYER } from '../src/game/game';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { findSnap } from '../src/game/construction';
@@ -299,6 +301,7 @@ if (isMain) {
   errs = checkReservations(g);
   check(errs.length === 0, 'reservations consistent ' + errs.slice(0, 3).join('; '));
   void direct; void findSnap;
+  scenario('access maintenance apportions the common civil bill once',sharedCivilAccess);
   console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
   process.exitCode = fails.length ? 1 : 0;
 }

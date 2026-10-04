@@ -31,8 +31,10 @@ export class World {
   readonly size: number;
   /** vertex heights, (size+1)^2 */
   readonly h: Float32Array;
-  /** vertex locks: bit 1 network formation, bit 2 building, bit 4 rail formation */
+  /** vertex locks: 1 ground formation, 2 building, 4 ground rail, 8 civil foundations/cover */
   readonly lock: Uint8Array;
+  /** Bound by the section service; civil locks are distinct from ground formation heights. */
+  repairCivilLocks?: (x0: number, z0: number, x1: number, z1: number) => void;
   net: Network;
   buildings = new Map<number, Building>();
   readonly lotVersions = new RegionVersions();

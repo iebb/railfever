@@ -18,7 +18,7 @@ export const DRY_MIN = WATER_Y + 0.05;
  * World.lock bits: 1 = a formation zone (any network edge), 2 = under a building, 4 = a rail formation zone.
  * Rails keep their exact profile (the terrain must never cover them); roads are draped on the terrain.
  */
-export const LOCK = { formation: 1, building: 2, rail: 4 };
+export const LOCK = { formation: 1, building: 2, rail: 4, civil: 8 };
 
 /** Per vertex: the height range the formations allow (flat core, slopes beside), and the nearest target. */
 interface Acc { lo: number; hi: number; dmin: number; tnear: number; core: boolean }
@@ -113,6 +113,7 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
   const changes: [number, number][] = [];
   for (const [k, a] of stamps) {
     const lock = w.lock[k];
+    if (lock & LOCK.civil) continue;
     // under a building, or another formation's zone (beyond our own formation): left alone
     if (lock & LOCK.building || (lock & LOCK.formation && !a.core)) continue;
     const x = k % s1, z = (k / s1) | 0;
@@ -232,6 +233,7 @@ export function recomputeLocks(w: World, x0: number, z0: number, x1: number, z1:
   for (let z = Math.max(0, Math.floor(z0)); z <= Math.min(w.size, Math.ceil(z1)); z++)
     for (let x = Math.max(0, Math.floor(x0)); x <= Math.min(w.size, Math.ceil(x1)); x++) w.lock[z * s1 + x] &= ~(LOCK.formation | LOCK.rail);
   for (const e of w.net.edgesNear(x0 - 2, z0 - 2, x1 + 2, z1 + 2)) lockEdge(w, e);
+  w.repairCivilLocks?.(x0, z0, x1, z1);
 }
 
 /** Raise/lower/flatten terrain with a circular brush. Returns the volume moved. */

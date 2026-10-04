@@ -2,6 +2,8 @@
 // second track laid beside an existing one later, with the shared-formation cost model (SHARED_TRACK) and the
 // old model (every track pays materials and structures in full).
 // npx esbuild scripts/trackcost.ts --bundle --platform=node --format=esm --outfile=$S/trackcost.mjs && node $S/trackcost.mjs
+import { scenario } from './sectionlib';
+import { civilBills } from './section-structurelib';
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal, SHARED_TRACK } from '../src/game/construction';
 import { fails, check, free, railOpts, fmt } from './lib';
@@ -49,5 +51,6 @@ console.log(`  second track beside it: before ~${M(oldCost(one))} (as a new trac
 check(two.cost < one.cost * 1.6, 'double track costs well under twice a single track');
 check(side.cost < one.cost * 0.6, 'a track beside an existing one shares its formation');
 check(sp.bridges / bl / PER >= 4 && sp.tunnels / tl / PER >= 8, 'viaducts >= 4x and tunnels >= 8x ground track per unit');
+scenario('one shared civil quote and bill retains paid width on reduction',civilBills);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
