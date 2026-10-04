@@ -53,8 +53,17 @@ export interface Line {
    * stop; vehicles run Vehicle.pattern (absent: one all-stops local)
    */
   patterns?: ServicePattern[];
+  /** City-growth calibration by operator and pattern; cumulative passenger receipts and comparable forecast periods. */
+  growth?: Record<string, GrowthObservation>;
   /** mail carried (loaded) this / last month and its income this / last year (a part of incomeYear); from the line's first mail on */
   mail?: LineMail;
+}
+
+export interface GrowthObservation {
+  day: number; signature: string; forecast: number;
+  counter: number; atCounter: number;
+  expected: number; receipts: number; rate: number; days: number;
+  priorExpected: number; priorReceipts: number;
 }
 
 export interface PatternSpacing {
@@ -869,6 +878,7 @@ export class Lines {
   static restore(d: any): Line {
     const l: Line = { ...d, stops: [...(d.stops ?? [])], vehicles: [...(d.vehicles ?? [])] };
     if (d.mail) l.mail = { ...d.mail };
+    if (d.growth) l.growth = Object.fromEntries(Object.entries(d.growth as Record<string, GrowthObservation>).map(([key, p]) => [key, { ...p }]));
     if (typeof l.num !== 'number') {
       const m = /(\d+)\s*$/.exec(String(l.name ?? ''));
       l.num = m ? Number(m[1]) : l.id;

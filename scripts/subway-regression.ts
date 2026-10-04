@@ -9,7 +9,11 @@ import { serialize, deserialize } from '../src/game/save';
 import { Overlay } from '../src/render/overlay';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
-import { check, fails } from './lib';
+import { linearStops } from '../src/game/lines';
+import { outerEnd, terminusOf } from '../src/game/ai-grow';
+import { saveNetwork, loadNetwork, scheduleNetworkTask, networkProfile } from '../src/game/ai-network';
+import { Train } from '../src/game/train';
+import { check, fails, checkReservations } from './lib';
 if (!process.argv[1]?.endsWith('subway-regression.mjs')) throw new Error('bundle as subway-regression.mjs');
 function flatGame(ais = 0): Game {
   const g = Game.create({ size: 512, seed: 5, towns: 0, hilliness: 'flat', water: 'low', startYear: 2000,
@@ -34,8 +38,8 @@ function newTown(g: Game, name: string, x: number, z: number, radius: number): T
  * A dense quarter: 8-storey blocks of flats on a street grid turned by `rot` (no street runs along its axis), every
  * block built up around a courtyard, `size` units across, `pop` residents.
  */
-function denseQuarter(g: Game, name: string, cx: number, cz: number, pop: number, size: number, rot: number): Town {
-  const t = newTown(g, name, cx, cz, size * 0.6);
+function denseQuarter(g: Game, name: string, cx: number, cz: number, pop: number, size: number, rot: number, existing?: Town): Town {
+  const t = existing ?? newTown(g, name, cx, cz, size * 0.6);
   const c = Math.cos(rot), s = Math.sin(rot), half = size / 2, step = 8;
   const P = (u: number, v: number) => ({ x: cx + u * c - v * s, z: cz + u * s + v * c });
   for (let v = -half; v <= half; v += step) for (let u = -half; u + step <= half; u += step) { const a = P(u, v), b = P(u + step, v); road(g, a.x, a.z, b.x, b.z); }
@@ -51,7 +55,7 @@ function denseQuarter(g: Game, name: string, cx: number, cz: number, pop: number
     const count = Math.ceil(remaining / (lots.length - i)); remaining -= count;
     t.buildings.add(g.world.addBuilding({ townId: t.id, x: p.x, z: p.z, angle: rot, w: 1.4, d: 1.4, type: 4, floors: 8, pop: count, seed: i, y: 4, built: 0 }).id);
   });
-  t.pop = pop;
+  t.pop += pop;
   g.demand.rebuild();
   return t;
 }
@@ -98,6 +102,20 @@ if (run('geometry')) {
     if (first === 'depot') { check(!h.depots.commit('rail', depot(), 0), 'fixture depot'); accepted = station().ok; }
     else { check(!h.stations.commitRail(station(), 0), 'fixture station'); accepted = depot().ok; }
     check(accepted === (depth >= 3.7), `#4 station depth ${depth}, ${first} first: actual volumes agree (accepted ${accepted})`);
+  }
+  // A growth preview through a cavern that will move must ignore both its track and its volume.
+  {
+    const h = flatGame(), net = h.world.net, id = h.depots.nextId;
+    const depot = h.depots.plan('rail', 180, 180, Math.PI / 2, 0, { level: 'underground', depth: 2.2, snap: false });
+    check(depot.ok && !h.depots.commit('rail', depot, 0), 'ignored cavern fixture builds');
+    const d = h.depots.get(id)!;
+    const preview = (ignore?: BuildOptions['ignore']) => net.withTemporaryNodes('rail', [
+      { x: 174, y: d.y, z: 180, dx: 1, dz: 0 }, { x: 186, y: d.y, z: 180, dx: -1, dz: 0 },
+    ], 0, (nodes) => planEdge(h, { ...nodes[0], kind: 'node', node: nodes[0].id }, { ...nodes[1], kind: 'node', node: nodes[1].id },
+      { ...subwayOpts('lightrail', 1, 0, 2.2), ...(ignore ? { ignore } : {}) }));
+    check(!preview().ok, 'growth preview refuses an existing cavern at the same depth');
+    check(!preview({ edges: new Set([d.edge]) }).ok, 'ignoring a cavern track still checks the cavern volume');
+    check(preview({ edges: new Set([d.edge]), depots: new Set([d.id]) }).ok, 'growth preview ignores a relocated cavern and its tunnel track together');
   }
   // #6: count station visits, independent of machine timing, and verify cache invalidation/purity.
   const h = flatGame(), overlay = new Overlay(h), count = 1000;
@@ -189,6 +207,133 @@ if (run('jobs')) {
   for (const copy of copies) {
     while (copy.game.tick < target) copy.game.stepTick();
     check(saved(copy.game) === reference, `#1 save at tick ${copy.tick} replays to ${target} exactly`);
+  }
+}
+// Subway + linegrow: the real saved urban job opens a tail/cavern terminus, then the saved daily
+// growth task carries its line through a dense new district and moves the cavern to the new end.
+if (run('growth')) {
+  const g = flatGame(1), T = denseQuarter(g, 'Growing Subway', 256, 256, 3000, 120, Math.PI / 4), ai = g.ais[0];
+  const checkpoints = (label: string) => {
+    const copies: { key: string; data: string }[] = [], seen = new Set<string>();
+    return {
+      copies,
+      capture(key: string) {
+        if (seen.has(key)) return;
+        seen.add(key);
+        const data = saved(g), loaded = deserialize(JSON.parse(data));
+        check(saved(loaded) === data, `${label}: ${key} round-trips exactly`);
+        copies.push({ key, data });
+      },
+      replay() {
+        const target = g.tick, reference = saved(g);
+        for (const copy of copies) {
+          const loaded = deserialize(JSON.parse(copy.data));
+          while (loaded.tick < target) loaded.stepTick();
+          const actual = saved(loaded);
+          if (actual !== reference) {
+            let i = 0; while (actual[i] === reference[i]) i++;
+            console.log(`  ${label} ${copy.key} mismatch at ${i}: ${reference.slice(i - 60, i + 120)} vs ${actual.slice(i - 60, i + 120)}`);
+          }
+          check(actual === reference, `${label}: ${copy.key} replays exactly through completion`);
+        }
+      },
+    };
+  };
+  const urban = checkpoints('subway opening');
+  // Open the small town's metro for this construction fixture; growth still has to pay under
+  // the real demand/fleet comparison once the new district arrives.
+  const forceBuild = AIController.forceBuild;
+  AIController.forceBuild = true;
+  g.aiEnabled = true;
+  check(ai.startProject('metro', [T.id]), 'growth: underground city project starts');
+  let ticks = 0;
+  while (ai.busy && ticks++ < 60000) {
+    g.stepTick();
+    const task = (ai as unknown as { urbanTask: { stage: string; fork?: number; at: number } | null }).urbanTask;
+    if (task && ['yardUnder', 'evaluate', 'approve', 'buildTail', 'buildYard', 'throat', 'finish', 'fleet'].includes(task.stage))
+      urban.capture(task.stage === 'fleet' ? `fleet:${task.at}` : task.stage);
+  }
+  check(ai.stats.urban === 1 && urban.copies.some((c) => c.key === 'buildTail') && urban.copies.some((c) => c.key === 'buildYard'),
+    'growth: saved opening crosses both tail and cavern build boundaries');
+  console.log(`  opening: ${urban.copies.map((c) => c.key).join(', ')}; ${ai.log.slice(-2).join(' | ')}`);
+  urban.replay();
+  AIController.forceBuild = forceBuild;
+  g.aiEnabled = false;
+  ai.state.cooldown = 1e9;
+  const line = g.lines.all().find((l) => l.owner === ai.companyId && l.kind === 'rail');
+  const path = line ? linearStops(line.stops) ?? [] : [];
+  const ends = path.length >= 2 ? [[0, 1], [path.length - 1, path.length - 2]].map(([i, j]) => {
+    const st = g.stations.get(path[i])!, neighbour = g.stations.get(path[j])!;
+    return { st, index: i, te: terminusOf(g, st, outerEnd(st, neighbour), ai.companyId)! };
+  }) : [];
+  const yard = ends.find((e) => e.te.kind === 'tail');
+  check(!!line && path.every((id) => g.stations.get(id)?.rail?.level === 'underground'), 'growth: AI opens an underground city line');
+  check(!!yard && Math.abs(yard.te.tail - 4) < 0.01 && yard.te.depots.length === 1,
+    'growth: its outer track has a level four-unit tail with a depot branch turned aside');
+  if (line && yard) {
+    const oldDepot = yard.te.depots[0], net = g.world.net;
+    check(g.depots.get(oldDepot)?.level === 'underground', 'growth: the branch ends in a cavern');
+    check(ends.every((e) => e.te.kind === 'tail' || e.te.kind === 'free'), 'growth: both initial termini remain extendable');
+    const allTunnel = (ids: number[]) => ids.every((id) => {
+      const e = net.edges.get(id);
+      return !!e && e.sections.length === 1 && e.sections[0].type === 'tunnel' && e.sections[0].s0 < 0.01 && e.sections[0].s1 >= e.len - 0.01;
+    });
+    check(allTunnel(yard.te.lead), 'growth: the original tail and cavern branch have no portals');
+    // Serve the original district's demand before asking where to build: the growth fix compares
+    // a new district with buying trains on the current route, and that alternative must be satisfied.
+    const cars = (g.vehicles.get(line.vehicles[0]) as Train).cars;
+    for (let i = line.vehicles.length; i < 6; i++) check(g.vehicles.buyTrain(oldDepot, [...cars], line.id) instanceof Train, 'growth: initial district fleet funded');
+    const info = (ai as unknown as { lines: Map<number, { maxVehicles: number }> }).lines.get(line.id)!;
+    info.maxVehicles = 20;
+    const settled = g.tick + 30 * TICKS_PER_DAY;
+    while (g.tick < settled) g.stepTick();
+    const { ux, uz } = yard.te;
+    denseQuarter(g, T.name, yard.st.x + ux * 70, yard.st.z + uz * 70, 40000, 72, Math.atan2(uz, ux) + Math.PI / 4, T);
+    const buildings = [...g.world.buildings.keys()], e0 = net.nextEdge;
+    scheduleNetworkTask(ai, 'extend', 0);
+    const state = saveNetwork(g);
+    for (const [, company] of state.companies) { company.next = company.next.map(([task]) => [task, g.day + 1e9]); company.job = null; company.care = company.care.filter(([key]) => key !== 'grow' + line.id); }
+    loadNetwork(g, state);
+    scheduleNetworkTask(ai, 'extend', 0);
+    const growing = checkpoints('subway extension');
+    g.aiEnabled = true;
+    const extended = () => (ai.stats as unknown as { netExtended?: number }).netExtended ?? 0;
+    const limit = g.day + 300;
+    let reviewed = false;
+    while (!extended() && g.day < limit) {
+      g.stepTick();
+      const job = saveNetwork(g).companies.find(([id]) => id === ai.companyId)?.[1].job;
+      if (job?.task === 'extend') reviewed = true;
+      if (reviewed && !job) break;
+      const cursor = job?.task === 'extend' ? job.items?.[job.cursor]?.grow : undefined;
+      if (cursor) {
+        const key = cursor.made ? `build:${cursor.at}:${cursor.made.stations.length}:${cursor.made.links.length}`
+          : cursor.at <= 2 ? `survey/value:${cursor.at}` : cursor.best ? 'valued winner' : '';
+        if (key) growing.capture(key);
+      }
+    }
+    const after = linearStops(line.stops) ?? [], added = after.filter((id) => !path.includes(id));
+    console.log(`  growth: ${path.length} -> ${after.length} stations; ${ai.log.slice(-3).join(' | ')}`);
+    console.log('  growth decisions: ' + JSON.stringify(Object.fromEntries(Object.entries(networkProfile.decisions).filter(([key]) => key.startsWith('extend.')))));
+    check(extended() === 1 && added.length > 0, 'growth: the daily network task extends the subway through the new district');
+    check(added.every((id) => g.stations.get(id)?.rail?.level === 'underground'), 'growth: every added station stays underground');
+    const running = [...net.edges.values()].filter((e) => e.id >= e0 && e.kind === 'rail' && e.owner === ai.companyId).map((e) => e.id);
+    check(running.length > 0 && allTunnel(running), 'growth: every new link, tail and cavern stays in tunnel without portals');
+    check(buildings.every((id) => g.world.buildings.has(id)), 'growth: buildings over the extension survive');
+    check(!g.depots.get(oldDepot), 'growth: the original cavern moves out of the running line');
+    const last = g.stations.get(after[yard.index === 0 ? 0 : after.length - 1])!, next = g.stations.get(after[yard.index === 0 ? 1 : after.length - 2])!;
+    const terminus = terminusOf(g, last, outerEnd(last, next), ai.companyId);
+    check(terminus?.kind === 'tail' && terminus.depots.every((id) => g.depots.get(id)?.level === 'underground'), 'growth: the new terminus remains extendable beside its relocated cavern');
+    check(growing.copies.some((c) => c.key.startsWith('build:') && !c.key.endsWith(':0')), 'growth: replay checkpoints include built links before the final depot move');
+    const served = new Set<number>(), target = g.tick + 160 * TICKS_PER_DAY;
+    while (g.tick < target) {
+      g.stepTick();
+      for (const id of line.vehicles) { const t = g.vehicles.get(id) as Train; if (t.state === 'loading') served.add(t.atStation); }
+    }
+    check(after.every((id) => served.has(id)), 'growth: trains from the relocated cavern call at every old and new station');
+    check(checkReservations(g).length === 0, 'growth: reservations remain consistent');
+    growing.replay();
+    console.log(`  exact replay: ${urban.copies.length} opening checkpoints and ${growing.copies.length} growth checkpoints`);
   }
 }
 // #1b: independent standalone access repair, saved before and between its bounded work units.
