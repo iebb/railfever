@@ -14,6 +14,7 @@ import type { RoadVehicle } from '../game/roadvehicle';
 import { stationBadges, badgeHtml } from './lineid';
 import { townService } from '../game/towns';
 import { onUiScale } from './uiscale';
+import { stationWalkLimit, stationInCity } from './gameapi';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
 
@@ -111,6 +112,8 @@ export class HoverCard {
           `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}${s.rail ? ' · ' + (railPartMode(s.rail) === 'mainline' ? 'Train station' : railPartMode(s.rail) === 'metro' ? 'Metro station' : 'Light-rail station') : ''}</div>` +
           (badges ? `<div class="hc-badges" aria-label="Station numbers">${badges}</div>` : '') +
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}` +
+          // walking reach along streets (an in-city metro / light-rail station walks half as far)
+          stat('walk', `<b>${Math.round(stationWalkLimit(g, s) * 10)} m</b> walk${stationInCity(s) ? ' · in-city (half)' : ''}`) +
           // mail waiting (stations that handle mail; never tram stops)
           `${stationShowsMail(g, s) ? stat('mail', `<b>${tonnes(s.mail?.total ?? 0)}</b> t mail`) : ''}</div>` +
           `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access: no passengers</span>' : 'Details'}</div>`,

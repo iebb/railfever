@@ -11,7 +11,7 @@ import { openAutoSignal } from './win-signals';
 import { computeLinePath } from './linepaths';
 import { brush as brushVolume } from '../game/terraform';
 import { bezOffset, startTangent, endTangent } from '../game/geom';
-import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, railPartMode, type RailMode, entranceAlong, railWidth, entrancesGo } from '../game/stations';
+import { stationLayout, StationPlan, DEFAULT_PLATFORM_LENGTH, PLATFORM_LENGTH, STATION_HEIGHT, STATION_DEPTH, ENTRANCE_TYPES, relocateStation, ThroughMode, railModeOf, railPartMode, type RailMode, entranceAlong, railWidth, entrancesGo, CITY_STATION } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { fmtMoney } from '../game/economy';
 import { STATION_RADIUS, BUSSTOP_RADIUS, NetKind, TRACK_TYPES, ROAD_TYPES, RAIL, LINE_LEVEL, TRAM, trackTypeOf } from '../game/constants';
@@ -20,7 +20,7 @@ import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
 import { fmtLen, fmtHeight, fmtMult } from './format';
-import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle } from './gameapi';
+import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle, planWalkLimit, stationWalkLimit, CITY_REACH } from './gameapi';
 import { stopWalkingCatchment, walkLimit, walkingCatchment, entrancePlanCatchment } from '../game/catchment';
 import type { FootRect } from '../render/overlay';
 import { STATION_STYLES } from '../game/station-styles';
@@ -823,10 +823,12 @@ export class Tools {
         const lv = pl.level;
         const moving = this.relocating != null ? g.stations.get(this.relocating) : undefined;
         const bonus = catchBonusOf(pl.style);
-        const reach = Math.round(catchWalkLimit('rail', bonus) * 10);
+        // (an in-city metro / light-rail station walks half as far)
+        const reach = Math.round(planWalkLimit(pl) * 10), inCity = Math.round(catchWalkLimit('rail', bonus) * 10) !== reach;
         const tt = TRACK_TYPES[pl.trackType];
         const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
         if (tt) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
+        if (inCity) rows.push(['walk', `In town: ${pl.mode === 'metro' ? 'metro' : 'light-rail'} reach <b>${Math.round(CITY_REACH * 100)}%</b> of other rail stations`]);
         const sty = STATION_STYLES[pl.style];
         if (sty) rows.push(['station', `${esc(sty.name)}${bonus ? ` · <b>+${Math.round(bonus * 100)}%</b> reach` : ''}`]);
         if (lv === 'elevated') rows.push(['bridge', `Elevated · deck <b>${Math.round(pl.height * 10)} m</b> up · ${plural(pl.entrances.length, 'stair tower')}`]);
@@ -1480,8 +1482,8 @@ export class Tools {
     // (the forecast leaves out the buildings its access street demolishes)
     const walk = pl.ok ? entrancePlanCatchment(g, st, pl) : null;
     drawCatchStreets(ov, 'hover', walk);
-    // (every rail station walks alike: the one rail reach with the station building's bonus)
-    const R = catchWalkLimit('rail', catchBonusOf(r.style));
+    // (the station's rail reach with its building's bonus; an in-city metro / light-rail station walks half as far)
+    const R = stationWalkLimit(g, st);
     let fresh = 0, reach = 0;
     if (walk) {
       const covered = walkingCatchment(g, st).buildings;

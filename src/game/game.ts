@@ -963,6 +963,8 @@ export class Game {
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
     this.mail.monthly();
+    // which metro / light-rail stations stand in town now (their walking reach: stations.ts CITY_STATION)
+    this.stations.updateCity();
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();

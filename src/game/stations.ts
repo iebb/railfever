@@ -53,6 +53,36 @@ export type PlatformStyle = 'island' | 'side';
  * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
 export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 23.52, tram: 21.56, bus: 15.68 };
+/**
+ * In-city metro and light-rail stations walk half as far: a station of metro or light-rail style (railPartMode)
+ * standing in a town (Station.city) gets this share of the rail walking limit (and of its building's bonus), at its
+ * forecourts, entrances and the rail access of its stops: a quarter of the area. Walks stay physical: every station
+ * shares buildings and covers them by one curve of the walk (catchment.ts walkWeight / coverOf: full coverage within
+ * FULL_COVER_WALK, 147 m, then tapering), so the half reach (147 m along streets) is wholly fully covered and simply
+ * cuts off the taper beyond; trips per building never depend on a station's type. Main-line-style stations, and
+ * metro or light-rail stops out in the country, keep the full reach.
+ */
+export const CITY_WALK_SCALE = 0.5;
+/**
+ * When a station stands in a town (Stations.cityAt): its town has at least `pop` residents and the station's centre
+ * lies within `core` x the town's compact core radius (Towns.maxRadius); once in town, a station keeps that until its
+ * town falls below `leavePop` or it lies beyond `leaveCore` x the radius. Decided when the station is built and at
+ * every month end, saved with the station: buildings coming and going never make it flicker between the two reaches.
+ */
+export const CITY_STATION = { pop: 3000, core: 1, leavePop: 2600, leaveCore: 1.15 };
+/**
+ * Walking scale of a station's rail part (1, or CITY_WALK_SCALE for an in-city metro / light-rail station). The rail
+ * access points of the station (forecourts, entrances, its stops' way to the platforms) all walk at this scale; its
+ * bus and tram stops keep their own reach.
+ */
+export function railWalkScale(st: { rail: RailPart | null; city?: boolean }): number {
+  // (the part's style decides, railPartMode: never the track type itself)
+  return st.rail && st.city && railPartMode(st.rail) !== 'mainline' ? CITY_WALK_SCALE : 1;
+}
+/** Walking scale of a planned rail station (StationPlan.city: an in-city metro / light-rail station walks half as far). */
+export function planWalkScale(plan: { mode: RailMode; city?: boolean }): number {
+  return plan.city && plan.mode !== 'mainline' ? CITY_WALK_SCALE : 1;
+}
 /** Legacy reach metadata for site scoring; passenger coverage uses catchment.ts. */
 export interface CatchShape { x: number; z: number; r: number; mode: CatchMode; active: boolean }
 /** Default platform length of a new rail station (units; 80 m: a loco and two or three coaches). */
@@ -65,8 +95,16 @@ export function railModeOf(trackType?: string): RailMode {
 }
 /** Default platform length for a station on track of this type. */
 export function defaultPlatformLength(trackType?: string): number { return PLATFORM_LENGTH[railModeOf(trackType)]; }
+/** Station types in messages (railPartMode). */
+const STYLE_WORD: Record<RailMode, string> = { mainline: 'main-line', metro: 'metro', lightrail: 'light-rail' };
 /** Walking range between the platforms / stops of two stations of a transfer complex (merge or link). */
 export const TRANSFER_RANGE = 14;
+/**
+ * Walking range of a link between two stations in one town's core, one of them an in-city metro / light-rail station
+ * (citycatch, Stations.linkRange): near city stations become one interchange, its passage under the street a little
+ * longer than an ordinary transfer walk. They stay two stations of one complex; the walk costs its length.
+ */
+export const CITY_TRANSFER_RANGE = 24;
 /** Days of service history a station keeps (Station.callDays): its service frequency is the share of them with a call (Stations.callShare). */
 export const CALL_DAYS = 30;
 const CALL_MASK = 2 ** CALL_DAYS - 1;
@@ -404,6 +442,11 @@ export interface Station {
   occ?: number; tpd?: number; ppd?: number; onPlat?: number[];
   /** mail: queues, rating and monthly figures (mail.ts), from the station's first mail or mail vehicle on */
   mail?: StationMail;
+  /**
+   * a metro / light-rail style station standing in a town (CITY_STATION; decided when built and at month ends, kept
+   * through rebuilds): it walks CITY_WALK_SCALE as far (railWalkScale). Unset for main-line stations and stops.
+   */
+  city?: boolean;
 }
 
 /** Collision rectangle of a station structure with its vertical extent (y0..y1), what it is and (entrances) which one. */
@@ -524,8 +567,8 @@ export const railPartMode = (r: RailPart): RailMode => r.mode === 'mainline' || 
  * Catchment circles of rail platforms: along the axis (both ends and between), so the area is measured from the
  * platforms; the radius is the rail walking limit (every rail station alike) with the building's bonus.
  */
-export function railCatchShapes(x: number, z: number, angle: number, length: number, active = true, mode: CatchMode = 'rail', bonus = 0): CatchShape[] {
-  const R = CATCHMENT_RADIUS[mode] * (1 + bonus), fx = Math.sin(angle), fz = Math.cos(angle);
+export function railCatchShapes(x: number, z: number, angle: number, length: number, active = true, mode: CatchMode = 'rail', bonus = 0, scale = 1): CatchShape[] {
+  const R = CATCHMENT_RADIUS[mode] * (1 + bonus) * scale, fx = Math.sin(angle), fz = Math.cos(angle);
   const n = length < 2 ? 1 : Math.max(3, Math.ceil(length / (R * 0.5)) + 1);
   const out: CatchShape[] = [];
   for (let i = 0; i < n; i++) {
@@ -594,6 +637,8 @@ export interface StationOpts {
   blockedEnds?: (1 | -1)[];
   /** rebuilding in place: the station's own added entrances, which a new building site avoids where it can */
   avoid?: Rect[];
+  /** below / above the street: how many street entrances to place (2-4; default by platform length) */
+  entrances?: number;
 }
 
 export interface StationPlan {
@@ -632,6 +677,8 @@ export interface StationPlan {
   forecourt: { x: number; z: number } | null;
   /** style 'over': the forecourt on the other side of the tracks */
   forecourt2?: { x: number; z: number } | null;
+  /** a metro / light-rail style station in a town (Station.city once built): it walks half as far (planWalkScale) */
+  city?: boolean;
 }
 
 /** A planned extra entrance (Stations.planEntrance). */
@@ -1006,6 +1053,12 @@ export class Stations {
       level, underground: level === 'underground', depth: 0, height: 0, layout, footprint,
       building: { x, z, angle, w: 0, d: 0 }, entrances: [], piers: [], demolish: [], cost: 0, join: null, links: [], access: null, roadAccess: false, forecourt: null,
     };
+    // a metro / light-rail station in town walks half as far (CITY_STATION; rebuilding or moving a station keeps its
+    // standing until its town no longer holds it, as the month-end decision does)
+    if (rmode !== 'mainline') {
+      const self = opts.ignoreStation !== undefined ? this.map.get(opts.ignoreStation) : undefined;
+      if (this.cityAt(x, z, self ? g.towns.list[self.townId] : g.towns.nearest(x, z), self?.city)) plan.city = true;
+    }
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
     if (!(length >= 3) || !(tracks >= 1 && tracks <= 8)) failp('Invalid station size');
     if (opts.style && !STATION_STYLES[opts.style]) plan.warnings.push(`Unknown style ‘${opts.style}’: using station building`);
@@ -1174,7 +1227,7 @@ export class Stations {
       plan.cost = civil * (3.4 + 0.5 * k);
     }
     if (level !== 'ground') {
-      const want = length >= 20 ? 4 : length >= 13 ? 3 : 2;
+      const want = opts.entrances ?? (length >= 20 ? 4 : length >= 13 ? 3 : 2);
       const sites = this.entranceSites(level, footprint, want, [], ign);
       if (!sites.length) failp('No room for station entrances');
       plan.entrances = sites.map((s) => ({ x: s.x, z: s.z, angle: s.angle, access: s.access }));
@@ -1512,6 +1565,8 @@ export class Stations {
     plan.layout.throughOffsets.forEach((off, i) => through.push(lay(off, 'T' + i, -1)));
     const level = plan.level;
     st.rail = this.partOf(plan, edges.map((e) => e.id), through.map((e) => e.id));
+    // (in town: the plan's standing, which a rebuild or move worked out from the station's own)
+    if (planWalkScale(plan) !== 1) st.city = true; else delete st.city;
     st.x = plan.x; st.z = plan.z;
     if (level === 'ground') {
       this.levelGround(plan);
@@ -2115,6 +2170,8 @@ export class Stations {
     if (!a || !b) return 'No such station';
     if (a === b) return 'The same station';
     if (a.owner !== b.owner) return 'Merge requires the same owner';
+    // (two station types stay two parts of one interchange: railMergeable says so, the merge links them)
+    if (a.rail && b.rail && railPartMode(a.rail) !== railPartMode(b.rail)) return `${STYLE_WORD[railPartMode(a.rail)]} + ${STYLE_WORD[railPartMode(b.rail)]}: link as one interchange`;
     if (a.rail && b.rail) { const r = this.railMergeable(intoId, fromId); return r ? `${r}: link them for transfers instead` : null; }
     const d = this.gap(a, b);
     if (d > TRANSFER_RANGE) return `Too far apart (${Math.round(d * 10)} m, at most ${TRANSFER_RANGE * 10} m)`;
@@ -2134,9 +2191,20 @@ export class Stations {
     if (a === b) return 'The same station';
     if (a.links.includes(b.id)) return 'Already linked';
     if (a.owner !== b.owner && !g.canUse(a.owner, b.owner) && !g.canUse(b.owner, a.owner)) return 'Foreign stations: needs track access';
-    const d = this.gap(a, b);
-    if (d > TRANSFER_RANGE) return `Walking transfer: ${Math.round(d * 10)} m > max ${TRANSFER_RANGE * 10} m`;
+    const d = this.gap(a, b), range = this.linkRange(a, b);
+    if (d > range) return `Walking transfer: ${Math.round(d * 10)} m > max ${range * 10} m`;
     return null;
+  }
+
+  /**
+   * How far apart two stations may be linked for walking transfers: TRANSFER_RANGE, or CITY_TRANSFER_RANGE when both
+   * stand in one town's core and one of them is an in-city metro / light-rail station (Station.city; the other in the
+   * core as cityAt says). Reads only the stations and their town: the same in the UI and the simulation.
+   */
+  linkRange(a: Station, b: Station): number {
+    if (a.townId < 0 || a.townId !== b.townId || !(a.city || b.city)) return TRANSFER_RANGE;
+    const town = this.game.towns.list[a.townId];
+    return [a, b].every((s) => s.city || this.cityAt(s.x, s.z, town)) ? CITY_TRANSFER_RANGE : TRANSFER_RANGE;
   }
 
   private addLink(a: Station, b: Station) {
@@ -2217,6 +2285,8 @@ export class Stations {
       a.rail = b.rail; b.rail = null;
       for (const eid of a.rail.edges) { const e = net.edges.get(eid); if (e) { e.station = a.id; net.markEdge(e); } }
       a.x = a.rail.x; a.z = a.rail.z;
+      // (the rail part keeps its standing in town)
+      if (b.city) a.city = true; else delete a.city;
     }
     a.stops.push(...b.stops);
     b.stops = [];
@@ -2300,6 +2370,9 @@ export class Stations {
     const A = a.rail, B = b.rail;
     if (!A || !B) return 'Not two rail stations';
     if (a.owner !== b.owner) return 'Merge requires the same owner';
+    // (stations of two types, main line / metro / light rail by railPartMode, each keep their own part, style and
+    // walking reach: they merge as one interchange, a transfer complex shown as one station, never as one rail part)
+    if (railPartMode(A) !== railPartMode(B)) return `${STYLE_WORD[railPartMode(A)]} + ${STYLE_WORD[railPartMode(B)]}: separate parts`;
     if ((A.level ?? 'ground') !== (B.level ?? 'ground') || Math.abs(A.y - B.y) > 0.3) return 'Platforms at different levels';
     const tilt = this.tilt(A, B);
     if (Math.abs(tilt) > MERGE_TILT) return `Platforms not parallel · ${Math.round((Math.abs(tilt) * 180) / Math.PI)}° apart`;
@@ -2458,7 +2531,7 @@ export class Stations {
     const r = st.rail;
     if (r) {
       this.refreshAccess();
-      const act = st.roadAccess, R = CATCHMENT_RADIUS.rail * (1 + styleOf(r.style).catchBonus);
+      const act = st.roadAccess, R = CATCHMENT_RADIUS.rail * (1 + styleOf(r.style).catchBonus) * railWalkScale(st);
       if ((r.level ?? 'ground') === 'ground') {
         for (const p of [this.forecourt(st), r.forecourt2]) if (p) out.push({ ...p, r: R, mode: 'rail', active: act });
         for (const e of r.entrances) {
@@ -2474,15 +2547,43 @@ export class Stations {
 
   /** Planned access/reach metadata; see planWalkingCatchment for the walking preview. */
   planCatchShapes(plan: StationPlan): CatchShape[] {
-    const R = CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus);
+    const R = CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale(plan);
     if (plan.level === 'ground') return [plan.forecourt, plan.forecourt2].filter((p): p is { x: number; z: number } => !!p).map((p) => ({ ...p, r: R, mode: 'rail' as const, active: plan.roadAccess }));
     return plan.entrances.map((e) => ({ x: e.x, z: e.z, r: R, mode: 'rail' as const, active: plan.roadAccess && e.access }));
   }
 
-  /** Nominal walking limit of a station, before the grid detour allowance. */
+  /** Nominal walking limit of a station, before the grid detour allowance (an in-city metro / light-rail station: half). */
   catchmentRadius(st: Station) {
-    if (st.rail) return CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail.style).catchBonus);
+    if (st.rail) return CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail.style).catchBonus) * railWalkScale(st);
     return st.stops.some((p) => this.game.world.net.edges.get(p.edge)?.tram) ? CATCHMENT_RADIUS.tram : CATCHMENT_RADIUS.bus;
+  }
+
+  /**
+   * Does a station at (x, z) of `town` stand in town (CITY_STATION)? `was`: its standing so far (a station in town
+   * stays there until its town shrinks below leavePop or lies beyond leaveCore x the core radius). Reads only the
+   * town's population and centre: cheap, and the same in a loaded game.
+   */
+  cityAt(x: number, z: number, town: Town | null | undefined, was?: boolean): boolean {
+    if (!town) return false;
+    const d = Math.hypot(x - town.x, z - town.z), core = this.game.towns.maxRadius(town);
+    return was ? town.pop >= CITY_STATION.leavePop && d <= core * CITY_STATION.leaveCore
+      : town.pop >= CITY_STATION.pop && d <= core * CITY_STATION.core;
+  }
+
+  /**
+   * Month end (game.ts): which metro / light-rail stations stand in town (cityAt, from their standing so far). A
+   * change of standing changes the station's walking reach, so the catchments are shared out again. Main-line
+   * stations and stops have no standing (Station.city unset).
+   */
+  updateCity(): void {
+    let changed = false;
+    for (const st of this.map.values()) {
+      const r = st.rail, was = st.city === true;
+      const city = !!r && railPartMode(r) !== 'mainline' && this.cityAt(r.x, r.z, this.game.towns.list[st.townId], was);
+      if (city) st.city = true; else if (st.city !== undefined) delete st.city;
+      if (city !== was) changed = true;
+    }
+    if (changed) this.walkVersion++;
   }
 
   /** Legacy circular AI site estimate (routing.ts migrates separately); never used for passenger coverage. */

@@ -8,6 +8,7 @@ import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
+import { CITY_STATION, CITY_WALK_SCALE } from '../game/stations';
 import { RAIL_FARE } from '../game/constants';
 import { FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../game/fares';
 
@@ -229,13 +230,13 @@ export function openHelp(ui: UI) {
       <li>Base reach: rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} · tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} · bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}.</li>
       <li>Street-grid allowance: +${Math.round((WALK_DETOUR - 1) * 100)}%.</li>
       <li>Street limits: rail ${fmtLen(walkLimit('rail'))} · tram ${fmtLen(walkLimit('tram'))} · bus ${fmtLen(walkLimit('bus'))}.</li>
-      <li>Main-line / metro / light rail: equal reach; buildings can extend it.</li>
+      <li>Main-line / metro / light rail: equal reach; in-city metro / light rail (town ${CITY_STATION.pop.toLocaleString('en-US')}+ core): half, ${fmtLen(walkLimit('rail') * CITY_WALK_SCALE / WALK_DETOUR)}; buildings extend reach.</li>
     </ul>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
       <li><b>Urban</b> (<kbd>U</kbd>): double track with wire; metro / light-rail station styles; ground / elevated / underground.</li>
       <li>Urban stations: close spacing, optional street entrances.</li>
-      <li>Any train / rail line: urban + main-line through running; equal fares and reach.</li>
+      <li>Any train / rail line: urban + main-line through running; equal fares.</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, Rail → Connect): two points → curve, turnouts, signals, cost.</li>
       <li>Click: build; <kbd>Esc</kbd> / right-click: restart; turnouts outside platforms / depots.</li>
       <li>Urban → <b>Re-level</b>: Lift / Sink / Ground; height / depth; click / drag your track.</li>

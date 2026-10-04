@@ -645,7 +645,7 @@ export class Hud {
       }
       const onLine = T.stationOnLine && T.relocating == null;
       if (t === 'metro-station') {
-        const styles: [string, string, string?][] = [['metro', 'Metro', 'Screen doors · side platforms · underground default'], ['lightrail', 'Light rail', 'Short side platforms · shelter · ground default']];
+        const styles: [string, string, string?][] = [['metro', 'Metro', 'Screen doors · side platforms · underground default · half reach in town cores'], ['lightrail', 'Light rail', 'Short side platforms · shelter · ground default · half reach in town cores']];
         opts.push(opt('Station style', seg(styles, T.stationType, (v) => { this.setStationType(v); redo(); })));
       }
       opts.push(opt('Level', seg<StationLevel>([['ground', onLine ? 'As the line' : 'Ground', onLine ? 'Matches the line’s level' : undefined], ['elevated', 'Elevated', 'Viaduct · little land use · extra cost'], ['underground', 'Underground', 'Surface entrances only · extra cost']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
