@@ -401,6 +401,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
+    ...(g.stations.emptyCatchmentCold ? { catchmentEmptyCold: true } : {}),
     depots: [...g.depots.map.values()], depotsNextId: g.depots.nextId,
     lines: [...g.lines.map.values()], linesNextId: g.lines.nextId,
     // ops: line ids merged into others as service patterns; this month's track wear; save format of the ops data
@@ -640,7 +641,10 @@ export function deserialize(d: any): Game {
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion;
   S.accessVersion = net.version;
-  g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty);
+  // A brand-new empty network has not run its first share-out. Historical horizon zero can also
+  // be warm, so preserve the explicit cold hint instead of conflating the two states.
+  if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
+    g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty);
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {

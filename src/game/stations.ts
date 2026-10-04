@@ -615,6 +615,8 @@ function rectGap(a: Rect, b: Rect): number {
 const angleOf = (fx: number, fz: number) => Math.atan2(fx, fz);
 
 export interface StationOpts {
+  /** AI survey only: memoize native straight entrance searches and return early after a site fails. */
+  aiSurvey?: boolean;
   /** Internal existing-track adapter: retain the real formation instead of laying a free station. */
   alignment?: RailStationAlignment;
   layout?: StationLayout;
@@ -761,6 +763,18 @@ export interface UpgradePlan {
   /** a ground station rebuilt in place: what becomes of its added entrances (new access streets are in `cost`) */
   entrances?: EntranceRefit;
 }
+
+
+type PlannedEntrance = Entrance & { access: boolean; demolish: number[] };
+interface EntranceRoadSample { x: number; z: number; angle: number; dem?: number[] | null }
+interface EntranceMemo {
+  world: Game['world']; net: Game['world']['net']; stations: Stations['map']; depots: Game['depots']['map']; epoch: string;
+  memo: Map<string, number[] | null>; roads: Map<string, EntranceRoadSample[]>; roadCount: number;
+  sites: Map<string, PlannedEntrance[]>; siteHits: number; siteMisses: number; hits: number; misses: number;
+}
+// Instance-keyed derived data: preview/refit Object.create instances cannot inherit a live cache.
+const entranceRevisions = new WeakMap<Stations, number>();
+const entranceMemos = new WeakMap<Stations, EntranceMemo>();
 
 export class Stations {
   map = new Map<number, Station>();
@@ -929,6 +943,7 @@ export class Stations {
 
   /** Mark the object chunks of a station's structures (platforms, building, entrances, piers) for re-rendering. */
   private markStation(st: Station) {
+    entranceRevisions.set(this, (entranceRevisions.get(this) ?? 0) + 1);
     const w = this.game.world;
     w.markObjArea(st.x - 20, st.z - 20, st.x + 20, st.z + 20);
     const r = st.rail;
@@ -1259,6 +1274,7 @@ export class Stations {
       // the building beside the platforms (either side, centred or towards an end) where its forecourt is
       // closest to a road on its own side of the tracks (or beyond the platform ends' lead corridors), with
       // nothing in the way but a few houses
+      if (opts.aiSurvey && !plan.ok) return plan;
       placeBuilding(plan.y, sty.placement);
       plan.cost = base + BUILDING_BASE * (sty.cost - 1) + (mx - mn) * length * layout.width * 600;
     } else if (level === 'underground') {
@@ -1303,9 +1319,10 @@ export class Stations {
       plan.cost = civil * (3.4 + 0.5 * k);
     }
     plan.cost += doors;
+    if (opts.aiSurvey && !plan.ok && !plan.error?.startsWith('No room')) return plan;
     if (level !== 'ground') {
       const want = opts.entrances ?? (length >= 20 ? 4 : length >= 13 ? 3 : 2);
-      const sites = opts.alignment ? this.curvedEntranceSites(level, shape, layout.width, want, ign) : this.entranceSites(level, footprint, want, [], ign);
+      const sites = opts.alignment ? this.curvedEntranceSites(level, shape, layout.width, want, ign) : this.entranceSites(level, footprint, want, [], ign, undefined, opts.aiSurvey);
       if (!sites.length) failp('No room for station entrances');
       plan.entrances = sites.map((s) => ({ x: s.x, z: s.z, angle: s.angle, access: s.access }));
       for (const s of sites) for (const id of s.demolish) demolish.add(id);
@@ -1559,8 +1576,15 @@ export class Stations {
    * Entrance sites for an underground / elevated station: beside roads (on the sidewalk, facing the street)
    * near the platform ends, else on free land beside the platform ends (without road access).
    */
-  private entranceSites(level: 'underground' | 'elevated', fp: Rect, want: number, taken: Entrance[], ignore?: number, reach?: number): (Entrance & { access: boolean; demolish: number[] })[] {
+  private entranceSites(level: 'underground' | 'elevated', fp: Rect, want: number, taken: Entrance[], ignore?: number, reach?: number, memo = false): (Entrance & { access: boolean; demolish: number[] })[] {
     const w = this.game.world, net = w.net;
+    const memoContext = memo ? this.entranceMemoContext() : undefined;
+    const siteKey = memoContext && !taken.length ? [level, fp.x, fp.z, fp.angle, fp.w, fp.d, want, ignore ?? '', reach ?? ''].join(':') : undefined;
+    if (siteKey && memoContext!.sites.has(siteKey)) {
+      memoContext!.siteHits++;
+      return memoContext!.sites.get(siteKey)!.map(e => ({ ...e, demolish: [...e.demolish] }));
+    }
+    if (siteKey) memoContext!.siteMisses++;
     const sz = ENTRANCE_SIZE[level];
     const maxD = reach ?? (level === 'elevated' ? 6 : 12);
     const fx = Math.sin(fp.angle), fz = Math.cos(fp.angle), rx = fz, rz = -fx;
@@ -1568,22 +1592,38 @@ export class Stations {
     type Cand = Entrance & { access: boolean; demolish: number[]; gap: number };
     const cands: Cand[] = [];
     const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
-    for (const e of net.edgesNear(fp.x - R, fp.z - R, fp.x + R, fp.z + R)) {
-      if (e.kind !== 'road' || e.depot >= 0) continue;
-      const hw = net.halfWidth(e), ra = net.junctionRadius(e.a) + 0.5, rb = net.junctionRadius(e.b) + 0.5;
-      for (let s = ra; s <= e.len - rb; s += 0.8) {
-        if (net.sectionAt(e, s) !== 'ground') continue;
-        net.pointAt(e, s, p, d);
-        const l = Math.hypot(d.x, d.z) || 1, nx = -d.z / l, nz = d.x / l;
-        for (const side of [1, -1]) {
-          const off = hw + sz.d / 2 + 0.06;
-          const cx = p.x + nx * off * side, cz = p.z + nz * off * side;
-          const gap = distToRect(cx, cz, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) - sz.d / 2;
+    if (memoContext) {
+      for (const e of net.edgesNear(fp.x - R, fp.z - R, fp.x + R, fp.z + R)) {
+        if (e.kind !== 'road' || e.depot >= 0) continue;
+        for (const c of this.entranceRoadSamples(level, e, memoContext, ignore)) {
+          const gap = distToRect(c.x, c.z, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) - sz.d / 2;
           if (gap > maxD) continue;
-          const ang = angleOf(-nx * side, -nz * side);
-          const dem = this.entranceFree(level, cx, cz, ang, fp, e.id, ignore);
-          if (!dem) continue;
-          cands.push({ x: cx, z: cz, angle: ang, access: true, demolish: dem, gap });
+          // Deck overlap depends on this station, unlike the environment around the roadside landing.
+          if (level === 'elevated' && rectsOverlap({ x: c.x, z: c.z, angle: c.angle, ...sz }, fp, 0.05)) continue;
+          if (c.dem === undefined) { memoContext.misses++; c.dem = this.entranceFree(level, c.x, c.z, c.angle, fp, e.id, ignore); }
+          else memoContext.hits++;
+          if (c.dem === null) continue;
+          cands.push({ x: c.x, z: c.z, angle: c.angle, access: true, demolish: [...c.dem], gap });
+        }
+      }
+    } else {
+      for (const e of net.edgesNear(fp.x - R, fp.z - R, fp.x + R, fp.z + R)) {
+        if (e.kind !== 'road' || e.depot >= 0) continue;
+        const hw = net.halfWidth(e), ra = net.junctionRadius(e.a) + 0.5, rb = net.junctionRadius(e.b) + 0.5;
+        for (let s = ra; s <= e.len - rb; s += 0.8) {
+          if (net.sectionAt(e, s) !== 'ground') continue;
+          net.pointAt(e, s, p, d);
+          const l = Math.hypot(d.x, d.z) || 1, nx = -d.z / l, nz = d.x / l;
+          for (const side of [1, -1]) {
+            const off = hw + sz.d / 2 + 0.06;
+            const cx = p.x + nx * off * side, cz = p.z + nz * off * side;
+            const gap = distToRect(cx, cz, fp.x, fp.z, fp.angle, fp.w / 2, fp.d / 2) - sz.d / 2;
+            if (gap > maxD) continue;
+            const ang = angleOf(-nx * side, -nz * side);
+            const dem = this.entranceFree(level, cx, cz, ang, fp, e.id, ignore);
+            if (!dem) continue;
+            cands.push({ x: cx, z: cz, angle: ang, access: true, demolish: dem, gap });
+          }
         }
       }
     }
@@ -1609,9 +1649,13 @@ export class Stations {
         const off = fp.w / 2 + sz.d / 2 + 0.5;
         const cx = t.x + rx * off * side, cz = t.z + rz * off * side;
         const ang = angleOf(rx * side, rz * side);
-        const dem = this.entranceFree(level, cx, cz, ang, fp, -1, ignore);
+        const dem = (memo ? this.memoEntranceFree(level, cx, cz, ang, fp, -1, ignore, memoContext) : this.entranceFree(level, cx, cz, ang, fp, -1, ignore));
         if (dem && !dem.length && farFrom({ x: cx, z: cz, angle: ang })) chosen.push({ x: cx, z: cz, angle: ang, access: false, demolish: [] });
       }
+    }
+    if (siteKey) {
+      if (memoContext!.sites.size >= 512) memoContext!.sites.clear();
+      memoContext!.sites.set(siteKey, chosen.map(e => ({ ...e, demolish: [...e.demolish] })));
     }
     return chosen;
   }
@@ -1628,6 +1672,60 @@ export class Stations {
       }
     }
     return out;
+  }
+
+  private entranceMemoContext(): EntranceMemo {
+    const g = this.game, w = g.world;
+    const epoch = [w.net.version, w.heightsVersion, w.lotVersions.version, this.walkVersion, this.map.size,
+      g.networkVersion, g.depots.map.size, entranceRevisions.get(this) ?? 0].join(':');
+    let state = entranceMemos.get(this);
+    if (!state || state.world !== w || state.net !== w.net || state.stations !== this.map || state.depots !== g.depots.map || state.epoch !== epoch) {
+      state = { world: w, net: w.net, stations: this.map, depots: g.depots.map, epoch, memo: new Map(), roads: new Map(), roadCount: 0,
+        sites: new Map(), siteHits: state?.siteHits ?? 0, siteMisses: state?.siteMisses ?? 0, hits: state?.hits ?? 0, misses: state?.misses ?? 0 };
+      entranceMemos.set(this, state);
+    }
+    return state;
+  }
+
+  /** Same native road sampling order as entranceSites; eligibility remains specific to each footprint. */
+  private entranceRoadSamples(level: 'underground' | 'elevated', e: NEdge, memo: EntranceMemo, ignore?: number): EntranceRoadSample[] {
+    const key = [level, e.id, ignore ?? ''].join(':');
+    const found = memo.roads.get(key);
+    if (found) return found;
+    const net = this.game.world.net, sz = ENTRANCE_SIZE[level], samples: EntranceRoadSample[] = [];
+    const hw = net.halfWidth(e), ra = net.junctionRadius(e.a) + 0.5, rb = net.junctionRadius(e.b) + 0.5;
+    const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+    for (let s = ra; s <= e.len - rb; s += 0.8) {
+      if (net.sectionAt(e, s) !== 'ground') continue;
+      net.pointAt(e, s, p, d);
+      const l = Math.hypot(d.x, d.z) || 1, nx = -d.z / l, nz = d.x / l;
+      for (const side of [1, -1]) {
+        const off = hw + sz.d / 2 + 0.06;
+        samples.push({ x: p.x + nx * off * side, z: p.z + nz * off * side, angle: angleOf(-nx * side, -nz * side) });
+      }
+    }
+    if (memo.roadCount + samples.length > 32768) { memo.roads.clear(); memo.roadCount = 0; }
+    if (samples.length <= 32768) { memo.roads.set(key, samples); memo.roadCount += samples.length; }
+    return samples;
+  }
+
+  private memoEntranceFree(level: 'underground' | 'elevated', x: number, z: number, angle: number, fp: Rect, road: number,
+    ignore?: number, context?: EntranceMemo): number[] | null {
+    if (level === 'elevated' && rectsOverlap({ x, z, angle, ...ENTRANCE_SIZE[level] }, fp, 0.05)) return null;
+    const state = context ?? this.entranceMemoContext(), key = [level, x, z, angle, road, ignore ?? ''].join(':');
+    if (state.memo.has(key)) { state.hits++; const result = state.memo.get(key)!; return result === null ? null : [...result]; }
+    state.misses++;
+    const result = this.entranceFree(level, x, z, angle, fp, road, ignore);
+    if (state.memo.size >= 8192) state.memo.clear();
+    state.memo.set(key, result === null ? null : [...result]);
+    return result;
+  }
+
+  /** Read-only diagnostics for the bounded derived cache. Does not prime a default/UI query. */
+  private entranceMemoStats() {
+    const m = entranceMemos.get(this);
+    return m ? { hits: m.hits, misses: m.misses, size: m.memo.size, siteHits: m.siteHits, siteMisses: m.siteMisses,
+      siteSize: m.sites.size, roadCount: m.roadCount, roadSize: m.roads.size, revision: entranceRevisions.get(this) ?? 0 } : null;
   }
 
   /** Can an entrance stand at (x, z)? Returns the buildings it replaces (small houses only) or null. */
@@ -2111,6 +2209,7 @@ export class Stations {
       g.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
     }
     this.repairSite(st);
+    entranceRevisions.set(this, (entranceRevisions.get(this) ?? 0) + 1);
     this.accessVersion = -1;
     g.lines.catchmentDirty = true;
     return null;
@@ -2142,6 +2241,7 @@ export class Stations {
     if (lv !== 'ground' && index === 0 && r.entrances[0] && (styleOf(r.style).placement === 'none' || !r.forecourt)) { const sz = ENTRANCE_SIZE[lv]; r.building = { x: r.entrances[0].x, z: r.entrances[0].z, angle: r.entrances[0].angle, w: sz.w, d: sz.d }; }
     if (typeof r.cost === 'number' && e.cost) r.cost = Math.max(0, r.cost - e.cost);
     for (const p of entranceLandings(e)) this.game.world.markObjArea(p.x - 3, p.z - 3, p.x + 3, p.z + 3);
+    entranceRevisions.set(this, (entranceRevisions.get(this) ?? 0) + 1);
     this.accessVersion = -1;
     this.game.lines.catchmentDirty = true;
     return null;
@@ -2779,6 +2879,9 @@ export class Stations {
   catchVersion = 0;
   /** Buildings up to this id took part in the last share-out (saved: after loading the shares come out the same). */
   catchMaxB = 0;
+
+  /** An untouched empty network has not performed its first catchment share-out. */
+  get emptyCatchmentCold() { return !this.sharesReady && this.map.size === 0 && this.catchMaxB === 0; }
 
   /**
    * Split each reachable building among stations, preferring served stations when any is served. Weight is

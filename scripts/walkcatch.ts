@@ -79,6 +79,23 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
 }
 
 {
+  console.log('new-game empty catchments and historical zero horizons');
+  for (const rivals of [0, 1]) for (const initialized of [false, true]) {
+    const g = Game.create({ size: 384, seed: 7, towns: 8, startYear: 1950, aiCompanies: rivals });
+    if (initialized) g.stations.restoreCatchmentShares(0);
+    const saved = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(saved));
+    const label = `${rivals} rivals, ${initialized ? 'initialized zero' : 'untouched empty'} catchment`;
+    check(g.stations.emptyCatchmentCold === !initialized, label + ': cold status is explicit');
+    let exact = JSON.stringify(serialize(loaded)) === saved;
+    for (let tick = 0; tick < 640 && exact; tick++) {
+      g.stepTick(); loaded.stepTick();
+      exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
+    }
+    check(exact, label + ': immediate save and every one of 640 native ticks remain exact');
+  }
+}
+
+{
   console.log('strict distance shares, regional caches and exact save round trips');
   const g = flatGame(192), main = road(g, node(g, 20, 60), node(g, 160, 60));
   const A = bus(g, 52, 60), B = bus(g, 72, 60), b = house(g, 60, 58);

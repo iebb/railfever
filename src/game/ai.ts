@@ -3964,15 +3964,18 @@ export class AIController {
       if (cursor.site < layout.targets.length) {
         const t = layout.targets[cursor.site], x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
         if (cursor.offset < 5) {
-          const d = [0, 1.5, -1.5, 3, -3][cursor.offset++], px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
-          const through = (layout.towns?.length ?? 0) > 1;
-          const native = through ? this.urbanSitePlan(T, layout, mode, length, layout.angle, 0, t + d, level,
-            cursor.sites[cursor.sites.length - 1] as StationPlan | undefined) : null;
-          const plan = through ? (native && typeof native !== 'string' ? native : null)
-            : g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
-              { trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
-                ...(level !== 'ground' && g.stations.cityAt(px, pz, g.towns.nearest(px, pz)) ? { entrances: CITY_ENTRANCES } : {}) });
-          if (plan?.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; }
+          // At most five fixed native attempts; the saved offset still resumes the next one.
+          for (let attempt = 0; attempt < 5 && cursor.offset < 5; attempt++) {
+            const d = [0, 1.5, -1.5, 3, -3][cursor.offset++], px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
+            const through = (layout.towns?.length ?? 0) > 1;
+            const native = through ? this.urbanSitePlan(T, layout, mode, length, layout.angle, 0, t + d, level,
+              cursor.sites[cursor.sites.length - 1] as StationPlan | undefined) : null;
+            const plan = through ? (native && typeof native !== 'string' ? native : null)
+              : g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
+                { aiSurvey: true, trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
+                  ...(level !== 'ground' && g.stations.cityAt(px, pz, g.towns.nearest(px, pz)) ? { entrances: CITY_ENTRANCES } : {}) });
+            if (plan?.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; break; }
+          }
         } else if ((layout.towns?.length ?? 0) > 1) {
           // A constrained centre corridor cannot borrow demand from an unbuildable virtual stop.
           // Skip this trial in one saved work unit; local alignments retain their broader site search.
@@ -4024,7 +4027,7 @@ export class AIController {
     } else opt = { trackType: 'electric', mode, level: lv };
     // (an in-city stop below or above the street walks half as far: entrances at both ends and both sides)
     if (lv !== 'ground' && g.stations.cityAt(x, z, g.towns.nearest(x, z))) opt = { ...opt, entrances: CITY_ENTRANCES };
-    const pl = g.stations.planRail(x, z, ang, PL, 2, me, opt);
+    const pl = g.stations.planRail(x, z, ang, PL, 2, me, { ...opt, aiSurvey: true });
     if (!pl.ok) return pl.error ?? 'invalid platform';
     if (pl.join?.rail) return 'existing rail platforms';
     if (prev && Math.abs(pl.y - prev.y) > reach + 0.05) return 'platform grade';
