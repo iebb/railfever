@@ -455,5 +455,27 @@ check(g.world.buildings.size > bld0, 'new buildings appeared');
   while (g.day < d0 + 30) g.update(0.25);
   console.log(`perf: ${fmt((performance.now() - t) / 30, 2)} ms per game day with ${g.vehicles.map.size} company vehicles + ${g.vehicles.ambient.length} town cars (see scripts/perf.ts for the 512-map stress test)`);
 }
+
+// The general railway fixture excludes tiny towns. Keep seed 11's tiny-village railway as its own passenger
+// control, without extending the two-year observation or substituting larger towns.
+if (seed === 11) {
+  const h = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
+  h.aiEnabled = false; h.economy.money = 80_000_000;
+  const larger = new Set(h.towns.list.filter((t) => t.pop >= 500).map((t) => t.id));
+  const tiny = placeAndConnect(h, 60, 150, 0, larger, 1, () => {}) ?? placeAndConnect(h, 150, 240, 0, larger, 1, () => {});
+  check(!!tiny, 'seed 11: a railway between two tiny villages connects');
+  if (tiny) {
+    const populations = [tiny.TA.pop, tiny.TB.pop];
+    const dep = depotBehind(h, tiny.A, tiny.B, 0), line = h.lines.create('rail');
+    line.stops = [tiny.A.id, tiny.B.id];
+    const v = h.vehicles.buyTrain(dep, [loco, coach, coach], line.id);
+    check(v instanceof Train, 'seed 11: the tiny-village train is bought');
+    if (v instanceof Train) {
+      while (h.day < 720) h.stepTick();
+      console.log(`tiny-village rail: ${tiny.TA.name} (${populations[0]}) - ${tiny.TB.name} (${populations[1]}), catch ${fmt(tiny.A.catchPop, 1)} / ${fmt(tiny.B.catchPop, 1)}, delivered ${v.delivered} in two years`);
+      check(populations.every((pop) => pop < 500) && v.delivered > 0, `seed 11: the tiny-village railway carries passengers in two years (${v.delivered})`);
+    }
+  }
+}
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

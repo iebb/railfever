@@ -6,7 +6,7 @@ import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { networkPlanner, runNetworkTask } from '../src/game/ai-network';
-import { distanceFare, speedFactor, fareFor, simNow, NO_TRANSFER_BONUS } from '../src/game/fares';
+import { distanceFare, speedFactor, fareFor, simNow, transferFareFactor, FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../src/game/fares';
 import { RAIL_FARE } from '../src/game/constants';
 import { fareFixture, fareTrain } from './fares';
 import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busStopSites, addBusStop, roadDepotNear, checkReservations, checkNaN, Train } from './lib';
@@ -16,7 +16,9 @@ import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busS
   console.log('converged cargo fare histories and group identity after a line edit');
   const { g, ids, stations } = fareFixture(), { t, l } = fareTrain(g, [ids[0], ids[2], ids[3], ids[1]]);
   const now = simNow(g);
-  const histories = [200, 300, 300];
+  // (below the minimum, as offsets from it: the minimum rose to 550 with the 2.7 recalibration, and earlier fares of
+  // 200 and 300 left nothing to pay on this leg)
+  const histories = [RAIL_FARE.minimum - 300, RAIL_FARE.minimum - 200, RAIL_FARE.minimum - 200];
   histories.forEach((rail, i) => t.cargo.set('converged' + i,
     { from: ids[0], alight: i === 0 ? ids[2] : ids[3], dest: ids[1], count: 1, day: g.day - i, t0: now - 40 - i * 10, transfers: 1, rail }));
   t.load = 3; l.stops = [ids[0], ids[1]]; t.stopIndex = 1; t.fixCargo(); g.lines.rebuild();
@@ -27,7 +29,8 @@ import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busS
   t.serveStation(stations[1], 0); lt.serveStation(loaded.stations.get(ids[1])!, 0);
   const live = t.incomeYear - before, restored = lt.incomeYear - restoredBefore;
   console.log(`  receipts: live ${live}, loaded ${restored}`);
-  const expected = histories.reduce((sum, railBefore, i) => sum + fareFor(12, 40 + i * 10, 1, { mode: 'rail', railBefore }), 0);
+  // (each changed vehicles once before: x0.9)
+  const expected = histories.reduce((sum, railBefore, i) => sum + fareFor(12, 40 + i * 10, 1, { mode: 'rail', railBefore }) * TRANSFER_FARE_FACTOR, 0);
   check(expected > 0 && Math.abs(live - expected) < 1e-8 && live === restored, 'loading preserves receipts when cargo drop-offs converge');
   check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), 'converged cargo settles identically after loading');
 }
@@ -47,24 +50,25 @@ import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busS
   check(w.count === 4 && w.transfers === 2 && w.rail === RAIL_FARE.minimum && w.t === now - 80, 'legacy merged waiting history and flags load sensibly');
   const saved = JSON.stringify(serialize(loaded)), again = deserialize(JSON.parse(saved));
   check(JSON.stringify(serialize(again)) === saved, 'legacy fare cohorts settle into an exact native round trip');
-  // Check both migrated cohorts' receipts, including the bonus for their non-transferring passengers.
+  // Check both migrated cohorts' receipts: their passengers who changed (legacy flags count one change each) and those
+  // who did not pay the group's mean transfer reduction (x0.9^0.5 here, within 0.2% of 0.95 for the exact split).
   const settled = deserialize(JSON.parse(saved)), train = settled.vehicles.get(t.id) as Train;
   const before = train.incomeYear;
   train.serveStation(settled.stations.get(ids[1])!, 0);
-  const expectedCargo = distanceFare(12) * speedFactor(12, 40) * 2 * (1 + NO_TRANSFER_BONUS / 2);
+  const expectedCargo = FARE_LEVEL * distanceFare(12) * speedFactor(12, 40) * 2 * transferFareFactor(1, 2);
   check(Math.abs(train.incomeYear - before - expectedCargo) < 1e-8
-    && Math.abs(expectedCargo - fareFor(12, 40, 2, { mode: 'rail', railBefore: 600 }) * (1 + NO_TRANSFER_BONUS / 2)) < 1e-8,
-    'legacy cargo cap preserves full distance receipts and no-transfer bonuses');
+    && Math.abs(expectedCargo - fareFor(12, 40, 2, { mode: 'rail', railBefore: 600 }) * transferFareFactor(1, 2)) < 1e-8,
+    'legacy cargo cap preserves full distance receipts with the mean transfer reduction');
   train.stopIndex = 0; train.serveStation(settled.stations.get(ids[0])!, 0);
   const boarded = [...train.cargo.values()];
   check(train.load === 4 && boarded.length === 1 && boarded[0].rail === RAIL_FARE.minimum && boarded[0].transfers === 2 && boarded[0].t0 === now - 80,
     'legacy capped waiting boards with its count, timing and transfer flags');
   const boardingIncome = train.incomeYear;
   train.serveStation(settled.stations.get(ids[1])!, 0);
-  const expectedWaiting = distanceFare(12) * speedFactor(12, 80) * 4 * (1 + NO_TRANSFER_BONUS / 2);
+  const expectedWaiting = FARE_LEVEL * distanceFare(12) * speedFactor(12, 80) * 4 * transferFareFactor(2, 4);
   check(Math.abs(train.incomeYear - boardingIncome - expectedWaiting) < 1e-8
-    && Math.abs(expectedWaiting - fareFor(12, 80, 4, { mode: 'rail', railBefore: 600 }) * (1 + NO_TRANSFER_BONUS / 2)) < 1e-8,
-    'legacy waiting cap preserves full distance receipts and no-transfer bonuses');
+    && Math.abs(expectedWaiting - fareFor(12, 80, 4, { mode: 'rail', railBefore: 600 }) * transferFareFactor(2, 4)) < 1e-8,
+    'legacy waiting cap preserves full distance receipts with the mean transfer reduction');
   for (let i = 0; i < 40; i++) { loaded.stepTick(); again.stepTick(); }
   check(JSON.stringify(serialize(again)) === JSON.stringify(serialize(loaded)), 'legacy fare cohorts replay exactly after migration');
 }

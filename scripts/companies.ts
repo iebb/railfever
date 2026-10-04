@@ -131,6 +131,50 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   }
 }
 
+{
+  // riders giving up waiting on a profitable bus or tram line at its fleet limit: the limit rises and a vehicle is added
+  type Info = { kind: string; maxVehicles: number; lastSold?: number };
+  const pick = AIS.flatMap((ai) => g.company(ai.companyId).defunct ? [] : ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! })))
+    .find(({ ai, l, info }) => l && info && l.kind !== 'rail' && l.owner === ai.companyId && l.vehicles.length > 0 && new Set(l.stops).size >= 2
+      // (a line whose stops all belong to others now takes no more vehicles of ours: lines.ts operateError)
+      && g.lines.operateError(l, ai.companyId) === null);
+  if (!pick) console.log('  (no AI bus or tram line to crowd)');
+  else {
+    const { ai, l, info } = pick;
+    // (a project of its own holds money back: let it finish, then none meanwhile)
+    for (let d = g.day + 720; ai.busy && g.day < d;) g.update(0.25);
+    ai.state.cooldown = Math.max(ai.state.cooldown, 400);
+    const n0 = l.vehicles.length, v0 = g.vehicles.get(l.vehicles[0])!;
+    const grow = Math.sqrt(ai.config.activeness);
+    // at its limit and paying well
+    info.maxVehicles = Math.max(1, Math.floor(n0 / grow)); info.lastSold = -1e9;
+    const m0 = info.maxVehicles;
+    g.company(l.owner).economy.money += 50_000_000;
+    // (at the decision instant: queues are trimmed before monthly management; last month's riders who gave up)
+    const crowd = () => {
+      l.incomeLast = l.costLast * 2 + 1_000_000;
+      for (const sid of new Set(l.stops)) {
+        const st = g.stations.get(sid)!, other = l.stops.find((x) => x !== sid)!;
+        g.stations.addWaiting(st, l.id, other, other, 20);
+        st.lostLast = 4 * v0.capacity;
+      }
+    };
+    const manage = ai.monthly.bind(ai);
+    ai.monthly = () => { crowd(); manage(); };
+    const d0 = g.day;
+    while (g.day < d0 + 100 && l.vehicles.length <= n0 && !g.company(l.owner).defunct) g.update(0.25);
+    console.log(`  riders giving up on ${l.name} (${new Set(l.stops).size} stops, activeness ${ai.config.activeness}): limit ${m0} -> ${info.maxVehicles}, vehicles ${n0} -> ${l.vehicles.length}; ${ai.log.slice(-2).join(' | ')}`);
+    check(info.maxVehicles > m0 && l.vehicles.length > n0, 'riders giving up on a profitable bus or tram line at its limit raise the limit and add a vehicle');
+    // at the limit its stops set (a bus line: two vehicles a stop; trams: two more than its stops) the limit stays put
+    const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length, model = (g.vehicles.get(l.vehicles[0]) as RoadVehicle).model!;
+    for (let k = 0; k < 12 && l.vehicles.length < hard; k++) g.vehicles.buyRoad(info.depot, model, l.id);
+    info.maxVehicles = Math.max(info.maxVehicles, Math.ceil(hard / grow) + 1);
+    const m1 = info.maxVehicles, n1 = l.vehicles.length;
+    for (const d1 = g.day; g.day < d1 + 70 && !g.company(l.owner).defunct;) g.update(0.25);
+    ai.monthly = manage;
+    check(n1 === hard && info.maxVehicles === m1 && l.vehicles.length <= hard, `a crowded line at the limit its stops set raises nothing more (${n1} of ${hard} vehicles, limit ${m1} -> ${info.maxVehicles})`);
+  }
+}
 
 // extending an AI railway from one of its stations (a hub) to another town
 {

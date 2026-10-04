@@ -13,7 +13,7 @@ import { outAndBack, linearStops } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
-import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime, NO_TRANSFER_BONUS } from '../src/game/fares';
+import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime } from '../src/game/fares';
 import { localTripMultiplier } from '../src/game/demand';
 import { URBAN_PAYBACK } from '../src/game/constants';
 import { patternHeadways } from '../src/game/patterns';
@@ -168,7 +168,7 @@ if (!arg('maps')) {
     const g = flat(1), ai = g.ais[0] as AIController & Record<string, any>;
     for (const [models, track, dist, len, mode] of [[[M('emu_b')], 'electric', 24, 28, 'rail'], [[M('bus_c')], 'street', 18, 20, 'bus']] as const) {
       const sv = ai.serviceYearCalc([...models], 2, dist, len, track, 0.7);
-      const receipt = fareFor(dist, estimateLegTime(dist, sv.kmh, sv.headway, len / dist), 1, { mode }) * (1 + NO_TRANSFER_BONUS);
+      const receipt = fareFor(dist, estimateLegTime(dist, sv.kmh, sv.headway, len / dist), 1, { mode });
       const estimate = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, false, { mode });
       const generic = estimateLegFare(dist, sv.kmh, sv.headway, 1, len / dist, true, true, { mode });
       console.log(`  ${mode}: ${dist} u, estimate ${fmt(sv.perPax, 0)} per trip (receipt ${fmt(receipt, 0)} per passenger)`);
@@ -190,7 +190,7 @@ if (!arg('maps')) {
       let ticks = 0;
       runDays(g, 360, () => { if (++ticks % 4 === 0) for (const id of line.vehicles) { const v = g.vehicles.get(id)!; if (['running', 'loading', 'waiting'].includes(v.state)) loads.push(v.load / v.capacity); } });
       load = loads.reduce((x, y) => x + y, 0) / Math.max(1, loads.length); net = profit(g, line);
-      console.log(`  year ${year}: income ${fmt(line.incomeLast / 1e3, 0)}k, running ${fmt(line.costLast / 1e3, 0)}k, upkeep ${fmt(g.maintenanceOf(1) / 1e3, 0)}k -> ${fmt(net / 1e3, 0)}k; load ${fmt(load * 100, 1)}%; walking ${fmt(sa.catchPop, 0)} / ${fmt(sb.catchPop, 0)}`);
+      console.log(`  year ${year}: income ${fmt(line.incomeLast / 1e3, 0)}k, running ${fmt(line.costLast / 1e3, 0)}k, upkeep ${fmt(g.maintenanceOf(1) / 1e3, 0)}k -> ${fmt(net / 1e3, 0)}k; load ${fmt(load * 100, 1)}%; walking ${fmt(sa.catchPop, 0)} / ${fmt(sb.catchPop, 0)}, headway ${fmt(patternHeadways(g, line)[0]?.headway ?? 0, 0)}s`);
     }
     check(load >= 0.15 && net >= 0, `a rail line between two 3,000-person towns with central stations is ${fmt(load * 100, 0)}% full and breaks even after upkeep by year three`);
     check(checkReservations(g).length === 0, 'two-town reservations consistent');

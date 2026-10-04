@@ -15,7 +15,7 @@ import { planDoubleTrack, commitDoubleTrack, DoublePlan } from '../game/trackops
 import { planStationUpgrade, commitStationUpgrade, stationCapacity, UpgradePlan } from '../game/stations';
 import { electrify } from '../game/build-ops';
 import { lineRoute, lineTable, patternHeadways, linePatterns, PATTERN_LABEL } from '../game/patterns';
-import { fareBreakdown, stationFareContext, NO_TRANSFER_BONUS } from '../game/fares';
+import { fareBreakdown, stationFareContext, TRANSFER_FARE_FACTOR, FARE_LEVEL } from '../game/fares';
 import { computeLinePath } from './linepaths';
 import { fmtLen, fmtPct, TYPE_META } from './format';
 import type { PartnerPolicy } from '../game/lines';
@@ -24,6 +24,7 @@ import type { PartnerPolicy } from '../game/lines';
 const memos = new WeakMap<Game, Map<string, { key: string; v: unknown; t: number }>>();
 const LINE_MEMOS = new Set(['cong', 'sigfix', 'dblfix', 'route', 'elec']);
 const STATION_MEMOS = new Set(['platfix', 'station-expand', 'restyle']);
+const VEHICLE_MEMOS = new Set(['van-add', 'van-drop']);
 
 /** Drop entries for deleted entities, even when their windows are no longer open. */
 export function pruneMemos(g: Game) {
@@ -33,9 +34,10 @@ export function pruneMemos(g: Game) {
     const [kind, id, depot] = name.split(':');
     const lineGone = (LINE_MEMOS.has(kind) || kind === 'rail-warning' && id !== 'none') && !g.lines.map.has(Number(id));
     const stationGone = STATION_MEMOS.has(kind) && !g.stations.map.has(Number(id));
+    const vehicleGone = VEHICLE_MEMOS.has(kind) && !g.vehicles.map.has(Number(id));
     const depotGone = kind === 'rail-warning' && depot !== 'none' && !g.depots.map.has(Number(depot))
       || kind === 'find-depot' && typeof c.v === 'number' && !g.depots.map.has(c.v);
-    if (lineGone || stationGone || depotGone) m.delete(name);
+    if (lineGone || stationGone || vehicleGone || depotGone) m.delete(name);
   }
 }
 
@@ -369,7 +371,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
       h('span', null, 'Speed factor'), h('span', { class: f.factor >= 1 ? 'pos' : 'neg' }, `×${f.factor.toFixed(2)}`),
       h('span', null, 'Fare per passenger'), h('span', null, `${fmtMoney(f.perPassenger)} (base ${fmtMoney(f.base)})`)),
     heads.length ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, heads.map((x) => `${pats.find((p) => p.id === x.pid)?.name ?? PATTERN_LABEL.local}: every ${minSec(x.headway)} (${plural(x.vehicles, 'vehicle')})`).join(' · ')) : null,
-    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; passengers who need no change pay ${Math.round(NO_TRANSFER_BONUS * 100)}% more.${l.kind === 'rail' ? ` A rail journey pays at least ${fmtMoney(RAIL_FARE.minimum)} before the speed factor, whatever the track type, once however often its passengers change trains.` : ''}`));
+    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; each change of vehicle takes ${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% off the fare of the leg ending in it and of every later leg.${l.kind === 'rail' ? ` A rail journey pays at least ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before the speed factor, whatever the track type, once however often its passengers change trains.` : ''}`));
 }
 
 /** Sell the player's vehicles on a line and delete it (or hand a shared line over to a partner). */

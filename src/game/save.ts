@@ -16,7 +16,7 @@ import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
 import { KMH_TO_UPS } from './constants';
 import { cargoGroups, type Vehicle, type CargoGroup } from './vehicle';
-import { fareGroupKey } from './fares';
+import { fareGroupKey, changeClass } from './fares';
 import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
 import type { StoredSave } from './storage';
 import { saveOps, loadOps } from './opcosts';
@@ -619,7 +619,7 @@ export function deserialize(d: any): Game {
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
-    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0));
+    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
     if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }

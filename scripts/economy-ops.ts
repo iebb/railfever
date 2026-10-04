@@ -1,7 +1,7 @@
 import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
 import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Realistic operations (UPDATE 9j / 9k): fares with the value of time (walk / bus / train / HSR speed factors,
-// waiting, the wait cap, the no-transfer bonus), operating costs (monthly breakdown sums, HSR vs intercity per
+// waiting, the wait cap, 10% off later legs per transfer), operating costs (monthly breakdown sums, HSR vs intercity per
 // train-km, energy per seat-km, a busy vs a poorly used HSR line), service patterns on a double-track line with
 // through stations (expresses pass, boarding only on stopping patterns, the overtaking hold, a short-turn),
 // one line per route (canonicalizeLines), routing that prefers direct services, and an exact save round trip.
@@ -17,7 +17,7 @@ import { autoSignalNetwork } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
 import { Economy, CATEGORIES, operatingCosts } from '../src/game/economy';
 import {
-  refTime, speedFactor, fareFor, walkTime, tripFactor, estimateLegFare, estimateLegTime, legacyFare, simNow, NO_TRANSFER_BONUS,
+  refTime, speedFactor, fareFor, walkTime, tripFactor, estimateLegFare, estimateLegTime, legacyFare, simNow, TRANSFER_FARE_FACTOR, transferFareFactor, FARE_LEVEL,
   WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MAX_SHORT, SPEED_MIN, fareCalibration,
 } from '../src/game/fares';
 import { estimateCostPerTrainKm, estimateVehicleYear, trackBasePerUnit, YEAR_S, KmCost } from '../src/game/opcosts';
@@ -65,13 +65,14 @@ const syn = (id: string, o: Partial<VehicleModel>): VehicleModel => ({ id, name:
   // demand elasticity and estimates
   check(tripFactor(100, 1000) === 2.5 && tripFactor(1e6, 100) === 0.3 && Math.abs(tripFactor(400, 400) - 1) < 1e-9, 'tripFactor (ref/time)^0.7 clamped 0.3..2.5');
   const expected = fareFor(500, estimateLegTime(500, 120, 200), 1);
-  check(Math.abs(estimateLegFare(500, 120, 200, 1, 1.15, true, false) - expected * (1 + NO_TRANSFER_BONUS)) < 1e-9 && estimateLegTime(500, 120, 200) > 100 + 5000 / (120 / 3.6), 'boarding-based direct estimate includes the actual no-transfer bonus');
-  check(Math.abs(estimateLegFare(500, 120, 200, 8, 1.15, false, false) - expected * 8) < 1e-9, 'actual boarding estimates count people once, and omit the bonus on a transfer leg');
+  check(Math.abs(estimateLegFare(500, 120, 200, 1, 1.15, true, false) - expected) < 1e-9 && estimateLegTime(500, 120, 200) > 100 + 5000 / (120 / 3.6), 'boarding-based direct estimate pays the full fare');
+  check(Math.abs(estimateLegFare(500, 120, 200, 8, 1.15, false, false) - expected * 8 * TRANSFER_FARE_FACTOR) < 1e-9, 'actual boarding estimates count people once, and a journey with a change pays 10% less');
+  check(transferFareFactor(0, 5) === 1 && Math.abs(transferFareFactor(5, 5) - 0.9) < 1e-12 && Math.abs(transferFareFactor(10, 5) - 0.81) < 1e-12 && Math.abs(transferFareFactor(3) - 0.729) < 1e-12, 'each change of vehicle takes 10% off the legs after it (x0.9, x0.81, x0.729)');
   check(estimateLegFare(500, 120, 200) === estimateLegFare(500, 120, 200, 4, 1.15, true, false), 'project OD capture is bounded at four boardings per potential trip');
   check(estimateLegFare(20, 25, 60) < estimateLegFare(20, 25, 60, 1, 1.15, true, false) * 1.25, 'nearby urban OD trips need little capture normalisation');
   const old = (d: number, days: number) => (d * d) / (d + 8) * 9.5 * (0.8 + 0.35 * Math.min(1, Math.max(0, (d / Math.max(0.4, days) - 2) / 8)));
-  const lr = [60, 150, 400].map((d) => legacyFare(d, d / 4, 1) / fareCalibration(d) / old(d, d / 4));
-  console.log(`  legacy fare() vs v2.2 at 4 units/day, before fare compensation: ${lr.map((x) => fmt(x, 2)).join(' / ')}`);
+  const lr = [60, 150, 400].map((d) => legacyFare(d, d / 4, 1) / fareCalibration(d) / FARE_LEVEL / old(d, d / 4));
+  console.log(`  legacy fare() vs v2.2 at 4 units/day, before fare compensation and level: ${lr.map((x) => fmt(x, 2)).join(' / ')}`);
   check(lr.every((x) => x > 0.6 && x < 1.6), 'legacy wrapper preserves the old distance/time balance before fare compensation');
 }
 
@@ -198,7 +199,7 @@ check(exPassPlatform === 0 || exPlatformKmh <= PLATFORM_PASS_KMH + 1, 'platform 
 check(exWrongCargo === 0, 'passengers board the express only for stops it serves');
 check(overtakes >= 1 && maxHold <= HOLD_MAX_S + 0.5, `a local waits at a through station while the express overtakes (bounded hold <= ${HOLD_MAX_S} s)`);
 check(ex.delivered > 0 && locals.every((t) => t.delivered > 0), 'every pattern carries passengers');
-// fares paid at the destination: the leg's time (wait + ride), the no-transfer bonus
+// fares paid per leg: the leg's time (wait + ride), 10% off per change of vehicle made before the leg or at its end
 {
   const t = locals[0];
   const now = simNow(g);
@@ -209,10 +210,44 @@ check(ex.delivered > 0 && locals.every((t) => t.delivered > 0), 'every pattern c
     t.serveStation(D, 0);
     return g.economy.money - m0;
   };
-  const quick = pay(now - 200, 0), slowLeg = pay(now - 1200, 0), changed = pay(now - 200, 100);
-  console.log(`  100 pax A->D: 200 s leg ${k(quick)}, 1200 s leg ${k(slowLeg)}, 200 s leg after a transfer ${k(changed)}`);
+  const quick = pay(now - 200, 0), slowLeg = pay(now - 1200, 0), changed = pay(now - 200, 100), twice = pay(now - 200, 200), thrice = pay(now - 200, 300);
+  console.log(`  100 pax A->D: 200 s leg ${k(quick)}, 1200 s leg ${k(slowLeg)}, 200 s leg after one / two / three transfers ${k(changed)} / ${k(twice)} / ${k(thrice)}`);
   check(slowLeg < quick * 0.5, 'a slow journey pays much less');
-  check(Math.abs(quick / changed - (1 + NO_TRANSFER_BONUS)) < 1e-6, `no-transfer bonus +${NO_TRANSFER_BONUS * 100}% on a direct journey`);
+  check(Math.abs(changed / quick - 0.9) < 1e-6 && Math.abs(twice / quick - 0.81) < 1e-6 && Math.abs(thrice / quick - 0.729) < 1e-6,
+    `the leg after one transfer pays x${TRANSFER_FARE_FACTOR}, after two x0.81, after three x0.729`);
+  // changing vehicles adds one change each: 100 passengers with one change so far reach B on a train that ends there (a
+  // line A-B) and change to the locals for D, two changes then (a train going on to D keeps them aboard: no change)
+  const M = g.lines.create('rail', 0); M.stops = outAndBack([A.id, B!.id]);
+  const feeder = new Train(g, g.vehicles.nextId++, [...t.cars], -1);
+  feeder.lineId = M.id; feeder.state = 'stopped'; g.vehicles.map.set(feeder.id, feeder); M.vehicles.push(feeder.id);
+  g.lines.rebuild();
+  B!.waiting.clear(); B!.waitingTotal = 0;
+  feeder.cargo.set('y', { alight: B!.id, dest: D.id, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 }); feeder.load = 100;
+  feeder.stopIndex = M.stops.indexOf(B!.id);
+  feeder.serveStation(B!, 0);
+  const onward = [...B!.waiting.values()].filter((w) => w.dest === D.id);
+  const people = onward.reduce((n, w) => n + w.count, 0), changes = onward.reduce((n, w) => n + (w.transfers ?? 0), 0);
+  check(people === 100 && Math.abs(changes / people - 2) < 1e-9 && onward.every((w) => w.line === L.id), `a second change of vehicle is counted (${people} passengers, ${changes} changes)`);
+  // the leg ending in a change pays x0.9 more: after one earlier change, x0.81 (a one-change journey: x0.9 on both legs)
+  const legTo = (dest: number) => {
+    feeder.cargo.clear(); feeder.load = 100; B!.waiting.clear(); B!.waitingTotal = 0;
+    feeder.cargo.set('z', { alight: B!.id, dest, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
+    feeder.stopIndex = M.stops.indexOf(B!.id);
+    const m0 = g.economy.money; feeder.serveStation(B!, 0); return g.economy.money - m0;
+  };
+  const ending = legTo(B!.id), changing = legTo(D.id);
+  console.log(`  100 pax A->B after one change: arriving ${k(ending)}, changing again at B ${k(changing)}`);
+  check(ending > 0 && Math.abs(changing / ending - TRANSFER_FARE_FACTOR) < 1e-6, 'the leg ending in a change pays x0.9 more (x0.81 after one earlier change)');
+  // on the locals, which go on to D, the same passengers stay aboard: no fare at B, no change
+  t.cargo.clear(); t.load = 100; B!.waiting.clear(); B!.waitingTotal = 0;
+  t.cargo.set('w', { alight: B!.id, dest: D.id, count: 100, from: A.id, day: g.day, t0: now - 200, transfers: 100 });
+  t.stopIndex = L.stops.indexOf(B!.id);
+  const m1 = g.economy.money; t.serveStation(B!, 0);
+  const kept = [...t.cargo.values()].find((c) => c.from === A.id);
+  check(g.economy.money === m1 && kept?.count === 100 && kept.alight === D.id && kept.transfers === 100 && !B!.waiting.size,
+    'passengers whose next leg is the same train stay aboard at B (no fare, no change)');
+  feeder.cargo.clear(); feeder.load = 0; M.vehicles = []; g.vehicles.map.delete(feeder.id); g.lines.delete(M.id);
+  t.cargo.clear(); t.load = 0; B!.waiting.clear(); B!.waitingTotal = 0;
   // boarding: the wait counted is at most WAIT_CAP_HEADWAYS of the service's headway (B: only the locals stop)
   t.cargo.clear(); t.load = 0;
   const hw = patternHeadway(g, L, t.pattern);

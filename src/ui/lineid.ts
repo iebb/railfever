@@ -54,8 +54,7 @@ export function vehicleMode(g: Game, v: Vehicle): LineMode {
 /** A rail line's symbol text: company letter + route letter (Lines.lineCode), or R + number; '' for other modes. */
 export function lineCodeOf(g: Game, l: Line): string {
   if (l.kind !== 'rail') return '';
-  const fn = (g.lines as unknown as { lineCode?: (id: number) => string }).lineCode;
-  const c = fn ? fn.call(g.lines, l.id) : '';
+  const c = l.code ? (g.company(l.owner).code ?? '?') + l.code : '';
   return c && !c.includes('?') ? c : 'R' + l.num;
 }
 

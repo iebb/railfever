@@ -154,6 +154,7 @@ if (process.argv.includes('--regression')) { done(); process.exit(fails.length ?
   flush(g);
   const withHall = new Set(walkingCatchment(g, S).buildings.keys());
   const gained = north.filter((id) => withHall.has(id));
+  check(!withHall.has(north[0]) && !withHall.has(north[north.length - 1]) && gained.some((id) => Math.abs(g.world.buildings.get(id)!.x - hall.landings[0].x) <= 8), 'the hall reaches nearby surviving north houses and excludes the far ends after the 30% walking reduction');
   check(gained.length >= 6 && S.catchPop > before + 100, `catchment gain: ${gained.length} north houses newly within reach, ${before.toFixed(0)} -> ${S.catchPop.toFixed(0)} residents`);
   console.log(`  catchment with the north side hall: ${before.toFixed(0)} -> ${S.catchPop.toFixed(0)} residents (${gained.length} north houses newly within walking reach)`);
   const solo = pop(g, [...withHall].filter((id) => !walkingCatchmentWithout(g, S, 0).buildings.has(id)));
@@ -539,8 +540,7 @@ function streetThroughHouse(blockPop: number, others: number) {
   runNetworkTask(b.ai, 'capacity');
   eco.spend = spend;
   const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - (3000 + 10 * 1250)) < 1e-6);
-  // (this station's entrance: with the doubled walking reach a gate at the far station, whose street ends at the same
-  // roads, can now reach these houses too and pay for itself)
+  // The entrance at this station must pay for its street and the compensation from the residents it newly covers.
   check(b.H.rail!.entrances.length === 1 && stat(b.ai, 'netEntrances') >= 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
     `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);
 }

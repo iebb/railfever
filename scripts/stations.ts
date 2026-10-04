@@ -109,7 +109,7 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const sh = g.stations.catchmentShapes(S);
   // (a station building draws people from further away: +20% for the classic one)
   const RB = CATCHMENT_RADIUS.rail * (1 + styleOf(S.rail!.style).catchBonus);
-  check(S.rail!.style === 'classic' && Math.abs(RB - 40.32) < 1e-9, 'a classic station building extends the 336 m rail walking limit by 20%');
+  check(S.rail!.style === 'classic' && Math.abs(RB - 28.224) < 1e-9, 'a classic station building extends the 235.2 m rail walking limit by 20%');
   const sf = g.stations.forecourt(S)!;
   check(sh.length === 1 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(sh[0].x - sf.x) < 0.01 && Math.abs(sh[0].z - sf.z) < 0.01, 'ground rail access starts at the forecourt');
   const busId = g.stations.nextId;
@@ -123,7 +123,7 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const tram = g.stations.get(tramId)!;
   const rb = g.stations.catchmentShapes(bus)[0], rt = g.stations.catchmentShapes(tram)[0];
   console.log(`  radii: rail ${sh[0].r}, tram ${rt?.r} (${rt?.mode}), bus ${rb?.r} (${rb?.mode})`);
-  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 22.4 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 30.8 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '224 m bus and 308 m tram radii (twice the earlier path limits), rail > tram > bus');
+  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 15.68 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 21.56 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '156.8 m bus and 215.6 m tram radii, rail > tram > bus');
   const hin = house(g, 138, 98), hout = house(g, 128, 144), hside = house(g, 128, 98);
   const cb = new Set(g.stations.catchmentBuildings(S));
   check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'street-front homes within the forecourt walking budget are covered');

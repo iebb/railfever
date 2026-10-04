@@ -20,10 +20,11 @@ type Cls = 'well served' | 'poorly served' | 'unserved';
 
 /**
  * Classes by the service a town had over the run (fixed, so older runs dumped with --out compare alike): unserved
- * with an active station in under 10 % of the months, well served with one in at least half of them and a service
- * level (below) of at least 0.08, else poorly served.
+ * with an active station in under 5 % of the months (essentially no service: a town served now and then, e.g. 23 of
+ * 240 months by coaches, grows from that service and is poorly served), well served with one in at least half of
+ * them and a service level (below) of at least 0.08, else poorly served.
  */
-const UNSERVED_MONTHS = 0.1, WELL_MONTHS = 0.5, WELL_SERVICE = 0.08;
+const UNSERVED_MONTHS = 0.05, WELL_MONTHS = 0.5, WELL_SERVICE = 0.08;
 /**
  * Target growth over 20 years per class (the geometric mean of the class: a few towns hemmed in by their neighbours
  * or the terrain hardly grow whatever their service), with some room for the two-seed sample.
