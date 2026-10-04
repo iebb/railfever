@@ -435,14 +435,14 @@ section(6, 'a new city line stops beside an existing station of a crossing line'
     const e = g.company(A).economy;
     return -e.yearTotals.reduce((n, y) => n + y.v.construction + y.v.vehicles, e.thisYear.construction + e.thisYear.vehicles);
   };
-  const stationCount = g.stations.map.size, capital = capitalSpent();
+  const assets = g.companyAssets(A).total, capital = capitalSpent();
   check(ai.startProject('lightrail', [t.id]), 'anchor: a light-rail project starts');
   let ticks = 0;
   while (ai.busy && ticks++ < 160000) g.stepTick();
   const line = g.lines.all().find((l) => l.owner === A && l.kind === 'rail');
   console.log('  ' + ai.log.slice(-3).join(' | '));
   if (height === 160) {
-    check(!line && ai.log.some(text => text.includes('not profitable')) && g.stations.map.size === stationCount
+    check(!line && ai.log.some(text => text.includes('not profitable')) && g.companyAssets(A).total === assets
       && capitalSpent() === capital, 'anchor: diffuse districts reject the unprofitable native quote without paying for a new line');
     continue;
   }
