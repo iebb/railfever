@@ -536,7 +536,7 @@ export class Vehicles {
     // a locomotive hauling coaches, or one or more electric multiple units coupled together
     const emu = cars.length > 0 && cars[0].kind === 'emu';
     if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
-    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu')) return 'Multiple units only couple with multiple units';
+    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu')) return 'Multiple units cannot couple with other cars';
     // (companies: an operator of the line owning one of its stations, lines.operateError)
     const tl = lineId != null ? g.lines.get(lineId) : undefined;
     const opErr = tl ? g.lines.operateError(tl, dp.owner) : null;
@@ -582,12 +582,12 @@ export class Vehicles {
     const g = this.game;
     const emu = cars.length > 0 && cars[0].kind === 'emu';
     if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
-    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu' || c.kind === 'bus' || c.kind === 'tram')) return 'Multiple units only couple with multiple units';
+    if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu' || c.kind === 'bus' || c.kind === 'tram')) return 'Multiple units cannot couple with other cars';
     if (t.onMap) {
-      if (t.state !== 'loading' || t.atStation < 0) return 'The train must stand in its depot or at a platform';
+      if (t.state !== 'loading' || t.atStation < 0) return 'Stop train in depot or at a platform';
       const head = t.segs[t.headSeg], e = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
       const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
-      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'The train does not fit on this platform';
+      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'Train does not fit on this platform';
     }
     if (t.lineId != null) { const why = lineCompatibility(g, t.lineId, cars); if (why) return why; }
     const { added } = consistDiff(t.cars, cars);

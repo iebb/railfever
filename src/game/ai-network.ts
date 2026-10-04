@@ -3949,7 +3949,7 @@ class NetPlanner {
       const served = this.addToLines(id, before);
       this.bump('netInserted');
       this.note(`station ${st.name} on ${served.map((x) => x.name).join(', ') || l.name} (${servedPop} residents beyond the stations' reach)`);
-      this.news(`opens ${st.name} station on ${l.name}: the town has grown along the line.`, st.x, st.z);
+      this.news(`opens ${st.name} station on ${l.name}.`, st.x, st.z);
       return;
     }
   }
@@ -4374,7 +4374,7 @@ class NetPlanner {
       for (const l of this.linesAt(st.id)) if (l.owner === me && l.kind === 'rail') this.signal(l.id);
       this.bump('netRelevelled');
       this.note(`lifted ${st.name} onto a viaduct (${crossings} level crossings${split ? ', the town on both sides' : ''})`);
-      this.news(`lifts ${st.name} and its approaches onto a viaduct: the streets pass beneath.`, st.x, st.z);
+      this.news(`lifts ${st.name} and its approaches onto a viaduct.`, st.x, st.z);
       return;
     }
   }

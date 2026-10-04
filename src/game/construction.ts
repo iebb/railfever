@@ -512,7 +512,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const sg = sgFull ? groupWindow(sgFull, start.node!, N) : null;
   const egFull = end.kind === 'node' && kind === 'rail' ? [...(end.group ?? [end.node!])].reverse() : null;
   const eg = egFull ? groupWindow(egFull, end.node!, N) : null;
-  if (N > 1 && end.kind !== 'free' && !(eg && eg.length === N)) fail(`Connect ${N} parallel tracks to ${N} track ends`);
+  if (N > 1 && end.kind !== 'free' && !(eg && eg.length === N)) fail(`${N} parallel tracks need ${N} track ends`);
   // group centres
   const centre = (sn: Snap, grp: number[] | null): Snap => {
     if (!grp || grp.length <= 1 || N === 1) return sn;
@@ -537,13 +537,13 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   // the end must be ahead of the start tangent
   const chx = fb.x - fa.x, chz = fb.z - fa.z, chl = Math.hypot(chx, chz);
-  if (fa.fixed && (fa.tx * chx + fa.tz * chz) / chl < -0.2) fail('Target is behind the track direction');
+  if (fa.fixed && (fa.tx * chx + fa.tz * chz) / chl < -0.2) fail('Target behind track direction');
   if (fb.fixed && (fb.tx * chx + fb.tz * chz) / chl < -0.2) fail('Cannot join from this direction');
   const centreBez = fitCurve(fa, fb);
   const minR = bezMinRadius(centreBez, 48);
   prop.stats.minRadius = minR;
   prop.stats.speed = kind === 'rail' ? Math.min((TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).speed, curveSpeed(minR, opts.type)) : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).speed;
-  if (minR < minRadiusOf(opts)) fail(kind === 'rail' ? `Curve too tight (radius ${Math.round(minR * 10)} m, min ${minRadiusOf(opts) * 10} m)` : 'Curve too tight');
+  if (minR < minRadiusOf(opts)) fail(kind === 'rail' ? `Radius ${Math.round(minR * 10)} m < min ${minRadiusOf(opts) * 10} m` : 'Curve too tight');
 
   // per-track curves: standard spacing, or the spacing of a snapped group (e.g. a station throat)
   // when the segment is too short to converge within the minimum radius
@@ -584,7 +584,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   if (N > 1 && bestR < minR) {
     prop.stats.minRadius = bestR;
     prop.stats.speed = Math.min(prop.stats.speed, curveSpeed(bestR, kind === 'rail' ? opts.type : undefined));
-    if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Curve too tight (radius ${Math.round(bestR * 10)} m, min ${minRadiusOf(opts) * 10} m)`);
+    if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Radius ${Math.round(bestR * 10)} m < min ${minRadiusOf(opts) * 10} m`);
   }
   const spread = N > 1 ? Math.max(Math.abs(offsets[0]), Math.abs(offsets[N - 1])) : 0;
 
@@ -675,7 +675,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push(level === 'underground' ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
 
   let sol = solveProfile(desired, ds, cons, grade);
-  if (!sol.ok) { fail('Too steep: make the route longer or change the height'); }
+  if (!sol.ok) { fail('Too steep: lengthen route or change height'); }
 
   // ---- crossings with existing edges
   const exclude = new Set<number>();
@@ -755,7 +755,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   if (crossings.length) {
     sol = solveProfile(desired, ds, cons, grade);
-    if (!sol.ok) fail('Cannot cross at these heights (too steep)');
+    if (!sol.ok) fail('Crossing too steep at these heights');
   }
   prop.crossings = crossings;
   const y = sol.y;
@@ -864,7 +864,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       for (const q of tp.sections) if (s >= q.s0 && s <= q.s1) sec = q.type;
       if (sec === 'tunnel') continue;
       // no cutting below the water line (the hole would fill with water): bank it up, or tunnel
-      if (sec === 'ground' && yy - formationDepth({ kind } as NEdge) < DRY_MIN - 0.005 && w.heightAt(p.x, p.z) > yy - formationDepth({ kind } as NEdge) + 0.01) fail('Below the water line here: raise it or go into a tunnel');
+      if (sec === 'ground' && yy - formationDepth({ kind } as NEdge) < DRY_MIN - 0.005 && w.heightAt(p.x, p.z) > yy - formationDepth({ kind } as NEdge) + 0.01) fail('Below water line: raise or tunnel');
       const nearEnd = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < 1.2);
       // buildings: on the formation; beside a railway also those standing where its cut or fill has to
       // reshape the ground (the formation reaches every grid cell the track touches, buildings keep their
@@ -928,7 +928,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
             : Math.abs(dy) > C.road;
           if (!clash) continue;
           // towns keep their streets clear of it; a company builds a retaining wall between (and pays for it)
-          if (opts.town) { fail(e.kind === 'rail' ? 'Too close to a track at another height' : 'Too close to a road at another height'); break; }
+          if (opts.town) { fail(e.kind === 'rail' ? 'Too close to track at another height' : 'Too close to road at another height'); break; }
           wallUnits += 0.5; wallArea += 0.5 * Math.abs(dy);
           break;
         }
@@ -1000,7 +1000,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   // a free end in mid-air (9i): allowed for the player (to be continued), but worth a word
   for (const tp of prop.tracks) {
     const bAt = (s0: number) => tp.sections.some((q) => q.type === 'bridge' && q.s0 <= s0 + 0.05 && q.s1 >= s0 - 0.05);
-    if ((tp.start.kind === 'free' && bAt(0)) || (tp.end.kind === 'free' && bAt(tp.len))) { prop.warnings.push('The free end stands on a bridge: continue it to the ground'); break; }
+    if ((tp.start.kind === 'free' && bAt(0)) || (tp.end.kind === 'free' && bAt(tp.len))) { prop.warnings.push('Bridge end: extend to ground'); break; }
   }
   return prop;
 }

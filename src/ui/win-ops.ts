@@ -118,19 +118,19 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
   if (!c || c.level < 2) return null;
   const mine = l.owner === PLAYER;
   const stuck = c.level >= 3;
-  const what = c.deadlock ? 'Trains are stuck waiting for each other (deadlock)' : stuck ? `Trains are stuck: one has waited ${minSec(c.longestWait)}` : `Congested: ${plural(c.waits, 'train')} waiting (longest ${minSec(c.longestWait)})`;
+  const what = c.deadlock ? 'Deadlock: trains waiting for each other' : stuck ? `Train stuck: ${minSec(c.longestWait)} wait` : `${plural(c.waits, 'train')} waiting · longest ${minSec(c.longestWait)}`;
   const btns: HTMLElement[] = [];
   let advice = '';
   const nv = g.networkVersion;
   if (c.suggestion === 'signals') {
-    advice = 'There are no signals where the trains wait: signal the line so trains can follow each other and pass at loops.';
+    advice = 'No signals at queues: auto-signal the line.';
     if (mine) {
       const pre = memo(g, 'sigfix:' + l.id, String(nv), () => autoSignalLine(g, l.id, PLAYER, { preview: true }));
       const n = pre.signals.filter((s) => s.action !== 'keep').length;
       if (n) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(pre.cost), 'data-sfx': 'none', onclick: () => {
         const r = autoSignalLine(g, l.id, PLAYER);
         ui.sound('signal', { pitch: 1.1 });
-        ui.toast(`Signalling: ${r.placed} placed · ${r.changed} changed${r.warnings.length ? ' — ' + r.warnings[0] : ''}`, r.warnings.length ? 'info' : 'good');
+        ui.toast(`Signalling: ${r.placed} placed · ${r.changed} changed${r.warnings.length ? ' · ' + r.warnings[0] : ''}`, r.warnings.length ? 'info' : 'good');
         after();
       } }, icon('signal', 15), `Auto-signal · ${plural(n, 'signal')} · ${fmtMoney(pre.cost)}`));
       btns.push(h('button', { class: 'btn sm', onclick: () => ui.openAutoSignal({ line: l.id }) }, 'Preview…'));
@@ -138,7 +138,7 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
   } else if (c.suggestion === 'platforms' && c.platformWaits.length) {
     const top = [...c.platformWaits].sort((a, b) => b.trains - a.trains)[0];
     const st = g.stations.get(top.station);
-    advice = `${plural(top.trains, 'train')} queue${top.trains === 1 ? 's' : ''} for a free platform at ${st?.name ?? 'a station'}: give it more platforms.`;
+    advice = `${plural(top.trains, 'train')} queue${top.trains === 1 ? 's' : ''} at ${st?.name ?? 'a station'}: add platforms.`;
     if (st && st.owner === PLAYER) {
       const up = memo(g, 'platfix:' + st.id, String(nv), () => expandPlan(g, st.id));
       if (up?.ok) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(up.cost), 'data-sfx': 'none', onclick: () => commitExpand(ui, st.id, after) }, icon('upgrade', 15), `${up.tracks} platforms at ${st.name} · ${fmtMoney(up.cost)}`));
@@ -146,7 +146,7 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
       btns.push(h('button', { class: 'btn sm', onclick: () => ui.openStation(st.id) }, 'Station…'));
     }
   } else if (c.suggestion === 'double' || c.suggestion === 'loops') {
-    advice = c.suggestion === 'double' ? 'The trains wait on single track: double the stretch so they can pass each other.' : 'Single track with few trains: a passing loop or double track on the stretch where they meet helps.';
+    advice = c.suggestion === 'double' ? 'Single-track queue: double this stretch.' : 'Single track: add a passing loop or double the waiting stretch.';
     if (mine) {
       const all = c.blockedStretches.flat();
       const key = nv + '|' + all.slice(0, 40).join(',');
@@ -154,18 +154,18 @@ export function congestionPanel(ui: UI, l: Line, after: () => void, showTrains?:
       if (plan?.ok) btns.push(h('button', { class: 'btn sm primary', disabled: !g.economy.canAfford(plan.cost), 'data-sfx': 'none', onclick: () => {
         const current = lineCongestion(g, l.id);
         const fresh = doubleFor(g, singleRun(g, current.blockedStretches.flat()));
-        if (!fresh?.ok) { ui.toast(fresh?.errors[0] ?? 'No single-track stretch to double here now', 'info'); after(); return; }
+        if (!fresh?.ok) { ui.toast(fresh?.errors[0] ?? 'No single-track stretch to double', 'info'); after(); return; }
         const r = commitDoubleTrack(g, fresh, true, { rightHand: ui.tools.rightHand });
         if (r.error) { ui.toast(r.error, 'bad'); return; }
         ui.sound('build-rail');
         ui.toast(`Double track: ${fmtLen(fresh.length)} · ${plural(r.signals, 'signal')} · ${plural(r.crossovers, 'crossover')}`, 'good');
         after();
       } }, icon('parallel', 15), `Double ${fmtLen(plan.length)} · ${fmtMoney(plan.cost)}`));
-      else if (plan) advice += ` (${plan.errors[0] ?? 'cannot be doubled here'}: try the Double track tool)`;
+      else if (plan) advice += ` · ${plan.errors[0] ?? 'cannot be doubled here'}; try Double track tool`;
       btns.push(h('button', { class: 'btn sm', onclick: () => { ui.tools.setTool('double'); const e = g.world.net.edges.get(all[0]); if (e) { const p = { x: 0, y: 0, z: 0 }; g.world.net.pointAt(e, e.len / 2, p); ui.centerOn(p.x, p.z, 45); } } }, icon('parallel', 15), 'Double track tool'));
     }
   } else {
-    advice = 'More trains than the track can take: take a train off the line, or add passing tracks.';
+    advice = 'Too many trains: remove one or add passing tracks.';
     if (showTrains) btns.push(h('button', { class: 'btn sm', onclick: showTrains }, icon('train', 15), 'Trains'));
   }
   if (c.edgeIds.length) btns.push(h('button', { class: 'btn sm ghost', 'data-tip': 'Show where the trains wait', onclick: () => {
@@ -192,11 +192,11 @@ export function expandPlan(g: Game, stationId: number): UpgradePlan | null {
 export function commitExpand(ui: UI, stationId: number, after: () => void) {
   const g = ui.game;
   const st = g.stations.get(stationId);
-  if (!st?.rail || st.owner !== PLAYER) { ui.toast('Choose one of your rail stations to expand', 'bad'); after(); return; }
+  if (!st?.rail || st.owner !== PLAYER) { ui.toast('Choose your rail station to expand', 'bad'); after(); return; }
   const up = expandPlan(g, stationId);
-  if (!up?.ok) { ui.toast(up?.error ?? 'This station cannot be expanded now', 'bad'); after(); return; }
+  if (!up?.ok) { ui.toast(up?.error ?? 'Cannot expand station', 'bad'); after(); return; }
   const err = commitStationUpgrade(g, up);
-  if (err === 'busy') { ui.toast('A train is in the station — try again in a moment', 'info'); return; }
+  if (err === 'busy') { ui.toast('Train at station: try again shortly', 'info'); return; }
   if (err) { ui.toast(err, 'bad'); return; }
   ui.sound('station', st ? { x: st.x, z: st.z } : {});
   ui.toast(`${st?.name ?? 'Station'} expanded to ${up.tracks} platform tracks`, 'good');
@@ -250,7 +250,7 @@ export function routePanel(ui: UI, l: Line): HTMLElement | null {
     h('div', { class: 'opbar', role: 'img', 'aria-label': 'Track owners along the route' }, r.owners.map((o) => h('i', { style: `flex:${Math.max(0.02, o.share)};--c:${own(o.owner).color}`, 'data-tip': `${own(o.owner).name}: ${fmtLen(o.distance)} (${fmtPct(o.share)})` }))),
     h('div', { class: 'legend' }, r.owners.map((o) => h('span', { style: `--c:${own(o.owner).color}` }, h('i'), `${own(o.owner).name} ${fmtPct(o.share)}`))),
     r.types.size ? h('div', { class: 'ttypes', style: 'margin-top:6px' }, [...r.types].sort((a, b) => b[1] - a[1]).map(([t, len]) => h('span', { class: 'ttype', style: `--c:${TYPE_META[t]?.color ?? '#9aa5b4'}` }, h('i'), `${TYPE_META[t]?.short ?? t} ${fmtLen(len)}`))) : null,
-    r.through ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Trains run through onto other networks or track types; track use is billed by usage share (Track access).') : null);
+    r.through ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Through running across networks / track types · track fees by usage share') : null);
 }
 
 /** Vehicles of the line that find no route their track types allow, with "electrify the line" where wire is missing. */
@@ -270,9 +270,9 @@ export function compatPanel(ui: UI, l: Line, after: () => void): HTMLElement | n
       const res = electrify(g, fresh?.standard ?? [], PLAYER);
       if (!res.changed) { ui.toast(res.error ?? 'Nothing to electrify', 'bad'); return; }
       ui.sound('build-rail', { pitch: 1.25 });
-      ui.toast(`${fmtLen(res.length)} of the line electrified${res.error ? ` — ${res.error}` : ''}`, res.error ? 'info' : 'good');
+      ui.toast(`${fmtLen(res.length)} electrified${res.error ? ` — ${res.error}` : ''}`, res.error ? 'info' : 'good');
       after();
-    } }, icon('bolt', 15), `Electrify the line · ${fmtLen(pre.length)} · ${fmtMoney(pre.cost)}`));
+    } }, icon('bolt', 15), `Electrify · ${fmtLen(pre.length)} · ${fmtMoney(pre.cost)}`));
   }
   btns.push(h('button', { class: 'btn sm', onclick: () => ui.openVehicle(bad[0].id) }, icon('train', 15), bad[0].name));
   return h('div', { class: 'alert' }, icon('warning', 16), h('div', { class: 'alert-b' },
@@ -287,14 +287,14 @@ export function joinBlock(g: Game, l: Line): string | null {
   if (l.owner === PLAYER || g.lines.canOperate(l, PLAYER)) return null;
   const pol = g.lines.partnerPolicy(l);
   if (pol === 'closed') return `${g.company(l.owner).name} runs it alone`;
-  if (pol === 'invite') return `Invite only: ${g.company(l.owner).name} picks its partners`;
+  if (pol === 'invite') return `Invite only: ${g.company(l.owner).name} chooses partners`;
   if (!g.canUse(PLAYER, l.owner)) return `No track access to ${g.company(l.owner).name}'s network`;
   // UPDATE 9k: an operator must own at least one station of the line
-  if (!l.stops.some((s) => g.stations.get(s)?.owner === PLAYER)) return 'You need a station of your own on the line';
+  if (!l.stops.some((s) => g.stations.get(s)?.owner === PLAYER)) return 'Needs your own station on the line';
   return null;
 }
 
-const POLICY_TEXT: Record<PartnerPolicy, string> = { open: 'Any company with a station on the line may add vehicles', invite: 'Only companies you invite', closed: 'Only you run vehicles on it' };
+const POLICY_TEXT: Record<PartnerPolicy, string> = { open: 'Any company owning a stop may add vehicles', invite: 'Invited companies only', closed: 'Your vehicles only' };
 
 /** Operators of a line: lead and partners with their vehicles; policy, invitations, join / leave. */
 export function sharedPanel(ui: UI, l: Line, after: () => void): HTMLElement {
@@ -305,8 +305,8 @@ export function sharedPanel(ui: UI, l: Line, after: () => void): HTMLElement {
   const rows = ops.map((o) => h('div', { class: 'row' },
     h('span', { class: 'inline' }, ui.ownerTag(o), o === l.owner ? h('span', { class: 'flag ok' }, 'Lead') : null),
     h('span', { class: 'num' }, plural(by.get(o) ?? 0, 'vehicle')),
-    mine && o !== l.owner ? h('button', { class: 'ibtn sm', 'data-tip': `Remove ${g.company(o).name} (its vehicles leave the line)`, 'aria-label': 'Remove partner', onclick: () => {
-      if (!confirm(`Remove ${g.company(o).name} from ${l.name}? Its vehicles there go back to their depots.`)) return;
+    mine && o !== l.owner ? h('button', { class: 'ibtn sm', 'data-tip': `Remove ${g.company(o).name}; vehicles leave`, 'aria-label': 'Remove partner', onclick: () => {
+      if (!confirm(`Remove ${g.company(o).name} from ${l.name}? Vehicles return to depots.`)) return;
       g.lines.leave(l.id, o); ui.sound('toggle', { pitch: 0.88 }); after();
     } }, icon('close', 14)) : null));
   const out = h('div', null, section('Operators', ops.length > 1 ? `shared by ${ops.length}` : null), h('div', { class: 'list' }, rows));
@@ -318,23 +318,23 @@ export function sharedPanel(ui: UI, l: Line, after: () => void): HTMLElement {
     const cands = g.activeCompanies.filter((c) => c.id !== PLAYER && !ops.includes(c.id));
     if (pol !== 'closed' && cands.length) {
       const sel = h('select', { class: 'select', 'aria-label': 'Invite a company' }, h('option', { value: '' }, 'Invite a company…'), cands.map((c) => h('option', { value: String(c.id) }, c.name))) as HTMLSelectElement;
-      sel.addEventListener('change', () => { if (!sel.value) return; g.lines.invite(l.id, Number(sel.value)); ui.sound('toggle', { pitch: 1.1 }); ui.toast(`${g.company(Number(sel.value)).name} may now run vehicles on ${l.name}`, 'good'); after(); });
+      sel.addEventListener('change', () => { if (!sel.value) return; g.lines.invite(l.id, Number(sel.value)); ui.sound('toggle', { pitch: 1.1 }); ui.toast(`${g.company(Number(sel.value)).name} may run vehicles on ${l.name}`, 'good'); after(); });
       add(out, h('div', { class: 'btns' }, sel));
     }
   } else if (g.lines.canOperate(l, PLAYER)) {
     add(out, h('div', { class: 'btns' },
       h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), 'Add a vehicle'),
       h('button', { class: 'btn danger', onclick: () => {
-        if (!confirm(`Leave ${l.name}? Your ${plural(by.get(PLAYER) ?? 0, 'vehicle')} there go back to their depots.`)) return;
-        g.lines.leave(l.id, PLAYER); ui.sound('toggle', { pitch: 0.88 }); ui.toast(`You no longer run ${l.name}`, 'info'); after();
+        if (!confirm(`Leave ${l.name}? Your ${plural(by.get(PLAYER) ?? 0, 'vehicle')} return to depots.`)) return;
+        g.lines.leave(l.id, PLAYER); ui.sound('toggle', { pitch: 0.88 }); ui.toast(`Left ${l.name}`, 'info'); after();
       } }, icon('leave', 16), 'Leave the line')));
   } else {
     const why = joinBlock(g, l);
     add(out, h('div', { class: 'btns' },
-      h('button', { class: 'btn primary', disabled: !!why, 'data-tip': why ?? 'Run your own vehicles on this line (they earn your fares; track fees as usual)', onclick: () => {
+      h('button', { class: 'btn primary', disabled: !!why, 'data-tip': why ?? 'Your vehicles earn fares; track fees apply', onclick: () => {
         const err = g.lines.join(l.id, PLAYER);
         if (err) { ui.toast(err, 'bad'); return; }
-        ui.sound('purchase'); ui.toast(`You joined ${l.name}: add vehicles to run it`, 'good'); after();
+        ui.sound('purchase'); ui.toast(`Joined ${l.name}; add vehicles`, 'good'); after();
       } }, icon('join', 16), 'Join the line'),
       why ? h('span', { class: 'muted', style: 'font-size:12px' }, why) : null));
   }
@@ -371,7 +371,7 @@ export function faresPanel(ui: UI, l: Line): HTMLElement | null {
       h('span', null, 'Speed factor'), h('span', { class: f.factor >= 1 ? 'pos' : 'neg' }, `×${f.factor.toFixed(2)}`),
       h('span', null, 'Fare per passenger'), h('span', null, `${fmtMoney(f.perPassenger)} (base ${fmtMoney(f.base)})`)),
     heads.length ? h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, heads.map((x) => `${pats.find((p) => p.id === x.pid)?.name ?? PATTERN_LABEL.local}: every ${minSec(x.headway)} (${plural(x.vehicles, 'vehicle')})`).join(' · ')) : null,
-    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Faster and more frequent service earns more per trip; each change of vehicle takes ${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% off the fare of the leg ending in it and of every later leg.${l.kind === 'rail' ? ` A rail journey pays at least ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before the speed factor, whatever the track type, once however often its passengers change trains.` : ''}`));
+    h('div', { class: 'muted', style: 'font-size:12px;margin-top:4px' }, `Speed and frequency raise fares · transfers: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on this and later legs${l.kind === 'rail' ? ` · rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)}: all track types, before speed factor, once per journey` : ''}`));
 }
 
 /** Sell the player's vehicles on a line and delete it (or hand a shared line over to a partner). */

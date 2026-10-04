@@ -67,7 +67,7 @@ try {
   await page.waitForFunction(() => (window as any).__rf?.game.options.seed === 12 && !document.querySelector('.title'));
   let prev = (await dbRecords(page)).find((r) => r.slot === 'autosave-previous');
   assert.equal(prev.meta.name, 'Autosave (previous game)'); assert.equal(prev.meta.money, 123456789);
-  assert.equal(dialogs[0], "Start a new game? Your current game will be kept as 'Autosave (previous game)'.");
+  assert.equal(dialogs[0], "Start a new game? Current game will be saved as 'Autosave (previous game)'.");
   await page.evaluate(() => { const g = (window as any).__rf.game; g.paused = true; g.economy.money = 987654321; (window as any).__rf.ui.openMenu(); });
   await page.getByRole('button', { name: 'Load game…', exact: true }).click();
   page.once('dialog', (d) => { dialogs.push(d.message()); void d.dismiss(); });
@@ -80,7 +80,7 @@ try {
   assert.equal((await getGame(page)).money, 123456789);
   prev = (await dbRecords(page)).find((r) => r.slot === 'autosave-previous');
   assert.equal(prev.meta.money, 987654321, 'Load archives the game being replaced, even when loading previous-game itself');
-  assert(dialogs.includes("Load another game? Your current game will be kept as 'Autosave (previous game)'."));
+  assert(dialogs.includes("Load another game? Current game will be saved as 'Autosave (previous game)'."));
   await hidden(page);
   await page.waitForFunction(async () => {
     const db = await new Promise<IDBDatabase>((r) => { const q = indexedDB.open('railfever', 2); q.onsuccess = () => r(q.result); });
@@ -99,7 +99,7 @@ try {
   await mem.goto(pathToFileURL(resolve(build)).href + '?new&nointro&seed=7&size=128&towns=3&ai=0');
   await mem.waitForFunction(() => !!(window as any).__rf?.game);
   await mem.locator('.storage-banner').waitFor();
-  assert((await mem.locator('.storage-banner').innerText()).includes("Saves won't survive a reload in this browser mode — use Export to keep your game"));
+  assert((await mem.locator('.storage-banner').innerText()).includes("Session-only saves: lost on reload; Export to keep."));
   await hidden(mem);
   await mem.locator('.savechip.memory').waitFor();
   assert((await mem.locator('.savechip').innerText()).includes('Session only'));

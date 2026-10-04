@@ -11,8 +11,8 @@ export type AutoTarget = { line: number } | { edges: number[]; label: string } |
 /** Marker colours of the preview: new, changed, kept signals. */
 export const AUTO_COLOR: Record<AutoSignal['action'], number> = { add: 0xffb020, change: 0x4fc3ff, keep: 0x9aa5b4 };
 const ROLE_LABEL: Record<AutoSignal['role'], string> = {
-  block: 'block signals on open line', approach: 'path signals before junctions and station entries',
-  starter: 'starter signals at platform ends', loop: 'signals at passing loops', depot: 'depot exit signals',
+  block: 'block: open line', approach: 'path: junctions and station entries',
+  starter: 'starters: platform ends', loop: 'passing loops', depot: 'depot exit signals',
 };
 const hex = (c: number) => '#' + c.toString(16).padStart(6, '0');
 
@@ -31,7 +31,7 @@ export function showAutoSignals(ui: UI, r: AutoSignalResult | null) {
 
 export function openAutoSignal(ui: UI, target: AutoTarget) {
   const g = ui.game;
-  const label = 'line' in target ? (g.lines.get(target.line)?.name ?? 'Line') : 'edges' in target ? target.label : 'All your railway';
+  const label = 'line' in target ? (g.lines.get(target.line)?.name ?? 'Line') : 'edges' in target ? target.label : 'Your whole railway';
   const win = ui.wm.open('autosig', 'Auto-signal', { width: 430, icon: 'signal', color: 'var(--rail)', sub: label, onClose: () => showAutoSignals(ui, null) });
   let key = '';
   let res: AutoSignalResult | null = null;
@@ -56,18 +56,18 @@ export function openAutoSignal(ui: UI, target: AutoTarget) {
         tile(String(keeps), 'Kept'),
         tile(fmtMoney(r.cost), 'Cost', g.economy.canAfford(r.cost) ? '' : 'neg')),
       h('div', { class: 'legend' }, legend(AUTO_COLOR.add, 'new'), legend(AUTO_COLOR.change, 'changed'), legend(AUTO_COLOR.keep, 'kept'), h('span', { class: 'muted' }, '▲ block · ◆ path')),
-      roles.size ? section('What it does') : null,
+      roles.size ? section('Signals') : null,
       roles.size ? h('div', { class: 'list' }, [...roles].map(([role, c]) => h('div', { class: 'row' }, h('span', null, ROLE_LABEL[role]), h('span', { class: 'num' }, String(c))))) : null,
       r.warnings.length ? h('div', { class: 'warn' }, icon('warning', 16), h('span', null, r.warnings.slice(0, 4).join(' · '))) : null,
-      !adds && !changes ? h('div', { class: 'pad muted' }, 'Everything is signalled by the rules already.') : null,
-      h('div', { class: 'pad muted', style: 'padding-bottom:0' }, 'Path signals guard junctions and station entries: a train passes only when its whole way to the next signal is free. Block signals space trains on open line. Single track keeps signals only at passing loops, so opposing trains never meet head on.'),
+      !adds && !changes ? h('div', { class: 'pad muted' }, 'Already signalled.') : null,
+      h('div', { class: 'pad muted', style: 'padding-bottom:0' }, 'Path: clear route to next signal · block: open-line spacing · single track: passing loops only'),
       h('div', { class: 'btns right' },
         h('button', { class: 'btn ghost', onclick: () => win.close() }, 'Cancel'),
         h('button', { class: 'btn primary', disabled: !adds && !changes || !g.economy.canAfford(r.cost), 'data-sfx': 'none', onclick: () => {
           if (adds + changes > 20 && !confirm(`Place ${adds} signals and change ${changes} for ${fmtMoney(r.cost)}?`)) return;
           const done = plan(false);
           ui.sound('signal', { pitch: 1.1 });
-          ui.toast(`Signalling: ${done.placed} placed · ${done.changed} changed${done.warnings.length ? ' — ' + done.warnings[0] : ''}`, done.warnings.length ? 'info' : 'good');
+          ui.toast(`Signalling: ${done.placed} placed · ${done.changed} changed${done.warnings.length ? ' · ' + done.warnings[0] : ''}`, done.warnings.length ? 'info' : 'good');
           win.close();
         } }, icon('signal', 16), adds || changes ? `Apply${r.cost ? ` for ${fmtMoney(r.cost)}` : ''}` : 'Apply')),
     );

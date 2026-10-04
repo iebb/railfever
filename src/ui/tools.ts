@@ -49,27 +49,27 @@ export function edgeLevel(e: NEdge): LineLevel {
 }
 
 export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
-  inspect: { name: 'Inspect', hint: 'Click stations, vehicles, depots, towns, buildings or tracks for details.' },
-  rail: { name: 'Build track', hint: 'Click to start, click again to build — construction continues from the new end with a smooth curve. Right-click, Esc or a long press ends the chain. Snap onto track ends to extend, onto track to branch. Hold Shift over a track to copy it as a parallel track.' },
-  road: { name: 'Build road', hint: 'Click to start, click again to build — continues from the new end. Snap onto roads to create junctions. Connect to town streets so buses can reach them.' },
-  station: { name: 'Train station', hint: 'Click to place. R / Shift+R or Alt+wheel rotate by 15°. Lines up with a nearby track end; connect its tracks with the track tool.' },
-  busstop: { name: 'Bus stop', hint: 'Click on a road. Next to one of your train stations it joins it (passengers transfer).' },
-  tram: { name: 'Tram tracks', hint: 'Add to roads: click a road, or press and drag along streets to lay tracks with overhead wire. New road builds a road with tracks; Remove takes your tracks up.' },
-  tramstop: { name: 'Tram stop', hint: 'Click on a road with tram tracks. Next to one of your stations it joins it (passengers transfer).' },
-  'depot-tram': { name: 'Tram depot', hint: 'Click next to a road with tram tracks: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
-  'depot-rail': { name: 'Train depot', hint: 'Click near a free end of your track (it snaps on), or place it and connect it with track. R / Shift+R or Alt+wheel rotates.' },
-  'depot-road': { name: 'Bus depot', hint: 'Click next to a road: the depot faces it and connects itself. R / Shift+R or Alt+wheel rotates when away from roads.' },
-  signal: { name: 'Signals', hint: 'Click a track to add a signal, click a signal to cycle two-way → one-way → one-way (reversed) → none. Drag along a track to place block signals at the chosen spacing (one-way signals face the drag direction). Remove mode or right-click takes signals away. Two-way signals suit single track with passing loops; one-way signals give double track a block every few hundred metres so trains can follow each other.' },
-  double: { name: 'Double track', hint: 'Click one of your single tracks, or drag along it, to lay a second track beside it with switches at both ends (into a free platform where a station is). Directional double track gets one running direction per track, block signals and crossovers before stations. Pick the side, or let it try both.' },
-  entrance: { name: 'Add entrance', hint: 'Add an entrance: beside a road near an underground or elevated station (pavilion or stair tower); beside the tracks of a ground station, on either side (a side entrance, a footbridge or underpass to both sides, or a gate at a platform end). Every entrance brings its own catchment area.' },
-  bulldoze: { name: 'Demolish', hint: 'Click to remove an object, or drag a rectangle to clear an area. Other companies’ property is protected.' },
-  terraform: { name: 'Terraform', hint: 'Hold the left button to raise or lower the ground under the brush. Level flattens to the height where you press.' },
-  'line-edit': { name: 'Edit line', hint: 'Click stations (or their labels) to add them as stops. Press Esc or Done when finished.' },
-  metro: { name: 'Urban-style track', hint: 'A preset for city railways: metro track (subway style) or light-rail track, underground, elevated (lifted rails on a viaduct) or on the ground. Click to start, click to build — construction continues from the new end. It is ordinary rail: every train may run on it (electric ones under the wire it carries) and one rail line may mix it with main-line track, so services through-run.' },
-  'metro-station': { name: 'Urban-style station', hint: `A preset for city stations on metro or light-rail track: underground by default with street entrances, side platforms, close together (~1 km). R / Shift+R or Alt+wheel rotates; it lines up with nearby track ends. An ordinary rail station: any rail line may stop here, with the same walking reach (${fmtLen(walkLimit('rail'))} along streets, before station-building bonuses) and fares as every rail station.` },
-  electrify: { name: 'Electrify', hint: 'Click a track, or drag along a line, to string overhead wire: standard track becomes electrified track for electric locomotives and EMUs (platform tracks included). Works on other companies’ track you may use; it stays theirs.' },
-  connect: { name: 'Connect tracks', hint: 'Click a point on one track, then a point on another: a connecting curve with turnouts into both tracks is planned within the curve and grade limits, and signalled where the track is. Click to build; Esc or right-click picks the first track again.' },
-  relevel: { name: 'Re-level', hint: 'Drag along a stretch of your track to lift it onto a viaduct or sink it into a tunnel in place, with ramps at both ends; stations on it go with it, lines and signals are kept.' },
+  inspect: { name: 'Inspect', hint: 'Click an object for details.' },
+  rail: { name: 'Build track', hint: 'Click: start / build; snap: extend / branch; Shift: parallel copy; right-click / Esc / long press: end.' },
+  road: { name: 'Build road', hint: 'Click: start / build; snap: junction; connect to town streets for buses.' },
+  station: { name: 'Train station', hint: 'Auto-aligns to track ends; R / Shift+R / Alt+wheel: rotate 15°; connect with track.' },
+  busstop: { name: 'Bus stop', hint: 'On a road; joins your nearby train station for transfers.' },
+  tram: { name: 'Tram tracks', hint: 'Click or drag along roads; New road: road with wire; Remove: your tracks.' },
+  tramstop: { name: 'Tram stop', hint: 'On tram tracks; joins your nearby station for transfers.' },
+  'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
+  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end; otherwise connect with track; R / Shift+R / Alt+wheel rotates.' },
+  'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
+  signal: { name: 'Signals', hint: 'Click: two-way → one-way → reversed → none; drag: series facing drag; right-click / Remove: remove.' },
+  double: { name: 'Double track', hint: 'Your single track → second track with end switches; directional: signals and station crossovers.' },
+  entrance: { name: 'Add entrance', hint: 'Ground: hall, footbridge, underpass or end gate; elevated / underground: roadside entrance; own catchment.' },
+  bulldoze: { name: 'Demolish', hint: 'Click: remove; drag: clear area; other companies’ property protected.' },
+  terraform: { name: 'Terraform', hint: 'Hold: raise / lower; Level: height where pressed.' },
+  'line-edit': { name: 'Edit line', hint: 'Click stations or labels to add stops; Esc / Done: finish.' },
+  metro: { name: 'Urban-style track', hint: 'Metro or light rail · any level · any train with required wire · through running with main-line track' },
+  'metro-station': { name: 'Urban-style station', hint: `Street entrances · side platforms · ~1 km spacing · R / Shift+R / Alt+wheel rotates · any rail line · ${fmtLen(walkLimit('rail'))} street reach before building bonuses · standard fares` },
+  electrify: { name: 'Electrify', hint: 'Click or drag: wire for standard and platform tracks; permitted foreign track keeps its owner.' },
+  connect: { name: 'Connect tracks', hint: 'Pick two track points for a signalled curve with turnouts; click: build; Esc / right-click: restart.' },
+  relevel: { name: 'Re-level', hint: 'Lift / sink with end ramps; stations move, lines and signals retained.' },
 };
 
 const CONSTRUCTION: ToolId[] = ['rail', 'road', 'tram', 'station', 'busstop', 'tramstop', 'depot-rail', 'depot-road', 'depot-tram', 'signal', 'bulldoze', 'terraform', 'double', 'entrance', 'metro', 'metro-station', 'electrify', 'connect', 'relevel'];
@@ -342,7 +342,7 @@ export class Tools {
       if (this.autoAlign) {
         this.autoAlign = false;
         this.onToolChange();
-        this.ui.toast('Align to track off: manual rotation', 'info');
+        this.ui.toast('Manual rotation: track alignment off', 'info');
       }
     }
     else if (this.tool === 'depot-rail' || this.tool === 'depot-road' || this.tool === 'depot-tram') this.depotAngle = norm(this.depotAngle + dir * 15 * DEG);
@@ -658,10 +658,10 @@ export class Tools {
     if (s.kind === 'edge') {
       const e = net.edges.get(s.edge!);
       if (e && e.station >= 0 && e.kind === 'rail') return 'Cannot branch off inside a station';
-      if (e && e.kind === 'rail' && !g.canUse(PLAYER, e.owner)) return `Track of ${g.company(e.owner).name} — request access first`;
+      if (e && e.kind === 'rail' && !g.canUse(PLAYER, e.owner)) return `Track of ${g.company(e.owner).name}: request access`;
     } else if (s.kind === 'node') {
       const n = net.nodes.get(s.node!);
-      if (n && n.kind === 'rail' && !g.canUse(PLAYER, n.owner)) return `Track of ${g.company(n.owner).name} — request access first`;
+      if (n && n.kind === 'rail' && !g.canUse(PLAYER, n.owner)) return `Track of ${g.company(n.owner).name}: request access`;
     }
     return null;
   }
@@ -839,12 +839,12 @@ export class Tools {
         // (its added entrances do not move with it: taken down, as a rebuild or re-level that drops them says)
         const gone = moving?.rail ? entrancesGo(moving.rail.level ?? 'ground', moving.rail.entrances, 'taken down at the old site') : null;
         if (gone) warn.push(gone);
-        if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access — this station won\u2019t attract passengers');
+        if (pl.ok && !pl.roadAccess && !warn.some((w) => /road/i.test(w))) warn.unshift('No road access: no passengers');
         if (pl.ok && pl.demolish.length) warn.push(`Demolishes ${plural(pl.demolish.length, 'building')}`);
         if (pl.ok && !g.economy.canAfford(pl.cost) && !warn.includes('Not enough money')) warn.push('Not enough money');
         // (one kind of rail station: the track type row names the construction style)
         const title = moving ? `Move ${esc(moving.name)}` : lv === 'elevated' ? 'Elevated station' : lv === 'underground' ? 'Underground station' : 'Train station';
-        this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn, hint: moving ? 'Click to move the station here · Esc cancels' : undefined }, pl.ok ? 'ok' : 'err');
+        this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn, hint: moving ? 'Click: move station; Esc: cancel' : undefined }, pl.ok ? 'ok' : 'err');
         break;
       }
       case 'busstop': this.hoverStop(p, false); break;
@@ -857,10 +857,10 @@ export class Tools {
         this.depotPlan = pl;
         ov.setDepotGhost(pl, kind);
         ov.setDemolish(pl.demolish?.length ? pl.demolish : null);
-        const how = pl.snapNode >= 0 ? 'Connects to the track end' : kind !== 'rail' && pos.road ? (kind === 'tram' ? 'Connects to the tram tracks' : 'Connects to the road') : kind === 'rail' ? 'Connect it with track afterwards' : kind === 'tram' ? 'Place it next to a road with tram tracks' : 'Place it next to a road';
+        const how = pl.snapNode >= 0 ? 'Connects to the track end' : kind !== 'rail' && pos.road ? (kind === 'tram' ? 'Connects to the tram tracks' : 'Connects to the road') : kind === 'rail' ? 'Connect it with track afterwards' : kind === 'tram' ? 'Beside a road with tram tracks' : 'Place it next to a road';
         const nd = pl.demolish?.length ?? 0;
         const movingDepot = this.relocatingDepot != null ? g.depots.get(this.relocatingDepot) : undefined;
-        this.tip({ title: movingDepot ? 'Move depot' : kind === 'rail' ? 'Train depot' : kind === 'tram' ? 'Tram depot' : 'Bus depot', hint: movingDepot ? 'Click to move the depot here · its vehicles move with it · Esc cancels' : undefined, cost: pl.ok ? pl.cost : undefined, rows: [[pl.snapNode >= 0 || pos.road ? 'check' : 'info', how]], err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn: [...(nd ? [`Demolishes ${plural(nd, 'building')}`] : []), ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])] }, pl.ok ? 'ok' : 'err');
+        this.tip({ title: movingDepot ? 'Move depot' : kind === 'rail' ? 'Train depot' : kind === 'tram' ? 'Tram depot' : 'Bus depot', hint: movingDepot ? 'Click: move depot and vehicles; Esc: cancel' : undefined, cost: pl.ok ? pl.cost : undefined, rows: [[pl.snapNode >= 0 || pos.road ? 'check' : 'info', how]], err: pl.ok ? [] : [pl.error ?? 'Cannot build'], warn: [...(nd ? [`Demolishes ${plural(nd, 'building')}`] : []), ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])] }, pl.ok ? 'ok' : 'err');
         break;
       }
       case 'signal': this.hoverSignal(p); break;
@@ -897,7 +897,7 @@ export class Tools {
         }
         if (this.terraMode === 'level') {
           this.overlay.setDisc({ x: p.x, z: p.z, r: this.brushRadius, y: h + 0.03, color: 0xffb020 });
-          this.tip({ title: 'Level ground', rows: [['level', `Flattens to <b>${Math.round(h * 10)} m</b> (where you press)`], ['catchment', `Radius ${this.brushRadius * 10} m`]], hint: 'Hold the button to apply' }, 'info');
+          this.tip({ title: 'Level ground', rows: [['level', `Level: <b>${Math.round(h * 10)} m</b> at press point`], ['catchment', `Radius ${this.brushRadius * 10} m`]], hint: 'Hold the button to apply' }, 'info');
         } else {
           const step = Math.round(brushVolume(g.world, p.x, p.z, this.brushRadius, this.terraMode, 0.25, 0, true) * 1500);
           this.tip({ title: this.terraMode === 'raise' ? 'Raise ground' : 'Lower ground', rows: [['coin', `≈ <b>${fmtMoney(step * 8)}</b> per second held`], ['catchment', `Radius ${this.brushRadius * 10} m`]], hint: 'Hold the button to apply' }, 'info');
@@ -918,7 +918,7 @@ export class Tools {
       const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
       ov.setMarker('hover0', n ? n : null, 'signal', 0xff5a5f);
       ov.setHoverEdge(n ? n.edges : null, 0xff5a5f);
-      this.tip(n ? (n.owner === PLAYER ? { title: 'Remove signal', rows: [['signal', SIGNAL_NAMES[n.signal]]], hint: 'Drag along a track to remove a series' } : { title: 'Signal', err: [`Belongs to ${g.company(n.owner).name}`] }) : { title: 'Remove signals', rows: [['info', 'Point at a signal, or drag along a track']] }, n && n.owner === PLAYER ? 'err' : 'info');
+      this.tip(n ? (n.owner === PLAYER ? { title: 'Remove signal', rows: [['signal', SIGNAL_NAMES[n.signal]]], hint: 'Drag along track to remove a series' } : { title: 'Signal', err: [`Belongs to ${g.company(n.owner).name}`] }) : { title: 'Remove signals', rows: [['info', 'Point at a signal or drag along track']] }, n && n.owner === PLAYER ? 'err' : 'info');
       return;
     }
     const n = net.nearestNode(p.x, p.z, 0.8, 'rail', (nn) => nn.edges.length === 2 && nn.signal > 0);
@@ -938,14 +938,14 @@ export class Tools {
     else if (e.owner !== PLAYER) err = `Track owned by ${g.company(e.owner).name}`;
     else if (ne.s < 1 || ne.s > e.len - 1) {
       const end = net.nodes.get(ne.s < 1 ? e.a : e.b)!;
-      if (end.edges.length !== 2) err = 'Signals need plain track (not at a switch or track end)';
+      if (end.edges.length !== 2) err = 'No signals at switches or track ends';
       q.x = end.x; q.y = end.y; q.z = end.z;
     }
     if (!q.x) net.pointAt(e, ne.s, q);
     ov.setMarker('hover0', q, 'signal', err ? 0xff5a4a : 0xffb020);
     ov.setHoverEdge(e.id, err ? 0xff5a4a : 0xffb020);
     const name = `${this.signalKind === 'oneway' ? 'One-way' : 'Two-way'} ${this.signalClass} signal`;
-    this.tip(err ? { title: 'Signal', err: [err] } : { title: name, cost: SIGNAL_COST, rows: this.signalKind === 'oneway' ? [['signal', `facing away from you${this.signalPass ? ' · passable from behind' : ''}`]] : [], hint: 'Click to place · drag along the track for a series' }, err ? 'err' : 'info');
+    this.tip(err ? { title: 'Signal', err: [err] } : { title: name, cost: SIGNAL_COST, rows: this.signalKind === 'oneway' ? [['signal', `facing away from you${this.signalPass ? ' · passable from behind' : ''}`]] : [], hint: 'Click: place; drag: series' }, err ? 'err' : 'info');
   }
 
   private hoverInspect(p: THREE.Vector3) {
@@ -1025,7 +1025,7 @@ export class Tools {
     } else if (hit.kind === 'building') {
       const b = g.world.buildings.get(hit.id)!;
       ov.setFootprints([{ x: b.x, z: b.z, angle: b.angle, w: b.w, d: b.d, color: 0xffb020, lift: 0.08 }]);
-      this.tip({ title: esc(g.towns.list[b.townId]?.name ?? 'Building'), rows: [['people', `<b>${b.pop}</b> residents in this building`]] }, 'info');
+      this.tip({ title: esc(g.towns.list[b.townId]?.name ?? 'Building'), rows: [['people', `<b>${b.pop}</b> residents`]] }, 'info');
     } else if (hit.kind === 'town') {
       this.hideTip();
     }
@@ -1038,7 +1038,7 @@ export class Tools {
     const d = this.down!.ground!;
     if (!this.sigDrag) {
       const ne = net.nearestEdge(d.x, d.z, 1.4, 'rail', (e) => e.station < 0 && e.depot < 0);
-      if (!ne || ne.edge.owner !== PLAYER) { ov.setSignalGhosts(null); this.tip({ title: 'Block signals', err: [ne ? `Track of ${g.company(ne.edge.owner).name}` : 'Start the drag on one of your tracks'] }, 'err'); return; }
+      if (!ne || ne.edge.owner !== PLAYER) { ov.setSignalGhosts(null); this.tip({ title: 'Block signals', err: [ne ? `Track of ${g.company(ne.edge.owner).name}` : 'Start on your track'] }, 'err'); return; }
       this.sigDrag = { edge: ne.edge.id, s0: ne.s, dir: 1, len: 0 };
     }
     const sd = this.sigDrag;
@@ -1120,7 +1120,7 @@ export class Tools {
       this.dbl = null;
       ov.setProposal(null); ov.setHoverEdge(null); ov.setMarker('start', null); ov.setMarker('hover0', null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title: 'Double track', err: [other.edge.owner !== PLAYER ? `Track of ${g.company(other.edge.owner).name}` : other.edge.station >= 0 ? 'Not inside stations' : 'Not on depot tracks'] } : { title: 'Double track', rows: [['parallel', 'Point at one of your single tracks, or drag along it']] }, other ? 'err' : 'info');
+      this.tip(other ? { title: 'Double track', err: [other.edge.owner !== PLAYER ? `Track of ${g.company(other.edge.owner).name}` : other.edge.station >= 0 ? 'Not inside stations' : 'Not on depot tracks'] } : { title: 'Double track', rows: [['parallel', 'Point at or drag along your single track']] }, other ? 'err' : 'info');
       return;
     }
     const key = `${chain.join(',')}|${this.doubleSide}|${g.networkVersion}`;
@@ -1149,8 +1149,8 @@ export class Tools {
     ];
     const walls = this.retainingWallRow(pl.proposals);
     if (walls) rows.push(walls);
-    if (this.directional) rows.push(['signal', `Directional: ${this.rightHand ? 'right' : 'left'}-hand running, block signals, crossovers before stations`]);
-    this.tip({ title: 'Double track', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : pl.errors.slice(0, 3), warn: pl.warnings, hint: pl.ok ? (d?.moved ? 'Release to build' : 'Click to build · drag along the line for more') : 'Try the other side or a shorter stretch' }, pl.ok ? 'ok' : 'err');
+    if (this.directional) rows.push(['signal', `${this.rightHand ? 'right' : 'left'}-hand running · block signals · station crossovers`]);
+    this.tip({ title: 'Double track', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : pl.errors.slice(0, 3), warn: pl.warnings, hint: pl.ok ? (d?.moved ? 'Release to build' : 'Click: build; drag: extend') : 'Try the other side or a shorter stretch' }, pl.ok ? 'ok' : 'err');
   }
 
   private commitDouble() {
@@ -1177,8 +1177,8 @@ export class Tools {
     const f = finishDoubleTrack(g, edges, PLAYER, { rightHand: this.rightHand });
     if (f.error) { this.ui.toast(`Double track kept two-way: ${f.error}`, 'info'); return; }
     // signals are visible on the track; crossovers are worth a word (once per chain)
-    if (f.crossovers) this.ui.toast(`Directional double track: ${plural(f.crossovers, 'crossover')} before the station · ${plural(f.signals, 'signal')}`, 'good');
-    else if (f.signals && !this.finishTold) { this.finishTold = true; this.ui.toast(`Directional double track: one way per track, ${plural(f.signals, 'block signal')}`, 'good'); }
+    if (f.crossovers) this.ui.toast(`Directional: ${plural(f.crossovers, 'crossover')} before station · ${plural(f.signals, 'signal')}`, 'good');
+    else if (f.signals && !this.finishTold) { this.finishTold = true; this.ui.toast(`One way per track · ${plural(f.signals, 'block signal')}`, 'good'); }
   }
 
   // ------------------------------------------------------------------ electrification
@@ -1197,7 +1197,7 @@ export class Tools {
     if (!ids.length) {
       this.elec = null;
       ov.setHoverEdge(null);
-      this.tip({ title: 'Electrify', rows: [['bolt', 'Point at a track, or drag along a line']] }, 'info');
+      this.tip({ title: 'Electrify', rows: [['bolt', 'Point at track or drag along a line']] }, 'info');
       return;
     }
     const key = ids.join(',') + '|' + g.networkVersion;
@@ -1207,15 +1207,15 @@ export class Tools {
     let len = 0;
     for (const id of ids) len += net.edges.get(id)?.len ?? 0;
     const rows: [string, string][] = [['length', `<b>${fmtLen(r.length)}</b> of track to wire${ids.length > 1 ? ` · ${ids.length} sections` : ''}`]];
-    if (r.changed && len - r.length > 0.5) rows.push(['check', `${fmtLen(len - r.length)} electrified already (or not standard track)`]);
-    rows.push(['bolt', 'Standard → electrified track: electric locomotives and EMUs can run']);
+    if (r.changed && len - r.length > 0.5) rows.push(['check', `${fmtLen(len - r.length)} already electrified or non-standard`]);
+    rows.push(['bolt', 'Wire for electric locomotives and EMUs']);
     const ownerOf = ids.map((id) => net.edges.get(id)?.owner ?? PLAYER).find((o) => o !== PLAYER && o >= 0);
-    if (ownerOf !== undefined) rows.push(['company', `Track of ${esc(g.company(ownerOf).name)} — stays theirs, you pay the wire`]);
+    if (ownerOf !== undefined) rows.push(['company', `Track of ${esc(g.company(ownerOf).name)} · you pay for wire`]);
     this.tip({
       title: 'Electrify', cost: r.changed ? r.cost : undefined, rows,
       err: r.changed ? [] : [r.error ?? 'Already electrified'],
       warn: r.changed && r.error ? [r.error] : r.changed && !g.economy.canAfford(r.cost) ? ['Not enough money'] : [],
-      hint: d?.moved ? 'Release to electrify' : 'Click to electrify · drag along the line for more',
+      hint: d?.moved ? 'Release to electrify' : 'Click: electrify; drag: extend',
     }, r.changed ? 'ok' : 'err');
   }
 
@@ -1266,14 +1266,14 @@ export class Tools {
       ov.setHoverEdge(pt.edge.id, err ? 0xff5a4a : 0xffb020);
       ov.setMarker('hover0', pt, 'edge', err ? 0xff5a4a : 0xffd84a);
       const tt = (TRACK_TYPES[pt.edge.type] ?? TRACK_TYPES.standard).name;
-      this.tip(err ? { title: 'Connect tracks', err: [err], hint: 'Click to request track access' } : { title: 'Connect tracks', rows: [['connect', 'Click to put the first turnout here'], ['rail', esc(tt) + (pt.edge.owner !== PLAYER ? ' · ' + esc(g.company(pt.edge.owner).name) : '')]] }, err ? 'err' : 'info');
+      this.tip(err ? { title: 'Connect tracks', err: [err], hint: 'Click to request track access' } : { title: 'Connect tracks', rows: [['connect', 'Click: first turnout'], ['rail', esc(tt) + (pt.edge.owner !== PLAYER ? ' · ' + esc(g.company(pt.edge.owner).name) : '')]] }, err ? 'err' : 'info');
       return;
     }
     const a = this.conn;
     if (!pt || pt.edge.id === a.edge) {
       ov.setProposal(null); ov.setDemolish(null); ov.setMarker('hover0', null);
       ov.setHoverEdge(a.edge, 0xffb020);
-      this.tip({ title: 'Connect tracks', rows: [['connect', 'Now point at the other track']], hint: 'Esc or right-click picks the first track again' }, 'info');
+      this.tip({ title: 'Connect tracks', rows: [['connect', 'Now point at the other track']], hint: 'Esc / right-click: pick first track again' }, 'info');
       return;
     }
     const key = this.connKey(a, pt);
@@ -1299,21 +1299,21 @@ export class Tools {
       const R = pl.minRadius;
       const type = pl.proposal?.opts.type ?? g.world.net.edges.get(ea)?.type ?? 'standard';
       rows.push(['radius', isFinite(R) && R < 5000 ? `radius <b>${Math.round(R * 10).toLocaleString('en-US')} m</b> · ${Math.round(Math.min((TRACK_TYPES[type] ?? TRACK_TYPES.standard).speed, curveSpeed(R, type)))} km/h` : 'straight']);
-      rows.push(['rail', '2 turnouts · path signals where the line is signalled']);
+      rows.push(['rail', '2 turnouts · path signals on signalled lines']);
       if (pl.proposal?.stats.bridges || pl.proposal?.stats.tunnels) rows.push(['bridge', `<span class="tt-hot">${pl.proposal.stats.bridges ? plural(pl.proposal.stats.bridges, 'bridge') : ''}${pl.proposal.stats.bridges && pl.proposal.stats.tunnels ? ' · ' : ''}${pl.proposal.stats.tunnels ? plural(pl.proposal.stats.tunnels, 'tunnel') : ''}</span>`]);
     }
     const walls = pl.proposal ? this.retainingWallRow([pl.proposal]) : null;
     if (walls) rows.push(walls);
     const warn = [...pl.warnings];
     if (pl.ok && pl.proposal?.demolish.length) warn.unshift(`Demolishes ${plural(pl.proposal.demolish.length, 'building')}`);
-    this.tip({ title: 'Connect tracks', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot connect here'], warn, hint: pl.ok ? 'Click to build · Esc picks again' : 'Try another point, or click to search nearby' }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
+    this.tip({ title: 'Connect tracks', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot connect here'], warn, hint: pl.ok ? 'Click to build · Esc picks again' : 'Try another point or click to search nearby' }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
   }
 
   private clickConnect() {
     const g = this.game;
     const pt = this.connPoint();
     if (!this.conn) {
-      if (!pt) { this.ui.toast('Click on a track (not a platform or depot track)', 'bad'); return; }
+      if (!pt) { this.ui.toast('Choose track outside platforms and depots', 'bad'); return; }
       if (!g.canUse(PLAYER, pt.edge.owner)) { requestAccessUI(this.ui, pt.edge.owner); return; }
       this.conn = { edge: pt.edge.id, s: pt.s, x: pt.x, y: pt.y, z: pt.z };
       this.overlay.setMarker('start0', pt, 'start', 0xffb020);
@@ -1329,7 +1329,7 @@ export class Tools {
       if (who !== null) { requestAccessUI(this.ui, who); return; }
       // a wider search: the turnouts may move a little along their tracks
       const wide = planConnection(g, a.edge, a.s, pt.edge.id, pt.s, PLAYER, { search: 8 });
-      if (wide.ok) { this.connPlan = { key, plan: wide }; this.showConnPlan(wide, a.edge, pt.edge.id); this.ui.toast('A curve fits with the turnouts moved a little — click again to build it', 'info'); return; }
+      if (wide.ok) { this.connPlan = { key, plan: wide }; this.showConnPlan(wide, a.edge, pt.edge.id); this.ui.toast('Turnouts shifted to fit; click again to build.', 'info'); return; }
       this.ui.toast(pl.error ?? 'Cannot connect the tracks here', 'bad');
       return;
     }
@@ -1360,7 +1360,7 @@ export class Tools {
       this.rlv = null;
       ov.setProposal(null); ov.setHoverEdge(null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at your track, or drag along a stretch']] }, other ? 'err' : 'info');
+      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at or drag along your track']] }, other ? 'err' : 'info');
       return;
     }
     const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}`;
@@ -1381,7 +1381,7 @@ export class Tools {
     if (pl.stations.length) rows.push(['station', `${pl.stations.map((s) => esc(g.stations.get(s.id)?.name ?? '?')).join(', ')} go${pl.stations.length === 1 ? 'es' : ''} with it`]);
     if (pl.crossings.length) rows.push(['crossing', `${plural(pl.crossings.length, 'level crossing')} become${pl.crossings.length === 1 ? 's' : ''} grade-separated`]);
     const err = pl.ok ? [] : [pl.error ?? 'Cannot re-level here'];
-    this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err, warn: [...pl.warnings], hint: pl.ok ? (d?.moved ? 'Release to rebuild' : 'Click to rebuild · drag along the line for more') : undefined }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
+    this.tip({ title, cost: pl.ok ? pl.cost : undefined, rows, err, warn: [...pl.warnings], hint: pl.ok ? (d?.moved ? 'Release to rebuild' : 'Click: rebuild; drag: extend') : undefined }, pl.ok && g.economy.canAfford(pl.cost) ? 'ok' : 'err');
   }
 
   private commitRelevel() {
@@ -1394,7 +1394,7 @@ export class Tools {
     const before = g.economy.money;
     let err: string | null;
     try { err = commitRelevel(g, r.plan); } catch (e) { err = (e as Error).message; }
-    if (err === 'busy') { this.ui.toast('A train is on this stretch — try again in a moment', 'info'); return; }
+    if (err === 'busy') { this.ui.toast('Train on stretch: try again shortly', 'info'); return; }
     if (err) { this.ui.toast(err, 'bad'); return; }
     this.ui.floatCost(Math.max(0, before - g.economy.money), this.client.x, this.client.y);
     this.ui.sound('build-rail', this.ground ? { x: this.ground.x, z: this.ground.z, pitch: 0.9 } : {});
@@ -1410,7 +1410,7 @@ export class Tools {
     if (!ne || ne.edge.owner !== PLAYER) {
       this.onTrack = null;
       ov.setStationGhost(null); ov.setSegments('throat', null); drawCatchStreets(ov, 'hover', null);
-      this.tip(ne ? { title: 'Station on the line', err: [`Track of ${g.company(ne.edge.owner).name}`] } : { title: 'Station on the line', rows: [['station', 'Point at one of your tracks: the station is cut into the line there']] }, ne ? 'err' : 'info');
+      this.tip(ne ? { title: 'Station on the line', err: [`Track of ${g.company(ne.edge.owner).name}`] } : { title: 'Station on the line', rows: [['station', 'Point at your track to insert a station']] }, ne ? 'err' : 'info');
       return;
     }
     const s = Math.round(ne.s * 2) / 2;
@@ -1432,7 +1432,7 @@ export class Tools {
       if (st.level !== 'ground') rows.push([st.level === 'elevated' ? 'bridge' : 'tunnel', st.level === 'elevated' ? 'elevated with the line' : 'underground with the line']);
       rows.push(['people', `<b>${catchStreetPop(g, planCatchStreets(g, st)).toLocaleString('en-US')}</b> residents in walking reach`]);
     }
-    this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click to build · trains keep running through it' : 'Straight, level track is needed for the platforms' }, pl.ok ? 'ok' : 'err');
+    this.tip({ title: 'Station on the line', cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn: [...pl.warnings, ...(pl.ok && !g.economy.canAfford(pl.cost) ? ['Not enough money'] : [])], hint: pl.ok ? 'Click: build; trains keep running' : 'Platforms need straight, level track' }, pl.ok ? 'ok' : 'err');
   }
 
   private commitStationOnLine(e: PointerEvent) {
@@ -1444,7 +1444,7 @@ export class Tools {
     const before = g.economy.money;
     const r = commitStationOnTrack(g, ot.plan);
     this.onTrack = null;
-    if (r.error === 'busy') { this.ui.toast('A train is on this stretch — try again in a moment', 'info'); return; }
+    if (r.error === 'busy') { this.ui.toast('Train on stretch: try again shortly', 'info'); return; }
     if (r.error) { this.ui.toast(r.error, 'bad'); return; }
     this.overlay.setSegments('throat', null);
     this.ui.floatCost(Math.max(0, before - g.economy.money), e.clientX, e.clientY);
@@ -1462,7 +1462,7 @@ export class Tools {
     const g = this.game, ov = this.overlay;
     const st = this.entranceStation != null ? g.stations.get(this.entranceStation) : undefined;
     const r = st?.rail;
-    if (!st || !r) { ov.setFootprints(null); ov.setProposal(null); drawCatchStreets(ov, 'hover', null); this.tip({ title: 'Add entrance', err: ['Pick a station first (station window → Build → Add entrance)'] }, 'err'); return; }
+    if (!st || !r) { ov.setFootprints(null); ov.setProposal(null); drawCatchStreets(ov, 'hover', null); this.tip({ title: 'Add entrance', err: ['Choose station → Build → Add entrance'] }, 'err'); return; }
     const ground = r.level === 'ground';
     const pl = g.stations.planEntrance(st.id, p.x, p.z, PLAYER, ground ? this.entranceKind : undefined);
     const T = ENTRANCE_TYPES[pl.kind];
@@ -1487,13 +1487,13 @@ export class Tools {
       const covered = walkingCatchment(g, st).buildings;
       for (const id of walk.buildings.keys()) { const b = g.world.buildings.get(id); if (!b) continue; reach += b.pop; if (!covered.has(id)) fresh += b.pop; }
     }
-    const rows: [string, string][] = pl.ok ? [['entrance', esc(T.desc)], ['people', `<b>${fresh.toLocaleString('en-US')}</b> residents newly within ${Math.round(R * 10)} m walking (${reach.toLocaleString('en-US')} in its reach)`]] : [];
-    if (pl.ok && pl.landings.length > 1) rows.push(['walk', `Stairs on both sides of the tracks · ${pl.landings.filter((q) => q.road).length === 2 ? 'streets on both' : 'a street on one'}`]);
+    const rows: [string, string][] = pl.ok ? [['entrance', esc(T.desc)], ['people', `<b>${fresh.toLocaleString('en-US')}</b> new residents within ${Math.round(R * 10)} m walk · ${reach.toLocaleString('en-US')} total`]] : [];
+    if (pl.ok && pl.landings.length > 1) rows.push(['walk', `Stairs on both sides · ${pl.landings.filter((q) => q.road).length === 2 ? 'streets on both' : 'a street on one'}`]);
     if (pl.access) rows.push(['road', `Access street ${fmtLen(pl.access.stats.len)} · ${fmtMoney(pl.access.cost)} (included)`]);
     if (pl.ok) rows.push(['coin', `Upkeep ${fmtMoney(T.upkeep)} a year`]);
     const warn = pl.ok ? [...pl.warnings] : [];
-    if (gone.length) warn.push(`Its access street demolishes ${plural(gone.length, 'building')} (${gone.reduce((n, id) => n + (g.world.buildings.get(id)?.pop ?? 0), 0).toLocaleString('en-US')} residents)`);
-    this.tip({ title: `${T.name} · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn, hint: ground ? 'Click beside the tracks to build · Esc when done' : 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
+    if (gone.length) warn.push(`Access street removes ${plural(gone.length, 'building')} · ${gone.reduce((n, id) => n + (g.world.buildings.get(id)?.pop ?? 0), 0).toLocaleString('en-US')} residents`);
+    this.tip({ title: `${T.name} · ${esc(st.name)}`, cost: pl.ok ? pl.cost : undefined, rows, err: pl.ok ? [] : [pl.error ?? 'Cannot build here'], warn, hint: ground ? 'Click beside tracks: build; Esc: finish' : 'Click to build · Esc when done' }, pl.ok ? 'ok' : 'err');
   }
 
   /** Object under a ground point (stations first, then depots, network, buildings, towns). */
@@ -1726,7 +1726,7 @@ export class Tools {
     }
     if (err) return { title: rail ? 'Track' : 'Road', err: [err] };
     const fo = this.foreignOwner(sn);
-    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track is yours, theirs stays theirs`], ['coin', `Shared maintenance ${fmtMult(this.game.accessMultiplier(fo))} when you run on it`]] };
+    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track: yours; existing track: theirs`], ['coin', `Shared upkeep ${fmtMult(this.game.accessMultiplier(fo))} when used`]] };
     if (sn.kind === 'node') {
       const n = net.nodes.get(sn.node!);
       const cnt = sn.group?.length ?? 1;
@@ -1740,7 +1740,7 @@ export class Tools {
     const rows: [string, string][] = [[rail ? 'rail' : 'road', `Click to start · ${esc(t)}`]];
     if (rail) rows.push([this.railLevel === 'elevated' ? 'bridge' : this.railLevel === 'underground' ? 'tunnel' : 'rail', typeLevelText(this.buildOptions())]);
     if (this.heightOffset) rows.push(['height', `Section ends at <b>${fmtHeight(this.heightOffset)}</b>`]);
-    return { title: rail ? 'New track' : 'New road', rows, hint: rail ? 'Hold Shift over a track to copy it in parallel' : undefined };
+    return { title: rail ? 'New track' : 'New road', rows, hint: rail ? 'Shift over track: parallel copy' : undefined };
   }
 
   private showPlanTip() {
@@ -1749,7 +1749,7 @@ export class Tools {
     const g = this.game;
     const N = Math.max(1, p.tracks.length);
     const st = p.stats;
-    if (p.errors[0] === 'Too short') { this.tip({ title: p.opts.kind === 'rail' ? 'Track' : 'Road', rows: [['target', 'Move the cursor to plan the next section']], hint: 'Right-click or Esc ends construction' }, 'info'); return; }
+    if (p.errors[0] === 'Too short') { this.tip({ title: p.opts.kind === 'rail' ? 'Track' : 'Road', rows: [['target', 'Point to plan next section']], hint: 'Right-click / Esc: end construction' }, 'info'); return; }
     this.tip(this.proposalTip(p, N), p.ok && g.economy.canAfford(p.cost) ? 'ok' : 'err');
   }
 
@@ -1759,7 +1759,7 @@ export class Tools {
       const s = i === 0 ? 0 : tp.len;
       return sn.kind === 'free' && tp.sections.some((q) => q.type === 'bridge' && q.s0 <= s + 0.05 && q.s1 >= s - 0.05);
     }));
-    if (bridgeEnd) warnings.push(`End stands on a bridge — ${p.opts.kind === 'rail' ? 'trains' : 'vehicles'} can't continue. Extend to the ground.`);
+    if (bridgeEnd) warnings.push(`Bridge end: ${p.opts.kind === 'rail' ? 'trains' : 'vehicles'} cannot continue; extend to ground`);
     if (p.opts.kind === 'road' && (!p.opts.level || p.opts.level === 'ground') && (p.opts.crossing === 'auto' || p.opts.crossing === 'level')) {
       const net = this.game.world.net, types = new Set<string>();
       for (const c of p.crossings) {
@@ -1768,7 +1768,7 @@ export class Tools {
       }
       for (const type of types) {
         const name = (TRACK_TYPES[type] ?? TRACK_TYPES.standard).name.replace(/ \(electrified\)$/, '');
-        warnings.push(`${name} doesn't allow level crossings. Choose Overpass or Underpass crossing mode.`);
+        warnings.push(`${name}: no level crossings; choose Overpass or Underpass`);
       }
     }
     return warnings;
@@ -1827,9 +1827,9 @@ export class Tools {
       rows.push(['crossing', [...m].map(([k, v]) => `${v} ${k}${v > 1 ? (k.endsWith('ss') ? 'es' : 's') : ''}`).join(', ')]);
     }
     if (this.heightOffset && this.hoverSnap?.kind === 'free' && !title) rows.push(['height', `end ${fmtHeight(this.heightOffset)}`]);
-    if (st.sharedSaving && st.sharedSaving > 0) rows.push(['coin', `<b>${fmtMoney(st.sharedSaving)}</b> saved: ${N > 1 ? 'the tracks share one formation' : 'it shares the formation of the track beside it'}`]);
+    if (st.sharedSaving && st.sharedSaving > 0) rows.push(['coin', `<b>${fmtMoney(st.sharedSaving)}</b> saved: ${N > 1 ? 'the tracks share one formation' : 'shared formation with adjacent track'}`]);
     for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (upkeep shared ${fmtMult(this.game.accessMultiplier(fo))})`]); break; } }
-    const warn = [...this.planWarnings(p), ...p.warnings.filter((w) => w !== 'The free end stands on a bridge: continue it to the ground')];
+    const warn = [...this.planWarnings(p), ...p.warnings.filter((w) => w !== 'Bridge end: extend to ground')];
     if (p.demolish.length) warn.unshift(`Demolishes ${plural(p.demolish.length, 'building')}`);
     const who = accessOwnerOf(this.game, p.errors[0]);
     if (who !== null) return { title: `${esc(this.game.company(who).name)}'s network`, cost: p.cost, rows, warn, err: [`${p.errors[0]}`], hint: accessState(this.game, who).kind === 'none' ? 'Click to request track access' : undefined };
@@ -1856,7 +1856,7 @@ export class Tools {
     const remove = this.tramMode === 'remove';
     if (!ids || !ids.length) {
       ov.setHoverEdge(null);
-      this.tip({ title: remove ? 'Remove tram tracks' : 'Tram tracks', rows: [['road', remove ? 'Point at your tram tracks' : 'Point at a road']], hint: 'Press and drag along streets for a whole route' }, 'info');
+      this.tip({ title: remove ? 'Remove tram tracks' : 'Tram tracks', rows: [['road', remove ? 'Point at your tram tracks' : 'Point at a road']], hint: 'Drag along streets for a route' }, 'info');
       return;
     }
     const r = remove ? removeTramTracks(g, ids, PLAYER, true) : addTramTracks(g, ids, PLAYER, true);
@@ -1866,14 +1866,14 @@ export class Tools {
     const rows: [string, string][] = [['length', `<b>${fmtLen(len)}</b> of road${ids.length > 1 ? ` · ${ids.length} sections` : ''}`]];
     if (!remove && r.changed < ids.length) rows.push(['check', `${ids.length - r.changed} section${ids.length - r.changed === 1 ? '' : 's'} already with tracks`]);
     const err = r.changed ? [] : [r.error ?? (remove ? 'No tram tracks of yours here' : 'Already has tram tracks')];
-    this.tip({ title: remove ? 'Remove tram tracks' : 'Lay tram tracks', cost: r.changed ? r.cost : undefined, rows, err, warn: r.changed && r.error ? [r.error] : !remove && r.changed && !g.economy.canAfford(r.cost) ? ['Not enough money'] : [], hint: d ? undefined : 'Click for one road · press and drag along streets' }, r.changed ? (remove ? 'err' : 'ok') : 'err');
+    this.tip({ title: remove ? 'Remove tram tracks' : 'Lay tram tracks', cost: r.changed ? r.cost : undefined, rows, err, warn: r.changed && r.error ? [r.error] : !remove && r.changed && !g.economy.canAfford(r.cost) ? ['Not enough money'] : [], hint: d ? undefined : 'Click: one road; drag: street route' }, r.changed ? (remove ? 'err' : 'ok') : 'err');
   }
 
   private commitTram(ids: number[]) {
     const g = this.game;
     const remove = this.tramMode === 'remove';
     const r = remove ? removeTramTracks(g, ids, PLAYER) : addTramTracks(g, ids, PLAYER);
-    if (!r.changed) { this.ui.toast(r.error ?? (remove ? 'No tram tracks of yours here' : 'These roads already have tram tracks'), 'bad'); return; }
+    if (!r.changed) { this.ui.toast(r.error ?? (remove ? 'No tram tracks of yours here' : 'Tram tracks already present'), 'bad'); return; }
     if (r.error) this.ui.toast(r.error, 'info');
     this.ui.floatCost(r.cost, this.client.x, this.client.y);
     this.ui.sound(remove ? 'demolish' : 'build-rail', this.ground ? { x: this.ground.x, z: this.ground.z } : {});
@@ -1883,7 +1883,7 @@ export class Tools {
   private hoverStop(p: THREE.Vector3, tram: boolean) {
     const g = this.game, ov = this.overlay;
     const pl = g.stations.planBusStop(p.x, p.z, PLAYER);
-    const tramErr = tram && pl.ok && pl.edge && !tramUsable(g, pl.edge, PLAYER) ? (pl.edge.tram ? `Tram tracks of ${g.company(pl.edge.tramOwner ?? -1).name} — click to request access` : 'Needs a road with tram tracks') : '';
+    const tramErr = tram && pl.ok && pl.edge && !tramUsable(g, pl.edge, PLAYER) ? (pl.edge.tram ? `Tram tracks of ${g.company(pl.edge.tramOwner ?? -1).name}: request access` : 'Needs a road with tram tracks') : '';
     const color = tram ? 0xc084fc : 0x46e07a;
     if (pl.ok && pl.edge && !tramErr) {
       const q = { x: 0, y: 0, z: 0 }, dd = { x: 0, y: 0, z: 0 };
@@ -1902,7 +1902,7 @@ export class Tools {
       if (lk) rows.push(['plus', `Links with ${esc(lk)} (transfers)`]);
       if (pl.edge.owner >= 0 && pl.edge.owner !== PLAYER) rows.push(['company', `Road of ${esc(g.company(pl.edge.owner).name)}`]);
       const to = pl.edge.tramOwner ?? -1;
-      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> (upkeep shared ${fmtMult(g.accessMultiplier(to))})`]);
+      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> · shared upkeep ${fmtMult(g.accessMultiplier(to))}`]);
       this.tip({ title: tram ? 'Tram stop' : 'Bus stop', cost: pl.cost, rows, warn: g.economy.canAfford(pl.cost) ? [] : ['Not enough money'] }, 'ok');
     } else {
       ov.setFootprints(null);
@@ -1942,7 +1942,7 @@ export class Tools {
       const prop = planEdge(g, a, b, { ...this.buildOptions(), kind: 'rail', type: e.type, tracks: 1, heightOffset: 0, ...lvo });
       const own = this.ownErr(a) ?? this.ownErr(b);
       if (own) { prop.ok = false; prop.errors.unshift(own); }
-      if (blocked) { prop.ok = false; prop.errors.unshift('There is already a track on this side'); }
+      if (blocked) { prop.ok = false; prop.errors.unshift('Track already on this side'); }
       return { prop, err: commit ? commitProposal(g, prop) : null };
     } finally {
       for (const id of temp) { const n = net.nodes.get(id); if (n && !n.edges.length) net.removeNode(id); }
@@ -1983,7 +1983,7 @@ export class Tools {
 
   private buildParallel() {
     const hit = this.edgeAtCursor('rail', (e) => e.station < 0 && e.depot < 0 && e.owner === PLAYER, 40);
-    if (!hit || !this.ground) { this.ui.toast('Hold Shift over one of your tracks to copy it', 'info'); return; }
+    if (!hit || !this.ground) { this.ui.toast('Shift over your track: parallel copy', 'info'); return; }
     const side = this.sideOf(hit.edge, this.ground.x, this.ground.z);
     const r = this.parallelPlan(hit.edge, side, true);
     if (!r.prop.ok) { this.ui.toast(r.prop.errors[0] ?? 'Cannot build here', 'bad'); return; }
@@ -2027,7 +2027,7 @@ export class Tools {
           const id = this.relocating;
           const before = g.economy.money;
           const err = relocateStation(g, id, pl);
-          if (err === 'busy') { this.ui.toast('A vehicle is at the station — try again in a moment', 'info'); return; }
+          if (err === 'busy') { this.ui.toast('Vehicle at station: try again shortly', 'info'); return; }
           if (err) { this.ui.toast(err, 'bad'); return; }
           this.ui.floatCost(Math.max(0, before - g.economy.money), e.clientX, e.clientY);
           this.ui.sound('station', { x: pl.x, z: pl.z });
@@ -2042,7 +2042,7 @@ export class Tools {
         else {
           this.ui.floatCost(pl.cost, e.clientX, e.clientY);
           this.ui.sound('station', { x: pl.x, z: pl.z });
-          if (!pl.roadAccess) this.ui.toast('The station has no road access yet: connect it to a street so passengers can reach it', 'info');
+          if (!pl.roadAccess) this.ui.toast('No road access: connect the station to a street', 'info');
         }
         break;
       }
@@ -2078,7 +2078,7 @@ export class Tools {
         if (this.relocatingDepot != null) {
           const before = g.economy.money;
           const err = relocateDepot(g, this.relocatingDepot, pl);
-          if (err === 'busy') { this.ui.toast('A vehicle is on the depot track — try again in a moment', 'info'); return; }
+          if (err === 'busy') { this.ui.toast('Vehicle on depot track: try again shortly', 'info'); return; }
           if (err) { this.ui.toast(err, 'bad'); return; }
           this.ui.floatCost(Math.max(0, before - g.economy.money), e.clientX, e.clientY);
           this.ui.sound('depot', { x: pl.x, z: pl.z });
@@ -2153,7 +2153,7 @@ export class Tools {
       const message = [`Demolish ${[...stations, ...depots].join(', ')}?`,
         `Affected lines: ${some(lines.map((l) => l.name))}`,
         `Affected vehicles: ${some(vehicles.map((v) => v.name))}`,
-        `Demolition costs ${fmtMoney(preview.cost)}. Construction costs are not refunded.`].join('\n\n');
+        `Demolition: ${fmtMoney(preview.cost)} · no construction refund`].join('\n\n');
       if (!confirm(message)) { this.hideTip(); return; }
     }
     const r = bulldoze(g, x0, z0, x1, z1, PLAYER, false);
@@ -2168,10 +2168,10 @@ export class Tools {
     const unaffordable = c.cost !== undefined && !this.game.economy.canAfford(c.cost);
     if (unaffordable) {
       c = { ...c, warn: c.warn?.filter((msg) => !this.ui.needsMoney(msg)),
-        err: [...(c.err ?? []).filter((msg) => !this.ui.needsMoney(msg)), `Not enough money: ${fmtMoney(c.cost!)} needed, ${fmtMoney(this.game.economy.money)} available`] };
+        err: [...(c.err ?? []).filter((msg) => !this.ui.needsMoney(msg)), `Not enough money: need ${fmtMoney(c.cost!)}, have ${fmtMoney(this.game.economy.money)}`] };
       kind = 'err';
     }
-    if (this.touchPreview) c = { ...c, hint: 'Tap the same spot to confirm · tap elsewhere to move the preview' };
+    if (this.touchPreview) c = { ...c, hint: 'Tap same spot: confirm; elsewhere: move preview' };
     this.showTip(tipHtml(c), kind);
     const finance = unaffordable || [...(c.err ?? []), ...(c.warn ?? [])].some((msg) => this.ui.needsMoney(msg));
     if (finance && !this.tooltip.querySelector('.finance-actions')) this.tooltip.append(this.ui.financeActions(() => this.refreshHover()));

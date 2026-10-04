@@ -769,7 +769,7 @@ async function decodeBytes(data: Uint8Array | string): Promise<Uint8Array> {
     if (!data.startsWith('gz:')) throw new Error('Invalid compressed chunk');
     data = unb64(data.slice(3));
   }
-  if (typeof DecompressionStream === 'undefined') throw new Error('This browser cannot decompress this save');
+  if (typeof DecompressionStream === 'undefined') throw new Error('Browser cannot decompress this save');
   const stream = new Blob([data as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
@@ -826,7 +826,7 @@ export function saveIncompatibility(info: { format?: unknown; version?: unknown;
   const format = info?.format ?? info?.version;
   if (format === undefined || (typeof format === 'number' && READABLE.includes(format))) return null;
   const by = typeof info?.game === 'string' ? `Railfever v${info.game}` : typeof format === 'number' && format > VERSION ? 'a newer version of Railfever' : 'an older version of Railfever';
-  return `This save is not compatible with this version (v${GAME_VERSION}): it was made by ${by}.`;
+  return `Incompatible with v${GAME_VERSION}: save from ${by}.`;
 }
 
 let slotCache: SlotInfo[] = [];

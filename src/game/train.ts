@@ -697,7 +697,7 @@ export class Train extends Vehicle {
           any = findRailRoute(g, frontier(g, { ...ts, dir: -ts.dir }, this.owner, false, null, turnAtPlatform(ts)), target.id, this.owner, this.id, 20000);
         }
       }
-      this.status = any ? `No compatible route to ${target.name} (${rule.wire ? 'needs electrified track' : `needs ${[...rule.types!].join('/')} track`})` : 'No route to ' + target.name;
+      this.status = any ? `No compatible route to ${target.name}: ${rule.wire ? 'needs electrified track' : `needs ${[...rule.types!].join('/')} track`}` : 'No route to ' + target.name;
       if (++this.failCount >= 3 && this.line && this.line.stops.length > 1) { this.advanceStop(); this.failCount = 0; }
       return false;
     }
@@ -751,7 +751,7 @@ export class Train extends Vehicle {
       this.segs = [];
       this.pending = [];
       this.state = 'depot';
-      this.status = 'Waiting for a free path out of the depot';
+      this.status = 'Depot exit path blocked';
     } else g.vehicles.noteSpacingRelease(this);
   }
 
@@ -972,7 +972,7 @@ export function lineCompatibility(g: Game, lineId: number, cars: VehicleModel[])
       if (!e || !ruleAllows(rule, e)) continue;
       if ([1, -1].some((d) => !!findRailRoute(g, railNext(g, e, d, l.owner, false, rule), b.id, l.owner, -1, 40000, false, rule))) { ok = true; break; }
     }
-    if (!ok) return `${cars[0]?.name ?? 'This train'} cannot run from ${a.name} to ${b.name}: the track there is not ${rule.wire ? 'electrified ' : ''}${rule.types ? [...rule.types].join(' / ') : ''} track`;
+    if (!ok) return `${cars[0]?.name ?? 'This train'}: ${a.name} → ${b.name} needs ${rule.wire ? 'electrified ' : ''}${rule.types ? [...rule.types].join(' / ') : ''} track`;
   }
   return null;
 }

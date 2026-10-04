@@ -19,7 +19,7 @@ export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; i
 /** One line on the player's access to another company's station. */
 function accessHint(g: Game, owner: number): string {
   const k = accessState(g, owner).kind;
-  return k === 'agreement' ? `${g.hasAccess(PLAYER, owner) ? 'Track access' : 'Open network'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'You are blocked from this network' : k === 'closed' ? 'The owner refuses access' : 'No track access · click to request';
+  return k === 'agreement' ? `${g.hasAccess(PLAYER, owner) ? 'Track access' : 'Open network'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'Access blocked' : k === 'closed' ? 'Access refused' : 'No track access · click to request';
 }
 
 const stat = (ic: string, html: string) => `<span class="hc-stat">${svg(ic, 14)}<span>${html}</span></span>`;
@@ -112,7 +112,7 @@ export class HoverCard {
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}` +
           // mail waiting (stations that handle mail; never tram stops)
           `${stationShowsMail(g, s) ? stat('mail', `<b>${tonnes(s.mail?.total ?? 0)}</b> t mail`) : ''}</div>` +
-          `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access — no passengers</span>' : 'Click for details'}</div>`,
+          `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access: no passengers</span>' : 'Details'}</div>`,
       };
     }
     if (t.kind === 'vehicle') {
@@ -142,7 +142,7 @@ export class HoverCard {
         html: `<div class="hc-title">${svg(d.kind === 'rail' ? 'depot' : 'garage', 16)}<span>${d.kind === 'rail' ? 'Train depot' : 'Bus depot'}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}</div>` +
           `<div class="hc-stats">${stat('vehicles', `<b>${n}</b> vehicle${n === 1 ? '' : 's'}`)}</div>` +
-          `<div class="hc-hint">${d.owner === PLAYER ? 'Click to buy vehicles' : 'Click for details'}</div>`,
+          `<div class="hc-hint">${d.owner === PLAYER ? 'Buy vehicles' : 'Details'}</div>`,
       };
     }
     const town = g.towns.list[t.id];
@@ -153,10 +153,10 @@ export class HoverCard {
     return {
       color: '#eef2f7',
       html: `<div class="hc-title">${svg('towns', 16)}<span>${esc(town.name)}</span></div>` +
-        `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport yet'}</div>` +
+        `<div class="hc-sub">${sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport'}</div>` +
         `<div class="hc-stats">${stat('people', `<b>${town.pop.toLocaleString('en-US')}</b>`)}${stat('chart', `<b>${pct}%</b> transported`)}${stat('up', `growth <b>${sv.label}</b>`)}` +
         `${town.mail ? stat('mail', `<b>${tonnes(town.mail.postedLast)}</b> t mail posted/mo`) : ''}</div>` +
-        `<div class="hc-hint">Click for details</div>`,
+        `<div class="hc-hint">Details</div>`,
     };
   }
 

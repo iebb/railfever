@@ -357,7 +357,7 @@ function farStreet(tracks: number, length: number, gap: number) {
   for (const [dx, dz] of [[-0.6, -1.3], [0.4, -1.3], [1.4, -1.0], [-1.6, -1.5]]) house(g2, door.x + dx, door.z + dz, 0, 5);
   flush(g2);
   const up2 = planStationUpgrade(g2, S2.id, { length: 12 });
-  check(up2.ok && up2.entrances?.fates[0]?.fate === 'cut' && up2.warnings.some((w) => /gate goes \(no street reaches it/.test(w)),
+  check(up2.ok && up2.entrances?.fates[0]?.fate === 'cut' && up2.warnings.some((w) => /gate removed: no street beside new platforms/.test(w)),
     `the plan warns that the gate goes (${up2.error ?? up2.warnings.join('; ')})`);
   const news0 = g2.news.length;
   check(!commitStationUpgrade(g2, up2), 'rebuilt');
@@ -366,7 +366,7 @@ function farStreet(tracks: number, length: number, gap: number) {
   check(r3.entrances.length === 0 && entranceUpkeep(r3) === 0 && g2.stationMaintenance(S2) === 20000 + r3.tracks * r3.length * 500,
     `the gate is gone, its upkeep with it (${r3.entrances.length} entrances, ${g2.stationMaintenance(S2)} a year)`);
   check(r3.cost === value0 + up2.cost - price, `its price left the station's value (${value0} + ${up2.cost} - ${price} = ${r3.cost})`);
-  check(g2.news.length > news0 && /gate was taken down/.test(g2.news[g2.news.length - 1].text), `noted in the news ("${g2.news[g2.news.length - 1]?.text}")`);
+  check(g2.news.length > news0 && /removing its platform-end gate: no street beside new platforms/.test(g2.news[g2.news.length - 1].text), `noted in the news ("${g2.news[g2.news.length - 1]?.text}")`);
   console.log(`  a gate whose new street would demolish houses: "${up2.warnings.join('; ')}"; news: "${g2.news[g2.news.length - 1]?.text}"`);
 
   // re-levelling: lifted onto a viaduct its added entrances go (warned, like moving the station); brought back to

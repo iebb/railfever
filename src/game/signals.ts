@@ -89,12 +89,12 @@ export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, 
   if (s < NODE_SNAP || s > e.len - NODE_SNAP) {
     node = net.nodes.get(s < NODE_SNAP ? e.a : e.b) ?? null;
     if (!node) return 'No track here';
-    if (node.edges.length !== 2) return 'Signals need plain track (not at a switch or a track end)';
+    if (node.edges.length !== 2) return 'No signals at switches or track ends';
     const other = net.edges.get(node.edges[0] === e.id ? node.edges[1] : node.edges[0]);
     if (!other || other.owner !== owner) return 'Not your track';
-    if ((e.station >= 0 || e.depot >= 0) && (other.station >= 0 || other.depot >= 0)) return 'Cannot place signals in stations or depots';
+    if ((e.station >= 0 || e.depot >= 0) && (other.station >= 0 || other.depot >= 0)) return 'No signals in stations or depots';
   } else {
-    if (e.station >= 0 || e.depot >= 0) return 'Cannot place signals in stations or depots';
+    if (e.station >= 0 || e.depot >= 0) return 'No signals in stations or depots';
     if (kind === 'none') return null;
     if (g.vehicles.isEdgeBusy(e.id)) return 'Train in the way';
     if (!g.company(owner).economy.canAfford(SIGNAL_COST)) return 'Not enough money';
@@ -399,7 +399,7 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
   const deg = (nid: number) => net.nodes.get(nid)?.edges.length ?? 0;
   const p = { x: 0, y: 0, z: 0 };
   const want = (edge: NEdge, s: number, forward: boolean, kind: 'block' | 'path', pass: boolean, role: AutoSignal['role']) => {
-    if (edge.owner !== owner) { res.warnings.push(`Track of ${g.company(edge.owner).name} near ${Math.round(edge.bez.x0)},${Math.round(edge.bez.z0)} is left as it is`); return; }
+    if (edge.owner !== owner) { res.warnings.push(`Track of ${g.company(edge.owner).name} near ${Math.round(edge.bez.x0)},${Math.round(edge.bez.z0)} unchanged`); return; }
     const atEnd = s < 0.6 || s > edge.len - 0.6;
     let node = atEnd ? (s < 0.6 ? edge.a : edge.b) : -1;
     if (node >= 0) s = node === edge.a ? 0 : edge.len;
@@ -464,7 +464,7 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
       if (n0 && n0.signal >= 2 && !n0.signalPass && n0.edges.length === 2) { if (net.signalFor(n0, leaveSide(s0.edge, s0.dir, c.start)) > 0) fw++; else bw++; }
       if (n1 && n1.signal >= 2 && !n1.signalPass && n1.edges.length === 2 && c.end !== c.start) { if (signalAllows(g, s1.edge, s1.dir, c.end)) fw++; else bw++; }
     }
-    if (fw && bw) { res.warnings.push('Track with one-way signals facing both ways left as it is'); continue; }
+    if (fw && bw) { res.warnings.push('Opposing one-way signals: track unchanged'); continue; }
     if (fw || bw) {
       // directional: block signals every `spacing`, a path signal before a junction / station at its end
       const D = fw ? 1 : -1;

@@ -528,8 +528,8 @@ function aiDoubleConnectS(g: Game, owner: number, a: aiDoubleSPt, b: aiDoubleSPt
     // Even a legacy ground parent cannot make a deep connecting piece an open cutting. Low land requires a
     // bridge or a covered tunnel; a shallow formation below the water line cannot be built at this height.
     const sec = inherited !== 'ground' ? inherited : depth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover ? 'tunnel' : y - terrain > 1.4 || terrain < DRY_MIN ? 'bridge' : 'ground';
-    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below the water line here: raise it or go into a tunnel', cost: 0 };
-    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill in the way of the bridge: use a tunnel', cost: 0 };
+    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below water line: raise or tunnel', cost: 0 };
+    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill blocks bridge: use tunnel', cost: 0 };
     price += (s1 - s0) * tt.costPerUnit * (sec === 'ground' ? 1 : structureFactor('rail', sec, Math.abs(depth)));
     if (sec === 'ground') continue;
     const last = sections[sections.length - 1];
@@ -577,11 +577,11 @@ function aiDoubleChainOf(g: Game, edgeIds: number[], owner: number): { steps: St
     const e = net.edges.get(id)!;
     if (e.kind !== 'rail') return { steps: [], error: 'Only railway track can be doubled' };
     if (e.owner !== owner) return { steps: [], error: 'Not your track' };
-    if (e.station >= 0 || e.depot >= 0) return { steps: [], error: 'Platform and depot tracks cannot be doubled' };
+    if (e.station >= 0 || e.depot >= 0) return { steps: [], error: 'Cannot double platform or depot tracks' };
   }
   const set = new Set(ids);
   const steps = aiDoubleWalkTrack(g, net.edges.get(ids[0])!, set);
-  if (steps.length !== ids.length) return { steps: [], error: 'The selected track is not one continuous line' };
+  if (steps.length !== ids.length) return { steps: [], error: 'Track not continuous' };
   if (ids.length > 1) {
     const iLast = steps.findIndex((s) => s.edge === ids[ids.length - 1]), iFirst = steps.findIndex((s) => s.edge === ids[0]);
     if (iLast < iFirst) return { steps: steps.reverse().map((s) => ({ edge: s.edge, dir: -s.dir })) };
@@ -642,7 +642,7 @@ function* aiPlanDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner: num
       if ((pt.x - n.x) * nv.x + (pt.z - n.z) * nv.z <= 0.12) continue;
       if (q.u < U * 0.4) uMin = Math.max(uMin, q.u + 1.5);
       else if (q.u > U * 0.6) uMax = Math.min(uMax, q.u - 1.5);
-      else return fail(`A branch leaves the line on that side (${m10(q.u)} m along)`);
+      else return fail(`Branch on this side at ${m10(q.u)} m`);
     }
   }
   const offAt = (u: number) => { const q = aiDoubleSampleAt(S, u), nv = nrm(q); return { u, x: q.x + nv.x * sp, z: q.z + nv.z * sp, y: q.y, tx: q.tx, tz: q.tz }; };
@@ -689,8 +689,8 @@ function* aiPlanDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner: num
     return { end: { kind: 'turnout', u: 0, node: -1 }, inner: NaN, err: why || 'no room' };
   };
   const a = yield* endOf(true), b = yield* endOf(false);
-  if (!a || isNaN(a.inner)) return fail(`No room for the turnout at the start (${a?.err ?? ''})`);
-  if (!b || isNaN(b.inner)) return fail(`No room for the turnout at the end (${b?.err ?? ''})`);
+  if (!a || isNaN(a.inner)) return fail(`No room for start turnout: ${a?.err ?? ''}`);
+  if (!b || isNaN(b.inner)) return fail(`No room for end turnout: ${b?.err ?? ''}`);
   plan.start = a.end; plan.end = b.end;
   const uS = a.inner, uE = b.inner;
   if (uE - uS < 3) return fail('Too short to double');
@@ -859,7 +859,7 @@ function* aiCommitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts: Fi
         ok = true;
         break;
       }
-      if (!ok) { const r = rollback(`New track could not be built at ${Math.round(pts[k].u * 10)} m (the ground or the network changed)`); dropNodes(); return r; }
+      if (!ok) { const r = rollback(`Build failed at ${Math.round(pts[k].u * 10)} m: ground or network changed`); dropNodes(); return r; }
     }
     const cur = nodes[nodes.length - 1];
     const tracks = () => new Set<number>([...main.map((s) => s.edge), ...created()]);
@@ -917,12 +917,12 @@ export const DEFAULT_AI_CONFIG: AIConfig = { activeness: 1, focus: { rail: 1, ro
 
 /** Ready-made personalities for the new-game and company screens. */
 export const AI_PRESETS: { id: string; name: string; hint: string; config: AIConfig }[] = [
-  { id: 'balanced', name: 'Balanced', hint: 'Railways, buses and trams in equal measure', config: DEFAULT_AI_CONFIG },
-  { id: 'cautious', name: 'Cautious', hint: 'Builds rarely, avoids debt', config: { activeness: 0.35, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.15, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'aggressive', name: 'Aggressive', hint: 'Expands fast on borrowed money, buys struggling rivals', config: { activeness: 1.6, focus: { rail: 1.2, road: 1, tram: 1 }, risk: 0.85, startMoney: 8_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
+  { id: 'balanced', name: 'Balanced', hint: 'Rail, bus and tram equally', config: DEFAULT_AI_CONFIG },
+  { id: 'cautious', name: 'Cautious', hint: 'Rare builds; avoids debt', config: { activeness: 0.35, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.15, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
+  { id: 'aggressive', name: 'Aggressive', hint: 'Fast expansion with loans; buys struggling rivals', config: { activeness: 1.6, focus: { rail: 1.2, road: 1, tram: 1 }, risk: 0.85, startMoney: 8_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
   { id: 'rail', name: 'Rail baron', hint: 'Intercity railways first', config: { activeness: 1.1, focus: { rail: 3, road: 0.4, tram: 0.3 }, risk: 0.6, startMoney: 6_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'bus', name: 'Bus operator', hint: 'Long-distance coaches and town buses', config: { activeness: 1, focus: { rail: 0.25, road: 3, tram: 0.6 }, risk: 0.4, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'tram', name: 'Tram builder', hint: 'Tram lines in the big towns', config: { activeness: 1, focus: { rail: 0.4, road: 0.7, tram: 3 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
+  { id: 'bus', name: 'Bus operator', hint: 'Intercity coaches and town buses', config: { activeness: 1, focus: { rail: 0.25, road: 3, tram: 0.6 }, risk: 0.4, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
+  { id: 'tram', name: 'Tram builder', hint: 'Trams in large towns', config: { activeness: 1, focus: { rail: 0.4, road: 0.7, tram: 3 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
 ];
 
 const clamp = (x: number, a: number, b: number) => (Number.isFinite(x) ? Math.max(a, Math.min(b, x)) : a);
@@ -2060,7 +2060,7 @@ export class AIController {
     this.stats.express++;
     const skipped = sug.stops.filter((x) => !x).length;
     this.note(`${l.name}: ${np.name} pattern (${n} trains, passing ${skipped} stops)`);
-    g.postNews(`${this.name} runs ${np.name.toLowerCase()} trains on ${l.name}, passing the quieter stations.`, 'ai');
+    g.postNews(`${this.name} runs ${np.name.toLowerCase()} trains on ${l.name}, skipping quieter stations.`, 'ai');
     return true;
   }
 
@@ -2705,8 +2705,8 @@ export class AIController {
     this.state.corridor = next ? [stB.id, next.id] : undefined;
     if (hub || hubB) this.stats.reused++;
     this.stats.spent += Math.max(0, spent0 - this.eco.money) + total - est;
-    g.postNews(hub ? `${this.name} extends its railway from ${hub.name} to ${stB.name} (${(len / 100).toFixed(1)} km).`
-      : `${this.name} opens a ${what} between ${stA.name} and ${stB.name} (${(len / 100).toFixed(1)} km).`, 'ai', (stA.x + stB.x) / 2, (stA.z + stB.z) / 2);
+    g.postNews(hub ? `${this.name} extends its railway ${hub.name} to ${stB.name}, ${(len / 100).toFixed(1)} km.`
+      : `${this.name} opens a ${what} ${stA.name} to ${stB.name}, ${(len / 100).toFixed(1)} km.`, 'ai', (stA.x + stB.x) / 2, (stA.z + stB.z) / 2);
     this.note(`${hub ? 'extended railway ' + hub.name + '-' + stB.name + (ext ? ' (line ' + line.name + ')' : '') : 'opened ' + what + ' ' + stA.name + '-' + stB.name}${hubB ? ' (joined at ' + hubB.name + ')' : ''}: ${Math.round(len)} u, ${res.bridges} bridges, ${res.tunnels} tunnels`);
     if (hs) { this.stats.hsr++; const inf = this.lines.get(line.id); if (inf) inf.hsr = true; }
     this.canonical(line.id);
@@ -3051,7 +3051,7 @@ export class AIController {
     this.stats.lines++; this.stats.shared++;
     if (joined) this.stats.joined++;
     p.access = -1;
-    g.postNews(`${this.name} runs trains on ${oName}'s railway between ${A?.name ?? stA.name} and ${B?.name ?? stB.name} (track access).`, 'ai', (stA.x + stB.x) / 2, (stA.z + stB.z) / 2);
+    g.postNews(`${this.name} runs trains on ${oName}’s railway from ${A?.name ?? stA.name} to ${B?.name ?? stB.name}.`, 'ai', (stA.x + stB.x) / 2, (stA.z + stB.z) / 2);
     this.note(`trains on ${oName}'s railway ${stA.name}-${stB.name}`);
     if (!joined) this.canonical(line.id);
   }
@@ -3500,7 +3500,7 @@ export class AIController {
     this.linkTransfers(c.id);
     this.stats.crossCity++;
     this.stats.railStations++;
-    g.postNews(`${this.name} opens a cross-city link under ${T.name}: ${l.name} runs through ${c.name}.`, 'ai', c.x, c.z);
+    g.postNews(`${this.name} opens an underground link in ${T.name} through ${l.name} at ${c.name}.`, 'ai', c.x, c.z);
     this.note(`${partner ? 'joint ' : ''}cross-city link in ${T.name}: ${a.st.name} - ${c.name} - ${b.st.name} (${l.name}, ${path.length} stations, ${Math.round(econ.net / 1000)}k/year forecast)`);
     this.canonical(l.id);
   }
@@ -3864,7 +3864,7 @@ export class AIController {
     this.stats.lines++; this.stats.urban++; this.stats.railStations += sts.length;
     for (const st of sts) { this.linkTransfers(st.id); yield; }
     const where = level === 'underground' ? 'underground' : level === 'elevated' ? 'elevated' : 'at street level';
-    g.postNews(`${this.name} opens the city rail line ${line.name} in ${T.name} (${sts.length} stations, ${where}).`, 'ai', T.x, T.z);
+    g.postNews(`${this.name} opens ${line.name} in ${T.name} with ${sts.length} stations, ${where}.`, 'ai', T.x, T.z);
     this.note(`opened ${what} ${line.name} in ${T.name} (${where}): ${sts.length} stations, ${fin.signals} signals; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.transfers)} transfers/year, ${Math.round(econ.net / 1000)}k/year forecast`);
     const cid = this.canonical(line.id);
     // The city railway is finished: a save from now on keeps it whatever follows (loading abandons only unfinished
@@ -3972,7 +3972,7 @@ export class AIController {
     this.stats.vehicles++; this.stats.through++;
     this.lines.set(tl.id, { kind: 'rail', towns: [...new Set([...info.towns, g.stations.get(mpath[0])?.townId ?? -1])], depot: info.depot, maxVehicles: 2, opened: g.day });
     this.signalLine(tl.id);
-    g.postNews(`${this.name} runs through trains from ${g.stations.get(mpath[0])?.name} into the ${g.towns.list[end.townId]?.name} city railway.`, 'ai', J.x, J.z);
+    g.postNews(`${this.name} runs through trains from ${g.stations.get(mpath[0])?.name} to ${g.towns.list[end.townId]?.name}’s city railway.`, 'ai', J.x, J.z);
     this.note(`through service ${tl.name} (${tl.stops.length} stops)`);
     // (the city line and the main line become patterns of the through line: one line per route)
     const tid = this.canonical(tl.id), tinfo = this.lines.get(tid);
@@ -4367,7 +4367,7 @@ export class AIController {
           for (const v of vs) { g.vehicles.sell(v.id); this.stats.sold++; }
           g.lines.leave(lid, this.companyId); this.lines.delete(lid);
           this.note(`left ${l.name}: five consecutive losing years after service cuts`);
-          g.postNews(`${this.name} leaves ${l.name} after five consecutive losing years.`, 'ai');
+          g.postNews(`${this.name} leaves ${l.name} after five losing years.`, 'ai');
           continue;
         }
         const account = this.railPolicy.account(l);
@@ -4514,7 +4514,7 @@ export class AIController {
         this.note(`rebuilt ${st.name} with ${length}-unit platforms`);
       } catch (e) { this.note('station rebuild failed: ' + String((e as Error)?.message ?? e)); }
     }
-    if (done) g.postNews(`${this.name} rebuilds the stations of ${l.name} with longer platforms.`, 'ai');
+    if (done) g.postNews(`${this.name} lengthens platforms on ${l.name}.`, 'ai');
     return done;
   }
 
@@ -4668,7 +4668,7 @@ export class AIController {
     this.stats.signals += signals;
     // the rest of the line (starters, junctions, the single-track stretches between the loops)
     signals += this.signalLine(l.id);
-    g.postNews(full ? `${this.name} doubles the track of ${l.name}.` : `${this.name} lays ${built > 1 ? built + ' passing loops' : 'a passing loop'} on ${l.name}.`, 'ai', (m.a.x + m.b.x) / 2, (m.a.z + m.b.z) / 2);
+    g.postNews(full ? `${this.name} doubles ${l.name}.` : `${this.name} lays ${built > 1 ? built + ' passing loops' : 'a passing loop'} on ${l.name}.`, 'ai', (m.a.x + m.b.x) / 2, (m.a.z + m.b.z) / 2);
     this.note(`${full ? 'doubled' : `${built} passing loop${built > 1 ? 's' : ''} on`} ${l.name} (${Math.round(newLen)} u new track of ${Math.round(m.len)} u, ${signals} signals, ${crossovers} crossovers${err ? ', ' + err : ''})`);
   }
 

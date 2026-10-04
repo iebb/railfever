@@ -99,7 +99,7 @@ export class Depots {
         if (d < hw - 0.1) { failp('Track or road in the way'); break; }
         // the depot's levelled pad and a track beside it share grid vertices: only at about the same height
         // (roads are draped on the ground)
-        if (e.kind === 'rail' && net.sectionAt(e, geo.cum[i]) === 'ground' && d < hw + EARTHWORKS.corePad && Math.abs(geo.pts[i * 3 + 1] - plan.y) > 0.3) { failp('Too close to a track at another height'); break; }
+        if (e.kind === 'rail' && net.sectionAt(e, geo.cum[i]) === 'ground' && d < hw + EARTHWORKS.corePad && Math.abs(geo.pts[i * 3 + 1] - plan.y) > 0.3) { failp('Too close to track at another height'); break; }
       }
     }
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
@@ -233,13 +233,13 @@ export function toggleSignal(g: Game, x: number, z: number, owner: number): stri
   const ne = net.nearestEdge(x, z, 1.0, 'rail');
   if (!ne) return 'Click on a track';
   const e = ne.edge;
-  if (e.station >= 0 || e.depot >= 0) return 'Cannot place signals in stations or depots';
+  if (e.station >= 0 || e.depot >= 0) return 'No signals in stations or depots';
   if (e.owner !== owner) return 'Not your track';
   let node = n && Math.hypot(n.x - x, n.z - z) < 0.8 ? n : null;
   if (!node) {
     if (ne.s < 1 || ne.s > e.len - 1) {
       const end = net.nodes.get(ne.s < 1 ? e.a : e.b)!;
-      if (end.edges.length !== 2) return 'Signals need plain track (not at a switch)';
+      if (end.edges.length !== 2) return 'No signals at switches';
       node = end;
     } else {
       if (g.vehicles.isEdgeBusy(e.id)) return 'Train in the way';
@@ -448,7 +448,7 @@ export function electrify(g: Game, edgeIds: number[], owner: number, dryRun = fa
   for (const id of new Set(edgeIds)) {
     const e = net.edges.get(id);
     if (!e || e.kind !== 'rail' || e.depot >= 0 || e.type !== ELECTRIFY.from) continue;
-    if (!g.canUse(owner, e.owner)) { res.error = 'Track of another company: needs track access'; continue; }
+    if (!g.canUse(owner, e.owner)) { res.error = 'Foreign track: needs track access'; continue; }
     res.cost += ELECTRIFY.costPerUnit * e.len; res.length += e.len; res.changed++;
     todo.push(e);
   }

@@ -210,7 +210,7 @@ export function filterBar(g: Game, f: LineFilter, counts: Partial<Record<LineMod
     const meta = MODE_META[m];
     return h('button', {
       class: 'fchip' + (on ? ' on' : '') + (n ? '' : ' none'), style: `--c:${meta.color}`, role: 'checkbox', 'aria-checked': on ? 'true' : 'false', 'aria-label': meta.label,
-      'data-tip': `${meta.label}: ${n} · click to ${on ? 'hide' : 'show'}, double-click for only these`, 'data-sfx': 'toggle',
+      'data-tip': `${meta.label}: ${n} · click: ${on ? 'hide' : 'show'}; double-click: only these`, 'data-sfx': 'toggle',
       onclick: () => { f.hidden = on ? [...f.hidden, m] : f.hidden.filter((x) => x !== m); saveFilters(); onChange(); },
       ondblclick: () => { f.hidden = LINE_MODES.filter((x) => x !== m); saveFilters(); onChange(); },
     }, icon(meta.icon, 14), compact ? null : h('span', null, meta.label), n ? h('small', null, String(n)) : null);

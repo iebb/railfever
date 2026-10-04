@@ -53,7 +53,7 @@ export function patternMatrix(l: Line): { stations: number[]; stopIndices: numbe
 export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => void) {
   const g = ui.game;
   const mine = l.owner === PLAYER;
-  if (l.stops.length < 2) { add(body, h('div', { class: 'pad' }, 'A line needs two stops before it can run several services.')); return; }
+  if (l.stops.length < 2) { add(body, h('div', { class: 'pad' }, 'Needs two stops to add services.')); return; }
   const { stations, stopIndices, cells, patterns } = patternMatrix(l);
   let heads: { pid: number; vehicles: number; headway: number }[] = [];
   try { heads = patternHeadways(g, l); } catch { heads = []; }
@@ -72,7 +72,7 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
     if (!p || !indices) return;
     const on = indices.some((i) => p.stops[i] !== false);
     const flags = l.stops.map((_, i) => (indices.includes(i) ? !on : p.stops[i] !== false));
-    if (new Set(l.stops.filter((_, i) => flags[i])).size < 2) { ui.toast('A service stops at two stations at least', 'info'); return; }
+    if (new Set(l.stops.filter((_, i) => flags[i])).size < 2) { ui.toast('Needs at least two stopping stations', 'info'); return; }
     p.stops = flags;
     p.ids = [...l.stops];
     p.name = nameFor(ui, l, p.kind, flags);
@@ -91,12 +91,12 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
     const mo = mailOnly.get(p.id) ?? 0, mc = mailHeads.find((x) => x.pid === p.id)?.cycle ?? 0;
     const next = PATTERN_KINDS[(PATTERN_KINDS.indexOf(p.kind) + 1) % PATTERN_KINDS.length];
     const kindCtl = mine
-      ? h('button', { class: 'pk ' + p.kind, 'data-tip': `${p.name} — click for ${PATTERN_LABEL[next]}`, 'aria-label': `${p.name}: change kind`, onclick: () => setKind(j, next) }, KIND_SHORT[p.kind])
+      ? h('button', { class: 'pk ' + p.kind, 'data-tip': `${p.name} → ${PATTERN_LABEL[next]}`, 'aria-label': `${p.name}: change kind`, onclick: () => setKind(j, next) }, KIND_SHORT[p.kind])
       : patBadge(p.kind, p.name);
     return h('th', null, h('span', { class: 'svh ' + p.kind }, kindCtl,
       h('small', { 'data-tip': p.name }, n ? `${n} · ${hw ? minSec(hw.headway) : '—'}` : mo ? null : 'no vehicles'),
       mo ? h('small', { class: 'svh-mail', 'data-tip': `${mo} mail-only vehicle${mo > 1 ? 's' : ''}${mc > 0 ? `, every ${minSec(mc / mo)}` : ''}` }, icon('mail', 11), `${mo} · ${mc > 0 ? minSec(mc / mo) : '—'}`) : null,
-      mine && patterns.length > 1 ? h('button', { class: 'ibtn sm', style: 'width:22px;height:20px', 'data-tip': `Remove ${p.name} (its vehicles run ${patterns[j === 0 ? 1 : 0].name})`, 'aria-label': 'Remove service', onclick: () => { const err = removePattern(g, l.id, p.id); if (err) ui.toast(err, 'bad'); else ui.sound('demolish', { pitch: 1.4 }); after(); } }, icon('close', 12)) : null));
+      mine && patterns.length > 1 ? h('button', { class: 'ibtn sm', style: 'width:22px;height:20px', 'data-tip': `Remove ${p.name}; vehicles → ${patterns[j === 0 ? 1 : 0].name}`, 'aria-label': 'Remove service', onclick: () => { const err = removePattern(g, l.id, p.id); if (err) ui.toast(err, 'bad'); else ui.sound('demolish', { pitch: 1.4 }); after(); } }, icon('close', 12)) : null));
   }));
   const rows = stations.map((sid, k) => {
     const st = g.stations.get(sid);
@@ -106,27 +106,27 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
       patterns.map((p, j) => {
         const c = cells[k][j];
         const tip = c === 'stop' ? `${p.name} stops at ${st?.name}` : c === 'out' ? `${p.name} turns before ${st?.name}` : `${p.name} passes ${st?.name}`;
-        return h('td', null, h('button', { class: `svb ${p.kind}${c === 'stop' ? '' : ' ' + c}`, disabled: !mine, 'data-tip': mine ? tip + ' — click to change' : tip, 'aria-label': tip, 'data-sfx': 'none', onclick: () => toggle(j, k) }, h('i')));
+        return h('td', null, h('button', { class: `svb ${p.kind}${c === 'stop' ? '' : ' ' + c}`, disabled: !mine, 'data-tip': mine ? tip + '; click to change' : tip, 'aria-label': tip, 'data-sfx': 'none', onclick: () => toggle(j, k) }, h('i')));
       }));
   });
   add(body,
     section('Services', `${patterns.length} pattern${patterns.length === 1 ? '' : 's'}`),
     h('div', { class: 'svc-wrap' }, h('table', { class: 'svc' }, h('thead', null, head), h('tbody', null, rows))),
     h('div', { class: 'muted', style: 'font-size:12px;margin-top:6px' }, mine
-      ? 'Click a dot: stop ● or pass │. A service that leaves out the stops at an end turns short there. Fast services pass on through tracks where stations have them, else slowly on a platform track.'
-      : '● stops · │ passes · faint: beyond the service’s terminus'));
+      ? '● stop / │ pass · omitted end stops: short-turn · non-stop trains: through tracks, else slower platform tracks'
+      : '● stop · │ pass · faint: beyond terminus'));
   if (mine) {
     const sug = suggestExpress(g, l);
     add(body, h('div', { class: 'btns' },
-      h('button', { class: 'btn', disabled: !sug, 'data-tip': sug ? 'Stops at the termini, interchanges and the busier stations' : 'Nothing worth skipping (four stations or more, some of them small)', onclick: () => {
+      h('button', { class: 'btn', disabled: !sug, 'data-tip': sug ? 'Termini, interchanges and busy stations' : 'Needs 4+ stations, including quieter stops', onclick: () => {
         const current = g.lines.get(l.id);
         const fresh = current ? suggestExpress(g, current) : null;
-        if (!current || !fresh) { ui.toast('No express service to add now', 'info'); after(); return; }
+        if (!current || !fresh) { ui.toast('No express service available', 'info'); after(); return; }
         const p = addPattern(g, current.id, fresh.kind, fresh.stops, nameFor(ui, current, fresh.kind, fresh.stops));
-        if (p) { ui.sound('toggle', { pitch: 1.15 }); ui.toast(`${p.name} added — assign vehicles to it in the Vehicles tab`, 'good'); }
+        if (p) { ui.sound('toggle', { pitch: 1.15 }); ui.toast(`${p.name} added; assign vehicles in Vehicles.`, 'good'); }
         after();
       } }, icon('services', 16), sug ? `Add ${PATTERN_LABEL[sug.kind]}` : 'Add express'),
-      h('button', { class: 'btn', 'data-tip': 'An all-stops service to edit: leave out end stations for a short-turn', onclick: () => {
+      h('button', { class: 'btn', 'data-tip': 'All stops; omit end stations for a short-turn', onclick: () => {
         const flags = l.stops.map(() => true);
         const p = addPattern(g, l.id, 'local', flags, nameFor(ui, l, 'local', flags));
         if (p) ui.sound('toggle');

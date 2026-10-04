@@ -43,14 +43,14 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
       } }, icon('save', 16), 'Save')));
     }
     add(win.body, section('Saved games', String(slots.length)));
-    if (!slots.length) add(win.body, h('div', { class: 'pad' }, 'No saved games yet.'));
+    if (!slots.length) add(win.body, h('div', { class: 'pad' }, 'No saved games.'));
     slots.sort((a, b) => (a.slot === 'autosave' ? -1 : b.slot === 'autosave' ? 1 : b.saved - a.saved));
     for (const s of slots) {
       const incompatible = saveIncompatibility(s);
       add(win.body, h('div', { class: 'slot' },
         h('div', { style: 'min-width:0' }, h('b', null, s.name),
           h('div', { class: 'muted' }, `${s.date} · ${fmtMoney(s.money)} · ${new Date(s.saved).toLocaleString()}${s.game ? ` · v${s.game}` : ''}`),
-          incompatible ? h('div', { class: 'neg' }, 'Not compatible with this version') : null),
+          incompatible ? h('div', { class: 'neg' }, 'Incompatible version') : null),
         h('div', { class: 'rowbtns' },
           mode === 'save'
             ? h('button', { class: 'btn sm', onclick: async () => { if (confirm('Overwrite this save?')) { try { await saveToSlot(ui.game, s.slot, s.name); savedNotice(ui); } catch (e) { ui.toast('Save failed: ' + (e as Error).message, 'bad'); } render(); } } }, 'Overwrite')
@@ -63,8 +63,8 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
           h('button', { class: 'ibtn sm', 'data-tip': 'Delete save', 'aria-label': 'Delete save', onclick: () => { if (confirm('Delete this save?')) { deleteSlot(s.slot); render(); } } }, icon('trash', 15)))));
     }
     add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, storageMode() === 'memory'
-      ? "Saves won't survive a reload in this browser mode — use Export to keep your game"
-      : 'Games are kept in this browser. The autosave is updated every minute of play and when you leave the page, and is restored when you come back.'));
+      ? "Session-only saves: lost on reload; Export to keep."
+      : 'Browser saves · autosave every minute and on leaving · restored on return'));
     add(win.body, h('div', { class: 'btns right' }, h('button', { class: 'btn', onclick: () => exportSave(ui) }, icon('export', 16), 'Export'), h('button', { class: 'btn', onclick: () => importSave(ui) }, icon('import', 16), 'Import')));
   };
   render();
@@ -72,7 +72,7 @@ export function openSaveLoad(ui: UI, mode: 'save' | 'load') {
 
 function savedNotice(ui: UI) {
   ui.hud.showSave('saved');
-  ui.toast(storageMode() === 'memory' ? 'Saved for this session — Export to keep your game' : 'Game saved', storageMode() === 'memory' ? 'info' : 'good');
+  ui.toast(storageMode() === 'memory' ? 'Session-only save; Export to keep' : 'Game saved', storageMode() === 'memory' ? 'info' : 'good');
 }
 
 export async function exportSave(ui: UI) {
@@ -131,11 +131,11 @@ export function openSettings(ui: UI) {
       win.body.append(field('Shadow quality', q));
     }
     if ('resolution' in s) {
-      const opts: [string, string][] = [['auto', 'Auto (holds ~60 fps)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']];
+      const opts: [string, string][] = [['auto', 'Auto (~60 fps)'], ['1', '100%'], ['0.75', '75%'], ['0.5', '50%']];
       const cur = String(s.resolution);
       const sel = h('select', { class: 'select', 'aria-label': 'Resolution' }, opts.map(([v, l]) => h('option', { value: v, selected: v === cur }, l)));
       sel.addEventListener('change', () => { s.resolution = sel.value === 'auto' ? 'auto' : Number(sel.value); apply(); });
-      win.body.append(field('Resolution', sel, 'Render scale on top of the pixel ratio'));
+      win.body.append(field('Resolution', sel, 'Render scale × pixel ratio'));
     }
     if ('pixelRatio' in s) {
       const vals = [1, 1.25, 1.5, 2];
@@ -157,7 +157,7 @@ export function openSettings(ui: UI) {
         if (focused) (win.body.querySelector('.uiscale .segb.on') as HTMLElement | null)?.focus({ preventScroll: true });
       }, 'uiscale');
       sg.setAttribute('aria-label', 'Interface size');
-      return field('Interface size', sg, 'Text, panels, windows and map labels');
+      return field('Interface size', sg, 'Text, panels, windows, map labels');
     };
     // audio: volume sliders (0–100 %) and mute
     const vol = (key: keyof Omit<AudioSettings, 'muted'>, label: string, hint?: string) => {
@@ -176,9 +176,9 @@ export function openSettings(ui: UI) {
       vol('ambient', 'Ambience', 'Wind, birds, town and traffic'),
       section('Interface'),
       uiSize(),
-      toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels, faster on slow GPUs'),
+      toggle('Reduce transparency', ui.reduceTransparency, (v) => { ui.reduceTransparency = v; ui.savePrefs(); }, 'Solid panels; faster on slow GPUs'),
       toggle('Construction grid', (grid()?.value ?? 0) > 0, (v) => { const u = grid(); if (u) u.value = v ? 1 : 0; }, 'G'),
-      toggle('Show the getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
+      toggle('Getting-started checklist', !ui.checklist.hidden, (v) => { if (v) ui.checklist.reopen(); else ui.checklist.dismiss(); }),
       section('Simulation'),
       toggle('Ambient town traffic', g.vehicles.ambientEnabled, (v) => { g.vehicles.ambientEnabled = v; g.vehicles.manageAmbient(); }),
       toggle('AI companies build', g.aiEnabled, (v) => { g.aiEnabled = v; }),
@@ -193,65 +193,140 @@ export function openHelp(ui: UI) {
   win.body.innerHTML = `
     <div class="help">
     <h4>Camera</h4>
-    <p><b>Right-drag</b> pan · <b>Middle-drag</b>, <kbd>Alt</kbd> + left-drag, or <kbd>Shift</kbd>/<kbd>Alt</kbd> + right-drag rotate &amp; tilt · <b>Wheel</b>, <kbd>Ctrl</kbd> + wheel / trackpad pinch, or <kbd>+</kbd>/<kbd>−</kbd> zoom · <kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd> move · <kbd>Q</kbd> <kbd>E</kbd> rotate · <kbd>R</kbd> <kbd>F</kbd> tilt · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap. On touch: two fingers pan, pinch and rotate.</p>
+    <ul>
+      <li><b>Right-drag</b>: pan.</li>
+      <li><b>Middle-drag</b>, <kbd>Alt</kbd>+left-drag or <kbd>Shift</kbd>/<kbd>Alt</kbd>+right-drag: rotate &amp; tilt.</li>
+      <li><b>Wheel</b>, <kbd>Ctrl</kbd>+wheel, trackpad pinch or <kbd>+</kbd>/<kbd>−</kbd>: zoom.</li>
+      <li><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd>: move · <kbd>Q</kbd>/<kbd>E</kbd>: rotate · <kbd>R</kbd>/<kbd>F</kbd>: tilt.</li>
+      <li>Touch: two fingers pan, pinch and rotate.</li>
+    </ul>
     <h4>Building track and roads</h4>
     <ol>
-      <li>Open <b>Rail</b> or <b>Road</b> in the dock (<kbd>2</kbd> / <kbd>6</kbd>). Click to set the start — on open ground, a track end, or onto a track to branch off.</li>
-      <li>Move the mouse: the preview shows the curve, bridges (blue), tunnels (purple), crossings and buildings in the way (red). The card shows cost, length, grade, radius and speed.</li>
-      <li>Click to build. Construction continues from the new end with a smooth curve; <b>right-click</b>, <kbd>Esc</kbd> or a long press ends it. You can also drag to build one section.</li>
-      <li>On touch, tap to preview the cost, then tap the same spot to confirm. A tap elsewhere moves the preview. For track, tap the start, then preview and confirm the end.</li>
-      <li>Options: standard, electric or high-speed track (up to 400 km/h), <b>1–4 parallel tracks</b>, road type, the <b>end height</b> (<kbd>[</kbd> <kbd>]</kbd>, ±5 m) for bridges and tunnels, and how to cross other lines. Hold <kbd>Shift</kbd> over a track to copy it as a parallel track.</li>
+      <li><b>Rail</b> / <b>Road</b> (<kbd>2</kbd> / <kbd>6</kbd>): click ground, an end to extend, or track to branch.</li>
+      <li>Preview: cost, length, grade, radius, speed, crossings and demolition.</li>
+      <li>Blue: bridges · purple: tunnels · red: buildings in the way.</li>
+      <li>Click: build / continue; drag: one section; right-click / <kbd>Esc</kbd> / long press: end.</li>
+      <li>Touch: tap start, end to preview, same spot to build; elsewhere: move preview.</li>
+      <li>Standard / electric / high-speed track: up to 400 km/h; 1–4 parallel tracks.</li>
+      <li>Road type, crossing mode and end height: <kbd>[</kbd>/<kbd>]</kbd>, ±5 m for bridges / tunnels.</li>
+      <li><kbd>Shift</kbd> over track: parallel copy.</li>
     </ol>
     <h4>Getting started</h4>
     <ol>
-      <li>Place a <b>train station</b> (<kbd>3</kbd>) near each of two towns — <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotates. It lines up with nearby track ends; manual rotation switches off Align to track. Its catchment follows walkable streets drawn in the transport mode’s colour.</li>
-      <li>Connect the stations with track and add a <b>train depot</b> (<kbd>5</kbd>) at a free track end.</li>
-      <li>Start with single track and one-platform halts; keep cash for the train. Bridges, tunnels and demolition cost extra. Open <b>Finances</b> (<kbd>I</kbd>, the money plate or Menu) to review costs or borrow. Money warnings offer <b>Borrow</b> and <b>Open finances</b>.</li>
-      <li>Open <b>Lines</b> (<kbd>L</kbd>) → <i>Rail line</i>, click both stations, then <i>Add train</i>. Keep trains shorter than the platforms.</li>
-      <li>Buses: <b>bus stops</b> (<kbd>7</kbd>) on roads, a <b>bus depot</b> (<kbd>8</kbd>) next to a road, and a bus line.</li>
-      <li>Trams: open <b>Tram</b> in the dock, lay <b>tracks</b> in town streets (click a road, or press and drag along streets), add <b>tram stops</b> and a <b>tram depot</b>, then create a tram line.</li>
+      <li>Two train stations (<kbd>3</kbd>) near towns → track → depot (<kbd>5</kbd>) at a free track end.</li>
+      <li><kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Alt</kbd>+wheel: rotate; manual rotation disables track alignment.</li>
+      <li>Start with single track and one-platform halts; reserve cash for a train.</li>
+      <li>Bridges, tunnels and demolition cost extra.</li>
+      <li><b>Finances</b> (<kbd>I</kbd>, money plate or Menu): costs and loans; money warnings offer Borrow.</li>
+      <li><b>Lines</b> (<kbd>L</kbd>) → Rail line → click both stations → Add train.</li>
+      <li>Train length ≤ platform length.</li>
+      <li>Buses: roadside stops (<kbd>7</kbd>) → roadside depot (<kbd>8</kbd>) → bus line → buy bus.</li>
+      <li>Trams: click / drag street tracks → stops → roadside tram depot → tram line.</li>
     </ol>
     <h4>Walking catchments</h4>
-    <p>Passengers walk along streets from station forecourts, entrances and stops. Base distances are rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} (every rail station alike, on main-line, metro or light-rail track), tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} and bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}. A ${Math.round((WALK_DETOUR - 1) * 100)}% street-grid allowance gives walking limits along streets of rail ${fmtLen(walkLimit('rail'))}, tram ${fmtLen(walkLimit('tram'))} and bus ${fmtLen(walkLimit('bus'))}. Station buildings can increase these distances.</p>
+    <ul>
+      <li>Forecourt / entrance / stop street reach; colours match transport mode.</li>
+      <li>Base reach: rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} · tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} · bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}.</li>
+      <li>Street-grid allowance: +${Math.round((WALK_DETOUR - 1) * 100)}%.</li>
+      <li>Street limits: rail ${fmtLen(walkLimit('rail'))} · tram ${fmtLen(walkLimit('tram'))} · bus ${fmtLen(walkLimit('bus'))}.</li>
+      <li>Main-line / metro / light rail: equal reach; buildings can extend it.</li>
+    </ul>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
-      <li><b>Urban</b> (<kbd>U</kbd>) opens the urban-style presets: metro or light-rail track and close-spaced stations. Choose the track type, then Ground, Elevated or Underground and its height or depth. Urban-style stations use the matching platform tracks and can have street entrances. It is all ordinary rail: the same walking reach and fares as any rail station, any rail line may stop there, and one line may run over main-line and urban track alike (through running).</li>
-      <li><b>Connect tracks</b> (<kbd>J</kbd>, also Rail → Connect): click a point on the first track, then point at another track to preview a connecting curve, turnouts, signals and cost. Click to build; <kbd>Esc</kbd> or right-click lets you pick the first track again. Pick outside platform and depot tracks.</li>
-      <li><b>Re-level</b> (Urban → Re-level): choose <b>Lift</b>, <b>Sink</b> or <b>Ground</b>, set height or depth, then click a track or drag along your stretch. The preview shows the cost, ramps and stations that move with it. Lines and signals stay connected; bridges and tunnels cost much more than ground track.</li>
-      <li><b>Electrify</b> (Rail → Electrify): click standard track, or drag along a stretch, to add overhead wire, including platform tracks. The preview shows the cost. Electric locomotives and EMUs need wire and a compatible track type; electrifying standard track keeps its 160 km/h limit.</li>
-      <li>In the <b>train composer</b>, choose <b>Multiple units</b> to buy EMUs or light-rail units. Price and capacity are for a whole unit; the Units control couples complete sets. Check the track-type badges and compatibility warning before buying.</li>
+      <li><b>Urban</b> (<kbd>U</kbd>): metro / light rail; ground / elevated / underground; height / depth.</li>
+      <li>Urban stations: matching track, close spacing, optional street entrances.</li>
+      <li>Any train / rail line: urban + main-line through running; equal fares and reach.</li>
+      <li><b>Connect tracks</b> (<kbd>J</kbd>, Rail → Connect): two points → curve, turnouts, signals, cost.</li>
+      <li>Click: build; <kbd>Esc</kbd> / right-click: restart; turnouts outside platforms / depots.</li>
+      <li>Urban → <b>Re-level</b>: Lift / Sink / Ground; height / depth; click / drag your track.</li>
+      <li>Ramps included; stations move; lines / signals stay; structures cost extra.</li>
+      <li><b>Electrify</b> (Rail): click / drag standard track; platform tracks included.</li>
+      <li>Electric locos / EMUs: wire + compatible track; standard remains 160 km/h.</li>
+      <li><b>Multiple units</b>: EMUs / light rail; price and capacity per complete unit.</li>
+      <li><b>Units</b> couples sets; check track badges and compatibility before buying.</li>
     </ul>
     <h4>Lines, demand and companies</h4>
     <ul>
-      <li>Lines are named automatically from their stops and get their own colour and company/route symbol. Click the name or symbol in a line window to change the name or colour (empty name = automatic again). Station badges such as <b>AS01</b> identify a station on each line.</li>
-      <li>The <b>Lines map</b> (<kbd>M</kbd>) has <b>Lines / Stations</b> displays. <b>Lines</b>: coloured routes with each station’s numbers on the station itself at every zoom (zoomed out the first number, +n for more lines; busier stations and interchanges win where they overlap). <b>Stations</b>: quieter routes under pins with each station’s name, passengers waiting and all its numbers. Press <kbd>B</kbd> to switch (or open Stations when the map is closed). A line’s name shows when you point at its route or one of its numbers (on touch: tap; tap again to open); click a route to open its line. Filter by transport mode and company. The <b>Demand</b> view (<kbd>P</kbd>) has a <b>Passengers / Mail</b> toggle. Passengers shows potential trips between towns (orange dashed arcs = unserved, blue solid arcs = served) and served districts. Mail shows potential tonnes per month between towns; arc width shows volume, while colour and dash length show the estimated share carried (orange short dashes = 0%, blue solid arcs = 100%). Town rings and labels show outgoing mail and its carried share. Mail vans, trucks and postbuses provide mail service. <kbd>Esc</kbd> closes either map.</li>
-      <li>In <b>Companies</b> (<kbd>C</kbd>) you can add AI rivals (up to seven, each with a style: cautious, aggressive, rail baron, bus operator, tram builder…), change their settings, and buy them out — you take over their network, vehicles, cash and loan.</li>
-      <li><b>Track access</b>: networks are <b>open</b> by default — any company may run on another's tracks and stations without asking (unless blocked) and pays its usage share of the upkeep (× the owner's multiplier: at 2× and 50/50 usage the user pays 2/3). In Track access (<kbd>K</kbd>) you can switch to Ask, Approve all or Reject all, block companies, and see who uses what.</li>
-      <li><b>Shared lines</b>: use a line’s Vehicles tab to invite partners or join an open line. Each company keeps its vehicles and fares; an operator must own a station on that line. Shared bus/tram stops show each company’s lines and estimated upkeep share in the station window.</li>
+      <li>Automatic names from stops, colours and company / route symbols; click to edit.</li>
+      <li>Empty name: automatic; badges such as <b>AS01</b>: station number on each rail line.</li>
+      <li><b>Lines map</b> (<kbd>M</kbd>): coloured routes and station numbers at every zoom.</li>
+      <li>Zoomed out: first number +n; busy stations / interchanges take overlap priority.</li>
+      <li><b>Stations</b>: quieter routes, pins with name, waiting passengers and all numbers.</li>
+      <li><kbd>B</kbd>: Lines / Stations; opens Stations if the map is closed.</li>
+      <li>Hover route / number: name; click route: open; touch: tap name, tap to open.</li>
+      <li>Filter by mode and company; <kbd>Esc</kbd>: close map.</li>
+      <li><b>Demand</b> (<kbd>P</kbd>): Passengers / Mail; <kbd>Esc</kbd>: close.</li>
+      <li>Town trips / served districts; orange dashed: unserved; blue solid: served.</li>
+      <li>Mail width: potential t/month; colour / dashes: estimated carried share.</li>
+      <li>Mail: orange short dashes 0%; blue solid 100%; estimate: routes, reach, ratings.</li>
+      <li>Mail rings / labels: outgoing tonnes / carried share, including onward mail.</li>
+      <li>Mail vehicles: vans, trucks and postbuses.</li>
+      <li><b>Companies</b> (<kbd>C</kbd>): up to seven AI rivals, with adjustable styles.</li>
+      <li>Buyouts transfer network, vehicles, cash and loan.</li>
+      <li><b>Track access</b> (<kbd>K</kbd>): networks open by default; blocked companies excluded.</li>
+      <li>Ask / Approve all / Reject all, company blocks, usage and agreements.</li>
+      <li>Upkeep split by usage × owner’s multiplier; 50/50 use at 2×: user pays 2/3.</li>
+      <li><b>Shared lines</b> → Vehicles: invite / join open lines; operators must own a stop.</li>
+      <li>Operators keep vehicles / fares; shared stops: lines and upkeep estimates.</li>
     </ul>
     <h4>Service patterns</h4>
     <ul>
-      <li>Open a line’s <b>Services</b> tab to add <b>Local, Rapid, Express or Limited Express</b> patterns. Click each station’s dot to switch between stop and pass; a service skipping the end stations turns at its first and last stopping stations (<b>short-turn</b>).</li>
-      <li>Assign each vehicle a <b>Service pattern</b> in its window or the line’s Vehicles tab. Passengers board services that stop where they need to alight. Trains skipping a station use its through tracks where available, or pass more slowly on a platform track.</li>
-      <li>Routes contained within a longer route become service patterns of that line. Faster trips, shorter waits and direct journeys earn higher fares; compare each vehicle’s monthly energy, crew and maintenance with its income, and the operating-cost breakdown in Finances.</li>
+      <li><b>Services</b>: Local / Rapid / Express / Limited Express; station dots: stop / pass.</li>
+      <li>Omit end stations: short-turn at first / last stopping station.</li>
+      <li>Assign patterns in a vehicle window or the line’s Vehicles tab.</li>
+      <li>Passengers board services that stop where they need to get off.</li>
+      <li>Non-stop trains use through tracks; platform tracks are slower.</li>
+      <li>A route inside a longer route becomes a service pattern of that line.</li>
+      <li>Monthly income vs energy, crew, maintenance; full breakdown: Finances.</li>
     </ul>
     <h4>Tips</h4>
     <ul>
-      <li>Several trains on a line need <b>signals</b> (<kbd>4</kbd>): click to place one, or drag along a track to place a series every 250 m – 1 km. Use one-way signals on double track; build passing loops on single track.</li>
-      <li><b>Auto-signal</b> (line window, Signals tool or the menu) signals a line or your whole railway by the rules: <b>path signals</b> before junctions and station entries (a train passes only when its whole way to the next signal is free), <b>block signals</b> along directional double track, signals at passing loops on single track. It shows a preview with the cost first. The <b>Signal blocks</b> view (top bar) colours each block free, reserved or occupied.</li>
-      <li>Stations can have <b>through tracks</b> without platforms (Through: 1–2, in the middle between side platforms or outside the islands) so non-stopping trains pass. Station tool → Place: <b>On a line</b> cuts a station into one of your existing tracks — trains keep running through it and lines can add the stop. Open track ends of a station can be connected in its Build tab.</li>
-      <li><b>Loop lines</b>: a line whose stops are three or more different stations circles round them one way (set Loop, Out and back or Auto in the line window); the lines map shows its direction.</li>
-      <li><b>Double track</b> (Rail → Double): click or drag along one of your single tracks to lay a second track beside it; directional double track gets block signals and crossovers before stations.</li>
-      <li>Stations can be <b>ground</b>, <b>elevated</b> or <b>underground</b>. Buildings are optional at every level; a building can widen the catchment. The station’s <b>Build</b> tab offers restyling, longer platforms, up to eight platform tracks, expansion side, entrances and relocation. Every entrance reaches its own streets: pavilions and stair towers beside a road for stations below or above the street; at ground stations a side hall, a footbridge or underpass with stairs to both sides of the tracks, or a gate at a platform end (with an access street where no road passes). The list shows the residents each one alone brings within walking reach. Rebuilding a ground station in place keeps its entrances beside the new platforms on a street (with a short new access street where needed, else they go, as the plan warns); moving a station or changing its level takes them down. Connected track changes level with the Re-level tool.</li>
-      <li>A station’s <b>Overview</b> shows platform occupancy and trains waiting, with an expansion recommendation and live cost. Nearby stations can be rebuilt as one station or joined into a walking-transfer complex; the merge panel explains which is possible and links to each complex part.</li>
-      <li>Fares grow with <b>distance</b> and the time saved against walking or driving, including the wait before boarding. A rail journey pays at least ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before the speed factor, whatever the track type, so short city hops pay too; changing trains adds no second minimum. On short trips the premium for speed is smaller (a few minutes saved on a walk). Fast, frequent services earn more, and each change of vehicle takes ${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% off the fare of the leg ending in it and of every later leg; high-speed trains also cost more energy and maintenance.</li>
-      <li>Fast, frequent service raises station ratings — well-served towns grow faster.</li>
-      <li>Double track runs one direction per track. Build single track and upgrade it later when traffic grows.</li>
-      <li>AI companies build their own networks (<b>Companies</b>, <kbd>C</kbd>). With track access you can join their network with your own track and use their stations and stops.</li>
+      <li>Signals (<kbd>4</kbd>): multiple trains; click: place / cycle; drag: 250 m – 1 km spacing.</li>
+      <li>One-way: double track; two-way: single track with passing loops.</li>
+      <li><b>Auto-signal</b>: line window, Signals or Menu; preview and cost before applying.</li>
+      <li>Path: junctions / station entries; route to next signal must be free.</li>
+      <li>Block: directional double track; single track: signals at passing loops.</li>
+      <li><b>Signal blocks</b> view: free / reserved / occupied.</li>
+      <li><b>Through</b>: 1–2 platform-free tracks, between side platforms or outside islands.</li>
+      <li><b>On a line</b>: insert into your track; trains keep running; add stop to lines.</li>
+      <li>Station → Build: connect open track ends.</li>
+      <li><b>Loop</b> / Out and back / Auto: 3+ distinct stops loop one way; map shows direction.</li>
+      <li>Rail → <b>Double</b>: click / drag single track; end switches to free platforms.</li>
+      <li>Directional double: one way per track, block signals and station crossovers.</li>
+      <li>Stations: ground / elevated / underground; optional buildings extend catchment.</li>
+      <li>Station → <b>Build</b>: style, length, eight platforms max, side, entrances, move.</li>
+      <li>Each entrance has its own street reach; list shows residents it alone adds.</li>
+      <li>Elevated / underground entrances: roadside stair towers / pavilions.</li>
+      <li>Ground: side hall, footbridge / underpass to both sides, platform-end gate.</li>
+      <li>Entrances can add access streets where no road passes.</li>
+      <li>Ground rebuilds keep entrances beside platforms; add access streets if needed.</li>
+      <li>No room / street: entrance removed, with a preview warning.</li>
+      <li>Moving or changing level removes entrances; Re-level moves connected track.</li>
+      <li><b>Overview</b>: platform use, waiting trains, expansion advice and live cost.</li>
+      <li>Merge panel: nearby stations → rebuild as one or link for walking transfers.</li>
+      <li>Fares: distance, time saved versus walking / driving, including wait.</li>
+      <li>Rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before speed factor, once per journey.</li>
+      <li>Equal rail fares on all track types; short trips earn a smaller speed premium.</li>
+      <li>Speed, frequency and direct journeys raise fares.</li>
+      <li>Each transfer: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on that leg and all later legs.</li>
+      <li>High-speed trains cost more energy and maintenance.</li>
+      <li>Fast, frequent service raises ratings; served towns grow faster.</li>
+      <li>Start single; double when traffic grows.</li>
+      <li>AI builds networks; track access allows connections and use of stops.</li>
     </ul>
     <h4>Keys</h4>
-    <p><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot · <kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform · <kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns · <kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations display · <kbd>P</kbd> demand view · <kbd>O</kbd> catchment · <kbd>Space</kbd> pause · <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> or <kbd>Alt</kbd>+wheel rotate stations / depots · <kbd>+</kbd>/<kbd>−</kbd> or <kbd>Ctrl</kbd>+wheel / pinch zoom · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance overlay · <kbd>Esc</kbd> cancel / close</p>
-    <p><kbd>I</kbd> finances · <kbd>,</kbd> slower · <kbd>.</kbd> faster (1×, 2×, 4×, 8×). <kbd>R</kbd>/<kbd>F</kbd> tilt the camera.</p>
-    <p>Space / Enter activates a keyboard-focused button or control. Global shortcuts are ignored while editing text or using form controls; Esc still cancels or closes.</p>
+    <ul>
+      <li><kbd>1</kbd> inspect · <kbd>2</kbd> track · <kbd>3</kbd> station · <kbd>4</kbd> signal · <kbd>5</kbd> train depot.</li>
+      <li><kbd>6</kbd> road · <kbd>7</kbd> bus stop · <kbd>8</kbd> bus depot · <kbd>9</kbd> demolish · <kbd>0</kbd> terraform.</li>
+      <li><kbd>U</kbd> urban rail · <kbd>J</kbd> connect tracks · <kbd>L</kbd> lines · <kbd>V</kbd> vehicles · <kbd>T</kbd> towns.</li>
+      <li><kbd>C</kbd> companies · <kbd>K</kbd> track access · <kbd>N</kbd> news · <kbd>I</kbd> finances.</li>
+      <li><kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations.</li>
+      <li><kbd>P</kbd> demand · <kbd>O</kbd> catchment · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance.</li>
+      <li><kbd>Space</kbd> pause · <kbd>,</kbd> slower · <kbd>.</kbd> faster: 1×, 2×, 4×, 8×.</li>
+      <li><kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Alt</kbd>+wheel: rotate station / depot.</li>
+      <li><kbd>+</kbd>/<kbd>−</kbd> / <kbd>Ctrl</kbd>+wheel / pinch: zoom · <kbd>R</kbd>/<kbd>F</kbd>: camera tilt.</li>
+      <li><kbd>Space</kbd> / <kbd>Enter</kbd>: activate focused control · <kbd>Esc</kbd>: cancel / close.</li>
+      <li>Form controls suppress global shortcuts; <kbd>Esc</kbd> still works.</li>
+    </ul>
     </div>`;
 }

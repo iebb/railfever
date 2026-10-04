@@ -482,15 +482,15 @@ export class MapModes {
     const numbered = new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size;
     // (a line's name shows only while it is pointed at, or tapped on touch screens)
     const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
-    const show = touch ? 'Tap a route or a number for its line’s name, again to open it.' : 'Point at a route or a number for its line’s name; click a route to open the line.';
+    const show = touch ? 'Tap route or number: line name; tap again: open.' : 'Hover route or number: line name; click route: open.';
     const note = this.display === 'lines'
-      ? `${numbered ? `${numbered} numbered stations: the numbers sit on the stations` : 'Rail lines number their stations on the map'} (company + line letter + number, e.g. AS01; zoomed out the first, +n more). ${show}`
-      : `Pins with each station’s name, passengers waiting and all its numbers, e.g. AS01. ${show}`;
+      ? `${numbered ? `${numbered} numbered stations` : 'Rail station numbers'} · company + line + station, e.g. AS01; zoomed out: first number +n · ${show}`
+      : `Pins: name, waiting passengers, numbers such as AS01 · ${show}`;
     c.append(
       h('div', { class: 'mc-head' }, icon('map', 18), h('span', { class: 'mc-title' }, 'Lines map'), h('span', { class: 'mc-sub' }, `${lines.length}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Close lines map', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Routes in their colours, station numbers on the stations (B)'], ['stations', 'Stations', 'Station pins with names, waiting passengers and all numbers (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
+        h('div', { class: 'mc-modes' }, seg<'lines' | 'stations'>([['lines', 'Lines', 'Coloured routes and station numbers (B)'], ['stations', 'Stations', 'Station pins: names, waiting passengers, numbers (B)']], this.display, (v) => { this.setDisplay(v); this.listSig = ''; })),
         filterBar(g, this.filter, modeCounts(g, all, this.filter), () => { this.filterVer++; this.listSig = ''; }, true),
         lines.length
           // rows are buttons: Tab to a line shows it on the map with its name, as pointing at it does; Enter opens it
@@ -508,7 +508,7 @@ export class MapModes {
             this.rows.set(l.id, row);
             return row;
           }))
-          : h('div', { class: 'mc-empty' }, all.length ? 'No lines match the filter.' : 'No lines with two or more stops yet.'),
+          : h('div', { class: 'mc-empty' }, all.length ? 'No lines match the filter.' : 'No lines with 2+ stops'),
         h('div', { class: 'mc-note' }, note),
         this.queue.length ? h('div', { class: 'mc-note' }, `Tracing routes… ${this.queue.length}`) : null),
     );
@@ -596,7 +596,7 @@ export class MapModes {
           sw(SIG_COLOR.block, 'Block signals', String(block), 'mc-dot'),
           sw(SHAPE, 'Two-way signals', String(twoWay), 'mc-diamond'),
           sw(SHAPE, 'One-way signals', String(path + block - twoWay), 'mc-arrow')),
-        h('div', { class: 'mc-note' }, 'A block runs from one signal to the next. Path signals guard junctions and station entries; block signals space trains on open line. Arrows point the way trains may pass.'),
+        h('div', { class: 'mc-note' }, 'Signal-to-signal blocks · path: junctions / station entries · block: open line · arrows: direction'),
         h('div', { class: 'btns' }, h('button', { class: 'btn sm', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'))),
     );
   }
@@ -626,10 +626,10 @@ export class MapModes {
       h('div', { class: 'mc-body' },
         h('div', { class: 'mc-list' }, row('rail', 'Rail stations', catchWalkLimit('rail')), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
         h('div', { class: 'mc-stats' },
-          h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of all residents live near your stations')),
+          h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of residents near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
           inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
-        h('div', { class: 'mc-note' }, 'Tinted streets show walking reach from forecourts, entrances and stops (tram dashed). Every rail station has the same reach, whatever its track type. Passengers come from homes connected to those streets. Distances include the street-grid allowance; station buildings can extend the walk. Hover a station to see its coverage.')),
+        h('div', { class: 'mc-note' }, 'Street reach from forecourts, entrances and stops · tram: dashed · equal rail reach · grid allowance included · buildings extend reach · hover: coverage')),
     );
   }
 
@@ -648,8 +648,8 @@ export class MapModes {
 
   private demandToggle() {
     const toggle = seg<'pax' | 'mail'>([
-      ['pax', 'Passengers', 'Potential passenger trips and served share'],
-      ['mail', 'Mail', 'Potential mail tonnes and estimated carried share'],
+      ['pax', 'Passengers', 'Potential trips · served share'],
+      ['mail', 'Mail', 'Potential tonnes · estimated carried share'],
     ], this.demandLayer, (v) => this.setDemandLayer(v));
     toggle.setAttribute('aria-label', 'Demand cargo');
     return h('div', { class: 'mc-modes mc-demand-toggle' }, toggle);
@@ -753,12 +753,12 @@ export class MapModes {
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close demand view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body mc-mail' },
         this.demandToggle(),
-        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Mail carried share: orange and short dashes = 0%, blue and solid = 100%' }, h('span', null, '0% carried'), h('i'), h('span', null, '100%')),
+        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Mail share: orange short dashes 0% · blue solid 100%' }, h('span', null, '0% carried'), h('i'), h('span', null, '100%')),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, fmtMailTonnes(d.potential)), h('span', null, 'potential t / month')),
           h('div', null, h('b', null, fmtMailTonnes(d.carried)), h('span', null, 'estimated carried t / month')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a mail station`)) : null),
-        h('div', { class: 'mc-note' }, 'Arc width: potential mail in both directions. Colour and dash length: estimated carried share from mail routes, catchments and station ratings. Rings and labels: each town’s outgoing mail, with mail for towns beyond the network that rides to where its lines end. Add mail vans, trucks or postbuses to carry mail.'),
+        h('div', { class: 'mc-note' }, 'Width: potential t/mo both ways · colour / dashes: estimated share · rings / labels: outgoing mail, including beyond-network mail · vans / trucks / postbuses'),
         pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest uncarried flows') : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {
           class: 'mc-row', 'data-tip': `${fmtMailTonnes(p.potential)} t / month potential · ${fmtMailTonnes(p.carried)} t / month estimated carried · ${(p.dist / 100).toFixed(1)} km · ${Math.round(p.share * 100)}% carried`,
@@ -826,13 +826,13 @@ export class MapModes {
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'Esc', 'data-sfx': 'none', 'aria-label': 'Close demand view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
         this.demandToggle(),
-        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Colour scale: orange and dashed = unserved, blue and solid = served' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
+        h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Unserved: orange dashed · served: blue solid' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, fmtInt(total)), h('span', null, 'trips / month between towns')),
           regions.length ? h('div', null, h('b', null, String(regions.length)), h('span', null, 'districts')) : null,
           h('div', null, h('b', null, `${Math.round(carried > 0 ? (mine / carried) * 100 : 0)}%`), h('span', null, 'of carried trips start on your lines')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a station`)) : null),
-        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts, brighter where they produce more trips. Arcs: trips per month between districts, dashed while unserved, solid once served. Hover a district for details.' : 'Arc width: potential trips per month; dashed arcs are unserved, solid ones served.'),
+        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts; brighter: more trips · arcs: trips/mo; dashed: unserved; solid: served · hover: details' : 'Width: trips/mo · dashed: unserved · solid: served'),
         flows.length || pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest unserved flows') : null,
         flows.length ? h('div', { class: 'mc-list' }, flows.map(flowRow)) : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {
