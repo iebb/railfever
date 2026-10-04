@@ -27,6 +27,9 @@
 //    access) is linked to ours by a connecting curve where direct services across both pay (each change of vehicle
 //    costs 10% of the fares of the leg ending in it and the later legs, and routing charges it): a joint line of ours
 //    runs them, the owner earns its fees and is offered mutual through running; walking links where no curve fits.
+//  - extend: city lines grow with their towns (ai-grow.ts): new stations beyond a terminus where residents along the
+//    line's way on are beyond every station's walk (a depot lead in the way moved first), a stop in a long gap that has
+//    filled in; valued by the line forecast against works, trains and upkeep.
 // Spending follows the company's money rules (available(), borrowing in steps as ai.ts does); land is graded and
 // a few town buildings demolished where that gives a better site (cost plus compensation, a small rating hit).
 import type { Game } from './game';
@@ -66,6 +69,7 @@ import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
 import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
+import { growTask, copyGrowCursor, growLine, type GrowCursor, type GrowHost } from './ai-grow';
 
 // ============================================================================ optional primitives (feature-detected)
 
@@ -118,7 +122,7 @@ const now = () => (typeof performance !== 'undefined' ? performance.now() : Date
 
 // ============================================================================ tasks
 
-type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink';
+type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink' | 'extend';
 
 /** Tasks in priority order: how often (days) and whether they spend money (then only with money to spare). */
 const TASKS: { id: Task; period: number; spend: boolean }[] = [
@@ -138,6 +142,7 @@ const TASKS: { id: Task; period: number; spend: boolean }[] = [
   { id: 'relevel', period: 360, spend: true },
   { id: 'midconnect', period: 150, spend: true },
   { id: 'xlink', period: 120, spend: true },
+  { id: 'extend', period: 150, spend: true },
 ];
 
 /** Fixed work allowance per daily call. Timing is profiling only; load never changes the amount of work. */
@@ -155,7 +160,7 @@ const INSERT_POP: Record<string, number> = { mainline: 650, metro: 900, lightrai
 /** Counters (in AIController.stats, saved with it): the ones ai.ts declares and this module's own. */
 type NetStat = 'grown' | 'merged' | 'paired' | 'connections' | 'stubs' | 'netDecommissioned' | 'netRetired' | 'netInserted' | 'netInterchanges'
   | 'netLinesMerged' | 'netRestyled' | 'netConsolidated' | 'netStopsMerged' | 'netThrough' | 'netMidConnections' | 'netRelevelled' | 'netCrossovers' | 'netGraded' | 'netDemolished' | 'netJoined' | 'netRoads' | 'netRoadUnitsSaved'
-  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops';
+  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops' | 'netExtended' | 'netGrowInfill' | 'netDepotsMoved';
 
 /** Frame cost of the daily network work over all companies (tests / profiling). */
 export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, decisions: {} as Record<string, number>,
@@ -214,6 +219,8 @@ interface WorkItem {
   entrance?: { at: number; best?: { kind: EntranceKind; x: number; z: number; gain: number } };
   /** a cross-company link being planned (xlink): the candidate sites and services valued, the next one, the best */
   xlink?: XLinkCursor;
+  /** a city line's growth being planned (extend, ai-grow.ts): the options surveyed, the next one to value, the best */
+  grow?: GrowCursor;
 }
 /**
  * A candidate connecting curve between two companies' lines: the turnout points on our track (a) and theirs (b), each
@@ -231,6 +238,7 @@ const copyXLink = (x: XLinkCursor): XLinkCursor => ({ ...x,
   ...(x.best ? { best: { ...x.best } } : {}) });
 const copyWorkItem = (i: WorkItem): WorkItem => ({ ...i, ids: [...i.ids],
   ...(i.xlink ? { xlink: copyXLink(i.xlink) } : {}),
+  ...(i.grow ? { grow: copyGrowCursor(i.grow) } : {}),
   ...(i.style ? { style: { ...i.style, ...(i.style.best ? { best: { ...i.style.best } } : {}) } } : {}),
   ...(i.entrance ? { entrance: { ...i.entrance, ...(i.entrance.best ? { best: { ...i.entrance.best } } : {}) } } : {}),
   ...(i.road ? { road: { ...i.road, ...(i.road.best ? { best: { ...i.road.best } } : {}) } } : {}) });
@@ -706,7 +714,7 @@ class NetPlanner {
         tp.steps++; tp.ms += dt; tp.max = Math.max(tp.max, dt);
         if (!this.job) break;
         // Expensive proposal work gets one prepared item per day; timing never changes that allowance.
-        if (['roads', 'capacity', 'midconnect', 'xlink'].includes(task) && prepared) break;
+        if (['roads', 'capacity', 'midconnect', 'xlink', 'extend'].includes(task) && prepared) break;
       }
     } catch (e) {
       this.note(`network work (${this.task}) failed: ${String((e as Error)?.message ?? e)}`);
@@ -793,6 +801,10 @@ class NetPlanner {
         const pairs = this.xlinkPairs();
         return this.inventory(task, pairs.map((_, i) => i), 1, XLINK_PAIRS).map((i) => pairs[i.ids[0]]);
       }
+      case 'extend': {
+        const host = this.growHost();
+        return this.inventory(task, ownLines.filter((l) => !this.cared('grow' + l.id) && !!growLine(host, l)).map((l) => l.id), 1, 3);
+      }
       case 'decommission': {
         const ids = this.inventory(task, ownLines.map((l) => l.id)).flatMap((i) => i.ids)
           .sort((a, b) => this.ai.railPolicy.lossOrder(a, b));
@@ -816,9 +828,9 @@ class NetPlanner {
     else {
       const item = job.items[job.cursor];
       if (item) this.drain(this.run(job.task, item));
-      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink) job.cursor++;
+      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow) job.cursor++;
     }
-    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink'].includes(job.task) ? 1 : Infinity;
+    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink', 'extend'].includes(job.task) ? 1 : Infinity;
     if (job.cursor >= job.items.length || job.done >= limit) this.job = null;
   }
 
@@ -847,7 +859,23 @@ class NetPlanner {
       case 'tidy': return this.tidyTask(ids);
       case 'relevel': return this.relevelTask(ids);
       case 'xlink': return this.xlinkTask(item);
+      case 'extend': return growTask(this.growHost(), item);
     }
+  }
+
+  /** What the city-line growth task (ai-grow.ts) uses of the planner. */
+  private growHost(): GrowHost {
+    return {
+      g: this.g, me: this.me, ai: this.ai,
+      note: (s) => this.note(s), news: (s, x, z) => this.news(s, x, z), considered: (k) => this.considered(k),
+      stat: (k, n = 1) => this.bump(k, n), succeed: () => { if (this.job) this.job.done++; },
+      cared: (k) => this.cared(k), careFor: (k, d) => this.careFor(k, d), canSpend: (c, s) => this.canSpend(c, s),
+      affordable: (c, s = 0.3) => c >= 0 && c <= Math.max(0, this.networkBudget()) * s,
+      fleet: (l) => this.fleet(l), managed: () => this.managed(), setStops: (l, s) => this.setStops(l, s),
+      signal: (id) => this.signal(id), canon: (id) => this.canon(id), mayAlter: (ids) => this.mayAlter(ids),
+      consent: (p, planned) => this.proposalConsent(p, planned), demolitionOk: (ids) => this.demolitionOk(ids),
+      compensate: (ids) => this.compensate(ids), localOnly: (l, sid) => this.localOnly(l, sid),
+    };
   }
 
   // ---------------------------------------------------------------- small helpers

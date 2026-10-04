@@ -1133,6 +1133,11 @@ interface TramPlannerExt {
 const tramExt = (t: TramPlanner) => t as unknown as TramPlannerExt;
 
 const LEAD = 20;
+/**
+ * (linegrow) A city railway's depot ramp branches off a straight tail this long (units) beyond a terminus's outer
+ * platform track: the line can later run on from the tail's end and the other track's (ai-grow.ts terminusOf).
+ */
+export const URBAN_TAIL = 4;
 /** Smallest town that gets an AI bus network. */
 const BUS_MIN_POP = 1500;
 
@@ -3713,26 +3718,44 @@ export class AIController {
       return cost;
     };
     // A depot and its ramp are part of the opening stage. Prove them before paying for the platforms.
-    type UrbanYard = { index: number; dir: number; x: number; z: number; cost: number };
+    // (linegrow) The ramp branches off a short straight tail beyond the outer platform track on the side it turns to and
+    // runs off sideways: the terminus stays a free end the line can later be extended from straight on (the other
+    // platform track stays unconnected there, the extension continues from the tail's end and its own; depot trains reach
+    // every platform over the crossovers before the terminus). A ramp straight on would sit on that extension and have to
+    // be moved first: only where no sideways site fits.
+    // city-integration: wip/subway rewrote this yard too (an underground line may keep its depot underground, a tunnel
+    // stub and a cavern, planSubwayYard, the cheaper of that and the ramp). Merged: plan that stub from this tail's fork
+    // turning aside to `track`'s side (its `lat`; ai-grow.ts planTerminusYard does so), never straight on.
+    type UrbanYard = { index: number; dir: number; x: number; z: number; cost: number; track: number; straight: boolean };
     const yard = function* (got: StationPlan[], a: number, lv: typeof level): Generator<void, UrbanYard | null> {
       const ux = Math.sin(a), uz = Math.cos(a), ramp = lv === 'underground' ? 58 : lv === 'elevated' ? 26 : 10;
-      for (const [index, dir] of [[0, -1], [got.length - 1, 1]]) {
-        const st = got[index], off = st.layout.trackOffsets[0];
-        const start = { x: st.x + uz * off + ux * st.length / 2 * dir, z: st.z - ux * off + uz * st.length / 2 * dir,
-          y: st.y, dx: ux * dir, dz: uz * dir };
-        for (const k of [1, 1.25, 0.85, 1.5, 2, 2.5]) for (const lat of [0, 12, -12, 24, -24, 36, -36]) {
-          const x = start.x + ux * ramp * k * dir - uz * lat, z = start.z + uz * ramp * k * dir + ux * lat;
+      for (const lats of [[12, -12, 24, -24, 36, -36], [0]]) for (const [index, dir] of [[0, -1], [got.length - 1, 1]]) {
+        const st = got[index];
+        for (const k of [1, 1.25, 0.85, 1.5, 2, 2.5]) for (const lat of lats) {
+          // (positive lat: left of the axis, the side of track 0; negative: the side of the last track)
+          const track = lat < 0 ? st.layout.trackOffsets.length - 1 : 0, off = st.layout.trackOffsets[track];
+          const tail = lat === 0 ? 0 : URBAN_TAIL;
+          const start = { x: st.x + uz * off + ux * st.length / 2 * dir, z: st.z - ux * off + uz * st.length / 2 * dir,
+            y: st.y, dx: ux * dir, dz: uz * dir };
+          const fork = { x: start.x + ux * tail * dir, z: start.z + uz * tail * dir, y: st.y, dx: ux * dir, dz: uz * dir };
+          const x = fork.x + ux * ramp * k * dir - uz * lat, z = fork.z + uz * ramp * k * dir + ux * lat;
           if (!g.world.inside(x, z, 8)) continue;
           yield;
-          const pr = net.withTemporaryNodes('rail', [start], me, (nodes) => planEdge(g,
-            { kind: 'node', x: start.x, y: start.y, z: start.z, node: nodes[0].id },
+          const pr = net.withTemporaryNodes('rail', [fork], me, (nodes) => planEdge(g,
+            { kind: 'node', x: fork.x, y: fork.y, z: fork.z, node: nodes[0].id },
             { kind: 'free', x, z, y: g.world.heightAt(x, z) },
             { kind: 'rail', type: mode, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me }));
           if (!pr.ok) continue;
+          // (the tail: straight and level from the platform end to the fork)
+          const tp = tail ? net.withTemporaryNodes('rail', [start, { ...fork, dx: -ux * dir, dz: -uz * dir }], me, (nodes) => planEdge(g,
+            { kind: 'node', x: start.x, y: start.y, z: start.z, node: nodes[0].id },
+            { kind: 'node', x: fork.x, y: fork.y, z: fork.z, node: nodes[1].id },
+            { kind: 'rail', type: mode, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me })) : null;
+          if (tp && !tp.ok) continue;
           const end = pr.tracks[0], tangent = endTangent(end.bez), y = end.prof[end.prof.length - 1];
           if (!depotFits(g, x, z, -tangent.x, -tangent.z, me, 0, y)) continue;
           const dp = g.depots.plan('rail', x + tangent.x * 2.15, z + tangent.z * 2.15, Math.atan2(-tangent.x, -tangent.z), me);
-          if (dp.ok) return { index, dir, x, z, cost: (pr.cost + dp.cost) * 1.1 };
+          if (dp.ok) return { index, dir, x, z, cost: (pr.cost + (tp?.cost ?? 0) + dp.cost) * 1.1, track, straight: lat === 0 };
         }
       }
       return null;
@@ -3826,12 +3849,23 @@ export class AIController {
       yield;
     }
     const doubleEdges = [...p.edges].filter((id) => net.edges.get(id)?.station === -1);
-    // a ramp up to the ground beyond the first (else the last) station, a depot at its end; the second track joins it
+    // a ramp up to the ground beyond the first (else the last) station, off the outer platform track on its side, a
+    // depot at its end; the other track joins it only on a ramp straight on (the terminus stays extendable otherwise)
     let dep = -1, depEnd = sts[plannedYard?.index ?? 0];
     if (plannedYard) {
       const outer = ends(depEnd, plannedYard.dir > 0), { x, z } = plannedYard;
       const t0 = net.nextEdge;
-      const pr = planEdge(g, nodeSnap(g, outer[0], 'rail'), { kind: 'free', x, z, y: g.world.heightAt(x, z) },
+      // (the tail first: straight on and level from the platform end; the ramp branches off its end)
+      let fork = outer[plannedYard.track] ?? outer[0];
+      const root = net.nodes.get(fork);
+      if (root && !plannedYard.straight) {
+        const fx = root.x + u.x * URBAN_TAIL * plannedYard.dir, fz = root.z + u.z * URBAN_TAIL * plannedYard.dir;
+        const tp = planEdge(g, nodeSnap(g, fork, 'rail'), { kind: 'free', x: fx, z: fz, y: root.y },
+          { kind: 'rail', type: mode, tracks: 1, heightOffset: root.y - g.world.heightAt(fx, fz) || 1e-3, crossing: 'auto', owner: me });
+        if (tp.ok && !commitProposal(g, tp)) { this.track(t0); const jn = nodeAt(g, 'rail', fx, fz); if (jn) fork = jn.id; }
+        yield;
+      }
+      const pr = planEdge(g, nodeSnap(g, fork, 'rail'), { kind: 'free', x, z, y: g.world.heightAt(x, z) },
         { kind: 'rail', type: mode, tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
       yield;
       if (pr.ok && !commitProposal(g, pr)) {
@@ -3844,7 +3878,7 @@ export class AIController {
     if (dep < 0) return fail('no depot site', 720);
     p.depots.push(dep);
     const throat = (Trackops as unknown as { connectStationThroat?: (g: Game, id: number, owner: number) => unknown }).connectStationThroat;
-    if (throat) { const t0 = net.nextEdge; throat(g, depEnd.id, me); this.track(t0); }
+    if (throat && plannedYard?.straight) { const t0 = net.nextEdge; throat(g, depEnd.id, me); this.track(t0); }
     yield;
     // directional running, crossovers before the ends
     const fin = finishDoubleTrack(g, doubleEdges, me);

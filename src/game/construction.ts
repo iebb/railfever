@@ -81,6 +81,12 @@ export interface BuildOptions {
   level?: 'ground' | 'elevated' | 'underground';
   levelHeight?: number;
   levelDepth?: number;
+  /**
+   * Plan as if these edges and depots were not there (no crossing, clash or obstacle with them): previews of works that
+   * take them up first (an extension whose depot lead is moved out of its way, ai-grow.ts). Never committed as such.
+   * city-integration: wip/subway's tunnel clashes and underground station / depot boxes skip them too.
+   */
+  ignore?: { edges: Set<number>; depots?: Set<number> };
 }
 
 export interface CrossingPlan {
@@ -701,7 +707,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
     for (let i = 0; i < K; i++) { x0 = Math.min(x0, pts[i * 2]); x1 = Math.max(x1, pts[i * 2]); z0 = Math.min(z0, pts[i * 2 + 1]); z1 = Math.max(z1, pts[i * 2 + 1]); }
     for (const e of net.edgesNear(x0, z0, x1, z1)) {
-      if (exclude.has(e.id)) continue;
+      if (exclude.has(e.id) || opts.ignore?.edges.has(e.id)) continue;
       const ge = net.geo(e);
       for (let i = 0; i < K - 1; i++) {
         const ax = pts[i * 2], az = pts[i * 2 + 1], bx = pts[i * 2 + 2], bz = pts[i * 2 + 3];
@@ -889,12 +895,12 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
           break;
         }
       }
-      for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd) { void dp; fail('Depot in the way'); } }
+      for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd && !opts.ignore?.depots?.has(dp.id)) { void dp; fail('Depot in the way'); } }
       // parallel conflicts with other edges
       const nearSwitch = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < SWITCH_ZONE);
       if (!nearEnd && !crossWin(ti, s)) {
         for (const e of net.edgesNear(p.x - hw - 1, p.z - hw - 1, p.x + hw + 1, p.z + hw + 1)) {
-          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
+          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id)) || opts.ignore?.edges.has(e.id)) continue;
           const ge = net.geo(e);
           const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.06 : hw + net.halfWidth(e) - 0.08;
           const ranges = geometryPointRanges(ge, p.x, p.z, need);
@@ -916,7 +922,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       const R = hw + 2 * EARTHWORKS.corePad + 0.6;
       if ((opts.town || i % 2 === 0) && sec === 'ground' && !nearEnd && !prop.errors.length && !crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < (R + 1.5) / Math.max(0.25, Math.sin(c.angle)))) {
         for (const e of net.edgesNear(p.x - R, p.z - R, p.x + R, p.z + R)) {
-          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
+          if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id)) || opts.ignore?.edges.has(e.id)) continue;
           const ehw = net.halfWidth(e), lim = hw + ehw + 2 * EARTHWORKS.corePad - 0.5;
           const r = nearestOnEdge(net, e, p.x, p.z);
           if (r.d > lim || net.sectionAt(e, r.s) !== 'ground') continue;

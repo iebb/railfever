@@ -22,6 +22,10 @@ import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, mode
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
+import { stopsWithInserted, type StopPlace } from '../game/line-edit';
+
+/** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
+const insertPlace = new Map<number, StopPlace>();
 
 /**
  * A vehicle's load in lists (compact): passengers "12/56", mail only "2.4/6 t", both "12/56 · 2.4 t" (the mail part
@@ -159,6 +163,7 @@ export function editLine(ui: UI, id: number) {
   if (!line || line.owner !== PLAYER) return;
   ui.tools.setTool('line-edit');
   ui.tools.lineEditId = line.id;
+  insertPlace.set(line.id, 'end');
   ui.hud.onToolChange();
   ui.toast('Click stations on the map to add them as stops', 'info');
 }
@@ -174,8 +179,13 @@ export function addStopToLine(ui: UI, lineId: number, stationId: number) {
   }
   // another company's station: needs an approved access agreement with its owner (asked for here)
   if (!g.canUse(PLAYER, st.owner) && requestAccessUI(ui, st.owner) !== 'granted') return;
-  if (l.stops[l.stops.length - 1] === stationId) { ui.toast('Already the last stop', 'info'); return; }
-  l.stops.push(stationId);
+  // (at the end unless the line window says otherwise: at the start, where the station fits, after a stop)
+  const place = insertPlace.get(lineId) ?? 'end';
+  const res = stopsWithInserted(g, l, stationId, place);
+  if (!res) { ui.toast(place === 'end' ? 'Already the last stop' : 'Already a stop there', 'info'); return; }
+  l.stops = res.stops;
+  // (after a chosen stop, the next one clicked goes after this one; at the start, before it: the line grows outwards)
+  if (typeof place === 'number') insertPlace.set(lineId, res.at);
   ui.sound('click', { pitch: 1 + Math.min(0.5, l.stops.length * 0.06) });
   g.lines.rebuild();
   for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
@@ -268,6 +278,7 @@ export function openLine(ui: UI, id: number) {
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
+            editing ? h('button', { class: 'ibtn sm' + (insertPlace.get(l.id) === i ? ' on' : ''), 'data-tip': 'Add the next stops after this one', 'aria-label': 'Add stops after this one', 'aria-pressed': insertPlace.get(l.id) === i ? 'true' : 'false', onclick: () => { insertPlace.set(l.id, i); rerender(); } }, icon('plus', 14)) : null,
             h('button', { class: 'ibtn sm', 'data-tip': 'Move up', 'aria-label': 'Move up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Move down', 'aria-label': 'Move down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
@@ -275,6 +286,13 @@ export function openLine(ui: UI, id: number) {
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops yet.'));
       const loop = g.lines.isLoop(l);
       add(win.body, section('Stops', l.stops.length >= 2 ? (loop ? 'vehicles circle round the stops' : 'vehicles run out and back') : ''), list);
+      // where the stops clicked on the map go: a line can grow at either end or between its stops without rebuilding it
+      if (mine && editing && l.stops.length) {
+        const place = insertPlace.get(l.id) ?? 'end';
+        add(win.body, field('New stops', seg<string>([['end', 'At the end', 'After the last stop'], ['start', 'At the start', 'Before the first stop'],
+          ['auto', 'Where they fit', 'On the line\u2019s way between two stops, else beyond the nearer end']], typeof place === 'number' ? '' : place,
+          (v) => { insertPlace.set(l.id, v as StopPlace); rerender(); }), typeof place === 'number' ? `After stop ${Math.min(place, l.stops.length - 1) + 1} (${g.stations.get(l.stops[Math.min(place, l.stops.length - 1)])?.name ?? ''})` : undefined));
+      }
       if (mine && l.stops.length >= 2) {
         const setting = l.loop === undefined ? 'auto' : l.loop ? 'loop' : 'back';
         add(win.body, field('Route', seg([['auto', 'Auto', 'Loop when the stops are three or more different stations'], ['loop', 'Loop', 'Vehicles keep circling one way round the stops'], ['back', 'Out and back', 'Vehicles turn at the first and last stop']], setting, (v) => {

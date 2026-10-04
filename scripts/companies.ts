@@ -459,7 +459,8 @@ g.aiAcquisitions = true;
   check(err === null, 'AI buys AI' + (err ? ': ' + err : ''));
   runDays(31);
   const ctl = g.ais.find((a) => a.companyId === buyer)!;
-  check(tl.every((id) => ctl.managedLines().includes(id)), 'the buyer AI manages the bought lines');
+  // (a bought line the buyer has joined into one of its own since is looked after as that line: lines.get follows the join)
+  check(tl.every((id) => { const l = g.lines.get(id); return !!l && ctl.managedLines().includes(l.id); }), 'the buyer AI manages the bought lines');
   check(tv.every((v) => v.owner === buyer && v.state !== 'noroute'), 'bought trams keep running');
   check(tv.some((v) => v instanceof RoadVehicle && v.model?.kind === 'tram') || !tl.length, 'trams among the bought vehicles');
 }
