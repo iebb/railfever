@@ -47,10 +47,15 @@ export const RAIL_FARE = { minimum: 550 };
 /** Tram and bus fares: a boarding charge in calibrated game money, followed by the scaled distance component. */
 export const ROAD_FARES = { tram: { boarding: 80, distance: 0.9 }, bus: { boarding: 12, distance: 0.9 } };
 /**
- * Years of operating surplus available to repay common railway works: twelve for light rail;
- * subway and cross-city construction retain fifteen for their larger civil investment.
+ * Civil investment horizons. City rail is long-lived infrastructure: twenty years for light rail,
+ * twenty-five for a subway. AI quotes discount the operating surplus at their actual borrowing rate.
+ * Cross-city joins retain their existing fifteen-year gate.
  */
-export const URBAN_PAYBACK = { metro: 15, lightrail: 12, crosscity: 15 };
+export const URBAN_PAYBACK = { metro: 25, lightrail: 20, crosscity: 15 };
+/** Present value of one year's surplus repeated over an investment horizon, at the actual borrowing rate. */
+export function discountedPayback(years: number, interestRate: number): number {
+  return interestRate > 0 ? (1 - Math.pow(1 + interestRate, -years)) / interestRate : years;
+}
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 

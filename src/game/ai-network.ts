@@ -52,6 +52,7 @@ import * as Patterns from './patterns';
 // capacity-integration: through-service stock respects the same corridor bid as monthly fleet management.
 import { sharedTrainAllowed, priceSharedProject } from './ai-capacity';
 import { railCapacityOptions } from './rail-capacity-options';
+import { layInitialDoubleTrack } from './ai-initial-track';
 import { autoSignalLine } from './signals';
 import { findRailRoute, railNext, platformWaits, depotReaches, lineCongestion, trackAllows, lineCompatibility } from './train';
 import type { Train } from './train';
@@ -2729,6 +2730,30 @@ class NetPlanner {
     return out;
   }
 
+  /** Price the connector's conflicting movements on every service at its ends, before buying through trains. */
+  private initialConnector(edges: number[], lines: Line[], revenue: number, boardings: number, trains: number,
+    headway: number, kmh: number, seats: number, trainReserve = 0): boolean {
+    const g = this.g, net = g.world.net;
+    if (!edges.length) return false;
+    const length = edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
+    const legs = lines.map(l => this.lineLegs(l)), approach = Math.max(0, ...legs.map((p, i) =>
+      p.reduce((n, p) => n + p.edge.len, 0) / Math.max(1, new Set(lines[i].stops).size - 1) / 2));
+    const junctionTraffic = lines.reduce((n, l) => n + (l.vehicles.length ? 1 / this.headway([l]) : 0), 0);
+    const affected = lines.reduce((n, l, i) => n + l.incomeLast * Math.min(0.3,
+      (length + approach) / Math.max(1, legs[i].reduce((n, p) => n + p.edge.len, 0))), 0);
+    const result = layInitialDoubleTrack(g, edges, this.me,
+      { revenue: revenue + affected, boardings, seats, trains, headway, kmh, blockLength: length + approach,
+        risk: this.ai.config.risk, junctionTraffic },
+      cost => this.ai.available() >= cost + trainReserve + 150_000 && this.ai.capacityFunds(cost),
+      p => this.proposalConsent(p) && p.demolish.length === 0);
+    if (result.built) {
+      this.ai.stats.doubled++; this.ai.stats.trackDouble += result.edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
+      this.ai.stats.signals += result.signals;
+      this.note(`connector double from opening (${Math.round(result.cost / 1000)}k; ${Math.round(result.choice!.recovered / 1000)}k recovered/year)`);
+    }
+    return result.built;
+  }
+
   /** Connecting curves between the interiors of two authorised routes, followed by a new through service. */
   private *midconnectTask(ids: number[]): Generator<void, void> {
     const g = this.g, net = g.world.net, me = this.me;
@@ -2813,7 +2838,7 @@ class NetPlanner {
         }
         const dirA = (forwardA ? c.a.dir : -c.a.dir) as 1 | -1, dirB = (forwardB ? c.b.dir : -c.b.dir) as 1 | -1;
         tested++;
-        const plan = Trackops.planConnection(g, c.a.edge.id, c.sa, c.b.edge.id, c.sb, me, { dirA, dirB, search: 2 });
+        const plan = Trackops.planConnection(g, c.a.edge.id, c.sa, c.b.edge.id, c.sb, me, { dirA, dirB, search: 2, junctionUpgrade: true });
         if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) continue;
         if (plan.proposal && (!this.proposalConsent(plan.proposal) || !this.demolitionOk(plan.proposal.demolish))) continue;
         // Incremental income pays for the curve, its upkeep and a real compatible train within our horizon.
@@ -2832,11 +2857,13 @@ class NetPlanner {
         net.onSplit.push(split);
         let result: ReturnType<typeof Trackops.commitConnection>;
         try {
-          result = Trackops.commitConnection(g, plan);
+          result = Trackops.commitConnection(g, plan, { signals: false });
           if (!result.error) {
+            const double = this.initialConnector(result.edges, [a, b], revenue, trips * 12, 1, headway, kmh,
+              t.capacity * 0.8 * 2 * YEAR_S / Math.max(1, headway), t.cars.reduce((n, m) => n + m.cost, 0));
             // Split edges have their own local arc lengths. Find the actual turnout position again rather
             // than using the pre-split length on an arbitrary edge near the junction.
-            for (const turnout of plan.turnouts) {
+            for (const turnout of double ? [] : plan.turnouts) {
               const hit = net.nearestEdge(turnout.x, turnout.z, 2, 'rail', (e) => descendants.has(e.id)
                 && e.station < 0 && e.depot < 0 && this.mayAlter([e.id]));
               if (hit && this.oneWayAround(hit.edge)) this.junctionCrossover({ e: hit.edge, s: hit.s,
@@ -3232,7 +3259,7 @@ class NetPlanner {
     const g = this.g;
     const ea = this.xlinkTurnout(s.ax, s.az, s.atx, s.atz), eb = this.xlinkTurnout(s.bx, s.bz, s.btx, s.btz);
     if (!ea || !eb || ea.edge.id === eb.edge.id) return null;
-    const plan = Trackops.planConnection(g, ea.edge.id, ea.s, eb.edge.id, eb.s, this.me, { dirA: ea.dir, dirB: eb.dir, search: 2 });
+    const plan = Trackops.planConnection(g, ea.edge.id, ea.s, eb.edge.id, eb.s, this.me, { dirA: ea.dir, dirB: eb.dir, search: 2, junctionUpgrade: true });
     if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) return null;
     // (no demolition: a link given up takes up its track and refunds the works, but cannot rebuild a house)
     if (plan.proposal && (!this.proposalConsent(plan.proposal) || plan.proposal.demolish.length > 0)) return null;
@@ -3362,7 +3389,9 @@ class NetPlanner {
       net.onSplit.push(split);
       try {
         const result = Trackops.commitConnection(g, plan, { signals: false });
-        if (!result.error) for (const turnout of plan.turnouts) {
+        const double = !result.error && this.initialConnector(result.edges, [a, b], econ.revenue, econ.value.trips * 12,
+          econ.trains, econ.headway, econ.kmh, econ.carried * econ.value.trips * 12, econ.trains * econ.trainCost);
+        if (!result.error) for (const turnout of double ? [] : plan.turnouts) {
           const hit = net.nearestEdge(turnout.x, turnout.z, 2, 'rail', (e) => known.has(e.id) && e.station < 0 && e.depot < 0 && this.mayAlter([e.id]));
           if (hit && this.oneWayAround(hit.edge)) this.junctionCrossover({ e: hit.edge, s: hit.s, x: turnout.x, z: turnout.z, dir: turnout === plan.turnouts[0] ? plan.dirA : plan.dirB });
         }
@@ -3776,17 +3805,22 @@ class NetPlanner {
         const free = ends.filter((id) => net.nodes.get(id)?.edges.length === 1);
         const lead = (free.length ? free : [...ends]).sort((p, q) => { const a = net.nodes.get(p)!, b = net.nodes.get(q)!; return Math.hypot(a.x - best!.c.x, a.z - best!.c.z) - Math.hypot(b.x - best!.c.x, b.z - best!.c.z); })[0];
         const snap: Snap = { kind: 'edge', x: best.c.x, z: best.c.z, y: best.c.y, edge: best.c.e.id, s: best.c.s };
-        const prop = planEdge(g, nodeSnap(g, lead, 'rail'), snap, this.railOpts(r.trackType));
+        const prop = planEdge(g, nodeSnap(g, lead, 'rail'), snap, { ...this.railOpts(r.trackType), junctionUpgrade: true });
         if (!prop.ok || !this.proposalConsent(prop) || !this.demolitionOk(prop.demolish)) { this.note(`no junction from ${st.name} towards ${g.stations.get(best.dest)?.name}: ${prop.errors[0] ?? 'buildings or ownership in the way'}`); continue; }
         if (networkOptions.throughTrips > 0 && prop.cost > best.revenue * 8) continue;
         if (!this.canSpend(prop.cost * 1.3 + 200_000, 0.25)) return;
         const directional = this.oneWayAround(best.c.e);
         const dem = [...prop.demolish];
         const { result: err, edges: made } = this.builtEdges(() => {
-          const err = commitProposal(g, prop);
+          const single = this.builtEdges(() => commitProposal(g, prop)), err = single.result;
           if (!err) {
+            const connector = single.edges.filter(id => { const e = net.edges.get(id); return e?.kind === 'rail' && e.station < 0 && e.depot < 0; });
+            const fleet = best!.line.vehicles.map(id => g.vehicles.get(id)).filter((v): v is Train => v?.kind === 'train');
+            const headway = this.headway([best!.line]), kmh = fleet.reduce((n, t) => n + t.maxSpeedKmh, 0) / Math.max(1, fleet.length) * 0.65;
+            const double = this.initialConnector(connector, [...new Set([...lines, ...this.linesAt(best!.dest)])], best!.revenue,
+              best!.value * 12, fleet.length, headway, kmh, fleet.reduce((n, t) => n + t.capacity, 0) * 0.8 * 2 * YEAR_S / Math.max(1, headway));
             OPS.connectStationThroat?.(g, st.id, me);
-            if (directional && (!routeBetween(g, st.id, best!.dest, me) || !routeBetween(g, best!.dest, st.id, me))) this.junctionCrossover(best!.c);
+            if (!double && directional && (!routeBetween(g, st.id, best!.dest, me) || !routeBetween(g, best!.dest, st.id, me))) this.junctionCrossover(best!.c);
           }
           return err;
         });

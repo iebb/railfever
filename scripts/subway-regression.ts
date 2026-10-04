@@ -1,6 +1,7 @@
 // Independent subway regressions: job replay, cross-slope cover, collision order, fleet funding and view work.
 import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { AIController } from '../src/game/ai';
+import { URBAN_PAYBACK, discountedPayback } from '../src/game/constants';
 import { planEdge, commitProposal, SUBWAY_COVER, type Proposal, type BuildOptions } from '../src/game/construction';
 import { subwayOpts } from '../src/game/subway';
 import { bezLine, arcTable, bezPoint, bezDeriv, tAtS } from '../src/game/geom';
@@ -8,7 +9,7 @@ import { profAt } from '../src/game/network';
 import { serialize, deserialize } from '../src/game/save';
 import { Overlay } from '../src/render/overlay';
 import type { Town } from '../src/game/towns';
-import type { Station } from '../src/game/stations';
+import type { Station, StationPlan } from '../src/game/stations';
 import { linearStops } from '../src/game/lines';
 import { outerEnd, terminusOf } from '../src/game/ai-grow';
 import { saveNetwork, loadNetwork, scheduleNetworkTask, networkProfile } from '../src/game/ai-network';
@@ -159,10 +160,16 @@ if (run('links')) {
     check(!p.ok || (p.demolish.length === 0 && p.tracks.every((t) => t.sections.length === 1 && t.sections[0].type === 'tunnel' && t.sections[0].s1 >= t.len - 0.01)),
       `#2 actual preview options refuse a surfaced valley link (accepted ${p.ok}, demolition ${p.demolish.includes(house.id)})`);
   }
-  while (g.stations.map.size < 5 && ai.busy && ticks++ < 50000) g.stepTick();
+  let plannedPlatforms = 0;
+  while (ai.busy && ticks++ < 50000) {
+    const task = (ai as unknown as { urbanTask: { stage: string; plans: StationPlan[] } | null }).urbanTask;
+    if (task?.stage === 'stations') plannedPlatforms = task.plans.length;
+    if (plannedPlatforms && g.stations.map.size >= plannedPlatforms) break;
+    g.stepTick();
+  }
   const stations = [...g.stations.map.values()].filter((s) => s.owner === 1 && s.rail);
-  check(stations.length === 5, 'fixture reaches construction with all planned platforms');
-  if (stations.length === 5) {
+  check(plannedPlatforms >= 3 && stations.length === plannedPlatforms, 'fixture reaches construction with all planned platforms');
+  if (plannedPlatforms >= 3 && stations.length === plannedPlatforms) {
     const a = stations[0], b = stations[1], cx = (a.x + b.x) / 2, cz = (a.z + b.z) / 2;
     const angle = a.rail!.angle, ux = Math.sin(angle), uz = Math.cos(angle), gap = Math.hypot(a.x - b.x, a.z - b.z) - a.rail!.length;
     for (let z = Math.floor(cz - gap); z <= Math.ceil(cz + gap); z++) for (let x = Math.floor(cx - gap); x <= Math.ceil(cx + gap); x++) {
@@ -212,7 +219,7 @@ if (run('jobs')) {
 // Subway + linegrow: the real saved urban job opens a tail/cavern terminus, then the saved daily
 // growth task carries its line through a dense new district and moves the cavern to the new end.
 if (run('growth')) {
-  const g = flatGame(1), T = denseQuarter(g, 'Growing Subway', 256, 256, 3000, 120, Math.PI / 4), ai = g.ais[0];
+  const g = flatGame(1), T = denseQuarter(g, 'Growing Subway', 256, 256, 8000, 120, Math.PI / 4), ai = g.ais[0];
   const checkpoints = (label: string) => {
     const copies: { key: string; data: string }[] = [], seen = new Set<string>();
     return {
@@ -240,10 +247,7 @@ if (run('growth')) {
     };
   };
   const urban = checkpoints('subway opening');
-  // Open the small town's metro for this construction fixture; growth still has to pay under
-  // the real demand/fleet comparison once the new district arrives.
-  const forceBuild = AIController.forceBuild;
-  AIController.forceBuild = true;
+  // A dense district supports the opening and later growth at the real economic gate.
   g.aiEnabled = true;
   check(ai.startProject('metro', [T.id]), 'growth: underground city project starts');
   let ticks = 0;
@@ -257,7 +261,6 @@ if (run('growth')) {
     'growth: saved opening crosses both tail and cavern build boundaries');
   console.log(`  opening: ${urban.copies.map((c) => c.key).join(', ')}; ${ai.log.slice(-2).join(' | ')}`);
   urban.replay();
-  AIController.forceBuild = forceBuild;
   g.aiEnabled = false;
   ai.state.cooldown = 1e9;
   const line = g.lines.all().find((l) => l.owner === ai.companyId && l.kind === 'rail');
@@ -288,7 +291,9 @@ if (run('growth')) {
     const settled = g.tick + 30 * TICKS_PER_DAY;
     while (g.tick < settled) g.stepTick();
     const { ux, uz } = yard.te;
-    denseQuarter(g, T.name, yard.st.x + ux * 70, yard.st.z + uz * 70, 40000, 72, Math.atan2(uz, ux) + Math.PI / 4, T);
+    denseQuarter(g, T.name, yard.st.x + ux * 50, yard.st.z + uz * 50, 40000, 32, Math.atan2(uz, ux) + Math.PI / 4, T);
+    // Growing town boundaries include the new district, as they do during ordinary town growth.
+    T.radius = Math.max(T.radius, Math.hypot(yard.st.x + ux * 50 - T.x, yard.st.z + uz * 50 - T.z) + 32 * 0.6);
     const buildings = [...g.world.buildings.keys()], e0 = net.nextEdge;
     scheduleNetworkTask(ai, 'extend', 0);
     const state = saveNetwork(g);
@@ -366,10 +371,10 @@ if (run('funding')) for (const startMoney of [5_000_000, 100_000_000]) {
   const g = flatGame(1), T = denseQuarter(g, 'Natural Selector', 256, 256, startMoney === 5_000_000 ? 8000 : 14000, 120, Math.PI / 4), ai = g.ais[0];
   const eco = g.company(1).economy; eco.money = startMoney;
   ai.state.cooldown = 0; ai.config = { ...ai.config, focus: { rail: 2.5, road: 0.1, tram: 0.1 } };
-  let approved: { total: number; net: number; fleet: number; operating?: number; interest?: number } | undefined;
+  let approved: { total: number; net: number; fleet: number } | undefined, approvedMode: 'metro' | 'lightrail' = 'metro';
   const internals = ai as unknown as { urbanEconomics: (...args: unknown[]) => typeof approved };
   const economics = internals.urbanEconomics.bind(ai);
-  internals.urbanEconomics = (...args) => { const r = economics(...args); if (args[5] !== undefined) approved = r; return r; };
+  internals.urbanEconomics = (...args) => { const r = economics(...args); if (args[5] !== undefined) { approved = r; approvedMode = args[1] as typeof approvedMode; } return r; };
   const failures: string[] = [], buy = g.vehicles.buyTrain.bind(g.vehicles);
   g.vehicles.buyTrain = (...args) => { const r = buy(...args); if (typeof r === 'string') failures.push(r); return r; };
   g.aiEnabled = true;
@@ -377,7 +382,14 @@ if (run('funding')) for (const startMoney of [5_000_000, 100_000_000]) {
   while (ai.busy && g.day < 720) g.stepTick();
   const line = g.lines.all().find((l) => l.owner === 1 && l.kind === 'rail');
   check(!line || (!!approved && line.vehicles.length >= approved.fleet && failures.length === 0), `#5 full forecast fleet funded at $${startMoney / 1e6}M (${line?.vehicles.length ?? 0}/${approved?.fleet ?? 0}, failures ${failures.join('; ')})`);
-  if (eco.loan > 0 && approved) check((approved.interest ?? 0) > 0 && approved.net < (approved.operating ?? -Infinity), '#5 unsupported loan interest reduces the investment return');
+  // The investment gate discounts operating surplus at the actual borrowing rate. Deducting loan
+  // interest again from that surplus would charge it twice. Assert the full discounted capital gate
+  // on the funded opening, rather than fields from the older undiscounted quote.
+  if (line && eco.loan > 0 && approved) {
+    const horizon = URBAN_PAYBACK[approvedMode], presentYears = discountedPayback(horizon, eco.interestRate);
+    check(presentYears < horizon && approved.net * presentYears >= approved.total,
+      '#5 loan-funded railway repays its full capital at the actual borrowing rate');
+  }
   if (startMoney === 100_000_000) check(!!line, 'profitable, well-funded subway still opens');
   console.log(`  selector: cash ${eco.money.toFixed(0)}, loan ${eco.loan}, forecast ${JSON.stringify(approved)}, ${ai.log.slice(-2).join(' | ')}`);
 }

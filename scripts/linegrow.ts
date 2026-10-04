@@ -195,12 +195,14 @@ if (run('termini')) {
 function presholm(depotAt: 'west' | 'east', yard: 'tail' | 'old', trains: number, grow: number, companies = 1) {
   const { g, ai, me } = flat(companies);
   const t = newTown(g, 'Presholm', 220, 256);
-  district(g, t, 150, 270, 256, 64, 7000);
+  // These construction cases need a dense walking district under half city reach.
+  // Keep the population, concentrate its buildings near the platforms.
+  district(g, t, 150, 270, 256, 32, 7000);
   // The old three-train fixture earns more by adding fleet on its existing route (validation finding 2).
   // Construction scenarios start with that demand already served, so new district coverage wins on incentives.
   const { line, sts, depot } = cityLine(g, me, [158, 183, 208, 233, 258], 256, depotAt, yard, Math.max(6, trains));
   runDays(g, 30);
-  if (grow) district(g, t, 270, 342, 256, 64, grow);
+  if (grow) district(g, t, 270, 342, 256, 32, grow);
   runDays(g, 5);
   return { g, ai, me, t, line, sts, depot };
 }
@@ -253,7 +255,7 @@ if (run('offset')) {
   const id = g.stations.nextId, p = g.stations.planRail(ideal - 5, 266, Math.PI / 2, 7, 1, 0, { level: 'ground', style: 'none' });
   check(p.ok && !g.stations.commitRail(p, 0), `offset: a halt beside the way on (${p.error ?? 'ok'})`);
   const halt = g.stations.get(id);
-  district(g, t, 270, 342, 256, 64, 4500);
+  district(g, t, 270, 342, 256, 32, 4500);
   runDays(g, 5);
   const before = linePath(line);
   growDaily(g, ai, 300);
@@ -270,7 +272,7 @@ if (run('underground')) {
   console.log('underground: a dense district built across the line\'s way on: the line runs on in a tunnel');
   const { g, ai, me, t, line, sts } = presholm('west', 'tail', 3, 0);
   // (a square, then blocks of flats with their streets right across the way on)
-  district(g, t, 292, 372, 256, 64, 6000, true, false);
+  district(g, t, 292, 372, 256, 32, 6000, true, false);
   runDays(g, 5);
   const before = linePath(line), east = sts[sts.length - 1];
   growDaily(g, ai, 300);
@@ -286,10 +288,15 @@ if (run('underground')) {
 
 if (run('services')) {
   console.log('services: a short-turn service and another company\'s trains on the line keep working as it grows');
-  const { g, ai, me, line, sts } = presholm('west', 'tail', 2, 4500, 2);
+  const { g, ai, me, line, sts, depot } = presholm('west', 'tail', 2, 4500, 2);
   // a short-turn service over the first three stations, with a train of its own
   const short = addPattern(g, line.id, 'local', line.stops.map((sid) => sts.slice(0, 3).some((s) => s.id === sid)), 'Short');
-  const st0 = g.vehicles.get(line.vehicles[0]) as Train;
+  const st0 = g.vehicles.buyTrain(depot, [M('lrv_b')], line.id) as Train;
+  // The player keeps this timetable while the AI coordinates its own and its partner's fleet.
+  // A loss-making AI short turn may be withdrawn before growth, which is a separate capacity decision.
+  g.setAccessPolicy(0, 'open');
+  sts[0].owner = 0; st0.owner = 0;
+  check(g.lines.join(line.id, 0) === null, 'services: the player joins with its short-turn train');
   check(!!short && !setVehiclePattern(g, st0.id, short.id), 'services: a short-turn service runs');
   // another company runs trains on the line too (it owns one of its stations; open access)
   const partner = g.ais[1].companyId;

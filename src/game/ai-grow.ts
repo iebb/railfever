@@ -21,7 +21,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
-import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, DAY_SECONDS, trackTypeOf } from './constants';
+import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf } from './constants';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
 import { linearStops, outAndBack } from './lines';
@@ -521,7 +521,8 @@ function funds(h: GrowHost, kind: 'ext' | 'fill', capital: number, borrow: boole
   return borrow ? h.canSpend(need, 0.3) : h.affordable(need, 0.3);
 }
 /** Years an urban extension's operating surplus has to repay it in (the rule its line opened by). */
-const payback = (mode: RailMode) => (mode === 'mainline' ? URBAN_PAYBACK.crosscity : URBAN_PAYBACK[mode]);
+const payback = (h: GrowHost, mode: RailMode) => discountedPayback(
+  mode === 'mainline' ? URBAN_PAYBACK.crosscity : URBAN_PAYBACK[mode], h.g.company(h.me).economy.interestRate);
 /** Upkeep a year of a station / a unit of double track at a level (game.ts stationMaintenance, opcosts trackMaintenance). */
 const LEVEL_STATION = STATION_UPKEEP_FACTOR, LEVEL_TRACK = { ground: 1, elevated: 4, underground: 5 };
 /** Compensation for demolished town buildings (ai-network compensate), on top of their price in the plans. */
@@ -721,14 +722,14 @@ function value(h: GrowHost, l: Line, beforeRoute: Station[], afterRoute: (Statio
   const fleetRevenue = (carried(forecast(g, before, mode, sv, extra), sv, extra) - today) * rate;
   const fleetNet = fleetRevenue - extra * sv.perTrain - len * 2 * extra * sv.wear;
   const fleetCapital = extra * sv.price;
-  const fleet = { score: fleetNet * payback(mode) - fleetCapital, net: fleetNet, capital: fleetCapital, revenue: fleetRevenue, trains: extra };
+  const fleet = { score: fleetNet * payback(h, mode) - fleetCapital, net: fleetNet, capital: fleetCapital, revenue: fleetRevenue, trains: extra };
   const revenue = (carried(forecast(g, after, mode, next, extra), next, extra) - today) * rate;
   const upkeep = track * 2 * (trackBasePerUnit(type) * (LEVEL_TRACK[level] ?? 1) + (sv.totalTrains + extra) * next.wear)
     + len * 2 * ((sv.totalTrains + extra) * next.wear - sv.totalTrains * sv.wear)
     + stations.reduce((a, p) => a + (20000 + p.tracks * p.length * 500) * (LEVEL_STATION[p.level] ?? 1), 0);
   const net = revenue - ((sv.trains + extra) * next.perTrain - sv.trains * sv.perTrain) - upkeep;
   const capital = works + extra * sv.price;
-  return { score: net * payback(mode) - capital, net, capital, revenue, trains: extra, fleet };
+  return { score: net * payback(h, mode) - capital, net, capital, revenue, trains: extra, fleet };
 }
 
 /** Passenger receipts and forecasts over the same saved, unchanged operator/pattern service periods. */
@@ -796,7 +797,7 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
     if (T.townId < 0 || T.townId !== N.townId || T.owner !== me) continue;
     const te = terminusOf(g, T, outerEnd(T, N), me);
     if (!te || te.kind === 'other' || te.heads.length !== 2) { h.considered('extend.blockedEnd'); continue; }
-    const r = T.rail!, PL = r.length, track = lineTrackAt(g, T), mode = track.mode, SP = cityStationSpacing(g, T.x, T.z, track, PL), R = cityStationRadius(g, T.x, T.z, mode);
+    const r = T.rail!, PL = r.length, track = lineTrackAt(g, T), mode = track.mode, SP = cityStationSpacing(g, T.x, T.z, track, PL);
     const rough = (lv: StationLevel) => (2 * PL * 9000 + 120000) * (lv === 'underground' ? 5 : lv === 'elevated' ? 3.5 : 1)
       + 2 * (SP - PL) * track.costPerUnit * (lv === 'underground' ? 7 : lv === 'elevated' ? 4.5 : 1.5);
     const q = endCentre(g, te), a0 = te.kind === 'free' ? 0 : TAIL;
@@ -807,11 +808,11 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
       let pop = 0;
       for (let k = 0; k < sites.length; k++) {
         if ((g.towns.nearest(sites[k].x, sites[k].z)?.id ?? -1) !== T.townId) break;
-        const add = uncoveredNear(g, covered, counted, sites[k].x, sites[k].z, R);
+        const add = uncoveredNear(g, covered, counted, sites[k].x, sites[k].z, cityStationRadius(g, sites[k].x, sites[k].z, mode));
         if (add <= 0) break;
         pop += add;
         for (const level of levelsFor(T)) {
-          const rank = pop * perRes * payback(mode) - 0.3 * rough(level) * (k + 1);
+          const rank = pop * perRes * payback(h, mode) - 0.3 * rough(level) * (k + 1);
           if (rank > 0) out.push({ kind: 'ext', end, n: k + 1, turn, level, pop, rank });
         }
       }
@@ -821,28 +822,37 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
   for (let i = 0; i + 1 < sts.length; i++) {
     const A = sts[i], B = sts[i + 1];
     if (A.townId < 0 || A.townId !== B.townId) continue;
-    const r = A.rail!, track = lineTrackAt(g, A), SP = cityStationSpacing(g, A.x, A.z, track, r.length), R = cityStationRadius(g, A.x, A.z, track.mode);
+    const r = A.rail!, track = lineTrackAt(g, A), SP = cityStationSpacing(g, A.x, A.z, track, r.length);
     const d = Math.hypot(B.x - A.x, B.z - A.z);
     if (d < 2 * SP) continue;
     let best: { x: number; z: number; pop: number } | null = null;
     for (let s = SP; s <= d - SP + 1e-6; s += 3) {
       const x = A.x + (B.x - A.x) * s / d, z = A.z + (B.z - A.z) * s / d;
-      const pop = uncoveredNear(g, covered, new Set(), x, z, R);
+      const pop = uncoveredNear(g, covered, new Set(), x, z, cityStationRadius(g, x, z, track.mode));
       if (pop > 0 && (!best || pop > best.pop)) best = { x, z, pop };
     }
     if (!best) continue;
     const lv = (r.level ?? 'ground') as StationLevel;
     const rough = (2 * r.length * 9000 + 120000) * (lv === 'underground' ? 5 : lv === 'elevated' ? 3.5 : 1);
-    const rank = best.pop * perRes * payback(track.mode) - 0.3 * rough;
+    const rank = best.pop * perRes * payback(h, track.mode) - 0.3 * rough;
     if (rank > 0) out.push({ kind: 'fill', a: A.id, b: B.id, x: best.x, z: best.z, pop: best.pop, rank });
   }
   out.sort((p, q) => q.rank - p.rank || p.pop - q.pop);
   // (the most promising six, two of each kind and level among them where there are: a cheap level that turns out not
   // to fit leaves the others their chance)
-  const picked: typeof out = [], per = new Map<string, number>();
+  const picked: typeof out = [], groups = new Map<string, typeof out>();
   for (const o of out) {
     const k = o.kind + (o.level ?? '');
-    if (picked.length < 6 && (per.get(k) ?? 0) < 2) { picked.push(o); per.set(k, (per.get(k) ?? 0) + 1); }
+    const candidates = groups.get(k) ?? [];
+    candidates.push(o); groups.set(k, candidates);
+  }
+  // A high-population bend can be blocked by streets while the straight continuation is buildable.
+  // Keep that cheaper alignment in the bounded search instead of spending both slots on one bend.
+  for (const candidates of groups.values()) {
+    if (picked.length < 6) picked.push(candidates[0]);
+    const alternative = candidates.find(o => o !== candidates[0] && o.kind === 'ext' && o.turn === 0)
+      ?? candidates.find(o => o !== candidates[0]);
+    if (alternative && picked.length < 6) picked.push(alternative);
   }
   for (const o of out) if (picked.length < 6 && !picked.includes(o)) picked.push(o);
   picked.sort((p, q) => q.rank - p.rank || p.pop - q.pop);

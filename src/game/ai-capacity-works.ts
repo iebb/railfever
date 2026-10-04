@@ -2,6 +2,7 @@
 import type { AIController } from './ai';
 import type { Game } from './game';
 import type { Line } from './lines';
+import type { Proposal } from './construction';
 import { sharedCapacityPlan, sharedUpgradeReturn, capacityTrackUpkeep } from './ai-capacity';
 import { autoSignalLine } from './signals';
 import { planStationUpgrade, commitStationUpgrade } from './stations';
@@ -35,8 +36,8 @@ function settleWorks(ai: AIController, value: WorksReturn, quoted: number, spent
 export function planCapacityTrackUpgrade(g: Game, edges: number[], side: 1 | -1, payer: number): DoublePlan {
   return planDoubleTrack(g, edges, side, payer);
 }
-export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan) {
-  return commitDoubleTrack(g, plan, true);
+export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: (p: Proposal) => boolean) {
+  return commitDoubleTrack(g, plan, true, {}, consent);
 }
 
 /** The title holder acts for the whole corridor; other operators gain paths under their access agreement. */

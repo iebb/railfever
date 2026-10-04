@@ -212,7 +212,14 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
       if (Math.abs(net.heightAtS(e, ne.s) - heightAt(sAtU(i / 16))) < RAIL.clearance) return { error: e.kind === 'rail' ? 'other track in the way' : 'road in the way', cost: 0 };
     }
   }
-  for (const c of net.crossings.values()) if ((tracks.has(c.e1) || tracks.has(c.e2)) && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) return { error: 'level crossing in the way', cost: 0 };
+  for (const c of net.crossings.values()) if ((tracks.has(c.e1) || tracks.has(c.e2)) && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) {
+    // Companion junction leads may pass beside a previously registered rail diamond. The actual new
+    // intersections above retain their own reservation resources; road crossings and denied titles still block.
+    if (junctions && c.kind === 'diamond' && [c.e1, c.e2].every(id => {
+      const e = net.edges.get(id); return e?.kind === 'rail' && !g.trackUpgradeError(owner, e.owner);
+    })) continue;
+    return { error: 'level crossing in the way', cost: 0 };
+  }
   // Nodes carry no section flag: inspect their incident parent rails too (station insertion lays node-to-node
   // fans). Determine the sections and their price before a dry run returns, so preview and commit agree.
   const secOf = (q: SPt): 'ground' | Section['type'] => {
@@ -471,7 +478,12 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
         if (twin && Math.abs(net.heightAtS(twin.edge, twin.s) - q.y) < 0.06) {
           const inner = atStart ? 8 : U - 8;
           const o = offAt(inner), t: SPt = { ...target, edge: twin.edge.id, s: twin.s };
-          const allowed = new Set([...chainSet, twin.edge.id]);
+          // A connector's curve contains none of the original trunk's split approaches. They are the same
+          // authorised junction formation, so its companion lead may run close before it diverges.
+          const approaches = n.edges.map(id => net.edges.get(id)!).filter(e => e?.kind === 'rail');
+          const allowed = new Set([...chainSet, twin.edge.id, ...[...besideTracks(g, [...approaches, twin.edge], 24)].filter(id => {
+            const e = net.edges.get(id); return e?.kind === 'rail' && !g.trackUpgradeError(owner, e.owner);
+          })]);
           const r = connectS(g, owner, t, o, allowed, true, undefined, net.edges.get(q.edge)!.owner, true);
           if (!r.error) return { end: { kind: 'track', u: atStart ? 0 : U, node: -1, snap: { kind: 'edge', x: target.x, z: target.z, y: q.y, edge: twin.edge.id, s: twin.s } }, inner };
         }
@@ -710,7 +722,13 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       }
       return mainPt(end.u);
     };
-    const allowed = () => new Set([...tracks(), ...[plan.start, plan.end].flatMap((q) => q.snap?.edge !== undefined ? [q.snap.edge] : [])]);
+    const allowed = () => new Set([...tracks(), ...[plan.start, plan.end].flatMap((q, i) => {
+      const junction = q.kind === 'track' ? net.nodes.get(i === 0 ? startNode(g, main[0]) : endNode(g, main[main.length - 1]))?.edges ?? [] : [];
+      const approaches = [...junction, ...(q.snap?.edge !== undefined ? [q.snap.edge] : [])].map(id => net.edges.get(id)!).filter(e => e?.kind === 'rail');
+      return [...(q.snap?.edge !== undefined ? [q.snap.edge] : []), ...[...besideTracks(g, approaches, 24)].filter(id => {
+        const e = net.edges.get(id); return e?.kind === 'rail' && !g.trackUpgradeError(owner, e.owner);
+      })];
+    })]);
     const r1 = plan.joined?.[1] ? { error: null } : connectS(g, owner, nodePt(cur, last), targetPt(plan.end, last), allowed(), false, undefined, net.nodes.get(cur)!.owner, plan.complete);
     if (r1.error) { const r = rollback(`End connection: ${r1.error}`); dropNodes(); return r; }
     const r2 = plan.joined?.[0] ? { error: null } : connectS(g, owner, targetPt(plan.start, pts[0]), nodePt(first.id, pts[0]), allowed(), false, undefined, first.owner, plan.complete);
@@ -1967,6 +1985,8 @@ export interface ConnectionOpts {
   dirB?: 1 | -1;
   /** crossings on the way (construction's crossing mode, default 'auto') */
   crossing?: BuildOptions['crossing'];
+  /** A connector of directional rails may cross its companion lead at a protected shallow diamond. */
+  junctionUpgrade?: boolean;
   /** track type of the connecting curve (default: track A's) */
   type?: string;
   /** signal the junctions by the rules when track there is signalled (default true) */
@@ -2033,7 +2053,7 @@ export function planConnection(g: Game, edgeA: number, sA: number, edgeB: number
       if (!best || score < best.score) best = { prop: null as unknown as Proposal, a: s1, b: s2, da, db, score, xo: { a, b, cost: c.cost } };
       continue;
     }
-    const prop = planEdge(g, { kind: 'edge', x: ax, z: az, y: net.heightAtS(ea, s1), edge: ea.id, s: s1 }, { kind: 'edge', x: bx, z: bz, y: net.heightAtS(eb, s2), edge: eb.id, s: s2 }, railOpts(owner, { type, crossing: opts.crossing ?? 'auto' }));
+    const prop = planEdge(g, { kind: 'edge', x: ax, z: az, y: net.heightAtS(ea, s1), edge: ea.id, s: s1 }, { kind: 'edge', x: bx, z: bz, y: net.heightAtS(eb, s2), edge: eb.id, s: s2 }, railOpts(owner, { type, crossing: opts.crossing ?? 'auto', junctionUpgrade: opts.junctionUpgrade }));
     if (!prop.ok) { firstErr = firstErr || prop.errors[0] || 'Cannot build the connection'; continue; }
     const score = prop.cost - Math.min(prop.stats.minRadius, 200) * 500 + (Math.abs(oa) + Math.abs(ob)) * 2000;
     if (!best || score < best.score) best = { prop, a: s1, b: s2, da, db, score };
