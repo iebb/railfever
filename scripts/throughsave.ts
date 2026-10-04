@@ -121,12 +121,13 @@ if (process.argv.includes('--regression')) {
   let ticks = 0;
   while ((!opened(ai) || ai.project) && ai.busy && ticks++ < 200000) g.stepTick();
   check(opened(ai) && !ai.project && !!ai.state.through, `the city railway is a finished project when the through service is planned (${ai.log.slice(-1)[0] ?? ''})`);
-  const saves: { tick: number; through: boolean; data: string }[] = [];
+  // (idle: no unsaved AI job in flight; the follow-up through job is saved with the company, other jobs are not)
+  const saves: { tick: number; through: boolean; idle: boolean; data: string }[] = [];
   let after = 0, roundTripErrors = 0;
   while (after < 3 && ticks++ < 200000) {
     const data = JSON.stringify(serialize(g));
     if (JSON.stringify(serialize(deserialize(JSON.parse(data)))) !== data) { roundTripErrors++; if (roundTripErrors === 1) console.log(`  round trip differs at tick ${g.tick}`); }
-    saves.push({ tick: g.tick, through: !!ai.state.through, data });
+    saves.push({ tick: g.tick, through: !!ai.state.through, idle: !ai.busy, data });
     g.stepTick();
     if (!ai.busy) after++;
   }
@@ -136,7 +137,7 @@ if (process.argv.includes('--regression')) {
   check(roundTripErrors === 0 && during.length >= 1, `every save during and after the through job loads exactly (${saves.length - roundTripErrors}/${saves.length}, ${during.length} with the job pending)`);
   check(ai.stats.through === 1, `the through service opens (${ai.stats.through})`);
   // the loaded games go on exactly as the original: 30 days in step (every save with the job pending, the last few after)
-  const replays = [...during.filter((_, i) => i % Math.max(1, Math.ceil(during.length / 12)) === 0), ...saves.slice(-2)]
+  const replays = [...during.filter((_, i) => i % Math.max(1, Math.ceil(during.length / 12)) === 0), ...saves.filter((s) => s.idle && !s.through).slice(-2)]
     .map((s) => ({ tick: s.tick, g: deserialize(JSON.parse(s.data)) }));
   const end = g.day + 30;
   while (g.day < end) { g.stepTick(); for (const r of replays) while (r.g.tick < g.tick) r.g.stepTick(); }

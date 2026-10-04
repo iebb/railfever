@@ -32,6 +32,8 @@ import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } f
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
 import { networkDaily, scheduleNetworkTask, XLINK_REACH } from './ai-network';
+import { planSubwayYard, buildSubwayYard, surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
+import { UNDERGROUND_DEPOT } from './build-ops';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail';
 import { offloadMail } from './mail';
@@ -44,6 +46,12 @@ export * from './routing';
 
 // Corridor expansions are independent of the slice size; keep terrain probes in short batches too.
 const AI_ROUTE_WORK = 1024;
+/**
+ * Years of operating surplus an urban railway may take to repay itself, by construction style (URBAN_PAYBACK): a line
+ * in tunnel (a subway, of either track style) amortises as long as the subway-style ones, a light-rail-style line on
+ * the ground or on a viaduct sooner.
+ */
+const urbanPayback = (mode: 'metro' | 'lightrail', level: string) => URBAN_PAYBACK[level === 'underground' ? 'metro' : mode];
 const AI_SITE_WORK = 64;
 // At eight units/day this leaves six days of the 60-day planning target for choosing a project.
 const AI_RAIL_PLAN_UNITS = 432;
@@ -1666,18 +1674,18 @@ export class AIController {
             sites.push({ x, z, townId: T.id, walk: pointWalkingCatchment(g, x, z, 'rail', 0, 8) });
             yield;
           }
-          const levels = mode === 'metro' ? ['underground'] : ['ground', 'elevated'];
+          const levels = mode === 'metro' ? ['underground'] : ['ground', 'elevated', 'underground'];
           let score = 0;
           for (const level of levels) {
             // Selection values the affordable opening stage; the job subsequently proves the actual sites,
             // grades, crossings and structure costs before any construction or borrowing.
             yield;
             const econ = this.urbanEconomics(sites, mode, level, [unit], 2);
-            if (econ.total * 1.05 > avail || econ.net * URBAN_PAYBACK[mode] < econ.total) continue;
+            if (econ.total * 1.05 > avail || econ.net * urbanPayback(mode, level) < econ.total) continue;
             // Compare the return over the accepted investment horizon (against a 4.5-year reference: with one rail
             // fare for city hops, a city railway's yearly return is modest, its life long). Using an annual-only
             // ranking crowded out viable city rail with cheap coaches until too little of the horizon remained.
-            score = Math.max(score, roi(econ.forecast.revenue, econ.yearly, econ.total) * URBAN_PAYBACK[mode] / 4.5);
+            score = Math.max(score, roi(econ.forecast.revenue, econ.yearly, econ.total) * urbanPayback(mode, level) / 4.5);
           }
           if (score > 0) opts.push({ score: score * Math.max(fw(focus.rail), fw(focus.tram)), kind: mode, towns: [T.id] });
         }
@@ -3586,8 +3594,13 @@ export class AIController {
     return { x, z, angle, spacing, L, targets: targets.sort((a, b) => a - b), interchanges: pair };
   }
 
-  /** Physics-based operating costs, actual structure upkeep and walking/OD ridership on the proposed stops. */
-  private urbanEconomics(points: (StationPlan | ForecastSite)[], mode: 'metro' | 'lightrail', level: string, cars: VehicleModel[], fleet: number, connectionCost?: number, yardCost?: number) {
+  /**
+   * Physics-based operating costs, actual structure upkeep and walking/OD ridership on the proposed stops. Without
+   * planned links and yard (choosing projects) the costs are estimated: a line on the ground pays for what it
+   * demolishes along its way (at the land value there), an underground line may keep its depot underground (a stub
+   * and a cavern instead of a long ramp up to the surface), whichever is cheaper.
+   */
+  private urbanEconomics(points: (StationPlan | ForecastSite)[], mode: 'metro' | 'lightrail', level: string, cars: VehicleModel[], fleet: number, connectionCost?: number, yardCost?: number, yardLength?: number) {
     const g = this.game, type = TRACK_TYPES[mode];
     const len = points.slice(1).reduce((a, s, i) => a + Math.hypot(s.x - points[i].x, s.z - points[i].z), 0);
     const spacing = len / Math.max(1, points.length - 1);
@@ -3599,15 +3612,23 @@ export class AIController {
     const forecast = g.demand.forecastLine(points, mode, kmh, headway);
     const capacity = fleet * yr.trips * cars.reduce((a, m) => a + m.capacity, 0) * 0.7;
     forecast.revenue *= Math.min(1, capacity / Math.max(1, forecast.boardings));
-    const ramp = level === 'underground' ? 58 : level === 'elevated' ? 26 : 10;
+    let ramp = level === 'underground' ? 58 : level === 'elevated' ? 26 : 10;
     const sf = level === 'underground' ? 6 : level === 'elevated' ? 3 : 1;
     const tf = level === 'underground' ? 5 : level === 'elevated' ? 4 : 1;
     const platform = mode === 'metro' ? 12 : 7;
     const stationCost = points.reduce((a, p) => a + ('cost' in p ? p.cost : (2 * platform * 9000 + 120_000) * sf), 0);
-    const total = stationCost + (connectionCost ?? len * 2 * type.costPerUnit * (level === 'underground' ? 8.5 : level === 'elevated' ? 4.5 : 1.5))
-      + (yardCost ?? ramp * type.costPerUnit * 3 + 250_000) + fleet * cars.reduce((a, m) => a + m.cost, 0);
+    // the depot: a ramp up to the surface, or (underground) a stub and a cavern at depth, whichever costs less
+    let yard = yardCost;
+    if (yard === undefined) {
+      yard = ramp * type.costPerUnit * 3 + 250_000;
+      const stub = 10, under = stub * subwayCostPerUnit(mode, 2.2, 1) + UNDERGROUND_DEPOT.base + UNDERGROUND_DEPOT.perDepth * 2.2;
+      if (level === 'underground' && under < yard) { yard = under; ramp = stub; }
+    } else if (yardLength !== undefined) ramp = yardLength;
+    const demolition = connectionCost === undefined && level === 'ground' ? surfaceDemolition(this.game, points, 0.55).cost : 0;
+    const total = stationCost + (connectionCost ?? len * 2 * type.costPerUnit * (level === 'underground' ? 8.5 : level === 'elevated' ? 4.5 : 1.5) + demolition)
+      + yard + fleet * cars.reduce((a, m) => a + m.cost, 0);
     const yearly = fleet * yr.total + (len * 2 + ramp) * (trackBasePerUnit(mode) * tf + fleet * yr.trackWearPerUnit)
-      + points.length * (20000 + 2 * platform * 500) * sf + 12000;
+      + points.length * (20000 + 2 * platform * 500) * sf + (ramp < 20 && level === 'underground' ? UNDERGROUND_DEPOT.upkeep : 12000);
     return { total, yearly, net: forecast.revenue - yearly, forecast, headway, fleet };
   }
 
@@ -3712,10 +3733,21 @@ export class AIController {
       }
       return cost;
     };
-    // A depot and its ramp are part of the opening stage. Prove them before paying for the platforms.
-    type UrbanYard = { index: number; dir: number; x: number; z: number; cost: number };
+    // A depot and its ramp are part of the opening stage. Prove them before paying for the platforms. Underground
+    // lines may keep their depot underground too (a tunnel stub and a cavern beyond an end station: no ramp, no
+    // portal, nothing demolished): the cheaper of that and a ramp up to a depot on the surface wins.
+    type UrbanYard = { index: number; dir: number; x: number; z: number; cost: number; under?: SubwayYardPlan };
     const yard = function* (got: StationPlan[], a: number, lv: typeof level): Generator<void, UrbanYard | null> {
       const ux = Math.sin(a), uz = Math.cos(a), ramp = lv === 'underground' ? 58 : lv === 'elevated' ? 26 : 10;
+      let under: UrbanYard | null = null;
+      if (lv === 'underground') for (const [index, dir] of [[0, -1], [got.length - 1, 1]]) {
+        const st = got[index], off = st.layout.trackOffsets[0];
+        yield;
+        const yp = planSubwayYard(g, { x: st.x + uz * off + ux * st.length / 2 * dir, z: st.z - ux * off + uz * st.length / 2 * dir, y: st.y, dx: ux * dir, dz: uz * dir }, me, { type: mode, depth: st.depth });
+        if (yp.ok && (!under || yp.cost < under.cost)) under = { index, dir, x: yp.x, z: yp.z, cost: yp.cost, under: yp };
+      }
+      // (a ramp can only be cheaper when its least cost, about twice ground track over its length, undercuts it)
+      if (under && under.cost < ramp * TRACK_TYPES[mode].costPerUnit * 2 + 90_000) return under;
       for (const [index, dir] of [[0, -1], [got.length - 1, 1]]) {
         const st = got[index], off = st.layout.trackOffsets[0];
         const start = { x: st.x + uz * off + ux * st.length / 2 * dir, z: st.z - ux * off + uz * st.length / 2 * dir,
@@ -3732,10 +3764,10 @@ export class AIController {
           const end = pr.tracks[0], tangent = endTangent(end.bez), y = end.prof[end.prof.length - 1];
           if (!depotFits(g, x, z, -tangent.x, -tangent.z, me, 0, y)) continue;
           const dp = g.depots.plan('rail', x + tangent.x * 2.15, z + tangent.z * 2.15, Math.atan2(-tangent.x, -tangent.z), me);
-          if (dp.ok) return { index, dir, x, z, cost: (pr.cost + dp.cost) * 1.1 };
+          if (dp.ok) { const c = (pr.cost + dp.cost) * 1.1; return under && under.cost <= c ? under : { index, dir, x, z, cost: c }; }
         }
       }
-      return null;
+      return under;
     };
     let plans: StationPlan[] = [], angle = a0, tries = 0, bestReturn = -Infinity, connectionCost: number | undefined, plannedYard: UrbanYard | undefined;
     const walks = (lv: typeof level, na: number, lats: number[]) => angles.slice(0, na).flatMap(({ a }) => lats.map((lat) => ({ a, lat, lv })));
@@ -3743,7 +3775,12 @@ export class AIController {
     const cands = mode === 'metro' ? walks('underground', 6, layout.interchanges.length ? lats : [0, 5, -5, 10, -10])
       : angles.slice(0, 6).flatMap(({ a }, i) => lats.flatMap((lat) =>
         (i < 3 ? ['ground', 'elevated', 'underground'] as const : ['underground'] as const).map((lv) => ({ a, lat, lv }))));
+    // every level of an alignment is compared (the best return wins: what a line on the ground demolishes, what a
+    // viaduct or tunnel costs, where the depot can go); the search ends two alignments after the first that pays back
+    let paid = false, cur = '', more = 2, bestPays = false;
     search: for (const { a, lat, lv } of cands) {
+      const key = `${a}|${lat}`;
+      if (key !== cur) { cur = key; if (paid && more-- <= 0) break search; }
       {
         const got: StationPlan[] = [];
         let tPrev = -Infinity;
@@ -3768,11 +3805,12 @@ export class AIController {
           if (!depot) { linkRejects.set('no depot site', (linkRejects.get('no depot site') ?? 0) + 1); continue; }
           const vehicle = this.urbanUnit(mode, PL);
           if (vehicle) {
-            const e = this.urbanEconomics(got, mode, lv, [vehicle], 2, links, depot.cost);
-            const ret = e.net / Math.max(1, e.total);
-            if (e.total < this.available() && ret > bestReturn) { bestReturn = ret; plans = got; angle = a; level = lv; connectionCost = links; plannedYard = depot; }
+            const e = this.urbanEconomics(got, mode, lv, [vehicle], 2, links, depot.cost, depot.under?.length);
+            // (the best return among the plans that repay themselves in their style's time, else the best return)
+            const ret = e.net / Math.max(1, e.total), pays = ret * urbanPayback(mode, lv) >= 1;
+            if (e.total < this.available() && ((pays && !bestPays) || (pays === bestPays && ret > bestReturn))) { bestReturn = ret; bestPays = pays; plans = got; angle = a; level = lv; connectionCost = links; plannedYard = depot; }
             yield;
-            if (got.length >= n && ret * URBAN_PAYBACK[mode] >= 1 && e.total < this.available()) break search;
+            if (got.length >= n && pays && e.total < this.available()) paid = true;
           }
         }
         if (tries > 1500) break search;
@@ -3784,8 +3822,8 @@ export class AIController {
     const unit = this.urbanUnit(mode, PL);
     if (!unit) return fail('no vehicles');
     const consist = [unit];
-    const econ = this.urbanEconomics(plans, mode, level, consist, 2, connectionCost, plannedYard?.cost), total = econ.total, fleet = econ.fleet;
-    if (!AIController.forceBuild && econ.net * URBAN_PAYBACK[mode] < total) return fail(`not profitable (${Math.round(econ.net / 1000)}k/year on ${Math.round(total / 1000)}k over ${URBAN_PAYBACK[mode]} years; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.boardings)} boardings, ${Math.round(econ.forecast.revenue / 1000)}k revenue)`, 360);
+    const econ = this.urbanEconomics(plans, mode, level, consist, 2, connectionCost, plannedYard?.cost, plannedYard?.under?.length), total = econ.total, fleet = econ.fleet;
+    if (!AIController.forceBuild && econ.net * urbanPayback(mode, level) < total) return fail(`not profitable (${Math.round(econ.net / 1000)}k/year on ${Math.round(total / 1000)}k over ${urbanPayback(mode, level)} years; ${Math.round(econ.forecast.covered)} covered, ${Math.round(econ.forecast.boardings)} boardings, ${Math.round(econ.forecast.revenue / 1000)}k revenue)`, 360);
     if (total > this.available() || !this.borrowFor(total)) return fail('too expensive', 720);
     this.state.phase = `building a ${what} in ${T.name}`;
     p.built = true;
@@ -3828,7 +3866,13 @@ export class AIController {
     const doubleEdges = [...p.edges].filter((id) => net.edges.get(id)?.station === -1);
     // a ramp up to the ground beyond the first (else the last) station, a depot at its end; the second track joins it
     let dep = -1, depEnd = sts[plannedYard?.index ?? 0];
-    if (plannedYard) {
+    if (plannedYard?.under) {
+      // the depot underground beyond the end station: its stub in tunnel, then the cavern
+      const outer = ends(depEnd, plannedYard.dir > 0), t0 = net.nextEdge;
+      dep = buildSubwayYard(g, outer[0], plannedYard.under, me, mode);
+      this.track(t0);
+      yield;
+    } else if (plannedYard) {
       const outer = ends(depEnd, plannedYard.dir > 0), { x, z } = plannedYard;
       const t0 = net.nextEdge;
       const pr = planEdge(g, nodeSnap(g, outer[0], 'rail'), { kind: 'free', x, z, y: g.world.heightAt(x, z) },
