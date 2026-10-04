@@ -4255,6 +4255,10 @@ class NetPlanner {
         if (b.owner < 0 || !g.canUse(me, b.owner) || g.accessPolicy(b.owner) !== 'open' || gap > 5) continue;
         const ls = this.linesAt(a.id);
         if (ls.some((l) => l.owner !== me || l.stops.includes(b.id) || new Set(l.stops.map((s) => (s === a.id ? b.id : s))).size < 2)) continue;
+        // Each operator needs an owned stop to buy more vehicles. Consolidating onto a neighbour
+        // must not remove anyone's last such stop, even while our line is otherwise profitable.
+        if (ls.some(l => g.lines.operatorsOf(l).some(owner => a.owner === owner
+          && !l.stops.some(s => s !== a.id && g.stations.get(s)?.owner === owner)))) continue;
         for (const l of ls) this.setStops(l, l.stops.map((s) => (s === a.id ? b.id : s)));
         if (!this.linesAt(a.id).length && !g.stations.removeStation(a.id)) {
           this.bump('netStopsMerged');

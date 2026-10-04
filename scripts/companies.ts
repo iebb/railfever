@@ -137,7 +137,7 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   let pick: { ai: AIController; l: NonNullable<ReturnType<typeof g.lines.get>>; info: Info } | undefined;
   for (const ai of AIS) {
     if (g.company(ai.companyId).defunct) continue;
-    // Finish the project before selecting: it may consolidate the selected line's last owned stop.
+    // Finish the project before selecting a line for capacity management.
     for (let d = g.day + 720; ai.busy && g.day < d;) g.update(0.25);
     if (ai.busy) continue;
     pick = ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! }))
@@ -149,10 +149,6 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
   if (!pick) console.log('  (no AI bus or tram line to crowd)');
   else {
     const { ai, l, info } = pick;
-    // Network maintenance runs even during cooldown and can hand the last owned stop to a neighbour.
-    // Hold the layout fixed for this capacity fixture; monthly fleet management still runs normally.
-    const daily = ai.daily;
-    ai.daily = () => {};
     ai.state.cooldown = Math.max(ai.state.cooldown, 400);
     const n0 = l.vehicles.length, v0 = g.vehicles.get(l.vehicles[0])!;
     const grow = Math.sqrt(ai.config.activeness);
@@ -182,7 +178,6 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     const m1 = info.maxVehicles, n1 = l.vehicles.length;
     for (const d1 = g.day; g.day < d1 + 70 && !g.company(l.owner).defunct;) g.update(0.25);
     ai.monthly = manage;
-    ai.daily = daily;
     check(n1 === hard && info.maxVehicles === m1 && l.vehicles.length <= hard, `a crowded line at the limit its stops set raises nothing more (${n1} of ${hard} vehicles, limit ${m1} -> ${info.maxVehicles})`);
   }
 }
