@@ -225,11 +225,11 @@ export function repairFormations(w: World, x0: number, z0: number, x1: number, z
 }
 
 /** Recompute network locks in an area (after removing edges or converting sections). */
-export function recomputeLocks(w: World, x0: number, z0: number, x1: number, z1: number) {
+export function recomputeLocks(w: World, x0: number, z0: number, x1: number, z1: number, ungraded?: ReadonlySet<number>) {
   const s1 = w.size + 1;
   for (let z = Math.max(0, Math.floor(z0)); z <= Math.min(w.size, Math.ceil(z1)); z++)
     for (let x = Math.max(0, Math.floor(x0)); x <= Math.min(w.size, Math.ceil(x1)); x++) w.lock[z * s1 + x] &= ~(LOCK.formation | LOCK.rail);
-  for (const e of w.net.edgesNear(x0 - 2, z0 - 2, x1 + 2, z1 + 2)) lockEdge(w, e);
+  for (const e of w.net.edgesNear(x0 - 2, z0 - 2, x1 + 2, z1 + 2)) if (!ungraded?.has(e.id)) lockEdge(w, e);
 }
 
 /** Raise/lower/flatten terrain with a circular brush. Returns the volume moved. */

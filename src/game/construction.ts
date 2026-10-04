@@ -9,8 +9,20 @@ import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
 import { SpatialGrid } from './spatial';
 import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
+import { demolitionTotal } from './demolition';
 
 const crossingGrids = new WeakMap<EdgeGeo, SpatialGrid>();
+const heightRanges = new WeakMap<EdgeGeo, [number, number]>();
+/** Lowest and highest point of an edge's sampled geometry (cached with the versioned geometry). */
+function heightRange(geo: EdgeGeo): [number, number] {
+  let r = heightRanges.get(geo);
+  if (!r) {
+    r = [Infinity, -Infinity];
+    for (let j = 0; j < geo.n; j++) { const y = geo.pts[j * 3 + 1]; if (y < r[0]) r[0] = y; if (y > r[1]) r[1] = y; }
+    heightRanges.set(geo, r);
+  }
+  return r;
+}
 const pointBounds = new WeakMap<EdgeGeo, Float64Array>();
 /** Ordered 32-sample ranges that can contain a point within reach. Bounds use the exact sampled geometry. */
 export function geometryPointRanges(geo: EdgeGeo, x: number, z: number, reach: number): number[] | undefined {
@@ -81,6 +93,12 @@ export interface BuildOptions {
   level?: 'ground' | 'elevated' | 'underground';
   levelHeight?: number;
   levelDepth?: number;
+  /**
+   * With level 'underground': a subway that stays underground the whole way, in tunnel at levelDepth below the
+   * ground above (no ramp, no portal). Both ends must be underground (a tunnel, an underground station's platform
+   * end, an underground depot's exit) or free; it fails where the track would come up to the surface.
+   */
+  subway?: boolean;
 }
 
 export interface CrossingPlan {
@@ -119,7 +137,12 @@ export interface Proposal {
     /** retaining walls (units of length) where it runs close beside another formation at another height */
     walls?: number;
     /** cost split: track (and road surface) on the ground, bridges / viaducts, tunnels, earthworks, the rest */
-    costSplit?: { track: number; bridges: number; tunnels: number; earthworks: number; other: number };
+    costSplit?: { track: number; bridges: number; tunnels: number; earthworks: number; other: number; demolition?: number };
+    /**
+     * Tunnels: the buildings a formation on the ground along the same alignment would have taken, and their price
+     * (demolition the tunnel saves; shown in the build preview). Absent without tunnels under buildings.
+     */
+    avoided?: { buildings: number; cost: number };
   };
 }
 
@@ -249,6 +272,70 @@ function nearestOnEdge(net: Game['world']['net'], e: NEdge, x: number, z: number
   const c = closestOnPolyline(x, z, pts.subarray(i0 * 3, (i1 + 1) * 3), 3, i1 - i0 + 1);
   const j = i0 + c.i;
   return { s: g.cum[j] + (g.cum[Math.min(n - 1, j + 1)] - g.cum[j]) * c.f, d: c.d };
+}
+
+/** Least cover over a subway (BuildOptions.subway): the track stays this far below the ground above it. */
+export const SUBWAY_COVER = TUNNEL_COVER;
+
+/** Lowest rendered terrain across the full bore. A terrain triangle is linear: its minima along
+ * this segment occur at an end or a grid/diagonal boundary, including dips between the two sides. */
+function boreTerrain(g: Game, x: number, z: number, nx: number, nz: number, hw: number): number {
+  const x0 = x - nx * hw, z0 = z - nz * hw, dx = nx * hw * 2, dz = nz * hw * 2;
+  let low = Math.min(g.world.heightAt(x0, z0), g.world.heightAt(x0 + dx, z0 + dz));
+  for (const [a, d] of [[x0, dx], [z0, dz], [x0 - z0, dx - dz]]) {
+    if (Math.abs(d) < 1e-9) continue;
+    for (let k = Math.ceil(Math.min(a, a + d)); k <= Math.floor(Math.max(a, a + d)); k++) {
+      const t = (k - a) / d;
+      low = Math.min(low, g.world.heightAt(x0 + dx * t, z0 + dz * t));
+    }
+  }
+  return low;
+}
+
+/** Is a snap underground: a free point, a point in a tunnel section, or a node whose every edge is in tunnel there. */
+export function snapUnderground(g: Game, sn: Snap): boolean {
+  const net = g.world.net;
+  if (sn.kind === 'free') return true;
+  if (sn.kind === 'edge') { const e = net.edges.get(sn.edge!); return !!e && net.sectionAt(e, sn.s!) === 'tunnel'; }
+  const n = net.nodes.get(sn.node!);
+  if (!n) return false;
+  // (a node without track yet, e.g. a planned station's platform end: by its depth)
+  if (!n.edges.length) return g.world.heightAt(n.x, n.z) - n.y >= SUBWAY_COVER;
+  return n.edges.every((id) => {
+    const e = net.edges.get(id);
+    return !!e && net.sectionAt(e, e.a === n.id ? Math.min(0.05, e.len) : Math.max(0, e.len - 0.05)) === 'tunnel';
+  });
+}
+
+/** An underground structure's volume: a station box below ground (platforms and tracks) or an underground depot. */
+export interface UndergroundBox { x: number; z: number; angle: number; w: number; d: number; y0: number; y1: number; station?: number; depot?: number }
+
+/**
+ * Underground station boxes and underground depots within `pad` of a proposal's tracks, except the stations and
+ * depots of the edges it joins (`joined`: edges at its ends and beyond the switches there).
+ */
+function undergroundBoxes(g: Game, prop: Proposal, pad: number, joined: Set<number>): UndergroundBox[] {
+  const net = g.world.net;
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  for (const tp of prop.tracks) {
+    const b = tp.bez;
+    for (const [x, z] of [[b.x0, b.z0], [b.x1, b.z1], [b.x2, b.z2], [b.x3, b.z3]]) { x0 = Math.min(x0, x); z0 = Math.min(z0, z); x1 = Math.max(x1, x); z1 = Math.max(z1, z); }
+  }
+  if (!isFinite(x0)) return [];
+  const cx = (x0 + x1) / 2, cz = (z0 + z1) / 2, r = Math.hypot(x1 - x0, z1 - z0) / 2 + pad;
+  const skipSt = new Set<number>(), skipDp = new Set<number>();
+  for (const id of joined) {
+    const e = net.edges.get(id);
+    if (!e) continue;
+    if (e.station >= 0) skipSt.add(e.station);
+    if (e.depot >= 0) skipDp.add(e.depot);
+    const th = g.stations.throughStationOf(e.id);
+    if (th >= 0) skipSt.add(th);
+  }
+  const out: UndergroundBox[] = [];
+  for (const q of g.stations.undergroundNear(cx, cz, r)) if (!skipSt.has(q.station)) out.push(q);
+  for (const q of g.depots.undergroundNear(cx, cz, r)) if (!skipDp.has(q.depot!)) out.push(q);
+  return out;
 }
 
 function maxGradeOf(o: BuildOptions) {
@@ -587,6 +674,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Radius ${Math.round(bestR * 10)} m < min ${minRadiusOf(opts) * 10} m`);
   }
   const spread = N > 1 ? Math.max(Math.abs(offsets[0]), Math.abs(offsets[N - 1])) : 0;
+  const subway = opts.level === 'underground' && !!opts.subway;
 
   // ---- sample centreline
   const M = Math.max(2, Math.ceil(L / PSTEP) + 1);
@@ -605,6 +693,22 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     }
     terr.push(t);
     if (!w.inside(p.x, p.z, 1)) fail('Outside the map');
+  }
+  // The highest formation terrain is appropriate for surface track; tunnel cover needs the lowest
+  // terrain over each actual curve, including adjusted station offsets and the whole bore width.
+  const cover = new Array<number>(M).fill(Infinity);
+  if (subway) for (const tp of prop.tracks) {
+    const tab = arcTable(tp.bez), steps = Math.max(1, Math.ceil(tp.len / 0.25));
+    for (let k = 0; k <= steps; k++) {
+      const s = tp.len * k / steps, t = tAtS(tab, s);
+      bezPoint(tp.bez, t, p);
+      const d = bezDeriv(tp.bez, t), l = Math.hypot(d.x, d.z) || 1;
+      const low = boreTerrain(g, p.x, p.z, -d.z / l, d.x / l, halfWidthOf(opts));
+      const i = Math.min(M - 1, Math.floor(s / tp.len * L / PSTEP));
+      // Both ends of an interval are below its least cover, so interpolated heights also fit.
+      cover[i] = Math.min(cover[i], low);
+      cover[Math.min(M - 1, i + 1)] = Math.min(cover[Math.min(M - 1, i + 1)], low);
+    }
   }
   const ds = sArr.map((s, i) => (i ? s - sArr[i - 1] : 0));
   const grade = maxGradeOf(opts);
@@ -630,7 +734,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     for (let i = 0; i < M; i++) {
       let v = level === 'elevated' ? -Infinity : Infinity;
       const r = level === 'elevated' ? 3 : 1;
-      for (let j = Math.max(0, i - r); j <= Math.min(M - 1, i + r); j++) v = level === 'elevated' ? Math.max(v, Math.max(terr[j], WATER_Y)) : Math.min(v, terr[j]);
+      for (let j = Math.max(0, i - r); j <= Math.min(M - 1, i + r); j++) v = level === 'elevated' ? Math.max(v, Math.max(terr[j], WATER_Y)) : Math.min(v, subway ? cover[j] : terr[j]);
       ext.push(v + levelOff);
     }
     if (level === 'elevated') {
@@ -665,17 +769,26 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const cons: Constraint[] = [];
   // the height offset applies to the end being placed; a free start sits on the ground (or at the level)
   const atLevel = (t: number) => (level === 'elevated' ? Math.max(t, WATER_Y) : t) + levelOff;
-  const startY = fa.y ?? atLevel(terr[0]);
-  const endY = fb.y ?? (end.kind === 'free' ? atLevel(terr[M - 1]) + opts.heightOffset : null);
+  const startY = fa.y ?? atLevel(subway ? cover[0] : terr[0]);
+  const endY = fb.y ?? (end.kind === 'free' ? atLevel(subway ? cover[M - 1] : terr[M - 1]) + opts.heightOffset : null);
   if (fa.y !== null) cons.push({ i: 0, kind: 'eq', v: fa.y });
   else desired[0] = startY;
   if (fb.y !== null) cons.push({ i: M - 1, kind: 'eq', v: fb.y });
   else { desired[M - 1] = endY!; if (opts.heightOffset) cons.push({ i: M - 1, kind: 'eq', v: endY! }); }
   // over water: a deck above it, or (underground) a tunnel below the bed
   for (let i = 0; i < M; i++) if (terr[i] < WATER_Y + 0.05) cons.push(level === 'underground' ? { i, kind: 'le', v: terr[i] - TUNNEL_COVER - 0.1 } : { i, kind: 'ge', v: WATER_Y + WATER_DECK });
+  // a subway stays underground: joins only underground track, keeps its cover the whole way (no ramp, no portal)
+  if (subway) {
+    if (prop.tracks.some((tp) => !snapUnderground(g, tp.start) || !snapUnderground(g, tp.end))) fail('Joins track on the surface: a subway stays underground (build Underground with ramps instead)');
+    for (let i = 0; i < M; i++) {
+      let t = cover[i];
+      for (let j = Math.max(0, i - 1); j <= Math.min(M - 1, i + 1); j++) t = Math.min(t, cover[j]);
+      cons.push({ i, kind: 'le', v: t - SUBWAY_COVER });
+    }
+  }
 
   let sol = solveProfile(desired, ds, cons, grade);
-  if (!sol.ok) { fail('Too steep: lengthen route or change height'); }
+  if (!sol.ok) { fail(subway ? 'Surfaces here: go deeper' : 'Too steep: lengthen route or change height'); }
 
   // ---- crossings with existing edges
   const exclude = new Set<number>();
@@ -753,9 +866,24 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     else if (mode === 'under') cons.push({ i: ci, kind: 'le', v: yo - RAIL.clearance });
     else cons.push({ i: ci, kind: 'eq', v: yo });
   }
-  if (crossings.length) {
+  // underground structures (station boxes below ground, underground depots) beside the stations and depots it
+  // joins: where it runs below ground, the track passes beneath them with the clearance or above them, whichever is
+  // nearer its height (on the surface it passes over them: streets and track run over cut-and-cover boxes)
+  const ugBoxes = undergroundBoxes(g, prop, hwNew + 1.5, switchSet);
+  let ugAdded = false;
+  if (ugBoxes.length) for (let i = 0; i < M; i++) {
+    if (sol.y[i] > terr[i] - 0.5 || nearEnds.some((ne) => Math.hypot(ne.x - xs[i], ne.z - zs[i]) < 1.2)) continue;
+    for (const bx of ugBoxes) {
+      // (a sample's reach covers the track between samples: the checks below look every half unit)
+      if (distToRect(xs[i], zs[i], bx.x, bx.z, bx.angle, bx.w / 2, bx.d / 2) > hwNew + 0.2 + PSTEP * 0.75) continue;
+      if (sol.y[i] < (bx.y0 + bx.y1) / 2) cons.push({ i, kind: 'le', v: bx.y0 - RAIL.clearance });
+      else cons.push({ i, kind: 'ge', v: bx.y1 + 0.2 });
+      ugAdded = true;
+    }
+  }
+  if (crossings.length || ugAdded) {
     sol = solveProfile(desired, ds, cons, grade);
-    if (!sol.ok) fail('Crossing too steep at these heights');
+    if (!sol.ok) fail(ugAdded ? 'Too steep under station or depot: go deeper' : 'Crossing too steep at these heights');
   }
   prop.crossings = crossings;
   const y = sol.y;
@@ -777,7 +905,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   for (let i = 0; i < M; i++) {
     const d = y[i] - terr[i];
-    if (level === 'underground' && d < -TUNNEL_COVER) type.push(2);
+    if (subway) type.push(2);
+    else if (level === 'underground' && d < -TUNNEL_COVER) type.push(2);
     else if (forcedBridge[i] || terr[i] < WATER_Y + 0.05 || d > (level === 'elevated' ? VIADUCT_H : opts.town && kind === 'road' && opts.type === 'street' ? TOWN_BANK_H : BRIDGE_H)) type.push(1);
     else type.push(0);
   }
@@ -845,14 +974,44 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       prof[i] = profAt(Float32Array.from(y), L, sc);
     }
     tp.prof = prof;
+    if (subway) {
+      // Commit takes each snapped node's actual height, including the second bore's endpoints.
+      if (tp.start.kind === 'node') prof[0] = net.nodes.get(tp.start.node!)!.y;
+      if (tp.end.kind === 'node') prof[prof.length - 1] = net.nodes.get(tp.end.node!)!.y;
+    }
     tp.sections = centreSections.map((sec) => ({ s0: (sec.s0 / L) * tp.len, s1: (sec.s1 / L) * tp.len, type: sec.type }));
   }
 
   // ---- obstacles along the corridor
-  const demolish = new Set<number>();
+  const demolish = new Set<number>(), avoided = new Set<number>();
   let trees = 0, wallUnits = 0, wallArea = 0;
   const hw = halfWidthOf(opts);
   const crossWin = (ti: number, s: number) => crossings.some((c) => c.track === ti && Math.abs(c.sNew - s) < 2.5);
+  /**
+   * Tunnels side by side: the same room as tracks on the ground (RAIL.spacing), at about the same depth; edges wholly at
+   * another height (a street above a subway, another subway deeper down) pass.
+   */
+  const tunnelClash = (yy: number, nearSwitch: boolean) => {
+    for (const e of net.edgesNear(p.x - hw - 1, p.z - hw - 1, p.x + hw + 1, p.z + hw + 1)) {
+      if (exclude.has(e.id) || (nearSwitch && switchSet.has(e.id))) continue;
+      const ge = net.geo(e);
+      // (an edge wholly at another height cannot clash: a street above a subway, a tunnel below a street)
+      const hr = heightRange(ge);
+      if (yy < hr[0] - RAIL.clearance || yy > hr[1] + RAIL.clearance) continue;
+      const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.06 : hw + net.halfWidth(e) - 0.08;
+      const ranges = geometryPointRanges(ge, p.x, p.z, need);
+      let best = Infinity, bi = 0;
+      for (const start of ranges ?? [0]) for (let j = start, end = ranges ? Math.min(ge.n, start + 32) : ge.n; j < end; j++) {
+        const dx = ge.pts[j * 3] - p.x, dz = ge.pts[j * 3 + 2] - p.z;
+        if (Math.abs(dx) > need + 1e-8 || Math.abs(dz) > need + 1e-8) continue;
+        const d = Math.hypot(dx, dz); if (d < best) { best = d; bi = j; }
+      }
+      if (best < need) {
+        const dy = Math.abs(ge.pts[bi * 3 + 1] - yy);
+        if (dy < RAIL.clearance) fail('Too close to a tunnel at this depth');
+      }
+    }
+  };
   prop.tracks.forEach((tp, ti) => {
     const tab = arcTable(tp.bez);
     const K = Math.max(2, Math.ceil(tab.len / 0.5) + 1);
@@ -860,9 +1019,26 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       const s = Math.min(i * 0.5, tab.len);
       bezPoint(tp.bez, tAtS(tab, s), p);
       const yy = profAt(tp.prof, tp.len, s);
+      if (subway) {
+        const d = bezDeriv(tp.bez, tAtS(tab, s)), l = Math.hypot(d.x, d.z) || 1;
+        if (boreTerrain(g, p.x, p.z, -d.z / l, d.x / l, hw) - yy < SUBWAY_COVER - 1e-5) fail('Would come up to the surface here: go deeper');
+      }
       let sec: Section['type'] | 'ground' = 'ground';
       for (const q of tp.sections) if (s >= q.s0 && s <= q.s1) sec = q.type;
-      if (sec === 'tunnel') continue;
+      // underground structures (station boxes, underground depots) at the track's height, at any level; in tunnels
+      // the room beside other tunnels at that depth, and the buildings that stay above (demolition saved)
+      const nearEndU = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < 1.2);
+      if (!nearEndU) for (const bx of ugBoxes) {
+        if (distToRect(p.x, p.z, bx.x, bx.z, bx.angle, bx.w / 2, bx.d / 2) > hw + 0.2) continue;
+        if (yy + RAIL.clearance <= bx.y0 || yy - (sec === 'tunnel' ? 0.2 : -0.05) >= bx.y1) continue;
+        fail(bx.depot !== undefined ? 'Underground depot in the way' : 'Underground station in the way');
+        break;
+      }
+      if (sec === 'tunnel') {
+        if (!nearEndU && !crossWin(ti, s)) tunnelClash(yy, nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < SWITCH_ZONE));
+        if (i % 2 === 0) for (const b of w.buildingsNear(p.x, p.z, hw + 2)) if (!avoided.has(b.id) && distToRect(p.x, p.z, b.x, b.z, b.angle, b.w / 2, b.d / 2) <= hw + 0.6) avoided.add(b.id);
+        continue;
+      }
       // no cutting below the water line (the hole would fill with water): bank it up, or tunnel
       if (sec === 'ground' && yy - formationDepth({ kind } as NEdge) < DRY_MIN - 0.005 && w.heightAt(p.x, p.z) > yy - formationDepth({ kind } as NEdge) + 0.01) fail('Below water line: raise or tunnel');
       const nearEnd = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < 1.2);
@@ -889,7 +1065,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
           break;
         }
       }
-      for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd) { void dp; fail('Depot in the way'); } }
+      for (const dp of g.depots.near(p.x, p.z, hw + 0.6)) { if (!nearEnd && dp.level !== 'underground') { void dp; fail('Depot in the way'); } }
       // parallel conflicts with other edges
       const nearSwitch = nearEnds.some((ne) => Math.hypot(ne.x - p.x, ne.z - p.z) < SWITCH_ZONE);
       if (!nearEnd && !crossWin(ti, s)) {
@@ -938,6 +1114,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   });
   prop.demolish = [...demolish];
   prop.trees = trees;
+  for (const id of demolish) avoided.delete(id);
+  if (avoided.size && !opts.town) prop.stats.avoided = { buildings: avoided.size, cost: Math.round(demolitionTotal(g, avoided)) };
 
   // ---- cost: track materials (bridges x6, tunnels x9) and earthworks. The first track of a formation pays
   // them in full; further tracks built with it, and stretches of track laid beside an existing one (at the
@@ -947,7 +1125,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const per = kind === 'rail' ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[opts.type] ?? ROAD_TYPES.road).costPerUnit;
     const beside = kind === 'rail' ? besideExisting(g, prop) : null;
     const S = SHARED_TRACK;
-    const split = { track: 0, bridges: 0, tunnels: 0, earthworks: 0, other: 0 };
+    const split: { track: number; bridges: number; tunnels: number; earthworks: number; other: number; demolition?: number } = { track: 0, bridges: 0, tunnels: 0, earthworks: 0, other: 0, demolition: 0 };
     let full = 0;
     const q = { x: 0, z: 0 };
     prop.tracks.forEach((tp, ti) => {
@@ -986,12 +1164,15 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     if (kind === 'rail') prop.stats.sharedSaving = Math.max(0, Math.round(full - cost));
     const before = cost;
     if (opts.tram && kind === 'road') for (const tp of prop.tracks) cost += TRAM.costPerUnit * tp.len;
-    for (const id of prop.demolish) { const b = w.buildings.get(id); if (b) cost += 6000 + b.pop * 2500; }
+    const demolition = demolitionTotal(g, prop.demolish);
+    cost += demolition;
+    split.demolition = demolition;
     cost += prop.trees * 250;
     for (const c of crossings) if (c.mode === 'level' || c.mode === 'diamond') cost += 15000;
     cost += wallArea * RETAINING_WALL;
     split.other = cost - before;
-    for (const k of Object.keys(split) as (keyof typeof split)[]) split[k] = Math.round(split[k]);
+    for (const k of Object.keys(split) as (keyof typeof split)[]) split[k] = Math.round(split[k] ?? 0);
+    if (!split.demolition) delete (split as { demolition?: number }).demolition;
     prop.stats.costSplit = split;
   }
   prop.cost = Math.round(cost);
@@ -1036,6 +1217,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   // demolition
   for (const id of prop.demolish) g.towns.demolishBuilding(id);
   const created: NEdge[] = [];
+  const changedLocks: [number, number, number, number][] = [];
   // edges that will be split later need their ids tracked through splits
   const remap = new Map<number, { e1: number; e2: number; s: number }>();
   const onSplit = (old: NEdge, e1: NEdge, e2: NEdge, s: number) => { remap.set(old.id, { e1: e1.id, e2: e2.id, s }); };
@@ -1087,7 +1269,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
         oe.sections = [...oe.sections.filter((q) => !(q.type === 'bridge' && q.s0 <= sec.s1 && q.s1 >= sec.s0)), sec];
         oe.sections.sort((a, b) => a.s0 - b.s0);
         net.touchEdge(oe);
-        recomputeLocks(w, c.x - wdt - 1, c.z - wdt - 1, c.x + wdt + 1, c.z + wdt + 1);
+        changedLocks.push([c.x - wdt - 1, c.z - wdt - 1, c.x + wdt + 1, c.z + wdt + 1]);
       } else if (c.mode === 'level' || c.mode === 'diamond') {
         // the new edge may have been split by a junction of this proposal: locate the part at sNew
         const nl = locate(ne.id, c.sNew);
@@ -1124,6 +1306,10 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
     const hw = net.halfWidth(e) + 0.5;
     for (let i = 0; i < geo.n; i += 2) if (net.sectionAt(e, geo.cum[i]) === 'ground') w.removeTreesNear(geo.pts[i * 3], geo.pts[i * 3 + 2], hw);
   }
+  // Converting a crossing to a bridge unlocks its old formation. New track must not acquire
+  // formation locks until its earthworks are complete, or its own fill is refused as existing rail.
+  const ungraded = new Set(finalEdges.map((e) => e.id));
+  for (const box of changedLocks) recomputeLocks(w, ...box, ungraded);
   applyEarthworks(w, finalEdges);
   coverTunnels(w, finalEdges);
   g.onNetworkChanged();

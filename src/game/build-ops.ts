@@ -7,6 +7,7 @@ import { distToRect, World } from './world';
 import { rectsOverlap } from './towns';
 import { applyEarthworks, recomputeLocks, brush, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
 import { planEdge, commitProposal, nodeGroup, Snap, Proposal } from './construction';
+import { demolitionCost } from './demolition';
 
 /** Depot kinds: rail, road (buses) and tram (on a road with tram tracks). */
 export type DepotKind = NetKind | 'tram';
@@ -20,9 +21,48 @@ export interface Depot {
   /** exit node (connects to the network) and the stub edge inside the building */
   node: number;
   edge: number;
+  /** 'underground': a depot at depth off a tunnel (no building at street level). Absent: on the surface. */
+  level?: 'underground';
+  /** underground: depth of its track below the lowest ground above */
+  depth?: number;
+  /** underground: what it cost to build (its value; older saves and surface depots: the standard price) */
+  cost?: number;
 }
 
+/**
+ * Underground depots (rail): a cavern at depth for the stabling track, reached by a tunnel; at street level only
+ * ventilation shafts where there is room. Its volume reaches `y0`..`y1` about the track (tunnels and stations keep
+ * clear of it) and it needs `cover` of ground above. Cost: `base` plus `perDepth` per unit of depth (excavation,
+ * lining, ventilation, pumps): about 3.5x a surface depot at the usual metro depth, but no land to buy, nothing to
+ * demolish and no levelling. Upkeep `upkeep` a year (ventilation and pumping; a surface rail depot: 12 000).
+ */
+export const UNDERGROUND_DEPOT = { y0: -0.3, y1: 0.95, cover: 0.8, base: 220_000, perDepth: 50_000, upkeep: 20_000, depth: { min: 1.2, max: 4, def: 2.2 } };
+
+const SHALLOW_DEPOT = 'Too close to the surface for an underground depot: go deeper';
+
+/** Placement level of a rail depot: 'auto' (underground off a track end in a tunnel), on the surface, or underground. */
+export type DepotLevel = 'auto' | 'surface' | 'underground';
+
+/** Is a free rail end in a tunnel there (its one edge in a tunnel section at that end)? */
+export function endInTunnel(g: Game, nodeId: number): boolean {
+  const net = g.world.net, n = net.nodes.get(nodeId);
+  if (!n || n.edges.length !== 1) return false;
+  const e = net.edges.get(n.edges[0]);
+  return !!e && net.sectionAt(e, e.a === n.id ? Math.min(0.05, e.len) : Math.max(0, e.len - 0.05)) === 'tunnel';
+}
+
+/** A depot's value when new (rail 90k, bus 60k, tram 120k; underground: what it cost). */
+export function depotValue(d: Depot): number { return d.cost ?? (d.kind === 'rail' ? 90000 : d.kind === 'road' ? 60000 : 120000); }
+/** A depot's yearly upkeep (rail 12k, bus 6k, tram 9k; underground rail depots more: ventilation and pumps). */
+export function depotUpkeep(d: Depot): number { return d.level === 'underground' ? UNDERGROUND_DEPOT.upkeep : d.kind === 'rail' ? 12000 : d.kind === 'road' ? 6000 : 9000; }
+
 export function depotSize(kind: DepotKind) { return kind === 'rail' ? { w: 1.5, d: 4.2 } : kind === 'tram' ? { w: 2.0, d: 3.9 } : { w: 1.8, d: 1.6 }; }
+
+/** Actual occupied volume, shared by depot, station and track placement and the underground view. */
+export function depotVolume(d: Pick<Depot, 'kind' | 'x' | 'z' | 'y' | 'angle' | 'level'>) {
+  const sz = depotSize(d.kind), under = d.level === 'underground';
+  return { x: d.x, z: d.z, angle: d.angle, ...sz, y0: d.y + (under ? UNDERGROUND_DEPOT.y0 : -0.2), y1: d.y + (under ? UNDERGROUND_DEPOT.y1 : 1.0) };
+}
 
 /** Network kind of a depot's track (tram depots sit on roads). */
 export const depotNetKind = (kind: DepotKind): NetKind => (kind === 'rail' ? 'rail' : 'road');
@@ -30,7 +70,13 @@ export const depotNetKind = (kind: DepotKind): NetKind => (kind === 'rail' ? 'ra
 /** May company `owner` run trams on this edge? (tram tracks it may use) */
 export function tramUsable(g: Game, e: NEdge, owner: number): boolean { return !!e.tram && g.canUse(owner, e.tramOwner ?? -1); }
 
-export interface DepotPlan { ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number; demolish: number[] }
+export interface DepotPlan {
+  ok: boolean; error?: string; x: number; z: number; y: number; angle: number; exitX: number; exitZ: number; snapNode: number; cost: number; demolish: number[];
+  /** 'underground': built at depth (rail depots off a track end in a tunnel, or by choice) */
+  level?: 'underground';
+  /** underground: depth of the depot track below the lowest ground above */
+  depth?: number;
+}
 
 export class Depots {
   map = new Map<number, Depot>();
@@ -49,15 +95,33 @@ export class Depots {
     return out;
   }
 
-  /** Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. Tram depots connect to tram tracks. */
-  plan(kind: DepotKind, x: number, z: number, angle: number, owner: number): DepotPlan {
+  /** Underground depots' volumes within r of (x, z): tunnels and stations keep clear of them. */
+  undergroundNear(x: number, z: number, r: number): { x: number; z: number; angle: number; w: number; d: number; y0: number; y1: number; depot: number }[] {
+    const out: { x: number; z: number; angle: number; w: number; d: number; y0: number; y1: number; depot: number }[] = [];
+    for (const d of this.map.values()) {
+      if (d.level !== 'underground') continue;
+      const sz = depotSize(d.kind);
+      if (Math.hypot(d.x - x, d.z - z) > r + Math.hypot(sz.w, sz.d) / 2) continue;
+      out.push({ ...depotVolume(d), depot: d.id });
+    }
+    return out;
+  }
+
+  /**
+   * Plan a depot at (x,z) facing `angle`; snaps to a nearby free track/road end. Tram depots connect to tram tracks.
+   * Rail depots: `level` 'auto' (default) builds underground off a track end in a tunnel (an underground station's
+   * platform end too), on the surface otherwise; 'underground' places one at `depth` below the ground (or at the
+   * height of the track end it snaps to, or at `y`). `snap: false`: no snapping (planning a depot for a track end
+   * that is not built yet).
+   */
+  plan(kind: DepotKind, x: number, z: number, angle: number, owner: number, opts: { level?: DepotLevel; depth?: number; y?: number; snap?: boolean } = {}): DepotPlan {
     const g = this.game;
     const w = g.world;
     const net = w.net;
     const sz = depotSize(kind);
     let snapNode = -1;
     // snap to a free rail end: depot exit coincides with it, facing along its direction
-    if (kind === 'rail') {
+    if (kind === 'rail' && opts.snap !== false) {
       const n = net.nearestNode(x, z, sz.d / 2 + 2.5, 'rail', (nn) => nn.edges.length === 1);
       if (n) {
         const e = net.edges.get(n.edges[0])!;
@@ -72,6 +136,17 @@ export class Depots {
     const exitX = x + fx * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3)), exitZ = z + fz * (sz.d / 2 + (kind === 'rail' ? 0.05 : 0.3));
     const plan: DepotPlan = { ok: true, x, z, y: 0, angle, exitX, exitZ, snapNode, cost: kind === 'rail' ? 90000 : kind === 'tram' ? 120000 : 60000, demolish: [] };
     const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
+    if (kind === 'rail') {
+      const lv = opts.level ?? 'auto', tunnelEnd = snapNode >= 0 && endInTunnel(g, snapNode);
+      if (lv === 'underground' && snapNode >= 0 && !tunnelEnd) failp('This track end is on the surface: an underground depot joins track in a tunnel');
+      else if (lv === 'surface' && tunnelEnd) failp('This track end is in a tunnel: build an underground depot there');
+      if (lv === 'underground') return this.planUnderground(plan, opts.depth, opts.y);
+      if (lv === 'auto' && tunnelEnd) {
+        // (a tunnel end too near the surface for a cavern keeps a depot on the surface, in its cutting, as before)
+        const u = this.planUnderground({ ...plan, demolish: [] }, opts.depth, opts.y);
+        if (u.ok || u.error !== SHALLOW_DEPOT) return u;
+      }
+    }
     if (!w.inside(x, z, 4)) failp('Too close to the map edge');
     let mx = -Infinity, mn = Infinity;
     for (const [a, b] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [0, 0]]) {
@@ -87,7 +162,7 @@ export class Depots {
     if (snapNode >= 0 ? Math.max(mx - plan.y, plan.y - mn) > 2.5 : mx - mn > 1.5) failp('Ground is too steep');
     const rect = { x, z, angle, w: sz.w, d: sz.d };
     const R = Math.hypot(sz.w, sz.d) / 2 + 1;
-    for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) { plan.demolish.push(id); plan.cost += 6000 + b.pop * 2500; } }
+    for (const id of w.bgrid.query(x - R, z - R, x + R, z + R)) { const b = w.buildings.get(id); if (b && rectsOverlap(rect, b, 0.05)) { plan.demolish.push(id); plan.cost += demolitionCost(g, b); } }
     const siblings = new Set(snapNode >= 0 ? nodeGroup(g, snapNode) : []);
     const R2 = R + EARTHWORKS.corePad + 1;
     for (const e of net.edgesNear(x - R2, z - R2, x + R2, z + R2)) {
@@ -96,6 +171,8 @@ export class Depots {
       const hw = net.halfWidth(e);
       for (let i = 0; i < geo.n; i++) {
         const d = distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], x, z, angle, sz.w / 2, sz.d / 2);
+        // (a tunnel deep below the levelled pad passes beneath it)
+        if (net.sectionAt(e, geo.cum[i]) === 'tunnel' && geo.pts[i * 3 + 1] + 1.0 < plan.y - 0.3) continue;
         if (d < hw - 0.1) { failp('Track or road in the way'); break; }
         // the depot's levelled pad and a track beside it share grid vertices: only at about the same height
         // (roads are draped on the ground)
@@ -103,7 +180,12 @@ export class Depots {
       }
     }
     for (const st of g.stations.footprintsNear(x, z, R)) if (g.stations.footprints(st).some((f) => rectsOverlap(rect, f, 0.02))) failp('Station in the way');
-    for (const d of this.map.values()) { const s2 = depotSize(d.kind); if (rectsOverlap(rect, { x: d.x, z: d.z, angle: d.angle, w: s2.w, d: s2.d }, 0.1)) failp('Depot in the way'); }
+    for (const d of this.map.values()) {
+      // (an underground depot well below the pad stays clear of it)
+      const v = depotVolume(d), pad = depotVolume({ kind, ...plan });
+      if (v.y1 <= pad.y0 || v.y0 >= pad.y1) continue;
+      if (rectsOverlap(rect, v, 0.1)) failp('Depot in the way');
+    }
     plan.cost += Math.round((mx - mn) * 20000);
     if (kind !== 'rail' && plan.ok) {
       const tram = kind === 'tram';
@@ -112,6 +194,56 @@ export class Depots {
       else if (link) { for (const id of link.demolish) if (!plan.demolish.includes(id)) plan.demolish.push(id); plan.cost += link.cost; }
       else if (!net.nearestEdge(exitX, exitZ, 4, 'road', (ed) => ed.depot < 0 && (!tram || tramUsable(g, ed, owner)))) failp(tram ? 'No tram track nearby' : 'No road nearby');
     }
+    return plan;
+  }
+
+  /**
+   * An underground rail depot (see UNDERGROUND_DEPOT): at the height of the track end it snaps to, else `depth`
+   * below the lowest ground above; nothing demolished, nothing levelled. Clear of tracks, roads and tunnels at
+   * its depth (by the planner's clearances), underground station boxes and other depots; enough cover above.
+   */
+  private planUnderground(plan: DepotPlan, depth?: number, atY?: number): DepotPlan {
+    const g = this.game, w = g.world, net = w.net, U = UNDERGROUND_DEPOT;
+    const sz = depotSize('rail');
+    const failp = (e: string) => { if (plan.ok) { plan.ok = false; plan.error = e; } };
+    plan.level = 'underground';
+    plan.demolish = [];
+    const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle), rx = fz, rz = -fx;
+    if (!w.inside(plan.x, plan.z, 4)) failp('Too close to the map edge');
+    // the ground above (the lowest point over the cavern and its exit; under water: the bed)
+    let mn = Infinity;
+    for (const [a, b] of [[-0.5, -0.5], [0.5, -0.5], [0.5, 0.5], [-0.5, 0.5], [0, 0], [0, -0.25], [0, 0.25], [-0.5, 0], [0.5, 0]]) {
+      mn = Math.min(mn, w.heightAt(plan.x + rx * sz.w * a + fx * sz.d * b, plan.z + rz * sz.w * a + fz * sz.d * b));
+    }
+    const node = plan.snapNode >= 0 ? net.nodes.get(plan.snapNode) : undefined;
+    plan.y = node ? node.y : atY ?? mn - Math.max(U.depth.min, Math.min(U.depth.max, depth ?? U.depth.def));
+    plan.depth = Math.max(0, mn - plan.y);
+    if (mn - (plan.y + U.y1) < U.cover) failp(SHALLOW_DEPOT);
+    const rect = depotVolume({ kind: 'rail', ...plan }), { y0, y1 } = rect;
+    const R = Math.hypot(sz.w, sz.d) / 2 + 1;
+    // tracks, roads and tunnels at its depth (the track it joins and the tracks beside it at that end excepted)
+    const siblings = new Set(plan.snapNode >= 0 ? nodeGroup(g, plan.snapNode) : []);
+    const own = node ? net.edges.get(node.edges[0]) : undefined;
+    for (const e of net.edgesNear(plan.x - R, plan.z - R, plan.x + R, plan.z + R)) {
+      if (siblings.has(e.a) || siblings.has(e.b)) continue;
+      const geo = net.geo(e), hw = net.halfWidth(e);
+      for (let i = 0; i < geo.n; i++) {
+        if (distToRect(geo.pts[i * 3], geo.pts[i * 3 + 2], plan.x, plan.z, plan.angle, sz.w / 2, sz.d / 2) >= hw - 0.05) continue;
+        const ey = geo.pts[i * 3 + 1];
+        if (ey + (e.kind === 'rail' ? 0.5 : 0.45) > y0 && ey - 0.1 < y1) { failp(net.sectionAt(e, geo.cum[i]) === 'tunnel' ? 'Tunnel in the way' : e.kind === 'rail' ? 'Track in the way' : 'Road in the way'); break; }
+      }
+    }
+    // underground station boxes (not the one whose platform end it joins) and other depots at its depth
+    const joined = own ? (own.station >= 0 ? own.station : g.stations.throughStationOf(own.id)) : -1;
+    for (const q of g.stations.undergroundNear(plan.x, plan.z, R)) {
+      if (q.station === joined) continue;
+      if (q.y1 > y0 && q.y0 < y1 && rectsOverlap(rect, q, 0)) failp('Underground station in the way');
+    }
+    for (const d of this.map.values()) {
+      const v = depotVolume(d);
+      if (v.y1 > y0 && v.y0 < y1 && rectsOverlap(rect, v, 0.1)) failp('Depot in the way');
+    }
+    plan.cost = Math.round(U.base + U.perDepth * plan.depth);
     return plan;
   }
 
@@ -137,6 +269,7 @@ export class Depots {
     const w = g.world;
     const net = w.net;
     if (!plan.ok) return plan.error ?? 'Cannot build';
+    if (plan.level === 'underground' && kind === 'rail') return this.commitUnderground(plan, owner);
     if (!g.company(owner).economy.spend(plan.cost, 'construction')) return 'Not enough money';
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
@@ -182,6 +315,28 @@ export class Depots {
         }
       }
     }
+    g.onNetworkChanged();
+    return null;
+  }
+
+  /** Build an underground rail depot as planned: its stub track in tunnel at depth; nothing at street level. */
+  private commitUnderground(plan: DepotPlan, owner: number): string | null {
+    const g = this.game, w = g.world, net = w.net;
+    if (plan.snapNode >= 0) { const n = net.nodes.get(plan.snapNode); if (!n || n.edges.length !== 1) return 'The track changed, plan again'; }
+    if (!g.company(owner).economy.spend(plan.cost, 'construction')) return 'Not enough money';
+    const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
+    const sz = depotSize('rail');
+    const inX = plan.x - fx * (sz.d / 2 - 0.4), inZ = plan.z - fz * (sz.d / 2 - 0.4);
+    const inner = net.addNode('rail', inX, plan.y, inZ, fx, fz, owner);
+    const exit = plan.snapNode >= 0 ? net.nodes.get(plan.snapNode)! : net.addNode('rail', plan.exitX, plan.y, plan.exitZ, fx, fz, owner);
+    const len = Math.hypot(exit.x - inX, exit.z - inZ);
+    const prof = new Float32Array(Math.max(2, Math.ceil(len) + 1)).fill(plan.y);
+    prof[prof.length - 1] = exit.y;
+    const id = this.nextId++;
+    const e = net.addEdge('rail', inner.id, exit.id, bezLine(inX, inZ, exit.x, exit.z), prof, [{ s0: 0, s1: len, type: 'tunnel' }], 'standard', owner, { depot: id });
+    const dp: Depot = { id, kind: 'rail', x: plan.x, z: plan.z, y: plan.y, angle: plan.angle, owner, node: exit.id, edge: e.id, level: 'underground', depth: Math.round((plan.depth ?? 0) * 1000) / 1000, cost: plan.cost };
+    this.map.set(id, dp);
+    w.markObjArea(plan.x - 4, plan.z - 4, plan.x + 4, plan.z + 4);
     g.onNetworkChanged();
     return null;
   }
@@ -325,6 +480,8 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
     const sz = depotSize(dp.kind);
     const hit = point ? distToRect(x0, z0, dp.x, dp.z, dp.angle, sz.w / 2, sz.d / 2) < 0.1 : inArea(dp.x, dp.z, 0);
     if (!hit) continue;
+    // (a click on a building above an underground depot takes the building)
+    if (point && dp.level === 'underground' && w.buildingsNear(x0, z0, 4).some((b) => distToRect(x0, z0, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.05)) continue;
     if (dp.owner !== owner) { res.error = 'Owned by another company'; continue; }
     res.depotIds.push(dp.id);
     const err = g.depots.removeError(dp.id);
@@ -344,7 +501,7 @@ export function bulldoze(g: Game, x0: number, z0: number, x1: number, z1: number
   const blds = point ? w.buildingsNear(x0, z0, 4).filter((b) => distToRect(x0, z0, b.x, b.z, b.angle, b.w / 2, b.d / 2) < 0.05)
     : [...w.buildings.values()].filter((b) => inArea(b.x, b.z, 0));
   for (const b of blds) {
-    planRemoval(6000 + b.pop * 2500, () => { g.towns.demolishBuilding(b.id); return null; });
+    planRemoval(demolitionCost(g, b), () => { g.towns.demolishBuilding(b.id); return null; });
   }
   // trees in area
   if (!point) {

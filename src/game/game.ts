@@ -4,7 +4,7 @@ import { Towns } from './towns';
 import { Stations, entranceUpkeep, lostShare } from './stations';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
-import { Depots } from './build-ops';
+import { Depots, depotValue, depotUpkeep } from './build-ops';
 import { Economy, Company, COMPANY_COLORS } from './economy';
 import { Shares, SHARE_COUNT } from './shares';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
@@ -630,7 +630,7 @@ export class Game {
       if (st.rail) a.stations += st.rail.cost ?? (st.rail.tracks * st.rail.length * 9000 + 120000) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1);
       a.stations += st.stops.length * 30000;
     }
-    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += d.kind === 'rail' ? 90000 : d.kind === 'road' ? 60000 : 120000;
+    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += depotValue(d);
     a.track *= INFRA_DEPRECIATION; a.road *= INFRA_DEPRECIATION; a.tram *= INFRA_DEPRECIATION;
     a.stations *= INFRA_DEPRECIATION; a.depots *= INFRA_DEPRECIATION;
     for (const v of this.vehicles.map.values()) if (v.owner === id) a.vehicles += this.vehicles.resaleValue(v);
@@ -921,7 +921,7 @@ export class Game {
       if (e.owner === owner) c += this.edgeMaintenance(e);
     }
     for (const st of this.stations.map.values()) if (st.owner === owner) c += this.stationMaintenance(st);
-    for (const d of this.depots.map.values()) if (d.owner === owner) c += d.kind === 'rail' ? 12000 : d.kind === 'road' ? 6000 : 9000;
+    for (const d of this.depots.map.values()) if (d.owner === owner) c += depotUpkeep(d);
     return c;
   }
 

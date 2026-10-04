@@ -1311,6 +1311,7 @@ function liftTower(ctx: ChunkCtx, st: Station, r: RailPartX, en: StationEntrance
 }
 
 export function buildDepot(ctx: ChunkCtx, d: Depot, color: number) {
+  if (d.level === 'underground') { undergroundDepot(ctx, d, color); return; }
   const w = ctx.game.world;
   const W = ctx.w, fac = ctx.fac;
   const sz = depotSize(d.kind);
@@ -1356,6 +1357,52 @@ export function buildDepot(ctx: ChunkCtx, d: Depot, color: number) {
   }
 }
 
+
+/**
+ * Underground depot: nothing at street level but its ventilation grilles and a small staff access house (stairs and
+ * a lift down to the cavern), where they fit between the streets and buildings above.
+ */
+function undergroundDepot(ctx: ChunkCtx, d: Depot, color: number) {
+  const W = ctx.w;
+  const sz = depotSize(d.kind);
+  const fx = Math.sin(d.angle), fz = Math.cos(d.angle), rx = fz, rz = -fx;
+  const fits = (x: number, z: number, w: number, dd: number, margin: number) => {
+    if (!clearOfNetwork(ctx, x, z, margin + Math.max(w, dd) / 2) || !clearOfBuildings(ctx, x, z, margin + Math.max(w, dd) / 2)) return null;
+    const [hi, lo] = groundRange(ctx, x, z, fx, fz, w, dd);
+    return lo < WATER_Y + 0.05 || hi - lo > 0.25 ? null : [hi, lo] as [number, number];
+  };
+  // ventilation grilles over the cavern
+  for (const a of [-sz.d * 0.3, sz.d * 0.3]) {
+    const x = d.x + fx * a, z = d.z + fz * a;
+    const g = fits(x, z, 0.3, 0.5, 0.15);
+    if (!g) continue;
+    const [hi, lo] = g;
+    W.use(WC.CONCRETE, 0xb3afa6, 0);
+    W.tbox(x, lo - 0.04, z, 0.3, hi + 0.03 - (lo - 0.04), 0.5, fx, fz, WSCALE.CONCRETE, false, true);
+    W.use(WC.METAL, 0x2b2e30, 0);
+    flatQuad(W, x, hi + 0.032, z, fx, fz, -0.11, 0.11, -0.2, 0.2);
+    W.use(WC.METAL, 0x5d6266, 0);
+    for (let k = -3; k <= 3; k++) flatQuad(W, x, hi + 0.033, z, fx, fz, -0.11, 0.11, k * 0.055 - 0.006, k * 0.055 + 0.006);
+  }
+  // the access house: over the cavern's inner end, else beside it (the first spot with room; all drawn by the chunk
+  // that owns the depot)
+  const BW = 0.5, BD = 0.6, H = 0.42;
+  for (const [a, l] of [[-sz.d * 0.32, 0], [0, 0], [-sz.d * 0.32, sz.w * 0.75], [-sz.d * 0.32, -sz.w * 0.75], [sz.d * 0.1, sz.w * 0.75], [sz.d * 0.1, -sz.w * 0.75]]) {
+    const x = d.x + fx * a + rx * l, z = d.z + fz * a + rz * l;
+    const g = fits(x, z, BW, BD, 0.2);
+    if (!g) continue;
+    const [hi, lo] = g, yf = hi + 0.03;
+    W.use(WC.CONCRETE, 0xa8a49b, 1);
+    W.tbox(x, lo - 0.06, z, BW + 0.04, yf - (lo - 0.06), BD + 0.04, fx, fz, WSCALE.CONCRETE, false, true);
+    ctx.fac.boxWalls(x, yf, z, BW, BD, H, fx, fz, FC.BRICK_PLAIN, FC.BRICK_PLAIN, 0xffffff, d.id * 13 + 7, { frontCell: FC.GARAGE });
+    roofFlat(W, x, yf + H, z, BW, BD, fx, fz, 0x8b8880);
+    W.use(WC.PLAIN, color, 1);
+    W.box(x + fx * (BD / 2 + 0.006), yf + H - 0.1, z + fz * (BD / 2 + 0.006), BW, 0.06, 0.012, fx, fz, false);
+    W.use(WC.METAL, 0x5d6266, 0);
+    W.box(x, yf + H, z - 0, 0.18, 0.1, 0.18, fx, fz);
+    break;
+  }
+}
 
 /** Tram depot: brick hall with three doors, tracks and overhead wires running in, company band. */
 function tramDepot(ctx: ChunkCtx, d: Depot, color: number, sz: { w: number; d: number }, y: number) {
