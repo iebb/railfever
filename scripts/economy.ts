@@ -30,28 +30,33 @@ const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=
 // and subway 8.3 -> 13.4. Narrower walks intentionally reduce local/village traffic; covered residents and separate
 // urban feeders sustain the useful intercity service. No balance checks or queue limits have been loosened.
 // These are repeatability checks; the bands below the simulation are the balance checks.
+// One physical track (30 m radius, 7% grade, 400 km/h cap) changes line profiles and journey times.
+// Re-captured only after the independent bands below and urbanecon passed: incomes/net k per year:
+// intercity 490.7/155.4 -> 514.9/233.1; busy bus 175.8/101.8 -> 203.6/129.3;
+// short bus 18.2/-15.6 -> 19.2/-14.6; village railway 242.1/-133.2 -> 211.2/-147.1.
+// Fare rates, demand rates, queue limits and the independent balance bands are unchanged.
 const seed7Baseline = {
   "seed": 7,
   "results": [
     {
       "name": "rail Oldwood-Coldden (104 u track)",
-      "income": 490727.68561051134,
-      "net": 155353.67224508338
+      "income": 514864.720310897,
+      "net": 233125.12536591495
     },
     {
       "name": "busy bus in Oldwood (2x Metro Articulated)",
-      "income": 175757.10905794488,
-      "net": 101796.7907211971
+      "income": 203593.79856282176,
+      "net": 129341.33055072182
     },
     {
       "name": "short bus in Oldwood (1x City Liner)",
-      "income": 18235.172678850053,
-      "net": -15560.166389677128
+      "income": 19209.909479210273,
+      "net": -14586.78717859483
     },
     {
       "name": "village rail Redwell(345)-Southley(237)",
-      "income": 242145.6385487659,
-      "net": -133161.3952190478
+      "income": 211225.06880188952,
+      "net": -147051.26411279422
     }
   ]
 };

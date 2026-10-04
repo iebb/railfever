@@ -1,6 +1,7 @@
+import { railPartMode, railModeOf } from '../src/game/stations';
 import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
 import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
-// Urban rail: construction styles from the platform track type (main line / metro / light rail) with their layouts and
+// Urban rail: station-part construction styles (main line / metro / light rail) with their layouts and
 // one rail walking limit for all; strict catchment (only street-connected buildings, shared out among stations,
 // worked out alike after loading); a dense underground metro line (6 stations, ~10 units apart, platform screen
 // doors, side platforms) made directional in one go and run with trains; auto-links by mode; a junction station
@@ -48,13 +49,13 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const side = stationLayout(2, 0, 'middle', 'side'), isl = stationLayout(2);
   check(near(side.trackOffsets[0], -0.225) && near(side.trackOffsets[1], 0.225) && side.platforms.length === 2 && side.platforms.every((p) => Math.abs(p.off) > 0.6), `side platforms: tracks at the plain double-track spacing (${side.trackOffsets.map((o) => fmt(o, 3)).join(', ')}), platforms outside`);
   check(isl.platforms.length === 1 && near(isl.platforms[0].off, 0), 'island platform between two tracks (main-line default)');
-  const pm = g.stations.planRail(60, 124, PI2, defaultPlatformLength('metro'), 2, 0, { trackType: 'metro' });
+  const pm = g.stations.planRail(60, 124, PI2, defaultPlatformLength('metro'), 2, 0, { trackType: 'electric', mode: 'metro' });
   console.log(`  metro plan: ${pm.ok ? 'ok' : pm.error}, ${pm.level}, depth ${fmt(pm.depth, 2)}, psd ${pm.psd}, ${pm.platformStyle}, ${pm.length * 10} m, ${pm.entrances.length} entrances, cost ${fmt(pm.cost / 1e6, 2)}M`);
   check(pm.ok && pm.mode === 'metro' && pm.level === 'underground' && pm.psd && pm.platformStyle === 'side' && pm.length === 12 && near(pm.depth, 2.2), 'metro: underground (22 m deep), platform screen doors, side platforms, 120 m platforms');
   const sm = g.stations.planCatchShapes(pm);
-  check(sm.length >= 2 && sm.every((c) => c.mode === 'rail' && c.r === CATCHMENT_RADIUS.rail && c.r === 23.52), `metro-track station: the one rail walking limit (235.2 m) at the ${sm.length} entrances`);
-  const pl = g.stations.planRail(120, 124, PI2, defaultPlatformLength('lightrail'), 2, 0, { trackType: 'lightrail' });
-  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 23.52 && c.mode === 'rail'), `light-rail track: on the ground, side platforms, the same 235.2 m rail walking limit (${pl.error ?? 'ok'})`);
+  check(sm.length >= 2 && sm.every((c) => c.mode === 'rail' && c.r === CATCHMENT_RADIUS.rail && c.r === 23.52), `metro station: the one rail walking limit (235.2 m) at the ${sm.length} entrances`);
+  const pl = g.stations.planRail(120, 124, PI2, defaultPlatformLength('lightrail'), 2, 0, { trackType: 'electric', mode: 'lightrail' });
+  check(pl.ok && pl.mode === 'lightrail' && pl.level === 'ground' && !pl.psd && pl.platformStyle === 'side' && g.stations.planCatchShapes(pl).every((c) => c.r === 23.52 && c.mode === 'rail'), `light-rail station: on the ground, side platforms, the same 235.2 m rail walking limit (${pl.error ?? 'ok'})`);
   const pe = g.stations.planRail(180, 124, PI2, 8, 2, 0, { trackType: 'electric' });
   check(pe.ok && pe.mode === 'mainline' && pe.platformStyle === 'island' && !pe.psd && pe.style === 'classic' && g.stations.planCatchShapes(pe).every((c) => Math.abs(c.r - 28.224) < 1e-9 && c.mode === 'rail'), `electric main line: island platform, the 235.2 m rail walking limit + 20% for its building (${pe.error ?? 'ok'})`);
   const built: [Station, string][] = [];
@@ -64,7 +65,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
     built.push([g.stations.get(id)!, tt]);
   }
   const net = g.world.net;
-  check(built.every(([st, tt]) => st.rail!.trackType === tt && st.rail!.edges.every((id) => net.edges.get(id)!.type === tt)), 'platform tracks of the station\'s track type');
+  check(built.every(([st, tt]) => st.rail!.trackType === 'electric' && st.rail!.edges.every((id) => net.edges.get(id)!.type === 'electric') && railPartMode(st.rail!) === railModeOf(tt)), 'all platform tracks are wired; their station styles are independent');
   check(built.map(([st]) => g.stations.mode(st)).join() === 'metro,lightrail,mainline' && built.every(([st]) => g.stations.catchMode(st) === 'rail'), `construction styles ${built.map(([st]) => g.stations.mode(st)).join(', ')}, one transport mode (rail)`);
   check(built.every(([st]) => g.stations.catchmentShapes(st).every((c) => c.mode === 'rail' && Math.abs(c.r - CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail!.style).catchBonus)) < 1e-9)), 'built stations: one rail catchment radius whatever the track type (and the building)');
   check(built[0][0].rail!.style === 'none' && built[1][0].rail!.style === 'shelter', 'no building for the metro station (street entrances), a halt for light rail');
@@ -123,7 +124,7 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const xs = [40, 70, 92, 114, 136, 166];
   const M: Station[] = [];
   for (const x of xs) {
-    const st = station(g, x, 124, PI2, defaultPlatformLength('metro'), 2, 0, { trackType: 'metro' });
+    const st = station(g, x, 124, PI2, defaultPlatformLength('metro'), 2, 0, { trackType: 'electric', mode: 'metro' });
     if (st) M.push(st);
   }
   check(M.length === 6 && M.every((s) => s.rail!.level === 'underground' && s.rail!.psd && s.rail!.platformStyle === 'side'), `6 underground metro stations 100 m apart (${M.length})`);
@@ -136,11 +137,11 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const e0 = net.nextEdge;
   let ok = true;
   for (let i = 0; i + 1 < M.length; i++) {
-    const p = link(g, M[i], M[i + 1], 0, { type: 'metro', level: 'underground' }, `tunnel ${i}`) ?? link(g, M[i], M[i + 1], 0, { type: 'metro' }, `tunnel ${i} (plain)`);
+    const p = link(g, M[i], M[i + 1], 0, { type: 'electric', level: 'underground' }, `tunnel ${i}`) ?? link(g, M[i], M[i + 1], 0, { type: 'electric' }, `tunnel ${i} (plain)`);
     if (!p) ok = false;
   }
   const tun = newTrack(g, e0);
-  check(ok && tun.every((id) => net.edges.get(id)!.type === 'metro'), `metro tunnels between the stations (${tun.length} edges)`);
+  check(ok && tun.every((id) => net.edges.get(id)!.type === 'electric'), `metro tunnels between the stations (${tun.length} edges)`);
   check(tun.every((id) => { const e = net.edges.get(id)!; return e.sections.some((s) => s.type === 'tunnel' && s.s0 <= 0.5 && s.s1 >= e.len - 0.5); }), 'all in tunnel');
   const f = finishDoubleTrack(g, tun, 0);
   console.log(`  directional: ${f.crossovers} crossovers, ${f.signals} signals, cost ${fmt(f.cost / 1e3, 0)}k ${f.error ?? ''}`);
@@ -182,15 +183,15 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   road(g, 10, 118, 246, 118);
   // company 0, the city's metro: M1, M2 and the junction station J (at street level here)
   const ML = defaultPlatformLength('metro');
-  const M1 = station(g, 40, 124, PI2, ML, 2, 0, { trackType: 'metro', level: 'ground' })!;
-  const M2 = station(g, 76, 124, PI2, ML, 2, 0, { trackType: 'metro', level: 'ground' })!;
-  const J = station(g, 112, 124, PI2, ML, 2, 0, { trackType: 'metro', level: 'ground' })!;
+  const M1 = station(g, 40, 124, PI2, ML, 2, 0, { trackType: 'electric', mode: 'metro', level: 'ground' })!;
+  const M2 = station(g, 76, 124, PI2, ML, 2, 0, { trackType: 'electric', mode: 'metro', level: 'ground' })!;
+  const J = station(g, 112, 124, PI2, ML, 2, 0, { trackType: 'electric', mode: 'metro', level: 'ground' })!;
   // company 1, the suburban railway (electrified main line): S1, S2
   const S1 = station(g, 160, 124, PI2, 10, 2, 1, { trackType: 'electric' })!;
   const S2 = station(g, 206, 124, PI2, 10, 2, 1, { trackType: 'electric' })!;
   check(!!(M1 && M2 && J && S1 && S2), 'stations of both companies');
   const e0 = net.nextEdge;
-  const a1 = link(g, M1, M2, 0, { type: 'metro' }, 'M1-M2'), a2 = link(g, M2, J, 0, { type: 'metro' }, 'M2-J');
+  const a1 = link(g, M1, M2, 0, { type: 'electric' }, 'M1-M2'), a2 = link(g, M2, J, 0, { type: 'electric' }, 'M2-J');
   const mine0 = newTrack(g, e0, 0);
   const e1 = net.nextEdge;
   // the suburban railway builds into the junction station's free throat (company 0's station, open access)

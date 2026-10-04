@@ -277,7 +277,7 @@ if (!arg('maps')) {
     const { g, C, a, b } = termini(3, 20000), ai = g.aiOf(owner)!;
     if (owner === 3) open(g, g.aiOf(1)!, 'crosscity', C);
     open(g, ai, 'metro', C);
-    const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.trackType === 'metro'));
+    const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.mode === 'metro'));
     check(!!line, 'the AI opens an urban railway serving both main-line stations');
     if (!line) continue;
     const metro = [...new Set(line.stops)].map((sid) => g.stations.get(sid)!);
@@ -292,7 +292,7 @@ if (!arg('maps')) {
     };
     runDays(g, 720); Vehicle.prototype.serveStation = serve;
     const upkeep = owner === 3 ? g.maintenanceOf(owner) : metro.reduce((n, s) => n + g.stationMaintenance(s), 0)
-      + [...g.world.net.edges.values()].filter((e) => e.owner === owner && e.type === 'metro').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
+      + [...g.world.net.edges.values()].filter((e) => e.owner === owner && e.kind === 'rail' && e.type === 'electric').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
     const net = line.incomeLast - line.costLast - upkeep;
     console.log(`  metro revenue ${fmt(line.incomeLast / 1e6, 2)}M, operating profit ${fmt(net / 1e6, 2)}M/year, transferred boardings ${transferBoards.get(owner) ?? 0}`);
     check((transferBoards.get(owner) ?? 0) > 0, 'naturally generated main-line arrivals transfer onto the urban line');
@@ -310,14 +310,14 @@ if (!arg('maps')) {
     const urbanProfit = (l: Line) => {
       const sts = [...new Set(l.stops)].map((id) => g.stations.get(id)!).filter((s) => s.rail);
       const upkeep = sts.reduce((n, s) => n + g.stationMaintenance(s), 0)
-        + [...g.world.net.edges.values()].filter((e) => e.owner === l.owner && ['metro', 'lightrail'].includes(e.type)).reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
+        + [...g.world.net.edges.values()].filter((e) => e.owner === l.owner && e.kind === 'rail' && e.type === 'electric').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
       return l.incomeLast - l.costLast - upkeep;
     };
     let reportedYear = g.year;
     while (g.day < years * 360) {
       g.stepTick();
       for (const l of g.lines.all()) {
-        if (!opened.has(l.id) && l.kind === 'rail' && l.vehicles.length > 0 && l.stops.some((s) => ['metro', 'lightrail'].includes(g.stations.get(s)?.rail?.trackType ?? ''))) {
+        if (!opened.has(l.id) && l.kind === 'rail' && l.vehicles.length > 0 && l.stops.some((s) => ['metro', 'lightrail'].includes(g.stations.get(s)?.rail?.mode ?? ''))) {
           const pop = Math.max(...l.stops.map((id) => g.towns.list[g.stations.get(id)?.townId ?? -1]?.pop ?? 0));
           opened.set(l.id, { day: g.day, pop });
           if (process.argv.includes('--details')) console.log(`  ${g.dateString()}: urban opening ${l.name}, population ${pop}`);
@@ -333,7 +333,7 @@ if (!arg('maps')) {
         console.log(`  ${g.dateString()}, ${fmt((performance.now() - started) / 1000, 1)}s elapsed; ${g.lines.all().length} lines, ${opened.size} urban openings`);
       }
     }
-    const lines = g.lines.all().filter((l) => l.kind === 'rail' && (opened.get(l.id)?.pop ?? 0) >= 5000 && l.stops.some((sid) => { const s = g.stations.get(sid); return s && ['metro', 'lightrail'].includes(s.rail?.trackType ?? '') && (g.towns.list[s.townId]?.pop ?? 0) >= 5000; }));
+    const lines = g.lines.all().filter((l) => l.kind === 'rail' && (opened.get(l.id)?.pop ?? 0) >= 5000 && l.stops.some((sid) => { const s = g.stations.get(sid); return s && ['metro', 'lightrail'].includes(s.rail?.mode ?? '') && (g.towns.list[s.townId]?.pop ?? 0) >= 5000; }));
     urban += lines.length;
     for (const l of lines) {
       const net = urbanProfit(l), age = (g.day - (opened.get(l.id)?.day ?? g.day)) / 360, atTwo = twoYearProfit.get(l.id);

@@ -7,7 +7,7 @@ import { pickTrain, modelYearCost, type LineInfo } from '../src/game/ai';
 import { forecastMailRevenue, projectMail, mailVans, type MailQueue } from '../src/game/ai-mail';
 import { MODEL_BY_ID, carriesMail } from '../src/game/vehicle-types';
 import { lineTable } from '../src/game/patterns';
-import { railModeOf } from '../src/game/stations';
+import { railPartMode } from '../src/game/stations';
 import { addMail, newJourney, stationMail } from '../src/game/mail';
 import type { Line } from '../src/game/lines';
 import { fails, check, fmt, placeAndConnect, depotBehind, Train, checkNaN, checkReservations } from './lib';
@@ -80,16 +80,16 @@ function policyChecks() {
   ai.mailPolicy.manage(l, info);
   check(!ai.mailPolicy.mailQueue.length && info.mailLook === undefined, 'no existing-line review before 180 days');
   g.day = 180;
-  for (const type of ['urban', 'hsr', 'track', 'foreign'] as const) {
-    const owner = l.owner, track = pr.A.rail!.trackType;
+  for (const type of ['urban', 'hsr', 'style', 'foreign'] as const) {
+    const owner = l.owner, mode = pr.A.rail!.mode;
     if (type === 'urban') info.urban = 'metro';
     if (type === 'hsr') info.hsr = true;
-    if (type === 'track') pr.A.rail!.trackType = 'lightrail';
+    if (type === 'style') pr.A.rail!.mode = 'lightrail';
     if (type === 'foreign') l.owner = 0;
     ai.mailPolicy.manage(l, info);
     check(!ai.mailPolicy.mailQueue.length && info.mailLook === undefined, `${type}: excluded from mail reviews`);
-    if (type === 'track') check(projectMail(g, points, cars, 1, 70, headway, 16).revenue === 0, 'city-style track gets no mail project bonus');
-    delete info.urban; delete info.hsr; l.owner = owner; pr.A.rail!.trackType = track;
+    if (type === 'style') check(projectMail(g, points, cars, 1, 70, headway, 16).revenue === 0, 'city-style stations get no mail project bonus');
+    delete info.urban; delete info.hsr; l.owner = owner; pr.A.rail!.mode = mode;
   }
   const length = pr.A.rail!.length;
   pr.A.rail!.length = t.length + 0.4;
@@ -208,7 +208,7 @@ function naturalRun(seed: number) {
       if (count && l) {
         mailLines.add(l.id);
         badLine ||= !!info?.urban || !!info?.hsr || l.kind !== 'rail' || !t.cars.some((m) => m.kind === 'loco')
-          || l.stops.some((id) => { const r = g.stations.get(id)?.rail; return !r || railModeOf(r.trackType) !== 'mainline' || r.trackType === 'highspeed'; });
+          || l.stops.some((id) => { const r = g.stations.get(id)?.rail; return !r || railPartMode(r) !== 'mainline' || r.trackType === 'highspeed'; });
       }
       const old = previous.get(t.id);
       if (old && old.length > count && !ai.log.some((s) => s.includes(`mail van`) && s.includes(t.name))) vanished = true;

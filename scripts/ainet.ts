@@ -11,7 +11,7 @@ import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 import '../src/game/patterns';
 import { Game } from '../src/game/game';
 import type { NEdge } from '../src/game/network';
-import { railModeOf, planStationUpgrade, commitStationUpgrade, CATCHMENT_RADIUS } from '../src/game/stations';
+import { railModeOf, railPartMode, planStationUpgrade, commitStationUpgrade, CATCHMENT_RADIUS } from '../src/game/stations';
 import { networkProfile, networkOptions, NETWORK_WORK_UNITS, networkDaily, saveNetwork, loadNetwork, midLineCrossovers, subsetLinePairs, networkPlanner, runNetworkTask, routeBetween, roadRouteBetween } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
 import type { Station } from '../src/game/stations';
@@ -76,7 +76,7 @@ export function aiNetMetrics(g: Game): AINetMetrics {
     pieces.push(`${g.company(ai.companyId).code ?? ai.companyId}: ${roots.size} pieces / ${lines} lines`);
   }
   // stations
-  const main = [...g.stations.map.values()].filter((st) => st.rail && st.owner > 0 && railModeOf(st.rail.trackType) === 'mainline');
+  const main = [...g.stations.map.values()].filter((st) => st.rail && st.owner > 0 && railPartMode(st.rail) === 'mainline');
   const complex = (st: Station) => Math.min(...g.stations.complex(st.id));
   const stations = new Set(main.map(complex)).size;
   const platforms = new Map<number, number>();
@@ -563,7 +563,8 @@ function reviewChecks() {
   }
   {
     const { g, ai, me } = aiFlat(), net = g.world.net;
-    const A = station(g, 50, 128, Math.PI / 2, 10, 2, me)!, B = station(g, 95, 128, Math.PI / 2, 10, 2, me)!;
+    // The common track's tighter turnouts need a shorter gap to force partial work and rollback.
+    const A = station(g, 50, 128, Math.PI / 2, 10, 2, me)!, B = station(g, 85, 128, Math.PI / 2, 10, 2, me)!;
     for (const t of [0, 1]) build(g, nodeSnap(g, endNode(g, A, t, true), 'rail'), nodeSnap(g, endNode(g, B, t, false), 'rail'), railOpts(me), 'review short parallel singles');
     lineWithTrain(g, me, [A, B]);
     const first = net.nextEdge, money = g.company(me).economy.money;
@@ -1417,10 +1418,16 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
         cash: e.money, loan: e.loan, maxLoan: e.maxLoan, minMoney: companyMinMoney.get(ai.companyId) ?? e.money };
     });
     const mid = midLineCrossovers(g).filter((c) => c.owner > 0);
-    const subs = subsetLinePairs(g);
+    const allSubs = subsetLinePairs(g);
+    // NetPlanner.canon uses sameOwnerOnly: cross-company partnerships are optional, not duplicate own lines.
+    const subs = allSubs.filter(([a, b]) => g.lines.get(a)?.owner === g.lines.get(b)?.owner);
+    const partnerSubsets = allSubs.length - subs.length;
+    if (allSubs.length) console.log('  subset lines / partnership candidates: ' + JSON.stringify(allSubs.map((ids) => ids.map((id) => {
+      const l = g.lines.get(id)!; return { id, owner: l.owner, kind: l.kind, stops: l.stops, name: l.name };
+    }))));
     const { calls, ms } = networkProfile;
     console.log(`seed ${seed}, ${years} years (${fmt((performance.now() - t0) / 1000, 0)} s): ${fmtNet(m)}`);
-    console.log(`  stations per rail town ${fmt(m.stations / Math.max(1, m.railTowns), 2)}; mid-line crossovers ${mid.length}; subset/superset line pairs ${subs.length}`);
+    console.log(`  stations per rail town ${fmt(m.stations / Math.max(1, m.railTowns), 2)}; mid-line crossovers ${mid.length}; same-company subset/superset line pairs ${subs.length}, possible partnerships ${partnerSubsets}`);
     console.log(`  AI: stations grown ${sum('grown')}, merged ${sum('merged')}, joined at a town's station ${sum('joinedStations')}, single tracks paired ${sum('paired')}, junctions ${sum('connections')}, stub track taken up ${fmt(sum('stubs'), 0)} u, lines ${sum('lines')}, rail stations ${sum('railStations')}`);
     console.log(`  network: ${NET_KEYS.map((k) => `${k.slice(3)} ${sum(k)}`).join(', ')}`);
     console.log(`  actions per company: ${companies.map((c) => `${c.code}: grown ${c.grown}, shortcuts ${c.shortcuts}, joined ${c.joined}, paired ${c.paired}, through ${c.through}, inserted ${c.inserted}, interchanges ${c.interchanges}, buildings ${c.restyled}, closed ${c.decommissioned}, stops merged ${c.stopsMerged}`).join('; ')}`);
@@ -1428,7 +1435,7 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
     console.log(`  money: ${g.ais.map((ai) => { const e = g.company(ai.companyId).economy; return `${g.company(ai.companyId).code} ${fmt(e.money / 1e6, 1)}M (loan ${fmt(e.loan / 1e6, 1)}/${fmt(e.maxLoan / 1e6, 0)}M)`; }).join(', ')}${isFinite(minMoney) ? `; lowest cash ${fmt(minMoney / 1e6, 1)}M` : ''}`);
     console.log(`  network work: ${calls} calls, ${networkProfile.steps} units (max ${networkProfile.maxSteps}/${NETWORK_WORK_UNITS} per call), avg ${fmt(ms / Math.max(1, calls), 3)} ms, max ${fmt(networkProfile.max, 1)} ms, ${networkProfile.slow} over 15 ms; per company max ${g.ais.map((ai) => fmt(networkPlanner(ai)?.prof.max ?? 0, 1)).join('/')} ms; steps by task ${Object.entries(networkProfile.tasks).map(([k, v]) => `${k} ${v.steps}x max ${fmt(v.max, 1)}`).join(', ')}`);
     if (process.argv.includes('--json')) console.log('METRICS ' + JSON.stringify({ seed, off, stations: m.stations, railParts: m.railParts, railTowns: m.railTowns,
-      stationsPerTown: m.stations / Math.max(1, m.railTowns), multiTowns: m.multiTowns, midCrossovers: mid.length, subsets: subs.length,
+      stationsPerTown: m.stations / Math.max(1, m.railTowns), multiTowns: m.multiTowns, midCrossovers: mid.length, subsets: subs.length, partnerSubsets,
       grown: sum('grown'), paired: sum('paired'), connections: sum('connections'), through: sum('netThrough'), inserted: sum('netInserted'), interchanges: sum('netInterchanges'),
       shortcuts: sum('netRoads'), roadUnitsSaved: sum('netRoadUnitsSaved'), joined: sum('netJoined'),
       consolidated: sum('netConsolidated'), restyled: sum('netRestyled'), relevelled: sum('netRelevelled'), decommissioned: sum('netDecommissioned'),
@@ -1451,7 +1458,7 @@ if (isMain && ['scenarios', 'state'].includes(process.argv[2])) {
     check(m.stubsOnBridge === 0, `seed ${seed}: no dead end on a bridge (${m.stubsOnBridge})`);
     check(m.multiTowns <= Math.max(1, Math.round(m.railTowns * 0.15)), `seed ${seed}: one station per town mostly (${m.multiTowns} of ${m.railTowns} towns with 2+)`);
     check(mid.length === 0, `seed ${seed}: no crossovers on plain line between stations (${mid.length})`);
-    check(subs.length === 0, `seed ${seed}: no subset / superset lines (${subs.length})`);
+    check(subs.length === 0, `seed ${seed}: no same-company subset / superset lines (${subs.length})`);
     check(errors === 0, `seed ${seed}: no AI errors (${errors})`);
     // Wall time under contention is reported, never used as a simulation rule or a correctness assertion.
     check(networkProfile.maxSteps <= NETWORK_WORK_UNITS, `seed ${seed}: network work stays within the deterministic allowance`);

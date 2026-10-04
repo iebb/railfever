@@ -1,6 +1,6 @@
 // Free-form transport network: nodes and cubic-Bezier edges with height profiles.
 import type { World } from './world';
-import { NetKind, PSTEP, ROAD_TYPES, LANE_OFFSET } from './constants';
+import { NetKind, PSTEP, ROAD_TYPES, LANE_OFFSET, trackTypeOf } from './constants';
 import {
   Bez, arcTable, tAtS, bezPoint, bezDeriv, bezSplit, startTangent, endTangent, bezMinRadius, closestOnPolyline, Vec3Like,
 } from './geom';
@@ -225,6 +225,7 @@ export class Network {
       id: this.nextEdge++, kind, a, b, sa, sb, bez, len: tab.len, prof, sections, type, owner,
       station: -1, depot: -1, version: 0, ...extra,
     };
+    if (kind === 'rail') e.type = trackTypeOf(e.type);
     this.edges.set(e.id, e);
     this.tables.set(e.id, { v: 0, t: tab });
     na.edges.push(e.id);

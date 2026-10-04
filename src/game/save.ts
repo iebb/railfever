@@ -14,7 +14,7 @@ import { Train, TSeg, makeSeg } from './train';
 import { RoadVehicle, RSeg, RCont, makeLaneSeg, makeConn } from './roadvehicle';
 import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
-import { KMH_TO_UPS } from './constants';
+import { KMH_TO_UPS, trackTypeOf } from './constants';
 import { cargoGroups, type Vehicle, type CargoGroup } from './vehicle';
 import { fareGroupKey, changeClass } from './fares';
 import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
@@ -179,7 +179,7 @@ function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknow
  * had them, so parts are written in this order whatever order their object has: a loaded game saves exactly alike.
  */
 const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffsets', 'platforms', 'edges', 'through', 'throughOffsets',
-  'throughEdges', 'width', 'throughMode', 'trackType', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
+  'throughEdges', 'width', 'throughMode', 'trackType', 'mode', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
   'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost'];
 /**
  * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
@@ -409,8 +409,9 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
-    // vehicles still to re-plan after the last network change (a few per tick), and lost-vehicle news timers
+    // vehicles still to re-plan after the last network change (a few per tick), and vehicle/line news timers
     replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
+    congestionTold: [...((g as any).congestionTold ?? new Map()).entries()],
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };
@@ -478,6 +479,7 @@ export function deserialize(d: any): Game {
   }
   for (const ed of d.net.edges as any[]) {
     const e: NEdge = { ...ed, bez: { ...ed.bez }, prof: f32dec(ed.prof), sections: (ed.sections as Section[]).map((s) => ({ ...s })) };
+    if (e.kind === 'rail') e.type = trackTypeOf(e.type);
     net.edges.set(e.id, e);
     const geo = net.geo(e);
     let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
@@ -613,6 +615,7 @@ export function deserialize(d: any): Game {
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
   if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
+  if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }

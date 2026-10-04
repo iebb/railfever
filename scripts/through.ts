@@ -1,3 +1,5 @@
+import { trackTypeOf } from '../src/game/constants';
+import { railPartMode, railModeOf } from '../src/game/stations';
 import { lineTable as startupTable, patternOf as startupPattern } from '../src/game/patterns';
 import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Urban rail between companies (v2.4): a Fukuoka-like through service (company A's metro under a town meets
@@ -34,7 +36,7 @@ function flatGame(size = 512, ais = 2): Game {
 }
 const station = (g: Game, x: number, z: number, owner: number, trackType: string, level: 'ground' | 'underground' = 'ground', len?: number): Station => {
   const id = g.stations.nextId;
-  const plan = g.stations.planRail(x, z, Math.PI / 2, len ?? (trackType === 'metro' ? 12 : 10), 2, owner, { trackType, level });
+  const plan = g.stations.planRail(x, z, Math.PI / 2, len ?? (trackType === 'metro' ? 12 : 10), 2, owner, { trackType: trackTypeOf(trackType), mode: railModeOf(trackType), level });
   const err = plan.ok ? g.stations.commitRail(plan, owner) : plan.error;
   if (err) throw new Error(`station at ${x}: ${err}`);
   return g.stations.get(id)!;
@@ -60,16 +62,16 @@ function counter(trains: Train[]) {
   const S1 = station(g, 380, Z, B, 'electric'), S2 = station(g, 460, Z, B, 'electric');
   const end = (st: Station, front: boolean) => stationEnds(g, st).map((e) => (front ? e.front : e.back));
   let ok = true;
-  for (let i = 0; i + 1 < Ms.length; i++) ok = !!build(g, nodeSnap(g, end(Ms[i], true)[0], 'rail'), nodeSnap(g, end(Ms[i + 1], false)[0], 'rail'), railOpts(A, 1, { type: 'metro', level: 'underground', levelDepth: Ms[i].rail!.depth }), 'metro') && ok;
+  for (let i = 0; i + 1 < Ms.length; i++) ok = !!build(g, nodeSnap(g, end(Ms[i], true)[0], 'rail'), nodeSnap(g, end(Ms[i + 1], false)[0], 'rail'), railOpts(A, 1, { type: 'electric', level: 'underground', levelDepth: Ms[i].rail!.depth }), 'metro') && ok;
   // the ramp (metro track, from the tunnel up to ground level) into the junction, then B's electric line
-  ok = !!build(g, nodeSnap(g, end(Ms[4], true)[0], 'rail'), nodeSnap(g, end(J, false)[0], 'rail'), railOpts(A, 1, { type: 'metro' }), 'ramp') && ok;
+  ok = !!build(g, nodeSnap(g, end(Ms[4], true)[0], 'rail'), nodeSnap(g, end(J, false)[0], 'rail'), railOpts(A, 1, { type: 'electric' }), 'ramp') && ok;
   ok = !!build(g, nodeSnap(g, end(J, true)[0], 'rail'), nodeSnap(g, end(S1, false)[0], 'rail'), railOpts(B, 1, { type: 'electric' }), 'J-S1') && ok;
   ok = !!build(g, nodeSnap(g, end(S1, true)[0], 'rail'), nodeSnap(g, end(S2, false)[0], 'rail'), railOpts(B, 1, { type: 'electric' }), 'S1-S2') && ok;
   check(ok, 'metro, ramp, junction and suburban line built');
   // depots: A's beyond the first metro station (a ramp up), B's beyond S2
   const net = g.world.net;
   // (the ramp climbs to the surface beyond the first metro station; the depot sits at its end)
-  const rampUp = build(g, nodeSnap(g, end(Ms[0], false)[0], 'rail'), free(g, 8, Z), railOpts(A, 1, { type: 'metro' }), 'depot ramp');
+  const rampUp = build(g, nodeSnap(g, end(Ms[0], false)[0], 'rail'), free(g, 8, Z), railOpts(A, 1, { type: 'electric' }), 'depot ramp');
   const topA = rampUp ? [...net.nodes.values()].filter((n) => n.kind === 'rail' && n.edges.length === 1 && n.x < 20).sort((p, q) => p.x - q.x)[0] : null;
   const dA = topA ? depotAtEnd(g, topA.id, A) : -1;
   if (dA < 0) console.log(`  depot A: ramp ${!!rampUp}, end node ${topA ? `${fmt(topA.x)},${fmt(topA.z)} y ${fmt(topA.y)} ground ${fmt(g.world.heightAt(topA.x, topA.z))}` : 'none'}`);
@@ -221,7 +223,7 @@ function counter(trains: Train[]) {
   const t0 = performance.now();
   while (g.day < 720) g.update(0.25);
   const st = g.ais.map((a) => a.stats);
-  const urbanLines = g.lines.all().filter((l) => l.kind === 'rail' && l.owner > 0 && l.stops.some((sid) => { const s2 = g.stations.get(sid); return !!s2?.rail && (s2.rail.trackType === 'metro' || s2.rail.trackType === 'lightrail'); }));
+  const urbanLines = g.lines.all().filter((l) => l.kind === 'rail' && l.owner > 0 && l.stops.some((sid) => { const s2 = g.stations.get(sid); return !!s2?.rail && railPartMode(s2.rail) !== 'mainline'; }));
   console.log(`  2 years (${fmt((performance.now() - t0) / 1000, 0)} s): urban lines ${urbanLines.map((l) => `${l.name} (${new Set(l.stops).size} stations)`).join(', ') || 'none'}; stats urban ${st.map((x) => x.urban).join('/')}, through ${st.map((x) => x.through).join('/')}; ${g.ais.map((a) => a.log.filter((x) => /metro|light rail|city railway|through/.test(x)).slice(-3).join(' | ')).join(' || ')}`);
   check(urbanLines.length >= 1, 'the AI opened an urban railway (metro or light rail)');
 }

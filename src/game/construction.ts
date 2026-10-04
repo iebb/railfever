@@ -1,6 +1,6 @@
 // Free-form construction planner for tracks and roads.
 import type { Game } from './game';
-import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL } from './constants';
+import { NetKind, RAIL, ROAD_TYPES, TRACK_TYPES, PSTEP, WATER_Y, TRAM, LINE_LEVEL, trackTypeOf } from './constants';
 import {
   Bez, bezFromTangents, bezLine, bezOffset, bezMinRadius, arcTable, tAtS, bezPoint, bezDeriv, segIntersect, angleBetween, V2,
   closestOnPolyline,
@@ -81,6 +81,10 @@ export interface BuildOptions {
   level?: 'ground' | 'elevated' | 'underground';
   levelHeight?: number;
   levelDepth?: number;
+  /** Planner's speed target: fast routes avoid level crossings and preserve their profiled heights. */
+  designSpeed?: number;
+  /** Planner's grade budget; the builder and any replacement profile keep the service's chosen grade. */
+  designGrade?: number;
 }
 
 export interface CrossingPlan {
@@ -208,12 +212,10 @@ const BRIDGE_H = 1.4;   // >14 m above ground -> bridge (banks first: structures
 const TOWN_BANK_H = 2.0;
 
 /**
- * May a road cross track of this type at grade (a level crossing)? Conventional main-line track up to
- * 160 km/h only: never high-speed, metro or light-rail reserved track.
+ * Unified track permits road level crossings. Trains slow to 160 km/h there; fast planners choose separation.
  */
 export function levelCrossingAllowed(trackType: string): boolean {
-  const tt = TRACK_TYPES[trackType] ?? TRACK_TYPES.standard;
-  return tt.mode === 'mainline' && tt.speed <= 160;
+  return true;
 }
 const WATER_DECK = 0.9;
 /** storey height of town buildings (towns.ts FLOOR_H; not imported: towns imports this module) */
@@ -252,7 +254,7 @@ function nearestOnEdge(net: Game['world']['net'], e: NEdge, x: number, z: number
 }
 
 function maxGradeOf(o: BuildOptions) {
-  return o.kind === 'rail' ? (TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).maxGrade : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).maxGrade;
+  return o.kind === 'rail' ? Math.min((TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).maxGrade, o.designGrade ?? Infinity) : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).maxGrade;
 }
 function minRadiusOf(o: BuildOptions) {
   return o.kind === 'rail' ? (TRACK_TYPES[o.type] ?? TRACK_TYPES.standard).minRadius : (ROAD_TYPES[o.type] ?? ROAD_TYPES.road).minRadius;
@@ -264,13 +266,12 @@ function halfWidthOf(o: BuildOptions) {
 }
 
 /**
- * Speed limit (km/h) in a curve of a radius in world units (R[m] = units x 10), with cant: v ~ 4.1 sqrt(R[m]) on
- * conventional track, 4.3 sqrt(R[m]) on high-speed track (300 km/h needs R ~ 4.9 km, 400 km/h R ~ 8.7 km).
- * Without a track type (roads): 4.3.
+ * Speed limit (km/h) in a curve of a radius in world units (R[m] = units x 10), with cant: v ~ 4.3 sqrt(R[m]) on
+ * all rail (300 km/h needs R ~ 4.9 km, 400 km/h R ~ 8.7 km). The legacy track argument is retained.
  */
 export function curveSpeed(radius: number, trackType?: string): number {
   if (!isFinite(radius)) return 999;
-  return (trackType === undefined || trackType === 'highspeed' ? 4.3 : 4.1) * Math.sqrt(radius * 10);
+  return 4.3 * Math.sqrt(radius * 10);
 }
 
 // ------------------------------------------------------------------------------------ snapping
@@ -498,6 +499,13 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
 export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): Proposal {
   const w = g.world;
   const net = w.net;
+  if (opts.kind === 'rail') {
+    const wired = [start, end].some((sn) => {
+      const ids = sn.kind === 'edge' ? [sn.edge!] : sn.kind === 'node' ? (sn.group ?? [sn.node!]).flatMap((id) => net.nodes.get(id)?.edges ?? []) : [];
+      return ids.some((id) => { const e = net.edges.get(id); return e?.kind === 'rail' && TRACK_TYPES[e.type]?.electrified; });
+    });
+    opts = { ...opts, type: wired ? 'electric' : trackTypeOf(opts.type) };
+  }
   const prop: Proposal = {
     ok: true, errors: [], warnings: [], opts, tracks: [], crossings: [], demolish: [], trees: 0, cost: 0,
     stats: { len: 0, maxGrade: 0, minRadius: Infinity, bridges: 0, tunnels: 0, speed: 999 },
@@ -734,9 +742,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     // at grade (a diamond with switches) only across one's own or usable track, else over or under it
     const levelOk = c.angle > 0.4 && secOld === 'ground' && e.depot < 0 && e.station < 0
       && !(kind === 'rail' && e.kind === 'rail' && e.owner >= 0 && e.owner !== opts.owner && !opts.town && !g.canUse(opts.owner, e.owner))
-      // roads cross railways at grade only on conventional track (no level crossings on high-speed, metro or
-      // light-rail reserved track)
-      && (kind === e.kind || levelCrossingAllowed(kind === 'rail' ? opts.type : e.type));
+      // Fast alignments request grade separation; the physical track is the same.
+      && (kind === e.kind || (opts.designSpeed ?? 0) <= 160 && levelCrossingAllowed(kind === 'rail' ? opts.type : e.type));
     const levelMode: CrossingPlan['mode'] = kind === 'rail' ? (e.kind === 'rail' ? 'diamond' : 'level') : e.kind === 'rail' ? 'level' : 'junction';
     // lines built elevated / underground pass over / under everything at the surface (another viaduct or
     // tunnel: by height)
@@ -938,6 +945,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   });
   prop.demolish = [...demolish];
   prop.trees = trees;
+
+  if (kind === 'rail' && prop.crossings.some((c) => c.mode === 'level')) prop.stats.speed = Math.min(prop.stats.speed, 160);
 
   // ---- cost: track materials (bridges x6, tunnels x9) and earthworks. The first track of a formation pays
   // them in full; further tracks built with it, and stretches of track laid beside an existing one (at the

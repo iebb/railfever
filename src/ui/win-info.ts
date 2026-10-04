@@ -4,14 +4,13 @@ import { PLAYER, type Game } from '../game/game';
 import { h, clear, fmtInt, bar, tile, section, icon, stepper, add } from './dom';
 import { fmtMoney, fmtMoneyFull } from '../game/economy';
 import { availableModels, VehicleModel, MODEL_BY_ID, modelTracks, carriesMail, mailOnlyModel } from '../game/vehicle-types';
-import { Train, depotReaches, depotServes, lineCompatibility, trackAllows } from '../game/train';
+import { Train, makeSeg, depotReaches, depotServes, lineCompatibility, trackAllows } from '../game/train';
 import { RoadVehicle, roadDepotReaches } from '../game/roadvehicle';
 import type { Line } from '../game/lines';
 import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
-import { TRACK_TYPES, ROAD_TYPES, TRAM } from '../game/constants';
-import { curveSpeed } from '../game/construction';
-import { fmtLen, fmtPct, fmtMult, equalUseShare, TYPE_META, fmtMail, fmtMailLoad, stationShowsMail } from './format';
+import { TRACK_TYPES, ROAD_TYPES, TRAM, KMH_TO_UPS } from '../game/constants';
+import { fmtLen, fmtPct, fmtMult, equalUseShare, fmtMail, fmtMailLoad, stationShowsMail } from './format';
 import { mailByTown, mailLostShare } from '../game/mail';
 import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
@@ -20,7 +19,7 @@ import { KIND_META } from './format';
 import { demandView, stationDemand } from '../game/demand';
 import { townDemandShare } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
-import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind } from '../game/stations';
+import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railPartMode, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { readWalkingCatchment, readEntranceCatchment } from '../game/catchment';
 import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
@@ -351,9 +350,9 @@ function complexParts(ui: UI, s: Station): HTMLElement | null {
     h('div', { class: 'list' }, c.parts.map((id) => {
       const p = g.stations.get(id);
       if (!p) return null;
-      // (rail is one mode; the platform track type is the part's construction style)
+      // Rail is one mode; each part keeps its own station style.
       const mode = g.stations.catchMode(p);
-      const label = mode === 'rail' ? `Rail · ${(TYPE_META[p.rail?.trackType ?? ''] ?? TYPE_META.standard).short.toLowerCase()} track` : mode === 'tram' ? 'Tram' : 'Bus';
+      const label = mode === 'rail' ? `Rail · ${p.rail ? railPartMode(p.rail) : 'mainline'} station` : mode === 'tram' ? 'Tram' : 'Bus';
       return h('div', { class: 'complex-part' },
         h('div', { class: 'inline wrap' }, ui.stationLink(id), id === c.main ? h('span', { class: 'flag ok' }, 'Main') : null, id === s.id ? h('span', { class: 'muted' }, '(this part)') : null, ui.ownerTag(p.owner)),
         h('div', { class: 'inline wrap muted' }, `${label}${p.rail ? ` · ${p.rail.level} · ${p.rail.tracks} platform tracks` : ''} · ${fmtInt(p.waitingTotal)} waiting`, badgeRow(g, id, Infinity, 'sm')));
@@ -476,9 +475,9 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
         const r = current?.rail;
         if (!r || current.owner !== PLAYER) return;
         const T = ui.tools;
-        T.setTool(railModeOf(r.trackType) === 'mainline' ? 'station' : 'metro-station');
+        T.setTool(railPartMode(r) === 'mainline' ? 'station' : 'metro-station');
         T.stationLen = r.length; T.stationTracks = r.tracks; T.stationLevel = r.level;
-        T.stationType = r.trackType; T.stationStyle = styleOf(r.style).id;
+        T.stationType = railPartMode(r); T.stationStyle = styleOf(r.style).id;
         T.stationThrough = r.through ?? 0; T.throughMode = r.throughMode ?? 'middle';
         T.stationOnLine = false; T.stationAngle = r.angle;
         if (r.level === 'elevated') T.stationHeight = r.height || T.stationHeight;
@@ -579,7 +578,7 @@ export function openEdge(ui: UI, id: number) {
     const geo = g.world.net.geo(ed);
     let grade = 0;
     for (let i = 1; i < ed.prof.length; i++) grade = Math.max(grade, Math.abs(ed.prof[i] - ed.prof[i - 1]));
-    const speed = rail ? Math.min(tt!.speed, curveSpeed(geo.minRadius)) : rt!.speed;
+    const speed = rail ? makeSeg(g, ed, 1).limit / KMH_TO_UPS : rt!.speed;
     const straight = !isFinite(geo.minRadius) || geo.minRadius > 5000;
     const sec = ed.sections.map((s) => `${s.type} ${Math.round((s.s1 - s.s0) * 10)} m`).join(', ');
     add(win.body, 
@@ -588,6 +587,7 @@ export function openEdge(ui: UI, id: number) {
         tile(`${Math.round(speed)}`, 'km/h limit'),
         tile(straight ? '—' : `${Math.round(geo.minRadius * 10)} m`, 'Min. radius'),
         tile(fmtPct(grade, 1), 'Max. grade')),
+      rail ? ui.kv('Overhead wire', tt!.electrified ? 'Yes' : 'No') : null,
       sec ? ui.kv('Structures', sec) : null,
       ed.tram ? ui.kv('Tram tracks', ed.tramOwner !== undefined && ed.tramOwner >= 0 ? g.company(ed.tramOwner).name : 'yes') : null,
       ed.station >= 0 ? ui.kv('Station', ui.stationLink(ed.station)) : null,
@@ -884,12 +884,13 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
   const exit = initialDepot ? g.world.net.nodes.get(initialDepot.node)?.edges.map((id) => g.world.net.edges.get(id)).find((e) => e?.kind === 'rail' && e.depot < 0) : null;
   const trackType = initialLine?.stops.map((id) => g.stations.get(id)?.rail?.trackType).find(Boolean) ?? exit?.type;
   const units = emus.filter((m) => !trackType || modelTracks(m).includes(trackType));
-  const primaryUnits = units.filter((m) => m.tracks?.[0] === trackType);
+  const stationMode = initialLine?.stops.map((id) => { const r = g.stations.get(id)?.rail; return r ? railPartMode(r) : 'mainline'; }).find((mode) => mode !== 'mainline') ?? 'mainline';
+  const primaryUnits = units.filter((m) => stationMode === 'metro' ? m.id.startsWith('metro') : stationMode === 'lightrail' ? m.id.startsWith('lrv') : m.id.startsWith('emu'));
   // (defaults: passenger stock; the mail vans, trucks and units are listed too)
   const pax = (list: VehicleModel[]) => list.filter((m) => !carriesMail(m));
   const lastOf = (list: VehicleModel[]) => pax(list)[pax(list).length - 1] ?? list[list.length - 1];
   const unitDefault = lastOf(primaryUnits) ?? lastOf(units) ?? lastOf(emus);
-  const state = { train: (emus.length && (trackType === 'metro' || trackType === 'lightrail' || trackType === 'highspeed') ? 'unit' : 'hauled') as 'hauled' | 'unit',
+  const state = { train: (emus.length && stationMode !== 'mainline' ? 'unit' : 'hauled') as 'hauled' | 'unit',
     loco: locos[locos.length - 1]?.id ?? '', locoN: 1, wagon: lastOf(wagons)?.id ?? '', count: 2, van: vans[vans.length - 1]?.id ?? '', vanN: 0,
     unit: unitDefault?.id ?? '', unitN: 1, bus: lastOf(buses)?.id ?? '', line: initialLine?.id ?? lineId, depot: depotId };
   let purchaseCars: VehicleModel[] = [];
@@ -920,7 +921,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
         h('div', { class: 'mtags' },
           m.kind === 'emu' ? h('span', { class: 'mtag' }, `${m.unitCars ?? 1} cars / unit`) : null,
           m.traction !== 'none' ? h('span', { class: 'mtag' }, m.traction === 'electric' ? icon('bolt', 12) : null, m.traction) : null,
-          rail ? modelTracks(m).filter((t) => m.traction !== 'electric' || TRACK_TYPES[t]?.electrified).map((t) => h('span', { class: 'mtag', style: `--c:${TYPE_META[t]?.color ?? '#9aa5b4'}`, title: `${TRACK_TYPES[t]?.name ?? t}${m.traction === 'electric' ? ' · electrification required' : ''}` }, h('i'), TYPE_META[t]?.short ?? t)) : null));
+          rail && m.traction === 'electric' ? h('span', { class: 'muted' }, 'Overhead wire required') : null));
     };
     if (rail) {
       if (emus.length) add(win.body, field('Train type', seg([['hauled', 'Locomotive + coaches'], ['unit', 'Multiple units']], state.train, (v) => { state.train = v; render(); })));
@@ -1088,12 +1089,12 @@ function railWarning(ui: UI, cars: VehicleModel[], line: Line | null | undefined
     const dp = depotId != null ? g.depots.get(depotId) : null;
     if (!dp) return null;
     if (dp.kind !== 'rail') return 'Choose a train depot for this model.';
-    if (line && line.stops.length >= 2 && depotServes(g, dp, line.stops[0], line.stops[1], cars) < 0) return `Depot ${dp.id} cannot send this train onto ${line.name}: check track types, electrification and access.`;
+    if (line && line.stops.length >= 2 && depotServes(g, dp, line.stops[0], line.stops[1], cars) < 0) return `Depot ${dp.id} cannot send this train onto ${line.name}: check overhead wire and access.`;
     if (line?.stops.length === 1 && !depotReaches(g, dp, line.stops[0], cars)) return `Depot ${dp.id} cannot reach ${g.stations.get(line.stops[0])?.name ?? 'the line'} with this model.`;
     if (!line?.stops.length) {
       const exits = g.world.net.nodes.get(dp.node)?.edges.map((id) => g.world.net.edges.get(id)).filter((e) => e?.kind === 'rail' && e.depot < 0) ?? [];
       if (!exits.length) return 'This depot is not connected to the rail network.';
-      if (exits.every((e) => e && !trackAllows(cars, e))) return 'The track leaving this depot does not allow this model: check track types and electrification.';
+      if (exits.every((e) => e && !trackAllows(cars, e))) return 'The track leaving this depot does not allow this model: check overhead wire.';
     }
     return null;
   }, 3000);

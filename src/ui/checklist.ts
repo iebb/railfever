@@ -100,10 +100,10 @@ export class Checklist {
     return [
       { id: 'budget', title: 'Keep money for a train', hint: this.budget(), action: ['Budget noted', () => { this.done.add('budget'); this.sig = ''; this.timer = 0; }] },
       { id: 'stations', title: 'Build two train stations', hint: 'Start with one-platform halts near two towns; keep the streets and houses where possible.', action: this.tool('station', 'Station tool') },
-      { id: 'track', title: 'Connect them with track', hint: 'Start with single track, from a platform end to the other station. Check the cost before building.', action: this.tool('rail', 'Track tool') },
+      { id: 'track', title: 'Connect them with track', hint: 'Start with single track, from a platform end to the other station. Check the cost before building; overhead wire continues automatically from wired track.', action: this.tool('rail', 'Track tool') },
       { id: 'depot', title: 'Add a train depot', hint: 'Place it at a free end of your track.', action: this.tool('depot-rail', 'Depot tool') },
       { id: 'line', title: 'Create a rail line', hint: 'Lines → Rail line, then click both stations.', action: ['Open lines', () => this.ui.openLines()] },
-      { id: 'train', title: 'Buy a train for the line', hint: 'Use Add train in the line window, or click your depot. Check the selected line before buying.' },
+      { id: 'train', title: 'Buy a train for the line', hint: 'Use Add train in the line window, or click your depot. Check the selected line before buying. Electric trains need overhead wire: use Electrify on the line.' },
       { id: 'delivery', title: 'Deliver the first passengers', hint: 'Assign the train to the line and let it run.' },
     ];
   }

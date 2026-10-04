@@ -96,7 +96,7 @@ for (let step = 0; step < STEPS; step++) {
       const kind = r.chance(0.55) ? 'rail' : 'road';
       const a = near(town.x, town.z, town.radius + 15), b = near(a.x, a.z, 25);
       const sa: Snap = findSnap(g, kind, a.x, a.z, 1.5), sb: Snap = findSnap(g, kind, b.x, b.z, 1.5);
-      const p = planEdge(g, sa, sb, { kind, type: kind === 'rail' ? (r.chance(0.8) ? 'standard' : 'highspeed') : r.chance(0.5) ? 'road' : 'street', tracks: kind === 'rail' ? 1 + r.int(2) : 1, heightOffset: r.chance(0.2) ? (r.next() - 0.5) * 6 : 0, crossing: r.pick(['auto', 'auto', 'over', 'under', 'level'] as const), owner: 0, tram: kind === 'road' && r.chance(0.25) });
+      const p = planEdge(g, sa, sb, { kind, type: kind === 'rail' ? (r.chance(0.8) ? 'standard' : 'electric') : r.chance(0.5) ? 'road' : 'street', tracks: kind === 'rail' ? 1 + r.int(2) : 1, heightOffset: r.chance(0.2) ? (r.next() - 0.5) * 6 : 0, crossing: r.pick(['auto', 'auto', 'over', 'under', 'level'] as const), owner: 0, tram: kind === 'road' && r.chance(0.25) });
       if (p.ok && !commitProposal(g, p)) did('built ' + kind);
     } else if (k < 0.33) {
       op = 'station';

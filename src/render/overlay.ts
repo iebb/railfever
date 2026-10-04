@@ -7,7 +7,7 @@ import type { DepotPlan, DepotKind } from '../game/build-ops';
 import { depotSize } from '../game/build-ops';
 import { arcTable, tAtS, bezPoint } from '../game/geom';
 import { profAt } from '../game/network';
-import { ROAD_TYPES, WATER_Y, NetKind } from '../game/constants';
+import { ROAD_TYPES, TRACK_TYPES, WATER_Y, NetKind } from '../game/constants';
 import { FLOOR_H } from '../game/towns';
 
 export type MarkerKind = 'node' | 'edge' | 'free' | 'start' | 'signal' | 'point';
@@ -485,6 +485,7 @@ export class Overlay {
       // centre line (rail) / lane divider (road) for readability; embedded rails for tram roads
       if (road && p.opts.tram) { ribbon(b, pts, n, 0.014, 0.05, () => cLine, 0.072); ribbon(b, pts, n, 0.014, 0.05, () => cLine, -0.072); }
       else ribbon(b, pts, n, road ? 0.025 : 0.04, 0.05, () => cLine);
+      if (!road && TRACK_TYPES[p.opts.type]?.electrified) ribbon(b, pts, n, 0.012, 0.58, () => cLine);
       this.structures(b, pts, types, n, step, hw, cPier, cPortal);
     }
     this.ghost.set(b);
