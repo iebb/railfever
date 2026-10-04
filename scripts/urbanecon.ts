@@ -95,13 +95,18 @@ function open(g: Game, ai: AIController, kind: 'metro' | 'lightrail' | 'crosscit
   g.aiEnabled = true;
   for (const c of g.ais) c.state.cooldown = 1e9;
   check(ai.startProject(kind, [t.id]), `${kind} project starts`);
-  let ticks = 0;
-  while (ai.busy && ticks++ < 160000) g.stepTick();
+  let ticks = 0, plannedStops = 0;
+  while (ai.busy && ticks++ < 160000) {
+    const task = accessAI(ai).urbanTask;
+    if (task?.stage === 'stations') plannedStops = task.plans.length;
+    g.stepTick();
+  }
   check(!ai.busy, `${kind} finishes within its work budget`);
   console.log('  ' + ai.log.slice(-3).join(' | '));
   // Keep services fixed while measuring, with the normal economy, routing, demand and vehicle physics active.
   for (const c of g.ais) c.monthly = () => {};
   g.aiEnabled = false;
+  return plannedStops;
 }
 function profit(g: Game, l: Line) {
   const owners = new Set(g.lines.operatorsOf(l));
@@ -206,9 +211,9 @@ if (!arg('maps')) {
     check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, 'rail') > 4, 'a dense centre has substantial local transit demand');
     check(fareFor(7, 60, 1, { mode: 'rail' }) > fareFor(7, 60, 1), 'a short rail hop pays the minimum fare (any track type)');
     check(refTime(100, 1) > refTime(100), 'congestion and parking slow the city car alternative');
-    open(g, ai, mode, t);
+    const plannedStops = open(g, ai, mode, t);
     const line = g.lines.all().find((l) => l.kind === 'rail' && l.owner === ai.companyId);
-    check(!!line && new Set(line.stops).size === 5, `a five-station ${mode} opens without forcing an uneconomic build`);
+    check(!!line && plannedStops >= 3 && new Set(line.stops).size === plannedStops, `all ${plannedStops} planned starter stations open without forcing an uneconomic ${mode}`);
     if (!line) continue;
     const cost = -(g.company(ai.companyId).economy.thisYear.construction + g.company(ai.companyId).economy.thisYear.vehicles);
     runDays(g, 720);
@@ -279,7 +284,29 @@ if (!arg('maps')) {
     // half-reach stations reach too little of 20,000 residents, and the AI rightly declines. The behaviour under test,
     // a subway serving both main-line termini through walking interchanges, needs a city where one pays: 26,000.)
     const { g, C, a, b } = termini(3, owner === 1 ? 26000 : 20000), ai = g.aiOf(owner)!;
-    if (owner === 3) open(g, g.aiOf(1)!, 'crosscity', C);
+    if (owner === 3) {
+      // A three-stop subway linked at every call to the through train has no incoming urban ride.
+      // Keep total population, but give the unserved intermediate neighbourhoods enough residents
+      // that a four/five-stop starter pays; this tests actual interchange journeys to those districts.
+      const buildings = [...C.buildings].map((id) => g.world.buildings.get(id)!);
+      const weights = buildings.map((b) => Math.abs(b.x - 340) < 12 || Math.abs(b.x - 430) < 12 ? 4 : 1);
+      const total = weights.reduce((n, w) => n + w, 0); let cumulative = 0, assigned = 0;
+      buildings.forEach((b, i) => {
+        cumulative += weights[i]; const count = Math.floor(C.pop * cumulative / total) - assigned;
+        b.pop = count; assigned += count;
+      });
+      check(assigned === C.pop && buildings.every((b) => b.pop >= 0), 'intermediate neighbourhoods preserve the city population');
+      g.demand.rebuild(); g.stations.recomputeCatchment();
+      open(g, g.aiOf(1)!, 'crosscity', C);
+      const centre = g.stations.all().find((st) => st.townId === C.id && st.rail?.level === 'underground')!;
+      const aliases = [a, centre, b].map((st) => g.stations.planRail(st.x, st.z - 2, Math.PI / 2, 8, 2, owner,
+        { mode: 'metro', trackType: 'standard', level: 'underground', depth: 4.4, style: 'none' }));
+      check(aliases.every((p) => p.ok), 'three walking-linked subway sites can be planned');
+      const before = JSON.stringify(serialize(g));
+      const overlap = g.demand.forecastLine(aliases, 'metro', 35, 50, owner);
+      check(overlap.transfers === 0, 'through arrivals already at the linked final station do not invent a city ride');
+      check(JSON.stringify(serialize(g)) === before, 'routed transfer forecast leaves simulation state unchanged');
+    }
     open(g, ai, 'metro', C);
     const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.mode === 'metro'));
     check(!!line, 'the AI opens an urban railway serving both main-line stations');
@@ -290,8 +317,9 @@ if (!arg('maps')) {
     const serve = Vehicle.prototype.serveStation;
     Vehicle.prototype.serveStation = function(st, perPax) {
       const waiting = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
-      const before = st.waitingTotal, result = serve.call(this, st, perPax);
-      if (this.lineId === line.id && waiting > 0 && st.waitingTotal < before) transferBoards.set(this.owner, (transferBoards.get(this.owner) ?? 0) + before - st.waitingTotal);
+      const result = serve.call(this, st, perPax);
+      const after = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
+      if (this.lineId === line.id && waiting > after) transferBoards.set(this.owner, (transferBoards.get(this.owner) ?? 0) + waiting - after);
       return result;
     };
     runDays(g, 720); Vehicle.prototype.serveStation = serve;

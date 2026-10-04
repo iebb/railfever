@@ -465,6 +465,7 @@ function chainSites(sx: number, sz: number, ux: number, uz: number, turn: number
 
 /** The line's service today, for valuing changes (as ai.ts urbanEconomics: physics-based hop times). */
 interface Service {
+  owner: number; line: number;
   cars: VehicleModel[]; trains: number; totalTrains: number; pid: number; path: number[];
   cycle: number; headway: number; hop: number; kmh: number; spacing: number;
   perTrain: number; wear: number; seats: number; trips: number; price: number; depot: number;
@@ -494,7 +495,7 @@ function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = []
   const info = h.managed()?.get(l.id);
   const home = ours[0] ?? fleet[0];
   const depot = info && g.depots.get(info.depot)?.owner === h.me ? info.depot : home.depotId;
-  return { cars, trains: ours.length, totalTrains: main.vehicles, pid: p.id, path: served, cycle,
+  return { owner: h.me, line: l.id, cars, trains: ours.length, totalTrains: main.vehicles, pid: p.id, path: served, cycle,
     headway: cycle / main.vehicles, hop, kmh: len * UNIT_M / (cycle / 2) * 3.6, spacing,
     perTrain: yr.total, wear: yr.trackWearPerUnit, seats: cars.reduce((a, m) => a + m.capacity, 0),
     trips: yr.trips, price: cars.reduce((a, m) => a + m.cost, 0), depot };
@@ -503,7 +504,7 @@ function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = []
 const routeLength = (points: (Station | StationPlan)[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
 /** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern. */
 const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service, extra = 0) =>
-  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra));
+  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line);
 /** The operator's share of the passenger receipts the pattern's combined fleet can carry. */
 const carried = (f: { revenue: number; boardings: number }, sv: Service, extra = 0) =>
   f.revenue * Math.min(1, (sv.totalTrains + extra) * sv.trips * sv.seats * 0.7 / Math.max(1, f.boardings))

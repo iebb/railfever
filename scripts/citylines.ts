@@ -55,13 +55,16 @@ for (const size of sizes) for (const seed of seeds) {
       const ok = spend(amount, category, force), p = a.project;
       if (ok && p && (p.kind === 'metro' || p.kind === 'lightrail') && (category === 'construction' || category === 'vehicles')) {
         const f = funding.get(p) ?? { spent: 0 }; f.spent += amount; funding.set(p, f);
+        const opening = openings.get(p.line); if (opening) opening.capital = f.spent;
       }
       return ok;
     };
     ai.eco.earn = (amount, category = 'income') => {
       earn(amount, category);
       const p = a.project, f = p && funding.get(p);
-      if (f && (category === 'construction' || category === 'vehicles')) f.spent -= amount;
+      if (f && (category === 'construction' || category === 'vehicles')) {
+        f.spent -= amount; const opening = openings.get(p.line); if (opening) opening.capital = f.spent;
+      }
     };
   }
   const create = g.lines.create.bind(g.lines);
@@ -70,7 +73,7 @@ for (const size of sizes) for (const seed of seeds) {
     if (kind === 'rail' && task?.estimate) {
       const e = task.estimate;
       openings.set(l.id, { id: l.id, owner, mode: task.mode, day: g.day, forecast: e.forecast.revenue, forecastCost: e.yearly,
-        quotedCapital: e.total, capital: 0, rate: a!.eco.interestRate, depot: task.depot, edges: [...a!.project.edges], years: [] });
+        quotedCapital: e.total, capital: funding.get(a!.project)?.spent ?? 0, rate: a!.eco.interestRate, depot: task.depot, edges: [...a!.project.edges], years: [] });
     }
     return l;
   }) as typeof g.lines.create;

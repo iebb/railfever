@@ -3938,7 +3938,7 @@ export class AIController {
     // retain the best return the company can fund. Six trains must not hide a viable two-train metro.
     for (let f = fleet; f <= f0 + 2; f++) {
       const headway = 2 * hop * Math.max(1, points.length - 1) / f;
-      const forecast = g.demand.forecastLine(points, mode, kmh, headway);
+      const forecast = g.demand.forecastLine(points, mode, kmh, headway, this.companyId);
       const capacity = f * yr.trips * cars.reduce((a, m) => a + m.capacity, 0) * 0.7;
       forecast.revenue *= Math.min(1, capacity / Math.max(1, forecast.boardings));
       const fleetCost = f * cars.reduce((a, m) => a + m.cost, 0), total = works + fleetCost;
