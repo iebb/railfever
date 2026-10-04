@@ -9,6 +9,8 @@ import { lineGraph, lineTable, mailFleet, TRANSFER_PENALTY_S, PLATFORM_CHANGE_S 
 import { transferWalkTime } from './fares';
 import type { RNG } from './rng';
 import { rerouteMail, type LineMail } from './mail';
+import { LEGACY_POLICY, PHYSICAL_POLICY, type TravelPolicy, type LegacyPolicy } from './travel-policy';
+import { TravelRouter, type PartAccess, type TieContext, type ArrivalState } from './travel-choice';
 
 export interface Line {
   id: number;
@@ -174,14 +176,16 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
 }
 
 /** Routing tables from each source over a routing graph: Map(source -> Map(dest -> first hop)), filled into `out`. */
-export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>()): Map<number, Map<number, Hop>> {
+export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>(), policy: LegacyPolicy = LEGACY_POLICY): Map<number, Map<number, Hop>> {
+  if (policy !== LEGACY_POLICY) throw new Error('Physical routing needs arrival states');
   const open = new RouteHeap();
   for (const src of sources) out.set(src, routeFrom(edges, src, open));
   return out;
 }
 
 /** The passenger or mail routing graph of the lines as they are (their tables; walking links), and the stations served. */
-export function routeGraph(g: Game, cargo: Cargo = 'pax'): { edges: Map<number, RouteEdge[]>; served: Set<number> } {
+export function routeGraph(g: Game, cargo: Cargo = 'pax', policy: LegacyPolicy = LEGACY_POLICY): { policy: LegacyPolicy; edges: Map<number, RouteEdge[]>; served: Set<number> } {
+  if (policy !== LEGACY_POLICY) throw new Error('Use Lines.shadowRouting for physical services');
   const edges = new Map<number, RouteEdge[]>(), served = new Set<number>();
   for (const l of g.lines.map.values()) {
     if (l.stops.length < 2 || l.vehicles.length === 0 || (cargo === 'mail' && mailFleet(g, l) === 'none')) continue;
@@ -194,7 +198,7 @@ export function routeGraph(g: Game, cargo: Cargo = 'pax'): { edges: Map<number, 
     const sa = stations.get(wl.from), sb = stations.get(wl.to);
     addEdge(edges, wl.from, { to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 });
   }
-  return { edges, served };
+  return { policy, edges, served };
 }
 
 /** Who may join a line as a further operator: anyone ('open'), companies the lead adds ('invite'), nobody. */
@@ -275,12 +279,26 @@ export class Lines {
   nextId = 1;
   /** routing[s] = Map(dest -> first hop) */
   routing = new Map<number, Map<number, Hop>>();
+  readonly routingPolicy = LEGACY_POLICY;
   servedStations = new Set<number>();
   /**
    * Mail routing over the lines with vehicles that carry mail (and walking links): mailRouting[s] = Map(dest -> first
    * hop). Where every line of a transfer complex carries mail on every vehicle, the passenger table itself.
    */
   mailRouting = new Map<number, Map<number, Hop>>();
+  readonly mailRoutingPolicy = LEGACY_POLICY;
+  readonly routingByPolicy = new Map([[LEGACY_POLICY, { pax: this.routing, mail: this.mailRouting }]]);
+  private shadowRouter?: TravelRouter;
+  /** Physical policy remains shadow-only in stage 2; existing nextHop/boarding/fare callers stay legacy. */
+  shadowRouting(policy: TravelPolicy = this.game.travelPolicy): TravelRouter | undefined {
+    if (policy !== PHYSICAL_POLICY) return;
+    const services = this.game.physicalServices(policy);
+    if (this.shadowRouter?.services !== services) this.shadowRouter = new TravelRouter(services);
+    return this.shadowRouter;
+  }
+  queryTransit(access: readonly PartAccess[], egress: readonly PartAccess[], tie: TieContext, arrival: ArrivalState = 'start') {
+    return this.shadowRouting()?.queryTransit(access, egress, tie, arrival);
+  }
   /** stations a line with vehicles carrying mail calls at (Lines.mailServed) */
   mailStations = new Set<number>();
   /** some vehicle on a line carries mail only (passenger shares then count only the vehicles with seats) */
@@ -806,7 +824,7 @@ export class Lines {
     for (const src of medges.keys()) {
       const root = find(src);
       if (!served.has(root)) continue;
-      const shared = apart.has(root) ? undefined : this.routing.get(src);
+      const shared = apart.has(root) || this.mailRoutingPolicy !== this.routingPolicy ? undefined : this.routingByPolicy.get(this.mailRoutingPolicy)?.pax.get(src);
       this.mailRouting.set(src, shared ?? routeFrom(medges, src, open));
     }
   }

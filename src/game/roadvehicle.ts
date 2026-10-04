@@ -57,6 +57,11 @@ function slowZones(c: Curve3, base: number): [number, number, number][] {
 
 const BRAKE = 0.3;
 const G = 0.981;
+/** Pure runtime acceleration (units/s²); forecast callers convert SI speed to units/s. */
+export function roadAcceleration(power: number, mass: number, speed: number, grade: number): number {
+  const tract = Math.min(1.6, power / (mass * Math.max(3, speed * 10)));
+  return (tract - 0.02) / 10 - G * grade;
+}
 const brakeTo = (dist: number) => Math.sqrt(2 * BRAKE * Math.max(0, dist));
 
 export function laneTrim(g: Game, e: NEdge): [number, number] {
@@ -147,7 +152,7 @@ export function roadNext(g: Game, e: NEdge, dir: number): { edge: NEdge; dir: nu
  * A* from the end of lane (edge, dir) to an edge carrying a stop of the target station. `allow` restricts
  * the edges (trams: tram tracks the owner may use); where nothing allowed continues, turning is cheap.
  */
-export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000, allow?: (e: NEdge) => boolean, uturn = 40): RCont[] | null {
+export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number, maxExpand = 40000, allow?: (e: NEdge) => boolean, uturn = 40, profile?: { edge: number; dir: number }): RCont[] | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.stops.length) return null;
@@ -199,11 +204,12 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
     const e = net.edges.get(NE[i])!;
     const d = ND[i];
     if ((best.get(key(e.id, d)) ?? Infinity) < NG[i]) continue;
-    if (goals.has(e.id)) {
+    if (goals.has(e.id) && (!profile || (e.id === profile.edge && d === profile.dir))) {
       const out: RCont[] = [];
       for (let j = i; j >= 0; j = NP[j]) out.push({ edge: NE[j], dir: ND[j] });
       return out.reverse();
     }
+    if (profile && goals.has(e.id)) continue;
     if (++n > maxExpand) break;
     expand(e, d, NG[i], i);
   }
@@ -607,8 +613,7 @@ export class RoadVehicle extends Vehicle {
       this.grade = this.length > 0.1 ? (A.y - B.y) / this.length : 0;
     }
     const P = this.model ? this.model.power : 80, M = this.model ? this.model.weight + this.load * 0.075 + (this.mailLoad ? this.mailLoad * MAIL_UNIT_T : 0) : 1.4;
-    const tract = Math.min(1.6, P / (M * Math.max(3, v * 10)));
-    const acc = (tract - 0.02) / 10 - G * this.grade;
+    const acc = roadAcceleration(P, M, v, this.grade);
     if (v < vt) this.speed = Math.min(vt, v + Math.max(acc, 0.01) * dt);
     else this.speed = Math.max(vt, v - BRAKE * 1.6 * dt);
     if (this.speed < 0) this.speed = 0;

@@ -25,6 +25,7 @@ import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
 import { walkRoadsChanged } from './catchment';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
+import { LEGACY_POLICY, restoreTravelPolicy } from './travel-policy';
 
 const VERSION = 3;
 /** Save formats this build reads (v2: older single-record saves). */
@@ -367,6 +368,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
   const V = g.vehicles as any;
   return {
     version: VERSION, game: GAME_VERSION,
+    ...(g.travelPolicy === LEGACY_POLICY ? {} : { travelPolicy: g.travelPolicy }),
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
@@ -494,6 +496,7 @@ export function deserialize(d: any): Game {
   w.dirtyObj.clear(); w.dirtyTerrain.clear();
 
   const g = new Game({ ...d.options }, w);
+  g.travelPolicy = restoreTravelPolicy(d.travelPolicy);
   g.tick = Number.isSafeInteger(d.tick) && d.tick >= 0 ? d.tick : Math.max(0,
     (d.day ?? 0) * TICKS_PER_DAY + Math.min(TICKS_PER_DAY - 1, Math.max(0, Math.floor((d.dayFrac ?? 0) * TICKS_PER_DAY + 1e-6))));
   g.rng.state = d.rng;

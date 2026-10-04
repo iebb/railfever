@@ -23,6 +23,7 @@ import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
 import { simNow } from './fares';
 import { redirectMail, mergeLineMail } from './mail';
+import { LEGACY_POLICY, type LegacyPolicy } from './travel-policy';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -47,7 +48,7 @@ export const TRANSFER_PENALTY_S = 360;
 /** Routing: walking to another platform of the same station (s). */
 export const PLATFORM_CHANGE_S = 45;
 /** Dwell assumed per stop (s) in the timetables of the line graph. */
-const DWELL = { rail: 10, road: 6 };
+export const DWELL = { rail: 10, road: 6 };
 
 // ------------------------------------------------------------------------------ line routes
 /** Turning index of an out-and-back stop list (A, B, C, B -> 2; A, B -> 1), else -1. */
@@ -105,6 +106,12 @@ export function linePatterns(l: Line): ServicePattern[] {
   if (!l.patterns || !l.patterns.length) return [{ id: 0, name: PATTERN_LABEL.local, kind: 'local', stops: l.stops.map(() => true), ids: [...l.stops] }];
   for (const p of l.patterns) align(l, p);
   return l.patterns;
+}
+
+/** Aligned, effective flags without mutating saved patterns during shadow/forecast queries. */
+export function readServicePatterns(l: Line): ServicePattern[] {
+  const copy = { ...l, patterns: l.patterns?.map((p) => ({ ...p, stops: [...p.stops], ids: p.ids && [...p.ids] })) };
+  return linePatterns(copy).map((p) => ({ ...p, stops: servedFlags(copy, p), ids: [...l.stops] }));
 }
 
 /** The pattern a vehicle with pattern id `pid` runs (unknown or unset: the first), or null when the line has none. */
@@ -338,10 +345,9 @@ function sdist(g: Game, a: number, b: number): number {
 }
 
 interface PatTime { pid: number; flags: boolean[]; n: number; cycle: number; freq: number; hop: number[]; route: string; timing: number[] }
-export interface LineTable { ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
+export interface LineTable { policy: LegacyPolicy; ver: number; key: string; stops: number[]; nv: number; pats: PatTime[]; allowed: Set<string>; edges: { from: number; to: number; cost: number }[]; served: Set<number> }
 /** Cached line tables: passengers, and mail where the line's mail fleet differs from its passenger fleet. */
-const tables = new WeakMap<Game, Map<number, LineTable>>();
-const mailTables = new WeakMap<Game, Map<number, LineTable>>();
+const policyTables = new WeakMap<Game, Map<LegacyPolicy, { pax: Map<number, LineTable>; mail: Map<number, LineTable> }>>();
 
 /**
  * Which of a line's vehicles carry mail: 'none', 'all' (every vehicle carries passengers and mail: the mail table
@@ -387,11 +393,14 @@ function slowest(vs: Vehicle[]): VehicleModel[] {
  * expected journey time (half the combined headway of the services worth taking plus the ride) and the services worth
  * taking (attractive set). Mail: the passenger table itself when every vehicle carries both (mailFleet 'all').
  */
-export function lineTable(g: Game, l: Line, cargo: Cargo = 'pax'): LineTable {
-  if (cargo === 'mail' && mailFleet(g, l) === 'all') return lineTable(g, l);
-  const cache = cargo === 'mail' ? mailTables : tables;
-  let m = cache.get(g);
-  if (!m) { m = new Map(); cache.set(g, m); }
+export function lineTable(g: Game, l: Line, cargo: Cargo = 'pax', policy: LegacyPolicy = LEGACY_POLICY): LineTable {
+  if (policy !== LEGACY_POLICY) throw new Error('Use physical service strategies for shadow passenger routing');
+  if (cargo === 'mail' && mailFleet(g, l) === 'all') return lineTable(g, l, 'pax', policy);
+  let policies = policyTables.get(g);
+  if (!policies) { policies = new Map(); policyTables.set(g, policies); }
+  let tables = policies.get(policy);
+  if (!tables) { tables = { pax: new Map(), mail: new Map() }; policies.set(policy, tables); }
+  const m = tables[cargo];
   const hit = m.get(l.id);
   // between routing rebuilds (stop and vehicle edits rebuild): the same table
   if (hit && hit.ver === g.lines.version && hit.stops === l.stops && hit.nv === l.vehicles.length) return hit;
@@ -481,7 +490,7 @@ export function lineTable(g: Game, l: Line, cargo: Cargo = 'pax'): LineTable {
     edges.push({ from, to, cost: T });
     for (const o of take) allowed.add(o.pid + ':' + o.a + ':' + to);
   }
-  const t: LineTable = { ver: g.lines.version, key, stops: l.stops, nv: l.vehicles.length, pats, allowed, edges, served };
+  const t: LineTable = { policy, ver: g.lines.version, key, stops: l.stops, nv: l.vehicles.length, pats, allowed, edges, served };
   m.set(l.id, t);
   return t;
 }

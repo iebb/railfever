@@ -59,7 +59,7 @@ const TRANSMISSION = 0.92, ROTATING = 1.06;
  * Starting acceleration (m/s^2) a consist is designed for (traction equipment, passenger comfort): metro and
  * light-rail sets 1.2, multiple units and loco-hauled trains 1.0 (adhesion permitting), high-speed sets 0.7.
  */
-function accelCap(cars: VehicleModel[]): number {
+export function accelCap(cars: VehicleModel[]): number {
   if (!cars.length || !cars.every((c) => c.kind === 'emu')) return 1.0;
   if (cars.some((c) => c.speed >= 200)) return 0.7;
   return cars.every((c) => c.speed <= 110) ? 1.2 : 1.0;
@@ -71,9 +71,13 @@ function accelCap(cars: VehicleModel[]): number {
  * with its own aerodynamics.
  */
 export function trainForces(t: Train, v: number): { traction: number; resistance: number } {
-  const ph = t.phys, m = t.mass * 1000;
+  return railForces(t.mass, t.power, t.phys, v);
+}
+/** Pure runtime force law, also used by physical service estimates (mass t, power kW, speed m/s). */
+export function railForces(mass: number, power: number, ph: { driven: number; accel: number; aero: number }, v: number): { traction: number; resistance: number } {
+  const m = mass * 1000;
   const mu = 0.161 + 7.5 / (v * 3.6 + 44);
-  const traction = Math.min(mu * 9.81 * ph.driven * 1000, (t.power * 1000 * TRANSMISSION) / Math.max(2, v), m * ROTATING * ph.accel);
+  const traction = Math.min(mu * 9.81 * ph.driven * 1000, (power * 1000 * TRANSMISSION) / Math.max(2, v), m * ROTATING * ph.accel);
   return { traction, resistance: m * (DAVIS.a0 + DAVIS.a1 * v) + ph.aero * v * v };
 }
 /** Share of a multiple unit's mass on driven axles. */
@@ -232,7 +236,7 @@ export interface RouteResult { conts: Cont[]; cost: number }
  * A* over (edge, direction) to any platform edge of the target station. With `exit`, tracks the owner may not
  * use are allowed at a high cost (only to get off them).
  */
-export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null): RouteResult | null {
+export function findRailRoute(g: Game, start: Cont[], target: number, owner: number, selfId: number, maxExpand = 60000, exit = false, rule: TrackRule | null = null, profile?: { edge: number; dir: number }): RouteResult | null {
   const net = g.world.net;
   const st = g.stations.get(target);
   if (!st || !st.rail) return null;
@@ -248,7 +252,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
   };
   const cost = (e: NEdge) => {
     let c = e.len;
-    const r = V.getRes(e.id);
+    const r = profile ? 0 : V.getRes(e.id);
     if (r && r !== selfId) c += 40;
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
@@ -269,12 +273,14 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     const e = net.edges.get(NE[i])!;
     const d = ND[i];
     if ((best.get(key(e.id, d)) ?? Infinity) < NG[i]) continue;
-    if (e.station === target) {
+    if (e.station === target && (!profile || (e.id === profile.edge && d === profile.dir))) {
       const conts: Cont[] = [];
       for (let j = i; j >= 0; j = NP[j]) conts.push({ edge: net.edges.get(NE[j])!, dir: ND[j] });
       conts.reverse();
       return { conts, cost: NG[i] };
     }
+    // A called station stops a train at the first platform reached, even in a static profile search.
+    if (profile && e.station === target) continue;
     if (++n > maxExpand) break;
     for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge), i);
   }

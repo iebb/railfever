@@ -21,6 +21,7 @@ import { DemandModel, GEN_RATE } from './demand';
 import { resolveDeadlocks, lineCongestion } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
+import { physicalServices } from './travel-times';
 
 export interface NewGameOptions {
   size: number;
@@ -95,6 +96,9 @@ export const MAX_FRAME_SECONDS = 8 * TICK;
 const FRAME_BUDGET_MS = 20;
 
 export class Game {
+  /** Internal shadow policy. Live passengers and mail retain the release policy until stage 4. */
+  travelPolicy: import('./travel-policy').TravelPolicy = 'legacy';
+  physicalServices(policy = this.travelPolicy) { return physicalServices(this, policy); }
   world: World;
   towns: Towns;
   stations: Stations;
