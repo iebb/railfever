@@ -17,7 +17,7 @@ import type { Town } from './towns';
 import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
-import { patternHeadways, linePatterns } from './patterns';
+import { patternHeadways, linePatterns, lineTable } from './patterns';
 
 export interface Region {
   id: number;
@@ -93,6 +93,17 @@ const feederQuality = (headway: number) => Math.max(0, Math.min(1,
   (MAINLINE_FEEDERS.cutoffHeadway - headway) / (MAINLINE_FEEDERS.cutoffHeadway - MAINLINE_FEEDERS.fullHeadway)));
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
 interface FeederPool { pop: number; regions: Map<number, number> }
+type ForecastPoint = StationPlan | Station | ForecastSite;
+const forecastStation = (p: ForecastPoint): Station | null => 'id' in p ? p : 'join' in p ? p.join : null;
+/** Same passenger areas as the committed facility, including native curves and an inherited joined stop. */
+function plannedStation(p: StationPlan, id: number, owner?: number, townId = -1): Station {
+  return { ...(p.join ?? { stops: [], links: [] }), id, owner: owner ?? p.join?.owner ?? 0,
+    x: p.x, z: p.z, townId: p.join?.townId ?? townId, city: p.city, rail: {
+      x: p.x, z: p.z, y: p.y, angle: p.angle, length: p.length, tracks: p.tracks,
+      level: p.level, underground: p.underground, depth: p.depth, height: p.height, alignment: p.alignment,
+      width: p.layout.width, trackOffsets: p.layout.trackOffsets, platforms: p.layout.platforms,
+    } } as Station;
+}
 
 /** City rides of a complete routed transfer journey, with the fare history of each boarding. */
 export function forecastTransferJourney(tables: Map<number, Map<number, Hop>>, from: number, destination: number,
@@ -163,6 +174,9 @@ export class DemandModel {
   private feederKey = '';
   private feeders = new Map<number, FeederPool>();
   private feederWalkKey = '';
+  private forecastGraphKey = '';
+  private forecastRouting: Game['lines']['routing'] | null = null;
+  private forecastGraph = new Map<number, { to: number; line: number; cost: number }[]>();
   private feederWalks = new Map<string, Map<number, number>>();
 
   constructor(private g: Game) {}
@@ -659,7 +673,15 @@ export class DemandModel {
    * feeder pool too; a city line's (every stop in one town) transfer demand is the arrivals at the town's other served
    * rail stations continuing to these districts, not another population pool.
    */
-  forecastLine(points: (StationPlan | Station | ForecastSite)[], _style: RailMode, kmh: number, headway: number, owner?: number, replacingLine?: number): ServiceForecast {
+  forecastLine(points: ForecastPoint[], _style: RailMode, kmh: number, headway: number, owner?: number, replacingLine?: number,
+    replacingPattern?: number): ServiceForecast {
+    // Keep every stop occurrence and output leg index. A joined facility/duplicate occurrence
+    // shares one physical population claim and origin; it is not another passenger destination.
+    const identities = points.map((p, i) => forecastStation(p)?.id ?? -i - 1);
+    const first = new Map<number, number>(); identities.forEach((id, i) => { if (!first.has(id)) first.set(id, i); });
+    const ranks = [...first.keys()], rank = identities.map(id => ranks.indexOf(id));
+    points = points.map((p, i) => first.get(identities[i]) === i
+      ? points.find(q => 'join' in q && q.join?.id === identities[i]) ?? p : p);
     const g = this.g;
     if (!this.regions.length) this.rebuild();
     const n = this.regions.length;
@@ -669,43 +691,84 @@ export class DemandModel {
       return { x: p.x, z: p.z, townId, pop: 0, regions: new Map<number, number>(),
         walk: 'walk' in p ? p.walk : built ? walkingCatchment(g, p) : planWalkingCatchment(g, p) };
     });
-    const ownStation = (id: number) => points.some((p) => 'id' in p && p.id === id);
+    const own = new Set(points.flatMap(p => { const st = forecastStation(p); return st ? [st.id] : []; }));
+    const ownStation = (id: number) => own.has(id);
     // per building: the sum and the best of the walking weights reaching it (the share-out's rule, Stations.computeShares)
     const sums = new Map<number, number>(), bests = new Map<number, number>();
     const reach = (bid: number, w: number) => { sums.set(bid, (sums.get(bid) ?? 0) + w); if (w > (bests.get(bid) ?? 0)) bests.set(bid, w); };
-    for (const s of sites) for (const [bid, walk] of s.walk.buildings) reach(bid, walkWeight(walk.distance));
+    sites.forEach((s, i) => {
+      if (first.get(identities[i]) === i) for (const [bid, walk] of s.walk.buildings) reach(bid, walkWeight(walk.distance));
+    });
     // Competing served stops share a building just as they do after construction (far-only buildings partly covered).
+    const competing = new Map<number, WalkingCatchment>();
+    const oldSums = new Map<number, number>(), oldBests = new Map<number, number>();
     for (const st of g.stations.map.values()) {
-      if (ownStation(st.id) || !g.lines.stationServed(st.id)) continue;
-      for (const [bid, walk] of walkingCatchment(g, st).buildings) if (sums.has(bid)) reach(bid, walkWeight(walk.distance));
+      if (!g.lines.stationServed(st.id)) continue;
+      const walk = walkingCatchment(g, st);
+      if (!ownStation(st.id)) competing.set(st.id, walk);
+      for (const [bid, entry] of walk.buildings) if (sums.has(bid)) {
+        const w = walkWeight(entry.distance);
+        oldSums.set(bid, (oldSums.get(bid) ?? 0) + w); oldBests.set(bid, Math.max(oldBests.get(bid) ?? 0, w));
+        if (!ownStation(st.id)) reach(bid, w);
+      }
     }
-    for (const s of sites) for (const [bid, walk] of s.walk.buildings) {
-      const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
-      const pop = b.pop * (walkWeight(walk.distance) / sums.get(bid)! * coverOf(bests.get(bid)!));
-      const r = this.regionOf(b); if (r < 0) continue;
-      s.pop += pop; s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
+    for (let i = 0; i < sites.length; i++) {
+      if (first.get(identities[i]) !== i) continue;
+      const s = sites[i];
+      for (const [bid, walk] of s.walk.buildings) {
+        const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
+        const pop = b.pop * (walkWeight(walk.distance) / sums.get(bid)! * coverOf(bests.get(bid)!));
+        const r = this.regionOf(b); if (r < 0) continue;
+        s.pop += pop; s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
+      }
     }
     // Keep the walking-only population for intra-town trips: car feeders provide regional access, not extra
     // local residents at the platforms. This matches weights() when a through railway has several city stops.
     const walking = sites.map((s) => ({ pop: s.pop, regions: new Map(s.regions) }));
     // A city line has no cross-town trips, hence no car feeders (as in weights(): only cross-town service has a pool).
     const city = sites.every((s) => s.townId >= 0 && s.townId === sites[0].townId);
+    const backgroundFeeders = new Map<number, FeederPool>();
     if (!city) {
       const covered = new Set<number>(sums.keys());
       for (const st of g.stations.map.values()) if (g.lines.stationServed(st.id)
         && [...(g.lines.routing.get(st.id)?.keys() ?? [])].some((id) => g.stations.get(id)?.townId !== st.townId))
         for (const bid of walkingCatchment(g, st).buildings.keys()) covered.add(bid);
       const extra: FeederSite[] = sites.map((s, i) => {
-        const p = points[i], access = 'access' in p ? p.access?.tracks.flatMap((t) => [t.start, t.end]) : undefined;
-        return 'id' in p ? { ...s, quality: feederQuality(headway), access: this.feederSite(p).access } : { ...s, quality: feederQuality(headway), access };
+        const p = points[i], built = forecastStation(p);
+        const access = built ? this.feederSite(built).access
+          : 'access' in p ? p.access?.tracks.flatMap(t => [t.start, t.end]) : undefined;
+        return { ...s, quality: first.get(identities[i]) === i ? feederQuality(headway) : 0, access };
       });
-      for (const st of g.stations.map.values()) if (st.rail && stationActive(g, st) && g.lines.stationServed(st.id) && !ownStation(st.id))
-        extra.push(this.feederSite(st));
+      const others = [...g.stations.map.values()].filter(st => st.rail && stationActive(g, st) && g.lines.stationServed(st.id) && !ownStation(st.id));
+      for (const st of others) extra.push(this.feederSite(st));
       const pools = this.feederPools(extra, covered);
+      others.forEach((st, i) => backgroundFeeders.set(st.id, pools[sites.length + i]));
       sites.forEach((s, i) => {
         s.pop += pools[i].pop;
         for (const [r, pop] of pools[i].regions) s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
       });
+    }
+    const context = this.forecastRoutes(points, kmh, headway, owner, replacingLine, replacingPattern);
+    const background = new Map<number, { walking: Map<number, number>; regional: Map<number, number> }>();
+    if (context) {
+      this.refreshFeeders();
+      for (const [id, walk] of competing) {
+        const st = g.stations.get(id)!; if (!stationActive(g, st)) continue;
+        const regions = new Map((this.shares.get(id) ?? []).map(([r, share]) => [r, st.catchPop * share]));
+        // Only the overlapping buildings change their native walking allocation. Outside shares stay intact.
+        for (const [bid, entry] of walk.buildings) if (sums.has(bid)) {
+          const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
+          const r = this.regionOf(b); if (r < 0) continue;
+          const w = walkWeight(entry.distance);
+          const old = w / Math.max(1e-9, oldSums.get(bid) ?? 0) * coverOf(oldBests.get(bid) ?? 0);
+          const now = w / sums.get(bid)! * coverOf(bests.get(bid)!);
+          regions.set(r, Math.max(0, (regions.get(r) ?? 0) + b.pop * (now - old)));
+        }
+        const regional = new Map(regions);
+        for (const [r, pop] of (backgroundFeeders.get(id) ?? this.feeders.get(id))?.regions ?? [])
+          regional.set(r, (regional.get(r) ?? 0) + pop);
+        background.set(id, { walking: regions, regional });
+      }
     }
     let boardings = 0, revenue = 0, transfers = 0;
     const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
@@ -726,9 +789,29 @@ export class DemandModel {
           y += w * this.ld[r * n + q] / TRIPS_PER_MONTH;
         }
         const centre = s.townId === t.townId ? Math.min(urbanIntensity(g, s), urbanIntensity(g, t)) : 0;
-        const seconds = estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(i - j) - 1) * 8;
+        const seconds = estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(rank[i] - rank[j]) - 1) * 8;
         const f = tripFactor(seconds, refTime(d, centre)) / TF_TYPICAL;
         parts.push({ count: x, ld: y, f, d, seconds, j, centre, sourceShare: source.pop / s.pop }); local += x; localF += x * f;
+      }
+      // Every reachable destination competes for local trips, as in weights(). Only this service's
+      // own destinations receive direct receipts here; external transfer receipts are priced separately.
+      for (const [id, hop] of context?.tables.get(context.ids[i]) ?? []) {
+        if (ownStation(id) || context!.ids.includes(id)) continue;
+        const dest = g.stations.get(id), cov = background.get(id);
+        if (!dest || !cov) continue;
+        const sameTown = s.townId >= 0 && s.townId === dest.townId;
+        const source = sameTown ? walking[i] : s;
+        if (!source.pop) continue;
+        const regions = sameTown ? cov.walking : cov.regional;
+        const d = Math.hypot(s.x - dest.x, s.z - dest.z), walk = Math.min(1, d / WALK);
+        let x = 0;
+        for (const [r, origin] of source.regions) for (const [q, pop] of regions) {
+          if (r >= n || q >= n) continue;
+          x += origin / source.pop * Math.min(1, pop / Math.max(1, this.regions[q].pop)) * this.od[r * n + q] * (r === q ? walk : 1);
+        }
+        const centre = sameTown ? Math.min(urbanIntensity(g, s), urbanIntensity(g, dest)) : 0;
+        const f = tripFactor(hop.cost, refTime(d, centre)) / TF_TYPICAL;
+        local += x; localF += x * f;
       }
       const k = localF > 0 ? localCapture(local, localF) / localF : 0;
       const wanted = parts.map((p) => {
@@ -746,7 +829,7 @@ export class DemandModel {
       const length = 'rail' in p ? p.rail?.length ?? 0 : 'length' in p ? p.length ?? PLATFORM_LENGTH.mainline : PLATFORM_LENGTH.mainline;
       const tracks = 'rail' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks ?? 2 : 2;
       const queue = Math.min(300, 12 + walking[i].pop * 0.035 + tracks * length * 0.75);
-      const slots = queue * (360 * DAY_SECONDS) / Math.max(1, headway) * (i === 0 || i === sites.length - 1 ? 1 : 2);
+      const slots = queue * (360 * DAY_SECONDS) / Math.max(1, headway) * (rank[i] === 0 || rank[i] === ranks.length - 1 ? 1 : 2);
       const capture = Math.min(1, slots / Math.max(1, sum));
       for (let j = 0; j < parts.length; j++) {
         const p = parts[j], count = wanted[j] * capture;
@@ -764,6 +847,80 @@ export class DemandModel {
     return { boardings, revenue, transfers, legLoads, covered: sites.reduce((a, s) => a + s.pop, 0) };
   }
 
+  /** Disposable passenger graph for the proposed timetable. Never edits a live line, pattern or vehicle. */
+  private forecastRoutes(points: ForecastPoint[], kmh: number, headway: number, owner?: number,
+    replacingLine?: number, replacingPattern?: number) {
+    const g = this.g, ids = points.map((p, i) => forecastStation(p)?.id ?? -i - 1), own = new Set(ids);
+    const unique = [...own], rank = ids.map(id => unique.indexOf(id));
+    // No other destinations: retain the previous direct forecast arithmetic exactly.
+    if (![...g.lines.routing.keys()].some(id => !own.has(id))) return null;
+    const key = g.lines.version + ':' + g.networkVersion;
+    if (key !== this.forecastGraphKey || this.forecastRouting !== g.lines.routing) {
+      this.forecastGraphKey = key; this.forecastRouting = g.lines.routing; this.forecastGraph = routeGraph(g).edges;
+    }
+    const edges = new Map(this.forecastGraph), copied = new Set<number>(), proposed = -2;
+    const add = (from: number, to: number, line: number, cost: number) => {
+      if (!copied.has(from)) { edges.set(from, [...(edges.get(from) ?? [])]); copied.add(from); }
+      edges.get(from)!.push({ to, line, cost });
+    };
+    const existing = replacingLine === undefined ? undefined : g.lines.get(replacingLine);
+    const operator = owner ?? points.map(forecastStation).find(st => st)?.owner;
+    const replace = existing?.kind === 'rail' && operator !== undefined && g.lines.operatorsOf(existing).includes(operator)
+      && (replacingPattern !== undefined ? linePatterns(existing).some(p => p.id === replacingPattern) : existing.stops.every(id => own.has(id)));
+    const opts = new Map<string, { ride: number; f: number }[]>();
+    const option = (from: number, to: number, ride: number, f: number) => {
+      const key = from + ':' + to, arr = opts.get(key) ?? []; arr.push({ ride, f }); opts.set(key, arr);
+    };
+    if (replace) {
+      for (const [id, es] of edges) edges.set(id, es.filter(e => e.line !== existing.id));
+      if (replacingPattern !== undefined) {
+        // Rebuild native attractive sets from the untouched patterns, not an aggregate with the old
+        // quoted pattern still in it. Hop times/frequencies are exactly those used by lineGraph().
+        const n = existing.stops.length;
+        for (const pt of lineTable(g, existing).pats) if (pt.pid !== replacingPattern) {
+          for (let a = 0; a < n; a++) if (pt.flags[a]) {
+            let ride = 0; const seen = new Set([existing.stops[a]]);
+            for (let k = 1, j = a; k < n; k++) {
+              ride += pt.flags[j] ? pt.hop[j] : 0; j = (a + k) % n;
+              if (!pt.flags[j] || seen.has(existing.stops[j])) continue;
+              seen.add(existing.stops[j]);
+              option(existing.stops[a], existing.stops[j], Math.max(1, ride - 10), pt.freq);
+            }
+          }
+        }
+      }
+    }
+    for (let i = 0; i < points.length; i++) for (let j = 0; j < points.length; j++) if (ids[i] !== ids[j]
+      && ids.indexOf(ids[i]) === i && ids.indexOf(ids[j]) === j) {
+      const d = Math.hypot(points[i].x - points[j].x, points[i].z - points[j].z);
+      const ride = estimateLegTime(d, kmh, 0, 1.05) + Math.max(0, Math.abs(rank[i] - rank[j]) - 1) * 8;
+      if (replace) option(ids[i], ids[j], ride, 1 / Math.max(1, headway));
+      else add(ids[i], ids[j], proposed, ride + Math.max(0, headway) / 2);
+    }
+    if (replace) for (const [key, arr] of opts) {
+      arr.sort((a, b) => a.ride - b.ride);
+      let F = 0, RF = 0, T = Infinity;
+      for (const o of arr) { if (o.ride >= T) break; F += o.f; RF += o.f * o.ride; T = (0.5 + RF) / F; }
+      const [from, to] = key.split(':').map(Number); add(from, to, existing.id, T);
+    }
+    for (let i = 0; i < points.length; i++) {
+      const p = points[i]; if (ids.indexOf(ids[i]) !== i || !('links' in p)) continue;
+      // A built point already has these graph links. StationPlan.links is the native preflight's
+      // exact accepted transfer set; a join reuses its station and inherited links.
+      if ('id' in p) continue;
+      const links = new Map(p.links.map(st => [st.id, st]));
+      for (const id of p.join?.links ?? []) { const st = g.stations.get(id); if (st) links.set(id, st); }
+      for (const st of links.values()) {
+        if (st.id === ids[i]) continue;
+        for (const [from, to] of [[ids[i], st.id], [st.id, ids[i]]])
+          edges.set(from, (edges.get(from) ?? []).filter(e => e.line !== WALK_LINE || e.to !== to));
+        const time = transferWalkTime(g.stations.gap(plannedStation(p, ids[i], operator), st));
+        add(ids[i], st.id, WALK_LINE, time); add(st.id, ids[i], WALK_LINE, time);
+      }
+    }
+    return { ids, tables: routeTables(edges, unique) };
+  }
+
   /** Route proposed city connections through the same passenger graph and transfer penalties as actual journeys.
    * A main-line arrival whose destination is reached by the walking complex needs no urban ride. Count only
    * journeys between an outside town and a proposed stop whose chosen route actually boards this city service. */
@@ -772,7 +929,7 @@ export class DemandModel {
   }[], kmh: number, headway: number, mode: RailMode, owner?: number, replacingLine?: number): { boardings: number; revenue: number; legLoads: number[] } {
     const g = this.g, townId = sites[0]?.townId, proposed = -2;
     const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
-    const built = new Set(points.filter((p): p is Station => 'id' in p).map((p) => p.id));
+    const built = new Set(points.flatMap(p => { const st = forecastStation(p); return st ? [st.id] : []; }));
     const operator = owner ?? points.find((p): p is Station => 'id' in p)?.owner;
     const nearby = [...g.stations.map.values()].filter((st) => st.rail && st.townId === townId
       && !built.has(st.id) && g.lines.stationServed(st.id) && stationActive(g, st)
@@ -780,7 +937,9 @@ export class DemandModel {
       && (points.some((p) => 'id' in p && p.links.includes(st.id)) || (operator !== undefined
         && (st.owner === operator || g.canUse(operator, st.owner) || g.canUse(st.owner, operator)))));
     if (!nearby.length) return { boardings: 0, revenue: 0, legLoads };
-    const ids = points.map((p, i) => 'id' in p ? p.id : -i - 1), indices = new Map(ids.map((id, i) => [id, i]));
+    const ids = points.map((p, i) => forecastStation(p)?.id ?? -i - 1), indices = new Map<number, number>();
+    ids.forEach((id, i) => { if (!indices.has(id)) indices.set(id, i); });
+    const ranks = [...indices.keys()], rank = ids.map(id => ranks.indexOf(id));
     const { edges, served } = routeGraph(g);
     // Requoting an existing city line replaces its frequency; it must not compete against its own old timetable.
     const existing = replacingLine === undefined ? undefined : g.lines.get(replacingLine);
@@ -792,17 +951,18 @@ export class DemandModel {
     };
     const boarding = new Set<number>();
     for (let i = 0; i < sites.length; i++) {
-      for (let j = 0; j < sites.length; j++) if (i !== j) {
+      if (indices.get(ids[i]) !== i) continue;
+      for (let j = 0; j < sites.length; j++) if (ids[i] !== ids[j] && indices.get(ids[i]) === i && indices.get(ids[j]) === j) {
         const d = Math.hypot(sites[i].x - sites[j].x, sites[i].z - sites[j].z);
-        add(ids[i], ids[j], proposed, estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(i - j) - 1) * 8);
+        add(ids[i], ids[j], proposed, estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(rank[i] - rank[j]) - 1) * 8);
       }
       const point = points[i], site = sites[i];
       const plan = 'layout' in point ? point : undefined;
-      const virtual = 'id' in point ? point : { id: ids[i], townId, x: site.x, z: site.z,
+      const virtual = 'id' in point ? point : plan ? plannedStation(plan, ids[i], operator, site.townId) : { id: ids[i], townId, x: site.x, z: site.z,
         city: mode !== 'mainline' && g.stations.cityAt(site.x, site.z, g.towns.list[site.townId]), stops: [], rail: { x: site.x, z: site.z,
-          angle: plan?.angle ?? Math.PI / 2, length: plan?.length ?? ('length' in point ? point.length : undefined) ?? 12,
-          tracks: plan?.tracks ?? 2, width: plan?.layout.width ?? stationLayout(2, 0, 'middle', 'side').width, trackOffsets: plan?.layout.trackOffsets ?? stationLayout(2, 0, 'middle', 'side').trackOffsets,
-          platforms: plan?.layout.platforms ?? stationLayout(2, 0, 'middle', 'side').platforms } } as unknown as Station;
+          angle: Math.PI / 2, length: ('length' in point ? point.length : undefined) ?? 12,
+          tracks: 2, width: stationLayout(2, 0, 'middle', 'side').width, trackOffsets: stationLayout(2, 0, 'middle', 'side').trackOffsets,
+          platforms: stationLayout(2, 0, 'middle', 'side').platforms } } as unknown as Station;
       for (const st of nearby) {
         // Built points keep their real links. Plans use the same platform gap and core transfer range as canLink.
         if ('id' in point && !point.links.includes(st.id)) continue;
@@ -823,7 +983,7 @@ export class DemandModel {
         : st ? this.coverage(st) : []);
     }
     let count = 0, revenue = 0;
-    for (const from of [...external.map((st) => st.id), ...ids]) {
+    for (const from of [...external.map((st) => st.id), ...ranks]) {
       const i = indices.get(from), st = g.stations.get(from), site = i !== undefined ? sites[i] : st!;
       const origin = new Map<number, number>(i !== undefined ? sites[i].regions : (this.shares.get(from) ?? []).map(([r, share]) => [r, st!.catchPop * share]));
       if (i === undefined) for (const [r, pop] of this.feeders.get(from)?.regions ?? []) origin.set(r, (origin.get(r) ?? 0) + pop);

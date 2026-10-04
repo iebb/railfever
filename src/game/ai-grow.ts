@@ -632,7 +632,7 @@ function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = []
 const routeLength = (points: (Station | StationPlan)[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
 /** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern. */
 const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service, extra = 0) =>
-  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line);
+  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line, sv.pid);
 /** The operator's share of receipts constrained by full-cycle seats on the busiest direction of an actual leg.
  * Long riders occupy every intervening segment; a physics estimate of annual average hops is not boarding capacity. */
 export const forecastSeatFactor = (legLoads: number[], cycle: number, trains: number, seats: number) =>
