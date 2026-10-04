@@ -109,8 +109,8 @@ export abstract class Vehicle {
   abstract update(dt: number): void;
   abstract worldPos(out: Vec3Like): boolean;
   abstract destroy(): void;
-  /** Called when the line's stops changed or a new line was assigned */
-  abstract onLineChanged(): void;
+  /** Called after a timetable edit; indicesRemapped means the editor already preserved each call's occurrence. */
+  abstract onLineChanged(indicesRemapped?: boolean): void;
 
   get line() { return this.lineId != null ? this.game.lines.get(this.lineId) ?? null : null; }
 

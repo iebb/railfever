@@ -892,13 +892,13 @@ export class Train extends Vehicle {
     return true;
   }
 
-  onLineChanged() {
+  onLineChanged(indicesRemapped = false) {
     this.fixCargo();
     if (this.backoff) return;
     // A stop inserted ahead of the current index must not change the train's physical destination.
     // Retain the served hop it is already completing, then follow the new timetable from that station.
     const line = this.line;
-    if (this.onMap && line && this.routeTarget >= 0) {
+    if (!indicesRemapped && this.onMap && this.state !== 'loading' && line && this.routeTarget >= 0) {
       for (let k = 0; k < line.stops.length; k++) {
         const i = (this.stopIndex + k) % line.stops.length;
         if (line.stops[i] === this.routeTarget && stopsAt(line, this.pattern, i)) { this.stopIndex = i; break; }

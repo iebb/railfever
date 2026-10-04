@@ -1327,6 +1327,21 @@ export function growThroat(g: Game, stationId: number, owner: number): { connect
       // no room for them now: the old crossovers come back (trains keep reaching every platform but the new ones)
       for (const l of removed) if (net.nodes.has(l.a) && net.nodes.has(l.b)) net.addEdge('rail', l.a, l.b, l.bez, l.prof, l.sections, l.type, owner);
     }
+    // Finishing can fail at the other end after rebuilding this end's pair. Its local throat still
+    // needs two-way access up to the outer crossover; old inward signals must not trap departures.
+    const throat = throatCrossovers(g, stationId, end, owner, ladder + 40);
+    if (throat?.legs.length) {
+      const outer = Math.max(...throat.legs.flatMap(id => {
+        const e = net.edges.get(id)!; return [dist(hs, e.a), dist(hs, e.b)];
+      }));
+      for (const nid of new Set(throat.line.flatMap(id => { const e = net.edges.get(id)!; return [e.a, e.b]; }))) {
+        const n = net.nodes.get(nid)!;
+        if (n.signal < 2 || n.signalPass || n.edges.length !== 2 || dist(hs, nid) > outer + 0.8
+          || n.edges.some(id => { const e = net.edges.get(id)!; return e.station >= 0 || !!g.trackUpgradeError(owner, e.owner); })) continue;
+        n.signal = 0; delete n.signalKind; delete n.signalPass;
+        g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2); net.version++;
+      }
+    }
   }
   g.onNetworkChanged();
   return { connected: res.connected, failed: res.failed, crossovers };

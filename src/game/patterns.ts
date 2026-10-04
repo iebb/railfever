@@ -974,7 +974,7 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   g.lines.map.delete(drop.id);
   g.lines.redirectLine(drop.id, keep.id, pid, maps[1], drop);
   g.lines.rebuild();
-  for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged();
+  for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged(true);
   const junction = g.stations.get(check.junction)!;
   const notice: JoinNotice = { from: drop.id, into: keep.id, pattern: pid, line: keep, junction: check.junction,
     text: `${drop.name} joined with ${keep.name} at ${junction.name}; existing services kept as short-turns` };
@@ -1064,7 +1064,7 @@ export function canonicalizeLines(g: Game, lineId?: number, options: { sameOwner
   }
   if (out.length) {
     g.lines.rebuild();
-    for (const nt of out) { const l = g.lines.get(nt.into); if (l) for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(); }
+    for (const nt of out) { const l = g.lines.get(nt.into); if (l) for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(true); }
   }
   return out;
 }

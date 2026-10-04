@@ -210,7 +210,8 @@ if (want('centre')) {
     while (ai.busy) g.update(0.25);
     console.log(`  ${big.name} (${big.pop}) - ${o.name}: ${ai.log.slice(-2).join(' | ')}`);
     st = [...g.stations.map.values()].find((s) => s.townId === big.id && s.owner === ai.companyId && s.rail);
-    if (st && g.lines.all().some((l) => l.owner === ai.companyId && l.stops.includes(st!.id))) { other = o; if (st.rail!.level === 'underground') break; }
+    // Interrupted works may retain an empty line; keep searching until a railway actually opens.
+    if (st && g.lines.all().some((l) => l.owner === ai.companyId && l.stops.includes(st!.id) && l.vehicles.some(id => g.vehicles.get(id) instanceof Train))) { other = o; if (st.rail!.level === 'underground') break; }
   }
   AIController.forceBuild = false;
   console.log(`  station ${st?.name} ${st?.rail?.level} ${st ? fmt(Math.hypot(st.x - big.x, st.z - big.z), 0) + ' u from the centre' : ''}${other ? ', line to ' + other.name : ''}`);

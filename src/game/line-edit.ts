@@ -92,5 +92,5 @@ export function replaceLineStops(g: Game, l: Line, stops: number[]): void {
   l.stops = stops;
   delete l.spacing;
   g.lines.rebuild();
-  for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged();
+  for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(true);
 }
