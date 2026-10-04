@@ -74,7 +74,7 @@ export function lineRoute(l: Line): Route {
 }
 
 // ------------------------------------------------------------------------------ patterns of a line
-/** Re-map a pattern's flags when the line's stops changed (by station and occurrence; new stops: stop). */
+/** Re-map by station and occurrence. New stops serve the existing span of a short-turn. */
 function align(l: Line, p: ServicePattern) {
   const ids = l.stops;
   const old = p.ids;
@@ -91,10 +91,29 @@ function align(l: Line, p: ServicePattern) {
   }
   const occ = new Map<number, number[]>();
   old.forEach((s, i) => { const a = occ.get(s); if (a) a.push(i); else occ.set(s, [i]); });
+  const oldRoute = lineRoute({ ...l, stops: old });
+  const position = new Map(oldRoute.stations.map((s, i) => [s, i]));
+  const served = old.filter((_, i) => p.stops[i] !== false);
+  const span = served.map(s => position.get(s)!);
+  const lo = Math.min(...span), hi = Math.max(...span);
+  // Express/rapid skips inside the old termini do not exclude a new intermediate call. All-stops
+  // services still extend normally; loops and ambiguous old physical routes keep their prior rule.
+  const shortTurn = !oldRoute.loop && position.size === oldRoute.stations.length
+    && new Set(served).size >= 2 && (lo > 0 || hi < oldRoute.stations.length - 1);
+  const route = shortTurn ? lineRoute(l) : null;
+  const withinSpan = (i: number) => {
+    if (!route) return true;
+    const at = route.turn > 0 && i > route.turn ? ids.length - i : i;
+    let before: number | undefined, after: number | undefined;
+    for (let j = at - 1; j >= 0 && before === undefined; j--) before = position.get(route.stations[j]);
+    for (let j = at + 1; j < route.stations.length && after === undefined; j++) after = position.get(route.stations[j]);
+    return before !== undefined && after !== undefined
+      && Math.min(before, after) >= lo && Math.max(before, after) <= hi;
+  };
   const used = new Map<number, number>();
-  p.stops = ids.map((s) => {
+  p.stops = ids.map((s, i) => {
     const a = occ.get(s);
-    if (!a) return true;
+    if (!a) return withinSpan(i);
     const k = used.get(s) ?? 0;
     used.set(s, k + 1);
     return p.stops[a[Math.min(k, a.length - 1)]] !== false;
