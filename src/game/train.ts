@@ -8,7 +8,7 @@ import { curveSpeed } from './construction';
 import { HEAVY_RAIL_TRACKS, aeroOf, auxKwOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
-import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture } from './patterns';
+import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, stopsAt } from './patterns';
 import { trackPassage } from './opcosts';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
@@ -895,6 +895,15 @@ export class Train extends Vehicle {
   onLineChanged() {
     this.fixCargo();
     if (this.backoff) return;
+    // A stop inserted ahead of the current index must not change the train's physical destination.
+    // Retain the served hop it is already completing, then follow the new timetable from that station.
+    const line = this.line;
+    if (this.onMap && line && this.routeTarget >= 0) {
+      for (let k = 0; k < line.stops.length; k++) {
+        const i = (this.stopIndex + k) % line.stops.length;
+        if (line.stops[i] === this.routeTarget && stopsAt(line, this.pattern, i)) { this.stopIndex = i; break; }
+      }
+    }
     if (!this.onMap) { this.state = 'depot'; this.retryTimer = 0; return; }
     if (this.state === 'loading') return;
     this.atStation = -1;
