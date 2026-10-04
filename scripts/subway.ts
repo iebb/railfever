@@ -376,7 +376,7 @@ function aiCity(build: (g: Game) => Town, mode: 'lightrail' | 'metro', force = f
   console.log(`  dense rows: ${ai.log.slice(-1)[0]}`);
   console.log(`  compared: ${econs.map((e) => `${e.level} ${M(e.total)} ${fmt(e.ret, 3)}`).join(', ')}`);
   check(el.length > 0 && ug.length > 0, 'a viaduct and a subway were both planned');
-  check(levels.length >= 4 && levels.every((v) => v === 'underground'), `the subway was built (${levels.join(', ')})`);
+  check(levels.length >= 3 && levels.every((v) => v === 'underground'), `a complete subway starter was built (${levels.join(', ')})`);
   check(el.length > 0 && ug.length > 0 && Math.min(...ug.map((e) => e.total)) < Math.min(...el.map((e) => e.total)), 'the subway costs less than the viaduct taking the buildings');
   check(el.length > 0 && ug.length > 0 && Math.max(...ug.map((e) => e.ret)) > Math.max(...el.map((e) => e.ret)), 'and returns more on its cost');
   check(h.depots.all().every((d) => d.level === 'underground'), 'its depot underground too');

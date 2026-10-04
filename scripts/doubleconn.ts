@@ -7,7 +7,7 @@ import { Train, lineCongestion } from '../src/game/train';
 import { initialTrackChoice, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { lineIsDouble, trackIsDouble, upgradeRoute } from '../src/game/dualtrack';
 import { planDoubleTrack, commitDoubleTrack, planConnection, commitConnection, connectStationThroat } from '../src/game/trackops';
-import { routeBetween } from '../src/game/ai-network';
+import { routeBetween, saveNetwork, networkPlanner } from '../src/game/ai-network';
 import { autoSignalLine } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
 import { station, endNode, nodeSnap, railOpts, build, check, done, depotFor, loco, runTrains } from './stationlib';
@@ -110,6 +110,33 @@ function fixtures() {
   same(original.g, loaded, 'next atomic double-build decision replays exactly');
   for (let i = 0; i < 80; i++) { original.g.stepTick(); loaded.stepTick(); }
   same(original.g, loaded, 'post-build fixed ticks remain identical');
+  midconnectReplay();
+}
+
+/** A pending curve-search cursor survives saving through its completion, with normal train traffic. */
+function midconnectReplay() {
+  const g = Game.create({ size: 512, seed: 23, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
+  g.aiAcquisitions = false;
+  let saved = false;
+  while (g.day < 1200) {
+    g.stepTick();
+    const idle = g.ais.every(ai => !(ai as any).job && !(ai as any).project);
+    if (idle && g.ais.some(ai => networkPlanner(ai)?.task === 'midconnect')
+      && saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect))) { saved = true; break; }
+  }
+  check(saved, 'natural map exercises a saved midconnect search without unrelated construction');
+  if (!saved) return;
+  for (const ai of g.ais) ai.state.cooldown = 1e9;
+  const snapshot = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(snapshot));
+  let exact = JSON.stringify(serialize(loaded)) === snapshot;
+  const day = g.day;
+  for (let i = 0; i < 640 && exact; i++) {
+    g.stepTick(); loaded.stepTick();
+    exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
+  }
+  check(exact && !saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect)),
+    'saved midconnect search completes with exact replay of 640 fixed ticks');
+  console.log(`  midconnect replay ${day} -> ${g.day}, exact ${exact}`);
 }
 
 interface Survey { seed: number; size: number; years: number; doubleShare: number; congestion: number; held: number;

@@ -243,6 +243,8 @@ interface WorkItem {
   xlink?: XLinkCursor;
   /** a city line's growth being planned (extend, ai-grow.ts): the options surveyed, the next one to value, the best */
   grow?: GrowCursor;
+  /** Next primitive site/movement to reprice in a mid-route connection search; no curve is saved. */
+  midconnect?: { site: number; movement: number; tested: number };
 }
 /**
  * A candidate connecting curve between two companies' lines: the turnout points on our track (a) and theirs (b), each
@@ -261,6 +263,7 @@ const copyXLink = (x: XLinkCursor): XLinkCursor => ({ ...x,
 const copyWorkItem = (i: WorkItem): WorkItem => ({ ...i, ids: [...i.ids],
   ...(i.xlink ? { xlink: copyXLink(i.xlink) } : {}),
   ...(i.grow ? { grow: copyGrowCursor(i.grow) } : {}),
+  ...(i.midconnect ? { midconnect: { ...i.midconnect } } : {}),
   ...(i.style ? { style: { ...i.style, ...(i.style.best ? { best: { ...i.style.best } } : {}) } } : {}),
   ...(i.entrance ? { entrance: { ...i.entrance, ...(i.entrance.best ? { best: { ...i.entrance.best } } : {}) } } : {}),
   ...(i.road ? { road: { ...i.road, ...(i.road.best ? { best: { ...i.road.best } } : {}) } } : {}) });
@@ -854,7 +857,7 @@ class NetPlanner {
     else {
       const item = job.items[job.cursor];
       if (item) this.drain(this.run(job.task, item));
-      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow) job.cursor++;
+      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow && !item?.midconnect) job.cursor++;
     }
     const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink', 'citylink', 'extend'].includes(job.task) ? 1 : Infinity;
     if (job.cursor >= job.items.length || job.done >= limit) this.job = null;
@@ -875,7 +878,7 @@ class NetPlanner {
       case 'pair': return this.pairTask(ids);
       case 'crossovers': return this.crossoversTask(ids);
       case 'connect': return this.connectTask(ids);
-      case 'midconnect': return this.midconnectTask(ids);
+      case 'midconnect': return this.midconnectTask(item);
       case 'roads': return this.roadsTask(item);
       case 'join': return this.joinTask(ids);
       case 'insert': return this.insertTask(ids);
@@ -2755,15 +2758,23 @@ class NetPlanner {
   }
 
   /** Connecting curves between the interiors of two authorised routes, followed by a new through service. */
-  private *midconnectTask(ids: number[]): Generator<void, void> {
-    const g = this.g, net = g.world.net, me = this.me;
+  private *midconnectTask(item: WorkItem): Generator<void, void> {
+    const pending = yield* this.midconnectStep(item);
+    if (!pending) delete item.midconnect;
+  }
+
+  /** One saved, deterministic search unit; all geometry is disposable. */
+  private *midconnectStep(item: WorkItem): Generator<void, boolean | undefined> {
+    const ids = item.ids, g = this.g, net = g.world.net, me = this.me;
     const a = g.lines.map.get(ids[0]), b = g.lines.map.get(ids[1]);
     if (!a || !b || a.kind !== 'rail' || b.kind !== 'rail' || !this.agrees(a.owner) || !this.agrees(b.owner)) return;
     if (a.owner !== me && b.owner !== me || this.ai.railPolicy.deepTrouble) return;
     const key = `mid${a.id}:${b.id}`;
-    if (this.cared(key)) return;
-    this.careFor(key, 180);
-    this.considered('midconnect.pair');
+    if (!item.midconnect) {
+      if (this.cared(key)) return;
+      this.careFor(key, 180);
+      this.considered('midconnect.pair');
+    }
     if (lineCongestion(g, a.id).level || lineCongestion(g, b.id).level) { this.considered('midconnect.congestion'); return; }
     const pa = this.pathOf(a), pb = this.pathOf(b);
     if (!pa || !pb) return;
@@ -2797,11 +2808,18 @@ class NetPlanner {
     sites.sort((a, b) => a.distance - b.distance || a.a.edge.id - b.a.edge.id || a.b.edge.id - b.b.edge.id);
     const stock = [...this.ai.railPolicy.fleet(a), ...this.ai.railPolicy.fleet(b)].sort((x, y) => x.value - y.value || x.id - y.id);
     if (!stock.length) return;
-    let tested = 0;
-    for (const c of sites) {
-      // Each saved pair is a bounded planning unit; no curve or generator is retained across saves.
-      if (tested >= 24) break;
-      for (const forwardA of [true, false]) for (const forwardB of [true, false]) {
+    const cursor = item.midconnect ??= { site: 0, movement: 0, tested: 0 };
+    let plans = 0, movements = 0;
+    for (let i = cursor.site; i < sites.length; i++) {
+      const c = sites[i];
+      if (cursor.tested >= 24) break;
+      for (let movement = cursor.movement; movement < 4; movement++) {
+        // Fixed search work, saved independently of timing. Geometry/values are rebuilt from today's network.
+        if (plans >= 2 || movements >= 64) return true;
+        movements++;
+        cursor.site = movement === 3 ? i + 1 : i;
+        cursor.movement = movement === 3 ? 0 : movement + 1;
+        const forwardA = movement < 2, forwardB = movement % 2 === 0;
         const left = forwardA ? pa.slice(0, c.a.leg + 1) : pa.slice(c.a.leg + 1).reverse();
         const right = forwardB ? pb.slice(c.b.leg + 1) : pb.slice(0, c.b.leg + 1).reverse();
         const path = [...left, ...right];
@@ -2837,7 +2855,7 @@ class NetPlanner {
           this.considered('midconnect.capacity'); return;
         }
         const dirA = (forwardA ? c.a.dir : -c.a.dir) as 1 | -1, dirB = (forwardB ? c.b.dir : -c.b.dir) as 1 | -1;
-        tested++;
+        cursor.tested++; plans++;
         const plan = Trackops.planConnection(g, c.a.edge.id, c.sa, c.b.edge.id, c.sb, me, { dirA, dirB, search: 2, junctionUpgrade: true });
         if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) continue;
         if (plan.proposal && (!this.proposalConsent(plan.proposal) || !this.demolitionOk(plan.proposal.demolish))) continue;

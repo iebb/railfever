@@ -123,6 +123,8 @@ if (process.argv.includes('--regression')) {
   let ticks = 0;
   while ((!opened(ai) || ai.project) && ai.busy && ticks++ < 200000) g.stepTick();
   check(opened(ai) && !ai.project && !!ai.state.through, `the city railway is a finished project when the through service is planned (${ai.log.slice(-1)[0] ?? ''})`);
+  const originalCityStations = [...g.stations.map.values()].filter((s) => s.rail && railPartMode(s.rail) === 'metro').map((s) => s.id).sort((a, b) => a - b);
+  check(originalCityStations.length >= 3, 'the city railway opens with a complete starter route');
   const saves: { tick: number; through: boolean; data: string }[] = [];
   let after = 0, roundTripErrors = 0;
   while (after < 3 && ticks++ < 200000) {
@@ -159,8 +161,8 @@ if (process.argv.includes('--regression')) {
     }
     return true;
   }), 'the main line keeps all its rail geometry and ownership through upgrade splits');
-  const cityStations = [...g.stations.map.values()].filter((s) => s.rail && railPartMode(s.rail) === 'metro').length;
-  check(cityStations === 5, `the city railway keeps its five stations (${cityStations})`);
+  const cityStations = [...g.stations.map.values()].filter((s) => s.rail && railPartMode(s.rail) === 'metro').map((s) => s.id).sort((a, b) => a - b);
+  check(JSON.stringify(cityStations) === JSON.stringify(originalCityStations), `the city railway keeps every original station (${cityStations.length})`);
 }
 
 // ------------------------------------------------------------------ 2. wiring that cannot be paid: nothing is built

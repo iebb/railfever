@@ -24,6 +24,7 @@ import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE } from '../src/game/constants';
+import { demolitionCost } from '../src/game/demolition';
 import { addBusStop, fails } from './lib';
 import { flatGame, station, endNode, loco, depotFor, check, build, railOpts, nodeSnap, done } from './stationlib';
 
@@ -534,12 +535,13 @@ function streetThroughHouse(blockPop: number, others: number) {
     `no entrance whose only new residents its own street demolishes (${H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; spent ${Math.round(money - g.company(me).economy.money)})`);
   // with residents beyond it, the AI builds and pays compensation for the house it demolishes
   const b = streetThroughHouse(10, 5);
+  const compensation = demolitionCost(b.g, b.blocker);
   const spends: [number, string, boolean][] = [];
   const eco = b.g.company(b.me).economy, spend = eco.spend.bind(eco);
   eco.spend = (x, cat, force = false) => { spends.push([x, cat, force]); return spend(x, cat, force); };
   runNetworkTask(b.ai, 'capacity');
   eco.spend = spend;
-  const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - (3000 + 10 * 1250)) < 1e-6);
+  const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - compensation) < 1e-6);
   // The entrance at this station must pay for its street and the compensation from the residents it newly covers.
   check(b.H.rail!.entrances.length === 1 && stat(b.ai, 'netEntrances') >= 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
     `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);
