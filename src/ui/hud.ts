@@ -193,7 +193,7 @@ export class Hud {
       sp.appendChild(b);
     }
     this.saveEl = h('span', { class: 'savechip', role: 'status', 'aria-live': 'polite' });
-    R.appendChild(h('div', { class: 'hud hud-tc' }, h('div', { class: 'clock chrome' }, this.dateEl, sp), this.saveEl));
+    R.appendChild(h('div', { class: 'hud hud-tc' }, h('div', { class: 'clock chrome' }, this.dateEl, sp)));
     // actions
     this.fpsEl = h('span', { class: 'fps' });
     this.badge = h('span', { class: 'badge' });
@@ -217,6 +217,7 @@ export class Hud {
     this.mapBtns.signals = h('button', { class: 'hbtn chrome', 'data-tip': 'Signal blocks', 'data-sfx': 'none', 'aria-label': 'Signal blocks', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('signals') }, icon('signal', 19));
     this.mapBtns.catchment = h('button', { class: 'hbtn chrome', 'data-tip': 'Catchment areas', 'data-key': 'O', 'data-sfx': 'none', 'aria-label': 'Catchment areas', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('catchment') }, icon('catchment', 19));
     R.appendChild(h('div', { class: 'hud hud-tr' },
+      this.saveEl,
       this.fpsEl,
       this.mapBtns.lines,
       this.mapBtns.demand,

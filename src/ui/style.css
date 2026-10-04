@@ -437,7 +437,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .hc-hint { margin-top: 6px; color: var(--text-3); font-size: var(--fs-11); font-weight: 500; letter-spacing: 0.01em; }
 
 /* ---------------------------------------------------------------- toasts, news, floats */
-.toasts { position: absolute; top: 84px; left: 50%; transform: translateX(-50%); display: flex; flex-direction: column; gap: 6px; align-items: center; z-index: 60; pointer-events: none; width: min(540px, calc(100vw - 20px)); }
+.toasts { position: absolute; top: 60px; right: 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-end; z-index: 75; pointer-events: none; width: min(420px, calc(100vw - 20px)); }
 .toast { display: flex; align-items: center; gap: 10px; max-width: 100%; padding: 10px 15px 10px 12px; border-radius: 12px; background: rgba(16, 22, 31, 0.93); border: 1px solid var(--hairline-2); box-shadow: var(--shadow-s); font-weight: 550; font-size: var(--fs-14); pointer-events: auto; animation: rise var(--t) var(--ease); transition: opacity 0.4s, transform 0.4s; }
 .toast .ic { color: var(--text-2); }
 .toast.bad { border-color: rgba(255, 107, 107, 0.5); color: #ffd2d2; }
@@ -577,12 +577,12 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .tm-btn.primary:hover { filter: brightness(1.06); }
 .tm-btn.primary small { color: rgba(27, 20, 5, 0.7); }
 .tm-btn .ic { color: inherit; }
-.savechip { display: inline-flex; align-items: center; gap: 4px; align-self: center; margin-top: 4px; padding: 2px 8px 2px 6px; border-radius: 999px; background: rgba(13, 18, 26, 0.72); border: 1px solid var(--hairline); color: var(--text-3); font: 600 var(--fs-11)/1.3 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; opacity: 0; transform: translateY(-3px); transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); pointer-events: none; }
+.savechip { display: inline-flex; align-items: center; gap: 4px; align-self: center; padding: 2px 8px 2px 6px; border-radius: 999px; background: rgba(13, 18, 26, 0.72); border: 1px solid var(--hairline); color: var(--text-3); font: 600 var(--fs-11)/1.3 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; opacity: 0; transform: translateY(-3px); transition: opacity var(--t) var(--ease), transform var(--t) var(--ease); pointer-events: none; }
 .savechip.show { opacity: 1; transform: none; }
 .savechip.saved .ic { color: var(--pos); }
 .savechip.error { color: var(--warn); }
 .savechip.memory { color: var(--warn); }
-.storage-banner { position: absolute; z-index: 95000; top: 76px; left: 50%; transform: translateX(-50%); display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid var(--warn); border-radius: var(--r-m); background: var(--surface-solid); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; font-size: var(--fs-13); }
+.storage-banner { position: absolute; z-index: 95000; top: 60px; right: 12px; display: flex; align-items: center; gap: 10px; width: max-content; max-width: calc(100vw - 24px); padding: 10px 12px; border: 1px solid var(--warn); border-radius: var(--r-m); background: var(--surface-solid); color: var(--text); box-shadow: var(--shadow); pointer-events: auto; font-size: var(--fs-13); }
 .storage-banner > .ic { color: var(--warn); flex-shrink: 0; }
 .storage-banner > span { flex: 1; }
 .storage-banner button { flex-shrink: 0; }
@@ -596,6 +596,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .ai-chip { display: inline-flex; align-items: center; gap: 6px; height: 24px; padding: 0 9px 0 7px; border-radius: 6px; background: var(--raised); font: 600 var(--fs-12)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; }
 .ai-chip i { width: 9px; height: 9px; border-radius: 3px; background: var(--c); }
 .title-foot { color: var(--text-3); font-size: var(--fs-12); }
+.title-ver { position: absolute; left: max(14px, env(safe-area-inset-left)); bottom: max(10px, env(safe-area-inset-bottom)); color: var(--text-3); font: 600 var(--fs-12)/1 var(--font-display); letter-spacing: var(--tr-caps-s); }
 @media (max-width: 920px) { .title.card-open .title-main { display: none; } }
 
 /* ---------------------------------------------------------------- left column: checklist, map card, minimap
@@ -1048,7 +1049,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 :root { --uis: 1; }
 #app .hud, #app .dockwrap, #app .leftcol, #app .toasts, #app .drawer, #app .title { zoom: var(--uis); }
 #app .dockwrap { max-width: calc((100vw - 20px) / var(--uis)); }
-#app .toasts { width: min(540px, calc((100vw - 20px) / var(--uis))); }
+#app .toasts { width: min(420px, calc((100vw - 20px) / var(--uis))); }
 #app .drawer { width: min(390px, calc((100vw - 20px) / var(--uis))); }
 #app .win > *, #app .toolcard > *, #app .tooltip > *, #app .uitip > *, #app .hovercard > *, #app .labels .lbl > * { zoom: var(--uis); }
 #app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
