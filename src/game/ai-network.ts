@@ -33,6 +33,7 @@
 // Spending follows the company's money rules (available(), borrowing in steps as ai.ts does); land is graded and
 // a few town buildings demolished where that gives a better site (cost plus compensation, a small rating hit).
 import type { Game } from './game';
+import { replaceLineStops } from './line-edit';
 import type { AIController } from './ai';
 import type { Station, StationPlan, EntranceKind } from './stations';
 import type { NEdge, NNode } from './network';
@@ -984,20 +985,7 @@ class NetPlanner {
 
   /** Change a line's stops; its vehicles keep heading for the stop they were heading for. */
   private setStops(l: Line, stops: number[]) {
-    const g = this.g, old = [...l.stops];
-    l.stops = stops;
-    for (const vid of l.vehicles) {
-      const v = g.vehicles.get(vid);
-      if (!v) continue;
-      const target = old[v.stopIndex] ?? old[0];
-      let k = 0;
-      for (let i = 0; i < Math.min(v.stopIndex, old.length); i++) if (old[i] === target) k++;
-      let idx = -1, seen = 0;
-      for (let i = 0; i < stops.length; i++) if (stops[i] === target) { idx = i; if (seen++ === k) break; }
-      v.stopIndex = idx >= 0 ? idx : 0;
-    }
-    g.lines.rebuild();
-    for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
+    replaceLineStops(this.g, l, stops);
   }
 
   /** Insert station `s` into a line between its consecutive stops x and y (either way round). */

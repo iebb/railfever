@@ -52,21 +52,45 @@ function fitIndex(g: Game, l: Line, list: number[], s: number, loop: boolean): n
  * or precede itself (already the stop there).
  */
 export function stopsWithInserted(g: Game, l: Line, s: number, place: StopPlace): { stops: number[]; at: number } | null {
-  const path = l.stops.length >= 3 ? linearStops(l.stops) : null;
+  const path = l.loop !== true && l.stops.length >= 3 ? linearStops(l.stops) : null;
   const list = path ?? [...l.stops];
   const loop = !path && g.lines.isLoop(l);
-  let i: number;
+  let i: number, returning = false;
   if (place === 'start') i = 0;
   else if (place === 'end') i = list.length;
   else if (place === 'auto') i = fitIndex(g, l, list, s, loop);
   else {
-    // after the stop at index `place` of the stop list (of an out-and-back list: after that station on its path)
-    const sid = l.stops[Math.max(0, Math.min(l.stops.length - 1, place))];
-    const k = list.indexOf(sid);
-    i = k < 0 ? list.length : k + 1;
+    const k = Math.max(0, Math.min(l.stops.length - 1, place));
+    // The turning stop and the return occurrences point towards the start, including the final gap back to A.
+    returning = !!path && k >= path.length - 1;
+    i = path ? returning ? l.stops.length - k : k + 1 : k + 1;
   }
   if (list[i - 1] === s || list[i] === s || (loop && list.length && ((i === 0 && list[list.length - 1] === s) || (i === list.length && list[0] === s)))) return null;
   if (path && path.includes(s)) return null;
   const out = [...list.slice(0, i), s, ...list.slice(i)];
-  return { stops: path ? outAndBack(out) : out, at: i };
+  const stops = path ? outAndBack(out) : out;
+  return { stops, at: returning ? stops.length - i : i };
+}
+
+/** Change a route while preserving each vehicle's target station and occurrence, including pending departures. */
+export function replaceLineStops(g: Game, l: Line, stops: number[]): void {
+  const old = l.stops;
+  const remap = (index: number) => {
+    const station = old[index];
+    if (station === undefined) return 0;
+    const occurrence = old.slice(0, index).filter((s) => s === station).length;
+    const indexes = stops.flatMap((s, i) => s === station ? [i] : []);
+    return indexes[Math.min(occurrence, indexes.length - 1)] ?? 0;
+  };
+  // All operators' vehicles belong to this route, including trains on a canonicalised through service.
+  for (const id of l.vehicles) {
+    const v = g.vehicles.get(id);
+    if (!v) continue;
+    v.stopIndex = remap(v.stopIndex);
+    if (v.spacing.departureIndex >= 0) v.spacing.departureIndex = remap(v.spacing.departureIndex);
+  }
+  l.stops = stops;
+  delete l.spacing;
+  g.lines.rebuild();
+  for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged();
 }

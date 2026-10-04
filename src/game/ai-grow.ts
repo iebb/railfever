@@ -21,12 +21,12 @@ import type { VehicleModel } from './vehicle-types';
 import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT } from './stations';
-import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK } from './constants';
+import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, DAY_SECONDS } from './constants';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
 import { linearStops, outAndBack } from './lines';
 import { depotFits, depotAtEnd, nodeSnap, nodeAt, stationEnds } from './routing';
-import { findRailRoute, railNext, depotReaches } from './train';
+import { findRailRoute, railNext, depotServes, consistRule } from './train';
 import { endTangent } from './geom';
 import { finishDoubleTrack, planStationOnTrack, commitStationOnTrack } from './trackops';
 import { linePatterns, patternHeadways } from './patterns';
@@ -368,7 +368,7 @@ export interface GrowOption {
  * The 'extend' work item's state: at 0 the survey, 1..opts the next option to value, then the best one's build in
  * steps (a depot moved, the stations, the track and the line; `made` what the build has laid so far).
  */
-export interface GrowCursor { at: number; opts?: GrowOption[]; best?: { opt: number; score: number }; made?: GrowBuild }
+export interface GrowCursor { at: number; opts?: GrowOption[]; best?: { opt: number; score: number; fleet?: boolean }; made?: GrowBuild }
 export const copyGrowCursor = (c: GrowCursor): GrowCursor => ({ at: c.at, ...(c.opts ? { opts: c.opts.map((o) => ({ ...o })) } : {}),
   ...(c.best ? { best: { ...c.best } } : {}), ...(c.made ? { made: copyGrowBuild(c.made) } : {}) });
 
@@ -387,7 +387,7 @@ export interface GrowHost {
   /** canSpend's test without its borrowing: `cost` within `share` of what the company can commit now */
   affordable(cost: number, share?: number): boolean;
   fleet(l: Line): { ours: number[]; others: number };
-  managed(): Map<number, { depot: number; maxVehicles: number; towns: number[]; opened: number }> | null;
+  managed(): Map<number, { depot: number; maxVehicles: number; towns: number[]; opened: number; urban?: string }> | null;
   setStops(l: Line, stops: number[]): void;
   signal(lineId: number): number;
   canon(lineId: number): void;
@@ -402,12 +402,12 @@ export interface GrowHost {
 export function growLine(h: GrowHost, l: Line): number[] | null {
   const g = h.g;
   if (l.kind !== 'rail' || l.owner !== h.me || !h.fleet(l).ours.length) return null;
-  const path = linearStops(l.stops);
+  const path = l.loop === true ? null : linearStops(l.stops);
   if (!path || path.length < 2 || !path.every((sid) => !!g.stations.get(sid)?.rail)) return null;
-  // a city part: two stations of one town at least
-  const towns = new Map<number, number>();
-  for (const sid of path) { const t = g.stations.get(sid)!.townId; if (t >= 0) towns.set(t, (towns.get(t) ?? 0) + 1); }
-  return [...towns.values()].some((n) => n >= 2) ? path : null;
+  const stations = path.map((sid) => g.stations.get(sid)!);
+  const town = stations[0].townId;
+  const urban = h.managed()?.get(l.id)?.urban || stations.every((s) => railPartMode(s.rail!) !== 'mainline');
+  return urban && town >= 0 && stations.every((s) => s.townId === town) ? path : null;
 }
 
 /** Resident counts of buildings within `r` of a point that no served rail station reaches on foot (each building once). */
@@ -450,37 +450,50 @@ function chainSites(sx: number, sz: number, ux: number, uz: number, turn: number
 }
 
 /** The line's service today, for valuing changes (as ai.ts urbanEconomics: physics-based hop times). */
-interface Service { cars: VehicleModel[]; trains: number; pid: number; headway: number; hop: number; kmh: number; spacing: number; perTrain: number; wear: number; seats: number; trips: number; price: number; depot: number }
-function serviceOf(h: GrowHost, l: Line, path: number[]): Service | null {
-  const g = h.g;
-  const ours = h.fleet(l).ours.map((id) => g.vehicles.get(id)).filter((v): v is Train => v?.kind === 'train') as Train[];
-  if (!ours.length) return null;
-  const sts = path.map((id) => g.stations.get(id)!);
-  let len = 0;
-  for (let i = 0; i + 1 < sts.length; i++) len += Math.hypot(sts[i + 1].x - sts[i].x, sts[i + 1].z - sts[i].z);
-  const spacing = Math.max(4, len / Math.max(1, sts.length - 1));
-  const cars = [...ours[0].cars];
+interface Service {
+  cars: VehicleModel[]; trains: number; totalTrains: number; pid: number; path: number[];
+  cycle: number; headway: number; hop: number; kmh: number; spacing: number;
+  perTrain: number; wear: number; seats: number; trips: number; price: number; depot: number;
+}
+function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = [], chosen?: number): Service | null {
+  const g = h.g, pats = linePatterns(l);
+  const fleet = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Train => v?.kind === 'train' && v.owner === h.me && v.carries('pax'));
+  if (!fleet.length) return null;
+  const pidOf = (t: Train) => pats.some((p) => p.id === t.pattern) ? t.pattern! : pats[0].id;
+  const ph = patternHeadways(g, l);
+  const eligible = pats.filter((p) => (chosen === undefined || p.id === chosen)
+    && affected.every((sid) => l.stops.some((s, i) => s === sid && p.stops[i] !== false))
+    && ph.some((x) => x.pid === p.id && x.vehicles > 0));
+  eligible.sort((a, b) => b.stops.filter((x) => x !== false).length - a.stops.filter((x) => x !== false).length
+    || fleet.filter((t) => pidOf(t) === b.id).length - fleet.filter((t) => pidOf(t) === a.id).length || a.id - b.id);
+  const p = eligible[0];
+  if (!p) return null;
+  const ours = fleet.filter((t) => pidOf(t) === p.id);
+  const served = path.filter((sid) => l.stops.some((s, i) => s === sid && p.stops[i] !== false));
+  if (served.length < 2) return null;
+  const sts = served.map((sid) => g.stations.get(sid)!);
+  const len = routeLength(sts), spacing = Math.max(4, len / (sts.length - 1));
+  const cars = [...(ours[0] ?? fleet[0]).cars];
   const yr = estimateVehicleYear(cars, spacing / 1.15, g.year, 0.4, lineTrackAt(g, sts[0]).speed);
-  const hop = YEAR_S / Math.max(1, yr.trips), kmh = spacing * UNIT_M / hop * 3.6;
-  // the main service: of the patterns our trains run, the one serving the most stations (then the most trains)
-  const pats = linePatterns(l), counts = new Map<number, number>();
-  const pidOf = (t: Train) => (pats.some((p) => p.id === t.pattern) ? t.pattern! : pats[0].id);
-  for (const t of ours) counts.set(pidOf(t), (counts.get(pidOf(t)) ?? 0) + 1);
-  const served = (id: number) => pats.find((p) => p.id === id)?.stops.filter((x) => x !== false).length ?? 0;
-  let pid = pats[0].id, trains = 0;
-  for (const [p, n] of counts) if (served(p) > served(pid) || (served(p) === served(pid) && n > trains) || trains === 0) { trains = n; pid = p; }
-  const ph = patternHeadways(g, l), main = ph.find((p) => p.pid === pid) ?? ph[0];
-  const headway = main && main.headway > 0 && Number.isFinite(main.headway) ? main.headway : 2 * hop * Math.max(1, sts.length - 1) / Math.max(1, trains);
+  const main = ph.find((x) => x.pid === p.id)!;
+  const cycle = main.cycle, hop = YEAR_S / Math.max(1, yr.trips);
   const info = h.managed()?.get(l.id);
-  const depot = info && g.depots.get(info.depot) ? info.depot : ours[0].depotId;
-  return { cars, trains, pid, headway, hop, kmh, spacing, perTrain: yr.total, wear: yr.trackWearPerUnit, seats: cars.reduce((a, m) => a + m.capacity, 0),
+  const home = ours[0] ?? fleet[0];
+  const depot = info && g.depots.get(info.depot)?.owner === h.me ? info.depot : home.depotId;
+  return { cars, trains: ours.length, totalTrains: main.vehicles, pid: p.id, path: served, cycle,
+    headway: cycle / main.vehicles, hop, kmh: len * UNIT_M / (cycle / 2) * 3.6, spacing,
+    perTrain: yr.total, wear: yr.trackWearPerUnit, seats: cars.reduce((a, m) => a + m.capacity, 0),
     trips: yr.trips, price: cars.reduce((a, m) => a + m.cost, 0), depot };
 }
 
-/** The demand model's forecast for a line over these stops at today's service. */
-const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service) => g.demand.forecastLine(points, mode, sv.kmh, sv.headway);
-/** Its annual fare revenue as far as `trains` trains carry it. */
-const carried = (f: { revenue: number; boardings: number }, sv: Service, trains: number) => f.revenue * Math.min(1, trains * sv.trips * sv.seats * 0.7 / Math.max(1, f.boardings));
+const routeLength = (points: (Station | StationPlan)[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
+/** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern. */
+const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service, extra = 0) =>
+  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra));
+/** The operator's share of the passenger receipts the pattern's combined fleet can carry. */
+const carried = (f: { revenue: number; boardings: number }, sv: Service, extra = 0) =>
+  f.revenue * Math.min(1, (sv.totalTrains + extra) * sv.trips * sv.seats * 0.7 / Math.max(1, f.boardings))
+    * (sv.trains + extra) / (sv.totalTrains + extra);
 
 /**
  * May the company commit `capital` (and a margin) to growing a line now? An extension is a further stage of the city
@@ -672,33 +685,78 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
 }
 
 /** The value of a planned extension or stop: annual revenue gained less the added costs a year, and the capital it needs. */
-interface Valuation { score: number; net: number; capital: number; revenue: number; trains: number }
-function value(h: GrowHost, l: Line, before: Station[], after: (Station | StationPlan)[], works: number, track: number, stations: StationPlan[], hops: number, sv: Service, mode: RailMode, level: StationLevel): Valuation {
+interface Investment { score: number; net: number; capital: number; revenue: number; trains: number }
+interface Valuation extends Investment { fleet: Investment }
+function value(h: GrowHost, l: Line, beforeRoute: Station[], afterRoute: (Station | StationPlan)[], works: number, track: number, stations: StationPlan[], _hops: number, sv: Service, mode: RailMode, level: StationLevel): Valuation {
   const g = h.g;
-  // trains to keep today's headway on the longer round trip (each stop more adds a hop each way)
-  const cycle = 2 * sv.hop * Math.max(1, before.length - 1);
-  const extra = Math.max(0, Math.ceil(sv.trains * (cycle + 2 * sv.hop * hops) / cycle - 1e-9) - sv.trains);
-  // (against today's line with as many trains: what the extra trains would carry on it anyway is theirs, not the
-  // extension's; the gain at the rate the line earns what is forecast for it today)
-  const f0 = forecast(g, before, mode, sv), f1 = forecast(g, after, mode, sv);
-  const revenue = (carried(f1, sv, sv.trains + extra) - carried(f0, sv, sv.trains + extra)) * observedRate(h, l, carried(f0, sv, sv.trains));
-  const type = lineTrackAt(g, before[0]).type;
-  const upkeep = track * 2 * (trackBasePerUnit(type) * (LEVEL_TRACK[level] ?? 1) + (sv.trains + extra) * sv.wear)
+  const before = beforeRoute.filter((s) => sv.path.includes(s.id));
+  const after = afterRoute.filter((s) => !('id' in s) || sv.path.includes(s.id));
+  const type = lineTrackAt(g, before[0]).type, len = routeLength(before), len1 = routeLength(after);
+  const spacing = Math.max(4, len1 / Math.max(1, after.length - 1));
+  const yr = estimateVehicleYear(sv.cars, spacing / 1.15, g.year, 0.4, lineTrackAt(g, before[0]).speed);
+  const hop = YEAR_S / Math.max(1, yr.trips);
+  // Scale the measured timetable cycle by the projected physics of the changed route, including added dwell.
+  const cycle = sv.cycle * hop * (after.length - 1) / (sv.hop * (before.length - 1));
+  const extra = Math.max(0, Math.ceil(sv.totalTrains * cycle / sv.cycle - 1e-9) - sv.totalTrains);
+  const next: Service = { ...sv, cycle, hop, spacing, kmh: len1 * UNIT_M / (cycle / 2) * 3.6, trips: yr.trips, perTrain: yr.total, wear: yr.trackWearPerUnit };
+  const f0 = forecast(g, before, mode, sv);
+  const today = carried(f0, sv), rate = observedRate(h, l, today, sv);
+  const fleetRevenue = (carried(forecast(g, before, mode, sv, extra), sv, extra) - today) * rate;
+  const fleetNet = fleetRevenue - extra * sv.perTrain - len * 2 * extra * sv.wear;
+  const fleetCapital = extra * sv.price;
+  const fleet = { score: fleetNet * payback(mode) - fleetCapital, net: fleetNet, capital: fleetCapital, revenue: fleetRevenue, trains: extra };
+  const revenue = (carried(forecast(g, after, mode, next, extra), next, extra) - today) * rate;
+  const upkeep = track * 2 * (trackBasePerUnit(type) * (LEVEL_TRACK[level] ?? 1) + (sv.totalTrains + extra) * next.wear)
+    + len * 2 * ((sv.totalTrains + extra) * next.wear - sv.totalTrains * sv.wear)
     + stations.reduce((a, p) => a + (20000 + p.tracks * p.length * 500) * (LEVEL_STATION[p.level] ?? 1), 0);
-  const net = revenue - extra * sv.perTrain - upkeep;
+  const net = revenue - ((sv.trains + extra) * next.perTrain - sv.trains * sv.perTrain) - upkeep;
   const capital = works + extra * sv.price;
-  return { score: net * payback(mode) - capital, net, capital, revenue, trains: extra };
+  return { score: net * payback(mode) - capital, net, capital, revenue, trains: extra, fleet };
 }
 
-/**
- * The line's passenger fares last year against the forecast for it today (0.25 .. 1.5), when it ran all of last year;
- * else 1: a line's changes are valued at the rate it is seen to earn its forecast.
- */
-function observedRate(h: GrowHost, l: Line, forecastToday: number): number {
-  const g = h.g, opened = h.managed()?.get(l.id)?.opened ?? g.day;
-  if (opened > Math.floor(g.day / 360) * 360 - 360 || !(forecastToday > 0)) return 1;
-  const fares = l.incomeLast - (l.mail?.incomeLast ?? 0);
-  return fares > 0 ? Math.max(0.25, Math.min(1.5, fares / forecastToday)) : 1;
+/** Passenger receipts and forecasts over the same saved, unchanged operator/pattern service periods. */
+function observedRate(h: GrowHost, l: Line, forecastToday: number, sv: Service): number {
+  const g = h.g, key = h.me + ':' + sv.pid;
+  const signature = l.stops.join(',') + '|' + linePatterns(l).map((p) => p.id + ':' + p.stops.map(Number).join('')).join('|')
+    + '|' + l.vehicles.map((id) => { const t = g.vehicles.get(id) as Train; return id + ':' + t.owner + ':' + t.pattern + ':' + t.cars.map((m) => m.id).sort().join(','); }).join('|');
+  const observations = l.growth ??= {};
+  let p = observations[key];
+  if (!p) {
+    const opened = h.managed()?.get(l.id)?.opened ?? g.day;
+    const fullYear = opened <= Math.floor(g.day / 360) * 360 - 360;
+    const soleService = sv.trains === l.vehicles.length && linePatterns(l).length === 1;
+    // Older saves have receipts but no historical forecast. Use them only as a conservative initial estimate;
+    // a measured zero is evidence, while a young/unobserved service gets a half-forecast prior.
+    const rate = fullYear && soleService && forecastToday > 0
+      ? Math.min(0.5, Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / forecastToday) : 0.5;
+    // One cycle of prior evidence prevents a few quiet daily work units from being mistaken for a complete
+    // service period. Its weight decays continuously; there is no minimum multiplier for weak/zero receipts.
+    const priorExpected = forecastToday * sv.cycle / (DAY_SECONDS * 360);
+    p = observations[key] = { day: g.day, signature, forecast: forecastToday, counter: 0, atCounter: 0, expected: 0, receipts: 0, rate, days: 0,
+      priorExpected, priorReceipts: priorExpected * rate };
+  } else {
+    const days = Math.max(0, g.day - p.day);
+    // Other tasks can change a route or fleet between reviews. Its unknown change date cannot be calibrated;
+    // keep the previous evidence and start the next comparable period without restoring optimism.
+    if (days > 0 && signature === p.signature && p.forecast > 0) {
+      p.expected += p.forecast * days / 360;
+      p.receipts += Math.max(0, p.counter - p.atCounter);
+      p.days = (p.days ?? 0) + days;
+      // Fade the young-service prior continuously; a full observed year is entirely measured evidence.
+      const prior = Math.max(0, 1 - p.days / 360);
+      p.rate = Math.min(1.5, (p.receipts + p.priorReceipts * prior) / (p.expected + p.priorExpected * prior));
+    }
+    p.day = g.day; p.signature = signature; p.forecast = forecastToday; p.atCounter = p.counter;
+  }
+  return p.rate;
+}
+
+/** Prefer the affordable investment with the greater surplus/payback score, including adding only trains. */
+function preference(h: GrowHost, kind: 'ext' | 'fill', v: Valuation): { score: number; fleet: boolean } | null {
+  const choices = [{ investment: v, fleet: false }, { investment: v.fleet, fleet: true }]
+    .filter((c) => c.investment.score > 0 && funds(h, kind, c.investment.capital, false))
+    .sort((a, b) => b.investment.score - a.investment.score || Number(b.fleet) - Number(a.fleet));
+  return choices.length ? { score: choices[0].investment.score, fleet: choices[0].fleet } : null;
 }
 
 /** Survey: where the line could grow (cheap counts of residents no station reaches on foot), the promising options first. */
@@ -800,8 +858,8 @@ function levelsFor(T: Station): StationLevel[] {
 }
 
 /** Value one option in today's world: the better level for an extension; null when it does not fit. */
-function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score: number; level: StationLevel } | null {
-  const g = h.g, sv = serviceOf(h, l, path);
+function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score: number; level: StationLevel; fleet: boolean } | null {
+  const g = h.g, sv = serviceOf(h, l, path, o.kind === 'ext' ? [path[o.end ? path.length - 1 : 0]] : [o.a!, o.b!]);
   if (!sv) return null;
   const before = path.map((id) => g.stations.get(id)!);
   const mode = railPartMode(before[0].rail!);
@@ -813,9 +871,8 @@ function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score:
     const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
     const v = value(h, l, before, after, p.works, p.track, p.stations, p.stations.length, sv, mode, level);
     h.considered('extend.ext.valued');
-    // (of the options that pay, the best the company can pay for now: a shorter extension today, more later)
-    if (v.score > 0 && !funds(h, 'ext', v.capital, false)) { h.considered('extend.ext.funds'); return null; }
-    return { score: v.score, level };
+    const best = preference(h, 'ext', v);
+    return best ? { ...best, level } : null;
   }
   const f = planFill(h, l, path, o);
   if (typeof f === 'string') { h.considered('extend.fill.' + f.split(' ')[0]); return null; }
@@ -826,8 +883,8 @@ function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score:
   // (a stop more costs a stop's dwell and braking each way: about a fifth of a hop)
   const v = value(h, l, before, after, f.plan.cost + compensation(g, f.plan.station!.demolish), 0, [f.plan.station!], 0.2, sv, mode, lv);
   h.considered('extend.fill.valued');
-  if (v.score > 0 && !funds(h, 'fill', v.capital, false)) { h.considered('extend.fill.funds'); return null; }
-  return { score: v.score, level: lv };
+  const best = preference(h, 'fill', v);
+  return best ? { ...best, level: lv } : null;
 }
 
 /** A station cut into the line's track between two stops near the option's point; a reason when none fits. */
@@ -912,19 +969,74 @@ function extendPatterns(l: Line, T: number, added: Set<number>) {
   }
 }
 
-/** Extra trains for a longer line (its main service's consist and pattern), from the line's depot; how many were bought. */
+/** Consist-aware entry onto the stopping pattern, before either borrowing or purchasing. */
 function addTrains(h: GrowHost, l: Line, sv: Service, n: number): number {
-  const g = h.g;
+  const g = h.g, dp = g.depots.get(sv.depot), p = linePatterns(l).find((p) => p.id === sv.pid);
+  if (n <= 0) return 0;
+  const stops = l.stops.filter((_, i) => p?.stops[i] !== false);
+  const reaches = !!dp && dp.owner === h.me && !!p && stops.some((s, i) => {
+    const next = stops[(i + 1) % stops.length];
+    return s !== next && depotServes(g, dp, s, next, sv.cars) >= 0;
+  });
+  const rule = consistRule(sv.cars);
+  const routes = reaches && stops.every((s, i) => {
+    const next = stops[(i + 1) % stops.length], st = g.stations.get(s);
+    return s === next || !!st?.rail?.edges.some((id) => {
+      const e = g.world.net.edges.get(id);
+      return e && [1, -1].some((dir) => !!findRailRoute(g, railNext(g, e, dir, h.me, false, rule), next, h.me, -1, 80000, false, rule));
+    });
+  });
+  if (!routes) { h.note(`${l.name}: no way from its depot through the service; no trains added`); h.considered('extend.depotCut'); return 0; }
   let bought = 0;
   for (let i = 0; i < n; i++) {
-    if (!g.depots.get(sv.depot) || !h.canSpend(sv.price * 1.1, 0.3)) break;
+    if (!h.canSpend(sv.price * 1.1, 0.3)) break;
     const t = g.vehicles.buyTrain(sv.depot, [...sv.cars], l.id);
     if (typeof t === 'string') break;
-    if (l.patterns && l.patterns.length > 1) { t.pattern = sv.pid; t.onLineChanged(); }
+    t.pattern = sv.pid; t.onLineChanged();
     bought++;
   }
   if (bought) h.ai.stats.vehicles += bought;
   return bought;
+}
+
+function observeCurrent(h: GrowHost, l: Line, path: number[], pid: number): void {
+  const sv = serviceOf(h, l, path, [], pid);
+  if (!sv) return;
+  const points = sv.path.map((id) => h.g.stations.get(id)!);
+  observedRate(h, l, carried(forecast(h.g, points, railPartMode(points[0].rail!), sv), sv), sv);
+}
+
+/** Revalue a chosen fleet-only alternative in today's world and buy only when it still wins on incentives. */
+function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolean {
+  const g = h.g, before = path.map((id) => g.stations.get(id)!);
+  const sv = serviceOf(h, l, path, o.kind === 'ext' ? [path[o.end ? path.length - 1 : 0]] : [o.a!, o.b!]);
+  if (!sv) return false;
+  let after: (Station | StationPlan)[], works: number, track: number, stations: StationPlan[], level: StationLevel;
+  if (o.kind === 'ext') {
+    const t = terminusAt(h, path, o.end!);
+    if (!t) return false;
+    const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground');
+    if (typeof p === 'string') return false;
+    after = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
+    ({ works, track, stations, level } = p);
+  } else {
+    const f = planFill(h, l, path, o);
+    if (typeof f === 'string') return false;
+    const station = f.plan.station!;
+    after = [...before]; after.splice(Math.max(path.indexOf(o.a!), path.indexOf(o.b!)), 0, station);
+    works = f.plan.cost + compensation(g, station.demolish); track = 0; stations = [station]; level = station.level;
+  }
+  const v = value(h, l, before, after, works, track, stations, stations.length, sv, railPartMode(before[0].rail!), level);
+  if (!preference(h, o.kind, v)?.fleet) return false;
+  // addTrains owns the reachability and borrowing check; no funds are borrowed before that check.
+  const bought = addTrains(h, l, sv, v.fleet.trains);
+  if (!bought) return false;
+  const info = h.managed()?.get(l.id);
+  if (info) info.maxVehicles = Math.max(info.maxVehicles, h.fleet(l).ours.length);
+  observeCurrent(h, l, path, sv.pid);
+  h.succeed(); h.considered('extend.fleet');
+  h.note(`${l.name}: added ${bought} trains on its existing route; fleet-only investment pays better than new stations (${Math.round(v.fleet.net / 1000)}k/year surplus)`);
+  return true;
 }
 
 /**
@@ -934,38 +1046,61 @@ function addTrains(h: GrowHost, l: Line, sv: Service, n: number): number {
  */
 export interface GrowBuild { sites: number[][]; stations: number[]; pieces: number[]; starts: number[]; links: number[]; spent: number; trains: number; revenue: number; net: number; capital: number;
   /** work units the track waited for a depot spur to clear (trains on it); the depot moved out to the new terminus */
-  waits: number; moved: boolean;
+  waits: number; moved: boolean; pid?: number;
+  /** Construction debits with the assets they paid for: retained/busy works cannot be refunded. */
+  debits?: { cost: number; edges: number[]; stations: number[]; depots: number[] }[];
   /** the depot spur beyond the terminus (a lead in the way on, a tail's yard) and its depots: they move out to the new terminus */
   spur: number[]; depots: number[] }
 export const copyGrowBuild = (b: GrowBuild): GrowBuild => ({ ...b, sites: b.sites.map((q) => [...q]), stations: [...b.stations], pieces: [...b.pieces], starts: [...b.starts], links: [...b.links],
-  spur: [...b.spur], depots: [...b.depots] });
+  spur: [...b.spur], depots: [...b.depots], ...(b.debits ? { debits: b.debits.map((d) => ({ ...d, edges: [...d.edges], stations: [...d.stations], depots: [...d.depots] })) } : {}) });
 
 /** An extension's plan and value in today's world (the funds it needs within the company's means), or a reason. */
 function extValued(h: GrowHost, l: Line, path: number[], o: GrowOption): { T: Station; te: TerminusEnd; p: ExtPlan; v: Valuation; sv: Service } | string {
   const g = h.g;
   const t = terminusAt(h, path, o.end!);
-  const sv = serviceOf(h, l, path);
+  const sv = serviceOf(h, l, path, t ? [t.T.id] : []);
   if (!t || !sv) return 'changed';
   const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground');
   if (typeof p === 'string') return p;
   const before = path.map((id) => g.stations.get(id)!), mode = railPartMode(t.T.rail!);
   const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
   const v = value(h, l, before, after, p.works, p.track, p.stations, p.stations.length, sv, mode, p.level);
-  if (v.score <= 0) return 'unpaid';
+  if (v.score <= 0 || v.fleet.score > v.score) return 'unpaid';
   if (!funds(h, 'ext', v.capital, true)) return 'funds';
   return { T: t.T, te: t.te, p, v, sv };
 }
 
-/** Take up what a build laid (its links, stations and pieces) and refund what it spent; a note why. */
-function extUndo(h: GrowHost, name: string, b: GrowBuild, why: string, spent = 0) {
+/** Record construction-category debits independently of loan inflows, with the assets created by this step. */
+function recordWorks(h: GrowHost, b: GrowBuild, construction: number, edge: number, station: number, depot: number): void {
+  const g = h.g, cost = Math.max(0, construction - g.company(h.me).economy.thisYear.construction);
+  if (!cost) return;
+  const edges: number[] = [], stations: number[] = [], depots: number[] = [];
+  for (let id = edge; id < g.world.net.nextEdge; id++) if (g.world.net.edges.get(id)?.owner === h.me) edges.push(id);
+  for (let id = station; id < g.stations.nextId; id++) if (g.stations.get(id)) stations.push(id);
+  for (let id = depot; id < g.depots.nextId; id++) if (g.depots.get(id)) depots.push(id);
+  (b.debits ??= []).push({ cost, edges, stations, depots });
+  b.spent += cost;
+}
+
+/** Refund only removed works. A cursor from an older save that already moved its depot keeps its recovery route. */
+function extUndo(h: GrowHost, name: string, b: GrowBuild, why: string) {
   const g = h.g, net = g.world.net, eco = g.company(h.me).economy;
-  for (const id of b.links) if (net.edges.has(id) && !g.vehicles.isEdgeBusy(id)) net.removeEdge(id);
-  for (const id of b.stations) if (g.stations.get(id)) g.stations.removeStation(id);
-  for (const id of b.pieces) if (net.edges.has(id) && !g.vehicles.isEdgeBusy(id)) net.removeEdge(id);
-  const refund = b.spent + spent;
+  if (b.moved) { h.note(`extension of ${name} stopped: ${why}; moved depot and recovery tracks retained`); h.considered('extend.recover'); return; }
+  const debits = b.debits ?? [];
+  for (const id of new Set(debits.flatMap((d) => d.depots))) if (g.depots.get(id)) g.depots.remove(id);
+  for (const id of new Set([...b.links, ...b.pieces, ...debits.flatMap((d) => d.edges)])) {
+    const e = net.edges.get(id);
+    if (e && e.depot < 0 && e.station < 0 && !g.vehicles.isEdgeBusy(id)) net.removeEdge(id);
+  }
+  for (const id of new Set([...b.stations, ...debits.flatMap((d) => d.stations)])) if (g.stations.get(id)) g.stations.removeStation(id);
+  const removed = (d: typeof debits[number]) => d.edges.every((id) => !net.edges.has(id))
+    && d.stations.every((id) => !g.stations.get(id)) && d.depots.every((id) => !g.depots.get(id));
+  const legacyRemoved = [...b.links, ...b.pieces].every((id) => !net.edges.has(id)) && b.stations.every((id) => !g.stations.get(id));
+  const untracked = Math.max(0, b.spent - debits.reduce((sum, d) => sum + d.cost, 0));
+  const refund = debits.filter(removed).reduce((sum, d) => sum + d.cost, 0) + (legacyRemoved ? untracked : 0);
   if (refund > 0) eco.spend(-refund, 'construction', true);
   g.onNetworkChanged(); g.lines.rebuild();
-  h.note(`extension of ${name} given up: ${why}; works refunded`);
+  h.note(`extension of ${name} given up: ${why}; ${Math.round(refund / 1000)}k removed works refunded`);
   h.considered('extend.rollback');
 }
 
@@ -978,14 +1113,15 @@ function extStations(h: GrowHost, l: Line, path: number[], o: GrowOption, prev?:
   const g = h.g, net = g.world.net, me = h.me, eco = g.company(me).economy;
   const ok = (q: Proposal) => h.consent(q) && h.demolitionOk(q.demolish);
   let b = prev;
-  const money = eco.money;
+  const construction = eco.thisYear.construction, edge0 = net.nextEdge, station0 = g.stations.nextId, depot0 = g.depots.nextId;
+  const fail = (why: string) => { if (b) { recordWorks(h, b, construction, edge0, station0, depot0); extUndo(h, l.name, b, why); } };
   if (!b) {
     const x = extValued(h, l, path, o);
     if (typeof x === 'string') return x;
-    const { T, te, p, v } = x;
+    const { T, te, p, v, sv } = x;
     if (te.kind === 'other') return 'terminus';
     b = { sites: p.stations.map((q) => [q.x, q.z, q.angle, q.depth, q.height]), stations: [], pieces: [], starts: [], links: [], spent: 0,
-      trains: v.trains, revenue: v.revenue, net: v.net, capital: v.capital, waits: 0, moved: false, spur: [...te.lead], depots: [...te.depots] };
+      trains: v.trains, revenue: v.revenue, net: v.net, capital: v.capital, waits: 0, moved: false, pid: sv.pid, debits: [], spur: [...te.lead], depots: [...te.depots] };
     for (let k = 0; k < te.heads.length; k++) {
       if (te.kind !== 'tail') { b.starts.push(te.heads[k]); continue; }
       if (k === te.root) { b.starts.push(te.fork); continue; }
@@ -993,26 +1129,26 @@ function extStations(h: GrowHost, l: Line, path: number[], o: GrowOption, prev?:
       const pp = planEdge(g, nodeSnap(g, n.id, 'rail'), { kind: 'free', x: fx, z: fz, y: n.y },
         { kind: 'rail', type: lineTrackAt(g, T).type, tracks: 1, heightOffset: n.y - g.world.heightAt(fx, fz) || 1e-3, crossing: 'auto', owner: me });
       const e0 = net.nextEdge;
-      if (!pp.ok || !ok(pp) || commitProposal(g, pp)) { extUndo(h, l.name, b, 'no room beside the tail', Math.max(0, money - eco.money)); return 'tail'; }
+      if (!pp.ok || !ok(pp) || commitProposal(g, pp)) { fail('no room beside the tail'); return 'tail'; }
       for (let id = e0; id < net.nextEdge; id++) if (net.edges.get(id)?.kind === 'rail') b.pieces.push(id);
       const q = nodeAt(g, 'rail', fx, fz);
-      if (!q) { extUndo(h, l.name, b, 'track end', Math.max(0, money - eco.money)); return 'tail'; }
+      if (!q) { fail('track end'); return 'tail'; }
       b.starts.push(q.id);
     }
   } else b = copyGrowBuild(b);
   // the next station, planned again on its site at the terminus's style
   const t = terminusAt(h, path, o.end!), site = b.sites.shift();
-  if (!t || !site) { extUndo(h, l.name, b, 'the line changed', Math.max(0, money - eco.money)); return 'changed'; }
+  if (!t || !site) { fail('the line changed'); return 'changed'; }
   const r = t.T.rail!, level = o.level ?? 'ground';
   // (the terminus's style: city-integration, the one-track branch passes railPartMode as the station's style)
   const re = g.stations.planRail(site[0], site[1], site[2], r.length, 2, me, { trackType: r.trackType, level, ...(site[3] ? { depth: site[3] } : {}), ...(site[4] ? { height: site[4] } : {}) });
-  if (!re.ok || re.join?.rail || !h.demolitionOk(re.demolish)) { extUndo(h, l.name, b, re.error ?? 'station site', Math.max(0, money - eco.money)); return 'site'; }
+  if (!re.ok || re.join?.rail || !h.demolitionOk(re.demolish)) { fail(re.error ?? 'station site'); return 'site'; }
   if (re.join) { re.links = [...new Set([...re.links, re.join])]; re.join = null; }
   const dem = [...re.demolish], id = g.stations.nextId;
-  if (g.stations.commitRail(re, me) || !g.stations.get(id)?.rail) { extUndo(h, l.name, b, 'station', Math.max(0, money - eco.money)); return 'station'; }
+  if (g.stations.commitRail(re, me) || !g.stations.get(id)?.rail) { fail('station'); return 'station'; }
   h.compensate(dem);
   b.stations.push(id);
-  b.spent += Math.max(0, money - eco.money);
+  recordWorks(h, b, construction, edge0, station0, depot0);
   return b;
 }
 
@@ -1037,18 +1173,15 @@ function linkPlans(h: GrowHost, T: Station, made: Station[], starts: number[], l
 
 /**
  * An extension's third step: the double track from the terminus out to its new stations (unused until the next step).
- * A depot beyond the terminus moves out in the same work unit (a lead in the way on: the track planned as if it were
- * gone; a tail's yard, which would otherwise join the line half way on one of its running tracks): the track is laid,
- * then a yard at the new terminus (sideways: that terminus stays extendable), the depot's trains moved home there (those
- * inside with it), the old spur taken up. Where the yard does not fit, the track goes again and the spur stays. 'wait'
- * while a train is on the spur.
+ * A lead in the way is ignored when planning the track. The old depot and spur stay until final validation; this
+ * step checks that a replacement yard fits. 'wait' while a train is on the spur.
  */
 function extLinks(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBuild): GrowBuild | string {
   const g = h.g, net = g.world.net, me = h.me, eco = g.company(me).economy;
   const t = terminusAt(h, path, o.end!), T = t?.T;
   const made = b.stations.map((id) => g.stations.get(id)).filter((s): s is Station => !!s?.rail);
-  const money = eco.money, out = copyGrowBuild(b);
-  const fail = (why: string) => { extUndo(h, l.name, out, why, Math.max(0, money - eco.money)); return why; };
+  const construction = eco.thisYear.construction, edge0 = net.nextEdge, station0 = g.stations.nextId, depot0 = g.depots.nextId, out = copyGrowBuild(b);
+  const fail = (why: string) => { recordWorks(h, out, construction, edge0, station0, depot0); extUndo(h, l.name, out, why); return why; };
   if (!t || !T || made.length !== b.stations.length || b.starts.some((id) => !net.nodes.has(id))) return fail('the line changed');
   const level = o.level ?? 'ground', te = t.te;
   const ok = (q: Proposal) => h.consent(q) && h.demolitionOk(q.demolish);
@@ -1069,19 +1202,8 @@ function extLinks(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBu
     for (let id = e0; id < net.nextEdge; id++) if (net.edges.get(id)?.kind === 'rail' && net.edges.get(id)!.owner === me) out.links.push(id);
     h.compensate(dem);
   }
-  if (move && yard) {
-    const dep = buildTerminusYard(g, me, yard, ok);
-    if (dep < 0) return fail('no yard at the new terminus');
-    for (const d of depots) { const err = moveDepotHome(g, d, dep); if (err) { h.note(`${T.name}: depot not moved (${err})`); return fail('depot ' + err); } }
-    let len = 0;
-    for (const id of b.spur) { const e = net.edges.get(id); if (e) { len += e.len; net.removeEdge(id); } }
-    eco.spend(len * 400, 'construction', true);
-    g.onNetworkChanged();
-    h.stat('netDepotsMoved');
-    h.note(`moved the depot at ${T.name} out to ${last.name}: ${l.name} runs on beyond ${T.name}`);
-    out.moved = true;
-  }
-  out.spent += Math.max(0, money - eco.money);
+  // Relocation waits until extConnect: all final validation and the irreversible move share one work unit.
+  recordWorks(h, out, construction, edge0, station0, depot0);
   return out;
 }
 
@@ -1091,36 +1213,58 @@ function extLinks(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBu
  * terminus, signals, trains for today's headway. Where trains find no way through, everything the build laid is taken
  * up again (works refunded).
  */
-function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBuild): boolean {
-  const g = h.g, me = h.me;
+function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBuild): boolean | 'wait' {
+  const g = h.g, me = h.me, net = g.world.net, eco = g.company(me).economy;
   const t = terminusAt(h, path, o.end!), T = t?.T;
   const made = b.stations.map((id) => g.stations.get(id)).filter((s): s is Station => !!s?.rail);
   if (!T || made.length !== b.stations.length) { extUndo(h, l.name, b, 'the line changed'); return false; }
   const level = o.level ?? 'ground';
   const ids = made.map((s) => s.id);
   const np = o.end ? [...path, ...ids] : [...[...ids].reverse(), ...path];
-  const old = [...l.stops];
-  h.setStops(l, outAndBack(np));
-  if (!routesOk(g, l, np)) {
-    h.setStops(l, old);
-    // (the depot moved out there: its trains' way stays; the works stay for a later look at the line)
-    if (b.moved) { h.note(`${l.name}: no way through to ${made[made.length - 1].name} yet; the line keeps its stops`); h.considered('extend.noWay'); }
-    else extUndo(h, l.name, b, 'no way through');
-    return false;
+  // Revalidate the complete route and all depot moves before discarding any old asset.
+  if (!routesOk(g, l, np)) { extUndo(h, l.name, b, 'no way through'); return false; }
+  const depots = b.moved ? [] : b.depots;
+  if (depots.some((id) => !g.depots.get(id))) { extUndo(h, l.name, b, 'depot changed'); return false; }
+  if (depots.some((id) => depotBusy(g, id)) || b.spur.some((id) => g.vehicles.isEdgeBusy(id))) return 'wait';
+  const construction = eco.thisYear.construction, edge0 = net.nextEdge, station0 = g.stations.nextId, depot0 = g.depots.nextId;
+  const fail = (why: string) => { recordWorks(h, b, construction, edge0, station0, depot0); extUndo(h, l.name, b, why); return false; };
+  let home = -1;
+  if (depots.length) {
+    const last = made[made.length - 1], prev = made.length > 1 ? made[made.length - 2] : T;
+    const ok = (q: Proposal) => h.consent(q) && h.demolitionOk(q.demolish);
+    const yard = planTerminusYard(g, me, last, outerEnd(last, prev), null, ok);
+    if (!yard) return fail('no yard at the new terminus');
+    home = buildTerminusYard(g, me, yard, ok);
+    if (home < 0) return fail('no yard at the new terminus');
   }
+  const fin = finishDoubleTrack(g, lineTrack(g, np, me), me);
+  if (fin.error) h.note(`${l.name}: ${fin.error}`);
+  if (!routesOk(g, l, np)) return fail('no way through after directional running');
+  if (home >= 0) {
+    const dp = g.depots.get(home)!;
+    const homed = [...g.vehicles.map.values()].filter((v): v is Train => v.kind === 'train' && depots.includes((v as Train).depotId));
+    if (!homed.every((v) => path.some((sid, i) => i + 1 < path.length && depotServes(g, { ...dp, owner: v.owner }, sid, path[i + 1], v.cars) >= 0))) return fail('new depot cannot serve the old route');
+    for (const id of depots) {
+      const err = moveDepotHome(g, id, home);
+      if (err) return fail('depot ' + err);
+      b.moved = true; // Protect every exit even if a later move unexpectedly fails.
+    }
+    let len = 0;
+    for (const id of b.spur) { const e = net.edges.get(id); if (e) { len += e.len; net.removeEdge(id); } }
+    eco.spend(len * 400, 'construction', true);
+    g.onNetworkChanged(); h.stat('netDepotsMoved');
+    h.note(`moved the depot at ${T.name} out to ${made[made.length - 1].name}: ${l.name} runs on beyond ${T.name}`);
+  }
+  recordWorks(h, b, construction, edge0, station0, depot0);
+  h.setStops(l, outAndBack(np));
   extendPatterns(l, T.id, new Set(ids));
   if (!o.end) g.lines.renumber(l.id);
   g.lines.rebuild();
   for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
-  // directional running over the whole line (crossovers before the new terminus), signals, trains
-  const fin = finishDoubleTrack(g, lineTrack(g, np, me), me);
-  if (fin.error) h.note(`${l.name}: ${fin.error}`);
   h.signal(l.id);
-  // (trains for the longer round trip leave the line's depot: only where they find their way onto the line)
-  const sv = serviceOf(h, l, np), dp = sv ? g.depots.get(sv.depot) : undefined;
-  const onto = !!dp && np.some((sid) => depotReaches(g, dp, sid));
-  if (sv && !onto) { h.note(`${l.name}: no way from its depot onto the line; no trains added`); h.considered('extend.depotCut'); }
-  const bought = sv && onto ? addTrains(h, l, sv, b.trains) : 0;
+  const sv = serviceOf(h, l, np, [T.id], b.pid);
+  const bought = sv ? addTrains(h, l, sv, b.trains) : 0;
+  if (sv) observeCurrent(h, l, np, sv.pid);
   const info = h.managed()?.get(l.id);
   if (info) {
     info.maxVehicles = Math.max(info.maxVehicles, h.fleet(l).ours.length);
@@ -1139,7 +1283,7 @@ function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: Grow
 /** Build a planned stop in a long gap (re-planned and valued in today's world); true when built. */
 function buildFill(h: GrowHost, l: Line, path: number[], o: GrowOption): boolean {
   const g = h.g, me = h.me;
-  const sv = serviceOf(h, l, path);
+  const sv = serviceOf(h, l, path, [o.a!, o.b!]);
   const f = planFill(h, l, path, o);
   if (!sv || typeof f === 'string') { if (typeof f === 'string') h.note(`no stop between ${g.stations.get(o.a!)?.name} and ${g.stations.get(o.b!)?.name} on ${l.name}: ${f}`); return false; }
   const before = path.map((id) => g.stations.get(id)!), mode = railPartMode(before[0].rail!);
@@ -1166,6 +1310,7 @@ function buildFill(h: GrowHost, l: Line, path: number[], o: GrowOption): boolean
   for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
   h.signal(l.id);
   addTrains(h, l, sv, v.trains);
+  observeCurrent(h, l, np, sv.pid);
   h.canon(l.id);
   h.stat('netGrowInfill');
   h.succeed();
@@ -1188,7 +1333,7 @@ export function* growTask(h: GrowHost, item: { ids: number[]; grow?: GrowCursor 
   const cursor = item.grow ??= { at: 0 };
   if (!l || !path || h.ai.railPolicy.deepTrouble || (h.ai.railPolicy.accounts.get(l.id)?.step ?? 0) > 0) {
     // (an extension half built: what it laid is taken up again)
-    if (cursor.made && !cursor.made.moved) extUndo(h, l?.name ?? 'a line', cursor.made, 'the line changed');
+    if (cursor.made) extUndo(h, l?.name ?? 'a line', cursor.made, 'the line changed');
     finish(180, 'invalid');
     return;
   }
@@ -1206,15 +1351,16 @@ export function* growTask(h: GrowHost, item: { ids: number[]; grow?: GrowCursor 
     cursor.at++;
     const ev = evaluate(h, l, path, opts[i]);
     yield;
-    if (ev && ev.score > 0 && (!cursor.best || ev.score > cursor.best.score)) cursor.best = { opt: i, score: ev.score };
+    if (ev && ev.score > 0 && (!cursor.best || ev.score > cursor.best.score)) cursor.best = { opt: i, score: ev.score, fleet: ev.fleet };
     return;
   }
   const best = cursor.best;
   if (!best) { finish(360, 'unpaid'); return; }
   const o = opts[best.opt];
+  if (best.fleet && !cursor.made) { finish(360, 'build'); buildFleet(h, l, path, o); yield; return; }
   if (o.kind === 'fill') { finish(360, 'build'); buildFill(h, l, path, o); yield; return; }
   // the extension's build, a step a work unit (a save between steps resumes them): (n + 1) the stations, one a unit;
-  // (n + 2) the track to them (a depot lead in its way moved out first); (n + 3) the line running on
+  // (n + 2) the track to them; (n + 3) final validation, depot relocation and the line running on atomically
   if (cursor.at === n + 1) {
     const b = extStations(h, l, path, o, cursor.made);
     yield;
@@ -1232,7 +1378,9 @@ export function* growTask(h: GrowHost, item: { ids: number[]; grow?: GrowCursor 
     return;
   }
   const b = cursor.made;
-  finish(360, 'build');
-  if (b) extConnect(h, l, path, o, b);
+  const connected = b ? extConnect(h, l, path, o, b) : false;
   yield;
+  if (connected === 'wait' && b && b.waits < 20) { b.waits++; return; }
+  if (connected === 'wait' && b) extUndo(h, l.name, b, 'trains kept the depot lead busy');
+  finish(360, 'build');
 }

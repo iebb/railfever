@@ -21,7 +21,7 @@ import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask } f
 import { terminusOf, outerEnd, planTerminusYard, buildTerminusYard, cityStationSpacing, lineTrackAt } from '../src/game/ai-grow';
 import { Train } from '../src/game/train';
 import { patternHeadways, addPattern, setVehiclePattern, linePatterns } from '../src/game/patterns';
-import { stopsWithInserted, type StopPlace } from '../src/game/line-edit';
+import { stopsWithInserted, replaceLineStops, type StopPlace } from '../src/game/line-edit';
 import { check, fails, fmt, checkReservations } from './lib';
 
 const M = (id: string) => MODEL_BY_ID.get(id)!;
@@ -196,7 +196,9 @@ function presholm(depotAt: 'west' | 'east', yard: 'tail' | 'old', trains: number
   const { g, ai, me } = flat(companies);
   const t = newTown(g, 'Presholm', 220, 256);
   district(g, t, 150, 270, 256, 64, 7000);
-  const { line, sts, depot } = cityLine(g, me, [158, 183, 208, 233, 258], 256, depotAt, yard, trains);
+  // The old three-train fixture earns more by adding fleet on its existing route (validation finding 2).
+  // Construction scenarios start with that demand already served, so new district coverage wins on incentives.
+  const { line, sts, depot } = cityLine(g, me, [158, 183, 208, 233, 258], 256, depotAt, yard, Math.max(6, trains));
   runDays(g, 30);
   if (grow) district(g, t, 270, 342, 256, 64, grow);
   runDays(g, 5);
@@ -336,7 +338,8 @@ if (run('infill')) {
   const t = newTown(g, 'Gapford', 220, 256);
   district(g, t, 150, 195, 256, 64, 3500);
   district(g, t, 246, 296, 256, 64, 3500);
-  const { line, sts } = cityLine(g, me, [158, 183, 258, 283], 256, 'west', 'tail', 3);
+  // Cover the existing route's fleet opportunity first; the gap's new catchment can then justify a halt.
+  const { line, sts } = cityLine(g, me, [158, 183, 258, 283], 256, 'west', 'tail', 12);
   runDays(g, 30);
   district(g, t, 195, 246, 256, 64, 5000);
   runDays(g, 5);
@@ -449,7 +452,7 @@ if (run('player')) {
   for (const v of line.vehicles) g.vehicles.get(v)?.onLineChanged();
   const add = (sid: number, place: StopPlace) => {
     const r = stopsWithInserted(g, line, sid, place);
-    if (r) { line.stops = r.stops; g.lines.rebuild(); for (const v of line.vehicles) g.vehicles.get(v)?.onLineChanged(); }
+    if (r) replaceLineStops(g, line, r.stops);
     return r;
   };
   // the rail tool from the terminus's free track ends: double track on to a new station
@@ -491,4 +494,3 @@ if (run('player')) {
 
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
-

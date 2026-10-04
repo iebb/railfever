@@ -5,7 +5,7 @@ import type { Game } from './game';
 import type { Station } from './stations';
 import type { Vec3Like } from './geom';
 import { fareFor, distanceFare, legacyFare, simNow, fareGroupKey, railHistory, changeClass, transferFareFactor, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
-import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway } from './patterns';
+import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway, patternOf } from './patterns';
 import { noteServe, OpCost } from './opcosts';
 import { DAY_SECONDS, type Cargo } from './constants';
 import { unloadMail, loadMail, fixMail, type MailLeg } from './mail';
@@ -231,6 +231,8 @@ export abstract class Vehicle {
       this.incomeYear += income;
       if (line) {
         line.incomeYear += income;
+        const observation = line.growth?.[this.owner + ':' + (patternOf(line, this.pattern)?.id ?? 0)];
+        if (observation) observation.counter += income;
         if (line.kind === 'rail') g.ais.find((a) => a.companyId === this.owner)?.railPolicy.operating(line.id, income);
       }
       g.onIncome(income, this, st);

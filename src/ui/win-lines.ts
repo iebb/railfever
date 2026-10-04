@@ -22,7 +22,7 @@ import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, mode
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
-import { stopsWithInserted, type StopPlace } from '../game/line-edit';
+import { stopsWithInserted, replaceLineStops, type StopPlace } from '../game/line-edit';
 
 /** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
 const insertPlace = new Map<number, StopPlace>();
@@ -183,12 +183,10 @@ export function addStopToLine(ui: UI, lineId: number, stationId: number) {
   const place = insertPlace.get(lineId) ?? 'end';
   const res = stopsWithInserted(g, l, stationId, place);
   if (!res) { ui.toast(place === 'end' ? 'Already the last stop' : 'Already a stop there', 'info'); return; }
-  l.stops = res.stops;
+  replaceLineStops(g, l, res.stops);
   // (after a chosen stop, the next one clicked goes after this one; at the start, before it: the line grows outwards)
   if (typeof place === 'number') insertPlace.set(lineId, res.at);
   ui.sound('click', { pitch: 1 + Math.min(0.5, l.stops.length * 0.06) });
-  g.lines.rebuild();
-  for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
   ui.hud.onToolChange();
   ui.wm.get('line-' + lineId)?.refresh?.();
 }
