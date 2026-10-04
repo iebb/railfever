@@ -69,8 +69,13 @@ function policyChecks() {
   check(projectMail(g, points, [MODEL_BY_ID.get('hsr_a')!], 1, 150, headway, 16).revenue === 0, 'HSR units get no mail project bonus or vans');
   check(projectMail(g, points, cars, 1, t.maxSpeedKmh * 0.6, headway, 16).yearly === modelYearCost(MODEL_BY_ID.get('van_steel')!, g.year), 'project accounts include van operating costs');
   const expensive = projectMail(g, points, cars, 100, t.maxSpeedKmh * 0.6, headway, 16);
-  check(expensive.revenue > 0 && !expensive.cars.some(carriesMail) && expensive.price === 0,
-    'project evaluation includes potential mail, while opening vans still require the purchase margin');
+  check(expensive.revenue === 0 && expensive.potential > 0 && !expensive.cars.some(carriesMail) && expensive.price === 0 && expensive.yearly === 0,
+    'rejected vans retain future potential separately and contribute no operating receipts or costs');
+  const sparse = projectMail(g, points, cars, 1, 60, 10000, 16);
+  check(sparse.potential > 0 && sparse.revenue === 0 && !sparse.cars.some(carriesMail) && sparse.price === 0 && sparse.yearly === 0,
+    'sparse service cannot improve project ROI with receipts from a van it will not buy');
+  check(opening.potential === opening.revenue && opening.price > 0 && opening.yearly > 0,
+    'selected vans contribute operating receipts together with their capital and operating costs');
 
   ai.mailPolicy.manage(l, info);
   check(!ai.mailPolicy.mailQueue.length && info.mailLook === undefined, 'no existing-line review before 180 days');

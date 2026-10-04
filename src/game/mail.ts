@@ -20,7 +20,7 @@ import { GEN_RATE, type ForecastSite } from './demand';
 import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
 import { boarding, servesStation, patternHeadways, linePatterns, mailFleet, TRANSFER_PENALTY_S } from './patterns';
-import { walkingCatchment, planWalkingCatchment, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { readWalkingCatchment, planWalkingCatchment, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 
 /**
  * A leg mail has been carried on: the vehicle, its line and its owner then, and the straight-line distance (units)
@@ -45,7 +45,7 @@ export interface StationMail {
   rating: number;
   /** fraction of a unit posted but not yet queued */
   genAccum: number;
-  /** posted here, loaded here, delivered here, lost here (queue overflow, no route any more): this / last month */
+  /** posted here, loaded here, delivered here, lost here (overflow, no route or lost acceptance): this / last month */
   genMonth: number; genLast: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
@@ -67,7 +67,7 @@ export const MAIL_TYPE_WEIGHT = [1, 1, 1, 1.5, 1, 2, 1.6, 0.3, 0, 0];
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);
 const NO_MAIL: MailDemand = { dest: [], w: [], served: 0 };
 /**
- * Can people reach the station (Station.roadAccess, kept up to date by the network listener)? Mail only reads the
+ * Can people reach the station (Station.roadAccess, committed by simulation/construction handling)? Mail only reads the
  * flag: demand.ts stationActive would refresh the access on the way, a side effect mail must not add.
  */
 const reachable = (st: Station) => st.roadAccess !== false;
@@ -173,12 +173,16 @@ function book(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: nu
 }
 
 /**
- * Mail delivered at `st`: counted (station, town) and paid. The journey's receipts (fares.ts mailFare: posting to now,
- * the distance from its origin, x 0.9 per change) are shared by its legs by the distances they carried: the delivering
+ * Mail delivered at `st`: counted (station, town, delivering vehicle) and paid only while it still accepts mail.
+ * Lost acceptance ends the journey as lost here, without receipts, on every delivery path. The receipts (fares.ts
+ * mailFare: posting to now, the distance from its origin, x 0.9 per change) are shared by its legs by the distances
+ * they carried: the delivering
  * vehicle (`by`, its last leg) and the earlier legs. Returns the delivering vehicle's share.
  */
 export function settleMail(g: Game, st: Station, count: number, j: MailJourney, by: { v: Vehicle; line: Line | null; dist: number } | null): number {
+  if (!g.mail.accepts(st)) { stationMail(g, st).lostMonth += count; return 0; }
   deliverMail(g, st, count);
+  if (by) by.v.mailDelivered += count;
   const fare = mailFare(j.od, simNow(g) - j.p, count, j.c);
   if (!(fare > 0)) return 0;
   let total = by ? Math.max(0, by.dist) : 0;
@@ -314,9 +318,11 @@ export function mergeLineMail(a: Line, b: Line) {
 
 /**
  * Station `b` becomes part of `a` (Stations.absorb): its mail state joins a's, mail anywhere heading to, changing at or
- * posted at `b` is re-addressed to `a` (mail now at its destination is delivered), also aboard vehicles (`re` maps ids).
+ * posted at `b` is re-addressed to `a`, also aboard vehicles (`re` maps ids). Returns mail now at its destination;
+ * the construction handler settles it after committing the merged access and routing, so acceptance is current.
  */
 export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => number) {
+  const deliveries: { st: Station; count: number; j: MailJourney }[] = [];
   const moved = b.mail ? [...b.mail.waiting.values()] : [];
   if (b.mail) {
     const ma = stationMail(g, a), mb = b.mail;
@@ -328,7 +334,7 @@ export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => 
   }
   const requeue = (st: Station, w: MailWait) => {
     const j = { ...journeyOf(w), o: re(w.o) };
-    if (re(w.dest) === st.id) settleMail(g, st, w.count, j, null);
+    if (re(w.dest) === st.id) deliveries.push({ st, count: w.count, j });
     else addMail(g, st, w.line, re(w.alight), re(w.dest), w.count, j);
   };
   for (const st of g.stations.map.values()) {
@@ -345,6 +351,7 @@ export function absorbMail(g: Game, a: Station, b: Station, re: (id: number) => 
     v.mailCargo.clear();
     for (const c of old) putMail(v, cargoGroup(re(c.alight), re(c.dest), c.count, re(c.from), { ...journeyOf(c), o: re(c.o) }));
   }
+  return deliveries;
 }
 
 /** Mail waiting at a station by destination town (and the lines it waits for), most first (for the station window). */
@@ -402,11 +409,11 @@ export function fixMail(v: Vehicle, l: Line, next: Station | null) {
  */
 function leaveVehicle(g: Game, v: Vehicle, st: Station, c: MailGroup, n: number): number {
   const line = v.line, from = g.stations.get(c.from), dist = from ? Math.hypot(from.x - st.x, from.z - st.z) : 0;
-  if (c.dest === st.id) { v.mailDelivered += n; return settleMail(g, st, n, c, { v, line, dist }); }
+  if (c.dest === st.id) return settleMail(g, st, n, c, { v, line, dist });
   const hop = g.lines.mailNextHop(st.id, c.dest);
   if (!hop) { stationMail(g, st).lostMonth += n; return 0; }
   const dest = g.stations.get(c.dest);
-  if (hop.line === WALK_LINE && hop.alight === c.dest && dest) { v.mailDelivered += n; return settleMail(g, dest, n, c, { v, line, dist }); }
+  if (hop.line === WALK_LINE && hop.alight === c.dest && dest) return settleMail(g, dest, n, c, { v, line, dist });
   const j = st.id === c.from ? journeyOf(c) : afterLeg(c, v, line, dist, true);
   g.lines.distribute(hop, n, (l, k) => addMail(g, st, l, hop.alight, c.dest, k, j), 'mail', g.mail.random);
   return 0;
@@ -606,7 +613,7 @@ export class MailModel {
   /** A station as a site of a mail allocation, with this feeder quality. */
   private site(st: Station, quality: number): AllocSite {
     const g = this.g;
-    return { key: st.id, townId: st.townId, walk: walkingCatchment(g, st).buildings, quality, feeders: () => g.demand.feederReach(st, MAIL_FEEDER.reach) };
+    return { key: st.id, townId: st.townId, walk: readWalkingCatchment(g, st).buildings, quality, feeders: () => g.demand.feederReach(st, MAIL_FEEDER.reach) };
   }
 
   /**

@@ -6,6 +6,8 @@ import * as THREE from 'three';
 import { Game, PLAYER, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { demandView } from '../src/game/demand';
+import { mailView } from '../src/game/mail-view';
+import { bezLine } from '../src/game/geom';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { h } from '../src/ui/dom';
 import type { UI } from '../src/ui/ui';
@@ -19,6 +21,8 @@ import { openTrackAccess } from '../src/ui/win-access';
 import { openAutoSignal } from '../src/ui/win-signals';
 import { lineCodeOf, stationBadges, lineTag } from '../src/ui/lineid';
 import { memo, pruneMemos } from '../src/ui/win-ops';
+import { MapModes } from '../src/ui/mapmodes';
+import { catchStreets } from '../src/ui/gameapi';
 import { placeAndConnect, depotBehind, busStopSites, addBusStop, roadDepotNear, fails } from './lib';
 
 // Only DOM operations used by these renderers: no browser, HTML parser or layout engine.
@@ -110,9 +114,10 @@ function same(actual: string, expected: string, label: string) {
   if (failures.length <= 10) console.log('FAIL ' + failures.at(-1));
 }
 function pure(g: Game, label: string, fn: () => void) {
-  const before = saved(g);
+  const before = saved(g), walkVersion = g.stations.walkVersion;
   fn();
   same(saved(g), before, label);
+  if (g.stations.walkVersion !== walkVersion) failures.push(`${label}: walkVersion changed from ${walkVersion} to ${g.stations.walkVersion}`);
   calls++;
 }
 function uiFor(g: Game): UI {
@@ -221,6 +226,96 @@ function fixture(seed: number) {
   return g;
 }
 
+// Every mail surface with unflushed access edits: cold map first, or warm panels first; pause and running modes.
+// The original, an untouched control, and a game loaded while the edit is pending must continue identically.
+{
+  const base = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 2000 });
+  base.economy.money = 1e9;
+  const pr = placeAndConnect(base, 80, 160, 0, new Set(), 1, () => {}); assert.ok(pr);
+  const depot = depotBehind(base, pr.A, pr.B, 0), line = base.lines.create('rail'); line.stops = [pr.A.id, pr.B.id];
+  const cars = ['diesel_b', 'van_ic', 'coach_ic', 'coach_ic'].map((id) => MODEL_BY_ID.get(id)!);
+  assert.equal(cars[0]?.kind, 'loco', JSON.stringify(cars.map((m) => [m?.id, m?.kind])));
+  const train = base.vehicles.buyTrain(depot, [...cars], line.id); assert.notEqual(typeof train, 'string', String(train));
+  for (let k = 0; k < TICKS_PER_DAY * 90; k++) base.stepTick();
+  assert.ok(base.stations.all().every((st) => base.mail.accepts(st)), 'mail fixture accepts at both ends');
+  assert.ok(base.towns.list.some((t) => t.mail), 'mail fixture has posted mail');
+  // Include an entrance so the station's infrastructure tab exercises all of its walking-coverage reads.
+  const forecourt = base.stations.forecourt(pr.A)!;
+  pr.A.rail!.entrances.push({ ...forecourt, angle: pr.A.rail!.angle, kind: 'gate' });
+  base.lines.rebuild();
+  // A newly purchased train exercises real depot recompose previews before its first tick.
+  const parked = base.vehicles.buyTrain(depot, [...cars], line.id); assert.notEqual(typeof parked, 'string', String(parked));
+  base.flushNetworkChanges(); base.lines.flushCatchment();
+  const initial = saved(base);
+  for (const paused of [true, false]) for (const edit of ['remove', 'add'] as const) for (const mapFirst of [true, false]) {
+    const g = deserialize(JSON.parse(initial)), control = deserialize(JSON.parse(initial));
+    for (const game of [g, control]) {
+      game.paused = paused;
+      if (!mapFirst) mailView(game); // A previously used map must also leave pending edits alone.
+      const net = game.world.net;
+      if (edit === 'remove') for (const e of [...net.edges.values()]) { if (e.kind === 'road') net.removeEdge(e.id); }
+      else {
+        const a = net.addNode('road', 2, game.world.heightAt(2, 2), 2, 0, 0, -1);
+        const b = net.addNode('road', 12, game.world.heightAt(12, 2), 2, 0, 0, -1);
+        net.addEdge('road', a.id, b.id, bezLine(2, 2, 12, 2), new Float32Array([a.y, b.y]), [], 'street', -1);
+      }
+      game.onNetworkChanged();
+    }
+    const label = `mail ${paused ? 'paused' : 'running'}, pending road ${edit}, ${mapFirst ? 'cold map first' : 'warm panels first'}`;
+    const pending = saved(g), loaded = deserialize(JSON.parse(pending)); loaded.paused = paused;
+    same(saved(control), pending, label + ': untouched control');
+    same(saved(loaded), pending, label + ': pending-edit save round trip');
+    const ui = uiFor(g), show = (name: string, fn: () => void) => pure(g, label + ': ' + name, fn);
+    // Real map toggles, card rendering and updates; only GPU drawing and minimap output are sinks.
+    Object.assign(ui.renderer.overlay, { setArcs() {}, setShareRings() {}, setCatchments() {}, setDim() {} });
+    Object.assign(ui.renderer, { labels: { townInfo: new Map() } });
+    Object.assign(ui, { minimap: { setMapMode() {} } });
+    const modes = Object.create(MapModes.prototype) as MapModes;
+    Object.assign(modes, { ui, mode: 'none', demandLayer: 'pax', demand: null, mailDemand: null, demandT: 0, shares: new Map(), card: h('div'), onChange() {} });
+    const map = () => {
+      show('Mail map layer', () => { modes.set('demand'); modes.setDemandLayer('mail'); modes.update(1); });
+      assert.ok(modes.mailDemand && modes.card.textContent?.includes('Mail'), 'real Mail card rendered');
+      show('Mail map update', () => modes.update(1));
+      show('Mail map close', () => modes.set('none'));
+    };
+    const panels = () => {
+      for (const st of g.stations.all()) {
+        show(`mail station walking overlay ${st.id}`, () => { catchStreets(g, st); });
+        show(`station mail ${st.id}`, () => openStation(ui, st.id));
+        assert.ok(ui.wm.get('station-' + st.id)!.body.textContent?.includes('Mail waiting'), 'station mail panel rendered');
+        allTabs(g, ui, 'station-' + st.id, label + ': station ' + st.id);
+      }
+      for (const town of g.towns.list.filter((t) => t.mail)) {
+        show(`town mail ${town.id}`, () => openTown(ui, town.id));
+        assert.ok(ui.wm.get('town-' + town.id)!.body.textContent?.includes('Mail last month'), 'town mail panel rendered');
+      }
+      show('line mail', () => openLine(ui, line.id)); allTabs(g, ui, 'line-' + line.id, label + ': line');
+      for (const v of g.vehicles.all()) {
+        show(`van controls ${v.id}`, () => openVehicle(ui, v.id));
+        assert.ok(ui.wm.get('veh-' + v.id)!.body.textContent?.includes('Mail vans'), 'van controls rendered');
+      }
+      show('mail window refresh', () => ui.wm.refreshAll());
+    };
+    if (mapFirst) { map(); panels(); } else { panels(); map(); }
+    same(saved(g), pending, label + ': all mail reads');
+    assert.ok(g.stations.all().every((st) => st.roadAccess), 'UI leaves the saved access flags untouched');
+    if (paused) {
+      for (const game of [g, control, loaded]) game.update(0);
+      same(saved(g), saved(control), label + ': paused construction flush');
+      same(saved(g), saved(loaded), label + ': loaded paused construction flush');
+    }
+    for (let k = 0; k < TICKS_PER_DAY * 30; k++) {
+      g.stepTick(); control.stepTick(); loaded.stepTick();
+      if (k < TICKS_PER_DAY * 2 || k % TICKS_PER_DAY === 0) {
+        same(saved(g), saved(control), label + ': UI replay tick ' + k);
+        same(saved(g), saved(loaded), label + ': pending-edit loaded replay tick ' + k);
+      }
+    }
+    assert.ok(g.stations.all().every((st) => st.roadAccess === (edit === 'add')), 'simulation refreshes access deterministically');
+    console.log(label + ': pure views and 30-day original/control/save-load replay');
+  }
+}
+
 for (const seed of [7, 11, 23]) {
   const initial = saved(fixture(seed));
   for (const paused of [true, false]) {
@@ -281,4 +376,4 @@ pure(memoGame, 'unnumbered station getters', () => {
 assert.equal(line.numbers, undefined, 'badge reads do not assign station numbers');
 
 assert.equal(failures.length, 0, failures.join('\n'));
-console.log(`PASS: ${calls} passive UI checks; seeds 7, 11, 23 paused/running with AI networks, dirty catchments and exact subsequent replay; code migration and vehicle memo pruning.`);
+console.log(`PASS: ${calls} passive UI checks; every mail view with pending road edits and exact 30-day replay; seeds 7, 11, 23 paused/running with AI networks, dirty catchments and exact subsequent replay; code migration and vehicle memo pruning.`);

@@ -17,7 +17,7 @@ import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
 import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
-import { addMail, trimMail, rerouteMail, absorbMail, newJourney, type StationMail, type MailJourney } from './mail';
+import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 
 /**
  * Passengers waiting for `line` to `alight` on their way to `dest`. `t`: sim time (s) they started waiting
@@ -763,7 +763,6 @@ export class Stations {
         if (st.stops.length !== before && !st.stops.length && !st.rail) this.deleteStation(st.id);
       }
     });
-    game.listeners?.network?.push(() => this.refreshAccess());
   }
 
   get(id: number) { return this.map.get(id); }
@@ -2246,7 +2245,7 @@ export class Stations {
     }
     for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
     // mail: b's queues and figures join a's; mail heading to or changing at b heads for a (also aboard vehicles)
-    absorbMail(g, a, b, re);
+    const mailDeliveries = absorbMail(g, a, b, re);
     for (const v of g.vehicles.map.values()) {
       let hit = false;
       for (const c of v.cargo.values()) if (c.alight === b.id || c.dest === b.id || c.from === b.id) { hit = true; break; }
@@ -2281,7 +2280,9 @@ export class Stations {
     this.markStation(a);
     this.accessVersion = -1;
     g.onNetworkChanged();
+    this.refreshAccess();
     g.lines.rebuild();
+    for (const d of mailDeliveries) settleMail(g, d.st, d.count, d.j, null);
   }
 
   /**

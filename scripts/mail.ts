@@ -10,9 +10,9 @@ import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { MODEL_BY_ID, MODELS, availableModels, carriesMail, mailOnlyModel, type VehicleModel } from '../src/game/vehicle-types';
 import { MAIL_UNIT_T, MAIL_STATION, MAIL_CAPTURE } from '../src/game/constants';
 import { mailFare, mailRefTime, mailEffDist as effDist, mailTripFactor, MAIL_FARE, simNow } from '../src/game/fares';
-import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull, newJourney, loadMail, unloadMail, mailByTown } from '../src/game/mail';
+import { stationMail, addMail, trimMail, mailQueueCap, mailLostShare, mailEra, townMailFactor, isFull, newJourney, loadMail, unloadMail, offloadMail, absorbMail, settleMail, journeyOf, mailByTown } from '../src/game/mail';
 import { mailFleet, canonicalizeLines } from '../src/game/patterns';
-import { mergeStops } from '../src/game/stations';
+import { mergeStops, WALK_LINE } from '../src/game/stations';
 import { serialize, deserialize } from '../src/game/save';
 import { bezLine } from '../src/game/geom';
 import { fails, check, fmt, placeAndConnect, depotBehind, addBusStop, roadDepotNear, busStopSites, Train, RoadVehicle } from './lib';
@@ -48,6 +48,48 @@ function fixture(cars: VehicleModel[]) {
   line.stops = [pr.A.id, pr.B.id];
   const train = g.vehicles.buyTrain(dep, cars, line.id) as Train;
   return { g, pr, dep, line, train };
+}
+
+// ---- lost acceptance: naturally posted in-flight mail must not be delivered or paid on any settlement path
+{
+  const f = fixture([M('diesel_b'), M('van_ic'), M('coach_ic'), M('coach_ic')]);
+  const { g, pr, train } = f;
+  for (let k = 0; k < 720 * TICKS_PER_DAY && ![...train.mailCargo.values()].some((c) => c.dest === pr.B.id); k++) g.stepTick();
+  const cargo = [...train.mailCargo.values()].filter((c) => c.dest === pr.B.id);
+  check(cargo.length > 0 && g.mail.accepts(pr.B), 'acceptance fixture: naturally posted mail aboard for an accepting destination');
+  if (cargo.length) {
+    const initial = JSON.stringify(serialize(g)), units = cargo.reduce((n, c) => n + c.count, 0), j = journeyOf(cargo[0]);
+    for (const path of ['unload', 'offload', 'walk', 'absorb', 'settle'] as const) {
+      const h = deserialize(JSON.parse(initial)), t = h.vehicles.get(train.id)!;
+      const A = h.stations.get(pr.A.id)!, B = h.stations.get(pr.B.id)!;
+      for (const st of h.stations.map.values()) if (st.mail) { st.mail.waiting.clear(); st.mail.total = 0; }
+      for (const [key, c] of t.mailCargo) if (c.dest !== B.id) { t.mailLoad -= c.count; t.mailCargo.delete(key); }
+      for (const e of [...h.world.net.edges.values()]) if (e.kind === 'road') h.world.net.removeEdge(e.id);
+      h.onNetworkChanged(); h.flushNetworkChanges(); h.lines.flushCatchment();
+      check(A.roadAccess === false && B.roadAccess === false && !h.mail.accepts(B) && h.mail.rate(B) === 0, `${path}: destination lost road access and acceptance`);
+      const totals = () => ({
+        lost: h.stations.all().reduce((n, st) => n + (st.mail?.lostMonth ?? 0), 0),
+        arrived: h.stations.all().reduce((n, st) => n + (st.mail?.arrivedMonth ?? 0), 0),
+        delivered: h.towns.list.reduce((n, town) => n + (town.mail?.deliveredMonth ?? 0), 0),
+        income: h.economy.thisYear.mailIncome, vehicle: t.mailDelivered,
+      });
+      const before = totals();
+      if (path === 'unload') check(unloadMail(h, t, B) === units, 'unload: all affected units get off');
+      if (path === 'offload') check(offloadMail(h, t, units, B) === units, 'offload: all affected units get off');
+      if (path === 'walk') addMail(h, A, WALK_LINE, B.id, B.id, units, { ...j, legs: [[t.id, f.line.id, t.owner, j.od]] });
+      if (path === 'absorb') {
+        addMail(h, A, f.line.id, B.id, B.id, units, { ...j, legs: [[t.id, f.line.id, t.owner, j.od]] });
+        const deliveries = absorbMail(h, A, B, (id) => id === B.id ? A.id : id);
+        if (deliveries) for (const d of deliveries) settleMail(h, d.st, d.count, d.j, null);
+      }
+      if (path === 'settle') settleMail(h, B, units, j, { v: t, line: t.line, dist: j.od });
+      const after = totals();
+      check(after.lost - before.lost === units && after.arrived === before.arrived && after.delivered === before.delivered && after.vehicle === before.vehicle,
+        `${path}: ${units} units counted as lost, with no station, town or vehicle deliveries`);
+      check(after.income === before.income, `${path}: lost acceptance pays no operator`);
+      console.log(`lost acceptance / ${path}: ${units} units, lost ${after.lost - before.lost}, income ${fmt(after.income - before.income, 2)}`);
+    }
+  }
 }
 
 // ---- passengers only: no mail at all; with a van: mail income, passengers as with any fourth car
@@ -332,6 +374,8 @@ runDays(vans.g, 360 * 3, () => {
     h.aiEnabled = false; h.world.h.fill(4); h.world.heightsVersion++;
     const net = h.world.net, a = net.addNode('road', 20, 4, 60, 0, 0, -1), b = net.addNode('road', 220, 4, 60, 0, 0, -1);
     net.addEdge('road', a.id, b.id, bezLine(20, 60, 220, 60), new Float32Array(201).fill(4), [], 'street', -1);
+    // A payable delivery now needs an accepting destination: real walking residents at these served stops.
+    for (const x of stopsX) h.world.addBuilding({ townId: -1, x, z: 59.6, angle: 0, w: 0.8, d: 0.8, type: 0, floors: 2, pop: 1000, seed: 1, y: 4, built: 0 });
     h.economy.money = 1e8;
     const ids = stopsX.map((x) => addBusStop(h, x, 60, 0)), dep = roadDepotNear(h, 100, 60, 0);
     const trucks = lines.map(([i, j]) => {
@@ -339,9 +383,27 @@ runDays(vans.g, 360 * 3, () => {
       l.stops = [ids[i], ids[j]];
       return h.vehicles.buyRoad(dep, M('mailtruck_c'), l.id) as RoadVehicle;
     });
+    h.flushNetworkChanges(); h.lines.flushCatchment();
+    check(ids.filter((id) => h.lines.mailServed(id)).every((id) => h.mail.accepts(h.stations.get(id)!)), 'straight-street fare fixture: every served destination accepts mail');
     return { h, ids, trucks, ok: ids.every((id) => id >= 0) && dep >= 0 && trucks.every((t) => t instanceof RoadVehicle) };
   };
   const at = (h: Game, seconds: number) => { h.tick = Math.round(seconds / h.tickSeconds); };
+  // Absorption can give an unserved target its source's mail service. Check acceptance after that service moves.
+  const merged = straight([40, 46, 140], [[1, 2]]);
+  if (merged.ok) {
+    const { h, ids, trucks } = merged, A = h.stations.get(ids[0])!, B = h.stations.get(ids[1])!, D = h.stations.get(ids[2])!, t = trucks[0];
+    check(A.id !== B.id && !h.mail.accepts(A) && h.mail.accepts(B), 'accepting absorption: target will inherit the source mail service');
+    at(h, 200);
+    const j = { ...newJourney(h, D, B.id), legs: [[t.id, t.line!.id, t.owner, 94] as [number, number, number, number]] };
+    addMail(h, A, t.line!.id, B.id, B.id, 10, j);
+    const income = h.economy.thisYear.mailIncome;
+    at(h, 1000);
+    const res = mergeStops(h, A.id, B.id);
+    check(!res.error && h.mail.accepts(A) && A.mail?.arrivedMonth === 10 && A.mail.lostMonth === 0,
+      'accepting absorption: merged service and geometry are ready before settlement');
+    check(Math.abs(h.economy.thisYear.mailIncome - income - mailFare(j.od, 800, 10)) < 1e-6,
+      'accepting absorption: legitimate mail still pays its whole journey fare once');
+  }
   /** Post 10 units at the first stop at 200 s, ride `legs` ([truck, from, to, start s, end s]); the trucks' receipts. */
   const journey = (w: ReturnType<typeof straight>, dest: number, legs: [number, number, number, number, number][], save?: number) => {
     let { h } = w;

@@ -12,7 +12,7 @@ import type { StationPlan, Station, StationLevel, CatchMode, CatchShape, Station
 import { CATCHMENT_RADIUS } from '../game/stations';
 import { STATION_STYLES, stylesFor, defaultStationStyle } from '../game/station-styles';
 import type { StationBuildingStyle } from '../game/station-styles';
-import { walkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
+import { readWalkingCatchment, planWalkingCatchment, walkingPopulation, WALK_DETOUR } from '../game/catchment';
 import type { WalkingCatchment } from '../game/catchment';
 import type { Overlay } from '../render/overlay';
 
@@ -121,7 +121,7 @@ export function catchShapes(g: Game, st: Station, all = false): CatchShape[] { r
 export function catchRadius(mode: CatchMode): number { return CATCHMENT_RADIUS[mode]; }
 /** Actual walking budget, including the grid detour calibration and the building style. */
 export function catchWalkLimit(mode: CatchMode, bonus = 0): number { return CATCHMENT_RADIUS[mode] * (1 + bonus) * WALK_DETOUR; }
-export const catchStreets = walkingCatchment;
+export const catchStreets = readWalkingCatchment;
 export const planCatchStreets = planWalkingCatchment;
 export const catchStreetPop = walkingPopulation;
 /** Independent, mode-coloured (and mode-dashed) street layers; all three are cleared when a preview/view closes. */

@@ -15,8 +15,10 @@
 //    load each, 0.4-1.5x on average (the coaches also carry the local trips); mail delivered both ways, at most 5% of
 //    it lost, queues under their caps.
 //  - AI lines with vans and a passenger service (coaches at least 5% full; lines without one run for their mail and
-//    are only reported): 20-70% of their passenger income together, each 10-100%; vans 0.33-2.5x the coaches' load
-//    each, within +-50% on average.
+//    are only reported): 20-70% of their passenger income together; vans 0.33-2.5x the coaches' load each, within
+//    +-50% on average. Each line: 10-100% of its passenger income where its coaches run at least 10% full (below
+//    that, a few passengers set the share, not the mail); every line earns 0.5-1.5x as much per mail unit as per
+//    passenger boarding (mail priced like the passengers it travels with).
 // Mail scales with MAIL_PER_PAX (constants.ts): prints the range of it that every target allows, and its middle (the AI
 // lines only roughly: their vans follow their forecasts). MAIL_FEEDER.share sets the networks against the single lines.
 // npx esbuild scripts/mailcal.ts --bundle --platform=node --format=esm --outfile=$S/mailcal.mjs && node $S/mailcal.mjs [seeds] [years] [--ai=5,7,11,23,51,61] [--aiyears=5] [--part=all|single|ai] [--json=path]
@@ -44,6 +46,10 @@ const AI_MEAN: Band = [0.2, 0.7], AI_LINE: Band = [0.1, 1];
 const VAN_MEAN: Band = [0.4, 1.5], VAN_ROUTE: Band = [0.33, 2], AI_VAN_MEAN: Band = [0.5, 1.5], VAN_LINE: Band = [0.33, 2.5];
 /** An AI line with vans whose coaches run less full than this has no passenger service to weigh its mail against. */
 const MIN_COACH_LOAD = 0.05;
+/** The per-line share band needs a real passenger service: coaches at least this full (else nearly empty coaches set it). */
+const LINE_SHARE_LOAD = 0.1;
+/** Income per mail unit loaded / income per passenger boarding, on every AI line with vans. */
+const AI_UNIT_PRICE: Band = [0.5, 1.5];
 /** The share of its posted mail a route may lose (queues overflowing, no route). */
 const MAX_LOST = 0.05;
 
@@ -157,8 +163,12 @@ if (part !== 'single') for (const seed of aiSeeds) {
     aiResults.push(r);
     const served = r.coachLoad >= MIN_COACH_LOAD;
     console.log(`AI seed ${seed} ${r.line}: ${r.trains} trains, ${r.vans} vans; passengers ${fmt(pax / 1000, 1)}k, mail ${fmt(mail / 1000, 1)}k (${pct(r.share)}); loads van ${pct(r.vanLoad)} coaches ${pct(r.coachLoad)} (x${fmt(r.ratio, 2)}); ${perUnit(r)}${served ? '' : ' (coaches nearly empty: not weighed)'}`);
+    if (r.units > 0 && r.boardings > 0) {
+      const price = (r.mail / r.units) / (r.pax / r.boardings);
+      check(within(price, AI_UNIT_PRICE), `AI seed ${seed} ${r.line}: income per mail unit ${ratioBand(AI_UNIT_PRICE)}x that per passenger boarding (x${fmt(price, 2)})`);
+    }
     if (!served) continue;
-    check(within(r.share, AI_LINE), `AI seed ${seed} ${r.line}: mail ${pct(r.share)} of passenger income within ${band(AI_LINE)}%`);
+    if (r.coachLoad >= LINE_SHARE_LOAD) check(within(r.share, AI_LINE), `AI seed ${seed} ${r.line}: mail ${pct(r.share)} of passenger income within ${band(AI_LINE)}%`);
     check(within(r.ratio, VAN_LINE), `AI seed ${seed} ${r.line}: the vans run at ${ratioBand(VAN_LINE)}x the coaches' load (x${fmt(r.ratio, 2)})`);
   }
 }

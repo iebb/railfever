@@ -821,6 +821,8 @@ export class Game {
     this.vehicles.onNetworkChanged();
     // lost vehicles re-plan at once, the others are staggered over the next ticks (no hitch)
     this.vehicles.replanAfterNetworkChange();
+    // Commit road access at this fixed simulation/construction boundary, before catchments and mail use it.
+    this.stations.refreshAccess();
     for (const l of this.listeners.network) l();
   }
 

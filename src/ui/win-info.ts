@@ -22,7 +22,7 @@ import { townDemandShare } from './gameapi';
 import type { Station, StationLevel, UpgradePlan } from '../game/stations';
 import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railModeOf, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
-import { walkingCatchment, walkingCatchmentWithout, entranceCatchment } from '../game/catchment';
+import { readWalkingCatchment, readEntranceCatchment } from '../game/catchment';
 import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
 import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
@@ -273,7 +273,7 @@ function mailPanel(ui: UI, s: Station, lines: Line[]): HTMLElement | null {
     ui.kv('Loaded · delivered', `${fmtMail(m?.pickupLast ?? 0)} · ${fmtMail(m?.arrivedLast ?? 0)}`),
     m && (m.lostLast > 0 || m.lostMonth > 0) ? ui.kv('Mail lost', h('span', {
       class: m.lostLast > 0 ? 'neg' : '',
-      'data-tip': `${fmtPct(mailLostShare(m))} of the mail here was lost (this and last month): the queue outgrew the station, or no route was left. More frequent mail vans help; it lowers the mail rating.`,
+      'data-tip': `${fmtPct(mailLostShare(m))} of the mail here was lost (this and last month): the queue outgrew the station, no route was left, or the destination stopped accepting mail. Lost mail lowers the mail rating.`,
     }, `${fmtMail(m.lostLast)} last month`)) : null,
     quiet ? h('div', { class: 'muted station-advice' }, 'Nothing posted here this month or last. Mail goes from town to town: it needs a vehicle with room for mail calling here and at a station in another town, and people within walking reach. A stop beside another mail station shares its catchment with it: merge the two.') : null);
 }
@@ -537,12 +537,12 @@ function entranceCoverage(ui: UI, s: Station): { only: number; reach: number }[]
   if (!r || !r.entrances.length) return [];
   const w = g.world, key = `${g.stations.walkVersion}|${w.net.roadVersions.version}|${w.lotVersions.version}|${s.roadAccess}|${JSON.stringify(r.entrances)}`;
   return memo(g, 'entrance-cover:' + s.id, key, () => {
-    const all = walkingCatchment(g, s).buildings;
+    const all = readWalkingCatchment(g, s).buildings;
     return r.entrances.map((_, i) => {
-      const without = walkingCatchmentWithout(g, s, i).buildings;
+      const without = readWalkingCatchment(g, s, i).buildings;
       let only = 0, reach = 0;
       for (const id of all.keys()) if (!without.has(id)) only += w.buildings.get(id)?.pop ?? 0;
-      for (const id of entranceCatchment(g, s, i).buildings.keys()) reach += w.buildings.get(id)?.pop ?? 0;
+      for (const id of readEntranceCatchment(g, s, i).buildings.keys()) reach += w.buildings.get(id)?.pop ?? 0;
       return { only, reach };
     });
   }, 3000);

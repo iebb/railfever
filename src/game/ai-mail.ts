@@ -164,16 +164,16 @@ function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number
   return revenue;
 }
 
-/** Mail's contribution to a proposed conventional railway, including its capital and operating cost. */
+/** Mail's operating contribution with the selected vans and their costs; potential is conditional on buying vans. */
 export function projectMail(g: Game, points: MailSite[], cars: VehicleModel[], fleet: number, kmh: number, headway: number, platform: number) {
-  const none = { revenue: 0, yearly: 0, price: 0, cars };
+  const none = { revenue: 0, potential: 0, yearly: 0, price: 0, cars };
   if (!points.every(mainlineSite) || !hauled(cars)) return none;
   const van = pickMailVan(g.year, cars);
   if (!van || lengthOf(cars) + van.length + 0.1 + PLATFORM_CLEARANCE > platform) return none;
   const revenue = forecastMailRevenue(g, points, kmh, headway, van.mail!);
   const yearly = modelYearCost(van, g.year) * fleet;
-  if (revenue < MARGIN * (yearly + van.cost * fleet / 8)) return { ...none, revenue };
-  return { revenue, yearly, price: van.cost, cars: withVans(cars, [van]) };
+  if (revenue < MARGIN * (yearly + van.cost * fleet / 8)) return { ...none, potential: revenue };
+  return { revenue, potential: revenue, yearly, price: van.cost, cars: withVans(cars, [van]) };
 }
 
 export class MailPolicy {
