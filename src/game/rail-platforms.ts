@@ -6,6 +6,9 @@ import { isLoopLine, turnIndex } from './patterns';
 import type { Train, TrackRule } from './train';
 import { consistRule, findRailRoute, railNext, ruleAllows } from './train';
 
+interface PlatformOption extends RailTrackGroup { routeCost: number }
+// Geometry rounding alone should not spread an Auto call onto a different directional approach.
+const DIRECT_ROUTE_EPS = 1e-4;
 interface Call { pattern: number; stop: number; station: number; occurrence: number; previous: number; next: number; turn: boolean }
 const signatures = new WeakMap<Line, string>();
 const topologies = new WeakMap<Game, { signature: string; epoch: number }>();
@@ -60,7 +63,7 @@ function stock(g: Game, l: Line, pattern: number): { owner: number; rule: TrackR
 }
 
 /** A candidate must connect the incoming and outgoing served hops on the same physical platform/direction. */
-function candidates(g: Game, l: Line, c: Call): RailTrackGroup[] {
+function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
   const st = g.stations.get(c.station), prev = g.stations.get(c.previous), next = g.stations.get(c.next), net = g.world.net;
   if (!st?.rail || !prev?.rail || !next?.rail || prev.id === st.id || next.id === st.id) return [];
   const fleet = stock(g, l, c.pattern).map(s => ({ ...s, incoming: g.stations.railTrackGroups(prev).flatMap(from => {
@@ -70,19 +73,26 @@ function candidates(g: Game, l: Line, c: Call): RailTrackGroup[] {
         ? railNext(g, e, dir, s.owner, false, s.rule, true) : [];
     });
   }) }));
-  return g.stations.railTrackGroups(st).filter(group => fleet.every(({ owner, rule, length, incoming }) => {
-    if (group.length + 1e-6 < length + 0.05 || group.steps.some(s => { const e = net.edges.get(s.edge); return !e || !g.canUse(owner, e.owner) || !ruleAllows(rule, e); })) return false;
-    for (const direction of [1, -1] as const) {
-      const arrival = direction === 1 ? group.steps[group.steps.length - 1] : group.steps[0];
-      const arrivalDir = direction * arrival.dir;
-      const ae = net.edges.get(arrival.edge)!;
-      const onward = !!findRailRoute(g, railNext(g, ae, arrivalDir, owner, false, rule), next.id, owner, -1, 20000, false, rule, true, { length })
-        || c.turn && !!findRailRoute(g, railNext(g, ae, -arrivalDir, owner, false, rule, true), next.id, owner, -1, 20000, false, rule, true, { length });
-      if (!onward) continue;
-      if (findRailRoute(g, incoming, st.id, owner, -1, 20000, false, rule, true, { group: group.id, direction, length })) return true;
+  return g.stations.railTrackGroups(st).flatMap(group => {
+    let routeCost = 0;
+    for (const { owner, rule, length, incoming } of fleet) {
+      if (group.length + 1e-6 < length + 0.05 || group.steps.some(s => { const e = net.edges.get(s.edge); return !e || !g.canUse(owner, e.owner) || !ruleAllows(rule, e); })) return [];
+      let best = Infinity;
+      for (const direction of [1, -1] as const) {
+        const arrival = findRailRoute(g, incoming, st.id, owner, -1, 20000, false, rule, true, { group: group.id, direction, length });
+        if (!arrival) continue;
+        const end = direction === 1 ? group.steps[group.steps.length - 1] : group.steps[0], arrivalDir = direction * end.dir, edge = net.edges.get(end.edge)!;
+        const onward = findRailRoute(g, railNext(g, edge, arrivalDir, owner, false, rule), next.id, owner, -1, 20000, false, rule, true, { length });
+        const reverse = c.turn ? findRailRoute(g, railNext(g, edge, -arrivalDir, owner, false, rule, true), next.id, owner, -1, 20000, false, rule, true, { length }) : null;
+        const departure = Math.min(onward?.cost ?? Infinity, reverse?.cost ?? Infinity);
+        best = Math.min(best, arrival.cost + departure);
+      }
+      if (!Number.isFinite(best)) return [];
+      // All operators/consists must have a legal arrival and departure; avoid a detour for any of them.
+      routeCost = Math.max(routeCost, best);
     }
-    return false;
-  }));
+    return [{ ...group, routeCost }];
+  });
 }
 
 /** Pure list for the platform preference control; group identity is independent of its displayed number. */
@@ -133,9 +143,13 @@ export function reconcilePlatforms(g: Game, force = false) {
       const options = candidates(g, l, c), old = previous.find(p => p.pattern === c.pattern && p.station === c.station && p.occurrence === c.occurrence)
         // A station merge changes its id while retaining the physical track group.
         ?? previous.find(p => p.pattern === c.pattern && p.stop === c.stop && options.some(q => q.id === p.group));
-      const retained = old && options.find(q => q.id === old.group || q.back === old.back && q.front === old.front);
+      const directCost = Math.min(...options.map(q => q.routeCost));
+      const direct = options.filter(q => q.routeCost <= directCost + DIRECT_ROUTE_EPS);
+      const valid = old && options.find(q => q.id === old.group || q.back === old.back && q.front === old.front);
+      // Explicit reconciliation updates Auto detours; valid manual preferences still take precedence.
+      const retained = valid && (old?.manual || valid.routeCost <= directCost + DIRECT_ROUTE_EPS) ? valid : undefined;
       let choice = retained;
-      if (!choice) choice = options.sort((a, b) => {
+      if (!choice) choice = direct.sort((a, b) => {
         const load = (q: RailTrackGroup) => (used.get(q.id) ?? []).reduce((n, p) => n + (p.line !== l.id ? 10 : p.pattern === c.pattern && p.stop === c.stop ? 0 : 1), 0);
         return load(a) - load(b) || a.offset - b.offset || a.id - b.id;
       })[0];

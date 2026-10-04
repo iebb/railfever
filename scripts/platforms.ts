@@ -6,11 +6,12 @@ import { setPatterns, linePatterns, joinLines } from '../src/game/patterns';
 import { replaceLineStops } from '../src/game/line-edit';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { arcTable, tAtS, bezPoint } from '../src/game/geom';
-import { planStationOnTrack, commitStationOnTrack } from '../src/game/trackops';
+import { planStationOnTrack, commitStationOnTrack, finishDoubleTrack } from '../src/game/trackops';
 import { depotAtEnd } from '../src/game/routing';
 import { Economy } from '../src/game/economy';
-import { checkReservations } from './lib';
-import { flatGame, station, endNode, nodeSnap, build, railOpts, loco, depotFor, check, done } from './stationlib';
+import { autoSignalNetwork } from '../src/game/signals';
+import { checkReservations, roadOpts } from './lib';
+import { flatGame, station, endNode, nodeSnap, build, railOpts, loco, depotFor, check, done, free, newTrack, runTrains } from './stationlib';
 
 const g = flatGame(256); g.aiEnabled = false;
 g.addAICompany({ accessPolicy: 'auto-approve' }); g.company(1).economy.money = 1e9;
@@ -134,6 +135,52 @@ check(!local.platforms?.some(p => p.group === deletedGroup.id), 'removed physica
   check(beforeLookup === JSON.stringify(serialize(stale)), 'unknown-pattern fallback is a pure lookup and retains the saved ID');
   reconcilePlatforms(stale, true);
   check(!restoredLine.platforms?.some(p => p.pattern === firstPattern), 'explicit reconciliation cannot allocate a too-short platform by ignoring unknown-pattern stock');
+}
+
+// Opposing through services must prefer the direct running track at their shared bidirectional junction.
+{
+  const d = flatGame(256); d.aiEnabled = false; d.addAICompany(); d.company(1).economy.money = 1e9;
+  d.setAccessPolicy(0, 'open'); d.setAccessPolicy(1, 'open');
+  build(d, free(d, 10, 118), free(d, 246, 118), roadOpts(0, 'road'), 'shared junction street');
+  const [a, b, junction, c, e] = [40, 76, 112, 160, 206].map((x, i) => station(d, x, 124, Math.PI / 2, i < 3 ? 12 : 10, 2, i < 3 ? 0 : 1,
+    { trackType: 'electric', mode: i < 3 ? 'metro' : 'mainline', level: 'ground' })!);
+  let from = d.world.net.nextEdge;
+  for (const [x, y] of [[a, b], [b, junction]]) build(d, nodeSnap(d, endNode(d, x, 0, true), 'rail'), nodeSnap(d, endNode(d, y, 0, false), 'rail'), railOpts(0, 2, { type: 'electric' }), 'metro double');
+  const metro = newTrack(d, from, 0); from = d.world.net.nextEdge;
+  for (const [x, y] of [[junction, c], [c, e]]) build(d, nodeSnap(d, endNode(d, x, 0, true), 'rail'), nodeSnap(d, endNode(d, y, 0, false), 'rail'), railOpts(1, 2, { type: 'electric' }), 'partner double');
+  const suburban = newTrack(d, from, 1);
+  check(!finishDoubleTrack(d, metro, 0).error && !finishDoubleTrack(d, suburban, 1).error, 'both operators retain complete directional running approaches');
+  const route = (ids: number[], owner: number) => { const l = d.lines.create('rail', owner); l.stops = [...ids, ...ids.slice(1, -1).reverse()]; d.lines.rebuild(); return l; };
+  const outward = route([a.id, b.id, junction.id, c.id, e.id], 0), inward = route([e.id, c.id, junction.id, b.id, a.id], 1), ending = route([e.id, c.id, junction.id], 1);
+  for (const owner of [0, 1]) autoSignalNetwork(d, owner);
+  const forward = platformPreference(outward, 0, 2)!.group, backward = platformPreference(outward, 0, 6)!.group;
+  check(forward !== backward && platformPreference(inward, 0, 2)?.group === backward && platformPreference(inward, 0, 6)?.group === forward,
+    'opposing routes use the direct directional platforms before spreading onto crossover detours');
+  check(!setPlatformPreference(d, inward, 0, 2, forward), 'a reachable crossover remains a legal manual preference');
+  reconcilePlatforms(d, true);
+  check(platformPreference(inward, 0, 2)?.manual && platformPreference(inward, 0, 2)?.group === forward, 'explicit Auto improvement preserves a valid manual crossover preference');
+  setPlatformPreference(d, inward, 0, 2, null);
+  const oldAuto = inward.platforms!.find(p => p.stop === 2)!, wrong = d.stations.railTrackGroups(junction).find(q => q.id === forward)!;
+  Object.assign(oldAuto, { group: wrong.id, back: wrong.back, front: wrong.front });
+  const oldSave = deserialize(JSON.parse(JSON.stringify(serialize(d)))), oldRoute = oldSave.lines.get(inward.id)!;
+  const before = JSON.stringify(serialize(oldSave)); platformChoices(oldSave, oldRoute, 0, 2);
+  check(before === JSON.stringify(serialize(oldSave)) && platformPreference(oldRoute, 0, 2)?.group === forward, 'a restored valid old Auto decision remains unchanged by UI reads');
+  reconcilePlatforms(oldSave, true);
+  check(platformPreference(oldRoute, 0, 2)?.group === backward && !platformPreference(oldRoute, 0, 2)?.manual, 'explicit reconciliation corrects an old Auto crossover detour');
+  reconcilePlatforms(d, true);
+  const depot0 = depotAtEnd(d, endNode(d, a, 0, false), 0), depot1 = depotAtEnd(d, endNode(d, e, 1, true), 1);
+  const t0 = [0, 1].map(() => d.vehicles.buyTrain(depot0, [MODEL_BY_ID.get('metro_b')!], outward.id) as Train);
+  const t1 = [0, 1].map(() => d.vehicles.buyTrain(depot1, [MODEL_BY_ID.get('emu_b')!], inward.id) as Train);
+  const t2 = [d.vehicles.buyTrain(depot1, [MODEL_BY_ID.get('emu_b')!], ending.id) as Train], all = [...t0, ...t1, ...t2];
+  check(all.every(t => t instanceof Train), 'both shared-junction operators purchase their actual stock');
+  const run = runTrains(d, all, 360), at = (ts: Train[], st: typeof a) => ts.reduce((n, t) => n + (run.arrivals.get(t.id) ?? []).filter(id => id === st.id).length, 0);
+  console.log('directional shared junction', JSON.stringify({ metroEnd: at(t0, e), suburbanEnd: at(t1, a), terminatingJunction: at(t2, junction), worstDays: run.worst.days }));
+  check(at(t0, e) >= 3 && at(t0, a) >= 3 && at(t1, a) >= 3 && at(t1, e) >= 3 && [t0, t1, t2].every(ts => at(ts, junction) >= 3),
+    'both opposing through routes and the terminating service repeatedly serve every required shared endpoint');
+  check(run.worst.days < 10 && deadlockCycles(d, 0).length === 0 && checkReservations(d).length === 0, 'direct Auto routing avoids the original eleven-day shared-junction interference');
+  const loaded = deserialize(JSON.parse(JSON.stringify(serialize(d)))); let exact = JSON.stringify(serialize(d)) === JSON.stringify(serialize(loaded));
+  for (let i = 0; i < 640 && exact; i++) { d.stepTick(); loaded.stepTick(); exact = JSON.stringify(serialize(d)) === JSON.stringify(serialize(loaded)); }
+  check(exact, 'both operators and the terminating shared-junction service replay every saved decision for640ticks');
 }
 
 // Construct real curved facilities on inherited rail, then drive one train through their physical groups.
