@@ -373,6 +373,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     ...g.saveCompanies(),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
+    ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
     world: {
       ...world, size: w.size, freeTrees: w.freeTrees.slice(),
       buildings: buildingRecords(w, binaryProfiles), nextBuildingId: w.nextBuildingId,
@@ -500,6 +501,7 @@ export function deserialize(d: any): Game {
     (d.day ?? 0) * TICKS_PER_DAY + Math.min(TICKS_PER_DAY - 1, Math.max(0, Math.floor((d.dayFrac ?? 0) * TICKS_PER_DAY + 1e-6))));
   g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
+  g.deadlockScan = d.deadlockScan ? structuredClone(d.deadlockScan) : null;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);
   g.shares.load(d.shares);

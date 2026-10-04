@@ -18,7 +18,7 @@ import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
-import { resolveDeadlocks, lineCongestion } from './train';
+import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 
@@ -171,6 +171,8 @@ export class Game {
     network: [] as (() => void)[],
   };
   networkVersion = 0;
+  /** In-progress deterministic wait-graph work, included in saves. */
+  deadlockScan: DeadlockScan | null = null;
   private networkDirty = false;
   private lostSince = new Map<number, number>();
   /** day each congested player line was last reported */
@@ -839,8 +841,10 @@ export class Game {
     this.tick++;
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
-      // trains in a circle of mutual waiting: one of them takes another way (every few days)
-      if (this.day % 3 === 0) resolveDeadlocks(this);
+    }
+    // Start a complete scan every three days and finish it in bounded fixed-tick slices.
+    if (this.deadlockScan || (this.tick % TICKS_PER_DAY === 0 && this.day % 3 === 0)) resolveDeadlocks(this, 40, DEADLOCK_WORK);
+    if (this.tick % TICKS_PER_DAY === 0) {
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
