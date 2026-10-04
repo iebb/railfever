@@ -11,6 +11,7 @@ import { walkLimit, WALK_DETOUR } from '../game/catchment';
 import { CITY_STATION, CITY_WALK_SCALE } from '../game/stations';
 import { RAIL_FARE } from '../game/constants';
 import { FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../game/fares';
+import { MAX_AI } from './gameapi';
 
 export function openMenu(ui: UI) {
   const win = ui.wm.open('menu', 'Menu', { width: 280, x: window.innerWidth - 300, y: 64, icon: 'menu', color: '#eef2f7' });
@@ -264,7 +265,7 @@ export function openHelp(ui: UI) {
       <li>Mail: orange short dashes 0%; blue solid 100%; estimate: routes, reach, ratings.</li>
       <li>Mail rings / labels: outgoing tonnes / carried share, including onward mail.</li>
       <li>Mail vehicles: vans, trucks and postbuses.</li>
-      <li><b>Companies</b> (<kbd>C</kbd>): up to seven AI rivals, with adjustable styles.</li>
+      <li><b>Companies</b> (<kbd>C</kbd>): up to ${MAX_AI} AI rivals, with adjustable styles and starting balances.</li>
       <li>Buyouts transfer network, vehicles, cash and loan.</li>
       <li><b>Track access</b> (<kbd>K</kbd>): networks open by default; blocked companies excluded.</li>
       <li>Ask / Approve all / Reject all, company blocks, usage and agreements.</li>

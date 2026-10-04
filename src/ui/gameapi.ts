@@ -85,9 +85,12 @@ export function presetOf(c: AIConfig): (typeof AI_PRESETS)[number] | undefined {
 }
 
 /** Configurations for a new game's AI companies by style ('mixed' = a different preset each). */
-export function aiConfigsFor(style: string, n: number): AIConfig[] {
+export function aiConfigsFor(style: string, n: number, startMoney?: number): AIConfig[] {
   const mixed = ['balanced', 'rail', 'bus', 'aggressive', 'tram', 'cautious', 'balanced'];
-  return Array.from({ length: n }, (_, i) => normalizeAIConfig((AI_PRESETS.find((p) => p.id === (style === 'mixed' ? mixed[i % mixed.length] : style)) ?? AI_PRESETS[0]).config));
+  return Array.from({ length: n }, (_, i) => {
+    const preset = (AI_PRESETS.find((p) => p.id === (style === 'mixed' ? mixed[i % mixed.length] : style)) ?? AI_PRESETS[0]).config;
+    return normalizeAIConfig(startMoney === undefined ? preset : { ...preset, startMoney });
+  });
 }
 
 // ------------------------------------------------------------------ stations: levels, catchment, transfers

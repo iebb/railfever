@@ -6,10 +6,10 @@ import type { VehicleModel } from './vehicle-types';
 import { Train } from './train';
 import { capacityRouteBetween as routeBetween, capacityTopologyKey } from './rail-capacity-routes';
 import { linearStops } from './lines';
-import { patternOf, patternStops, patternHeadways, nextStopIndex } from './patterns';
+import { patternOf, patternStops, patternHeadways, nextStopIndex, lineRoute, isLoopLine } from './patterns';
 import { fareFor, estimateLegTime, tripFactor, refTime } from './fares';
 import { estimateVehicleYear, YEAR_S, trackBasePerUnit } from './opcosts';
-import { KMH_TO_UPS, TRACK_TYPES, RAIL } from './constants';
+import { KMH_TO_UPS, TRACK_TYPES, RAIL, UNIT_M } from './constants';
 import { railPartMode } from './stations';
 import { railCapacityOptions } from './rail-capacity-options';
 
@@ -32,6 +32,8 @@ interface Channel {
   line: Line; owner: number; pattern: number; cars: VehicleModel[]; trains: Train[];
   cycle: number; seats: number; running: number; capital: number; budget: number; boardings: number;
   use: Map<number, number>; limit: number;
+  /** Whole-route bid; mixed, partial and circular services retain the existing conservative model. */
+  native?: { path: number[]; share: number; seats: number };
 }
 export interface CapacityAllocation { line: number; owner: number; pattern: number; trains: number; traffic: number }
 export interface SharedCapacityPlan {
@@ -43,7 +45,28 @@ export interface SharedCapacityPlan {
 
 const inventoryMemo = new WeakMap<Game, { key: string; value: RouteInventory }>();
 const planMemo = new WeakMap<Game, Map<number, { key: string; plan: SharedCapacityPlan; channels: Channel[]; counts: number[]; inventory: RouteInventory }>>();
+const forecastMemo = new WeakMap<Game, { epoch: string; quotes: Map<string, { revenue: number; boardings: number; peak: number }> }>();
 const fleet = (g: Game, l: Line) => l.vehicles.map(id => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train);
+
+/** Native queue capture and fares at this exact service frequency. The memo is disposable: no decision
+ * depends on a previous call, and route, stock, access, walking inputs and fixed simulation time invalidate it. */
+function quoteEpoch(g: Game): string {
+  return `${g.day}:${g.tick}:${capacityTopologyKey(g)}:${g.lines.version}:${g.demand.version}:`
+    + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}`;
+}
+function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
+  const epoch = quoteEpoch(g);
+  let memo = forecastMemo.get(g);
+  if (!memo || memo.epoch !== epoch) { memo = { epoch, quotes: new Map() }; forecastMemo.set(g, memo); }
+  const stock = fleet(g, c.line).map(t => `${t.id}/${t.pattern}/${t.cars.map(m => `${m.id},${m.capacity},${m.speed}`).join(';')}`).join('|');
+  const key = `${c.line.id}:${c.line.owner}:${c.native!.path.join(',')}:${stock}:${kmh}:${headway}`;
+  const old = memo.quotes.get(key); if (old) return old;
+  const sites = c.native!.path.map(id => g.stations.get(id)!);
+  const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id);
+  const value = { revenue: f.revenue, boardings: f.boardings, peak: Math.max(1, ...f.legLoads) };
+  if (memo.quotes.size >= 256) memo.quotes.clear();
+  memo.quotes.set(key, value); return value;
+}
 
 /** Parallel running tracks at the same height; crossovers/grade separations never count as another lane. */
 function parallel(g: Game, e: NEdge): number[] {
@@ -207,6 +230,11 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       weights.set(key, Math.max(1, traffic + catchment * 0.1 + payments / Math.max(1, d.fare)));
     }
     const sum = [...weights.values()].reduce((n, x) => n + x, 0);
+    const route = lineRoute(l);
+    const complete = !isLoopLine(l) && !route.loop && !!linearStops(l.stops) && route.stations.length >= 2
+      && new Set(route.stations).size === route.stations.length
+      && new Set([...groups.values()].map(c => c.pid)).size === 1
+      && [...groups.values()].every(c => patternStops(l, c.pid).length === l.stops.length);
     for (const [key, c] of groups) {
       const indices = patternStops(l, c.pid);
       if (indices.length < 2 || !c.cars.length) continue;
@@ -236,7 +264,9 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       out.push({ line: l, owner: c.owner, pattern: c.pid, cars: c.cars, trains: c.trains,
         cycle: pcycle, seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * indices.length * 0.65,
         running: year.total + wear, capital: c.cars.reduce((n, m) => n + m.cost, 0), budget: d.revenue * part, boardings: d.boardings * part,
-        use, limit: use.size ? Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u)))) : 0 });
+        use, limit: use.size ? Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u)))) : 0,
+        ...(complete ? { native: { path: route.stations, share: part,
+          seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * .65 } } : {}) });
     }
   }
   return out.sort((a, b) => a.line.id - b.line.id || a.owner - b.owner || a.pattern - b.pattern);
@@ -249,7 +279,7 @@ function loads(channels: Channel[], counts: number[]): Map<number, number> {
 }
 
 /** More holds mean fewer round trips, lower time-valued fares, and more passengers abandoning the queue. */
-function receipts(channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>): number[] {
+function receipts(g: Game, channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>): number[] {
   const load = loads(channels, counts);
   return channels.map((c, i) => {
     if (!counts[i]) return 0;
@@ -271,6 +301,23 @@ function receipts(channels: Channel[], counts: number[], inv: RouteInventory, en
     const availability = c.cycle / (c.cycle + 2 * delay);
     const d = c.line.capacity!.demand!;
     const frequency = channels.reduce((n, other, j) => n + (other.line.id === c.line.id && other.pattern === c.pattern ? counts[j] / other.cycle : 0), 0);
+    if (c.native) {
+      // The saved monthly quote already records its reference headway and stock speed in ride/seconds.
+      // Derive them for old saves too, rather than letting a warm cache choose a different baseline.
+      const referenceHeadway = Math.max(1, 2 * (d.seconds - d.ride));
+      const kmh = Math.max(1, d.distance * UNIT_M * 1.15 * 3.6 / Math.max(1, d.ride));
+      const reference = nativeQuote(g, c, referenceHeadway, kmh);
+      if (reference.revenue > 0) {
+        const quote = nativeQuote(g, c, 1 / frequency + 2 * delay, kmh);
+        // A protected observed/lost-demand boarding floor carries people too. Preserve a higher fare-only
+        // budget without inventing riders, but scale native leg occupation when the saved boarding floor is larger.
+        const boardingFloor = Math.max(1, d.boardings / Math.max(1, reference.boardings));
+        const carried = Math.min(1, c.native.seats * counts[i] * availability / Math.max(1, quote.peak * boardingFloor * c.native.share));
+        // Native receipts recover sparse-call queue abandonment and reprice the actual OD fares together.
+        // The observed-receipt/lost-demand floor remains in c.budget; do not also apply the old fare/capture.
+        return c.budget * quote.revenue / reference.revenue * carried * availability;
+      }
+    }
     const seconds = d.ride + 0.5 / Math.max(0.001, frequency) + delay;
     const fare = fareFor(d.distance, seconds, 1, { mode: 'rail' }) / Math.max(1, d.fare);
     const capture = tripFactor(seconds, refTime(d.distance)) / Math.max(0.01, tripFactor(d.seconds, refTime(d.distance)));
@@ -280,8 +327,8 @@ function receipts(channels: Channel[], counts: number[], inv: RouteInventory, en
   });
 }
 const fleetCount = (channels: Channel[], line: number) => channels.reduce((n, c) => n + (c.line.id === line ? c.trains.length : 0), 0);
-const netValue = (channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>) =>
-  receipts(channels, counts, inv, enlarged).reduce((n, r, i) => n + r - counts[i] * (channels[i].running + channels[i].capital * 0.03), 0);
+const netValue = (g: Game, channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>) =>
+  receipts(g, channels, counts, inv, enlarged).reduce((n, r, i) => n + r - counts[i] * (channels[i].running + channels[i].capital * 0.03), 0);
 
 function connectedLines(g: Game, l: Line, inv: RouteInventory): Line[] {
   const ids = new Set<number>([l.id]), used = new Set<number>();
@@ -302,30 +349,32 @@ function connectedLines(g: Game, l: Line, inv: RouteInventory): Line[] {
 /** Every operator reads the same deterministic auction of paths, weighted by its traffic/access payments. */
 export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
   const inv = inventory(g), lines = connectedLines(g, l, inv);
-  const key = `${g.day}:${capacityTopologyKey(g)}:${g.lines.version}:` + lines.map(x => `${x.id}/${fleet(g, x).map(t => `${t.id},${t.owner},${t.pattern},${t.delivered},${t.profitLast},${t.cars.map(c => c.id).join(',')}`).join('/')}/${x.capacity?.delay}/${x.capacity?.held}/${x.capacity?.longest}`).join(';');
+  const key = `${quoteEpoch(g)}:` + lines.map(x => `${x.id}/${x.owner}/${x.stops.join(',')}/${x.loop}/${x.patterns?.map(p => `${p.id},${p.stops.join(',')}`).join('/')}/`
+    + `${fleet(g, x).map(t => `${t.id},${t.owner},${t.pattern},${t.delivered},${t.profitLast},${t.cars.map(c => `${c.id},${c.capacity},${c.speed},${c.length}`).join(':')}`).join('/')}/`
+    + `${x.capacity?.delay}/${x.capacity?.held}/${x.capacity?.longest}/${JSON.stringify(x.capacity?.demand)}`).join(';');
   let m = planMemo.get(g); if (!m) { m = new Map(); planMemo.set(g, m); }
   const old = m.get(l.id);
   if (old?.key === key) return { ...old.plan, limit: old.plan.allocations.filter(a => a.line === l.id).reduce((n, a) => n + a.trains, 0),
     physical: Math.max(0, ...old.channels.filter(c => c.line.id === l.id).map(c => c.limit)) };
   const channels = channelsFor(g, lines, inv), counts = channels.map(c => c.trains.length);
   const target = channels.map(c => g.company(c.owner).ai ? 0 : c.trains.length);
-  let value = netValue(channels, target, inv);
+  let value = netValue(g, channels, target, inv);
   // Each accepted path has positive marginal surplus after its delays to *all* services have been charged.
   for (;;) {
     let best = -1, gain = 0;
     for (let i = 0; i < channels.length; i++) {
       if (!g.company(channels[i].owner).ai || target[i] >= channels[i].limit) continue;
-      target[i]++; const next = netValue(channels, target, inv) - value; target[i]--;
+      target[i]++; const next = netValue(g, channels, target, inv) - value; target[i]--;
       if (next > gain + 1e-6) { best = i; gain = next; }
     }
     if (best < 0) break;
     target[best]++; value += gain;
   }
   const withdraw: SharedCapacityPlan['withdraw'] = [];
-  const actual = netValue(channels, counts, inv);
+  const actual = netValue(g, channels, counts, inv);
   channels.forEach((c, i) => {
     if (!g.company(c.owner).ai || counts[i] <= target[i]) return;
-    counts[i]--; const marginal = actual - netValue(channels, counts, inv); counts[i]++;
+    counts[i]--; const marginal = actual - netValue(g, channels, counts, inv); counts[i]++;
     const worst = [...c.trains].sort((a, b) => a.delivered / Math.max(1, g.day - a.boughtDay) - b.delivered / Math.max(1, g.day - b.boughtDay)
       || a.profitLast - b.profitLast || b.id - a.id)[0];
     if (worst) withdraw.push({ train: worst.id, owner: c.owner, line: c.line.id, value: marginal });
@@ -336,7 +385,7 @@ export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
     allocations: channels.map((c, i) => ({ line: c.line.id, owner: c.owner, pattern: c.pattern, trains: target[i], traffic: c.budget })),
     withdraw, limit: channels.reduce((n, c, i) => n + (c.line.id === l.id ? target[i] : 0), 0),
     physical: Math.max(0, ...channels.filter(c => c.line.id === l.id).map(c => c.limit)),
-    revenue: receipts(channels, counts, inv).reduce((n, x) => n + x, 0), delay: Math.max(0, ...lines.map(x => x.capacity?.delay ?? 0)) };
+    revenue: receipts(g, channels, counts, inv).reduce((n, x) => n + x, 0), delay: Math.max(0, ...lines.map(x => x.capacity?.delay ?? 0)) };
   const entry = { key, plan, channels, counts, inventory: inv };
   for (const x of lines) m.set(x.id, entry);
   return plan;
@@ -353,8 +402,8 @@ export function marginalSharedTrain(g: Game, l: Line, owner: number, cars: Vehic
   const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv, { line: l, owner, cars, pattern });
   const pid = patternOf(l, pattern)?.id ?? 0, i = channels.findIndex(c => c.line.id === l.id && c.owner === owner && c.pattern === pid);
   if (i < 0) return -Infinity;
-  const counts = channels.map(c => c.trains.length), before = netValue(channels, counts, inv);
-  counts[i]++; return netValue(channels, counts, inv) - before;
+  const counts = channels.map(c => c.trains.length), before = netValue(g, channels, counts, inv);
+  counts[i]++; return netValue(g, channels, counts, inv) - before;
 }
 
 export function sharedTrainAllowed(g: Game, l: Line, owner: number, cars: VehicleModel[], pattern?: number): boolean {
@@ -372,7 +421,7 @@ export function marginalSharedConsist(g: Game, l: Line, t: Train, cars: VehicleM
   const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv);
   const i = channels.findIndex(c => c.line.id === l.id && c.owner === t.owner && c.pattern === (patternOf(l, t.pattern)?.id ?? 0));
   if (i < 0) return -Infinity;
-  const counts = channels.map(c => c.trains.length), before = netValue(channels, counts, inv), c = channels[i], n = Math.max(1, counts[i]);
+  const counts = channels.map(c => c.trains.length), before = netValue(g, channels, counts, inv), c = channels[i], n = Math.max(1, counts[i]);
   const legs = patternStops(l, c.pattern).length, hop = c.line.capacity!.demand!.distance / Math.max(1, legs / 2);
   const oldYear = estimateVehicleYear(t.cars, hop, g.year, 0.5), newYear = estimateVehicleYear(cars, hop, g.year, 0.5);
   const extraSeats = cars.reduce((s, m) => s + m.capacity, 0) - t.capacity;
@@ -380,10 +429,13 @@ export function marginalSharedConsist(g: Game, l: Line, t: Train, cars: VehicleM
   channels[i] = { ...c, seats: c.seats + extraSeats * YEAR_S / c.cycle * legs * 0.65 / n,
     running: c.running + (newYear.total - oldYear.total) / n, capital: c.capital + (newCost - oldCost) / n,
     cycle: c.cycle * (1 + Math.max(0, oldYear.trips / Math.max(1, newYear.trips) - 1) / n), use: new Map(c.use) };
+  // Stock speed changes retain the existing cycle-cost estimate; frequency fares use the saved reference speed.
+  if (c.native) channels[i].native = { ...c.native,
+    seats: (c.native.seats + extraSeats * YEAR_S / c.cycle * .65 / n) * c.cycle / channels[i].cycle };
   const length = cars.reduce((s, m) => s + m.length, 0) - t.length;
   for (const [rid, u] of c.use) if (inv.resources[rid].kind === 'platform')
     channels[i].use.set(rid, u + length / Math.max(0.4, t.maxSpeed * 0.6) / c.cycle / n);
-  return netValue(channels, counts, inv) - before;
+  return netValue(g, channels, counts, inv) - before;
 }
 
 /** Surplus recovered by an upgrade, at today's fleet (and its next profitable departure). */
@@ -391,18 +443,18 @@ export function sharedUpgradeReturn(g: Game, l: Line, resourceIds: number[], mul
   sharedCapacityPlan(g, l);
   const e = planMemo.get(g)!.get(l.id)!;
   const enlarged = new Map(resourceIds.map(id => [id, e.inventory.resources[id].available * multiplier]));
-  const before = netValue(e.channels, e.counts, e.inventory);
-  let after = netValue(e.channels, e.counts, e.inventory, enlarged), bestCounts = [...e.counts];
+  const before = netValue(g, e.channels, e.counts, e.inventory);
+  let after = netValue(g, e.channels, e.counts, e.inventory, enlarged), bestCounts = [...e.counts];
   for (let i = 0; i < e.channels.length; i++) {
     const counts = [...e.counts]; counts[i]++;
-    const value = netValue(e.channels, counts, e.inventory, enlarged);
+    const value = netValue(g, e.channels, counts, e.inventory, enlarged);
     if (value > after) { after = value; bestCounts = counts; }
   }
   const annual = after - before - upkeep;
   const risk = g.aiOf(l.owner)?.config.risk ?? 0.5;
   // Capital's opportunity cost plus debt service, the same economic terms as through-link construction.
   const required = cost * (0.045 - 0.03 * risk + 0.03);
-  const oldReceipts = receipts(e.channels, e.counts, e.inventory), newReceipts = receipts(e.channels, bestCounts, e.inventory, enlarged);
+  const oldReceipts = receipts(g, e.channels, e.counts, e.inventory), newReceipts = receipts(g, e.channels, bestCounts, e.inventory, enlarged);
   const gains = new Map<number, number>();
   e.channels.forEach((c, i) => {
     const gain = newReceipts[i] - oldReceipts[i] - (bestCounts[i] - e.counts[i]) * (c.running + c.capital * 0.03);

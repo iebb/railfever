@@ -17,7 +17,8 @@ const selected = process.argv.slice(2);
 const want = (n: number) => !selected.length || selected.includes(String(n));
 const ext: GrowOption = { kind: 'ext', end: 1, n: 3, turn: 0, level: 'ground', pop: 4500 };
 const fixture = () => presholm('west', 'tail', 3, 4500);
-const generous = (g: Game) => { g.demand.forecastLine = (points) => ({ revenue: points.length > 5 ? 30_000_000 : 500_000, boardings: 1000, covered: 10000, transfers: 0 }); };
+// Synthetic 1,000-boarder forecasts mean 500 endpoint riders each way, occupying every directional leg.
+const generous = (g: Game) => { g.demand.forecastLine = (points) => ({ revenue: points.length > 5 ? 30_000_000 : 500_000, boardings: 1000, covered: 10000, transfers: 0, legLoads: new Array(2 * (points.length - 1)).fill(500) }); };
 
 // The same host contract used by the saved network planner, with funding and target remapping kept explicit.
 function host(g: Game, ai: AIController): GrowHost {
@@ -95,7 +96,7 @@ if (want(2)) {
   const forecasts: { stops: number; headway: number }[] = [];
   g.demand.forecastLine = (points, _mode, _kmh, headway) => {
     forecasts.push({ stops: points.length, headway });
-    return { revenue: 1e10 / headway * (1 + .05 * (points.length - 5)), boardings: 1000, covered: 10000, transfers: 0 };
+    return { revenue: 1e10 / headway * (1 + .05 * (points.length - 5)), boardings: 1000, covered: 10000, transfers: 0, legLoads: new Array(2 * (points.length - 1)).fill(500) };
   };
   const h = host(g, ai), item = itemFor(line);
   finish(h, item);
@@ -120,7 +121,7 @@ if (want(3)) {
   }
   const { g, ai, line } = fixture();
   let annual = 1_000_000;
-  g.demand.forecastLine = (points) => ({ revenue: points.length > 5 ? 30_000_000 : annual, boardings: 1000, covered: 10000, transfers: 0 });
+  g.demand.forecastLine = (points) => ({ revenue: points.length > 5 ? 30_000_000 : annual, boardings: 1000, covered: 10000, transfers: 0, legLoads: new Array(2 * (points.length - 1)).fill(500) });
   const h = host(g, ai);
   step(h, itemFor(line));
   const period = Object.values(line.growth ?? {})[0];
@@ -157,7 +158,7 @@ if (want(4)) {
     g.onNetworkChanged(); g.lines.rebuild();
     check(!line.stops.some((sid) => depotReaches(g, g.depots.get(depot)!, sid, [M('lrv_b')])), `4: ${fault} depot cannot serve the actual consist`);
     if (fault === 'unwired') check(line.stops.some((sid) => depotReaches(g, g.depots.get(depot)!, sid)), '4: unwired depot has a topological route');
-    g.demand.forecastLine = (points) => ({ revenue: points.length > 4 ? 30_000_000 : 500_000, boardings: 1000, covered: 10000, transfers: 0 });
+    g.demand.forecastLine = (points) => ({ revenue: points.length > 4 ? 30_000_000 : 500_000, boardings: 1000, covered: 10000, transfers: 0, legLoads: new Array(2 * (points.length - 1)).fill(500) });
     const n = line.vehicles.length, h = host(g, ai);
     let purchaseFunding = 0;
     const fund = h.canSpend;

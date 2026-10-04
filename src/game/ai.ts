@@ -41,6 +41,7 @@ import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn,
 import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
 import { initialSecondTrackCost, initialTrackChoice, layInitialDoubleTrack } from './ai-initial-track';
+import { urbanTrunks } from './ai-urban';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1117,6 +1118,8 @@ interface UrbanTask {
 interface UrbanLayout {
   x: number; z: number; angle: number; spacing: number; step: number; end: number; L: number; platform: number;
   targets: number[]; interchanges: number[];
+  /** Actual centres on a through alignment; absent for legacy/local layouts. */
+  towns?: number[];
 }
 type UrbanQuote = UrbanLayout & { quote?: ReturnType<AIController['urbanEconomics']> };
 interface UrbanSurvey {
@@ -1254,7 +1257,7 @@ export class AIController {
   static slowMs = 8;
   /** tests: build forced projects even when the estimate says they would not pay */
   static forceBuild = false;
-  /** towns from this size get their main-line stations in the centre, underground (and cross-city links) */
+  /** Minimum town population for a separate underground cross-city joining project. */
   static centrePop = 5000;
   /**
    * Search from the same town size at which the fare/demand model recognises a dense centre.
@@ -2520,29 +2523,69 @@ export class AIController {
       if (!re.ok) return fail('no high-speed station site');
       pr[end] = re;
     }
-    // big towns: the new station in the city centre, underground (subway style), where it serves clearly more people
-    // than the site found on the ground (its cost and the tunnel's are weighed with the rest below)
-    let underground = false;
-    if (!hs && centre) for (const end of ['a', 'b'] as const) {
-      if (end === 'a' ? hub : hubB) continue;
-      const T = end === 'a' ? A : B, sp: StationPlan = pr[end], other: StationPlan = end === 'a' ? pr.b : pr.a;
-      if (T.pop < AIController.centrePop || Math.hypot(sp.x - T.x, sp.z - T.z) < T.radius * 0.35) continue;
-      const ug: StationPlan | null = yield* this.centreStation(T, other, PLATFORM);
-      if (!ug || !reach(ug, other) || !(end === 'a' ? leadsMeet(ug, other, LEAD) : leadsMeet(other, ug, LEAD))) continue;
-      const popOf = (q: StationPlan) => walkingPopulation(g, planWalkingCatchment(g, q));
-      // (only for a company with the money: the station and its tunnel cost several times a ground station)
-      if (popOf(ug) < popOf(sp) * 1.3 || (ug.cost - sp.cost) * 3 > this.available()) continue;
-      pr = end === 'a' ? { a: ug, b: pr.b } : { a: pr.a, b: ug };
-      // The surface pair's other station faced the outskirts site. Moving this end into the centre can
-      // leave its last approach pointing across a street; choose a surface site facing the new platforms.
-      if (!(end === 'a' ? hubB : hub) && other.level === 'ground') {
-        const town = end === 'a' ? B : A;
-        const aligned = yield* aiStationSiteGen(g, town, ug, { tracks: ST, length: PLATFORM, owner,
-          front: LEAD + 2, back: 20, quick: true, accept: (q) => end === 'a' ? leadsMeet(ug, q, LEAD) : leadsMeet(q, ug, LEAD) });
-        if (aligned && reach(ug, aligned)) pr = end === 'a' ? { a: ug, b: aligned } : { a: aligned, b: ug };
+    // A central alignment is an economic alternative at every town size. Price the reachable pair,
+    // including the structures needed to cross its streets, against the existing surface/hub layout.
+    let underground = false, preferredRoute: RoutePlan | null = null;
+    if (!hs && centre) {
+      const base = pr, pairs = [base];
+      for (const level of ['ground', 'elevated', 'underground'] as const) {
+        const a = hub ? base.a : yield* this.centreStation(A, base.b, PLATFORM, level);
+        const b = hubB ? base.b : yield* this.centreStation(B, a ?? base.a, PLATFORM, level);
+        if (a && b && reach(a, b) && leadsMeet(a, b, LEAD)) pairs.push({ a, b });
       }
-      underground = true;
-      this.note(`${what} ${A.name}-${B.name}: an underground station in central ${T.name}`);
+      const routeFor = function* (pair: typeof base): Generator<void, RoutePlan | string> {
+        const sa = hub && Math.sin(pair.a.angle) * (pair.b.x - pair.a.x) + Math.cos(pair.a.angle) * (pair.b.z - pair.a.z) < 0 ? -1 : 1;
+        const sb = hubB && Math.sin(pair.b.angle) * (pair.a.x - pair.b.x) + Math.cos(pair.b.angle) * (pair.a.z - pair.b.z) < 0 ? -1 : 1;
+        const da = { x: Math.sin(pair.a.angle) * sa, z: Math.cos(pair.a.angle) * sa };
+        const db = { x: Math.sin(pair.b.angle) * sb, z: Math.cos(pair.b.angle) * sb };
+        const fa = { x: pair.a.x + da.x * pair.a.length / 2, z: pair.a.z + da.z * pair.a.length / 2 };
+        const fb = { x: pair.b.x + db.x * pair.b.length / 2, z: pair.b.z + db.z * pair.b.length / 2 };
+        const from = { x: fa.x + da.x * LEAD, z: fa.z + da.z * LEAD, tx: da.x, tz: da.z };
+        const to = { x: fb.x + db.x * LEAD, z: fb.z + db.z * LEAD, tx: -db.x, tz: -db.z };
+        // Price a directly fitted through alignment before paying for a full corridor search.
+        // The selected geometry is checked again by the ordinary build path; a terrain/clearance
+        // rejection leaves the original surface search available, without consuming its work budget.
+        const aligned = alignCorridor([from, to], from, to);
+        if (aligned.minR < 14) return 'central approach curve';
+        const way = [...aligned.way, { ...fb, tx: -db.x, tz: -db.z }];
+        const exclude = new Set([...(hub?.rail?.edges ?? []), ...(hubB?.rail?.edges ?? [])]);
+        const prof = yield* chainProfileGen(g, [{ ...fa, tx: da.x, tz: da.z }, ...way], tracks, pair.a.y, pair.b.y,
+          'rail', exclude, false, undefined, type, 256, (0.035 / TRACK_TYPES.standard.maxGrade) *
+            (pair.a.level === 'underground' || pair.b.level === 'underground' ? .95 : .85));
+        if (!prof || (yield* routeConflictGen(g, prof, 'rail', tracks, exclude, 40, true))) return 'central clearance';
+        return { way, prof, minR: aligned.minR, expanded: 0 };
+      };
+      let best = -Infinity;
+      for (const pair of pairs) {
+        const route = yield* routeFor(pair);
+        if (typeof route === 'string') continue;
+        const len = route.prof.s[route.prof.s.length - 1], dist = Math.hypot(pair.b.x - pair.a.x, pair.b.z - pair.a.z);
+        if (len > dist * 1.55 + 25) continue;
+        const overlap = routeAlongside(g, route.prof, Math.min(25, len / 5), trackClassOf(type));
+        if (overlap > .3) continue;
+        const stock = pickTrain(g.year, Math.min(PLATFORM, pair.a.length, pair.b.length), len, openingCoaches(A.pop, B.pop));
+        if (!stock) continue;
+        const works = estimateChainCost(route.prof, tracks, 'rail', type);
+        const infrastructure = works.cost * 1.15 + (hub ? 0 : pair.a.cost) + (hubB ? 0 : pair.b.cost) + 260_000;
+        const civilUpkeep = trackBasePerUnit(type) * (works.bridge * 3 + works.tunnel * 4)
+          + (hub ? 0 : (20_000 + pair.a.tracks * pair.a.length * 500) * (STATION_UPKEEP_FACTOR[pair.a.level] ?? 1))
+          + (hubB ? 0 : (20_000 + pair.b.tracks * pair.b.length * 500) * (STATION_UPKEEP_FACTOR[pair.b.level] ?? 1)) + 12_000;
+        for (const fleet of [1, 2]) {
+          const sv = this.serviceYear(stock, fleet, dist, len, type, .4);
+          const forecast = g.demand.forecastLine([hub ?? pair.a, hubB ?? pair.b], 'mainline', sv.kmh, sv.headway, owner);
+          const mail = projectMail(g, [hub ?? pair.a, hubB ?? pair.b], stock, fleet, sv.kmh, sv.headway,
+            Math.min(PLATFORM, pair.a.length, pair.b.length));
+          const capital = infrastructure + (stock.reduce((n, c) => n + c.cost, 0) + mail.price) * fleet;
+          const income = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + .7 * mail.revenue) * (1 - overlap);
+          const net = income - sv.running - mail.yearly - sv.trackUpkeep - civilUpkeep;
+          const need = infrastructure * (.045 - .03 * this.config.risk) + capital * .03;
+          const score = (net - need) / capital;
+          if (capital <= this.available() && net > need && score > best) { best = score; pr = pair; preferredRoute = route; }
+          yield;
+        }
+      }
+      underground = pr.a.level === 'underground' || pr.b.level === 'underground';
+      if (pr !== base) this.note(`${what} ${A.name}-${B.name}: central ${pr.a.level}/${pr.b.level} alignment pays better than the surface alternative`);
     }
     const planning = this.state.phase;
     this.state.phase = `${planning}: route`;
@@ -2567,7 +2610,7 @@ export class AIController {
     // of the new station's passengers, the line joins that station's track at a junction on its approach instead
     // (a station of its own only when no junction works)
     let join: { S: Station; J: JunctionSite } | null = null;
-    let plan: RoutePlan | string = 'no route';
+    let plan: RoutePlan | string = preferredRoute ?? 'no route';
     const S = hubB ? null : this.townStation(B, pr.b);
     // (a terminus of our own right beside another company's station would duplicate it: join that station's approach
     // where a junction fits, whatever share of the new site's catchment it covers)
@@ -2586,7 +2629,7 @@ export class AIController {
       if (!join) this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`);
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
-    if (!join) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
+    if (!join && !preferredRoute) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
     // (an underground centre station the line cannot reach, or pay for: the railway with stations on the ground)
     const ground = function* (self: AIController, why: string): Generator<void, void> { self.note(`${what} ${A.name}-${B.name}: underground station dropped (${why})`); yield* self.railJob(A, B, hubId, type, false); };
     if (typeof plan === 'string') { if (underground) return yield* ground(this, plan); return fail(plan, plan.startsWith('route runs') ? 720 : 900); }
@@ -2668,7 +2711,8 @@ export class AIController {
       if (!sp) continue;
       // a building of its time and town (a halt in a village, a concourse in a city)
       const style = defaultStationStyle(g.year, ST, sp.level ?? 'ground', 'mainline', (sp === pr.a ? A : B).pop);
-      const tt = { ...(hs ? { trackType: type } : {}), ...(sp.level && sp.level !== 'ground' ? { level: sp.level, depth: sp.depth || undefined } : {}) };
+      const tt = { ...(hs ? { trackType: type } : {}), ...(sp.level && sp.level !== 'ground'
+        ? { level: sp.level, depth: sp.depth || undefined, height: sp.height || undefined, entrances: sp.entrances.length } : {}) };
       let re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, { style, ...tt });
       yield;
       if (!re.ok || !stationAccessSafe(re)) { re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, tt); yield; }
@@ -3492,7 +3536,7 @@ export class AIController {
    * An underground main-line station in the centre of town T (subway style), its platforms pointing at `toward`:
    * the site among a few near the centre with the most people in reach of its entrances, or null.
    */
-  private *centreStation(T: Town, toward: P2, PL: number): Generator<void, StationPlan | null> {
+  private *centreStation(T: Town, toward: P2, PL: number, level: 'ground' | 'elevated' | 'underground' = 'underground'): Generator<void, StationPlan | null> {
     const g = this.game, me = this.companyId;
     const a0 = Math.atan2(toward.x - T.x, toward.z - T.z);
     let best: StationPlan | null = null, bestPop = 0;
@@ -3501,9 +3545,9 @@ export class AIController {
         const x = T.x + Math.sin(a0 + da) * r, z = T.z + Math.cos(a0 + da) * r;
         for (const aa of [0, 0.25, -0.25]) {
           const angle = Math.atan2(toward.x - x, toward.z - z) + aa;
-          const pl = g.stations.planRail(x, z, angle, PL, 2, me, { level: 'underground', depth: 2.4 });
+          const pl = g.stations.planRail(x, z, angle, PL, 2, me, { level, depth: 2.4, height: 1.5, ...(level !== 'ground' ? { entrances: CITY_ENTRANCES } : {}) });
           yield;
-          if (!pl.ok || pl.join) continue;
+          if (!pl.ok || pl.join || !stationAccessSafe(pl)) continue;
           const pop = walkingPopulation(g, planWalkingCatchment(g, pl));
           if (pop > bestPop) { bestPop = pop; best = pl; }
         }
@@ -3829,7 +3873,7 @@ export class AIController {
    * of a walking reach apart, light-rail-style halts a little closer (cheaper stops, slower vehicles), never closer
    * than platforms and turnouts allow. Neighbouring catchments overlap: the forecast shares their buildings.
    */
-  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number, stopsWanted = 5, platform = mode === 'metro' ? 12 : 7) {
+  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number, stopsWanted = 5, platform = mode === 'metro' ? 12 : 7): Omit<UrbanLayout, 'interchanges'> & { interchanges: Station[] } {
     // A light-rail terminus needs two crossover diagonals and their clearances between platforms. The walking
     // reach may shrink, but the 18-unit throat cannot: shorter gaps leave both tracks two-way and trains blocked.
     const end = platform + Math.max(TRACK_TYPES.electric.minRadius * 2 + 2, 18);
@@ -3886,11 +3930,19 @@ export class AIController {
         for (const platform of new Set([close.platform, this.urbanPlatform(mode)])) {
           const base = this.urbanLayout(T, mode, undefined, count, platform);
           for (const step of new Set([base.step, base.spacing])) {
-            const layout = this.urbanLayout(T, mode, step, count, platform), key = platform + ':' + layout.targets.join(',');
-            if (seen.has(key)) continue;
-            seen.add(key);
-            for (const level of mode === 'metro' ? ['underground'] as const : ['ground', 'elevated', 'underground'] as const)
-              trials.push({ layout: plain(layout), level, count });
+            const local = this.urbanLayout(T, mode, step, count, platform);
+            const alternatives = [local, ...urbanTrunks(g, T, local.end, count)
+              .filter(c => c.targets.length === count && !c.towns.some(id => this.urbanReserved(id)))
+              .filter(c => ![...this.lines.values()].some(info => info.urban &&
+                c.towns.filter(id => info.towns.includes(id)).length >= 2))
+              .map(c => ({ ...local, ...c, interchanges: [] as Station[] }))];
+            for (const layout of alternatives) {
+              const key = `${platform}:${layout.x}:${layout.z}:${layout.angle}:${layout.targets.join(',')}`;
+              if (seen.has(key)) continue;
+              seen.add(key);
+              for (const level of mode === 'metro' ? ['underground'] as const : ['ground', 'elevated', 'underground'] as const)
+                trials.push({ layout: plain(layout), level, count });
+            }
           }
         }
       }
@@ -3913,13 +3965,21 @@ export class AIController {
         const t = layout.targets[cursor.site], x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
         if (cursor.offset < 5) {
           const d = [0, 1.5, -1.5, 3, -3][cursor.offset++], px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
-          const plan = g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
-            { trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
-              ...(level !== 'ground' && g.stations.cityAt(px, pz, T) ? { entrances: CITY_ENTRANCES } : {}) });
-          if (plan.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; }
+          const through = (layout.towns?.length ?? 0) > 1;
+          const native = through ? this.urbanSitePlan(T, layout, mode, length, layout.angle, 0, t + d, level,
+            cursor.sites[cursor.sites.length - 1] as StationPlan | undefined) : null;
+          const plan = through ? (native && typeof native !== 'string' ? native : null)
+            : g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
+              { trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
+                ...(level !== 'ground' && g.stations.cityAt(px, pz, g.towns.nearest(px, pz)) ? { entrances: CITY_ENTRANCES } : {}) });
+          if (plan?.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; }
+        } else if ((layout.towns?.length ?? 0) > 1) {
+          // A constrained centre corridor cannot borrow demand from an unbuildable virtual stop.
+          // Skip this trial in one saved work unit; local alignments retain their broader site search.
+          cursor.trial++; cursor.site = cursor.offset = 0; cursor.sites = [];
         } else {
-          const scale = g.stations.cityAt(x, z, T) ? CITY_WALK_SCALE : 1;
-          cursor.sites.push({ x, z, townId: T.id, length, tracks: 2,
+          const scale = g.stations.cityAt(x, z, g.towns.nearest(x, z)) ? CITY_WALK_SCALE : 1;
+          cursor.sites.push({ x, z, townId: g.towns.nearest(x, z)?.id ?? T.id, length, tracks: 2,
             walk: level === 'ground' ? pointWalkingCatchment(g, x, z, 'rail', scale - 1, 1.6)
               : stopSiteWalkingCatchment(g, x, z, layout.angle, length, 'rail', scale) });
           cursor.site++; cursor.offset = 0;
@@ -3933,6 +3993,54 @@ export class AIController {
       }
       yield;
     }
+  }
+
+  /** The same native platform, access and grade checks used by a through quote and its construction. */
+  private urbanSitePlan(T: Town, layout: Pick<UrbanLayout, 'x' | 'z'>, mode: 'metro' | 'lightrail', PL: number,
+    ang: number, lat: number, t: number, lv: UrbanLevel, prev?: StationPlan): StationPlan | string | null {
+    const g = this.game, me = this.companyId, grade = TRACK_TYPES.electric.maxGrade * 0.8;
+    const lim = lv === 'underground' ? { lo: 1.5, hi: 3.8, pref: 2.2 } : { lo: 1.2, hi: 2.8, pref: 1.5 };
+    const ux = Math.sin(ang), uz = Math.cos(ang), x = layout.x + ux * t - uz * lat, z = layout.z + uz * t + ux * lat;
+    if (!g.world.inside(x, z, 10)) return null;
+    // the ground over / under the platforms
+    let lo = Infinity, hi = -Infinity;
+    for (const k of [-0.5, 0, 0.5]) { const h = g.world.heightAt(x + ux * PL * k, z + uz * PL * k); lo = Math.min(lo, h); hi = Math.max(hi, h); }
+    const reach = prev ? grade * Math.max(1, Math.hypot(x - prev.x, z - prev.z) - PL - 2) : Infinity;
+    let opt: object;
+    if (lv === 'underground') {
+      // platform height y = lo - depth, depth within the limits, y within reach of the previous platforms
+      const under = [...g.stations.map.values()].find((st) => st.townId === T.id && st.rail?.level === 'underground'
+        && railPartMode(st.rail) === 'mainline' && Math.hypot(st.x - x, st.z - z) < 10);
+      const preferred = under ? Math.max(lim.pref, under.rail!.depth + 1.2) : lim.pref;
+      const want = lo - preferred, y = prev ? Math.max(prev.y - reach, Math.min(prev.y + reach, want)) : want;
+      const depth = lo - y;
+      if (depth < lim.lo || depth > Math.max(lim.hi, preferred)) return null;
+      opt = { trackType: 'electric', mode, level: lv, depth };
+    } else if (lv === 'elevated') {
+      const want = hi + lim.pref, y = prev ? Math.max(prev.y - reach, Math.min(prev.y + reach, want)) : want;
+      const height = y - hi;
+      if (height < lim.lo || height > lim.hi) return null;
+      opt = { trackType: 'electric', mode, level: lv, height };
+    } else opt = { trackType: 'electric', mode, level: lv };
+    // (an in-city stop below or above the street walks half as far: entrances at both ends and both sides)
+    if (lv !== 'ground' && g.stations.cityAt(x, z, g.towns.nearest(x, z))) opt = { ...opt, entrances: CITY_ENTRANCES };
+    const pl = g.stations.planRail(x, z, ang, PL, 2, me, opt);
+    if (!pl.ok) return pl.error ?? 'invalid platform';
+    if (pl.join?.rail) return 'existing rail platforms';
+    if (prev && Math.abs(pl.y - prev.y) > reach + 0.05) return 'platform grade';
+    if (pl.join) {
+      // Keep the existing road service's station identity. The urban railway has its own platforms and
+      // a walking complex with that stop, so an abandoned rail project cannot remove a working bus stop.
+      pl.links = [...new Set([...pl.links, pl.join])]; pl.join = null;
+    }
+    // stairs up to a deck (or a ramp's way) must not stand where the line runs on beyond the platform ends
+    if (lv !== 'underground') for (const e of pl.entrances) {
+      const dx = e.x - pl.x, dz = e.z - pl.z;
+      if (Math.abs(dx * ux + dz * uz) > PL / 2 - 0.3 && Math.abs(dx * uz - dz * ux) < pl.footprint.w / 2 + 1.1) return 'entrance on the continuing track';
+    }
+    // the track from the previous station must not run into another station (at its level)
+    if (prev && this.stationOnTheWay(prev.x, prev.z, pl.x, pl.z, lv)) return null;
+    return pl;
   }
 
   /**
@@ -4050,10 +4158,11 @@ export class AIController {
       maxStops = this.urbanSurvey?.maxStops ?? maxStops;
       const layout = yield* this.urbanStep(T, mode, maxStops, true), L = layout.L;
       this.urbanSurvey = null;
-      const range = (a: number) => { let mn = Infinity, mx = -Infinity; for (let t = -L / 2 - 8; t <= L / 2 + 8; t += 3) { const h = g.world.heightAt(T.x + Math.sin(a) * t, T.z + Math.cos(a) * t); mn = Math.min(mn, h); mx = Math.max(mx, h); } return mx - mn; };
-      const angles = (layout.interchanges.length ? [0] : [0, Math.PI / 2, Math.PI / 6, -Math.PI / 6, Math.PI / 3, -Math.PI / 3])
+      const range = (a: number) => { let mn = Infinity, mx = -Infinity; for (let t = -L / 2 - 8; t <= L / 2 + 8; t += 3) { const h = g.world.heightAt(layout.x + Math.sin(a) * t, layout.z + Math.cos(a) * t); mn = Math.min(mn, h); mx = Math.max(mx, h); } return mx - mn; };
+      const through = (layout.towns?.length ?? 0) > 1;
+      const angles = (layout.interchanges.length || through ? [0] : [0, Math.PI / 2, Math.PI / 6, -Math.PI / 6, Math.PI / 3, -Math.PI / 3])
         .map((da) => ({ a: layout.angle + da, r: range(layout.angle + da) - (da === 0 ? 0.6 : 0) })).sort((p1, p2) => p1.r - p2.r);
-      const lats = layout.interchanges.length ? [0, 2, -2] : [0, 5, -5, 10, -10, 15, -15];
+      const lats = layout.interchanges.length || through ? [0, 2, -2] : [0, 5, -5, 10, -10, 15, -15];
       const candidates: UrbanTask['candidates'] = mode === 'metro' ? (layout.interchanges.length ? lats : [0, 5, -5, 10, -10]).flatMap((lat) => angles.map(({ a }) => ({ a, lat, lv: 'underground' as const })))
         : lats.flatMap((lat) => angles.flatMap(({ a }, i) => (i < 3 ? ['ground', 'elevated', 'underground'] as const : ['underground'] as const).map((lv) => ({ a, lat, lv }))));
       // Compare an opening stage between the interchanges with the full line's optional outer stops.
@@ -4067,6 +4176,7 @@ export class AIController {
       const variants = candidates.flatMap((c) => this.urbanVariants({ ...layout, targets: c.trim ? layout.targets.slice(1, -1) : layout.targets }, anchors, c.a, c.lat, layout.platform)
         .map((targets) => ({ ...c, targets: [...targets] })));
       candidates.splice(0, candidates.length, ...variants);
+      p.towns = layout.towns ? [T.id, ...layout.towns.filter(id => id !== T.id)] : [T.id];
       this.urbanTask = { town: T.id, mode, maxStops, layout: { ...layout, interchanges: layout.interchanges.map((s) => s.id) }, candidates,
         stage: 'sites', candidate: 0, target: 0, offset: 0, tries: 0, previous: -1e9, got: [], link: 0, links: 0, yardAt: 0, yard: null,
         plans: [], angle: layout.angle, level: mode === 'metro' ? 'underground' : 'elevated', bestReturn: -1e30, bestPays: false, paid: false, alignment: '', more: 2,
@@ -4074,7 +4184,7 @@ export class AIController {
     }
     const task = this.urbanTask;
     const layout = task.layout, PL = layout.platform ?? (mode === 'metro' ? 12 : 7), SP = layout.spacing, n = layout.targets.length;
-    const designGrade = TRACK_TYPES.electric.maxGrade, grade = designGrade * 0.8;
+    const designGrade = TRACK_TYPES.electric.maxGrade;
     const retry = function* (self: AIController, why: string, days = 1500): Generator<void, void> {
       const count = task.maxStops ?? maxStops;
       if (count > 3 && n > 3 && !p.built) { self.urbanTask = null; yield* self.urbanJob(T, mode, Math.min(count - 1, n - 1)); }
@@ -4084,48 +4194,8 @@ export class AIController {
     const reject = (list: [string, number][], why: string) => { const r = list.find((q) => q[0] === why); if (r) r[1]++; else list.push([why, 1]); };
     const rejectSite = (why: string) => { reject(task.siteRejects, why); return null; };
     const site = (ang: number, lat: number, t: number, lv: UrbanLevel, prev: StationPlan | undefined): StationPlan | null => {
-      const lim = lv === 'underground' ? { lo: 1.5, hi: 3.8, pref: 2.2 } : { lo: 1.2, hi: 2.8, pref: 1.5 };
-      const ux = Math.sin(ang), uz = Math.cos(ang), x = layout.x + ux * t - uz * lat, z = layout.z + uz * t + ux * lat;
-      if (!g.world.inside(x, z, 10)) return null;
-      // the ground over / under the platforms
-      let lo = Infinity, hi = -Infinity;
-      for (const k of [-0.5, 0, 0.5]) { const h = ground(x + ux * PL * k, z + uz * PL * k); lo = Math.min(lo, h); hi = Math.max(hi, h); }
-      const reach = prev ? grade * Math.max(1, Math.hypot(x - prev.x, z - prev.z) - PL - 2) : Infinity;
-      let opt: object;
-      if (lv === 'underground') {
-        // platform height y = lo - depth, depth within the limits, y within reach of the previous platforms
-        const under = [...g.stations.map.values()].find((st) => st.townId === T.id && st.rail?.level === 'underground'
-          && railPartMode(st.rail) === 'mainline' && Math.hypot(st.x - x, st.z - z) < 10);
-        const preferred = under ? Math.max(lim.pref, under.rail!.depth + 1.2) : lim.pref;
-        const want = lo - preferred, y = prev ? Math.max(prev.y - reach, Math.min(prev.y + reach, want)) : want;
-        const depth = lo - y;
-        if (depth < lim.lo || depth > Math.max(lim.hi, preferred)) return null;
-        opt = { trackType: 'electric', mode, level: lv, depth };
-      } else if (lv === 'elevated') {
-        const want = hi + lim.pref, y = prev ? Math.max(prev.y - reach, Math.min(prev.y + reach, want)) : want;
-        const height = y - hi;
-        if (height < lim.lo || height > lim.hi) return null;
-        opt = { trackType: 'electric', mode, level: lv, height };
-      } else opt = { trackType: 'electric', mode, level: lv };
-      // (an in-city stop below or above the street walks half as far: entrances at both ends and both sides)
-      if (lv !== 'ground' && g.stations.cityAt(x, z, T)) opt = { ...opt, entrances: CITY_ENTRANCES };
-      const pl = g.stations.planRail(x, z, ang, PL, 2, me, opt);
-      if (!pl.ok) return rejectSite(pl.error ?? 'invalid platform');
-      if (pl.join?.rail) return rejectSite('existing rail platforms');
-      if (prev && Math.abs(pl.y - prev.y) > reach + 0.05) return rejectSite('platform grade');
-      if (pl.join) {
-        // Keep the existing road service's station identity. The urban railway has its own platforms and
-        // a walking complex with that stop, so an abandoned rail project cannot remove a working bus stop.
-        pl.links = [...new Set([...pl.links, pl.join])]; pl.join = null;
-      }
-      // stairs up to a deck (or a ramp's way) must not stand where the line runs on beyond the platform ends
-      if (lv !== 'underground') for (const e of pl.entrances) {
-        const dx = e.x - pl.x, dz = e.z - pl.z;
-        if (Math.abs(dx * ux + dz * uz) > PL / 2 - 0.3 && Math.abs(dx * uz - dz * ux) < pl.footprint.w / 2 + 1.1) return rejectSite('entrance on the continuing track');
-      }
-      // the track from the previous station must not run into another station (at its level)
-      if (prev && this.stationOnTheWay(prev.x, prev.z, pl.x, pl.z, lv)) return null;
-      return pl;
+      const plan = this.urbanSitePlan(T, layout, mode, PL, ang, lat, t, lv, prev);
+      return typeof plan === 'string' ? rejectSite(plan) : plan;
     };
     const offs = [0];
     for (let d = 1.5; d <= SP * 0.9; d += 1.5) { offs.push(d); if (d <= SP * 0.3) offs.push(-d); }
@@ -4342,7 +4412,8 @@ export class AIController {
         keepFleet(() => this.signalLine(line.id)); task.at = 0; task.stage = 'fleet';
       } else if (task.stage === 'fleet') {
         if (task.at >= task.estimate!.fleet) {
-          const info: LineInfo = { kind: 'rail', towns: [T.id], depot: task.depot, maxVehicles: Math.max(task.estimate!.fleet, task.stations.length), opened: g.day, double: true, urban: mode };
+          const towns = [...new Set(task.stations.map(id => g.stations.get(id)?.townId ?? -1).filter(id => id >= 0))];
+          const info: LineInfo = { kind: 'rail', towns, depot: task.depot, maxVehicles: Math.max(task.estimate!.fleet, task.stations.length), opened: g.day, double: true, urban: mode };
           this.lines.set(p.line, info); this.stats.lines++; this.stats.urban++; this.stats.railStations += task.stations.length;
           task.at = 0; task.stage = 'transfers'; continue;
         }

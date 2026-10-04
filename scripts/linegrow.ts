@@ -17,7 +17,7 @@ import { connectStationThroat, finishDoubleTrack, planStationOnTrack, commitStat
 import { autoSignalLine } from '../src/game/signals';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { serialize, deserialize } from '../src/game/save';
-import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask } from '../src/game/ai-network';
+import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask, networkDaily } from '../src/game/ai-network';
 import { terminusOf, outerEnd, planTerminusYard, buildTerminusYard, cityStationSpacing, lineTrackAt } from '../src/game/ai-grow';
 import { Train } from '../src/game/train';
 import { patternHeadways, addPattern, setVehiclePattern, linePatterns } from '../src/game/patterns';
@@ -339,6 +339,93 @@ if (run('nopay')) {
   console.log(`  decisions: ${decisions()}`);
   check(stat(ai, 'netExtended') === 0 && linePath(line).join() === before.join(), 'nopay: the line keeps its stations');
   check((networkProfile.decisions['extend.line'] ?? 0) > 0, 'nopay: the line was looked at');
+}
+
+if (run('busy')) {
+  console.log('busy: occupied depot leads keep their assets and retry on a saved short deadline');
+  const {g,ai,line,depot}=presholm('east','old',6,4500);
+  check(g.vehicles.buyTrain(depot,[M('lrv_b')],line.id) instanceof Train,'busy: a real departure occupies the old depot approach');
+  const construction=ai.eco.thisYear.construction,stations=g.stations.map.size;
+  let replay:Game|undefined,flag=false,deadline=false,reset=false,comparisons=0;
+  g.aiEnabled=true;scheduleNetworkTask(ai,'extend',0);
+  const until=g.day+100;
+  while(g.day<until) {
+    g.stepTick();replay?.stepTick();
+    if(g.tick%g.ticksPerDay)continue;
+    const data=serialize(g).aiNetwork, state=data?.companies.find(([id])=>id===ai.companyId)?.[1];
+    const cursors=state?.job?.items?.flatMap(i=>i.grow?[i.grow]:[])??[];
+    if(!flag&&cursors.some(c=>c.encounteredBusy&&!c.best)) {
+      flag=true;const frozen=JSON.stringify(serialize(g));replay=deserialize(JSON.parse(frozen));
+      check(JSON.stringify(serialize(replay))===frozen,'busy: saved occupied-approach decision round-trips exactly');
+      check(g.stations.map.size===stations&&ai.eco.thisYear.construction===construction,
+        'busy: blocked preflight keeps stations, lead, depot and paid construction unchanged');
+    }
+    if(flag&&!deadline) {
+      const care=state?.care.find(([key])=>key==='grow'+line.id)?.[1];
+      if(care!==undefined) {
+        deadline=true;
+        check(care===g.day+15&&state?.next.find(([task])=>task==='extend')?.[1]===care,
+          'busy: both saved line care and next survey are exactly fifteen days away');
+      }
+    }
+    if(deadline&&cursors.some(c=>c.at<=1&&!c.encounteredBusy))reset=true;
+    if(replay){comparisons++;check(JSON.stringify(serialize(g))===JSON.stringify(serialize(replay)),
+      'busy: checkpoint remains exact through day '+g.day);}
+  }
+  check(flag&&deadline&&reset,'busy: an actual blocked survey is saved, retried and clears its old busy flag');
+  check(comparisons>15,'busy: saved decision and deadline resume beyond the retry');
+  const poor=presholm('west','tail',6,160),before=linePath(poor.line).join();
+  poor.g.aiEnabled=true;scheduleNetworkTask(poor.ai,'extend',0);
+  let economicDeadline=false;const stop=poor.g.day+30;
+  while(poor.g.day<stop&&!economicDeadline) {
+    poor.g.stepTick();if(poor.g.tick%poor.g.ticksPerDay)continue;
+    const state=serialize(poor.g).aiNetwork?.companies.find(([id])=>id===poor.ai.companyId)?.[1];
+    const care=state?.care.find(([key])=>key==='grow'+poor.line.id)?.[1];
+    if(care!==undefined){economicDeadline=true;check(care===poor.g.day+360,'busy: unchanged losing district keeps the economic year-long cooldown');}
+  }
+  check(economicDeadline&&linePath(poor.line).join()===before,'busy: a losing economic premise gains no extension');
+
+  // The approach can become occupied after a feasible fleet quote, before its saved purchase phase.
+  const selected=presholm('east','old',2,4500),sg=selected.g,sa=selected.ai;
+  sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],null);
+  sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],selected.line.id);
+  sg.aiEnabled=true;scheduleNetworkTask(sa,'extend',0);
+  let chosen=false;const limit=sg.day+150;
+  while(sg.day<limit&&!chosen) {
+    runDays(sg,1);
+    const state=serialize(sg).aiNetwork?.companies.find(([id])=>id===sa.companyId)?.[1];
+    chosen=state?.job?.items?.some(i=>!!i.grow?.best?.fleet&&i.grow.at>(i.grow.opts?.length??0))??false;
+  }
+  check(chosen,'busy: an ordinary survey reaches a saved feasible fleet-first purchase');
+  if(chosen) {
+    sg.aiEnabled=false;runDays(sg,1);
+    const last=selected.sts[selected.sts.length-1],te=terminusOf(sg,last,outerEnd(last,selected.sts[selected.sts.length-2]),sa.companyId);
+    check(te?.kind==='lead'&&[...te.lead,...te.depots.map(id=>sg.depots.get(id)!.edge)].some(id=>sg.vehicles.isEdgeBusy(id)),
+      'busy: a running departure occupies the same approach by the purchase phase');
+    const frozen=JSON.stringify(serialize(sg)),copy=deserialize(JSON.parse(frozen));
+    const assets=()=>JSON.stringify({money:sa.eco.money,loan:sa.eco.loan,construction:sa.eco.thisYear.construction,
+      vehicles:sa.eco.thisYear.vehicles,rails:[...sg.world.net.edges.keys()],stations:[...sg.stations.map.keys()],
+      depots:[...sg.depots.map.keys()],fleet:[...sg.vehicles.map.keys()]});
+    const paid=assets();networkDaily(sa);networkDaily(copy.aiOf(sa.companyId)!);
+    check(assets()===paid,'busy: selected busy revalidation spends no funds and changes no assets');
+    check(JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy)),
+      'busy: selected purchase rejection and saved retry are exact with cold caches');
+    const state=serialize(sg).aiNetwork?.companies.find(([id])=>id===sa.companyId)?.[1];
+    check(state?.care.find(([key])=>key==='grow'+selected.line.id)?.[1]===sg.day+15
+      &&state?.next.find(([task])=>task==='extend')?.[1]===sg.day+15,
+      'busy: a selected busy option retains both fifteen-day deadlines rather than a year');
+    sg.aiEnabled=copy.aiEnabled=true;
+    let exact=true;
+    for(let k=0;k<640;k++) {sg.stepTick();copy.stepTick();exact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy));}
+    check(exact,'busy: selected-option retry and resulting fleet replay exactly for 640 ticks');
+    for(let day=0;day<60&&!sa.log.some(s=>/fleet-only investment/.test(s));day++) {
+      runDays(sg,1);runDays(copy,1);
+      check(JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy)),
+        'busy: saved retry remains exact through its next affordable fleet review');
+    }
+    check(sa.log.some(s=>/fleet-only investment/.test(s)),
+      'busy: the retry executes a genuinely profitable fleet action once the approach clears');
+  }
 }
 
 if (run('infill')) {

@@ -6,8 +6,10 @@ const routes = new WeakMap<Game, { key: string; paths: Map<string, number[] | nu
 
 /** Direct AI policy edits refresh permissions without changing the track's version. */
 export function capacityTopologyKey(g: Game): string {
-  return `${g.networkVersion}/` + g.companies.map(user => g.companies.reduce((bits, owner) =>
-    bits | (g.canUse(user.id, owner.id) ? 1 << owner.id : 0), 0)).join(',');
+  // Bought-out companies retain their ids, so replacements can eventually exceed a 32-bit mask.
+  const companies = g.activeCompanies;
+  return `${g.networkVersion}/` + companies.map(user => companies.map(owner =>
+    g.canUse(user.id, owner.id) ? owner.id : '').join(':')).join(',');
 }
 
 export function capacityRouteBetween(g: Game, a: number, b: number, owner: number): number[] | null {

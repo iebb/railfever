@@ -200,7 +200,7 @@ export function openCompetitors(ui: UI) {
 }
 
 /** Colours offered for a new AI company. */
-const AI_COLORS = [...COMPANY_COLORS.slice(1), '#8ac926', '#6a5acd', '#c2185b', '#00897b', '#d4d4d8'];
+const AI_COLORS = COMPANY_COLORS.slice(1);
 
 const activenessWord = (v: number) => (v < 0.5 ? 'Passive' : v < 0.85 ? 'Relaxed' : v < 1.3 ? 'Normal' : v < 1.7 ? 'Busy' : 'Aggressive');
 const riskWord = (v: number) => (v < 0.25 ? 'Cautious' : v < 0.55 ? 'Moderate' : v < 0.8 ? 'Bold' : 'Reckless');

@@ -3,16 +3,18 @@
 // stations and depots so every platform is reachable from both tracks), and moving a depot.
 import type { Game } from './game';
 import { RAIL, TRACK_TYPES, PSTEP, LINE_LEVEL } from './constants';
-import { bezFromTangents, bezMinRadius, bezPoint, endTangent, arcTable, tAtS, segIntersect, angleBetween } from './geom';
+import { bezFromTangents, bezMinRadius, bezPoint, bezDeriv, endTangent, arcTable, tAtS, segIntersect, angleBetween } from './geom';
 import { applyEarthworks, repairFormations, DRY_MIN, TUNNEL_LINING } from './terraform';
 import type { NEdge, Section } from './network';
-import { planEdge, commitProposal, fitCurve, Snap, Proposal, BuildOptions, structureFactor } from './construction';
-import { setSignal, SIGNAL_SPACING, autoSignalLine } from './signals';
+import { profAt } from './network';
+import { planEdge, commitProposal, fitCurve, Snap, Proposal, TrackPlan, BuildOptions, structureFactor } from './construction';
+import { setSignal, SIGNAL_SPACING, SIGNAL_COST, autoSignalLine } from './signals';
 import type { DepotPlan } from './build-ops';
 import { stationLayout, defaultPlatformLength, railModeOf, railPartMode, entrancesGo, refitWarnings, entranceLandings, landingRect, entranceKind } from './stations';
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
 import { planNativeStationOnTrack, commitNativeStationOnTrack } from './station-on-track';
 import type { NativeStationPlan } from './station-on-track';
+import { trackBasePerUnit } from './opcosts';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
 export interface Step { edge: number; dir: number }
@@ -129,7 +131,7 @@ function refund(g: Game, owner: number, before: number) {
 // ------------------------------------------------------------------ S-curves between parallel tracks
 
 /** End of a connecting S-curve: a point on an edge (split there) or a node, with the track direction there. */
-interface SPt { x: number; z: number; y: number; tx: number; tz: number; edge?: number; s?: number; node?: number }
+interface SPt { x: number; z: number; y: number; tx: number; tz: number; edge?: number; s?: number; node?: number; section?: 'ground' | Section['type'] }
 
 /** Price of the two turnouts of a connection (plus its track). */
 const TURNOUT_COST = 15000;
@@ -138,7 +140,8 @@ const TURNOUT_COST = 15000;
  * An S-curve between two points on (nearly) parallel tracks (a turnout to a new track, a crossover leg): checks
  * it and, unless `dry`, lays it, splitting the tracks there. `tracks`: the edges it may touch (its two tracks).
  */
-function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, dry: boolean, type?: string, infrastructureOwner = owner, junctions = false): { error: string | null; cost: number } {
+function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, dry: boolean, type?: string, infrastructureOwner = owner, junctions = false,
+  removed?: ReadonlySet<number>): { error: string | null; cost: number; length?: number; upkeep?: number } {
   const net = g.world.net, w = g.world;
   for (const q of [a, b]) {
     const es = q.edge !== undefined ? [net.edges.get(q.edge)] : q.node !== undefined ? net.nodes.get(q.node)?.edges.map((id) => net.edges.get(id)) ?? [] : [];
@@ -215,6 +218,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     }
   }
   for (const c of net.crossings.values()) if ((tracks.has(c.e1) || tracks.has(c.e2)) && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) {
+    if (removed?.has(c.e1) || removed?.has(c.e2)) continue;
     // Companion junction leads may pass beside a previously registered rail diamond. The actual new
     // intersections above retain their own reservation resources; road crossings and denied titles still block.
     if (junctions && c.kind === 'diamond' && [c.e1, c.e2].every(id => {
@@ -225,6 +229,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   // Nodes carry no section flag: inspect their incident parent rails too (station insertion lays node-to-node
   // fans). Determine the sections and their price before a dry run returns, so preview and commit agree.
   const secOf = (q: SPt): 'ground' | Section['type'] => {
+    if (q.section) return q.section;
     if (q.edge !== undefined) { const e = net.edges.get(q.edge); return e ? net.sectionAt(e, q.s ?? 0) : 'ground'; }
     const n = q.node !== undefined ? net.nodes.get(q.node) : undefined;
     const es = (n?.edges ?? []).map((id) => net.edges.get(id)!).filter((e) => e?.kind === 'rail');
@@ -254,7 +259,8 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   }
   if (diamonds.some((c) => sections.some((s) => s.s0 <= sAtU(c.u) && s.s1 >= sAtU(c.u)))) return { error: 'junction needs a ground approach', cost: 0 };
   const cost = Math.round(price);
-  if (dry) return { error: null, cost };
+  const upkeep = trackBasePerUnit(ttype) * (tab.len + sections.reduce((n, s) => n + (s.s1 - s.s0) * (s.type === 'tunnel' ? 4 : 3), 0));
+  if (dry) return { error: null, cost, length: tab.len, upkeep };
   for (const q of [a, b]) if (q.edge !== undefined && g.vehicles.isEdgeBusy(q.edge)) return { error: 'train in the way', cost };
   const eco = g.company(owner).economy;
   if (!eco.canAfford(cost)) return { error: 'Not enough money', cost };
@@ -293,7 +299,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   }
   eco.spend(cost, 'construction');
   g.onNetworkChanged();
-  return { error: null, cost };
+  return { error: null, cost, length: len, upkeep: g.edgeMaintenance(e) };
 }
 
 // ------------------------------------------------------------------ doubling a single track
@@ -777,6 +783,8 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
 // ------------------------------------------------------------------ directional double track
 
 export interface FinishOpts {
+  /** Verified idle owned depot/lead edges removed by the caller in the same successful atomic step; never part of the finished pair. */
+  ignoreEdges?: readonly number[];
   /** Temporary loops close on the single main at both ends; station crossovers belong to the later full upgrade. */
   mergeEnds?: boolean;
   /** trains keep to the right-hand track (default true) */
@@ -797,7 +805,128 @@ export interface FinishOpts {
   log?: (s: string) => void;
 }
 
-export interface FinishResult { signals: number; crossovers: number; cost: number; error?: string; /** crossovers taken out (normalise) */ removed?: number }
+export interface FinishResult {
+  signals: number; crossovers: number; cost: number; error?: string;
+  /** Newly installed crossover arcs only; main rails and their normal upkeep are priced separately. */
+  track?: number; upkeep?: number;
+  /** crossovers taken out (normalise) */ removed?: number;
+}
+
+const crossoverLength = (lat: number, minR: number) => Math.max(5, Math.min(12, Math.sqrt(60 * lat * Math.min(1, minR / 12)) + 2));
+
+/** Both endpoint windows need two diagonals, their native endpoint/pair gaps, and clearance between the windows. */
+export const doubleTrackCrossoverGap = (type: string) => Math.ceil(4 * crossoverLength(RAIL.spacing,
+  (TRACK_TYPES[type] ?? TRACK_TYPES.standard).minRadius) + 2 * 1.5 + 2 * 1.3 + 2);
+
+/** Pure geometry of a not-yet-built rail, with the same samples and profile used by Network.geo. */
+function samplePlan(t: TrackPlan, index: number): Sample[] {
+  const tab = arcTable(t.bez), step = Math.max(0.25, tab.len / 1500), out: Sample[] = [];
+  const p = { x: 0, z: 0 }, d = { x: 0, z: 0 };
+  for (let i = 0; i <= Math.ceil(tab.len / step); i++) {
+    const s = Math.min(i * step, tab.len), u = tAtS(tab, s);
+    bezPoint(t.bez, u, p); bezDeriv(t.bez, u, d);
+    const L = Math.hypot(d.x, d.z) || 1;
+    out.push({ u: s, s, edge: index, x: p.x, z: p.z, y: profAt(t.prof, t.len, s), tx: d.x / L, tz: d.z / L });
+  }
+  return out;
+}
+
+/**
+ * Check both crossover pairs of a prospective station-to-station double link before paying for it. This uses
+ * numerical proposal geometry only: no prospective nodes/edges, allocator changes, splits, signals or spending.
+ * The returned cost includes native crossover prices and a conservative signal reserve; commit rechecks the
+ * complete new pair with finishDoubleTrack. Planned stations and earlier diagonals are obstacles too.
+ */
+export function planDoubleTrackFinish(g: Game, proposal: Proposal, owner: number, stations: readonly StationPlan[] = []): FinishResult {
+  const res: FinishResult = { signals: 0, crossovers: 0, cost: 0, track: 0, upkeep: 0 };
+  const reject = (error: string) => ({ ...res, error });
+  if (!proposal.ok || proposal.opts.kind !== 'rail' || proposal.tracks.length !== 2) return reject('Not a complete prospective double track');
+  const net = g.world.net;
+  const removed = proposal.opts.ignore?.edges ?? new Set<number>();
+  for (const id of removed) {
+    const e = net.edges.get(id);
+    if (e && (e.kind !== 'rail' || e.owner !== owner || g.vehicles.isEdgeBusy(id)))
+      return reject('Only idle owned depot/lead edges can be excluded from crossover clearance');
+  }
+  for (const t of proposal.tracks) for (const q of [t.start, t.end]) {
+    const es = q.edge !== undefined ? [net.edges.get(q.edge)] : q.node !== undefined ? net.nodes.get(q.node)?.edges.map(id => net.edges.get(id)) ?? [] : [];
+    for (const e of es) if (e?.kind === 'rail') { const err = g.trackUpgradeError(owner, e.owner); if (err) return reject(err); }
+  }
+  const A = samplePlan(proposal.tracks[0], 0);
+  let B = samplePlan(proposal.tracks[1], 1);
+  const mid = B[Math.floor(B.length / 2)], near = A[nearestSample(A, mid.x, mid.z).i];
+  if (mid.tx * near.tx + mid.tz * near.tz < 0) {
+    const L = B[B.length - 1].u;
+    B = B.reverse().map(q => ({ ...q, u: L - q.u, tx: -q.tx, tz: -q.tz }));
+  }
+  let lo = Infinity, hi = -Infinity, lat = 0, count = 0;
+  for (const p of B) {
+    const nearest = nearestSample(A, p.x, p.z), q = A[nearest.i];
+    if (nearest.d < 0.3 || nearest.d > 1.7 || Math.abs(p.tx * q.tx + p.tz * q.tz) < 0.97) continue;
+    lo = Math.min(lo, q.u); hi = Math.max(hi, q.u); lat += nearest.d; count++;
+  }
+  if (!(hi - lo > 6)) return reject('The prospective tracks do not run side by side');
+  const D = crossoverLength(lat / count, (TRACK_TYPES[proposal.opts.type] ?? TRACK_TYPES.standard).minRadius);
+  const onB = (u: number) => {
+    const q = sampleAt(A, u), b = B[nearestSample(B, q.x, q.z).i];
+    return sampleAt(B, b.u + (q.x - b.x) * b.tx + (q.z - b.z) * b.tz);
+  };
+  const section = (q: Sample): 'ground' | Section['type'] => proposal.tracks[q.edge].sections.find(s =>
+    (q.s >= s.s0 || s.s0 < 0.02) && (q.s <= s.s1 || s.s1 > proposal.tracks[q.edge].len - 0.02))?.type ?? 'ground';
+  const toPt = (q: Sample): SPt => ({ x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, section: section(q) });
+  const zones: [number, number][] = [], diagonals: Sample[][] = [];
+  const tryLead = (fromA: boolean, u: number, sgn: number): string | null => {
+    const ua = fromA ? u : u + sgn * D, ub = fromA ? u + sgn * D : u;
+    if (ua < lo + 0.5 || ua > hi - 0.5 || ub < lo + 0.5 || ub > hi - 0.5) return 'outside the double track';
+    if (zones.some(([a, b]) => Math.min(ua, ub) < b + 1 && Math.max(ua, ub) > a - 1)) return 'crossover zone in the way';
+    const pa = sampleAt(A, ua), pb = onB(ub), a = fromA ? toPt(pa) : toPt(pb), b = fromA ? toPt(pb) : toPt(pa);
+    for (const q of [pa, pb]) for (const id of net.nodeGrid.query(q.x - 1.2, q.z - 1.2, q.x + 1.2, q.z + 1.2)) {
+      const n = net.nodes.get(id);
+      if (n?.kind === 'rail' && n.edges.filter(id => !removed.has(id)).length > 2 && Math.hypot(n.x - q.x, n.z - q.z) < 1.2) return 'switch too close';
+    }
+    const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
+    const sa = a.tx * dx + a.tz * dz >= 0 ? 1 : -1, sb = b.tx * dx + b.tz * dz >= 0 ? 1 : -1;
+    const bez = bezFromTangents(a.x, a.z, a.tx * sa, a.tz * sa, b.x, b.z, b.tx * sb, b.tz * sb, L * 0.38, L * 0.38);
+    const tab = arcTable(bez), prof = new Float32Array(Math.max(2, Math.ceil(tab.len / PSTEP) + 1));
+    for (let i = 0; i < prof.length; i++) prof[i] = a.y + (b.y - a.y) * Math.min(i * PSTEP, tab.len) / tab.len;
+    const samples = samplePlan({ bez, prof, len: tab.len, sections: [], start: proposal.tracks[0].start, end: proposal.tracks[0].end }, 0);
+    for (const p of samples) {
+      for (const st of stations) {
+        const dx = p.x - st.x, dz = p.z - st.z, ux = Math.sin(st.angle), uz = Math.cos(st.angle);
+        if (Math.abs(p.y - st.y) < RAIL.clearance && Math.abs(dx * ux + dz * uz) < st.length / 2 + 0.32
+          && Math.abs(dx * uz - dz * ux) < st.layout.width / 2 + 0.32) return 'planned station in the way';
+      }
+      for (const previous of diagonals) {
+        const near = nearestSample(previous, p.x, p.z), q = previous[near.i];
+        if (near.d < 0.68 && Math.abs(q.y - p.y) < RAIL.clearance) return 'planned crossover in the way';
+      }
+    }
+    for (const c of proposal.crossings) if ((c.mode === 'level' || c.mode === 'diamond' || c.mode === 'junction')
+      && Math.hypot(c.x - (a.x + b.x) / 2, c.z - (a.z + b.z) / 2) < L / 2 + 1.5) return 'planned crossing in the way';
+    const result = connectS(g, owner, a, b, new Set(removed), true, proposal.opts.type, owner, false, removed);
+    if (result.error) return result.error;
+    diagonals.push(samples); res.cost += result.cost; res.crossovers++;
+    res.track! += result.length!; res.upkeep! += result.upkeep!;
+    return null;
+  };
+  for (const atStart of [true, false]) {
+    const edge0 = atStart ? lo : hi, sgn = atStart ? -1 : 1;
+    let first = NaN, second = NaN;
+    for (let k = 1.5; k <= 40 && isNaN(first); k += 0.75) {
+      const u = edge0 - sgn * (k + D);
+      if (!tryLead(true, u, sgn)) first = u;
+    }
+    if (!isNaN(first)) for (let k = 1.3; k <= 40 && isNaN(second); k += 0.75) {
+      const u = first - sgn * (k + D);
+      if (!tryLead(false, u, sgn)) second = u;
+    }
+    if (isNaN(first) || isNaN(second)) return reject(`No prospective crossover room at ${atStart ? 'start' : 'end'}`);
+    zones.push([Math.min(first, first + sgn * D, second, second + sgn * D), Math.max(first, first + sgn * D, second, second + sgn * D)]);
+  }
+  res.signals = 2 * Math.ceil((hi - lo) / SIGNAL_SPACING) + 4;
+  res.cost += res.signals * SIGNAL_COST;
+  return res;
+}
 
 /** What lies just beyond an end of a double stretch: the tracks merging, a station or a depot, or open line. */
 function beyond(g: Game, nodes: number[], outward: { x: number; z: number }, reach = 30): 'merge' | 'station' | 'depot' | 'open' {
@@ -846,8 +975,15 @@ function beyond(g: Game, nodes: number[], outward: { x: number; z: number }, rea
  */
 export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opts: FinishOpts = {}): FinishResult {
   const net = g.world.net;
-  const res: FinishResult = { signals: 0, crossovers: 0, cost: 0 };
+  const res: FinishResult = { signals: 0, crossovers: 0, cost: 0, track: 0, upkeep: 0 };
   const eco = g.company(owner).economy, money0 = eco.money;
+  const removed = new Set(opts.ignoreEdges ?? []);
+  for (const id of removed) {
+    const e = net.edges.get(id);
+    if (e && (e.kind !== 'rail' || e.owner !== owner || g.vehicles.isEdgeBusy(id))) {
+      res.error = 'Only idle owned depot/lead edges can be excluded from crossover clearance'; return res;
+    }
+  }
   for (const id of edgeIds) { const e = net.edges.get(id); const err = e?.kind === 'rail' && g.trackUpgradeError(owner, e.owner); if (err) { res.error = err; return res; } }
   const set = new Set(edgeIds.filter((id) => { const e = net.edges.get(id); return !!e && e.kind === 'rail' && !g.trackUpgradeError(owner, e.owner) && e.station < 0 && e.depot < 0; }));
   if (set.size < 2) { res.error = 'Not a double track'; return res; }
@@ -925,7 +1061,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     // inline stations where there is room; none on plain line between stations
     // crossover length: by the lateral distance and the common curve limit
     const minR = (TRACK_TYPES[lineType(g, A)] ?? TRACK_TYPES.standard).minRadius;
-    const D = Math.max(5, Math.min(12, Math.sqrt(60 * lat * Math.min(1, minR / 12)) + 2));
+    const D = crossoverLength(lat, minR);
     /** crossover zones in A's distance (atStart: at the start / end of the stretch; null: beside an inline station) */
     const zones: { atStart: boolean | null; z0: number; z1: number }[] = [];
     const overlapsZone = (a: number, b: number) => zones.some((z) => Math.min(a, b) < z.z1 + 1 && Math.max(a, b) > z.z0 - 1);
@@ -939,12 +1075,13 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
       for (const [L, q] of [[lists[0], pa], [lists[1], pb]] as [Step[], Sample][]) {
         for (const st of L) for (const nid of [startNode(g, st), endNode(g, st)]) {
           const n = net.nodes.get(nid);
-          if (n && n.edges.length > 2 && Math.hypot(n.x - q.x, n.z - q.z) < 1.2) return 'switch too close';
+          if (n && n.edges.filter(id => !removed.has(id)).length > 2 && Math.hypot(n.x - q.x, n.z - q.z) < 1.2) return 'switch too close';
         }
       }
-      const tracks = new Set<number>([...lists[0].map((x) => x.edge), ...lists[1].map((x) => x.edge)]);
+      const tracks = new Set<number>([...lists[0].map((x) => x.edge), ...lists[1].map((x) => x.edge), ...removed]);
       const toPt = (q: Sample): SPt => ({ x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, edge: q.edge, s: q.s });
-      const err = (fromA ? connectS(g, owner, toPt(pa), toPt(pb), tracks, false, undefined, net.edges.get(pa.edge)!.owner) : connectS(g, owner, toPt(pb), toPt(pa), tracks, false, undefined, net.edges.get(pb.edge)!.owner)).error;
+      const err = (fromA ? connectS(g, owner, toPt(pa), toPt(pb), tracks, false, undefined, net.edges.get(pa.edge)!.owner, false, removed)
+        : connectS(g, owner, toPt(pb), toPt(pa), tracks, false, undefined, net.edges.get(pb.edge)!.owner, false, removed)).error;
       if (err) opts.log?.(`  crossover ${fromA ? 'A->B' : 'B->A'} at ${u1.toFixed(1)}: ${err}`);
       return err;
     };
@@ -1044,6 +1181,12 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
         continue;
       }
       res.crossovers += 2;
+      for (let id = e0; id < net.nextEdge; id++) {
+        const e = net.edges.get(id);
+        if (e?.kind === 'rail' && !lists.some(L => L.some(x => x.edge === id))) {
+          res.track! += e.len; res.upkeep! += g.edgeMaintenance(e);
+        }
+      }
       const us = [first, first + sgn * D, second, second + sgn * D];
       zones.push({ atStart: w.atStart, z0: Math.min(...us), z1: Math.max(...us) });
     }

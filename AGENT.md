@@ -21,6 +21,7 @@ Railfever is a Transport Fever / OpenTTD style transport game built with TypeScr
 - Prefer capacity works when their recovered surplus pays for construction and upkeep. Shared services must consider all operators' traffic and delays.
 - Assign suitable platforms when creating routes and coordinate services sharing a station to reduce interference. Assignments must remain valid after line and station edits without bypassing reservations or train clearance.
 - Keep UI copy terse: labels, useful numbers and short functional tooltips. Preserve feature meaning when resolving conflicts with trimmed strings.
+- New Game supports up to fifteen AI rivals and a starting-balance override; leaving it unset retains each personality's balance and existing loan rules.
 
 ## Working together
 

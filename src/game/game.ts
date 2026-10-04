@@ -31,7 +31,7 @@ export interface NewGameOptions {
   hilliness: Hilliness;
   water: WaterAmount;
   startYear: number;
-  /** number of AI competitors (0..7; at least as many as aiConfigs) */
+  /** number of AI competitors (0..MAX_AI_COMPANIES; at least as many as aiConfigs) */
   aiCompanies?: number;
   /** per-AI settings (entry i for the i-th AI company); missing entries and fields use the defaults */
   aiConfigs?: Partial<AIConfig>[];
@@ -80,7 +80,7 @@ export interface CompanyAssets { track: number; road: number; tram: number; stat
 
 export const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export const PLAYER = 0;
-export const MAX_AI_COMPANIES = 7;
+export const MAX_AI_COMPANIES = 15;
 /** Infrastructure counts at this share of its replacement cost in a company's value. */
 const INFRA_DEPRECIATION = 0.6;
 /** Upkeep and value of elevated and underground stations relative to a ground station. */
