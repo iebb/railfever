@@ -218,7 +218,9 @@ const decisions = () => Object.entries(networkProfile.decisions).filter(([k]) =>
 
 if (run('extend')) {
   console.log('extend: the town grows past a city line\'s terminus; the line runs on through new stations');
-  const { g, ai, me, line, sts, depot } = presholm('west', 'tail', 3, 4500);
+  // Maintaining frequency must pay for each departure's occupation and delay. This new district
+  // funds the third profitable train; at 4500 residents its marginal return was negative.
+  const { g, ai, me, line, sts, depot } = presholm('west', 'tail', 3, 6500);
   const before = linePath(line), east = sts[sts.length - 1], trains0 = line.vehicles.length;
   const head0 = patternHeadways(g, line)[0]?.headway ?? 0;
   networkProfile.tasks['extend'] = { steps: 0, ms: 0, max: 0 };
@@ -387,6 +389,8 @@ if (run('relocate')) {
   const way = nte ? wayOnFree(g, last, nte.end, 40, nte.tail) : 'no terminus';
   check(nte?.kind === 'tail' && !way, `relocate: the depot's new yard leaves the new terminus extendable (${nte?.kind}; ${way ?? 'way on free'})`);
   spare.setLine(line.id);
+  // Start beside its relocated depot, then verify the service through subsequent stops.
+  spare.stopIndex = line.stops.indexOf(last.id); spare.onLineChanged();
   const seen = new Set<number>();
   runDays(g, 240, () => { if (spare.state === 'loading' && spare.atStation >= 0) seen.add(spare.atStation); });
   check(seen.size >= 2, `relocate: the train from the moved depot runs the line (${seen.size} stations)`);

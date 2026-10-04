@@ -17,7 +17,7 @@ import { linearStops, outAndBack } from './lines';
 import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
-import { Train, depotReaches, depotServes, findRailRoute, railNext, lineCongestion, lineCompatibility } from './train';
+import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy } from './economy';
@@ -1655,6 +1655,7 @@ export class AIController {
             const amortisation = 0.045 - 0.03 * this.config.risk;
             const years = 1 / (0.03 + amortisation), capital = outlay * 0.03 + infrastructure * amortisation;
             const upkeep = (hub ? 1 : 2) * (20_000 + 2 * L * 500) + 12_000 + trackCost * 0.01;
+            if (revenue <= sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital) continue;
             score = Math.max(score, roi(revenue, sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital, outlay) * years / 9);
           }
         }
@@ -1717,8 +1718,12 @@ export class AIController {
       const st = g.stations.get(cor[0]), C = g.towns.list[cor[1]];
       const B = st ? g.towns.list[st.townId] : undefined;
       if (st && B && C && st.owner === this.companyId && this.hubFor(B, C) === st && !this.isFailed(this.pairKey(B.id, C.id))) {
-        const best = opts.filter((o) => o.kind === 'rail').reduce((m, o) => Math.max(m, o.score), 0);
-        opts.push({ score: Math.max(best * 1.2, 0.5 * fw(focus.rail)), kind: 'rail', towns: [B.id, C.id], hub: st.id });
+        // Continuing our network still has its own stations, track and fleet to repay. Prefer its
+        // affordable quotation, rather than borrowing the score of an unrelated railway.
+        const continuation = opts.find((o) => o.kind === 'rail' && o.hub === st.id && o.score > 0
+          && o.towns.includes(B.id) && o.towns.includes(C.id));
+        if (continuation) continuation.score *= 1.2;
+        else this.state.corridor = undefined;
       } else this.state.corridor = undefined;
     }
     // trains on another company's railway (track access): much cheaper than building
@@ -2720,6 +2725,33 @@ export class AIController {
     }
     this.stats.track += res.built; this.stats.bridges += res.bridges; this.stats.tunnels += res.tunnels;
     yield;
+    // Use a real complete pair's direction to site a new depot on the outside of its future second rail.
+    // Retain only primitive edge/direction hints; the atomic adapter reprices after the depot is committed.
+    const pairOptions: { cost: number; entries: Map<number, 1 | -1>; corridor: P2[] }[] = [];
+    if (initialBudget) {
+      for (const side of [1, -1] as const) {
+        // Discard the actual proposal before yielding; only these coordinates and entry directions survive.
+        const option = (() => {
+          const pair = Trackops.planDoubleTrack(g, upgradeRoute(g, stA.id, stB.id, owner), side, owner);
+          if (!pair.ok || !pair.complete || pair.start.kind === 'turnout' || pair.end.kind === 'turnout'
+            || pair.cost + 80_000 > initialBudget * 1.2) return null;
+          const entries = new Map(pair.steps.map(s => [s.edge, (-pair.side * s.dir) as 1 | -1]));
+          const corridor: P2[] = [];
+          for (const proposal of pair.proposals) for (const track of proposal.tracks) {
+            const table = arcTable(track.bez), count = Math.ceil(track.len * 2);
+            for (let i = 0; i <= count; i++) {
+              const point = { x: 0, z: 0 };
+              bezPoint(track.bez, tAtS(table, Math.min(i * 0.5, track.len)), point);
+              corridor.push(point);
+            }
+          }
+          return { cost: pair.cost, entries, corridor };
+        })();
+        if (option) pairOptions.push(option);
+        yield;
+      }
+    }
+    pairOptions.sort((a, b) => a.cost - b.cost);
     // ---- depot: one of ours that serves both stations, else on a siding off the new line (station ends stay
     // free for extensions), else behind a station. A depot serves the line when its trains reach one station and
     // go on from there to the other (trains leave a siding one way and turn at the first station; a depot behind a
@@ -2744,6 +2776,8 @@ export class AIController {
     // against the pair's eventual one-way direction, so prefer the terminal yard for an initial pair.
     if (initialBudget) for (const [st, o] of [[stA, stB], [stB, stA]] as [Station, Station][]) if (dep < 0)
       take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    for (const pair of pairOptions) for (const st of [stB, stA]) if (dep < 0)
+      take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60, pair.entries, pair.corridor));
     for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
     for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
     this.track(d0);
@@ -2761,15 +2795,8 @@ export class AIController {
     // including both junction leads, rather than exempting an unopened line from an upgrade-return gate.
     let initiallyDoubled = false;
     let early: { line: Line; info: LineInfo } | null = null;
-    const pairRoute = upgradeRoute(g, stA.id, stB.id, owner), pairing = new Set(pairRoute);
-    const stub = net.edges.get(dp.edge);
-    // A departure must reach a platform without travelling along the formation whose running direction
-    // will change. Complete endpoint junctions then feed either track; a facing interior siding stays single.
-    const pairDepot = !!stub && [stA.id, stB.id].some(id => {
-      const path = findRailRoute(g, [{ edge: stub, dir: 1 }], id, owner, -1);
-      return !!path && path.conts.every(c => !pairing.has(c.edge.id));
-    });
-    if (initialBudget && pairDepot) {
+    const pairRoute = upgradeRoute(g, stA.id, stB.id, owner);
+    if (initialBudget) {
       const line = g.lines.create('rail', owner);
       line.stops = [stA.id, stB.id];
       p.line = line.id;
@@ -2780,7 +2807,8 @@ export class AIController {
       g.lines.rebuild();
       const t0 = net.nextEdge;
       const result = layInitialDoubleTrack(g, pairRoute, owner, initialTraffic,
-        cost => cost <= initialBudget * 1.2 && this.available() >= cost + (trainCost + mail.price) * nTrains + 300_000 && this.borrowFor(cost));
+        cost => cost <= initialBudget * 1.2 && this.available() >= cost + (trainCost + mail.price) * nTrains + 300_000 && this.borrowFor(cost),
+        undefined, plan => this.initialPairDepot(plan, dep, stA.id, stB.id, hs ? cars : undefined));
       initiallyDoubled = result.built;
       if (result.built) {
         this.stats.doubled++; this.stats.trackDouble += result.edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
@@ -3028,8 +3056,25 @@ export class AIController {
     }
   }
 
+  /** Prove departure under a candidate pair's right-hand running, before paying for its extra rail. */
+  private initialPairDepot(plan: DoublePlan, dep: number, a: number, b: number, cars?: VehicleModel[]): boolean {
+    const g = this.game, dp = g.depots.get(dep), stub = dp && g.world.net.edges.get(dp.edge);
+    if (!stub) return false;
+    // The companion at +(-tz,+tx) carries the plan direction; the original carries the opposite direction.
+    const directions = new Map(plan.steps.map(s => [s.edge, -plan.side * s.dir]));
+    const stack = [{ edge: stub, dir: 1 }], seen = new Set<string>(), rule = cars ? consistRule(cars) : null;
+    while (stack.length && seen.size < 80000) {
+      const c = stack.pop()!, key = `${c.edge.id}:${c.dir}`;
+      if (seen.has(key) || (directions.has(c.edge.id) && directions.get(c.edge.id) !== c.dir)) continue;
+      seen.add(key);
+      if (c.edge.station === a || c.edge.station === b) return true;
+      stack.push(...railNext(g, c.edge, c.dir, this.companyId, false, rule));
+    }
+    return false;
+  }
+
   /** A depot on a siding off our edges near (x, z) (as buildDepotNearLine, a try per step). */
-  private *depotNearLine(edges: number[], x: number, z: number, maxDist: number): Generator<void, number> {
+  private *depotNearLine(edges: number[], x: number, z: number, maxDist: number, entries?: Map<number, 1 | -1>, reserved?: P2[]): Generator<void, number> {
     const g = this.game, net = g.world.net, owner = this.companyId;
     const cands: { id: number; s: number; d: number }[] = [];
     const p = { x: 0, y: 0, z: 0 };
@@ -3047,9 +3092,10 @@ export class AIController {
     cands.sort((a, b) => a.d - b.d || a.id - b.id);
     let tries = 0;
     for (const c of cands) {
-      if (!net.edges.has(c.id)) continue;
+      if (!net.edges.has(c.id) || (entries && !entries.has(c.id))) continue;
       yield;
-      const dep = buildDepotOnLine(g, c.id, c.s, owner);
+      const dir = entries?.get(c.id);
+      const dep = buildDepotOnLine(g, c.id, c.s, owner, dir === undefined ? undefined : { dir, side: -1, reserved });
       if (dep >= 0) return dep;
       if (++tries >= 12) break;
       yield;

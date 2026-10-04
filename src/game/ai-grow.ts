@@ -27,6 +27,7 @@ import { WALK_DETOUR, walkingCatchment } from './catchment';
 import { linearStops, outAndBack } from './lines';
 import { depotFits, depotAtEnd, nodeSnap, nodeAt, stationEnds } from './routing';
 import { findRailRoute, railNext, depotServes, consistRule } from './train';
+import { marginalSharedTrain } from './ai-capacity';
 import { endTangent } from './geom';
 import { finishDoubleTrack, planStationOnTrack, commitStationOnTrack } from './trackops';
 import { linePatterns, patternHeadways } from './patterns';
@@ -1017,6 +1018,9 @@ function addTrains(h: GrowHost, l: Line, sv: Service, n: number): number {
   if (!routes) { h.note(`${l.name}: no way from its depot through the service; no trains added`); h.considered('extend.depotCut'); return 0; }
   let bought = 0;
   for (let i = 0; i < n; i++) {
+    // Each new departure consumes the line's blocks and platforms, including on a private city railway.
+    // Reprice after each purchase so a profitable fleet-only alternative cannot buy an overcrowded batch.
+    if (!(marginalSharedTrain(g, l, h.me, sv.cars, sv.pid) > 0)) break;
     if (!h.canSpend(sv.price * 1.1, 0.3)) break;
     const t = g.vehicles.buyTrain(sv.depot, [...sv.cars], l.id);
     if (typeof t === 'string') break;

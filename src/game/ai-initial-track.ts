@@ -1,6 +1,7 @@
 // Initial capacity is an investment: compare saved fares and avoided live works with the extra rail's upkeep.
 import type { Game } from './game';
 import type { Proposal } from './construction';
+import type { DoublePlan } from './trackops';
 import { SHARED_TRACK, structureFactor } from './construction';
 import { TRACK_TYPES, UNIT_M, ELECTRIFY, WATER_Y } from './constants';
 import { trackBasePerUnit } from './opcosts';
@@ -66,13 +67,14 @@ export function initialSecondTrackCost(prof: { y: number[]; terr: number[]; s: n
  * uneconomic or obstructed pair without replacing it with a partial loop. Future saved sections with tracks=2
  * should replace this function's physical implementation while retaining the traffic/value contract.
  * capacity-integration: tracks=3/4 or parallel pairs may extend this adapter when double capacity is exhausted;
- * platform and overtaking works continue through the shared-capacity adapter today.
+ * platform and overtaking works continue through the shared-capacity adapter today. `preserveEntry` can
+ * reject a plan direction which would strand an already proven depot, before any extra capacity is paid.
  */
 export function layInitialDoubleTrack(g: Game, edges: number[], payer: number, traffic: InitialTrackTraffic,
-  fund: (cost: number) => boolean, consent?: (p: Proposal) => boolean) {
+  fund: (cost: number) => boolean, consent?: (p: Proposal) => boolean, preserveEntry?: (p: DoublePlan) => boolean) {
   const plans = ([1, -1] as const).map(side => planCapacityTrackUpgrade(g, edges, side, payer))
     .filter(p => p.ok && p.complete && p.start.kind !== 'turnout' && p.end.kind !== 'turnout'
-      && (!consent || p.proposals.every(consent))).sort((a, b) => a.cost - b.cost || b.side - a.side);
+      && (!consent || p.proposals.every(consent)) && (!preserveEntry || preserveEntry(p))).sort((a, b) => a.cost - b.cost || b.side - a.side);
   for (const plan of plans) {
     const type = g.world.net.edges.get(edges[0])?.type ?? 'standard', per = trackBasePerUnit(type);
     const upkeep = plan.proposals.reduce((n, p, i) => n + (plan.skipped?.includes(i) ? 0 : p.tracks.reduce((n, t) =>

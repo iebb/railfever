@@ -7,6 +7,7 @@ import { Train, lineCongestion, depotServes } from '../src/game/train';
 import { initialTrackChoice, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { lineIsDouble, trackIsDouble, upgradeRoute } from '../src/game/dualtrack';
 import { planDoubleTrack, commitDoubleTrack, planConnection, commitConnection, connectStationThroat } from '../src/game/trackops';
+import { buildDepotOnLine } from '../src/game/routing';
 import { routeBetween, saveNetwork, networkPlanner } from '../src/game/ai-network';
 import { autoSignalLine } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
@@ -40,6 +41,7 @@ function fixtures() {
   console.log(`  second rail ${Math.round(built.cost)}, recovered ${Math.round(built.choice?.recovered ?? 0)}/year`);
 
   openingCleanup();
+  openingDirections();
   failedOpening();
 
   console.log('Connector between directional pairs');
@@ -147,6 +149,41 @@ function openingCleanup() {
     'an existing running service survives even without draft depot metadata');
 }
 
+/** The paid pair must retain an interior depot's actual departure direction on either side. */
+function openingDirections() {
+  console.log('Directional opening depots');
+  for (const dir of [1, -1] as const) {
+    const f = fixture(), route = upgradeRoute(f.g, f.A.id, f.B.id, 1), e = f.g.world.net.edges.get(route[0])!;
+    const depot = buildDepotOnLine(f.g, e.id, e.len / 2, 1, { dir, side: -1 });
+    check(depot >= 0 && depotServes(f.g, f.g.depots.get(depot)!, f.A.id, f.B.id) >= 0,
+      `single opening depot serves both stops (${dir})`);
+    const blocked = fixture(), edge = blocked.g.world.net.edges.get(upgradeRoute(blocked.g, blocked.A.id, blocked.B.id, 1)[0])!;
+    const yard = f.g.depots.get(depot)!, reserved: { x: number; z: number }[] = [];
+    // A planned corridor across every outside-yard alternative must veto siting before any paid work.
+    for (let dx = -3; dx <= 3; dx += 0.5) for (let dz = -3; dz <= 3; dz += 0.5)
+      reserved.push({ x: yard.x + dx, z: yard.z + dz });
+    const empty = JSON.stringify(serialize(blocked.g));
+    check(buildDepotOnLine(blocked.g, edge.id, edge.len / 2, 1, { dir, side: -1, reserved }) < 0
+      && JSON.stringify(serialize(blocked.g)) === empty,
+      `reserved companion corridor vetoes the depot before any branch is committed (${dir})`);
+    const current = upgradeRoute(f.g, f.A.id, f.B.id, 1), ai = f.g.ais[0] as any;
+    const preserve = (plan: ReturnType<typeof planDoubleTrack>) => ai.initialPairDepot(plan, depot, f.A.id, f.B.id);
+    const plans = ([1, -1] as const).map(side => planDoubleTrack(f.g, current, side, 1));
+    check(plans.some(p => p.ok && preserve(p)), `a complete candidate retains depot departure (${dir})`);
+    const before = JSON.stringify(serialize(f.g));
+    let deniedFunds = 0;
+    const denied = layInitialDoubleTrack(f.g, current, 1, traffic, () => { deniedFunds++; return true; }, undefined, () => false);
+    check(!denied.built && deniedFunds === 0 && JSON.stringify(serialize(f.g)) === before,
+      `rejected depot directions pay nothing and leave the formation unchanged (${dir})`);
+    let funded = 0;
+    const built = layInitialDoubleTrack(f.g, current, 1, traffic, () => { funded++; return true; }, undefined, preserve);
+    check(built.built && funded === 1 && depotServes(f.g, f.g.depots.get(depot)!, f.A.id, f.B.id) >= 0,
+      `funded complete pair preserves the interior depot (${dir})`);
+    check(lineIsDouble(f.g, f.l, 1) && !!routeBetween(f.g, f.A.id, f.B.id, 1) && !!routeBetween(f.g, f.B.id, f.A.id, 1),
+      `depot-aware opening keeps both station routes and the full companion (${dir})`);
+  }
+}
+
 /** Exercise the real opening job when no depot builder can supply a usable site. */
 function failedOpening() {
   const g = Game.create({ size: 512, seed: 11, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
@@ -229,6 +266,9 @@ function midconnectReplay() {
   observation.verdict('midconnect natural opening');
   check(saved, 'natural map exercises a saved midconnect search without unrelated construction');
   if (!saved) return;
+  const requests = saveNetwork(g).companies.flatMap(([owner, state]) => (state.job?.items ?? [])
+    .filter(i => i.midconnect).map(i => ({ owner, key: i.ids.join(':'), initial: { ...i.midconnect! }, retired: -1 })));
+  const subsequent = new Map<string, { owner: number; key: string; tick: number; initial: unknown }>();
   for (const ai of g.ais) ai.state.cooldown = 1e9;
   const snapshot = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(snapshot));
   let exact = JSON.stringify(serialize(loaded)) === snapshot;
@@ -236,9 +276,20 @@ function midconnectReplay() {
   for (let i = 0; i < 640 && exact; i++) {
     g.stepTick(); loaded.stepTick();
     exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
+    const pending = saveNetwork(g).companies.flatMap(([owner, state]) => (state.job?.items ?? [])
+      .filter(item => item.midconnect).map(item => ({ owner, key: item.ids.join(':'), initial: item.midconnect })));
+    for (const request of requests) if (request.retired < 0 && !pending.some(p => p.owner === request.owner && p.key === request.key))
+      request.retired = i + 1;
+    for (const p of pending) if (!requests.some(r => r.retired < 0 && p.owner === r.owner && p.key === r.key)) {
+      const key = `${p.owner}/${p.key}`;
+      if (!subsequent.has(key)) subsequent.set(key, { ...p, tick: i + 1 });
+    }
   }
-  check(exact && !saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect)),
+  // Other companies may begin a new search during replay; completion belongs to the saved requests.
+  check(exact && requests.every(r => r.retired >= 0),
     'saved midconnect search completes with exact replay of 640 fixed ticks');
+  console.log(`  saved midconnect requests ${JSON.stringify(requests)}`);
+  if (subsequent.size) console.log(`  subsequent midconnect requests ${JSON.stringify([...subsequent.values()])}`);
   console.log(`  midconnect replay ${day} -> ${g.day}, exact ${exact}`);
 }
 

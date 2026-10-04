@@ -1388,18 +1388,26 @@ export function buildRailDepot(g: Game, st: Station, owner: number, frontDir?: P
 }
 
 /** Depot on a short siding branching off a rail edge near (x,z) (e.g. a main line outside town). */
-export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: number): number {
+export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: number,
+  entry?: { dir: 1 | -1; side: 1 | -1; reserved?: readonly P2[] }): number {
   const net = g.world.net;
   const e = net.edges.get(edgeId);
   if (!e || e.station >= 0 || e.depot >= 0) return -1;
   const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
-  for (const side of [1, -1]) for (const dirSign of [1, -1]) {
+  // A paired formation may need a specific departure direction; keep its future companion side clear.
+  for (const side of entry ? [entry.side] : [1, -1]) for (const dirSign of entry ? [-entry.dir] : [1, -1])
+    for (const offset of entry?.reserved ? [2.2, 3.2, 4.2, 5.2] : [2.2]) {
     net.pointAt(e, s, p, d);
     const l = Math.hypot(d.x, d.z) || 1;
     const tx = (d.x / l) * dirSign, tz = (d.z / l) * dirSign;
-    // diverge over 12 units to 2.2 units off the line, then a 6-unit straight siding
-    const ex = p.x + tx * 12 - tz * 2.2 * side, ez = p.z + tz * 12 + tx * 2.2 * side;
-    const fx = p.x + tx * 18 - tz * 2.2 * side, fz = p.z + tz * 18 + tx * 2.2 * side;
+    // Diverge over 12 units, then a 6-unit straight siding. A reserved curve may need a wider outside yard.
+    const ex = p.x + tx * 12 - tz * offset * side, ez = p.z + tz * 12 + tx * offset * side;
+    const fx = p.x + tx * 18 - tz * offset * side, fz = p.z + tz * 18 + tx * offset * side;
+    // Curves can bring the future companion back under an outward-facing yard. Reject its footprint
+    // before building the siding, with construction's 0.32+0.6 clearance plus half a sample interval.
+    const size = depotSize('rail');
+    if (entry?.reserved?.some(q => distToRect(q.x, q.z, fx + tx * 2.15, fz + tz * 2.15,
+      Math.atan2(-tx, -tz), size.w / 2, size.d / 2) <= 1.17)) continue;
     if (!depotFits(g, fx, fz, -tx, -tz, owner, 30, net.heightAtS(e, s))) continue;
     const start = findSnap(g, 'rail', p.x, p.z, 0.3);
     if (start.kind !== 'edge' || start.edge !== edgeId) continue;
