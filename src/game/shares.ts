@@ -60,7 +60,7 @@ export class Shares {
   private tradeError(owner: number, target: number): string | null {
     const b = this.game.companies[owner], t = this.game.companies[target];
     if (!b || !t || b.defunct || t.defunct) return 'No such active company';
-    if (owner === target) return 'A company cannot trade its own shares';
+    if (owner === target) return 'Cannot trade own shares';
     return null;
   }
 
@@ -69,7 +69,7 @@ export class Shares {
     const seen = new Set<number>();
     let id: number | null = owner;
     while (id !== null) {
-      if (id === target || seen.has(id)) return 'Full ownership cannot create a control cycle';
+      if (id === target || seen.has(id)) return 'Full ownership would create a control cycle';
       seen.add(id);
       id = this.ownerOf(id);
     }
@@ -100,7 +100,7 @@ export class Shares {
     const s = this.state(target);
     s.shareholders[owner] = this.shareCount(owner, target) + 1;
     if (s.shareholders[owner] === SHARE_COUNT) {
-      this.game.postNews(`${this.game.company(owner).name} now owns 100% of ${this.game.company(target).name}. It can be merged or kept as a subsidiary.`, owner === 0 ? 'good' : 'ai');
+      this.game.postNews(`${this.game.company(owner).name} owns 100% of ${this.game.company(target).name}; merge or keep as subsidiary.`, owner === 0 ? 'good' : 'ai');
     }
     return null;
   }
@@ -111,7 +111,7 @@ export class Shares {
     if (this.shareCount(owner, target) === 0) return 'You own no shares to sell';
     const price = this.quote(owner, target).sellPrice;
     if (!Number.isFinite(price) || price <= 0) return 'Shares have no tradable value';
-    if (!this.game.companies[target].economy.canAfford(money(this.quote(owner, target).value))) return 'The company lacks cash to repurchase 10%';
+    if (!this.game.companies[target].economy.canAfford(money(this.quote(owner, target).value))) return 'Company lacks cash to repurchase 10%';
     return null;
   }
 
@@ -131,8 +131,8 @@ export class Shares {
   canMerge(owner: number, target: number): string | null {
     const err = this.tradeError(owner, target);
     if (err) return err;
-    if (!this.game.companies[target].ai) return 'The player company cannot become a subsidiary or be merged';
-    if (this.shareCount(owner, target) !== SHARE_COUNT) return 'Own 100% of the company before merging or keeping it as a subsidiary';
+    if (!this.game.companies[target].ai) return 'Player company cannot be a subsidiary or merged';
+    if (this.shareCount(owner, target) !== SHARE_COUNT) return 'Needs 100% ownership to merge or keep as subsidiary';
     return this.controlError(owner, target);
   }
 
@@ -142,14 +142,14 @@ export class Shares {
     const s = this.state(target);
     if (s.subsidiaryOf === owner) return null;
     s.subsidiaryOf = owner;
-    this.game.postNews(`${this.game.company(target).name} will keep operating as a subsidiary of ${this.game.company(owner).name}.`, owner === 0 ? 'good' : 'ai');
+    this.game.postNews(`${this.game.company(target).name} operates as a subsidiary of ${this.game.company(owner).name}.`, owner === 0 ? 'good' : 'ai');
     return null;
   }
 
   /** Legacy full buyouts remain available only when no company's existing stake would be overwritten. */
   canBuyout(owner: number, target: number): string | null {
     if (this.shareCount(owner, target) === SHARE_COUNT) return this.canMerge(owner, target);
-    if (this.freeFloat(target) !== SHARE_COUNT) return 'Invest to 100% before merging; existing shareholders keep their shares';
+    if (this.freeFloat(target) !== SHARE_COUNT) return 'Merge needs 100%; existing shareholders keep shares';
     return this.controlError(owner, target);
   }
 

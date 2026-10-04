@@ -45,7 +45,7 @@ const hidden = () => {
 try {
   if (memory) {
     await until(() => !!win.document.querySelector('.storage-banner'));
-    assert(win.document.querySelector('.storage-banner')!.textContent!.includes("Saves won't survive a reload in this browser mode — use Export to keep your game"));
+    assert(win.document.querySelector('.storage-banner')!.textContent!.includes("Session-only saves: lost on reload; Export to keep."));
     hidden(); await until(() => !!listSlots().find((s) => s.slot === 'autosave'));
     assert(win.document.querySelector('.savechip')!.textContent!.includes('Session only'));
     (win.document.querySelector('[aria-label="Dismiss storage notice"]') as HTMLElement).click();
@@ -102,7 +102,7 @@ try {
     button(win.document.querySelector('.ng-card')!, 'Start').click();
     await until(() => current().game.options.seed === 12 && !win.document.querySelector('.title'));
     assert.equal((await loadFromSlot('autosave-previous')).economy.money, 123456789);
-    assert.equal(confirmations[0], "Start a new game? Your current game will be kept as 'Autosave (previous game)'.");
+    assert.equal(confirmations[0], "Start a new game? Current game will be saved as 'Autosave (previous game)'.");
     current().game.paused = true; current().game.economy.money = 987654321;
     current().ui.openMenu(); button(win.document.querySelector('.win:not(.closing)')!, 'Load game…').click();
     const beforeLoad = confirmations.length;
@@ -113,7 +113,7 @@ try {
     await until(() => current().game.options.seed === 11);
     assert.equal(current().game.economy.money, 123456789);
     assert.equal((await loadFromSlot('autosave-previous')).economy.money, 987654321);
-    assert(confirmations.includes("Load another game? Your current game will be kept as 'Autosave (previous game)'."));
+    assert(confirmations.includes("Load another game? Current game will be saved as 'Autosave (previous game)'."));
     hidden(); await until(() => !!listSlots().find((s) => s.slot === 'autosave'));
     assert.equal((await loadFromSlot('autosave-previous')).economy.money, 987654321, 'later autosave does not overwrite the previous game');
     assert(win.document.querySelector('.savechip')!.textContent!.includes('Saved'));

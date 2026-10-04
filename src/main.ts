@@ -73,7 +73,7 @@ function setGame(g: Game, hasPlayed = false) {
 }
 
 /** Loading text for generating a world of the given size. */
-const genText = (size: number) => (size >= 1024 ? 'Generating a large world… this takes a few seconds' : 'Generating world…');
+const genText = (size: number) => (size >= 1024 ? 'Generating large world… a few seconds' : 'Generating world…');
 
 function newGame(opts: NewGameOptions): Promise<boolean> {
   return switchGame('new', async () => {
@@ -86,12 +86,12 @@ function newGame(opts: NewGameOptions): Promise<boolean> {
 async function switchGame(kind: 'new' | 'load', next: () => Promise<Game>): Promise<boolean> {
   if (switching) return false;
   const current = game, keep = !!current && played;
-  if (keep && !confirm((kind === 'new' ? 'Start a new game?' : 'Load another game?') + " Your current game will be kept as 'Autosave (previous game)'.")) return false;
+  if (keep && !confirm((kind === 'new' ? 'Start a new game?' : 'Load another game?') + " Current game will be saved as 'Autosave (previous game)'.")) return false;
   switching = true;
   const paused = current?.paused;
   if (current) current.paused = true;
   try {
-    showLoading(keep ? 'Keeping your current game…' : 'Loading…');
+    showLoading(keep ? 'Saving current game…' : 'Loading…');
     // A hide/timer save already in flight must finish before the switch and next game's autosave.
     await pendingAutosave;
     if (keep) await saveToSlot(current!, 'autosave-previous', 'Autosave (previous game)');
@@ -182,7 +182,7 @@ async function boot() {
       try { await backupSlot('autosave', 'autosave-failed', 'Autosave (failed to load)'); autosaveNeedsBackup = false; }
       catch (backupError) { console.warn('Could not back up the failed autosave', backupError); }
       const why = saveIncompatibility(auto);
-      ui.toast(why ? `${why} Here is a new map; the old autosave is kept as 'Autosave (failed to load)'.` : 'Could not load the autosave — here is a new map', 'bad');
+      ui.toast(why ? `${why} New map; backup: 'Autosave (failed to load)'.` : 'Autosave load failed; new map opened', 'bad');
     }
   }
   if (!game) {

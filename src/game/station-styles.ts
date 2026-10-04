@@ -46,37 +46,37 @@ export const CONCOURSE_PAVILION = 1.1;
 
 export const STATION_STYLES: Record<string, StationBuildingStyle> = {
   none: {
-    id: 'none', name: 'No building', desc: 'Platforms only: a ramp at the platform end to the street and a ticket machine',
+    id: 'none', name: 'No building', desc: 'Platforms, street ramp and ticket machine',
     levels: ['ground', 'elevated', 'underground'], from: 1830, minTracks: 1, maxTracks: 8, placement: 'none',
     size: () => ({ w: 0, d: 0 }), cost: 0, rating: 0, catchBonus: 0,
   },
   shelter: {
-    id: 'shelter', name: 'Halt', desc: 'Shelters and a small canopy beside the platform: country halts and light-rail stops',
+    id: 'shelter', name: 'Halt', desc: 'Shelters and canopy for country halts or light rail',
     levels: ['ground', 'elevated'], from: 1830, minTracks: 1, maxTracks: 2, placement: 'side',
     size: (length) => ({ w: Math.min(2.2, Math.max(1.0, length * 0.18)), d: 0.55 }), cost: 0.15, rating: 0.01, catchBonus: 0,
   },
   classic: {
-    id: 'classic', name: 'Station building', desc: 'A station building beside the platforms with a forecourt on the street',
+    id: 'classic', name: 'Station building', desc: 'Platform-side building with street forecourt',
     levels: ['ground', 'elevated', 'underground'], from: 1830, minTracks: 1, maxTracks: 8, placement: 'side',
     size: sideSize, cost: 1, rating: 0.03, catchBonus: 0.2,
   },
   brick: {
-    id: 'brick', name: 'Brick station', desc: 'A gabled brick building of the early railway age',
+    id: 'brick', name: 'Brick station', desc: 'Early-era gabled brick building',
     levels: ['ground', 'elevated', 'underground'], from: 1830, to: 1960, minTracks: 1, maxTracks: 8, placement: 'side',
     size: (length, tracks) => { const s = sideSize(length, tracks); return { w: Math.min(4, s.w * 1.1), d: s.d }; }, cost: 1.1, rating: 0.03, catchBonus: 0.2,
   },
   modern: {
-    id: 'modern', name: 'Modern station', desc: 'Glass and steel beside the platforms',
+    id: 'modern', name: 'Modern station', desc: 'Platform-side glass and steel',
     levels: ['ground', 'elevated', 'underground'], from: 1955, minTracks: 1, maxTracks: 8, placement: 'side',
     size: sideSize, cost: 1.2, rating: 0.04, catchBonus: 0.25,
   },
   concourse: {
-    id: 'concourse', name: 'Concourse station', desc: 'A concourse bridging the tracks with entrances on both sides (bridge-station style)',
+    id: 'concourse', name: 'Concourse station', desc: 'Over-track concourse; entrances on both sides',
     levels: ['ground', 'elevated'], from: 1960, minTracks: 2, maxTracks: 8, placement: 'over',
     size: (length, _tracks, width) => ({ w: Math.min(4.2, Math.max(1.8, 1.4 + length * 0.1)), d: width + 2 * CONCOURSE_PAVILION }), cost: 1.8, rating: 0.05, catchBonus: 0.25,
   },
   terminal: {
-    id: 'terminal', name: 'Terminal', desc: 'A head building across the buffer ends and a train shed over the platforms (big termini)',
+    id: 'terminal', name: 'Terminal', desc: 'Buffer-end building and platform train shed',
     levels: ['ground'], from: 1840, minTracks: 4, maxTracks: 8, placement: 'end',
     size: (_length, _tracks, width) => ({ w: width + 1.2, d: 2.2 }), cost: 2.4, rating: 0.05, catchBonus: 0.3,
   },

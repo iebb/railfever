@@ -196,8 +196,8 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     // Even a legacy ground parent cannot make a deep connecting piece an open cutting. Low land requires a
     // bridge or a covered tunnel; a shallow formation below the water line cannot be built at this height.
     const sec = inherited !== 'ground' ? inherited : depth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover ? 'tunnel' : y - terrain > 1.4 || terrain < DRY_MIN ? 'bridge' : 'ground';
-    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below the water line here: raise it or go into a tunnel', cost: 0 };
-    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill in the way of the bridge: use a tunnel', cost: 0 };
+    if (sec !== 'tunnel' && y - 0.1 < DRY_MIN - 0.005) return { error: 'Below water line: raise or tunnel', cost: 0 };
+    if (sec === 'bridge' && depth > 0.2) return { error: 'Hill blocks bridge: use tunnel', cost: 0 };
     price += (s1 - s0) * tt.costPerUnit * (sec === 'ground' ? 1 : structureFactor('rail', sec, Math.abs(depth)));
     if (sec === 'ground') continue;
     const last = sections[sections.length - 1];
@@ -274,11 +274,11 @@ function chainOf(g: Game, edgeIds: number[], owner: number): { steps: Step[]; er
     const e = net.edges.get(id)!;
     if (e.kind !== 'rail') return { steps: [], error: 'Only railway track can be doubled' };
     if (e.owner !== owner) return { steps: [], error: 'Not your track' };
-    if (e.station >= 0 || e.depot >= 0) return { steps: [], error: 'Platform and depot tracks cannot be doubled' };
+    if (e.station >= 0 || e.depot >= 0) return { steps: [], error: 'Cannot double platform or depot tracks' };
   }
   const set = new Set(ids);
   const steps = walkTrack(g, net.edges.get(ids[0])!, set);
-  if (steps.length !== ids.length) return { steps: [], error: 'The selected track is not one continuous line' };
+  if (steps.length !== ids.length) return { steps: [], error: 'Track not continuous' };
   if (ids.length > 1) {
     const iLast = steps.findIndex((s) => s.edge === ids[ids.length - 1]), iFirst = steps.findIndex((s) => s.edge === ids[0]);
     if (iLast < iFirst) return { steps: steps.reverse().map((s) => ({ edge: s.edge, dir: -s.dir })) };
@@ -337,7 +337,7 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
       if ((pt.x - n.x) * nv.x + (pt.z - n.z) * nv.z <= 0.12) continue;
       if (q.u < U * 0.4) uMin = Math.max(uMin, q.u + 1.5);
       else if (q.u > U * 0.6) uMax = Math.min(uMax, q.u - 1.5);
-      else return fail(`A branch leaves the line on that side (${m10(q.u)} m along)`);
+      else return fail(`Branch on this side at ${m10(q.u)} m`);
     }
   }
   const offAt = (u: number) => { const q = sampleAt(S, u), nv = nrm(q); return { u, x: q.x + nv.x * sp, z: q.z + nv.z * sp, y: q.y, tx: q.tx, tz: q.tz }; };
@@ -382,8 +382,8 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
     return { end: { kind: 'turnout', u: 0, node: -1 }, inner: NaN, err: why || 'no room' };
   };
   const a = endOf(true), b = endOf(false);
-  if (!a || isNaN(a.inner)) return fail(`No room for the turnout at the start (${a?.err ?? ''})`);
-  if (!b || isNaN(b.inner)) return fail(`No room for the turnout at the end (${b?.err ?? ''})`);
+  if (!a || isNaN(a.inner)) return fail(`No room for start turnout: ${a?.err ?? ''}`);
+  if (!b || isNaN(b.inner)) return fail(`No room for end turnout: ${b?.err ?? ''}`);
   plan.start = a.end; plan.end = b.end;
   const uS = a.inner, uE = b.inner;
   if (uE - uS < 3) return fail('Too short to double');
@@ -499,7 +499,7 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
         ok = true;
         break;
       }
-      if (!ok) { const r = rollback(`New track could not be built at ${Math.round(pts[k].u * 10)} m (the ground or the network changed)`); dropNodes(); return r; }
+      if (!ok) { const r = rollback(`Build failed at ${Math.round(pts[k].u * 10)} m: ground or network changed`); dropNodes(); return r; }
     }
     const cur = nodes[nodes.length - 1];
     const tracks = () => new Set<number>([...main.map((s) => s.edge), ...created()]);
@@ -621,7 +621,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     const q = SA[near.i], dot = Math.abs(geo.tan[m * 2] * q.tx + geo.tan[m * 2 + 1] * q.tz);
     if (near.d > 0.3 && near.d < 1.7 && dot > 0.95) { B = walkTrack(g, e, walkSet, inA); break; }
   }
-  if (!B) { res.error = 'Not a double track (no parallel second track)'; return res; }
+  if (!B) { res.error = 'No parallel second track'; return res; }
   // orient B along A
   let SB = sampleSteps(g, B);
   {
@@ -718,7 +718,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     for (const end of ends) {
       const want = opts.crossoversAt === 'always' ? end.kind !== 'merge' : end.kind === 'station' || end.kind === 'depot';
       const th = end.kind === 'station' ? opts.throatLength ?? 0 : 0;
-      if ((opts.crossovers ?? true) && want) windows.push({ edge0: end.atStart ? lo + th : hi - th, sgn: end.atStart ? -1 : 1, must: true, atStart: end.atStart, label: `before the ${end.kind} at the ${end.atStart ? 'start' : 'end'} of the double track` });
+      if ((opts.crossovers ?? true) && want) windows.push({ edge0: end.atStart ? lo + th : hi - th, sgn: end.atStart ? -1 : 1, must: true, atStart: end.atStart, label: `before ${end.kind} at ${end.atStart ? 'start' : 'end'} of double track` });
     }
     if ((opts.crossovers ?? true) && inline.size) {
       const span = new Map<number, [number, number]>();
@@ -786,7 +786,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
         for (let id = e0; id < net.nextEdge; id++) if (net.edges.has(id) && !lists.some((L) => L.some((x) => x.edge === id))) net.removeEdge(id);
         refund(g, owner, m0);
         SA = sampleSteps(g, lists[0]); SB = sampleSteps(g, lists[1]);
-        if (w.must) res.error = `No room for crossovers ${w.label}: the tracks stay two-way`;
+        if (w.must) res.error = `No crossover room ${w.label}: tracks stay two-way`;
         continue;
       }
       res.crossovers += 2;
@@ -954,7 +954,7 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
         let why = appr.length === 1 ? 'no room' : 'a switch right at the platform end';
         if (appr.length === 1) {
           const e = net.edges.get(appr[0])!;
-          if (!g.canUse(owner, e.owner)) why = `the track there belongs to ${g.company(e.owner).name} (no track access)`;
+          if (!g.canUse(owner, e.owner)) why = `track of ${g.company(e.owner).name}: needs track access`;
           else for (const d of outs) {
             // not between the switches of crossovers there (a train leaving the new track could not cross over)
             const band = opts.avoid?.[end];
@@ -966,7 +966,7 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
             const nearSwitch = via.some((id) => { const ve = net.edges.get(id)!; return [ve.a, ve.b].some((nid) => { const n = net.nodes.get(nid)!; return n.edges.length > 2 && Math.hypot(n.x - q.x, n.z - q.z) < 1.5; }); });
             if (nearSwitch) { why = 'a switch in the way'; continue; }
             const qe = q.edge !== undefined ? net.edges.get(q.edge) : undefined;
-            if (qe && !g.canUse(owner, qe.owner)) { why = `the track there belongs to ${g.company(qe.owner).name} (no track access)`; break; }
+            if (qe && !g.canUse(owner, qe.owner)) { why = `track of ${g.company(qe.owner).name}: needs track access`; break; }
             // the neighbour's approach as far as the turnout runs beside the new curve
             const tracks = new Set<number>([...own, ...via, ...ends.flatMap((t) => [...approach(t.front), ...approach(t.back)])]);
             const c = connectS(g, owner, { x: nj.x, z: nj.z, y: nj.y, tx: ax, tz: az, node: nj.id }, q, tracks, false);
@@ -1324,10 +1324,10 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
     const c = S[nearestSample(S, cx, cz).i];
     for (let d = -L / 2 - 0.5; d <= L / 2 + 0.5; d += 0.5) {
       const p = sampleAt(S, c.u + d);
-      if (Math.abs(p.u - (c.u + d)) > 0.01) return fail(`Not enough plain track here (the station needs ${Math.round((L + 1) * 10)} m)`);
+      if (Math.abs(p.u - (c.u + d)) > 0.01) return fail(`Needs ${Math.round((L + 1) * 10)} m of plain track`);
       const lat = latOf(p.x, p.z) - latOf(c.x, c.z);
-      if (Math.abs(lat) > 0.15) return fail(`The line curves here: the platforms need ${Math.round(L * 10)} m of straight track`);
-      if (Math.abs(p.y - yc) > 0.15) return fail('The line climbs here: the platforms need level track');
+      if (Math.abs(lat) > 0.15) return fail(`Curve: platforms need ${Math.round(L * 10)} m straight track`);
+      if (Math.abs(p.y - yc) > 0.15) return fail('Grade: platforms need level track');
     }
   }
   const lv: StationLevel = o.level ?? (net.sectionAt(e, s) === 'tunnel' ? 'underground' : net.sectionAt(e, s) === 'bridge' ? 'elevated' : 'ground');
@@ -1351,7 +1351,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
   for (let m = 0; m < mainsS.length; m++) {
     const S = mainsS[m], c = S[nearestSample(S, cx, cz).i];
     const cut: [number, number] = [c.u - L / 2 - throat, c.u + L / 2 + throat];
-    if (cut[0] < 0.5 || cut[1] > S[S.length - 1].u - 0.5) return fail(`Not enough plain track on both sides (the station and its throats need ${Math.round((L + 2 * throat) * 10)} m)`);
+    if (cut[0] < 0.5 || cut[1] > S[S.length - 1].u - 0.5) return fail(`Station and throats need ${Math.round((L + 2 * throat) * 10)} m plain track on both sides`);
     const steps = m === 0 ? A.steps : B!.steps;
     plan.mains.push({ steps, cut, lat: lats[m] });
     for (const q2 of S) if (q2.u > cut[0] - 1 && q2.u < cut[1] + 1) ignore.add(q2.edge);
@@ -1372,7 +1372,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
       const sp: SPt = { x: sx, z: sz, y: yc, tx: fx, tz: fz };
       const cp: SPt = { x: cu.x, z: cu.z, y: cu.y, tx: cu.tx, tz: cu.tz, edge: cu.edge, s: cu.s };
       const r = end ? connectS(g, owner, sp, cp, allowed, true) : connectS(g, owner, cp, sp, allowed, true);
-      if (r.error) return fail(`Cannot connect the station tracks to the line: ${r.error}`);
+      if (r.error) return fail(`Cannot connect station to line: ${r.error}`);
       cost += r.cost;
       plan.throat.push({ x0: cu.x, z0: cu.z, x1: sx, z1: sz });
     }
@@ -1530,7 +1530,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
     if (!sp.ok) return fail(`${st.name}: ${sp.error ?? 'cannot be rebuilt at that level'}`);
     // its added entrances: beside the platforms where they fit and a street reaches them (ground), else they go
     const fit = ground ? g.stations.previewRefit(st, sp) : null;
-    const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'the station is rebuilt at the new level');
+    const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'station rebuilt at new level');
     for (const w of [...refitWarnings(fit), ...(gone ? [gone] : [])]) plan.warnings.push(`${st.name}: ${w[0].toLowerCase()}${w.slice(1)}`);
     plan.stations.push({ id: sid, plan: sp, ...(fit?.streets ? { streets: fit.streets } : {}) });
     stY.set(sid, sp.y);
@@ -1589,7 +1589,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
       for (let i = 1; i < y.length; i++) { const dd = pts[i].d - pts[i - 1].d; if (!isFinite(fixed[i])) y[i] = Math.max(y[i - 1] - grade * dd, Math.min(y[i - 1] + grade * dd, y[i])); }
       for (let i = y.length - 2; i >= 0; i--) { const dd = pts[i + 1].d - pts[i].d; if (!isFinite(fixed[i])) y[i] = Math.max(y[i + 1] - grade * dd, Math.min(y[i + 1] + grade * dd, y[i])); }
     }
-    for (let i = 1; i < y.length; i++) if (Math.abs(y[i] - y[i - 1]) > grade * (pts[i].d - pts[i - 1].d) * 1.15 + 0.02) return fail('Too steep between the fixed points: pick a longer stretch for the ramps');
+    for (let i = 1; i < y.length; i++) if (Math.abs(y[i] - y[i - 1]) > grade * (pts[i].d - pts[i - 1].d) * 1.15 + 0.02) return fail('Ramps too steep: choose longer stretch');
     pts.forEach((q, i) => { if (q.node !== undefined) newY.set(q.node, y[i]); });
     // ramp lengths at the outer ends: where the track reaches the wanted height
     for (const [i0, dir] of [[0, 1], [y.length - 1, -1]] as [number, number][]) {
@@ -1642,7 +1642,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
     if (!pe || !other) continue;
     const e = net.edges.get(mine)!;
     const yNew = profAtS(pe.prof, e.len, s), yOther = net.heightAtS(other, os);
-    if (Math.abs(yNew - yOther) < RAIL.clearance + 0.3) return fail(`${other.kind === 'road' ? 'A road' : 'Another track'} crosses at the same height near ${Math.round(c.x)},${Math.round(c.z)}: pick a longer stretch`);
+    if (Math.abs(yNew - yOther) < RAIL.clearance + 0.3) return fail(`${other.kind === 'road' ? 'A road' : 'Another track'} crosses at same height near ${Math.round(c.x)},${Math.round(c.z)}: choose longer stretch`);
     plan.crossings.push(cid);
   }
   plan.cost = Math.max(0, Math.round(plan.cost));
@@ -1750,7 +1750,7 @@ export function planConnection(g: Game, edgeA: number, sA: number, edgeB: number
   const plan: ConnectionPlan = { ok: false, warnings: [], owner, cost: 0, proposal: null, turnouts: [], dirA: 1, dirB: 1, length: 0, minRadius: 0 };
   const ea = net.edges.get(edgeA), eb = net.edges.get(edgeB);
   if (!ea || !eb || ea.kind !== 'rail' || eb.kind !== 'rail') { plan.error = 'Pick two railway tracks'; return plan; }
-  if (ea.station >= 0 || eb.station >= 0 || ea.depot >= 0 || eb.depot >= 0) { plan.error = 'Turnouts go on plain track, not on platforms or depot tracks'; return plan; }
+  if (ea.station >= 0 || eb.station >= 0 || ea.depot >= 0 || eb.depot >= 0) { plan.error = 'Turnouts need track outside platforms and depots'; return plan; }
   if (ea.id === eb.id) { plan.error = 'Pick two different tracks'; return plan; }
   const type = opts.type ?? ea.type;
   const span = Math.max(0, opts.search ?? 0);
@@ -1761,7 +1761,7 @@ export function planConnection(g: Game, edgeA: number, sA: number, edgeB: number
   let firstErr = '';
   for (const oa of offs) for (const ob of offs) {
     const s1 = Math.max(1, Math.min(ea.len - 1, sA + oa)), s2 = Math.max(1, Math.min(eb.len - 1, sB + ob));
-    if (ea.len < 2.5 || eb.len < 2.5) { firstErr = 'A track piece is too short for a turnout'; break; }
+    if (ea.len < 2.5 || eb.len < 2.5) { firstErr = 'Track too short for turnout'; break; }
     net.pointAt(ea, s1, p, t);
     const ax = p.x, az = p.z, atx = t.x, atz = t.z;
     net.pointAt(eb, s2, p, t);
@@ -1769,7 +1769,7 @@ export function planConnection(g: Game, edgeA: number, sA: number, edgeB: number
     // construction leaves A towards B and arrives on B in the direction of the chord
     const cx = bx - ax, cz = bz - az;
     const da: 1 | -1 = cx * atx + cz * atz >= 0 ? 1 : -1, db: 1 | -1 = cx * btx + cz * btz >= 0 ? 1 : -1;
-    if ((opts.dirA && opts.dirA !== da) || (opts.dirB && opts.dirB !== db)) { firstErr = firstErr || 'No curve gives that through movement here'; continue; }
+    if ((opts.dirA && opts.dirA !== da) || (opts.dirB && opts.dirB !== db)) { firstErr = firstErr || 'No curve allows through running here'; continue; }
     // two tracks side by side: a crossover between them
     const tal = Math.hypot(atx, atz) || 1, tbl = Math.hypot(btx, btz) || 1;
     const par = Math.abs((atx * btx + atz * btz) / (tal * tbl)) > 0.97 && Math.abs((cx * -atz + cz * atx) / tal) < 2.2;
@@ -1864,7 +1864,7 @@ export function pairAsDoubleTrack(g: Game, edgesA: number[], edgesB: number[], o
   const bad = (error: string): FinishResult => ({ signals: 0, crossovers: 0, cost: 0, error });
   const ok = (ids: number[]) => ids.length > 0 && ids.every((id) => { const e = net.edges.get(id); return !!e && e.kind === 'rail' && e.station < 0 && e.depot < 0; });
   if (!ok(edgesA) || !ok(edgesB)) return bad('Pick two plain railway tracks');
-  for (const id of [...edgesA, ...edgesB]) { const e = net.edges.get(id)!; if (e.owner !== owner) return bad(`Track of ${g.company(e.owner).name}: only own tracks can be paired`); }
+  for (const id of [...edgesA, ...edgesB]) { const e = net.edges.get(id)!; if (e.owner !== owner) return bad(`Track of ${g.company(e.owner).name}: pair your own tracks only`); }
   if (edgesA.some((id) => edgesB.includes(id))) return bad('The two tracks share track');
   return finishDoubleTrack(g, [...edgesA, ...edgesB], owner, { ...opts, crossoversAt: 'always' });
 }
@@ -1888,7 +1888,7 @@ export function canMerge(g: Game, aId: number, bId: number): MergeCheck {
   const a = S.get(aId), b = S.get(bId);
   if (!a || !b || a === b) return { ok: false, kind: null, reason: a === b ? 'The same station' : 'No such station' };
   const m = S.canMerge(aId, bId);
-  if (!m) return { ok: true, kind: 'rebuild', reason: a.rail && b.rail ? 'Side by side: one station with all the platforms' : 'Close together: one station' };
+  if (!m) return { ok: true, kind: 'rebuild', reason: a.rail && b.rail ? 'Side by side: one station, all platforms' : 'Close together: one station' };
   if (a.links.includes(b.id)) return { ok: true, kind: 'complex', reason: `Already linked (${m})` };
   const l = S.canLink(aId, bId);
   if (!l) return { ok: true, kind: 'complex', reason: `${m}; linked for transfers instead` };

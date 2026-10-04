@@ -61,7 +61,7 @@ export function openLines(ui: UI) {
       filterBar(g, f, modeCounts(g, all, f), () => { win.last = undefined; render(); }));
     const sugg = !f.hidden.includes('bus') || !f.hidden.includes('coach') ? intercitySuggestions(ui) : null;
     if (!lines.length) {
-      add(win.body, h('div', { class: 'pad' }, all.some((l) => l.owner === PLAYER || f.company !== 'mine') ? 'No lines match the filter.' : 'No lines yet. A line is an ordered list of stations that vehicles serve in a loop. Build two stations, create a line, click the stations on the map, then add vehicles.'), sugg);
+      add(win.body, h('div', { class: 'pad' }, all.some((l) => l.owner === PLAYER || f.company !== 'mine') ? 'No lines match the filter.' : 'Build two stations → create line → add stops on map → add vehicles.'), sugg);
       return;
     }
     // lines with mail show "pax · mail t" last month
@@ -134,13 +134,13 @@ function intercitySuggestions(ui: UI): HTMLElement | null {
     h('div', { class: 'list' }, suggCache.rows.map((r) => h('div', { class: 'row' },
       h('span', null, icon('bus', 14), ` ${name(r.a)} – ${name(r.b)}`),
       h('span', { class: 'muted' }, `≈ ${((r.dist * 1.25) / 100).toFixed(1)} km by road · ${fmtInt(r.potential)} trips/mo`),
-      h('button', { class: 'btn sm', 'data-tip': 'Show both towns and pick the bus stop tool', onclick: () => {
+      h('button', { class: 'btn sm', 'data-tip': 'Show towns; choose bus stop tool', onclick: () => {
         const A = g.towns.list[r.a], B = g.towns.list[r.b];
         if (A && B) ui.centerOn((A.x + B.x) / 2, (A.z + B.z) / 2, Math.max(60, r.dist * 0.9));
         ui.tools.setTool('busstop');
-        ui.toast(`Place a bus stop in ${name(r.a)} and in ${name(r.b)}, then create a bus line — long routes suit coaches`, 'info');
+        ui.toast(`Bus stops in ${name(r.a)} and ${name(r.b)} → bus line; long routes suit coaches.`, 'info');
       } }, 'Plan')))),
-    h('div', { class: 'muted', style: 'margin-top:4px' }, 'Fares grow with distance: long bus routes between towns pay better than short hops in town.'));
+    h('div', { class: 'muted', style: 'margin-top:4px' }, 'Longer bus trips earn higher fares.'));
 }
 
 function newLine(ui: UI, kind: LineKind) {
@@ -160,7 +160,7 @@ export function editLine(ui: UI, id: number) {
   ui.tools.setTool('line-edit');
   ui.tools.lineEditId = line.id;
   ui.hud.onToolChange();
-  ui.toast('Click stations on the map to add them as stops', 'info');
+  ui.toast('Click map stations to add stops', 'info');
 }
 
 export function addStopToLine(ui: UI, lineId: number, stationId: number) {
@@ -169,7 +169,7 @@ export function addStopToLine(ui: UI, lineId: number, stationId: number) {
   const st = g.stations.get(stationId);
   if (!l || !st || l.owner !== PLAYER) return;
   if (!servesKind(g, st, l.kind)) {
-    ui.toast(l.kind === 'rail' ? 'This station has no train platforms' : l.kind === 'tram' ? 'This station has no tram stop' : 'This station has no bus stop', 'bad');
+    ui.toast(l.kind === 'rail' ? 'No train platforms' : l.kind === 'tram' ? 'No tram stop' : 'No bus stop', 'bad');
     return;
   }
   // another company's station: needs an approved access agreement with its owner (asked for here)
@@ -230,7 +230,7 @@ export function openLine(ui: UI, id: number) {
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
     if (route?.through || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
-      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Runs over several operators’ networks or track types' }, 'Through service') : null,
+      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Multiple operators’ networks or track types' }, 'Through service') : null,
       nPat > 1 ? h('span', { class: 'flag shared' }, `${nPat} services`) : null,
       nOps ? h('span', { class: 'flag shared', 'data-tip': g.lines.operatorsOf(l).map((o) => g.company(o).name).join(' · ') }, `Shared · ${nOps + 1} operators`) : null));
     if (palette && mine) {
@@ -251,7 +251,7 @@ export function openLine(ui: UI, id: number) {
       add(win.body, congestionPanel(ui, l, rerender, () => { win.tab = 'vehicles'; rerender(); }), compatPanel(ui, l, rerender));
       // a line inside another line's route becomes one of its services when editing ends (UPDATE 9k)
       const sup = editing && l.stops.length >= 2 ? subsetOf(g, l) : null;
-      if (sup) add(win.body, h('div', { class: 'alert info' }, icon('info', 16), h('div', { class: 'alert-b' }, 'These stops lie on ', h('b', null, sup.name), ': when you finish, this line becomes one of its services (a short-turn or a service skipping stops).')));
+      if (sup) add(win.body, h('div', { class: 'alert info' }, icon('info', 16), h('div', { class: 'alert-b' }, 'These stops lie on ', h('b', null, sup.name), ': becomes a short-turn or skip-stop service when finished.')));
       const broken = ui.lineBroken.get(id) ?? [];
       const list = h('div', { class: 'list stops' });
       l.stops.forEach((sid, i) => {
@@ -263,21 +263,21 @@ export function openLine(ui: UI, id: number) {
         list.appendChild(h('div', { class: 'row' },
           b ? badgeEl(b, 'sm') : l.kind === 'rail' ? h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)) : lineSymbol(g, l, 'sm'),
           ui.stationLink(sid),
-          st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `Station of ${g.company(st.owner).name}: upkeep shared by usage at ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
+          st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `${g.company(st.owner).name} · upkeep by usage ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
           stopDots(l, i),
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
-            h('button', { class: 'ibtn sm', 'data-tip': 'Move up', 'aria-label': 'Move up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
-            h('button', { class: 'ibtn sm', 'data-tip': 'Move down', 'aria-label': 'Move down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
+            h('button', { class: 'ibtn sm', 'data-tip': 'Move stop up', 'aria-label': 'Move stop up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
+            h('button', { class: 'ibtn sm', 'data-tip': 'Move stop down', 'aria-label': 'Move stop down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
       });
-      if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops yet.'));
+      if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops.'));
       const loop = g.lines.isLoop(l);
-      add(win.body, section('Stops', l.stops.length >= 2 ? (loop ? 'vehicles circle round the stops' : 'vehicles run out and back') : ''), list);
+      add(win.body, section('Stops', l.stops.length >= 2 ? (loop ? 'one-way circuit' : 'out and back') : ''), list);
       if (mine && l.stops.length >= 2) {
         const setting = l.loop === undefined ? 'auto' : l.loop ? 'loop' : 'back';
-        add(win.body, field('Route', seg([['auto', 'Auto', 'Loop when the stops are three or more different stations'], ['loop', 'Loop', 'Vehicles keep circling one way round the stops'], ['back', 'Out and back', 'Vehicles turn at the first and last stop']], setting, (v) => {
+        add(win.body, field('Route', seg([['auto', 'Auto', 'Loop with 3+ distinct stations'], ['loop', 'Loop', 'One-way circuit'], ['back', 'Out and back', 'Turn at first and last stops']], setting, (v) => {
           g.lines.setLoop(l.id, v === 'auto' ? undefined : v === 'loop');
           ui.sound('toggle', { pitch: v === 'back' ? 0.9 : 1.1 });
           changed();
@@ -288,12 +288,12 @@ export function openLine(ui: UI, id: number) {
           g.lines.setEvenSpacing(l.id, enabled);
           ui.sound('toggle', { pitch: enabled ? 1.1 : 0.9 });
           rerender();
-        }, 'Space vehicles out at stops and depot departures')));
+        }, 'Holds at stops and depot departures')));
         add(win.body, h('div', { class: 'btns' },
           h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
-          h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops before joining lines' : 'Combine two lines at a shared terminus into a through line', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),
-          l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Signal the line’s track by the rules (preview first)', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
-        if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'A line needs at least two stops.'));
+          h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops first' : 'Shared terminus for through running', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),
+          l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Preview signals for this line', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
+        if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Needs at least two stops.'));
       }
       add(win.body, routePanel(ui, l));
     } else if (win.tab === 'services') {
@@ -312,7 +312,7 @@ export function openLine(ui: UI, id: number) {
           h('span', { class: 'muted' }, v.status),
           h('span', { class: 'num' }, loadText(v))));
       }
-      if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles on this line.'));
+      if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
       if (operates) add(win.body, h('div', { class: 'btns' },
         h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), `Add ${meta.vehicle}`),
@@ -326,17 +326,17 @@ export function openLine(ui: UI, id: number) {
       add(win.body,
         ui.kv('Income this year', fmtMoneyFull(l.incomeYear)),
         // (a part of the income above)
-        carriesMail ? ui.kv('Mail income this year', h('span', { 'data-tip': `Part of the income above: mail pays by distance and how fast it arrives${lm?.incomeLast ? ` · last year ${fmtMoneyFull(lm.incomeLast)}` : ''}` }, fmtMoneyFull(lm?.incomeYear ?? 0))) : null,
+        carriesMail ? ui.kv('Mail income this year', h('span', { 'data-tip': `Included in income · mail fare: distance and speed${lm?.incomeLast ? ` · last year ${fmtMoneyFull(lm.incomeLast)}` : ''}` }, fmtMoneyFull(lm?.incomeYear ?? 0))) : null,
         ui.kv('Running costs this year', fmtMoneyFull(l.costYear)),
         ui.kv('Profit last year', h('span', { class: l.incomeLast - l.costLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(l.incomeLast - l.costLast))),
         ui.kv('Load factor', cap ? fmtPct(load / cap) : '—'),
-        carriesMail ? ui.kv('Mail load factor', h('span', { 'data-tip': `${fmtMailLoad(mail, room)} on board now` }, room ? fmtPct(mail / room) : '—')) : null,
+        carriesMail ? ui.kv('Mail load factor', h('span', { 'data-tip': `${fmtMailLoad(mail, room)} on board` }, room ? fmtPct(mail / room) : '—')) : null,
         carriesMail ? ui.kv('Mail last month', `${fmtMail(lm?.last ?? 0)} loaded`) : null,
         faresPanel(ui, l));
       const losing = l.incomeLast - l.costLast < 0 && profit < 0 && l.vehicles.length > 0;
-      if (mine && losing) add(win.body, h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Losing money'), h('div', null, 'Last year and this year so far. Faster or more frequent service, express services or a longer route can help; else decommission it.'))));
+      if (mine && losing) add(win.body, h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Losing money'), h('div', null, 'Losses last year and this year; try faster, frequent or express service, a longer route, or decommission.'))));
       if (operates) add(win.body, h('div', { class: 'btns' },
-        h('button', { class: 'btn', 'data-tip': mine ? 'Sell your vehicles on it and delete the line (a partner takes a shared line over)' : 'Sell your vehicles on it and leave the line', onclick: () => decommission(ui, l, () => { if (g.lines.get(id)?.id === id) rerender(); else win.close(); }) }, icon('trash', 16), 'Decommission…'),
+        h('button', { class: 'btn', 'data-tip': mine ? 'Sell your vehicles; delete line or hand to partner' : 'Sell your vehicles and leave', onclick: () => decommission(ui, l, () => { if (g.lines.get(id)?.id === id) rerender(); else win.close(); }) }, icon('trash', 16), 'Decommission…'),
         mine ? h('button', { class: 'btn danger', onclick: () => { if (confirm(`Delete ${l.name}? Its vehicles will stop.`)) { g.lines.delete(l.id); win.close(); } } }, icon('trash', 16), 'Delete line') : null));
     }
   };
@@ -359,18 +359,18 @@ function openLineJoin(ui: UI, id: number) {
     win.sub.textContent = l.name;
     const choices = g.lines.all().filter((other) => other.id !== id).map((other) => ({ other, check: canJoinLines(g, l, other) }));
     const candidates = choices.filter((c) => c.check.ok);
-    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines at a shared terminus. Through vehicles can carry passengers across the junction without changing trains or buses.'));
+    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines at a shared terminus for through running.'));
     if (error) add(win.body, h('div', { class: 'alert warn', role: 'alert' }, error));
     if (!candidates.length) {
-      add(win.body, h('div', { class: 'alert info' }, choices.length ? 'No lines can be joined right now.' : 'There are no other lines to join.'));
+      add(win.body, h('div', { class: 'alert info' }, choices.length ? 'No joinable lines.' : 'No other lines.'));
       // Reasons at an actual shared terminus are most useful (disconnected platforms, access or rolling stock).
       const rejected = choices.filter((c) => !c.check.ok).sort((a, b) => Number(b.check.junction !== null) - Number(a.check.junction !== null));
       if (rejected.length) add(win.body, h('div', { class: 'list linejoin-reasons' }, rejected.slice(0, 8).map(({ other, check }) => h('div', { class: 'linejoin-reason' },
         h('b', null, other.name), h('span', { class: 'muted' }, check.reason)))));
-      add(win.body, h('div', { class: 'muted linejoin-note' }, 'Both lines need the same transport kind, a shared terminus and a connected route. Each operator must own a station on the joined line and have access to the route.'));
+      add(win.body, h('div', { class: 'muted linejoin-note' }, 'Same mode · shared terminus · connected route · each operator needs a station and route access'));
       return;
     }
-    add(win.body, section('Lines you can join', `${candidates.length}`), h('div', { class: 'list linejoin-choices' }, candidates.map(({ other, check }) => h('button', {
+    add(win.body, section('Joinable lines', `${candidates.length}`), h('div', { class: 'list linejoin-choices' }, candidates.map(({ other, check }) => h('button', {
       class: 'linejoin-choice' + (selected === other.id ? ' on' : ''), 'aria-pressed': selected === other.id ? 'true' : 'false',
       onclick: () => { selected = other.id; error = ''; win.last = undefined; render(); },
     }, lineSymbol(g, other, 'sm'), h('span', { class: 'linejoin-choice-text' }, h('b', null, other.name),
@@ -382,7 +382,7 @@ function openLineJoin(ui: UI, id: number) {
     add(win.body, section('Joined route', 'out and back'), h('ol', { class: 'linejoin-route', style: `--linejoin-color:${survivor.color}`, 'aria-label': 'Joined route' },
       preview.route.map((sid) => h('li', { class: sid === preview.junction ? 'junction' : '' },
         h('span', null, g.stations.get(sid)?.name ?? '?'), sid === preview.junction ? h('span', { class: 'flag thru' }, 'Junction') : null))),
-      h('p', { class: 'linejoin-note' }, h('b', null, survivor.name), ' keeps its name, code and colour. Existing vehicles keep their owners and their old sections as short-turn services. New vehicles default to the full through route.'),
+      h('p', { class: 'linejoin-note' }, h('b', null, survivor.name), ': name, code and colour retained; vehicle owners unchanged; old sections become short-turns; new vehicles run the full route.'),
       h('div', { class: 'btns' }, h('button', { class: 'btn primary', onclick: () => {
         // Revalidate: access or track may have changed while the preview was open.
         const result = joinLines(g, id, choice.other.id);
@@ -437,7 +437,7 @@ export function openVehicles(ui: UI) {
     const counts: Partial<Record<LineMode, number>> = {};
     for (const v of all) if (vehicleMatches(g, v, { hidden: [], company: f.company })) { const m = vehicleMode(g, v); counts[m] = (counts[m] ?? 0) + 1; }
     add(win.body, filterBar(g, f, counts, () => { win.last = undefined; render(); }));
-    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, mine.length ? 'No vehicles match the filter.' : 'No vehicles yet. Build a depot, open it, and buy a train, bus or tram.')); return; }
+    if (!vs.length) { add(win.body, h('div', { class: 'pad' }, mine.length ? 'No vehicles match the filter.' : 'Build a depot → buy a train, bus or tram.')); return; }
     const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Vehicle'), h('th', null, 'Line'), h('th', null, 'Status'), h('th', { class: 'r' }, 'Load'), h('th', { class: 'r' }, 'Profit (yr)')));
     for (const v of vs.slice(0, 300)) {
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => ui.openVehicle(v.id) },

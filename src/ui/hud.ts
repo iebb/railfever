@@ -26,7 +26,7 @@ interface Cat { id: string; label: string; icon: string; color: string; tip: str
 const CATS: Cat[] = [
   { id: 'inspect', label: 'Inspect', icon: 'inspect', color: '#eef2f7', tip: 'Inspect', keys: '1', tools: ['inspect'] },
   { id: 'rail', label: 'Rail', icon: 'rail', color: 'var(--rail)', tip: 'Rail: track, double track, signals, depot, electrify, connect', keys: '2 4 5 J', tools: ['rail', 'double', 'signal', 'depot-rail', 'electrify', 'connect'] },
-  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'Urban-style rail presets: subway and light-rail track and close-spaced stations, lift / sink track. Ordinary rail: any train and any rail line may use them', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
+  { id: 'urban', label: 'Urban', icon: 'metro', color: 'var(--rail)', tip: 'Metro and light rail · stations · lift / sink track · any train or rail line', keys: 'U', tools: ['metro', 'metro-station', 'relevel'] },
   { id: 'road', label: 'Road', icon: 'road', color: 'var(--road)', tip: 'Road: roads, bus depot', keys: '6 8', tools: ['road', 'depot-road'] },
   { id: 'tram', label: 'Tram', icon: 'tram', color: 'var(--tram)', tip: 'Tram: tracks, stops, depot', keys: '', tools: ['tram', 'tramstop', 'depot-tram'] },
   { id: 'stations', label: 'Stations', icon: 'station', color: 'var(--station)', tip: 'Stations: train, bus', keys: '3 7', tools: ['station', 'busstop'] },
@@ -64,37 +64,37 @@ const toolAvailable = (t: ToolId) => !!t;
 
 /** One-line descriptions for the compact tool card (the long help sits behind '?'). */
 const TOOL_SHORT: Partial<Record<ToolId, string>> = {
-  rail: 'Click to start, click to build — continues from the new end.',
-  road: 'Click to start, click to build — continues from the new end.',
-  station: 'Click to place — lines up with nearby track ends.',
+  rail: 'Click: start / build; continue from the new end.',
+  road: 'Click: start / build; continue from the new end.',
+  station: 'Auto-aligns with nearby track ends.',
   busstop: 'Click on a road to place a stop.',
-  'depot-rail': 'Click near a free track end to attach the depot.',
-  'depot-road': 'Click next to a road — the depot connects itself.',
-  tram: 'Lay tracks in roads: click one, or drag along streets.',
+  'depot-rail': 'Snaps to a free track end.',
+  'depot-road': 'Roadside: connects automatically.',
+  tram: 'Road tracks: click or drag along streets.',
   tramstop: 'Click on a road with tram tracks.',
-  'depot-tram': 'Click next to a road with tram tracks.',
-  signal: 'Click to add or cycle a signal · drag along a track to place block signals.',
-  double: 'Click or drag along one of your single tracks to double it.',
-  entrance: 'Click beside the tracks (ground station) or a road near the station.',
-  bulldoze: 'Click to remove, drag to clear an area.',
-  terraform: 'Hold the button to reshape the ground.',
-  'line-edit': 'Click stations to add them as stops.',
-  metro: 'Click to start, click to build — underground, elevated or on the ground.',
-  'metro-station': 'Click to place — underground by default, entrances on the street.',
-  electrify: 'Click a track, or drag along a line, to string overhead wire.',
-  connect: 'Click a point on one track, then on another, to join them.',
-  relevel: 'Click or drag along your track to lift or sink it in place.',
+  'depot-tram': 'Beside a road with tram tracks.',
+  signal: 'Click: add / cycle; drag: place a series.',
+  double: 'Click or drag along your single track.',
+  entrance: 'Ground: beside tracks; elevated / underground: near a road.',
+  bulldoze: 'Click: remove; drag: clear an area.',
+  terraform: 'Hold to raise, lower or level.',
+  'line-edit': 'Click stations to add stops.',
+  metro: 'Click: start / build; ground, elevated or underground.',
+  'metro-station': 'Underground by default; street entrances.',
+  electrify: 'Click track or drag along a line.',
+  connect: 'Pick a point on each track.',
+  relevel: 'Click or drag along your track.',
 };
 
 /** Longer tray tooltips where the name alone does not explain the tool. */
 const TRAY_TIP: Partial<Record<ToolId, string>> = {
-  signal: 'Signals split track into blocks so several trains can run on a line. Two-way: trains pass in both directions (single track with passing loops). One-way: block signals for double track — trains only enter from the signal side. Drag along a track to place a series.',
-  double: 'Upgrade to double track: lay a second track beside one of yours, with switches at both ends.',
-  electrify: 'Electrify: overhead wire turns standard track into electrified track for electric locomotives and EMUs.',
-  connect: 'Connect tracks: a curve with turnouts from one track into another (junctions, through running).',
-  metro: 'Urban-style track preset: metro or light-rail track, underground (subway), elevated or on the ground. Ordinary rail for every train and line.',
-  'metro-station': 'Urban-style station preset: metro or light-rail platforms, underground by default, close together. Same walking reach and fares as every rail station.',
-  relevel: 'Re-level: lift a stretch of your track onto a viaduct or sink it into a tunnel, in place.',
+  signal: 'Two-way: single track with loops; one-way: double track; drag: signal a stretch.',
+  double: 'Second track with switches at both ends.',
+  electrify: 'Overhead wire for electric locomotives and EMUs.',
+  connect: 'Connecting curve with turnouts for through running.',
+  metro: 'Metro or light rail · ground / elevated / underground · any train or rail line',
+  'metro-station': 'Metro or light rail · underground by default · standard rail reach and fares',
+  relevel: 'Lift onto a viaduct or sink into a tunnel.',
 };
 const TOOL_LABEL: Partial<Record<ToolId, string>> = { tram: 'Tracks', tramstop: 'Tram stop', 'depot-tram': 'Tram depot', rail: 'Track', double: 'Double', signal: 'Signals', 'depot-rail': 'Train depot', road: 'Road', 'depot-road': 'Bus depot', station: 'Train station', busstop: 'Bus stop', entrance: 'Entrance', metro: 'Urban track', 'metro-station': 'Station', relevel: 'Re-level', electrify: 'Electrify', connect: 'Connect' };
 
@@ -251,7 +251,7 @@ export class Hud {
       this.showSave('memory');
       if (this.storageBanner || this.storageDismissed) return;
       this.storageBanner = h('div', { class: 'storage-banner', role: 'status', 'aria-live': 'polite' },
-        icon('warning', 18), h('span', null, "Saves won't survive a reload in this browser mode — use Export to keep your game"),
+        icon('warning', 18), h('span', null, "Session-only saves: lost on reload; Export to keep."),
         h('button', { class: 'btn sm', onclick: () => exportSave(this.ui) }, 'Export'),
         h('button', { class: 'ibtn sm', 'aria-label': 'Dismiss storage notice', onclick: () => {
           this.storageDismissed = true; this.storageBanner?.remove(); this.storageBanner = null;
@@ -266,7 +266,7 @@ export class Hud {
     const el = this.saveEl;
     clearTimeout(this.saveHide);
     el.className = 'savechip show ' + state;
-    el.replaceChildren(icon(state === 'error' || state === 'memory' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : state === 'memory' ? 'Session only — use Export' : 'Autosave failed');
+    el.replaceChildren(icon(state === 'error' || state === 'memory' ? 'warning' : state === 'saved' ? 'check' : 'save', 13), state === 'saving' ? 'Saving…' : state === 'saved' ? 'Saved' : state === 'memory' ? 'Session only · Export' : 'Autosave failed');
     if (state !== 'saving' && state !== 'memory') this.saveHide = window.setTimeout(() => {
       if (storageMode() === 'memory') this.showSave('memory'); else el.classList.remove('show');
     }, state === 'error' ? 5000 : 1600);
@@ -324,7 +324,7 @@ export class Hud {
       this.sAccess = nReq;
       this.accessBadge.textContent = String(nReq);
       this.accessBadge.style.display = nReq ? '' : 'none';
-      this.accessBtn.dataset.tip = nReq ? `Track access — ${nReq} request${nReq > 1 ? 's' : ''} waiting` : 'Track access';
+      this.accessBtn.dataset.tip = nReq ? `Track access · ${nReq} request${nReq > 1 ? 's' : ''} waiting` : 'Track access';
     }
     const money = g.economy.money;
     const sm = fmtMoneyFull(money);
@@ -544,12 +544,12 @@ export class Hud {
     const step = (v: number, d: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, Math.round((v + d) * 100) / 100));
     return h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Level'),
       seg<LineLevel>([
-        ['ground', names[0], 'On the ground: earthworks, bridges and tunnels only where needed'],
-        ['elevated', names[1], 'A continuous viaduct (lifted rails over the streets): about 5–8× the cost of ground track'],
-        ['underground', names[2], 'A continuous tunnel (subway): cut-and-cover about 6–9×, deep bored tunnels 9.5–13× the cost of ground track'],
+        ['ground', names[0], 'Earthworks; bridges and tunnels where needed'],
+        ['elevated', names[1], 'Continuous viaduct · about 5–8× ground-track cost'],
+        ['underground', names[2], 'Continuous tunnel · cut-and-cover 6–9×; deep bored 9.5–13× ground-track cost'],
       ], lv, setLv),
-      lv === 'elevated' ? stepper(`${Math.round(height * 10)} m`, () => setH(step(height, -0.1, H.min, H.max)), () => setH(step(height, 0.1, H.min, H.max)), 'Deck height above the ground beneath')
-        : lv === 'underground' ? stepper(`${Math.round(depth * 10)} m`, () => setD(step(depth, -0.25, D.min, D.max)), () => setD(step(depth, 0.25, D.min, D.max)), 'Depth below the ground above: shallow cut-and-cover is cheaper than deep bored tunnel') : null);
+      lv === 'elevated' ? stepper(`${Math.round(height * 10)} m`, () => setH(step(height, -0.1, H.min, H.max)), () => setH(step(height, 0.1, H.min, H.max)), 'Deck height above ground')
+        : lv === 'underground' ? stepper(`${Math.round(depth * 10)} m`, () => setD(step(depth, -0.25, D.min, D.max)), () => setD(step(depth, 0.25, D.min, D.max)), 'Depth below ground; shallow tunnels cost less') : null);
   }
 
   /** Station building style: Auto, then the styles for the level, platform tracks and year, with their catchment bonus. */
@@ -566,7 +566,7 @@ export class Hud {
     const chip = (id: string, label: string, tip: string, bonus = 0) => h('button', { class: 'styb' + (cur === id ? ' on' : ''), 'data-tip': tip, role: 'radio', 'aria-checked': cur === id ? 'true' : 'false', onclick: () => pick(id) }, label, bonus ? h('small', null, `+${Math.round(bonus * 100)}%`) : null);
     return h('div', { class: 'opt wide' }, h('span', { class: 'opt-l' }, 'Building'),
       h('div', { class: 'stychips', role: 'radiogroup', 'aria-label': 'Building style' },
-        chip('auto', 'Auto', 'A fitting building for the era, level and town (or none)'),
+        chip('auto', 'Auto', 'By era, level and town; may choose no building'),
         list.map((st) => { const b = catchBonusOf(st.id); return chip(st.id, STYLE_SHORT[st.id] ?? st.name, `${st.name}: ${st.desc}${b ? ` · catchment +${Math.round(b * 100)}%` : st.id === 'none' ? ' · no catchment bonus' : ''}`, b); })));
   }
 
@@ -595,22 +595,22 @@ export class Hud {
         opts.push(this.levelOpts(T.railLevel, T.levelHeight, T.levelDepth, (lv) => { T.railLevel = lv; redo(); }, (hh) => { T.levelHeight = hh; redo(); }, (d) => { T.levelDepth = d; redo(); }));
         opts.push(typeSpec(T.railType, T.railLevel, T.levelHeight, T.levelDepth));
         const many = this.moreTracks || T.tracks > 2;
-        opts.push(opt('Tracks', seg<number>(many ? [[1, 'Single'], [2, 'Double'], [3, '3'], [4, '4']] : [[1, 'Single', 'One track — upgrade to double later'], [2, 'Double', 'Two parallel tracks: trains pass each other']], T.tracks, (v) => { T.tracks = v; redo(); }),
+        opts.push(opt('Tracks', seg<number>(many ? [[1, 'Single'], [2, 'Double'], [3, '3'], [4, '4']] : [[1, 'Single', 'Upgrade to double later'], [2, 'Double', 'Parallel tracks for passing']], T.tracks, (v) => { T.tracks = v; redo(); }),
           many ? null : h('button', { class: 'ibtn sm', 'data-tip': 'More tracks (3–4)', 'aria-label': 'More tracks', onclick: () => { this.moreTracks = true; this.renderCard(); } }, icon('plus', 14))));
         if (T.tracks === 2) {
-          opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track, signals and crossovers before stations'));
+          opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track · signals · crossovers before stations'));
           if (T.directional) opts.push(opt('Run on', seg<string>([['right', 'Right'], ['left', 'Left']], T.rightHand ? 'right' : 'left', (v) => { T.rightHand = v === 'right'; redo(); })));
         }
       } else {
         opts.push(opt('Road', seg([['street', 'Town street', `${ROAD_TYPES.street.speed} km/h · sidewalks`], ['road', 'Country road', `${ROAD_TYPES.road.speed} km/h`]], T.roadType, (v) => { T.roadType = v; redo(); })));
       }
-      opts.push(opt('End', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: raised ends make bridges, lowered ends cuttings and tunnels ( [ / ] or PgUp / PgDn )')));
+      opts.push(opt('End', stepper(fmtHeight(T.heightOffset), () => T.adjustHeight(-0.5), () => T.adjustHeight(0.5), 'End height: bridges / cuttings / tunnels · [ / ] or PgUp / PgDn')));
       // elevated / underground lines cross everything over / under by themselves
       if (!T.railBuild || T.railLevel === 'ground') opts.push(opt('Cross', seg([
-        ['auto', 'Auto', 'Choose a permitted crossing for the terrain and track type'],
+        ['auto', 'Auto', 'By terrain and track type'],
         ['over', 'Overpass', 'Build above the line being crossed'],
         ['under', 'Underpass', 'Build below the line being crossed'],
-        ['level', 'Level', 'Road level crossings: conventional main-line track up to 160 km/h only; high-speed, metro and light-rail track need an overpass or underpass'],
+        ['level', 'Level', 'Main-line ≤160 km/h; high-speed / metro / light rail need over / underpasses'],
       ], T.crossing, (v) => { T.crossing = v; redo(); })));
       if (T.start) opts.push(h('button', { class: 'btn sm', onclick: () => T.cancel() }, icon('close', 14), 'End chain'));
     } else if (t === 'electrify') {
@@ -623,14 +623,14 @@ export class Hud {
       opts.push(this.levelOpts(T.relevelTo, T.levelHeight, T.levelDepth, (lv) => { T.relevelTo = lv; redo(); }, (hh) => { T.levelHeight = hh; redo(); }, (d) => { T.levelDepth = d; redo(); }, ['Ground', 'Lift', 'Sink']));
     } else if (t === 'signal') {
       opts.push(opt('Mode', seg([['place', 'Place'], ['remove', 'Remove']], T.signalMode, (v) => { T.signalMode = v; redo(); })));
-      opts.push(opt('Type', seg([['oneway', 'One-way', 'Trains pass in one direction (double track)'], ['twoway', 'Two-way', 'Trains pass both ways: single track with passing loops']], T.signalKind, (v) => { T.signalKind = v; redo(); })));
-      opts.push(opt('Kind', seg([['block', 'Block', 'Spaces trains on open line'], ['path', 'Path', 'Guards junctions and station entries: a train passes only when its whole way to the next signal is free']], T.signalClass, (v) => { T.signalClass = v; redo(); })));
-      if (T.signalKind === 'oneway') opts.push(toggle('Passable from behind', T.signalPass, (v) => { T.signalPass = v; redo(); }, 'Trains may run the other way past it'));
+      opts.push(opt('Type', seg([['oneway', 'One-way', 'One direction; double track'], ['twoway', 'Two-way', 'Both directions; single track with passing loops']], T.signalKind, (v) => { T.signalKind = v; redo(); })));
+      opts.push(opt('Kind', seg([['block', 'Block', 'Spaces trains on open line'], ['path', 'Path', 'Junctions and station entries: path to the next signal must be free']], T.signalClass, (v) => { T.signalClass = v; redo(); })));
+      if (T.signalKind === 'oneway') opts.push(toggle('Passable from behind', T.signalPass, (v) => { T.signalPass = v; redo(); }, 'Allows reverse-direction trains'));
       opts.push(opt('Spacing', seg<number>([[25, '250 m'], [50, '500 m'], [100, '1 km']], T.signalSpacing, (v) => { T.signalSpacing = v; redo(); })));
-      opts.push(h('button', { class: 'btn sm', 'data-tip': 'Signal all your railway by the rules (preview first)', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'));
+      opts.push(h('button', { class: 'btn sm', 'data-tip': 'Preview signals for your railway', onclick: () => this.ui.openAutoSignal() }, icon('signal', 14), 'Auto-signal railway…'));
     } else if (t === 'double') {
-      opts.push(opt('Side', seg([['auto', 'Auto', 'Right, or left when the right is blocked'], ['right', 'Right'], ['left', 'Left']], T.doubleSide, (v) => { T.doubleSide = v; redo(); })));
-      opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track, signals, crossovers before stations'));
+      opts.push(opt('Side', seg([['auto', 'Auto', 'Right first, then left if blocked'], ['right', 'Right'], ['left', 'Left']], T.doubleSide, (v) => { T.doubleSide = v; redo(); })));
+      opts.push(toggle('Directional', T.directional, (v) => { T.directional = v; redo(); }, 'One way per track · signals · crossovers before stations'));
       if (T.directional) opts.push(opt('Run on', seg<string>([['right', 'Right'], ['left', 'Left']], T.rightHand ? 'right' : 'left', (v) => { T.rightHand = v === 'right'; redo(); })));
     } else if (t === 'entrance') {
       const st = T.entranceStation != null ? this.ui.game.stations.get(T.entranceStation) : undefined;
@@ -649,17 +649,17 @@ export class Hud {
       const onLine = T.stationOnLine && T.relocating == null;
       if (!onLine) {
         const types: [string, string, string?][] = t === 'metro-station'
-          ? [['metro', 'Metro', `Metro-track platforms (${TRACK_TYPES.metro.speed} km/h urban track): platform screen doors, side platforms, underground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`], ['lightrail', 'Light rail', `Light-rail-track platforms (${TRACK_TYPES.lightrail.speed} km/h, tight curves): side platforms, a halt on the ground by default; ${fmtLen(walkLimit('rail'))} walking reach along streets like every rail station`]]
-          : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Electrified platform tracks (EMUs, electric locomotives)'], ['highspeed', 'High-speed']];
+          ? [['metro', 'Metro', `${TRACK_TYPES.metro.speed} km/h · screen doors · side platforms · underground default · ${fmtLen(walkLimit('rail'))} street reach`], ['lightrail', 'Light rail', `${TRACK_TYPES.lightrail.speed} km/h · tight curves · side platforms · ground default · ${fmtLen(walkLimit('rail'))} street reach`]]
+          : [['auto', 'Auto', 'As the track it lines up with'], ['standard', 'Standard'], ['electric', 'Electric', 'Wire for EMUs and electric locomotives'], ['highspeed', 'High-speed']];
         if (!types.some(([v]) => v === T.stationType)) T.stationType = types[0][0];
         opts.push(opt('Track', seg(types, T.stationType, (v) => { this.setStationType(v); redo(); })));
       }
-      opts.push(opt('Level', seg<StationLevel>([['ground', onLine ? 'As the line' : 'Ground', onLine ? 'On the ground, on a bridge or in a tunnel like the line there' : undefined], ['elevated', 'Elevated', 'On a viaduct: little land used, costs extra'], ['underground', 'Underground', 'Below ground: only entrances on the surface, costs extra']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
-      if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(STATION_HEIGHT.min, +(T.stationHeight - 0.3).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(STATION_HEIGHT.max, +(T.stationHeight + 0.3).toFixed(1)); redo(); }, 'Deck height above the highest ground beneath')));
+      opts.push(opt('Level', seg<StationLevel>([['ground', onLine ? 'As the line' : 'Ground', onLine ? 'Matches the line’s level' : undefined], ['elevated', 'Elevated', 'Viaduct · little land use · extra cost'], ['underground', 'Underground', 'Surface entrances only · extra cost']], T.stationLevel, (v) => { T.stationLevel = v; redo(); })));
+      if (T.stationLevel === 'elevated') opts.push(opt('Height', stepper(`${Math.round(T.stationHeight * 10)} m`, () => { T.stationHeight = Math.max(STATION_HEIGHT.min, +(T.stationHeight - 0.3).toFixed(1)); redo(); }, () => { T.stationHeight = Math.min(STATION_HEIGHT.max, +(T.stationHeight + 0.3).toFixed(1)); redo(); }, 'Deck height above highest ground')));
       if (T.stationLevel === 'underground') opts.push(opt('Depth', stepper(`${Math.round(T.stationDepth * 10)} m`, () => { T.stationDepth = Math.max(STATION_DEPTH.min, +(T.stationDepth - 0.3).toFixed(1)); redo(); }, () => { T.stationDepth = Math.min(STATION_DEPTH.max, +(T.stationDepth + 0.3).toFixed(1)); redo(); }, 'Platform depth below the ground')));
       if (!onLine) opts.push(this.styleOpts());
-      if (T.relocating == null) opts.push(opt('Place', seg([['free', 'Anywhere', 'A new station, lined up with nearby track ends'], ['line', 'On a line', 'Cut the station into one of your tracks: trains keep running through it']], T.stationOnLine ? 'line' : 'free', (v) => { T.stationOnLine = v === 'line'; redo(); })));
-      opts.push(opt('Through', stepper(String(T.stationThrough), () => { T.stationThrough = Math.max(0, T.stationThrough - 1); redo(); }, () => { T.stationThrough = Math.min(2, T.stationThrough + 1); redo(); }, 'Tracks without platforms for trains that do not stop'),
+      if (T.relocating == null) opts.push(opt('Place', seg([['free', 'Anywhere', 'Auto-aligns with nearby track ends'], ['line', 'On a line', 'Insert into your track; trains keep running']], T.stationOnLine ? 'line' : 'free', (v) => { T.stationOnLine = v === 'line'; redo(); })));
+      opts.push(opt('Through', stepper(String(T.stationThrough), () => { T.stationThrough = Math.max(0, T.stationThrough - 1); redo(); }, () => { T.stationThrough = Math.min(2, T.stationThrough + 1); redo(); }, 'Platform-free tracks for non-stopping trains'),
         T.stationThrough ? seg([['middle', 'Middle', 'Between side platforms'], ['outer', 'Outer', 'Outside the island platforms']], T.throughMode, (v) => { T.throughMode = v; redo(); }) : null));
       opts.push(opt('Length', stepper(`${T.stationLen * 10} m`, () => { T.stationLen = Math.max(4, T.stationLen - 2); redo(); }, () => { T.stationLen = Math.min(40, T.stationLen + 2); redo(); })));
       opts.push(opt('Tracks', stepper(String(T.stationTracks), () => { T.stationTracks = Math.max(1, T.stationTracks - 1); redo(); }, () => { T.stationTracks = Math.min(8, T.stationTracks + 1); redo(); }, 'Platform tracks (up to 8)')));

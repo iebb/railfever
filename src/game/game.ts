@@ -223,7 +223,7 @@ export class Game {
     const n = Math.max(0, Math.min(MAX_AI_COMPANIES, Math.max(opts.aiCompanies ?? 0, opts.aiConfigs?.length ?? 0)));
     for (let i = 0; i < n; i++) g.addAICompany(opts.aiConfigs?.[i] ?? {});
     g.vehicles.manageAmbient();
-    g.postNews(`Welcome to Railfever! Connect the towns of this region with rail and bus lines. Press F1 for a quick guide.`, 'info');
+    g.postNews(`Welcome to Railfever; F1 opens Help.`, 'info');
     return g;
   }
 
@@ -302,8 +302,8 @@ export class Game {
     this.access.push({ user, owner, since: this.day, usageShareLastMonth: 0, paidLastMonth: 0, paidTotal: 0 });
     this.accessKeys.add(user * 4096 + owner);
     this.metered.add(owner);
-    if (owner === PLAYER) this.postNews(`${u.name} runs on your network (open access: it pays its share of the upkeep).`, 'info');
-    else if (user === PLAYER) this.postNews(`You run on ${o.name}'s network (open access: you pay your share of the upkeep).`, 'info');
+    if (owner === PLAYER) this.postNews(`${u.name} uses your open network and shares upkeep.`, 'info');
+    else if (user === PLAYER) this.postNews(`You use ${o.name}’s open network and share upkeep.`, 'info');
   }
 
   /** How `owner` answers access requests. */
@@ -422,13 +422,13 @@ export class Game {
       this.rebuildAccessKeys();
       this.metered.add(owner);
       this.onNetworkChanged();
-      if (user === PLAYER || owner === PLAYER) this.postNews(`${this.company(user).name} signs a track access agreement with ${this.company(owner).name}.`, 'info');
+      if (user === PLAYER || owner === PLAYER) this.postNews(`${this.company(user).name} agrees track access with ${this.company(owner).name}.`, 'info');
     }
     return 'granted';
   }
 
   private refused(user: number, owner: number): 'rejected' {
-    if (user === PLAYER) this.postNews(`${this.company(owner).name} refuses you access to its tracks.`, 'bad');
+    if (user === PLAYER) this.postNews(`${this.company(owner).name} refuses track access.`, 'bad');
     return 'rejected';
   }
 
@@ -437,7 +437,7 @@ export class Game {
     const old = this.accessRequests.filter((q) => this.day - q.day >= ACCESS_REQUEST_DAYS);
     if (!old.length) return;
     this.accessRequests = this.accessRequests.filter((q) => this.day - q.day < ACCESS_REQUEST_DAYS);
-    for (const q of old) if (q.user === PLAYER) this.postNews(`Your request for access to ${this.company(q.owner).name}'s tracks expired.`, 'info');
+    for (const q of old) if (q.user === PLAYER) this.postNews(`Track access request to ${this.company(q.owner).name} expired.`, 'info');
   }
 
   /**
@@ -452,7 +452,7 @@ export class Game {
     const stops = this.lines.dropForeignStops(user, owner);
     this.onNetworkChanged();
     if (user === PLAYER || owner === PLAYER) {
-      this.postNews(`The track access agreement between ${this.company(user).name} and ${this.company(owner).name} ends${stops ? ` (${stops} stop${stops > 1 ? 's' : ''} removed from lines)` : ''}.`, 'info');
+      this.postNews(`Track access between ${this.company(user).name} and ${this.company(owner).name} ends${stops ? `; ${stops} stop${stops > 1 ? 's' : ''} removed from lines` : ''}.`, 'info');
     }
     return null;
   }
@@ -762,8 +762,8 @@ export class Game {
     this.lines.rebuild();
     this.onNetworkChanged();
     this.postNews(price !== undefined
-      ? `${b.name} buys ${t.name} for $${(price / 1e6).toFixed(2)}M and takes over its network.`
-      : `${b.name} merges ${t.name} and takes over its network.`, buyer === PLAYER ? 'good' : 'ai');
+      ? `${b.name} buys ${t.name} for $${(price / 1e6).toFixed(2)}M, taking its network.`
+      : `${b.name} merges ${t.name}, taking its network.`, buyer === PLAYER ? 'good' : 'ai');
     return null;
   }
 
@@ -785,7 +785,7 @@ export class Game {
     for (const l of this.listeners.income) l(amount, v, st);
     if (v.owner === PLAYER && !this.firstArrival.has(st.id) && v.kind === 'train') {
       this.firstArrival.add(st.id);
-      this.postNews(`Citizens celebrate! The first train arrives at ${st.name}.`, 'good', st.x, st.z);
+      this.postNews(`The first train arrives at ${st.name}.`, 'good', st.x, st.z);
     }
   }
 
@@ -859,7 +859,7 @@ export class Game {
         this.lostSince.set(v.id, -1);
         const p = { x: 0, y: 0, z: 0 };
         v.worldPos(p);
-        this.postNews(`${v.name} is lost: ${v.status.toLowerCase()}. Check the line's track or roads.`, 'bad', p.x, p.z);
+        this.postNews(`${v.name} has no route: ${v.status.toLowerCase()}; check track or roads.`, 'bad', p.x, p.z);
       }
     }
   }
@@ -932,12 +932,12 @@ export class Game {
       const c = lineCongestion(this, l.id);
       if (c.level < 2 || this.day - (this.congestionTold.get(l.id) ?? -1e9) < 180) continue;
       this.congestionTold.set(l.id, this.day);
-      const fix = { signals: 'signals on the line', platforms: 'more platforms at the stations where trains wait', loops: 'passing loops on the single track', double: 'a second track', 'fewer-trains': 'fewer trains', none: '' }[c.suggestion];
+      const fix = { signals: 'signals on the line', platforms: 'more platforms where trains wait', loops: 'passing loops on the single track', double: 'a second track', 'fewer-trains': 'fewer trains', none: '' }[c.suggestion];
       const st = this.stations.get(l.stops[0]);
       const p = { x: st?.x ?? this.world.size / 2, y: 0, z: st?.z ?? this.world.size / 2 };
       const waiting = l.vehicles.map((id) => this.vehicles.get(id)).find((v) => v?.state === 'waiting');
       waiting?.worldPos(p);
-      this.postNews(`${l.name} is congested: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? ' (stuck)' : ''}.${fix ? ' Suggested: ' + fix + '.' : ''}`, 'bad', p.x, p.z);
+      this.postNews(`${l.name}: ${c.waits} train${c.waits === 1 ? '' : 's'} waiting for a free path${c.deadlock ? '; deadlock' : ''}${fix ? '; try ' + fix : ''}.`, 'bad', p.x, p.z);
     }
   }
 
@@ -967,7 +967,7 @@ export class Game {
     if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();
     this.deferCatchment = true;
-    if (this.economy.money < 0 && m % 3 === 2) this.postNews('Warning: your company is in debt. Take out a loan or cut costs!', 'info');
+    if (this.economy.money < 0 && m % 3 === 2) this.postNews('Company in debt: borrow or cut costs.', 'info');
   }
 
   private onNewYear() {
@@ -988,7 +988,7 @@ export class Game {
       e.endYear(this.year - 1);
     }
     for (const m of MODELS) {
-      if (m.intro === this.year) this.postNews(`New vehicle available: ${m.name} (${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''}${m.mail ? ', ' + +(m.mail * MAIL_UNIT_T).toFixed(1) + ' t of mail' : ''})`, 'vehicle');
+      if (m.intro === this.year) this.postNews(`${m.name} now available: ${m.speed} km/h${m.capacity ? ', ' + m.capacity + ' passengers' : ''}${m.mail ? ', ' + +(m.mail * MAIL_UNIT_T).toFixed(1) + ' t mail' : ''}.`, 'vehicle');
     }
   }
 

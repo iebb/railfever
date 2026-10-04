@@ -65,7 +65,7 @@ export function openFinances(ui: UI) {
       tbl.appendChild(h('tr', { class: 'total' }, h('td', null, 'Profit'), cols.map((c) => { const s = recordSum(c.v); return h('td', { class: s < 0 ? 'neg' : 'pos' }, fmtMoney(s)); })));
       for (const cat of NON_PROFIT_CATEGORIES) if (cols.some((c) => valueOf(c.v, cat))) tbl.appendChild(row(cat, 'after'));
       add(win.body, section('Income & expenses'), h('div', { class: 'finance-table' }, tbl),
-        h('div', { class: 'muted finance-note' }, 'Overheads are fixed vehicle costs. Older records keep their combined running costs in the same row; new bills separate energy, crew and vehicle maintenance.'));
+        h('div', { class: 'muted finance-note' }, 'Overheads: fixed vehicle costs · legacy bills combine running costs; new bills split energy, crew and maintenance'));
     } else {
       const ms = e.months.slice(-24);
       add(win.body, section('Monthly profit & income', `${ms.length} months`));
@@ -85,7 +85,7 @@ export function openFinances(ui: UI) {
         section('Monthly operating cost breakdown'),
         chart(OPERATING_COSTS.map((k) => ({ values: ms.map((m) => -valueOf(m.v, k)), color: COST_COLORS[k] ?? '#a4afbf', label: financeLabel(k) })), { w: 548, h: 170, labels: monthLabels(e, 24) }),
         h('div', { class: 'legend' }, OPERATING_COSTS.map((k) => h('span', { style: `--c:${COST_COLORS[k] ?? '#a4afbf'}` }, h('i'), financeLabel(k)))),
-        h('div', { class: 'muted finance-note' }, 'Operating costs include energy, crew, vehicle maintenance, overheads, infrastructure upkeep, track wear and access fees. Purchases and construction stay in the finance table.'));
+        h('div', { class: 'muted finance-note' }, 'Energy · crew · maintenance · overheads · infrastructure · wear · access fees; purchases and construction in finance table'));
       }
       const years = e.yearTotals.slice(-8);
       if (years.length) {
@@ -159,9 +159,9 @@ export function openCompetitors(ui: UI) {
       h('div', { class: 'btns' },
         toggle('AI construction', g.aiEnabled, (v) => { g.aiEnabled = v; ui.sound('toggle', { pitch: v ? 1.1 : 0.9 }); win.last = undefined; render(); }, 'AI vehicles keep running when off'),
         h('span', { class: 'spacer' }),
-        h('button', { class: 'btn', 'data-tip': 'Requests, policy, blocking and agreements', onclick: () => ui.openTrackAccess() }, icon('key', 16), 'Track access', nReq ? h('span', { class: 'cnt' }, String(nReq)) : null),
+        h('button', { class: 'btn', 'data-tip': 'Requests · policy · blocks · agreements', onclick: () => ui.openTrackAccess() }, icon('key', 16), 'Track access', nReq ? h('span', { class: 'cnt' }, String(nReq)) : null),
         h('button', { class: 'btn', disabled: nAI >= MAX_AI, 'data-tip': nAI >= MAX_AI ? `At most ${MAX_AI} AI companies` : 'Add a rival with its own style', onclick: () => openAIConfig(ui, null) }, icon('plus', 16), 'Add AI company')),
-      h('div', { class: 'muted', style: 'margin-top:6px' }, 'Value: cash − loan + depreciated network and vehicles. Share prices also include two years of positive profit. Profit excludes share transfers and dividends. AI share trading is off.'),
+      h('div', { class: 'muted', style: 'margin-top:6px' }, 'Value: cash − loan + depreciated assets · shares: +2 years’ positive profit · profit excludes share trades / dividends · AI share trading off'),
       gone.length ? h('div', { class: 'muted', style: 'margin-top:4px' }, gone.map((c) => `${c.name} was bought by ${c.boughtBy != null ? g.company(c.boughtBy).name : 'a rival'}.`).join(' ')) : null);
   };
 
@@ -170,7 +170,7 @@ export function openCompetitors(ui: UI) {
     const n = Math.max(0, ...comps.map((c) => c.economy.months.length));
     const len = Math.min(24, n);
     add(win.body, section('Monthly profit by company', `${len} months`));
-    if (!len) { add(win.body, h('div', { class: 'pad' }, 'History appears after the first month.')); return; }
+    if (!len) { add(win.body, h('div', { class: 'pad' }, 'History starts after the first month.')); return; }
     const series = comps.map((co) => {
       const ms = co.economy.months.slice(-len);
       return { values: Array<number>(len - ms.length).fill(0).concat(ms.map(monthSum)), color: co.color, label: co.name };
@@ -258,7 +258,7 @@ export function openAIConfig(ui: UI, id: number | null) {
       slider('Rail', st.cfg.focus.rail, 0, 3, 0.1, focusWord, (v) => (st.cfg.focus.rail = v)),
       slider('Bus', st.cfg.focus.road, 0, 3, 0.1, focusWord, (v) => (st.cfg.focus.road = v)),
       slider('Tram', st.cfg.focus.tram, 0, 3, 0.1, focusWord, (v) => (st.cfg.focus.tram = v)),
-      section('Track access', 'when others want to use its network'),
+      section('Track access', 'network access requests'),
       field('Access', seg<AccessPolicy>([['open', 'Open'], ['ask', 'Judge each'], ['auto-approve', 'Approve all'], ['auto-reject', 'Refuse all']], st.cfg.accessPolicy, (v) => { st.cfg.accessPolicy = v; render(); }),
         st.cfg.accessPolicy === 'open' ? 'Anyone may use its network' : st.cfg.accessPolicy === 'ask' ? 'Refuses competitors when cautious' : undefined),
       multSlider('Users pay', st.mult, false, (v) => { st.mult = v; }, (v) => `${fmtMult(v)} · 50/50 usage → ${fmtPct(equalUseShare(v))}`),
@@ -341,11 +341,11 @@ export function openInvest(ui: UI, id: number) {
       held === SHARE_COUNT ? h('div', { class: 'share-control' },
         section(kept ? 'Your subsidiary' : 'You own 100%'),
         h('div', { class: 'share-note' }, kept
-          ? 'It keeps its name, colour and AI operations, and pays you yearly dividends. You can merge it later.'
-          : 'Merge its network, vehicles, cash and loan into your company, or keep its name, colour and AI operations as a subsidiary.'),
+          ? 'Name, colour and AI retained · yearly dividends · merge later'
+          : 'Take network, vehicles, cash and loan; or retain name, colour and AI as a subsidiary.'),
         h('div', { class: 'btns' },
           h('button', { class: 'btn primary', disabled: !!g.shares.canMerge(PLAYER, id), 'data-sfx': 'none', onclick: () => {
-            if (!confirm(`Merge ${co.name} into ${g.player.name}? Its network, vehicles, cash and loan become yours.`)) return;
+            if (!confirm(`Merge ${co.name} into ${g.player.name}? Take network, vehicles, cash and loan.`)) return;
             const err = g.mergeCompany(PLAYER, id);
             if (err) { ui.toast(err, 'bad'); ui.sound('error'); refresh(); return; }
             ui.sound('purchase');
@@ -357,7 +357,7 @@ export function openInvest(ui: UI, id: number) {
             const err = g.shares.keepAsSubsidiary(PLAYER, id);
             if (err) { ui.toast(err, 'bad'); ui.sound('error'); refresh(); return; }
             ui.sound('toggle');
-            ui.toast(`${co.name} will keep operating as your subsidiary`, 'good');
+            ui.toast(`${co.name} kept as your subsidiary`, 'good');
             refresh();
           } }, 'Keep as subsidiary'))) : null,
       h('div', { class: 'tiles' },
@@ -374,11 +374,11 @@ export function openInvest(ui: UI, id: number) {
           h('button', { class: 'btn', disabled: !!sellWhy, 'data-sfx': 'none', 'data-tip': sellWhy ?? `Sell one share of ${co.name}`, onclick: () => trade(false) }, icon('minus', 16), `Sell 10% · ${fmtMoneyFull(quote.sellPrice)}`),
           h('div', { class: 'share-note' }, `Fee −${Math.round(quote.fee * 100)}% (${fmtMoneyFull(quote.feeAmount)})`),
           sellWhy ? h('div', { class: 'share-note muted' }, sellWhy) : null)),
-      h('div', { class: 'share-note muted' }, 'Share value uses net assets plus two years of positive profit, with a minimum valuation. The premium rises by 5 percentage points per share you hold. Purchases fund the company at base value; sales use its cash. Premiums and fees are transaction charges.'),
+      h('div', { class: 'share-note muted' }, 'Share value: net assets +2 years’ positive profit, subject to minimum · premium: +5 points per share held · purchases fund company at base value; sales use its cash · premiums / fees: transaction charges'),
       section('Dividends', dividendYear !== null ? String(dividendYear) : 'No full year yet'),
       ui.kv('You received last year', h('span', { class: 'pos' }, fmtMoneyFull(g.shares.dividendLastYear(PLAYER, id)))),
       ui.kv('Total paid to shareholders', fmtMoneyFull(g.shares.dividendsPaidLastYear(id))),
-      h('div', { class: 'share-note muted' }, `${Math.round(DIVIDEND_RATE * 100)}% of positive annual profit is paid pro rata, limited by available cash. The free float's portion stays in the company.`),
+      h('div', { class: 'share-note muted' }, `${Math.round(DIVIDEND_RATE * 100)}% of positive annual profit, pro rata, capped by cash · free float’s share retained`),
       section('Company assets'),
       h('table', { class: 'tbl fin' },
         h('tr', null, h('th', null, 'Asset'), h('th', null, ''), h('th', null, 'Value')),

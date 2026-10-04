@@ -577,10 +577,10 @@ export class Lines {
     const g = this.game;
     const l = this.map.get(lineId), st = g.stations.get(stationId);
     if (!l || !st) return 'No such line or station';
-    if (!g.canUse(l.owner, st.owner)) return `${st.name} belongs to ${g.company(st.owner).name} (no track access agreement)`;
-    if (l.kind === 'rail' && !st.rail) return 'This station has no train platforms';
-    if (l.kind === 'road' && !st.stops.length) return 'This station has no bus stop';
-    if (l.kind === 'tram' && !g.stations.tramStops(st, l.owner).length) return 'This station has no tram stop (on tram tracks you may use)';
+    if (!g.canUse(l.owner, st.owner)) return `${st.name}: track access needed from ${g.company(st.owner).name}`;
+    if (l.kind === 'rail' && !st.rail) return 'No train platforms';
+    if (l.kind === 'road' && !st.stops.length) return 'No bus stop';
+    if (l.kind === 'tram' && !g.stations.tramStops(st, l.owner).length) return 'No tram stop on accessible tracks';
     return null;
   }
 
@@ -646,7 +646,7 @@ export class Lines {
   operateError(l: Line, company: number): string | null {
     const g = this.game;
     if (company !== l.owner && !l.operators?.includes(company)) return `${g.company(company).name} is not an operator of ${l.name}`;
-    if (l.stops.length && !this.ownsStationOn(l, company)) return `${g.company(company).name} owns no station of ${l.name}: a company running services on a line owns at least one of its stations`;
+    if (l.stops.length && !this.ownsStationOn(l, company)) return `${g.company(company).name} needs a station it owns on ${l.name}`;
     return null;
   }
   /**
@@ -660,7 +660,7 @@ export class Lines {
     if (company === l.owner) return null;
     const g = this.game, co = g.companies[company];
     if (!co || co.defunct) return 'No such company';
-    if (!this.ownsStationOn(l, company)) return `${co.name} owns no station of ${l.name}: a company running services on a line owns at least one of its stations`;
+    if (!this.ownsStationOn(l, company)) return `${co.name} needs a station it owns on ${l.name}`;
     // (invited: in already)
     if (l.operators?.includes(company)) return null;
     if (this.partnerPolicy(l) !== 'open') return `${g.company(l.owner).name} runs ${l.name} alone`;

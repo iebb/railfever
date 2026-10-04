@@ -30,8 +30,8 @@ export function requestAccessUI(ui: UI, owner: number): AccessResult {
   const g = ui.game;
   const co = g.company(owner);
   const r = g.requestAccess(PLAYER, owner);
-  if (r === 'granted') { ui.toast(`Track access agreed with ${co.name} — upkeep shared ${fmtMult(g.accessMultiplier(owner))}`, 'good'); ui.sound('toggle', { pitch: 1.12 }); }
-  else if (r === 'pending') { ui.toast(`Request sent — ${co.name} will answer`, 'info'); ui.sound('click'); }
+  if (r === 'granted') { ui.toast(`Access agreed with ${co.name} · upkeep ${fmtMult(g.accessMultiplier(owner))}`, 'good'); ui.sound('toggle', { pitch: 1.12 }); }
+  else if (r === 'pending') { ui.toast(`Request sent; ${co.name} will answer`, 'info'); ui.sound('click'); }
   else if (r === 'blocked') ui.toast(`${co.name} has blocked you from its network`, 'bad');
   else ui.toast(`${co.name} refuses access to its network`, 'bad');
   ui.wm.get('access')?.refresh?.();
@@ -45,7 +45,7 @@ function endAgreement(ui: UI, user: number, owner: number, verb: string): boolea
   const whose = user === PLAYER ? 'Your' : `${g.company(user).name}'s`;
   const what = [
     imp.stops ? `${whose} lines lose ${imp.stops} stop${imp.stops > 1 ? 's' : ''} on ${imp.lines.length} line${imp.lines.length > 1 ? 's' : ''}` : '',
-    imp.onTrack ? `${imp.onTrack} vehicle${imp.onTrack > 1 ? 's' : ''} on the network must find another route` : '',
+    imp.onTrack ? `${imp.onTrack} vehicle${imp.onTrack > 1 ? 's' : ''} must reroute` : '',
   ].filter(Boolean).join('; ');
   const other = g.company(user === PLAYER ? owner : user).name;
   if (what && !confirm(`${verb} the track access agreement with ${other}? ${what}.`)) return false;
@@ -58,9 +58,9 @@ function endAgreement(ui: UI, user: number, owner: number, verb: string): boolea
 /** The player's access to `owner`'s network, in short. */
 export function accessState(g: Game, owner: number): { kind: 'agreement' | 'pending' | 'blocked' | 'closed' | 'none'; text: string } {
   const a = g.agreement(PLAYER, owner);
-  if (a) return { kind: 'agreement', text: `${g.accessPolicy(owner) === 'open' ? 'Open network' : 'Agreement'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))} · your share last month ${fmtPct(a.usageShareLastMonth)} · paid ${fmtMoney(a.paidLastMonth)}` };
+  if (a) return { kind: 'agreement', text: `${g.accessPolicy(owner) === 'open' ? 'Open network' : 'Agreement'} · upkeep ${fmtMult(g.accessMultiplier(owner))} · last month share ${fmtPct(a.usageShareLastMonth)} · paid ${fmtMoney(a.paidLastMonth)}` };
   // an open network may be used without asking (the agreement for the fees starts with the first use)
-  if (g.canUse(PLAYER, owner)) return { kind: 'agreement', text: `Open network · upkeep shared ${fmtMult(g.accessMultiplier(owner))} when you use it` };
+  if (g.canUse(PLAYER, owner)) return { kind: 'agreement', text: `Open network · upkeep ${fmtMult(g.accessMultiplier(owner))} on use` };
   const q = g.requestsBy(PLAYER).find((r) => r.owner === owner);
   if (q) return { kind: 'pending', text: `Request pending · ${Math.max(0, ACCESS_REQUEST_DAYS - (g.day - q.day))} days left` };
   if (g.isBlocked(owner, PLAYER)) return { kind: 'blocked', text: 'You are blocked from this network' };
@@ -101,14 +101,14 @@ export function openTrackAccess(ui: UI) {
 
     // ---- incoming requests
     add(win.body, section('Incoming requests', reqs.length ? String(reqs.length) : null));
-    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No requests waiting. Companies asking to run on your tracks appear here.' : policy === 'open' ? 'Your network is open: other companies may use it without asking (unless blocked) and share its upkeep.' : `New requests are answered automatically (${policy === 'auto-approve' ? 'approved' : 'rejected'}).`));
+    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No pending requests.' : policy === 'open' ? 'Open network · no request needed · blocked companies excluded · shared upkeep' : `Automatic answers: ${policy === 'auto-approve' ? 'approved' : 'rejected'}`));
     for (const r of reqs) {
       const name = g.company(r.user).name;
       const left = Math.max(0, ACCESS_REQUEST_DAYS - (g.day - r.day));
       add(win.body, h('div', { class: 'acc req' },
         h('div', { class: 'acc-l' },
-          h('div', { class: 'acc-t' }, ui.ownerTag(r.user), g.competes(r.user, PLAYER) ? h('span', { class: 'flag warn', 'data-tip': 'Its lines serve town pairs your lines serve' }, 'competitor') : null),
-          h('div', { class: 'acc-s' }, `${r.reason ? r.reason + ' · ' : ''}asked ${fmtMonthYear(g, r.day)} · ${left} days to answer (then rejected)`)),
+          h('div', { class: 'acc-t' }, ui.ownerTag(r.user), g.competes(r.user, PLAYER) ? h('span', { class: 'flag warn', 'data-tip': 'Serves the same town pairs as you' }, 'competitor') : null),
+          h('div', { class: 'acc-s' }, `${r.reason ? r.reason + ' · ' : ''}asked ${fmtMonthYear(g, r.day)} · ${left} days left; then auto-rejected`)),
         h('div', { class: 'rowbtns' },
           h('button', { class: 'btn sm primary', 'data-sfx': 'none', onclick: () => { const err = g.approveAccess(r.id); if (err) ui.toast(err, 'bad'); else { ui.toast(`${name} may now use your network`, 'good'); ui.sound('toggle', { pitch: 1.12 }); } rerender(); } }, icon('check', 15), 'Approve'),
           h('button', { class: 'btn sm', 'data-sfx': 'none', onclick: () => { g.rejectAccess(r.id); ui.toast(`Request from ${name} rejected`, 'info'); ui.sound('toggle', { pitch: 0.88 }); rerender(); } }, 'Reject'),
@@ -117,15 +117,15 @@ export function openTrackAccess(ui: UI) {
 
     // ---- policy
     add(win.body, section('Your policy'),
-      field('Access', seg<AccessPolicy>([['open', 'Open', 'Anyone may use your network (except blocked companies)'], ['ask', 'Ask', 'Companies ask; you approve or reject each request'], ['auto-approve', 'Approve all', 'Requests are approved automatically'], ['auto-reject', 'Reject all', 'Nobody new may use your network']], policy, (v) => {
+      field('Access', seg<AccessPolicy>([['open', 'Open', 'Open to all except blocked companies'], ['ask', 'Ask', 'Approve or reject each request'], ['auto-approve', 'Approve all', 'Auto-approve requests'], ['auto-reject', 'Reject all', 'Nobody new may use your network']], policy, (v) => {
         g.setAccessPolicy(PLAYER, v);
         ui.sound('toggle', { pitch: v === 'auto-reject' ? 0.88 : 1.12 });
         rerender();
-      }), policy === 'open' ? `Open — anyone may use your network and pays ${fmtMult(m)} of their usage share of the upkeep` : policy === 'auto-reject' ? 'Existing agreements continue — revoke them below.' : undefined),
+      }), policy === 'open' ? `Open to all · users pay ${fmtMult(m)} of their usage share` : policy === 'auto-reject' ? 'Existing agreements continue; revoke below.' : undefined),
       multSlider('Users pay', m, false, (v) => g.setAccessMultiplier(PLAYER, v), (v) => `${fmtMult(v)} · 50/50 usage → they pay ${fmtPct(equalUseShare(v))}`),
       h('div', { class: 'explain' },
-        h('p', null, 'Users ', h('b', null, 'share the upkeep'), ' of what they use: every month each track, tram track and station that carried other companies’ traffic has its maintenance split by usage — the owner’s traffic counts once, each user’s counts × the owner’s multiplier.'),
-        h('p', { class: 'ex' }, icon('info', 15), h('span', null, `Example: 50/50 usage at ${fmtMult(2)} → the user pays 2/3, the owner 1/3. At ${fmtMult(0)} access is free; an item only others use is paid by them in full.`))));
+        h('p', null, 'Users ', h('b', null, 'share the upkeep'), ' by usage: monthly track, tram track and station upkeep; owner weight 1, users × owner’s multiplier.'),
+        h('p', { class: 'ex' }, icon('info', 15), h('span', null, `50/50 use at ${fmtMult(2)}: user 2/3, owner 1/3; ${fmtMult(0)}: free; solely used by others: they pay all.`))));
     if (others.length) {
       const grid = h('div', { class: 'blockgrid' });
       for (const co of others) {
@@ -175,14 +175,14 @@ export function openTrackAccess(ui: UI) {
         const om = g.accessMultiplier(a.owner);
         tbl.appendChild(h('tr', null,
           h('td', { class: 'ellip' }, ui.ownerTag(a.owner)),
-          h('td', { 'data-tip': `At equal use you pay ${fmtPct(equalUseShare(om))} of the upkeep` }, fmtMult(om)),
+          h('td', { 'data-tip': `Equal use: you pay ${fmtPct(equalUseShare(om))} upkeep` }, fmtMult(om)),
           h('td', null, fmtPct(a.usageShareLastMonth)),
           h('td', { class: a.paidLastMonth ? 'neg' : 'muted' }, fmtMoney(a.paidLastMonth)),
           h('td', { class: a.paidTotal ? 'neg' : 'muted' }, fmtMoney(a.paidTotal)),
           h('td', null, h('button', { class: 'btn sm', onclick: () => { if (endAgreement(ui, PLAYER, a.owner, 'End')) rerender(); } }, 'End'))));
       }
       add(win.body, tbl);
-    } else add(win.body, h('div', { class: 'pad muted' }, 'You use no other company’s network.'));
+    } else add(win.body, h('div', { class: 'pad muted' }, 'No other networks used.'));
 
     // ---- request access to others
     const candidates = others.filter((co) => !g.hasAccess(PLAYER, co.id));
@@ -193,7 +193,7 @@ export function openTrackAccess(ui: UI) {
         const hd = networkSummary(g, co.id);
         add(win.body, h('div', { class: 'acc' },
           h('div', { class: 'acc-l' },
-            h('div', { class: 'acc-t' }, ui.ownerTag(co.id), h('span', { class: 'mult', 'data-tip': `Users pay ${fmtPct(equalUseShare(g.accessMultiplier(co.id)))} of the upkeep at equal use` }, fmtMult(g.accessMultiplier(co.id)))),
+            h('div', { class: 'acc-t' }, ui.ownerTag(co.id), h('span', { class: 'mult', 'data-tip': `Equal use: users pay ${fmtPct(equalUseShare(g.accessMultiplier(co.id)))} upkeep` }, fmtMult(g.accessMultiplier(co.id)))),
             h('div', { class: 'acc-s' }, [st.kind === 'none' ? policyText(g, co.id) : st.text, hd].filter(Boolean).join(' · '))),
           accessControl(ui, co.id, rerender)));
       }
@@ -208,7 +208,7 @@ function endAgreementConfirm(ui: UI, user: number): boolean {
   const g = ui.game;
   if (!g.hasAccess(user, PLAYER)) return true;
   const imp = g.accessImpact(user, PLAYER);
-  return !(imp.stops || imp.onTrack) || confirm(`Block ${g.company(user).name}? Its agreement ends: its lines lose ${imp.stops} stop${imp.stops === 1 ? '' : 's'} at your stations.`);
+  return !(imp.stops || imp.onTrack) || confirm(`Block ${g.company(user).name}? Agreement ends; ${imp.stops} stop${imp.stops === 1 ? '' : 's'} removed from its lines.`);
 }
 
 /** "12.4 km track · 3 stations" */

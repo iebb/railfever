@@ -836,16 +836,16 @@ export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJ
   const no = (reason: string): LineJoinCheck => ({ ok: false, junction, reason });
   if (!la || !lb) return no('No such line');
   if (la === lb) return no('Choose two different lines');
-  if (la.kind !== lb.kind) return no('Lines must have the same transport kind (rail, road or tram)');
+  if (la.kind !== lb.kind) return no('Mode mismatch: rail, road or tram');
   const ra = lineRoute(la), rb = lineRoute(lb);
   if (la.loop === true || lb.loop === true || ra.loop || rb.loop) return no('Loop lines have no termini to join');
-  if ([ra, rb].some((r) => r.stations.length < 2 || new Set(r.stations).size !== r.stations.length)) return no('Each line needs a route between two distinct termini');
+  if ([ra, rb].some((r) => r.stations.length < 2 || new Set(r.stations).size !== r.stations.length)) return no('Each line needs two distinct termini');
   const ends = [ra.stations[0], ra.stations[ra.stations.length - 1]];
   const shared = ends.filter((s) => s === rb.stations[0] || s === rb.stations[rb.stations.length - 1]);
-  if (!shared.length) return no('Lines do not share a terminus station');
+  if (!shared.length) return no('No shared terminus');
   junction = shared[0];
-  if (shared.length > 1) return no('Lines share both termini; combine them as service patterns instead');
-  if (ra.stations.some((s) => s !== junction && rb.stations.includes(s))) return no('Lines overlap beyond their junction; join lines that meet only at a terminus');
+  if (shared.length > 1) return no('Both termini shared: use service patterns');
+  if (ra.stations.some((s) => s !== junction && rb.stations.includes(s))) return no('Routes overlap: join only at a terminus');
   // The longer route survives; equal lengths keep the older line. Keep its original direction too.
   const keepA = ra.stations.length > rb.stations.length || (ra.stations.length === rb.stations.length && la.id < lb.id);
   const keep = keepA ? la : lb, drop = keepA ? lb : la;
@@ -858,20 +858,20 @@ export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJ
   for (const owner of operators) {
     const co = g.companies[owner];
     if (!co || co.defunct) return no('An operator no longer exists');
-    if (!g.lines.ownsStationOn(proposed, owner)) return no(`${co.name} owns no station on the joined line; each operator must own a station`);
+    if (!g.lines.ownsStationOn(proposed, owner)) return no(`${co.name} needs its own station on joined line`);
     for (const sid of route) {
       const st = g.stations.get(sid);
-      if (!st) return no('A station on the route no longer exists');
-      if (!g.canUse(owner, st.owner)) return no(`${co.name} has no access to ${st.name} (${g.company(st.owner).name})`);
+      if (!st) return no('Route station no longer exists');
+      if (!g.canUse(owner, st.owner)) return no(`${co.name}: access to ${st.name} needed from ${g.company(st.owner).name}`);
     }
-    for (const otherOwner of operators) if (!g.canUse(owner, otherOwner)) return no(`${co.name} has no track access to ${g.company(otherOwner).name}'s network`);
+    for (const otherOwner of operators) if (!g.canUse(owner, otherOwner)) return no(`${co.name} needs track access from ${g.company(otherOwner).name}`);
   }
   const rules = new Map<string, { owner: number; rule: TrackRule | null; cars?: VehicleModel[] }>();
   for (const owner of operators) rules.set(owner + ':any', { owner, rule: null });
   for (const vid of proposed.vehicles) {
     const v = g.vehicles.get(vid);
     if (!v) continue;
-    if (!operators.includes(v.owner)) return no(`${g.company(v.owner).name} is not an operator of either line`);
+    if (!operators.includes(v.owner)) return no(`${g.company(v.owner).name} does not operate either line`);
     if (v.kind !== 'train' || proposed.kind !== 'rail') continue;
     const cars = (v as Train).cars, rule = consistRule(cars);
     const key = v.owner + ':' + (rule.types === null ? '*' : [...rule.types].sort().join(',')) + ':' + rule.wire;
@@ -973,7 +973,7 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged();
   const junction = g.stations.get(check.junction)!;
   const notice: JoinNotice = { from: drop.id, into: keep.id, pattern: pid, line: keep, junction: check.junction,
-    text: `${drop.name} joined with ${keep.name} at ${junction.name}: one through line, with the existing services kept as short-turns` };
+    text: `${drop.name} joined with ${keep.name} at ${junction.name}; existing services kept as short-turns` };
   if (opts.notify !== false) g.postNews(notice.text, 'info', junction.x, junction.z);
   return notice;
 }
@@ -1023,7 +1023,7 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
   // ids of b (and of lines merged into b before) now lead to a, with the pattern b's vehicles run
   g.lines.redirectLine(b.id, a.id, pid, map);
   const pn = a.patterns.find((p) => p.id === pid)?.name ?? 'a pattern';
-  return { from: b.id, into: a.id, pattern: pid, text: `${b.name} merged into ${a.name} as a service pattern (${pn})` };
+  return { from: b.id, into: a.id, pattern: pid, text: `${b.name} merged into ${a.name} as ${pn} service` };
 }
 
 /**
