@@ -411,7 +411,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
     // vehicles still to re-plan after the last network change (a few per tick), and vehicle/line news timers
     replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
-    congestionTold: [...((g as any).congestionTold ?? new Map()).entries()],
+    ...((g as any).congestionTold?.size ? { congestionTold: [...(g as any).congestionTold.entries()] } : {}),
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };

@@ -64,10 +64,10 @@ export function congestionOf(g: Game, lineId: number): LineCongestion | null {
 }
 
 // ------------------------------------------------------------------ congestion
-/** Plain own single track around the given edges (to the switches / stations at both ends), the longest run. */
+/** Plain accessible single track around the given edges (to switches / stations at both ends), the longest run. */
 function singleRun(g: Game, edgeIds: number[], max = 60): number[] {
   const net = g.world.net;
-  const plain = (e: NEdge | undefined): e is NEdge => !!e && e.kind === 'rail' && e.owner === PLAYER && e.station < 0 && e.depot < 0;
+  const plain = (e: NEdge | undefined): e is NEdge => !!e && e.kind === 'rail' && !g.trackUpgradeError(PLAYER, e.owner) && e.station < 0 && e.depot < 0;
   const seen = new Set<number>();
   let best: number[] = [], bestLen = 0;
   for (const id of edgeIds) {

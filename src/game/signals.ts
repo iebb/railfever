@@ -83,7 +83,8 @@ export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, 
   const net = g.world.net;
   const e = net.edges.get(edgeId);
   if (!e || e.kind !== 'rail') return 'No track here';
-  if (e.owner !== owner) return 'Not your track';
+  const access = g.trackUpgradeError(owner, e.owner);
+  if (access) return access;
   const dir = forward ? 1 : -1;
   let node: NNode | null = null;
   if (s < NODE_SNAP || s > e.len - NODE_SNAP) {
@@ -91,7 +92,9 @@ export function setSignal(g: Game, edgeId: number, s: number, kind: SignalKind, 
     if (!node) return 'No track here';
     if (node.edges.length !== 2) return 'No signals at switches or track ends';
     const other = net.edges.get(node.edges[0] === e.id ? node.edges[1] : node.edges[0]);
-    if (!other || other.owner !== owner) return 'Not your track';
+    if (!other) return 'No track here';
+    const access = g.trackUpgradeError(owner, other.owner);
+    if (access) return access;
     if ((e.station >= 0 || e.depot >= 0) && (other.station >= 0 || other.depot >= 0)) return 'No signals in stations or depots';
   } else {
     if (e.station >= 0 || e.depot >= 0) return 'No signals in stations or depots';
@@ -136,7 +139,7 @@ export function signalsAlong(g: Game, edgeId: number, dir: number, spacing: numb
   spacing = Math.max(4, spacing);
   let d = dir > 0 ? 1 : -1;
   let s = Math.max(0, Math.min(e.len, o.s0 ?? (d > 0 ? 0 : e.len)));
-  if (e.owner !== owner) { out.stop = 'foreign'; return out; }
+  if (g.trackUpgradeError(owner, e.owner)) { out.stop = 'foreign'; return out; }
   if (e.station >= 0) { out.stop = 'station'; return out; }
   if (e.depot >= 0) { out.stop = 'depot'; return out; }
   const raw: { edge: NEdge; s: number; forward: boolean; at: number }[] = [];
@@ -159,7 +162,7 @@ export function signalsAlong(g: Game, edgeId: number, dir: number, spacing: numb
     const c = conts[0];
     if (c.edge.station >= 0) { out.stop = 'station'; break; }
     if (c.edge.depot >= 0) { out.stop = 'depot'; break; }
-    if (c.edge.owner !== owner) { out.stop = 'foreign'; break; }
+    if (g.trackUpgradeError(owner, c.edge.owner)) { out.stop = 'foreign'; break; }
     if (visited.has(c.edge.id)) { out.stop = 'loop'; break; }
     e = c.edge; d = c.dir; s = d > 0 ? 0 : e.len;
   }
@@ -228,7 +231,7 @@ export function clearSignalsAlong(g: Game, edgeId: number, dir: number, owner: n
   const net = g.world.net;
   let e = net.edges.get(edgeId);
   let removed = 0;
-  if (!e || e.kind !== 'rail' || e.owner !== owner) return { removed };
+  if (!e || e.kind !== 'rail' || g.trackUpgradeError(owner, e.owner)) return { removed };
   let d = dir > 0 ? 1 : -1;
   const s0 = Math.max(0, Math.min(e.len, o.s0 ?? (d > 0 ? 0 : e.len)));
   let travelled = -(d > 0 ? s0 : e.len - s0);
@@ -238,11 +241,11 @@ export function clearSignalsAlong(g: Game, edgeId: number, dir: number, owner: n
     travelled += e.len;
     if (travelled > maxLength + 1e-6) break;
     const node = net.nodes.get(d > 0 ? e.b : e.a)!;
-    if (node.signal && node.edges.length === 2) { node.signal = 0; removed++; g.world.markObjArea(node.x - 2, node.z - 2, node.x + 2, node.z + 2); }
+    if (node.signal && node.edges.length === 2 && node.edges.every((id) => !g.trackUpgradeError(owner, net.edges.get(id)!.owner))) { node.signal = 0; removed++; g.world.markObjArea(node.x - 2, node.z - 2, node.x + 2, node.z + 2); }
     const conts = net.nextRail(e, d);
     if (conts.length !== 1 || node.edges.length > 2) break;
     const c = conts[0];
-    if (c.edge.owner !== owner || c.edge.station >= 0 || c.edge.depot >= 0 || visited.has(c.edge.id)) break;
+    if (!!g.trackUpgradeError(owner, c.edge.owner) || c.edge.station >= 0 || c.edge.depot >= 0 || visited.has(c.edge.id)) break;
     e = c.edge; d = c.dir;
   }
   if (removed) { net.version++; g.onNetworkChanged(); }
@@ -399,7 +402,8 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
   const deg = (nid: number) => net.nodes.get(nid)?.edges.length ?? 0;
   const p = { x: 0, y: 0, z: 0 };
   const want = (edge: NEdge, s: number, forward: boolean, kind: 'block' | 'path', pass: boolean, role: AutoSignal['role']) => {
-    if (edge.owner !== owner) { res.warnings.push(`Track of ${g.company(edge.owner).name} near ${Math.round(edge.bez.x0)},${Math.round(edge.bez.z0)} unchanged`); return; }
+    const access = g.trackUpgradeError(owner, edge.owner);
+    if (access) { res.warnings.push(access); return; }
     const atEnd = s < 0.6 || s > edge.len - 0.6;
     let node = atEnd ? (s < 0.6 ? edge.a : edge.b) : -1;
     if (node >= 0) s = node === edge.a ? 0 : edge.len;
@@ -446,6 +450,31 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
   }
   // ---- plain track
   const chains = chainsOf(g, E, special);
+  // A diamond has no switch node. Protect its conflicting movements explicitly, preserving the running
+  // direction of its chain. Path reservations include the shared crossing ID, not the whole junction.
+  for (const crossing of net.crossings.values()) {
+    if (crossing.kind !== 'diamond') continue;
+    for (const [id, s] of [[crossing.e1, crossing.s1], [crossing.e2, crossing.s2]]) {
+      const chain = chains.find((c) => c.steps.some((q) => q.edge.id === id));
+      if (!chain) continue;
+      const i = chain.steps.findIndex((q) => q.edge.id === id), step = chain.steps[i];
+      const u = chain.cum[i] + (step.dir > 0 ? s : step.edge.len - s);
+      let fw = 0, bw = 0;
+      for (const q of chain.steps) for (const nid of [q.edge.a, q.edge.b]) {
+        const n = net.nodes.get(nid)!;
+        if (n.signal < 2 || n.signalPass || n.edges.length !== 2) continue;
+        const side = leaveSide(q.edge, q.dir, nid);
+        if (net.signalFor(n, side) > 0) fw++; else bw++;
+      }
+      const dirs = fw && !bw ? [1] : bw && !fw ? [-1] : fw && bw ? [] : [1, -1];
+      for (const dir of dirs) {
+        const at = u - dir * 2.5;
+        if (at <= 0.7 || at >= chain.len - 0.7) continue;
+        const q = chainAt(chain, at, dir);
+        want(q.edge, q.s, q.forward, 'path', !fw && !bw, 'approach');
+      }
+    }
+  }
   const pairKey = (c: Chain) => Math.min(c.start, c.end) + ':' + Math.max(c.start, c.end);
   const twins = new Map<string, number>();
   for (const c of chains) twins.set(pairKey(c), (twins.get(pairKey(c)) ?? 0) + 1);

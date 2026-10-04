@@ -154,7 +154,9 @@ function counter(trains: Train[]) {
   const end = (st: Station, front: boolean) => stationEnds(g, st).map((e) => (front ? e.front : e.back));
   let ok = true;
   for (let i = 0; i + 1 < S.length; i++) ok = !!build(g, nodeSnap(g, end(S[i], true)[0], 'rail'), nodeSnap(g, end(S[i + 1], false)[0], 'rail'), railOpts(PLAYER), 'line') && ok;
-  for (const st of S) connectStationThroat(g, st.id, st.owner);
+  // The player owns the approach tracks and funds these shared-station turnouts. AI builders may not split
+  // player rail, even with access; using the station's AI owner here would leave its second platform disconnected.
+  for (const st of S) connectStationThroat(g, st.id, PLAYER);
   check(ok, 'single-track line with passing places at the stations');
   const line = g.lines.create('rail', PLAYER);
   line.stops = outAndBack(S.map((s) => s.id));

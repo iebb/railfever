@@ -170,7 +170,9 @@ for (const seed of [7, 11, 23]) {
     if (net.nodes.has(nextNode)) throw failure; // fail inside planEdge, after preview nodes have been added
     return geo.call(net, e);
   };
-  try { assert.throws(() => planDoubleTrack(g, main, 1, 0), (e) => e === failure); }
+  // Platform 0's companion is on the left. Use that side for a direct approach, so the injected exception
+  // continues to exercise temporary-node geometry rather than an end-connection diamond preview.
+  try { assert.throws(() => planDoubleTrack(g, main, -1, 0), (e) => e === failure); }
   finally { net.geo = geo; }
   sameState(snapshot(g), before, 'double-track planning exception');
   cleanupChecks++;
@@ -198,7 +200,7 @@ function sameCommit(label: string, plan: (g: Game, main: number[], parallel: num
   console.log(`  ${label}: direct / after-hover commits identical`);
 }
 
-sameCommit('double track', (g, main) => planDoubleTrack(g, main, 1, 0), (g, p) => commitDoubleTrack(g, p, false));
+sameCommit('double track', (g, main) => planDoubleTrack(g, main, -1, 0), (g, p) => commitDoubleTrack(g, p, false));
 sameCommit('connection', (g, _main, parallel) => planConnection(g, parallel[0], 40, parallel[1], 50, 0), (g, p) => commitConnection(g, p, { signals: false }));
 sameCommit('relevel', (g, _main, parallel) => planRelevel(g, parallel, 'elevated', 0), commitRelevel);
 sameCommit('station on track', (g, _main, parallel) => planStationOnTrack(g, parallel[0], 100, { length: 10, tracks: 2 }, 0), commitStationOnTrack);
