@@ -69,7 +69,7 @@ function fixtures() {
   console.log(`  full plan ${JSON.stringify(plan.allocations)}, physical=${plan.physical}, extra=${Math.round(value)}`);
   check(value < 0 && !sharedTrainAllowed(g, l, 2, loco()), 'second operator declines a train when the shared line is full');
   const extra = g.vehicles.buyTrain((ts[1] as Train).depotId, loco(), l.id) as Train;
-  ts[0].delivered = 1000; ts[1].delivered = 1000; extra.delivered = 0;
+  ts[0].delivered = 1000; ts[1].delivered = 0; extra.delivered = 0;
   l.capacity!.delay = 120; l.capacity!.longest = 150;
   const congested = sharedCapacityPlan(g, l);
   console.log(`  congested plan ${JSON.stringify(congested.allocations)}, withdraw=${JSON.stringify(congested.withdraw)}`);

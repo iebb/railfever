@@ -357,8 +357,26 @@ export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
   if (old?.key === key) return { ...old.plan, limit: old.plan.allocations.filter(a => a.line === l.id).reduce((n, a) => n + a.trains, 0),
     physical: Math.max(0, ...old.channels.filter(c => c.line.id === l.id).map(c => c.limit)) };
   const channels = channelsFor(g, lines, inv), counts = channels.map(c => c.trains.length);
-  const target = channels.map(c => g.company(c.owner).ai ? 0 : c.trains.length);
-  let value = netValue(g, channels, target, inv);
+  const actual = netValue(g, channels, counts, inv);
+  const contribution = channels.map((c, i) => {
+    if (!g.company(c.owner).ai || !counts[i]) return Infinity;
+    counts[i]--; const value = actual - netValue(g, channels, counts, inv); counts[i]++;
+    return value;
+  });
+  const target = [...counts];
+  let value = actual;
+  // A physical withdrawal must improve the fleet that exists now, not an allocation whose better
+  // replacement trains have not been bought. Find beneficial actual removals before pricing additions.
+  for (;;) {
+    let best = -1, gain = 0;
+    for (let i = 0; i < channels.length; i++) {
+      if (!g.company(channels[i].owner).ai || !target[i] || contribution[i] >= -1e-6) continue;
+      target[i]--; const next = netValue(g, channels, target, inv) - value; target[i]++;
+      if (next > gain + 1e-6) { best = i; gain = next; }
+    }
+    if (best < 0) break;
+    target[best]--; value += gain;
+  }
   // Each accepted path has positive marginal surplus after its delays to *all* services have been charged.
   for (;;) {
     let best = -1, gain = 0;
@@ -371,13 +389,11 @@ export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
     target[best]++; value += gain;
   }
   const withdraw: SharedCapacityPlan['withdraw'] = [];
-  const actual = netValue(g, channels, counts, inv);
   channels.forEach((c, i) => {
-    if (!g.company(c.owner).ai || counts[i] <= target[i]) return;
-    counts[i]--; const marginal = actual - netValue(g, channels, counts, inv); counts[i]++;
+    if (!g.company(c.owner).ai || counts[i] <= target[i] || contribution[i] >= -1e-6) return;
     const worst = [...c.trains].sort((a, b) => a.delivered / Math.max(1, g.day - a.boughtDay) - b.delivered / Math.max(1, g.day - b.boughtDay)
       || a.profitLast - b.profitLast || b.id - a.id)[0];
-    if (worst) withdraw.push({ train: worst.id, owner: c.owner, line: c.line.id, value: marginal });
+    if (worst) withdraw.push({ train: worst.id, owner: c.owner, line: c.line.id, value: contribution[i] });
   });
   withdraw.sort((a, b) => a.value - b.value || b.train - a.train || a.owner - b.owner);
   const used = new Set(channels.flatMap(c => [...c.use.keys()]));
