@@ -142,6 +142,14 @@ function connectionTrackPrice(type: string, length: number, section: 'ground' | 
     * (section === 'ground' ? 1 : structureFactor('rail', section, Math.abs(depth)));
 }
 
+/** The same numerical lead curve is used for native construction and pure formation reserves. */
+function connectionCurve(a: SPt, b: SPt) {
+  const dx = b.x - a.x, dz = b.z - a.z, length = Math.hypot(dx, dz);
+  const sa = a.tx * dx + a.tz * dz >= 0 ? 1 : -1, sb = b.tx * dx + b.tz * dz >= 0 ? 1 : -1;
+  return { length, bez: bezFromTangents(a.x, a.z, a.tx * sa, a.tz * sa,
+    b.x, b.z, b.tx * sb, b.tz * sb, length * 0.38, length * 0.38) };
+}
+
 /**
  * An S-curve between two points on (nearly) parallel tracks (a turnout to a new track, a crossover leg): checks
  * it and, unless `dry`, lays it, splitting the tracks there. `tracks`: the edges it may touch (its two tracks).
@@ -153,7 +161,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     const es = q.edge !== undefined ? [net.edges.get(q.edge)] : q.node !== undefined ? net.nodes.get(q.node)?.edges.map((id) => net.edges.get(id)) ?? [] : [];
     for (const e of es) if (e?.kind === 'rail') { const err = g.trackUpgradeError(owner, e.owner); if (err) return { error: err, cost: 0 }; }
   }
-  const dx = b.x - a.x, dz = b.z - a.z, L = Math.hypot(dx, dz);
+  const geometry = connectionCurve(a, b), L = geometry.length;
   if (L < 2) return { error: 'too short', cost: 0 };
   // the wire state of what it connects (plain track first)
   const typeAt = (q: SPt): string | undefined => {
@@ -164,8 +172,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   };
   const ttype = [type, typeAt(a), typeAt(b)].some((t) => t && TRACK_TYPES[t]?.electrified) ? 'electric' : type ?? typeAt(b) ?? typeAt(a) ?? 'standard';
   const tt = TRACK_TYPES[ttype] ?? TRACK_TYPES.standard;
-  const sa = a.tx * dx + a.tz * dz >= 0 ? 1 : -1, sb = b.tx * dx + b.tz * dz >= 0 ? 1 : -1;
-  const bez = bezFromTangents(a.x, a.z, a.tx * sa, a.tz * sa, b.x, b.z, b.tx * sb, b.tz * sb, L * 0.38, L * 0.38);
+  const bez = geometry.bez;
   if (bezMinRadius(bez, 32) < tt.minRadius) return { error: 'curve too tight', cost: 0 };
   if (Math.abs(b.y - a.y) > tt.maxGrade * L + 0.02) return { error: 'too steep', cost: 0 };
   const tab = arcTable(bez);
@@ -852,9 +859,42 @@ export function doubleTrackCompletionReserve(type: string, length: number, depth
     upkeep: crossovers * diagonal * trackBasePerUnit(type) * multiplier, signals, crossovers };
 }
 
+/** Count potential lead diamonds before native construction can split the intersected rails. Counting
+ * intersections with individual geometry spans also covers post-split pieces, rather than relying on
+ * the current edge-ID de-duplication. Future companion segments and the other endpoint lead count too. */
+function leadDiamondReserve(g: Game, a: SPt, b: SPt, future: readonly (readonly { x: number; z: number }[])[]) {
+  const bez = connectionCurve(a, b).bez;
+  const lead = Array.from({ length: 65 }, (_, i) => bezPoint(bez, i / 64));
+  const x0 = Math.min(bez.x0, bez.x1, bez.x2, bez.x3), x1 = Math.max(bez.x0, bez.x1, bez.x2, bez.x3);
+  const z0 = Math.min(bez.z0, bez.z1, bez.z2, bez.z3), z1 = Math.max(bez.z0, bez.z1, bez.z2, bez.z3);
+  let count = 0;
+  const scan = (points: readonly { x: number; z: number }[]) => {
+    for (let j = 1; j < points.length; j++) {
+      const c = points[j - 1], d = points[j];
+      if (Math.max(c.x, d.x) < x0 || Math.min(c.x, d.x) > x1 || Math.max(c.z, d.z) < z0 || Math.min(c.z, d.z) > z1) continue;
+      for (let k = 1; k < lead.length; k++) {
+        const p = lead[k - 1], q = lead[k];
+        if (segIntersect(p.x, p.z, q.x, q.z, c.x, c.z, d.x, d.z)) count++;
+      }
+    }
+  };
+  for (const e of g.world.net.edgesNear(x0 - 0.5, z0 - 0.5, x1 + 0.5, z1 + 0.5)) {
+    if (e.kind !== 'rail' || e.station >= 0 || e.depot >= 0 || [a, b].some(p => p.node !== undefined && (e.a === p.node || e.b === p.node))) continue;
+    const geo = g.world.net.geo(e);
+    scan(Array.from({ length: geo.n }, (_, i) => ({ x: geo.pts[i * 3], z: geo.pts[i * 3 + 2] })));
+  }
+  for (const points of future) {
+    // A future segment incident to the new lead node is excluded by connectS's native node test.
+    if (!points.length || [points[0], points[points.length - 1]].some(p => [a, b].some(q => Math.hypot(p.x - q.x, p.z - q.z) < 0.001))) continue;
+    scan(points);
+  }
+  return count;
+}
+
 export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
   const net = g.world.net, samples = sampleSteps(g, plan.steps);
-  if (!plan.ok || !samples.length || !plan.points.length) return { cost: Infinity, upkeep: Infinity, signals: 0, crossovers: 0 };
+  if (!plan.ok || !samples.length || !plan.points.length) return { cost: Infinity, formationCost: Infinity,
+    segmentCost: Infinity, upkeep: Infinity, signals: 0, crossovers: 0 };
   const endpointEdges = [plan.start, plan.end].flatMap(e => e.snap?.edge !== undefined ? [e.snap.edge]
     : net.nodes.get(e.node)?.edges ?? []);
   const reuseEdges = (plan.reuse ?? []).flatMap(q => q?.edge !== undefined ? [q.edge]
@@ -871,10 +911,43 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
   const oldLength = samples[samples.length - 1].u;
   // Include reused companion rail and both endpoint leads; neither can extend the paired section beyond
   // the selected main chain. The signal budget counts both rails plus every possible diagonal.
-  let leads = 0, endpointCrossings = 0, crossoverCost = 0, upkeep = 0;
-  for (const [i, e] of [plan.start, plan.end].entries()) {
+  const segmentCost = plan.proposals.reduce((n, p) => n + p.cost, 0);
+  const mainEdges = new Set(plan.steps.map(s => s.edge));
+  const leadEnds = [plan.start, plan.end].map((e, i) => {
     const inner = plan.points[i === 0 ? 0 : plan.points.length - 1];
     const target = e.snap ?? net.nodes.get(e.node) ?? sampleAt(samples, e.u);
+    const reuse = plan.reuse?.[i === 0 ? 0 : plan.points.length - 1];
+    let innerPt: SPt = { ...inner, ...(reuse?.kind === 'node' ? { node: reuse.node }
+      : reuse?.kind === 'edge' ? { edge: reuse.edge, s: reuse.s } : {}) };
+    // Reuse is refound at commit time, and a split node lies on the exact parent Bezier/profile.
+    // Resolve those same read-only coordinates instead of pricing the nearby preview offset.
+    if (reuse) {
+      const node = net.nearestNode(inner.x, inner.z, 0.08, 'rail', n => n.edges.length > 0
+        && n.edges.every(id => !g.trackUpgradeError(plan.owner, net.edges.get(id)!.owner)));
+      const edge = node ? null : net.nearestEdge(inner.x, inner.z, 0.08, 'rail', e => !mainEdges.has(e.id)
+        && !g.trackUpgradeError(plan.owner, e.owner));
+      if (node) innerPt = { ...inner, x: node.x, z: node.z, y: node.y, node: node.id };
+      else if (edge) {
+        const point = bezPoint(edge.edge.bez, tAtS(net.table(edge.edge), edge.s));
+        innerPt = { ...inner, ...point, y: net.heightAtS(edge.edge, edge.s), edge: edge.edge.id, s: edge.s };
+      }
+    }
+    let targetPt: SPt = { ...inner, ...target, ...(e.kind === 'platform' ? { node: e.node }
+      : e.kind === 'track' ? { edge: e.snap!.edge, s: e.snap!.s } : { edge: (target as Sample).edge, s: (target as Sample).s }) };
+    if (e.kind === 'track') {
+      const node = net.nearestNode(target.x, target.z, 0.08, 'rail');
+      if (node) targetPt = { ...inner, x: node.x, z: node.z, y: node.y, node: node.id };
+      else {
+        const edge = net.nearestEdge(target.x, target.z, 0.08, 'rail');
+        if (edge) targetPt = { ...targetPt, edge: edge.edge.id, s: edge.s };
+      }
+    }
+    return i === 0 ? [targetPt, innerPt] as const : [innerPt, targetPt] as const;
+  });
+  let leads = 0, endpointCrossings = 0, crossoverCost = 0, leadCost = 0, upkeep = 0;
+  for (const [i, e] of [plan.start, plan.end].entries()) {
+    const inner = { ...plan.points[i === 0 ? 0 : plan.points.length - 1], ...leadEnds[i][i === 0 ? 1 : 0] };
+    const target = leadEnds[i][i === 0 ? 0 : 1];
     const leadChord = Math.hypot(target.x - inner.x, target.z - inner.z);
     const leadLength = plan.joined?.[i] ? 0 : 2.52 * leadChord;
     leads += leadLength;
@@ -885,11 +958,17 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
     const lo = i === 0 ? 0 : Math.max(0, inner.u - scan), hi = i === 0 ? Math.min(oldLength, inner.u + scan) : oldLength;
     const points = samples.filter(q => q.u >= lo && q.u <= hi);
     let tunnel = false, bridge = false;
+    for (const id of endpointEdges) {
+      const edge = net.edges.get(id);
+      for (const s of edge?.sections ?? []) { tunnel ||= s.type === 'tunnel'; bridge ||= s.type === 'bridge'; }
+    }
+    const future: { x: number; z: number }[][] = [];
     for (const q of points) { const s = net.sectionAt(net.edges.get(q.edge)!, q.s); tunnel ||= s === 'tunnel'; bridge ||= s === 'bridge'; }
     for (let k = 0; k < plan.proposals.length; k++) {
       if (plan.points[k + 1].u < lo || plan.points[k].u > hi) continue;
       for (const t of plan.proposals[k].tracks) {
-        points.push(...samplePlan(t, -1));
+        const rail = samplePlan(t, -1);
+        points.push(...rail); future.push(rail.map(p => ({ x: Math.fround(p.x), z: Math.fround(p.z) })));
         for (const s of t.sections) { tunnel ||= s.type === 'tunnel'; bridge ||= s.type === 'bridge'; }
       }
     }
@@ -909,7 +988,7 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
       points.push(...sampleSteps(g, [{ edge: id, dir: 1 }]));
       for (const s of edge.sections) { tunnel ||= s.type === 'tunnel'; bridge ||= s.type === 'bridge'; }
     }
-    points.push({ ...inner, ...target, edge: -1, s: 0 });
+    points.push({ ...inner, edge: -1, s: 0 }, { ...inner, ...target, edge: -1, s: 0 });
     let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity, y0 = Infinity, y1 = -Infinity;
     for (const q of points) {
       x0 = Math.min(x0, q.x); x1 = Math.max(x1, q.x); z0 = Math.min(z0, q.z); z1 = Math.max(z1, q.z);
@@ -932,15 +1011,34 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
     const multiplier = tunnel || depth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover ? 5 : bridge || height > 1.4 ? 4 : 1;
     upkeep += leadLength * trackBasePerUnit(type) * multiplier;
     if (plan.joined?.[i]) continue;
-    const targetPt: SPt = { ...inner, ...target, ...(e.kind === 'platform' ? { node: e.node }
-      : e.kind === 'track' ? { edge: e.snap!.edge, s: e.snap!.s } : { edge: (target as Sample).edge, s: (target as Sample).s }) };
-    const allowed = new Set([...plan.steps.map(s => s.edge), ...reuseEdges, ...endpointEdges]);
-    const reuse = plan.reuse?.[i === 0 ? 0 : plan.points.length - 1];
-    const innerPt: SPt = { ...inner, ...(reuse?.kind === 'node' ? { node: reuse.node }
-      : reuse?.kind === 'edge' ? { edge: reuse.edge, s: reuse.s } : {}) };
-    const lead = i === 0 ? connectS(g, plan.owner, targetPt, innerPt, allowed, true, type, plan.owner, !!plan.complete)
-      : connectS(g, plan.owner, innerPt, targetPt, allowed, true, type, plan.owner, !!plan.complete);
-    endpointCrossings += lead.crossings ?? 0;
+    if (!plan.joined?.[1 - i]) {
+      const otherIndex = 1 - i, ends = leadEnds[otherIndex], priced = connectionCurve(...ends).bez;
+      // connectS prices the supplied curve, then nodeOf resolves a track Snap to a node or exact split
+      // point. Network.geo samples that curve with its endpoints replaced; retain its original controls.
+      const targetIndex = otherIndex === 0 ? 0 : 1, q = ends[targetIndex], edge = net.edges.get(q.edge ?? -1);
+      let point = q;
+      if (edge && q.s !== undefined) {
+        const node = q.s < 0.3 ? net.nodes.get(edge.a) : q.s > edge.len - 0.3 ? net.nodes.get(edge.b) : undefined;
+        point = { ...q, ...(node ?? bezPoint(edge.bez, tAtS(net.table(edge), q.s))) };
+      }
+      const other = targetIndex === 0 ? { ...priced, x0: point.x, z0: point.z } : { ...priced, x3: point.x, z3: point.z };
+      const tab = arcTable(other), step = Math.max(0.25, tab.len / 1500);
+      future.push(Array.from({ length: Math.max(2, Math.ceil(tab.len / step) + 1) }, (_, k) => {
+        const p = bezPoint(other, tAtS(tab, Math.min(k * step, tab.len)));
+        return { x: Math.fround(p.x), z: Math.fround(p.z) };
+      }));
+    }
+    const diamonds = plan.complete ? leadDiamondReserve(g, ...leadEnds[i], future) : 0;
+    endpointCrossings += diamonds;
+    const arc = arcTable(connectionCurve(...leadEnds[i]).bez).len;
+    // Actual lead profiles also pass through diamond heights within native rail clearance of the
+    // endpoint interpolation. Keep those heights inside the post-earthwork structure envelope.
+    const leadDepth = Math.max(depth, h1 - Math.min(inner.y, target.y) + (diamonds ? RAIL.clearance : 0));
+    const leadHeight = Math.max(height, Math.max(inner.y, target.y) - h0 + (diamonds ? RAIL.clearance : 0));
+    let price = connectionTrackPrice(type, arc, 'ground', 0);
+    if (tunnel || leadDepth >= TUNNEL_LINING.rail + TUNNEL_LINING.cover) price = Math.max(price, connectionTrackPrice(type, arc, 'tunnel', leadDepth));
+    if (bridge || leadHeight > 1.4) price = Math.max(price, connectionTrackPrice(type, arc, 'bridge', leadHeight));
+    leadCost += Math.ceil(2 * TURNOUT_COST + diamonds * 15000 + price);
   }
   const reused = new Set((plan.reuse ?? []).flatMap(q => q?.edge !== undefined ? [q.edge]
     : q?.node !== undefined ? net.nodes.get(q.node)?.edges.filter(id => net.edges.get(id)?.station === -1) ?? [] : []));
@@ -951,7 +1049,9 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
   // autoSignalLine protects diamonds in both directions on both rails and every chain end. Each crossover
   // adds two switch nodes/three chains; a crossing can split both rails. Reserve its block budget again.
   const reserve = doubleTrackCompletionReserve(type, pairedLength, 0, 0, false, false, crossovers, crossings, branches);
-  return { ...reserve, cost: plan.cost + crossoverCost + reserve.signals * SIGNAL_COST, upkeep, endpointCrossings };
+  const formationCost = Math.max(plan.cost, segmentCost + leadCost);
+  return { ...reserve, cost: formationCost + crossoverCost + reserve.signals * SIGNAL_COST,
+    formationCost, segmentCost, upkeep, endpointCrossings };
 }
 
 /** Both endpoint windows need two diagonals, their native endpoint/pair gaps, and clearance between the windows. */

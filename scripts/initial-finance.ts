@@ -4,9 +4,13 @@ import { Economy } from '../src/game/economy';
 import { initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { commitCapacityTrackUpgrade } from '../src/game/ai-capacity-works';
 import { fundInitialConnector } from '../src/game/ai-network';
-import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion } from '../src/game/trackops';
+import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion, planConnection, commitConnection } from '../src/game/trackops';
+import { buildDepotOnLine } from '../src/game/routing';
+import { routeBetween } from '../src/game/ai-network';
+import { lineIsDouble } from '../src/game/dualtrack';
+import { autoSignalLine, SIGNAL_COST } from '../src/game/signals';
 import { upgradeRoute } from '../src/game/dualtrack';
-import { serialize } from '../src/game/save';
+import { serialize, deserialize } from '../src/game/save';
 import { setSignal } from '../src/game/signals';
 import { station, endNode, nodeSnap, railOpts, build, check, fails, depotFor, loco } from './stationlib';
 import { free, roadOpts } from './lib';
@@ -134,6 +138,52 @@ for (const [level, curved, platforms, shared, signals, grade, reused] of [
   console.log(`  ${level}/${curved ? 'curve' : 'straight'}/${platforms}/${shared ? 'shared' : 'own'}: quote ${funded}, paid ${paid}, quote ${ms.toFixed(2)}ms`);
 }
 
+console.log('Native endpoint formation allowances');
+function endpointAllowance(g: Game, edges: number[], label: string, preserve?: (p: ReturnType<typeof planDoubleTrack>) => boolean) {
+  const plans = ([1, -1] as const).map(side => planDoubleTrack(g, edges, side, 1)).filter(p => p.ok && p.complete
+    && p.start.kind !== 'turnout' && p.end.kind !== 'turnout' && (!preserve || preserve(p))).sort((a, b) => a.cost - b.cost || b.side - a.side);
+  check(plans.length > 0, `${label}: native complete candidate fits`);
+  if (!plans.length) return;
+  const plan = plans[0], state = JSON.stringify(serialize(g)), proposal = JSON.stringify(plan), quote = quoteDoubleTrackCompletion(g, plan);
+  check(state === JSON.stringify(serialize(g)) && proposal === JSON.stringify(plan), `${label}: full formation quote is pure`);
+  const preimage = deserialize(JSON.parse(state)), native = commitDoubleTrack(preimage, plan, false);
+  // With finish=false only autoSignalLine can add signals; each placed signal pays the native £9k.
+  const formationPaid = native.cost - native.signals * SIGNAL_COST;
+  check(!native.error && formationPaid > plan.cost && formationPaid <= quote.formationCost,
+    `${label}: native lead/diamond formation exceeds the old raw quote and fits its explicit allowance`);
+  const eco = g.company(1).economy, cash = eco.money, book = eco.current.construction;
+  let funded = 0;
+  const result = layInitialDoubleTrack(g, edges, 1, traffic, cost => { funded = cost; return true; }, undefined, preserve);
+  check(result.built && result.cost <= funded && funded === quote.cost
+    && cash - eco.money === book - eco.current.construction && eq(cash - eco.money, result.cost),
+    `${label}: the same funded total completes native geometry and pays the full ledger`);
+  console.log(`  ${label}: raw ${plan.cost}, native formation ${formationPaid}, formation allowance ${quote.formationCost}, total quote ${funded}, paid ${result.cost}`);
+}
+const depotOpening = fixture(), depotEdge = depotOpening.g.world.net.edges.get(upgradeRoute(depotOpening.g, depotOpening.A.id, depotOpening.B.id, 1)[0])!;
+const interiorDepot = buildDepotOnLine(depotOpening.g, depotEdge.id, depotEdge.len / 2, 1, { dir: 1, side: -1 });
+check(interiorDepot >= 0, 'native direction+1 interior depot is built before quoting');
+endpointAllowance(depotOpening.g, upgradeRoute(depotOpening.g, depotOpening.A.id, depotOpening.B.id, 1), 'direction+1 depot',
+  p => (depotOpening.g.ais[0] as any).initialPairDepot(p, interiorDepot, depotOpening.A.id, depotOpening.B.id));
+check(lineIsDouble(depotOpening.g, depotOpening.l, 1), 'funded depot geometry remains a complete native pair');
+const junction = fixture(), j = junction.g, C = station(j, 30, 300, Math.PI / 2, 12, 2, 1)!, D = station(j, 350, 300, Math.PI / 2, 12, 2, 1)!;
+build(j, nodeSnap(j, endNode(j, C, 1, true), 'rail'), nodeSnap(j, endNode(j, D, 1, false), 'rail'), railOpts(1), 'second native connector trunk');
+const secondLine = j.lines.create('rail', 1); secondLine.stops = [C.id, D.id];
+for (const [a, b, line] of [[junction.A, junction.B, junction.l], [C, D, secondLine]] as const) {
+  const route = upgradeRoute(j, a.id, b.id, 1), plan = ([1, -1] as const).map(side => planDoubleTrack(j, route, side, 1)).find(p => p.ok)!;
+  check(!commitDoubleTrack(j, plan).error, 'native directional fixture trunk builds'); autoSignalLine(j, line.id, 1);
+}
+const source = routeBetween(j, junction.A.id, junction.B.id, 1)!, target = routeBetween(j, C.id, D.id, 1)!;
+const a = j.world.net.nearestEdge(120, 190, 2, 'rail', e => source.includes(e.id))!, b = j.world.net.nearestEdge(235, 300, 2, 'rail', e => target.includes(e.id))!;
+const connectorPlan = planConnection(j, a.edge.id, a.s, b.edge.id, b.s, 1, { dirA: 1, dirB: 1, junctionUpgrade: true });
+check(connectorPlan.ok, 'native connector formation can be priced');
+if (connectorPlan.ok) {
+  const connector = commitConnection(j, connectorPlan, { signals: false });
+  check(!connector.error, 'native single connector commits');
+  endpointAllowance(j, connector.edges, 'directional connector');
+  check(!!routeBetween(j, junction.A.id, D.id, 1) && !!routeBetween(j, D.id, junction.A.id, 1),
+    'funded connector preserves lawful native service routes in both directions');
+}
+
 console.log('Same geometry, cash versus incremental interest');
 for (const debt of [false, true]) {
   const f = fixture(), edges = upgradeRoute(f.g, f.A.id, f.B.id, 1), e = f.g.company(1).economy;
@@ -216,7 +266,7 @@ for (const prefunded of [false, true]) {
   check(eq(-eco.months[0].v.interest, eco.loan * eco.interestRate / 12), 'connector borrowing is charged by the native monthly interest ledger');
 }
 console.log('Scoped funded construction ceiling');
-for (const mode of ['success', 'cap', 'refund', 'throw'] as const) {
+for (const mode of ['success', 'cap', 'refund', 'throw', 'quoteThrow'] as const) {
   const f = fixture(), eco = f.g.company(1).economy;
   const plans = ([1, -1] as const).map(side => planDoubleTrack(f.g, upgradeRoute(f.g, f.A.id, f.B.id, 1), side, 1));
   const plan = plans.filter(p => p.ok && p.complete && p.start.kind !== 'turnout' && p.end.kind !== 'turnout')
@@ -228,6 +278,7 @@ for (const mode of ['success', 'cap', 'refund', 'throw'] as const) {
   const own = Object.getOwnPropertyDescriptor(eco, 'canAfford'), ownSpend = Object.getOwnPropertyDescriptor(eco, 'spend');
   let calls = 0, threw = false;
   let result: ReturnType<typeof commitCapacityTrackUpgrade> | undefined;
+  if (mode === 'quoteThrow') Object.defineProperty(plan, 'steps', { get() { throw new Error('intentional quote failure'); } });
   try {
     result = commitCapacityTrackUpgrade(f.g, plan, () => {
       check(eco.money === cash + eco.current.construction - ledger, 'callbacks see native cash and books throughout the capped construction');
@@ -246,18 +297,22 @@ for (const mode of ['success', 'cap', 'refund', 'throw'] as const) {
     'a failed native segment refunds paid construction without losing the scoped ceiling state');
   if (mode === 'cap') check(!!result!.error || !!result!.finishError, 'underfunded legacy finish reserve refuses excess native spending');
   if (mode === 'throw') check(threw, 'native callback exceptions preserve method restoration');
+  if (mode === 'quoteThrow') check(threw && calls === 0 && eco.money === cash && eco.current.construction === ledger,
+    'a fallback quote exception leaves native methods and books untouched before construction');
   check(eco.canAfford(full * 2), 'ordinary native affordability is no longer capped after return');
 }
 const changed = fixture(), oldEdges = upgradeRoute(changed.g, changed.A.id, changed.B.id, 1);
 const oldPlan = ([1, -1] as const).map(side => planDoubleTrack(changed.g, oldEdges, side, 1)).filter(p => p.ok && p.complete
   && p.start.kind !== 'turnout' && p.end.kind !== 'turnout').sort((a, b) => a.cost - b.cost || b.side - a.side)[0];
-const approved = quoteDoubleTrackCompletion(changed.g, oldPlan).cost;
+const approvedQuote = quoteDoubleTrackCompletion(changed.g, oldPlan), approved = approvedQuote.cost;
 check(!!build(changed.g, free(changed.g, 190, 150), free(changed.g, 190, 230), roadOpts(1), 'native crossing price change'),
   'native crossing can change a stored formation price before commit');
 const revised = planDoubleTrack(changed.g, upgradeRoute(changed.g, changed.A.id, changed.B.id, 1), oldPlan.side, 1);
-check(revised.ok && revised.cost > oldPlan.cost, 'fresh native crossing quote costs more than the stored formation');
+const crossingPreimage = deserialize(JSON.parse(JSON.stringify(serialize(changed.g)))), fresh = commitDoubleTrack(crossingPreimage, revised, false);
+check(revised.ok && !fresh.error && fresh.cost - fresh.signals * SIGNAL_COST > approvedQuote.formationCost,
+  'actual native crossing formation exceeds the previously approved formation allowance');
 const changedEco = changed.g.company(1).economy, originalCash = changedEco.money, originalBook = changedEco.current.construction;
-const failure = commitCapacityTrackUpgrade(changed.g, oldPlan, undefined, approved);
+const failure = commitCapacityTrackUpgrade(changed.g, oldPlan, undefined, approved, approvedQuote);
 check(!!failure.error && changedEco.money === originalCash && changedEco.current.construction === originalBook,
   'native higher-cost formation replan refunds before it consumes the mandatory finishing reserve');
 const middle = fixture(), middlePlan = ([1, -1] as const).map(side => planDoubleTrack(middle.g,

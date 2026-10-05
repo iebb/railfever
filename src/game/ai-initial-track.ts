@@ -111,7 +111,7 @@ export function layInitialDoubleTrack(g: Game, edges: number[], payer: number, t
     const annualInterest = Math.max(finance.incrementalLoan, retainedLoan) * financeAtEntry.interestRate;
     const choice = initialTrackChoice(traffic, complete.cost, upkeep + complete.upkeep, annualInterest);
     if (!choice.double || !finance.affordable || !fund(complete.cost)) return { built: false, choice, edges: [], signals: 0, cost: 0 };
-    const result = commitCapacityTrackUpgrade(g, plan, consent, complete.cost);
+    const result = commitCapacityTrackUpgrade(g, plan, consent, complete.cost, complete);
     if (!result.error) return { built: !result.finishError, choice, ...result };
   }
   return { built: false, choice: undefined, edges: [], signals: 0, cost: 0 };

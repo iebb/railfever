@@ -253,7 +253,9 @@ function openingNatural() {
 
 /** A pending curve-search cursor survives saving through its completion, with normal train traffic. */
 function midconnectReplay() {
-  let g = Game.create({ size: 512, seed: 23, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
+  // Ordinary rail-focused survey settings naturally supply several funded services for the saved search.
+  let g = Game.create({ size: 512, seed: 5, towns: 12, hilliness: 'hilly', water: 'medium', startYear: 1985,
+    aiConfigs: Array.from({ length: 3 }, () => ({ focus: { rail: 2.5, road: 1.2, tram: 0.5 } })) });
   g.aiAcquisitions = false;
   const observation = openingObserver(g);
   let saved = false;

@@ -6,7 +6,7 @@ import type { Proposal } from './construction';
 import { sharedCapacityPlan, sharedUpgradeReturn, capacityTrackUpkeep } from './ai-capacity';
 import { autoSignalLine } from './signals';
 import { planStationUpgrade, commitStationUpgrade } from './stations';
-import { planDoubleTrack, commitDoubleTrack, type DoublePlan } from './trackops';
+import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion, type DoublePlan } from './trackops';
 import { lineCongestion } from './train';
 
 type WorksReturn = ReturnType<typeof sharedUpgradeReturn>;
@@ -36,8 +36,10 @@ function settleWorks(ai: AIController, value: WorksReturn, quoted: number, spent
 export function planCapacityTrackUpgrade(g: Game, edges: number[], side: 1 | -1, payer: number): DoublePlan {
   return planDoubleTrack(g, edges, side, payer);
 }
-export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: (p: Proposal) => boolean, maxSpend?: number) {
+export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: (p: Proposal) => boolean, maxSpend?: number,
+  formation?: { formationCost: number }) {
   if (maxSpend === undefined) return commitDoubleTrack(g, plan, true, {}, consent);
+  const reserve = formation ?? quoteDoubleTrackCompletion(g, plan);
   const eco = g.company(plan.owner).economy;
   const own = Object.getOwnPropertyDescriptor(eco, 'canAfford'), native = eco.canAfford;
   const ownSpend = Object.getOwnPropertyDescriptor(eco, 'spend'), nativeSpend = eco.spend;
@@ -54,7 +56,7 @@ export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: 
       if (cost > 0 && category === 'construction' && !canAfford.call(this, cost)) return false;
       return nativeSpend.call(this, cost, category, force);
     } });
-  try { return commitDoubleTrack(g, plan, true, { maxFormationSpend: plan.cost }, consent); }
+  try { return commitDoubleTrack(g, plan, true, { maxFormationSpend: reserve.formationCost }, consent); }
   finally {
     if (own) Object.defineProperty(eco, 'canAfford', own); else Reflect.deleteProperty(eco, 'canAfford');
     if (ownSpend) Object.defineProperty(eco, 'spend', ownSpend); else Reflect.deleteProperty(eco, 'spend');
