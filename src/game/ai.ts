@@ -1222,6 +1222,8 @@ export interface AIState {
   phase: string;
   cooldown: number;
   projects: number;
+  /** Next detailed city opportunity; rotating the search keeps other construction moving. */
+  urbanSearchCursor?: number;
   rng?: number;
   failed?: [string, number][];
   stats?: AIStats;
@@ -1267,7 +1269,7 @@ const BUS_MIN_POP = 1500;
 export class AIController {
   readonly railPolicy: RailPolicy;
   readonly mailPolicy: MailPolicy;
-  state: AIState = { phase: 'idle', cooldown: 10, projects: 0 };
+  state: AIState = { phase: 'idle', cooldown: 10, projects: 0, urbanSearchCursor: 0 };
   stats: AIStats = {
     railStations: 0, busStops: 0, track: 0, road: 0, bridges: 0, tunnels: 0, lines: 0, vehicles: 0, failed: 0, spent: 0, sold: 0, trams: 0, shared: 0, acquired: 0,
     reused: 0, doubled: 0, signals: 0, loops: 0, transfers: 0, multiTown: 0, rings: 0, joined: 0, urban: 0, through: 0, electrified: 0, trackDouble: 0, trackShared: 0, coaches: 0,
@@ -1323,7 +1325,8 @@ export class AIController {
     this.mailPolicy = new MailPolicy(this);
     this.cfg = normalizeAIConfig(config);
     this.rng = new RNG((game.options.seed * 977 + companyId * 7919) >>> 0);
-    this.state.cooldown = Math.round((12 + companyId * 9) / this.config.activeness);
+    this.state.urbanSearchCursor = companyId - 1;
+    this.state.cooldown = Math.round((2 + companyId % 5) / this.config.activeness);
     game.world.net.onSplit.push(this.splitListener);
   }
 
@@ -1608,6 +1611,9 @@ export class AIController {
     const g = this.game, c = this.config, act = c.activeness, focus = c.focus;
     const avail = this.available();
     const own = [...this.lines.values()];
+    const lastInvestment = own.reduce((day, line) => Math.max(day, line.opened), 0);
+    const preferredWeight = Math.max(focus.rail * focus.rail, focus.road * focus.road, focus.tram * focus.tram);
+    const considers = (weight: number) => g.day - lastInvestment > 360 || weight * weight >= 0.1 * preferredWeight;
     const railLines = own.filter((l) => l.kind === 'rail').length, busLines = own.filter((l) => l.kind === 'bus').length, tramLines = own.filter((l) => l.kind === 'tram').length;
     // don't overbuild: keep the debt serviceable
     const yearNet = this.eco.yearTotals.length ? this.eco.lastYearProfit : 0;
@@ -1631,7 +1637,7 @@ export class AIController {
     const share = (a: number, b: number) => 1 / (1 + (served.get(this.pairKey(a, b)) ?? 0));
     // intercity railways: preferably extending our network from a station we have (hubs and branches)
     const railModels = pickTrain(g.year, aiPlatformLength(2000, 2000, g.year), 150, 3) ?? [];
-    if (focus.rail > 0 && avail > 3_000_000 && railModels.length) {
+    if (focus.rail > 0 && considers(focus.rail) && avail > 3_000_000 && railModels.length) {
       const townFails = this.railTownFailures();
       const rivals = this.rivalRailPairs();
       const T = g.towns.list;
@@ -1797,7 +1803,11 @@ export class AIController {
     // Compare affordable stages of a city railway: a small light-rail-style opening first, or a subway where the
     // capacity repays the tunnels over their discounted civil life. Both are ordinary rail (one catchment, fare and forecast model;
     // the style picks track, level, platforms and spacing). Preview uses real pedestrian routes, never a town fraction.
-    if ((focus.rail > 0 || focus.tram > 0) && TRACK_TYPES.electric) {
+    const pricedOpening = own.length === 0 && opts.some((o) => o.score > 0 && considers(
+      o.kind === 'rail' || o.kind === 'share' || o.kind === 'hsr' || o.kind === 'crosscity' ? focus.rail : focus.road));
+    // Start from already priced openings. Later selections compare one detailed city opportunity,
+    // rather than blocking every route behind a survey of every town and construction style.
+    if (!pricedOpening && (focus.rail > 0 || focus.tram > 0) && TRACK_TYPES.electric) {
       const urbanIn = new Map<number, number>();
       for (const l of g.lines.map.values()) {
         if (l.kind !== 'rail') continue;
@@ -1805,6 +1815,7 @@ export class AIController {
         for (const sid of l.stops) { const st = g.stations.get(sid); if (st?.rail && railPartMode(st.rail) !== 'mainline' && st.townId >= 0) towns.add(st.townId); }
         for (const t of towns) urbanIn.set(t, (urbanIn.get(t) ?? 0) + 1);
       }
+      const cityOpportunities: { town: Town; mode: 'lightrail' | 'metro' }[] = [];
       for (const T of g.towns.list) {
         if (T.pop < AIController.urbanPop || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
         if (this.urbanReserved(T.id) || (urbanIn.get(T.id) ?? 0) >= (T.pop >= 6000 ? 3 : 1)) continue;
@@ -1812,6 +1823,15 @@ export class AIController {
           // Price each construction style independently. A failed surface proposal says little
           // about a subway, and population alone does not decide whether its investment pays.
           if (this.isFailed('urban' + mode + T.id)) continue;
+          if (!considers(mode === 'metro' ? focus.rail : Math.max(focus.rail, focus.tram))) continue;
+          cityOpportunities.push({ town: T, mode });
+        }
+      }
+      const cursor = this.state.urbanSearchCursor ?? this.companyId - 1;
+      const opportunity = cityOpportunities[cursor % Math.max(1, cityOpportunities.length)];
+      for (const { town: T, mode } of opportunity ? [opportunity] : []) {
+          // Advance before yielding so a reload does not endlessly restart the same long valuation.
+          this.state.urbanSearchCursor = (cursor + 1) % cityOpportunities.length;
           yield;
           const layout = yield* this.urbanStep(T, mode), unit = this.urbanUnit(mode, this.urbanPlatform(mode));
           if (!unit) continue;
@@ -1827,7 +1847,6 @@ export class AIController {
               urbanLayout: { ...handoff, targets: [...handoff.targets], interchanges: handoff.interchanges.map(s => s.id),
                 ...(handoff.towns ? { towns: [...handoff.towns] } : {}) } });
           }
-        }
       }
     }
     // tram lines in big towns (ai-tram.ts)
@@ -1859,7 +1878,7 @@ export class AIController {
     const lastOpened = own.reduce((a, l) => Math.max(a, l.opened), 0);
     const restless = g.day - lastOpened > 360;
     for (let i = opts.length - 1; i >= 0; i--) if (!(opts[i].score > 0) || (!restless && wOf(opts[i].kind) < 0.1 * wMax)) opts.splice(i, 1);
-    if (!opts.length) { this.state.phase = 'idle'; this.state.cooldown = Math.round(60 / act); return; }
+    if (!opts.length) { this.state.phase = 'idle'; this.state.cooldown = Math.round(15 / act); return; }
     // one of the best few, the better ones (squared score) much more likely
     opts.sort((a, b) => b.score - a.score);
     if (AIController.profile) this.lastOptions = opts.map((o) => ({ kind: o.kind, towns: o.towns, score: o.score }));
@@ -1891,7 +1910,7 @@ export class AIController {
     this.splitPieces.clear();
     this.state.phase = 'idle';
     const act = this.config.activeness;
-    this.state.cooldown = p && p.line >= 0 ? Math.round((60 + this.rng.int(70)) / act)
+    this.state.cooldown = p && p.line >= 0 ? Math.round((14 + this.rng.int(21)) / act)
       : p && !p.built ? Math.round((4 + this.rng.int(8)) / Math.sqrt(act)) : Math.round((20 + this.rng.int(20)) / Math.sqrt(act));
   }
 
@@ -5642,7 +5661,8 @@ export class AIController {
     if (data?.config) this.config = normalizeAIConfig(data.config);
     const s = data?.state;
     if (!s) return;
-    this.state = { phase: s.phase ?? 'idle', cooldown: s.cooldown ?? 10, projects: s.projects ?? 0 };
+    this.state = { phase: s.phase ?? 'idle', cooldown: s.cooldown ?? 10, projects: s.projects ?? 0,
+      urbanSearchCursor: Number.isSafeInteger(s.urbanSearchCursor) && s.urbanSearchCursor >= 0 ? s.urbanSearchCursor : this.companyId - 1 };
     if (Array.isArray(s.corridor) && s.corridor.length === 2) this.state.corridor = [s.corridor[0], s.corridor[1]];
     // a through service being planned resumes where it was (its cursor), as the running game goes on with it
     if (!s.project && s.through && typeof s.through.line === 'number') {
