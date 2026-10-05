@@ -27,6 +27,7 @@ import { type ForecastSite } from './demand';
 import { walkSitePop, walkLimit, planWalkingCatchment, walkingCatchment, walkingPopulation, pointWalkingCatchment, pedestrianRoad, stopSiteWalkingCatchment } from './catchment';
 import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import * as Patterns from './patterns';
+import { platformPreference, platformChoices } from './rail-platforms';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
@@ -54,6 +55,24 @@ const AI_ROUTE_WORK = 1024;
 /** Present value of a year's surplus over the civil investment horizon, at the company's borrowing rate. */
 const urbanPayback = (mode: 'metro' | 'lightrail', rate: number) => discountedPayback(URBAN_PAYBACK[mode], rate);
 const AI_SITE_WORK = 64;
+
+/** A paid opening train starts at a served call its actual depot/consist can reach and leave lawfully. */
+export function openingRailCall(g: Game, t: Train, preferredStation = -1): number {
+  const l = t.line, dp = g.depots.get(t.depotId), stub = dp && g.world.net.edges.get(dp.edge);
+  if (!l || !dp || !stub || dp.kind !== 'rail' || stub.kind !== 'rail' || dp.owner !== t.owner
+    || g.lines.operateError(l, t.owner)) return -1;
+  const pattern = Patterns.patternOf(l, t.pattern)?.id ?? l.patterns?.[0]?.id ?? 0, indices = Patterns.patternStops(l, pattern);
+  // The next-hop route alone cannot prove a later foreign call fits the same actual fleet/pattern.
+  // Native platform choices prove lawful incoming/outgoing full-fit paths at every served occurrence.
+  if (indices.some(index => !platformChoices(g, l, pattern, index).length)) return -1;
+  indices.sort((a, b) => Number(l.stops[b] === preferredStation) - Number(l.stops[a] === preferredStation) || a - b);
+  for (const index of indices) {
+    const saved = platformPreference(l, t.pattern, index), onward = l.stops[Patterns.nextStopIndex(l, t.pattern, index)];
+    if (findRailRoute(g, [{ edge: stub, dir: 1 }], l.stops[index], t.owner, t.id, 60000, false, t.rule, false,
+      { preferred: saved?.group, manual: saved?.manual, length: t.length, onward })) return index;
+  }
+  return -1;
+}
 // At eight units/day this leaves six days of the 60-day planning target for choosing a project.
 const AI_RAIL_PLAN_UNITS = 432;
 /**
@@ -1085,6 +1104,8 @@ interface Project {
   edges: number[];
   depots: number[];
   line: number;
+  /** Final timetable being opened/merged; lifecycle ownership remains in `line`. Saved with this project. */
+  openingLine?: number;
   started: number;
   /** Completed selection survey; construction proves its sites, yard, fleet and economics again. */
   urbanLayout?: UrbanLayout;
@@ -2128,6 +2149,11 @@ export class AIController {
     const g = this.game, me = this.companyId;
     for (const l of [...g.lines.map.values()].sort((a, b) => a.id - b.id)) {
       if (!l.vehicles.some(id => g.vehicles.get(id)?.owner === me) || !usesSharedRail(g, l)) continue;
+      // An opening/merge still has temporary route families and bidders. Price its finalized service,
+      // never sell a paid opening train between its purchase yield and completion of those same works.
+      const p = this.project;
+      if (this.job && p?.built && ['rail', 'hsr', 'share', 'metro', 'lightrail'].includes(p.kind)
+        && l.owner === me && g.lines.get(p.openingLine ?? p.line)?.id === l.id) continue;
       const plan = sharedCapacityPlan(g, l), cut = plan.withdraw[0];
       if (!cut || cut.owner !== me || plan.lines.some(id => g.lines.get(id)?.capacity?.withdrawn === g.day)) continue;
       const t = g.vehicles.get(cut.train);
@@ -2956,13 +2982,13 @@ export class AIController {
     const extA = hs ? undefined : endsAt(hub, stB), extB = hs || extA ? undefined : endsAt(hubB, stA);
     const ext = extA ?? extB, at = extA ? stA : stB, add = extA ? stB : stA;
     let line = ext ? g.lines.get(ext[0])! : early?.line ?? null;
+    let extensionLength = 0;
     if (line && ext) {
       let path = linearStops(line.stops)!;
       if (path[0] === at.id) path = path.reverse();
       path = [...path, add.id];
+      extensionLength = path.length;
       line.stops = outAndBack(path);
-      ext[1].towns = [...new Set([...ext[1].towns, A.id, B.id])];
-      ext[1].maxVehicles = Math.max(ext[1].maxVehicles, Math.min(6, path.length + 1));
       g.lines.rebuild();
       for (const vid of line.vehicles) g.vehicles.get(vid)?.onLineChanged();
       this.stats.multiTown = Math.max(this.stats.multiTown, path.length);
@@ -2979,6 +3005,7 @@ export class AIController {
       } else line.stops = first === stA.id ? [stA.id, stB.id] : [stB.id, stA.id];
       if (early) g.lines.rebuild();
     }
+    p.openingLine = line.id;
     // signals for the new or extended line (before its trains run)
     this.signalLine(line.id);
     yield;
@@ -2988,7 +3015,12 @@ export class AIController {
     let bought = 0;
     for (let i = 0; i < nTrains; i++) {
       const t = g.vehicles.buyTrain(dep, this.mailPolicy.openingCars(line, mail.cars), line.id);
-      if (typeof t !== 'string') { bought++; this.stats.vehicles++; }
+      if (typeof t !== 'string') {
+        const call = openingRailCall(g, t, first);
+        if (call < 0) { g.vehicles.sell(t.id); return fail('depot no longer serves the final timetable', 720); }
+        t.stopIndex = call;
+        bought++; this.stats.vehicles++;
+      }
       yield;
     }
     if (!bought) this.note(`no money for a train on ${line.name} yet`);
@@ -3001,7 +3033,13 @@ export class AIController {
       const info = this.lines.get(line.id);
       if (info) { info.double = lineIsDouble(g, line, owner); if (info.double) info.maxVehicles = Math.max(4, info.maxVehicles); }
     }
-    if (ext) p.line = line.id;
+    if (ext) {
+      // A refused/cancelled extension retires its added stops through native station cleanup.
+      // Its completed-service metadata belongs to the same successful completion boundary.
+      ext[1].towns = [...new Set([...ext[1].towns, A.id, B.id])];
+      ext[1].maxVehicles = Math.max(ext[1].maxVehicles, Math.min(6, extensionLength + 1));
+      p.line = line.id;
+    }
     this.stats.lines += ext ? 0 : 1; this.stats.railStations += (hub ? 0 : 1) + (hubB ? 0 : 1);
     if (hubB) this.stats.joinedStations++;
     // the corridor goes on: the town beyond B is the next extension (through B's free platform ends)
@@ -3384,6 +3422,13 @@ export class AIController {
     if (!sharedTrainAllowed(g, line, me, cars)) { if (joined) g.lines.leave(line.id, me); return fail('shared paths would lose money', 360); }
     const t = g.vehicles.buyTrain(dep, cars, line.id);
     if (typeof t === 'string') { if (joined) g.lines.leave(line.id, me); return fail('could not buy a train: ' + t, 360); }
+    const call = openingRailCall(g, t, ra ? a : b);
+    if (call < 0) {
+      g.vehicles.sell(t.id);
+      if (joined) g.lines.leave(line.id, me);
+      return fail('depot no longer serves the final timetable', 360);
+    }
+    t.stopIndex = call;
     this.stats.vehicles++;
     const A = g.towns.list[stA.townId], B = g.towns.list[stB.townId];
     this.lines.set(line.id, { kind: 'rail', towns: [A?.id ?? -1, B?.id ?? -1], depot: dep, maxVehicles: 1, opened: g.day, shared: owner, joined: joined || undefined });
@@ -4997,6 +5042,12 @@ export class AIController {
       }
       // our vehicles (a shared line has other operators' too)
       const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is NonNullable<typeof v> => !!v && v.owner === this.companyId);
+      // Older purchases may already be saved at the wrong initial call. Repair only a depot departure;
+      // moving bodies, pending routes and their held reservations retain their native destination.
+      for (const t of vs) if (t instanceof Train && !t.onMap && !t.backoff && t.state === 'noroute' && !t.pending.length) {
+        const call = openingRailCall(g, t);
+        if (call >= 0 && call !== t.stopIndex) { t.stopIndex = call; t.onLineChanged(); }
+      }
       // a line that lost its stops (track access ended, stations gone): close it (leave it, if it is another's),
       // as we do one we no longer run trains on
       if (new Set(l.stops).size < 2 || (info.kind !== 'rail' && info.joined && !vs.length && g.day - info.opened > 90)) {
@@ -5045,7 +5096,11 @@ export class AIController {
         const cost = cars ? cars.reduce((a, c) => a + c.cost, 0) : Infinity;
         if (cars && sharedTrainAllowed(g, l, this.companyId, cars) && this.available() > cost + 300_000 && this.borrowFor(cost)) {
           const t = g.vehicles.buyTrain(info.depot, cars, lid);
-          if (typeof t !== 'string') { this.stats.vehicles++; this.note(`first train on ${l.name}`); }
+          if (typeof t !== 'string') {
+            const call = openingRailCall(g, t);
+            if (call < 0) g.vehicles.sell(t.id);
+            else { t.stopIndex = call; this.stats.vehicles++; this.note(`first train on ${l.name}`); }
+          }
         }
         continue;
       }
@@ -5108,7 +5163,12 @@ export class AIController {
         // a further train on a single track: signals first (starters, passing loops), so trains wait instead of meeting head-on
         if (!info.double && info.shared === undefined) this.signalLine(lid);
         const t = g.vehicles.buyTrain(info.depot, [...v0.cars].sort((a, b) => (a.kind === 'loco' ? -1 : 0) - (b.kind === 'loco' ? -1 : 0)), lid);
-        if (typeof t !== 'string') { this.stats.vehicles++; this.note(`added a train to ${l.name}`); }
+        if (typeof t !== 'string') {
+          t.pattern = v0.pattern;
+          const call = openingRailCall(g, t);
+          if (call < 0) g.vehicles.sell(t.id);
+          else { t.stopIndex = call; this.stats.vehicles++; this.note(`added a train to ${l.name}`); }
+        }
       } else if (v0 instanceof RoadVehicle && v0.model) {
         const model = roadModel ?? v0.model;
         if (!this.borrowFor(model.cost)) continue;
@@ -5210,8 +5270,11 @@ export class AIController {
       if (this.railPolicy.account(l).step > 0 || this.railPolicy.deepTrouble) continue;
       const nt = g.vehicles.buyTrain(dep, cars, l.id);
       if (typeof nt === 'string') continue;
-      this.mailPolicy.replaced(t, nt);
       nt.pattern = t.pattern;
+      const call = openingRailCall(g, nt, t.atStation);
+      if (call < 0) { g.vehicles.sell(nt.id); continue; }
+      nt.stopIndex = call;
+      this.mailPolicy.replaced(t, nt);
       const name = t.name;
       // The replacement starts at its depot: mail aboard waits here with its journey intact.
       if (t.mailLoad > 0) offloadMail(g, t, t.mailLoad, g.stations.get(t.atStation) ?? null);
