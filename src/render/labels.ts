@@ -379,8 +379,8 @@ export class Labels {
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
       let y = s.rail ? s.rail.y + 1.0 : Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8;
-      // Underground station symbols belong above the surface, so terrain does not bury them.
-      if (compact) y = Math.max(y, Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8);
+      // Station signs belong above the surface, including full plates over underground platforms.
+      y = Math.max(y, Math.max(world.heightAt(s.x, s.z), WATER_Y) + 0.8);
       if (pins) y = pinY(game, s);
       const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
       // Selection raises symbol priority, but may not bypass their collisions or distance fade.
@@ -451,9 +451,9 @@ export class Labels {
         const lift = L.kind === 'town' ? L.gap : 0;
         x0 = c.sx - c.w / 2; x1 = c.sx + c.w / 2; y0 = c.sy - c.h - lift; y1 = c.sy - lift;
       }
-      // station numbers and town names are separate layers that never push each other out (numbers drawn on top);
-      // stop dots without numbers give way to town names
-      const layer = L.kind === 'mk' && L.nBadges ? 1 : L.kind === 'town' ? 2 : 0;
+      // Station signs and numbers never give way to town names; stations still declutter against each other.
+      // Stop dots without numbers give way to town names.
+      const layer = L.kind === 'stn' || (L.kind === 'mk' && L.nBadges) ? 1 : L.kind === 'town' ? 2 : 0;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 5) if (layer + placed[i + 4] !== 3 && x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;
@@ -583,8 +583,8 @@ export class Labels {
     const steps = c.compact ? 100 : 20;
     const op = c.force ? 1 : Math.round(Math.min(c.opacity, Math.max(0, Math.min(1, (c.maxDist - c.d) / (c.maxDist * 0.25)))) * steps) / steps;
     if (op !== l.op) { l.op = op; l.el.style.opacity = String(op); }
-    // (station numbers above town names, the hovered line's tag above everything)
-    const z = l.kind === 'tag' ? 250000 : (l.kind === 'mk' ? 200000 : 100000) - Math.round(c.d * 10);
+    // (station signs and numbers above town names, the hovered line's tag above everything)
+    const z = l.kind === 'tag' ? 250000 : (l.kind === 'mk' || l.kind === 'stn' ? 200000 : 100000) - Math.round(c.d * 10);
     if (Math.abs(z - l.z) > 5) { l.z = z; l.el.style.zIndex = String(z); }
   }
 
