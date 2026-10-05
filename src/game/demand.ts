@@ -93,6 +93,7 @@ const feederQuality = (headway: number) => Math.max(0, Math.min(1,
   (MAINLINE_FEEDERS.cutoffHeadway - headway) / (MAINLINE_FEEDERS.cutoffHeadway - MAINLINE_FEEDERS.fullHeadway)));
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
 interface FeederPool { pop: number; regions: Map<number, number> }
+const feederSites = new WeakMap<DemandModel, { key: string; sites: Map<string, Map<number, number>> }>();
 type ForecastPoint = StationPlan | Station | ForecastSite;
 const forecastStation = (p: ForecastPoint): Station | null => 'id' in p ? p : 'join' in p ? p.join : null;
 /** Same passenger areas as the committed facility, including native curves and an inherited joined stop. */
@@ -438,8 +439,13 @@ export class DemandModel {
 
   /** Town-pair proposals revisit the same station access with different frequencies. Cache only geometry;
    * population, competing claims, eligibility and service quality are still calculated for each proposal. */
+  private feederGeometryKey(): string {
+    const g = this.g;
+    return `${g.world.net.version}:${g.lines.version}:${g.world.heightsVersion}:${g.world.nextBuildingId}:${g.world.buildings.size}`;
+  }
+
   private feederWalk(x: number, z: number, reach: number): Map<number, number> {
-    const g = this.g, key = `${g.world.net.version}:${g.lines.version}:${g.world.heightsVersion}:${g.world.nextBuildingId}:${g.world.buildings.size}`;
+    const g = this.g, key = this.feederGeometryKey();
     if (key !== this.feederWalkKey) { this.feederWalkKey = key; this.feederWalks.clear(); }
     const site = `${x}:${z}:${reach}`, cached = this.feederWalks.get(site);
     if (cached) return cached;
@@ -460,6 +466,32 @@ export class DemandModel {
     return buildings;
   }
 
+  /** Merge an access site's walks once, in their original lot order. Frequencies and competing claims use
+   * these distances repeatedly; no populations, district ids or quality weights belong in this cache. */
+  private feederSiteWalk(s: FeederSite): Map<number, number> {
+    const key = this.feederGeometryKey();
+    let memo = feederSites.get(this);
+    if (!memo || memo.key !== key) {
+      memo = { key, sites: new Map() };
+      feederSites.set(this, memo);
+    }
+    const access = s.access?.length ? s.access : [s];
+    let site = `${s.x}:${s.z}:${MAINLINE_FEEDERS.reach}`;
+    for (const p of access) site += `:${p.x}:${p.z}`;
+    const cached = memo.sites.get(site);
+    if (cached) return cached;
+    const buildings = new Map<number, number>();
+    for (const p of access) {
+      const leg = Math.hypot(p.x - s.x, p.z - s.z), reach = MAINLINE_FEEDERS.reach - leg;
+      if (reach <= 0) continue;
+      for (const [bid, distance] of this.feederWalk(p.x, p.z, reach))
+        buildings.set(bid, Math.min(buildings.get(bid) ?? Infinity, distance + leg));
+    }
+    if (memo.sites.size >= 256) memo.sites.clear();
+    memo.sites.set(site, buildings);
+    return buildings;
+  }
+
   /** A separate car feeder pool, never a wider walking catchment. Catchments with an existing intercity route
    * are excluded: those residents already enter through routed feeder transfers. A local-only bus does not
    * supply a railway it cannot reach. Competing main-line stations share every lot once. */
@@ -472,13 +504,7 @@ export class DemandModel {
     const indices: number[] = [], weights: number[] = [], next: number[] = [];
     sites.forEach((s, i) => {
       if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500) return;
-      const buildings = new Map<number, number>();
-      for (const p of s.access?.length ? s.access : [s]) {
-        const leg = Math.hypot(p.x - s.x, p.z - s.z), reach = MAINLINE_FEEDERS.reach - leg;
-        if (reach <= 0) continue;
-        for (const [bid, distance] of this.feederWalk(p.x, p.z, reach))
-          buildings.set(bid, Math.min(buildings.get(bid) ?? Infinity, distance + leg));
-      }
+      const buildings = this.feederSiteWalk(s);
       for (const [bid, distance] of buildings) {
         const b = this.g.world.buildings.get(bid);
         if (!b || b.townId !== s.townId || covered.has(bid)) continue;
