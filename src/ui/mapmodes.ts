@@ -8,7 +8,7 @@ import { PLAYER } from '../game/game';
 import { h, icon, clear, seg } from './dom';
 import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, allBadges, MODE_META, LineFilter, Badge } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
-import { townDemandShare, mailDemandView, fmtMailTonnes, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode } from './gameapi';
+import { townDemandShare, mailDemandView, fmtMailTonnes, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode, CITY_REACH, stationInCity } from './gameapi';
 import { demandView, DemandView } from '../game/demand';
 import { ROUTE_LIFT } from '../render/overlay';
 import { mailView, type MailView } from '../game/mail-view';
@@ -17,6 +17,7 @@ import { markY, markHalfHeight, pinY } from '../render/labels';
 import type { Labels, StationMark } from '../render/labels';
 import { RouteIndex } from './routepick';
 import { fmtInt } from './dom';
+import { CITY_STATION } from '../game/stations';
 
 export type MapMode = 'none' | 'lines' | 'demand' | 'catchment' | 'signals';
 
@@ -615,21 +616,23 @@ export class MapModes {
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);
     const pop = g.towns.list.reduce((a, t) => a + t.pop, 0);
     const towns = g.towns.list.filter((t) => !mine.some((s) => Math.hypot(s.x - t.x, s.z - t.z) < t.radius + 10));
-    const n = (m: CatchMode) => mine.filter((s) => g.stations.catchMode(s) === m).length;
+    // (in-city metro / light-rail stations walk half as far: a row of their own)
+    const city = mine.filter((s) => stationInCity(s)).length;
+    const n = (m: CatchMode) => mine.filter((s) => g.stations.catchMode(s) === m).length - (m === 'rail' ? city : 0);
     const c = this.card;
     clear(c);
     // the ring's border repeats the mode's dash pattern on the map (solid, dashed, dotted)
-    const row = (m: CatchMode, label: string, r: number) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: 'mc-ring ' + m, style: `--c:${hexCss(CATCH_COLOR[m])}` }), h('span', { class: 'mc-name' }, label), h('span', { class: 'mc-num' }, `${Math.round(r * 10)} m · ${n(m)}`));
+    const row = (m: CatchMode, label: string, r: number, count = n(m)) => h('div', { class: 'mc-row', style: 'cursor:default' }, h('i', { class: 'mc-ring ' + m, style: `--c:${hexCss(CATCH_COLOR[m])}` }), h('span', { class: 'mc-name' }, label), h('span', { class: 'mc-num' }, `${Math.round(r * 10)} m · ${count}`));
     c.append(
       h('div', { class: 'mc-head' }, icon('catchment', 18), h('span', { class: 'mc-title' }, 'Catchment'), h('span', { class: 'mc-sub' }, `${fmtInt(reach)} residents`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-sfx': 'none', 'aria-label': 'Close catchment view', onclick: () => this.set('none') }, icon('close', 16))),
       h('div', { class: 'mc-body' },
-        h('div', { class: 'mc-list' }, row('rail', 'Rail stations', catchWalkLimit('rail')), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
+        h('div', { class: 'mc-list' }, row('rail', 'Rail stations', catchWalkLimit('rail')), row('rail', 'City metro / LR', catchWalkLimit('rail') * CITY_REACH, city), row('tram', 'Tram stops', catchWalkLimit('tram')), row('bus', 'Bus stops', catchWalkLimit('bus'))),
         h('div', { class: 'mc-stats' },
           h('div', null, h('b', null, pop > 0 ? `${Math.round((reach / pop) * 100)}%` : '–'), h('span', null, 'of residents near your stations')),
           towns.length ? h('div', null, h('b', null, String(towns.length)), h('span', null, `town${towns.length > 1 ? 's' : ''} without your stations`)) : null,
           inactive ? h('div', null, h('b', { class: 'neg' }, String(inactive)), h('span', null, `station${inactive > 1 ? 's' : ''} without road access`)) : null),
-        h('div', { class: 'mc-note' }, 'Street reach from forecourts, entrances and stops · tram: dashed · equal rail reach · grid allowance included · buildings extend reach · hover: coverage')),
+        h('div', { class: 'mc-note' }, `Street reach from forecourts, entrances and stops · tram: dashed · rail: equal reach; in-city metro / light rail (town ${fmtInt(CITY_STATION.pop)}+ core): half · grid allowance included · buildings extend reach · hover: coverage`)),
     );
   }
 

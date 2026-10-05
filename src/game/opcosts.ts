@@ -3,7 +3,7 @@
 // tram, a fireman on steam, conductors on long-distance trains), vehicle maintenance per car-km rising with speed
 // plus time-based upkeep, and energy from the physics: traction energy at the wheels / efficiency (electric 0.85,
 // diesel 0.35, steam 0.07), hotel load, regenerative braking on electric stock, at era prices. Tracks: a base
-// maintenance per unit by type (high-speed about 3x standard) plus wear per train passage (axle load x (v/160)^2),
+// maintenance per unit (wire upkeep when electrified) plus wear per train passage (axle load x (v/160)^2),
 // recorded per edge and billed monthly to the owner; track-access usage is metered by that wear.
 //
 // Calibration: under its kind's typical duty (in service all year, stops at the usual spacing) a consist costs
@@ -42,8 +42,8 @@ export function loadOf(v: { load: number; mailLoad: number }): number { return v
 export const WEAR_RATE = 0.25;
 /** Base track maintenance (per unit and year) as a share of TRACK_TYPES.maintPerUnit (the rest comes from wear). */
 export const TRACK_BASE_SHARE = 0.75;
-/** Minimum base maintenance per type relative to standard track (high-speed: tight tolerances, catenary, signalling). */
-export const TRACK_TYPE_FACTOR: Record<string, number> = { standard: 1, electric: 1.25, highspeed: 3, metro: 1.3, lightrail: 0.85 };
+/** Minimum base maintenance relative to plain track; wired aliases share catenary upkeep. */
+export const TRACK_TYPE_FACTOR: Record<string, number> = { standard: 1, electric: 1.25, highspeed: 1.25, metro: 1.25, lightrail: 1.25 };
 
 type Source = 'electric' | 'diesel' | 'steam';
 /** Price / wage indices by year (1980 = 1), interpolated. */
@@ -334,14 +334,14 @@ export function noteServe(g: Game, v: Vehicle, stationId: number, x: number, z: 
 }
 
 // ------------------------------------------------------------------------------ track maintenance and wear
-/** Base maintenance per unit and year of a track type (TRACK_BASE_SHARE of maintPerUnit, high-speed >= 3x standard). */
+/** Base maintenance per unit and year of a wire state (TRACK_BASE_SHARE of maintPerUnit). */
 export function trackBasePerUnit(type: string): number {
   const std = TRACK_TYPES.standard.maintPerUnit;
   const per = Math.max(TRACK_TYPES[type]?.maintPerUnit ?? std, (TRACK_TYPE_FACTOR[type] ?? 0) * std);
   return per * TRACK_BASE_SHARE;
 }
 
-/** Yearly base maintenance of a rail or road edge (rail: by type, structures 3x / tunnels 4x on top; without wear). */
+/** Yearly base maintenance of a rail or road edge (rail: wire state, structures 3x / tunnels 4x on top; without wear). */
 export function trackMaintenance(e: NEdge): number {
   const per = e.kind === 'rail' ? trackBasePerUnit(e.type) : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).maintPerUnit;
   let c = e.len * per;

@@ -1,5 +1,5 @@
 // Bridges (girder, steel truss, stone viaduct, concrete arch; piers, abutments) and tunnel portals.
-import { RAIL, ROAD_TYPES, TRACK_TYPES } from '../game/constants';
+import { RAIL, ROAD_TYPES } from '../game/constants';
 import type { NEdge } from '../game/network';
 import { closestOnPolyline } from '../game/geom';
 import { ChunkCtx, Smp, PP, sweep, sampleAt, inChunk, EARTHWORK_TINT } from './build-common';
@@ -69,10 +69,15 @@ function continuesAt(ctx: ChunkCtx, e: NEdge, nodeId: number, type: 'bridge' | '
   return false;
 }
 
-/** Dead end of an underground station platform: the track ends inside the station box, no portal. */
+/**
+ * Dead end of an underground station platform (the track ends inside the station box), of an underground depot's
+ * track (in its cavern) or of a tunnel deep in the ground (a subway's free end): no portal.
+ */
 function buriedEnd(ctx: ChunkCtx, e: NEdge, nodeId: number): boolean {
-  if (ctx.stationEdges?.get(e.id) !== 'underground') return false;
   const node = ctx.game.world.net.nodes.get(nodeId);
+  if (e.depot >= 0 && ctx.game.depots.get(e.depot)?.level === 'underground') return true;
+  if (node && node.edges.length <= 1 && ctx.game.world.heightAt(node.x, node.z) - node.y > 1.2) return true;
+  if (ctx.stationEdges?.get(e.id) !== 'underground') return false;
   return !node || node.edges.length <= 1;
 }
 
@@ -141,7 +146,7 @@ function computeStyle(ctx: ChunkCtx, e: NEdge, s0: number, s1: number): BridgeSt
   let st: BridgeStyle = 'girder';
   if (e.kind === 'rail') {
     if (water && L >= 9) st = 'truss';
-    else if (L >= 8 && med >= 2.0) st = (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified ? 'arch' : 'viaduct';
+    else if (L >= 8 && med >= 2.0) st = 'viaduct';
   } else if (water) st = L >= 10 ? 'tiedarch' : 'viaduct';
   else if (L >= 12 && med >= 2.4) st = 'arch';
   if (st === 'viaduct' || st === 'arch') {
@@ -769,7 +774,7 @@ function buildPortal(ctx: ChunkCtx, e: NEdge, p: Smp, out: number, offs: number[
   const ox = p.tx * out, oz = p.tz * out; // outward
   const lx = p.lx, lz = p.lz;
   const y = p.y;
-  const modern = !rail || (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).electrified;
+  const modern = !rail;
   const cell = modern ? WC.CONCRETE : WC.STONE, sc = modern ? WSCALE.CONCRETE : WSCALE.STONE;
   const tone = modern ? CONCRETE : STONE, dark = modern ? CONCRETE_DARK : STONE_DARK;
   const light = modern ? 0xd6d2ca : 0xd2c4ad;

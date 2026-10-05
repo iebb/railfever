@@ -55,7 +55,7 @@ console.log(`${T.name}: ${T.pop} people, radius ${fmt(T.radius, 0)}; lines ${fmt
 
 // ---- 1. a metro line underground at constant depth beneath the town (no demolition, streets untouched)
 {
-  const opts = railOpts(0, 2, { type: 'metro', level: 'underground', levelDepth: 2.2 });
+  const opts = railOpts(0, 2, { type: 'electric', level: 'underground', levelDepth: 2.2 });
   const ux = Math.sin(aU), uz = Math.cos(aU);
   const p = planEdge(g, free(g, T.x - ux * L, T.z - uz * L), free(g, T.x + ux * L, T.z + uz * L), opts);
   check(p.ok, `underground line planned (${p.errors.join(', ')})`);
@@ -77,12 +77,12 @@ console.log(`${T.name}: ${T.pop} people, radius ${fmt(T.radius, 0)}; lines ${fmt
   const before = bridgedStreets(), e0 = net.nextEdge;
   check(commitProposal(g, p) === null, 'underground line built');
   check(bridgedStreets() === before, 'no street turned into a bridge over the tunnel');
-  check(newEdges(e0).every((e) => e.type === 'metro' && e.sections.length > 0 && e.sections.every((s) => s.type === 'tunnel')), 'metro edges, tunnel sections');
+  check(newEdges(e0).every((e) => e.type === 'electric' && e.sections.length > 0 && e.sections.every((s) => s.type === 'tunnel')), 'metro edges, tunnel sections');
 }
 
 // ---- 2. an elevated line over the streets (one viaduct, crossing over roads and the subway)
 {
-  const opts = railOpts(0, 2, { type: 'metro', level: 'elevated', levelHeight: 1.5 });
+  const opts = railOpts(0, 2, { type: 'electric', level: 'elevated', levelHeight: 1.5 });
   const ux = Math.sin(aE), uz = Math.cos(aE);
   const p = planEdge(g, free(g, T.x - ux * L, T.z - uz * L), free(g, T.x + ux * L, T.z + uz * L), opts);
   check(p.ok, `elevated line planned (${p.errors.join(', ')})`);
@@ -102,7 +102,7 @@ console.log(`${T.name}: ${T.pop} people, radius ${fmt(T.radius, 0)}; lines ${fmt
   let built = -1;
   const ux = Math.sin(aU), uz = Math.cos(aU);
   for (const [lat, along] of [[16, -8], [-16, -8], [20, 6], [-20, 6], [24, -14], [-24, -14]] as const) {
-    const plan = g.stations.planRail(T.x + uz * lat + ux * along, T.z - ux * lat + uz * along, aU, 8, 2, 0, { level: 'underground', trackType: 'metro' } as never);
+    const plan = g.stations.planRail(T.x + uz * lat + ux * along, T.z - ux * lat + uz * along, aU, 8, 2, 0, { level: 'underground', trackType: 'electric', mode: 'metro' } as never);
     if (!plan.ok) continue;
     const id = g.stations.nextId;
     if (!g.stations.commitRail(plan, 0)) { built = id; break; }
@@ -119,7 +119,7 @@ console.log(`${T.name}: ${T.pop} people, radius ${fmt(T.radius, 0)}; lines ${fmt
       return { n, out, dry };
     }).sort((a, b) => b.dry - a.dry);
     const { n, out } = cand[0];
-    const p = planEdge(g, nodeSnap(g, n.id, 'rail'), free(g, n.x + fx * out * 30, n.z + fz * out * 30), railOpts(0, 1, { type: 'metro', level: 'underground', levelDepth: st.rail.depth ?? 2.2 }));
+    const p = planEdge(g, nodeSnap(g, n.id, 'rail'), free(g, n.x + fx * out * 30, n.z + fz * out * 30), railOpts(0, 1, { type: 'electric', level: 'underground', levelDepth: st.rail.depth ?? 2.2 }));
     console.log(`  station ${st.name}: platforms ${fmt((st.rail.depth ?? 0) * 10, 0)} m down; line from it ${fmt(share(p, 'tunnel') * 100, 0)} % in tunnel (${p.errors.join(', ') || 'ok'})`);
     check(p.ok && share(p, 'tunnel') > 0.9, 'a line leaves the underground station underground');
   }
@@ -139,11 +139,11 @@ const hEdges = (from: number) => [...hn.edges.values()].filter((e) => e.id >= fr
 {
   // ground track, then down a ramp into a tunnel; a depot at the far end; metro units bought there
   const e0 = hn.nextEdge;
-  const pg = planEdge(h, free(h, 40, 128), free(h, 70, 128), railOpts(0, 1, { type: 'metro' }));
+  const pg = planEdge(h, free(h, 40, 128), free(h, 70, 128), railOpts(0, 1, { type: 'electric' }));
   check(pg.ok && commitProposal(h, pg) === null, `ground metro track (${pg.errors.join(', ')})`);
   const ge = hEdges(e0)[0];
   const inner = hn.nodes.get(ge.a)!.x > hn.nodes.get(ge.b)!.x ? ge.a : ge.b, outer = inner === ge.a ? ge.b : ge.a;
-  const p = planEdge(h, nodeSnap(h, inner, 'rail'), free(h, 120, 128), railOpts(0, 1, { type: 'metro', level: 'underground' }));
+  const p = planEdge(h, nodeSnap(h, inner, 'rail'), free(h, 120, 128), railOpts(0, 1, { type: 'electric', level: 'underground' }));
   const secs = p.tracks[0]?.sections ?? [];
   const tun = secs.find((q) => q.type === 'tunnel');
   console.log(`  ramp down: ${fmt(tun?.s0 ?? 0, 0)} units to the portal, then tunnel; max grade ${fmt(p.stats.maxGrade * 100, 1)} %; sections ${secs.map((q) => `${q.type} ${fmt(q.s0, 0)}-${fmt(q.s1, 0)}`).join(', ')} of ${fmt(p.tracks[0]?.len ?? 0, 0)}`);
@@ -165,7 +165,7 @@ const hEdges = (from: number) => [...hn.edges.values()].filter((e) => e.id >= fr
   // two underground metro stations joined by a tunnel, a ramp up to a depot on the surface, a train between them
   const ids: number[] = [];
   for (const x of [80, 130]) {
-    const plan = h.stations.planRail(x, 60, Math.PI / 2, 8, 1, 0, { level: 'underground', trackType: 'metro' } as never);
+    const plan = h.stations.planRail(x, 60, Math.PI / 2, 8, 1, 0, { level: 'underground', trackType: 'electric', mode: 'metro' } as never);
     const id = h.stations.nextId;
     if (plan.ok && !h.stations.commitRail(plan, 0)) ids.push(id);
     else console.log(`  station at ${x}: ${plan.error ?? 'commit failed'}`);
@@ -175,10 +175,10 @@ const hEdges = (from: number) => [...hn.edges.values()].filter((e) => e.id >= fr
     const [A, B] = ids.map((id) => h.stations.get(id)!);
     const ends = (st: typeof A) => { const e = stationEnds(h, st)[0]; return [e.front, e.back].map((id) => hn.nodes.get(id)!).sort((p, q) => p.x - q.x); };
     const [, aE2] = ends(A), [bW, bE] = ends(B);
-    const link = planEdge(h, nodeSnap(h, aE2.id, 'rail'), nodeSnap(h, bW.id, 'rail'), railOpts(0, 1, { type: 'metro', level: 'underground', levelDepth: A.rail!.depth }));
+    const link = planEdge(h, nodeSnap(h, aE2.id, 'rail'), nodeSnap(h, bW.id, 'rail'), railOpts(0, 1, { type: 'electric', level: 'underground', levelDepth: A.rail!.depth }));
     check(link.ok && share(link, 'tunnel') > 0.95 && commitProposal(h, link) === null, `tunnel between the stations (${link.errors.join(', ')})`);
     const e1 = hn.nextEdge;
-    const up = planEdge(h, nodeSnap(h, bE.id, 'rail'), free(h, bE.x + 50, 60), railOpts(0, 1, { type: 'metro' }));
+    const up = planEdge(h, nodeSnap(h, bE.id, 'rail'), free(h, bE.x + 50, 60), railOpts(0, 1, { type: 'electric' }));
     const upSec = up.tracks[0]?.sections ?? [];
     console.log(`  ramp up: ${upSec.map((q) => `${q.type} ${fmt(q.s0, 0)}-${fmt(q.s1, 0)}`).join(', ')} of ${fmt(up.tracks[0]?.len ?? 0, 0)}, max grade ${fmt(up.stats.maxGrade * 100, 1)} %`);
     check(up.ok && upSec.length === 1 && upSec[0].type === 'tunnel' && upSec[0].s0 < 0.5 && up.tracks[0].len - upSec[0].s1 > 8 && commitProposal(h, up) === null, `a ramp up from the underground station to the surface (${up.errors.join(', ')})`);

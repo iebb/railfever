@@ -1,17 +1,18 @@
 // Vehicle manager: ownership, reservations, spatial hash, purchases, recomposition and ambient traffic.
 import type { Game } from './game';
 import { Vehicle } from './vehicle';
-import { Train, CROSS_BASE, lineCompatibility, type TSeg } from './train';
+import { Train, CROSS_BASE, lineCompatibility, consistRule, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
-import { curvePoint, type NEdge } from './network';
+import { curvePoint, type NEdge, type Crossing } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 import { spacingSchedule } from './patterns';
 import { simNow } from './fares';
 import { offloadMail } from './mail';
 import type { Station } from './stations';
+import { sharedRailSpacing } from './rail-headways';
 
 /** Cars added and removed between two consists (by model, as multisets). */
 export function consistDiff(from: VehicleModel[], to: VehicleModel[]): { added: VehicleModel[]; removed: VehicleModel[] } {
@@ -238,6 +239,18 @@ export class Vehicles {
     this.ambient = this.ambient.filter((a) => !a.seg || !a.occupiedEdges().includes(e.id));
   }
 
+  /** Construction can add a crossing to an already reserved edge without splitting it. */
+  onCrossingAdded(c: Crossing) {
+    const resource = CROSS_BASE + c.id;
+    for (const t of this.trains()) {
+      for (const list of [t.segs, t.pending]) for (const s of list) {
+        if (s.e !== c.e1 && s.e !== c.e2) continue;
+        if (!s.res.includes(resource)) s.res.push(resource);
+        if (list === t.segs) this.setRes(resource, t.id);
+      }
+    }
+  }
+
   /** After construction: refresh geometry, drop stale look-ahead. */
   onNetworkChanged() {
     for (const v of this.map.values()) {
@@ -364,8 +377,10 @@ export class Vehicles {
 
   /** A depot's releases into the same pattern/direction are staggered; failed exits consume no slot. */
   waitForSpacingRelease(v: Vehicle): boolean {
-    const s = spacingSchedule(this.game, v);
-    const released = s?.clock.released?.[this.spacingReleaseKey(v)];
+    v.targetStation();
+    // capacity-integration: depots of different companies feeding the same approach share its departure slots.
+    const shared = sharedRailSpacing(this.game, v), s = shared ?? spacingSchedule(this.game, v);
+    const released = s?.clock.released?.[shared?.key ?? this.spacingReleaseKey(v)];
     if (s && s.vehicles >= 2 && released !== undefined && simNow(this.game) - released < s.headway) {
       v.status = 'Waiting to depart (spacing)';
       return true;
@@ -375,8 +390,8 @@ export class Vehicles {
 
   noteSpacingRelease(v: Vehicle) {
     v.resetSpacing(); // returning to a depot cancels any unfinished station departure
-    const s = spacingSchedule(this.game, v);
-    if (s) (s.clock.released ??= {})[this.spacingReleaseKey(v)] = simNow(this.game);
+    const shared = sharedRailSpacing(this.game, v), s = shared ?? spacingSchedule(this.game, v);
+    if (s) (s.clock.released ??= {})[shared?.key ?? this.spacingReleaseKey(v)] = simNow(this.game);
   }
 
   /** May v enter connector c (no conflicting vehicle inside the junction)? */
@@ -587,7 +602,7 @@ export class Vehicles {
       if (t.state !== 'loading' || t.atStation < 0) return 'Stop train in depot or at a platform';
       const head = t.segs[t.headSeg], e = head && head.e >= 0 ? g.world.net.edges.get(head.e) : undefined;
       const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
-      if (!e || e.station !== t.atStation || t.headPos < len + 0.05) return 'Train does not fit on this platform';
+      if (!e || e.station !== t.atStation || t.platformResizePath(len, consistRule(cars)) === null) return 'Train does not fit on a clear compatible platform';
     }
     if (t.lineId != null) { const why = lineCompatibility(g, t.lineId, cars); if (why) return why; }
     const { added } = consistDiff(t.cars, cars);
@@ -607,11 +622,13 @@ export class Vehicles {
     const err = this.recomposeError(t, cars);
     if (err) return err;
     const g = this.game, eco = g.company(t.owner).economy;
+    const platformPath = t.onMap ? t.platformResizePath(cars.reduce((n, c) => n + c.length + 0.1, 0), consistRule(cars)) : [];
     const { added, removed } = consistDiff(t.cars, cars);
     const cost = added.reduce((s, c) => s + c.cost, 0), price = removed.reduce((s, c) => s + c.cost, 0);
     const refund = price > 0 && t.value > 0 ? this.resaleValue(t) * price / t.value : 0;
     if (cost > 0 && !eco.spend(cost, 'vehicles')) return 'Not enough money';
     if (refund > 0) eco.earn(refund, 'vehicles');
+    if (platformPath) t.reservePlatformResize(platformPath);
     t.value += cost - price;
     // the new consist the way round the train stands (its locomotive at the end it was at)
     t.cars = t.runsBackward ? [...cars].reverse() : [...cars];

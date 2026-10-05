@@ -8,8 +8,10 @@ import { storageMode } from '../game/storage';
 import { fmtDate, fmtLen } from './format';
 import { audio, AudioSettings } from '../audio/engine';
 import { walkLimit, WALK_DETOUR } from '../game/catchment';
+import { CITY_STATION, CITY_WALK_SCALE } from '../game/stations';
 import { RAIL_FARE } from '../game/constants';
 import { FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../game/fares';
+import { MAX_AI } from './gameapi';
 
 export function openMenu(ui: UI) {
   const win = ui.wm.open('menu', 'Menu', { width: 280, x: window.innerWidth - 300, y: 64, icon: 'menu', color: '#eef2f7' });
@@ -207,7 +209,7 @@ export function openHelp(ui: UI) {
       <li>Blue: bridges · purple: tunnels · red: buildings in the way.</li>
       <li>Click: build / continue; drag: one section; right-click / <kbd>Esc</kbd> / long press: end.</li>
       <li>Touch: tap start, end to preview, same spot to build; elsewhere: move preview.</li>
-      <li>Standard / electric / high-speed track: up to 400 km/h; 1–4 parallel tracks.</li>
+      <li>One track type: curves and grades set speed, up to 400 km/h; 1–4 parallel tracks.</li>
       <li>Road type, crossing mode and end height: <kbd>[</kbd>/<kbd>]</kbd>, ±5 m for bridges / tunnels.</li>
       <li><kbd>Shift</kbd> over track: parallel copy.</li>
     </ol>
@@ -229,21 +231,23 @@ export function openHelp(ui: UI) {
       <li>Base reach: rail ${fmtLen(walkLimit('rail') / WALK_DETOUR)} · tram ${fmtLen(walkLimit('tram') / WALK_DETOUR)} · bus ${fmtLen(walkLimit('bus') / WALK_DETOUR)}.</li>
       <li>Street-grid allowance: +${Math.round((WALK_DETOUR - 1) * 100)}%.</li>
       <li>Street limits: rail ${fmtLen(walkLimit('rail'))} · tram ${fmtLen(walkLimit('tram'))} · bus ${fmtLen(walkLimit('bus'))}.</li>
-      <li>Main-line / metro / light rail: equal reach; buildings can extend it.</li>
+      <li>Main-line / metro / light rail: equal reach; in-city metro / light rail (town ${CITY_STATION.pop.toLocaleString('en-US')}+ core): half, ${fmtLen(walkLimit('rail') * CITY_WALK_SCALE / WALK_DETOUR)}; buildings extend reach.</li>
     </ul>
     <h4>Urban rail &amp; network tools</h4>
     <ul>
-      <li><b>Urban</b> (<kbd>U</kbd>): metro / light rail; ground / elevated / underground; height / depth.</li>
-      <li>Urban stations: matching track, close spacing, optional street entrances.</li>
-      <li>Any train / rail line: urban + main-line through running; equal fares and reach.</li>
+      <li><b>Urban</b> (<kbd>U</kbd>): double track with wire; metro / light-rail station styles; ground / elevated / underground.</li>
+      <li><b>Stay underground</b>: all tunnel, no portals, no demolition. Depot at a tunnel end: underground, vents only.</li>
+      <li>Building below ground shows tunnels, underground stations and depots by depth.</li>
+      <li>Urban stations: close spacing, optional street entrances.</li>
+      <li>Any train / rail line: urban + main-line through running; equal fares.</li>
       <li><b>Connect tracks</b> (<kbd>J</kbd>, Rail → Connect): two points → curve, turnouts, signals, cost.</li>
       <li>Click: build; <kbd>Esc</kbd> / right-click: restart; turnouts outside platforms / depots.</li>
       <li>Urban → <b>Re-level</b>: Lift / Sink / Ground; height / depth; click / drag your track.</li>
       <li>Ramps included; stations move; lines / signals stay; structures cost extra.</li>
-      <li><b>Electrify</b> (Rail): click / drag standard track; platform tracks included.</li>
-      <li>Electric locos / EMUs: wire + compatible track; standard remains 160 km/h.</li>
+      <li><b>Electrify</b> (Rail): click / drag track; platform tracks included; new track inherits wire.</li>
+      <li>Electric locos, EMUs, metro and light-rail units need wire; wire doesn't change speed.</li>
       <li><b>Multiple units</b>: EMUs / light rail; price and capacity per complete unit.</li>
-      <li><b>Units</b> couples sets; check track badges and compatibility before buying.</li>
+      <li><b>Units</b> couples sets; check the wire requirement before buying.</li>
     </ul>
     <h4>Lines, demand and companies</h4>
     <ul>
@@ -261,7 +265,7 @@ export function openHelp(ui: UI) {
       <li>Mail: orange short dashes 0%; blue solid 100%; estimate: routes, reach, ratings.</li>
       <li>Mail rings / labels: outgoing tonnes / carried share, including onward mail.</li>
       <li>Mail vehicles: vans, trucks and postbuses.</li>
-      <li><b>Companies</b> (<kbd>C</kbd>): up to seven AI rivals, with adjustable styles.</li>
+      <li><b>Companies</b> (<kbd>C</kbd>): up to ${MAX_AI} AI rivals, with adjustable styles and starting balances.</li>
       <li>Buyouts transfer network, vehicles, cash and loan.</li>
       <li><b>Track access</b> (<kbd>K</kbd>): networks open by default; blocked companies excluded.</li>
       <li>Ask / Approve all / Reject all, company blocks, usage and agreements.</li>
@@ -288,7 +292,7 @@ export function openHelp(ui: UI) {
       <li>Block: directional double track; single track: signals at passing loops.</li>
       <li><b>Signal blocks</b> view: free / reserved / occupied.</li>
       <li><b>Through</b>: 1–2 platform-free tracks, between side platforms or outside islands.</li>
-      <li><b>On a line</b>: insert into your track; trains keep running; add stop to lines.</li>
+      <li><b>On a line</b>: build on existing track with access rights; platforms follow bends; busy sites wait.</li>
       <li>Station → Build: connect open track ends.</li>
       <li><b>Loop</b> / Out and back / Auto: 3+ distinct stops loop one way; map shows direction.</li>
       <li>Rail → <b>Double</b>: click / drag single track; end switches to free platforms.</li>
@@ -306,7 +310,7 @@ export function openHelp(ui: UI) {
       <li>Merge panel: nearby stations → rebuild as one or link for walking transfers.</li>
       <li>Fares: distance, time saved versus walking / driving, including wait.</li>
       <li>Rail minimum ${fmtMoney(RAIL_FARE.minimum * FARE_LEVEL)} before speed factor, once per journey.</li>
-      <li>Equal rail fares on all track types; short trips earn a smaller speed premium.</li>
+      <li>Equal rail fares for every station style; short trips earn a smaller speed premium.</li>
       <li>Speed, frequency and direct journeys raise fares.</li>
       <li>Each transfer: −${Math.round((1 - TRANSFER_FARE_FACTOR) * 100)}% on that leg and all later legs.</li>
       <li>High-speed trains cost more energy and maintenance.</li>

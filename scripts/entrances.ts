@@ -24,6 +24,7 @@ import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { RoadVehicle } from '../src/game/roadvehicle';
 import { PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE } from '../src/game/constants';
+import { demolitionCost } from '../src/game/demolition';
 import { addBusStop, fails } from './lib';
 import { flatGame, station, endNode, loco, depotFor, check, build, railOpts, nodeSnap, done } from './stationlib';
 
@@ -247,7 +248,7 @@ if (process.argv.includes('--regression')) { done(); process.exit(fails.length ?
   const road = streets(g);
   road(40, 84, 150, 84); road(40, 108, 150, 108);
   for (let x = 70; x <= 122; x += 4) { house(g, x, 82.4, 0); house(g, x, 109.6, Math.PI); }
-  const U = station(g, 96, 96, Math.PI / 2, 12, 2, 0, { trackType: 'metro' })!;
+  const U = station(g, 96, 96, Math.PI / 2, 12, 2, 0, { trackType: 'electric', mode: 'metro' })!;
   check(U.rail!.level === 'underground' && U.rail!.entrances.length >= 2 && U.rail!.entrances.every((e) => e.kind === undefined), 'metro station: entrances built with it carry no kind (the station’s own upkeep)');
   const m0 = g.stationMaintenance(U);
   const ep = g.stations.planEntrance(U.id, 110, 84.9, 0, 'footbridge');
@@ -400,7 +401,7 @@ function farStreet(tracks: number, length: number, gap: number) {
   // (the street right beside the hall: a pavilion on its sidewalk there would stand on the hall)
   const g = flatGame(192, 3), road = streets(g);
   road(40, 99.5, 150, 99.5);
-  const U = station(g, 96, 96, Math.PI / 2, 12, 2, 0, { trackType: 'metro', style: 'classic' })!;
+  const U = station(g, 96, 96, Math.PI / 2, 12, 2, 0, { trackType: 'electric', mode: 'metro', style: 'classic' })!;
   const r = U.rail!;
   check(r.level === 'underground' && r.style === 'classic' && !!r.forecourt, `fixture: an underground station with a hall at street level (${r.style}, forecourt ${!!r.forecourt})`);
   const hall = r.building;
@@ -534,12 +535,13 @@ function streetThroughHouse(blockPop: number, others: number) {
     `no entrance whose only new residents its own street demolishes (${H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; spent ${Math.round(money - g.company(me).economy.money)})`);
   // with residents beyond it, the AI builds and pays compensation for the house it demolishes
   const b = streetThroughHouse(10, 5);
+  const compensation = demolitionCost(b.g, b.blocker);
   const spends: [number, string, boolean][] = [];
   const eco = b.g.company(b.me).economy, spend = eco.spend.bind(eco);
   eco.spend = (x, cat, force = false) => { spends.push([x, cat, force]); return spend(x, cat, force); };
   runNetworkTask(b.ai, 'capacity');
   eco.spend = spend;
-  const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - (3000 + 10 * 1250)) < 1e-6);
+  const paid = spends.some(([x, cat, force]) => cat === 'construction' && force && Math.abs(x - compensation) < 1e-6);
   // The entrance at this station must pay for its street and the compensation from the residents it newly covers.
   check(b.H.rail!.entrances.length === 1 && stat(b.ai, 'netEntrances') >= 1 && !b.g.world.buildings.has(b.blocker.id) && paid,
     `the AI's entrance demolished the house in its street's way and paid its compensation (${b.H.rail!.entrances.map((e) => e.kind).join(', ') || 'none'}; ${spends.map(([x, c, f]) => `${c}${f ? '!' : ''} ${Math.round(x)}`).join(', ')})`);

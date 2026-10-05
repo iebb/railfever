@@ -14,7 +14,7 @@ import { Train, TSeg, makeSeg } from './train';
 import { RoadVehicle, RSeg, RCont, makeLaneSeg, makeConn } from './roadvehicle';
 import { makeCurve } from './network';
 import { MODEL_BY_ID } from './vehicle-types';
-import { KMH_TO_UPS } from './constants';
+import { KMH_TO_UPS, trackTypeOf } from './constants';
 import { cargoGroups, type Vehicle, type CargoGroup } from './vehicle';
 import { fareGroupKey, changeClass } from './fares';
 import { putSave, putSaveOnce, getSave, deleteSave, listSaves, migrateLegacy } from './storage';
@@ -179,8 +179,8 @@ function chunkWorld(w: World, c: WorldCache, value: (chunk: SaveChunk) => unknow
  * had them, so parts are written in this order whatever order their object has: a loaded game saves exactly alike.
  */
 const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffsets', 'platforms', 'edges', 'through', 'throughOffsets',
-  'throughEdges', 'width', 'throughMode', 'trackType', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
-  'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost'];
+  'throughEdges', 'width', 'throughMode', 'trackType', 'mode', 'platformStyle', 'psd', 'style', 'forecourt2', 'building', 'level', 'underground',
+  'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost', 'alignment', 'groups', 'native'];
 /**
  * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
  * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike.
@@ -329,10 +329,11 @@ function restoreBase(g: Game, v: Vehicle, d: any) {
 function trainOf(t: Train) {
   return {
     ...baseOf(t), type: 'train', cars: t.cars.map((c) => c.id), depotId: t.depotId,
-    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
+    segs: t.segs.map((s) => (s.e < 0 ? [-1, s.dir, s.len, s.depot] : [s.e, s.dir])), headSeg: t.headSeg, headPos: t.headPos,
     pending: t.pending.map((s) => [s.e, s.dir]), speed: t.speed, waitTime: t.waitTime, retryTimer: t.retryTimer,
     loadTimer: t.loadTimer, routeTarget: t.routeTarget, atStation: t.atStation, reversed: t.reversed, blockedBy: t.blockedBy,
     failCount: t.failCount, stuckTime: t.stuckTime, grade: t.grade,
+    backoff: t.backoff ? { waitFor: [...t.backoff.waitFor], clear: [...t.backoff.clear] } : null,
   };
 }
 
@@ -370,8 +371,15 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    // Save owed walking population work independently of the scheduled demand publication flag.
+    // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
+    catchmentDirty: g.lines.catchmentDirty,
+    catchmentInputsDirty: g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending,
+    // A cold load must preserve whether saved road access already matched its network.
+    catchmentAccessCurrent: (g.stations as any).accessVersion === w.net.version,
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
+    ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
     world: {
       ...world, size: w.size, freeTrees: w.freeTrees.slice(),
       buildings: buildingRecords(w, binaryProfiles), nextBuildingId: w.nextBuildingId,
@@ -399,6 +407,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     stationsNextId: g.stations.nextId,
     // the buildings of the last catchment share-out (the shares are worked out alike after loading)
     catchMaxB: g.stations.catchMaxB,
+    ...(g.stations.emptyCatchmentCold ? { catchmentEmptyCold: true } : {}),
     depots: [...g.depots.map.values()], depotsNextId: g.depots.nextId,
     lines: [...g.lines.map.values()], linesNextId: g.lines.nextId,
     // ops: line ids merged into others as service patterns; this month's track wear; save format of the ops data
@@ -409,8 +418,9 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     ambient: g.vehicles.ambient.map(roadOf),
     vehiclesNextId: g.vehicles.nextId, nextAmbientId: g.vehicles.nextAmbientId, ambientEnabled: g.vehicles.ambientEnabled,
     vrng: V.rng?.state, ambientTimer: V.ambientTimer,
-    // vehicles still to re-plan after the last network change (a few per tick), and lost-vehicle news timers
+    // vehicles still to re-plan after the last network change (a few per tick), and vehicle/line news timers
     replanQueue: [...(V.replanQueue ?? [])], lostSince: [...((g as any).lostSince ?? new Map()).entries()],
+    ...((g as any).congestionTold?.size ? { congestionTold: [...(g as any).congestionTold.entries()] } : {}),
     firstArrival: [...g.firstArrival],
     news: g.news.slice(-40),
   };
@@ -477,7 +487,8 @@ export function deserialize(d: any): Game {
     net.nodeGrid.insert(nn.id, nn.x, nn.z, nn.x, nn.z);
   }
   for (const ed of d.net.edges as any[]) {
-    const e: NEdge = { ...ed, bez: { ...ed.bez }, prof: f32dec(ed.prof), sections: (ed.sections as Section[]).map((s) => ({ ...s })) };
+    const e: NEdge = { ...ed, bez: { ...ed.bez }, prof: f32dec(ed.prof), sections: ((ed.sections ?? []) as Section[]).map((s) => ({ ...s })) };
+    if (e.kind === 'rail') e.type = trackTypeOf(e.type);
     net.edges.set(e.id, e);
     const geo = net.geo(e);
     let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
@@ -498,6 +509,7 @@ export function deserialize(d: any): Game {
     (d.day ?? 0) * TICKS_PER_DAY + Math.min(TICKS_PER_DAY - 1, Math.max(0, Math.floor((d.dayFrac ?? 0) * TICKS_PER_DAY + 1e-6))));
   g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
+  g.deadlockScan = d.deadlockScan ? structuredClone(d.deadlockScan) : null;
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);
   g.shares.load(d.shares);
@@ -505,6 +517,9 @@ export function deserialize(d: any): Game {
   g.towns.list = (d.towns as any[]).map((t) => {
     const { growth, ...rest } = t;
     const town = { ...rest, buildings: new Set<number>(t.buildings) } as Town;
+    // Direct in-memory round trips must own their mutable street-planning arrays too.
+    // Sharing a grid lets one game's failed-street search alter the other's next growth step.
+    if (t.grid) town.grid = structuredClone(t.grid);
     if (t.mail) town.mail = { ...t.mail };
     g.towns.restoreCache(town, growth);
     return town;
@@ -537,10 +552,10 @@ export function deserialize(d: any): Game {
   const V = g.vehicles;
   const tseg = (x: number[], t: Train): TSeg | null => {
     if (x[0] < 0) {
-      const dp = g.depots.get(t.depotId);
+      const dp = g.depots.get(x[3] ?? t.depotId);
       const sg = dp ? depotSeg(g, dp, x[2] ?? t.length + 0.3) : null;
       // keep the saved length exactly (rebuilding the curve can differ in the last bit)
-      if (sg && typeof x[2] === 'number') sg.len = x[2];
+      if (sg) { sg.dir = x[1]; if (typeof x[2] === 'number') sg.len = x[2]; }
       return sg;
     }
     const e = net.edges.get(x[0]);
@@ -586,6 +601,7 @@ export function deserialize(d: any): Game {
       t.routeTarget = vd.routeTarget; t.atStation = vd.atStation; t.reversed = !!vd.reversed; t.blockedBy = vd.blockedBy ?? 0;
       t.failCount = vd.failCount ?? 0;
       t.stuckTime = vd.stuckTime ?? 0; t.grade = vd.grade ?? 0;
+      t.backoff = vd.backoff ? { waitFor: [...vd.backoff.waitFor], clear: [...vd.backoff.clear] } : null;
       const segs: TSeg[] = [];
       let ok = true;
       for (const x of vd.segs as number[][]) { const s = tseg(x, t); if (!s) { ok = false; break; } segs.push(s); }
@@ -613,6 +629,7 @@ export function deserialize(d: any): Game {
   if (typeof d.ambientTimer === 'number') VA.ambientTimer = d.ambientTimer;
   if (Array.isArray(d.replanQueue)) VA.replanQueue = (d.replanQueue as number[]).slice();
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
+  if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
@@ -623,14 +640,21 @@ export function deserialize(d: any): Game {
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
-  try { g.lines.rebuild(); } catch (e) { console.warn('Save load: rebuild failed', e); }
-  // Walking caches also track which street edits must dirty catchments. Restore those dependencies now;
-  // leaving them cold would skip a recompute in the loaded game. A pending share-out does this next tick,
-  // including its road-access refresh; don't apply those changes early while loading. Prime with saved access.
-  const S = g.stations as any, accessVersion = S.accessVersion;
+  // Saved platform preferences are restored verbatim; loading routing tables is not a route edit.
+  try { g.lines.rebuild(true, false); } catch (e) { console.warn('Save load: rebuild failed', e); }
+  // Restore derived walking dependencies and shares at the saved building horizon. A cold share cache would
+  // slice a pending refresh while the running game's warm cache commits it immediately.
+  // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
+  const S = g.stations as any, accessVersion = S.accessVersion, savedAccessVersion = net.version;
+  // The explicit marker separates owed population work from a frequency-only demand refresh.
+  const populationPending = typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
+    : !!d.catchmentDirty || !!d.catchmentRoadsDirty;
   S.accessVersion = net.version;
-  if (!d.catchmentDirty) for (const st of g.stations.map.values()) g.stations.catchmentBuildings(st);
-  S.accessVersion = accessVersion;
+  // A brand-new empty network has not run its first share-out. Historical horizon zero can also
+  // be warm, so preserve the explicit cold hint instead of conflating the two states.
+  if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
+    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
     const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
@@ -646,7 +670,18 @@ export function deserialize(d: any): Game {
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  // New saves preserve pending/current access metadata while the AI warms derived walking entries.
+  const protectNetworkWarm = typeof d.catchmentAccessCurrent === 'boolean', networkAccessVersion = S.accessVersion;
+  if (protectNetworkWarm) S.accessVersion = net.version;
   try { loadNetwork(g, d.aiNetwork); } catch (e) { console.warn('Save load: loadNetwork failed', e); }
+  finally { if (protectNetworkWarm) S.accessVersion = networkAccessVersion; }
+  // Saved road shapes restore after the first share-cache prime. Align their disposable input
+  // versions too; retain any genuinely pending population work for the next simulation tick.
+  // Prime only derived memberships with saved access; do not refresh pending access while loading.
+  S.accessVersion = net.version;
+  if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
+    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

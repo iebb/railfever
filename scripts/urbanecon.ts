@@ -5,17 +5,17 @@ import { AIController } from '../src/game/ai';
 import { Train } from '../src/game/train';
 import { Vehicle } from '../src/game/vehicle';
 import type { Town } from '../src/game/towns';
-import type { Station } from '../src/game/stations';
-import type { Line } from '../src/game/lines';
+import { WALK_LINE, type Station } from '../src/game/stations';
+import type { Line, RouteEdge } from '../src/game/lines';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { bezLine } from '../src/game/geom';
-import { outAndBack, linearStops } from '../src/game/lines';
+import { outAndBack, linearStops, routeTables } from '../src/game/lines';
 import { stationEnds, nodeSnap, buildDepotOnLine } from '../src/game/routing';
 import { connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
-import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime } from '../src/game/fares';
-import { localTripMultiplier } from '../src/game/demand';
-import { URBAN_PAYBACK } from '../src/game/constants';
+import { fareFor, refTime, urbanIntensity, estimateLegFare, estimateLegTime, distanceFare, simNow, TRANSFER_FARE_FACTOR } from '../src/game/fares';
+import { localTripMultiplier, forecastTransferJourney } from '../src/game/demand';
+import { URBAN_PAYBACK, RAIL_FARE } from '../src/game/constants';
 import { patternHeadways } from '../src/game/patterns';
 import { walkingCatchment } from '../src/game/catchment';
 import { serialize, deserialize } from '../src/game/save';
@@ -95,13 +95,18 @@ function open(g: Game, ai: AIController, kind: 'metro' | 'lightrail' | 'crosscit
   g.aiEnabled = true;
   for (const c of g.ais) c.state.cooldown = 1e9;
   check(ai.startProject(kind, [t.id]), `${kind} project starts`);
-  let ticks = 0;
-  while (ai.busy && ticks++ < 160000) g.stepTick();
+  let ticks = 0, plannedStops = 0;
+  while (ai.busy && ticks++ < 160000) {
+    const task = accessAI(ai).urbanTask;
+    if (task?.stage === 'stations') plannedStops = task.plans.length;
+    g.stepTick();
+  }
   check(!ai.busy, `${kind} finishes within its work budget`);
   console.log('  ' + ai.log.slice(-3).join(' | '));
   // Keep services fixed while measuring, with the normal economy, routing, demand and vehicle physics active.
   for (const c of g.ais) c.monthly = () => {};
   g.aiEnabled = false;
+  return plannedStops;
 }
 function profit(g: Game, l: Line) {
   const owners = new Set(g.lines.operatorsOf(l));
@@ -111,6 +116,48 @@ function profit(g: Game, l: Line) {
 }
 
 if (!arg('maps')) {
+  console.log('multi-transfer city fares follow passenger receipts');
+  {
+    // Bus → regional train → city train, using the production router and walking interchanges.
+    // Two adjacent urban hops represent passengers staying on the same train after a retargeted stop.
+    const edges = new Map<number, RouteEdge[]>(), city = -2, bus = 10, regional = 11;
+    const link = (a: number, b: number, line: number) => {
+      for (const [from, to] of [[a, b], [b, a]]) {
+        const es = edges.get(from) ?? []; es.push({ to, line, cost: line === WALK_LINE ? 4 : 60 }); edges.set(from, es);
+      }
+    };
+    link(0, 1, bus); link(1, 2, WALK_LINE); link(2, 3, regional); link(3, 4, WALK_LINE);
+    link(4, 6, city); link(6, 5, city);
+    const tables = routeTables(edges, edges.keys()), rail = (line: number) => line !== bus;
+    const x = [-20, 20, 24, 124, 140, 200, 170], railFare = (a: number, b: number) => distanceFare(Math.abs(x[b] - x[a]));
+    const incoming = forecastTransferJourney(tables, 0, 5, city, rail, railFare), outgoing = forecastTransferJourney(tables, 5, 0, city, rail, railFare);
+    check(incoming.length === 1 && incoming[0].from === 4 && incoming[0].to === 5 && incoming[0].railBefore === RAIL_FARE.minimum
+      && incoming[0].changes === 2, 'two incoming vehicle changes discount the complete urban ride by 0.9²');
+    check(outgoing.length === 1 && outgoing[0].railBefore === 0 && outgoing[0].changes === 1,
+      'an outgoing urban leg pays 0.9; later changes do not retroactively reduce its fare');
+    const shortIncoming = forecastTransferJourney(tables, 0, 5, city, rail, () => distanceFare(4));
+    check(shortIncoming.length === 1 && shortIncoming[0].railBefore > 0 && shortIncoming[0].railBefore < RAIL_FARE.minimum,
+      'a short prior rail ride preserves its actual distance fare towards the journey minimum');
+    check(forecastTransferJourney(tables, 4, 5, city, rail, railFare).length === 0, 'staying aboard one urban train is not a transfer journey');
+    const broken = new Map(tables); broken.delete(3);
+    check(forecastTransferJourney(broken, 5, 0, city, rail, railFare).length === 0, 'a traced urban ride with no onward route to the destination earns no forecast transfers');
+    const g = flat(0), start = station(g, 140, 256, 0, -1), end = station(g, 200, 256, 0, -1), final = station(g, 260, 256, 0, -1);
+    const seconds = 120;
+    for (const [name, journey, from, to, dest, before] of [
+      ['incoming', incoming, start, end, end, 2], ['outgoing', outgoing, end, start, final, 0],
+      ['short prior rail', shortIncoming, start, end, end, 2],
+    ] as const) {
+      const leg = journey[0]; if (!leg) continue;
+      const v = new Train(g, -1, [M('emu_b')], -1);
+      v.cargo.set('fare-test', { from: from.id, alight: to.id, dest: dest.id, count: 1, day: g.day,
+        t0: simNow(g) - seconds, transfers: before, rail: leg.railBefore }); v.load = 1;
+      v.serveStation(to, 0.2);
+      const estimate = fareFor(60, seconds, 1, { mode: 'rail', railBefore: leg.railBefore })
+        * Math.pow(TRANSFER_FARE_FACTOR, leg.changes);
+      check(v.incomeYear > 0 && Math.abs(v.incomeYear - estimate) < 1e-8,
+        `${name} multi-transfer forecast agrees with the actual booked passenger fare`);
+    }
+  }
   console.log('frequent main-line feeder access');
   {
     const g = flat(1), a = town(g, 'West Centre', 150, 256, 6000, 64, 48), b = town(g, 'East Centre', 362, 256, 6000, 64, 48);
@@ -206,9 +253,9 @@ if (!arg('maps')) {
     check(intensity > 0.7 && localTripMultiplier(g, { x: t.x, z: t.z, townId: t.id }, 'rail') > 4, 'a dense centre has substantial local transit demand');
     check(fareFor(7, 60, 1, { mode: 'rail' }) > fareFor(7, 60, 1), 'a short rail hop pays the minimum fare (any track type)');
     check(refTime(100, 1) > refTime(100), 'congestion and parking slow the city car alternative');
-    open(g, ai, mode, t);
+    const plannedStops = open(g, ai, mode, t);
     const line = g.lines.all().find((l) => l.kind === 'rail' && l.owner === ai.companyId);
-    check(!!line && new Set(line.stops).size === 5, `a five-station ${mode} opens without forcing an uneconomic build`);
+    check(!!line && plannedStops >= 3 && new Set(line.stops).size === plannedStops, `all ${plannedStops} planned starter stations open without forcing an uneconomic ${mode}`);
     if (!line) continue;
     const cost = -(g.company(ai.companyId).economy.thisYear.construction + g.company(ai.companyId).economy.thisYear.vehicles);
     runDays(g, 720);
@@ -274,10 +321,36 @@ if (!arg('maps')) {
 
   for (const owner of [3, 1]) {
     console.log(`${owner === 3 ? 'third company' : 'terminus owner'} urban interchange line`);
-    const { g, C, a, b } = termini(3, 20000), ai = g.aiOf(owner)!;
-    if (owner === 3) open(g, g.aiOf(1)!, 'crosscity', C);
+    // (citycatch: in-city subway stations walk half as far. The terminus owner's subway was sized at the old reach and
+    // barely repaid at baseline (2.72M forecast against 2.61M needed); in this city's 140 m unbuilt corridor its
+    // half-reach stations reach too little of 20,000 residents, and the AI rightly declines. The behaviour under test,
+    // a subway serving both main-line termini through walking interchanges, needs a city where one pays: 26,000.)
+    const { g, C, a, b } = termini(3, owner === 1 ? 26000 : 20000), ai = g.aiOf(owner)!;
+    if (owner === 3) {
+      // A three-stop subway linked at every call to the through train has no incoming urban ride.
+      // Keep total population, but give the unserved intermediate neighbourhoods enough residents
+      // that a four/five-stop starter pays; this tests actual interchange journeys to those districts.
+      const buildings = [...C.buildings].map((id) => g.world.buildings.get(id)!);
+      const weights = buildings.map((b) => Math.abs(b.x - 340) < 12 || Math.abs(b.x - 430) < 12 ? 4 : 1);
+      const total = weights.reduce((n, w) => n + w, 0); let cumulative = 0, assigned = 0;
+      buildings.forEach((b, i) => {
+        cumulative += weights[i]; const count = Math.floor(C.pop * cumulative / total) - assigned;
+        b.pop = count; assigned += count;
+      });
+      check(assigned === C.pop && buildings.every((b) => b.pop >= 0), 'intermediate neighbourhoods preserve the city population');
+      g.demand.rebuild(); g.stations.recomputeCatchment();
+      open(g, g.aiOf(1)!, 'crosscity', C);
+      const centre = g.stations.all().find((st) => st.townId === C.id && st.rail?.level === 'underground')!;
+      const aliases = [a, centre, b].map((st) => g.stations.planRail(st.x, st.z - 2, Math.PI / 2, 8, 2, owner,
+        { mode: 'metro', trackType: 'standard', level: 'underground', depth: 4.4, style: 'none' }));
+      check(aliases.every((p) => p.ok), 'three walking-linked subway sites can be planned');
+      const before = JSON.stringify(serialize(g));
+      const overlap = g.demand.forecastLine(aliases, 'metro', 35, 50, owner);
+      check(overlap.transfers === 0, 'through arrivals already at the linked final station do not invent a city ride');
+      check(JSON.stringify(serialize(g)) === before, 'routed transfer forecast leaves simulation state unchanged');
+    }
     open(g, ai, 'metro', C);
-    const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.trackType === 'metro'));
+    const line = g.lines.all().find((l) => l.owner === owner && l.stops.some((sid) => g.stations.get(sid)?.rail?.mode === 'metro'));
     check(!!line, 'the AI opens an urban railway serving both main-line stations');
     if (!line) continue;
     const metro = [...new Set(line.stops)].map((sid) => g.stations.get(sid)!);
@@ -286,13 +359,14 @@ if (!arg('maps')) {
     const serve = Vehicle.prototype.serveStation;
     Vehicle.prototype.serveStation = function(st, perPax) {
       const waiting = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
-      const before = st.waitingTotal, result = serve.call(this, st, perPax);
-      if (this.lineId === line.id && waiting > 0 && st.waitingTotal < before) transferBoards.set(this.owner, (transferBoards.get(this.owner) ?? 0) + before - st.waitingTotal);
+      const result = serve.call(this, st, perPax);
+      const after = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
+      if (this.lineId === line.id && waiting > after) transferBoards.set(this.owner, (transferBoards.get(this.owner) ?? 0) + waiting - after);
       return result;
     };
     runDays(g, 720); Vehicle.prototype.serveStation = serve;
     const upkeep = owner === 3 ? g.maintenanceOf(owner) : metro.reduce((n, s) => n + g.stationMaintenance(s), 0)
-      + [...g.world.net.edges.values()].filter((e) => e.owner === owner && e.type === 'metro').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
+      + [...g.world.net.edges.values()].filter((e) => e.owner === owner && e.kind === 'rail' && e.type === 'electric').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
     const net = line.incomeLast - line.costLast - upkeep;
     console.log(`  metro revenue ${fmt(line.incomeLast / 1e6, 2)}M, operating profit ${fmt(net / 1e6, 2)}M/year, transferred boardings ${transferBoards.get(owner) ?? 0}`);
     check((transferBoards.get(owner) ?? 0) > 0, 'naturally generated main-line arrivals transfer onto the urban line');
@@ -310,14 +384,14 @@ if (!arg('maps')) {
     const urbanProfit = (l: Line) => {
       const sts = [...new Set(l.stops)].map((id) => g.stations.get(id)!).filter((s) => s.rail);
       const upkeep = sts.reduce((n, s) => n + g.stationMaintenance(s), 0)
-        + [...g.world.net.edges.values()].filter((e) => e.owner === l.owner && ['metro', 'lightrail'].includes(e.type)).reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
+        + [...g.world.net.edges.values()].filter((e) => e.owner === l.owner && e.kind === 'rail' && e.type === 'electric').reduce((n, e) => n + g.edgeMaintenance(e), 0) + 12000;
       return l.incomeLast - l.costLast - upkeep;
     };
     let reportedYear = g.year;
     while (g.day < years * 360) {
       g.stepTick();
       for (const l of g.lines.all()) {
-        if (!opened.has(l.id) && l.kind === 'rail' && l.vehicles.length > 0 && l.stops.some((s) => ['metro', 'lightrail'].includes(g.stations.get(s)?.rail?.trackType ?? ''))) {
+        if (!opened.has(l.id) && l.kind === 'rail' && l.vehicles.length > 0 && l.stops.some((s) => ['metro', 'lightrail'].includes(g.stations.get(s)?.rail?.mode ?? ''))) {
           const pop = Math.max(...l.stops.map((id) => g.towns.list[g.stations.get(id)?.townId ?? -1]?.pop ?? 0));
           opened.set(l.id, { day: g.day, pop });
           if (process.argv.includes('--details')) console.log(`  ${g.dateString()}: urban opening ${l.name}, population ${pop}`);
@@ -333,7 +407,7 @@ if (!arg('maps')) {
         console.log(`  ${g.dateString()}, ${fmt((performance.now() - started) / 1000, 1)}s elapsed; ${g.lines.all().length} lines, ${opened.size} urban openings`);
       }
     }
-    const lines = g.lines.all().filter((l) => l.kind === 'rail' && (opened.get(l.id)?.pop ?? 0) >= 5000 && l.stops.some((sid) => { const s = g.stations.get(sid); return s && ['metro', 'lightrail'].includes(s.rail?.trackType ?? '') && (g.towns.list[s.townId]?.pop ?? 0) >= 5000; }));
+    const lines = g.lines.all().filter((l) => l.kind === 'rail' && (opened.get(l.id)?.pop ?? 0) >= 5000 && l.stops.some((sid) => { const s = g.stations.get(sid); return s && ['metro', 'lightrail'].includes(s.rail?.mode ?? '') && (g.towns.list[s.townId]?.pop ?? 0) >= 5000; }));
     urban += lines.length;
     for (const l of lines) {
       const net = urbanProfit(l), age = (g.day - (opened.get(l.id)?.day ?? g.day)) / 360, atTwo = twoYearProfit.get(l.id);

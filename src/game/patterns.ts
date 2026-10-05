@@ -23,6 +23,8 @@ import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
 import { simNow } from './fares';
 import { redirectMail, mergeLineMail } from './mail';
+import { sharedRailSpacing } from './rail-headways';
+import { inheritPlatformPreferences } from './rail-platforms';
 
 export type PatternKind = 'local' | 'rapid' | 'express' | 'limited';
 export interface ServicePattern {
@@ -72,7 +74,7 @@ export function lineRoute(l: Line): Route {
 }
 
 // ------------------------------------------------------------------------------ patterns of a line
-/** Re-map a pattern's flags when the line's stops changed (by station and occurrence; new stops: stop). */
+/** Re-map by station and occurrence. New stops serve the existing span of a short-turn. */
 function align(l: Line, p: ServicePattern) {
   const ids = l.stops;
   const old = p.ids;
@@ -89,10 +91,29 @@ function align(l: Line, p: ServicePattern) {
   }
   const occ = new Map<number, number[]>();
   old.forEach((s, i) => { const a = occ.get(s); if (a) a.push(i); else occ.set(s, [i]); });
+  const oldRoute = lineRoute({ ...l, stops: old });
+  const position = new Map(oldRoute.stations.map((s, i) => [s, i]));
+  const served = old.filter((_, i) => p.stops[i] !== false);
+  const span = served.map(s => position.get(s)!);
+  const lo = Math.min(...span), hi = Math.max(...span);
+  // Express/rapid skips inside the old termini do not exclude a new intermediate call. All-stops
+  // services still extend normally; loops and ambiguous old physical routes keep their prior rule.
+  const shortTurn = !oldRoute.loop && position.size === oldRoute.stations.length
+    && new Set(served).size >= 2 && (lo > 0 || hi < oldRoute.stations.length - 1);
+  const route = shortTurn ? lineRoute(l) : null;
+  const withinSpan = (i: number) => {
+    if (!route) return true;
+    const at = route.turn > 0 && i > route.turn ? ids.length - i : i;
+    let before: number | undefined, after: number | undefined;
+    for (let j = at - 1; j >= 0 && before === undefined; j--) before = position.get(route.stations[j]);
+    for (let j = at + 1; j < route.stations.length && after === undefined; j++) after = position.get(route.stations[j]);
+    return before !== undefined && after !== undefined
+      && Math.min(before, after) >= lo && Math.max(before, after) <= hi;
+  };
   const used = new Map<number, number>();
-  p.stops = ids.map((s) => {
+  p.stops = ids.map((s, i) => {
     const a = occ.get(s);
-    if (!a) return true;
+    if (!a) return withinSpan(i);
     const k = used.get(s) ?? 0;
     used.set(s, k + 1);
     return p.stops[a[Math.min(k, a.length - 1)]] !== false;
@@ -552,9 +573,11 @@ function departureKey(l: Line, v: Vehicle, index = v.stopIndex): string {
 export function holdForSpacing(g: Game, v: Vehicle): boolean {
   const l = v.line;
   if (!l) return false;
-  const schedule = spacingSchedule(g, v);
-  if (!schedule || schedule.vehicles < 2 || !schedule.timing.includes(v.stopIndex) || g.vehicles.spacingBlocked(v)) return false;
-  const now = simNow(g), prev = schedule.clock.departures[departureKey(l, v)];
+  const local = spacingSchedule(g, v);
+  // capacity-integration: different companies' patterns/lines use one timetable on the shared approach.
+  const shared = sharedRailSpacing(g, v), schedule = shared ?? local;
+  if (!schedule || schedule.vehicles < 2 || (!shared && !local?.timing.includes(v.stopIndex)) || g.vehicles.spacingBlocked(v)) return false;
+  const now = simNow(g), prev = schedule.clock.departures[shared?.key ?? departureKey(l, v)];
   if (!prev || prev.vehicle === v.id) return false;
   // Street detours and junctions can make a road timetable optimistic. Balance a rolling cycle of road
   // departures as well as enforcing the scheduled minimum; never increase the cap. Rail paths already
@@ -581,6 +604,9 @@ export function noteSpacingDeparture(g: Game, v: Vehicle) {
       const recent = [...(schedule.clock.departures[key]?.recent ?? []), at].slice(-schedule.vehicles - 1);
       schedule.clock.departures[key] = { at, vehicle: v.id, recent };
     }
+    // capacity-integration: a red signal consumes no slot; only a real departure updates the corridor clock.
+    const shared = sharedRailSpacing(g, v, index);
+    if (shared) shared.clock.departures[shared.key] = { at: simNow(g), vehicle: v.id };
   }
   v.resetSpacing();
 }
@@ -758,7 +784,7 @@ export type LineJoinCheck =
   | { ok: true; junction: number; reason: null; route: number[]; into: number; from: number };
 export interface JoinNotice extends MergeNotice { line: Line; junction: number }
 export interface JoinOptions {
-  /** Default: continue the surviving numbers when extending its end; renumber when extending its start. */
+  /** @deprecated Every stop edit now renumbers the route family, regardless of this legacy option. */
   renumber?: boolean;
   /** Post the notice to the news feed (default true). */
   notify?: boolean;
@@ -931,7 +957,6 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   const oldKeep: Line = { ...keep, stops: [...keep.stops] };
   const sources = [oldKeep, drop];
   const oldPatterns = sources.map((l) => linePatterns(l).map((p) => ({ ...p, stops: [...servedFlags(l, l.patterns?.length ? p : null)], ids: [...l.stops] })));
-  const renumber = opts.renumber ?? (lineRoute(oldKeep).stations[0] === check.junction);
   // A join keeps the visible name, even when that name used to follow the termini automatically.
   if (keep.autoName) keep.joinedName = keep.name;
   keep.stops = outAndBack(check.route);
@@ -960,6 +985,7 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
     }
   });
   keep.patterns = normalize(keep, list);
+  inheritPlatformPreferences(keep, oldKeep, maps[0]);
   keep.vehicles = [...new Set([...oldKeep.vehicles, ...drop.vehicles])];
   const operators = [...new Set([...g.lines.operatorsOf(oldKeep), ...g.lines.operatorsOf(drop)])].filter((o) => o !== keep.owner);
   if (operators.length) keep.operators = operators;
@@ -967,10 +993,9 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   redirectWaiting(g, drop.id, keep.id);
   const pid = maps[1].get(oldPatterns[1][0].id)!;
   g.lines.map.delete(drop.id);
-  g.lines.redirectLine(drop.id, keep.id, pid, maps[1]);
-  if (renumber) g.lines.renumber(keep.id);
+  g.lines.redirectLine(drop.id, keep.id, pid, maps[1], drop);
   g.lines.rebuild();
-  for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged();
+  for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged(true);
   const junction = g.stations.get(check.junction)!;
   const notice: JoinNotice = { from: drop.id, into: keep.id, pattern: pid, line: keep, junction: check.junction,
     text: `${drop.name} joined with ${keep.name} at ${junction.name}; existing services kept as short-turns` };
@@ -1021,7 +1046,7 @@ function mergeLine(g: Game, a: Line, b: Line, dir: 1 | -1): MergeNotice {
   const pid = map.get(firstB) ?? 0;
   g.lines.map.delete(b.id);
   // ids of b (and of lines merged into b before) now lead to a, with the pattern b's vehicles run
-  g.lines.redirectLine(b.id, a.id, pid, map);
+  g.lines.redirectLine(b.id, a.id, pid, map, b);
   const pn = a.patterns.find((p) => p.id === pid)?.name ?? 'a pattern';
   return { from: b.id, into: a.id, pattern: pid, text: `${b.name} merged into ${a.name} as ${pn} service` };
 }
@@ -1060,7 +1085,7 @@ export function canonicalizeLines(g: Game, lineId?: number, options: { sameOwner
   }
   if (out.length) {
     g.lines.rebuild();
-    for (const nt of out) { const l = g.lines.get(nt.into); if (l) for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(); }
+    for (const nt of out) { const l = g.lines.get(nt.into); if (l) for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(true); }
   }
   return out;
 }

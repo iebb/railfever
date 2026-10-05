@@ -24,7 +24,7 @@ export interface RSeg {
   len: number;
   limit: number;
   tunnels: [number, number][];
-  crossings: { id: number; pos: number }[];
+  crossings: { id: number; pos: number; x: number; z: number }[];
   /** bus stop position along this lane */
   stopAt?: number;
   depot?: boolean;
@@ -65,6 +65,12 @@ export function laneTrim(g: Game, e: NEdge): [number, number] {
   return [Math.min(ra, e.len * 0.45), Math.max(e.len - rb, e.len * 0.55)];
 }
 
+/** Crossing markers use the lane/connector's own arc, not the road centreline arc. */
+function crossingPos(curve: Curve3, x: number, z: number): number {
+  const q = closestOnPolyline(x, z, curve.pts, 3, curve.cum.length);
+  return curve.cum[q.i] + (curve.cum[q.i + 1] - curve.cum[q.i]) * q.f;
+}
+
 export function makeLaneSeg(g: Game, e: NEdge, dir: number): RSeg {
   const net = g.world.net;
   const curve = net.lane(e, dir);
@@ -79,8 +85,8 @@ export function makeLaneSeg(g: Game, e: NEdge, dir: number): RSeg {
     const a = map(sec.s0), b = map(sec.s1);
     tunnels.push([Math.min(a, b), Math.max(a, b)]);
   }
-  const crossings: { id: number; pos: number }[] = [];
-  for (const c of net.crossings.values()) if (c.kind === 'level' && c.e2 === e.id) crossings.push({ id: c.id, pos: map(c.s2) });
+  const crossings: RSeg['crossings'] = [];
+  for (const c of net.crossings.values()) if (c.kind === 'level' && c.e2 === e.id) crossings.push({ id: c.id, pos: crossingPos(curve, c.x, c.z), x: c.x, z: c.z });
   return {
     kind: 'lane', e: e.id, dir, node: -1, from: -1, fromDir: 0, curve, len: curve.len, limit: Math.max(8, kmh) * KMH_TO_UPS,
     tunnels, crossings, depot: e.depot >= 0, slow: slowZones(curve, Math.max(8, kmh) * KMH_TO_UPS),
@@ -120,7 +126,9 @@ export function makeConn(a: RSeg, b: RSeg, node: number): RSeg | null {
   const kmh = straight ? Math.min(a.limit, b.limit) / KMH_TO_UPS : Math.max(10, Math.min(35, curveSpeed(curve.minRadius)));
   return {
     kind: 'conn', e: b.e, dir: b.dir, node, from: a.e, fromDir: a.dir, curve, len: curve.len, limit: kmh * KMH_TO_UPS,
-    tunnels: [], crossings: [],
+    // A crossing in a junction's trimmed road window must be considered before entering it.
+    tunnels: [], crossings: [...new Map([...a.crossings, ...b.crossings].map(c => [c.id, c])).values()]
+      .map(c => ({ ...c, pos: crossingPos(curve, c.x, c.z) })),
   };
 }
 
@@ -546,6 +554,59 @@ export class RoadVehicle extends Vehicle {
 
   private tmpA = { x: 0, y: 0, z: 0 };
   private tmpB = { x: 0, y: 0, z: 0 };
+
+  /** First swept-body contact with a crossing's stop-clearance plane, in actual path arc.
+   * The normal points from the crossing to the closest point of our present front–tail
+   * chord. Keeping BOTH endpoints on its safe side keeps that whole chord clear even
+   * around a bend or across a lane/connector boundary. Already occupying the train's
+   * unchanged 0.55u roadBusyNear envelope must clear; stopping it there blocks both modes.
+   * The 0.60u stop clearance is the existing road gate margin, not a larger exclusion. */
+  private crossingStop(x: number, z: number, look: number): number {
+    const a = this.tmpA, b = this.tmpB;
+    this.pointBehind(0, a); this.pointBehind(this.length, b);
+    const dx = b.x - a.x, dz = b.z - a.z, l2 = dx * dx + dz * dz;
+    const f = l2 > 1e-9 ? Math.max(0, Math.min(1, ((x - a.x) * dx + (z - a.z) * dz) / l2)) : 0;
+    const nx = a.x + dx * f - x, nz = a.z + dz * f - z, distance = Math.hypot(nx, nz);
+    if (distance < 0.55) return Infinity;
+    if (distance <= 0.6) return 0;
+    const ux = nx / distance, uz = nz / distance;
+    const path = [...this.trail].reverse().concat(this.seg!, this.ahead);
+    let origin = -this.pos;
+    for (const s of this.trail) origin -= s.len;
+    const contact = (start: number): number => {
+      let off = origin, previousS = start, previous = distance;
+      // pointBehind clamps an unavailable tail to the earliest known path point.
+      const p = { x: 0, y: 0, z: 0 };
+      for (const s of path) {
+        if (off + s.len < start) { off += s.len; continue; }
+        if (off > start + look) break;
+        const from = Math.max(0, start - off), to = Math.min(s.len, start + look - off);
+        if (to < from) { off += s.len; continue; }
+        const visit = (arc: number): number => {
+          curvePoint(s.curve, arc, p);
+          const value = (p.x - x) * ux + (p.z - z) * uz, at = Math.max(start, off + arc);
+          if (value < 0.6) {
+            const t = previous > 0.6 ? (previous - 0.6) / (previous - value) : 0;
+            return Math.max(0, previousS + (at - previousS) * t - start);
+          }
+          previous = value; previousS = at;
+          return Infinity;
+        };
+        let hit = visit(from);
+        if (hit < Infinity) return hit;
+        const cum = s.curve.cum;
+        let lo = 0, hi = cum.length;
+        while (lo < hi) { const mid = (lo + hi) >> 1; if (cum[mid] <= from) lo = mid + 1; else hi = mid; }
+        for (let j = lo; j < cum.length && cum[j] < to; j++) {
+          hit = visit(cum[j]); if (hit < Infinity) return hit;
+        }
+        hit = visit(to); if (hit < Infinity) return hit;
+        off += s.len;
+      }
+      return Infinity;
+    };
+    return Math.min(contact(0), contact(-this.length));
+  }
   /** time to the next gradient sample (saved, so a loaded game drives exactly alike) */
   gradeTimer = 0;
 
@@ -558,6 +619,8 @@ export class RoadVehicle extends Vehicle {
     const v = this.speed;
     const look = (v * v) / (2 * BRAKE) + 1.5;
     let vt = Math.min(this.cruise, seg.limit);
+    let crossingMove = Infinity;
+    let checkedCrossings: Set<number> | undefined;
     // walk the known path (current segment, then the look-ahead)
     let d = -this.pos;
     const ahead = this.ahead;
@@ -576,8 +639,15 @@ export class RoadVehicle extends Vehicle {
       }
       for (const c of s.crossings) {
         const dist = d + c.pos;
-        if (dist < 0.45 || dist > look + 1) continue;
-        if (V.crossingClosed.has(c.id)) vt = Math.min(vt, brakeTo(dist - 0.6));
+        // The front has already passed this crossing: let its trailing body clear.
+        if (dist < 0 || dist > look + 1 || !V.crossingClosed.has(c.id)) continue;
+        if (checkedCrossings?.has(c.id)) continue;
+        (checkedCrossings ??= new Set()).add(c.id);
+        const crossing = g.world.net.crossings.get(c.id);
+        if (!crossing) continue;
+        const stop = this.crossingStop(crossing.x, crossing.z, look + 1);
+        crossingMove = Math.min(crossingMove, stop);
+        vt = Math.min(vt, brakeTo(stop));
       }
       // junction admission before entering a connector at a real junction
       if (s.kind === 'conn' && i > 0) {
@@ -612,7 +682,10 @@ export class RoadVehicle extends Vehicle {
     if (v < vt) this.speed = Math.min(vt, v + Math.max(acc, 0.01) * dt);
     else this.speed = Math.max(vt, v - BRAKE * 1.6 * dt);
     if (this.speed < 0) this.speed = 0;
-    this.pos += this.speed * dt;
+    // Do not overshoot a closed gate during the fixed step, including a newly closed one.
+    const move = this.speed * dt;
+    this.pos += Math.min(move, crossingMove);
+    if (move > crossingMove) this.speed = 0;
     if (this.speed > 0 && this.spacing.departureIndex >= 0) noteSpacingDeparture(g, this);
     // advance through segments
     while (this.seg && this.pos > this.seg.len) {

@@ -26,21 +26,33 @@
 //  - xlink: another AI company's network beside or across ours (stations or tracks within XLINK_REACH, mutual open
 //    access) is linked to ours by a connecting curve where direct services across both pay (each change of vehicle
 //    costs 10% of the fares of the leg ending in it and the later legs, and routing charges it): a joint line of ours
-//    runs them, the owner earns its fees and is offered mutual through running; walking links where no curve fits.
+//    runs them, the owner earns its fees and is offered mutual through running; walking links where no curve fits;
+//  - citylink: two lines' stations a short walk apart in one town (ours, or an agreeing company's: mutual open access)
+//    become one interchange: linked for transfers when within walking range, else a stop of ours beside the other
+//    line's station, when the trips the change of lines newly allows pay for it (each change costs 10% of the fares).
+//  - extend: city lines grow with their towns (ai-grow.ts): new stations beyond a terminus where residents along the
+//    line's way on are beyond every station's walk (a depot lead in the way moved first), a stop in a long gap that has
+//    filled in; valued by the line forecast against works, trains and upkeep.
 // Spending follows the company's money rules (available(), borrowing in steps as ai.ts does); land is graded and
 // a few town buildings demolished where that gives a better site (cost plus compensation, a small rating hit).
 import type { Game } from './game';
+import { replaceLineStops } from './line-edit';
+import { demolitionCost } from './demolition';
 import type { AIController } from './ai';
 import type { Station, StationPlan, EntranceKind } from './stations';
 import type { NEdge, NNode } from './network';
 import type { Line } from './lines';
 import type { Economy } from './economy';
 import type { Proposal, BuildOptions, Snap } from './construction';
-import { railModeOf, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide, TRANSFER_RANGE } from './stations';
+import { railModeOf, railPartMode, PLATFORM_LENGTH, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide, TRANSFER_RANGE, railWalkScale, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
 import * as Trackops from './trackops';
 import * as StationsMod from './stations';
 import * as Patterns from './patterns';
+// capacity-integration: through-service stock respects the same corridor bid as monthly fleet management.
+import { sharedTrainAllowed, priceSharedProject } from './ai-capacity';
+import { railCapacityOptions } from './rail-capacity-options';
+import { layInitialDoubleTrack } from './ai-initial-track';
 import { autoSignalLine } from './signals';
 import { findRailRoute, railNext, platformWaits, depotReaches, lineCongestion, trackAllows, lineCompatibility } from './train';
 import type { Train } from './train';
@@ -60,12 +72,13 @@ import { tramUsable } from './build-ops';
 import { closestOnPolyline } from './geom';
 import { YEAR_S, estimateVehicleYear } from './opcosts';
 import { TRANSFER_FARE_FACTOR } from './fares';
-import { TF_TYPICAL } from './demand';
+import { TF_TYPICAL, TRIPS_PER_MONTH, localTripMultiplier } from './demand';
 import { TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
 import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
 import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
+import { growTask, copyGrowCursor, growLine, type GrowCursor, type GrowHost } from './ai-grow';
 
 // ============================================================================ optional primitives (feature-detected)
 
@@ -118,7 +131,7 @@ const now = () => (typeof performance !== 'undefined' ? performance.now() : Date
 
 // ============================================================================ tasks
 
-type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink';
+type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink' | 'citylink' | 'extend';
 
 /** Tasks in priority order: how often (days) and whether they spend money (then only with money to spare). */
 const TASKS: { id: Task; period: number; spend: boolean }[] = [
@@ -138,6 +151,9 @@ const TASKS: { id: Task; period: number; spend: boolean }[] = [
   { id: 'relevel', period: 360, spend: true },
   { id: 'midconnect', period: 150, spend: true },
   { id: 'xlink', period: 120, spend: true },
+  // (last: the others keep their slots and first runs; it spends only on a stop, checked there)
+  { id: 'citylink', period: 120, spend: false },
+  { id: 'extend', period: 150, spend: true },
 ];
 
 /** Fixed work allowance per daily call. Timing is profiling only; load never changes the amount of work. */
@@ -155,7 +171,7 @@ const INSERT_POP: Record<string, number> = { mainline: 650, metro: 900, lightrai
 /** Counters (in AIController.stats, saved with it): the ones ai.ts declares and this module's own. */
 type NetStat = 'grown' | 'merged' | 'paired' | 'connections' | 'stubs' | 'netDecommissioned' | 'netRetired' | 'netInserted' | 'netInterchanges'
   | 'netLinesMerged' | 'netRestyled' | 'netConsolidated' | 'netStopsMerged' | 'netThrough' | 'netMidConnections' | 'netRelevelled' | 'netCrossovers' | 'netGraded' | 'netDemolished' | 'netJoined' | 'netRoads' | 'netRoadUnitsSaved'
-  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops';
+  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops' | 'netExtended' | 'netGrowInfill' | 'netDepotsMoved' | 'netCityLinks' | 'netCityStops';
 
 /** Frame cost of the daily network work over all companies (tests / profiling). */
 export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, decisions: {} as Record<string, number>,
@@ -166,14 +182,25 @@ export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, 
  * must newly cover.
  */
 // These gates were calibrated at the old passenger rate. Money limits remain in game money.
-export const networkOptions = { enabled: true, throughTrips: 25 * PASSENGER_RATE_SCALE, interchangeTrips: 45 * PASSENGER_RATE_SCALE, insertPop: PASSENGER_RATE_SCALE,
+export const networkOptions = {
+  // capacity-integration: disabling network cooperation also disables its bids, fleet review and shared clocks.
+  get enabled() { return railCapacityOptions.enabled; }, set enabled(value: boolean) { railCapacityOptions.enabled = value; },
+  throughTrips: 25 * PASSENGER_RATE_SCALE, interchangeTrips: 45 * PASSENGER_RATE_SCALE, insertPop: PASSENGER_RATE_SCALE,
   /** trips a month a cross-company direct service must carry (xlink) */
   xlinkTrips: 10 * PASSENGER_RATE_SCALE,
   /** tests and calibration: link the best curve found whatever its economics or the partner's view (as AIController.forceBuild) */
-  xlinkForce: false };
+  xlinkForce: false,
+  /** trips a month two lines' stations in one town must newly allow to be linked into one interchange (citylink) */
+  cityLinkTrips: 2 * PASSENGER_RATE_SCALE };
 
 /** Two companies' lines whose stations or tracks come this close (units) are neighbours a curve may link (xlink). */
 export const XLINK_REACH = 30;
+/**
+ * citylink: two lines whose stations in one town come within this walking gap (units) are offered an interchange: a
+ * link when within walking range (Stations.linkRange), else a stop of ours beside the other line's station. Years its
+ * revenue has to repay such a stop (as an inserted station's), and how far the stop may lie from that station.
+ */
+export const CITY_LINK_REACH = 40, CITY_LINK_YEARS = 8, CITY_LINK_GAP = 12;
 /**
  * Share of the regional trips between two towns (townTrips, all modes) a direct rail service attracts at a typical
  * trip factor (xlinkValue; as the road shortcuts' estimate): stations' walking catchments cover only part of a town.
@@ -206,6 +233,12 @@ function segmentGap(p0: { x: number; z: number }, p1: { x: number; z: number }, 
 
 const planners = new WeakMap<AIController, NetPlanner>();
 
+/** Fund the optional connector rail while retaining the through fleet's already-approved cash reserve. */
+export function fundInitialConnector(ai: AIController, cost: number, trainReserve: number) {
+  const remaining = trainReserve + 150_000;
+  return ai.available() >= cost + remaining && ai.capacityFunds(cost + remaining);
+}
+
 interface RoadChoice { ax: number; az: number; bx: number; bz: number; crossing: 'auto' | 'over' | 'under'; cost: number; demolish: boolean }
 interface WorkItem {
   ids: number[]; retire?: 'stations' | 'depots' | 'track' | 'all'; road?: { at: number; best?: RoadChoice };
@@ -214,6 +247,10 @@ interface WorkItem {
   entrance?: { at: number; best?: { kind: EntranceKind; x: number; z: number; gain: number } };
   /** a cross-company link being planned (xlink): the candidate sites and services valued, the next one, the best */
   xlink?: XLinkCursor;
+  /** a city line's growth being planned (extend, ai-grow.ts): the options surveyed, the next one to value, the best */
+  grow?: GrowCursor;
+  /** Next primitive site/movement to reprice in a mid-route connection search; no curve is saved. */
+  midconnect?: { site: number; movement: number; tested: number };
 }
 /**
  * A candidate connecting curve between two companies' lines: the turnout points on our track (a) and theirs (b), each
@@ -231,6 +268,8 @@ const copyXLink = (x: XLinkCursor): XLinkCursor => ({ ...x,
   ...(x.best ? { best: { ...x.best } } : {}) });
 const copyWorkItem = (i: WorkItem): WorkItem => ({ ...i, ids: [...i.ids],
   ...(i.xlink ? { xlink: copyXLink(i.xlink) } : {}),
+  ...(i.grow ? { grow: copyGrowCursor(i.grow) } : {}),
+  ...(i.midconnect ? { midconnect: { ...i.midconnect } } : {}),
   ...(i.style ? { style: { ...i.style, ...(i.style.best ? { best: { ...i.style.best } } : {}) } } : {}),
   ...(i.entrance ? { entrance: { ...i.entrance, ...(i.entrance.best ? { best: { ...i.entrance.best } } : {}) } } : {}),
   ...(i.road ? { road: { ...i.road, ...(i.road.best ? { best: { ...i.road.best } } : {}) } } : {}) });
@@ -706,7 +745,7 @@ class NetPlanner {
         tp.steps++; tp.ms += dt; tp.max = Math.max(tp.max, dt);
         if (!this.job) break;
         // Expensive proposal work gets one prepared item per day; timing never changes that allowance.
-        if (['roads', 'capacity', 'midconnect', 'xlink'].includes(task) && prepared) break;
+        if (['roads', 'capacity', 'midconnect', 'xlink', 'extend'].includes(task) && prepared) break;
       }
     } catch (e) {
       this.note(`network work (${this.task}) failed: ${String((e as Error)?.message ?? e)}`);
@@ -793,6 +832,14 @@ class NetPlanner {
         const pairs = this.xlinkPairs();
         return this.inventory(task, pairs.map((_, i) => i), 1, XLINK_PAIRS).map((i) => pairs[i.ids[0]]);
       }
+      case 'citylink': {
+        const pairs = this.cityLinkPairs();
+        return this.inventory(task, pairs.map((_, i) => i), 1, 6).map((i) => pairs[i.ids[0]]);
+      }
+      case 'extend': {
+        const host = this.growHost();
+        return this.inventory(task, ownLines.filter((l) => !this.cared('grow' + l.id) && !!growLine(host, l)).map((l) => l.id), 1, 3);
+      }
       case 'decommission': {
         const ids = this.inventory(task, ownLines.map((l) => l.id)).flatMap((i) => i.ids)
           .sort((a, b) => this.ai.railPolicy.lossOrder(a, b));
@@ -816,9 +863,9 @@ class NetPlanner {
     else {
       const item = job.items[job.cursor];
       if (item) this.drain(this.run(job.task, item));
-      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink) job.cursor++;
+      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow && !item?.midconnect) job.cursor++;
     }
-    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink'].includes(job.task) ? 1 : Infinity;
+    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink', 'citylink', 'extend'].includes(job.task) ? 1 : Infinity;
     if (job.cursor >= job.items.length || job.done >= limit) this.job = null;
   }
 
@@ -837,7 +884,7 @@ class NetPlanner {
       case 'pair': return this.pairTask(ids);
       case 'crossovers': return this.crossoversTask(ids);
       case 'connect': return this.connectTask(ids);
-      case 'midconnect': return this.midconnectTask(ids);
+      case 'midconnect': return this.midconnectTask(item);
       case 'roads': return this.roadsTask(item);
       case 'join': return this.joinTask(ids);
       case 'insert': return this.insertTask(ids);
@@ -847,7 +894,24 @@ class NetPlanner {
       case 'tidy': return this.tidyTask(ids);
       case 'relevel': return this.relevelTask(ids);
       case 'xlink': return this.xlinkTask(item);
+      case 'citylink': return this.cityLinkTask(ids);
+      case 'extend': return growTask(this.growHost(), item);
     }
+  }
+
+  /** What the city-line growth task (ai-grow.ts) uses of the planner. */
+  private growHost(): GrowHost {
+    return {
+      g: this.g, me: this.me, ai: this.ai,
+      note: (s) => this.note(s), news: (s, x, z) => this.news(s, x, z), considered: (k) => this.considered(k),
+      stat: (k, n = 1) => this.bump(k, n), succeed: () => { if (this.job) this.job.done++; },
+      cared: (k) => this.cared(k), careFor: (k, d) => this.careFor(k, d), canSpend: (c, s) => this.canSpend(c, s),
+      affordable: (c, s = 0.3) => c >= 0 && c <= Math.max(0, this.networkBudget()) * s,
+      fleet: (l) => this.fleet(l), managed: () => this.managed(), setStops: (l, s) => this.setStops(l, s),
+      signal: (id) => this.signal(id), canon: (id) => this.canon(id), mayAlter: (ids) => this.mayAlter(ids),
+      consent: (p, planned) => this.proposalConsent(p, planned), demolitionOk: (ids) => this.demolitionOk(ids),
+      compensate: (ids, residents) => this.compensate(ids, residents), localOnly: (l, sid) => this.localOnly(l, sid),
+    };
   }
 
   // ---------------------------------------------------------------- small helpers
@@ -858,7 +922,7 @@ class NetPlanner {
   }
   private bump(k: NetStat, n = 1) {
     const s = this.ai.stats as unknown as Record<string, number>; s[k] = (s[k] ?? 0) + n;
-    const success: Partial<Record<Task, NetStat>> = { capacity: 'grown', roads: 'netRoads', join: 'netJoined', pair: 'paired', connect: 'netThrough', midconnect: 'netMidConnections', insert: 'netInserted', interchange: 'netInterchanges', relevel: 'netRelevelled', xlink: 'netXLinks' };
+    const success: Partial<Record<Task, NetStat>> = { capacity: 'grown', roads: 'netRoads', join: 'netJoined', pair: 'paired', connect: 'netThrough', midconnect: 'netMidConnections', insert: 'netInserted', interchange: 'netInterchanges', relevel: 'netRelevelled', xlink: 'netXLinks', citylink: 'netCityLinks' };
     if (this.job && success[this.job.task] === k) this.job.done += n;
   }
   private considered(k: string) { networkProfile.decisions[k] = (networkProfile.decisions[k] ?? 0) + 1; }
@@ -956,20 +1020,7 @@ class NetPlanner {
 
   /** Change a line's stops; its vehicles keep heading for the stop they were heading for. */
   private setStops(l: Line, stops: number[]) {
-    const g = this.g, old = [...l.stops];
-    l.stops = stops;
-    for (const vid of l.vehicles) {
-      const v = g.vehicles.get(vid);
-      if (!v) continue;
-      const target = old[v.stopIndex] ?? old[0];
-      let k = 0;
-      for (let i = 0; i < Math.min(v.stopIndex, old.length); i++) if (old[i] === target) k++;
-      let idx = -1, seen = 0;
-      for (let i = 0; i < stops.length; i++) if (stops[i] === target) { idx = i; if (seen++ === k) break; }
-      v.stopIndex = idx >= 0 ? idx : 0;
-    }
-    g.lines.rebuild();
-    for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
+    replaceLineStops(this.g, l, stops);
   }
 
   /** Insert station `s` into a line between its consecutive stops x and y (either way round). */
@@ -1124,7 +1175,7 @@ class NetPlanner {
     return true;
   }
   private roadOutlay(p: Proposal): number {
-    return p.cost + p.demolish.reduce((s, id) => { const b = this.g.world.buildings.get(id); return s + (b ? 3000 + b.pop * 1250 : 0); }, 0);
+    return p.cost + p.demolish.reduce((s, id) => { const b = this.g.world.buildings.get(id); return s + (b ? demolitionCost(this.g, b) : 0); }, 0);
   }
 
   /** Facing nodes / edge taps, reached along the stop's own street network rather than an isolated nearby road. */
@@ -1380,7 +1431,7 @@ class NetPlanner {
             && !fresh.tracks[x.track].sections.some((q) => q.type === 'tunnel' && x.sNew >= q.s0 - 0.5 && x.sNew <= q.s1 + 0.5)))
             && g.vehicles.isEdgeBusy(x.edge))) { this.careFor(key, 15); continue; }
         if (!this.canSpend(total)) continue;
-        const demolished = fresh.demolish.map((id) => g.world.buildings.get(id)!).filter(Boolean).map((b) => ({ townId: b.townId, pop: b.pop }));
+        const demolished = fresh.demolish.map((id) => g.world.buildings.get(id)!).filter(Boolean).map((b) => ({ townId: b.townId, pop: b.pop, cost: demolitionCost(g, b) }));
         const money = this.eco.money;
         const built = this.builtEdges(() => commitProposal(g, fresh), 'road');
         if (built.result) {
@@ -1589,12 +1640,12 @@ class NetPlanner {
     return pop <= 90;
   }
   /** Compensation for demolished town buildings (on top of the demolition in the plan's cost) and a small rating hit. */
-  private compensate(ids: number[], residents?: { townId: number; pop: number }[]) {
+  private compensate(ids: number[], residents?: { townId: number; pop: number; cost: number }[]) {
     if (!ids.length) return;
     const g = this.g, w = g.world;
     let pay = 0;
     const towns = new Set<number>();
-    for (const b of residents ?? ids.map((id) => w.buildings.get(id)).filter((b): b is NonNullable<typeof b> => !!b)) { pay += 3000 + b.pop * 1250; towns.add(b.townId); }
+    for (const b of residents ?? ids.flatMap((id) => { const b = w.buildings.get(id); return b ? [{ townId: b.townId, pop: b.pop, cost: demolitionCost(g, b) }] : []; })) { pay += b.cost; towns.add(b.townId); }
     if (pay) this.eco.spend(pay, 'construction', true);
     for (const st of g.stations.map.values()) if (st.owner === this.me && towns.has(st.townId)) st.rating = Math.max(0, st.rating - 0.015 * ids.length);
     this.bump('netDemolished', ids.length);
@@ -1887,9 +1938,10 @@ class NetPlanner {
     if (!r) return 0;
     const b0 = styleOf(r.style).catchBonus ?? 0, b1 = styleOf(style).catchBonus ?? 0;
     if (!(b1 > b0)) return 0;
-    // (one walking reach for every rail station, whatever its track type)
-    const shapes = (b: number) => (r.level ?? 'ground') === 'ground' ? railCatchShapes(r.x, r.z, r.angle, r.length, true, 'rail', b)
-      : r.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS.rail * (1 + b), mode: 'rail' as const, active: true }));
+    // (one walking reach for every rail station, whatever its track type; half of it at an in-city metro / light-rail station)
+    const k = railWalkScale(st);
+    const shapes = (b: number) => (r.level ?? 'ground') === 'ground' ? railCatchShapes(r.x, r.z, r.angle, r.length, true, 'rail', b, k)
+      : r.entrances.map((e) => ({ x: e.x, z: e.z, r: CATCHMENT_RADIUS.rail * (1 + b) * k, mode: 'rail' as const, active: true }));
     const inner = shapes(b0), outer = shapes(b1);
     const others = [...g.stations.map.values()].filter((o) => o !== st && o.rail && Math.hypot(o.x - st.x, o.z - st.z) < 160).flatMap((o) => g.stations.catchmentShapes(o, true));
     let extra = 0;
@@ -1952,7 +2004,7 @@ class NetPlanner {
     const g = this.g, r = st.rail!;
     if (!this.mayAlter([...r.edges, ...r.throughEdges, ...this.approachOf(st, 80)])) return 'no';
     const now0 = { tracks: r.tracks, through: r.through ?? 0, length: r.length };
-    if (railModeOf(r.trackType) !== 'mainline') want = { ...now0, length: want.length };
+    if (railPartMode(r) !== 'mainline') want = { ...now0, length: want.length };
     const same = (q: typeof now0) => q.tracks === now0.tracks && q.through === now0.through && q.length === now0.length;
     const steps = [{ ...want, tracks: Math.min(want.tracks, now0.tracks + 1) }, want, { ...want, through: now0.through },
       { ...now0, length: want.length }, { ...now0, tracks: Math.min(want.tracks, now0.tracks + 1) }]
@@ -2025,7 +2077,7 @@ class NetPlanner {
       if (!cap) continue;
       const lines = this.linesAt(st.id);
       // ai.ts also grows its managed lines; the size cooldown prevents duplicate work here.
-      const mainline = railModeOf(r.trackType) === 'mainline';
+      const mainline = railPartMode(r) === 'mainline';
       let want: { tracks: number; through: number; length: number } | null = null, why = '';
       if (cap.recommended) { want = { ...cap.recommended }; why = cap.reason; }
       // trains of any company held for a platform here
@@ -2089,7 +2141,7 @@ class NetPlanner {
   private restyle(st: Station, terminus: boolean, item: WorkItem): boolean {
     const g = this.g, r = st.rail!;
     if (!this.mayAlter([...r.edges, ...r.throughEdges])) { delete item.style; return false; }
-    const mode = railModeOf(r.trackType), T = g.towns.list[st.townId], pop = T?.pop ?? 0;
+    const mode = railPartMode(r), T = g.towns.list[st.townId], pop = T?.pop ?? 0;
     const cur = styleOf(r.style).id;
     const avail = new Set(stylesFor(r.level ?? 'ground', r.tracks, g.year).map((s) => s.id));
     const cands: string[] = [];
@@ -2218,7 +2270,7 @@ class NetPlanner {
     if (!this.canSpend(plan.cost, 0.15)) { this.considered('ent.funds'); return false; }
     const dem = plan.access ? [...plan.access.demolish] : [];
     // their residents before they go (building the entrance demolishes them: compensation reads these)
-    const residents = dem.map((id) => g.world.buildings.get(id)).filter((b): b is NonNullable<typeof b> => !!b).map((b) => ({ townId: b.townId, pop: b.pop }));
+    const residents = dem.map((id) => g.world.buildings.get(id)).filter((b): b is NonNullable<typeof b> => !!b).map((b) => ({ townId: b.townId, pop: b.pop, cost: demolitionCost(g, b) }));
     if (g.stations.commitEntrance(st.id, plan, this.me)) return false;
     this.compensate(dem, residents);
     this.bump('netEntrances');
@@ -2359,16 +2411,22 @@ class NetPlanner {
     return [...agg.values()].filter((p) => p.len >= 15).sort((p, q) => q.len - p.len);
   }
 
+  /** The same rails and adjacent platform starters used by native directional pairing. */
+  private pairScope(A: number[], B: number[]) {
+    const g = this.g, net = g.world.net, stations = new Map<number, number>(), edges = new Set([...A, ...B]);
+    for (const st of g.stations.map.values()) if (st.rail && this.agrees(st.owner)
+      && st.rail.edges.some((id) => { const e = net.edges.get(id); return e && [e.a, e.b].some((n) => net.nodes.get(n)?.edges.some((x) => edges.has(x))); })) {
+      stations.set(st.id, st.owner);
+      for (const id of [...st.rail.edges, ...st.rail.throughEdges]) edges.add(id);
+    }
+    return { edges, stations };
+  }
+
   /** The primitive accepts one owner. Apply jointly authorised works synchronously and restore all titles,
    * including descendants of split edges. New crossovers belong to the company paying for the work. */
   private pairTracks(A: number[], B: number[]): FinishLike {
-    const g = this.g, net = g.world.net, owners = new Map<number, number>(), nodes = new Map<number, number>(), stations = new Map<number, number>();
-    const set = new Set([...A, ...B]);
-    for (const st of g.stations.map.values()) if (st.rail && this.agrees(st.owner)
-      && st.rail.edges.some((id) => { const e = net.edges.get(id); return e && [e.a, e.b].some((n) => net.nodes.get(n)?.edges.some((x) => set.has(x))); })) {
-      stations.set(st.id, st.owner);
-      for (const id of [...st.rail.edges, ...st.rail.throughEdges]) set.add(id);
-    }
+    const g = this.g, net = g.world.net, owners = new Map<number, number>(), nodes = new Map<number, number>();
+    const { edges: set, stations } = this.pairScope(A, B);
     for (const id of set) {
       const e = net.edges.get(id);
       if (!e || !this.agrees(e.owner)) return { signals: 0, crossovers: 0, cost: 0, error: 'Joint track works need mutual open access' };
@@ -2497,6 +2555,12 @@ class NetPlanner {
       const lines = this.linesOver(new Set([...A, ...B]));
       yield;
       if (!lines.length || !this.linesRoute(lines)) continue;
+      // Direction changes protect occupied track and native holds, including a train's reserved
+      // continuation and station works. Check the exact native pairing scope before committing.
+      const scope = this.pairScope(A, B);
+      if ([...scope.edges].some(id => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0)) {
+        this.careFor(key, 20); continue;
+      }
       if (!this.canSpend(150_000, 0.3)) return;
       const signals = new Map([...net.nodes].map(([id, n]) => [id, { signal: n.signal, kind: n.signalKind, pass: n.signalPass }]));
       const money = this.eco.money;
@@ -2663,7 +2727,7 @@ class NetPlanner {
 
   private midLines(): Line[] {
     return this.g.lines.all().filter((l) => l.kind === 'rail' && this.agrees(l.owner) && this.pathOf(l) && l.vehicles.length
-      && l.stops.every((sid) => railModeOf(this.g.stations.get(sid)?.rail?.trackType ?? '') === 'mainline'));
+      && l.stops.every((sid) => { const r = this.g.stations.get(sid)?.rail; return !r || railPartMode(r) === 'mainline'; }));
   }
 
   /** Directed plain-track pieces, retaining the stop interval for selecting the two far-end halves. */
@@ -2687,16 +2751,48 @@ class NetPlanner {
     return out;
   }
 
+  /** Price the connector's conflicting movements on every service at its ends, before buying through trains. */
+  private initialConnector(edges: number[], lines: Line[], revenue: number, boardings: number, trains: number,
+    headway: number, kmh: number, seats: number, trainReserve = 0): boolean {
+    const g = this.g, net = g.world.net;
+    if (!edges.length) return false;
+    const length = edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
+    const legs = lines.map(l => this.lineLegs(l)), approach = Math.max(0, ...legs.map((p, i) =>
+      p.reduce((n, p) => n + p.edge.len, 0) / Math.max(1, new Set(lines[i].stops).size - 1) / 2));
+    const junctionTraffic = lines.reduce((n, l) => n + (l.vehicles.length ? 1 / this.headway([l]) : 0), 0);
+    const affected = lines.reduce((n, l, i) => n + l.incomeLast * Math.min(0.3,
+      (length + approach) / Math.max(1, legs[i].reduce((n, p) => n + p.edge.len, 0))), 0);
+    const result = layInitialDoubleTrack(g, edges, this.me,
+      { revenue: revenue + affected, boardings, seats, trains, headway, kmh, blockLength: length + approach,
+        risk: this.ai.config.risk, junctionTraffic },
+      cost => fundInitialConnector(this.ai, cost, trainReserve),
+      p => this.proposalConsent(p) && p.demolish.length === 0, undefined, trainReserve + 150_000);
+    if (result.built) {
+      this.ai.stats.doubled++; this.ai.stats.trackDouble += result.edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
+      this.ai.stats.signals += result.signals;
+      this.note(`connector double from opening (${Math.round(result.cost / 1000)}k; ${Math.round(result.choice!.recovered / 1000)}k recovered/year)`);
+    }
+    return result.built;
+  }
+
   /** Connecting curves between the interiors of two authorised routes, followed by a new through service. */
-  private *midconnectTask(ids: number[]): Generator<void, void> {
-    const g = this.g, net = g.world.net, me = this.me;
+  private *midconnectTask(item: WorkItem): Generator<void, void> {
+    const pending = yield* this.midconnectStep(item);
+    if (!pending) delete item.midconnect;
+  }
+
+  /** One saved, deterministic search unit; all geometry is disposable. */
+  private *midconnectStep(item: WorkItem): Generator<void, boolean | undefined> {
+    const ids = item.ids, g = this.g, net = g.world.net, me = this.me;
     const a = g.lines.map.get(ids[0]), b = g.lines.map.get(ids[1]);
     if (!a || !b || a.kind !== 'rail' || b.kind !== 'rail' || !this.agrees(a.owner) || !this.agrees(b.owner)) return;
     if (a.owner !== me && b.owner !== me || this.ai.railPolicy.deepTrouble) return;
     const key = `mid${a.id}:${b.id}`;
-    if (this.cared(key)) return;
-    this.careFor(key, 180);
-    this.considered('midconnect.pair');
+    if (!item.midconnect) {
+      if (this.cared(key)) return;
+      this.careFor(key, 180);
+      this.considered('midconnect.pair');
+    }
     if (lineCongestion(g, a.id).level || lineCongestion(g, b.id).level) { this.considered('midconnect.congestion'); return; }
     const pa = this.pathOf(a), pb = this.pathOf(b);
     if (!pa || !pb) return;
@@ -2730,11 +2826,18 @@ class NetPlanner {
     sites.sort((a, b) => a.distance - b.distance || a.a.edge.id - b.a.edge.id || a.b.edge.id - b.b.edge.id);
     const stock = [...this.ai.railPolicy.fleet(a), ...this.ai.railPolicy.fleet(b)].sort((x, y) => x.value - y.value || x.id - y.id);
     if (!stock.length) return;
-    let tested = 0;
-    for (const c of sites) {
-      // Each saved pair is a bounded planning unit; no curve or generator is retained across saves.
-      if (tested >= 24) break;
-      for (const forwardA of [true, false]) for (const forwardB of [true, false]) {
+    const cursor = item.midconnect ??= { site: 0, movement: 0, tested: 0 };
+    let plans = 0, movements = 0;
+    for (let i = cursor.site; i < sites.length; i++) {
+      const c = sites[i];
+      if (cursor.tested >= 24) break;
+      for (let movement = cursor.movement; movement < 4; movement++) {
+        // Fixed search work, saved independently of timing. Geometry/values are rebuilt from today's network.
+        if (plans >= 2 || movements >= 64) return true;
+        movements++;
+        cursor.site = movement === 3 ? i + 1 : i;
+        cursor.movement = movement === 3 ? 0 : movement + 1;
+        const forwardA = movement < 2, forwardB = movement % 2 === 0;
         const left = forwardA ? pa.slice(0, c.a.leg + 1) : pa.slice(c.a.leg + 1).reverse();
         const right = forwardB ? pb.slice(c.b.leg + 1) : pb.slice(0, c.b.leg + 1).reverse();
         const path = [...left, ...right];
@@ -2770,8 +2873,8 @@ class NetPlanner {
           this.considered('midconnect.capacity'); return;
         }
         const dirA = (forwardA ? c.a.dir : -c.a.dir) as 1 | -1, dirB = (forwardB ? c.b.dir : -c.b.dir) as 1 | -1;
-        tested++;
-        const plan = Trackops.planConnection(g, c.a.edge.id, c.sa, c.b.edge.id, c.sb, me, { dirA, dirB, search: 2 });
+        cursor.tested++; plans++;
+        const plan = Trackops.planConnection(g, c.a.edge.id, c.sa, c.b.edge.id, c.sb, me, { dirA, dirB, search: 2, junctionUpgrade: true });
         if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) continue;
         if (plan.proposal && (!this.proposalConsent(plan.proposal) || !this.demolitionOk(plan.proposal.demolish))) continue;
         // Incremental income pays for the curve, its upkeep and a real compatible train within our horizon.
@@ -2790,11 +2893,13 @@ class NetPlanner {
         net.onSplit.push(split);
         let result: ReturnType<typeof Trackops.commitConnection>;
         try {
-          result = Trackops.commitConnection(g, plan);
+          result = Trackops.commitConnection(g, plan, { signals: false });
           if (!result.error) {
+            const double = this.initialConnector(result.edges, [a, b], revenue, trips * 12, 1, headway, kmh,
+              t.capacity * 0.8 * 2 * YEAR_S / Math.max(1, headway), t.cars.reduce((n, m) => n + m.cost, 0));
             // Split edges have their own local arc lengths. Find the actual turnout position again rather
             // than using the pre-split length on an arbitrary edge near the junction.
-            for (const turnout of plan.turnouts) {
+            for (const turnout of double ? [] : plan.turnouts) {
               const hit = net.nearestEdge(turnout.x, turnout.z, 2, 'rail', (e) => descendants.has(e.id)
                 && e.station < 0 && e.depot < 0 && this.mayAlter([e.id]));
               if (hit && this.oneWayAround(hit.edge)) this.junctionCrossover({ e: hit.edge, s: hit.s,
@@ -2853,7 +2958,7 @@ class NetPlanner {
   private xlinkLine(l: Line): boolean {
     const g = this.g;
     return l.kind === 'rail' && l.vehicles.length > 0 && !!this.pathOf(l)
-      && l.stops.every((sid) => railModeOf(g.stations.get(sid)?.rail?.trackType ?? '') === 'mainline');
+      && l.stops.every((sid) => { const r = g.stations.get(sid)?.rail; return !r || railPartMode(r) === 'mainline'; });
   }
 
   /** Our line `a` (our trains on it) and another AI company's line `b`: linkable under mutual open access, never the player's. */
@@ -3119,7 +3224,7 @@ class NetPlanner {
     let spans = 0, full = 0;
     const direct = (path: number[]) => g.lines.all().some((l) => l.kind === 'rail' && l.stops.includes(path[0]) && l.stops.includes(path[path.length - 1]));
     let considered = 0;
-    const minR = (TRACK_TYPES.standard?.minRadius ?? 12) * 1.5;
+    const minR = Math.max(18, (TRACK_TYPES.standard?.minRadius ?? 3) * 1.5);
     const skew = new Map<XLinkSite, number>();
     for (const c of raw.slice(0, 384)) {
       net.pointAt(c.a.edge, c.sa, q, ta); net.pointAt(c.b.edge, c.sb, p2, tb);
@@ -3190,7 +3295,7 @@ class NetPlanner {
     const g = this.g;
     const ea = this.xlinkTurnout(s.ax, s.az, s.atx, s.atz), eb = this.xlinkTurnout(s.bx, s.bz, s.btx, s.btz);
     if (!ea || !eb || ea.edge.id === eb.edge.id) return null;
-    const plan = Trackops.planConnection(g, ea.edge.id, ea.s, eb.edge.id, eb.s, this.me, { dirA: ea.dir, dirB: eb.dir, search: 2 });
+    const plan = Trackops.planConnection(g, ea.edge.id, ea.s, eb.edge.id, eb.s, this.me, { dirA: ea.dir, dirB: eb.dir, search: 2, junctionUpgrade: true });
     if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) return null;
     // (no demolition: a link given up takes up its track and refunds the works, but cannot rebuild a house)
     if (plan.proposal && (!this.proposalConsent(plan.proposal) || plan.proposal.demolish.length > 0)) return null;
@@ -3320,7 +3425,9 @@ class NetPlanner {
       net.onSplit.push(split);
       try {
         const result = Trackops.commitConnection(g, plan, { signals: false });
-        if (!result.error) for (const turnout of plan.turnouts) {
+        const double = !result.error && this.initialConnector(result.edges, [a, b], econ.revenue, econ.value.trips * 12,
+          econ.trains, econ.headway, econ.kmh, econ.carried * econ.value.trips * 12, econ.trains * econ.trainCost);
+        if (!result.error) for (const turnout of double ? [] : plan.turnouts) {
           const hit = net.nearestEdge(turnout.x, turnout.z, 2, 'rail', (e) => known.has(e.id) && e.station < 0 && e.depot < 0 && this.mayAlter([e.id]));
           if (hit && this.oneWayAround(hit.edge)) this.junctionCrossover({ e: hit.edge, s: hit.s, x: turnout.x, z: turnout.z, dir: turnout === plan.turnouts[0] ? plan.dirA : plan.dirB });
         }
@@ -3351,7 +3458,12 @@ class NetPlanner {
     const routes = path.slice(1).every((sid, i) => routeBetween(g, path[i], sid, me) && routeBetween(g, sid, path[i], me));
     const why = !routes ? 'no way through the curve both ways' : lineCompatibility(g, l.id, cars);
     let bought = 0;
-    if (!why) for (let i = 0; i < econ.trains; i++) { if (typeof g.vehicles.buyTrain(depot.id, cars, l.id) !== 'string') bought++; }
+    // capacity-integration: the link's newly connected OD fares are its bid, including feeder journeys.
+    priceSharedProject(g, l, { revenue: econ.value.revenue, boardings: econ.value.trips * 12, kmh: econ.kmh, headway: econ.headway });
+    if (!why) for (let i = 0; i < econ.trains; i++) {
+      if (!forced && !sharedTrainAllowed(g, l, me, cars)) break;
+      if (typeof g.vehicles.buyTrain(depot.id, cars, l.id) !== 'string') bought++;
+    }
     if (why || !bought) {
       for (const vid of [...l.vehicles]) g.vehicles.sell(vid);
       g.lines.delete(l.id);
@@ -3650,6 +3762,7 @@ class NetPlanner {
     const counted = (x: Line) => x === l || new Set(l.stops.filter((sid) => x.stops.includes(sid))).size >= 2;
     if (lines.some((x) => this.xlinkRoom(x) - (counted(x) ? 0 : l.vehicles.length) < 1)) { this.considered('xlink.partner.room'); return false; }
     if (!this.canSpend(cost * 1.2 + 150_000, 0.3)) { this.considered('xlink.partner.funds'); return false; }
+    if (!networkOptions.xlinkForce && !sharedTrainAllowed(g, l, me, cars)) { this.considered('xlink.partner.capacityValue'); return false; }
     const t = g.vehicles.buyTrain(depot.id, cars, l.id);
     if (typeof t === 'string') { this.considered('xlink.partner.train'); return false; }
     this.managed()?.set(l.id, { kind: 'rail', towns: [...new Set(path.map((sid) => g.stations.get(sid)?.townId ?? -1).filter((x) => x >= 0))],
@@ -3666,7 +3779,7 @@ class NetPlanner {
     let built = 0;
     for (const st of this.selected(g.stations.map.values(), ids)) {
       if (built >= 1) return;
-      if (st.owner !== me || !st.rail || railModeOf(st.rail.trackType) !== 'mainline' || (st.rail.level ?? 'ground') !== 'ground') continue;
+      if (st.owner !== me || !st.rail || railPartMode(st.rail) !== 'mainline' || (st.rail.level ?? 'ground') !== 'ground') continue;
       if (!this.mayAlter([...st.rail.edges, ...st.rail.throughEdges, ...this.approachOf(st, 80)])) continue;
       const lines = this.linesAt(st.id).filter((l) => l.owner === me && l.kind === 'rail' && this.fleet(l).ours.length);
       const ending = lines.filter((l) => { const p = this.pathOf(l); return !!p && (p[0] === st.id || p[p.length - 1] === st.id); });
@@ -3711,7 +3824,7 @@ class NetPlanner {
           if (tried.has(k)) continue;
           tried.add(k);
           const S2 = g.stations.get(dest.station);
-          if (!S2?.rail || (S2.owner !== me && !g.canUse(me, S2.owner)) || railModeOf(S2.rail.trackType) !== 'mainline') continue;
+          if (!S2?.rail || (S2.owner !== me && !g.canUse(me, S2.owner)) || railPartMode(S2.rail) !== 'mainline') continue;
           for (const l of ending) {
             const path = this.pathOf(l)!;
             if (path.includes(S2.id)) continue;
@@ -3728,17 +3841,22 @@ class NetPlanner {
         const free = ends.filter((id) => net.nodes.get(id)?.edges.length === 1);
         const lead = (free.length ? free : [...ends]).sort((p, q) => { const a = net.nodes.get(p)!, b = net.nodes.get(q)!; return Math.hypot(a.x - best!.c.x, a.z - best!.c.z) - Math.hypot(b.x - best!.c.x, b.z - best!.c.z); })[0];
         const snap: Snap = { kind: 'edge', x: best.c.x, z: best.c.z, y: best.c.y, edge: best.c.e.id, s: best.c.s };
-        const prop = planEdge(g, nodeSnap(g, lead, 'rail'), snap, this.railOpts(r.trackType));
+        const prop = planEdge(g, nodeSnap(g, lead, 'rail'), snap, { ...this.railOpts(r.trackType), junctionUpgrade: true });
         if (!prop.ok || !this.proposalConsent(prop) || !this.demolitionOk(prop.demolish)) { this.note(`no junction from ${st.name} towards ${g.stations.get(best.dest)?.name}: ${prop.errors[0] ?? 'buildings or ownership in the way'}`); continue; }
         if (networkOptions.throughTrips > 0 && prop.cost > best.revenue * 8) continue;
         if (!this.canSpend(prop.cost * 1.3 + 200_000, 0.25)) return;
         const directional = this.oneWayAround(best.c.e);
         const dem = [...prop.demolish];
         const { result: err, edges: made } = this.builtEdges(() => {
-          const err = commitProposal(g, prop);
+          const single = this.builtEdges(() => commitProposal(g, prop)), err = single.result;
           if (!err) {
+            const connector = single.edges.filter(id => { const e = net.edges.get(id); return e?.kind === 'rail' && e.station < 0 && e.depot < 0; });
+            const fleet = best!.line.vehicles.map(id => g.vehicles.get(id)).filter((v): v is Train => v?.kind === 'train');
+            const headway = this.headway([best!.line]), kmh = fleet.reduce((n, t) => n + t.maxSpeedKmh, 0) / Math.max(1, fleet.length) * 0.65;
+            const double = this.initialConnector(connector, [...new Set([...lines, ...this.linesAt(best!.dest)])], best!.revenue,
+              best!.value * 12, fleet.length, headway, kmh, fleet.reduce((n, t) => n + t.capacity, 0) * 0.8 * 2 * YEAR_S / Math.max(1, headway));
             OPS.connectStationThroat?.(g, st.id, me);
-            if (directional && (!routeBetween(g, st.id, best!.dest, me) || !routeBetween(g, best!.dest, st.id, me))) this.junctionCrossover(best!.c);
+            if (!double && directional && (!routeBetween(g, st.id, best!.dest, me) || !routeBetween(g, best!.dest, st.id, me))) this.junctionCrossover(best!.c);
           }
           return err;
         });
@@ -3772,9 +3890,11 @@ class NetPlanner {
   // ================================================================ stations inserted where towns grew (9l)
   /** Residents within a station's catchment at (x, z) along a line not covered by any other rail station there. */
   private uncovered(x: number, z: number, angle: number, length: number, mode: 'mainline' | 'metro' | 'lightrail', coverCache: Map<number, boolean>, existing: { x: number; z: number; r: number }[]): number {
-    // (one walking reach for every rail style: `mode` sets only the callers' spacing and thresholds)
+    // (one walking reach for every rail style, `mode` sets only the callers' spacing and thresholds; but an in-city
+    // metro / light-rail stop walks half as far, CITY_WALK_SCALE)
     const g = this.g, w = g.world;
-    const shapes = railCatchShapes(x, z, angle, length, true, 'rail', 0);
+    const scale = mode !== 'mainline' && g.stations.cityAt(x, z, g.towns.nearest(x, z)) ? CITY_WALK_SCALE : 1;
+    const shapes = railCatchShapes(x, z, angle, length, true, 'rail', 0, scale);
     let pop = 0;
     const seen = new Set<number>();
     for (const c of shapes) for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
@@ -3833,14 +3953,14 @@ class NetPlanner {
    * Insert a through station into own track at (edge, s), trying a little either way along `steps` (edge, s)
    * where the plan fails (straight level track needed). Returns the new station id or -1 ('busy': -2).
    */
-  private *insertAt(spots: { e: number; s: number }[], length: number, why: string, maxCost: number, opts: { tracks?: number; accept?: (p: OnTrackPlanLike) => boolean } = {}): Generator<void, number> {
+  private *insertAt(spots: { e: number; s: number }[], length: number, why: string, maxCost: number, opts: { tracks?: number; mode?: import('./stations').RailMode; accept?: (p: OnTrackPlanLike) => boolean } = {}): Generator<void, number> {
     const g = this.g, me = this.me;
     if (!OPS.planStationOnTrack || !OPS.commitStationOnTrack) return -1;
     let firstErr = '';
     for (let i = 0; i < spots.length; i++) {
       const sp = spots[i];
       if (!this.mayAlter([sp.e])) continue;
-      const plan = OPS.planStationOnTrack(g, sp.e, sp.s, { length, tracks: opts.tracks, style: 'none' }, me);
+      const plan = OPS.planStationOnTrack(g, sp.e, sp.s, { length, tracks: opts.tracks, mode: opts.mode, style: 'none' }, me);
       if (i % 3 === 2) yield;
       if (!plan.ok) { this.considered('station.site'); firstErr ||= plan.error ?? ''; continue; }
       if (opts.accept && !opts.accept(plan)) { this.considered('station.catchmentOrSpacing'); firstErr ||= 'catchment, spacing or value'; continue; }
@@ -3881,7 +4001,7 @@ class NetPlanner {
       this.careFor('ins' + l.id, 180);
       const sts = [...new Set(l.stops)].map((id) => g.stations.get(id)).filter((s): s is Station => !!s?.rail);
       if (sts.length < 2) continue;
-      const mode = railModeOf(sts[0].rail!.trackType);
+      const mode = railPartMode(sts[0].rail!);
       let covered = cover.get(mode);
       if (!covered) cover.set(mode, covered = new Map());
       // (every rail station covers its residents, whatever its track type)
@@ -3907,7 +4027,7 @@ class NetPlanner {
             net.pointAt(e, s, q, dq);
             // dense spacing rules: clear of every rail station of the mode (any line, any company)
             let near = false;
-            for (const o of g.stations.footprintsNear(q.x, q.z, spacing)) if (o.rail && railModeOf(o.rail.trackType) === mode && Math.hypot(o.rail.x - q.x, o.rail.z - q.z) < spacing) { near = true; break; }
+            for (const o of g.stations.footprintsNear(q.x, q.z, spacing)) if (o.rail && railPartMode(o.rail) === mode && Math.hypot(o.rail.x - q.x, o.rail.z - q.z) < spacing) { near = true; break; }
             if (near) continue;
             // (open country: nothing to cover)
             if (!g.world.bgrid.query(q.x - R, q.z - R, q.x + R, q.z + R).length) continue;
@@ -3933,7 +4053,7 @@ class NetPlanner {
       let servedPop = best.pop;
       const accept = (p: OnTrackPlanLike) => {
         const st = p.station;
-        if (!st || [...g.stations.map.values()].some((o) => o.rail && railModeOf(o.rail.trackType) === mode && Math.hypot(o.x - st.x, o.z - st.z) < spacing)) return false;
+        if (!st || [...g.stations.map.values()].some((o) => o.rail && railPartMode(o.rail) === mode && Math.hypot(o.x - st.x, o.z - st.z) < spacing)) return false;
         const pop = this.uncovered(st.x, st.z, st.angle, st.length, mode, covered!, existing);
         if (pop < INSERT_POP[mode] * networkOptions.insertPop || p.cost > Math.max(0, pop * value - upkeep) * 8) return false;
         servedPop = pop;
@@ -3941,7 +4061,7 @@ class NetPlanner {
       };
       // A one-train single-track service needs a halt, not a new passing station. The planner retains
       // existing parallel tracks; add another platform only when several trains need to pass here.
-      const id = yield* this.insertAt(spots, platform, `no station site in ${town?.name ?? 'town'} on ${l.name}`, maxCost, { tracks: l.vehicles.length > 1 ? 2 : 1, accept });
+      const id = yield* this.insertAt(spots, platform, `no station site in ${town?.name ?? 'town'} on ${l.name}`, maxCost, { tracks: l.vehicles.length > 1 ? 2 : 1, mode, accept });
       if (id === -2) { this.careFor('ins' + l.id, 15); continue; }
       if (id < 0) continue;
       const st = g.stations.get(id)!;
@@ -3958,7 +4078,7 @@ class NetPlanner {
   /** Fit the trains actually using the line, rather than requiring its longest existing platforms. */
   private platformFor(l: Line): number {
     const st = this.g.stations.get(l.stops[0]);
-    let length = defaultPlatformLength(st?.rail?.trackType);
+    let length = st?.rail ? PLATFORM_LENGTH[railPartMode(st.rail)] : defaultPlatformLength();
     for (const id of l.vehicles) {
       const v = this.g.vehicles.get(id) as unknown as { length?: number } | undefined;
       if (v?.length) length = Math.max(length, Math.ceil(v.length + 0.5));
@@ -4082,10 +4202,134 @@ class NetPlanner {
     this.news(`opens ${st.name}, an interchange between ${best.l1.name} and ${best.l2.name}.`, st.x, st.z);
   }
 
+  // ================================================================ city interchanges (citycatch)
+  /**
+   * Our served rail lines with a town in common with another served rail line (ours, or an agreeing company's), where
+   * one of the two calls at an in-city metro / light-rail station there (Station.city: near city stations).
+   */
+  private cityLinkPairs(): WorkItem[] {
+    const g = this.g, me = this.me, out: WorkItem[] = [];
+    const rail = g.lines.all().filter((l) => l.kind === 'rail' && l.vehicles.length > 0 && new Set(l.stops).size >= 2);
+    const towns = new Map(rail.map((l) => [l.id, new Set(l.stops.map((sid) => g.stations.get(sid)?.townId ?? -1).filter((t) => t >= 0))]));
+    const city = new Map(rail.map((l) => [l.id, new Set(l.stops.map((sid) => g.stations.get(sid)).filter((s) => s?.city).map((s) => s!.townId))]));
+    for (const a of rail) {
+      if (a.owner !== me || !this.fleet(a).ours.length) continue;
+      for (const b of rail) {
+        // (two of our lines once: the lower id leads)
+        if (a === b || !this.agrees(b.owner) || (b.owner === me && this.fleet(b).ours.length && b.id < a.id)) continue;
+        if (this.cared(`cl${a.id}:${b.id}`)) continue;
+        const shared = [...towns.get(b.id)!].filter((t) => towns.get(a.id)!.has(t));
+        if (!shared.some((t) => city.get(a.id)!.has(t) || city.get(b.id)!.has(t))) continue;
+        out.push({ ids: [a.id, b.id] });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Trips a month and yearly revenue newly possible between two sets of stations in one town: the local demand from
+   * each station's walking regions to the regions the other set's stations cover (the regional OD model, as passenger
+   * generation shares it out, with the town's rail uplift), both ways, for station pairs routing serves badly or not
+   * at all today; each such journey makes a change of lines (TRANSFER_FARE_FACTOR).
+   */
+  private cityTrips(as: number[], bs: number[], headway = 900): { trips: number; revenue: number } {
+    const g = this.g, D = g.demand, n = D.regions.length, od = D.od;
+    let trips = 0, revenue = 0;
+    if (!n || od.length !== n * n) return { trips, revenue };
+    const pair = (a: Station, b: Station) => {
+      const shares = D.shares.get(a.id);
+      if (!shares || !(a.catchPop > 0)) return 0;
+      const d = Math.hypot(a.x - b.x, a.z - b.z), walk = Math.min(1, d / 25);
+      let x = 0;
+      for (const [q, cov] of D.coverageSnapshot(b, false)) for (const [r, sr] of shares) if (r < n && q < n) x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
+      return a.catchPop * TRIPS_PER_MONTH * x * localTripMultiplier(g, a, 'rail', 1);
+    };
+    for (const x of new Set(as)) for (const y of new Set(bs)) {
+      const A = g.stations.get(x), B = g.stations.get(y);
+      if (x === y || !A || !B || A.townId < 0 || A.townId !== B.townId) continue;
+      const d = Math.hypot(A.x - B.x, A.z - B.z), time = estimateLegTime(d, 35, headway, 1.3) + 360;
+      const hop = g.lines.nextHop(x, y);
+      if (hop && hop.cost < time * 1.4) continue;
+      const t = pair(A, B) + pair(B, A);
+      trips += t;
+      revenue += t * 12 * estimateLegFare(d, 35, headway, 1, 1.3, false, false, { mode: 'rail' }) * TRANSFER_FARE_FACTOR;
+    }
+    return { trips, revenue };
+  }
+
+  /**
+   * One pair of lines with stations in one town (citylink): their nearest stations there become one interchange where
+   * the change of lines newly allows enough trips: linked for walking transfers when within walking range (linkRange: free, under
+   * the stations' access rules), else a stop of ours on our own track within CITY_LINK_GAP of the other line's station
+   * (linked to it), when the trips' revenue repays the stop and its upkeep within CITY_LINK_YEARS.
+   */
+  private *cityLinkTask(ids: number[]): Generator<void, void> {
+    const g = this.g, me = this.me, [aid, bid] = ids;
+    const A = g.lines.get(aid), B = g.lines.get(bid);
+    if (!A || !B) return;
+    this.careFor(`cl${aid}:${bid}`, 360);
+    this.considered('citylink.pair');
+    const sa = [...new Set(A.stops)], sb = [...new Set(B.stops)];
+    if (sa.some((x) => { const c = new Set(g.stations.complex(x)); return sb.some((y) => c.has(y)); })) { this.considered('citylink.meet'); return; }
+    let near: { a: Station; b: Station; gap: number } | null = null;
+    for (const x of sa) for (const y of sb) {
+      const X = g.stations.get(x), Y = g.stations.get(y);
+      // (near in-city stations: one of the two an in-city metro / light-rail station)
+      if (!X?.rail || !Y?.rail || X.townId < 0 || X.townId !== Y.townId || !(X.city || Y.city) || Math.hypot(X.x - Y.x, X.z - Y.z) > 160) continue;
+      const gap = g.stations.gap(X, Y);
+      if (!near || gap < near.gap || (gap === near.gap && X.id + Y.id < near.a.id + near.b.id)) near = { a: X, b: Y, gap };
+    }
+    if (!near || near.gap > CITY_LINK_REACH) { this.considered('citylink.far'); return; }
+    yield;
+    const value = this.cityTrips(sa, sb, this.headway([A, B]));
+    networkProfile.decisions['citylink.maxTrips'] = Math.max(networkProfile.decisions['citylink.maxTrips'] ?? 0, value.trips);
+    if (value.trips < networkOptions.cityLinkTrips) { this.considered('citylink.demand'); return; }
+    if (near.gap <= g.stations.linkRange(near.a, near.b)) {
+      const why = g.stations.canLink(near.a.id, near.b.id);
+      if (why || g.stations.link(near.a.id, near.b.id)) { this.considered('citylink.rules'); return; }
+      this.bump('netCityLinks');
+      this.note(`interchange ${near.a.name} - ${near.b.name}${near.b.owner !== me ? ` (${g.company(near.b.owner).name})` : ''}: linked for transfers, ${Math.round(value.trips)} trips a month newly connected`);
+      return;
+    }
+    if (!this.mayBuild()) { this.considered('citylink.funds'); return; }
+    // a stop of ours beside the other line's station (on our line; on either when both are ours)
+    const options: { l: Line; to: Station }[] = [{ l: A, to: near.b }];
+    if (B.owner === me && this.fleet(B).ours.length) options.push({ l: B, to: near.a });
+    for (const { l, to } of options) {
+      const own = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((s): s is Station => !!s?.rail);
+      const nearest = own.reduce<Station | undefined>((best, st) => !best || Math.hypot(st.x - to.x, st.z - to.z) < Math.hypot(best.x - to.x, best.z - to.z) ? st : best, undefined);
+      const mode = nearest ? railPartMode(nearest.rail!) : 'mainline';
+      const L = Math.max(4, this.platformFor(l)), route = [...new Set(this.pairsOf(l).flatMap(([a, b]) => this.route(a, b, l.owner) ?? []))];
+      const spots = this.spotsNear(route, to.x, to.z, CITY_LINK_GAP + L / 2 + 4).slice(0, 14);
+      if (!spots.length) { this.considered('citylink.noTrack'); continue; }
+      const before = new Map<number, [number, number][]>();
+      for (const o of g.lines.map.values()) if (o.owner === me && o.kind === 'rail') before.set(o.id, this.pairsOf(o));
+      // the stop's own upkeep (its level: the line's there) must be repaid by the newly connected trips
+      const accept = (p: OnTrackPlanLike) => {
+        const st = p.station as StationPlan | null;
+        if (!st || this.planGap(st, to) > CITY_LINK_GAP || own.some((o) => Math.hypot(o.x - st.x, o.z - st.z) < st.length + 6)) return false;
+        const upkeep = (20_000 + st.tracks * st.length * 500) * STATION_UPKEEP_FACTOR[st.level];
+        return (value.revenue - upkeep) * CITY_LINK_YEARS >= p.cost;
+      };
+      const id = yield* this.insertAt(spots, L, `no interchange stop beside ${to.name}`, Math.max(0, value.revenue * CITY_LINK_YEARS), { accept, tracks: 2, mode });
+      if (id === -2) { this.careFor(`cl${aid}:${bid}`, 15); return; }
+      if (id < 0) continue;
+      const st = g.stations.get(id)!;
+      this.roadAccess(st);
+      const served = this.addToLines(id, before);
+      if (!served.length) { g.stations.removeStation(id); this.considered('citylink.unserved'); continue; }
+      if (!g.stations.get(st.id)?.links.includes(to.id) && !g.stations.canLink(st.id, to.id)) g.stations.link(st.id, to.id);
+      this.bump('netCityLinks'); this.bump('netCityStops');
+      this.note(`interchange stop ${st.name} on ${l.name} beside ${to.name}${to.owner !== me ? ` (${g.company(to.owner).name})` : ''}: ${Math.round(value.trips)} trips a month newly connected`);
+      this.news(`opens ${st.name} on ${l.name}, an interchange with ${to.name}.`, st.x, st.z);
+      return;
+    }
+  }
+
   // ================================================================ one station per town (9g consolidation)
   private *consolidateTask(ids: number[]): Generator<void, void> {
     const g = this.g, net = g.world.net, me = this.me;
-    const mine = [...g.stations.map.values()].filter((s) => s.owner === me && s.rail && railModeOf(s.rail.trackType) === 'mainline' && (s.rail.level ?? 'ground') === 'ground' && s.townId >= 0);
+    const mine = [...g.stations.map.values()].filter((s) => s.owner === me && s.rail && railPartMode(s.rail) === 'mainline' && (s.rail.level ?? 'ground') === 'ground' && s.townId >= 0);
     for (let i = 0; i < mine.length; i++) for (let j = 0; j < mine.length; j++) {
       const A = mine[i], B = mine[j];
       if (!ids.includes(A.id) || i === j || A.townId !== B.townId || !g.stations.get(A.id) || !g.stations.get(B.id)) continue;
@@ -4255,6 +4499,10 @@ class NetPlanner {
         if (b.owner < 0 || !g.canUse(me, b.owner) || g.accessPolicy(b.owner) !== 'open' || gap > 5) continue;
         const ls = this.linesAt(a.id);
         if (ls.some((l) => l.owner !== me || l.stops.includes(b.id) || new Set(l.stops.map((s) => (s === a.id ? b.id : s))).size < 2)) continue;
+        // Each operator needs an owned stop to buy more vehicles. Consolidating onto a neighbour
+        // must not remove anyone's last such stop, even while our line is otherwise profitable.
+        if (ls.some(l => g.lines.operatorsOf(l).some(owner => a.owner === owner
+          && !l.stops.some(s => s !== a.id && g.stations.get(s)?.owner === owner)))) continue;
         for (const l of ls) this.setStops(l, l.stops.map((s) => (s === a.id ? b.id : s)));
         if (!this.linesAt(a.id).length && !g.stations.removeStation(a.id)) {
           this.bump('netStopsMerged');
@@ -4350,7 +4598,7 @@ class NetPlanner {
     if (!OPS.planRelevel || !OPS.commitRelevel) return;
     if (this.eco.yearTotals.length && this.eco.lastYearProfit < 0) return;
     for (const st of this.selected(g.stations.map.values(), ids)) {
-      if (st.owner !== me || !st.rail || (st.rail.level ?? 'ground') !== 'ground' || railModeOf(st.rail.trackType) !== 'mainline' || this.cared('lift' + st.id)) continue;
+      if (st.owner !== me || !st.rail || (st.rail.level ?? 'ground') !== 'ground' || railPartMode(st.rail) !== 'mainline' || this.cared('lift' + st.id)) continue;
       const T = g.towns.list[st.townId];
       if (!T || T.pop < 3500 || Math.hypot(st.x - T.x, st.z - T.z) > T.radius * 0.6) continue;
       this.careFor('lift' + st.id, 720);

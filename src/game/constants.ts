@@ -24,9 +24,11 @@ export const LOCAL_DEMAND_DISTANCE = 40, LOCAL_DEMAND_EXP = 0.85, LOCAL_SERVED_S
 /**
  * Urban trips use the same compressed calendar. Extra local trips apply only inside large, dense towns, by the mode
  * that carries the journey (demand.ts journeyMode): rail is one mode (main-line, metro and light-rail track alike),
- * then tram and bus. Rail twice the tram: faster and more frequent, not a different kind of trip.
+ * then tram and bus. Rail three times the tram: faster and more frequent, not a different kind of trip (12 since in-
+ * city metro and light-rail stops walk half as far, from 8: the same for every rail station in a dense centre, so a
+ * city railway of closer stops still repays; scripts/citycatch.ts, urbanecon.ts).
  */
-export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 8, tram: 4, bus: 2 };
+export const URBAN_DEMAND = { minPop: 3000, fullPop: 8000, density: 0.65, rail: 12, tram: 4, bus: 2 };
 /** Small unmodelled car/drop-off feeder share of cross-town rail trips; bus/tram feeders are routed as real transfers. */
 export const MAINLINE_FEEDER_SHARE = 0.08;
 /**
@@ -45,10 +47,15 @@ export const RAIL_FARE = { minimum: 550 };
 /** Tram and bus fares: a boarding charge in calibrated game money, followed by the scaled distance component. */
 export const ROAD_FARES = { tram: { boarding: 80, distance: 0.9 }, bus: { boarding: 12, distance: 0.9 } };
 /**
- * Years of operating surplus available to repay an urban rail project, by construction style: subway-style tunnels
- * and cross-city links amortise longer than light-rail-style surface or viaduct lines.
+ * Civil investment horizons. City rail is long-lived infrastructure: twenty years for light rail,
+ * twenty-five for a subway. AI quotes discount the operating surplus at their actual borrowing rate.
+ * Cross-city joins retain their existing fifteen-year gate.
  */
-export const URBAN_PAYBACK = { metro: 15, lightrail: 9, crosscity: 15 };
+export const URBAN_PAYBACK = { metro: 25, lightrail: 20, crosscity: 15 };
+/** Present value of one year's surplus repeated over an investment horizon, at the actual borrowing rate. */
+export function discountedPayback(years: number, interestRate: number): number {
+  return interestRate > 0 ? (1 - Math.pow(1 + interestRate, -years)) / interestRate : years;
+}
 /** km/h -> world units per (game) second. */
 export const KMH_TO_UPS = 1 / 36;
 
@@ -118,28 +125,31 @@ export interface TrackType {
   maintPerUnit: number;
   /** overhead wire: electric traction needs it */
   electrified: boolean;
-  /**
-   * construction style (stations take theirs from their platform track: level, platforms, building, spacing).
-   * Every style is rail: any rail line may use it, with one catchment and fare model.
-   */
+  /** @deprecated Station construction style belongs to RailPart.mode. */
   mode: 'mainline' | 'metro' | 'lightrail';
-  /** earthworks of its formation relative to heavy rail (light rail: narrower and lighter) */
+  /** earthworks of the common rail formation */
   formation: number;
 }
 
 /**
- * Track types. `standard` is unelectrified; `electric` is the same main-line track with overhead wire (what
- * `electrify` turns standard track into); `metro` is electrified urban-style track (tighter curves, steeper grades,
- * ~100 km/h), `lightrail` light electrified track (tight curves, steep grades, a light formation). All are rail:
- * every rail vehicle runs on all of them (electric traction needs the wire) and one line may mix them.
+ * One physical track: tight city curves and grades are legal; geometry and the train determine speed.
+ * The two ids record only overhead wire. Old ids are aliases for compatibility with saves and other branches.
  */
+const TRACK: TrackType = { id: 'standard', name: 'Track', speed: 400, maxGrade: 0.07, minRadius: 3, costPerUnit: 7500, maintPerUnit: 300, electrified: false, mode: 'mainline', formation: 1 };
+const WIRED_TRACK: TrackType = { ...TRACK, id: 'electric', electrified: true, costPerUnit: 10000, maintPerUnit: 380 };
 export const TRACK_TYPES: Record<string, TrackType> = {
-  standard: { id: 'standard', name: 'Standard track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 7500, maintPerUnit: 300, electrified: false, mode: 'mainline', formation: 1 },
-  electric: { id: 'electric', name: 'Electrified track', speed: 160, maxGrade: 0.035, minRadius: 12, costPerUnit: 10000, maintPerUnit: 380, electrified: true, mode: 'mainline', formation: 1 },
-  highspeed: { id: 'highspeed', name: 'High-speed track (electrified)', speed: 400, maxGrade: 0.03, minRadius: 40, costPerUnit: 22000, maintPerUnit: 900, electrified: true, mode: 'mainline', formation: 1.1 },
-  metro: { id: 'metro', name: 'Metro track (electrified)', speed: 100, maxGrade: 0.045, minRadius: 8, costPerUnit: 9500, maintPerUnit: 400, electrified: true, mode: 'metro', formation: 0.9 },
-  lightrail: { id: 'lightrail', name: 'Light rail track (electrified)', speed: 80, maxGrade: 0.07, minRadius: 3, costPerUnit: 6500, maintPerUnit: 260, electrified: true, mode: 'lightrail', formation: 0.6 },
+  standard: TRACK,
+  electric: WIRED_TRACK,
+  /** @deprecated Use electric; high speed is a geometry choice. */
+  highspeed: WIRED_TRACK,
+  /** @deprecated Use electric and RailPart.mode = 'metro'. */
+  metro: WIRED_TRACK,
+  /** @deprecated Use electric and RailPart.mode = 'lightrail'. */
+  lightrail: WIRED_TRACK,
 };
+
+/** Canonical wire state of a rail type, including legacy ids. */
+export function trackTypeOf(type?: string): string { return (TRACK_TYPES[type ?? ''] ?? TRACK_TYPES.standard).id; }
 
 /** Overhead wire for existing track (`electrify`): standard -> electric, per unit of track. */
 export const ELECTRIFY = { costPerUnit: 2500, from: 'standard', to: 'electric' };

@@ -191,7 +191,22 @@ if (main && !process.argv.includes('--hooks-only')) for (const { seed, size } of
   g.lines.flushCatchment(); original(); checkFull(g);
   const unchanged: number[] = [];
   for (let i = 0; i < 100; i++) { const t = performance.now(); original(); unchanged.push(performance.now() - t); }
-  const saved = JSON.stringify(serialize(g)), load = () => deserialize(JSON.parse(saved)), loaded = load();
+  const saved = JSON.stringify(serialize(g)), loadTimes: number[] = [];
+  const load = () => {
+    const data = JSON.parse(saved), start = performance.now(), loaded = deserialize(data);
+    loadTimes.push(performance.now() - start);
+    return loaded;
+  };
+  // Clean saves restore derived shares eagerly. Keep the independent cold-work/tick-budget fixture explicit.
+  const coldLoad = () => {
+    const loaded = load(), S = loaded.stations as any;
+    S.sharesReady = false;
+    for (const key of ['shareSt', 'shareB', 'walkSt', 'covered', 'coveredPop', 'shareMembers', 'served']) S[key] = new Map();
+    S.pendingPop.clear();
+    S.catchInputs = { roads: -1, lots: -1, terrain: -1, stations: -1, served: -1 };
+    return loaded;
+  };
+  const loaded = coldLoad();
   writeFileSync(`catchperf-load-${size}-${seed}.json`, saved);
   const loadSlices: number[] = [];
   const loadRecompute = loaded.stations.recomputeCatchment.bind(loaded.stations);
@@ -200,6 +215,8 @@ if (main && !process.argv.includes('--hooks-only')) for (const { seed, size } of
   };
   loaded.lines.catchmentDirty = true;
   loaded.lines.flushCatchment();
+  if (loaded.stations.map.size >= 16 && loaded.tick > 0 && loaded.tick % loaded.ticksPerDay !== loaded.ticksPerDay - 1)
+    assert.ok(loaded.stations.catchmentWorkPending && loaded.lines.catchmentDirty, 'explicitly cold shares retain sliced preparation');
   let loadTicks = 0;
   while (loaded.lines.catchmentDirty) { assert.ok(loadTicks++ < loaded.ticksPerDay); loaded.stepTick(); }
   const afterLoad = loadSlices[0];
@@ -209,7 +226,7 @@ if (main && !process.argv.includes('--hooks-only')) for (const { seed, size } of
     for (let tick = 0; tick < loadTicks; tick++) synchronous.stepTick();
     sameSave(loaded, synchronous, 'sliced load and synchronous load continue identically');
     // A load on the final tick of a day must finish before that day's passenger generation.
-    const late = load(), lateSync = load();
+    const late = coldLoad(), lateSync = load();
     late.dayFrac = lateSync.dayFrac = (late.ticksPerDay - 1) / late.ticksPerDay;
     late.lines.catchmentDirty = true; lateSync.stations.recomputeCatchment(); lateSync.demand.recomputeShares(); lateSync.lines.catchmentDirty = false;
     late.stepTick(); lateSync.stepTick();
@@ -221,7 +238,7 @@ if (main && !process.argv.includes('--hooks-only')) for (const { seed, size } of
     sameSave(g, oracle, 'unchanged-code oracle', oracleModule!.serialize);
   }
   const report = { seed, size, years, node: process.version, mode: baseline ? 'before' : timingOnly ? 'after-timing' : 'after', calls: run, ticks: tickStats, unchanged: stats(unchanged), afterLoad,
-    loadSlices: stats(loadSlices), loadTicks, cpuCalls: cpuRun,
+    loadSlices: stats(loadSlices), loadTicks, loadTimes: stats(loadTimes), cpuCalls: cpuRun,
     checks, stations: g.stations.map.size, buildings: g.world.buildings.size, delivered: g.vehicles.all().reduce((a, v) => a + v.delivered, 0),
     stateHash: createHash('sha256').update(JSON.stringify(serialize(g))).digest('hex'), oracleEqual: oracle ? true : undefined,
     slowCalls: slowCalls.sort((a, b) => b.ms - a.ms).slice(0, 8),

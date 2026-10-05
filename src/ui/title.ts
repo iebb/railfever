@@ -1,5 +1,9 @@
 // Title screen over the live (blurred) world: wordmark, main actions and the new-game card.
 import { GAME_VERSION } from '../game/version';
+
+declare const __BUILD__: string | undefined;
+/** The build's short commit (Vite define; absent in headless bundles). */
+const BUILD = typeof __BUILD__ === 'string' ? __BUILD__ : '';
 import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
@@ -82,8 +86,10 @@ export function showTitle(o: TitleOpts) {
       btn('plus', 'New game', '', () => openCard()),
       btn('save', 'Load game', '', () => { close(false); openSaveLoad(ui, 'load'); }),
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
-    h('div', { class: 'title-foot' }, `Railfever v${GAME_VERSION}${/\/preview\//.test(location.pathname) ? ' preview' : ''} · offline in your browser`),
+    h('div', { class: 'title-foot' }, 'Offline in your browser'),
   );
+  const preview = /\/preview\//.test(location.pathname);
+  root.append(h('div', { class: 'title-ver', title: BUILD ? `Build ${BUILD}` : undefined }, `v${GAME_VERSION}${preview ? ` preview${BUILD ? ` · ${BUILD}` : ''}` : ''}`));
   row.appendChild(main);
   root.appendChild(row);
   ui.root.appendChild(root);
@@ -92,7 +98,7 @@ export function showTitle(o: TitleOpts) {
 
   function openCard() {
     if (card) return;
-    const st = { size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', seed: Math.floor(Math.random() * 99999) };
+    const st = { size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', money: null as number | null, seed: Math.floor(Math.random() * 99999) };
     const c = h('div', { class: 'ng-card glass' });
     card = c;
     const render = () => {
@@ -103,6 +109,8 @@ export function showTitle(o: TitleOpts) {
       const seed = h('input', { type: 'number', value: String(st.seed), class: 'input', style: 'width:110px', 'aria-label': 'Seed' }) as HTMLInputElement;
       seed.addEventListener('input', () => { st.seed = Number(seed.value) || 1; });
       const era = ERAS.find(([y]) => y === st.year);
+      const money = h('input', { type: 'number', min: '0', max: '1000', step: 'any', value: st.money == null ? '' : String(st.money), placeholder: 'Preset', class: 'input', style: 'width:110px', 'aria-label': 'AI starting balance in millions' }) as HTMLInputElement;
+      money.addEventListener('input', () => { st.money = money.value === '' ? null : money.valueAsNumber; });
       add(c,
         h('div', { class: 'ng-title' }, 'New game'),
         field('Map size', seg(MAP_SIZES, st.size, (v) => { st.size = v; st.towns = defaultTowns(v); render(); }), `${(st.size / 100).toFixed(1)} × ${(st.size / 100).toFixed(1)} km${st.size >= 1024 ? ' · large maps: a few seconds to generate' : ''}`),
@@ -112,16 +120,19 @@ export function showTitle(o: TitleOpts) {
         field('Start year', seg(ERAS.map(([y, l]) => [y, l] as [number, string]), st.year, (v) => { st.year = v; render(); }), era?.[2]),
         field('Competitors', h('div', { class: 'inline wrap' },
           stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(MAX_AI, st.ai + 1); render(); }),
-          h('div', { class: 'ai-chips' }, st.ai ? aiConfigsFor(st.style, st.ai).map((cfg, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[(i + 1) % COMPANY_COLORS.length]}`, 'data-tip': presetOf(cfg)?.name ?? '' }, h('i'), AI_NAMES[i % AI_NAMES.length])) : h('span', { class: 'muted' }, 'Sandbox: no rivals')))),
+          h('div', { class: 'ai-chips' }, st.ai ? aiConfigsFor(st.style, st.ai).map((cfg, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[i + 1]}`, 'data-tip': presetOf(cfg)?.name ?? '' }, h('i'), AI_NAMES[i % AI_NAMES.length] + (i >= AI_NAMES.length ? ` ${i + 1}` : ''))) : h('span', { class: 'muted' }, 'Sandbox: no rivals')))),
         st.ai ? field('AI style', seg([['cautious', 'Cautious'], ['balanced', 'Balanced'], ['aggressive', 'Aggressive'], ['mixed', 'Mixed']], st.style, (v) => { st.style = v; render(); }),
           st.style === 'mixed' ? 'Rail barons, bus operators, tram builders…' : AI_PRESETS.find((p) => p.id === st.style)?.hint) : null,
+        st.ai ? field('AI balance', h('div', { class: 'inline' }, money, '$M', h('button', { class: 'btn ghost sm', onclick: () => { st.money = null; render(); } }, 'Use preset')),
+          'Each rival; the first $5M is a loan. Blank uses the style’s balance.') : null,
         field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', 'data-tip': 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
           h('button', { class: 'btn ghost', onclick: () => { c.remove(); card = null; root.classList.remove('card-open'); if (o.newGame && g) close(); } }, 'Cancel'),
           h('button', { class: 'btn primary lg', onclick: async () => {
+            if (st.ai && !money.reportValidity()) return;
             const nt = Math.min(st.towns, Math.round((st.size * st.size) / 3000));
             // The shell returns success after confirmation, preservation, and world creation.
-            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai) }) as unknown as Promise<boolean>);
+            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai, st.money == null ? undefined : st.money * 1_000_000) }) as unknown as Promise<boolean>);
             if (started) close(false);
           } }, icon('play', 18), 'Start')),
       );

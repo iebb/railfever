@@ -2,12 +2,13 @@
 import * as THREE from 'three';
 import type { Game } from '../game/game';
 import type { Proposal, CrossingPlan } from '../game/construction';
+import { stationPose, stationStripRects } from '../game/station-geometry';
 import type { StationPlan } from '../game/stations';
 import type { DepotPlan, DepotKind } from '../game/build-ops';
-import { depotSize } from '../game/build-ops';
+import { depotSize, depotVolume, UNDERGROUND_DEPOT } from '../game/build-ops';
 import { arcTable, tAtS, bezPoint } from '../game/geom';
 import { profAt } from '../game/network';
-import { ROAD_TYPES, WATER_Y, NetKind } from '../game/constants';
+import { ROAD_TYPES, TRACK_TYPES, WATER_Y, NetKind } from '../game/constants';
 import { FLOOR_H } from '../game/towns';
 
 export type MarkerKind = 'node' | 'edge' | 'free' | 'start' | 'signal' | 'point';
@@ -367,6 +368,9 @@ export class Overlay {
   private arcs: ScreenRibbon;
   private shareRings: GhostMesh;
   private sigs: GhostMesh;
+  /** underground view: tunnels, underground station boxes and depots seen through the ground (by depth) */
+  private under: GhostMesh;
+  private underKey = '';
   private dim = dimLayer();
   private demoKey = '';
   private markers = new Map<string, THREE.Mesh>();
@@ -393,6 +397,7 @@ export class Overlay {
     this.arcs.style = { casing: 1, caseAlpha: 0.55, opacity: 1 };
     this.shareRings = new GhostMesh(this.group, 0.9, 0.3, 48);
     this.sigs = new GhostMesh(this.group, 0.95, 0.45, 42);
+    this.under = new GhostMesh(this.group, 0.5, 0.42, 22);
     this.group.add(this.dim);
     const flat = (g: THREE.BufferGeometry) => g.rotateX(-Math.PI / 2);
     this.markerGeo = {
@@ -485,6 +490,7 @@ export class Overlay {
       // centre line (rail) / lane divider (road) for readability; embedded rails for tram roads
       if (road && p.opts.tram) { ribbon(b, pts, n, 0.014, 0.05, () => cLine, 0.072); ribbon(b, pts, n, 0.014, 0.05, () => cLine, -0.072); }
       else ribbon(b, pts, n, road ? 0.025 : 0.04, 0.05, () => cLine);
+      if (!road && TRACK_TYPES[p.opts.type]?.electrified) ribbon(b, pts, n, 0.012, 0.58, () => cLine);
       this.structures(b, pts, types, n, step, hw, cPier, cPortal);
     }
     this.ghost.set(b);
@@ -610,15 +616,30 @@ export class Overlay {
     const w = this.game.world;
     const gy = (x: number, z: number) => Math.max(w.heightAt(x, z), WATER_Y);
     const base = col(pl.ok ? C.ok : C.bad).clone();
-    if (level === 'underground') boxRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y - 0.6, y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+    if (pl.alignment) {
+      for (const f of stationStripRects(pl, 0, pl.layout.width)) {
+        const p = stationPose(pl, 0, 0);
+        if (level === 'underground') boxRect(b, f.x, f.z, f.angle, f.w, f.d, p.y - 0.6, p.y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+        else flatRect(b, f.x, f.z, f.angle, f.w, f.d, p.y + 0.02, base);
+      }
+    } else if (level === 'underground') boxRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y - 0.6, y + 0.9, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
     else flatRect(b, fr.x, fr.z, fr.angle, fr.w, fr.d, y + 0.02, base);
     const cp = col(pl.ok ? 0xd9f7e2 : 0xffd2cc).clone();
-    for (const p of pl.layout.platforms) flatRect(b, pl.x + rx * p.off, pl.z + rz * p.off, pl.angle, p.w, pl.length * 0.96, y + 0.1, cp);
+    const strip = (off: number, width: number, length: number, lift: number, c: THREE.Color) => {
+      if (!pl.alignment) { flatRect(b, pl.x + rx * off, pl.z + rz * off, pl.angle, width, length, y + lift, c); return; }
+      const n = Math.max(1, Math.ceil(length / 0.3));
+      for (let i = 0; i < n; i++) {
+        const a = -length / 2 + length * i / n, z = -length / 2 + length * (i + 1) / n;
+        const p = stationPose(pl, off - width / 2, a), q = stationPose(pl, off + width / 2, a), r = stationPose(pl, off + width / 2, z), s = stationPose(pl, off - width / 2, z);
+        b.quad(p.x, p.y + lift, p.z, q.x, q.y + lift, q.z, r.x, r.y + lift, r.z, s.x, s.y + lift, s.z, c);
+      }
+    };
+    for (const p of pl.layout.platforms) strip(p.off, p.w, pl.length * 0.96, 0.1, cp);
     const ct = col(pl.ok ? 0x1d4f30 : 0x6e1d1d).clone();
-    for (const o of pl.layout.trackOffsets) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.16, pl.length, y + 0.05, ct);
+    for (const o of pl.layout.trackOffsets) strip(o, 0.16, pl.length, 0.05, ct);
     // through tracks (no platform) run the full length and a little beyond
     const cth = col(pl.ok ? 0x4fc3ff : 0xff9a8a).clone();
-    for (const o of pl.layout.throughOffsets ?? []) flatRect(b, pl.x + rx * o, pl.z + rz * o, pl.angle, 0.2, pl.length + 1.2, y + 0.06, cth);
+    for (const o of pl.layout.throughOffsets ?? []) strip(o, 0.2, pl.alignment ? pl.length : pl.length + 1.2, 0.06, cth);
     // street-level access: the station building, or entrance pavilions / stair towers (red: no road beside it)
     const ce = col(pl.ok ? 0xf3e7c4 : 0xffb3a8).clone(), cno = col(0xff8a7a).clone();
     if (level === 'ground') { const bd = pl.building; flatRect(b, bd.x, bd.z, bd.angle, bd.w, bd.d, y + 0.3, ce); }
@@ -631,13 +652,14 @@ export class Overlay {
     this.foot.set(b);
   }
 
-  /** Ghost of a planned depot with an arrow showing the door / track direction. */
+  /** Ghost of a planned depot with an arrow showing the door / track direction (underground: its cavern at depth). */
   setDepotGhost(pl: DepotPlan | null, kind: DepotKind = 'rail') {
     if (!pl) { this.foot.set(null); return; }
     const b = this.buf.clear();
     const sz = depotSize(kind);
     const y = pl.y;
-    flatRect(b, pl.x, pl.z, pl.angle, sz.w, sz.d, y + 0.04, col(pl.ok ? C.ok : C.bad).clone());
+    if (pl.level === 'underground') boxRect(b, pl.x, pl.z, pl.angle, sz.w, sz.d, y + UNDERGROUND_DEPOT.y0, y + UNDERGROUND_DEPOT.y1, col(pl.ok ? C.okTunnel : C.badTunnel).clone());
+    else flatRect(b, pl.x, pl.z, pl.angle, sz.w, sz.d, y + 0.04, col(pl.ok ? C.ok : C.bad).clone());
     // door arrow
     const fx = Math.sin(pl.angle), fz = Math.cos(pl.angle), rx = fz, rz = -fx;
     const tipx = pl.x + fx * (sz.d / 2 + 0.55), tipz = pl.z + fz * (sz.d / 2 + 0.55);
@@ -646,6 +668,46 @@ export class Overlay {
     b.v(tipx, y + 0.08, tipz, c); b.v(bx + rx * 0.45, y + 0.08, bz + rz * 0.45, c); b.v(bx - rx * 0.45, y + 0.08, bz - rz * 0.45, c);
     if (kind === 'rail') flatRect(b, pl.x, pl.z, pl.angle, 0.14, sz.d, y + 0.06, col(0x203828).clone());
     this.foot.set(b);
+  }
+
+  /**
+   * Underground view (while building below ground): every tunnel section, underground station box and underground
+   * depot, drawn through the ground and shaded by depth (shallow: pale violet, deep: dark blue), so new tunnels can
+   * pass them at another depth. Rebuilt when the network changes; false hides it.
+   */
+  setUnderground(on: boolean) {
+    const g = this.game, net = g.world.net, w = g.world;
+    const key = on ? `${g.networkVersion}:${net.version}:${g.stations.map.size}:${g.depots.map.size}` : '';
+    if (key === this.underKey) return;
+    this.underKey = key;
+    if (!on) { this.under.set(null); return; }
+    const b = this.buf.clear();
+    const shallow = new THREE.Color(0xd8c4ff), deep = new THREE.Color(0x2c4bd6), tmp = new THREE.Color();
+    const shade = (depth: number) => tmp.copy(shallow).lerp(deep, Math.max(0, Math.min(1, (depth - 0.8) / 3))).clone();
+    for (const e of net.edges.values()) {
+      if (!e.sections.some((q) => q.type === 'tunnel')) continue;
+      const geo = net.geo(e), hw = net.halfWidth(e) + 0.08;
+      const pts: number[] = [], cols: THREE.Color[] = [];
+      const flush = () => { if (pts.length >= 6) { const n = pts.length / 3, cc = cols.slice(); ribbon(b, pts, n, hw, 0.06, (i) => cc[i]); } pts.length = 0; cols.length = 0; };
+      for (let i = 0; i < geo.n; i++) {
+        if (net.sectionAt(e, geo.cum[i]) !== 'tunnel') { flush(); continue; }
+        const x = geo.pts[i * 3], y = geo.pts[i * 3 + 1], z = geo.pts[i * 3 + 2];
+        pts.push(x, y, z);
+        cols.push(shade(w.heightAt(x, z) - y));
+      }
+      flush();
+    }
+    for (const st of g.stations.map.values()) {
+      const r = st.rail;
+      if (!r || (r.level ?? 'ground') !== 'underground') continue;
+      for (const q of g.stations.undergroundBoxes(st)) boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(r.depth ?? 2));
+    }
+    for (const d of g.depots.map.values()) {
+      if (d.level !== 'underground') continue;
+      const q = depotVolume(d);
+      boxRect(b, q.x, q.z, q.angle, q.w, q.d, q.y0, q.y1, shade(d.depth ?? 2));
+    }
+    this.under.set(b);
   }
 
   // ---------------------------------------------------------------- edge highlight
@@ -881,7 +943,7 @@ export class Overlay {
   linePathIds() { return [...this.linePaths.keys()]; }
 
   dispose() {
-    for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, this.arcs, this.shareRings, this.sigs, ...this.linePaths.values()]) g.dispose();
+    for (const g of [this.ghost, this.foot, this.hover, this.rings, this.demo, this.disc, this.arcs, this.shareRings, this.sigs, this.under, ...this.linePaths.values()]) g.dispose();
     for (const L of this.catch.values()) { L.fill.dispose(); L.edge.dispose(); }
     for (const r of [...this.trackLayers, ...this.segLayers.values()]) r.dispose();
     for (const g of Object.values(this.markerGeo)) g.dispose();

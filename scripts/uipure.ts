@@ -221,6 +221,9 @@ function fixture(seed: number) {
   const bd = roadDepotNear(g, ...sites[0], 0);
   assert.notEqual(typeof g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, road.id), 'string', 'fixture bus');
   for (let k = 0; k < TICKS_PER_DAY * 180; k++) g.stepTick();
+  // Economic construction may finish later than the original six-month fixture. Wait for real foreign service
+  // before testing foreign windows, without forcing a project or replacing the required coverage.
+  while (g.day < 720 && !g.lines.all().some((l) => l.owner !== PLAYER && l.vehicles.length)) g.stepTick();
   assert.ok(g.lines.all().some((l) => l.owner !== PLAYER && l.vehicles.length), `seed ${seed}: AI network has service`);
   assert.equal(fails.length, 0, 'shared fixture checks');
   return g;

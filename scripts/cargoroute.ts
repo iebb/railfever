@@ -136,7 +136,8 @@ for (const seed of seeds) {
   const t = timing(edges);
   timings.push({ ...t, sources: edges.size, hops: hops(g.lines.routing) });
   console.log(`  routing search: heap ${fmt(t.heap, 2)} ms, sort-based ${fmt(t.ref, 2)} ms (${edges.size} sources)`);
-  if (seed === seeds[0]) aiGame = g;
+  // Modern city units cannot take vans. Select a real locomotive service from the tested networks.
+  if (!aiGame && g.vehicles.all().some((v) => v instanceof Train && v.cars.some((c) => c.kind === 'loco'))) aiGame = g;
 }
 const heapMs = timings.reduce((a, t) => a + t.heap, 0), refMs = timings.reduce((a, t) => a + t.ref, 0);
 console.log(`routing search total: heap ${fmt(heapMs, 1)} ms, sort-based ${fmt(refMs, 1)} ms (${fmt(refMs / Math.max(0.01, heapMs), 1)}x)`);
@@ -144,6 +145,7 @@ check(heapMs <= refMs * 1.25 + 2, `the heap search is not slower than the sort-b
 
 // ---- mail on AI networks: a van for each locomotive-hauled train when it next stands at a platform (complexes whose
 // trains all get one share the passenger tables; the others route mail on their own)
+check(!!aiGame, 'the seeded AI networks include a locomotive-hauled service for mail routing');
 if (aiGame) {
   const g = aiGame, done = new Set<number>(), hauled = g.vehicles.all().filter((v): v is Train => v instanceof Train && v.cars.some((c) => c.kind === 'loco'));
   let added = 0;
@@ -162,7 +164,7 @@ if (aiGame) {
       if (!err) added++; else console.log(`  recompose ${v.name} (${v.cars.map((c) => c.id).join(',')}, reversed ${v.reversed}): ${err}`);
     }
   }
-  console.log(`AI network seed ${seeds[0]}: vans added to ${added} of ${hauled.length} locomotive-hauled trains at platforms`);
+  console.log(`AI network: vans added to ${added} of ${hauled.length} locomotive-hauled trains at platforms`);
   check(added > 0, 'vans added to AI trains at platforms (recompose while loading)');
   const { edges } = routeGraph(g, 'mail');
   const mail = routeTables(edges, edges.keys());

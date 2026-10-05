@@ -1,3 +1,4 @@
+import { railPartMode } from '../game/stations';
 // In-world hover card (inspect mode): name + key stats, anchored above the station, vehicle, depot or town.
 import * as THREE from 'three';
 import type { UI } from './ui';
@@ -13,6 +14,7 @@ import type { RoadVehicle } from '../game/roadvehicle';
 import { stationBadges, badgeHtml } from './lineid';
 import { townService } from '../game/towns';
 import { onUiScale } from './uiscale';
+import { stationWalkLimit, stationInCity } from './gameapi';
 
 export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; id: number }
 
@@ -85,7 +87,8 @@ export class HoverCard {
     if (t.kind === 'depot') {
       const d = g.depots.get(t.id);
       if (!d) return null;
-      p.x = d.x; p.y = d.y + 1.6; p.z = d.z;
+      // (an underground depot: above the street over it)
+      p.x = d.x; p.y = (d.level === 'underground' ? Math.max(w.heightAt(d.x, d.z), WATER_Y) : d.y) + 1.6; p.z = d.z;
       return p;
     }
     const town = g.towns.list[t.id];
@@ -107,9 +110,11 @@ export class HoverCard {
       return {
         color: co.color,
         html: `<div class="hc-title">${svg(s.rail ? 'station' : s.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop', 16)}<span>${esc(s.name)}</span></div>` +
-          `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}</div>` +
+          `<div class="hc-sub">${esc(co.name)}${town ? ' · ' + esc(town.name) : ''}${s.rail ? ' · ' + (railPartMode(s.rail) === 'mainline' ? 'Train station' : railPartMode(s.rail) === 'metro' ? 'Metro station' : 'Light-rail station') : ''}</div>` +
           (badges ? `<div class="hc-badges" aria-label="Station numbers">${badges}</div>` : '') +
           `<div class="hc-stats">${stat('people', `<b>${s.waitingTotal.toLocaleString('en-US')}</b> waiting`)}${stat('star', `<b>${Math.round(s.rating * 100)}%</b>`)}${stat('lines', `<b>${lines}</b> line${lines === 1 ? '' : 's'}`)}` +
+          // walking reach along streets (an in-city metro / light-rail station walks half as far)
+          stat('walk', `<b>${Math.round(stationWalkLimit(g, s) * 10)} m</b> walk${stationInCity(s) ? ' · in-city (half)' : ''}`) +
           // mail waiting (stations that handle mail; never tram stops)
           `${stationShowsMail(g, s) ? stat('mail', `<b>${tonnes(s.mail?.total ?? 0)}</b> t mail`) : ''}</div>` +
           `<div class="hc-hint">${s.owner >= 0 && s.owner !== PLAYER ? accessHint(g, s.owner) : s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false ? '<span class="neg">No road access: no passengers</span>' : 'Details'}</div>`,
@@ -139,7 +144,7 @@ export class HoverCard {
       const n = g.vehicles.all().filter((v) => (v as Train | RoadVehicle).depotId === d.id).length;
       return {
         color: co.color,
-        html: `<div class="hc-title">${svg(d.kind === 'rail' ? 'depot' : 'garage', 16)}<span>${d.kind === 'rail' ? 'Train depot' : 'Bus depot'}</span></div>` +
+        html: `<div class="hc-title">${svg(d.kind === 'rail' ? 'depot' : 'garage', 16)}<span>${d.kind === 'rail' ? (d.level === 'underground' ? 'Underground train depot' : 'Train depot') : 'Bus depot'}</span></div>` +
           `<div class="hc-sub">${esc(co.name)}</div>` +
           `<div class="hc-stats">${stat('vehicles', `<b>${n}</b> vehicle${n === 1 ? '' : 's'}`)}</div>` +
           `<div class="hc-hint">${d.owner === PLAYER ? 'Buy vehicles' : 'Details'}</div>`,

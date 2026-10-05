@@ -22,6 +22,11 @@ import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, mode
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
+import { stopsWithInserted, replaceLineStops, type StopPlace } from '../game/line-edit';
+import { platformChoices, platformPreference, setPlatformPreference } from '../game/rail-platforms';
+
+/** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
+const insertPlace = new Map<number, StopPlace>();
 
 /**
  * A vehicle's load in lists (compact): passengers "12/56", mail only "2.4/6 t", both "12/56 · 2.4 t" (the mail part
@@ -159,6 +164,7 @@ export function editLine(ui: UI, id: number) {
   if (!line || line.owner !== PLAYER) return;
   ui.tools.setTool('line-edit');
   ui.tools.lineEditId = line.id;
+  insertPlace.set(line.id, 'end');
   ui.hud.onToolChange();
   ui.toast('Click map stations to add stops', 'info');
 }
@@ -174,11 +180,14 @@ export function addStopToLine(ui: UI, lineId: number, stationId: number) {
   }
   // another company's station: needs an approved access agreement with its owner (asked for here)
   if (!g.canUse(PLAYER, st.owner) && requestAccessUI(ui, st.owner) !== 'granted') return;
-  if (l.stops[l.stops.length - 1] === stationId) { ui.toast('Already the last stop', 'info'); return; }
-  l.stops.push(stationId);
+  // (at the end unless the line window says otherwise: at the start, where the station fits, after a stop)
+  const place = insertPlace.get(lineId) ?? 'end';
+  const res = stopsWithInserted(g, l, stationId, place);
+  if (!res) { ui.toast(place === 'end' ? 'Already the last stop' : 'Already a stop there', 'info'); return; }
+  replaceLineStops(g, l, res.stops);
+  // (after a chosen stop, the next one clicked goes after this one; at the start, before it: the line grows outwards)
+  if (typeof place === 'number') insertPlace.set(lineId, res.at);
   ui.sound('click', { pitch: 1 + Math.min(0.5, l.stops.length * 0.06) });
-  g.lines.rebuild();
-  for (const vid of l.vehicles) g.vehicles.get(vid)?.onLineChanged();
   ui.hud.onToolChange();
   ui.wm.get('line-' + lineId)?.refresh?.();
 }
@@ -230,7 +239,7 @@ export function openLine(ui: UI, id: number) {
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
     if (route?.through || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
-      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Multiple operators’ networks or track types' }, 'Through service') : null,
+      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Across operators’ networks' }, 'Through service') : null,
       nPat > 1 ? h('span', { class: 'flag shared' }, `${nPat} services`) : null,
       nOps ? h('span', { class: 'flag shared', 'data-tip': g.lines.operatorsOf(l).map((o) => g.company(o).name).join(' · ') }, `Shared · ${nOps + 1} operators`) : null));
     if (palette && mine) {
@@ -268,13 +277,41 @@ export function openLine(ui: UI, id: number) {
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),
           mine ? h('span', { class: 'rowbtns' },
+            editing ? h('button', { class: 'ibtn sm' + (insertPlace.get(l.id) === i ? ' on' : ''), 'data-tip': 'Add stops after', 'aria-label': 'Add stops after', 'aria-pressed': insertPlace.get(l.id) === i ? 'true' : 'false', onclick: () => { insertPlace.set(l.id, i); rerender(); } }, icon('plus', 14)) : null,
             h('button', { class: 'ibtn sm', 'data-tip': 'Move stop up', 'aria-label': 'Move stop up', onclick: () => { if (i > 0) { [l.stops[i - 1], l.stops[i]] = [l.stops[i], l.stops[i - 1]]; changed(); } } }, icon('up', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Move stop down', 'aria-label': 'Move stop down', onclick: () => { if (i < l.stops.length - 1) { [l.stops[i + 1], l.stops[i]] = [l.stops[i], l.stops[i + 1]]; changed(); } } }, icon('down', 14)),
             h('button', { class: 'ibtn sm', 'data-tip': 'Remove stop', 'aria-label': 'Remove stop', onclick: () => { l.stops.splice(i, 1); changed(); } }, icon('close', 14))) : null));
+        if (l.kind === 'rail' && st?.rail) {
+          const groups = g.stations.railTrackGroups(st);
+          const controls = linePatterns(l).filter(p => p.stops[i] !== false).map(p => {
+            const choice = platformPreference(l, p.id, i), available = platformChoices(g, l, p.id, i);
+            const number = (group: number) => groups.findIndex(q => q.id === group) + 1;
+            const select = h('select', { class: 'input sm', disabled: !mine,
+              'aria-label': `${p.name} platform preference at ${st.name}`,
+              title: 'Preferred platform; trains may use a legal free alternative',
+              onchange: (e: Event) => {
+                const value = (e.target as HTMLSelectElement).value;
+                const error = setPlatformPreference(g, l, p.id, i, value === 'auto' ? null : Number(value));
+                if (error) ui.toast(error, 'bad');
+                ui.onLineEdited(l.id); rerender();
+              } },
+              h('option', { value: 'auto', selected: !choice?.manual }, choice ? `Auto · P${number(choice.group)}` : 'Auto'),
+              available.map(q => h('option', { value: q.id, selected: choice?.manual && choice.group === q.id }, `P${number(q.id)}`)));
+            return field((l.patterns?.length ?? 0) > 1 ? `${p.name} platform` : 'Platform preference', select);
+          });
+          if (controls.length) list.appendChild(h('div', { class: 'pad' }, controls));
+        }
       });
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops.'));
       const loop = g.lines.isLoop(l);
       add(win.body, section('Stops', l.stops.length >= 2 ? (loop ? 'one-way circuit' : 'out and back') : ''), list);
+      // where the stops clicked on the map go: a line can grow at either end or between its stops without rebuilding it
+      if (mine && editing && l.stops.length) {
+        const place = insertPlace.get(l.id) ?? 'end';
+        add(win.body, field('New stops', seg<string>([['end', 'At the end', 'After last stop'], ['start', 'At the start', 'Before first stop'],
+          ['auto', 'Where they fit', 'Between stops or at either end']], typeof place === 'number' ? '' : place,
+          (v) => { insertPlace.set(l.id, v as StopPlace); rerender(); }), typeof place === 'number' ? `After stop ${Math.min(place, l.stops.length - 1) + 1} (${g.stations.get(l.stops[Math.min(place, l.stops.length - 1)])?.name ?? ''})` : undefined));
+      }
       if (mine && l.stops.length >= 2) {
         const setting = l.loop === undefined ? 'auto' : l.loop ? 'loop' : 'back';
         add(win.body, field('Route', seg([['auto', 'Auto', 'Loop with 3+ distinct stations'], ['loop', 'Loop', 'One-way circuit'], ['back', 'Out and back', 'Turn at first and last stops']], setting, (v) => {

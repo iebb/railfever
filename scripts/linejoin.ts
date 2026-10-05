@@ -138,7 +138,8 @@ console.log('own lines, through services and passengers');
     expected = fareFor(Math.hypot(E.x - A.x, E.z - A.z), simNow(g) - t0, count);
     delivered = true;
   });
-  run(g, 400, () => {
+  // The common track permits tighter, slower crossovers: retain six calls per train within a bounded run.
+  run(g, 600, () => {
     for (const t of [tw, tr, te, tt]) {
       if (t.state === 'loading' && prev.get(t.id) !== 'loading') {
         const stations = seen.get(t.id) ?? new Set<number>(); stations.add(t.atStation); seen.set(t.id, stations);

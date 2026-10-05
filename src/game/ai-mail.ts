@@ -3,7 +3,7 @@ import type { AIController, LineInfo } from './ai';
 import { modelYearCost } from './ai';
 import type { Game } from './game';
 import type { Line } from './lines';
-import { railModeOf } from './stations';
+import { railModeOf, railPartMode } from './stations';
 import { MAIL_STATION, DAY_SECONDS } from './constants';
 import { mailEra, mailGenRate, townMailFactor, mailQueueCap, mailQueueCapOf, mailCapture, routedJourney, type MailPoint } from './mail';
 import { mailFare, mailTripFactor, estimateLegTime } from './fares';
@@ -27,8 +27,8 @@ export const mailVanLength = (t: Train): number => mailVans(t).reduce((s, m) => 
 const lengthOf = (cars: VehicleModel[]) => cars.reduce((s, m) => s + m.length + 0.1, 0);
 const platformOf = (g: Game, l: Line) => Math.min(...l.stops.map((id) => g.stations.get(id)?.rail?.length ?? 0));
 const mainlineSite = (p: MailSite) => !('rail' in p && p.rail
-  ? railModeOf(p.rail.trackType) !== 'mainline' || p.rail.trackType === 'highspeed'
-  : 'trackType' in p && (railModeOf(p.trackType) !== 'mainline' || p.trackType === 'highspeed'));
+  ? railPartMode(p.rail) !== 'mainline' || p.rail.trackType === 'highspeed'
+  : 'trackType' in p && (railModeOf('mode' in p && typeof p.mode === 'string' ? p.mode : p.trackType) !== 'mainline' || p.trackType === 'highspeed'));
 const hauled = (cars: VehicleModel[]) => cars.some((m) => m.kind === 'loco')
   && cars.some((m) => m.capacity > 0) && cars.every((m) => m.kind === 'loco' || m.kind === 'wagon');
 
@@ -156,7 +156,7 @@ function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number
     const daily = pops[i] * mailGenRate() * mailEra(g.year) * townMailFactor(g.towns.list[T]?.pop ?? 0)
       * (0.2 + ('mail' in p ? p.mail?.rating ?? 0.65 : 0.65));
     const units = parts.map((x) => daily * YEAR * x.w * k), total = units.reduce((a, b) => a + b, 0);
-    const tracks = 'id' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks : 2, stops = 'id' in p ? p.stops.length : 0;
+    const tracks = 'id' in p ? p.rail?.tracks ?? 0 : 'tracks' in p ? p.tracks ?? 2 : 2, stops = 'id' in p ? p.stops.length : 0;
     const room = (YEAR_SECONDS / headway) * Math.min(capacity, mailQueueCapOf(pops[i], tracks, stops));
     const fit = Math.min(1, room / Math.max(1, total));
     revenue += parts.reduce((s, x, k) => s + units[k] * x.fare, 0) * fit;

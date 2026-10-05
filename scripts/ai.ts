@@ -12,12 +12,12 @@ const T0 = performance.now();
 const g = Game.create({ size: SIZE, seed, towns: Math.round(SIZE / 38), hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: NAI });
 console.log(`map ${SIZE} seed ${seed}: ${g.towns.list.length} towns, pop ${g.towns.list.reduce((a, t) => a + t.pop, 0)}, ${g.ais.length} AI companies, gen ${fmt(performance.now() - T0, 0)} ms`);
 // time the AI work per day
-const aiTime = g.ais.map(() => ({ t: 0, n: 0, max: 0 }));
+const aiTime = g.ais.map(() => ({ t: 0, n: 0, max: 0, peak: '' }));
 g.ais.forEach((ai, i) => {
   // daily() picks projects; work() runs the project's units spread over the day (max: the slowest call)
   const f = ai.daily.bind(ai), w = ai.work.bind(ai);
-  ai.daily = () => { const t = performance.now(); f(); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].n++; aiTime[i].max = Math.max(aiTime[i].max, dt); };
-  ai.work = (f0: number, f1: number) => { const t = performance.now(); w(f0, f1); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].max = Math.max(aiTime[i].max, dt); };
+  ai.daily = () => { const t = performance.now(); f(); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].n++; if (dt > aiTime[i].max) { aiTime[i].max = dt; aiTime[i].peak = `daily: ${g.day} ${ai.state.phase}`; } };
+  ai.work = (f0: number, f1: number) => { const t = performance.now(); w(f0, f1); const dt = performance.now() - t; aiTime[i].t += dt; if (dt > aiTime[i].max) { aiTime[i].max = dt; aiTime[i].peak = `work: ${g.day} ${ai.state.phase}`; } };
 });
 let errors = 0;
 const origWarn = console.warn;
@@ -53,6 +53,7 @@ for (let i = 0; i < g.ais.length; i++) {
   console.log(`  lines: ${lines.length} (${lines.filter((l) => l.kind === 'rail').length} rail), vehicles ${vehicles.length} (${vehicles.filter((v) => v instanceof Train).length} trains), delivered ${delivered}, projects ${ai.state.projects}, failed ${st.failed}, sold ${st.sold}`);
   for (const l of lines) console.log(`    ${l.name}: ${l.stops.map((s) => g.stations.get(s)?.name).join(' - ')}, ${l.vehicles.length} veh, income last/this year ${fmtMoney(l.incomeLast)}/${fmtMoney(l.incomeYear)}, cost ${fmtMoney(l.costLast)}`);
   console.log(`  AI time: avg ${fmt(aiTime[i].t / Math.max(1, aiTime[i].n), 2)} ms/day, max ${fmt(aiTime[i].max, 1)} ms`);
+  if (AIController.profile) console.log('  peak: ' + aiTime[i].peak);
   console.log('  log: ' + ai.log.slice(process.argv.includes('--log') ? 0 : -8).join('\n       '));
   check(earning.length >= 1, `${co.name} has a working line earning money`);
   check(vehicles.length >= 1, `${co.name} has vehicles`);

@@ -1,10 +1,11 @@
 // The game: owns all simulation state and advances time.
 import { World } from './world';
 import { Towns } from './towns';
-import { Stations, entranceUpkeep, lostShare } from './stations';
+import { Stations, entranceUpkeep, lostShare, STATION_UPKEEP_FACTOR } from './stations';
+import { stationPlatformLength } from './station-geometry';
 import { Lines } from './lines';
 import { Vehicles } from './vehicles';
-import { Depots } from './build-ops';
+import { Depots, depotValue, depotUpkeep } from './build-ops';
 import { Economy, Company, COMPANY_COLORS } from './economy';
 import { Shares, SHARE_COUNT } from './shares';
 import { generateHeights, generateTrees, Hilliness, WaterAmount } from './terrain-gen';
@@ -18,9 +19,10 @@ import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
 import { DemandModel, GEN_RATE } from './demand';
-import { resolveDeadlocks, lineCongestion } from './train';
+import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
+import { observeRailCapacity } from './ai-capacity';
 
 export interface NewGameOptions {
   size: number;
@@ -29,7 +31,7 @@ export interface NewGameOptions {
   hilliness: Hilliness;
   water: WaterAmount;
   startYear: number;
-  /** number of AI competitors (0..7; at least as many as aiConfigs) */
+  /** number of AI competitors (0..MAX_AI_COMPANIES; at least as many as aiConfigs) */
   aiCompanies?: number;
   /** per-AI settings (entry i for the i-th AI company); missing entries and fields use the defaults */
   aiConfigs?: Partial<AIConfig>[];
@@ -78,7 +80,7 @@ export interface CompanyAssets { track: number; road: number; tram: number; stat
 
 export const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 export const PLAYER = 0;
-export const MAX_AI_COMPANIES = 7;
+export const MAX_AI_COMPANIES = 15;
 /** Infrastructure counts at this share of its replacement cost in a company's value. */
 const INFRA_DEPRECIATION = 0.6;
 /** Upkeep and value of elevated and underground stations relative to a ground station. */
@@ -171,6 +173,8 @@ export class Game {
     network: [] as (() => void)[],
   };
   networkVersion = 0;
+  /** In-progress deterministic wait-graph work, included in saves. */
+  deadlockScan: DeadlockScan | null = null;
   private networkDirty = false;
   private lostSince = new Map<number, number>();
   /** day each congested player line was last reported */
@@ -272,6 +276,11 @@ export class Game {
   /** May `user` run vehicles on `owner`'s tracks and stop at its stations? (own, agreed, or open and not blocked) */
   canUse(user: number, owner: number): boolean {
     return owner === user || owner < 0 || this.accessKeys.has(user * 4096 + owner) || (this.openNet[owner] === 1 && user >= 0 && !this.blockedKeys.has(owner * 4096 + user));
+  }
+  /** Upgrades are paid by the user, retained by the infrastructure owner. AI never alters player rail. */
+  trackUpgradeError(user: number, owner: number): string | null {
+    if (user !== PLAYER && owner === PLAYER) return 'AI companies cannot upgrade the player\'s track';
+    return this.canUse(user, owner) ? null : `Track of ${this.company(owner).name}: needs track access`;
   }
   hasAccess(user: number, owner: number): boolean { return this.accessKeys.has(user * 4096 + owner); }
   agreement(user: number, owner: number): AccessAgreement | undefined { return this.access.find((a) => a.user === user && a.owner === owner); }
@@ -540,15 +549,15 @@ export class Game {
 
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
-    // (ops) base upkeep by track type (high-speed ~3x standard); wear by train passages is billed on top monthly
+    // (ops) base upkeep including overhead wire; wear by train passages is billed on top monthly
     return trackMaintenance(e);
   }
   /**
    * Yearly maintenance of a station (platforms and stops; the platform tracks count as edges): an elevated
-   * station costs about 3x a ground one, an underground one about 6x; entrances added later by their kind.
+   * station costs twice a ground one, an underground one four times; entrances added later by their kind.
    */
   stationMaintenance(st: Station): number {
-    return (st.rail ? (20000 + st.rail.tracks * st.rail.length * 500) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1) + entranceUpkeep(st.rail) : 0) + st.stops.length * 3000;
+    return (st.rail ? (20000 + stationPlatformLength(st.rail) * 500) * (STATION_UPKEEP_FACTOR[st.rail.level] ?? 1) + entranceUpkeep(st.rail) : 0) + st.stops.length * 3000;
   }
 
   /**
@@ -618,7 +627,7 @@ export class Game {
     const a: CompanyAssets = { track: 0, road: 0, tram: 0, stations: 0, depots: 0, vehicles: 0, total: 0 };
     for (const e of this.world.net.edges.values()) {
       if (e.tram && e.tramOwner === id && e.depot < 0) a.tram += e.len * TRAM.costPerUnit;
-      if (e.owner !== id || e.station >= 0 || e.depot >= 0) continue;
+      if (e.owner !== id || e.depot >= 0 || e.station >= 0 && !this.stations.get(e.station)?.rail?.native) continue;
       const per = e.kind === 'rail' ? (TRACK_TYPES[e.type] ?? TRACK_TYPES.standard).costPerUnit : (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).costPerUnit;
       let v = per * e.len;
       for (const s of e.sections) v += (s.s1 - s.s0) * per * (s.type === 'tunnel' ? 8 : 5);
@@ -630,7 +639,7 @@ export class Game {
       if (st.rail) a.stations += st.rail.cost ?? (st.rail.tracks * st.rail.length * 9000 + 120000) * (STATION_LEVEL_FACTOR[st.rail.level] ?? 1);
       a.stations += st.stops.length * 30000;
     }
-    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += d.kind === 'rail' ? 90000 : d.kind === 'road' ? 60000 : 120000;
+    for (const d of this.depots.map.values()) if (d.owner === id) a.depots += depotValue(d);
     a.track *= INFRA_DEPRECIATION; a.road *= INFRA_DEPRECIATION; a.tram *= INFRA_DEPRECIATION;
     a.stations *= INFRA_DEPRECIATION; a.depots *= INFRA_DEPRECIATION;
     for (const v of this.vehicles.map.values()) if (v.owner === id) a.vehicles += this.vehicles.resaleValue(v);
@@ -839,8 +848,10 @@ export class Game {
     this.tick++;
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
-      // trains in a circle of mutual waiting: one of them takes another way (every few days)
-      if (this.day % 3 === 0) resolveDeadlocks(this);
+    }
+    // Start a complete scan every three days and finish it in bounded fixed-tick slices.
+    if (this.deadlockScan || (this.tick % TICKS_PER_DAY === 0 && this.day % 3 === 0)) resolveDeadlocks(this, 40, DEADLOCK_WORK);
+    if (this.tick % TICKS_PER_DAY === 0) {
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();
         if (this.day % (DAYS_PER_MONTH * MONTHS_PER_YEAR) === 0) this.onNewYear();
@@ -906,6 +917,8 @@ export class Game {
     // station ratings (and service frequency), then town growth paced by the towns' public transport (towns.ts)
     this.stations.updateRatings();
     this.towns.daily();
+    // capacity-integration: measure every operator before any of them makes today's fleet decision.
+    if (this.aiEnabled) observeRailCapacity(this);
     // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
     if (this.aiEnabled) for (const ai of [...this.ais]) {
       ai.daily();
@@ -921,7 +934,7 @@ export class Game {
       if (e.owner === owner) c += this.edgeMaintenance(e);
     }
     for (const st of this.stations.map.values()) if (st.owner === owner) c += this.stationMaintenance(st);
-    for (const d of this.depots.map.values()) if (d.owner === owner) c += d.kind === 'rail' ? 12000 : d.kind === 'road' ? 6000 : 9000;
+    for (const d of this.depots.map.values()) if (d.owner === owner) c += depotUpkeep(d);
     return c;
   }
 
@@ -963,6 +976,8 @@ export class Game {
     }
     for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
     this.mail.monthly();
+    // which metro / light-rail stations stand in town now (their walking reach: stations.ts CITY_STATION)
+    this.stations.updateCity();
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
     if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();

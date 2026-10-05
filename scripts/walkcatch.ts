@@ -65,7 +65,7 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   console.log('underground entrances and unconnected access');
   const g = flatGame(128);
   road(g, node(g, 16, 52), node(g, 112, 52)); road(g, node(g, 16, 76), node(g, 112, 76));
-  const S = station(g, 64, 64, Math.PI / 2, 12, 2, 0, { trackType: 'metro' })!;
+  const S = station(g, 64, 64, Math.PI / 2, 12, 2, 0, { trackType: 'electric', mode: 'metro' })!;
   if (!S) throw new Error('metro fixture');
   S.rail!.entrances = [{ x: 54, z: 52.8, angle: Math.PI }, { x: 80, z: 76.8, angle: Math.PI }, { x: 30, z: 65, angle: 0 }];
   const a = house(g, 58, 50), b = house(g, 84, 74), platform = house(g, 64, 63);
@@ -76,6 +76,23 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   check(walkingCatchment(g, S).buildings.has(a.id) && !walkingCatchment(g, S).buildings.has(b.id), 'removing an entrance removes only its street coverage');
   S.rail!.entrances = [{ x: 64, z: 65, angle: 0 }]; flush(g);
   check(!S.roadAccess && walkingCatchment(g, S).buildings.size === 0 && S.catchPop === 0, 'a station without connected entrances has no catchment');
+}
+
+{
+  console.log('new-game empty catchments and historical zero horizons');
+  for (const rivals of [0, 1]) for (const initialized of [false, true]) {
+    const g = Game.create({ size: 384, seed: 7, towns: 8, startYear: 1950, aiCompanies: rivals });
+    if (initialized) g.stations.restoreCatchmentShares(0);
+    const saved = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(saved));
+    const label = `${rivals} rivals, ${initialized ? 'initialized zero' : 'untouched empty'} catchment`;
+    check(g.stations.emptyCatchmentCold === !initialized, label + ': cold status is explicit');
+    let exact = JSON.stringify(serialize(loaded)) === saved;
+    for (let tick = 0; tick < 640 && exact; tick++) {
+      g.stepTick(); loaded.stepTick();
+      exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded));
+    }
+    check(exact, label + ': immediate save and every one of 640 native ticks remain exact');
+  }
 }
 
 {
@@ -105,6 +122,104 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   const v = g.stations.catchVersion, cut = g.world.net.splitEdge(main.id, 36)!;
   g.world.net.removeEdge(cut.e2.id); flush(g);
   check(g.stations.catchVersion > v && !g.stations.buildingShares(A).ids.includes(b.id), 'local removal disconnects frontage and recomputes shares');
+}
+
+{
+  console.log('clean saves retain incremental catchment timing with sixteen stations');
+  const g = flatGame(256);
+  g.aiEnabled = false; g.vehicles.ambientEnabled = false;
+  road(g, node(g, 16, 60), node(g, 240, 60));
+  const stops = Array.from({ length: 16 }, (_, i) => bus(g, 25 + i * 13, 60));
+  g.day = 1;
+  g.stations.recomputeCatchment(); g.flushNetworkChanges(); g.lines.flushCatchment();
+  const horizon = g.stations.catchMaxB, oldPop = stops[2].catchPop;
+  check(horizon === 0, 'zero is a real historical horizon when the last share-out contained no buildings');
+  // A lot can exist beyond the last share-out. Loading must retain the saved horizon and populations.
+  const b = house(g, 60, 58);
+  const pending = house(g, 64, 58);
+  const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
+  check(!g.lines.catchmentDirty && JSON.stringify(serialize(loaded)) === data, 'sixteen-station clean save round trip is exact');
+  check(loaded.stations.catchMaxB === horizon && loaded.stations.get(stops[2].id)!.catchPop === oldPop,
+    'clean load preserves historical building horizon and catchment populations');
+  // Do not read buildingShares before this trigger: a getter would hide the cold-cache replay regression.
+  for (const w of [g, loaded]) {
+    const building = w.world.buildings.get(b.id)!;
+    building.pop += 8; w.world.touchBuilding(building);
+    w.lines.markDemandSharesDirty(); w.stepTick();
+  }
+  check(!g.lines.catchmentDirty && !loaded.lines.catchmentDirty && loaded.stations.catchMaxB === pending.id,
+    'the first live invalidation commits immediately in both original and loaded games');
+  check(JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)), 'first incremental invalidation after a clean load is byte-identical');
+  for (let i = 0; i < 2 * g.ticksPerDay; i++) { g.stepTick(); loaded.stepTick(); }
+  check(JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)), 'sixteen-station clean save continues exactly for two days');
+
+  const building = g.world.buildings.get(b.id)!;
+  building.pop += 10; g.world.touchBuilding(building); g.lines.markDemandSharesDirty();
+  const dirtyData = JSON.stringify(serialize(g)), dirty = deserialize(JSON.parse(dirtyData));
+  check(dirty.lines.catchmentDirty && JSON.stringify(serialize(dirty)) === dirtyData,
+    'a pending dirty save preserves its populations and pending refresh on immediate round trip');
+  // This established original has warm shares even while the population refresh is pending. Loading must
+  // preserve its next-tick publication; disposable walking caches cannot introduce a cold-work delay.
+  g.stepTick(); dirty.stepTick();
+  check(!g.lines.catchmentDirty && !dirty.lines.catchmentDirty && !dirty.stations.catchmentWorkPending,
+    'a dirty load commits its pending refresh on the same tick as the warm original');
+  let exact = JSON.stringify(serialize(g)) === JSON.stringify(serialize(dirty));
+  for (let i = 1; i < 640; i++) {
+    g.stepTick(); dirty.stepTick();
+    exact &&= JSON.stringify(serialize(g)) === JSON.stringify(serialize(dirty));
+  }
+  check(exact, 'pending dirty population refresh continues byte-identically for every one of 640 ticks');
+}
+
+{
+  console.log('pending road edits retain warm catchment timing with sixteen rail stations');
+  const base = flatGame(384); base.aiEnabled = false; base.vehicles.ambientEnabled = false;
+  const roads: number[] = [], stations: number[] = [], ends: number[] = [];
+  for (let i = 0; i < 16; i++) {
+    const st = station(base, 30 + i % 4 * 60, 30 + Math.floor(i / 4) * 60, Math.PI / 2, 8, 1, 0, { style: 'modern' });
+    check(!!st, 'pending-road fixture constructs every rail facility');
+    if (!st) throw new Error('Pending-road fixture');
+    const f = base.stations.forecourt(st)!;
+    const a = node(base, f.x - 24, f.z), b = node(base, f.x, f.z);
+    roads.push(road(base, a, b).id); stations.push(st.id); ends.push(b.id);
+    house(base, f.x - 6, f.z - 2); house(base, f.x + 7, f.z - 2);
+  }
+  base.day = 1; base.flushNetworkChanges(); base.stations.recomputeCatchment(); base.lines.flushCatchment();
+  check(base.stations.map.size === 16 && base.stations.all().every(st => st.roadAccess && st.catchPop > 0),
+    'all sixteen rail facilities retain nonzero populations before the edit');
+  base.stepTick();
+  check(base.tick > 0 && base.tick % base.ticksPerDay !== base.ticksPerDay - 1, 'pending edit starts inside a day where a cold sixteen-station share cache would slice');
+  const initial = JSON.stringify(serialize(base));
+  for (const paused of [true, false]) for (const edit of ['remove', 'add', 'unrelated'] as const) {
+    const g = deserialize(JSON.parse(initial)); g.paused = paused;
+    const first = g.stations.get(stations[0])!, oldPop = first.catchPop;
+    if (edit === 'remove') g.world.net.removeEdge(roads[0]);
+    else if (edit === 'add') {
+      const a = g.world.net.nodes.get(ends[0])!;
+      road(g, a, node(g, a.x + 10, a.z));
+    } else road(g, node(g, 4, 360), node(g, 12, 360));
+    g.onNetworkChanged();
+    const pending = JSON.stringify(serialize(g)), state = JSON.parse(pending);
+    check(!state.catchmentDirty && state.networkDirty && state.catchmentRoadsDirty === (edit !== 'unrelated'),
+      `${edit}/${paused}: save retains the unflushed road edit without applying its catchment population`);
+    const loaded = deserialize(JSON.parse(pending)); loaded.paused = paused;
+    check(JSON.stringify(serialize(loaded)) === pending && loaded.stations.get(first.id)!.catchPop === oldPop,
+      `${edit}/${paused}: pending save round trip preserves its population`);
+    if (paused) {
+      g.update(0); loaded.update(0);
+      check(JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)), `${edit}/paused: construction flush is exact`);
+    }
+    let exact = true, immediate = true;
+    for (let i = 0; i < 2 * g.ticksPerDay; i++) {
+      g.stepTick(); loaded.stepTick();
+      if (i === 0) immediate = !g.stations.catchmentWorkPending && !loaded.stations.catchmentWorkPending &&
+        !g.lines.catchmentDirty && !loaded.lines.catchmentDirty;
+      if (JSON.stringify(serialize(loaded)) !== JSON.stringify(serialize(g))) exact = false;
+    }
+    check(immediate && exact, `${edit}/${paused}: warm pending edit commits without cold slicing and every replay tick is exact`);
+    check(edit === 'remove' ? first.catchPop === 0 && !first.roadAccess : edit === 'add' ? first.catchPop > oldPop : first.catchPop === oldPop,
+      `${edit}/${paused}: the relevant road edit changes coverage and an unrelated edit preserves saved population`);
+  }
 }
 
 {
