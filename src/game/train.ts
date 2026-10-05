@@ -8,7 +8,7 @@ import { curveSpeed } from './construction';
 import { HEAVY_RAIL_TRACKS, aeroOf, auxKwOf } from './vehicle-types';
 import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
-import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, stopsAt } from './patterns';
+import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, nextStopIndex, stopsAt } from './patterns';
 import { trackPassage } from './opcosts';
 import { platformPreference } from './rail-platforms';
 
@@ -250,10 +250,64 @@ export interface RouteResult { conts: Cont[]; cost: number }
 /** A platform preference never overrides physical routing, signals or reservations. */
 export interface RailRouteTarget {
   group?: number; preferred?: number; length?: number; direction?: 1 | -1;
+  /** A service arrival must also be able to leave this platform for its next served station. */
+  onward?: number;
   /** Auto breaks geometry ties; an explicit manual preference accepts a modest legal detour. */
   manual?: boolean;
   /** Contiguous target-platform path already held before the route's initial frontier. */
   prefix?: { edge: number; dir: number; length: number };
+}
+
+const platformDepartureCache = new WeakMap<Game, { topology: string; routes: Map<string, boolean> }>();
+
+/** Native departure frontiers after stopping at the last ordered platform edge. */
+export function platformDepartureFrontiers(g: Game, ordered: { edge: number; dir: number }[], owner: number,
+  rule: TrackRule | null, length: number, exit = false): { forward: Cont[]; reverse: Cont[] } {
+  const net = g.world.net, head = ordered[ordered.length - 1];
+  // Reversal starts behind the actual body, not behind the last fragment of a split platform.
+  let i = ordered.length - 1, rem = length;
+  while (i > 0 && rem > net.edges.get(ordered[i].edge)!.len) rem -= net.edges.get(ordered[i--].edge)!.len;
+  const tail = ordered[i];
+  return {
+    forward: railNext(g, net.edges.get(head.edge)!, head.dir, owner, exit, rule),
+    // Match Train.planRoute: only the first station starter may be passed when backing off a platform.
+    reverse: railNext(g, net.edges.get(tail.edge)!, -tail.dir, owner, exit, rule, true),
+  };
+}
+
+function departureRoutes(g: Game): Map<string, boolean> {
+  // Some legacy callers edit node signals directly. Cold and warm caches must see the same lawful graph.
+  const topology = JSON.stringify([g.networkVersion, g.world.net.version,
+    [...g.world.net.nodes.values()].filter(n => n.kind === 'rail' && n.signal)
+      .map(n => [n.id, n.signal, !!n.signalPass])]);
+  let cache = platformDepartureCache.get(g);
+  if (!cache || cache.topology !== topology) {
+    cache = { topology, routes: new Map() }; platformDepartureCache.set(g, cache);
+  }
+  return cache.routes;
+}
+
+/** Pure topology check: future occupancy is transient; the departure still reserves its actual path normally. */
+function platformCanDepart(g: Game, ordered: { edge: number; dir: number }[], next: number, owner: number,
+  rule: TrackRule | null, length: number, maxExpand: number, routes: Map<string, boolean>): boolean {
+  // Access can change through an AI policy edit at a tick boundary, independently of the physical graph.
+  const access = g.companies.map(c => g.canUse(owner, c.id) ? 1 : 0).join('');
+  const key = JSON.stringify([owner, access, rule?.wire, rule?.types && [...rule.types].sort(), length, next,
+    maxExpand, ordered.map(s => [s.edge, s.dir])]);
+  const known = routes.get(key);
+  if (known !== undefined) return known;
+  const frontiers = platformDepartureFrontiers(g, ordered, owner, rule, length);
+  const onward = (start: Cont[], exit = false) => start.length > 0 && !!findRailRoute(g, start, next, owner, -1,
+    maxExpand, exit, rule, true, { length });
+  let ok = onward(frontiers.forward) || onward(frontiers.reverse);
+  if (!ok && ordered.some(s => !g.canUse(owner, g.world.net.edges.get(s.edge)!.owner))) {
+    // A train caught on revoked foreign platform track retains the native route-off-access fallback.
+    const escape = platformDepartureFrontiers(g, ordered, owner, rule, length, true);
+    ok = onward(escape.forward, true) || onward(escape.reverse, true);
+  }
+  if (routes.size >= 4096) routes.clear();
+  routes.set(key, ok);
+  return ok;
 }
 
 /**
@@ -267,6 +321,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
   if (!st || !st.rail) return null;
   const tx = st.rail.x, tz = st.rail.z;
   const V = g.vehicles;
+  const departures = platform.onward !== undefined && platform.onward !== target ? departureRoutes(g) : undefined;
   // Stop at the arrival end of the entire physical platform, even when it was split into several edges.
   const ends = new Map<number, number>();
   const platformSteps = new Map<number, { remaining: number; previous?: { edge: number; dir: number } }>();
@@ -277,6 +332,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     for (const direction of [1, -1]) {
       if (platform.direction !== undefined && platform.direction !== direction) continue;
       const ordered = direction === 1 ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+      if (departures && !platformCanDepart(g, ordered, platform.onward!, owner, rule, platform.length ?? 0, maxExpand, departures)) continue;
       let remaining = group.length;
       ordered.forEach((step, i) => {
         platformSteps.set(step.edge * 2 + (step.dir > 0 ? 1 : 0), { remaining, previous: ordered[i - 1] });
@@ -918,6 +974,7 @@ export class Train extends Vehicle {
     const rule = this.rule;
     const savedPlatform = this.line ? platformPreference(this.line, this.pattern, this.stopIndex) : undefined;
     const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length };
+    if (this.line) platform.onward = this.line.stops[nextStopIndex(this.line, this.pattern, this.stopIndex)];
     const last = this.segs[this.segs.length - 1];
     const group = last && g.stations.railTrackGroups(target).find(q => q.steps.some(s => s.edge === last.e));
     if (group) {

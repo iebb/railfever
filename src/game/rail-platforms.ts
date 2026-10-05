@@ -4,7 +4,7 @@ import type { Line, RailPlatformCall } from './lines';
 import type { RailTrackGroup } from './stations';
 import { isLoopLine, turnIndex } from './patterns';
 import type { Train, TrackRule } from './train';
-import { consistRule, findRailRoute, railNext, ruleAllows } from './train';
+import { consistRule, findRailRoute, platformDepartureFrontiers, railNext, ruleAllows } from './train';
 
 interface PlatformOption extends RailTrackGroup { routeCost: number }
 // Geometry rounding alone should not spread an Auto call onto a different directional approach.
@@ -81,9 +81,10 @@ function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
       for (const direction of [1, -1] as const) {
         const arrival = findRailRoute(g, incoming, st.id, owner, -1, 20000, false, rule, true, { group: group.id, direction, length });
         if (!arrival) continue;
-        const end = direction === 1 ? group.steps[group.steps.length - 1] : group.steps[0], arrivalDir = direction * end.dir, edge = net.edges.get(end.edge)!;
-        const onward = findRailRoute(g, railNext(g, edge, arrivalDir, owner, false, rule), next.id, owner, -1, 20000, false, rule, true, { length });
-        const reverse = c.turn ? findRailRoute(g, railNext(g, edge, -arrivalDir, owner, false, rule, true), next.id, owner, -1, 20000, false, rule, true, { length }) : null;
+        const ordered = direction === 1 ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+        const frontiers = platformDepartureFrontiers(g, ordered, owner, rule, length);
+        const onward = findRailRoute(g, frontiers.forward, next.id, owner, -1, 20000, false, rule, true, { length });
+        const reverse = c.turn ? findRailRoute(g, frontiers.reverse, next.id, owner, -1, 20000, false, rule, true, { length }) : null;
         const departure = Math.min(onward?.cost ?? Infinity, reverse?.cost ?? Infinity);
         best = Math.min(best, arrival.cost + departure);
       }

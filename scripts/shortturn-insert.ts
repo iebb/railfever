@@ -77,12 +77,25 @@ if (line && inserted >= 0) {
   check(!!savedManual?.manual && savedManual.group === manual?.group, 'manual platform preference follows its repeated occurrence across insertion');
   check(l.platforms?.filter(q => !q.manual).every(q => platformChoices(g, l, q.pattern, q.stop).some(c => c.id === q.group)),
     'Auto allocations remain physically valid for the actual stopping patterns');
-  // Let existing native construction finish; inhibit new project selection without changing assets or demand.
-  while (g.day < insertionDay + 360 && g.ais.some(a => (a as any).project)) {
-    for (const ai of g.ais) ai.state.cooldown = 1e9;
+  // Drain the projects already running without allowing a new selection. The native urban survey can
+  // exhaust 1,500 sites after retrying its selected layout: here it retires on day 622, 373 days after
+  // insertion. Allow 480 setup days; the operating and replay windows below remain 360 days / 640 ticks.
+  const draining = new Map(g.ais.map(ai => [ai.companyId, (ai as any).project]));
+  const nativeSave = JSON.stringify(serialize(g));
+  const inhibitSelection = () => { for (const ai of g.ais) ai.state.cooldown = Math.max(ai.state.cooldown, 18); };
+  inhibitSelection();
+  const setup = serialize(g), original = JSON.parse(nativeSave);
+  setup.ais.forEach((ai: any, i: number) => { ai.state.cooldown = original.ais[i].state.cooldown; });
+  check(JSON.stringify(setup) === nativeSave, 'drain setup changes only saved controller cooldowns');
+  let originalProjectsOnly = true;
+  while (g.day < insertionDay + 480 && g.ais.some(a => (a as any).project)) {
+    inhibitSelection();
     g.stepTick();
+    originalProjectsOnly &&= g.ais.every(ai => !(ai as any).project || (ai as any).project === draining.get(ai.companyId));
   }
-  check(!g.ais.some(a => (a as any).project), 'unrelated construction completes before the train replay checkpoint');
+  check(originalProjectsOnly, 'drain advances only the original native projects without selecting replacements');
+  check(!g.ais.some(a => (a as any).project || a.busy), 'unrelated construction completes before the train replay checkpoint');
+  console.log('native construction drain', JSON.stringify({ day: g.day, elapsedDays: g.day - insertionDay, originalProjectsOnly }));
   g.aiEnabled = false;
   const stock = g.vehicles.trains().filter(v => v.owner === 3 && v.lineId === l.id && v.pattern === pid);
   check(stock.length > 0 && stock.every(v => v.onMap), 'actual foreign short-turn trains operate on the joint route');
