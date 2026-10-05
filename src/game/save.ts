@@ -371,12 +371,10 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
-    // Preserve owed input/population work even when no route rebuild set the explicit dirty flag.
-    // Reading a save never applies the refresh or changes the running game's caches or flags.
-    catchmentDirty: g.lines.catchmentDirty || (!(g as any).networkDirty &&
-      (g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)),
-    // Unflushed street edits keep their existing timing/dirty representation until the network flush.
-    ...((g as any).networkDirty && (g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)
+    // Save owed walking population work independently of the scheduled demand publication flag.
+    // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
+    catchmentDirty: g.lines.catchmentDirty,
+    ...((g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)
       ? { catchmentInputsDirty: true } : {}),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),

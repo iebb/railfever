@@ -30,12 +30,14 @@ if(!snapshot){
  const sid=h.stations.nextId;check(!h.stations.commitBusStop(60,60,0),'native road stop is paid');
  const house=(x:number,pop:number)=>h.world.addBuilding({townId:-1,x,z:58,angle:0,w:.8,d:.8,type:0,floors:2,pop,seed:1,y:3,built:0});
  const gone=house(58,10);house(64,20);h.stations.refreshAccess(true);h.lines.catchmentDirty=true;h.lines.flushCatchment();
+ h.flushNetworkChanges();h.lines.flushCatchment();
+ check(!(h as any).networkDirty&&!h.lines.catchmentDirty,'native construction is flushed before the independent lot edit');
  check(h.stations.get(sid)!.catchPop===30,'the original warm native catchment has both buildings');
  h.world.removeBuilding(gone.id);
  const flag=h.lines.catchmentDirty,encoded=saved(h);
  const pending=JSON.parse(encoded);
- check(!flag&&h.stations.catchmentInputsChanged()&&(pending.catchmentDirty||pending.catchmentInputsDirty),
-  'a native lot edit saves its logical pending work without requiring a route rebuild');
+ check(!flag&&h.stations.catchmentInputsChanged()&&pending.catchmentDirty===flag&&pending.catchmentInputsDirty===true,
+  'a native lot edit retains explicit refresh timing and saves owed population work separately');
  check(h.lines.catchmentDirty===flag&&saved(h)===encoded,'serializing pending dependencies does not mutate native flags, cash/books or RNG');
  const restored=deserialize(JSON.parse(encoded));check(saved(restored)===encoded,'pending walking dependencies round-trip exactly');
  h.lines.rebuild();restored.lines.rebuild();h.lines.flushCatchment();restored.lines.flushCatchment();
