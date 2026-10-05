@@ -36,8 +36,29 @@ function settleWorks(ai: AIController, value: WorksReturn, quoted: number, spent
 export function planCapacityTrackUpgrade(g: Game, edges: number[], side: 1 | -1, payer: number): DoublePlan {
   return planDoubleTrack(g, edges, side, payer);
 }
-export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: (p: Proposal) => boolean) {
-  return commitDoubleTrack(g, plan, true, {}, consent);
+export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: (p: Proposal) => boolean, maxSpend?: number) {
+  if (maxSpend === undefined) return commitDoubleTrack(g, plan, true, {}, consent);
+  const eco = g.company(plan.owner).economy;
+  const own = Object.getOwnPropertyDescriptor(eco, 'canAfford'), native = eco.canAfford;
+  const ownSpend = Object.getOwnPropertyDescriptor(eco, 'spend'), nativeSpend = eco.spend;
+  const construction = eco.current.construction;
+  // Keep cash, debt and books visible at their real native values. Only this synchronous construction
+  // call is capped; refunds reduce net spend normally and the exact prior method state is restored.
+  const canAfford = function(this: typeof eco, cost: number) {
+    return native.call(this, cost) && construction - this.current.construction + cost <= maxSpend;
+  };
+  Object.defineProperty(eco, 'canAfford', { configurable: true, writable: true, enumerable: own?.enumerable ?? false, value: canAfford });
+  Object.defineProperty(eco, 'spend', { configurable: true, writable: true, enumerable: ownSpend?.enumerable ?? false,
+    value: function(this: typeof eco, cost: number, category: Parameters<typeof nativeSpend>[1], force = false) {
+      // Existing-node signals spend directly; they must observe the same ceiling as new-node signals.
+      if (cost > 0 && category === 'construction' && !canAfford.call(this, cost)) return false;
+      return nativeSpend.call(this, cost, category, force);
+    } });
+  try { return commitDoubleTrack(g, plan, true, { maxFormationSpend: plan.cost }, consent); }
+  finally {
+    if (own) Object.defineProperty(eco, 'canAfford', own); else Reflect.deleteProperty(eco, 'canAfford');
+    if (ownSpend) Object.defineProperty(eco, 'spend', ownSpend); else Reflect.deleteProperty(eco, 'spend');
+  }
 }
 
 /** The title holder acts for the whole corridor; other operators gain paths under their access agreement. */

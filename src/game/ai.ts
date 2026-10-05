@@ -40,7 +40,7 @@ import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn,
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
 import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
-import { initialSecondTrackCost, initialTrackChoice, layInitialDoubleTrack } from './ai-initial-track';
+import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
@@ -2713,10 +2713,12 @@ export class AIController {
     const extra = initialSecondTrackCost(prof, type);
     const existing = [...g.lines.map.values()].filter(l => l.kind === 'rail' && l.stops.some(sid => sid === hub?.id || sid === hubB?.id || sid === join?.S.id));
     const junctionTraffic = existing.reduce((n, l) => n + l.vehicles.length / Math.max(120, service.sv.headway * nTrains), 0);
-    const forecastFleet = Math.max(nTrains, Math.min(4, Math.ceil(service.forecast.boardings / Math.max(1, service.sv.seats / nTrains))));
     const initialTraffic = { revenue: service.income, boardings: service.forecast.boardings, seats: service.sv.seats,
-      trains: forecastFleet, headway: service.sv.headway * nTrains / forecastFleet, kmh: service.sv.kmh, blockLength: len, risk: this.config.risk, junctionTraffic };
-    const choice = initialTrackChoice(initialTraffic, extra.cost, extra.upkeep);
+      trains: nTrains, headway: service.sv.headway, kmh: service.sv.kmh, blockLength: len, risk: this.config.risk, junctionTraffic };
+    // Current recovery uses the fleet this project purchases. Unmet demand belongs to the future-upgrade
+    // term, rather than opposing arrivals from hypothetical trains whose capital/running costs are unpaid.
+    const finance = initialTrackFinancing(this.eco, service.total + 300_000, extra.cost);
+    const choice = initialTrackChoice(initialTraffic, extra.cost, extra.upkeep, finance.annualInterest);
     // Reprice the pair after the formation is built: the standalone quote can overstate its actual cost.
     // The construction callback still reserves the full opening fleet, and the pair must repay its own
     // upkeep and capital; it cannot consume the train budget or rescue a losing service.
@@ -2816,7 +2818,7 @@ export class AIController {
         const option = (() => {
           const pair = Trackops.planDoubleTrack(g, upgradeRoute(g, stA.id, stB.id, owner), side, owner);
           if (!pair.ok || !pair.complete || pair.start.kind === 'turnout' || pair.end.kind === 'turnout'
-            || pair.cost + 80_000 > initialBudget * 1.2) return null;
+            || Trackops.quoteDoubleTrackCompletion(g, pair).cost > initialBudget * 1.2) return null;
           const entries = new Map(pair.steps.map(s => [s.edge, (-pair.side * s.dir) as 1 | -1]));
           const corridor: P2[] = [];
           for (const proposal of pair.proposals) for (const track of proposal.tracks) {
@@ -2890,7 +2892,7 @@ export class AIController {
       const t0 = net.nextEdge;
       const result = layInitialDoubleTrack(g, pairRoute, owner, initialTraffic,
         cost => cost <= initialBudget * 1.2 && this.available() >= cost + (trainCost + mail.price) * nTrains + 300_000 && this.borrowFor(cost),
-        undefined, plan => this.initialPairDepot(plan, dep, stA.id, stB.id, hs ? cars : undefined));
+        undefined, plan => this.initialPairDepot(plan, dep, stA.id, stB.id, hs ? cars : undefined), (trainCost + mail.price) * nTrains + 300_000);
       initiallyDoubled = result.built;
       if (result.built) {
         this.stats.doubled++; this.stats.trackDouble += result.edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);

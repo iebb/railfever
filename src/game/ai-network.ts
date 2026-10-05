@@ -233,6 +233,12 @@ function segmentGap(p0: { x: number; z: number }, p1: { x: number; z: number }, 
 
 const planners = new WeakMap<AIController, NetPlanner>();
 
+/** Fund the optional connector rail while retaining the through fleet's already-approved cash reserve. */
+export function fundInitialConnector(ai: AIController, cost: number, trainReserve: number) {
+  const remaining = trainReserve + 150_000;
+  return ai.available() >= cost + remaining && ai.capacityFunds(cost + remaining);
+}
+
 interface RoadChoice { ax: number; az: number; bx: number; bz: number; crossing: 'auto' | 'over' | 'under'; cost: number; demolish: boolean }
 interface WorkItem {
   ids: number[]; retire?: 'stations' | 'depots' | 'track' | 'all'; road?: { at: number; best?: RoadChoice };
@@ -2747,8 +2753,8 @@ class NetPlanner {
     const result = layInitialDoubleTrack(g, edges, this.me,
       { revenue: revenue + affected, boardings, seats, trains, headway, kmh, blockLength: length + approach,
         risk: this.ai.config.risk, junctionTraffic },
-      cost => this.ai.available() >= cost + trainReserve + 150_000 && this.ai.capacityFunds(cost),
-      p => this.proposalConsent(p) && p.demolish.length === 0);
+      cost => fundInitialConnector(this.ai, cost, trainReserve),
+      p => this.proposalConsent(p) && p.demolish.length === 0, undefined, trainReserve + 150_000);
     if (result.built) {
       this.ai.stats.doubled++; this.ai.stats.trackDouble += result.edges.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0);
       this.ai.stats.signals += result.signals;
