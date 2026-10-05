@@ -14,6 +14,7 @@ import { stationEnds, nodeSnap, nodeAt, buildRailDepot, buildDepotOnLine } from 
 import { fails, check, fmt, build, free, railOpts, checkReservations, Train } from './lib';
 import type { Economy, Category } from '../src/game/economy';
 import type { Vehicle } from '../src/game/vehicle';
+import { brakeDistance, trainForces } from '../src/game/train';
 
 export interface AccessLayout {
   g: Game; A: number; D: number; E: number; depA: number; depAI: number;
@@ -209,12 +210,38 @@ if (isMain) {
   check(errs.length === 0, 'reservations consistent ' + errs.slice(0, 3).join('; '));
 
   // ---- 4. policies, rejection, expiry, blocking
-  // blocking ends the agreement (the AI line loses its stops at the player's stations, its train has no route)
+  // Blocking removes foreign calls immediately. A train physically caught on that track may still escape
+  // to its remaining owned stop; its position at this test checkpoint must not decide the access result.
+  const caughtOnPlayer = at.occupiedEdges().some(id => net.edges.get(id)?.owner === PLAYER);
   g.blockCompany(PLAYER, ai);
   check(g.isBlocked(PLAYER, ai) && !g.canUse(ai, PLAYER) && g.requestAccess(ai, PLAYER) === 'blocked', 'blocked: agreement ended, requests refused');
   check(!aiLine.stops.some((s) => g.stations.get(s)?.owner === PLAYER), `AI line lost its stops at player stations (${aiLine.stops.map((s) => g.stations.get(s)?.name).join(', ')})`);
-  run(10);
-  check(!pathEdges(at).some((id) => net.edges.get(id)?.owner === PLAYER) || at.state === 'noroute' || at.state === 'stopped', `blocked AI train keeps off the player network (${at.state}: ${at.status})`);
+  g.stepTick(); // let the native loading departure / network replan choose its route off revoked track
+  const escapePath = [...at.segs, ...at.pending], foreignEscape = new Set(escapePath.filter(s => net.edges.get(s.e)?.owner === PLAYER).map(s => s.e));
+  if (caughtOnPlayer) check(net.edges.get(escapePath.at(-1)?.e ?? -1)?.owner === ai && g.stations.get(at.routeTarget)?.owner === ai,
+    'a caught blocked train plans its escape to its remaining owned stop');
+  // This fixture is flat. Bound the whole planned trip by half its lowest native speed limit, with a
+  // conservative acceleration from the actual consist's traction and braking room for its full body.
+  const escapeSpeed = Math.min(at.maxSpeed, ...escapePath.map(s => s.limit)) / 2;
+  const forces = trainForces(at, escapeSpeed * 10), acceleration = (forces.traction - forces.resistance) / (at.mass * 1000 * 20);
+  const seconds = escapeSpeed / acceleration + (escapePath.reduce((n, s) => n + s.len, 0) + at.length + 2 * brakeDistance(escapeSpeed)) / escapeSpeed;
+  const escapeDays = Math.ceil(seconds / (g.tickSeconds * g.ticksPerDay));
+  check(!caughtOnPlayer || Number.isFinite(escapeDays) && acceleration > 0, 'native consist can clear its finite flat escape path');
+  const deadline = g.day + (caughtOnPlayer && Number.isFinite(escapeDays) ? escapeDays : 0);
+  const foreignPath = () => pathEdges(at).filter(id => net.edges.get(id)?.owner === PLAYER);
+  let outsideEscape = false, reentered = false, cleared = foreignPath().length === 0;
+  const observeBlocked = () => {
+    outsideEscape ||= foreignPath().some(id => !foreignEscape.has(id));
+    if (cleared && foreignPath().length) reentered = true;
+    if (!foreignPath().length) cleared = true;
+  };
+  const blockedDay = g.day;
+  while (!cleared && g.day < deadline) { g.stepTick(); observeBlocked(); }
+  console.log(`  blocked escape: caught ${caughtOnPlayer}, cleared in ${g.day - blockedDay} days, native path bound ${caughtOnPlayer ? escapeDays : 0} days, foreign path ${foreignEscape.size} edges`);
+  check(cleared && !outsideEscape && checkReservations(g).length === 0,
+    `blocked AI train clears its pre-existing escape without other foreign entry or reservation conflicts (${at.state}: ${at.status})`);
+  for (let k = 0; k < 10 * g.ticksPerDay; k++) { g.stepTick(); observeBlocked(); }
+  check(cleared && !reentered && !foreignPath().length, `blocked AI train keeps off the player network after physically clearing it (${at.state}: ${at.status})`);
   g.unblockCompany(PLAYER, ai);
   check(!g.isBlocked(PLAYER, ai), 'unblocked');
   // reject
