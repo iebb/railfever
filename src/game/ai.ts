@@ -41,7 +41,7 @@ import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn,
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
 import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
-import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan } from './ai-initial-track';
+import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan, openingFundingBaseline, openingFundingAppraisal } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
@@ -3010,8 +3010,9 @@ export class AIController {
     }
     p.openingLine = line.id;
     // Optional depot-spur crossings are priced against the actual final timetable and departure rails.
-    // borrowFor(fleet + 300k) below itself keeps another 300k. Optional work must not trigger that loan.
+    // borrowFor(fleet + 300k) keeps another 300k. Price additional debt against original normal signalling/funding.
     const fleet = mail.cars.reduce((n, c) => n + c.cost, 0) * nTrains, fleetReserve = fleet + 600_000;
+    let fundingBaseline: ReturnType<typeof openingFundingBaseline> | undefined;
     const openingReturn = { total, fleet, income, running, maintenance: maint,
       wear: Math.max(0, sv.trackUpkeep - len * trackBasePerUnit(type)), amortisation };
     let repaired = false, finishing = 0;
@@ -3019,9 +3020,18 @@ export class AIController {
       if (ext || !p.stations.includes(stA.id) || !p.stations.includes(stB.id) || st.owner !== owner) continue;
       const signalPlan = openingSignalPlan(g, line, dep, mail.cars, first);
       if (!signalPlan) continue;
+      // No yield here: retain this original no-repair debt comparison across both stations/candidate retries.
+      const originalFunding = fundingBaseline ??= openingFundingBaseline(this.eco, fleet,
+        Signals.autoSignalLine(g, line.id, owner, { preview: true }).cost);
       const t0 = net.nextEdge;
+      let approved: ReturnType<typeof openingFundingAppraisal> | undefined;
       const result = Trackops.connectStationThroat(g, st.id, owner, { junctions: true, reserve: fleetReserve, signals: signalPlan,
-        approve: (cost, upkeep, finish) => openingThroatReturn(g, throatFinance, p, openingReturn, cost + finish, upkeep)?.pays === true });
+        approve: (cost, upkeep, finish) => {
+          const quote = openingFundingAppraisal(this.eco, originalFunding, cost + finish, this.loanAppetite, this.available());
+          approved = quote.affordable && openingThroatReturn(g, throatFinance, p, openingReturn, cost + finish, upkeep, quote.annualInterest)?.pays === true ? quote : undefined;
+          return !!approved;
+        },
+        fund: () => !!approved && this.borrowFor(approved.amount) && this.eco.money >= approved.target });
       this.track(t0);
       if (result.connected) { repaired = true; finishing = result.finishing ?? 0; }
       if (result.failed.length) this.note(`${what} ${st.name}: incomplete throat (${result.failed.join('; ')})`);
@@ -3030,7 +3040,8 @@ export class AIController {
     if (repaired) {
       const exact = openingSignalPlan(g, line, dep, mail.cars, first);
       if (!exact || exact.cost > finishing || this.eco.money < fleetReserve + exact.cost
-        || openingThroatReturn(g, throatFinance, p, openingReturn, exact.cost, 0)?.pays !== true)
+        || openingThroatReturn(g, throatFinance, p, openingReturn, exact.cost, 0,
+          Math.max(0, this.eco.loan - fundingBaseline!.noRepairLoan) * this.eco.interestRate)?.pays !== true)
         return fail('opening signalling exceeds its paid completion reserve', 720);
       const signals = Signals.autoSignalLine(g, [...exact.edges], owner);
       this.stats.signals += signals.placed;

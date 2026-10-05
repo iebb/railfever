@@ -16,7 +16,7 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
-import { walkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
@@ -3065,11 +3065,10 @@ export class Stations {
     return true;
   }
 
-  /** Uncached, synchronous reference using the original full share-out and floating-point order. */
-  debugFullCatchment(): { stations: Map<number, { ids: number[]; w: number[]; pop: number }>; buildings: Map<number, { st: number[]; w: number[] }> } {
+  /** Native share weighting and sum order, without publishing populations or demand. */
+  private shareView(walks: Map<number, WalkingCatchment>): { stations: Map<number, { ids: number[]; w: number[]; pop: number }>; buildings: Map<number, { st: number[]; w: number[] }> } {
     const w = this.game.world, stations = new Map<number, { ids: number[]; w: number[]; pop: number }>();
     const buildings = new Map<number, { st: number[]; w: number[] }>(), covered = new Map<number, { sid: number; distance: number }[]>();
-    const walks = fullWalkingCatchments(this.game);
     for (const st of this.map.values()) {
       stations.set(st.id, { ids: [], w: [], pop: 0 });
       for (const [id, walk] of walks.get(st.id)!.buildings) {
@@ -3094,10 +3093,23 @@ export class Stations {
     return { stations, buildings };
   }
 
-  /** The shares as last worked out (a loaded game works them out again on first use, for the same buildings). */
-  private ensureShares() {
-    if (this.sharesReady) return;
-    this.computeShares(this.catchMaxB > 0 ? this.catchMaxB : this.game.world.nextBuildingId - 1);
+  /** Uncached, synchronous reference using the original full share-out and floating-point order. */
+  debugFullCatchment() { return this.shareView(fullWalkingCatchments(this.game)); }
+
+  private readShares: {
+    inputs: { roads: number; lots: number; terrain: number; stations: number; served: number }; maxB: number;
+    stations: Map<number, { ids: number[]; w: number[] }>; buildings: Map<number, { st: number[]; w: number[] }>;
+  } | null = null;
+
+  /** Current native membership at the saved horizon; only disposable read caches change here. */
+  private currentReadShares() {
+    const old = this.readShares;
+    if (old && old.maxB === this.catchMaxB && this.sameCatchInputs(old.inputs)) return old;
+    const walks = new Map<number, WalkingCatchment>();
+    for (const st of this.map.values()) walks.set(st.id, readWalkingCatchment(this.game, st));
+    const view = this.shareView(walks);
+    return this.readShares = { inputs: this.currentCatchInputs(), maxB: this.catchMaxB,
+      stations: new Map([...view.stations].map(([id, s]) => [id, { ids: s.ids, w: s.w }])), buildings: view.buildings };
   }
 
   /** Rebuild derived shares at the saved horizon; a pending road edit still owes a population refresh. */
@@ -3107,20 +3119,18 @@ export class Stations {
   }
 
   /**
-   * Exact catchment of a station: buildings reachable on foot and the share of each building's people it
-   * serves (parallel arrays; overlapping walking catchments split the population, see computeShares).
-   * Passenger generation and attraction both use these shares. Updated
-   * with the catchment (lines.flushCatchment); read-only.
+   * Current walking membership of the published building horizon. Pending inputs are read without
+   * publishing catchment populations or demand ahead of their monthly/service update.
    */
   buildingShares(st: Station | number): { ids: number[]; w: number[] } {
-    this.ensureShares();
-    return this.shareSt.get(typeof st === 'number' ? st : st.id) ?? { ids: [], w: [] };
+    const shares = this.sharesReady && !this.catchmentInputsChanged() ? this.shareSt : this.currentReadShares().stations;
+    return shares.get(typeof st === 'number' ? st : st.id) ?? { ids: [], w: [] };
   }
 
   /** The stations whose catchment holds a building, and their shares of its people (summing to 1; empty: none). */
   stationsForBuilding(bId: number): { st: number[]; w: number[] } {
-    this.ensureShares();
-    return this.shareB.get(bId) ?? { st: [], w: [] };
+    const shares = this.sharesReady && !this.catchmentInputsChanged() ? this.shareB : this.currentReadShares().buildings;
+    return shares.get(bId) ?? { st: [], w: [] };
   }
 
   /** Sum of share x f(building) over a station's catchment (e.g. its residents or its jobs). */

@@ -155,7 +155,7 @@ function connectionCurve(a: SPt, b: SPt) {
  * it and, unless `dry`, lays it, splitting the tracks there. `tracks`: the edges it may touch (its two tracks).
  */
 function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, dry: boolean, type?: string, infrastructureOwner = owner, junctions = false,
-  removed?: ReadonlySet<number>, maxSpend = Infinity, protection?: { edges: ReadonlySet<number>; reserve: number; signalScope?: ReadonlySet<number> }): { error: string | null; cost: number; length?: number; upkeep?: number; crossings?: number } {
+  removed?: ReadonlySet<number>, maxSpend = Infinity, protection?: { edges: ReadonlySet<number>; reserve: number; signalScope?: ReadonlySet<number>; appraiseFunds?: boolean }): { error: string | null; cost: number; length?: number; upkeep?: number; crossings?: number } {
   const net = g.world.net, w = g.world;
   for (const q of [a, b]) {
     const es = q.edge !== undefined ? [net.edges.get(q.edge)] : q.node !== undefined ? net.nodes.get(q.node)?.edges.map((id) => net.edges.get(id)) ?? [] : [];
@@ -285,7 +285,7 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
     if ([...affected].some(id => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0)
       || [...net.crossings.values()].some(c => (affected.has(c.e1) || affected.has(c.e2)) && g.vehicles.crossingReservedBy(c.id) !== 0))
       return { error: 'train or reserved path in the throat', cost };
-    if (cost > g.company(owner).economy.money - protection.reserve) return { error: 'Not enough money after reserved fleet', cost };
+    if ((!dry || !protection.appraiseFunds) && cost > g.company(owner).economy.money - protection.reserve) return { error: 'Not enough money after reserved fleet', cost };
   }
   if (dry) return { error: null, cost, length: tab.len, upkeep, crossings: diamonds.length };
   for (const q of [a, b]) if (q.edge !== undefined && g.vehicles.isEdgeBusy(q.edge)) return { error: 'train in the way', cost };
@@ -1600,6 +1600,8 @@ export interface StationThroatOptions {
   reserve?: number;
   /** Reprice the actual candidate under the caller's existing project return before construction. */
   approve?: (cost: number, upkeep: number, finishing: number) => boolean;
+  /** Caller funds its approved full opening after the native protected dry quote; connectors never borrow. */
+  fund?: (cost: number, upkeep: number, finishing: number) => boolean;
   /** Exact native current operating-scope preview; optional leads must keep all existing affected rails within it. */
   signals?: { edges: ReadonlySet<number>; cost: number };
 }
@@ -1610,8 +1612,18 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
   const res: { connected: number; failed: string[]; cost?: number; upkeep?: number; finishing?: number } = { connected: 0, failed: [] };
   if (!st || !st.rail) return res;
   if (opts.junctions && !opts.signals) { res.failed.push('no native signalling completion quote'); return res; }
+  if (opts.fund && (!opts.junctions || !opts.approve)) { res.failed.push('funding needs an approved native junction quote'); return res; }
   const access = g.trackUpgradeError(owner, st.owner);
   if (access) { res.failed.push(access); return res; }
+  if (opts.fund) {
+    const scope = opts.signals!.edges;
+    if ([...scope].some(id => {
+      const e = net.edges.get(id);
+      return !e || g.trackUpgradeError(owner, e.owner) || g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0;
+    }) || [...net.crossings.values()].some(c => (scope.has(c.e1) || scope.has(c.e2)) && g.vehicles.crossingReservedBy(c.id) !== 0)) {
+      res.failed.push('operating signal scope is not clear and authorised'); return res;
+    }
+  }
   const r = st.rail;
   const outs = railPartMode(r) === 'mainline' ? [8, 10, 12, 15, 18, 22, 26, 30, 34] : [4, 5, 6, 8, 10, 12, 15, 18, 22, 26];
   for (const end of ['front', 'back'] as const) {
@@ -1647,7 +1659,7 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
             // the neighbour's approach as far as the turnout runs beside the new curve
             const tracks = new Set<number>([...own, ...via, ...ends.flatMap((t) => [...approach(t.front), ...approach(t.back)])]);
             const start = { x: nj.x, z: nj.z, y: nj.y, tx: ax, tz: az, node: nj.id };
-            const protection = opts.junctions ? { edges: tracks, reserve: Math.max(0, opts.reserve ?? 0), signalScope: opts.signals!.edges } : undefined;
+            const protection = opts.junctions ? { edges: tracks, reserve: Math.max(0, opts.reserve ?? 0), signalScope: opts.signals!.edges, appraiseFunds: !!opts.fund } : undefined;
             if (opts.junctions) {
               if (nj.signal !== 0 || nj.edges.length !== 1) { why = 'platform start is not fresh and unsignalled'; continue; }
               const quote = connectS(g, owner, start, q, tracks, true, undefined, st.owner, true, undefined, Infinity, protection);
@@ -1658,8 +1670,10 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
               const diamonds = [...net.crossings.values()].filter(c => c.kind === 'diamond' && (opts.signals!.edges.has(c.e1) || opts.signals!.edges.has(c.e2))).length;
               const finishing = opts.signals!.cost + SIGNAL_COST * (3 + 4 * (diamonds + (quote.crossings ?? 0)));
               protection!.reserve += finishing;
-              if (quote.cost > g.company(owner).economy.money - protection!.reserve) { why = 'Not enough money after fleet and signalling'; continue; }
+              if (!opts.fund && quote.cost > g.company(owner).economy.money - protection!.reserve) { why = 'Not enough money after fleet and signalling'; continue; }
               if (opts.approve && !opts.approve(quote.cost, quote.upkeep ?? 0, finishing)) { why = 'throat does not pay for its construction and upkeep'; continue; }
+              if (opts.fund && !opts.fund(quote.cost, quote.upkeep ?? 0, finishing)) { why = 'approved opening cannot be fully funded'; continue; }
+              if (quote.cost > g.company(owner).economy.money - protection!.reserve) { why = 'Not enough money after fleet and signalling'; continue; }
               res.finishing = Math.max(res.finishing ?? 0, finishing);
             }
             const c = connectS(g, owner, start, q, tracks, false, undefined, st.owner, !!opts.junctions, undefined, Infinity, protection);

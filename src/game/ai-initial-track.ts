@@ -155,7 +155,7 @@ export function openingThroatBaseline(g: Game, owner: number): OpeningThroatBase
 export function openingThroatReturn(g: Game, before: OpeningThroatBaseline,
   project: { edges: readonly number[]; stations: readonly number[]; depots: readonly number[] },
   service: { total: number; fleet: number; income: number; running: number; maintenance: number; wear: number; amortisation: number },
-  cost: number, upkeep: number): { pays: boolean; capital: number; maintenance: number; need: number; paid: number } | null {
+  cost: number, upkeep: number, annualInterest = 0): { pays: boolean; capital: number; maintenance: number; need: number; paid: number } | null {
   if (before.assets.some(a => openingAssetSignature(g, a.kind, a.id) !== a.signature)) return null;
   const eco = g.company(before.owner).economy;
   let construction = eco.thisYear.construction;
@@ -173,7 +173,27 @@ export function openingThroatReturn(g: Game, before: OpeningThroatBaseline,
   const capital = Math.max(service.total, paid + service.fleet + cost);
   const maintenance = Math.max(service.maintenance, Math.max(assets, g.maintenanceOf(before.owner) - before.maintenance) + service.wear + upkeep);
   const need = (capital - service.fleet) * service.amortisation + capital * .03;
-  return { pays: [capital, maintenance, need].every(Number.isFinite) && service.income - service.running - maintenance >= need, capital, maintenance, need, paid };
+  return { pays: [capital, maintenance, need, annualInterest].every(Number.isFinite) && annualInterest >= 0
+    && service.income - service.running - maintenance - annualInterest >= need, capital, maintenance, need, paid };
+}
+
+type OpeningEconomy = Pick<Economy, 'money' | 'loan' | 'maxLoan' | 'loanStep' | 'interestRate'>;
+export interface OpeningFundingBaseline { readonly fleet: number; readonly noRepairLoan: number }
+/** Original normal signalling and subsequent stock funding, before any optional loans or paid leads. */
+export function openingFundingBaseline(e: OpeningEconomy, fleet: number, normalSignals: number): OpeningFundingBaseline {
+  return { fleet, noRepairLoan: e.loan + initialTrackFinancing(e, fleet + 300_000 + normalSignals, 0).totalLoan };
+}
+/** Complete native cash target. Retained loans from unsuccessful earlier candidates still carry interest. */
+export function openingFundingAppraisal(e: OpeningEconomy, original: OpeningFundingBaseline,
+  completion: number, appetite: number, available: number) {
+  const amount = original.fleet + 300_000 + completion, target = amount + 300_000;
+  const finance = initialTrackFinancing(e, original.fleet + 300_000, completion);
+  const endLoan = e.loan + finance.totalLoan, incrementalLoan = Math.max(0, endLoan - original.noRepairLoan);
+  const annualInterest = incrementalLoan * e.interestRate;
+  const affordable = [amount, target, endLoan, annualInterest, available].every(Number.isFinite) && completion >= 0
+    && e.money + finance.totalLoan >= target && available >= target
+    && (finance.totalLoan === 0 || endLoan <= e.maxLoan * appetite);
+  return { affordable, amount, target, endLoan, incrementalLoan, annualInterest };
 }
 
 /** Exact current timetable and native initial-departure rails; no prospective graph or allocated IDs. */

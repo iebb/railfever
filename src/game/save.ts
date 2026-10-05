@@ -374,8 +374,9 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     // Save owed walking population work independently of the scheduled demand publication flag.
     // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
     catchmentDirty: g.lines.catchmentDirty,
-    ...((g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)
-      ? { catchmentInputsDirty: true } : {}),
+    catchmentInputsDirty: g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending,
+    // A cold load must preserve whether saved road access already matched its network.
+    catchmentAccessCurrent: (g.stations as any).accessVersion === w.net.version,
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
@@ -644,13 +645,16 @@ export function deserialize(d: any): Game {
   // Restore derived walking dependencies and shares at the saved building horizon. A cold share cache would
   // slice a pending refresh while the running game's warm cache commits it immediately.
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
-  const S = g.stations as any, accessVersion = S.accessVersion;
+  const S = g.stations as any, accessVersion = S.accessVersion, savedAccessVersion = net.version;
+  // The explicit marker separates owed population work from a frequency-only demand refresh.
+  const populationPending = typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
+    : !!d.catchmentDirty || !!d.catchmentRoadsDirty;
   S.accessVersion = net.version;
   // A brand-new empty network has not run its first share-out. Historical horizon zero can also
   // be warm, so preserve the explicit cold hint instead of conflating the two states.
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
-    g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty || !!d.catchmentInputsDirty);
-  S.accessVersion = accessVersion;
+    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
     const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
@@ -666,11 +670,18 @@ export function deserialize(d: any): Game {
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  // New saves preserve pending/current access metadata while the AI warms derived walking entries.
+  const protectNetworkWarm = typeof d.catchmentAccessCurrent === 'boolean', networkAccessVersion = S.accessVersion;
+  if (protectNetworkWarm) S.accessVersion = net.version;
   try { loadNetwork(g, d.aiNetwork); } catch (e) { console.warn('Save load: loadNetwork failed', e); }
+  finally { if (protectNetworkWarm) S.accessVersion = networkAccessVersion; }
   // Saved road shapes restore after the first share-cache prime. Align their disposable input
   // versions too; retain any genuinely pending population work for the next simulation tick.
+  // Prime only derived memberships with saved access; do not refresh pending access while loading.
+  S.accessVersion = net.version;
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
-    g.stations.restoreCatchmentShares(d.catchMaxB, g.lines.catchmentDirty || g.lines.catchmentRoadsDirty || !!d.catchmentInputsDirty);
+    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;
