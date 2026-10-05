@@ -94,6 +94,11 @@ const feederQuality = (headway: number) => Math.max(0, Math.min(1,
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
 interface FeederPool { pop: number; regions: Map<number, number> }
 const feederSites = new WeakMap<DemandModel, { key: string; sites: Map<string, Map<number, number>> }>();
+const feederClaims = new WeakMap<DemandModel, {
+  bids: number[]; sums: number[]; qualities: number[]; first: number[]; last: number[];
+  indices: number[]; weights: number[]; next: number[];
+  claimById: Uint32Array;
+}>();
 type ForecastPoint = StationPlan | Station | ForecastSite;
 const forecastStation = (p: ForecastPoint): Station | null => 'id' in p ? p : 'join' in p ? p.join : null;
 /** Same passenger areas as the committed facility, including native curves and an inherited joined stop. */
@@ -497,32 +502,55 @@ export class DemandModel {
    * supply a railway it cannot reach. Competing main-line stations share every lot once. */
   private feederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
     const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
-    // Forecasts revisit hundreds of lots. Store their claims as numeric linked lists rather than allocating
-    // an array, per-site objects and a temporary quality array for every lot. Traversal keeps the original
-    // building/site order, including its floating-point sums, so this changes no demand or AI choices.
-    const claims = new Map<number, { sum: number; quality: number; first: number; last: number }>();
-    const indices: number[] = [], weights: number[] = [], next: number[] = [];
+    // Each lot has a numeric claim index, avoiding a claim object per lot on every forecast. Parallel arrays
+    // retain first-claim insertion order and the linked site order, including the original floating-point sums.
+    const buffers = feederClaims.get(this) ?? { bids: [], sums: [], qualities: [], first: [], last: [], indices: [], weights: [], next: [], claimById: new Uint32Array(256) };
+    // A nested read gets independent scratch; an exception simply discards this disposable buffer.
+    feederClaims.delete(this);
+    // Native lot ids are dense. Bound the lookup table, and keep sparse or non-integer legacy ids in a Map.
+    // Zero means unclaimed; touched entries are cleared before scratch can be reused, without an aging stamp.
+    const limit = this.g.world.nextBuildingId <= 65536 ? this.g.world.nextBuildingId : 0;
+    if (limit > buffers.claimById.length) {
+      let size = buffers.claimById.length;
+      while (size < limit) size *= 2;
+      buffers.claimById = new Uint32Array(size);
+    }
+    const { bids, sums, qualities, first, last, indices, weights, next } = buffers;
+    const claimById = buffers.claimById;
+    let sparse: Map<number, number> | undefined;
+    let claimCount = 0, rowCount = 0;
     sites.forEach((s, i) => {
       if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500) return;
       const buildings = this.feederSiteWalk(s);
       for (const [bid, distance] of buildings) {
         const b = this.g.world.buildings.get(bid);
         if (!b || b.townId !== s.townId || covered.has(bid)) continue;
-        const k = indices.length, weight = s.quality / (1 + distance / 30), claim = claims.get(bid);
-        indices.push(i); weights.push(weight); next.push(-1);
-        if (claim) {
-          claim.sum += weight; claim.quality = Math.max(claim.quality, s.quality);
-          next[claim.last] = k; claim.last = k;
-        } else claims.set(bid, { sum: weight, quality: s.quality, first: k, last: k });
+        const dense = bid >= 0 && bid < claimById.length && Number.isInteger(bid);
+        const claim = dense ? claimById[bid] - 1 : sparse?.get(bid) ?? -1;
+        const k = rowCount++, weight = s.quality / (1 + distance / 30);
+        indices[k] = i; weights[k] = weight; next[k] = -1;
+        if (claim >= 0) {
+          sums[claim] += weight; qualities[claim] = Math.max(qualities[claim], s.quality);
+          next[last[claim]] = k; last[claim] = k;
+        } else {
+          const c = claimCount++;
+          if (dense) claimById[bid] = c + 1;
+          else (sparse ??= new Map()).set(bid, c);
+          bids[c] = bid; sums[c] = weight; qualities[c] = s.quality; first[c] = k; last[c] = k;
+        }
       }
     });
-    for (const [bid, claim] of claims) {
+    for (let claim = 0; claim < claimCount; claim++) {
+      const bid = bids[claim];
+      if (bid >= 0 && bid < claimById.length && Number.isInteger(bid)) claimById[bid] = 0;
       const b = this.g.world.buildings.get(bid)!, r = this.regionOf(b); if (r < 0) continue;
-      for (let k = claim.first; k >= 0; k = next[k]) {
-        const pop = b.pop * MAINLINE_FEEDERS.share * claim.quality * weights[k] / claim.sum, pool = result[indices[k]];
+      for (let k = first[claim]; k >= 0; k = next[k]) {
+        const pop = b.pop * MAINLINE_FEEDERS.share * qualities[claim] * weights[k] / sums[claim], pool = result[indices[k]];
         pool.pop += pop; pool.regions.set(r, (pool.regions.get(r) ?? 0) + pop);
       }
     }
+    // Retain ordinary query buffers only; a large UI query cannot pin unbounded scratch in the game.
+    if (next.length <= 16384 && bids.length <= 8192) feederClaims.set(this, buffers);
     return result;
   }
 

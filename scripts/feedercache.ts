@@ -18,10 +18,38 @@ function previousWalk(this: any, s: any): Map<number, number> {
   }
   return buildings;
 }
+// Literal claim-object preimage. Its Map insertion and linked site order are the arithmetic control.
+function previousPools(this: any, sites: any[], covered: Set<number>) {
+  const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
+  const claims = new Map<number, { sum: number; quality: number; first: number; last: number }>();
+  const indices: number[] = [], weights: number[] = [], next: number[] = [];
+  sites.forEach((s, i) => {
+    if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500) return;
+    const buildings = this.feederSiteWalk(s);
+    for (const [bid, distance] of buildings) {
+      const b = this.g.world.buildings.get(bid);
+      if (!b || b.townId !== s.townId || covered.has(bid)) continue;
+      const k = indices.length, weight = s.quality / (1 + distance / 30), claim = claims.get(bid);
+      indices.push(i); weights.push(weight); next.push(-1);
+      if (claim) {
+        claim.sum += weight; claim.quality = Math.max(claim.quality, s.quality);
+        next[claim.last] = k; claim.last = k;
+      } else claims.set(bid, { sum: weight, quality: s.quality, first: k, last: k });
+    }
+  });
+  for (const [bid, claim] of claims) {
+    const b = this.g.world.buildings.get(bid)!, r = this.regionOf(b); if (r < 0) continue;
+    for (let k = claim.first; k >= 0; k = next[k]) {
+      const pop = b.pop * MAINLINE_FEEDERS.share * claim.quality * weights[k] / claim.sum, pool = result[indices[k]];
+      pool.pop += pop; pool.regions.set(r, (pool.regions.get(r) ?? 0) + pop);
+    }
+  }
+  return result;
+}
 function withoutSiteCache<T>(d: any, query: () => T): T {
-  const fast = d.feederSiteWalk;
-  d.feederSiteWalk = previousWalk;
-  try { return query(); } finally { d.feederSiteWalk = fast; }
+  const fast = d.feederSiteWalk, pools = d.feederPools;
+  d.feederSiteWalk = previousWalk; d.feederPools = previousPools;
+  try { return query(); } finally { d.feederSiteWalk = fast; d.feederPools = pools; }
 }
 const poolJSON = (p: any[]) => JSON.stringify(p.map(s => ({ pop: s.pop, regions: [...s.regions] })));
 const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'flat', water: 'low', startYear: 1990,
@@ -55,6 +83,7 @@ function parity(label: string) {
     label + ' exact merged lot order and distances');
   const fast = d.feederPools(sites, covered), old = withoutSiteCache(d, () => d.feederPools(sites, covered));
   check(poolJSON(fast) === poolJSON(old), label + ' exact native populations, competing weights and region order');
+  check(poolJSON(fast) === poolJSON(previousPools.call(d, sites, covered)), label + ' warm geometry matches literal claim-object preimage');
   check(JSON.stringify(serialize(g)) === before, label + ' leaves full saved state unchanged');
   return fast;
 }
@@ -71,6 +100,54 @@ check(JSON.stringify([...inherited.feederSiteWalk(site)]) === JSON.stringify([..
   && inherited.feederSiteWalk(site) !== parentWalk && walkCalls > beforePreview,
   'an inherited preview starts with its own disposable site cache');
 check(d.feederSiteWalk(site) === parentWalk, 'preview reads do not replace the parent geometry cache');
+check(poolJSON(inherited.feederPools(sites, covered)) === poolJSON(previousPools.call(d, sites, covered)),
+  'an inherited preview has independent numeric claim scratch and exact pools');
+// Keep native lot geometry/population, while exercising ids outside the bounded dense lookup. This preview
+// cannot change the world's saved ids; the literal Map preimage is the control for both dense and sparse paths.
+const legacy: any = Object.create(d), ids = new Map<number, number>(), nativeMaps = sites.map(s => d.feederSiteWalk(s));
+const unusual = [0, 65535, 65536, 2 ** 32 + 7, -3, 1.5, Infinity, NaN];
+nativeMaps.forEach((map, i) => { for (const id of map.keys())
+  if (g.world.buildings.get(id)?.townId === sites[i].townId && !ids.has(id))
+    ids.set(id, ids.size < unusual.length ? unusual[ids.size] : ids.size + 100);
+});
+for (const map of nativeMaps) for (const id of map.keys()) if (!ids.has(id))
+  ids.set(id, ids.size < unusual.length ? unusual[ids.size] : ids.size + 100);
+legacy.g = Object.create(g); legacy.g.world = Object.create(g.world);
+legacy.g.world.buildings = new Map([...ids].map(([id, key]) => [key, { ...g.world.buildings.get(id)!, id: key }]));
+const legacyMaps = nativeMaps.map(map => new Map([...map].map(([id, distance]) => [ids.get(id)!, distance])));
+legacy.feederSiteWalk = (s: any) => legacyMaps[sites.indexOf(s)];
+legacy.g.world.nextBuildingId = 2 ** 32 + 100;
+for (const ordered of [sites, [...sites].reverse(), sites.slice(1)]) {
+  check(poolJSON(legacy.feederPools(ordered, covered)) === poolJSON(previousPools.call(legacy, ordered, covered)),
+    'sparse, large, non-integer and boundary lot ids preserve Map claims and order');
+}
+legacy.g.world.nextBuildingId = 65536;
+check(poolJSON(legacy.feederPools(sites, covered)) === poolJSON(previousPools.call(legacy, sites, covered)),
+  'growing the bounded dense lookup preserves formerly sparse claims');
+legacy.g.world.nextBuildingId = 256;
+const excluded = sites.map(s => ({ ...s, quality: 0 }));
+check(legacy.feederPools(excluded, covered).every((p: any) => p.pop === 0 && p.regions.size === 0),
+  'an empty query ignores retained scratch rows');
+check(poolJSON(legacy.feederPools(sites, covered)) === poolJSON(previousPools.call(legacy, sites, covered)),
+  'a smaller id bound and empty intervening query do not retain old claim markers');
+const regionOf = d.regionOf;
+let nested = false, nestedPool = '';
+d.regionOf = function (b: any) {
+  if (!nested) { nested = true; nestedPool = poolJSON(this.feederPools([...sites].reverse(), covered)); }
+  return regionOf.call(this, b);
+};
+const reentrant = d.feederPools(sites, covered); d.regionOf = regionOf;
+check(nested && nestedPool === poolJSON(previousPools.call(d, [...sites].reverse(), covered))
+  && poolJSON(reentrant) === poolJSON(previousPools.call(d, sites, covered)), 'nested native demand reads cannot overwrite outer scratch');
+let threw = false;
+d.regionOf = () => { throw new Error('deliberate scratch interruption'); };
+try { d.feederPools(sites, covered); } catch { threw = true; } finally { d.regionOf = regionOf; }
+check(threw, 'a deliberately interrupted read exercises scratch disposal'); parity('after interrupted read');
+const liveLots = lots.filter(id => g.world.buildings.get(id)?.townId === site.townId).length;
+const largeSites = Array.from({ length: Math.ceil(17000 / liveLots) }, () => site);
+check(poolJSON(d.feederPools(largeSites, covered)) === poolJSON(previousPools.call(d, largeSites, covered)),
+  'a query beyond the retained row bound still preserves exact claim order and arithmetic');
+parity('after large discarded scratch');
 
 // Live quantities must change the result even with the same cached geometry.
 const bid = lots.find(id => g.world.buildings.get(id)?.townId === TA.id)!;
@@ -81,6 +158,7 @@ check(poolJSON(parity('live population')) !== initialPool, 'live population is n
 building.pop = population;
 const beforeQuality = poolJSON(d.feederPools(sites, covered)); site.quality = .25; rival.quality = .95;
 check(poolJSON(parity('live quality')) !== beforeQuality, 'quality and competing allocation are recomputed');
+const positiveQuality = site.quality; site.quality = 0; parity('first site excluded'); site.quality = positiveQuality;
 const beforeCovered = poolJSON(d.feederPools(sites, covered)); covered.add(bid);
 check(poolJSON(parity('live covered lot')) !== beforeCovered, 'covered lots are excluded from warm geometry');
 covered.clear();
@@ -146,7 +224,7 @@ const quote = forecast(), revenue = quote.revenue; quote.revenue = -1; quote.leg
 check(forecast().revenue === revenue && forecast().legLoads.every(v => v >= 0), 'forecast output remains independent and live');
 check(saved === JSON.stringify(serialize(g)), 'warm and uncached forecast reads are serialized-pure');
 const twin = deserialize(JSON.parse(saved)), cold: any = twin.demand;
-cold.feederSiteWalk = previousWalk;
+cold.feederSiteWalk = previousWalk; cold.feederPools = previousPools;
 const twinQuote = (h = 140) => twin.demand.forecastLine([twin.stations.get(A.id)!, twin.stations.get(B.id)!], 'mainline', 120, h, 0, line.id);
 check(JSON.stringify(forecast()) === JSON.stringify(twinQuote()) && saved === JSON.stringify(serialize(twin)),
   'loaded no-site-cache control has exact forecast and full native state');
@@ -158,7 +236,7 @@ for (let tick = 0; tick < 640; tick++) {
   if ((g.ais[0] as any).urbanSurvey || (g.ais[0] as any).urbanTask) plannerRan = true;
   if (JSON.stringify(serialize(g)) !== JSON.stringify(serialize(twin))) { exact = false; console.log('first replay mismatch', tick); break; }
 }
-check(exact, 'all 640 full serialized native ticks match the previous merge control');
+check(exact, 'all 640 full serialized native ticks match the previous merge and claim-object control');
 check(JSON.stringify(g.ais[0].state) !== aiBefore && plannerRan,
   'native AI advances its saved city survey and construction planner during the exact replay');
 check(checkReservations(g).length === 0 && checkReservations(twin).length === 0, 'native replay keeps lawful reservations');
