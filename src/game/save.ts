@@ -371,6 +371,13 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    // Preserve owed input/population work even when no route rebuild set the explicit dirty flag.
+    // Reading a save never applies the refresh or changes the running game's caches or flags.
+    catchmentDirty: g.lines.catchmentDirty || (!(g as any).networkDirty &&
+      (g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)),
+    // Unflushed street edits keep their existing timing/dirty representation until the network flush.
+    ...((g as any).networkDirty && (g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending)
+      ? { catchmentInputsDirty: true } : {}),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
@@ -644,7 +651,7 @@ export function deserialize(d: any): Game {
   // A brand-new empty network has not run its first share-out. Historical horizon zero can also
   // be warm, so preserve the explicit cold hint instead of conflating the two states.
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
-    g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty);
+    g.stations.restoreCatchmentShares(d.catchMaxB, !!d.catchmentDirty || !!d.catchmentRoadsDirty || !!d.catchmentInputsDirty);
   S.accessVersion = accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
@@ -662,6 +669,10 @@ export function deserialize(d: any): Game {
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
   try { loadNetwork(g, d.aiNetwork); } catch (e) { console.warn('Save load: loadNetwork failed', e); }
+  // Saved road shapes restore after the first share-cache prime. Align their disposable input
+  // versions too; retain any genuinely pending population work for the next simulation tick.
+  if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
+    g.stations.restoreCatchmentShares(d.catchMaxB, g.lines.catchmentDirty || g.lines.catchmentRoadsDirty || !!d.catchmentInputsDirty);
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

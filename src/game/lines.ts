@@ -928,6 +928,9 @@ export class Lines {
   /** Recompute the station catchments if routing changed since (called by the game every tick). */
   flushCatchment() {
     const stations = this.game.stations;
+    // Construction can change lots or terrain without rebuilding the route graph. Those existing
+    // dependency versions still owe a population refresh, including after a cold save load.
+    if (stations.catchmentInputsChanged() || stations.catchmentPopulationPending) this.catchmentDirty = true;
     if (!this.catchmentDirty) { stations.prepareCatchmentTick(); return; }
     this.catchmentDirty = false;
     // A frequency-only rebuild still refreshes demand's moving region assignment; walking work is skipped.

@@ -1109,6 +1109,8 @@ interface Project {
   started: number;
   /** Completed selection survey; construction proves its sites, yard, fleet and economics again. */
   urbanLayout?: UrbanLayout;
+  /** Earlier local survey heading, repriced as an additional smaller-stage alternative. */
+  urbanHeading?: { angle: number; stops: number };
   /** share: the network owner whose access agreement this project signed (-1: none) */
   access?: number;
   /** construction started (a failure then cost money; failed plans are retried sooner) */
@@ -4267,6 +4269,18 @@ export class AIController {
       const lats = layout.interchanges.length || through ? [0, 2, -2] : [0, 5, -5, 10, -10, 15, -15];
       const candidates: UrbanTask['candidates'] = mode === 'metro' ? (layout.interchanges.length ? lats : [0, 5, -5, 10, -10]).flatMap((lat) => angles.map(({ a }) => ({ a, lat, lv: 'underground' as const })))
         : lats.flatMap((lat) => angles.flatMap(({ a }, i) => (i < 3 ? ['ground', 'elevated', 'underground'] as const : ['underground'] as const).map((lv) => ({ a, lat, lv }))));
+      const heading = p.urbanHeading;
+      if (!through && !layout.interchanges.length && heading && Number.isFinite(heading.angle)
+        && Number.isInteger(heading.stops) && heading.stops >= 2
+        && layout.targets.length < heading.stops) {
+        // The town axis can change while a larger opening is surveyed. Add its earlier heading
+        // after the existing bounded search, using new native sites, works, fleet and prices.
+        const retainedLats = mode === 'metro' ? [0, 5, -5, 10, -10] : lats;
+        const retained = retainedLats.flatMap(lat => (mode === 'metro' ? ['underground'] as const
+          : ['ground', 'elevated', 'underground'] as const).map(lv => ({ a: heading.angle, lat, lv })));
+        for (const c of retained) if (!candidates.some(q => Math.abs(q.a - c.a) < 1e-9 && q.lat === c.lat && q.lv === c.lv))
+          candidates.push(c);
+      }
       // Compare an opening stage between the interchanges with the full line's optional outer stops.
       // Both stages must prove their sites, full fleet and investment return before building.
       if (layout.interchanges.length === 2 && layout.targets.length >= 6) {
@@ -4286,6 +4300,9 @@ export class AIController {
     }
     const task = this.urbanTask;
     const layout = task.layout, PL = layout.platform ?? (mode === 'metro' ? 12 : 7), SP = layout.spacing, n = layout.targets.length;
+    // Infer the same saved relation for urban work begun by an older build, without retaining proposals.
+    if (!p.urbanHeading && !layout.interchanges.length && (layout.towns?.length ?? 1) === 1)
+      p.urbanHeading = { angle: layout.angle, stops: n };
     const designGrade = TRACK_TYPES.electric.maxGrade;
     const retry = function* (self: AIController, why: string, days = 1500): Generator<void, void> {
       const count = task.maxStops ?? maxStops;
