@@ -155,7 +155,7 @@ function connectionCurve(a: SPt, b: SPt) {
  * it and, unless `dry`, lays it, splitting the tracks there. `tracks`: the edges it may touch (its two tracks).
  */
 function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, dry: boolean, type?: string, infrastructureOwner = owner, junctions = false,
-  removed?: ReadonlySet<number>, maxSpend = Infinity): { error: string | null; cost: number; length?: number; upkeep?: number; crossings?: number } {
+  removed?: ReadonlySet<number>, maxSpend = Infinity, protection?: { edges: ReadonlySet<number>; reserve: number; signalScope?: ReadonlySet<number> }): { error: string | null; cost: number; length?: number; upkeep?: number; crossings?: number } {
   const net = g.world.net, w = g.world;
   for (const q of [a, b]) {
     const es = q.edge !== undefined ? [net.edges.get(q.edge)] : q.node !== undefined ? net.nodes.get(q.node)?.edges.map((id) => net.edges.get(id)) ?? [] : [];
@@ -273,6 +273,20 @@ function connectS(g: Game, owner: number, a: SPt, b: SPt, tracks: Set<number>, d
   if (diamonds.some((c) => sections.some((s) => s.s0 <= sAtU(c.u) && s.s1 >= sAtU(c.u)))) return { error: 'junction needs a ground approach', cost: 0 };
   const cost = Math.round(price);
   const upkeep = trackBasePerUnit(ttype) * (tab.len + sections.reduce((n, s) => n + (s.s1 - s.s0) * (s.type === 'tunnel' ? 4 : 3), 0));
+  if (protection) {
+    // The native intersection plan names the crossed rails. Protect them as well as the platform,
+    // its approaches and endpoint splits before any mutation, including reserved future paths.
+    const affected = new Set([...protection.edges, ...diamonds.map(c => c.edge)]);
+    for (const q of [a, b]) {
+      if (q.edge !== undefined) affected.add(q.edge);
+      if (q.node !== undefined) for (const id of net.nodes.get(q.node)?.edges ?? []) affected.add(id);
+    }
+    if (protection.signalScope && [...affected].some(id => !protection.signalScope!.has(id))) return { error: 'affected track outside priced operating scope', cost };
+    if ([...affected].some(id => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0)
+      || [...net.crossings.values()].some(c => (affected.has(c.e1) || affected.has(c.e2)) && g.vehicles.crossingReservedBy(c.id) !== 0))
+      return { error: 'train or reserved path in the throat', cost };
+    if (cost > g.company(owner).economy.money - protection.reserve) return { error: 'Not enough money after reserved fleet', cost };
+  }
   if (dry) return { error: null, cost, length: tab.len, upkeep, crossings: diamonds.length };
   for (const q of [a, b]) if (q.edge !== undefined && g.vehicles.isEdgeBusy(q.edge)) return { error: 'train in the way', cost };
   const eco = g.company(owner).economy;
@@ -1578,11 +1592,24 @@ function pointOut(g: Game, node: number, e: NEdge, d: number, via?: number[], pa
  * turnouts. The builder may be the station's owner or another company with access, and only joins usable track.
  * Returns how many were connected, and why others could not be.
  */
-export function connectStationThroat(g: Game, stationId: number, owner: number, opts: { avoid?: Partial<Record<'front' | 'back', [number, number]>> } = {}): { connected: number; failed: string[] } {
+export interface StationThroatOptions {
+  avoid?: Partial<Record<'front' | 'back', [number, number]>>;
+  /** An unopened paid formation may cross its depot spur with a native registered diamond. */
+  junctions?: boolean;
+  /** Cash kept for the complete actual fleet and operating cushion; this operation never borrows. */
+  reserve?: number;
+  /** Reprice the actual candidate under the caller's existing project return before construction. */
+  approve?: (cost: number, upkeep: number, finishing: number) => boolean;
+  /** Exact native current operating-scope preview; optional leads must keep all existing affected rails within it. */
+  signals?: { edges: ReadonlySet<number>; cost: number };
+}
+
+export function connectStationThroat(g: Game, stationId: number, owner: number, opts: StationThroatOptions = {}): { connected: number; failed: string[]; cost?: number; upkeep?: number; finishing?: number } {
   const net = g.world.net;
   const st = g.stations.get(stationId);
-  const res = { connected: 0, failed: [] as string[] };
+  const res: { connected: number; failed: string[]; cost?: number; upkeep?: number; finishing?: number } = { connected: 0, failed: [] };
   if (!st || !st.rail) return res;
+  if (opts.junctions && !opts.signals) { res.failed.push('no native signalling completion quote'); return res; }
   const access = g.trackUpgradeError(owner, st.owner);
   if (access) { res.failed.push(access); return res; }
   const r = st.rail;
@@ -1619,7 +1646,28 @@ export function connectStationThroat(g: Game, stationId: number, owner: number, 
             if (qe && !g.canUse(owner, qe.owner)) { why = `track of ${g.company(qe.owner).name}: needs track access`; break; }
             // the neighbour's approach as far as the turnout runs beside the new curve
             const tracks = new Set<number>([...own, ...via, ...ends.flatMap((t) => [...approach(t.front), ...approach(t.back)])]);
-            const c = connectS(g, owner, { x: nj.x, z: nj.z, y: nj.y, tx: ax, tz: az, node: nj.id }, q, tracks, false, undefined, st.owner);
+            const start = { x: nj.x, z: nj.z, y: nj.y, tx: ax, tz: az, node: nj.id };
+            const protection = opts.junctions ? { edges: tracks, reserve: Math.max(0, opts.reserve ?? 0), signalScope: opts.signals!.edges } : undefined;
+            if (opts.junctions) {
+              if (nj.signal !== 0 || nj.edges.length !== 1) { why = 'platform start is not fresh and unsignalled'; continue; }
+              const quote = connectS(g, owner, start, q, tracks, true, undefined, st.owner, true, undefined, Infinity, protection);
+              if (quote.error) { why = quote.error; continue; }
+              // Fresh start: at most one starter. Splitting a non-opposed chain adds at most two
+              // directional approaches; splitting its retained signal gaps cannot add block signals.
+              // Each new or retained diamond in the scope may need four native approaches.
+              const diamonds = [...net.crossings.values()].filter(c => c.kind === 'diamond' && (opts.signals!.edges.has(c.e1) || opts.signals!.edges.has(c.e2))).length;
+              const finishing = opts.signals!.cost + SIGNAL_COST * (3 + 4 * (diamonds + (quote.crossings ?? 0)));
+              protection!.reserve += finishing;
+              if (quote.cost > g.company(owner).economy.money - protection!.reserve) { why = 'Not enough money after fleet and signalling'; continue; }
+              if (opts.approve && !opts.approve(quote.cost, quote.upkeep ?? 0, finishing)) { why = 'throat does not pay for its construction and upkeep'; continue; }
+              res.finishing = Math.max(res.finishing ?? 0, finishing);
+            }
+            const c = connectS(g, owner, start, q, tracks, false, undefined, st.owner, !!opts.junctions, undefined, Infinity, protection);
+            if (!c.error && opts.junctions) {
+              res.cost = (res.cost ?? 0) + c.cost; res.upkeep = (res.upkeep ?? 0) + (c.upkeep ?? 0);
+              // One paid lead changes scope IDs through native splits. A later lead needs a fresh preview.
+              res.connected++; return res;
+            }
             if (!c.error) { conn[j] = true; changed = true; res.connected++; break; }
             why = c.error;
           }

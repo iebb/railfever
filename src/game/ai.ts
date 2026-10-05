@@ -41,7 +41,7 @@ import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn,
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
 import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
-import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack } from './ai-initial-track';
+import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
@@ -2772,6 +2772,8 @@ export class AIController {
     if (!this.borrowFor(total)) return fail('no money', 360);
     p.built = true;
     const spent0 = this.eco.money;
+    // This live legacy rail generator cancels on load; no saved cursor resumes this construction baseline.
+    const throatFinance = openingThroatBaseline(g, owner);
     if (wireEdges.length) electrify(g, wireEdges, owner);
     const built = new Map<StationPlan, number>();
     for (const sp of [hub ? null : pr.a, hubB || join ? null : pr.b]) {
@@ -2956,9 +2958,8 @@ export class AIController {
       // platforms still loose at the line's end (wide high-speed curves need a longer throat): turnout ladders
       // onto the approach (stations API)
       if (ends.slice(1).some((id) => net.nodes.get(id)?.edges.length === 1)) {
-        const throat = (Trackops as unknown as { connectStationThroat?: (g: Game, id: number, owner: number) => unknown }).connectStationThroat;
         const t0 = net.nextEdge;
-        if (throat && st.owner === owner) throat(g, st.id, owner);
+        if (st.owner === owner) Trackops.connectStationThroat(g, st.id, owner);
         this.track(t0);
         yield;
       }
@@ -3008,12 +3009,40 @@ export class AIController {
       if (early) g.lines.rebuild();
     }
     p.openingLine = line.id;
+    // Optional depot-spur crossings are priced against the actual final timetable and departure rails.
+    // borrowFor(fleet + 300k) below itself keeps another 300k. Optional work must not trigger that loan.
+    const fleet = mail.cars.reduce((n, c) => n + c.cost, 0) * nTrains, fleetReserve = fleet + 600_000;
+    const openingReturn = { total, fleet, income, running, maintenance: maint,
+      wear: Math.max(0, sv.trackUpkeep - len * trackBasePerUnit(type)), amortisation };
+    let repaired = false, finishing = 0;
+    for (const st of [stA, stB]) {
+      if (ext || !p.stations.includes(stA.id) || !p.stations.includes(stB.id) || st.owner !== owner) continue;
+      const signalPlan = openingSignalPlan(g, line, dep, mail.cars, first);
+      if (!signalPlan) continue;
+      const t0 = net.nextEdge;
+      const result = Trackops.connectStationThroat(g, st.id, owner, { junctions: true, reserve: fleetReserve, signals: signalPlan,
+        approve: (cost, upkeep, finish) => openingThroatReturn(g, throatFinance, p, openingReturn, cost + finish, upkeep)?.pays === true });
+      this.track(t0);
+      if (result.connected) { repaired = true; finishing = result.finishing ?? 0; }
+      if (result.failed.length) this.note(`${what} ${st.name}: incomplete throat (${result.failed.join('; ')})`);
+    }
     // signals for the new or extended line (before its trains run)
-    this.signalLine(line.id);
+    if (repaired) {
+      const exact = openingSignalPlan(g, line, dep, mail.cars, first);
+      if (!exact || exact.cost > finishing || this.eco.money < fleetReserve + exact.cost
+        || openingThroatReturn(g, throatFinance, p, openingReturn, exact.cost, 0)?.pays !== true)
+        return fail('opening signalling exceeds its paid completion reserve', 720);
+      const signals = Signals.autoSignalLine(g, [...exact.edges], owner);
+      this.stats.signals += signals.placed;
+      if (signals.placed !== exact.plan.placed || signals.changed !== exact.plan.changed
+        || signals.warnings.some(w => !exact.plan.warnings.includes(w))) return fail('opening signalling cannot be completed safely', 720);
+    } else this.signalLine(line.id);
     yield;
     // (building may have cost more than planned: borrow for the trains; a line still without one gets its first
     // train later, see manage, rather than the railway being lost)
-    this.borrowFor((trainCost + mail.price) * nTrains + 300_000);
+    if (repaired) {
+      if (this.eco.money < fleetReserve) return fail('paid opening fleet reserve changed before purchase', 720);
+    } else this.borrowFor((trainCost + mail.price) * nTrains + 300_000);
     let bought = 0;
     for (let i = 0; i < nTrains; i++) {
       const t = g.vehicles.buyTrain(dep, this.mailPolicy.openingCars(line, mail.cars), line.id);

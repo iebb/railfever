@@ -152,7 +152,9 @@ export function usesSharedRail(g: Game, l: Line): boolean {
   if ((l.operators?.length ?? 0) > 0 || new Set(fleet(g, l).map(t => t.owner)).size > 1) return true;
   const inv = inventory(g), ours = new Set((inv.routes.get(l.id) ?? []).flat());
   if ([...ours].some(id => { const e = g.world.net.edges.get(id); return e && e.owner >= 0 && e.owner !== l.owner; })) return true;
-  return [...inv.routes].some(([id, routes]) => id !== l.id && routes.some(h => h.some(e => ours.has(e))));
+  if ([...inv.routes].some(([id, routes]) => id !== l.id && routes.some(h => h.some(e => ours.has(e))))) return true;
+  // Different representative platform rails still use the same station's pooled capacity.
+  return connectedLines(g, l, inv).length > 1;
 }
 
 export function observeRailCapacity(g: Game) {

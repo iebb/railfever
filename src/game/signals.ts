@@ -298,7 +298,7 @@ export interface AutoSignalOpts {
 }
 
 /** Track a line uses: the best route between consecutive stops (from every platform, both ways) and the stops' station tracks. */
-function lineTrack(g: Game, lineId: number): Set<number> {
+export function lineTrack(g: Game, lineId: number): Set<number> {
   const net = g.world.net;
   const E = new Set<number>();
   const l = g.lines.get(lineId);
@@ -348,7 +348,7 @@ function lineTrack(g: Game, lineId: number): Set<number> {
 interface Chain { steps: { edge: NEdge; dir: number }[]; cum: number[]; len: number; start: number; end: number }
 
 /** Maximal runs of plain track (no station / depot track) through two-edge nodes within E. */
-function chainsOf(g: Game, E: Set<number>, special: (e: NEdge) => boolean): Chain[] {
+export function chainsOf(g: Game, E: Set<number>, special: (e: NEdge) => boolean): Chain[] {
   const net = g.world.net;
   const seen = new Set<number>();
   const out: Chain[] = [];

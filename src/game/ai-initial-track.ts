@@ -7,6 +7,11 @@ import { SHARED_TRACK, structureFactor } from './construction';
 import { TRACK_TYPES, UNIT_M, ELECTRIFY, WATER_Y } from './constants';
 import { trackBasePerUnit } from './opcosts';
 import { planCapacityTrackUpgrade, commitCapacityTrackUpgrade } from './ai-capacity-works';
+import { depotUpkeep } from './build-ops';
+import { autoSignalLine, lineTrack, chainsOf } from './signals';
+import { consistRule, findRailRoute, platformDepartureFrontiers } from './train';
+import type { Line } from './lines';
+import type { VehicleModel } from './vehicle-types';
 
 export interface InitialTrackTraffic {
   revenue: number;
@@ -115,4 +120,96 @@ export function layInitialDoubleTrack(g: Game, edges: number[], payer: number, t
     if (!result.error) return { built: !result.finishError, choice, ...result };
   }
   return { built: false, choice: undefined, edges: [], signals: 0, cost: 0 };
+}
+
+interface OpeningAsset { kind: 'edge' | 'node' | 'station' | 'depot'; id: number; signature: string }
+export interface OpeningThroatBaseline {
+  owner: number; year: number; construction: number; maintenance: number; assets: OpeningAsset[];
+}
+function openingAssetSignature(g: Game, kind: OpeningAsset['kind'], id: number): string | undefined {
+  const net = g.world.net;
+  if (kind === 'edge') {
+    const e = net.edges.get(id);
+    return e && JSON.stringify([e.owner, e.kind, e.type, e.len, e.tram, e.tramOwner, e.a, e.b, e.sa, e.sb, e.bez, e.prof, e.sections, e.station, e.depot]);
+  }
+  if (kind === 'node') {
+    const n = net.nodes.get(id);
+    return n && JSON.stringify([n.owner, n.x, n.y, n.z, n.edges, n.signal, n.signalPass, n.signalKind]);
+  }
+  if (kind === 'station') { const s = g.stations.get(id); return s && JSON.stringify([s.owner, s.rail, s.stops]); }
+  const d = g.depots.get(id); return d && JSON.stringify(d);
+}
+/** Native opening books, before construction. Legacy rail generators cancel on load; they do not resume this baseline. */
+export function openingThroatBaseline(g: Game, owner: number): OpeningThroatBaseline {
+  const assets: OpeningAsset[] = [], nodes = new Set<number>();
+  const add = (kind: OpeningAsset['kind'], id: number) => { const signature = openingAssetSignature(g, kind, id); if (signature !== undefined) assets.push({ kind, id, signature }); };
+  for (const e of g.world.net.edges.values()) if (e.owner === owner || e.tram && e.tramOwner === owner) { add('edge', e.id); nodes.add(e.a); nodes.add(e.b); }
+  for (const id of nodes) add('node', id);
+  for (const s of g.stations.map.values()) if (s.owner === owner) add('station', s.id);
+  for (const d of g.depots.map.values()) if (d.owner === owner) add('depot', d.id);
+  return { owner, year: g.year, construction: g.company(owner).economy.thisYear.construction, maintenance: g.maintenanceOf(owner), assets };
+}
+
+/** Reprice paid native formation, not the depot/throat estimate twice. Unrelated expense is conservative;
+ * changes to old owned assets invalidate the baseline so their refunds/upkeep falls cannot subsidise this opening. */
+export function openingThroatReturn(g: Game, before: OpeningThroatBaseline,
+  project: { edges: readonly number[]; stations: readonly number[]; depots: readonly number[] },
+  service: { total: number; fleet: number; income: number; running: number; maintenance: number; wear: number; amortisation: number },
+  cost: number, upkeep: number): { pays: boolean; capital: number; maintenance: number; need: number; paid: number } | null {
+  if (before.assets.some(a => openingAssetSignature(g, a.kind, a.id) !== a.signature)) return null;
+  const eco = g.company(before.owner).economy;
+  let construction = eco.thisYear.construction;
+  for (let year = before.year; year < g.year; year++) {
+    const record = eco.yearTotals.find(r => r.year === year);
+    if (!record) return null;
+    construction += record.v.construction;
+  }
+  const paid = before.construction - construction;
+  if (paid < 0 || !Number.isFinite(paid)) return null;
+  let assets = 0;
+  for (const id of new Set(project.edges)) { const e = g.world.net.edges.get(id); if (e?.owner === before.owner) assets += g.edgeMaintenance(e); }
+  for (const id of new Set(project.stations)) { const s = g.stations.get(id); if (s?.owner === before.owner) assets += g.stationMaintenance(s); }
+  for (const id of new Set(project.depots)) { const d = g.depots.get(id); if (d?.owner === before.owner) assets += depotUpkeep(d); }
+  const capital = Math.max(service.total, paid + service.fleet + cost);
+  const maintenance = Math.max(service.maintenance, Math.max(assets, g.maintenanceOf(before.owner) - before.maintenance) + service.wear + upkeep);
+  const need = (capital - service.fleet) * service.amortisation + capital * .03;
+  return { pays: [capital, maintenance, need].every(Number.isFinite) && service.income - service.running - maintenance >= need, capital, maintenance, need, paid };
+}
+
+/** Exact current timetable and native initial-departure rails; no prospective graph or allocated IDs. */
+export function openingSignalPlan(g: Game, line: Line, depot: number, cars: VehicleModel[], first: number) {
+  // The supported fresh opening has native default stock; custom patterns need their own departure proof.
+  if (line.patterns?.length || line.operators?.length || line.vehicles.length || line.stops.length !== 2 || line.stops[0] === line.stops[1]
+    || line.stops.some(id => g.stations.get(id)?.owner !== line.owner)) return null;
+  const dp = g.depots.get(depot), stub = dp && g.world.net.edges.get(dp.edge), index = line.stops.indexOf(first);
+  if (!dp || dp.owner !== line.owner || !stub || index < 0) return null;
+  const onward = line.stops[1 - index], rule = consistRule(cars), length = cars.reduce((n, c) => n + c.length + .1, 0);
+  const path = findRailRoute(g, [{ edge: stub, dir: 1 }], first, line.owner, -1, 60000, false, rule, true, { length, onward });
+  if (!path) return null;
+  const end = path.conts[path.conts.length - 1];
+  const group = g.stations.railTrackGroups(g.stations.get(first)!).find(q => q.steps.some(s => s.edge === end.edge.id));
+  if (!group) return null;
+  const arrival = group.steps.find(s => s.edge === end.edge.id)!;
+  const ordered = arrival.dir === end.dir ? group.steps : [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+  const departure = platformDepartureFrontiers(g, ordered, line.owner, rule, length);
+  const returning = findRailRoute(g, [...departure.forward, ...departure.reverse], onward, line.owner, -1, 60000, false, rule, true, { length, onward: first });
+  if (!returning) return null;
+  const secondEnd = returning.conts[returning.conts.length - 1];
+  const secondGroup = g.stations.railTrackGroups(g.stations.get(onward)!).find(q => q.steps.some(s => s.edge === secondEnd.edge.id));
+  if (!secondGroup) return null;
+  const secondArrival = secondGroup.steps.find(s => s.edge === secondEnd.edge.id)!;
+  const secondOrdered = secondArrival.dir === secondEnd.dir ? secondGroup.steps : [...secondGroup.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }));
+  const secondDeparture = platformDepartureFrontiers(g, secondOrdered, line.owner, rule, length);
+  const home = findRailRoute(g, [...secondDeparture.forward, ...secondDeparture.reverse], first, line.owner, -1, 60000, false, rule, true, { length, onward });
+  if (!home) return null;
+  const edges = new Set([...lineTrack(g, line.id), stub.id, ...path.conts.map(c => c.edge.id), ...returning.conts.map(c => c.edge.id), ...home.conts.map(c => c.edge.id)]);
+  if ([...edges].some(id => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0)
+    || [...g.world.net.crossings.values()].some(c => (edges.has(c.e1) || edges.has(c.e2)) && g.vehicles.crossingReservedBy(c.id) !== 0)) return null;
+  const through = new Set(g.stations.all().flatMap(s => s.rail?.throughEdges ?? []));
+  const chains = chainsOf(g, edges, e => e.station >= 0 || e.depot >= 0 || through.has(e.id));
+  // A split of a circular two-way chain can create new twin-loop exits outside the local role bound.
+  if (chains.some(c => c.start === c.end)) return null;
+  const plan = autoSignalLine(g, [...edges], line.owner, { preview: true });
+  if (plan.warnings.some(w => w === 'Opposing one-way signals: track unchanged')) return null;
+  return { edges, cost: plan.cost, plan };
 }
