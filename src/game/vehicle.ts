@@ -3,6 +3,7 @@
 // stops of its service pattern) and the odometer for the operating costs (opcosts.ts).
 import type { Game } from './game';
 import type { Station } from './stations';
+import { WALK_LINE } from './stations';
 import type { Vec3Like } from './geom';
 import { fareFor, distanceFare, legacyFare, simNow, fareGroupKey, railHistory, changeClass, transferFareFactor, WAIT_CAP_HEADWAYS, stationFareContext, type FareMode } from './fares';
 import { stopsAt, nextStopIndex, servesStation, boarding, patternHeadway, patternOf } from './patterns';
@@ -206,7 +207,13 @@ export abstract class Vehicle {
       // each change of vehicle takes 10% off the leg ending in it and every later leg (fares.ts TRANSFER_FARE_FACTOR):
       // their changes so far, and one more for those changing here
       const changing = c.dest !== st.id;
-      f *= transferFareFactor((c.transfers ?? 0) + (changing ? c.count : 0), c.count);
+      const hop = changing ? g.lines.nextHop(st.id, c.dest) : undefined;
+      let next = hop, boardingAt = st.id;
+      for (let n = 0; next?.line === WALK_LINE && n < 4; n++) {
+        boardingAt = next.alight; next = g.lines.nextHop(boardingAt, c.dest);
+      }
+      const chargedChange = changing && !g.stations.isSameStationComplex(st.id, next ? boardingAt : c.dest);
+      f *= transferFareFactor((c.transfers ?? 0) + (chargedChange ? c.count : 0), c.count);
       income += f;
       if (c.dest === st.id) {
         st.arrivedMonth += c.count;
@@ -215,9 +222,8 @@ export abstract class Vehicle {
         if (town) town.passTransMonth += c.count;
       } else {
         // changing here: they wait for their next leg, each with one change of vehicle more
-        const hop = g.lines.nextHop(st.id, c.dest);
         const rail = railHistory(mode === 'rail' ? before + distanceFare(dist) : before);
-        const changes = 1 + (c.count > 0 ? Math.max(0, c.transfers ?? 0) / c.count : 0);
+        const changes = (chargedChange ? 1 : 0) + (c.count > 0 ? Math.max(0, c.transfers ?? 0) / c.count : 0);
         if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n * changes, rail));
       }
       moved += c.count;

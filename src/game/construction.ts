@@ -76,6 +76,8 @@ export interface BuildOptions {
   type: string;
   tracks: number;
   heightOffset: number;
+  /** Player endpoint edits retain the earlier profile and change only the final grade transition. */
+  endHeightOnly?: boolean;
   crossing: 'auto' | 'over' | 'under' | 'level';
   owner: number;
   /** An access-funded upgrade: the builder pays, this company retains the added infrastructure. */
@@ -650,6 +652,9 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
 // ------------------------------------------------------------------------------------ planning
 
 export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): Proposal {
+  const baseEndProfile = opts.endHeightOnly && opts.heightOffset && end.kind === 'free'
+    ? planEdge(g, start, end, { ...opts, heightOffset: 0, endHeightOnly: false }).tracks[0]
+    : undefined;
   const w = g.world;
   const net = w.net;
   if (opts.kind === 'rail') {
@@ -861,6 +866,14 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     }
   }
 
+  if (baseEndProfile?.prof.length && endY !== null) {
+    const originalEnd = profAt(baseEndProfile.prof, baseEndProfile.len, baseEndProfile.len);
+    const transition = Math.max(8, Math.abs(endY - originalEnd) / Math.max(0.001, grade) * 1.25);
+    const unchangedUntil = Math.max(0, L - transition);
+    for (let i = 0; i < M; i++) if (i === 0 || sArr[i] < unchangedUntil) {
+      cons.push({ i, kind: 'eq', v: profAt(baseEndProfile.prof, baseEndProfile.len, sArr[i] / L * baseEndProfile.len) });
+    }
+  }
   let sol = solveProfile(desired, ds, cons, grade);
   if (!sol.ok) { fail(subway ? 'Surfaces here: go deeper' : 'Too steep: lengthen route or change height'); }
 

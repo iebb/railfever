@@ -210,13 +210,13 @@ export function openHelp(ui: UI) {
       <li>Click: build / continue; drag: one section; right-click / <kbd>Esc</kbd> / long press: end.</li>
       <li>Touch: tap start, end to preview, same spot to build; elsewhere: move preview.</li>
       <li>One track type: curves and grades set speed, up to 400 km/h; 1–4 parallel tracks.</li>
-      <li>Road type, crossing mode and end height: <kbd>[</kbd>/<kbd>]</kbd>, ±5 m for bridges / tunnels.</li>
+      <li>Road type, crossing mode and final-section height: <kbd>,</kbd>/<kbd>.</kbd> or <kbd>PgDn</kbd>/<kbd>PgUp</kbd>, ±5 m (<kbd>Shift</kbd>: ±1 m) for bridges / tunnels.</li>
       <li><kbd>Shift</kbd> over track: parallel copy.</li>
     </ol>
     <h4>Getting started</h4>
     <ol>
       <li>Two train stations (<kbd>3</kbd>) near towns → track → depot (<kbd>5</kbd>) at a free track end.</li>
-      <li><kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Alt</kbd>+wheel: rotate; manual rotation disables track alignment.</li>
+      <li><kbd>N</kbd> / <kbd>M</kbd> (<kbd>Shift</kbd>: fine) / <kbd>Alt</kbd>+wheel: rotate; manual rotation disables track alignment.</li>
       <li>Start with single track and one-platform halts; reserve cash for a train.</li>
       <li>Bridges, tunnels and demolition cost extra.</li>
       <li><b>Finances</b> (<kbd>I</kbd>, money plate or Menu): costs and loans; money warnings offer Borrow.</li>
@@ -327,7 +327,7 @@ export function openHelp(ui: UI) {
       <li><kbd>M</kbd> lines map · <kbd>H</kbd> collapse minimap · <kbd>B</kbd> Lines / Stations.</li>
       <li><kbd>P</kbd> demand · <kbd>O</kbd> catchment · <kbd>G</kbd> grid · <kbd>F1</kbd> help · <kbd>F3</kbd> performance.</li>
       <li><kbd>Space</kbd> pause · <kbd>,</kbd> slower · <kbd>.</kbd> faster: 1×, 2×, 4×, 8×.</li>
-      <li><kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> / <kbd>Alt</kbd>+wheel: rotate station / depot.</li>
+      <li><kbd>N</kbd> / <kbd>M</kbd> (<kbd>Shift</kbd>: fine) / <kbd>Alt</kbd>+wheel: rotate station / depot.</li>
       <li><kbd>+</kbd>/<kbd>−</kbd> / <kbd>Ctrl</kbd>+wheel / pinch: zoom · <kbd>R</kbd>/<kbd>F</kbd>: camera tilt.</li>
       <li><kbd>Space</kbd> / <kbd>Enter</kbd>: activate focused control · <kbd>Esc</kbd>: cancel / close.</li>
       <li>Form controls suppress global shortcuts; <kbd>Esc</kbd> still works.</li>

@@ -259,7 +259,7 @@ export function legacyFare(dist: number, days: number, count: number): number {
 }
 
 /** Time (s) of a walking transfer of `gapUnits` between linked stations. */
-export function transferWalkTime(gapUnits: number): number { return TRANSFER_WALK.baseS + (Math.max(0, gapUnits) * UNIT_M * 1.2) / TRANSFER_WALK.mps; }
+export function transferWalkTime(gapUnits: number, internal = false): number { return (internal ? 0 : TRANSFER_WALK.baseS) + (Math.max(0, gapUnits) * UNIT_M * 1.2) / TRANSFER_WALK.mps; }
 
 // ------------------------------------------------------------------------------ mail
 /**

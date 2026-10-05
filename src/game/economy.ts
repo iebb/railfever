@@ -166,6 +166,8 @@ export class Economy {
 export interface Company {
   id: number;
   name: string;
+  /** Town hosting the company headquarters; stable across network growth and acquisitions. */
+  hqTown?: number;
   color: string;
   ai: boolean;
   economy: Economy;

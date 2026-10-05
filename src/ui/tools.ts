@@ -53,13 +53,13 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   inspect: { name: 'Inspect', hint: 'Click an object for details.' },
   rail: { name: 'Build track', hint: 'Click: start / build; snap: extend / branch; Shift: parallel copy; right-click / Esc / long press: end.' },
   road: { name: 'Build road', hint: 'Click: start / build; snap: junction; connect to town streets for buses.' },
-  station: { name: 'Train station', hint: 'Auto-aligns to track ends; R / Shift+R / Alt+wheel: rotate 15°; connect with track.' },
+  station: { name: 'Train station', hint: 'Auto-aligns to track ends; N / M (Shift: fine) / Alt+wheel: rotate 15°; connect with track.' },
   busstop: { name: 'Bus stop', hint: 'On a road; joins your nearby train station for transfers.' },
   tram: { name: 'Tram tracks', hint: 'Click or drag along roads; New road: road with wire; Remove: your tracks.' },
   tramstop: { name: 'Tram stop', hint: 'On tram tracks; joins your nearby station for transfers.' },
-  'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
-  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end (underground at a tunnel end); otherwise connect with track; R / Shift+R / Alt+wheel rotates.' },
-  'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
+  'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: N / M (Shift: fine) / Alt+wheel rotates.' },
+  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end (underground at a tunnel end); otherwise connect with track; N / M (Shift: fine) / Alt+wheel rotates.' },
+  'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: N / M (Shift: fine) / Alt+wheel rotates.' },
   signal: { name: 'Signals', hint: 'Own or accessible track · click: two-way → one-way → reversed → none; drag: series facing drag; right-click / Remove: remove.' },
   double: { name: 'Double track', hint: 'Own or accessible single track → second track through platforms and junctions; directional: signals and station crossovers.' },
   entrance: { name: 'Add entrance', hint: 'Ground: hall, footbridge, underpass or end gate; elevated / underground: roadside entrance; own catchment.' },
@@ -67,7 +67,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   terraform: { name: 'Terraform', hint: 'Hold: raise / lower; Level: height where pressed.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations or labels to add stops; Esc / Done: finish.' },
   metro: { name: 'Urban-style track', hint: 'Double track with wire · underground default · any level · any train (electric ones need the wire) · mixes with main-line track' },
-  'metro-station': { name: 'Urban-style station', hint: `Metro / light-rail style · street entrances · side platforms · ~1 km spacing · R / Shift+R / Alt+wheel rotates · any rail line · ${fmtLen(walkLimit('rail'))} street reach before building bonuses · standard fares` },
+  'metro-station': { name: 'Urban-style station', hint: `Metro / light-rail style · street entrances · side platforms · ~1 km spacing · N / M (Shift: fine) / Alt+wheel rotates · any rail line · ${fmtLen(walkLimit('rail'))} street reach before building bonuses · standard fares` },
   electrify: { name: 'Electrify', hint: 'Click or drag: overhead wire, platforms included; permitted foreign track keeps its owner.' },
   connect: { name: 'Connect tracks', hint: 'Pick two track points for a signalled curve with turnouts; click: build; Esc / right-click: restart.' },
   relevel: { name: 'Re-level', hint: 'Lift / sink with end ramps; stations move, lines and signals retained.' },
@@ -274,7 +274,7 @@ export class Tools {
 
   buildOptions(): BuildOptions {
     const rail = this.railBuild;
-    const o: BuildOptions = { kind: rail ? 'rail' : 'road', type: rail ? this.railType : this.roadType, tracks: rail ? this.tracks : 1, heightOffset: this.heightOffset, crossing: this.crossing, owner: PLAYER, tram: this.tool === 'tram' || undefined };
+    const o: BuildOptions = { kind: rail ? 'rail' : 'road', type: rail ? this.railType : this.roadType, tracks: rail ? this.tracks : 1, heightOffset: this.heightOffset, endHeightOnly: true, crossing: this.crossing, owner: PLAYER, tram: this.tool === 'tram' || undefined };
     if (rail && this.railLevel !== 'ground') { o.level = this.railLevel; o.levelHeight = this.levelHeight; o.levelDepth = this.levelDepth; }
     if (rail && this.railLevel === 'underground' && this.subwayOnly) o.subway = true;
     return o;
@@ -364,7 +364,7 @@ export class Tools {
   }
 
   adjustHeight(d: number) {
-    this.heightOffset = Math.max(-6, Math.min(6, Math.round((this.heightOffset + d) * 2) / 2));
+    this.heightOffset = Math.max(-6, Math.min(6, Math.round((this.heightOffset + d) * 10) / 10));
     this.onToolChange();
     this.refreshHover();
   }

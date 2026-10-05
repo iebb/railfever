@@ -16,7 +16,7 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
-import { walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
@@ -58,21 +58,25 @@ export type CatchMode = 'rail' | 'tram' | 'bus';
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Nominal walking limit per mode (units, 1 = 10 m): 70% of release 2.6's limits. Rail is one mode:
+ * Nominal walking limit per mode (units, 1 = 10 m): half of release 2.9's limits. Rail is one mode:
  * main-line, metro and light-rail stations walk alike. catchment.ts applies the
  * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 23.52, tram: 21.56, bus: 15.68 };
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 11.76, tram: 10.78, bus: 7.84 };
 /**
  * In-city metro and light-rail stations walk half as far: a station of metro or light-rail style (railPartMode)
  * standing in a town (Station.city) gets this share of the rail walking limit (and of its building's bonus), at its
  * forecourts, entrances and the rail access of its stops: a quarter of the area. Walks stay physical: every station
  * shares buildings and covers them by one curve of the walk (catchment.ts walkWeight / coverOf: full coverage within
- * FULL_COVER_WALK, 147 m, then tapering), so the half reach (147 m along streets) is wholly fully covered and simply
+ * FULL_COVER_WALK, then tapering), so the smaller in-city reach is wholly fully covered and simply
  * cuts off the taper beyond; trips per building never depend on a station's type. Main-line-style stations, and
  * metro or light-rail stops out in the country, keep the full reach.
  */
 export const CITY_WALK_SCALE = 0.5;
+/** Intermediate interchange walks use half the standard endpoint street budget, without changing catchment coverage. */
+export function transferWalkLimit(g: Game, a: Station, b: Station): number {
+  return 0.5 * WALK_DETOUR * Math.min(g.stations.catchmentRadius(a), g.stations.catchmentRadius(b));
+}
 /**
  * When a station stands in a town (Stations.cityAt): its town has at least `pop` residents and the station's centre
  * lies within `core` x the town's compact core radius (Towns.maxRadius); once in town, a station keeps that until its
@@ -1762,7 +1766,8 @@ export class Stations {
     const st = join ?? this.create(plan.x, plan.z, owner);
     this.buildRailPart(st, plan, owner);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
-    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.accessVersion = -1;
     g.onNetworkChanged();
     g.lines.rebuild();
@@ -1794,7 +1799,8 @@ export class Stations {
       g.world.removeTreesNear(f.x, f.z, Math.hypot(f.w, f.d) / 2 + 0.3);
     }
     this.repairSite(st);
-    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.markStation(st); this.accessVersion = -1;
     g.onNetworkChanged(); g.lines.rebuild();
     return { error: null, station: st.id };
@@ -2391,7 +2397,7 @@ export class Stations {
     const st = p.join ?? this.create(p.px!, p.pz!, owner);
     st.stops.push({ edge: p.edge!.id, s: p.s!, x: p.px!, z: p.pz! });
     if (!st.rail) { st.x = st.stops.reduce((a, q) => a + q.x, 0) / st.stops.length; st.z = st.stops.reduce((a, q) => a + q.z, 0) / st.stops.length; }
-    for (const o of p.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of p.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
     g.world.net.markEdge(p.edge!);
     this.accessVersion = -1;
     g.onNetworkChanged();
@@ -2451,31 +2457,69 @@ export class Stations {
 
   /** Can two stations be linked for walking transfers? Null if yes, else the reason. */
   canLink(aId: number, bId: number): string | null {
-    const g = this.game;
     const a = this.map.get(aId), b = this.map.get(bId);
     if (!a || !b) return 'No such station';
     if (a === b) return 'The same station';
     if (a.links.includes(b.id)) return 'Already linked';
-    if (a.owner !== b.owner && !g.canUse(a.owner, b.owner) && !g.canUse(b.owner, a.owner)) return 'Foreign stations: needs track access';
+    // Passenger walking passages are public; operating either company's platforms still requires native rail access.
     const d = this.gap(a, b), range = this.linkRange(a, b);
     if (d > range) return `Walking transfer: ${Math.round(d * 10)} m > max ${range * 10} m`;
     return null;
   }
 
-  /**
-   * How far apart two stations may be linked for walking transfers: TRANSFER_RANGE, or CITY_TRANSFER_RANGE when both
-   * stand in one town's core and one of them is an in-city metro / light-rail station (Station.city; the other in the
-   * core as cityAt says). Reads only the stations and their town: the same in the UI and the simulation.
-   */
-  linkRange(a: Station, b: Station): number {
-    if (a.townId < 0 || a.townId !== b.townId || !(a.city || b.city)) return TRANSFER_RANGE;
-    const town = this.game.towns.list[a.townId];
-    return [a, b].every((s) => s.city || this.cityAt(s.x, s.z, town)) ? CITY_TRANSFER_RANGE : TRANSFER_RANGE;
+  /** Intermediate transfer reach, distinct from either station's origin/destination walking coverage. */
+  linkRange(a: Station, b: Station): number { return transferWalkLimit(this.game, a, b); }
+
+  /** Automatic complexes stay compact: every existing part must be near every part being added. */
+  private nearbyComplex(a: Station, b: Station): boolean {
+    const left = this.complex(a.id), right = this.complex(b.id);
+    if (left.some(id => right.includes(id))) return false;
+    for (const x of left) for (const y of right) {
+      const p = this.map.get(x)!, q = this.map.get(y)!;
+      if (this.consecutiveStops(x, y) || this.gap(p, q) > Math.min(autoLinkRange(this.mode(p), this.mode(q)), this.linkRange(p, q))) return false;
+    }
+    return true;
+  }
+
+  /** Nearby rail platforms are one public interchange, retaining their separate track groups and owners. */
+  private autoLinkNearby(st: Station): number {
+    if (!st.rail) return 0;
+    const candidates = [...this.map.values()].filter(o => o !== st && o.rail && !st.links.includes(o.id))
+      .map(o => ({ st: o, gap: this.gap(st, o) })).sort((a, b) => a.gap - b.gap || a.st.id - b.st.id);
+    let added = 0;
+    for (const c of candidates) {
+      if (c.gap > Math.min(autoLinkRange(this.mode(st), this.mode(c.st)), this.linkRange(st, c.st))) continue;
+      if (!this.nearbyComplex(st, c.st) || this.canLink(st.id, c.st.id)) continue;
+      this.addLink(st, c.st); added++;
+    }
+    return added;
+  }
+
+  /** Load migration: retain valid explicit passages and group old nearby rail parts once. No physical assets move. */
+  restoreComplexes(autoLink: boolean): boolean {
+    let changed = false;
+    for (const st of this.map.values()) {
+      const kept = st.links.filter(id => {
+        const other = this.map.get(id);
+        return !!other && other !== st && this.gap(st, other) <= this.linkRange(st, other);
+      });
+      if (kept.length !== st.links.length) { st.links = kept; changed = true; }
+    }
+    if (autoLink) for (const st of [...this.map.values()].sort((a, b) => a.id - b.id)) if (this.autoLinkNearby(st)) changed = true;
+    const named = new Set<number>();
+    for (const st of this.map.values()) if (!named.has(st.id)) {
+      const group = stationComplex(this.game, st.id);
+      if (group.parts.length > 1) this.renameComplex(st.id, this.map.get(group.main)!.name);
+      for (const id of group.parts) named.add(id);
+    }
+    return changed;
   }
 
   private addLink(a: Station, b: Station) {
     if (!a.links.includes(b.id)) a.links.push(b.id);
     if (!b.links.includes(a.id)) b.links.push(a.id);
+    const main = this.map.get(stationComplex(this.game, a.id).main)!;
+    this.renameComplex(a.id, main.name);
   }
 
   /** Link two stations for walking transfers (both stay separate stations). Null = OK, else the reason. */
@@ -2494,6 +2538,21 @@ export class Stations {
     if (a && a.links.includes(bId)) { a.links = a.links.filter((x) => x !== bId); n++; }
     if (b && b.links.includes(aId)) { b.links = b.links.filter((x) => x !== aId); n++; }
     if (n) this.game.lines.rebuild();
+  }
+
+  /** One logical station, with physical platform IDs and track permissions kept separate. Pure membership read. */
+  isSameStationComplex(aId: number, bId: number): boolean {
+    const st = this.map.get(aId);
+    if (!st || !this.map.has(bId)) return false;
+    const parts = this.complex(aId);
+    return parts.includes(bId) && (parts.length > 1 || !!st.rail && st.stops.length > 0);
+  }
+
+  /** All platform groups of one public station share its actual saved name. */
+  renameComplex(id: number, name: string) {
+    const value = name.trim().slice(0, 40);
+    if (!value) return;
+    for (const part of this.complex(id)) { const st = this.map.get(part); if (st) st.name = value; }
   }
 
   /** All stations of a station's transfer complex (itself and everything linked to it, transitively). */
@@ -2519,7 +2578,7 @@ export class Stations {
   }
 
   /** Walking transfer cost between linked stations (Lines.rebuild adds its transfer penalty). */
-  walkCost(a: Station, b: Station): number { return WALK_BASE + WALK_PER_UNIT * this.gap(a, b); }
+  walkCost(a: Station, b: Station): number { return (this.isSameStationComplex(a.id, b.id) ? 0 : WALK_BASE) + WALK_PER_UNIT * this.gap(a, b); }
 
   /** Walking transfer edges of all transfer complexes (both directions), for the line graph. */
   walkLinks(): { from: number; to: number; cost: number }[] {
@@ -3208,7 +3267,7 @@ export class Stations {
     }
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
-    const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to)) : 0);
+    const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to), this.isSameStationComplex(from.id, to.id)) : 0);
     g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail));
   }
 
@@ -3935,7 +3994,8 @@ export class Stations {
     this.repairSite({ x: old.x, z: old.z, rail: old });
     this.buildRailPart(st, plan, st.owner);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
-    for (const o of plan.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.accessVersion = -1;
     g.onNetworkChanged();
     g.lines.rebuild();

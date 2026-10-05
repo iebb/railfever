@@ -1,6 +1,6 @@
 // The game: owns all simulation state and advances time.
 import { World } from './world';
-import { Towns } from './towns';
+import { Towns, type Town } from './towns';
 import { Stations, entranceUpkeep, lostShare, STATION_UPKEEP_FACTOR } from './stations';
 import { stationPlatformLength } from './station-geometry';
 import { Lines } from './lines';
@@ -218,6 +218,11 @@ export class Game {
     const g = new Game(opts);
     generateHeights(g.world, { seed: opts.seed, hilliness: opts.hilliness, water: opts.water });
     g.towns.generate(opts.towns, opts.seed);
+    g.initializeHeadquarters();
+    if (!opts.playerName && g.headquartersOf(PLAYER)) {
+      g.player.name = `${g.headquartersOf(PLAYER)!.name} Transport`;
+      g.player.code = g.freeCompanyCode(g.player.name, PLAYER);
+    }
     generateIntercityRoads(g);
     generateTrees(g.world, opts.seed);
     g.demand.rebuild();
@@ -241,14 +246,14 @@ export class Game {
     const id = this.companies.length;
     const cfg = normalizeAIConfig(config);
     const live = this.activeCompanies;
-    const usedNames = new Set(this.companies.map((c) => c.name));
     const usedColors = new Set(live.map((c) => c.color.toLowerCase()));
-    const nm = name?.trim() || AI_NAMES.find((n) => !usedNames.has(n)) || `${AI_NAMES[(id - 1) % AI_NAMES.length]} ${id}`;
+    const hq = this.nextHeadquarters();
+    const nm = name?.trim() || this.headquartersName(hq, cfg.focus);
     const col = color || COMPANY_COLORS.slice(1).find((c) => !usedColors.has(c.toLowerCase())) || COMPANY_COLORS[1 + ((id - 1) % (COMPANY_COLORS.length - 1))];
     const economy = new Economy();
     economy.money = cfg.startMoney;
     economy.loan = Math.min(cfg.startMoney, 5_000_000);
-    const co: Company = { id, name: nm, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
+    const co: Company = { id, name: nm, hqTown: hq?.id, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
     this.companies.push(co);
     this.allowAccess[id] = cfg.accessPolicy !== 'auto-reject';
     this.ais.push(new AIController(this, id, cfg));
@@ -257,6 +262,39 @@ export class Game {
   }
 
   company(id: number): Company { return this.companies[id] ?? this.townCompany; }
+
+  /** The company's saved city base. Reading it never assigns or moves headquarters. */
+  headquartersOf(companyId: number): Town | undefined {
+    const id = this.companies[companyId]?.hqTown;
+    return id === undefined ? undefined : this.towns.list.find(t => t.id === id);
+  }
+
+  /** Share town bases only once each populated town has a company; larger towns are considered first. */
+  private nextHeadquarters(): Town | undefined {
+    const used = new Map<number, number>();
+    for (const co of this.companies) if (co.hqTown !== undefined) used.set(co.hqTown, (used.get(co.hqTown) ?? 0) + 1);
+    return this.towns.list.filter(t => t.pop > 0).sort((a, b) =>
+      (used.get(a.id) ?? 0) - (used.get(b.id) ?? 0) || b.pop - a.pop || a.id - b.id)[0];
+  }
+
+  private headquartersName(hq: Town | undefined, focus: AIConfig['focus'], except = -1): string {
+    const suffix = focus.rail > focus.road && focus.rail >= focus.tram ? 'Railways'
+      : focus.tram > focus.rail && focus.tram > focus.road ? 'Tramways' : 'Transport';
+    const base = `${hq?.name ?? 'Rival'} ${suffix}`, used = new Set(this.companies.filter(c => c.id !== except).map(c => c.name));
+    let name = base;
+    for (let n = 2; used.has(name); n++) name = `${base} ${n}`;
+    return name;
+  }
+
+  /** Legacy saves infer the city from an owned station before falling back to the stable town allocation. */
+  private initializeHeadquarters() {
+    for (const co of this.companies) {
+      if (this.headquartersOf(co.id)) continue;
+      const station = [...this.stations.map.values()].filter(st => st.owner === co.id && this.towns.list.some(t => t.id === st.townId))
+        .sort((a, b) => a.id - b.id)[0];
+      co.hqTown = station?.townId ?? this.nextHeadquarters()?.id;
+    }
+  }
 
   /** A company letter for JR-style station numbers: its initials first, then its other letters, then any free one. */
   freeCompanyCode(name: string, except = -1): string {
@@ -1012,7 +1050,7 @@ export class Game {
   saveCompanies() {
     return {
       companies: this.companies.map((c) => ({
-        id: c.id, name: c.name, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1, code: c.code ?? '',
+        id: c.id, name: c.name, hqTown: c.hqTown ?? -1, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1, code: c.code ?? '',
         economy: JSON.parse(JSON.stringify(c.economy)),
       })),
       ais: this.ais.map((a) => a.toJSON()),
@@ -1039,6 +1077,7 @@ export class Game {
   restoreCompanies(d: any) {
     this.companies = ((d.companies ?? []) as any[]).map((c) => {
       const co: Company = { id: c.id, name: c.name, color: c.color, ai: !!c.ai, economy: Economy.fromJSON(c.economy) };
+      if (Number.isSafeInteger(c.hqTown) && c.hqTown >= 0) co.hqTown = c.hqTown;
       if (c.defunct) co.defunct = true;
       if (typeof c.boughtBy === 'number' && c.boughtBy >= 0) co.boughtBy = c.boughtBy;
       if (typeof c.code === 'string' && c.code) co.code = c.code;
@@ -1079,6 +1118,18 @@ export class Game {
 
   /** Restore the AI controllers once stations, lines and vehicles exist (an interrupted project is cleaned up). */
   restoreAIs(d: any) {
+    this.initializeHeadquarters();
+    // Only recognized generated names in pre-HQ saves migrate; custom names, station codes and history stay intact.
+    for (const co of this.companies) {
+      const saved = ((d.companies ?? []) as any[]).find(c => c.id === co.id), hq = this.headquartersOf(co.id);
+      if (!hq || saved?.hqTown !== undefined) continue;
+      const genericAI = AI_NAMES.some(name => co.name === name || (co.name.startsWith(name + ' ') && /^\d+$/.test(co.name.slice(name.length + 1))))
+        || /^Rival Transport(?: \d+)?$/.test(co.name);
+      if (co.id === PLAYER ? !this.options.playerName && co.name === 'Railfever Transport' : co.ai && genericAI) {
+        const data = ((d.ais ?? []) as any[]).find(a => a?.companyId === co.id);
+        co.name = this.headquartersName(hq, normalizeAIConfig(data?.config).focus, co.id);
+      }
+    }
     if (!this.demandSaved) { this.demand.rebuild(); this.demand.recomputeShares(); this.demandSaved = true; }
     this.ais = [];
     for (const c of this.companies) {

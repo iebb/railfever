@@ -27,6 +27,8 @@ import { walkRoadsChanged } from './catchment';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
 const VERSION = 3;
+/** Catchment/transfer parameters changed: old saved populations refresh at the next native boundary. */
+const CATCHMENT_RULES_VERSION = 1;
 /** Save formats this build reads (v2: older single-record saves). */
 const READABLE = [2, VERSION];
 const TREE_CHUNK = SAVE_TREES;
@@ -371,8 +373,10 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    stationComplexVersion: 1,
     // Save owed walking population work independently of the scheduled demand publication flag.
     // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
+    catchmentRulesVersion: CATCHMENT_RULES_VERSION,
     catchmentDirty: g.lines.catchmentDirty,
     catchmentInputsDirty: g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending,
     // A cold load must preserve whether saved road access already matched its network.
@@ -637,6 +641,8 @@ export function deserialize(d: any): Game {
   // older maps: town streets ending on a bridge are cut back to the ground (9i). Current saves keep their network as
   // saved (towns tidy their bridge ends as they grow): tidying here would make a loaded game differ from the running one.
   if (!d.opsVersion) try { g.towns.tidyBridgeEnds(); } catch (e) { console.warn('Save load: tidyBridgeEnds failed', e); }
+  // Public walking complexes preserve physical station IDs and owners; migrate old nearby platforms once.
+  const complexesChanged = g.stations.restoreComplexes(d.stationComplexVersion !== 1);
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
@@ -646,9 +652,10 @@ export function deserialize(d: any): Game {
   // slice a pending refresh while the running game's warm cache commits it immediately.
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion, savedAccessVersion = net.version;
+  const catchmentRulesChanged = d.catchmentRulesVersion !== CATCHMENT_RULES_VERSION;
   // The explicit marker separates owed population work from a frequency-only demand refresh.
-  const populationPending = typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
-    : !!d.catchmentDirty || !!d.catchmentRoadsDirty;
+  const populationPending = catchmentRulesChanged || complexesChanged || (typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
+    : !!d.catchmentDirty || !!d.catchmentRoadsDirty);
   S.accessVersion = net.version;
   // A brand-new empty network has not run its first share-out. Historical horizon zero can also
   // be warm, so preserve the explicit cold hint instead of conflating the two states.
@@ -661,7 +668,7 @@ export function deserialize(d: any): Game {
     if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
-  g.lines.catchmentDirty = !!d.catchmentDirty;
+  g.lines.catchmentDirty = catchmentRulesChanged || complexesChanged || !!d.catchmentDirty;
   g.lines.catchmentRoadsDirty = !!d.catchmentRoadsDirty;
   // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
   if (!d.opsVersion) {

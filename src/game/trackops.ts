@@ -1939,6 +1939,8 @@ export const ladderReach = (n: number) => 4 + 7 * Math.max(1, n);
 export interface OnTrackOpts {
   /** Keep the running rail in place and mount compact station surfaces on its true alignment. */
   reuseTrack?: boolean;
+  /** Deliberate formation rebuild; ordinary station-on-track placement preserves every running rail. */
+  rebuildTrack?: boolean;
   /** platform length (default: by station style, see defaultPlatformLength) */
   length?: number;
   /** platform tracks (default: 1 on single track, 2 on double track) */
@@ -2017,7 +2019,7 @@ export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrac
   const fail = (m: string) => { plan.ok = false; plan.error = m; return plan; };
   const e = net.edges.get(edgeId);
   if (!e || e.kind !== 'rail') return fail('No track here');
-  if (o.reuseTrack || e.owner !== owner) return planNativeStationOnTrack(g, edgeId, s, o, owner);
+  if (o.rebuildTrack !== true || o.reuseTrack || e.owner !== owner) return planNativeStationOnTrack(g, edgeId, s, o, owner);
   if (e.station >= 0 || e.depot >= 0) return fail('Already a station or depot track');
   const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(o.mode ?? e.type)));
   const reach = L / 2 + 30;

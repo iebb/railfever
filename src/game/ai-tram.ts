@@ -74,9 +74,10 @@ export class TramPlanner {
   }
 
   /** Start a tram project in the best candidate town; false if there is none. */
-  start(): boolean {
+  start(townId?: number): boolean {
     if (this.job) return false;
-    const town = this.candidates()[0];
+    const candidates = this.candidates();
+    const town = townId === undefined ? candidates[0] : candidates.find(t => t.id === townId);
     if (!town || !pickTram(this.game.year, town.pop)) return false;
     this.project = { town: town.id, edges: [], stations: [], stops: [], depot: -1, line: -1 };
     this.reason = '';

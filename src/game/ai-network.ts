@@ -4333,6 +4333,7 @@ class NetPlanner {
     for (let i = 0; i < mine.length; i++) for (let j = 0; j < mine.length; j++) {
       const A = mine[i], B = mine[j];
       if (!ids.includes(A.id) || i === j || A.townId !== B.townId || !g.stations.get(A.id) || !g.stations.get(B.id)) continue;
+      if (g.stations.isSameStationComplex(A.id, B.id)) continue;
       if (!this.mayAlter([...A.rail!.edges, ...A.rail!.throughEdges, ...B.rail!.edges, ...B.rail!.throughEdges, ...this.approachOf(A, 80), ...this.approachOf(B, 80)])) continue;
       if (Math.hypot(A.x - B.x, A.z - B.z) > 40) continue;
       this.considered('consolidate.nearTermini');

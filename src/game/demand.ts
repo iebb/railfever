@@ -10,7 +10,7 @@
 import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
 import { WALK_LINE, PLATFORM_LENGTH, stationLayout } from './stations';
-import { routeGraph, routeTables, type Hop } from './lines';
+import { routeGraph, routeTables, transferComplexes, type Hop, type RouteEdge } from './lines';
 import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, distanceFare, railHistory, transferWalkTime, TRANSFER_FARE_FACTOR, type DemandSite, type FareMode } from './fares';
 import type { Building } from './world';
 import type { Town } from './towns';
@@ -106,14 +106,16 @@ function plannedStation(p: StationPlan, id: number, owner?: number, townId = -1)
   return { ...(p.join ?? { stops: [], links: [] }), id, owner: owner ?? p.join?.owner ?? 0,
     x: p.x, z: p.z, townId: p.join?.townId ?? townId, city: p.city, rail: {
       x: p.x, z: p.z, y: p.y, angle: p.angle, length: p.length, tracks: p.tracks,
-      level: p.level, underground: p.underground, depth: p.depth, height: p.height, alignment: p.alignment,
+      level: p.level, underground: p.underground, depth: p.depth, height: p.height, alignment: p.alignment, style: p.style,
+      mode: p.mode, trackType: p.trackType,
       width: p.layout.width, trackOffsets: p.layout.trackOffsets, platforms: p.layout.platforms,
     } } as Station;
 }
 
 /** City rides of a complete routed transfer journey, with the fare history of each boarding. */
 export function forecastTransferJourney(tables: Map<number, Map<number, Hop>>, from: number, destination: number,
-  cityLine: number, isRail: (line: number) => boolean, railFare: (from: number, to: number) => number
+  cityLine: number, isRail: (line: number) => boolean, railFare: (from: number, to: number) => number,
+  sameComplex: (a: number, b: number) => boolean = () => false
 ): { from: number; to: number; railBefore: number; changes: number }[] {
   const rides: { line: number; from: number; to: number }[] = [], seen = new Set<number>();
   let at = from, aboard = false;
@@ -131,13 +133,17 @@ export function forecastTransferJourney(tables: Map<number, Map<number, Hop>>, f
     at = hop.alight;
   }
   if (at !== destination || rides.length < 2) return [];
-  let railBefore = 0;
+  let railBefore = 0, changesBefore = 0;
   return rides.flatMap((ride, before) => {
     const history = railBefore;
+    const next = rides[before + 1];
+    const endingChange = next ? !sameComplex(ride.to, next.from) : ride.to !== destination && !sameComplex(ride.to, destination);
+    const changes = changesBefore + (endingChange ? 1 : 0);
+    changesBefore += endingChange ? 1 : 0;
     if (isRail(ride.line)) railBefore = railHistory(railBefore + railFare(ride.from, ride.to));
     return ride.line === cityLine ? [{ from: ride.from, to: ride.to, railBefore: history,
       // Passenger receipts apply changes already made and the change at this leg's end, not later changes.
-      changes: before + (ride.to !== destination ? 1 : 0) }] : [];
+      changes }] : [];
   });
 }
 
@@ -897,6 +903,12 @@ export class DemandModel {
       const connecting = this.forecastTransfers(points, sites, kmh, headway, _style, owner, replacingLine);
       transfers = connecting.boardings; boardings += connecting.boardings; revenue += connecting.revenue;
       connecting.legLoads.forEach((load, i) => { legLoads[i] += load; });
+    // A partial-pattern attractive set contains unmodified services too; its whole-line receipts
+    // cannot all be assigned to the one pattern being requoted.
+    } else if (context && replacingPattern === undefined) {
+      const connecting = this.forecastMainlineConnections(sites, walking, background, context, kmh, headway);
+      transfers = connecting.boardings; boardings += connecting.boardings; revenue += connecting.revenue;
+      connecting.legLoads.forEach((load, i) => { legLoads[i] += load; });
     }
     return { boardings, revenue, transfers, legLoads, covered: sites.reduce((a, s) => a + s.pop, 0) };
   }
@@ -913,9 +925,9 @@ export class DemandModel {
       this.forecastGraphKey = key; this.forecastRouting = g.lines.routing; this.forecastGraph = routeGraph(g).edges;
     }
     const edges = new Map(this.forecastGraph), copied = new Set<number>(), proposed = -2;
-    const add = (from: number, to: number, line: number, cost: number) => {
+    const add = (from: number, to: number, line: number, cost: number, internalTransfer = false) => {
       if (!copied.has(from)) { edges.set(from, [...(edges.get(from) ?? [])]); copied.add(from); }
-      edges.get(from)!.push({ to, line, cost });
+      edges.get(from)!.push({ to, line, cost, ...(internalTransfer ? { internalTransfer } : {}) });
     };
     const existing = replacingLine === undefined ? undefined : g.lines.get(replacingLine);
     const operator = owner ?? points.map(forecastStation).find(st => st)?.owner;
@@ -966,13 +978,88 @@ export class DemandModel {
       for (const id of p.join?.links ?? []) { const st = g.stations.get(id); if (st) links.set(id, st); }
       for (const st of links.values()) {
         if (st.id === ids[i]) continue;
+        const facility = plannedStation(p, ids[i], operator);
+        if (g.stations.gap(facility, st) > g.stations.linkRange(facility, st)) continue;
         for (const [from, to] of [[ids[i], st.id], [st.id, ids[i]]])
           edges.set(from, (edges.get(from) ?? []).filter(e => e.line !== WALK_LINE || e.to !== to));
-        const time = transferWalkTime(g.stations.gap(plannedStation(p, ids[i], operator), st));
-        add(ids[i], st.id, WALK_LINE, time); add(st.id, ids[i], WALK_LINE, time);
+        const time = transferWalkTime(g.stations.gap(facility, st), true);
+        add(ids[i], st.id, WALK_LINE, time, true); add(st.id, ids[i], WALK_LINE, time, true);
       }
     }
-    return { ids, tables: routeTables(edges, unique) };
+    const sameComplex = this.forecastComplexes(points, edges);
+    return { ids, tables: routeTables(edges, unique, new Map(), sameComplex), edges,
+      proposed: replace ? existing.id : proposed, sameComplex };
+  }
+
+  private forecastComplexes(points: ForecastPoint[], edges: Map<number, RouteEdge[]>) {
+    const combined = new Set(points.flatMap(p => 'join' in p && p.join?.stops.length ? [p.join.id] : []));
+    return transferComplexes(edges, (a, b) => this.g.stations.isSameStationComplex(a, b) || (a === b && combined.has(a)));
+  }
+
+  /** Receipts on this proposed trunk, not on the other services carrying its connecting passengers. */
+  private forecastMainlineConnections(sites: {
+    x: number; z: number; townId: number; pop: number; regions: Map<number, number>;
+  }[], walking: { pop: number; regions: Map<number, number> }[], background: Map<number, {
+    walking: Map<number, number>; regional: Map<number, number>;
+  }>, context: NonNullable<ReturnType<DemandModel['forecastRoutes']>>, kmh: number, headway: number
+  ): { boardings: number; revenue: number; legLoads: number[] } {
+    const g = this.g, indices = new Map<number, number>(), n = this.regions.length;
+    context.ids.forEach((id, i) => { if (!indices.has(id)) indices.set(id, i); });
+    const ranks = [...indices.keys()], rank = context.ids.map(id => ranks.indexOf(id));
+    const tables = routeTables(context.edges, context.edges.keys(), new Map(), context.sameComplex);
+    const locations = new Map<number, { x: number; z: number; townId: number;
+      walking: Map<number, number>; regional: Map<number, number> }>();
+    for (const [id, i] of indices) locations.set(id, { ...sites[i], walking: walking[i].regions, regional: sites[i].regions });
+    for (const [id, shares] of background) {
+      const st = g.stations.get(id); if (st) locations.set(id, { x: st.x, z: st.z, townId: st.townId, ...shares });
+    }
+    let boardings = 0, revenue = 0;
+    const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
+    for (const [from, origin] of locations) {
+      const parts: { to: number; pop: number; x: number; y: number; f: number; local: boolean }[] = [];
+      let local = 0, localF = 0;
+      for (const [to, hop] of tables.get(from) ?? []) {
+        const dest = locations.get(to); if (!dest) continue;
+        const sameTown = origin.townId >= 0 && origin.townId === dest.townId;
+        const source = sameTown ? origin.walking : origin.regional;
+        const target = sameTown ? dest.walking : dest.regional;
+        const pop = [...source.values()].reduce((sum, v) => sum + v, 0); if (!(pop > 0)) continue;
+        const d = Math.hypot(origin.x - dest.x, origin.z - dest.z), walk = Math.min(1, d / WALK);
+        let x = 0, y = 0;
+        for (const [r, residents] of source) for (const [q, covered] of target) {
+          if (r >= n || q >= n) continue;
+          const weight = residents / pop * Math.min(1, covered / Math.max(1, this.regions[q].pop));
+          x += weight * this.od[r * n + q] * (r === q ? walk : 1);
+          y += weight * this.ld[r * n + q] / TRIPS_PER_MONTH;
+        }
+        const centre = sameTown ? Math.min(urbanIntensity(g, origin), urbanIntensity(g, dest)) : 0;
+        const f = tripFactor(hop.cost, refTime(d, centre)) / TF_TYPICAL;
+        parts.push({ to, pop, x, y, f, local: sameTown }); local += x; localF += x * f;
+      }
+      const capture = localF > 0 ? localCapture(local, localF) / localF : 0;
+      for (const part of parts) {
+        // Direct journeys between our own stops were priced above, once per physical station claim.
+        if (indices.has(from) && indices.has(part.to)) continue;
+        const rides = forecastTransferJourney(tables, from, part.to, context.proposed,
+          line => line === context.proposed || g.lines.get(line)?.kind === 'rail', (a, b) => {
+            const p = locations.get(a) ?? g.stations.get(a), q = locations.get(b) ?? g.stations.get(b);
+            return p && q ? distanceFare(Math.hypot(p.x - q.x, p.z - q.z)) : 0;
+          }, context.sameComplex);
+        if (!rides.length) continue;
+        const passengers = part.pop * TRIPS_PER_MONTH * 12 * (part.x * part.f * capture
+          + part.y * Math.max(0.3, Math.min(2, part.f))) * (part.local ? 1 : 1 + MAINLINE_FEEDER_SHARE);
+        for (const ride of rides) {
+          const a = indices.get(ride.from), b = indices.get(ride.to); if (a === undefined || b === undefined) continue;
+          const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);
+          boardings += passengers; addLegLoad(legLoads, sites.length, a, b, passengers);
+          const seconds = estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(rank[a] - rank[b]) - 1) * 8;
+          revenue += fareFor(d, seconds, passengers,
+            { mode: 'rail', centre: Math.min(urbanIntensity(g, sites[a]), urbanIntensity(g, sites[b])), railBefore: ride.railBefore })
+            * Math.pow(TRANSFER_FARE_FACTOR, ride.changes);
+        }
+      }
+    }
+    return { boardings, revenue, legLoads };
   }
 
   /** Route proposed city connections through the same passenger graph and transfer penalties as actual journeys.
@@ -1000,8 +1087,9 @@ export class DemandModel {
     if (existing?.kind === 'rail' && operator !== undefined && g.lines.operatorsOf(existing).includes(operator)
       && existing.stops.every((id) => built.has(id)))
       for (const [id, es] of edges) edges.set(id, es.filter((e) => e.line !== existing.id));
-    const add = (from: number, to: number, line: number, cost: number) => {
-      let es = edges.get(from); if (!es) { es = []; edges.set(from, es); } es.push({ to, line, cost });
+    const add = (from: number, to: number, line: number, cost: number, internalTransfer = false) => {
+      let es = edges.get(from); if (!es) { es = []; edges.set(from, es); }
+      es.push({ to, line, cost, ...(internalTransfer ? { internalTransfer } : {}) });
     };
     const boarding = new Set<number>();
     for (let i = 0; i < sites.length; i++) {
@@ -1022,14 +1110,15 @@ export class DemandModel {
         if ('id' in point && !point.links.includes(st.id)) continue;
         const gap = g.stations.gap(virtual, st), range = g.stations.linkRange(virtual, st);
         if (gap > range) continue;
-        const time = transferWalkTime(gap);
-        add(ids[i], st.id, WALK_LINE, time); add(st.id, ids[i], WALK_LINE, time); boarding.add(ids[i]);
+        const time = transferWalkTime(gap, true);
+        add(ids[i], st.id, WALK_LINE, time, true); add(st.id, ids[i], WALK_LINE, time, true); boarding.add(ids[i]);
       }
     }
     if (!boarding.size) return { boardings: 0, revenue: 0, legLoads };
     const external = [...served].map((id) => g.stations.get(id)!).filter((st) => st && st.townId !== townId && stationActive(g, st));
     if (!external.length) return { boardings: 0, revenue: 0, legLoads };
-    const tables = routeTables(edges, edges.keys()), n = this.regions.length;
+    const sameComplex = this.forecastComplexes(points, edges);
+    const tables = routeTables(edges, edges.keys(), new Map(), sameComplex), n = this.regions.length;
     const coverage = new Map<number, [number, number][]>();
     for (const id of edges.keys()) {
       const i = indices.get(id), st = g.stations.get(id);
@@ -1066,7 +1155,7 @@ export class DemandModel {
             const from = indices.has(a) ? sites[indices.get(a)!] : g.stations.get(a);
             const to = indices.has(b) ? sites[indices.get(b)!] : g.stations.get(b);
             return from && to ? distanceFare(Math.hypot(from.x - to.x, from.z - to.z)) : 0;
-          });
+          }, sameComplex);
         const passengers = pop * TRIPS_PER_MONTH * 12 * (part.x * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)))
           * (1 + MAINLINE_FEEDER_SHARE);
         for (const leg of legs) {

@@ -3,7 +3,7 @@ import type { UI } from './ui';
 import { MONTH_NAMES, PLAYER, DEFAULT_ACCESS_MULTIPLIER } from '../game/game';
 import type { Game } from '../game/game';
 import { h, clear, tile, section, icon, toggle, add, field, stepper, seg } from './dom';
-import { AI_NAMES, AI_PRESETS, normalizeAIConfig } from '../game/ai';
+import { AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import { liveCompanies, aiCount, aiConfigOf, addAI, applyAIConfig, presetOf, MAX_AI, DEFAULT_AI } from './gameapi';
 import { fmtMoney, fmtMoneyFull, NON_PROFIT_CATEGORIES, PROFIT_CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category, OPERATING_COSTS, operatingCosts } from '../game/economy';
 import { SHARE_COUNT, DIVIDEND_RATE } from '../game/shares';
@@ -135,14 +135,17 @@ export function openCompetitors(ui: UI) {
   const overview = () => {
     const nAI = aiCount(g);
     const nReq = g.requestsTo(PLAYER).length;
-    const tbl = h('table', { class: 'tbl fin companies-table' }, h('tr', null, ['Company', 'Ownership', 'Value', 'Cash', 'Profit (yr)', 'Vehicles', 'Stations', 'Lines', ''].map((t) => h('th', null, t))));
+    const tbl = h('table', { class: 'tbl fin companies-table' }, h('tr', null, ['Company', 'HQ', 'Ownership', 'Value', 'Cash', 'Profit (yr)', 'Vehicles', 'Stations', 'Lines', ''].map((t) => h('th', null, t))));
     for (const co of liveCompanies(g)) {
       const e = co.economy;
       const profit = e.lastYearProfit;
       const hd = holdings(g, co.id);
       const cfg = co.ai ? aiConfigOf(g, co.id) : null;
+      const hq = g.headquartersOf(co.id);
       tbl.appendChild(h('tr', null,
         h('td', { class: 'ellip' }, ui.ownerTag(co.id), co.id === PLAYER ? h('span', { class: 'muted' }, ' you') : cfg ? h('span', { class: 'muted' }, ' ' + (presetOf(cfg)?.name ?? 'Custom')) : null),
+        h('td', null, hq ? h('button', { class: 'btn sm', 'data-tip': 'Show headquarters city',
+          'aria-label': `Headquarters of ${co.name}: ${hq.name}`, onclick: () => { ui.centerOn(hq.x, hq.z); ui.openTown(hq.id); } }, hq.name) : '–'),
         h('td', { class: 'company-ownership', title: ownershipLabel(g, co.id) }, ownershipLabel(g, co.id)),
         h('td', null, fmtMoney(g.companyValue(co.id))),
         h('td', { class: e.money < 0 ? 'neg' : '' }, fmtMoney(e.money)),
@@ -212,7 +215,7 @@ export function openAIConfig(ui: UI, id: number | null) {
   const co = id != null ? g.company(id) : null;
   const used = new Set(liveCompanies(g).map((c) => c.color.toLowerCase()));
   const st = {
-    name: co?.name ?? suggestName(g),
+    name: co?.name ?? '',
     color: co?.color ?? AI_COLORS.find((c) => !used.has(c.toLowerCase())) ?? AI_COLORS[0],
     cfg: normalizeAIConfig((id != null ? aiConfigOf(g, id) : null) ?? DEFAULT_AI),
     /** what other companies pay for using this AI's network (track access multiplier) */
@@ -235,7 +238,7 @@ export function openAIConfig(ui: UI, id: number | null) {
   const render = () => {
     clear(win.body);
     if (co?.defunct) { add(win.body, h('div', { class: 'pad' }, `${co.name} now belongs to ${co.boughtBy != null ? g.company(co.boughtBy).name : 'another company'}.`)); return; }
-    const name = h('input', { class: 'input', value: st.name, style: 'flex:1', 'aria-label': 'Company name', disabled: !!co, maxlength: '32' }) as HTMLInputElement;
+    const name = h('input', { class: 'input', value: st.name, placeholder: 'From headquarters city', style: 'flex:1', 'aria-label': 'Company name', disabled: !!co, maxlength: '32' }) as HTMLInputElement;
     name.addEventListener('input', () => { st.name = name.value; });
     presetBtns = AI_PRESETS.map((p) => [p.id, h('button', { class: 'segb', 'data-tip': p.hint, onclick: () => {
       const money = st.cfg.startMoney;
@@ -288,11 +291,6 @@ export function openAIConfig(ui: UI, id: number | null) {
   };
   win.refresh = undefined;
   render();
-}
-
-function suggestName(g: Game): string {
-  const used = new Set(g.companies.map((c) => c.name));
-  return AI_NAMES.find((n) => !used.has(n)) ?? `Rival Transport ${g.companies.length}`;
 }
 
 /** Investment: ten share steps, annual returns, and the owner's choice when all shares are held. */

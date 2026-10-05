@@ -22,7 +22,7 @@ import type { Station, StationLevel, UpgradePlan } from '../game/stations';
 import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railPartMode, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind, railModeOf, CITY_STATION } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { readWalkingCatchment, readEntranceCatchment } from '../game/catchment';
-import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
+import { connectStationThroat } from '../game/trackops';
 import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
 import { memo, expandPlan, commitExpand } from './win-ops';
@@ -50,8 +50,9 @@ export function openStation(ui: UI, id: number) {
   const g = ui.game;
   const st = g.stations.get(id);
   if (!st) return;
-  const co = g.company(st.owner);
-  const win = ui.wm.open('station-' + id, st.name, { width: 430, icon: st.rail ? 'station' : 'busstop', color: co.color, cls: 'station-info' });
+  const co = g.company(st.owner), complex = stationComplex(g, id), main = g.stations.get(complex.main)!;
+  for (const part of complex.parts) if (part !== complex.main) ui.wm.close('station-' + part);
+  const win = ui.wm.open('station-' + complex.main, main.name, { width: 430, icon: st.rail ? 'station' : 'busstop', color: co.color, cls: 'station-info' });
   /** pending rebuild (platform length / tracks / level) of the station window's Build tab */
   const up: StationBuild = { length: st.rail?.length ?? DEFAULT_PLATFORM_LENGTH, tracks: st.rail?.tracks ?? 2, through: st.rail?.through ?? 0, level: st.rail?.level ?? 'ground', side: 'auto' };
   const restyle: RestyleState = { current: styleOf(st.rail?.style).id, selected: styleOf(st.rail?.style).id };
@@ -70,9 +71,9 @@ export function openStation(ui: UI, id: number) {
     if (JSON.stringify(s.rail) !== railSig) syncBuild();
     const mine = s.owner === PLAYER;
     ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine ? [['build', 'Build'] as [string, string]] : [])], render);
-    win.title.textContent = s.name;
+    win.title.textContent = g.stations.get(stationComplex(g, id).main)?.name ?? s.name;
     const town = g.towns.list[s.townId];
-    win.sub.textContent = [g.company(s.owner).name, town?.name].filter(Boolean).join(' · ');
+    win.sub.textContent = [complex.parts.length > 1 ? s.name : null, g.company(s.owner).name, town?.name].filter(Boolean).join(' · ');
     clear(win.body);
     const lines = g.lines.linesAt(s.id);
     const rerender = () => { win.last = undefined; render(); };
@@ -117,11 +118,11 @@ export function openStation(ui: UI, id: number) {
         h('div', { class: 'btns' },
           h('button', { class: 'btn', onclick: () => ui.centerOn(s.x, s.z) }, icon('target', 16), 'Center'),
           h('button', { class: 'btn' + (ui.catchmentStation === id ? ' on' : ''), onclick: () => { ui.setCatchment(ui.catchmentStation === id ? -1 : id); win.last = undefined; render(); } }, icon('catchment', 16), 'Catchment'),
-          mine ? h('button', { class: 'btn ghost', onclick: () => { const n = prompt('Rename station', s.name); if (n) { s.name = n.slice(0, 40); render(); } } }, icon('edit', 16), 'Rename') : null),
+          mine ? h('button', { class: 'btn ghost', onclick: () => { const n = prompt('Rename station', s.name); if (n) { g.stations.renameComplex(s.id, n); render(); } } }, icon('edit', 16), 'Rename') : null),
         capacityPanel(ui, s, () => { syncBuild(); rerender(); }),
         complexParts(ui, s),
         sharedStopPanel(ui, s, lines),
-        mine ? transferSection(ui, s, () => { syncBuild(); rerender(); }) : null,
+        transferSection(ui, s, () => { syncBuild(); rerender(); }),
       );
     } else if (win.tab === 'waiting') {
       const byDest = new Map<number, number>();
@@ -349,7 +350,7 @@ function restylePanel(ui: UI, s: Station, state: RestyleState, after: () => void
 function complexParts(ui: UI, s: Station): HTMLElement | null {
   const g = ui.game, c = stationComplex(g, s.id);
   if (c.parts.length < 2) return null;
-  return h('div', null, section('Complex parts', ui.stationLink(c.main)),
+  return h('div', null, section('Platform groups & stops', ui.stationLink(c.main)),
     h('div', { class: 'list' }, c.parts.map((id) => {
       const p = g.stations.get(id);
       if (!p) return null;
@@ -401,29 +402,31 @@ function transferSection(ui: UI, s: Station, after: () => void): HTMLElement | n
   const g = ui.game;
   const opts = g.stations.transferOptions(s.id);
   if (!opts.length) return null;
+  const mergeCheck = (otherId: number) => {
+    const error = s.links.includes(otherId) ? null : g.stations.canLink(s.id, otherId);
+    return { ok: !error, kind: error ? null : 'complex' as const, reason: error ?? 'One station name; separate buildings, platform groups and owners' };
+  };
   const kindIcon = (o: Station | undefined) => (!o ? 'station' : o.rail ? 'station' : o.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop');
   const done = (err: string | null | void, ok: string) => { if (typeof err === 'string' && err) ui.toast(err, 'bad'); else { ui.toast(ok, 'good'); ui.sound('station', { x: s.x, z: s.z, pitch: 1.1 }); } after(); };
   return h('div', null,
-    section('Merge with nearby station'),
+    section('Merge into one station'),
     h('div', { class: 'list' }, opts.slice(0, 6).map((o) => {
       const other = g.stations.get(o.id);
-      const c = canMerge(g, s.id, o.id);
+      const c = mergeCheck(o.id);
       const linked = o.linked && c.kind === 'complex';
       return h('div', { class: 'merge-choice' },
         h('div', { class: 'inline wrap' }, icon(kindIcon(other), 15), ui.stationLink(o.id), h('span', { class: 'muted' }, fmtLen(o.gap)),
-          c.kind ? h('span', { class: 'flag' }, c.kind === 'rebuild' ? 'Rebuild' : 'Complex') : null),
+          c.kind ? h('span', { class: 'flag' }, 'Station complex') : null),
         h('div', { class: c.ok ? 'muted' : 'neg' }, c.reason),
         h('div', { class: 'btns' },
           o.linked
             ? h('button', { class: 'btn sm', 'data-tip': 'Ends walking transfers', onclick: () => { g.stations.unlink(s.id, o.id); done(null, `${o.name} unlinked`); } }, 'Unlink')
             : h('button', { class: 'btn sm', disabled: !!o.link, 'data-tip': o.link ?? 'Walking transfers between stations', onclick: () => done(g.stations.link(s.id, o.id), `${o.name} linked for transfers`) }, 'Link'),
           h('button', { class: 'btn sm primary', disabled: !c.ok || linked, 'data-tip': c.reason, onclick: () => {
-            const check = canMerge(g, s.id, o.id);
+            const check = mergeCheck(o.id);
             if (!check.ok) { done(check.reason, ''); return; }
-            if (check.kind === 'rebuild' && !confirm(`Merge ${o.name} into ${s.name}? Platforms, stops, queues and line stops move to ${s.name}.`)) return;
-            const result = mergeStations(g, s.id, o.id);
-            done(result.error, result.kind === 'complex' ? `${o.name} joined to the transfer complex` : `${o.name} merged into ${s.name}`);
-          } }, linked ? 'In complex' : c.kind === 'complex' ? 'Form complex' : 'Merge')));
+            done(s.links.includes(o.id) ? null : g.stations.link(s.id, o.id), `${o.name} joined to ${s.name}`);
+          } }, linked ? 'In station' : c.kind === 'complex' ? 'Merge into station' : 'Merge')));
     })));
 }
 

@@ -8,7 +8,6 @@ import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
 import { COMPANY_COLORS } from '../game/economy';
-import { AI_NAMES } from '../game/ai';
 import { openSaveLoad, openSettings } from './win-menu';
 import { MAX_AI, aiConfigsFor, presetOf, AI_PRESETS } from './gameapi';
 import { inertBehind } from './windows';
@@ -120,7 +119,7 @@ export function showTitle(o: TitleOpts) {
         field('Start year', seg(ERAS.map(([y, l]) => [y, l] as [number, string]), st.year, (v) => { st.year = v; render(); }), era?.[2]),
         field('Competitors', h('div', { class: 'inline wrap' },
           stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(MAX_AI, st.ai + 1); render(); }),
-          h('div', { class: 'ai-chips' }, st.ai ? aiConfigsFor(st.style, st.ai).map((cfg, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[i + 1]}`, 'data-tip': presetOf(cfg)?.name ?? '' }, h('i'), AI_NAMES[i % AI_NAMES.length] + (i >= AI_NAMES.length ? ` ${i + 1}` : ''))) : h('span', { class: 'muted' }, 'Sandbox: no rivals')))),
+          h('div', { class: 'ai-chips' }, st.ai ? aiConfigsFor(st.style, st.ai).map((cfg, i) => h('span', { class: 'ai-chip', style: `--c:${COMPANY_COLORS[i + 1]}`, 'data-tip': presetOf(cfg)?.name ?? '' }, h('i'), `Rival ${i + 1}`)) : h('span', { class: 'muted' }, 'Sandbox: no rivals')))),
         st.ai ? field('AI style', seg([['cautious', 'Cautious'], ['balanced', 'Balanced'], ['aggressive', 'Aggressive'], ['mixed', 'Mixed']], st.style, (v) => { st.style = v; render(); }),
           st.style === 'mixed' ? 'Rail barons, bus operators, tram builders…' : AI_PRESETS.find((p) => p.id === st.style)?.hint) : null,
         st.ai ? field('AI balance', h('div', { class: 'inline' }, money, '$M', h('button', { class: 'btn ghost sm', onclick: () => { st.money = null; render(); } }, 'Use preset')),

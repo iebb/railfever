@@ -17,7 +17,7 @@ import { linearStops, outAndBack } from './lines';
 import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
-import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility } from './train';
+import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy } from './economy';
@@ -39,7 +39,7 @@ import { MailPolicy, projectMail, keepMailVans, mailVanLength } from './ai-mail'
 import { offloadMail } from './mail';
 import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn, upgradeRoute } from './dualtrack';
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
-import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist } from './ai-capacity';
+import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist, priceSharedProject } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
 import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan, openingFundingBaseline, openingFundingAppraisal } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
@@ -1333,6 +1333,26 @@ export class AIController {
   private get eco(): Economy { return this.game.company(this.companyId).economy; }
   private get name() { return this.game.company(this.companyId).name; }
 
+  /** Actual services, including our trains on a partner's line; empty drafts do not count. */
+  private operatingTowns(): Set<number> {
+    const g = this.game, towns = new Set<number>();
+    for (const l of g.lines.map.values()) if (l.vehicles.some(id => g.vehicles.get(id)?.owner === this.companyId))
+      for (const id of l.stops) { const town = g.stations.get(id)?.townId; if (town !== undefined && town >= 0) towns.add(town); }
+    return towns;
+  }
+
+  /** The ordinary bus planner can join this actual rail station at one of its street-stop candidates. */
+  private busInterchange(T: Town): number | undefined {
+    const g = this.game, q = { x: 0, y: 0, z: 0 };
+    for (const e of g.towns.streets(T, 0)) {
+      if (e.len < 4) continue;
+      g.world.net.pointAt(e, e.len / 2, q);
+      const plan = g.stations.planBusStop(q.x, q.z, this.companyId), st = plan.join;
+      if (plan.ok && st?.rail && st.townId === T.id && g.lines.stationServed(st.id)) return st.id;
+    }
+    return undefined;
+  }
+
   /** Work units per game day (more for active companies). */
   get budget(): number { return Math.max(3, Math.min(16, Math.round(8 * Math.pow(this.config.activeness, 0.6)))); }
 
@@ -1366,8 +1386,9 @@ export class AIController {
       if (l.owner !== this.companyId || l.kind !== 'tram') continue;
       for (const s of l.stops) { const st = g.stations.get(s); if (st && st.townId >= 0) served.add(st.townId); }
     }
+    const hq = !this.operatingTowns().size ? g.headquartersOf(this.companyId)?.id : undefined;
     return g.towns.list.filter((t) => t.pop >= TramPlanner.minPop && !served.has(t.id) && !this.isFailed('tram' + t.id) && this.localRoom(t))
-      .sort((a, b) => b.pop - a.pop || a.id - b.id);
+      .sort((a, b) => Number(b.id === hq) - Number(a.id === hq) || b.pop - a.pop || a.id - b.id);
   }
 
   /** Is there room for a rail depot behind a planned station (stub or switch for multi-track)? */
@@ -1486,7 +1507,7 @@ export class AIController {
     if (this.job || this.disposed || this.cooperationReserved()) return false;
     if (kind === 'crosscity' && this.game.ais.some((ai) => ai !== this && ai.project?.kind === 'crosscity' && ai.project.towns.includes(towns[0]))) return false;
     const g = this.game, T = towns.map((id) => g.towns.list[id]);
-    if (kind === 'tram') return this.startTram();
+    if (kind === 'tram') return this.startTram(towns[0]);
     this.project = { kind, towns, stations: [], edges: [], depots: [], line: -1, started: g.day };
     this.job = kind === 'rail' || kind === 'hsr' ? this.railJob(T[0], T[1], hub, kind === 'hsr' ? 'highspeed' : 'standard') : kind === 'bus' ? this.busJob(T[0]) : kind === 'coach' ? this.coachJob(T[0], T[1])
       : kind === 'metro' || kind === 'lightrail' ? this.urbanJob(T[0], kind) : kind === 'crosscity' ? this.crossCityJob(T[0]) : this.roadJob(T[0], T[1]);
@@ -1622,7 +1643,8 @@ export class AIController {
     }
     // every option is scored by its expected return: yearly revenue from the regional OD demand at distance-based
     // fares, minus running costs and upkeep, over the outlay (focus and network effects on top)
-    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; urbanLayout?: UrbanLayout }[] = [];
+    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number; urbanLayout?: UrbanLayout; viable?: boolean }[] = [];
+    const operating = this.operatingTowns(), hq = g.headquartersOf(this.companyId)?.id;
     const D = yield* this.townDemand();
     // fares with the value of time (fares.ts): ~60% of the top speed on average, waiting half the headway (by
     // default a service about as often as its one-way run takes)
@@ -1650,13 +1672,16 @@ export class AIController {
         const trips = D.pair(A.id, B.id);
         // no copy of a rival's railway between the same towns unless demand is large (trains on it under track access are cheaper)
         if (rivals.has(this.pairKey(A.id, B.id)) && trips < 250) continue;
-        const hubA = this.hubFor(A, B), hubB = hubA ? null : this.hubFor(B, A);
-        const hub = hubA ?? hubB;
+        const freeA = this.hubFor(A, B), freeB = freeA ? null : this.hubFor(B, A);
+        const branchA = !freeA && !freeB ? this.branchStation(A, B) : null;
+        const branchB = !freeA && !freeB && !branchA ? this.branchStation(B, A) : null;
+        const hubA = freeA ?? branchA, hubB = freeB ?? branchB;
+        const hub = freeA ?? freeB, joined = branchA ?? branchB;
         const hubRails = [hubA?.rail, hubB?.rail], hubOwners = [hubA?.owner, hubB?.owner];
         const hubsLive = () => [hubA, hubB].every((st, k) => !st || this.railHubLive(st, hubRails[k], hubOwners[k]));
         const len = d * 1.3, L = aiPlatformLength(A.pop, B.pop, g.year);
         const trackCost = len * 13_000;
-        const infrastructure = trackCost + (hub ? 1 : 2) * (2 * L * 9000 + 120_000) + 260_000;
+        const infrastructure = trackCost + (hub || joined ? 1 : 2) * (2 * L * 9000 + 120_000) + 260_000;
         // a corridor alongside existing rail (any owner) mostly shares that line's passengers and its valley:
         // revenue shared, and the project marked down hard (reusing the line is the better option, see shareOptions)
         const overlap = corridorOverlap(g, A.x, A.z, B.x, B.z, Math.min(30, d / 4));
@@ -1665,11 +1690,12 @@ export class AIController {
         const models = pickTrain(g.year, L, len, openingCoaches(A.pop, B.pop)) ?? railModels;
         yield;
         if (!hubsLive()) continue railPairs;
-        const sites: ForecastSite[] = [];
+        const sites: (ForecastSite | Station)[] = [];
         for (const t of [A, B]) {
           const h = t === A ? hubA : hubB;
           if (h) {
-            sites.push({ x: h.x, z: h.z, townId: t.id, length: h.rail!.length, tracks: h.rail!.tracks, walk: walkingCatchment(g, h) });
+            // Keep station identity and links: this hub is not a competing anonymous stop.
+            sites.push(h);
           } else {
             // A ground platform and its leads need space on the approaching side of town.
             // A centre point overstates the walks before a station site has been proved.
@@ -1685,7 +1711,7 @@ export class AIController {
           const sv = this.serviceYear(models, fleet, d, len);
           yield;
           if (!hubsLive()) continue railPairs;
-          const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway);
+          const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, this.companyId);
           const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
           const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap);
           const outlay = infrastructure + fleet * (models.reduce((s, m) => s + m.cost, 0) + mail.price);
@@ -1695,7 +1721,7 @@ export class AIController {
             // centre walks can keep speculative rail ahead of services that can actually open.
             const amortisation = 0.045 - 0.03 * this.config.risk;
             const years = 1 / (0.03 + amortisation), capital = outlay * 0.03 + infrastructure * amortisation;
-            const upkeep = (hub ? 1 : 2) * (20_000 + 2 * L * 500) + 12_000 + trackCost * 0.01;
+            const upkeep = (hub || joined ? 1 : 2) * (20_000 + 2 * L * 500) + 12_000 + trackCost * 0.01;
             if (revenue <= sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital) continue;
             score = Math.max(score, roi(revenue, sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital, outlay) * years / 9);
           }
@@ -1706,11 +1732,10 @@ export class AIController {
         if (rivals.has(this.pairKey(A.id, B.id))) score *= 0.4;
         // the new line feeds our network: through trains when it continues one of our lines (a multi-town line);
         // from another company's station (open access) our trains continue its line
-        if (hub && hub.owner === this.companyId) score *= this.lineEndsAt(hub.id) ? 1.9 : 1.3;
-        else if (hub) score *= this.foreignPathTo(hub) ? 1.7 : 1.4;
+        // Connection preference is a separate tier; native forecasts price transfers and saved capital.
         // a town beyond (a corridor the line can continue along later)
-        else if (this.townBeyond(A, B) || this.townBeyond(B, A)) score *= 1.25;
-        opts.push({ score: score * (railLines === 0 ? 1.3 : 1) * fw(focus.rail), kind: 'rail', towns: hubB ? [B.id, A.id] : [A.id, B.id], hub: hub?.id });
+        if (!hub && !joined && (this.townBeyond(A, B) || this.townBeyond(B, A))) score *= 1.25;
+        opts.push({ score: score * (railLines === 0 ? 1.3 : 1) * fw(focus.rail), kind: 'rail', towns: joined ? branchA ? [B.id, A.id] : [A.id, B.id] : hubB ? [B.id, A.id] : [A.id, B.id], hub: hub?.id, join: joined?.id });
       }
     }
     // cross-city links (9k): in a big town where two of our main lines end from different sides, an underground
@@ -1786,7 +1811,7 @@ export class AIController {
         const sv = this.serviceYear([coach!], 2, d, d * 1.3, 'road');
         const carried = Math.min(D.pair(A.id, B.id) * 0.25 * 12 * share(A.id, B.id), sv.seats);
         const score = roi(carried * sv.perPax, sv.running + 12_000, 700_000);
-        opts.push({ score: score * fw(focus.road), kind: 'coach', towns: [A.id, B.id] });
+        opts.push({ score: score * fw(focus.road), kind: 'coach', towns: [A.id, B.id], viable: carried * sv.perPax > sv.running + 12_000 && 700_000 <= avail });
       }
     }
     // town buses in larger towns (between their districts), few lines per town
@@ -1797,13 +1822,14 @@ export class AIController {
         const bm = pickBus(g.year, T.pop);
         const sv = bm ? this.serviceYear([bm], 3, 22, 26, 'street') : null;
         const score = sv ? roi(Math.min(D.local(T.id) * 0.3 * 12, sv.seats) * sv.perPax, sv.running + 15_000, 650_000) : 0;
-        opts.push({ score: score * (busLines === 0 ? 1.15 : 1) * fw(focus.road), kind: 'bus', towns: [T.id] });
+        opts.push({ score: score * (busLines === 0 ? 1.15 : 1) * fw(focus.road), kind: 'bus', towns: [T.id], hub: this.busInterchange(T),
+          viable: !!sv && Math.min(D.local(T.id) * 0.3 * 12, sv.seats) * sv.perPax > sv.running + 15_000 && 650_000 <= avail });
       }
     }
     // Compare affordable stages of a city railway: a small light-rail-style opening first, or a subway where the
     // capacity repays the tunnels over their discounted civil life. Both are ordinary rail (one catchment, fare and forecast model;
     // the style picks track, level, platforms and spacing). Preview uses real pedestrian routes, never a town fraction.
-    const pricedOpening = own.length === 0 && opts.some((o) => o.score > 0 && considers(
+    const pricedOpening = own.length === 0 && opts.some((o) => o.score > 0 && o.viable !== false && (!operating.size && hq !== undefined ? o.towns.includes(hq) : true) && considers(
       o.kind === 'rail' || o.kind === 'share' || o.kind === 'hsr' || o.kind === 'crosscity' ? focus.rail : focus.road));
     // Start from already priced openings. Later selections compare one detailed city opportunity,
     // rather than blocking every route behind a survey of every town and construction style.
@@ -1828,10 +1854,12 @@ export class AIController {
         }
       }
       const cursor = this.state.urbanSearchCursor ?? this.companyId - 1;
-      const opportunity = cityOpportunities[cursor % Math.max(1, cityOpportunities.length)];
+      const home = !operating.size ? cityOpportunities.filter(o => o.town.id === hq) : [];
+      const candidates = home.length ? home : cityOpportunities;
+      const opportunity = candidates[cursor % Math.max(1, candidates.length)];
       for (const { town: T, mode } of opportunity ? [opportunity] : []) {
           // Advance before yielding so a reload does not endlessly restart the same long valuation.
-          this.state.urbanSearchCursor = (cursor + 1) % cityOpportunities.length;
+          this.state.urbanSearchCursor = (cursor + 1) % candidates.length;
           yield;
           const layout = yield* this.urbanStep(T, mode), unit = this.urbanUnit(mode, this.urbanPlatform(mode));
           if (!unit) continue;
@@ -1858,7 +1886,8 @@ export class AIController {
           const tm = availableModels(g.year, 'tram').sort((a, b) => b.capacity / b.cost - a.capacity / a.cost)[0];
           const sv = tm ? this.serviceYear([tm], 3, 25, 28, 'street') : null;
           const score = sv ? roi(Math.min(D.local(town.id) * 0.45 * 12, sv.seats) * sv.perPax, sv.running + 60_000, 2_200_000) : 0;
-          opts.push({ score: score * (tramLines === 0 ? 1.15 : 1) * fw(focus.tram), kind: 'tram', towns: [town.id] });
+          opts.push({ score: score * (tramLines === 0 ? 1.15 : 1) * fw(focus.tram), kind: 'tram', towns: [town.id],
+            viable: !!sv && Math.min(D.local(town.id) * 0.45 * 12, sv.seats) * sv.perPax > sv.running + 60_000 && 2_200_000 <= avail });
         }
       }
     }
@@ -1868,7 +1897,8 @@ export class AIController {
         if (A.id >= B.id || this.isFailed('road' + this.pairKey(A.id, B.id))) continue;
         const d = Math.hypot(A.x - B.x, A.z - B.z);
         if (d < 50 || d > 130) continue;
-        opts.push({ score: 0.6 * roi(D.pair(A.id, B.id) * 0.2 * 12 * fareAt(d, 90), 80_000, 1_200_000 + d * 4000) * fw(focus.road), kind: 'road', towns: [A.id, B.id] });
+        opts.push({ score: 0.6 * roi(D.pair(A.id, B.id) * 0.2 * 12 * fareAt(d, 90), 80_000, 1_200_000 + d * 4000) * fw(focus.road), kind: 'road', towns: [A.id, B.id],
+          viable: D.pair(A.id, B.id) * 0.2 * 12 * fareAt(d, 90) > 80_000 && 1_200_000 + d * 4000 <= avail });
       }
     }
     // a company with a clear favourite saves up for it rather than spending on kinds it barely cares for (unless
@@ -1882,25 +1912,31 @@ export class AIController {
     // one of the best few, the better ones (squared score) much more likely
     opts.sort((a, b) => b.score - a.score);
     if (AIController.profile) this.lastOptions = opts.map((o) => ({ kind: o.kind, towns: o.towns, score: o.score }));
-    const top = opts.slice(0, 4);
+    // Home openings get first consideration when affordable and viable. Later growth joins actual served facilities.
+    const preferred = opts.filter(o => o.viable !== false && (!operating.size && hq !== undefined ? o.towns.includes(hq)
+      : (o.hub ?? o.join) !== undefined && g.lines.stationServed((o.hub ?? o.join)!) || !!o.urbanLayout?.interchanges.some(id => g.lines.stationServed(id))));
+    const top = (preferred.length ? preferred : opts).slice(0, 4);
     let r = this.rng.next() * top.reduce((a, o) => a + o.score * o.score, 0), pick = top[0];
     for (const o of top) { r -= o.score * o.score; if (r <= 0) { pick = o; break; } }
     if (pick.kind === 'tram') {
-      if (!this.startTram()) { this.markFailed('tram', 120); this.state.cooldown = 20; }
+      if (!this.startTram(pick.towns[0])) { this.markFailed('tram', 120); this.state.cooldown = 20; }
       return;
     }
     const towns = pick.towns.map((id) => g.towns.list[id]);
     this.project = { kind: pick.kind, towns: pick.towns, stations: [], edges: [], depots: [], line: -1, started: g.day,
       ...(pick.urbanLayout ? { urbanLayout: pick.urbanLayout } : {}) };
-    // a railway starts at the hub, else at the bigger town
-    const railEnds = pick.kind !== 'rail' || pick.hub !== undefined || towns[0].pop >= towns[1].pop ? towns : [towns[1], towns[0]];
-    this.job = pick.kind === 'rail' ? this.railJob(railEnds[0], railEnds[1], pick.hub ?? -1)
+    // A reused rail hub stays first; fresh corridors build the HQ station before their other endpoint.
+    const originTowns = towns[1]?.id === hq ? [towns[1], towns[0]] : towns;
+    const railEnds = pick.kind !== 'rail' && pick.kind !== 'hsr' || pick.hub !== undefined || pick.join !== undefined ? towns
+      : towns[1]?.id === hq ? [towns[1], towns[0]]
+      : towns[0]?.id === hq || towns[0].pop >= towns[1].pop ? towns : [towns[1], towns[0]];
+    this.job = pick.kind === 'rail' ? this.railJob(railEnds[0], railEnds[1], pick.hub ?? -1, 'standard', true, pick.join ?? -1)
       : pick.kind === 'hsr' ? this.railJob(railEnds[0], railEnds[1], -1, 'highspeed')
       : pick.kind === 'crosscity' ? this.crossCityJob(towns[0])
       : pick.kind === 'share' ? this.shareJob(pick.share![0], pick.share![1], pick.share![2], pick.share![3])
-      : pick.kind === 'coach' ? this.coachJob(towns[0], towns[1])
+      : pick.kind === 'coach' ? this.coachJob(originTowns[0], originTowns[1])
       : pick.kind === 'metro' || pick.kind === 'lightrail' ? this.urbanJob(towns[0], pick.kind)
-      : pick.kind === 'bus' ? this.busJob(towns[0]) : this.roadJob(towns[0], towns[1]);
+      : pick.kind === 'bus' ? this.busJob(towns[0]) : this.roadJob(originTowns[0], originTowns[1]);
     this.state.projects++;
   }
 
@@ -2006,6 +2042,18 @@ export class AIController {
     return foreign;
   }
 
+  /** A paid station approached by an existing railway: build a real junction, not a duplicate town terminus. */
+  private branchStation(T: Town, toward: P2): Station | null {
+    let best: Station | null = null, distance = Infinity;
+    for (const st of this.game.stations.map.values()) {
+      if (st.townId !== T.id || !st.rail || railPartMode(st.rail) !== 'mainline' || !this.railHubLive(st)
+        || !this.game.lines.stationServed(st.id) || !this.approachJunctions(st, toward).length) continue;
+      const d = Math.hypot(st.x - toward.x, st.z - toward.z);
+      if (d < distance) { best = st; distance = d; }
+    }
+    return best;
+  }
+
   /**
    * Mutual open access with another AI company: both networks open to each other (never the player, whose track the AI
    * does not alter). The standing consent for joint track works, as the network planner's (ai-network.ts agrees).
@@ -2020,6 +2068,69 @@ export class AIController {
   private railHubLive(st: Station, rail = st.rail, owner = st.owner, access = true): boolean {
     return this.game.stations.get(st.id) === st && !!st.rail && st.rail === rail && st.owner === owner
       && this.agrees(st.owner) && (!access || this.game.stations.hasAccess(st));
+  }
+
+  /** The exact supported own terminus which the final builder may extend; patterned services stay separate. */
+  private railExtensionAt(st: Station | null, other = -1): [number, LineInfo] | undefined {
+    if (!st || st.owner !== this.companyId) return undefined;
+    return [...this.lines].find(([id, info]) => {
+      const l = this.game.lines.get(id), path = l && linearStops(l.stops);
+      return l?.owner === this.companyId && !l.patterns?.length && !l.operators?.length && info.kind === 'rail'
+        && !info.hsr && info.shared === undefined && !info.urban && !!path
+        && (path[0] === st.id || path[path.length - 1] === st.id) && !path.includes(other);
+    });
+  }
+
+  /** Preserve every physical member ID in the proposed through itinerary; complex walking links are not rail links. */
+  private railItinerary(a: StationPlan | Station, b: StationPlan | Station, hubA: Station | null, hubB: Station | null) {
+    const extA = this.railExtensionAt(hubA, 'id' in b ? b.id : -1), extB = extA ? undefined : this.railExtensionAt(hubB, 'id' in a ? a.id : -1);
+    const extension = extA ?? extB, at = extA ? hubA : hubB;
+    const foreignA = !extension && hubA?.owner !== this.companyId && hubA ? this.foreignRouteTo(hubA) : null;
+    const foreign = foreignA ?? (!extension && hubB?.owner !== this.companyId && hubB ? this.foreignRouteTo(hubB) : null);
+    let ids = extension ? linearStops(this.game.lines.get(extension[0])!.stops)! : foreign?.path;
+    if (!ids) return { points: [a, b], old: [] as Station[], extension, foreign };
+    ids = [...ids];
+    if (extension && ids[0] === at?.id) ids.reverse();
+    const old = ids.map(id => this.game.stations.get(id)).filter((s): s is Station => !!s);
+    const added = extA || foreignA ? b : a;
+    if ('id' in added && ids.includes(added.id)) return { points: [a, b], old: [] as Station[], extension: undefined, foreign: null };
+    return { points: [...old, added], old, extension, foreign };
+  }
+
+  /** Full-body native arrival and return on existing paid legs, without stock allocation or ignored track rights. */
+  private quotedRailLeg(a: Station, b: Station, cars: VehicleModel[]): number[] | null {
+    const g = this.game, rule = consistRule(cars), length = cars.reduce((n, c) => n + c.length + .1, 0);
+    let best: ReturnType<typeof findRailRoute> = null;
+    for (const group of g.stations.railTrackGroups(a)) {
+      if (group.length < length) continue;
+      for (const steps of [group.steps, [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }))]) {
+        const frontier = platformDepartureFrontiers(g, steps, this.companyId, rule, length);
+        const found = findRailRoute(g, [...frontier.forward, ...frontier.reverse], b.id, this.companyId, -1, 15000, false, rule, true, { length, onward: a.id });
+        if (found && (!best || found.cost < best.cost)) best = found;
+      }
+    }
+    return best ? best.conts.map(c => c.edge.id) : null;
+  }
+
+  /** Native per-leg operating estimates include intermediate stops instead of pricing one short endpoint hop. */
+  private railCycle(cars: VehicleModel[], lengths: number[], speedCap = Infinity) {
+    const cap = Math.min(speedCap, ...cars.map(c => c.speed));
+    const legs = lengths.map(len => { const year = estimateVehicleYear(cars, len / 1.15, this.game.year, .4, cap); return { len, year, seconds: YEAR_S / year.trips }; });
+    const seconds = legs.reduce((n, l) => n + l.seconds, 0), length = lengths.reduce((n, l) => n + l, 0);
+    return { seconds, seats: YEAR_S / seconds * cars.reduce((n, c) => n + c.capacity, 0) * .4,
+      running: legs.reduce((n, l) => n + l.year.total * l.seconds / seconds, 0),
+      wear: legs.reduce((n, l) => n + l.len * l.year.trackWearPerUnit * l.seconds / seconds, 0),
+      kmh: length * UNIT_M / 1000 / (seconds / 3600) };
+  }
+
+  /** Foreign infrastructure's native sole-user upkeep bound: no free through-running or invented fee discount. */
+  private railFeeBound(points: (StationPlan | Station)[], rails: Set<number>): number {
+    const g = this.game, owners = new Map<number, number>();
+    for (const st of points) if ('id' in st && st.owner !== this.companyId && g.accessMultiplier(st.owner) > 0)
+      owners.set(st.owner, (owners.get(st.owner) ?? 0) + g.stationMaintenance(st));
+    for (const id of rails) { const e = g.world.net.edges.get(id); if (e && e.owner !== this.companyId && e.owner >= 0 && g.accessMultiplier(e.owner) > 0)
+      owners.set(e.owner, (owners.get(e.owner) ?? 0) + g.edgeMaintenance(e)); }
+    return [...owners.values()].reduce((n, upkeep) => n + upkeep, 0);
   }
 
   /** Stations (in order, ending at `st`) of another company's railway line that ends at `st` (out and back), and that line. */
@@ -2514,10 +2625,10 @@ export class AIController {
    * traffic grows, see manage), a depot on a siding (station ends stay free for extensions), and a line with
    * short trains. A line ending at the hub is extended to B (through trains) instead of a new line.
    */
-  private *railJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true): Generator<void, void> {
+  private *railJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true, joinId = -1): Generator<void, void> {
     const p = this.project!;
     let hubsLive = () => true;
-    const job = this.railPlanJob(A, B, hubId, type, centre, check => { hubsLive = check; });
+    const job = this.railPlanJob(A, B, hubId, type, centre, check => { hubsLive = check; }, joinId);
     let units = 0;
     try {
       while (true) {
@@ -2541,11 +2652,12 @@ export class AIController {
   }
 
   private *railPlanJob(A: Town, B: Town, hubId = -1, type = 'standard', centre = true,
-    register?: (check: () => boolean) => void): Generator<void, void> {
+    register?: (check: () => boolean) => void, joinId = -1): Generator<void, void> {
     const g = this.game, owner = this.companyId, net = g.world.net;
     const watched = new Map<Station, { rail: Station['rail']; owner: number; access: boolean }>();
+    let itineraryLive = () => true;
     const watch = (st: Station | null | undefined, access = true) => { if (st && !watched.has(st)) watched.set(st, { rail: st.rail, owner: st.owner, access }); };
-    register?.(() => [...watched].every(([st, before]) => this.railHubLive(st, before.rail, before.owner, before.access)));
+    register?.(() => itineraryLive() && [...watched].every(([st, before]) => this.railHubLive(st, before.rail, before.owner, before.access)));
     const p = this.project!;
     // A high-speed railway uses main-line stations where they can take it, and wide curves with shallow grades between them.
     const hs = type === 'highspeed' || p.kind === 'hsr', hsUnit = hs ? this.hsrUnit() : null;
@@ -2571,7 +2683,7 @@ export class AIController {
     const reach = (a: StationPlan, b: StationPlan) => Math.abs(a.y - b.y) <= grade * Math.hypot(a.x - b.x, a.z - b.z) * 1.15;
     // one station where lines meet: B's station (ours, or an open network's) with its platform ends towards A
     // free takes the line too, rather than a second station in the town
-    const hb = this.hubFor(B, hub ?? A);
+    const hb = joinId >= 0 ? null : this.hubFor(B, hub ?? A);
     let hubB = hb && hb !== hub && hb.rail && railPartMode(hb.rail) === 'mainline' && (!hs || hb.rail.length >= hsUnit!.length + 0.4) ? hb : null;
     watch(hubB);
     if (hubB && !this.railHubLive(hubB)) return fail('station or track access changed while planning', 360);
@@ -2694,11 +2806,12 @@ export class AIController {
     // (a station of its own only when no junction works)
     let join: { S: Station; J: JunctionSite } | null = null;
     let plan: RoutePlan | string = preferredRoute ?? 'no route';
-    const S = hubB ? null : this.townStation(B, pr.b);
+    const S = hubB ? null : joinId >= 0 ? g.stations.get(joinId) ?? null : this.townStation(B, pr.b);
+    if (joinId >= 0 && (!S?.rail || S.townId !== B.id || !this.railHubLive(S))) return fail('joining station or access changed', 360);
     // (a terminus of our own right beside another company's station would duplicate it: join that station's approach
     // where a junction fits, whatever share of the new site's catchment it covers)
     const duplicate = !!S && S.owner !== owner && Math.hypot(S.x - pr.b.x, S.z - pr.b.z) - (S.rail!.length + PLATFORM) / 2 <= XLINK_REACH;
-    if (S && (this.newCatchShare(pr.b) < 0.6 || duplicate)) {
+    if (S && (joinId >= 0 || this.newCatchShare(pr.b) < 0.6 || duplicate)) {
       watch(S);
       if (hs && S.rail!.length < hsUnit!.length + 0.4) return fail('existing station platforms too short', 720);
       for (const J of this.approachJunctions(S, frontA).slice(0, 4)) {
@@ -2709,13 +2822,13 @@ export class AIController {
         const pj = yield* routeGen(g, from, W, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: J.y, pre: [start], avoid: [avoidA], exclude: new Set(J.chain), ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 2, parallel: 3, sliced: true }, AI_ROUTE_WORK);
         if (typeof pj !== 'string') { plan = pj; join = { S, J }; watch(S); break; }
       }
-      if (!join && hs) return fail(`no junction into ${S.name}`, 720);
+      if (!join && (hs || joinId >= 0)) return fail(`no junction into ${S.name}`, 720);
       if (!join) { watched.delete(S); this.note(`railway ${A.name}-${B.name}: no junction into ${S.name} (a station of its own)`); }
     }
     // (running alongside existing rail costs extra: such a line would mostly share the passengers of the other)
     if (!join && !preferredRoute) plan = yield* routeGen(g, from, to, { kind: 'rail', owner, tracks, y0: pr.a.y, y1: pr.b.y, pre: [start], post: [{ x: frontB.x, z: frontB.z, tx: -fb.x, tz: -fb.z }], avoid, ...curve, gradeMargin: (hs ? 0.03 : 0.035) / TRACK_TYPES.standard.maxGrade * (underground ? 0.95 : 0.85), retries: 3, parallel: 3, sliced: true }, AI_ROUTE_WORK);
     // (an underground centre station the line cannot reach, or pay for: the railway with stations on the ground)
-    const ground = function* (self: AIController, why: string): Generator<void, void> { self.note(`${what} ${A.name}-${B.name}: underground station dropped (${why})`); yield* self.railJob(A, B, hubId, type, false); };
+    const ground = function* (self: AIController, why: string): Generator<void, void> { self.note(`${what} ${A.name}-${B.name}: underground station dropped (${why})`); yield* self.railJob(A, B, hubId, type, false, joinId); };
     if (typeof plan === 'string') { if (underground) return yield* ground(this, plan); return fail(plan, plan.startsWith('route runs') ? 720 : 900); }
     const endB = join ? asPlan(join.S) : pr.b;
     this.state.phase = `${planning}: costs`;
@@ -2731,31 +2844,82 @@ export class AIController {
     yield;
     const big = Math.sqrt(A.pop * B.pop) >= 2500;
     // (trains fit the shortest platforms of the line: a joined station's may be shorter)
-    const cars = hs ? [hsUnit!] : pickTrain(g.year, Math.min(PLATFORM, hub ? lenA : PLATFORM, hubB ? lenB : join ? join.S.rail!.length : PLATFORM), len, openingCoaches(A.pop, B.pop));
-    if (!cars) return fail('no trains available');
+    const initialCars = hs ? [hsUnit!] : pickTrain(g.year, Math.min(PLATFORM, hub ? lenA : PLATFORM, hubB ? lenB : join ? join.S.rail!.length : PLATFORM), len, openingCoaches(A.pop, B.pop));
+    if (!initialCars) return fail('no trains available');
+    let cars: VehicleModel[] = initialCars;
     let nTrains = big ? 2 : 1;
-    const trainCost = cars.reduce((a, c) => a + c.cost, 0);
+    let trainCost = cars.reduce((a, c) => a + c.cost, 0);
     const est = estimateChainCost(prof, tracks, 'rail', type).cost * 1.15;
     const wireEdges = hs ? [...(hub?.rail?.edges ?? []), ...(hubB?.rail?.edges ?? []), ...(join?.S.rail?.edges ?? []), ...(join?.J.chain ?? [])] : [];
     const wireCost = wireEdges.length ? electrify(g, wireEdges, owner, true).cost : 0;
     const infrastructure = est + wireCost + (hub ? 0 : pr.a.cost) + (hubB || join ? 0 : pr.b.cost) + 260_000;
     const speedCap = hs ? routeCurveSpeed([start, ...way], type, hsUnit!.speed) : Infinity;
-    const opening = (fleet: number) => {
-      const sv = this.serviceYear(cars, fleet, dist, len, type, 0.4, speedCap);
-      const forecast = g.demand.forecastLine([hub ?? pr.a, hubB ?? join?.S ?? pr.b], 'mainline', sv.kmh, sv.headway);
-      const mail = projectMail(g, [hub ?? pr.a, hubB ?? join?.S ?? pr.b], cars, fleet, sv.kmh, sv.headway,
-        Math.min(PLATFORM, hub ? lenA : PLATFORM, hubB ? lenB : join ? join.S.rail!.length : PLATFORM));
-      const income = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * (1 - alongside);
-      const maint = sv.trackUpkeep + (hub ? 0 : 40_000) + (hubB || join ? 0 : 40_000) + 12_000 + est * 0.01;
-      return { sv, forecast, income, maint, mail, net: income - sv.running - mail.yearly - maint, total: infrastructure + (trainCost + mail.price) * fleet };
+    const full = this.railItinerary(hub ?? pr.a, hubB ?? join?.S ?? pr.b, hub, hubB ?? join?.S ?? null);
+    for (const st of full.old) watch(st);
+    const platform = Math.min(PLATFORM, ...full.points.map(p => 'id' in p ? p.rail?.length ?? 0 : p.length));
+    const throughCars = hs ? cars : pickTrain(g.year, platform, len, openingCoaches(A.pop, B.pop));
+    const oldLengths: number[] = [], oldRails = new Set<number>();
+    let throughFits = !!throughCars;
+    if (throughCars) for (let i = 1; i < full.old.length; i++) {
+      const leg = this.quotedRailLeg(full.old[i - 1], full.old[i], throughCars);
+      if (!leg) { throughFits = false; break; }
+      for (const id of leg) oldRails.add(id);
+      oldLengths.push(leg.reduce((n, id) => n + (net.edges.get(id)?.len ?? 0), 0));
+    }
+    const existingFleet = full.extension ? g.lines.get(full.extension[0])!.vehicles.map(id => g.vehicles.get(id))
+      .filter((v): v is Train => v instanceof Train && v.owner === owner) : [];
+    // An existing electric/HSR or patterned fleet is not promised an unpriced new compatible formation.
+    if (existingFleet.some(t => t.rule.wire && !TRACK_TYPES[type]?.electrified || t.length > PLATFORM)) throughFits = false;
+    const opening = (fleet: number, through = false) => {
+      const stock = through ? throughCars! : cars;
+      const points = through ? full.points : [hub ?? pr.a, hubB ?? join?.S ?? pr.b];
+      const lengths = through ? [...oldLengths, len] : [len];
+      const cycle = this.railCycle(stock, lengths, Math.min(speedCap, TRACK_TYPES[type]?.speed ?? 160)), oldCycles = through ? existingFleet.map(t => this.railCycle(t.cars, lengths, Math.min(speedCap, TRACK_TYPES[type]?.speed ?? 160))) : [];
+      const rates = fleet / cycle.seconds + oldCycles.reduce((n, c) => n + 1 / c.seconds, 0);
+      const totalFleet = fleet + oldCycles.length;
+      const sv = through ? { headway: 2 / rates, kmh: lengths.reduce((n, l) => n + l, 0) * UNIT_M / 1000 / (totalFleet / rates / 3600),
+        seats: fleet * cycle.seats + oldCycles.reduce((n, c) => n + c.seats, 0),
+        running: fleet * cycle.running + oldCycles.reduce((n, c) => n + c.running, 0),
+        trackUpkeep: len * trackBasePerUnit(type) + fleet * cycle.wear + oldCycles.reduce((n, c) => n + c.wear, 0) }
+        : this.serviceYear(stock, fleet, dist, len, type, .4, speedCap);
+      const forecast = g.demand.forecastLine(points, 'mainline', sv.kmh, sv.headway, owner, through ? full.extension?.[0] : undefined);
+      // Existing vans retain their traffic; do not sell it again as revenue of this extension.
+      const mail = through && existingFleet.length ? { revenue: 0, potential: 0, yearly: 0, price: 0, cars: stock }
+        : projectMail(g, points, stock, fleet, sv.kmh, through ? 2 * cycle.seconds / fleet : sv.headway,
+          through ? platform : Math.min(PLATFORM, hub ? lenA : PLATFORM, hubB ? lenB : join ? join.S.rail!.length : PLATFORM));
+      const gross = forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + .7 * mail.revenue;
+      let baselineRevenue = 0, baselineRunning = 0, baselineWear = 0;
+      if (through && existingFleet.length) {
+        const baseline = existingFleet.map(t => this.railCycle(t.cars, oldLengths));
+        const frequency = baseline.reduce((n, c) => n + 1 / c.seconds, 0), seats = baseline.reduce((n, c) => n + c.seats, 0);
+        const before = g.demand.forecastLine(full.old, 'mainline', oldLengths.reduce((n, l) => n + l, 0) * UNIT_M / 1000 / (baseline.length / frequency / 3600), 2 / frequency, owner, full.extension![0]);
+        baselineRevenue = before.revenue * Math.min(1, seats / Math.max(1, before.boardings));
+        baselineRunning = baseline.reduce((n, c) => n + c.running, 0); baselineWear = baseline.reduce((n, c) => n + c.wear, 0);
+      }
+      const fees = this.railFeeBound(points, through ? oldRails : new Set());
+      const delta = gross - baselineRevenue;
+      const income = delta > 0 ? delta * (1 - alongside) : delta, running = sv.running - baselineRunning;
+      const maint = Math.max(len * trackBasePerUnit(type), sv.trackUpkeep - baselineWear)
+        + (hub ? 0 : 40_000) + (hubB || join ? 0 : 40_000) + 12_000 + est * .01 + fees;
+      return { sv: { ...sv, running }, forecast, income, maint, mail, net: income - running - mail.yearly - maint,
+        total: infrastructure + (stock.reduce((n, c) => n + c.cost, 0) + mail.price) * fleet, cars: stock, through, fees };
     };
     let service = opening(nTrains);
     yield;
-    if (!hs) for (const fleet of [1, 2]) {
-      if (fleet === nTrains) continue;
-      const candidate = opening(fleet);
-      if (candidate.total <= this.available() && candidate.net / candidate.total > service.net / service.total) { nTrains = fleet; service = candidate; }
-      yield;
+    for (const fleet of hs ? [nTrains] : [1, 2]) {
+      for (const through of !hs && throughFits && full.old.length >= 2 ? [false, true] : [false]) {
+        if (fleet === nTrains && !through) continue;
+        const candidate = opening(fleet, through);
+        if (candidate.total <= this.available() && candidate.net / candidate.total > service.net / service.total) { nTrains = fleet; service = candidate; }
+        yield;
+      }
+    }
+    cars = service.cars; trainCost = cars.reduce((n, c) => n + c.cost, 0);
+    if (service.through) {
+      const oldLine = g.lines.get(full.extension?.[0] ?? full.foreign!.line)!;
+      const identity = () => JSON.stringify([oldLine.stops, oldLine.patterns, oldLine.operators, oldLine.vehicles.map(id => { const t = g.vehicles.get(id); return [id, t?.owner, t instanceof Train ? t.cars.map(c => c.id) : []]; })]);
+      const before = identity();
+      itineraryLive = () => g.lines.get(oldLine.id) === oldLine && identity() === before;
     }
     const extra = initialSecondTrackCost(prof, type);
     const existing = [...g.lines.map.values()].filter(l => l.kind === 'rail' && l.stops.some(sid => sid === hub?.id || sid === hubB?.id || sid === join?.S.id));
@@ -2996,12 +3160,12 @@ export class AIController {
     // ---- line: extend our line ending at the hub (through trains stopping at every station: a multi-town
     // line A–hub–B, out and back), or a new one
     // (or ours ending at B's station, joined: extended back to A)
-    const endsAt = (st: Station | null, other: Station) => st ? [...this.lines].find(([lid, info]) => {
-      const l = g.lines.get(lid);
-      const path = l && l.id === lid ? linearStops(l.stops) : null;
-      return info.kind === 'rail' && info.shared === undefined && !info.urban && !!path && (path[0] === st.id || path[path.length - 1] === st.id) && !path.includes(other.id);
-    }) : undefined;
-    const extA = hs ? undefined : endsAt(hub, stB), extB = hs || extA ? undefined : endsAt(hubB, stA);
+    if (!itineraryLive()) return fail('through timetable or stock changed during construction', 360);
+    if (service.through && existingFleet.some(t => !this.quotedRailLeg(stA, stB, t.cars)))
+      return fail('existing through fleet cannot use the completed branch', 720);
+    itineraryLive = () => true; // The builder now changes the exact itinerary it priced.
+    const extA = hs || !service.through || !full.extension || full.old.at(-1)?.id !== stA.id ? undefined : full.extension;
+    const extB = hs || !service.through || extA ? undefined : full.extension;
     const ext = extA ?? extB, at = extA ? stA : stB, add = extA ? stB : stA;
     let line = ext ? g.lines.get(ext[0])! : early?.line ?? null;
     let extensionLength = 0;
@@ -3018,9 +3182,10 @@ export class AIController {
       if (!line) { line = g.lines.create('rail', owner); p.line = line.id; }
       // the first stop is one the depot reaches; from another company's station, our trains run on along its line
       // too (stopping at its stations: a line through several towns on shared track)
-      const froute = !hs && hub && hub.owner !== owner ? this.foreignRouteTo(hub) : null, fpath = froute?.path;
+      const foreignEnd = hub?.owner !== owner && hub ? hub : (hubB ?? join?.S)?.owner !== owner ? hubB ?? join?.S : null;
+      const froute = !hs && service.through && foreignEnd ? full.foreign : null, fpath = froute?.path;
       if (fpath && fpath.length >= 2) {
-        line.stops = outAndBack([...fpath, stB.id]);
+        line.stops = outAndBack([...fpath, foreignEnd === hub ? stB.id : stA.id]);
         // a through service: the route keeps its letter and numbering (their AS01…, our BS08…)
         g.lines.inheritRoute(line.id, froute!.line);
         this.stats.multiTown = Math.max(this.stats.multiTown, fpath.length + 1);
@@ -3073,9 +3238,16 @@ export class AIController {
     if (repaired) {
       if (this.eco.money < fleetReserve) return fail('paid opening fleet reserve changed before purchase', 720);
     } else this.borrowFor((trainCost + mail.price) * nTrains + 300_000);
+    // The actual shared timetable bids with its native full-route forecast, then honours the paid capacity auction.
+    priceSharedProject(g, line, { ...forecast, kmh: sv.kmh, headway: sv.headway });
     let bought = 0;
     for (let i = 0; i < nTrains; i++) {
-      const t = g.vehicles.buyTrain(dep, this.mailPolicy.openingCars(line, mail.cars), line.id);
+      const openingCars = this.mailPolicy.openingCars(line, mail.cars);
+      if (!sharedTrainAllowed(g, line, owner, openingCars)) {
+        if (!bought && service.through) return fail('shared capacity cannot admit the priced through fleet', 360);
+        break;
+      }
+      const t = g.vehicles.buyTrain(dep, openingCars, line.id);
       if (typeof t !== 'string') {
         const call = openingRailCall(g, t, first);
         if (call < 0) { g.vehicles.sell(t.id); return fail('depot no longer serves the final timetable', 720); }
@@ -3108,7 +3280,7 @@ export class AIController {
     // the joined station's own lines get their signals again (the junction on its approach)
     if (join) { this.stats.joinedStations++; for (const l2 of g.lines.map.values()) if (l2.owner === owner && l2.id !== line.id && l2.stops.includes(join.S.id)) this.signalLine(l2.id); }
     this.state.corridor = next ? [stB.id, next.id] : undefined;
-    if (hub || hubB) this.stats.reused++;
+    if (hub || hubB || join) this.stats.reused++;
     this.stats.spent += Math.max(0, spent0 - this.eco.money) + total - est;
     g.postNews(hub ? `${this.name} extends its railway ${hub.name} to ${stB.name}, ${(len / 100).toFixed(1)} km.`
       : `${this.name} opens a ${what} ${stA.name} to ${stB.name}, ${(len / 100).toFixed(1)} km.`, 'ai', (stA.x + stB.x) / 2, (stA.z + stB.z) / 2);
@@ -3364,7 +3536,7 @@ export class AIController {
 
   // ---------------------------------------------------------------- trains on another company's railway
   /** Railways of other companies (that grant access) between two towns we don't connect: [owner, station A, station B]. */
-  private shareOptions(opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number] }[], own: LineInfo[], D: { pair: (a: number, b: number) => number }) {
+  private shareOptions(opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number }[], own: LineInfo[], D: { pair: (a: number, b: number) => number }) {
     const g = this.game, me = this.companyId;
     const trainsAt = new Map<number, number>();
     for (const l of g.lines.map.values()) {
@@ -3375,17 +3547,15 @@ export class AIController {
       if (l.kind !== 'rail' || l.owner === me || l.stops.length < 2 || !l.vehicles.length || g.lines.canOperate(l, me)) continue;
       const o = l.owner, co = g.companies[o];
       if (!co || co.defunct || g.accessPolicy(o) === 'auto-reject' || g.isBlocked(o, me) || g.requestsBy(me).some((q) => q.owner === o)) continue;
-      // an open line: our trains join it (one line, several operators) when it has room for another train; only
-      // where it stops at a station of ours (a company running services on a line owns one of its stations; a line
-      // of our own between two of theirs would own none)
+      // An accessible open line may admit our trains without a station title; stock still pays its native usage fees.
       const joinable = g.lines.partnerPolicy(l) === 'open' && g.canUse(me, o);
-      if (!joinable || !g.lines.ownsStationOn(l, me)) continue;
+      if (!joinable || l.stops.some(id => { const st = g.stations.get(id); return !st || !g.canUse(me, st.owner); })) continue;
       if (l.vehicles.length >= this.lineCapacity(l)) continue;
       const sA = g.stations.get(l.stops[0]);
-      if (!sA || !sA.rail || sA.owner !== o) continue;
+      if (!sA?.rail) continue;
       let sB: Station | undefined, bd = 0;
       for (const sid of l.stops) { const s = g.stations.get(sid); const d = s ? Math.hypot(s.x - sA.x, s.z - sA.z) : 0; if (s && d > bd) { bd = d; sB = s; } }
-      if (!sB || !sB.rail || sB.owner !== o || bd < 60 || bd > 260) continue;
+      if (!sB?.rail || bd < 60 || bd > 260) continue;
       const A = g.towns.list[sA.townId], B = g.towns.list[sB.townId];
       if (!A || !B || A === B) continue;
       const key = 'share' + o + ':' + this.pairKey(sA.id, sB.id);
@@ -3401,7 +3571,7 @@ export class AIController {
       const sv = this.serviceYear(pickTrain(g.year, Math.min(sA.rail.length, sB.rail.length), bd * 1.3, 2) ?? [], 1, bd, bd * 1.3);
       const net = Math.min(D.pair(A.id, B.id) * 0.3 * 12 * Math.min(1, part), sv.seats) * sv.perPax - sv.running * 0.5 - 100_000 - upkeep * (m / (1 + m));
       const score = Math.sqrt(Math.max(0, net / 1_000_000)) * this.config.focus.rail * this.config.focus.rail;
-      opts.push({ score, kind: 'share', towns: [A.id, B.id], share: [o, sA.id, sB.id, joinable ? l.id : -1] });
+      opts.push({ score, kind: 'share', towns: [A.id, B.id], hub: sA.id, share: [o, sA.id, sB.id, joinable ? l.id : -1] });
     }
   }
 
@@ -3473,8 +3643,6 @@ export class AIController {
     let line: Line;
     if (joined) line = jl!;
     else {
-      // (a line of our own needs a station of ours on it)
-      if (stA.owner !== me && stB.owner !== me) return fail('no station of ours on the line', 1500);
       line = g.lines.create('rail', me);
       line.stops = ra ? [a, b] : [b, a];
       p.line = line.id;
@@ -4870,9 +5038,9 @@ export class AIController {
   }
 
   // ---------------------------------------------------------------- tram (ai-tram.ts does the planning and building)
-  private startTram(): boolean {
+  private startTram(townId?: number): boolean {
     const g = this.game, tp = this.tramPlanner();
-    if (!tp.start()) return false;
+    if (!tp.start(townId)) return false;
     const town = tramExt(tp).project?.town ?? -1;
     this.project = { kind: 'tram', towns: town >= 0 ? [town] : [], stations: [], edges: [], depots: [], line: -1, started: g.day };
     this.job = this.tramJob(g.towns.list[town]);
