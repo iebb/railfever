@@ -2897,6 +2897,8 @@ export class Stations {
   private shareMembers = new Map<number, Map<number, number>>();
   private served = new Map<number, boolean>();
   private pendingPop = new Set<number>();
+  /** Saved input work can remain owed even when there are no stations to put in pendingPop. */
+  private pendingInputs = false;
   private catchInputs = { roads: -1, lots: -1, terrain: -1, stations: -1, served: -1 };
 
   /** Event counters only; callers can avoid even entering the walking/share computation. */
@@ -2913,7 +2915,7 @@ export class Stations {
     return p.roads === w.net.roadVersions.version && p.lots === w.lotVersions.version && p.terrain === w.terrainVersions.version &&
       p.stations === this.walkVersion && p.served === this.game.lines.servedVersion;
   }
-  get catchmentPopulationPending() { return this.pendingPop.size > 0; }
+  get catchmentPopulationPending() { return this.pendingInputs || this.pendingPop.size > 0; }
 
   private computeShares(maxB: number) {
     if (!this.catchmentInputsChanged() && maxB === this.catchMaxB) return;
@@ -3061,7 +3063,7 @@ export class Stations {
     this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
     this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
     for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
-    this.pendingPop.clear(); this.fullPreparation = null;
+    this.pendingPop.clear(); this.pendingInputs = false; this.fullPreparation = null;
     return true;
   }
 
@@ -3115,6 +3117,7 @@ export class Stations {
   /** Rebuild derived shares at the saved horizon; a pending road edit still owes a population refresh. */
   restoreCatchmentShares(maxB = this.game.world.nextBuildingId - 1, populationPending = false) {
     this.computeShares(maxB);
+    this.pendingInputs = populationPending;
     if (!populationPending) this.pendingPop.clear();
   }
 
@@ -3162,6 +3165,7 @@ export class Stations {
       st.catchPop = pop;
     }
     this.pendingPop.clear();
+    this.pendingInputs = false;
     return true;
   }
 

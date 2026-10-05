@@ -14,7 +14,8 @@ const protectedState = (g: Game) => {
   const s = g.stations as any;
   return JSON.stringify({ save: serialize(g), rng: g.rng.state, res: [...(g.vehicles as any).res],
     accessVersion: s.accessVersion, walkVersion: s.walkVersion, inputs: s.catchInputs,
-    pendingPop: [...s.pendingPop], catchVersion: s.catchVersion, catchMaxB: s.catchMaxB });
+    pendingPop: [...s.pendingPop], pendingInputs: s.pendingInputs,
+    catchVersion: s.catchVersion, catchMaxB: s.catchMaxB });
 };
 function differences(a: string, b: string) {
   const items: unknown[] = [];
@@ -90,6 +91,39 @@ for (const edit of ['remove', 'add', 'untouched'] as const) {
     writeFileSync(out + '.' + edit + '.before.native.json', data);
     writeFileSync(out + '.' + edit + '.loaded.native.json', after);
   }
+}
+// A native lot edit owes work even before there are station IDs to receive a population update.
+{
+  const g = flatGame(128);
+  road(g, 20, 60, 110, 60); g.onNetworkChanged();
+  const house = g.world.addBuilding({ townId: -1, x: 30, z: 58, angle: 0, w: .8, d: .8,
+    type: 0, floors: 2, pop: 30, seed: 1, y: 3, built: 0 });
+  g.flushNetworkChanges(); g.lines.catchmentDirty = true; g.lines.flushCatchment();
+  house.pop = 40; g.world.touchBuilding(house);
+  const original = protectedState(g), data = saved(g), loaded = deserialize(JSON.parse(data));
+  check(g.stations.map.size === 0 && !g.lines.catchmentDirty && JSON.parse(data).catchmentInputsDirty,
+    'empty published network owes native lot work without an eager demand refresh');
+  check(saved(loaded) === data && protectedState(g) === original,
+    'empty pending inputs load exactly without changing the original native state');
+  const beforeReads = [protectedState(g), protectedState(loaded)];
+  g.stations.stationsForBuilding(house.id); loaded.stations.stationsForBuilding(house.id);
+  check(protectedState(g) === beforeReads[0] && protectedState(loaded) === beforeReads[1]
+    && JSON.parse(saved(loaded)).catchmentInputsDirty,
+  'empty warm membership reads preserve the independent owed-input work');
+  const sid = g.stations.nextId;
+  check(!g.stations.commitBusStop(30, 60, 0) && !loaded.stations.commitBusStop(30, 60, 0),
+    'the first real station is constructed through the same native API');
+  g.stepTick(); loaded.stepTick();
+  check(g.stations.get(sid)!.catchPop === 40 && loaded.stations.get(sid)!.catchPop === 40
+    && !(g.stations as any).pendingInputs && !(loaded.stations as any).pendingInputs,
+  'the native first-station flush publishes population and consumes owed inputs');
+  let exact = saved(g) === saved(loaded);
+  for (let tick = 0; tick < 640; tick++) {
+    g.stepTick(); loaded.stepTick();
+    if (saved(g) !== saved(loaded) || checkReservations(g).length || checkReservations(loaded).length) { exact = false; break; }
+  }
+  check(exact, 'empty pending work and the first real station replay all640 native ticks');
+  results.push({ edit: 'empty-inputs-first-station', exact, final: { tick: g.tick, pop: g.stations.get(sid)!.catchPop } });
 }
 if (out) writeFileSync(out, JSON.stringify({ failures: fails.length, results }, null, 2) + '\n');
 console.log(fails.length ? `${fails.length} CHECKS FAILED` : 'ALL LOAD ACCESS CHECKS PASSED');
