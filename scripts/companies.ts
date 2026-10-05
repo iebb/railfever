@@ -211,6 +211,7 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     };
     const manage = ai.monthly.bind(ai);
     ai.monthly = () => { crowd(); manage(); };
+    crowd();
     const d0 = g.day;
     while (g.day < d0 + 100 && l.vehicles.length <= n0 && !g.company(l.owner).defunct) g.update(0.25);
     console.log(`  riders giving up on ${l.name} (${new Set(l.stops).size} stops, activeness ${ai.config.activeness}): limit ${m0} -> ${info.maxVehicles}, vehicles ${n0} -> ${l.vehicles.length}; ${ai.log.slice(-2).join(' | ')}`);

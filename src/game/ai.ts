@@ -1340,7 +1340,7 @@ export class AIController {
       if (l.owner !== this.companyId || l.kind !== 'tram') continue;
       for (const s of l.stops) { const st = g.stations.get(s); if (st && st.townId >= 0) served.add(st.townId); }
     }
-    return g.towns.list.filter((t) => t.pop >= TramPlanner.minPop && !served.has(t.id) && !this.isFailed('tram' + t.id))
+    return g.towns.list.filter((t) => t.pop >= TramPlanner.minPop && !served.has(t.id) && !this.isFailed('tram' + t.id) && this.localRoom(t))
       .sort((a, b) => b.pop - a.pop || a.id - b.id);
   }
 

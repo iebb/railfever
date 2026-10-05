@@ -2411,16 +2411,22 @@ class NetPlanner {
     return [...agg.values()].filter((p) => p.len >= 15).sort((p, q) => q.len - p.len);
   }
 
+  /** The same rails and adjacent platform starters used by native directional pairing. */
+  private pairScope(A: number[], B: number[]) {
+    const g = this.g, net = g.world.net, stations = new Map<number, number>(), edges = new Set([...A, ...B]);
+    for (const st of g.stations.map.values()) if (st.rail && this.agrees(st.owner)
+      && st.rail.edges.some((id) => { const e = net.edges.get(id); return e && [e.a, e.b].some((n) => net.nodes.get(n)?.edges.some((x) => edges.has(x))); })) {
+      stations.set(st.id, st.owner);
+      for (const id of [...st.rail.edges, ...st.rail.throughEdges]) edges.add(id);
+    }
+    return { edges, stations };
+  }
+
   /** The primitive accepts one owner. Apply jointly authorised works synchronously and restore all titles,
    * including descendants of split edges. New crossovers belong to the company paying for the work. */
   private pairTracks(A: number[], B: number[]): FinishLike {
-    const g = this.g, net = g.world.net, owners = new Map<number, number>(), nodes = new Map<number, number>(), stations = new Map<number, number>();
-    const set = new Set([...A, ...B]);
-    for (const st of g.stations.map.values()) if (st.rail && this.agrees(st.owner)
-      && st.rail.edges.some((id) => { const e = net.edges.get(id); return e && [e.a, e.b].some((n) => net.nodes.get(n)?.edges.some((x) => set.has(x))); })) {
-      stations.set(st.id, st.owner);
-      for (const id of [...st.rail.edges, ...st.rail.throughEdges]) set.add(id);
-    }
+    const g = this.g, net = g.world.net, owners = new Map<number, number>(), nodes = new Map<number, number>();
+    const { edges: set, stations } = this.pairScope(A, B);
     for (const id of set) {
       const e = net.edges.get(id);
       if (!e || !this.agrees(e.owner)) return { signals: 0, crossovers: 0, cost: 0, error: 'Joint track works need mutual open access' };
@@ -2549,6 +2555,12 @@ class NetPlanner {
       const lines = this.linesOver(new Set([...A, ...B]));
       yield;
       if (!lines.length || !this.linesRoute(lines)) continue;
+      // Direction changes protect occupied track and native holds, including a train's reserved
+      // continuation and station works. Check the exact native pairing scope before committing.
+      const scope = this.pairScope(A, B);
+      if ([...scope.edges].some(id => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id) !== 0)) {
+        this.careFor(key, 20); continue;
+      }
       if (!this.canSpend(150_000, 0.3)) return;
       const signals = new Map([...net.nodes].map(([id, n]) => [id, { signal: n.signal, kind: n.signalKind, pass: n.signalPass }]));
       const money = this.eco.money;
