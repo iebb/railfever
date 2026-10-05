@@ -4,7 +4,7 @@ import { Economy } from '../src/game/economy';
 import { initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { commitCapacityTrackUpgrade } from '../src/game/ai-capacity-works';
 import { fundInitialConnector } from '../src/game/ai-network';
-import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion, planConnection, commitConnection } from '../src/game/trackops';
+import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion, planConnection, commitConnection, connectionCurveAtNode } from '../src/game/trackops';
 import { buildDepotOnLine } from '../src/game/routing';
 import { routeBetween } from '../src/game/ai-network';
 import { lineIsDouble } from '../src/game/dualtrack';
@@ -138,6 +138,29 @@ for (const [level, curved, platforms, shared, signals, grade, reused] of [
   console.log(`  ${level}/${curved ? 'curve' : 'straight'}/${platforms}/${shared ? 'shared' : 'own'}: quote ${funded}, paid ${paid}, quote ${ms.toFixed(2)}ms`);
 }
 
+console.log('Native node priority in prospective lead geometry');
+{
+  const f = fixture(), { g } = f, route = upgradeRoute(g, f.A.id, f.B.id, 1);
+  const plan = ([1, -1] as const).map(side => planDoubleTrack(g, route, side, 1))
+    .find(p => p.ok && p.complete && p.start.kind === 'platform' && p.end.kind === 'platform')!;
+  const before = JSON.stringify(serialize(g)), quoted = quoteDoubleTrackCompletion(g, plan);
+  check(JSON.stringify(serialize(g)) === before, 'prospective endpoint quote remains pure');
+  const result = commitDoubleTrack(g, plan, false);
+  check(!result.error, 'native platform leads supply independent committed geometry');
+  for (const end of [plan.start, plan.end]) {
+    const lead = result.edges.map(id => g.world.net.edges.get(id)!).find(e => e?.a === end.node || e?.b === end.node)!;
+    const target = g.world.net.nodes.get(end.node)!, wrong = g.world.net.edges.get(route[0])!;
+    // offAt retains edge/s at runtime; platform targets acquire node without stripping that metadata.
+    const mixed = { x: target.x, z: target.z, node: target.id, edge: wrong.id, s: wrong.len / 2 };
+    const state = JSON.stringify(serialize(g)), curve = JSON.stringify(lead.bez);
+    const prospective = connectionCurveAtNode(g, lead.bez, mixed, lead.a === target.id);
+    check(JSON.stringify(prospective) === curve,
+      'mixed node/edge endpoint preserves the actual native platform node and all committed lead controls');
+    check(JSON.stringify(serialize(g)) === state && JSON.stringify(lead.bez) === curve,
+      'node-priority endpoint sampling does not mutate native geometry or saved state');
+  }
+  check(result.cost <= quoted.formationCost, 'node-priority quote still funds the same native lead formation');
+}
 console.log('Native endpoint formation allowances');
 function endpointAllowance(g: Game, edges: number[], label: string, preserve?: (p: ReturnType<typeof planDoubleTrack>) => boolean) {
   const plans = ([1, -1] as const).map(side => planDoubleTrack(g, edges, side, 1)).filter(p => p.ok && p.complete

@@ -3,7 +3,7 @@
 // stations and depots so every platform is reachable from both tracks), and moving a depot.
 import type { Game } from './game';
 import { RAIL, TRACK_TYPES, PSTEP, LINE_LEVEL } from './constants';
-import { bezFromTangents, bezMinRadius, bezPoint, bezDeriv, endTangent, arcTable, tAtS, segIntersect, angleBetween } from './geom';
+import { bezFromTangents, bezMinRadius, bezPoint, bezDeriv, endTangent, arcTable, tAtS, segIntersect, angleBetween, type Bez } from './geom';
 import { applyEarthworks, repairFormations, DRY_MIN, TUNNEL_LINING, EARTHWORKS } from './terraform';
 import type { NEdge, Section } from './network';
 import { profAt } from './network';
@@ -891,6 +891,17 @@ function leadDiamondReserve(g: Game, a: SPt, b: SPt, future: readonly (readonly 
   return count;
 }
 
+/** Prospective connectS geometry after nodeOf: preserve its priced controls and honor node before edge. */
+export function connectionCurveAtNode(g: Game, priced: Bez, q: Pick<SPt, 'x' | 'z' | 'node' | 'edge' | 's'>, atStart: boolean): Bez {
+  const net = g.world.net, edge = q.node === undefined ? net.edges.get(q.edge ?? -1) : undefined;
+  let point: { x: number; z: number } = net.nodes.get(q.node ?? -1) ?? q;
+  if (edge && q.s !== undefined) {
+    const node = q.s < 0.3 ? net.nodes.get(edge.a) : q.s > edge.len - 0.3 ? net.nodes.get(edge.b) : undefined;
+    point = node ?? bezPoint(edge.bez, tAtS(net.table(edge), q.s));
+  }
+  return atStart ? { ...priced, x0: point.x, z0: point.z } : { ...priced, x3: point.x, z3: point.z };
+}
+
 export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
   const net = g.world.net, samples = sampleSteps(g, plan.steps);
   if (!plan.ok || !samples.length || !plan.points.length) return { cost: Infinity, formationCost: Infinity,
@@ -1015,13 +1026,8 @@ export function quoteDoubleTrackCompletion(g: Game, plan: DoublePlan) {
       const otherIndex = 1 - i, ends = leadEnds[otherIndex], priced = connectionCurve(...ends).bez;
       // connectS prices the supplied curve, then nodeOf resolves a track Snap to a node or exact split
       // point. Network.geo samples that curve with its endpoints replaced; retain its original controls.
-      const targetIndex = otherIndex === 0 ? 0 : 1, q = ends[targetIndex], edge = net.edges.get(q.edge ?? -1);
-      let point = q;
-      if (edge && q.s !== undefined) {
-        const node = q.s < 0.3 ? net.nodes.get(edge.a) : q.s > edge.len - 0.3 ? net.nodes.get(edge.b) : undefined;
-        point = { ...q, ...(node ?? bezPoint(edge.bez, tAtS(net.table(edge), q.s))) };
-      }
-      const other = targetIndex === 0 ? { ...priced, x0: point.x, z0: point.z } : { ...priced, x3: point.x, z3: point.z };
+      const targetIndex = otherIndex === 0 ? 0 : 1, q = ends[targetIndex];
+      const other = connectionCurveAtNode(g, priced, q, targetIndex === 0);
       const tab = arcTable(other), step = Math.max(0.25, tab.len / 1500);
       future.push(Array.from({ length: Math.max(2, Math.ceil(tab.len / step) + 1) }, (_, k) => {
         const p = bezPoint(other, tAtS(tab, Math.min(k * step, tab.len)));
