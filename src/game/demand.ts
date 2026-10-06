@@ -184,6 +184,8 @@ export class DemandModel {
   /** next town to refresh (a few per day, see daily) */
   private cursor = 0;
   private cache = new Map<number, StationDemand>();
+  /** Private rows for the current weights sweep; public coverage queries still return fresh arrays. */
+  private weightCoverage = new WeakMap<Station, { walking?: [number, number][]; regional?: [number, number][] }>();
   private cacheKey = '';
   private feederKey = '';
   private feeders = new Map<number, FeederPool>();
@@ -676,7 +678,7 @@ export class DemandModel {
   weights(st: Station): StationDemand {
     const g = this.g;
     const key = g.day + ':' + g.world.lotVersions.version + ':' + g.vehicles.map.size + ':' + g.lines.version + ':' + this.version + ':' + g.networkVersion;
-    if (key !== this.cacheKey) { this.cache.clear(); this.cacheKey = key; }
+    if (key !== this.cacheKey) { this.cache.clear(); this.weightCoverage = new WeakMap(); this.cacheKey = key; }
     const c = this.cache.get(st.id);
     if (c) return c;
     this.refreshFeeders();
@@ -697,7 +699,11 @@ export class DemandModel {
       const walk = Math.min(1, Math.hypot(ds.x - st.x, ds.z - st.z) / WALK);
       const sameTown = st.townId >= 0 && st.townId === ds.townId;
       const source = sameTown ? walkingOrigin ?? [] : origin;
-      for (const [q, cov] of this.coverage(ds, !sameTown)) for (const [r, sr] of source) {
+      let row = this.weightCoverage.get(ds);
+      if (!row) { row = {}; this.weightCoverage.set(ds, row); }
+      const coverageMode = sameTown ? 'walking' : 'regional';
+      const coverage = row[coverageMode] ??= this.coverageSnapshot(ds, !sameTown);
+      for (const [q, cov] of coverage) for (const [r, sr] of source) {
         if (r >= n || q >= n) continue;
         x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
         y += sr * (ld[r * n + q] ?? 0) * cov;
@@ -1030,6 +1036,13 @@ export class DemandModel {
   ): { boardings: number; revenue: number; legLoads: number[] } {
     const g = this.g, indices = new Map<number, number>(), n = this.regions.length;
     context.ids.forEach((id, i) => { if (!indices.has(id)) indices.set(id, i); });
+    // An isolated proposal cannot carry a connecting journey. Include incoming edges too:
+    // a one-way background service may feed this trunk without a return connection.
+    let connected = false;
+    for (const [from, edges] of context.edges) {
+      if (edges.some(edge => indices.has(from) !== indices.has(edge.to))) { connected = true; break; }
+    }
+    if (!connected) return { boardings: 0, revenue: 0, legLoads: new Array(Math.max(0, 2 * (sites.length - 1))).fill(0) };
     const ranks = [...indices.keys()], rank = context.ids.map(id => ranks.indexOf(id));
     const tables = routeTables(context.edges, context.edges.keys(), new Map(), context.sameComplex);
     const locations = new Map<number, { x: number; z: number; townId: number;
@@ -1041,6 +1054,8 @@ export class DemandModel {
     let boardings = 0, revenue = 0;
     const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
     for (const [from, origin] of locations) {
+      const walkingPop = [...origin.walking.values()].reduce((sum, v) => sum + v, 0);
+      const regionalPop = [...origin.regional.values()].reduce((sum, v) => sum + v, 0);
       const parts: { to: number; pop: number; x: number; y: number; f: number; local: boolean }[] = [];
       let local = 0, localF = 0;
       for (const [to, hop] of tables.get(from) ?? []) {
@@ -1048,7 +1063,7 @@ export class DemandModel {
         const sameTown = origin.townId >= 0 && origin.townId === dest.townId;
         const source = sameTown ? origin.walking : origin.regional;
         const target = sameTown ? dest.walking : dest.regional;
-        const pop = [...source.values()].reduce((sum, v) => sum + v, 0); if (!(pop > 0)) continue;
+        const pop = sameTown ? walkingPop : regionalPop; if (!(pop > 0)) continue;
         const d = Math.hypot(origin.x - dest.x, origin.z - dest.z), walk = Math.min(1, d / WALK);
         let x = 0, y = 0;
         for (const [r, residents] of source) for (const [q, covered] of target) {
