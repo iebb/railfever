@@ -399,6 +399,8 @@ export class VehiclesView {
   private sphere = new THREE.Sphere();
   private camPos = new THREE.Vector3();
   private cull = false;
+  private renderInterest = new Set<number>();
+  private trackedVehicleIds = new Set<number>();
   private pxScale = 1200;
   /** Stable lane / connector ids, invalidated by network edits and pruned when no longer used. */
   private profileRanges = new Map<string, { ranges: Float32Array; used: number }>();
@@ -486,6 +488,29 @@ vRfGlass = step(2.5, aPaint);`);
     return px > HI_PX * d ? 2 : px > MIN_PX * d ? 1 : 0;
   }
 
+  /** Followed/inspected vehicles keep interpolation even outside the current view. */
+  setTrackedVehicleIds(ids: readonly number[]) {
+    this.trackedVehicleIds.clear();
+    for (const id of ids) {
+      this.trackedVehicleIds.add(id);
+      // The previous frame's interest set is already read by Vehicles. Retain a newly
+      // followed/inspected vehicle before the next tick, even before this view draws again.
+      this.renderInterest.add(id);
+    }
+  }
+
+  /** Reuse the existing culling sample; retain a margin before a moving vehicle enters the view. */
+  private wantPose(v: Train | RoadVehicle, x: number, y: number, z: number, len: number, audible: number): boolean {
+    const dx = x - this.camPos.x, dy = y - this.camPos.y, dz = z - this.camPos.z, d2 = dx * dx + dy * dy + dz * dz;
+    const motion = Math.max(2, v.speed * Math.max(0.25, this.game!.speed * 0.2));
+    const sound = audible + len / 2 + motion;
+    if (d2 <= sound * sound) return true;
+    this.sphere.center.set(x, y, z); this.sphere.radius = len / 2 + 1.2 + motion;
+    if (!this.frustum.intersectsSphere(this.sphere)) return false;
+    const px = len * this.pxScale, minimum = MIN_PX * 0.5;
+    return px * px > minimum * minimum * d2;
+  }
+
   /**
    * `pointScale`: drawing-buffer pixels per unit at unit distance (point sprite sizes); `lodScale`: the same at the
    * configured resolution, for the LOD / culling choices (a dynamic-resolution step must not switch models).
@@ -493,12 +518,15 @@ vRfGlass = step(2.5, aPaint);`);
   update(game: Game, dt: number, light: number, pointScale = 1200, camera?: THREE.Camera, lodScale = pointScale) {
     const night = this.mats.uniforms.uNight.value;
     if (this.game !== game || this.profileVersion !== game.world.net.version) {
+      if (this.game !== game) this.game?.vehicles.setRenderInterest(null);
       this.profileRanges.clear();
       this.profileVersion = game.world.net.version;
     }
     this.game = game;
     this.pxScale = lodScale;
     this.cull = !!camera;
+    this.renderInterest.clear();
+    for (const id of this.trackedVehicleIds) this.renderInterest.add(id);
     if (camera) {
       this.camPos.setFromMatrixPosition(camera.matrixWorld);
       this.pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
@@ -510,6 +538,7 @@ vRfGlass = step(2.5, aPaint);`);
       else this.updateRoad(v as RoadVehicle, night);
     }
     for (const v of game.vehicles.ambient) this.updateRoad(v, night);
+    game.vehicles.setRenderInterest(camera ? this.renderInterest : null);
     let n = 0;
     for (const p of this.batches.values()) { n += p.hi.finish(); n += p.lo.finish(); }
     n += this.bogies.b2.finish() + this.bogies.b3.finish();
@@ -529,7 +558,9 @@ vRfGlass = step(2.5, aPaint);`);
     if (!t.onMap) return;
     if (this.cull) {
       const len = t.length;
-      if (!this.game!.vehicles.renderPointBehind(t, len / 2, tE) || !this.lod(tE.x, tE.y, tE.z, len)) return;
+      if (!this.game!.vehicles.renderPointBehind(t, len / 2, tE)) return;
+      if (this.wantPose(t, tE.x, tE.y, tE.z, len, 150)) this.renderInterest.add(t.id);
+      if (!this.lod(tE.x, tE.y, tE.z, len)) return;
     }
     const slots = this.trainLayout(t);
     const n = trainCarPoses(t, this.poses, slots, this.game!);
@@ -611,6 +642,8 @@ vRfGlass = step(2.5, aPaint);`);
     if (this.cull) {
       const len = v.length;
       vehicles.renderPointBehind(v, len / 2, tE);
+      const audible = v.ambient ? 30 : v.model?.kind === 'tram' ? 60 : v.model && isRoadCoach(v.model) ? 50 : 40;
+      if (this.wantPose(v, tE.x, tE.y, tE.z, len, audible)) this.renderInterest.add(v.id);
       if (!this.lod(tE.x, tE.y, tE.z, len)) return;
     }
     if (v.model && v.model.kind === 'tram') { this.updateTram(v, v.model, night); return; }
@@ -848,6 +881,7 @@ vRfGlass = step(2.5, aPaint);`);
   }
 
   dispose() {
+    this.game?.vehicles.setRenderInterest(null);
     for (const p of this.batches.values()) { p.hi.dispose(); p.lo.dispose(); }
     this.batches.clear();
     this.bogies.b2.dispose(); this.bogies.b3.dispose();

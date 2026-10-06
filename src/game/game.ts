@@ -157,10 +157,14 @@ export class Game {
     this.tick = this.day * TICKS_PER_DAY + Math.floor(Math.max(0, f) * TICKS_PER_DAY + 1e-7);
   }
   speed = 1;
+  /** Browser-only pacing hook: yield after a complete tick when background planning was launched. */
+  runtimeFrameYield?: () => boolean;
   // Pause freezes the interpolation remainder and previous vehicle poses too.
   paused = false;
   /** Wall-time remainder belongs to the scheduler, never the saved simulation. */
   private accumulator = 0;
+  /** Whole ticks deferred to give a planning worker an event-loop turn; pacing only, absent from saves. */
+  private plannerTicks = 0;
   get alpha() { return this.accumulator / TICK; }
   rng: RNG;
   news: News[] = [];
@@ -850,12 +854,20 @@ export class Game {
     if (!Number.isFinite(dtReal) || dtReal <= 0 || !Number.isFinite(this.speed) || this.speed <= 0) return;
     this.accumulator += Math.min(dtReal, MAX_FRAME_SECONDS) * this.speed;
     // A tiny tolerance prevents floating wall-time sums (e.g. three 1/60 frames) losing a whole tick.
-    const ticks = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    const due = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    const ticks = due + this.plannerTicks;
+    this.plannerTicks = 0;
     // Keep only the fractional tick, even if the budget drops some of this frame's whole ticks.
-    this.accumulator = Math.max(0, this.accumulator - ticks * TICK);
+    this.accumulator = Math.max(0, this.accumulator - due * TICK);
     const started = performance.now();
     for (let i = 0; i < ticks && !this.paused; i++) {
       this.stepTick();
+      // Let the browser deliver a worker's derived result before releasing the next batch of ticks.
+      // The callback changes wall-time pacing only; every released tick still runs in full.
+      if (this.runtimeFrameYield?.()) {
+        this.plannerTicks = ticks - i - 1;
+        break;
+      }
       // Wall time controls release rate only; stepTick never reads this pacing clock.
       if (performance.now() - started >= FRAME_BUDGET_MS) break;
     }

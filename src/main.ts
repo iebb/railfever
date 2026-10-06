@@ -8,6 +8,7 @@ import { loadFonts } from './ui/fonts';
 import { defaultTowns, DEFAULT_MAP_SIZE } from './ui/title';
 import { aiConfigsFor, MAX_AI } from './ui/gameapi';
 import { audio } from './audio/engine';
+import { enableCorridorWorker, disposeCorridorWorker, consumeCorridorWorkerLaunch } from './game/corridor-worker';
 
 const fontsReady = loadFonts();
 audio.loadSettings();
@@ -53,7 +54,13 @@ function afterPaint(fn: () => void) {
 }
 
 function setGame(g: Game, hasPlayed = false) {
+  if (game && game !== g) {
+    disposeCorridorWorker(game);
+    game.runtimeFrameYield = undefined;
+  }
   game = g;
+  enableCorridorWorker(g);
+  g.runtimeFrameYield = () => consumeCorridorWorkerLaunch(g);
   played = hasPlayed;
   renderer.setGame(g);
   ui.setGame(g);
@@ -128,11 +135,19 @@ window.addEventListener('pagehide', () => { autosave('pagehide'); });
 
 let last = performance.now();
 const focusV = new THREE.Vector3();
+const trackedVehicles: number[] = [];
 function loop(now: number) {
   const wallDt = Math.max(0, (now - last) / 1000);
   const dt = Math.min(MAX_FRAME_SECONDS, wallDt);
   last = now;
   if (game) {
+    trackedVehicles.length = 0;
+    if (ui.following !== null) trackedVehicles.push(ui.following);
+    for (const id of ui.wm.wins.keys()) if (id.startsWith('veh-')) {
+      const vehicle = Number(id.slice(4));
+      if (Number.isFinite(vehicle)) trackedVehicles.push(vehicle);
+    }
+    renderer.vehicles.setTrackedVehicleIds(trackedVehicles);
     const t0 = performance.now();
     try { game.update(dt); } catch (e) { console.error(e); }
     renderer.simMs = performance.now() - t0;

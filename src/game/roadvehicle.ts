@@ -718,17 +718,30 @@ export function roadDepotReaches(g: Game, dp: Depot, stationId: number): boolean
   return !!findRoadRoute(g, stub, 1, stationId, 60000, dp.kind === 'tram' ? (e) => tramUsable(g, e, dp.owner) : undefined);
 }
 
-/** Do two connector curves cross (2D)? */
+interface ConnConflict {
+  a: Float32Array; b: Float32Array; na: number; nb: number; conflict: boolean;
+}
+const connConflicts = new WeakMap<Curve3, WeakMap<Curve3, ConnConflict>>();
+
+/** Do two connector curves cross (2D)? Geometry is immutable until a route/network edit replaces its curve. */
 export function connsConflict(a: RSeg, b: RSeg): boolean {
   if (a.e === b.e && a.dir === b.dir) return true;
   const pa = a.curve.pts, pb = b.curve.pts;
   const na = a.curve.cum.length, nb = b.curve.cum.length;
+  let pairs = connConflicts.get(a.curve);
+  const saved = pairs?.get(b.curve);
+  if (saved && saved.a === pa && saved.b === pb && saved.na === na && saved.nb === nb) return saved.conflict;
+  const result = (conflict: boolean) => {
+    if (!pairs) { pairs = new WeakMap(); connConflicts.set(a.curve, pairs); }
+    pairs.set(b.curve, { a: pa, b: pb, na, nb, conflict });
+    return conflict;
+  };
   for (let i = 0; i < na - 1; i += 2) {
     const i2 = Math.min(na - 1, i + 2);
     for (let j = 0; j < nb - 1; j += 2) {
       const j2 = Math.min(nb - 1, j + 2);
-      if (segIntersect(pa[i * 3], pa[i * 3 + 2], pa[i2 * 3], pa[i2 * 3 + 2], pb[j * 3], pb[j * 3 + 2], pb[j2 * 3], pb[j2 * 3 + 2])) return true;
+      if (segIntersect(pa[i * 3], pa[i * 3 + 2], pa[i2 * 3], pa[i2 * 3 + 2], pb[j * 3], pb[j * 3 + 2], pb[j2 * 3], pb[j2 * 3 + 2])) return result(true);
     }
   }
-  return false;
+  return result(false);
 }

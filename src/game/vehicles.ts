@@ -78,6 +78,11 @@ export class Vehicles {
   private get ambientTimer() { return this.ambientTicks * this.game.tickSeconds; }
   private set ambientTimer(seconds: number) { this.ambientTicks = Math.max(0, Math.round(seconds / this.game.tickSeconds)); }
   private renderPoses = new WeakMap<Vehicle, RenderPose>();
+  /** Derived render demand; camera choices never change vehicle movement or saved state. */
+  private renderInterest: ReadonlySet<number> | null = null;
+  /** Derived counters of the last fixed tick, for viewport diagnostics. */
+  renderPoseCount = 0;
+  get renderInterestSize() { return this.renderInterest?.size ?? this.map.size + this.ambient.length; }
   private prevPoint = { x: 0, y: 0, z: 0 };
   private prevDir = { x: 0, y: 0, z: 0 };
   private renderPoint: RenderPoint<TSeg | RSeg> = { seg: null!, pos: 0 };
@@ -96,8 +101,13 @@ export class Vehicles {
 
   resetRenderPoses() { this.renderPoses = new WeakMap(); }
 
+  /** null retains every pose (headless/default); ids are read until the next call. */
+  setRenderInterest(ids: ReadonlySet<number> | null) { this.renderInterest = ids; }
+
   private rememberPose(v: Vehicle) {
+    if (this.renderInterest && !this.renderInterest.has(v.id)) return;
     if (!(v instanceof Train || v instanceof RoadVehicle)) return;
+    this.renderPoseCount++;
     let p = this.renderPoses.get(v);
     if (!p) { p = { segs: [], head: 0, pos: 0, reversed: false, length: 0, speed: 0, tick: 0 }; this.renderPoses.set(v, p); }
     p.segs.length = 0;
@@ -478,6 +488,7 @@ export class Vehicles {
   }
 
   update(dt: number) {
+    this.renderPoseCount = 0;
     if (this.replanQueue.length) this.replanSome(6);
     this.rebuildOcc();
     this.updateCrossings();

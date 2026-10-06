@@ -13,6 +13,8 @@ import { distToRect } from './world';
 import { Heap } from './train';
 import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { walkSitePop } from './catchment';
+import type { CorridorSnapshot } from './planning-corridor';
+import { requestCorridor, advanceCorridor, cancelCorridor } from './corridor-worker';
 
 /** Optional headless profiling observer. Never consulted by the planner's decisions or work schedule. */
 export const planningProbe: { observe?: (stage: string, begin: boolean, work?: number) => void } = {};
@@ -133,6 +135,51 @@ function nearestDir(tx: number, tz: number) {
   let bd = 0, bv = -2;
   DIRS.forEach(([dx, dz], i) => { const v = (dx * tx + dz * tz) / Math.hypot(dx, dz); if (v > bv) { bv = v; bd = i; } });
   return bd;
+}
+
+const corridorTerrain = new WeakMap<Game, { key: string; id: string; world: Game['world']; net: Game['world']['net']; h: Float32Array; lock: Uint8Array }>();
+let corridorTerrainId = 0;
+
+/** One detached terrain/formation revision, shared by requests and exact synchronous fallback. */
+export function captureCorridorSnapshot(g: Game, from: OPoint, to: OPoint, opts: CorridorOpts): CorridorSnapshot {
+  const w = g.world, key = `${w.size}:${w.heightsVersion}:${w.net.version}:${w.lotVersions.version}`;
+  let terrain = corridorTerrain.get(g);
+  if (!terrain || terrain.key !== key || terrain.world !== w || terrain.net !== w.net) {
+    terrain = { key, id: `${++corridorTerrainId}:${key}`, world: w, net: w.net, h: w.h.slice(), lock: w.lock.slice() };
+    corridorTerrain.set(g, terrain);
+  }
+  const forbid: CorridorSnapshot['forbid'] = [];
+  for (const st of g.stations.map.values()) for (const f of g.stations.footprints(st))
+    forbid.push({ x: f.x, z: f.z, a: f.angle, w: f.w / 2 + 1.5, d: f.d / 2 + 1.5, r: Math.hypot(f.w / 2 + 1.5, f.d / 2 + 1.5) });
+  for (const dp of g.depots.map.values()) forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5, r: Math.hypot(2.5, 3.5) });
+  const revision = terrain.id + ':' + g.networkVersion + ':' + forbid.map(f => `${f.x},${f.z},${f.a},${f.w},${f.d},${f.r}`).join(';');
+  const railGrade = opts.type ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).maxGrade * Math.min(1, Math.max(0.1, opts.gradeMargin ?? 0.85)) : 0.03;
+  return { revision, terrainId: terrain.id, size: w.size, h: terrain.h, lock: terrain.lock, waterLimit: WATER_Y + 0.05,
+    from: { ...from }, to: { ...to }, opts: { ...opts, avoid: opts.avoid?.map(a => ({ ...a })) }, forbid,
+    grade: opts.kind === 'rail' ? railGrade : 0.07, field: opts.parallel ? railField(g, opts.trackClass) : undefined };
+}
+
+/** Prefetch costs one logical unit in every environment. Worker timing only selects an exact derived cache. */
+function* plannedCorridor(g: Game, from: OPoint, to: OPoint, opts: CorridorOpts, budget: number): Generator<void, { path: P2[] | null; expanded: number }> {
+  const before = captureCorridorSnapshot(g, from, to, opts);
+  let job = requestCorridor(g, before, budget);
+  try {
+    yield;
+    const current = captureCorridorSnapshot(g, from, to, opts);
+    if (current.revision !== before.revision) {
+      cancelCorridor(job);
+      job = requestCorridor(g, current, budget);
+    }
+    while (true) {
+      planningProbe.observe?.('corridor', true);
+      const beforeExpanded = job.reply?.steps[job.index - 1]?.expanded ?? job.kernel?.expanded ?? 0;
+      let step: ReturnType<typeof advanceCorridor> | null = null;
+      try { step = advanceCorridor(job); }
+      finally { planningProbe.observe?.('corridor', false, step ? step.expanded - beforeExpanded : 0); }
+      if (step.state !== 'running') return { path: step.path, expanded: step.expanded };
+      yield;
+    }
+  } finally { cancelCorridor(job); }
 }
 
 /**
@@ -890,9 +937,15 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
     let path: P2[] | null = [{ x: from.x, z: from.z }, { x: to.x, z: to.z }], expanded = 0;
     if (attempt >= 0) {
-      const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength });
-      while (cs.step(budget) === 'running') yield;
-      path = cs.path; expanded = cs.expanded;
+      const opts: CorridorOpts = { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength };
+      if (o.sliced && o.kind === 'rail') {
+        const result = yield* plannedCorridor(g, from, to, opts, budget);
+        path = result.path; expanded = result.expanded;
+      } else {
+        const cs = new CorridorSearch(g, from, to, opts);
+        while (cs.step(budget) === 'running') yield;
+        path = cs.path; expanded = cs.expanded;
+      }
     }
     if (!path) return why || 'no corridor';
     planningProbe.observe?.('alignment', true);

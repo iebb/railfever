@@ -6,6 +6,7 @@ import { SMAAPass } from 'three/addons/postprocessing/SMAAPass.js';
 import { FXAAPass } from 'three/addons/postprocessing/FXAAPass.js';
 import { FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import type { Game } from '../game/game';
+import { corridorWorkerStats } from '../game/corridor-worker';
 import { TerrainView, raycastTerrain } from './terrain';
 import { ObjectsView } from './objects';
 import { VehiclesView } from './vehicles-view';
@@ -1136,10 +1137,14 @@ export class Renderer {
     const sh = this.sun.shadow.camera;
     const k = (n: number) => (n >= 1e6 ? (n / 1e6).toFixed(2) + 'M' : n >= 1e3 ? (n / 1e3).toFixed(1) + 'k' : String(n));
     const res = this.settings.resolution === 'auto' ? `auto ${Math.round(this.resScale * 100)}%` : `${Math.round(Number(this.settings.resolution) * 100)}%`;
+    const planning = this.game ? corridorWorkerStats(this.game) : null;
+    const worker = planning ? `rail planner ${planning.active ? 'worker' : 'inline'}   pending ${planning.pending}   hits ${planning.hits}   fallback ${planning.fallback}   worker total ${planning.computeMs.toFixed(1)} ms\n` : '';
+    const poses = this.game ? `pose histories ${this.game.vehicles.renderPoseCount}/${this.game.vehicles.map.size + this.game.vehicles.ambient.length}   wanted ${this.game.vehicles.renderInterestSize}\n` : '';
     this.dbgEl.textContent =
       `fps ${this.fps.toFixed(0)}   frame ${this.frameMs.toFixed(1)} ms\n` +
       `cpu ${this.cpuMs.toFixed(1)} ms   sim ${this.simMs.toFixed(1)} ms   gpu ${this.gpu && this.gpu.samples ? this.gpu.ms.toFixed(1) + ' ms' : 'n/a'}\n` +
       `ui ${this.uiMs.toFixed(1)} ms   audio ${this.audioMs.toFixed(1)} ms   loop ${this.loopMs.toFixed(1)} ms   post ${this.postMs.toFixed(1)} ms\n` +
+      worker + poses +
       `draw calls ${this.stats.calls}   tris ${k(this.stats.tris)}\n` +
       `geometries ${info.memory.geometries}   textures ${info.memory.textures}   programs ${info.programs?.length ?? 0}\n` +
       `pixel ratio ${this.renderer.getPixelRatio().toFixed(2)} (${res})   AO ${this.settings.ao ? (this.aoSuspended ? 'auto-off' : 'on') : 'off'}   AA ${this.resScale < 0.8 || this.settings.shadowQuality === 'low' ? 'FXAA' : 'SMAA'} + MSAA ${this.post ? this.post.samples : 0}x   shadows ${this.sunFar.castShadow ? '2 cascades' : this.sun.castShadow ? '1 map' : 'off'}\n` +
