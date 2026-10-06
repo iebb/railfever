@@ -455,6 +455,7 @@ export class Labels {
     }
     // ---- line name tags (lines map: the line under the pointer), above everything and outside the declutter
     for (const [id, t] of this.routeTags) {
+      if (!this.inView(camera, t.x, t.y, t.z, 1e5)) continue;
       let l = this.tags.get(id);
       if (!l) {
         l = this.make('tag', id, () => this.onClickTag(id));

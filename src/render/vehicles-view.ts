@@ -13,6 +13,7 @@ import { carriesMail, mailOnlyModel } from '../game/vehicle-types';
 import { applyClouds } from './clouds';
 import { srgbToLinear } from './geo';
 import { RAIL } from '../game/constants';
+import type { Curve3 } from '../game/network';
 
 /** Rail head above the edge profile (same as build-rail's RAIL_TOP_Y); road vehicles sit on the profile. */
 export const RAIL_Y = RAIL.railTop - RAIL.bedHeight;
@@ -22,7 +23,9 @@ export const CAR_GAP = 0.1;
 /** A vehicle uses its detailed model when its length covers at least this many pixels. */
 const HI_PX = 46;
 /** Below this many pixels a vehicle is not drawn at all (whole-map views of big maps). */
-const MIN_PX = 1.2;
+const MIN_PX = 3;
+/** Exhaust and lamp sprites add no useful detail below this length on screen. */
+const EFFECT_PX = 12;
 
 export interface V3 { x: number; y: number; z: number }
 
@@ -265,6 +268,7 @@ interface BatchPair { hi: Batch; lo: Batch; ambient: boolean }
 interface TramInfo { n: number; sec: number; roles: TramRole[]; style: string }
 
 const SMOKE_ATTRS = ['position', 'aSize', 'aAlpha', 'aTone'];
+const smokeSphere = new THREE.Sphere();
 
 /** Steam puffs (white, large, slow) and diesel exhaust (dark, small, quick). */
 class Smoke {
@@ -290,7 +294,7 @@ class Smoke {
       transparent: true, depthWrite: false, fog: false,
       vertexShader: `attribute float aSize; attribute float aAlpha; attribute float aTone; varying float vA; varying float vT; uniform float uScale;
         void main(){ vec4 mv = modelViewMatrix * vec4(position,1.0); gl_Position = projectionMatrix * mv;
-          gl_PointSize = clamp(aSize * uScale / max(-mv.z, 0.01), 1.0, 500.0); vA = aAlpha; vT = aTone; }`,
+          gl_PointSize = clamp(aSize * uScale / max(-mv.z, 0.01), 1.0, 500.0); vA = aAlpha * step(${MIN_PX.toFixed(1)}, gl_PointSize); vT = aTone; }`,
       fragmentShader: `uniform float uLight; varying float vA; varying float vT;
         void main(){ vec2 c = gl_PointCoord - 0.5; float r = length(c) * 2.0; float a = 1.0 - smoothstep(0.15, 1.0, r);
           if (a * vA <= 0.004) discard;
@@ -311,11 +315,18 @@ class Smoke {
     this.life[i] = 0; this.maxLife[i] = life * (0.8 + Math.random() * 0.4);
     this.size[i] = s0; this.grow[i] = grow; this.shade[i] = shade; this.alpha[i] = 0; this.tone[i] = shade;
   }
-  update(dt: number) {
+  update(dt: number, frustum?: THREE.Frustum, camera?: THREE.Vector3, pxScale = 1200) {
     let j = 0;
     for (let i = 0; i < this.count; i++) {
       const L = this.maxLife[i], l = this.life[i] + dt;
       if (l > L) continue;
+      if (frustum && camera) {
+        const size = this.size[i] + this.grow[i] * dt;
+        smokeSphere.center.set(this.pos[i * 3], this.pos[i * 3 + 1], this.pos[i * 3 + 2]);
+        smokeSphere.radius = size + dt * Math.hypot(this.vel[i * 3], this.vel[i * 3 + 1], this.vel[i * 3 + 2]);
+        const largest = size + this.grow[i] * (L - l);
+        if (!frustum.intersectsSphere(smokeSphere) || largest * pxScale < MIN_PX * smokeSphere.center.distanceTo(camera)) continue;
+      }
       if (j !== i) {
         this.maxLife[j] = L; this.grow[j] = this.grow[i]; this.shade[j] = this.shade[i];
       }
@@ -333,7 +344,10 @@ class Smoke {
     this.count = j;
     this.geo.setDrawRange(0, this.count);
     this.points.visible = this.count > 0;
-    for (const n of SMOKE_ATTRS) (this.geo.getAttribute(n) as THREE.BufferAttribute).needsUpdate = true;
+    if (this.count) for (const n of SMOKE_ATTRS) {
+      const a = this.geo.getAttribute(n) as THREE.BufferAttribute;
+      a.clearUpdateRanges(); a.addUpdateRange(0, this.count * a.itemSize); a.needsUpdate = true;
+    }
   }
 }
 
@@ -375,8 +389,10 @@ class Lights {
     this.points.visible = night > 0.02 && this.n > 0;
     this.mat.uniforms.uNight.value = night;
     this.geo.setDrawRange(0, this.n);
-    (this.geo.getAttribute('position') as THREE.BufferAttribute).needsUpdate = true;
-    (this.geo.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true;
+    if (this.n) for (const name of ['position', 'color']) {
+      const a = this.geo.getAttribute(name) as THREE.BufferAttribute;
+      a.clearUpdateRanges(); a.addUpdateRange(0, this.n * 3); a.needsUpdate = true;
+    }
     this.n = 0;
   }
 }
@@ -387,6 +403,8 @@ export class VehiclesView {
   paintMat: THREE.MeshStandardMaterial;
   /** instances drawn in the last update */
   instances = 0;
+  /** Vehicles rejected before any interpolated point/model/effect work, for F3. */
+  coarseCulled = 0;
   private batches = new Map<ModelGeo, BatchPair>();
   private bogies: Record<'b2' | 'b3', Batch>;
   smoke = new Smoke();
@@ -399,6 +417,10 @@ export class VehiclesView {
   private sphere = new THREE.Sphere();
   private camPos = new THREE.Vector3();
   private cull = false;
+  private curveBounds = new WeakMap<Curve3, { pts: Float32Array; count: number; box: THREE.Box3 }>();
+  private coarseBox = new THREE.Box3();
+  private viewBox = new THREE.Box3();
+  private corner = new THREE.Vector3();
   private renderInterest = new Set<number>();
   private trackedVehicleIds = new Set<number>();
   private pxScale = 1200;
@@ -476,7 +498,7 @@ vRfGlass = step(2.5, aPaint);`);
 
   /**
    * Visible (with a margin for shadows) and detailed enough for the high LOD? 0 culled (outside the view or
-   * under ~1 px), 1 lo, 2 hi.
+   * under 3 px), 1 lo, 2 hi.
    */
   private lod(x: number, y: number, z: number, len: number): number {
     if (!this.cull) return 2;
@@ -500,15 +522,49 @@ vRfGlass = step(2.5, aPaint);`);
   }
 
   /** Reuse the existing culling sample; retain a margin before a moving vehicle enters the view. */
-  private wantPose(v: Train | RoadVehicle, x: number, y: number, z: number, len: number, audible: number): boolean {
+  private wantPose(v: Train | RoadVehicle, x: number, y: number, z: number, len: number, audible: number, displayLen = len): boolean {
     const dx = x - this.camPos.x, dy = y - this.camPos.y, dz = z - this.camPos.z, d2 = dx * dx + dy * dy + dz * dz;
     const motion = Math.max(2, v.speed * Math.max(0.25, this.game!.speed * 0.2));
     const sound = audible + len / 2 + motion;
     if (d2 <= sound * sound) return true;
     this.sphere.center.set(x, y, z); this.sphere.radius = len / 2 + 1.2 + motion;
     if (!this.frustum.intersectsSphere(this.sphere)) return false;
-    const px = len * this.pxScale, minimum = MIN_PX * 0.5;
+    const px = displayLen * this.pxScale, minimum = MIN_PX * 0.5;
     return px * px > minimum * minimum * d2;
+  }
+
+  private bounds(curve: Curve3): THREE.Box3 {
+    let entry = this.curveBounds.get(curve);
+    if (!entry || entry.pts !== curve.pts || entry.count !== curve.pts.length) {
+      const box = new THREE.Box3(), p = curve.pts;
+      for (let i = 0; i < p.length; i += 3) box.expandByPoint(this.corner.set(p[i], p[i + 1], p[i + 2]));
+      entry = { pts: p, count: p.length, box }; this.curveBounds.set(curve, entry);
+    }
+    return entry.box;
+  }
+
+  /**
+   * Every body point is within a full vehicle length of its head curve. Union the previous head too,
+   * including reversals and transitions: interpolated points stay inside this conservative box.
+   * Road height may be draped onto edited terrain, so reject roads only by XZ distance and a box spanning
+   * the visible frustum's entire height. Nearby sound and explicit tracking keep their pose histories.
+   */
+  private coarseReject(v: Train | RoadVehicle, curve: Curve3, len: number, displayLen: number, audible: number, road = false): boolean {
+    const box = this.coarseBox.copy(this.bounds(curve)), prev = this.game!.vehicles.previousRenderCurve(v, len);
+    if (prev && prev !== curve) box.union(this.bounds(prev));
+    box.expandByScalar(len + 1.2);
+    const p = this.camPos;
+    const dx = Math.max(box.min.x - p.x, 0, p.x - box.max.x), dz = Math.max(box.min.z - p.z, 0, p.z - box.max.z);
+    const dy = road ? 0 : Math.max(box.min.y - p.y, 0, p.y - box.max.y);
+    const distance2 = dx * dx + dy * dy + dz * dz;
+    const motion = Math.max(2, v.speed * Math.max(0.25, this.game!.speed * 0.2));
+    if (distance2 <= (audible + motion) ** 2) return false;
+    if (road) { box.min.y = this.viewBox.min.y; box.max.y = this.viewBox.max.y; }
+    box.expandByScalar(motion);
+    const px = displayLen * this.pxScale, minimum = MIN_PX * 0.5;
+    const reject = px * px <= minimum * minimum * distance2 || !this.frustum.intersectsBox(box);
+    if (reject) this.coarseCulled++;
+    return reject;
   }
 
   /**
@@ -520,17 +576,23 @@ vRfGlass = step(2.5, aPaint);`);
     if (this.game !== game || this.profileVersion !== game.world.net.version) {
       if (this.game !== game) this.game?.vehicles.setRenderInterest(null);
       this.profileRanges.clear();
+      this.curveBounds = new WeakMap();
       this.profileVersion = game.world.net.version;
     }
     this.game = game;
     this.pxScale = lodScale;
     this.cull = !!camera;
+    this.coarseCulled = 0;
     this.renderInterest.clear();
     for (const id of this.trackedVehicleIds) this.renderInterest.add(id);
     if (camera) {
       this.camPos.setFromMatrixPosition(camera.matrixWorld);
       this.pm.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
       this.frustum.setFromProjectionMatrix(this.pm);
+      this.viewBox.makeEmpty();
+      for (const x of [-1, 1]) for (const y of [-1, 1]) for (const z of [-1, 1]) {
+        this.viewBox.expandByPoint(this.corner.set(x, y, z).unproject(camera));
+      }
     }
     this.tick++;
     for (const v of game.vehicles.map.values()) {
@@ -545,7 +607,7 @@ vRfGlass = step(2.5, aPaint);`);
     this.instances = n;
     this.lights.mat.uniforms.uScale.value = pointScale;
     this.lights.finish(night);
-    this.smoke.update(dt);
+    this.smoke.update(dt, camera ? this.frustum : undefined, camera ? this.camPos : undefined, lodScale);
     this.smoke.mat.uniforms.uLight.value = light;
     this.smoke.mat.uniforms.uScale.value = pointScale;
     if ((this.tick & 255) === 0) {
@@ -556,13 +618,16 @@ vRfGlass = step(2.5, aPaint);`);
 
   private updateTrain(t: Train, dt: number, night: number) {
     if (!t.onMap) return;
+    const slots = this.trainLayout(t);
     if (this.cull) {
       const len = t.length;
+      let displayLen = 0;
+      for (const sl of slots) displayLen = Math.max(displayLen, sl.len);
+      if (this.coarseReject(t, t.segs[t.headSeg].curve, len, displayLen, 150)) return;
       if (!this.game!.vehicles.renderPointBehind(t, len / 2, tE)) return;
-      if (this.wantPose(t, tE.x, tE.y, tE.z, len, 150)) this.renderInterest.add(t.id);
+      if (this.wantPose(t, tE.x, tE.y, tE.z, len, 150, displayLen)) this.renderInterest.add(t.id);
       if (!this.lod(tE.x, tE.y, tE.z, len)) return;
     }
-    const slots = this.trainLayout(t);
     const n = trainCarPoses(t, this.poses, slots, this.game!);
     const accel = this.game!.vehicles.renderAcceleration(t);
     const active = t.state === 'running' || t.state === 'waiting' || t.state === 'loading';
@@ -570,9 +635,9 @@ vRfGlass = step(2.5, aPaint);`);
       const p = this.poses[i];
       if (p.hidden) continue;
       const sl = slots[i], cm = sl.m;
-      const m = this.slotGeo(sl);
       const lod = this.lod(p.x, p.y, p.z, sl.len);
       if (!lod) continue;
+      const m = this.slotGeo(sl);
       const bp = this.pair(m, false, sl.emu);
       const b = lod === 2 ? bp.hi : bp.lo;
       const o = b.push(t.id);
@@ -584,17 +649,31 @@ vRfGlass = step(2.5, aPaint);`);
         const bb = this.bogies[m.bogieKind];
         writeBasis(bb.mat16, bb.push(t.id), q.x, q.y + RAIL_Y, q.z, d.x, d.y, d.z);
       }
-      if (active && m.chimney) this.emitSteam(t.id, b.mat16, o, m.chimney, t.speed, p, dt, t.reversed);
-      if (active && m.exhaust) this.emitExhaust(t.id, b.mat16, o, m.exhaust, t.speed, accel, dt);
+      if (active && this.effectVisible(p.x, p.y, p.z, sl.len)) {
+        if (m.chimney) this.emitSteam(t.id, b.mat16, o, m.chimney, t.speed, p, dt, t.reversed);
+        if (m.exhaust) this.emitExhaust(t.id, b.mat16, o, m.exhaust, t.speed, accel, dt);
+      }
     }
     if (night > 0.02 && n > 0) {
       // white lamps on the leading face, red on the trailing face (hauled cars keep their orientation when the
       // train reverses; multiple-unit cab cars face out of the unit)
-      const hs = slots[0], h = this.poses[0], hm = this.slotGeo(hs);
-      if (!h.hidden) this.lamps(h, hs.emu ? hm.front : t.reversed ? hm.rear : hm.front, 1, 0.93, 0.78);
-      const rs = slots[n - 1], r = this.poses[n - 1], rm = this.slotGeo(rs);
-      if (!r.hidden) this.lamps(r, rs.emu ? (rs.end < 0 ? rm.front : rm.rear) : t.reversed ? rm.front : rm.rear, 1, 0.06, 0.03);
+      const hs = slots[0], h = this.poses[0];
+      if (!h.hidden && this.effectVisible(h.x, h.y, h.z, hs.len)) {
+        const hm = this.slotGeo(hs);
+        this.lamps(h, hs.emu ? hm.front : t.reversed ? hm.rear : hm.front, 1, 0.93, 0.78);
+      }
+      const rs = slots[n - 1], r = this.poses[n - 1];
+      if (!r.hidden && this.effectVisible(r.x, r.y, r.z, rs.len)) {
+        const rm = this.slotGeo(rs);
+        this.lamps(r, rs.emu ? (rs.end < 0 ? rm.front : rm.rear) : t.reversed ? rm.front : rm.rear, 1, 0.06, 0.03);
+      }
     }
+  }
+
+  private effectVisible(x: number, y: number, z: number, len: number): boolean {
+    if (!this.cull) return true;
+    this.sphere.center.set(x, y, z); this.sphere.radius = len / 2 + 1.2;
+    return this.frustum.intersectsSphere(this.sphere) && len * this.pxScale > EFFECT_PX * this.sphere.center.distanceTo(this.camPos);
   }
 
   /** Lamps given in model space of a posed car. */
@@ -641,9 +720,11 @@ vRfGlass = step(2.5, aPaint);`);
     const vehicles = this.game!.vehicles;
     if (this.cull) {
       const len = v.length;
-      vehicles.renderPointBehind(v, len / 2, tE);
       const audible = v.ambient ? 30 : v.model?.kind === 'tram' ? 60 : v.model && isRoadCoach(v.model) ? 50 : 40;
-      if (this.wantPose(v, tE.x, tE.y, tE.z, len, audible)) this.renderInterest.add(v.id);
+      const displayLen = v.model?.kind === 'tram' ? this.tram(v.model).sec : len;
+      if (this.coarseReject(v, v.seg.curve, len, displayLen, audible, true)) return;
+      if (!vehicles.renderPointBehind(v, len / 2, tE)) return;
+      if (this.wantPose(v, tE.x, tE.y, tE.z, len, audible, displayLen)) this.renderInterest.add(v.id);
       if (!this.lod(tE.x, tE.y, tE.z, len)) return;
     }
     if (v.model && v.model.kind === 'tram') { this.updateTram(v, v.model, night); return; }
@@ -678,7 +759,7 @@ vRfGlass = step(2.5, aPaint);`);
       const c = b.col3, ci = (o / 16) * 3;
       c[ci] = srgbToLinear(cr); c[ci + 1] = srgbToLinear(cg); c[ci + 2] = srgbToLinear(cb);
     }
-    if (night > 0.02) {
+    if (night > 0.02 && this.effectVisible(px, py, pz, L)) {
       const pose = this.rpose;
       pose.x = px; pose.y = py; pose.z = pz; pose.fx = fx; pose.fy = fy; pose.fz = fz;
       this.lamps(pose, m.front, 1, 0.94, 0.8);
@@ -852,7 +933,7 @@ vRfGlass = step(2.5, aPaint);`);
       const ci = (o / 16) * 3, c = b.col3, a = b.acc3;
       c[ci] = main[0]; c[ci + 1] = main[1]; c[ci + 2] = main[2];
       a[ci] = acc[0]; a[ci + 1] = acc[1]; a[ci + 2] = acc[2];
-      if (night > 0.02) {
+      if (night > 0.02 && this.effectVisible(px, py, pz, t.sec)) {
         const pose = this.rpose;
         pose.x = px; pose.y = py; pose.z = pz; pose.fx = fx; pose.fy = fy; pose.fz = fz;
         if (i === 0) this.lamps(pose, geo.front, 1, 0.94, 0.8);

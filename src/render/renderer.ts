@@ -1148,7 +1148,7 @@ export class Renderer {
       `draw calls ${this.stats.calls}   tris ${k(this.stats.tris)}\n` +
       `geometries ${info.memory.geometries}   textures ${info.memory.textures}   programs ${info.programs?.length ?? 0}\n` +
       `pixel ratio ${this.renderer.getPixelRatio().toFixed(2)} (${res})   AO ${this.settings.ao ? (this.aoSuspended ? 'auto-off' : 'on') : 'off'}   AA ${this.resScale < 0.8 || this.settings.shadowQuality === 'low' ? 'FXAA' : 'SMAA'} + MSAA ${this.post ? this.post.samples : 0}x   shadows ${this.sunFar.castShadow ? '2 cascades' : this.sun.castShadow ? '1 map' : 'off'}\n` +
-      `terrain tris ${k(this.terrain.triangles())}   vehicles ${this.vehicles.instances}\n` +
+      `terrain tris ${k(this.terrain.triangles())}   vehicles ${this.vehicles.instances}   skipped ${this.vehicles.coarseCulled}\n` +
       `shadow ${this.settings.shadows ? `${this.sun.shadow.mapSize.x}² ±${sh.right.toFixed(0)}` : 'off'}   cam dist ${this.controls.smoothDistance.toFixed(1)}`;
   }
 }

@@ -5,7 +5,7 @@ import { Train, CROSS_BASE, lineCompatibility, consistRule, type TSeg } from './
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
-import { curvePoint, type NEdge, type Crossing } from './network';
+import { curvePoint, type Curve3, type NEdge, type Crossing } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 import { spacingSchedule } from './patterns';
@@ -126,6 +126,12 @@ export class Vehicles {
   renderAcceleration(v: Train | RoadVehicle): number {
     const p = this.renderPoses.get(v);
     return p && p.tick === this.game.tick - 1 ? (v.speed - p.speed) / this.game.tickSeconds : 0;
+  }
+
+  /** Previous head curve used by interpolation; lets the view reject whole paths before sampling poses. */
+  previousRenderCurve(v: Train | RoadVehicle, length = v.length): Curve3 | null {
+    const p = this.renderPoses.get(v);
+    return p && p.tick === this.game.tick - 1 && p.length === length ? p.segs[p.head]?.curve ?? null : null;
   }
 
   /** Interpolate committed poses without changing simulation state. Returned metadata is scratch: consume before the next query. */
