@@ -84,7 +84,7 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   'metro-station': 'Underground by default; street entrances.',
   electrify: 'Click track or drag along a line.',
   connect: 'Pick a point on each track.',
-  relevel: 'Click or drag along your track.',
+  relevel: 'Click or drag along permitted track.',
 };
 
 /** Longer tray tooltips where the name alone does not explain the tool. */

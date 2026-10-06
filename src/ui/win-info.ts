@@ -70,7 +70,8 @@ export function openStation(ui: UI, id: number) {
     if (!s) { win.close(); return; }
     if (JSON.stringify(s.rail) !== railSig) syncBuild();
     const mine = s.owner === PLAYER;
-    ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine ? [['build', 'Build'] as [string, string]] : [])], render);
+    const sharedWorks = !!s.rail && !g.trackUpgradeError(PLAYER, s.owner);
+    ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine || sharedWorks ? [['build', 'Build'] as [string, string]] : [])], render);
     win.title.textContent = g.stations.get(stationComplex(g, id).main)?.name ?? s.name;
     const town = g.towns.list[s.townId];
     win.sub.textContent = [complex.parts.length > 1 ? s.name : null, g.company(s.owner).name, town?.name].filter(Boolean).join(' · ');
@@ -447,6 +448,8 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
   const g = ui.game;
   const r = s.rail;
   if (!r) { add(body, h('div', { class: 'pad' }, 'Bus / tram stops: remove and rebuild to move.')); return; }
+  add(body, stationConnectionTools(ui, s));
+  if (s.owner !== PLAYER) return;
   const changed = up.length !== r.length || up.tracks !== r.tracks || up.through !== (r.through ?? 0) || up.level !== r.level;
   const pl = changed ? plan() : null;
   add(body,
@@ -531,6 +534,34 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
     ground
       ? h('div', { class: 'btns' }, GROUND_ENTRANCES.map((k) => h('button', { class: 'btn sm', 'data-tip': `${ENTRANCE_TYPES[k].desc} · upkeep ${fmtMoney(ENTRANCE_TYPES[k].upkeep)}/yr · own catchment`, onclick: () => startEntrance(ui, s.id, k) }, icon('plus', 14), `${short[k]} · ${fmtMoney(entranceCost(k, r))}`)))
       : h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => startEntrance(ui, s.id) }, icon('plus', 16), 'Add entrance'), h('span', { class: 'muted' }, `${fmtMoney(entranceCost(r.level === 'elevated' ? 'tower' : 'pavilion', r))} each · own catchment`)));
+}
+
+/** Paid works retain the existing station's owner; nearby platforms are a new player-owned part. */
+function stationConnectionTools(ui: UI, s: Station): HTMLElement | null {
+  const g = ui.game, r = s.rail;
+  if (!r) return null;
+  const access = g.trackUpgradeError(PLAYER, s.owner);
+  const nearby = () => {
+    const T = ui.tools;
+    T.setTool(railPartMode(r) === 'mainline' ? 'station' : 'metro-station');
+    T.stationLen = r.length; T.stationTracks = Math.min(2, r.tracks); T.stationLevel = r.level;
+    T.stationType = railPartMode(r); T.stationStyle = styleOf(r.style).id;
+    T.stationHeight = r.height || T.stationHeight; T.stationDepth = r.depth || T.stationDepth;
+    T.stationThrough = 0; T.stationOnLine = true; T.stationAngle = r.angle; T.autoAlign = true;
+    T.refreshHover(); ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40);
+    ui.toast('Choose track beside the station for your platforms', 'info');
+  };
+  const level = (to: 'elevated' | 'underground') => {
+    ui.tools.setTool('relevel'); ui.tools.relevelTo = to; ui.tools.refreshHover();
+    ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40);
+  };
+  return h('div', null, section('Track connections'),
+    s.owner !== PLAYER ? h('div', { class: 'muted' }, 'You pay construction; station ownership stays.') : null,
+    h('div', { class: 'btns' },
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Lift station and approaches with ramps', onclick: () => level('elevated') }, icon('bridge', 15), 'Lift'),
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Bury station and approaches with ramps', onclick: () => level('underground') }, icon('tunnel', 15), 'Bury'),
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Player-owned platforms on nearby permitted track', onclick: nearby }, icon('station', 15), 'Nearby platforms'),
+      h('button', { class: 'btn sm', disabled: !!access, onclick: () => { ui.tools.setTool('connect'); ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40); } }, icon('connect', 15), 'Connect tracks')));
 }
 
 /**

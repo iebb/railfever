@@ -71,6 +71,7 @@ import type { RoadVehicle, RSeg } from './roadvehicle';
 import { tramUsable } from './build-ops';
 import { closestOnPolyline } from './geom';
 import { YEAR_S, estimateVehicleYear } from './opcosts';
+import { rerouteLine, rerouteTask, copyRerouteCursor, type RerouteCursor, type RerouteHost } from './ai-reroute';
 import { TRANSFER_FARE_FACTOR } from './fares';
 import { TF_TYPICAL, TRIPS_PER_MONTH, localTripMultiplier } from './demand';
 import { TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
@@ -79,6 +80,7 @@ import { pickTrain } from './ai';
 import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
 import { growTask, copyGrowCursor, growLine, type GrowCursor, type GrowHost } from './ai-grow';
+import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
 
 // ============================================================================ optional primitives (feature-detected)
 
@@ -131,7 +133,7 @@ const now = () => (typeof performance !== 'undefined' ? performance.now() : Date
 
 // ============================================================================ tasks
 
-type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink' | 'citylink' | 'extend';
+type Task = 'lines' | 'decommission' | 'capacity' | 'pair' | 'crossovers' | 'connect' | 'midconnect' | 'roads' | 'join' | 'insert' | 'interchange' | 'consolidate' | 'stops' | 'tidy' | 'relevel' | 'xlink' | 'citylink' | 'extend' | 'reroute' | 'through';
 
 /** Tasks in priority order: how often (days) and whether they spend money (then only with money to spare). */
 const TASKS: { id: Task; period: number; spend: boolean }[] = [
@@ -142,8 +144,8 @@ const TASKS: { id: Task; period: number; spend: boolean }[] = [
   { id: 'join', period: 90, spend: false },
   { id: 'pair', period: 90, spend: true },
   { id: 'tidy', period: 120, spend: false },
-  { id: 'connect', period: 120, spend: true },
-  { id: 'insert', period: 120, spend: true },
+  { id: 'connect', period: 90, spend: true },
+  { id: 'insert', period: 90, spend: true },
   { id: 'interchange', period: 150, spend: true },
   { id: 'consolidate', period: 120, spend: true },
   { id: 'crossovers', period: 180, spend: false },
@@ -153,8 +155,13 @@ const TASKS: { id: Task; period: number; spend: boolean }[] = [
   { id: 'xlink', period: 120, spend: true },
   // (last: the others keep their slots and first runs; it spends only on a stop, checked there)
   { id: 'citylink', period: 120, spend: false },
-  { id: 'extend', period: 150, spend: true },
+  { id: 'extend', period: 90, spend: true },
+  { id: 'reroute', period: 90, spend: true },
+  { id: 'through', period: 90, spend: true },
 ];
+
+/** Existing corridors are reviewed before committing to another separate railway. */
+const RAIL_EXPANSION_TASKS: readonly string[] = ['join', 'through', 'insert', 'reroute', 'extend', 'connect', 'midconnect', 'xlink', 'citylink'];
 
 /** Fixed work allowance per daily call. Timing is profiling only; load never changes the amount of work. */
 export const NETWORK_WORK_UNITS = 4;
@@ -171,7 +178,7 @@ const INSERT_POP: Record<string, number> = { mainline: 650, metro: 900, lightrai
 /** Counters (in AIController.stats, saved with it): the ones ai.ts declares and this module's own. */
 type NetStat = 'grown' | 'merged' | 'paired' | 'connections' | 'stubs' | 'netDecommissioned' | 'netRetired' | 'netInserted' | 'netInterchanges'
   | 'netLinesMerged' | 'netRestyled' | 'netConsolidated' | 'netStopsMerged' | 'netThrough' | 'netMidConnections' | 'netRelevelled' | 'netCrossovers' | 'netGraded' | 'netDemolished' | 'netJoined' | 'netRoads' | 'netRoadUnitsSaved'
-  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops' | 'netExtended' | 'netGrowInfill' | 'netDepotsMoved' | 'netCityLinks' | 'netCityStops';
+  | 'netEntrances' | 'netXLinks' | 'netXServices' | 'netXPartner' | 'netXComplex' | 'netXLoops' | 'netExtended' | 'netGrowInfill' | 'netDepotsMoved' | 'netCityLinks' | 'netCityStops' | 'netRerouted' | 'netRerouteStops';
 
 /** Frame cost of the daily network work over all companies (tests / profiling). */
 export const networkProfile = { calls: 0, steps: 0, maxSteps: 0, ms: 0, max: 0, slow: 0, decisions: {} as Record<string, number>,
@@ -249,6 +256,9 @@ interface WorkItem {
   xlink?: XLinkCursor;
   /** a city line's growth being planned (extend, ai-grow.ts): the options surveyed, the next one to value, the best */
   grow?: GrowCursor;
+  /** Saved middle-city diversion survey/build; original physical corridor remains in service. */
+  reroute?: RerouteCursor;
+  through?: ThroughCursor;
   /** Next primitive site/movement to reprice in a mid-route connection search; no curve is saved. */
   midconnect?: { site: number; movement: number; tested: number };
 }
@@ -269,6 +279,8 @@ const copyXLink = (x: XLinkCursor): XLinkCursor => ({ ...x,
 const copyWorkItem = (i: WorkItem): WorkItem => ({ ...i, ids: [...i.ids],
   ...(i.xlink ? { xlink: copyXLink(i.xlink) } : {}),
   ...(i.grow ? { grow: copyGrowCursor(i.grow) } : {}),
+  ...(i.reroute ? { reroute: copyRerouteCursor(i.reroute) } : {}),
+  ...(i.through ? { through: copyThroughCursor(i.through) } : {}),
   ...(i.midconnect ? { midconnect: { ...i.midconnect } } : {}),
   ...(i.style ? { style: { ...i.style, ...(i.style.best ? { best: { ...i.style.best } } : {}) } } : {}),
   ...(i.entrance ? { entrance: { ...i.entrance, ...(i.entrance.best ? { best: { ...i.entrance.best } } : {}) } } : {}),
@@ -284,6 +296,8 @@ export interface NetworkPlannerState {
   demand?: { day: number; nt: number; P: number[] } | null;
   job?: NetworkJob | null;
   scans?: [string, number][];
+  /** Finite snapshot of due network opportunities before the next new-project decision. */
+  expansionReview?: Task[] | null;
 }
 interface NetworkSave {
   version: 1; companies: [number, NetworkPlannerState][];
@@ -448,11 +462,21 @@ export function loadNetwork(g: Game, data?: NetworkSave): void {
  * The AI controller's daily hook (ai.ts daily(), while no project runs): a network task's next steps within
  * a few milliseconds. Never throws.
  */
-export function networkDaily(ai: AIController): void {
-  if (ai.disposed || !networkOptions.enabled) return;
+export function networkDaily(ai: AIController, reviewExpansion = false): boolean {
+  if (ai.disposed || !networkOptions.enabled) return false;
   let p = planners.get(ai);
   if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
-  p.daily();
+  if (reviewExpansion) p.reviewExpansion();
+  p.daily(reviewExpansion);
+  return p.expansionPending;
+}
+
+/** The finite review has finished; a subsequent project decision may capture fresh due work. */
+export function finishNetworkReview(ai: AIController): void { planners.get(ai)?.finishReview(); }
+
+/** A newly opened/extended railway brings its own-network opportunities forward. */
+export function scheduleRailExpansionReview(ai: AIController, inDays = 15): void {
+  for (const task of RAIL_EXPANSION_TASKS) scheduleNetworkTask(ai, task, inDays);
 }
 
 /** Bring a network task forward (ai.ts: a new line beside another company's network): never later than it was planned. */
@@ -677,6 +701,8 @@ class NetPlanner {
   job: NetworkJob | null = null;
   get task(): Task | null { return this.job?.task ?? null; }
   private scans = new Map<string, number>();
+  private expansionReview: Task[] | null = null;
+  get expansionPending() { return !!this.expansionReview?.length; }
   /** day each task may run next */
   private next = new Map<Task, number>();
   /** per-object cool-down: key -> day it may be looked at again */
@@ -705,6 +731,7 @@ class NetPlanner {
       demand: this.dem ? { day: this.dem.day, nt: this.dem.nt, P: Array.from(this.dem.P) } : null,
       job: this.job ? { ...this.job, items: this.job.items?.map(copyWorkItem) ?? null } : null,
       scans: [...this.scans].sort(strings),
+      expansionReview: this.expansionReview ? [...this.expansionReview] : null,
     };
   }
 
@@ -715,6 +742,7 @@ class NetPlanner {
     if (Array.isArray(s.retire)) this.retire = new Map(s.retire.map(([k, d]) => [k, d]));
     if (s.demand && Array.isArray(s.demand.P) && s.demand.P.length === s.demand.nt * s.demand.nt) this.dem = { ...s.demand, P: new Float64Array(s.demand.P) };
     if (Array.isArray(s.scans)) this.scans = new Map(s.scans);
+    if (Array.isArray(s.expansionReview)) this.expansionReview = s.expansionReview.filter(id => TASKS.some(t => t.id === id));
     if (s.job && TASKS.some((t) => t.id === s.job!.task)) this.job = { ...s.job, items: s.job.items?.map(copyWorkItem) ?? null };
   }
 
@@ -722,16 +750,38 @@ class NetPlanner {
   private get name(): string { return this.g.company(this.me).name; }
   private managed(): Map<number, ManagedLine> | null { return (this.ai as unknown as { lines?: Map<number, ManagedLine> }).lines ?? null; }
 
-  daily() {
+  reviewExpansion(): void {
+    if (this.expansionReview !== null) return;
+    const served = [...this.g.lines.map.values()].some(l => l.kind === 'rail' && l.owner === this.me && this.fleet(l).ours.length);
+    this.expansionReview = served ? RAIL_EXPANSION_TASKS.flatMap(id => {
+      const task = TASKS.find(t => t.id === id);
+      return task && (this.next.get(task.id) ?? 0) <= this.g.day ? [task.id] : [];
+    }) : null;
+  }
+
+  finishReview(): void { this.expansionReview = null; }
+
+  daily(finishingReview = false) {
     const t0 = now();
     let units = 0;
     try {
       const g = this.g;
       for (const [key, day] of this.care) if (day <= g.day) this.care.delete(key);
       if (!this.job) {
-        const t = TASKS.find((x) => (this.next.get(x.id) ?? 0) <= g.day && (x.id !== 'midconnect' || this.midLines().length >= 2)
-          && (x.id !== 'xlink' || this.xlinkPartners()));
+        const due = (x: typeof TASKS[number]) => (this.next.get(x.id) ?? 0) <= g.day && (x.id !== 'midconnect' || this.midLines().length >= 2)
+          && (x.id !== 'xlink' || this.xlinkPartners());
+        if (this.expansionReview) this.expansionReview = this.expansionReview.filter(id => {
+          const task = TASKS.find(t => t.id === id);
+          return !!task && due(task);
+        });
+        // Recovery remains first. Complete the captured improvement review before another new route;
+        // newly due tasks cannot keep extending that snapshot and starve the project chooser.
+        const recovery = TASKS.find(x => (x.id === 'lines' || x.id === 'decommission') && due(x));
+        const review = this.expansionReview?.[0];
+        const t = recovery ?? (review ? TASKS.find(x => x.id === review) : undefined)
+          ?? (finishingReview && this.expansionReview !== null ? undefined : TASKS.find(due));
         if (!t) return;
+        if (this.expansionReview) this.expansionReview = this.expansionReview.filter(id => id !== t.id);
         this.next.set(t.id, g.day + t.period + ((this.me * 7 + g.day) % 13));
         this.considered(t.id + '.scheduled');
         if (t.spend && !this.mayBuild()) { this.considered(t.id + '.funds'); return; }
@@ -745,7 +795,7 @@ class NetPlanner {
         tp.steps++; tp.ms += dt; tp.max = Math.max(tp.max, dt);
         if (!this.job) break;
         // Expensive proposal work gets one prepared item per day; timing never changes that allowance.
-        if (['roads', 'capacity', 'midconnect', 'xlink', 'extend'].includes(task) && prepared) break;
+        if (['roads', 'capacity', 'midconnect', 'xlink', 'insert', 'extend', 'through', 'reroute'].includes(task) && prepared) break;
       }
     } catch (e) {
       this.note(`network work (${this.task}) failed: ${String((e as Error)?.message ?? e)}`);
@@ -840,6 +890,15 @@ class NetPlanner {
         const host = this.growHost();
         return this.inventory(task, ownLines.filter((l) => !this.cared('grow' + l.id) && !!growLine(host, l)).map((l) => l.id), 1, 3);
       }
+      case 'reroute': {
+        const host = this.rerouteHost();
+        return this.inventory(task, ownLines.filter(l => !this.cared('reroute' + l.id) && !!rerouteLine(host, l)).map(l => l.id), 1, 3);
+      }
+      case 'through': {
+        const host = this.throughHost(), middle = this.inventory('throughMiddle', throughMiddleLines(host), 1, 4).flatMap(i => i.ids);
+        const triples = throughCandidates(host, middle);
+        return this.inventory(task, triples.map((_, i) => i), 1, 4).map(i => ({ ids: triples[i.ids[0]] }));
+      }
       case 'decommission': {
         const ids = this.inventory(task, ownLines.map((l) => l.id)).flatMap((i) => i.ids)
           .sort((a, b) => this.ai.railPolicy.lossOrder(a, b));
@@ -863,9 +922,9 @@ class NetPlanner {
     else {
       const item = job.items[job.cursor];
       if (item) this.drain(this.run(job.task, item));
-      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow && !item?.midconnect) job.cursor++;
+      if (!item?.road && !item?.style && !item?.entrance && !item?.xlink && !item?.grow && !item?.reroute && !item?.through && !item?.midconnect) job.cursor++;
     }
-    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink', 'citylink', 'extend'].includes(job.task) ? 1 : Infinity;
+    const limit = job.task === 'pair' ? 2 : ['roads', 'join', 'connect', 'midconnect', 'insert', 'interchange', 'relevel', 'xlink', 'citylink', 'extend', 'reroute', 'through'].includes(job.task) ? 1 : Infinity;
     if (job.cursor >= job.items.length || job.done >= limit) this.job = null;
   }
 
@@ -896,7 +955,13 @@ class NetPlanner {
       case 'xlink': return this.xlinkTask(item);
       case 'citylink': return this.cityLinkTask(ids);
       case 'extend': return growTask(this.growHost(), item);
+      case 'reroute': return rerouteTask(this.rerouteHost(), item);
+      case 'through': return throughTask(this.throughHost(), item);
     }
+  }
+
+  private rerouteHost(): RerouteHost {
+    return { ...this.growHost(), stat: (key, n = 1) => this.bump(key, n) };
   }
 
   /** What the city-line growth task (ai-grow.ts) uses of the planner. */
@@ -911,6 +976,26 @@ class NetPlanner {
       signal: (id) => this.signal(id), canon: (id) => this.canon(id), mayAlter: (ids) => this.mayAlter(ids),
       consent: (p, planned) => this.proposalConsent(p, planned), demolitionOk: (ids) => this.demolitionOk(ids),
       compensate: (ids, residents) => this.compensate(ids, residents), localOnly: (l, sid) => this.localOnly(l, sid),
+    };
+  }
+
+  private throughHost(): ThroughHost {
+    return { g: this.g, me: this.me, ai: this.ai,
+      cared: k => this.cared(k), careFor: (k, d) => this.careFor(k, d), considered: k => this.considered(k),
+      selectSides: (mid, ids) => this.inventory('throughSides' + mid, ids, 1, 6).flatMap(i => i.ids),
+      note: s => this.note(s), news: (s, x, z) => this.news(s, x, z),
+      affordable: (c, s) => c >= 0 && c <= Math.max(0, this.networkBudget()) * s,
+      canSpend: (c, s) => this.canSpend(c, s), room: l => this.xlinkRoom(l), mayAlter: ids => this.mayAlter(ids),
+      managed: () => this.managed() ?? undefined, canon: id => this.canon(id),
+      stat: (k, n) => this.bump(k, n), succeed: () => { if (this.job) this.job.done++; },
+      plan: s => this.xlinkPlan(s),
+      survey: (a, b) => {
+        const reverse = a.owner !== this.me;
+        const sites = this.xlinkSurvey(reverse ? b : a, reverse ? a : b, true);
+        if (typeof sites === 'string') return [];
+        return reverse ? sites.map(s => ({ ...s, ax: s.bx, az: s.bz, atx: -s.btx, atz: -s.btz,
+          bx: s.ax, bz: s.az, btx: -s.atx, btz: -s.atz, left: [...s.right].reverse(), right: [...s.left].reverse(), la: s.lb, lb: s.la })) : sites;
+      },
     };
   }
 
@@ -3167,7 +3252,7 @@ class NetPlanner {
    * into its platforms; never a free end either line could grow from) 14-90 units apart, with each way of running
    * a direct service across, valued; the best few. A reason string when there is nothing to plan.
    */
-  private xlinkSurvey(a: Line, b: Line): XLinkSite[] | string {
+  private xlinkSurvey(a: Line, b: Line, geometryOnly = false): XLinkSite[] | string {
     const g = this.g, net = g.world.net, me = this.me;
     const pa = this.pathOf(a)!, pb = this.pathOf(b)!;
     // the lines meet at a station already: joining their services is the join task's work
@@ -3239,7 +3324,7 @@ class NetPlanner {
         if (ca < 0.3 || cb < 0.3) continue;
         const alpha = Math.acos(Math.min(1, ca)), beta = Math.acos(Math.min(1, cb));
         const turnA = ax * cz - az * cx, turnB = cx * bz - cz * bx;
-        if (alpha > 0.08 && beta > 0.08 && turnA * turnB < 0) continue;
+        if (!geometryOnly && alpha > 0.08 && beta > 0.08 && turnA * turnB < 0) continue;
         if (Math.abs(alpha - beta) > 0.5 || (alpha + beta > 0.05 && c.d / (2 * Math.sin((alpha + beta) / 2)) < minR)) continue;
         const left = forwardA ? pa.slice(0, c.a.leg + 1) : pa.slice(c.a.leg + 1).reverse();
         // (a depot lead beyond a terminus: into its platforms, then along the whole line)
@@ -3254,6 +3339,12 @@ class NetPlanner {
         const room = Math.min(roomA + Number(sideA === 'loop'), roomB + Number(sideB === 'loop'));
         if (room < 1) { full++; continue; }
         const k = `${left.join(',')}|${right.join(',')}|${room}`;
+        if (geometryOnly) {
+          considered++;
+          const site: XLinkSite = { ax: q.x, az: q.z, atx: ax, atz: az, bx: p2.x, bz: p2.z, btx: bx, btz: bz,
+            d: c.d, left, right, value: 0, la: sideA === 'loop', lb: sideB === 'loop' };
+          skew.set(site, Math.abs(alpha - beta)); out.push(site); continue;
+        }
         let econ = memo.get(k);
         if (!econ) { econ = this.xlinkEconomics(a, b, left, right, c.d, cars, A, B, room - 1, (q.x + p2.x) / 2, (q.z + p2.z) / 2); memo.set(k, econ); considered++; }
         networkProfile.decisions['xlink.maxTrips'] = Math.max(networkProfile.decisions['xlink.maxTrips'] ?? 0, econ.value.trips);

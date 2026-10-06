@@ -3978,7 +3978,7 @@ export class Stations {
   relevelInPlace(stationId: number, plan: StationPlan) {
     const g = this.game;
     const st = this.map.get(stationId), r = st?.rail;
-    if (!st || !r || r.native) return;
+    if (!st || !r || r.native && !plan.alignment) return;
     this.markStation(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     // added entrances: a ground station staying on the ground keeps them beside its platforms where they still fit
@@ -3986,6 +3986,7 @@ export class Stations {
     const added = r.entrances.filter((e) => e.kind), keep = (r.level ?? 'ground') === 'ground' && plan.level === 'ground';
     const addedCost = added.reduce((c, e) => c + (e.cost ?? 0), 0);
     r.level = plan.level; r.underground = plan.level === 'underground'; r.y = plan.y; r.depth = plan.depth; r.height = plan.height;
+    if (r.native) r.alignment = plan.alignment;
     r.entrances = plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle }));
     r.piers = plan.piers.map((p) => ({ ...p }));
     r.style = plan.style; r.building = plan.building;

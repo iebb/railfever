@@ -66,3 +66,35 @@ export function onwardCentres(g: Game, x: number, z: number, ux: number, uz: num
     .filter(c => !towns.has(c.town) && c.pop > 0 && c.along >= gap && c.along <= 220 && c.side <= 8)
     .sort((a, b) => a.along - b.along || a.town - b.town);
 }
+
+/** Occupied city districts beyond a real terminus, including those after an empty first stop.
+ * These bounded polar probes match grow's curved first link and station axis. Population only
+ * orders the search; the native station, track and marginal service quotations still decide. */
+export function urbanDistricts(g: Game, town: number, x: number, z: number, ux: number, uz: number,
+  gap: number, platform: number, reach: number, covered: Set<number>): { turn: number; gap: number; pop: number }[] {
+  const choices: { turn: number; gap: number; pop: number; x: number; z: number }[] = [];
+  for (const turn of [0, .2, -.2, .4, -.4, .6, -.6]) {
+    const dx = ux * Math.cos(turn) + uz * Math.sin(turn), dz = -ux * Math.sin(turn) + uz * Math.cos(turn);
+    const ax = ux * Math.cos(2 * turn) + uz * Math.sin(2 * turn), az = -ux * Math.sin(2 * turn) + uz * Math.cos(2 * turn);
+    // Look past the opening formation without paying for empty intermediate platforms.
+    for (let link = gap + Math.max(8, reach); link <= 160; link += Math.max(8, reach)) {
+      const sx = x + dx * link + ax * platform / 2, sz = z + dz * link + az * platform / 2;
+      if (!g.world.inside(sx, sz, 10) || g.towns.nearest(sx, sz)?.id !== town) continue;
+      let pop = 0;
+      for (const id of g.world.bgrid.query(sx - reach, sz - reach, sx + reach, sz + reach)) {
+        const b = g.world.buildings.get(id);
+        if (!b || b.pop <= 0 || covered.has(id) || b.townId !== town || (b.x - sx) ** 2 + (b.z - sz) ** 2 > reach * reach) continue;
+        pop += b.pop;
+      }
+      if (pop > 0) choices.push({ turn, gap: link, pop, x: sx, z: sz });
+    }
+  }
+  choices.sort((a, b) => b.pop / (b.gap + platform) - a.pop / (a.gap + platform) || a.gap - b.gap || a.turn - b.turn);
+  const picked: typeof choices = [];
+  for (const c of choices) {
+    if (picked.some(p => Math.hypot(c.x - p.x, c.z - p.z) < reach)) continue;
+    picked.push(c);
+    if (picked.length === 4) break;
+  }
+  return picked.map(({ turn, gap, pop }) => ({ turn, gap, pop }));
+}

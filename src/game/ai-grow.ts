@@ -2,13 +2,13 @@
 // (ai.ts urbanJob: the depot ramp branches off a short tail beside the line's straight continuation; terminusOf tells
 // what lies beyond a terminus), and the AI network task 'extend' (ai-network.ts runs growTask) reviews the company's
 // city lines as their towns grow:
-//  - beyond a terminus: residents along the line's onward direction that no rail station reaches on foot get one to
+//  - beyond a city terminus (including compatible electric through services): residents along the line's onward direction that no rail station reaches on foot get one to
 //    three new stations, and the terminus becomes a through stop (a depot lead in the way goes: its depot moves out to a
 //    yard beside the new terminus, the trains in the depot with it);
 //  - infill: a stop in a long gap between two stations where the town has filled in;
 // each valued by the demand model's line forecast against its works, trains and upkeep (incentives, not rules: an
 // option is built when its operating surplus repays it within the urban payback horizon, the best one the company can
-// pay for now first), at the line's level or underground (nothing above to demolish) where that comes out better. The
+// pay for now first), with ground, elevated and underground works fully priced where each comes out better. The
 // work item's cursor (the survey, the options valued one a work unit, then the winner's build in steps: its stations
 // one a unit, the track to them, the line running on) is saved with the planner and replays exactly; a step that
 // fails takes up what the build laid and refunds it.
@@ -23,7 +23,7 @@ import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf, RAIL, ROAD_TYPES } from './constants';
-import { onwardCentres } from './ai-urban';
+import { onwardCentres, urbanDistricts } from './ai-urban';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
 import { linearStops, outAndBack } from './lines';
@@ -499,6 +499,8 @@ export interface GrowOption {
   kind: 'ext' | 'fill';
   /** ext: the path end (0: the first station, 1: the last), the stations beyond, the first link's bearing off the axis (radians), the level */
   end?: 0 | 1; n?: number; turn?: number; level?: StationLevel;
+  /** The new station parts' actual style; absent on older cursors means the existing terminus's. */
+  mode?: RailMode;
   /** A priced continuation to a neighbouring centre; gap is from the existing ends to its platform start. */
   town?: number; gap?: number;
   /** fill: the consecutive stations and the point between them */
@@ -549,7 +551,24 @@ export function growLine(h: GrowHost, l: Line): number[] | null {
   const stations = path.map((sid) => g.stations.get(sid)!);
   const town = stations[0].townId;
   const urban = h.managed()?.get(l.id)?.urban || stations.every((s) => railPartMode(s.rail!) !== 'mainline');
-  return urban && town >= 0 && stations.every((s) => s.townId >= 0) ? path : null;
+  if (urban && town >= 0 && stations.every((s) => s.townId >= 0)) return path;
+  // An electric passenger unit can continue from a main-line city platform onto the same
+  // physical rail. Freight and intercity locomotive consists retain their trunk search.
+  const compatible = l.vehicles.some(id => {
+    const v = g.vehicles.get(id) as Train | undefined;
+    return v?.kind === 'train' && v.owner === h.me && v.carries('pax')
+      && v.cars.every(m => m.kind === 'emu' && m.traction === 'electric');
+  });
+  return compatible && [stations[0], stations[stations.length - 1]].some(s => s.owner === h.me && s.townId >= 0
+    && TRACK_TYPES[lineTrackAt(g, s).type].electrified) ? path : null;
+}
+
+/** Preserve an urban part's style; a through electric unit takes its real city-service style. */
+function growthMode(T: Station, sv: Service): RailMode | null {
+  const mode = railPartMode(T.rail!);
+  if (mode !== 'mainline') return mode;
+  if (!sv.cars.every(m => m.kind === 'emu' && m.traction === 'electric')) return null;
+  return sv.cars.every(m => m.id.startsWith('lrv_')) ? 'lightrail' : 'metro';
 }
 
 /** Resident counts of buildings within `r` of a point that no served rail station reaches on foot (each building once). */
@@ -713,10 +732,10 @@ function spurIgnore(g: Game, spur: number[], depots: number[]): NonNullable<Buil
  * as far out (a tail: the branch stays beside the line). Checked in today's world with the stations' and links'
  * previews. A reason when it does not fit.
  */
-function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn: number, level: StationLevel, destination?: Pick<GrowOption, 'town' | 'gap'>): ExtPlan | string {
+function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn: number, level: StationLevel, destination?: Pick<GrowOption, 'town' | 'gap' | 'mode'>): ExtPlan | string {
   const g = h.g, net = g.world.net, me = h.me, r = T.rail!;
   if (te.heads.length !== 2 || te.kind === 'other' || T.owner !== me) return 'terminus';
-  const track = lineTrackAt(g, T), grade = track.maxGrade * 0.8;
+  const track = { ...lineTrackAt(g, T), mode: destination?.mode ?? railPartMode(r) }, grade = track.maxGrade * 0.8;
   const PL = r.length, SP = cityStationSpacing(g, T.x, T.z, track, PL);
   // a depot beyond the terminus moves out to a yard at the new terminus, its spur taken up: a lead in the way on
   // (the track planned as if it were gone), or a tail's yard (it would join the line half way, on one running track)
@@ -755,7 +774,7 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     const reach = grade * Math.max(1, link);
     let lo = Infinity, hi = -Infinity;
     for (const k of [-0.5, 0, 0.5]) { const y = g.world.heightAt(x + ux * PL * k, z + uz * PL * k); lo = Math.min(lo, y); hi = Math.max(hi, y); }
-    // (the new station's style: the terminus's)
+    // New parts retain the quoted city style; the existing station is not restyled.
     let opt: Record<string, unknown> = { trackType: track.platform, mode: track.mode, level, ...(level !== 'ground' && g.stations.cityAt(x, z, g.towns.nearest(x, z)) ? { entrances: 4 } : {}) };
     if (level === 'underground') {
       const want = lo - Math.max(STATION_DEPTH.metro, (lv0 === 'underground' ? r.depth : 0)), y = Math.max(prevY - reach, Math.min(prevY + reach, want));
@@ -950,7 +969,9 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
     if (T.townId < 0 || T.owner !== me) continue;
     const te = terminusOf(g, T, outerEnd(T, N), me);
     if (!te || te.kind === 'other' || te.heads.length !== 2) { h.considered('extend.blockedEnd'); continue; }
-    const r = T.rail!, PL = r.length, track = lineTrackAt(g, T), mode = track.mode, SP = cityStationSpacing(g, T.x, T.z, track, PL);
+    const r = T.rail!, PL = r.length, base = lineTrackAt(g, T), mode = growthMode(T, sv);
+    if (!mode || (mode !== base.mode && !TRACK_TYPES[base.type].electrified)) continue;
+    const track = { ...base, mode }, SP = cityStationSpacing(g, T.x, T.z, track, PL);
     const rough = (lv: StationLevel) => (2 * PL * 9000 + 120000) * (lv === 'underground' ? 5 : lv === 'elevated' ? 3.5 : 1)
       + 2 * (SP - PL) * track.costPerUnit * (lv === 'underground' ? 7 : lv === 'elevated' ? 4.5 : 1.5);
     const q = endCentre(g, te), a0 = te.kind === 'free' ? 0 : TAIL;
@@ -963,7 +984,7 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
       for (const level of levelsFor(T)) {
         const factor = LEVEL_TRACK[level], capital = rough(level) + 2 * Math.max(0, c.along - SP) * track.costPerUnit * factor;
         const rank = pop * perRes * payback(h, mode) - .3 * capital;
-        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: 0, level, town: c.town, gap: c.along - PL / 2, pop, rank });
+        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: 0, level, mode, town: c.town, gap: c.along - PL / 2, pop, rank });
       }
     }
     for (const turn of [0, 0.2, -0.2, 0.4, -0.4]) {
@@ -980,8 +1001,17 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
         pop += add;
         for (const level of levelsFor(T)) {
           const rank = pop * perRes * payback(h, mode) - 0.3 * rough(level) * (k + 1);
-          if (rank > 0) out.push({ kind: 'ext', end, n: k + 1, turn, level, pop, rank });
+          if (rank > 0) out.push({ kind: 'ext', end, n: k + 1, turn, level, mode, pop, rank });
         }
+      }
+    }
+    const nativeGap = Math.max(doubleTrackCrossoverGap(track.type), track.minRadius * 2 + 2, mode === 'lightrail' ? 18 : 0);
+    for (const c of urbanDistricts(g, T.townId, sx, sz, te.ux, te.uz, Math.max(nativeGap, SP - PL - a0), PL,
+      cityStationRadius(g, T.x, T.z, mode), covered)) {
+      for (const level of levelsFor(T)) {
+        const capital = rough(level) + 2 * Math.max(0, c.gap - (SP - PL)) * track.costPerUnit * LEVEL_TRACK[level];
+        const rank = c.pop * perRes * payback(h, mode) - .3 * capital;
+        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: c.turn, level, mode, gap: c.gap, pop: c.pop, rank });
       }
     }
   }
@@ -1041,14 +1071,11 @@ function terminusAt(h: GrowHost, path: number[], end: 0 | 1): { T: Station; te: 
 }
 
 /**
- * Levels an extension may be built at: the terminus's own, underground (nothing above to demolish, a dense town), and
- * from a viaduct down to the ground too (out where the town thins, at a third of the price).
+ * Compare all native levels, including their paid approach ramps. The terminus's own level goes first.
  */
 function levelsFor(T: Station): StationLevel[] {
   const lv = (T.rail!.level ?? 'ground') as StationLevel;
-  // city-integration: the subway branch builds underground-only lines with underground depots (subway-api.md); its
-  // planner takes over here for underground extensions when merged.
-  return lv === 'underground' ? ['underground'] : lv === 'elevated' ? ['elevated', 'ground', 'underground'] : ['ground', 'underground'];
+  return [lv, ...(['ground', 'elevated', 'underground'] as StationLevel[]).filter(level => level !== lv)];
 }
 
 /** Value one option in today's world: the better level for an extension; null when it does not fit. */
@@ -1056,10 +1083,10 @@ function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score:
   const g = h.g, sv = serviceOf(h, l, path, o.kind === 'ext' ? [path[o.end ? path.length - 1 : 0]] : [o.a!, o.b!]);
   if (!sv) return null;
   const before = path.map((id) => g.stations.get(id)!);
-  const mode = railPartMode(before[0].rail!);
+  const mode = o.kind === 'ext' ? o.mode ?? railPartMode(before[0].rail!) : railPartMode(before[0].rail!);
   if (o.kind === 'ext') {
     const t = terminusAt(h, path, o.end!), level = o.level ?? 'ground';
-    if (!t) return null;
+    if (!t || o.mode && growthMode(t.T, sv) !== o.mode) return null;
     const p = planExtension(h, t.T, t.te, o.n!, o.turn!, level, o);
     if (typeof p === 'string') { h.considered('extend.ext.' + p.split(' ')[0]); return p === 'busy' ? 'busy' : null; }
     const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
@@ -1211,7 +1238,7 @@ function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolea
   let after: (Station | StationPlan)[], works: number, track: number, stations: StationPlan[], level: StationLevel, crossoverUpkeep = 0, crossoverTrack = 0;
   if (o.kind === 'ext') {
     const t = terminusAt(h, path, o.end!);
-    if (!t) return false;
+    if (!t || o.mode && growthMode(t.T, sv) !== o.mode) return false;
     const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground', o);
     if (typeof p === 'string') return p === 'busy' ? 'busy' : false;
     after = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
@@ -1223,7 +1250,7 @@ function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolea
     after = [...before]; after.splice(Math.max(path.indexOf(o.a!), path.indexOf(o.b!)), 0, station);
     works = f.plan.cost + compensation(g, station.demolish); track = 0; stations = [station]; level = station.level;
   }
-  const v = value(h, l, before, after, works, track, stations, stations.length, sv, railPartMode(before[0].rail!), level, crossoverUpkeep, crossoverTrack);
+  const v = value(h, l, before, after, works, track, stations, stations.length, sv, o.mode ?? railPartMode(before[0].rail!), level, crossoverUpkeep, crossoverTrack);
   if (!preference(h, o.kind, v)?.fleet) return false;
   // addTrains owns the reachability and borrowing check; no funds are borrowed before that check.
   const bought = addTrains(h, l, sv, v.fleet.trains);
@@ -1256,10 +1283,10 @@ function extValued(h: GrowHost, l: Line, path: number[], o: GrowOption): { T: St
   const g = h.g;
   const t = terminusAt(h, path, o.end!);
   const sv = serviceOf(h, l, path, t ? [t.T.id] : []);
-  if (!t || !sv) return 'changed';
+  if (!t || !sv || o.mode && growthMode(t.T, sv) !== o.mode) return 'changed';
   const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground', o);
   if (typeof p === 'string') return p;
-  const before = path.map((id) => g.stations.get(id)!), mode = railPartMode(t.T.rail!);
+  const before = path.map((id) => g.stations.get(id)!), mode = o.mode ?? railPartMode(t.T.rail!);
   const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
   const v = value(h, l, before, after, p.works, p.track, p.stations, p.stations.length, sv, mode, p.level, p.crossoverUpkeep, p.crossoverTrack);
   if (v.score <= 0 || v.fleet.score > v.score) return 'unpaid';
@@ -1335,12 +1362,11 @@ function extStations(h: GrowHost, l: Line, path: number[], o: GrowOption, prev?:
       b.starts.push(q.id);
     }
   } else b = copyGrowBuild(b);
-  // the next station, planned again on its site at the terminus's style
+  // The next station, planned again at its quoted level and style.
   const t = terminusAt(h, path, o.end!), site = b.sites.shift();
   if (!t || !site) { fail('the line changed'); return 'changed'; }
   const r = t.T.rail!, level = o.level ?? 'ground';
-  // (the terminus's style: city-integration, the one-track branch passes railPartMode as the station's style)
-  const re = g.stations.planRail(site[0], site[1], site[2], r.length, 2, me, { trackType: lineTrackAt(g, t.T).platform, mode: railPartMode(r), level, ...(level !== 'ground' && g.stations.cityAt(site[0], site[1], g.towns.nearest(site[0], site[1])) ? { entrances: 4 } : {}), ...(site[3] ? { depth: site[3] } : {}), ...(site[4] ? { height: site[4] } : {}) });
+  const re = g.stations.planRail(site[0], site[1], site[2], r.length, 2, me, { trackType: lineTrackAt(g, t.T).platform, mode: o.mode ?? railPartMode(r), level, ...(level !== 'ground' && g.stations.cityAt(site[0], site[1], g.towns.nearest(site[0], site[1])) ? { entrances: 4 } : {}), ...(site[3] ? { depth: site[3] } : {}), ...(site[4] ? { height: site[4] } : {}) });
   if (!re.ok || re.join?.rail || !h.demolitionOk(re.demolish)) { fail(re.error ?? 'station site'); return 'site'; }
   if (re.join) { re.links = [...new Set([...re.links, re.join])]; re.join = null; }
   const dem = [...re.demolish], residents = displacedResidents(g, dem), id = g.stations.nextId;

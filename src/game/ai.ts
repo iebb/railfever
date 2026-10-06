@@ -32,7 +32,7 @@ import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
-import { networkDaily, scheduleNetworkTask, networkOptions, XLINK_REACH } from './ai-network';
+import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, scheduleNetworkTask, networkOptions, XLINK_REACH } from './ai-network';
 import { planSubwayYard, buildSubwayYard, surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLength } from './ai-mail';
@@ -1442,7 +1442,7 @@ export class AIController {
       // a project's work units run spread over the day (see work)
       if (this.job) return;
       // the network it has: stations grown, tracks paired and joined, lines merged or closed (ai-network.ts)
-      networkDaily(this);
+      const reviewingRail = networkDaily(this, this.state.cooldown <= 0);
       if (this.railPolicy.deepTrouble) { this.state.phase = 'cutting operating costs'; return; }
       // Other construction can remove or isolate a forecourt street. Restore passenger access before
       // investing in another route, with a retry interval when no affordable repair fits.
@@ -1456,6 +1456,8 @@ export class AIController {
         return;
       }
       if (this.state.cooldown > 0) { this.state.cooldown--; return; }
+      if (reviewingRail) { this.state.phase = 'reviewing rail network'; return; }
+      finishNetworkReview(this);
       this.state.phase = 'evaluating projects';
       this.job = this.chooseProject();
     } catch (e) { this.onError(e); }
@@ -1659,7 +1661,7 @@ export class AIController {
     const share = (a: number, b: number) => 1 / (1 + (served.get(this.pairKey(a, b)) ?? 0));
     // intercity railways: preferably extending our network from a station we have (hubs and branches)
     const railModels = pickTrain(g.year, aiPlatformLength(2000, 2000, g.year), 150, 3) ?? [];
-    if (focus.rail > 0 && considers(focus.rail) && avail > 3_000_000 && railModels.length) {
+    if (focus.rail > 0 && considers(focus.rail) && avail > (railLines ? 750_000 : 3_000_000) && railModels.length) {
       const townFails = this.railTownFailures();
       const rivals = this.rivalRailPairs();
       const T = g.towns.list;
@@ -1737,8 +1739,6 @@ export class AIController {
         // the new line feeds our network: through trains when it continues one of our lines (a multi-town line);
         // from another company's station (open access) our trains continue its line
         // Connection preference is a separate tier; native forecasts price transfers and saved capital.
-        // a town beyond (a corridor the line can continue along later)
-        if (!hub && !joined && (this.townBeyond(A, B) || this.townBeyond(B, A))) score *= 1.25;
         adjustment *= (railLines === 0 ? 1.3 : 1) * fw(focus.rail);
         opts.push({ score: score * adjustment, extensionScore: throughScore * adjustment, kind: 'rail', towns: joined ? branchA ? [B.id, A.id] : [A.id, B.id] : hubB ? [B.id, A.id] : [A.id, B.id], hub: hub?.id, join: joined?.id });
       }
@@ -1951,6 +1951,8 @@ export class AIController {
 
   private endProject() {
     const p = this.project;
+    const line = p && p.line >= 0 ? this.game.lines.get(p.line) : undefined;
+    if (line?.kind === 'rail' && line.vehicles.some(id => this.game.vehicles.get(id)?.owner === this.companyId)) scheduleRailExpansionReview(this);
     this.project = null;
     this.splitPieces.clear();
     this.state.phase = 'idle';
@@ -4310,17 +4312,26 @@ export class AIController {
     const g = this.game, spacing = Math.max(end, walkLimit('rail') * (mode === 'metro' ? 0.72 : 0.6));
     // in-city stops walk half as far: between the end stations they stand closer together (CITY_SPACING)
     const mid = Math.max(platform + 6, walkLimit('rail') * CITY_WALK_SCALE * CITY_SPACING[mode]);
-    const sts = [...g.stations.map.values()].filter((s) => s.townId === T.id && s.rail && railPartMode(s.rail) === 'mainline' && g.lines.stationServed(s.id));
-    let pair: Station[] = [], dist = 0;
+    const own = new Set<number>();
+    for (const line of g.lines.map.values()) if (line.kind === 'rail' && line.vehicles.some(id => g.vehicles.get(id)?.owner === this.companyId))
+      for (const id of line.stops) if (g.lines.stationServed(id)) own.add(id);
+    const sts = [...g.stations.map.values()].filter((s) => s.townId === T.id && s.rail
+      && (own.has(s.id) || railPartMode(s.rail) === 'mainline') && g.lines.stationServed(s.id)
+      && (s.owner === this.companyId || g.canUse(this.companyId, s.owner)));
+    let pair: Station[] = [], dist = 0, ownAnchors = -1;
     for (const a of sts) for (const b of sts) {
-      const d = Math.hypot(a.x - b.x, a.z - b.z);
-      if (a.id < b.id && d > dist && d <= Math.max(320, T.radius * 3)) { pair = [a, b]; dist = d; }
+      const d = Math.hypot(a.x - b.x, a.z - b.z), anchors = Number(own.has(a.id)) + Number(own.has(b.id));
+      if (a.id < b.id && d > 1e-6 && d <= Math.max(320, T.radius * 3) && (anchors > ownAnchors || anchors === ownAnchors && d > dist)) {
+        pair = [a, b]; dist = d; ownAnchors = anchors;
+      }
     }
+    const single = !pair.length ? sts.find(s => own.has(s.id)) : undefined;
     const axis = this.townAxis(T);
-    const angle = pair.length ? Math.atan2(pair[1].x - pair[0].x, pair[1].z - pair[0].z) : Math.atan2(axis.x, axis.z);
-    const offset = mode === 'lightrail' && pair.length ? 5 : 0;
-    const x = (pair.length ? (pair[0].x + pair[1].x) / 2 : T.x) - Math.cos(angle) * offset;
-    const z = (pair.length ? (pair[0].z + pair[1].z) / 2 : T.z) + Math.sin(angle) * offset;
+    const angle = pair.length ? Math.atan2(pair[1].x - pair[0].x, pair[1].z - pair[0].z)
+      : single && Math.hypot(T.x - single.x, T.z - single.z) > 1 ? Math.atan2(T.x - single.x, T.z - single.z) : Math.atan2(axis.x, axis.z);
+    const offset = mode === 'lightrail' && (pair.length || single) ? 5 : 0;
+    let x = (pair.length ? (pair[0].x + pair[1].x) / 2 : single?.x ?? T.x) - Math.cos(angle) * offset;
+    let z = (pair.length ? (pair[0].z + pair[1].z) / 2 : single?.z ?? T.z) + Math.sin(angle) * offset;
     // Open a three/four-stop stage when capital is tight; extensions can follow retained operating profit.
     const city = g.stations.cityAt(x, z, T), step = stepWanted ?? (city ? mid : spacing);
     const maxStops = stopsWanted;
@@ -4329,6 +4340,9 @@ export class AIController {
     const stagedPair = pair.length && stopsWanted < 5;
     const L = pair.length ? stagedPair ? Math.max(dist, spacing * 2 + step * (stopsWanted - 3)) : dist + spacing * 2
       : spacing * 2 + step * (count - 3);
+    // A single company interchange starts the city corridor toward its occupied centre.
+    // The first target stays at that hub, including four-stop opening stages.
+    if (single) { x += Math.sin(angle) * L / 2; z += Math.cos(angle) * L / 2; }
     const targets = stagedPair ? [-L / 2, ...Array.from({ length: stopsWanted - 2 }, (_, i) =>
       stopsWanted === 3 ? 0 : -L / 2 + spacing + (L - spacing * 2) * i / (stopsWanted - 3)), L / 2]
       : pair.length ? [-dist / 2 - spacing, -dist / 2, dist / 2, dist / 2 + spacing]
@@ -4336,7 +4350,7 @@ export class AIController {
     // A paired corridor can open between its interchanges before extending beyond them. The old pair
     // branch ignored the requested stage count, so every smaller quote still bought the full line.
     if (pair.length && !stagedPair) for (let t = -dist / 2 + step; t < dist / 2 - step * 0.65; t += step) targets.push(t);
-    return { x, z, angle, spacing, step, end, L, platform, targets: targets.sort((a, b) => a - b), interchanges: pair };
+    return { x, z, angle, spacing, step, end, L, platform, targets: targets.sort((a, b) => a - b), interchanges: single ? [single] : pair };
   }
 
   /**

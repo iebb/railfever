@@ -14,6 +14,7 @@ import { stationLayout, defaultPlatformLength, railModeOf, railPartMode, entranc
 import type { StationPlan, StationLevel, ThroughMode, PlatformStyle } from './stations';
 import { planNativeStationOnTrack, commitNativeStationOnTrack } from './station-on-track';
 import type { NativeStationPlan } from './station-on-track';
+import { alignmentAtLevel, gatherRelevelApproaches, relevelBoundaryError, relevelCrossingError } from './station-relevel';
 import { trackBasePerUnit } from './opcosts';
 
 /** A track as travelled: edges in order, each in direction +1 (a -> b) or -1. */
@@ -2207,6 +2208,8 @@ export interface RelevelOpts {
 export interface RelevelPlan {
   ok: boolean; error?: string; warnings: string[];
   owner: number; level: StationLevel; cost: number;
+  /** Disposable quote revision: reject changed geometry/terrain before any payment. */
+  networkVersion?: number; heightsVersion?: number;
   /** new heights (profile samples, as NEdge.prof) and structure sections of every edge of the stretch */
   edges: { id: number; prof: Float32Array; sections: Section[] }[];
   /** new node heights (the stretch's outer ends keep theirs: the ramps start there) */
@@ -2229,13 +2232,14 @@ export interface RelevelPlan {
  */
 export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, owner: number, opts: RelevelOpts = {}): RelevelPlan {
   const net = g.world.net, w = g.world;
-  const plan: RelevelPlan = { ok: false, warnings: [], owner, level, cost: 0, edges: [], nodes: [], stations: [], crossings: [], ramps: [] };
+  const plan: RelevelPlan = { ok: false, warnings: [], owner, level, cost: 0, edges: [], nodes: [], stations: [], crossings: [], ramps: [], networkVersion: net.version, heightsVersion: w.heightsVersion };
   const fail = (m: string) => { plan.ok = false; plan.error = m; return plan; };
   const set = new Set<number>();
   for (const id of edgeIds) {
     const e = net.edges.get(id);
     if (!e || e.kind !== 'rail') continue;
-    if (e.owner !== owner) return fail('Not your track');
+    const access = g.trackUpgradeError(owner, e.owner);
+    if (access) return fail(access);
     if (e.depot >= 0) return fail('Depot tracks stay on the ground');
     set.add(id);
   }
@@ -2243,7 +2247,7 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
   // stations on the stretch: platform / through tracks with picked track on both sides (or picked themselves)
   const stations = new Set<number>();
   for (const st of g.stations.all()) {
-    if (!st.rail || st.owner !== owner) continue;
+    if (!st.rail) continue;
     const ids = [...st.rail.edges, ...st.rail.throughEdges];
     const inline = ids.some((id) => set.has(id)) || ids.some((id) => {
       const e = net.edges.get(id);
@@ -2251,14 +2255,25 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
       return !!e && cont(e.a) && cont(e.b);
     });
     if (!inline) continue;
-    if (st.rail.native) return fail(`${st.name}: retained track station needs geometry-preserving re-level`);
+    const access = g.trackUpgradeError(owner, st.owner);
+    if (access) return fail(access);
+    for (const id of ids) {
+      const e = net.edges.get(id), error = e && g.trackUpgradeError(owner, e.owner);
+      if (error) return fail(error);
+    }
+    if (st.rail.native && (!st.rail.alignment || !st.rail.groups
+      || g.stations.railTrackGroups(st, true).length !== st.rail.groups.length || st.rail.groups.length !== st.rail.alignment.tracks.length))
+      return fail(`${st.name}: retained track geometry is incomplete`);
     stations.add(st.id);
     for (const id of ids) set.add(id);
   }
   const tt = TRACK_TYPES[lineType(g, [{ edge: [...set][0], dir: 1 }])] ?? TRACK_TYPES.standard;
-  const grade = tt.maxGrade * 0.92;
+  let grade = tt.maxGrade * 0.92;
   const off = level === 'elevated' ? Math.max(LINE_LEVEL.height.min, Math.min(LINE_LEVEL.height.max, opts.height ?? LINE_LEVEL.height.def))
     : level === 'underground' ? -Math.max(LINE_LEVEL.depth.min, Math.min(LINE_LEVEL.depth.max, opts.depth ?? LINE_LEVEL.depth.def)) : 0;
+  const nativeEnds = new Map([...stations].filter(id => g.stations.get(id)!.rail!.native).map(id => [id, g.stations.get(id)!.rail!.y]));
+  const touchingApproaches = gatherRelevelApproaches(g, set, nativeEnds, owner);
+  if (touchingApproaches) return fail(touchingApproaches);
   // the stations' new platform level (as built new there, its own structures ignored)
   const stY = new Map<number, number>();
   for (const sid of stations) {
@@ -2269,8 +2284,11 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
     const sp = g.stations.planRail(r.x, r.z, r.angle, r.length, r.tracks, owner, {
       level, ignoreStation: sid, ignoreEdges: set, through: r.through ?? 0, throughMode: r.throughMode, trackType: r.trackType, mode: railPartMode(r),
       platformStyle: r.platformStyle, psd: r.psd, style: level === 'ground' ? r.style : 'none', height: opts.height, depth: opts.depth, avoid,
+      ...(r.native ? { alignment: r.alignment, layout: { trackOffsets: [...r.trackOffsets], throughOffsets: [...r.throughOffsets],
+        platforms: r.platforms.map(p => ({ ...p })), width: r.width }, blockedEnds: [1, -1] as (1 | -1)[] } : {}),
     });
     if (!sp.ok) return fail(`${st.name}: ${sp.error ?? 'cannot be rebuilt at that level'}`);
+    if (r.native) sp.alignment = alignmentAtLevel(r.alignment!, sp.y);
     // its added entrances: beside the platforms where they fit and a street reaches them (ground), else they go
     const fit = ground ? g.stations.previewRefit(st, sp) : null;
     const gone = ground ? null : entrancesGo(r.level ?? 'ground', r.entrances, 'station rebuilt at new level');
@@ -2279,6 +2297,11 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
     stY.set(sid, sp.y);
     plan.cost += Math.max(0, sp.cost - (r.cost ?? 0) * 0.3) + (fit?.streets ?? 0);
   }
+  // Every station's physical ends need permitted approaches. Outside fixed profiles must
+  // never be replaced merely because their node is also a platform endpoint.
+  const approaches = gatherRelevelApproaches(g, set, stY, owner);
+  if (approaches) return fail(approaches);
+  for (const id of set) grade = Math.min(grade, (TRACK_TYPES[net.edges.get(id)!.type] ?? TRACK_TYPES.standard).maxGrade * 0.92);
   // the stretch's nodes: outer ends (track continues beyond, or nothing: a dead end) and inner ones
   const nodesOf = new Map<number, number[]>();
   for (const id of set) { const e = net.edges.get(id)!; for (const nid of [e.a, e.b]) { const a = nodesOf.get(nid) ?? []; a.push(id); nodesOf.set(nid, a); } }
@@ -2368,26 +2391,21 @@ export function planRelevel(g: Game, edgeIds: number[], level: StationLevel, own
       }
       plan.edges.push({ id: e.id, prof, sections });
       // structures cost: the new ones minus a third of the old
-      if (e.station < 0 && g.stations.throughStationOf(e.id) < 0) {
-        for (const sc of sections) plan.cost += (sc.s1 - sc.s0) * tt.costPerUnit * structureFactor('rail', sc.type, sc.type === 'bridge' ? Math.max(0.6, prof[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))] - ter[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))]) : Math.max(1, ter[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))] - prof[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))]));
-        for (const sc of e.sections) plan.cost -= (sc.s1 - sc.s0) * tt.costPerUnit * structureFactor('rail', sc.type, 1.2) * 0.3;
+      const facility = g.stations.get(e.station >= 0 ? e.station : g.stations.throughStationOf(e.id));
+      // Retained running rail is a separate asset from its native station facility.
+      if (!facility?.rail || facility.rail.native) {
+        const edgeType = TRACK_TYPES[e.type] ?? tt;
+        for (const sc of sections) plan.cost += (sc.s1 - sc.s0) * edgeType.costPerUnit * structureFactor('rail', sc.type, sc.type === 'bridge' ? Math.max(0.6, prof[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))] - ter[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))]) : Math.max(1, ter[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))] - prof[Math.min(m - 1, Math.round(((sc.s0 + sc.s1) / 2) / PSTEP))]));
+        for (const sc of e.sections) plan.cost -= (sc.s1 - sc.s0) * edgeType.costPerUnit * structureFactor('rail', sc.type, 1.2) * 0.3;
         if (!kind) plan.cost += e.len * 600;   // earthworks back on the ground
       }
     }
   }
   plan.nodes = [...newY].map(([id, y]) => ({ id, y }));
-  // crossings on the stretch: grade-separated now (a road or track at the same height is in the way)
-  for (const [cid, c] of net.crossings) {
-    if (!set.has(c.e1) && !set.has(c.e2)) continue;
-    const mine = set.has(c.e1) ? c.e1 : c.e2, s = set.has(c.e1) ? c.s1 : c.s2;
-    const other = net.edges.get(mine === c.e1 ? c.e2 : c.e1), os = mine === c.e1 ? c.s2 : c.s1;
-    const pe = plan.edges.find((x) => x.id === mine);
-    if (!pe || !other) continue;
-    const e = net.edges.get(mine)!;
-    const yNew = profAtS(pe.prof, e.len, s), yOther = net.heightAtS(other, os);
-    if (Math.abs(yNew - yOther) < RAIL.clearance + 0.3) return fail(`${other.kind === 'road' ? 'A road' : 'Another track'} crosses at same height near ${Math.round(c.x)},${Math.round(c.z)}: choose longer stretch`);
-    plan.crossings.push(cid);
-  }
+  const boundary = relevelBoundaryError(g, plan);
+  if (boundary) return fail(boundary);
+  const clearance = relevelCrossingError(g, plan);
+  if (clearance) return fail(clearance);
   plan.cost = Math.max(0, Math.round(plan.cost));
   plan.ok = true;
   if (!g.company(owner).economy.canAfford(plan.cost)) plan.warnings.push('Not enough money');
@@ -2408,7 +2426,10 @@ function profAtS(prof: Float32Array, len: number, s: number): number {
 export function commitRelevel(g: Game, plan: RelevelPlan, opts: { waitForTrains?: boolean } = {}): string | null {
   const net = g.world.net, w = g.world;
   if (!plan.ok) return plan.error ?? 'Cannot rebuild';
+  if (plan.networkVersion !== undefined && plan.networkVersion !== net.version || plan.heightsVersion !== undefined && plan.heightsVersion !== w.heightsVersion) return 'The track or ground changed, plan again';
   for (const x of plan.edges) if (!net.edges.has(x.id)) return 'The track changed, plan again';
+  for (const x of plan.edges) { const error = g.trackUpgradeError(plan.owner, net.edges.get(x.id)!.owner); if (error) return error; }
+  for (const s of plan.stations) { const st = g.stations.get(s.id); if (!st) return 'The station changed, plan again'; const error = g.trackUpgradeError(plan.owner, st.owner); if (error) return error; }
   if (opts.waitForTrains && plan.edges.some((x) => g.vehicles.isEdgeBusy(x.id))) return 'busy';
   const eco = g.company(plan.owner).economy;
   if (!eco.canAfford(plan.cost)) return 'Not enough money';

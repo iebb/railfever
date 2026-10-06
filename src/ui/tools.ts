@@ -1364,10 +1364,10 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ re-level (lift / sink track in place)
-  /** Own track to lift / sink: the track under the cursor, or along it from the press point (stations on it go along). */
+  /** Permitted track to lift / sink; its stations and ownership stay with it. */
   private hoverRelevel(p: THREE.Vector3) {
     const g = this.game, net = g.world.net, ov = this.overlay;
-    const ok = (e: NEdge) => e.owner === PLAYER && e.depot < 0;
+    const ok = (e: NEdge) => !g.trackUpgradeError(PLAYER, e.owner) && e.depot < 0;
     const cur = net.nearestEdge(p.x, p.z, 1.4, 'rail', ok);
     let chain: number[] = [];
     const d = this.down;
@@ -1380,10 +1380,10 @@ export class Tools {
       this.rlv = null;
       ov.setProposal(null); ov.setHoverEdge(null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at or drag along your track']] }, other ? 'err' : 'info');
+      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : g.trackUpgradeError(PLAYER, other.edge.owner) ?? 'Cannot rebuild this track'] } : { title, rows: [['relevel', 'Point at or drag along permitted track']] }, other ? 'err' : 'info');
       return;
     }
-    const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}`;
+    const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}|${g.world.heightsVersion}|${chain.map(id => g.canUse(PLAYER, net.edges.get(id)!.owner)).join(',')}`;
     if (this.rlv?.key !== key) {
       let plan: RelevelPlan;
       try { plan = planRelevel(g, chain, this.relevelTo, PLAYER, { height: this.levelHeight, depth: this.levelDepth }); }
@@ -1396,6 +1396,8 @@ export class Tools {
     let len = 0;
     for (const x of pl.edges.length ? pl.edges : chain.map((id) => ({ id }))) len += net.edges.get(x.id)?.len ?? 0;
     const rows: [string, string][] = [['length', `<b>${fmtLen(len)}</b> of track${pl.edges.length > 1 ? ` · ${pl.edges.length} sections` : ''}`]];
+    const foreign = new Set(pl.edges.map(e => net.edges.get(e.id)!.owner).filter(owner => owner !== PLAYER && owner >= 0));
+    if (foreign.size) rows.push(['company', `${[...foreign].map(owner => esc(g.company(owner).name)).join(', ')} · you pay construction`]);
     if (this.relevelTo !== 'ground') rows.push([this.relevelTo === 'elevated' ? 'bridge' : 'tunnel', this.relevelTo === 'elevated' ? `deck <b>${Math.round(this.levelHeight * 10)} m</b> up` : `<b>${Math.round(this.levelDepth * 10)} m</b> deep`]);
     if (pl.ramps.length) rows.push(['grade', `ramps ${pl.ramps.map((r) => fmtLen(r)).join(' · ')}`]);
     if (pl.stations.length) rows.push(['station', `${pl.stations.map((s) => esc(g.stations.get(s.id)?.name ?? '?')).join(', ')} go${pl.stations.length === 1 ? 'es' : ''} with it`]);
