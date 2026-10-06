@@ -9,6 +9,7 @@ import { mailEra, mailGenRate, townMailFactor, mailQueueCap, mailQueueCapOf, mai
 import { mailFare, mailTripFactor, estimateLegTime } from './fares';
 import { lineTable } from './patterns';
 import { Train } from './train';
+import { prospectiveWalkGroups } from './catchment';
 import { availableModels, carriesMail, MODEL_BY_ID, type VehicleModel } from './vehicle-types';
 
 const YEAR = 360;
@@ -120,6 +121,7 @@ function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number
   const { n, share } = g.mail.townShares();
   const pops = g.mail.forecastPops(points, headway, line);
   const towns = points.map((p) => townOf(g, p));
+  const groups = prospectiveWalkGroups(g, points).groups;
   const ok = points.map((p, i) => towns[i] >= 0 && towns[i] < n && reachableSite(p) && pops[i] >= MAIL_STATION.acceptPop);
   const table = line ? lineTable(g, line) : null;
   let revenue = 0;
@@ -131,6 +133,7 @@ function directRevenue(g: Game, points: MailSite[], kmh: number, headway: number
     for (let j = 0; j < points.length; j++) {
       const U = towns[j], q = points[j];
       if (!ok[j] || U === T) continue;
+      if (groups[i] === groups[j]) continue;
       const d = Math.hypot(q.x - p.x, q.z - p.z);
       const seconds = table && 'id' in p && 'id' in q
         ? table.edges.find((e) => e.from === p.id && e.to === q.id)?.cost

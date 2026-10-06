@@ -11,7 +11,7 @@ import { svg } from '../ui/icons';
 import { uiScale } from '../ui/uiscale';
 
 /** A station number badge as the UI computes it (ui/lineid.ts Badge); `line`: the line it numbers (hover, tap). */
-export interface LabelBadge { code: string; prefix: string; num: string; color: string; line?: number }
+export interface LabelBadge { code: string; prefix: string; num: string; color: string; line?: number; station?: number }
 
 /**
  * A station in the lines map's line display, drawn on the station itself: its numbering badges on the lines shown
@@ -19,6 +19,8 @@ export interface LabelBadge { code: string; prefix: string; num: string; color: 
  * the highlighted lines change; the label's DOM is rebuilt only when `sig` changes.
  */
 export interface StationMark {
+  /** Global focused/open route order, retained when physical members share one marker. */
+  order?: Record<number, number>;
   badges: LabelBadge[];
   /** the lines shown that stop here; a hover or tap on the stop dot (or the name) picks the first */
   lines: number[];
@@ -136,6 +138,7 @@ function badgeSpan(b: LabelBadge, cls = 'snum sm'): HTMLSpanElement {
   const e = span(cls);
   e.style.setProperty('--c', b.color);
   if (b.line != null) e.dataset.line = String(b.line);
+  if (b.station != null) e.dataset.station = String(b.station);
   const i = document.createElement('i'); i.textContent = b.prefix;
   const n = document.createElement('b'); n.textContent = b.num;
   e.append(i, n);
@@ -195,6 +198,11 @@ export class Labels {
   private badgeRef: Map<number, LabelBadge[]> | null = null;
   private parts = new Map<number, number[]>();
   private merged = new Map<number, LabelBadge[]>();
+  private shownMarks: Map<number, StationMark> | null = null;
+  private hoverAnchor: number | null = null;
+  private markRef: Map<number, StationMark> | null = null;
+  private markComplexRef: Map<number, number> | null = null;
+  private groupedMarks = new Map<number, StationMark>();
 
   constructor(parent: HTMLElement) {
     this.container = document.createElement('div');
@@ -224,6 +232,8 @@ export class Labels {
     this.complexRef = null;
     this.badgeRef = null;
     this.parts.clear(); this.merged.clear();
+    this.shownMarks = null;
+    this.markRef = null; this.markComplexRef = null; this.groupedMarks.clear();
     this.routeTags.clear(); this.townInfo.clear();
     this.badges = null; this.complexOf = null; this.pinStations = null; this.stationMarks = null; this.openStation = null;
     this.cands.length = 0; this.pool.length = 0; this.keep.clear();
@@ -252,16 +262,17 @@ export class Labels {
     el.addEventListener('click', (e) => {
       e.stopPropagation();
       if (this.downType === 'touch' && (kind === 'mk' || kind === 'stn') && this.tapLine(kind, id, e.target)) return;
-      onClick();
+      if (kind === 'mk' || kind === 'stn') this.onClickStation(this.stationAt(id, e.target)); else onClick();
     });
     if (kind === 'mk' || kind === 'stn') {
       // a number picks its line; elsewhere on a marker its station's first line (mouse and pen: touch taps instead)
       el.addEventListener('pointerover', (e) => {
         if (e.pointerType === 'touch' || (kind === 'stn' && !this.pinStations)) return;
         const line = this.lineAt(kind, id, e.target);
-        this.setHoverLine(line, line == null ? null : id);
+        this.hoverAnchor = id;
+        this.setHoverLine(line, line == null ? null : this.stationAt(id, e.target));
       });
-      el.addEventListener('pointerleave', (e) => { if (e.pointerType !== 'touch' && this.hoverStn === id) this.setHoverLine(null, null); });
+      el.addEventListener('pointerleave', (e) => { if (e.pointerType !== 'touch' && this.hoverAnchor === id) this.setHoverLine(null, null); });
     }
     el.style.display = 'none';
     this.container.appendChild(el);
@@ -274,17 +285,23 @@ export class Labels {
   private lineAt(kind: Label['kind'], id: number, target: EventTarget | null): number | null {
     const b = (target as HTMLElement | null)?.closest?.('[data-line]') as HTMLElement | null;
     if (b?.dataset.line) return Number(b.dataset.line);
-    return kind === 'mk' ? this.stationMarks?.get(id)?.lines[0] ?? null : null;
+    return kind === 'mk' ? this.shownMarks?.get(id)?.lines[0] ?? null : null;
+  }
+
+  private stationAt(id: number, target: EventTarget | null): number {
+    const badge = (target as HTMLElement | null)?.closest?.('[data-station]') as HTMLElement | null;
+    return badge?.dataset.station ? Number(badge.dataset.station) : id;
   }
 
   /** Touch tap on a station's numbers (lines map): the first tap shows the line, as hovering does. */
   private tapLine(kind: Label['kind'], id: number, target: EventTarget | null): boolean {
     if (kind === 'stn' && !this.pinStations) return false;
     const line = this.lineAt(kind, id, target);
-    return line != null && this.onTapLine(line, id);
+    return line != null && this.onTapLine(line, this.stationAt(id, target));
   }
 
   private setHoverLine(line: number | null, station: number | null) {
+    if (line === null) this.hoverAnchor = null;
     if (line === this.hoverLn && station === this.hoverStn) return;
     this.hoverLn = line; this.hoverStn = station;
     this.onHoverLine(line, station);
@@ -301,9 +318,38 @@ export class Labels {
     for (const [id, main] of this.complexOf) { const a = this.parts.get(main); if (a) a.push(id); else this.parts.set(main, [id]); }
     for (const [main, ids] of this.parts) {
       const out: LabelBadge[] = [];
-      for (const id of [main, ...ids.filter((x) => x !== main)]) for (const b of this.badges?.get(id) ?? []) if (!out.some((o) => o.code === b.code)) out.push(b);
+      for (const id of [main, ...ids.filter((x) => x !== main)]) for (const b of this.badges?.get(id) ?? []) if (!out.some((o) => o.code === b.code)) out.push({ ...b, station: b.station ?? id });
       this.merged.set(main, out);
     }
+  }
+
+  /** One lines-map marker for a public station; badges retain their physical member/line targets. */
+  private complexMarks(marks: Map<number, StationMark> | null): Map<number, StationMark> | null {
+    if (!marks) return null;
+    if (marks === this.markRef && this.complexOf === this.markComplexRef) return this.groupedMarks;
+    this.markRef = marks; this.markComplexRef = this.complexOf;
+    const out = new Map<number, StationMark>();
+    const colors = new Map<number, string>();
+    for (const [id, mark] of marks) {
+      const main = this.complexOf?.get(id) ?? id;
+      let group = out.get(main);
+      if (!group) { group = { ...mark, badges: [], lines: [], order: {} }; out.set(main, group); }
+      Object.assign(group.order!, mark.order);
+      if (mark.lines.length) colors.set(mark.lines[0], mark.color);
+      if (mark.on && !group.on) group.color = mark.color;
+      group.on ||= mark.on; group.dim &&= mark.dim;
+      for (const line of mark.lines) if (!group.lines.includes(line)) group.lines.push(line);
+      for (const b of mark.badges) if (!group.badges.some(o => o.code === b.code)) group.badges.push({ ...b, station: b.station ?? id });
+      group.rank = Math.max(group.rank, mark.rank, group.lines.length);
+    }
+    for (const mark of out.values()) {
+      const order = (id: number | undefined) => id === undefined ? 2 : mark.order?.[id] ?? 2;
+      mark.lines.sort((a, b) => order(a) - order(b));
+      mark.badges.sort((a, b) => order(a.line) - order(b.line));
+      mark.color = colors.get(mark.lines[0]) ?? mark.color;
+      mark.sig = mark.badges.map(b => `${b.code}:${b.color}:${b.line}:${b.station}`).join(',') + ':' + mark.color;
+    }
+    return this.groupedMarks = out;
   }
 
   update(game: Game, camera: THREE.PerspectiveCamera, w: number, h: number, camDist: number) {
@@ -316,7 +362,7 @@ export class Labels {
     const now = performance.now();
     this.refreshComplexes();
     const pins = this.pinStations;
-    const smarks = this.stationMarks;
+    const smarks = this.shownMarks = this.complexMarks(this.stationMarks);
     // ---- towns (with station numbers on the map, their names stand a little higher: a central station sits below)
     const townMax = Math.max(180, camDist * 3.2);
     const townGap = smarks ? TOWN_LIFT * uiScale() : 0;
@@ -347,8 +393,8 @@ export class Labels {
         let l = this.markers.get(id);
         if (!l) { l = this.make('mk', id, () => this.onClickStation(id)); this.markers.set(id, l); }
         this.setMarkContent(l, m, s.name);
-        const isHl = this.hl === id;
-        this.setCls(l, 'lbl mk' + (m.badges.length ? '' : ' dot') + (far ? ' far' : '') + (named ? ' named' : '') + (m.on ? ' on' : '') + (m.dim && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (this.openStation === id ? ' open' : ''));
+        const members = this.parts.get(id) ?? [id], isHl = members.includes(this.hl!);
+        this.setCls(l, 'lbl mk' + (m.badges.length ? '' : ' dot') + (far ? ' far' : '') + (named ? ' named' : '') + (m.on ? ' on' : '') + (m.dim && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (members.includes(this.openStation!) ? ' open' : ''));
         // numbered stations above town names, unnumbered stop dots below them (unless their line is highlighted)
         const prio = isHl ? 1e9 : (m.badges.length ? 3e5 : 4e4) + (m.on ? 2e5 : 0) + m.rank * 5000 + Math.min(8000, s.waitingTotal * 4 + (s.pickupLast + s.arrivedLast) * 0.2);
         cands.push(this.cand(l, s.x, y, s.z, prio, 1e5, ms, isHl, m.badges.length ? MARK_BH : MARK_DOT));
@@ -359,12 +405,12 @@ export class Labels {
     const symbolOpacity = railSymbolOpacity(camDist);
     const pinMax = Math.max(400, camDist * 4);
     if (!smarks) for (const s of game.stations.map.values()) {
-      const mk = this.marks.get(s.id);
-      const isHl = this.hl === s.id;
       const main = this.complexOf?.get(s.id);
       const part = main !== undefined && main !== s.id;
-      // pins: only the stations of the lines shown; other plates of a complex only when marked / selected
-      if ((pins && !pins.has(s.id)) || (part && !mk && !isHl && !(pins && pins.has(s.id) && !pins.has(main!)))) continue;
+      if (part) continue;
+      const ids = this.parts.get(s.id) ?? [s.id];
+      const mk = ids.map(id => this.marks.get(id)).find(Boolean), isHl = ids.includes(this.hl!);
+      if (pins && !ids.some(id => pins.has(id))) continue;
       const force = (!!mk && !pins) || isHl;
       // Keep explicit map pins and the existing forced road plates. Rail symbols still obey the zoom band.
       const mode = pins || (force && !s.rail) ? 'plate' : stationLabelMode(camDist, !!s.rail);
@@ -378,7 +424,6 @@ export class Labels {
       if (!this.inView(camera, s.x, y, s.z, maxDist)) continue;
       let l = this.stations.get(s.id);
       if (!l) { const id = s.id; l = this.make('stn', id, () => this.onClickStation(id)); this.stations.set(s.id, l); }
-      const ids = !part && main !== undefined ? this.parts.get(s.id) : undefined;
       const fresh = force || now - l.refreshed >= 150 || l.cls.includes(' compact') !== compact || l.cls.includes(' pin') !== !!pins;
       if (fresh) {
         l.refreshed = now;
@@ -566,16 +611,17 @@ export class Labels {
     if (!l.badges) return;
     const count = list?.length ?? 0;
     const data = l.badgeData;
-    let changed = data.length !== count * 5 || l.badgeMax !== max;
+    let changed = data.length !== count * 6 || l.badgeMax !== max;
     if (list) for (let j = 0; j < count && !changed; j++) {
-      const b = list[j], k = j * 5;
-      changed = data[k] !== b.code || data[k + 1] !== b.prefix || data[k + 2] !== b.num || data[k + 3] !== b.color || data[k + 4] !== String(b.line);
+      const b = list[j], k = j * 6;
+      changed = data[k] !== b.code || data[k + 1] !== b.prefix || data[k + 2] !== b.num || data[k + 3] !== b.color || data[k + 4] !== String(b.line) || data[k + 5] !== String(b.station);
     }
     if (!changed) return;
-    data.length = count * 5;
+    data.length = count * 6;
     if (list) for (let j = 0; j < count; j++) {
-      const b = list[j], k = j * 5;
+      const b = list[j], k = j * 6;
       data[k] = b.code; data[k + 1] = b.prefix; data[k + 2] = b.num; data[k + 3] = b.color; data[k + 4] = String(b.line);
+      data[k + 5] = String(b.station);
     }
     l.badgeMax = max;
     const shown = Math.min(count, max);
@@ -611,7 +657,7 @@ export class Labels {
 
   private hide(l: Label) {
     if (this.hoveredTag != null && this.tags.get(this.hoveredTag) === l) this.setHoverTag(null);
-    if ((l.kind === 'mk' || l.kind === 'stn') && this.hoverStn === l.id) this.setHoverLine(null, null);
+    if ((l.kind === 'mk' || l.kind === 'stn') && this.hoverAnchor === l.id) this.setHoverLine(null, null);
     l.shown = false; l.el.style.display = 'none';
   }
 

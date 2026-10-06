@@ -419,6 +419,7 @@ export class MapModes {
     const order = (id: number) => (id === focus ? 0 : open.has(id) ? 1 : 2);
     for (const [sid, m] of out) {
       m.lines.sort((a, b) => order(a) - order(b));
+      m.order = Object.fromEntries(m.lines.map(id => [id, order(id)]));
       // (lines running through on one route share a number: shown once)
       m.badges = (badges.get(sid) ?? []).filter((b) => this.visIds.has(b.line)).sort((a, b) => order(a.line) - order(b.line))
         .filter((b, i, a) => a.findIndex((o) => o.code === b.code) === i);
@@ -610,7 +611,12 @@ export class MapModes {
     const sig = g.world.net.version + '|' + g.stations.catchVersion + '|' + mine.length + '|' + Math.floor(g.day / 30);
     if (sig === this.catchSig) return;
     this.catchSig = sig;
-    const segments = mine.flatMap((s) => catchStreets(g, s).segments);
+    const shown = new Set<number>();
+    const segments = mine.flatMap(s => {
+      const group = g.stations.catchmentGroup(s.id);
+      if (shown.has(group)) return [];
+      shown.add(group); return catchStreets(g, s).segments;
+    });
     drawCatchStreets(this.ui.renderer.overlay, 'map', { segments, buildings: new Map() });
     const inactive = mine.filter((s) => s.rail && !s.roadAccess).length;
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);

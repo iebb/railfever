@@ -28,7 +28,7 @@ import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } fr
 
 const VERSION = 3;
 /** Catchment/transfer parameters changed: old saved populations refresh at the next native boundary. */
-const CATCHMENT_RULES_VERSION = 1;
+const CATCHMENT_RULES_VERSION = 2;
 /** Save formats this build reads (v2: older single-record saves). */
 const READABLE = [2, VERSION];
 const TREE_CHUNK = SAVE_TREES;
@@ -653,6 +653,7 @@ export function deserialize(d: any): Game {
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion, savedAccessVersion = net.version;
   const catchmentRulesChanged = d.catchmentRulesVersion !== CATCHMENT_RULES_VERSION;
+  if (catchmentRulesChanged || complexesChanged) g.stations.refreshAccess(true);
   // The explicit marker separates owed population work from a frequency-only demand refresh.
   const populationPending = catchmentRulesChanged || complexesChanged || (typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
     : !!d.catchmentDirty || !!d.catchmentRoadsDirty);
@@ -661,7 +662,7 @@ export function deserialize(d: any): Game {
   // be warm, so preserve the explicit cold hint instead of conflating the two states.
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
     g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
-  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
     const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
@@ -688,7 +689,7 @@ export function deserialize(d: any): Game {
   S.accessVersion = net.version;
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
     g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
-  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

@@ -16,7 +16,7 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
-import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, walkClaimShares, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
@@ -951,6 +951,8 @@ export class Stations {
     for (const o of st.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== id); }
     st.links = [];
     this.map.delete(id);
+    this.accessVersion = -1;
+    this.walkVersion++;
     this.game.lines.onStationRemoved(id);
     this.markStation(st);
   }
@@ -2369,9 +2371,18 @@ export class Stations {
     this.accessVersion = v;
     this.walkVersion++;
     let changed = walkRoadsChanged(this.game);
+    const direct = new Map<number, boolean>();
+    for (const st of this.map.values()) direct.set(st.id, st.rail ? this.railReachable(st)
+      : st.stops.some(s => { const e = this.game.world.net.edges.get(s.edge); return !!e && pedestrianRoad(e); }));
+    const seen = new Set<number>();
     for (const st of this.map.values()) {
-      const a = !st.rail || this.railReachable(st);
-      if (a !== st.roadAccess) { st.roadAccess = a; changed = true; }
+      if (seen.has(st.id)) continue;
+      const parts = this.catchmentMembers(st.id), accessible = parts.some(id => direct.get(id));
+      for (const id of parts) {
+        seen.add(id);
+        const part = this.map.get(id)!;
+        if (accessible !== part.roadAccess) { part.roadAccess = accessible; changed = true; }
+      }
     }
     if (changed) this.game.lines.catchmentDirty = true;
   }
@@ -2571,6 +2582,9 @@ export class Stations {
   private addLink(a: Station, b: Station) {
     if (!a.links.includes(b.id)) a.links.push(b.id);
     if (!b.links.includes(a.id)) b.links.push(a.id);
+    this.accessVersion = -1;
+    this.catchGroups.version = -1;
+    this.walkVersion++;
     const main = this.map.get(stationComplex(this.game, a.id).main)!;
     this.renameComplex(a.id, main.name);
   }
@@ -2590,7 +2604,7 @@ export class Stations {
     let n = 0;
     if (a && a.links.includes(bId)) { a.links = a.links.filter((x) => x !== bId); n++; }
     if (b && b.links.includes(aId)) { b.links = b.links.filter((x) => x !== aId); n++; }
-    if (n) this.game.lines.rebuild();
+    if (n) { this.accessVersion = -1; this.catchGroups.version = -1; this.walkVersion++; this.game.lines.rebuild(); }
   }
 
   /** One logical station, with physical platform IDs and track permissions kept separate. Pure membership read. */
@@ -2606,7 +2620,7 @@ export class Stations {
   renameComplex(id: number, name: string) {
     const value = name.trim().slice(0, 40);
     if (!value) return;
-    for (const part of this.complex(id)) { const st = this.map.get(part); if (st) st.name = value; }
+    for (const part of this.catchmentMembers(id)) { const st = this.map.get(part); if (st) st.name = value; }
   }
 
   /** All stations of a station's transfer complex (itself and everything linked to it, transitively). */
@@ -2614,6 +2628,33 @@ export class Stations {
     const out = [id], seen = new Set(out);
     for (let i = 0; i < out.length; i++) for (const o of this.map.get(out[i])?.links ?? []) if (!seen.has(o) && this.map.has(o)) { seen.add(o); out.push(o); }
     return out;
+  }
+
+  private catchGroups = { version: -1, count: -1, ids: new Map<number, number>(), members: new Map<number, number[]>() };
+  /** Stable physical-complex identity for population claims; independent of display mode or ownership. */
+  catchmentGroup(id: number): number {
+    const cache = this.catchGroups;
+    if (cache.version !== this.walkVersion || cache.count !== this.map.size) {
+      cache.version = this.walkVersion; cache.count = this.map.size; cache.ids.clear(); cache.members.clear();
+      const adjacent = new Map<number, Set<number>>();
+      for (const st of this.map.values()) adjacent.set(st.id, new Set());
+      for (const st of this.map.values()) for (const to of st.links) if (this.map.has(to)) {
+        adjacent.get(st.id)!.add(to); adjacent.get(to)!.add(st.id);
+      }
+      for (const st of this.map.values()) if (!cache.ids.has(st.id)) {
+        const parts = [st.id], seen = new Set(parts);
+        for (let i = 0; i < parts.length; i++) for (const to of adjacent.get(parts[i])!) if (!seen.has(to)) { seen.add(to); parts.push(to); }
+        const group = Math.min(...parts);
+        cache.members.set(group, parts);
+        for (const member of parts) cache.ids.set(member, group);
+      }
+    }
+    return cache.ids.get(id) ?? id;
+  }
+
+  /** Logical member identity is undirected even for an asymmetric legacy passage; rail route edges stay physical. */
+  catchmentMembers(id: number): readonly number[] {
+    return this.catchGroups.members.get(this.catchmentGroup(id)) ?? [id];
   }
 
   /** Nearby stations for the merge / link controls: walking gap, linked, and why a merge / link is not possible. */
@@ -3009,6 +3050,7 @@ export class Stations {
   private coveredPop = new Map<number, number>();
   private shareMembers = new Map<number, Map<number, number>>();
   private served = new Map<number, boolean>();
+  private shareGroups = new Map<number, number>();
   private pendingPop = new Set<number>();
   /** Saved input work can remain owed even when there are no stations to put in pendingPop. */
   private pendingInputs = false;
@@ -3038,11 +3080,17 @@ export class Stations {
     let servedChanged = false;
     for (const [sid, old] of this.walkSt) if (!this.map.has(sid)) {
       for (const id of old.buildings.keys()) { this.covered.get(id)?.delete(sid); dirty.add(id); populations.add(id); }
-      this.walkSt.delete(sid); this.served.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
+      this.walkSt.delete(sid); this.served.delete(sid); this.shareGroups.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
     }
     for (const st of this.map.values()) {
       order.set(st.id, order.size);
       const walk = walkingCatchment(this.game, st), old = this.walkSt.get(st.id);
+      const group = this.catchmentGroup(st.id);
+      if (this.shareGroups.get(st.id) !== group) {
+        for (const id of old?.buildings.keys() ?? []) dirty.add(id);
+        for (const id of walk.buildings.keys()) dirty.add(id);
+        this.shareGroups.set(st.id, group);
+      }
       if (walk !== old) {
         for (const [id, before] of old?.buildings ?? []) {
           populations.add(id);
@@ -3083,11 +3131,10 @@ export class Stations {
       const reaches = b && b.pop > 0 && id <= maxB
         ? [...(this.covered.get(id) ?? [])].sort((a, b) => order.get(a[0])! - order.get(b[0])!) : [];
       const anyServed = reaches.some(([sid]) => this.served.get(sid));
-      let sum = 0, best = 0;
-      const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum * cover); }
+      const weights = walkClaimShares(reaches.map(([sid, distance]) => ({ group: this.catchmentGroup(sid),
+        weight: anyServed && !this.served.get(sid) ? 0 : walkWeight(distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(weights[k]); }
       if (!this.covered.get(id)?.size) this.covered.delete(id);
       if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
       if (!old && !rec.st.length) continue;
@@ -3155,12 +3202,11 @@ export class Stations {
       if (!b || b.pop <= 0 || id > job.maxB) continue;
       // covered was filled in station Map order, exactly as in the original share-out.
       const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
-      let sum = 0, best = 0; const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
-      if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sid = reaches[k][0], sh = wt[k] / sum * cover;
+      const weights = walkClaimShares(reaches.map(([sid, distance]) => ({ group: this.catchmentGroup(sid),
+        weight: anyServed && !job.served.get(sid) ? 0 : walkWeight(distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) {
+        const sid = reaches[k][0], sh = weights[k];
         rec.st.push(sid); rec.w.push(sh);
         let station = job.shareSt.get(sid), members = job.members.get(sid);
         if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
@@ -3173,6 +3219,7 @@ export class Stations {
     if (job.building < job.ids.length) return false;
     // Publish all shares and populations together. Demand keeps its previous shares until this point too.
     this.walkSt = job.walks; this.covered = job.covered; this.coveredPop = job.pop; this.served = job.served;
+    this.shareGroups = new Map(job.stations.map(st => [st.id, this.catchmentGroup(st.id)]));
     this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
     this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
     for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
@@ -3194,12 +3241,11 @@ export class Stations {
     }
     for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
       const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
-      let sum = 0, best = 0; const wt: number[] = [];
-      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; if (v > best) best = v; }
-      if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sh = wt[k] / sum * cover, sid = reaches[k].sid, ps = stations.get(sid)!;
+      const weights = walkClaimShares(reaches.map(r => ({ group: this.catchmentGroup(r.sid),
+        weight: anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) {
+        const sh = weights[k], sid = reaches[k].sid, ps = stations.get(sid)!;
         rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
       }
       buildings.set(id, rec);
@@ -4137,7 +4183,7 @@ export function stationComplex(g: Game, id: number): { main: number; parts: numb
     const m = S.mode(st);
     return (st.rail ? 100 + st.rail.tracks * 10 : 0) + (m === 'mainline' ? 5 : m === 'metro' ? 3 : m === 'lightrail' ? 2 : 0) + Math.min(4.9, (st.pickupLast + st.arrivedLast) / 1000);
   };
-  const parts = S.complex(id).sort((a, b) => rank(b) - rank(a) || a - b);
+  const parts = [...S.catchmentMembers(id)].sort((a, b) => rank(b) - rank(a) || a - b);
   return { main: parts[0] ?? id, parts };
 }
 

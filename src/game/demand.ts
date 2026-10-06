@@ -16,7 +16,7 @@ import type { Building } from './world';
 import type { Town } from './towns';
 import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
-import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns, lineTable } from './patterns';
 
 export interface Region {
@@ -166,6 +166,8 @@ const NO_DEMAND: StationDemand = { dest: [], w: [], served: 0 };
 
 /** The regional demand model of a game (kept in game.demand, saved with it). */
 export class DemandModel {
+  /** Disposable overlap-only work counts for planner diagnostics. */
+  forecastClaimStats = { buildings: 0, oldRecords: 0, newRecords: 0 };
   regions: Region[] = [];
   /** per town: district layout (core radius, sector count) and its region ids (centre / the town first) */
   private towns = new Map<number, { core: number; sectors: number; ids: number[] }>();
@@ -753,31 +755,56 @@ export class DemandModel {
     });
     const own = new Set(points.flatMap(p => { const st = forecastStation(p); return st ? [st.id] : []; }));
     const ownStation = (id: number) => own.has(id);
-    // per building: the sum and the best of the walking weights reaching it (the share-out's rule, Stations.computeShares)
-    const sums = new Map<number, number>(), bests = new Map<number, number>();
-    const reach = (bid: number, w: number) => { sums.set(bid, (sums.get(bid) ?? 0) + w); if (w > (bests.get(bid) ?? 0)) bests.set(bid, w); };
-    sites.forEach((s, i) => {
-      if (first.get(identities[i]) === i) for (const [bid, walk] of s.walk.buildings) reach(bid, walkWeight(walk.distance));
-    });
-    // Competing served stops share a building just as they do after construction (far-only buildings partly covered).
-    const competing = new Map<number, WalkingCatchment>();
-    const oldSums = new Map<number, number>(), oldBests = new Map<number, number>();
+    // Forecast the same one-claim-per-complex allocation as the committed station share-out.
+    const prospective = prospectiveWalkGroups(g, points), groups = prospective.groups;
+    const competing = new Map<number, WalkingCatchment>(), oldClaims = new Map<number, { key: number; group: number; weight: number }[]>();
+    const union = new Map<number, Map<number, { distance: number; limit: number }>>();
+    const proposedGroups = new Set(groups), native: { id: number; group: number; oldGroup: number; walk: WalkingCatchment }[] = [];
+    const include = (group: number, walk: WalkingCatchment) => {
+      let buildings = union.get(group); if (!buildings) union.set(group, buildings = new Map());
+      for (const [bid, entry] of walk.buildings) if (entry.distance < (buildings.get(bid)?.distance ?? Infinity)) buildings.set(bid, entry);
+    };
+    sites.forEach((s, i) => { if (first.get(identities[i]) === i) include(groups[i], s.walk); });
     for (const st of g.stations.map.values()) {
       if (!g.lines.stationServed(st.id)) continue;
-      const walk = walkingCatchment(g, st);
+      const walk = walkingCatchment(g, st), oldGroup = g.stations.catchmentGroup(st.id), group = prospective.native(st.id);
+      native.push({ id: st.id, group, oldGroup, walk });
+      if (proposedGroups.has(group)) include(group, walk);
       if (!ownStation(st.id)) competing.set(st.id, walk);
-      for (const [bid, entry] of walk.buildings) if (sums.has(bid)) {
-        const w = walkWeight(entry.distance);
-        oldSums.set(bid, (oldSums.get(bid) ?? 0) + w); oldBests.set(bid, Math.max(oldBests.get(bid) ?? 0, w));
-        if (!ownStation(st.id)) reach(bid, w);
+    }
+    const sums = new Set<number>();
+    for (const buildings of union.values()) for (const bid of buildings.keys()) sums.add(bid);
+    for (const { id, oldGroup, walk } of native) {
+      for (const [bid, entry] of walk.buildings) {
+        if (!sums.has(bid)) continue;
+        let list = oldClaims.get(bid); if (!list) oldClaims.set(bid, list = []);
+        list.push({ key: id, group: oldGroup, weight: walkWeight(entry.distance) });
       }
     }
+    const claims = new Map<number, { key: number; group: number; weight: number }[]>();
+    const add = (key: number, group: number, walk?: WalkingCatchment) => {
+      for (const [bid, entry] of union.get(group) ?? walk?.buildings ?? []) {
+        if (!sums.has(bid)) continue;
+        let list = claims.get(bid); if (!list) claims.set(bid, list = []);
+        list.push({ key, group, weight: walkWeight(entry.distance) });
+      }
+    };
+    sites.forEach((_, i) => { if (first.get(identities[i]) === i) add(identities[i], groups[i]); });
+    for (const [id, walk] of competing) add(id, prospective.native(id), walk);
+    const allocation = (claims: typeof oldClaims) => new Map([...claims].map(([bid, list]) => {
+      const shares = walkClaimShares(list);
+      return [bid, new Map(list.map((c, i) => [c.key, shares[i]]))] as const;
+    }));
+    const oldShares = allocation(oldClaims), newShares = allocation(claims);
+    this.forecastClaimStats = { buildings: sums.size, oldRecords: [...oldClaims.values()].reduce((n, a) => n + a.length, 0),
+      newRecords: [...claims.values()].reduce((n, a) => n + a.length, 0) };
     for (let i = 0; i < sites.length; i++) {
       if (first.get(identities[i]) !== i) continue;
       const s = sites[i];
-      for (const [bid, walk] of s.walk.buildings) {
+      s.walk = { segments: s.walk.segments, buildings: union.get(groups[i]) ?? s.walk.buildings };
+      for (const [bid] of s.walk.buildings) {
         const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
-        const pop = b.pop * (walkWeight(walk.distance) / sums.get(bid)! * coverOf(bests.get(bid)!));
+        const pop = b.pop * (newShares.get(bid)?.get(identities[i]) ?? 0);
         const r = this.regionOf(b); if (r < 0) continue;
         s.pop += pop; s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
       }
@@ -816,12 +843,10 @@ export class DemandModel {
         const st = g.stations.get(id)!; if (!stationActive(g, st)) continue;
         const regions = new Map((this.shares.get(id) ?? []).map(([r, share]) => [r, st.catchPop * share]));
         // Only the overlapping buildings change their native walking allocation. Outside shares stay intact.
-        for (const [bid, entry] of walk.buildings) if (sums.has(bid)) {
+        for (const [bid] of union.get(prospective.native(id)) ?? walk.buildings) if (sums.has(bid)) {
           const b = g.world.buildings.get(bid); if (!b || b.pop <= 0) continue;
           const r = this.regionOf(b); if (r < 0) continue;
-          const w = walkWeight(entry.distance);
-          const old = w / Math.max(1e-9, oldSums.get(bid) ?? 0) * coverOf(oldBests.get(bid) ?? 0);
-          const now = w / sums.get(bid)! * coverOf(bests.get(bid)!);
+          const old = oldShares.get(bid)?.get(id) ?? 0, now = newShares.get(bid)?.get(id) ?? 0;
           regions.set(r, Math.max(0, (regions.get(r) ?? 0) + b.pop * (now - old)));
         }
         const regional = new Map(regions);
@@ -837,7 +862,7 @@ export class DemandModel {
       const parts: { count: number; ld: number; f: number; d: number; seconds: number; j: number; centre: number; sourceShare: number }[] = [];
       let local = 0, localF = 0;
       for (let j = 0; j < sites.length; j++) {
-        if (i === j || !sites[j].pop) continue;
+        if (i === j || groups[i] === groups[j] || !sites[j].pop) continue;
         const t = sites[j], d = Math.hypot(s.x - t.x, s.z - t.z), walk = Math.min(1, d / WALK);
         const sameTown = s.townId >= 0 && s.townId === t.townId;
         const source = sameTown ? walking[i] : s, destination = sameTown ? walking[j] : t;
