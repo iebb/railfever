@@ -780,6 +780,16 @@ interface EntranceMemo {
 const entranceRevisions = new WeakMap<Stations, number>();
 const entranceMemos = new WeakMap<Stations, EntranceMemo>();
 
+interface PlatformGeometryMemo { inputs: unknown[]; areas: Rect[] }
+interface PlatformGapMemo { a: PlatformGeometryMemo; b: PlatformGeometryMemo; distance: number }
+interface StationGeometryMemo {
+  net: Game['world']['net']; version: number; walk: number;
+  areas: WeakMap<Station, PlatformGeometryMemo>;
+  gaps: WeakMap<Station, WeakMap<Station, PlatformGapMemo>>;
+}
+// Geometry queries never publish simulation state; temporary forecast stations are keyed by object, not reused IDs.
+const stationGeometryMemos = new WeakMap<Stations, StationGeometryMemo>();
+
 export class Stations {
   map = new Map<number, Station>();
   nextId = 1;
@@ -1429,8 +1439,43 @@ export class Stations {
     return r ? { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length } : null;
   }
 
+  private geometryMemo(): StationGeometryMemo {
+    const net = this.game.world.net;
+    let memo = stationGeometryMemos.get(this);
+    if (!memo || memo.net !== net || memo.version !== net.version || memo.walk !== this.walkVersion) {
+      memo = { net, version: net.version, walk: this.walkVersion, areas: new WeakMap(), gaps: new WeakMap() };
+      stationGeometryMemos.set(this, memo);
+    }
+    return memo;
+  }
+
+  private platformGeometry(st: Station, memo = this.geometryMemo()): PlatformGeometryMemo {
+    const r = st.rail, width = r ? railWidth(r) : 0;
+    const inputs: unknown[] = [r, r?.x, r?.z, r?.angle, r?.length, width, r?.alignment];
+    // stationStripRects uses the track nearest offset zero, its exact curves and reference-arc mapping.
+    let track = r?.alignment?.tracks[0];
+    for (const t of r?.alignment?.tracks ?? []) if (track && Math.abs(t.offset) < Math.abs(track.offset)) track = t;
+    inputs.push(track);
+    if (track) {
+      inputs.push(track.offset, track.length, track.pieces.length, track.knots.length);
+      for (const p of track.pieces) {
+        const c = p.curve;
+        inputs.push(p, p.length, c.x0, c.z0, c.x1, c.z1, c.x2, c.z2, c.x3, c.z3);
+      }
+      for (const k of track.knots) inputs.push(k.u, k.s);
+    }
+    // Gap also depends on road-stop positions, even for temporary stations sharing an ID.
+    for (const p of st.stops) inputs.push(p.x, p.z);
+    const old = memo.areas.get(st);
+    if (old && old.inputs.length === inputs.length && old.inputs.every((v, i) => Object.is(v, inputs[i]))) return old;
+    const current = { inputs, areas: r ? stationStripRects(r, 0, width) : [] };
+    memo.areas.set(st, current);
+    return current;
+  }
+
   platformAreas(st: Station): Rect[] {
-    return st.rail ? stationStripRects(st.rail, 0, railWidth(st.rail)) : [];
+    // Preserve the public fresh-array contract: callers cannot corrupt a later cached geometry query.
+    return this.platformGeometry(st).areas.map(r => ({ ...r }));
   }
 
   /**
@@ -2425,14 +2470,22 @@ export class Stations {
   // ---------------------------------------------------------------- transfer complexes
   /** Walking distance between the platform areas / stops of two stations (0 when they overlap). */
   gap(a: Station, b: Station): number {
+    const memo = this.geometryMemo(), ga = this.platformGeometry(a, memo), gb = this.platformGeometry(b, memo);
+    const previous = memo.gaps.get(a)?.get(b);
+    if (previous?.a === ga && previous.b === gb) return previous.distance;
     let d = Infinity;
-    const ra = this.platformAreas(a), rb = this.platformAreas(b);
+    const ra = ga.areas, rb = gb.areas;
     for (const p of ra) for (const q of rb) d = Math.min(d, rectGap(p, q));
     for (const p of a.stops) {
       for (const q of rb) d = Math.min(d, distToRect(p.x, p.z, q.x, q.z, q.angle, q.w / 2, q.d / 2));
       for (const q of b.stops) d = Math.min(d, Math.hypot(p.x - q.x, p.z - q.z));
     }
     for (const p of ra) for (const q of b.stops) d = Math.min(d, distToRect(q.x, q.z, p.x, p.z, p.angle, p.w / 2, p.d / 2));
+    let forward = memo.gaps.get(a), reverse = memo.gaps.get(b);
+    if (!forward) { forward = new WeakMap(); memo.gaps.set(a, forward); }
+    if (!reverse) { reverse = new WeakMap(); memo.gaps.set(b, reverse); }
+    forward.set(b, { a: ga, b: gb, distance: d });
+    reverse.set(a, { a: gb, b: ga, distance: d });
     return d;
   }
 
@@ -2544,6 +2597,7 @@ export class Stations {
   isSameStationComplex(aId: number, bId: number): boolean {
     const st = this.map.get(aId);
     if (!st || !this.map.has(bId)) return false;
+    if (!st.links.length) return aId === bId && !!st.rail && st.stops.length > 0;
     const parts = this.complex(aId);
     return parts.includes(bId) && (parts.length > 1 || !!st.rail && st.stops.length > 0);
   }

@@ -190,8 +190,11 @@ export class Renderer {
   };
   /** simulation milliseconds of the last frame (set by the main loop, shown in the debug overlay) */
   simMs = 0;
-  /** main-thread milliseconds of the last whole frame (simulation, rendering, UI; set by the main loop) */
+  /** main-thread milliseconds of the last whole frame (simulation, rendering, UI and audio; set by the main loop) */
   loopMs = 0;
+  /** UI and audio milliseconds supplied by the main loop; outside the measured render CPU time. */
+  uiMs = 0;
+  audioMs = 0;
   /** current dynamic resolution scale (fraction of the capped device pixel ratio) */
   resScale = 1;
   fps = 60;
@@ -909,7 +912,7 @@ export class Renderer {
     this.stats.tris = info.render.triangles;
     this.labels.update(g, cam, this.container.clientWidth, this.container.clientHeight, dist);
     this.cpuMs = this.cpuMs * 0.9 + (performance.now() - t0) * 0.1;
-    if (this.probe && this.probeT < 0 && this.settings.resolution === 'auto' && !document.hidden && !g.paused && (++this.probeN & 3) === 0) {
+    if (this.probe && this.probeT < 0 && this.settings.resolution === 'auto' && !document.hidden && (++this.probeN & 3) === 0) {
       this.probeT = performance.now();
       this.probe.port2.postMessage(0);
     }
@@ -1136,6 +1139,7 @@ export class Renderer {
     this.dbgEl.textContent =
       `fps ${this.fps.toFixed(0)}   frame ${this.frameMs.toFixed(1)} ms\n` +
       `cpu ${this.cpuMs.toFixed(1)} ms   sim ${this.simMs.toFixed(1)} ms   gpu ${this.gpu && this.gpu.samples ? this.gpu.ms.toFixed(1) + ' ms' : 'n/a'}\n` +
+      `ui ${this.uiMs.toFixed(1)} ms   audio ${this.audioMs.toFixed(1)} ms   loop ${this.loopMs.toFixed(1)} ms   post ${this.postMs.toFixed(1)} ms\n` +
       `draw calls ${this.stats.calls}   tris ${k(this.stats.tris)}\n` +
       `geometries ${info.memory.geometries}   textures ${info.memory.textures}   programs ${info.programs?.length ?? 0}\n` +
       `pixel ratio ${this.renderer.getPixelRatio().toFixed(2)} (${res})   AO ${this.settings.ao ? (this.aoSuspended ? 'auto-off' : 'on') : 'off'}   AA ${this.resScale < 0.8 || this.settings.shadowQuality === 'low' ? 'FXAA' : 'SMAA'} + MSAA ${this.post ? this.post.samples : 0}x   shadows ${this.sunFar.castShadow ? '2 cascades' : this.sun.castShadow ? '1 map' : 'off'}\n` +

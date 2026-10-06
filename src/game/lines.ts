@@ -101,11 +101,18 @@ export interface RouteEdge { to: number; line: number; cost: number; internalTra
 /** Disposable prospective complex membership follows admitted internal passages, never station names. */
 export function transferComplexes(edges: Map<number, RouteEdge[]>, native?: (a: number, b: number) => boolean) {
   const parent = new Map<number, number>();
-  const root = (id: number): number => { const p = parent.get(id); return p === undefined || p === id ? id : root(p); };
+  const root = (id: number): number => {
+    let r = id;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+    for (let at = id; at !== r;) { const next = parent.get(at)!; parent.set(at, r); at = next; }
+    return r;
+  };
   for (const [from, links] of edges) for (const e of links) if (e.line === WALK_LINE && e.internalTransfer) {
     const a = root(from), b = root(e.to); parent.set(a, b); parent.set(from, b); parent.set(e.to, b);
   }
-  return (a: number, b: number) => !!native?.(a, b) || (parent.has(a) && parent.has(b) && root(a) === root(b));
+  // Freeze this graph's admitted passage components once; no repeated traversal during Dijkstra.
+  for (const id of parent.keys()) parent.set(id, root(id));
+  return (a: number, b: number) => (parent.has(a) && parent.has(b) && parent.get(a) === parent.get(b)) || !!native?.(a, b);
 }
 
 function addEdge(edges: Map<number, RouteEdge[]>, from: number, e: RouteEdge) {
@@ -172,11 +179,13 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
   while (open.size) {
     const c = open.top(), u = open.pop();
     if (c > (best.get(u) ?? Infinity)) continue;
+    // Every outgoing ride has the same transfer at this popped node. First boarding and walking
+    // edges need no complex query; compute the penalty lazily for the first outgoing ride only.
+    let transfer: number | undefined;
     for (const e of edges.get(u) ?? []) {
-      // boarding again after a ride: a transfer (penalty, plus changing platforms unless they walked here)
-      const internal = sameComplex(arrival.get(u) ?? u, u);
-      const transfer = e.line !== WALK_LINE && rode.get(u) ? (internal ? 0 : TRANSFER_PENALTY_S) + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
-      const nc = c + e.cost + transfer;
+      if (e.line !== WALK_LINE && rode.get(u) && transfer === undefined)
+        transfer = (sameComplex(arrival.get(u) ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (walked.get(u) ? 0 : PLATFORM_CHANGE_S);
+      const nc = c + e.cost + (e.line === WALK_LINE ? 0 : transfer ?? 0);
       if (nc < (best.get(e.to) ?? Infinity)) {
         best.set(e.to, nc);
         first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
@@ -214,7 +223,19 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
 export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>(),
   nativeComplex?: (a: number, b: number) => boolean): Map<number, Map<number, Hop>> {
   const open = new RouteHeap();
-  const sameComplex = transferComplexes(edges, nativeComplex);
+  // Membership is a pure snapshot for this synchronous table build. Cache ordered pairs locally,
+  // including false answers; the next build observes any link/combined-platform change immediately.
+  const membership = new Map<number, Map<number, boolean>>();
+  const native = nativeComplex ? (a: number, b: number) => {
+    let row = membership.get(a);
+    const found = row?.get(b);
+    if (found !== undefined) return found;
+    const value = !!nativeComplex(a, b);
+    if (!row) { row = new Map(); membership.set(a, row); }
+    row.set(b, value);
+    return value;
+  } : undefined;
+  const sameComplex = transferComplexes(edges, native);
   for (const src of sources) out.set(src, routeFrom(edges, src, open, sameComplex));
   return out;
 }
