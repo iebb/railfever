@@ -35,6 +35,8 @@ export interface NewGameOptions {
   aiCompanies?: number;
   /** per-AI settings (entry i for the i-th AI company); missing entries and fields use the defaults */
   aiConfigs?: Partial<AIConfig>[];
+  /** Uniform, fully borrowed starting balance for the player and every initial rival. */
+  startMoney?: number;
   playerName?: string;
 }
 
@@ -190,7 +192,7 @@ export class Game {
   private deferCatchment = false;
 
   constructor(opts: NewGameOptions, world?: World) {
-    this.options = opts;
+    this.options = opts.startMoney === undefined ? opts : { ...opts, startMoney: Number.isFinite(opts.startMoney) ? Math.max(0, Math.min(1e9, opts.startMoney)) : 5_000_000 };
     this.world = world ?? new World(opts.size);
     this.rng = new RNG(opts.seed * 101 + 7);
     this.towns = new Towns(this);
@@ -201,6 +203,7 @@ export class Game {
     this.demand = new DemandModel(this);
     this.mail = new MailModel(this);
     this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
+    if (this.options.startMoney !== undefined) this.companies[PLAYER].economy.startWithLoan(this.options.startMoney);
     this.companies[PLAYER].code = this.freeCompanyCode(this.companies[PLAYER].name);
     this.allowAccess[PLAYER] = true;
     this.accessPolicies[PLAYER] = DEFAULT_ACCESS_POLICY;
@@ -234,7 +237,7 @@ export class Game {
     g.world.dirtyTerrain.clear();
     g.refreshAccess();
     const n = Math.max(0, Math.min(MAX_AI_COMPANIES, Math.max(opts.aiCompanies ?? 0, opts.aiConfigs?.length ?? 0)));
-    for (let i = 0; i < n; i++) g.addAICompany(opts.aiConfigs?.[i] ?? {});
+    for (let i = 0; i < n; i++) g.addAICompany({ ...opts.aiConfigs?.[i], ...(opts.startMoney !== undefined ? { startMoney: g.economy.initialLoan } : {}) });
     g.vehicles.manageAmbient();
     g.postNews(`Welcome to Railfever; F1 opens Help.`, 'info');
     return g;
@@ -248,15 +251,14 @@ export class Game {
   addAICompany(config: Partial<AIConfig> = {}, name?: string, color?: string): Company {
     if (!this.canAddAI()) throw new Error(`At most ${MAX_AI_COMPANIES} AI companies`);
     const id = this.companies.length;
-    const cfg = normalizeAIConfig(config);
+    const cfg = normalizeAIConfig({ ...config, ...(config.startMoney === undefined && this.options.startMoney !== undefined ? { startMoney: this.options.startMoney } : {}) });
     const live = this.activeCompanies;
     const usedColors = new Set(live.map((c) => c.color.toLowerCase()));
     const hq = this.nextHeadquarters();
     const nm = name?.trim() || this.headquartersName(hq, cfg.focus);
     const col = color || COMPANY_COLORS.slice(1).find((c) => !usedColors.has(c.toLowerCase())) || COMPANY_COLORS[1 + ((id - 1) % (COMPANY_COLORS.length - 1))];
     const economy = new Economy();
-    economy.money = cfg.startMoney;
-    economy.loan = Math.min(cfg.startMoney, 5_000_000);
+    economy.startWithLoan(cfg.startMoney);
     const co: Company = { id, name: nm, hqTown: hq?.id, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
     this.companies.push(co);
     this.allowAccess[id] = cfg.accessPolicy !== 'auto-reject';
@@ -755,8 +757,10 @@ export class Game {
     // The shares are already paid for; take over cash, loan and stakes in other companies.
     const be = b.economy, te = t.economy;
     if (te.money >= 0) be.earn(te.money, 'acquisition'); else be.spend(-te.money, 'acquisition', true);
+    be.initialLoan = Math.min(be.initialLoan, be.loan) + Math.min(te.initialLoan, te.loan);
     be.loan += te.loan;
-    te.money = 0; te.loan = 0;
+    be.maxLoan = Math.max(be.maxLoan, be.initialLoan);
+    te.money = 0; te.loan = 0; te.initialLoan = 0;
     this.shares.onMerge(buyer, target);
     // assets
     const w = this.world, net = w.net;

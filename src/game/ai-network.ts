@@ -42,7 +42,7 @@ import type { AIController } from './ai';
 import type { Station, StationPlan, EntranceKind } from './stations';
 import type { NEdge, NNode } from './network';
 import type { Line } from './lines';
-import type { Economy } from './economy';
+import { loanLimit, type Economy } from './economy';
 import type { Proposal, BuildOptions, Snap } from './construction';
 import { railModeOf, railPartMode, PLATFORM_LENGTH, defaultPlatformLength, planStationUpgrade, commitStationUpgrade, railCatchShapes, CATCHMENT_RADIUS, ENTRANCE_TYPES, railWidth, entranceSide, TRANSFER_RANGE, railWalkScale, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { defaultStationStyle, styleOf, stylesFor } from './station-styles';
@@ -79,7 +79,7 @@ import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
 import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
-import { growTask, copyGrowCursor, growLine, type GrowCursor, type GrowHost } from './ai-grow';
+import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
 import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
 
 // ============================================================================ optional primitives (feature-detected)
@@ -474,6 +474,20 @@ export function networkDaily(ai: AIController, reviewExpansion = false): boolean
 /** The finite review has finished; a subsequent project decision may capture fresh due work. */
 export function finishNetworkReview(ai: AIController): void { planners.get(ai)?.finishReview(); }
 
+/** A chooser's bounded city growth quote uses the same host and native saved build task. */
+export function* previewUrbanGrowth(ai: AIController, lineId: number): Generator<void, UrbanGrowthQuote | null> {
+  if (ai.disposed) return null;
+  let p = planners.get(ai);
+  if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
+  return yield* p.previewUrbanGrowth(lineId);
+}
+export function queueUrbanGrowth(ai: AIController, quote: UrbanGrowthQuote): boolean {
+  if (ai.disposed) return false;
+  let p = planners.get(ai);
+  if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
+  return p.queueUrbanGrowth(quote);
+}
+
 /** A newly opened/extended railway brings its own-network opportunities forward. */
 export function scheduleRailExpansionReview(ai: AIController, inDays = 15): void {
   for (const task of RAIL_EXPANSION_TASKS) scheduleNetworkTask(ai, task, inDays);
@@ -814,6 +828,20 @@ class NetPlanner {
 
   start(task: Task): void { this.job = { task, items: null, cursor: 0, done: 0 }; }
 
+  *previewUrbanGrowth(lineId: number): Generator<void, UrbanGrowthQuote | null> {
+    if (this.job) return null;
+    return yield* probeUrbanGrowth(this.growHost(), lineId);
+  }
+  queueUrbanGrowth(quote: UrbanGrowthQuote): boolean {
+    const line = this.g.lines.get(quote.line);
+    if (this.job || !line || !growLine(this.growHost(), line) || !quote.cursor.best || quote.cursor.best.fleet || quote.cursor.made) return false;
+    this.job = { task: 'extend', items: [{ ids: [line.id], grow: copyGrowCursor(quote.cursor) }], cursor: 0, done: 0 };
+    const period = TASKS.find(t => t.id === 'extend')!.period;
+    this.next.set('extend', this.g.day + period);
+    this.ai.state.cooldown = Math.max(1, this.ai.state.cooldown);
+    return true;
+  }
+
   /** The task's next run within `days` (or sooner, as planned). */
   soon(task: Task, days: number): void { this.next.set(task, Math.min(this.next.get(task) ?? Infinity, this.g.day + days)); }
 
@@ -1019,8 +1047,8 @@ class NetPlanner {
    * new lines at the lower appetite, which otherwise bars even small repairs once that appetite is used. */
   private networkBudget(): number {
     const e = this.eco;
-    return this.ai.available() + Math.max(0, e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2) - e.loan)
-      - Math.max(0, e.maxLoan * this.ai.loanAppetite - e.loan);
+    return this.ai.available() + Math.max(0, loanLimit(e, Math.min(0.97, this.ai.loanAppetite + 0.2)) - e.loan)
+      - Math.max(0, loanLimit(e, this.ai.loanAppetite) - e.loan);
   }
 
   /** May the company spend on its network now? (its money rules: cash plus credit, loan and losses in bounds) */
@@ -1034,7 +1062,7 @@ class NetPlanner {
     if (this.ai.railPolicy.deepTrouble) return 'trouble';
     const e = this.eco, c = this.ai.config;
     if (this.networkBudget() < 750_000) return 'cash';
-    if (e.loan > e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2)) return 'loan';
+    if (e.loan > loanLimit(e, Math.min(0.97, this.ai.loanAppetite + 0.2))) return 'loan';
     // Opening a railway is a capital outlay, not a recurring loss that should bar useful improvements.
     const v = e.yearTotals[e.yearTotals.length - 1]?.v;
     if (v && e.lastYearProfit - v.construction - v.vehicles < -1_500_000 * (0.5 + c.risk)) return 'loss';
@@ -1043,7 +1071,7 @@ class NetPlanner {
   /** Borrow in steps (as ai.ts) until `amount` is there. */
   private borrowFor(amount: number): boolean {
     const e = this.eco;
-    while (e.money < amount + 300_000 && e.loan + e.loanStep <= e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2) && e.borrow()) { /* borrow in steps */ }
+    while (e.money < amount + 300_000 && e.loan + e.loanStep <= loanLimit(e, Math.min(0.97, this.ai.loanAppetite + 0.2)) && e.borrow()) { /* borrow in steps */ }
     return e.money >= amount;
   }
   /** A spend of `cost` within `share` of what the company can commit; borrows for it. */
@@ -3283,13 +3311,13 @@ class NetPlanner {
       return m;
     };
     for (const p of A.slice(0, 256)) {
-      if (p.edge.len < 3 || railModeOf(p.edge.type) !== 'mainline' || !this.mayAlter([p.edge.id])) continue;
+      if (p.edge.len < 3 || !geometryOnly && railModeOf(p.edge.type) !== 'mainline' || !this.mayAlter([p.edge.id])) continue;
       const ma = marksOf(p.edge);
       let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
       for (const u of ma) { x0 = Math.min(x0, u.x); z0 = Math.min(z0, u.z); x1 = Math.max(x1, u.x); z1 = Math.max(z1, u.z); }
       for (const e of net.edgesNear(x0 - 90, z0 - 90, x1 + 90, z1 + 90)) {
         const rs = bEdges.get(e.id);
-        if (!rs || e.id === p.edge.id || e.len < 3 || railModeOf(e.type) !== 'mainline' || !this.mayAlter([e.id])) continue;
+        if (!rs || e.id === p.edge.id || e.len < 3 || !geometryOnly && railModeOf(e.type) !== 'mainline' || !this.mayAlter([e.id])) continue;
         if (e.a === p.edge.a || e.a === p.edge.b || e.b === p.edge.a || e.b === p.edge.b) continue;
         for (const u of ma) for (const v of marksOf(e)) {
           const d = Math.hypot(u.x - v.x, u.z - v.z);
@@ -3812,7 +3840,7 @@ class NetPlanner {
   private throughTrainPossible(path: number[], legs: { edge: NEdge }[]): boolean {
     const g = this.g, me = this.me, e = this.eco;
     if (this.buildBar()) return false;
-    const credit = Math.max(0, e.maxLoan * Math.min(0.97, this.ai.loanAppetite + 0.2) - e.loan);
+    const credit = Math.max(0, loanLimit(e, Math.min(0.97, this.ai.loanAppetite + 0.2)) - e.loan);
     const cars = this.xlinkStock(g.lines.all().filter((x) => x.kind === 'rail' && x.owner === me), path, legs);
     if (!cars) return false;
     const cost = cars.reduce((s, m) => s + m.cost, 0) * 1.2 + 150_000;

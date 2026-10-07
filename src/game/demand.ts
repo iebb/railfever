@@ -18,6 +18,7 @@ import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, LOCAL_DEMAND_DISTANC
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
 import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns, lineTable } from './patterns';
+import { sampleDemandDestinations } from './demand-sampling';
 
 export interface Region {
   id: number;
@@ -671,6 +672,8 @@ export class DemandModel {
 
   /**
    * Destinations of a station's passengers by OD demand (cached for the day, until routing or catchments change).
+   * Large networks rotate a bounded set of actual destinations daily; their block weights approximate the full
+   * OD totals. Small networks keep the exact calculation. Physical routing and receipts remain native.
    * The day, the town lots and the fleet are part of the key: the urban uplift follows towns as they grow
    * (urbanIntensity) and the services that carry each journey (journeyMode), which change without a routing or
    * network version; a game loaded later that day works out the same weights as the one that went on.
@@ -691,9 +694,13 @@ export class DemandModel {
     const n = this.regions.length, od = this.od, ld = this.ld;
     const parts: { d: number; x: number; y: number; f: number; local: number; feeder: number }[] = [];
     let local = 0, localF = 0;
-    for (const [d, hop] of table) {
+    const destinations: Station[] = [];
+    for (const d of table.keys()) {
       const ds = g.stations.get(d);
-      if (!ds || !stationActive(g, ds)) continue;
+      if (ds && stationActive(g, ds)) destinations.push(ds);
+    }
+    for (const { destination: ds, weight } of sampleDemandDestinations(st, g.day, destinations)) {
+      const d = ds.id, hop = table.get(d)!;
       // local trips (the OD share) and long-distance trips (relative to the local trip rate) to d's regions
       let x = 0, y = 0;
       const walk = Math.min(1, Math.hypot(ds.x - st.x, ds.z - st.z) / WALK);
@@ -708,7 +715,9 @@ export class DemandModel {
         x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
         y += sr * (ld[r * n + q] ?? 0) * cov;
       }
+      x *= weight;
       y /= TRIPS_PER_MONTH;
+      y *= weight;
       if (!(x > 0) && !(y > 0)) continue;
       const f = this.serviceFactor(st, ds, hop);
       // the uplift and the car feeders of the service that carries the journey, not of the platforms the station has

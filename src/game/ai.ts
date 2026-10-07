@@ -20,7 +20,7 @@ import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCu
 import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
-import { Economy } from './economy';
+import { Economy, loanLimit } from './economy';
 import { availableModels, VehicleModel, MODEL_BY_ID, carriesMail } from './vehicle-types';
 import { estimateLegFare, estimateLegTime } from './fares';
 import { type ForecastSite } from './demand';
@@ -32,7 +32,8 @@ import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
-import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, scheduleNetworkTask, networkOptions, XLINK_REACH } from './ai-network';
+import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, scheduleNetworkTask, networkOptions, XLINK_REACH, previewUrbanGrowth, queueUrbanGrowth } from './ai-network';
+import { urbanGrowthCandidates, type UrbanGrowthQuote } from './ai-grow';
 import { planSubwayYard, buildSubwayYard, surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLength } from './ai-mail';
@@ -948,7 +949,7 @@ export interface AIConfig {
   focus: { rail: number; road: number; tram: number };
   /** 0 … 1: loan appetite and the payback it accepts (0 cautious, 1 bold); bold companies also buy rivals */
   risk: number;
-  /** cash at the start (the first 5M of it is borrowed) */
+  /** Fully borrowed cash at the start. */
   startMoney: number;
   /** 0 … 3: weight of other companies' usage when they share the maintenance of this company's network (see Game) */
   accessMultiplier: number;
@@ -1224,6 +1225,8 @@ export interface AIState {
   projects: number;
   /** Next detailed city opportunity; rotating the search keeps other construction moving. */
   urbanSearchCursor?: number;
+  /** One existing compatible city service gets a native marginal quote per project choice. */
+  urbanGrowthCursor?: number;
   rng?: number;
   failed?: [string, number][];
   stats?: AIStats;
@@ -1269,7 +1272,7 @@ const BUS_MIN_POP = 1500;
 export class AIController {
   readonly railPolicy: RailPolicy;
   readonly mailPolicy: MailPolicy;
-  state: AIState = { phase: 'idle', cooldown: 10, projects: 0, urbanSearchCursor: 0 };
+  state: AIState = { phase: 'idle', cooldown: 10, projects: 0, urbanSearchCursor: 0, urbanGrowthCursor: 0 };
   stats: AIStats = {
     railStations: 0, busStops: 0, track: 0, road: 0, bridges: 0, tunnels: 0, lines: 0, vehicles: 0, failed: 0, spent: 0, sold: 0, trams: 0, shared: 0, acquired: 0,
     reused: 0, doubled: 0, signals: 0, loops: 0, transfers: 0, multiTown: 0, rings: 0, joined: 0, urban: 0, through: 0, electrified: 0, trackDouble: 0, trackShared: 0, coaches: 0,
@@ -1362,7 +1365,7 @@ export class AIController {
   /** Money that can be committed: cash plus unused credit (within the appetite), minus a safety reserve. */
   available(): number {
     const e = this.eco;
-    return e.money + Math.max(0, e.maxLoan * this.loanAppetite - e.loan) - 1_000_000 - this.game.maintenanceOf(this.companyId) * 0.5;
+    return e.money + Math.max(0, loanLimit(e, this.loanAppetite) - e.loan) - 1_000_000 - this.game.maintenanceOf(this.companyId) * 0.5;
   }
 
   /** What the company is doing (for the UI). */
@@ -1640,12 +1643,12 @@ export class AIController {
     const railLines = own.filter((l) => l.kind === 'rail').length, busLines = own.filter((l) => l.kind === 'bus').length, tramLines = own.filter((l) => l.kind === 'tram').length;
     // don't overbuild: keep the debt serviceable
     const yearNet = this.eco.yearTotals.length ? this.eco.lastYearProfit : 0;
-    if (this.eco.loan > this.eco.maxLoan * Math.min(0.97, this.loanAppetite + 0.2) || (own.length >= 3 && yearNet < -1_500_000 * (0.5 + c.risk))) {
+    if (this.eco.loan > loanLimit(this.eco, Math.min(0.97, this.loanAppetite + 0.2)) || (own.length >= 3 && yearNet < -1_500_000 * (0.5 + c.risk))) {
       this.state.phase = 'consolidating'; this.state.cooldown = Math.round(90 / Math.sqrt(act)); return;
     }
     // every option is scored by its expected return: yearly revenue from the regional OD demand at distance-based
     // fares, minus running costs and upkeep, over the outlay (focus and network effects on top)
-    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number; urbanLayout?: UrbanLayout; viable?: boolean; extensionScore?: number }[] = [];
+    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number; urbanLayout?: UrbanLayout; growth?: UrbanGrowthQuote; viable?: boolean; extensionScore?: number }[] = [];
     const operating = this.operatingTowns(), hq = g.headquartersOf(this.companyId)?.id;
     const D = yield* this.townDemand();
     // fares with the value of time (fares.ts): ~60% of the top speed on average, waiting half the headway (by
@@ -1839,17 +1842,19 @@ export class AIController {
     // Start from already priced openings. Later selections compare one detailed city opportunity,
     // rather than blocking every route behind a survey of every town and construction style.
     if (!pricedOpening && (focus.rail > 0 || focus.tram > 0) && TRACK_TYPES.electric) {
-      const urbanIn = new Map<number, number>();
-      for (const l of g.lines.map.values()) {
-        if (l.kind !== 'rail') continue;
-        const towns = new Set<number>();
-        for (const sid of l.stops) { const st = g.stations.get(sid); if (st?.rail && railPartMode(st.rail) !== 'mainline' && st.townId >= 0) towns.add(st.townId); }
-        for (const t of towns) urbanIn.set(t, (urbanIn.get(t) ?? 0) + 1);
+      const grow = urbanGrowthCandidates(g, this.companyId), growthCursor = this.state.urbanGrowthCursor ?? 0;
+      const existing = networkOptions.enabled ? grow[growthCursor % Math.max(1, grow.length)] : undefined;
+      if (existing) {
+        this.state.urbanGrowthCursor = (growthCursor + 1) % grow.length;
+        const growth = yield* previewUrbanGrowth(this, existing.id);
+        if (growth && considers(growth.mode === 'metro' ? focus.rail : Math.max(focus.rail, focus.tram))) {
+          const score = growth.score * (growth.mode === 'metro' ? fw(focus.rail) : Math.max(fw(focus.rail), fw(focus.tram)));
+          opts.push({ score, kind: growth.mode, towns: growth.towns, growth, viable: true, extensionScore: score });
+        }
       }
       const cityOpportunities: { town: Town; mode: 'lightrail' | 'metro' }[] = [];
       for (const T of g.towns.list) {
-        if (T.pop < AIController.urbanPop || this.isFailed('urban' + T.id) || own.some((l) => l.urban && l.towns.includes(T.id))) continue;
-        if (this.urbanReserved(T.id) || (urbanIn.get(T.id) ?? 0) >= (T.pop >= 6000 ? 3 : 1)) continue;
+        if (T.pop < AIController.urbanPop || this.isFailed('urban' + T.id) || this.urbanReserved(T.id)) continue;
         for (const mode of ['lightrail', 'metro'] as const) {
           // Price each construction style independently. A failed surface proposal says little
           // about a subway, and population alone does not decide whether its investment pays.
@@ -1876,7 +1881,7 @@ export class AIController {
           const score = roi(econ.forecast.revenue, econ.yearly + econ.total / years, econ.total) * years / 4.5;
           if (score > 0) {
             const { quote: _, ...handoff } = layout;
-            opts.push({ score: score * Math.max(fw(focus.rail), fw(focus.tram)), kind: mode, towns: [T.id],
+            opts.push({ score: score * (mode === 'metro' ? fw(focus.rail) : Math.max(fw(focus.rail), fw(focus.tram))), kind: mode, towns: [T.id],
               urbanLayout: { ...handoff, targets: [...handoff.targets], interchanges: handoff.interchanges.map(s => s.id),
                 ...(handoff.towns ? { towns: [...handoff.towns] } : {}) } });
           }
@@ -1927,6 +1932,12 @@ export class AIController {
     const top = (extensions.length ? extensions : connected.length ? connected : opts).slice(0, 4);
     let r = this.rng.next() * top.reduce((a, o) => a + o.score * o.score, 0), pick = top[0];
     for (const o of top) { r -= o.score * o.score; if (r <= 0) { pick = o; break; } }
+    if (pick.growth) {
+      const queued = queueUrbanGrowth(this, pick.growth);
+      this.state.phase = queued ? 'extending urban railway' : 'reviewing rail network';
+      this.state.cooldown = 1; this.project = null; this.job = null;
+      return;
+    }
     if (pick.kind === 'tram') {
       if (!this.startTram(pick.towns[0])) { this.markFailed('tram', 120); this.state.cooldown = 20; }
       return;
@@ -4241,7 +4252,7 @@ export class AIController {
    * Quotes still have to repay their entire capital at the borrowing rate; keep the normal cash/upkeep cushion. */
   private urbanAvailable(): number {
     const e = this.eco, appetite = Math.min(0.95, this.loanAppetite + 0.2 * this.config.risk);
-    return e.money + Math.max(0, e.maxLoan * appetite - e.loan) - 1_000_000 - this.game.maintenanceOf(this.companyId) * 0.5;
+    return e.money + Math.max(0, loanLimit(e, appetite) - e.loan) - 1_000_000 - this.game.maintenanceOf(this.companyId) * 0.5;
   }
   /** High-speed units of the year (best seats x speed for the money and running costs), or null before there are any. */
   private hsrUnit(): VehicleModel | null {
@@ -5921,7 +5932,7 @@ export class AIController {
       const ce = co.economy;
       const last2 = ce.yearTotals.slice(-2);
       const losing = last2.length === 2 && last2.every((y) => Object.values(y.v).reduce((a, b) => a + b, 0) < 0);
-      if (!(ce.money < 0 || ce.loan >= ce.maxLoan * 0.95 || losing)) continue;
+      if (!(ce.money < 0 || ce.loan >= loanLimit(ce, 0.95) && ce.loan > ce.initialLoan || losing)) continue;
       const price = g.buyoutPrice(co.id);
       if (price > e.money - 1_500_000 || price > this.available() * 0.5) continue;
       const name = co.name;
@@ -5960,7 +5971,8 @@ export class AIController {
     const s = data?.state;
     if (!s) return;
     this.state = { phase: s.phase ?? 'idle', cooldown: s.cooldown ?? 10, projects: s.projects ?? 0,
-      urbanSearchCursor: Number.isSafeInteger(s.urbanSearchCursor) && s.urbanSearchCursor >= 0 ? s.urbanSearchCursor : this.companyId - 1 };
+      urbanSearchCursor: Number.isSafeInteger(s.urbanSearchCursor) && s.urbanSearchCursor >= 0 ? s.urbanSearchCursor : this.companyId - 1,
+      urbanGrowthCursor: Number.isSafeInteger(s.urbanGrowthCursor) && s.urbanGrowthCursor >= 0 ? s.urbanGrowthCursor : 0 };
     if (Array.isArray(s.corridor) && s.corridor.length === 2) this.state.corridor = [s.corridor[0], s.corridor[1]];
     // a through service being planned resumes where it was (its cursor), as the running game goes on with it
     if (!s.project && s.through && typeof s.through.line === 'number') {

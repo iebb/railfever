@@ -1,4 +1,4 @@
-// A saved, bounded review of own / foreign / own rail services. Geometry is repriced before construction.
+// Saved, bounded reviews of licensed urban pairs and own / foreign / own rail services.
 import type { Game } from './game';
 import type { AIController } from './ai';
 import type { Line } from './lines';
@@ -19,6 +19,8 @@ import { curveSpeed } from './construction';
 import { patternStops } from './patterns';
 import { bezFromTangents, bezDeriv, tAtS } from './geom';
 import { SAVE_TREES, type Tree } from './world';
+import { railPartMode } from './stations';
+import { platformChoices } from './rail-platforms';
 
 /** Local native turnout survey supplied by the existing two-network planner. */
 export interface ThroughLink {
@@ -26,11 +28,11 @@ export interface ThroughLink {
   d: number; left: number[]; right: number[]; value: number; la: boolean; lb: boolean;
 }
 interface Choice { path: number[]; links: ThroughLink[]; score: number; cars: string[]; reuse?: number }
-export interface ThroughCursor { at: number; signature: string; best?: Choice }
+export interface ThroughCursor { at: number; signature: string; best?: Choice; trials?: number[][][] }
 export interface ThroughItem { ids: number[]; through?: ThroughCursor }
 export const copyThroughCursor = (c: ThroughCursor): ThroughCursor => ({ ...c, ...(c.best ? { best: {
   ...c.best, path: [...c.best.path], cars: [...c.best.cars], links: c.best.links.map(copyLink),
-} } : {}) });
+} } : {}), ...(c.trials ? { trials: c.trials.map(t => t.map(p => [...p])) } : {}) });
 const copyLink = (s: ThroughLink): ThroughLink => ({ ...s, left: [...s.left], right: [...s.right] });
 interface Managed { kind: string; towns: number[]; depot: number; maxVehicles: number; opened: number; across?: boolean }
 export interface ThroughHost {
@@ -51,6 +53,7 @@ const signature = (g: Game, ls: Line[], owner: number) => JSON.stringify(ls.map(
 const keyOf = (ids: number[]) => 'through' + ids.join(':');
 const orient = (p: number[], reverse: boolean) => reverse ? [...p].reverse() : [...p];
 const concat = (...ps: number[][]) => ps.flatMap((p, i) => i && ps[i - 1].at(-1) === p[0] ? p.slice(1) : p);
+const urban = (g: Game, l: Line) => l.stops.some(id => { const r = g.stations.get(id)?.rail; return r && railPartMode(r) !== 'mainline'; });
 /** This atomic lane cannot leave a supported original road/rail behind with its construction refunded. */
 function reversible(p: ConnectionPlan): boolean {
   const prop = p.proposal;
@@ -67,10 +70,21 @@ export function throughCandidates(h: ThroughHost, middleIds: number[]): number[]
   const own = ls.filter(l => l.owner === h.me && l.vehicles.some(id => h.g.vehicles.get(id)?.owner === h.me));
   const near = (a: Line, b: Line) => {
     const pa = pathOf(a)!, pb = pathOf(b)!;
-    return [pa[0], pa.at(-1)!].some(x => [pb[0], pb.at(-1)!].some(y => {
-      const X = h.g.stations.get(x), Y = h.g.stations.get(y);
-      return !!X && !!Y && (x === y || Math.hypot(X.x - Y.x, X.z - Y.z) <= 100);
-    }));
+    const city = urban(h.g, a) || urban(h.g, b);
+    return [pa[0], pa.at(-1)!].some(x => {
+      const X = h.g.stations.get(x);
+      if (!X) return false;
+      if ((city ? pb : [pb[0], pb.at(-1)!]).some(y => {
+        const Y = h.g.stations.get(y);
+        return !!Y && (x === y || Math.hypot(X.x - Y.x, X.z - Y.z) <= 100);
+      })) return true;
+      // A joined city branch can meet a long foreign leg between its distant calls.
+      return city && pb.slice(1).some((id, i) => {
+        const A = h.g.stations.get(pb[i])!, B = h.g.stations.get(id)!, dx = B.x - A.x, dz = B.z - A.z;
+        const t = Math.max(0, Math.min(1, ((X.x - A.x) * dx + (X.z - A.z) * dz) / Math.max(1e-9, dx * dx + dz * dz)));
+        return Math.hypot(X.x - A.x - dx * t, X.z - A.z - dz * t) <= 100;
+      });
+    });
   };
   const out: number[][] = [];
   for (const id of middleIds) {
@@ -78,12 +92,52 @@ export function throughCandidates(h: ThroughHost, middleIds: number[]): number[]
     if (!b || b.owner === h.me || !h.g.canUse(h.me, b.owner)) continue;
     const nearby = own.filter(a => near(a, b)), selected = new Set(h.selectSides(b.id, nearby.map(l => l.id)));
     const sides = nearby.filter(l => selected.has(l.id));
+    // A city railway can continue over one open foreign route without owning another
+    // outer trunk first. Its local fleet and the foreign timetable remain separate.
+    for (const a of sides) if (urban(h.g, a) || urban(h.g, b)) {
+      const ids = [a.id, b.id]; if (!h.cared(keyOf(ids))) out.push(ids);
+    }
     for (let i = 0; i < sides.length; i++) for (let j = i + 1; j < sides.length; j++) {
       const ids = [sides[i].id, b.id, sides[j].id];
       if (!h.cared(keyOf(ids))) out.push(ids);
     }
   }
   return out;
+}
+
+/** Saved geometry shortlist only. The closest two foreign entry stops per direction
+ * include shared intermediate hubs; every retained trial still needs native rail proof. */
+function throughTrials(g: Game, lines: Line[]): number[][][] {
+  if (lines.length === 3) return Array.from({ length: 8 }, (_, n) => lines.map((l, i) => orient(pathOf(l)!, !!(n & 1 << i))));
+  const out: number[][][] = [], seen = new Set<string>();
+  for (const reverseA of [false, true]) for (const reverseB of [false, true]) {
+    const a = orient(pathOf(lines[0])!, reverseA), b = orient(pathOf(lines[1])!, reverseB), X = g.stations.get(a.at(-1)!)!;
+    const entries = b.slice(0, -1).map((id, i) => { const s = g.stations.get(id)!;
+      return { i, id, distance: Math.hypot(s.x - X.x, s.z - X.z) }; })
+      .sort((p, q) => p.distance - q.distance || p.id - q.id).slice(0, 2);
+    for (const entry of entries) {
+      const right = b.slice(entry.i), key = a.join(',') + '|' + right.join(',');
+      if (!seen.has(key)) { seen.add(key); out.push([a, right]); }
+    }
+  }
+  return out;
+}
+
+type ThroughProof = ReturnType<typeof routeEdges>;
+/** A quote-local cache never crosses a work unit, construction or a saved boundary. */
+export interface ThroughQuoteContext { routes: Map<string, ThroughProof>; platforms: Map<string, boolean>; lookups: number; hits: number;
+  world?: Game['world']; epoch?: string; broad?: boolean }
+export const throughQuoteContext = (): ThroughQuoteContext => ({ routes: new Map(), platforms: new Map(), lookups: 0, hits: 0 });
+function proof(g: Game, path: number[], owner: number, cars: VehicleModel[], strict: boolean, context?: ThroughQuoteContext): ThroughProof {
+  if (!context) return routeEdges(g, path, owner, cars, strict);
+  const epoch = [g.tick, g.networkVersion, g.world.net.version, g.lines.version, g.stations.walkVersion,
+    g.companies.map(c => Number(g.canUse(owner, c.id))).join('')].join(':');
+  if (context.world !== g.world || context.epoch !== epoch) {
+    context.routes.clear(); context.platforms.clear(); context.world = g.world; context.epoch = epoch;
+  }
+  const key = JSON.stringify([path, owner, modelKey(cars), strict]); context.lookups++;
+  if (context.routes.has(key)) { context.hits++; return context.routes.get(key)!; }
+  const value = routeEdges(g, path, owner, cars, strict); context.routes.set(key, value); return value;
 }
 
 /** Native rail only, with actual stock, platform length and lawful onward departure. No walking edges. */
@@ -118,6 +172,25 @@ function routeEdges(g: Game, path: number[], owner: number, cars: VehicleModel[]
 }
 /** Pure native feasibility inventory, also used by focused platform/permission controls. */
 export const throughRouteProof = (g: Game, path: number[], owner: number, cars: VehicleModel[]) => routeEdges(g, path, owner, cars);
+/** The same full-body depot entry as openingRailCall, before allocating a new timetable. */
+export function throughOpeningCall(g: Game, path: number[], owner: number, cars: VehicleModel[], depotId: number): number {
+  const depot = g.depots.get(depotId), stub = depot && g.world.net.edges.get(depot.edge);
+  if (!depot || depot.owner !== owner || depot.kind !== 'rail' || !stub || stub.kind !== 'rail') return -1;
+  const stops = outAndBack(path), length = cars.reduce((n, m) => n + m.length + .1, 0), rule = consistRule(cars);
+  for (let i = 0; i < stops.length; i++) if (findRailRoute(g, [{ edge: stub, dir: 1 }], stops[i], owner, -1, 60000, false, rule, false,
+    { length, onward: stops[(i + 1) % stops.length] })) return i;
+  return -1;
+}
+/** A through call continues forward on one incoming/outgoing physical platform.
+ * Reversing at an intermediate stop is not a substitute for a connected timetable. */
+function throughPlatforms(g: Game, path: number[], owner: number, cars: VehicleModel[], context?: ThroughQuoteContext): boolean {
+  const key = JSON.stringify([path, owner, modelKey(cars)]);
+  if (context?.platforms.has(key)) return context.platforms.get(key)!;
+  const stock = g.vehicles.trains().find(t => t.owner === owner && modelKey(t.cars) === modelKey(cars));
+  const line = { id: -1, owner, kind: 'rail', stops: outAndBack(path), vehicles: stock ? [stock.id] : [] } as unknown as Line;
+  const fits = line.stops.every((_, i) => platformChoices(g, line, 0, i).length > 0);
+  context?.platforms.set(key, fits); return fits;
+}
 function cycle(g: Game, cars: VehicleModel[], legs: { length: number; cap: number }[], extraCap = Infinity) {
   const estimates = legs.map(l => { const year = estimateVehicleYear(cars, l.length / 1.15, g.year, .4, Math.min(l.cap, extraCap));
     return { year, seconds: YEAR_S / Math.max(1e-9, year.trips) }; });
@@ -136,18 +209,19 @@ function stocks(h: ThroughHost, ls: Line[], path: number[]): VehicleModel[][] {
 }
 /** One through train. Full existing own receipts are deducted, so retained local income never finances it twice. */
 export function quoteThrough(h: ThroughHost, ls: Line[], path: number[], cars: VehicleModel[], works: number, links: ThroughLink[], reuse?: Train,
-  built?: readonly number[], prepared?: ConnectionPlan[]) {
-  const g = h.g, edges = routeEdges(g, path, h.me, cars, !links.length); if (!edges) return null;
+  built?: readonly number[], prepared?: ConnectionPlan[], context?: ThroughQuoteContext) {
+  const g = h.g, edges = proof(g, path, h.me, cars, !links.length, context); if (!edges) return null;
+  if (!links.length && !context?.broad && !throughPlatforms(g, path, h.me, cars, context)) return null;
   const plans = prepared ?? links.map(s => h.plan(s)); if (plans.some(p => !p || !reversible(p))) return null;
   const speedCap = Math.min(Infinity, ...plans.map(p => curveSpeed(p!.minRadius, 'standard')));
   const service = cycle(g, cars, edges.legs, speedCap), kmh = service.kmh;
   const forecast = g.demand.forecastLine(path.map(id => g.stations.get(id)!), 'mainline', kmh, service.seconds, h.me);
   const factor = forecastSeatFactor(forecast.legLoads, service.seconds, 1, cars.reduce((n, m) => n + m.capacity, 0));
   let oldReceipts = 0, lostLocal = 0, releasedRunning = 0;
-  for (const l of [ls[0], ls[2]]) {
+  for (const l of ls.filter(l => l.owner === h.me)) {
     const p = pathOf(l)!, fleet = l.vehicles.map(id => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train && t.owner === h.me);
     if (!fleet.length) return null;
-    const services = fleet.map(t => { const local = routeEdges(g, p, h.me, t.cars); return local ? { t, local, cost: cycle(g, t.cars, local.legs) } : null; });
+    const services = fleet.map(t => { const local = proof(g, p, h.me, t.cars, true, context); return local ? { t, local, cost: cycle(g, t.cars, local.legs) } : null; });
     if (services.some(s => !s)) return null;
     const estimate = (without?: number) => {
       const kept = services.filter(s => s && s.t.id !== without).map(s => s!), frequency = kept.reduce((n, s) => n + 1 / s.cost.seconds, 0);
@@ -193,13 +267,15 @@ function boundary(h: ThroughHost, a: Line, b: Line, pa: number[], pb: number[], 
 export function* throughTask(h: ThroughHost, item: ThroughItem): Generator<void, void> {
   const g = h.g, ls = item.ids.map(id => g.lines.map.get(id)), key = keyOf(item.ids);
   const finish = (why: string) => { delete item.through; h.careFor(key, 180); h.considered('through.' + why); };
-  if (ls.length !== 3 || ls.some(l => !l || !pathOf(l)) || ls[0]!.owner !== h.me || ls[2]!.owner !== h.me || ls[1]!.owner === h.me || !g.canUse(h.me, ls[1]!.owner)) { finish('invalid'); return; }
+  if (![2, 3].includes(ls.length) || ls.some(l => !l || !pathOf(l)) || ls[0]!.owner !== h.me || ls.length === 3 && ls[2]!.owner !== h.me
+    || ls[1]!.owner === h.me || !g.canUse(h.me, ls[1]!.owner) || ls.length === 2 && !ls.some(l => urban(g, l!))) { finish('invalid'); return; }
   const lines = ls as Line[], sig = signature(g, lines, h.me), c = item.through ??= { at: 0, signature: sig };
   if (c.signature !== sig) { finish('changed'); return; }
-  if (c.at < 8) {
-    const n = c.at++, pa = orient(pathOf(lines[0])!, !!(n & 1)), pb = orient(pathOf(lines[1])!, !!(n & 2)), pc = orient(pathOf(lines[2])!, !!(n & 4));
+  const trials = c.trials ??= throughTrials(g, lines);
+  if (c.at < trials.length) {
+    const [pa, pb, pc = []] = trials[c.at++];
     const initial = concat(pa, pb, pc), stock = stocks(h, lines, initial)[0]; if (!stock || lines.some(l => h.room(l) < 1)) return;
-    const ab = boundary(h, lines[0], lines[1], pa, pb, stock), bc = boundary(h, lines[1], lines[2], pb, pc, stock);
+    const ab = boundary(h, lines[0], lines[1], pa, pb, stock), bc = lines.length === 3 ? boundary(h, lines[1], lines[2], pb, pc, stock) : null;
     if (ab === false || bc === false) return;
     let path = initial;
     if (ab || bc) {
@@ -211,27 +287,32 @@ export function* throughTask(h: ThroughHost, item: ThroughItem): Generator<void,
     const links = [ab, bc].filter((s): s is ThroughLink => !!s), plans = links.map(s => h.plan(s));
     if (plans.some(p => !p)) return;
     const works = plans.reduce((sum, p) => sum + p!.cost, 0);
-    const reuse = [undefined, ...[lines[0], lines[2]].flatMap(l => l.vehicles.map(id => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train && t.owner === h.me && t.state === 'depot' && modelKey(t.cars) === modelKey(stock)))];
+    const context = throughQuoteContext(); context.broad = true;
+    const reuse = [undefined, ...lines.filter(l => l.owner === h.me).flatMap(l => l.vehicles.map(id => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train && t.owner === h.me && t.state === 'depot' && modelKey(t.cars) === modelKey(stock)))];
     for (const train of reuse) {
-      const q = quoteThrough(h, lines, path, stock, works, links, train, undefined, plans as ConnectionPlan[]);
-      if (q && q.score > 0 && h.affordable(q.capital * 1.2 + 150000, 0.35) && (!c.best || q.score > c.best.score))
-        c.best = { path, links: links.map(copyLink), score: q.score, cars: stock.map(m => m.id), ...(train ? { reuse: train.id } : {}) };
+      const q = quoteThrough(h, lines, path, stock, works, links, train, undefined, plans as ConnectionPlan[], context);
+      if (!q || !(q.score > 0) || !h.affordable(q.capital * 1.2 + 150000, 0.35) || c.best && q.score <= c.best.score) continue;
+      // Expensive complete platform/depot checks belong to a paid contender, then run
+      // again on the current constructed itinerary before any actual stock is published.
+      if (!links.length && (!throughPlatforms(g, path, h.me, stock, context) || !(train ? [g.depots.get(train.depotId)] : [...g.depots.map.values()])
+        .some(d => d && throughOpeningCall(g, path, h.me, stock, d.id) >= 0))) continue;
+      c.best = { path, links: links.map(copyLink), score: q.score, cars: stock.map(m => m.id), ...(train ? { reuse: train.id } : {}) };
     }
     return;
   }
   const best = c.best; finish(best ? 'build' : 'unpaid'); if (!best) return;
   const cars = best.cars.map(id => MODEL_BY_ID.get(id)!).filter(Boolean); if (cars.length !== best.cars.length) return;
   const stored = best.reuse === undefined ? undefined : g.vehicles.get(best.reuse);
-  const reuse = stored instanceof Train && stored.owner === h.me && [lines[0].id, lines[2].id].includes(stored.lineId ?? -1)
+  const reuse = stored instanceof Train && stored.owner === h.me && lines.some(l => l.owner === h.me && l.id === stored.lineId)
     && stored.state === 'depot' && modelKey(stored.cars) === modelKey(cars) ? stored : undefined;
   const plans = best.links.map(s => h.plan(s)); if (plans.some(p => !p)) return;
   if (plans.some(p => p!.turnouts.some(t => g.vehicles.isEdgeBusy(t.edge)))) { h.considered('through.busy'); return; }
   let q = quoteThrough(h, lines, best.path, cars, plans.reduce((n, p) => n + p!.cost, 0), best.links, reuse, undefined, plans as ConnectionPlan[]);
   const depots = reuse ? [g.depots.get(reuse.depotId)].filter(d => !!d) : [...g.depots.map.values()];
-  const ownA = pathOf(lines[0])!, ownC = pathOf(lines[2])!;
   // Before new turnouts exist, prove the depot on an existing own leg. The final itinerary is proved after build.
-  const depot = depots.find(d => d.kind === 'rail' && d.owner === h.me && (depotServes(g, d, ownA[0], ownA[1], cars) >= 0
-    || depotServes(g, d, ownC[0], ownC[1], cars) >= 0));
+  const depot = depots.find(d => d.kind === 'rail' && d.owner === h.me && (!best.links.length
+    ? throughOpeningCall(g, best.path, h.me, cars, d.id) >= 0
+    : lines.filter(l => l.owner === h.me).some(l => { const p = pathOf(l)!; return depotServes(g, d, p[0], p[1], cars) >= 0; })));
   if (!q || q.score <= 0 || !depot || !h.canSpend(q.capital * 1.2 + 150000, 0.35)) return;
   const transaction = buildThroughConnections(g, best.links, h.plan, h.mayAlter, true);
   if (transaction.error) { h.considered('through.rollback'); return; }
@@ -256,7 +337,7 @@ export function* throughTask(h: ThroughHost, item: ThroughItem): Generator<void,
   h.ai.stats.lines++; if (!reuse) h.ai.stats.vehicles++;
   h.stat('netThrough'); h.stat('netXServices'); if (best.links.length) h.stat('connections', best.links.length); h.succeed();
   h.note(`${l.name}: direct across ${g.company(lines[1].owner).name}'s ${lines[1].name}; ${reuse ? 'reuses a spare train' : 'buys one train'}, ${Math.round(q.score / 1000)}k annual surplus after access and local service costs`);
-  h.news(`runs through its two outer routes over ${g.company(lines[1].owner).name}'s middle railway.`, g.stations.get(best.path[0])!.x, g.stations.get(best.path[0])!.z);
+  h.news(`runs through its railway over ${g.company(lines[1].owner).name}'s ${lines.length === 3 ? 'middle ' : ''}railway.`, g.stations.get(best.path[0])!.x, g.stations.get(best.path[0])!.z);
   // Keep both shorter own timetables as patterns. The foreign operator and its fleet keep their own line.
   h.canon(l.id);
 }
@@ -264,6 +345,7 @@ export function* throughTask(h: ThroughHost, item: ThroughItem): Generator<void,
 /** Roll back only this transaction's added connectors. Split descendants of every original asset stay. */
 export function buildThroughConnections(g: Game, links: ThroughLink[], plan: (s: ThroughLink) => ConnectionPlan | null,
   mayAlter: (ids: number[]) => boolean = () => true, finish = false) {
+  if (!links.length) return { error: null, edges: [] as number[], cost: 0, rollback() {} };
   const net = g.world.net, protectedIds = new Set(net.edges.keys()), added = new Set<number>(), owners = new Map<number, number>();
   const nodeOwners = new Map<number, number>();
   const heights = new Map<number, number>(), trees = new Map<number, Tree>(), w = g.world;

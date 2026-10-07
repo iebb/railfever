@@ -267,7 +267,7 @@ export function openAIConfig(ui: UI, id: number | null) {
       multSlider('Users pay', st.mult, false, (v) => { st.mult = v; }, (v) => `${fmtMult(v)} · 50/50 usage → ${fmtPct(equalUseShare(v))}`),
       co ? null : field('Start money', stepper(fmtMoney(st.cfg.startMoney),
         () => { st.cfg.startMoney = Math.max(1_000_000, st.cfg.startMoney - 1_000_000); render(); },
-        () => { st.cfg.startMoney = Math.min(50_000_000, st.cfg.startMoney + 1_000_000); render(); }), `The first ${fmtMoney(5_000_000)} is a loan`),
+        () => { st.cfg.startMoney = Math.min(50_000_000, st.cfg.startMoney + 1_000_000); render(); }), 'Entire amount is a loan'),
       h('div', { class: 'btns right' },
         co ? h('button', { class: 'btn ghost', onclick: () => openInvest(ui, co.id) }, icon('money', 16), 'Invest…') : null,
         h('span', { class: 'spacer' }),
