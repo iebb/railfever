@@ -196,7 +196,7 @@ export function openTown(ui: UI, id: number) {
   const g = ui.game;
   const town = g.towns.list[id];
   if (!town) return;
-  const win = ui.wm.open('town-' + id, town.name, { width: 350, icon: 'towns', color: '#eef2f7' });
+  const win = ui.wm.open('town-' + id, town.name, { width: 380, icon: 'towns', color: '#eef2f7' });
   const render = () => {
     clear(win.body);
     const counts = new Map<number, number>();
@@ -204,19 +204,20 @@ export function openTown(ui: UI, id: number) {
     const sv = townService(g, town);
     const lost = town.passLostLast ?? 0;
     win.sub.textContent = sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport';
-    add(win.body, 
+    // (the subtitle counts the active stations; the growth tile explains itself on hover)
+    const growth = tile(sv.label[0].toUpperCase() + sv.label.slice(1), 'Growth', sv.score >= 0.2 ? 'pos' : '');
+    growth.setAttribute('data-tip', growthTip(sv));
+    add(win.body,
       h('div', { class: 'tiles' },
         tile(fmtInt(town.pop), 'Population'),
-        tile(fmtInt(town.buildings.size), 'Buildings'),
         tile(sv.stations ? fmtPct(sv.transported) : '—', 'Transported', '', bar(sv.stations ? sv.transported : 0)),
-        tile(sv.label[0].toUpperCase() + sv.label.slice(1), 'Growth', sv.score >= 0.2 ? 'pos' : '')),
-      ui.kv('Growth', h('span', { 'data-tip': growthTip(sv) }, growthText(sv))),
+        growth),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
       ui.kv('Gave up waiting', h('span', { class: lost > 0 ? 'neg' : '' }, `${fmtInt(lost)} last month`)),
       // (Town.mail exists from the town's first mail on)
       town.mail ? ui.kv('Mail last month', `${fmtMail(town.mail.postedLast)} posted · ${fmtMail(town.mail.deliveredLast)} delivered`) : null,
       demandRows(ui, id),
-      section('Buildings'),
+      section('Buildings', fmtInt(town.buildings.size)),
       h('div', { class: 'list' }, [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => h('div', { class: 'row' }, h('span', null, BUILDING_TYPES[t]?.name ?? '?'), h('span', { class: 'num' }, String(c))))),
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => ui.centerOn(town.x, town.z) }, icon('target', 16), 'Center')),
     );
@@ -225,11 +226,6 @@ export function openTown(ui: UI, id: number) {
   render();
 }
 
-/** What drives a town's growth: "fast — 64% of passengers transported, 3 active stations". */
-function growthText(sv: TownService): string {
-  if (!sv.stations) return `${sv.label} · no active stations`;
-  return `${sv.label} · ${fmtPct(sv.transported)} transported · ${sv.stations} active station${sv.stations > 1 ? 's' : ''}`;
-}
 function growthTip(sv: TownService): string {
   if (!sv.stations) return 'Growth: stations called at within 3 months · frequency · passenger capacity';
   return `Active-station reach: ${fmtPct(sv.coverage)} · weighted by 30-day calls: ${fmtPct(sv.reach)} · mean rating ${fmtPct(sv.rating)} · ` +
@@ -409,9 +405,16 @@ function transferSection(ui: UI, s: Station, after: () => void): HTMLElement | n
   };
   const kindIcon = (o: Station | undefined) => (!o ? 'station' : o.rail ? 'station' : o.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop');
   const done = (err: string | null | void, ok: string) => { if (typeof err === 'string' && err) ui.toast(err, 'bad'); else { ui.toast(ok, 'good'); ui.sound('station', { x: s.x, z: s.z, pitch: 1.1 }); } after(); };
+  // stations neither linkable nor mergeable get one line instead of a card each with disabled buttons
+  const shown = opts.slice(0, 6), checks = new Map(shown.map((o) => [o.id, mergeCheck(o.id)]));
+  const usable = shown.filter((o) => o.linked || !o.link || checks.get(o.id)!.ok);
+  const far = shown.filter((o) => !usable.includes(o));
+  const farLine = far.length ? h('div', { class: 'muted station-advice', 'data-tip': far.map((o) => `${o.name}: ${checks.get(o.id)!.reason}`).join(' · ') },
+    `Too far to merge: ${far.slice(0, 2).map((o) => `${o.name} ${fmtLen(o.gap)}`).join(', ')}${far.length > 2 ? ` +${far.length - 2}` : ''}`) : null;
+  if (!usable.length) return h('div', null, farLine);
   return h('div', null,
     section('Merge into one station'),
-    h('div', { class: 'list' }, opts.slice(0, 6).map((o) => {
+    h('div', { class: 'list' }, usable.map((o) => {
       const other = g.stations.get(o.id);
       const c = mergeCheck(o.id);
       const linked = o.linked && c.kind === 'complex';
@@ -428,7 +431,7 @@ function transferSection(ui: UI, s: Station, after: () => void): HTMLElement | n
             if (!check.ok) { done(check.reason, ''); return; }
             done(s.links.includes(o.id) ? null : g.stations.link(s.id, o.id), `${o.name} joined to ${s.name}`);
           } }, linked ? 'In station' : c.kind === 'complex' ? 'Merge into station' : 'Merge')));
-    })));
+    })), farLine);
 }
 
 /** Add-entrance mode of the entrance tool for a station (ground stations: of `kind`). */
@@ -695,23 +698,26 @@ export function openVehicle(ui: UI, id: number) {
         room > 0 ? tile(fmtMailLoad(v2.mailLoad, room), 'Mail', 'mail', bar(v2.mailLoad / room, 'var(--mail)')) : null,
         tile(fmtMoney(v2.profitYear), 'Profit this year', v2.profitYear < 0 ? 'neg' : 'pos'),
         tile(`${v2.age.toFixed(1)}`, 'Years old')),
-      h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Line'), h('span', { class: 'v' }, lineEl)),
-      vehicleService(ui, v2, after),
-      mine && v2 instanceof Train ? mailVanControl(ui, v2, after) : null,
-      compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
+      // what it is doing now, then what to do with it; the service settings and the bills below
       ui.kv('Status', v2.status),
       target ? h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Next stop'), h('span', { class: 'v' }, ui.stationLink(target.id))) : null,
       v2 instanceof Train && Math.abs(v2.grade) > 0.004 ? ui.kv('Gradient', fmtPct(v2.grade, 1)) : null,
-      ui.kv('Profit last year', h('span', { class: v2.profitLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(v2.profitLast))),
-      ui.kv('Base running cost', fmtMoney(v2.runningCost) + ' / yr'),
-      ui.kv('Value', fmtMoney(g.vehicles.resaleValue(v2))),
-      vehicleCosts(v2),
+      compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
       h('div', { class: 'btns' },
         h('button', { class: 'btn' + (ui.following === id ? ' on' : ''), onclick: () => { if (ui.following === id) ui.centerOn(...ui.posOf(v2)); else ui.follow(v2); win.last = undefined; render(); } }, icon('target', 16), ui.following === id ? 'Following' : 'Follow'),
         v2.line ? h('button', { class: 'btn', onclick: () => ui.openLine(v2.lineId!) }, icon('lines', 16), 'Line') : null,
         mine && upgradeOption(ui, v2) ? h('button', { class: 'btn', title: upgradeOption(ui, v2)!.label, onclick: () => upgradeVehicle(ui, v2) }, icon('up', 16), 'Upgrade') : null,
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
+      section('Service'),
+      mine ? field('Line', lineEl) : h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Line'), h('span', { class: 'v' }, lineEl)),
+      vehicleService(ui, v2, after),
+      mine && v2 instanceof Train ? mailVanControl(ui, v2, after) : null,
+      section('Money'),
+      ui.kv('Profit last year', h('span', { class: v2.profitLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(v2.profitLast))),
+      ui.kv('Base running cost', fmtMoney(v2.runningCost) + ' / yr'),
+      ui.kv('Value', fmtMoney(g.vehicles.resaleValue(v2))),
+      vehicleCosts(v2),
     );
     if (scroll) win.body.scrollTop = scroll;
     if (focusedVanButton) {
@@ -739,7 +745,7 @@ function vehicleService(ui: UI, v: Vehicle, after: () => void): HTMLElement | nu
     after();
   });
   return h('div', null,
-    field('Service pattern', h('span', { class: 'vehicle-service' }, patBadge(cur.kind, cur.name), sel), `${n} stations · Services tab: stop / pass / short-turn`),
+    field('Service pattern', h('span', { class: 'vehicle-service' }, patBadge(cur.kind, cur.name), sel), `${n} stations`),
     h('div', { class: 'btns' }, h('button', { class: 'btn sm ghost', onclick: () => {
       ui.openLine(l.id);
       const w = ui.wm.get('line-' + l.id);
@@ -1069,8 +1075,13 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
       opError || !dp ? h('div', { class: 'warn' }, icon('warning', 16), opError ?? `No ${depotTitle(kind).toLowerCase()} ${line ? 'connected to line for selected model' : 'available'}; build one or choose another depot.`) : null,
       !g.economy.canAfford(cost) ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' },
         h('b', null, `Not enough money: need ${fmtMoney(cost)}, have ${fmtMoney(g.economy.money)}`), ui.financeActions(render))) : null,
-      h('div', { class: 'btns right' }, h('button', { class: 'btn primary', disabled: !cars.length || !dp || !!opError || dp.owner !== PLAYER || !g.economy.canAfford(cost), 'data-sfx': 'none', onclick: () => buy() }, icon('plus', 16), `Buy for ${fmtMoney(cost)}`)),
     );
+    // (last in the window and pinned to its bottom while the model lists scroll)
+    // (what blocks the purchase replaces the summary: the warnings above may be scrolled away)
+    const blocked = !cars.length ? 'Choose a model' : opError ? opError : !dp ? `No ${depotTitle(kind).toLowerCase()}` : !g.economy.canAfford(cost) ? 'Not enough money' : '';
+    const buyBar = h('div', { class: 'btns right buybar' },
+      h('span', { class: 'buybar-sum' + (warn || blocked ? ' neg' : ''), 'data-tip': blocked || undefined }, blocked || [cap ? `${cap} seats` : mailCap ? fmtMail(mailCap) : '', spd ? `${spd} km/h` : '', rail && cars.length ? `${Math.round(len * 10)} m` : ''].filter(Boolean).join(' · ')),
+      h('button', { class: 'btn primary', disabled: !!blocked || dp?.owner !== PLAYER, 'data-sfx': 'none', onclick: () => buy() }, icon('plus', 16), `Buy for ${fmtMoney(cost)}`));
     if (depotId != null && g.depots.get(depotId)?.owner === PLAYER) {
       add(win.body, h('div', { class: 'btns' }, h('span', { class: 'spacer' }), h('button', { class: 'btn ghost', 'data-tip': 'Move depot and vehicles', onclick: () => {
         const T = ui.tools;
@@ -1088,6 +1099,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
           h('div', { class: 'list' }, here.map((v) => h('div', { class: 'row link', onclick: () => openVehicle(ui, v.id) }, h('span', null, v.name), h('span', { class: 'muted' }, v.status)))));
       }
     }
+    add(win.body, buyBar);
     if (scroll) win.body.scrollTop = scroll;
     if (focusIndex >= 0) win.body.querySelectorAll<HTMLElement>('.model, .stp, .segb')[focusIndex]?.focus({ preventScroll: true });
     const buy = () => {

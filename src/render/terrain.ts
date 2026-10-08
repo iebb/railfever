@@ -1145,11 +1145,12 @@ vec3 rfNrm = normalize(vWNormal);
     vec2 g10 = 1.0 - smoothstep(gw * 0.75, gw * 2.0, abs(fract(p / 10.0 + 0.5) - 0.5) * 10.0);
     float major = max(g10.x, g10.y) * (1.0 - smoothstep(0.8, 2.5, fw));
     float hw = max(fwidth(h), 1e-4);
-    float c1 = (1.0 - smoothstep(hw * 0.6, hw * 1.6, abs(fract(h + 0.5) - 0.5))) * (1.0 - smoothstep(0.25, 0.8, hw));
+    // 10 m contours fade out as they crowd together (steep ground, zoomed out); 50 m contours stay
+    float c1 = (1.0 - smoothstep(hw * 0.6, hw * 1.6, abs(fract(h + 0.5) - 0.5))) * (1.0 - smoothstep(0.12, 0.45, hw));
     float c5 = 1.0 - smoothstep(hw * 0.8, hw * 2.0, abs(fract(h / 5.0 + 0.5) - 0.5) * 5.0);
-    col = mix(col, vec3(0.0), minor * 0.22);
-    col = mix(col, vec3(0.01), major * 0.4);
-    col = mix(col, rf_srgb(vec3(0.98, 0.92, 0.62)), max(c1 * 0.35, c5 * 0.5));
+    col = mix(col, vec3(0.0), minor * 0.16);
+    col = mix(col, vec3(0.01), major * 0.3);
+    col = mix(col, rf_srgb(vec3(0.98, 0.92, 0.62)), max(c1 * 0.22, c5 * 0.4));
     rfGlow += rf_srgb(vec3(0.98, 0.92, 0.62)) * max(c1, c5) * 0.04;
   }
   diffuseColor.rgb = col;

@@ -841,7 +841,8 @@ export class Tools {
         const reach = Math.round(planWalkLimit(pl) * 10), inCity = Math.round(catchWalkLimit('rail', bonus) * 10) !== reach;
         const tt = TRACK_TYPES[pl.trackType];
         const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
-        if (tt) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
+        // (a plain train station needs no row under the "Train station" title)
+        if (tt && (pl.mode === 'metro' || pl.mode === 'lightrail' || tt.electrified || pl.psd)) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
         if (inCity) rows.push(['walk', `In town: ${pl.mode === 'metro' ? 'metro' : 'light-rail'} reach <b>${Math.round(CITY_REACH * 100)}%</b> of other rail stations`]);
         const sty = STATION_STYLES[pl.style];
         if (sty) rows.push(['station', `${esc(sty.name)}${bonus ? ` · <b>+${Math.round(bonus * 100)}%</b> reach` : ''}`]);

@@ -165,8 +165,8 @@ export function editLine(ui: UI, id: number) {
   ui.tools.setTool('line-edit');
   ui.tools.lineEditId = line.id;
   insertPlace.set(line.id, 'end');
+  // (the Edit line tool card says what to click; no toast repeating it)
   ui.hud.onToolChange();
-  ui.toast('Click map stations to add stops', 'info');
 }
 
 export function addStopToLine(ui: UI, lineId: number, stationId: number) {
@@ -285,6 +285,8 @@ export function openLine(ui: UI, id: number) {
           const groups = g.stations.railTrackGroups(st);
           const controls = linePatterns(l).filter(p => p.stops[i] !== false).map(p => {
             const choice = platformPreference(l, p.id, i), available = platformChoices(g, l, p.id, i);
+            // nothing to choose at a one-platform stop (unless a manual choice needs undoing)
+            if (available.length < 2 && !choice?.manual) return null;
             const number = (group: number) => groups.findIndex(q => q.id === group) + 1;
             const select = h('select', { class: 'input sm', disabled: !mine,
               'aria-label': `${p.name} platform preference at ${st.name}`,
@@ -297,9 +299,10 @@ export function openLine(ui: UI, id: number) {
               } },
               h('option', { value: 'auto', selected: !choice?.manual }, choice ? `Auto · P${number(choice.group)}` : 'Auto'),
               available.map(q => h('option', { value: q.id, selected: choice?.manual && choice.group === q.id }, `P${number(q.id)}`)));
-            return field((l.patterns?.length ?? 0) > 1 ? `${p.name} platform` : 'Platform preference', select);
+            // (a slim row under the stop, not a full form field: the stop list stays a list)
+            return h('div', { class: 'stop-opt' }, h('span', null, (l.patterns?.length ?? 0) > 1 ? `${p.name} platform` : 'Platform'), select);
           });
-          if (controls.length) list.appendChild(h('div', { class: 'pad' }, controls));
+          if (controls.some(Boolean)) list.appendChild(h('div', { class: 'stop-opts' }, controls));
         }
       });
       if (!l.stops.length) list.appendChild(h('div', { class: 'pad' }, 'No stops.'));
@@ -326,7 +329,10 @@ export function openLine(ui: UI, id: number) {
           ui.sound('toggle', { pitch: enabled ? 1.1 : 0.9 });
           rerender();
         }, 'Holds at stops and depot departures')));
+        // next step of a new line: its first vehicle (later ones: Vehicles tab)
+        const firstVehicle = l.stops.length >= 2 && !l.vehicles.length;
         add(win.body, h('div', { class: 'btns' },
+          firstVehicle ? h('button', { class: 'btn primary', onclick: () => { if (editing) ui.tools.setTool('inspect'); ui.openPurchase(l.kind, null, l.id); } }, icon('plus', 16), `Add ${meta.vehicle}`) : null,
           h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
           h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops first' : 'Shared terminus for through running', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),
           l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Preview signals for this line', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));

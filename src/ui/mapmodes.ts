@@ -484,10 +484,10 @@ export class MapModes {
     const numbered = new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size;
     // (a line's name shows only while it is pointed at, or tapped on touch screens)
     const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
-    const show = touch ? 'Tap route or number: line name; tap again: open.' : 'Hover route or number: line name; click route: open.';
+    const show = touch ? 'tap: name · tap again: open' : 'hover: name · click: open';
     const note = this.display === 'lines'
-      ? `${numbered ? `${numbered} numbered stations` : 'Rail station numbers'} · company + line + station, e.g. AS01; zoomed out: first number +n · ${show}`
-      : `Pins: name, waiting passengers, numbers such as AS01 · ${show}`;
+      ? `${numbered ? `${numbered} stations · ` : ''}numbers: company, line, stop (AS01) · ${show}`
+      : `Pins: name, waiting, numbers · ${show}`;
     c.append(
       h('div', { class: 'mc-head' }, icon('map', 18), h('span', { class: 'mc-title' }, 'Lines map'), h('span', { class: 'mc-sub' }, `${lines.length}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Close lines map', onclick: () => this.set('none') }, icon('close', 16))),
@@ -841,7 +841,7 @@ export class MapModes {
           regions.length ? h('div', null, h('b', null, String(regions.length)), h('span', null, 'districts')) : null,
           h('div', null, h('b', null, `${Math.round(carried > 0 ? (mine / carried) * 100 : 0)}%`), h('span', null, 'of carried trips start on your lines')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a station`)) : null),
-        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts; brighter: more trips · arcs: trips/mo; dashed: unserved; solid: served · hover: details' : 'Width: trips/mo · dashed: unserved · solid: served'),
+        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts · arcs: trips/mo, dashed unserved · hover: details' : 'Width: trips/mo · dashed: unserved'),
         flows.length || pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest unserved flows') : null,
         flows.length ? h('div', { class: 'mc-list' }, flows.map(flowRow)) : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {

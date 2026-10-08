@@ -3,7 +3,7 @@
 // drawn on the stations themselves (line display) or station pins with all their numbers (station display), and the
 // name tag of the line under the pointer. Priority-capped, decluttered, terrain-occluded; DOM writes only on change.
 import * as THREE from 'three';
-import type { Game } from '../game/game';
+import { PLAYER, type Game } from '../game/game';
 import type { Station } from '../game/stations';
 import { WATER_Y } from '../game/constants';
 import { ROUTE_LIFT } from './overlay';
@@ -50,6 +50,12 @@ const OCCLUDE_KEEP = 0.4;
 const RAIL_SYMBOL_MAX_DIST = STATION_NAME_MAX_DIST * Math.exp(3 * 100 * 0.0014);
 const RAIL_SYMBOL_FADE_DIST = STATION_NAME_MAX_DIST * Math.exp(2 * 100 * 0.0014);
 const RAIL_SYMBOL_SIZE = 28;
+/**
+ * Other companies' bus and tram stops: name plates only up close; in the town view a small stop symbol in the
+ * company colour (name on hover) that gives way to town names and to the player's stations.
+ */
+const RIVAL_STOP_NAME_DIST = 55;
+const MINOR_STOP_SIZE = 20;
 /** a small numbering badge on a plate (25 px square + 2 px gap, style.css .snum.sm) and a plate showing badges */
 const BADGE_W = 27, BADGED_PLATE_H = 29;
 /**
@@ -117,6 +123,8 @@ interface Label {
   gap: number; below: boolean;
   sx: number; sy: number; sc: number; op: number; z: number; shown: boolean;
   refreshed: number; served: boolean; waiting: number; size: number; activity: number;
+  /** another company's bus / tram stop (a small symbol that yields to town names and the player's stations) */
+  minor: boolean;
   occAt: number; occVersion: number; occMargin: number; occluded: boolean;
   occX: number; occY: number; occZ: number; occCX: number; occCY: number; occCZ: number;
 }
@@ -277,7 +285,7 @@ export class Labels {
     el.style.display = 'none';
     this.container.appendChild(el);
     return { el, kind, id, name, sub, ico, mark, badges, sym, extra, more, dot, text: '', subText: '', markText: '', markColor: '', icoKind: '', cls: '', bg: '', symText: '', markSig: '', badgeData: [], badgeMax: -1, nBadges: 0, gap: 0, below: false, sx: -1e9, sy: -1e9, sc: -1, op: -1, z: -1, shown: false,
-      refreshed: -1e9, served: false, waiting: 0, size: 0, activity: 0, occAt: -1e9, occVersion: -1, occMargin: -1,
+      refreshed: -1e9, served: false, waiting: 0, size: 0, activity: 0, minor: false, occAt: -1e9, occVersion: -1, occMargin: -1,
       occluded: false, occX: 0, occY: 0, occZ: 0, occCX: 0, occCY: 0, occCZ: 0 };
   }
 
@@ -412,8 +420,11 @@ export class Labels {
       const mk = ids.map(id => this.marks.get(id)).find(Boolean), isHl = ids.includes(this.hl!);
       if (pins && !ids.some(id => pins.has(id))) continue;
       const force = (!!mk && !pins) || isHl;
+      const minor = !force && !pins && s.owner !== PLAYER && !ids.some((id) => game.stations.get(id)?.rail);
       // Keep explicit map pins and the existing forced road plates. Rail symbols still obey the zoom band.
-      const mode = pins || (force && !s.rail) ? 'plate' : stationLabelMode(camDist, !!s.rail);
+      const mode = pins || (force && !s.rail) ? 'plate'
+        : minor ? (camDist < RIVAL_STOP_NAME_DIST ? 'plate' : camDist < STATION_NAME_MAX_DIST ? 'symbol' : 'hidden')
+        : stationLabelMode(camDist, !!s.rail);
       if (mode === 'hidden') continue;
       const compact = mode === 'symbol';
       const maxDist = compact ? stMax : force ? 3000 : pins ? pinMax : stMax;
@@ -424,6 +435,7 @@ export class Labels {
       if (!this.inView(camera, s.x, y, s.z, maxDist)) continue;
       let l = this.stations.get(s.id);
       if (!l) { const id = s.id; l = this.make('stn', id, () => this.onClickStation(id)); this.stations.set(s.id, l); }
+      l.minor = minor;
       const fresh = force || now - l.refreshed >= 150 || l.cls.includes(' compact') !== compact || l.cls.includes(' pin') !== !!pins;
       if (fresh) {
         l.refreshed = now;
@@ -435,7 +447,8 @@ export class Labels {
         }
       }
       const { served, waiting, size, activity } = l;
-      if (!compact && fresh) {
+      // (a rival stop's symbol shows its name on hover)
+      if ((!compact || minor) && fresh) {
         this.setText(l, s.name, served ? String(waiting) : '–', false);
         this.setMark(l, pins ? undefined : mk);
         const bl = (ids ? this.merged.get(s.id) : undefined) ?? this.badges?.get(s.id) ?? null;
@@ -446,12 +459,12 @@ export class Labels {
       if (!s.rail) for (const stop of s.stops) if (world.net.edges.get(stop.edge)?.tram) { icon = 'tram'; break; }
       this.setIcon(l, icon);
       const noRoad = !!s.rail && (s as unknown as { roadAccess?: boolean }).roadAccess === false;
-      this.setCls(l, 'lbl stn' + (pins ? ' pin' : '') + (compact ? ' compact' : '') + (!compact && l.nBadges ? ' badged' : '') + (!compact && !served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad && !pins && !compact ? ' noroad' : ''));
+      this.setCls(l, 'lbl stn' + (pins ? ' pin' : '') + (compact ? ' compact' : '') + (minor ? ' minor' : '') + (!compact && l.nBadges ? ' badged' : '') + (!compact && !served && !mk && !isHl ? ' dim' : '') + (isHl ? ' hl' : '') + (noRoad && !pins && !compact ? ' noroad' : ''));
       const bg = game.company(s.owner).color;
       if (l.bg !== bg) { l.bg = bg; l.el.style.setProperty('--c', bg); l.el.style.setProperty('--ink', inkFor(bg)); }
-      const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
+      const prio = isHl ? 1e9 : mk ? 1e8 : pins ? 5e4 + l.nBadges * 1e3 : minor ? (compact ? 3e3 : 6e3) + Math.min(2000, waiting * 2) : compact ? 2e4 + (served ? 1000 : 0) + Math.min(8000, size * 20) + Math.min(8000, waiting * 4 + activity * 0.2) : (served ? 2e4 : 1e4);
       // Selection raises symbol priority, but may not bypass their collisions or distance fade.
-      cands.push(this.cand(l, s.x, y, s.z, prio, maxDist, isHl ? 1.1 : 1, force && !compact, compact ? RAIL_SYMBOL_SIZE : pins ? 44 : l.nBadges ? BADGED_PLATE_H : 24, compact, compact ? symbolOpacity : 1));
+      cands.push(this.cand(l, s.x, y, s.z, prio, maxDist, isHl ? 1.1 : 1, force && !compact, compact ? (minor ? MINOR_STOP_SIZE : RAIL_SYMBOL_SIZE) : pins ? 44 : l.nBadges ? BADGED_PLATE_H : 24, compact, compact && !minor ? symbolOpacity : 1));
     }
     // ---- line name tags (lines map: the line under the pointer), above everything and outside the declutter
     for (const [id, t] of this.routeTags) {
@@ -515,13 +528,13 @@ export class Labels {
         const name = L.cls.includes(' named') ? (L.text.length * 6.4 + 18) * s * ui : 0;
         x0 = c.sx - c.w / 2; x1 = c.sx + c.w / 2 + name; y0 = c.sy - c.h / 2; y1 = c.sy + c.h / 2;
       } else {
-        c.w = (c.compact ? RAIL_SYMBOL_SIZE : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
+        c.w = (c.compact ? (L.minor ? MINOR_STOP_SIZE : RAIL_SYMBOL_SIZE) : L.kind === 'tag' ? Math.min(170, L.text.length * 6.6 + 16) + (L.symText ? 28 : 16) : L.text.length * (L.kind === 'town' ? 9 : 7.2) + (L.kind === 'stn' ? (L.cls.includes(' pin') ? 22 : 56) + L.nBadges * BADGE_W : 12)) * s * ui;
         const lift = L.kind === 'town' ? L.gap : 0;
         x0 = c.sx - c.w / 2; x1 = c.sx + c.w / 2; y0 = c.sy - c.h - lift; y1 = c.sy - lift;
       }
-      // Station signs and numbers never give way to town names; stations still declutter against each other.
-      // Stop dots without numbers give way to town names.
-      const layer = L.kind === 'stn' || (L.kind === 'mk' && L.nBadges) ? 1 : L.kind === 'town' ? 2 : 0;
+      // The player's station signs and numbers never give way to town names; stations still declutter against each
+      // other. Stop dots without numbers and other companies' bus / tram stops give way to town names.
+      const layer = L.kind === 'stn' && L.minor ? 0 : L.kind === 'stn' || (L.kind === 'mk' && L.nBadges) ? 1 : L.kind === 'town' ? 2 : 0;
       let hit = false;
       if (!c.force) for (let i = 0; i < placed.length; i += 5) if (layer + placed[i + 4] !== 3 && x0 < placed[i + 2] && x1 > placed[i] && y0 < placed[i + 3] && y1 > placed[i + 1]) { hit = true; break; }
       if (hit) continue;

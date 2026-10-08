@@ -32,7 +32,7 @@ function monthLabels(e: Economy, n: number) { return e.months.slice(-n).map((m) 
 
 export function openFinances(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('finances', 'Finances', { width: 580, icon: 'money', color: 'var(--pos)', sub: g.player.name, cls: 'finances-info' });
+  const win = ui.wm.open('finances', 'Finances', { width: 650, icon: 'money', color: 'var(--pos)', sub: g.player.name, cls: 'finances-info' });
   const render = () => {
     const e = g.economy;
     ui.wm.setTabs(win, [['overview', 'Overview'], ['history', 'History']], render);
@@ -78,12 +78,12 @@ export function openFinances(ui: UI) {
           { values: ms.map((m) => valueOf(m.v, 'income') + valueOf(m.v, 'mailIncome') + valueOf(m.v, 'trackIncome')), color: '#8fc3ff', label: 'Income' },
           { values: ms.map((m) => operatingCosts(m.v)), color: '#ffc857', label: 'Operating costs' },
           ...(mail ? [{ values: ms.map((m) => valueOf(m.v, 'mailIncome')), color: MAIL_COLOR, label: 'Mail income', dash: [5, 3] }] : []),
-        ], { w: 548, h: 170, labels: monthLabels(e, 24) }),
+        ], { w: 618, h: 170, labels: monthLabels(e, 24) }),
         h('div', { class: 'legend' }, h('span', { style: '--c:#4ade80' }, h('i'), 'Profit'), h('span', { style: '--c:#8fc3ff' }, h('i'), 'Income'),
           mail ? h('span', { class: 'lg-dash', style: `--c:${MAIL_COLOR}` }, h('i'), 'of which mail') : null,
           h('span', { style: '--c:#ffc857' }, h('i'), 'Vehicle costs, upkeep, wear & fees')),
         section('Monthly operating cost breakdown'),
-        chart(OPERATING_COSTS.map((k) => ({ values: ms.map((m) => -valueOf(m.v, k)), color: COST_COLORS[k] ?? '#a4afbf', label: financeLabel(k) })), { w: 548, h: 170, labels: monthLabels(e, 24) }),
+        chart(OPERATING_COSTS.map((k) => ({ values: ms.map((m) => -valueOf(m.v, k)), color: COST_COLORS[k] ?? '#a4afbf', label: financeLabel(k) })), { w: 618, h: 170, labels: monthLabels(e, 24) }),
         h('div', { class: 'legend' }, OPERATING_COSTS.map((k) => h('span', { style: `--c:${COST_COLORS[k] ?? '#a4afbf'}` }, h('i'), financeLabel(k)))),
         h('div', { class: 'muted finance-note' }, 'Energy · crew · maintenance · overheads · infrastructure · wear · access fees; purchases and construction in finance table'));
       }
