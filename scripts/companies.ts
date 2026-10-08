@@ -589,7 +589,8 @@ g.aiAcquisitions = true;
 {
   while (g.ais.some((a) => a.busy)) g.update(0.25);
   g.ais[0].config = { activeness: 0.6, focus: { rail: 2, road: 0.5, tram: 1.5 }, risk: 0.3, startMoney: 5_000_000, accessMultiplier: 1.5 };
-  g.setAccessMultiplier(PLAYER, 2.5);
+  // The new price factor maximum is 2; round-trip that ceiling instead of the old 2.5 multiplier.
+  g.setAccessMultiplier(PLAYER, 2);
   const lr = g.lines.all()[0];
   if (lr) g.lines.rename(lr.id, 'Renamed line');
   const json = JSON.stringify(serialize(g));
@@ -606,7 +607,7 @@ g.aiAcquisitions = true;
   let railOwner = railCo.id;
   while (g.company(railOwner).defunct && g.company(railOwner).boughtBy !== undefined) railOwner = g.company(railOwner).boughtBy!;
   check(JSON.stringify(g2.access) === JSON.stringify(g.access) && g2.canUse(PLAYER, railOwner), 'agreements and fees restored for the railway\'s current owner');
-  check(g2.accessMultiplier(PLAYER) === 2.5 && g2.accessMultiplier(g.ais[0].companyId) === 1.5, 'access multipliers restored');
+  check(g2.accessMultiplier(PLAYER) === 2 && g2.accessMultiplier(g.ais[0].companyId) === 1.5, 'access price factors restored');
   console.log('  defunct: ' + g.companies.filter((c) => c.defunct).map((c) => `${c.name} (bought by ${g.company(c.boughtBy ?? -1).name})`).join(', '));
   check(g2.companies.filter((c) => c.defunct).length >= 2 && g2.companies.every((c, i) => !!c.defunct === !!g.companies[i].defunct && c.boughtBy === g.companies[i].boughtBy), 'defunct companies restored');
   check(g2.ais.length === g.ais.length && g2.ais.every((a) => !g2.company(a.companyId).defunct), 'no AI for defunct companies');

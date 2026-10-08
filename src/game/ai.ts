@@ -1,6 +1,6 @@
 // AI competitors: companies that plan and build bus networks, tram lines and intercity railways using the same
 // construction API as the player (findSnap / planEdge / commitProposal, stations, depots, lines, vehicles).
-// Each company has a configuration (activeness, focus, risk, track access policy and multiplier); it may run
+// Each company has a configuration (activeness, focus, risk, track access policy and price factor); it may run
 // trains on other companies' railways under a track access agreement, and buy struggling rivals.
 import type { Game, AccessPolicy } from './game';
 import type { Town } from './towns';
@@ -951,23 +951,23 @@ export interface AIConfig {
   risk: number;
   /** Fully borrowed cash at the start. */
   startMoney: number;
-  /** 0 … 3: weight of other companies' usage when they share the maintenance of this company's network (see Game) */
+  /** 0 … 2: price factor on users' shares of annual full cost (legacy saved field name) */
   accessMultiplier: number;
-  /** sharing the network: open (default: anyone not blocked, no requests), judge requests (cautious companies refuse competitors), or always yes / no */
+  /** sharing the network: open (default: anyone not blocked, no requests), judge requests (cautious owners compare fee income and displaced fares), or always yes / no */
   accessPolicy: AccessPolicy;
 }
 
 /** AI companies share their tracks openly by default: everyone may use them, at a 1x usage share. */
-export const DEFAULT_AI_CONFIG: AIConfig = { activeness: 1, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 1, accessPolicy: 'open' };
+export const DEFAULT_AI_CONFIG: AIConfig = { activeness: 1, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 0.625, accessPolicy: 'open' };
 
 /** Ready-made personalities for the new-game and company screens. */
 export const AI_PRESETS: { id: string; name: string; hint: string; config: AIConfig }[] = [
   { id: 'balanced', name: 'Balanced', hint: 'Rail, bus and tram equally', config: DEFAULT_AI_CONFIG },
-  { id: 'cautious', name: 'Cautious', hint: 'Rare builds; avoids debt', config: { activeness: 0.35, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.15, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'aggressive', name: 'Aggressive', hint: 'Fast expansion with loans; buys struggling rivals', config: { activeness: 1.6, focus: { rail: 1.2, road: 1, tram: 1 }, risk: 0.85, startMoney: 8_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'rail', name: 'Rail baron', hint: 'Intercity railways first', config: { activeness: 1.1, focus: { rail: 3, road: 0.4, tram: 0.3 }, risk: 0.6, startMoney: 6_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'bus', name: 'Bus operator', hint: 'Intercity coaches and town buses', config: { activeness: 1, focus: { rail: 0.25, road: 3, tram: 0.6 }, risk: 0.4, startMoney: 4_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
-  { id: 'tram', name: 'Tram builder', hint: 'Trams in large towns', config: { activeness: 1, focus: { rail: 0.4, road: 0.7, tram: 3 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 1, accessPolicy: 'open' } },
+  { id: 'cautious', name: 'Cautious', hint: 'Rare builds; avoids debt', config: { activeness: 0.35, focus: { rail: 1, road: 1, tram: 1 }, risk: 0.15, startMoney: 4_000_000, accessMultiplier: 0.625, accessPolicy: 'open' } },
+  { id: 'aggressive', name: 'Aggressive', hint: 'Fast expansion with loans; buys struggling rivals', config: { activeness: 1.6, focus: { rail: 1.2, road: 1, tram: 1 }, risk: 0.85, startMoney: 8_000_000, accessMultiplier: 0.625, accessPolicy: 'open' } },
+  { id: 'rail', name: 'Rail baron', hint: 'Intercity railways first', config: { activeness: 1.1, focus: { rail: 3, road: 0.4, tram: 0.3 }, risk: 0.6, startMoney: 6_000_000, accessMultiplier: 0.625, accessPolicy: 'open' } },
+  { id: 'bus', name: 'Bus operator', hint: 'Intercity coaches and town buses', config: { activeness: 1, focus: { rail: 0.25, road: 3, tram: 0.6 }, risk: 0.4, startMoney: 4_000_000, accessMultiplier: 0.625, accessPolicy: 'open' } },
+  { id: 'tram', name: 'Tram builder', hint: 'Trams in large towns', config: { activeness: 1, focus: { rail: 0.4, road: 0.7, tram: 3 }, risk: 0.5, startMoney: 5_000_000, accessMultiplier: 0.625, accessPolicy: 'open' } },
 ];
 
 const clamp = (x: number, a: number, b: number) => (Number.isFinite(x) ? Math.max(a, Math.min(b, x)) : a);
@@ -980,7 +980,7 @@ export function normalizeAIConfig(c?: Partial<AIConfig> | null, base: AIConfig =
     focus: { rail: clamp(f.rail, 0, 5), road: clamp(f.road, 0, 5), tram: clamp(f.tram, 0, 5) },
     risk: clamp(c?.risk ?? base.risk, 0, 1),
     startMoney: clamp(c?.startMoney ?? base.startMoney, 0, 1e9),
-    accessMultiplier: clamp(c?.accessMultiplier ?? base.accessMultiplier, 0, 3),
+    accessMultiplier: clamp(c?.accessMultiplier ?? base.accessMultiplier, 0, 2),
     accessPolicy: c?.accessPolicy === 'open' || c?.accessPolicy === 'ask' || c?.accessPolicy === 'auto-approve' || c?.accessPolicy === 'auto-reject' ? c.accessPolicy : base.accessPolicy,
   };
 }
@@ -1427,7 +1427,7 @@ export class AIController {
   private checkConfig() {
     const c = this.config;
     const ok = (x: unknown, a: number, b: number) => typeof x === 'number' && x >= a && x <= b;
-    if (!c || !ok(c.activeness, 0.25, 2) || !ok(c.risk, 0, 1) || !c.focus || !ok(c.focus.rail, 0, 5) || !ok(c.focus.road, 0, 5) || !ok(c.focus.tram, 0, 5) || !ok(c.startMoney, 0, 1e9) || !ok(c.accessMultiplier, 0, 3) || !['open', 'ask', 'auto-approve', 'auto-reject'].includes(c.accessPolicy)) {
+    if (!c || !ok(c.activeness, 0.25, 2) || !ok(c.risk, 0, 1) || !c.focus || !ok(c.focus.rail, 0, 5) || !ok(c.focus.road, 0, 5) || !ok(c.focus.tram, 0, 5) || !ok(c.startMoney, 0, 1e9) || !ok(c.accessMultiplier, 0, 2) || !['open', 'ask', 'auto-approve', 'auto-reject'].includes(c.accessPolicy)) {
       this.config = c; // the setter normalizes (a field changed in place)
     }
   }
@@ -2237,14 +2237,14 @@ export class AIController {
       kmh: length * UNIT_M / 1000 / (seconds / 3600) };
   }
 
-  /** Foreign infrastructure's native sole-user upkeep bound: no free through-running or invented fee discount. */
+  /** Conservative sole-user fixed-charge bound; the service quote already includes its own wear. */
   private railFeeBound(points: (StationPlan | Station)[], rails: Set<number>): number {
-    const g = this.game, owners = new Map<number, number>();
-    for (const st of points) if ('id' in st && st.owner !== this.companyId && g.accessMultiplier(st.owner) > 0)
-      owners.set(st.owner, (owners.get(st.owner) ?? 0) + g.stationMaintenance(st));
-    for (const id of rails) { const e = g.world.net.edges.get(id); if (e && e.owner !== this.companyId && e.owner >= 0 && g.accessMultiplier(e.owner) > 0)
-      owners.set(e.owner, (owners.get(e.owner) ?? 0) + g.edgeMaintenance(e)); }
-    return [...owners.values()].reduce((n, upkeep) => n + upkeep, 0);
+    const g = this.game, items = [
+      ...points.filter((st): st is Station => 'id' in st),
+      ...[...rails].map(id => g.world.net.edges.get(id)).filter((e): e is NEdge => !!e),
+    ];
+    const owners = new Set(items.map(item => item.owner));
+    return [...owners].reduce((n, owner) => n + g.accessChargeEstimate(this.companyId, owner, items, 1), 0);
   }
 
   /** Stations (in order, ending at `st`) of another company's railway line that ends at `st` (out and back), and that line. */
@@ -3692,13 +3692,20 @@ export class AIController {
       // a free platform for our train at both ends (each train waits for a free path, so this cannot jam)
       const room = Math.min(sA.rail.tracks, sB.rail.tracks) - Math.max(trainsAt.get(sA.id) ?? 0, trainsAt.get(sB.id) ?? 0);
       if (room < 1) continue;
-      // a train and a depot; the fees are our usage share of the line's upkeep (the owner's multiplier)
-      const m = g.accessMultiplier(o), upkeep = bd * 1.3 * 330 + 60_000;
+      // Quote the actual shared route's full cost and our train's own wear.
       // joining: our train takes its share of the line's passengers (one more train among those running it)
       const part = joinable ? 1 / (l.vehicles.length + 1) * 2 : 1;
       // (one train of the year's models: its fares by the time the trip takes, its running costs; opcosts / fares)
-      const sv = this.serviceYear(pickTrain(g.year, Math.min(sA.rail.length, sB.rail.length), bd * 1.3, 2) ?? [], 1, bd, bd * 1.3);
-      const net = Math.min(D.pair(A.id, B.id) * 0.3 * 12 * Math.min(1, part), sv.seats) * sv.perPax - sv.running * 0.5 - 100_000 - upkeep * (m / (1 + m));
+      const stock = pickTrain(g.year, Math.min(sA.rail.length, sB.rail.length), bd * 1.3, 2) ?? [];
+      const rails = stock.length ? this.quotedRailLeg(sA, sB, stock) : null;
+      if (!rails) continue;
+      const items = [...new Set(rails)].map(id => g.world.net.edges.get(id)!).filter(e => e.depot < 0);
+      const length = items.reduce((n, e) => n + e.len, 0);
+      const sv = this.serviceYear(stock, 1, bd, length);
+      const wear = estimateVehicleYear(stock, length / 1.15, g.year, 0.7).trackWearPerUnit;
+      const feeItems = [...items, ...[...new Set(l.stops)].map(id => g.stations.get(id)!).filter(Boolean)];
+      const fees = [...new Set(feeItems.map(item => item.owner))].reduce((n, owner) => n + g.accessChargeEstimate(me, owner, feeItems, 1 / (l.vehicles.length + 1), items.filter(e => e.owner === owner).reduce((w, e) => w + e.len * wear, 0)), 0);
+      const net = Math.min(D.pair(A.id, B.id) * 0.3 * 12 * Math.min(1, part), sv.seats) * sv.perPax - sv.running * 0.5 - 100_000 - fees;
       const score = Math.sqrt(Math.max(0, net / 1_000_000)) * this.config.focus.rail * this.config.focus.rail;
       opts.push({ score, kind: 'share', towns: [A.id, B.id], hub: sA.id, share: [o, sA.id, sB.id, joinable ? l.id : -1] });
     }
@@ -4032,9 +4039,23 @@ export class AIController {
     const cost = (centre?.cost ?? 2_000_000) + len * TRACK_TYPES[tunnelType].costPerUnit * 8.5 + 100_000;
     const revenue = Math.max(0, combined.revenue - old[0] - old[1]);
     const yearly = len * trackBasePerUnit(tunnelType) * 5 + STATION_UPKEEP_FACTOR.underground * (20_000 + 2 * (centre?.length ?? 12) * 500) + 50_000;
-    const net = revenue - yearly;
-    const gainA = partner ? combined.revenue * share - old[0] - yearly * share : net;
-    const gainB = partner ? combined.revenue * (1 - share) - old[1] - yearly * (1 - share) : 0;
+    // Joint services pay each other for the existing halves as ordinary users. Price the actual retained
+    // routes; foreign wear is reimbursed in full and cancelled against the receiving owner's gross wear.
+    const countA = Math.max(1, cars.filter(t => t.owner === this.companyId).length), countB = Math.max(1, cars.filter(t => t.owner === partner?.companyId).length);
+    const quote = (end: typeof a, user: number, fleet: number) => {
+      const stations = end.path.map(id => g.stations.get(id)!), edges = new Map<number, NEdge>();
+      for (let i = 1; i < stations.length; i++) for (const id of this.quotedRailLeg(stations[i - 1], stations[i], train) ?? []) {
+        const e = g.world.net.edges.get(id); if (e && e.depot < 0) edges.set(id, e);
+      }
+      const wearRate = estimateVehicleYear(train, totalLen / Math.max(1, points.length - 1), g.year, 0.4).trackWearPerUnit;
+      const wear = [...edges.values()].filter(e => e.owner === end.st.owner).reduce((n, e) => n + e.len * wearRate * fleet, 0);
+      return { fee: g.accessChargeEstimate(user, end.st.owner, [...edges.values(), ...stations], fleet / (countA + countB), wear), wear };
+    };
+    const paidA = partner ? quote(b, this.companyId, countA) : { fee: 0, wear: 0 };
+    const paidB = partner ? quote(a, partner.companyId, countB) : { fee: 0, wear: 0 };
+    const net = revenue - yearly - paidA.wear - paidB.wear;
+    const gainA = partner ? combined.revenue * share - old[0] - yearly * share - paidA.fee + paidB.fee - paidB.wear : net;
+    const gainB = partner ? combined.revenue * (1 - share) - old[1] - yearly * (1 - share) - paidB.fee + paidA.fee - paidA.wear : 0;
     const viable = this.available() >= cost * share * 1.05 && (!partner || partner.available() >= cost * (1 - share) * 1.05)
       && gainA > 0 && gainA * URBAN_PAYBACK.crosscity >= cost * share
       && (!partner || (gainB > 0 && gainB * URBAN_PAYBACK.crosscity >= cost * (1 - share) && usageA > 0 && usageB > 0

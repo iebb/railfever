@@ -784,6 +784,8 @@ function xlinkChecks() {
     check(locals.every((t) => t.state !== 'noroute') && calls.every((n) => n >= 6) && run.worst.days < 120, `xlink ${mode}: the companies' own trains keep running beside the direct ones`);
     const paid = g.agreement(me, other)?.paidTotal ?? 0, earned = g.agreement(other, me)?.paidTotal ?? 0;
     console.log(`  ${mode}: fees blue -> red ${fmt(paid / 1000, 1)}k, red -> blue ${fmt(earned / 1000, 1)}k; cash blue ${fmt(g.company(me).economy.money / 1e6, 2)}M, red ${fmt(g.company(other).economy.money / 1e6, 2)}M`);
+    console.log('ACCESS METRICS ' + JSON.stringify({ scenario: `xlink ${mode}`, services: 1, trains: trains.length,
+      agreements: g.access.length, feesPaid: paid + earned, bluePaid: paid, redPaid: earned }));
     check(paid > 0 && earned > 0, `xlink ${mode}: track access fees flow both ways`);
     check([me, other].every((id) => { const c = g.company(id); return !c.defunct && c.economy.money > 0 && c.economy.loan <= c.economy.maxLoan; }), `xlink ${mode}: both companies stay solvent`);
     check(checkReservations(g).length === 0, `xlink ${mode}: reservations remain consistent`);

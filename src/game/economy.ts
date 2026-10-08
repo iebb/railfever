@@ -79,6 +79,9 @@ function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Ca
   return r;
 }
 
+/** Base borrowing rate; infrastructure annuities do not follow a company's later rate changes. */
+export const BASE_INTEREST_RATE = 0.04;
+
 export class Economy {
   money = 5_000_000;
   loan = 5_000_000;
@@ -86,7 +89,7 @@ export class Economy {
   initialLoan = 0;
   maxLoan = 25_000_000;
   loanStep = 500_000;
-  interestRate = 0.04;
+  interestRate = BASE_INTEREST_RATE;
   current: Record<Category, number> = emptyRecord();
   months: MonthRecord[] = [];
   yearTotals: { year: number; v: Record<Category, number> }[] = [];

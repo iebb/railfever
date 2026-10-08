@@ -215,6 +215,23 @@ const FORECOURT = 0.85;
 const ACCESS_REACH = 40;
 /** Price of a station building of cost factor 1 (a 'classic' building; styles scale it). */
 const BUILDING_BASE = 60000;
+
+/** Platforms, tracks and access before level, building style and fit-out. Retained rail is priced separately. */
+export function stationPlatformCost(platformLength: number, throughLength: number, native: boolean): number {
+  return (platformLength + throughLength * 0.7) * (native ? 1500 : 9000) + 120000;
+}
+
+/** Civil structure price at the station's actual depth/height. */
+export function stationLevelCost(civil: number, level: StationLevel, depth: number, height: number): number {
+  if (level === 'underground') {
+    const k = Math.max(0, Math.min(1, (depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
+    return civil * (3.8 + 1.5 * k);
+  }
+  if (level === 'elevated') return civil * (3.4 + 0.5 * Math.min(1, Math.max(0, (height - STATION_HEIGHT.min) / 1.8)));
+  return civil;
+}
+
+export function stationBuildingCost(style: string | undefined): number { return BUILDING_BASE * styleOf(style).cost; }
 /** Style 'none': the ramp pad beside a platform end, and how far a road may be from its foot. */
 const NO_BUILDING_PAD = { w: 0.8, d: 0.5 };
 const NO_BUILDING_REACH = 1.6;
@@ -1182,7 +1199,7 @@ export class Stations {
     const platformLength = physical ? physical.filter((t) => layout.trackOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : tracks * length;
     const throughLength = physical ? physical.filter((t) => layout.throughOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : through * length;
     // Retained running rail (including its existing civil structure) is not the facility payer's asset.
-    const base = (platformLength + throughLength * 0.7) * (physical ? 1500 : 9000) + 120000;
+    const base = stationPlatformCost(platformLength, throughLength, !!physical);
     const doors = psd ? platformLength * 2500 : 0;
     const civil = base - BUILDING_BASE;
     const fixed = opts.fixedY;
@@ -1300,9 +1317,8 @@ export class Stations {
       if (fixed !== undefined) { plan.y = fixed; plan.depth = mn - fixed; if (plan.depth < STATION_DEPTH.min - 0.4) failp('Too shallow for underground station'); }
       const err = areas.map((f) => { const volume = undergroundStationVolume(f, plan.y); return this.rectConflict(volume, volume.y0 - (opts.alignment ? 0.15 : 0), volume.y1 + (opts.alignment ? 0.15 : 0), null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges }); }).find(Boolean);
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
-      const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
       // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
-      plan.cost = civil * (3.8 + 1.5 * k);
+      plan.cost = stationLevelCost(civil, level, plan.depth, plan.height);
     } else {
       // elevated: the deck clears the ground, buildings, roads and tracks beneath
       plan.height = Math.max(STATION_HEIGHT.min, Math.min(STATION_HEIGHT.max, opts.height ?? STATION_HEIGHT.def));
@@ -1330,9 +1346,8 @@ export class Stations {
       const pr = opts.alignment ? this.curvedPiers(shape, layout.width, demolish, ign, opts.ignoreEdges) : this.viaductPiers(footprint, layout.width, demolish, ign, opts.ignoreEdges);
       if (pr.error) failp(pr.error);
       plan.piers = pr.piers;
-      const k = Math.min(1, Math.max(0, (plan.height - STATION_HEIGHT.min) / 1.8));
       // Deck, columns and elevated access, plus the towers below: roughly 3-4x a ground station.
-      plan.cost = civil * (3.4 + 0.5 * k);
+      plan.cost = stationLevelCost(civil, level, plan.depth, plan.height);
     }
     plan.cost += doors;
     if (opts.aiSurvey && !plan.ok && !plan.error?.startsWith('No room')) return plan;

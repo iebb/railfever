@@ -13,7 +13,7 @@ import type { Game } from '../game/game';
 import { availableModels } from '../game/vehicle-types';
 import { findDepot } from './win-info';
 import { chart } from './charts';
-import { fmtPct, fmtMult, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail } from './format';
+import { fmtPct, fmtAccessFactor, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail } from './format';
 import type { Vehicle } from '../game/vehicle';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
@@ -272,7 +272,7 @@ export function openLine(ui: UI, id: number) {
         list.appendChild(h('div', { class: 'row' },
           b ? badgeEl(b, 'sm') : l.kind === 'rail' ? h('span', { class: 'stopn', style: `background:${l.color}` }, String(i + 1)) : lineSymbol(g, l, 'sm'),
           ui.stationLink(sid),
-          st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `${g.company(st.owner).name} · upkeep by usage ${fmtMult(g.accessMultiplier(st.owner))}` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
+          st && st.owner >= 0 && st.owner !== l.owner ? h('span', { class: 'owner', style: `--c:${g.company(st.owner).color}`, 'data-tip': `${g.company(st.owner).name} · ${fmtAccessFactor(g.accessMultiplier(st.owner))} · 75% cap` }, h('i'), g.company(st.owner).name.split(' ')[0]) : null,
           stopDots(l, i),
           noRoute ? h('span', { class: 'neg', title: 'No route to the next stop' }, '⚠ no route') : null,
           h('span', { class: 'muted num' }, `${waiting} waiting`),

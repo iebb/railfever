@@ -5,7 +5,7 @@ import type { UI } from './ui';
 import { PLAYER } from '../game/game';
 import { WATER_Y } from '../game/constants';
 import { esc, svg } from './dom';
-import { fmtMult, tonnes, stationShowsMail } from './format';
+import { fmtAccessFactor, tonnes, stationShowsMail } from './format';
 import { accessState } from './win-access';
 import type { Game } from '../game/game';
 import { fmtMoney } from '../game/economy';
@@ -21,7 +21,7 @@ export interface HoverTarget { kind: 'station' | 'vehicle' | 'depot' | 'town'; i
 /** One line on the player's access to another company's station. */
 function accessHint(g: Game, owner: number): string {
   const k = accessState(g, owner).kind;
-  return k === 'agreement' ? `${g.hasAccess(PLAYER, owner) ? 'Track access' : 'Open network'} · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'Access blocked' : k === 'closed' ? 'Access refused' : 'No track access · click to request';
+  return k === 'agreement' ? `${g.hasAccess(PLAYER, owner) ? 'Track access' : 'Open network'} · ${fmtAccessFactor(g.accessMultiplier(owner))} · 75% cap` : k === 'pending' ? 'Access request pending' : k === 'blocked' ? 'Access blocked' : k === 'closed' ? 'Access refused' : 'No track access · click to request';
 }
 
 const stat = (ic: string, html: string) => `<span class="hc-stat">${svg(ic, 14)}<span>${html}</span></span>`;

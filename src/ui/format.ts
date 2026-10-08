@@ -1,4 +1,5 @@
 // Display formatting shared by the HUD, windows and tooltips.
+import { ACCESS_CAP } from '../game/access-cost';
 import type { Game, News } from '../game/game';
 import type { Line } from '../game/lines';
 import type { Station } from '../game/stations';
@@ -40,8 +41,9 @@ export const fmtHeight = (h: number) => (h === 0 ? '±0 m' : `${h > 0 ? '+' : '�
 export const fmtPct = (f: number, digits = 0) => `${(f * 100).toFixed(digits)}%`;
 /** Track access multiplier: ×2, ×1.25, ×0.5. */
 export const fmtMult = (m: number) => `×${Number.isInteger(m) ? m : m.toFixed(2).replace(/0$/, '')}`;
-/** Share of an item's maintenance a user pays at multiplier m when it uses the item as much as the owner. */
-export const equalUseShare = (m: number) => (m > 0 ? m / (1 + m) : 0);
+/** Fixed full-cost fraction at equal use; wear is reimbursed separately. */
+export const equalUseShare = (p: number) => Math.min(ACCESS_CAP, Math.max(0, p) / 2);
+export const fmtAccessFactor = (p: number) => `×${Number(p.toFixed(5))} of cost`;
 
 /** Mail (whole units of MAIL_UNIT_T) in tonnes, without the unit: 0.4, 12.5, 1,240. */
 export function tonnes(units: number): string {

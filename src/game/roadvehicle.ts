@@ -610,6 +610,17 @@ export class RoadVehicle extends Vehicle {
   /** time to the next gradient sample (saved, so a loaded game drives exactly alike) */
   gradeTimer = 0;
 
+  /** Actual travelled tram distance; a junction connector belongs half to each incident edge. */
+  private meterTram(seg: RSeg, distance: number) {
+    if (!this.isTram || !(distance > 0)) return;
+    const net = this.game.world.net, e = net.edges.get(seg.e);
+    if (e?.tram) this.game.recordTrackUse(this.owner, e, seg.kind === 'conn' ? distance / 2 : distance, true);
+    if (seg.kind === 'conn') {
+      const from = net.edges.get(seg.from);
+      if (from?.tram) this.game.recordTrackUse(this.owner, from, distance / 2, true);
+    }
+  }
+
   private drive(dt: number) {
     if (!this.seg) return;
     const g = this.game;
@@ -635,7 +646,10 @@ export class RoadVehicle extends Vehicle {
       if (s.stopAt !== undefined && !this.ambient) {
         const dist = d + s.stopAt;
         if (dist >= -0.05) vt = Math.min(vt, brakeTo(dist) + 0.01);
-        if (i === 0 && dist <= 0.03 && this.speed < 0.08) { this.pos = Math.max(this.pos, s.stopAt); this.speed = 0; this.arrive(); return; }
+        if (i === 0 && dist <= 0.03 && this.speed < 0.08) {
+          this.meterTram(s, Math.max(0, s.stopAt - this.pos));
+          this.pos = Math.max(this.pos, s.stopAt); this.speed = 0; this.arrive(); return;
+        }
       }
       for (const c of s.crossings) {
         const dist = d + c.pos;
@@ -684,15 +698,19 @@ export class RoadVehicle extends Vehicle {
     if (this.speed < 0) this.speed = 0;
     // Do not overshoot a closed gate during the fixed step, including a newly closed one.
     const move = this.speed * dt;
+    let meterFrom = this.pos;
     this.pos += Math.min(move, crossingMove);
     if (move > crossingMove) this.speed = 0;
     if (this.speed > 0 && this.spacing.departureIndex >= 0) noteSpacingDeparture(g, this);
     // advance through segments
     while (this.seg && this.pos > this.seg.len) {
+      this.meterTram(this.seg, Math.max(0, this.seg.len - meterFrom));
+      meterFrom = 0;
       if (!this.ahead.length) {
         this.fill();
         if (!this.ahead.length) {
           this.pos = this.seg.len;
+          meterFrom = this.pos;
           this.speed = 0;
           if (this.ambient) this.state = 'stopped';
           break;
@@ -705,6 +723,7 @@ export class RoadVehicle extends Vehicle {
       this.seg = this.ahead.shift()!;
       if (this.ahead.length < 3) this.fill();
     }
+    if (this.seg) this.meterTram(this.seg, Math.max(0, this.pos - meterFrom));
     if (this.speed < 0.01) this.stuck += dt; else this.stuck = 0;
   }
 
