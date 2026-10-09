@@ -13,12 +13,12 @@ import type { Line } from './lines';
 import type { Vehicle } from './vehicle';
 import type { Train, TSeg } from './train';
 import type { Station } from './stations';
-import { TRACK_TYPES, UNIT_M, type Cargo } from './constants';
+import { TRACK_TYPES, ROAD_TYPES, UNIT_M, type Cargo } from './constants';
 import { consistOf, hopEstimate } from './opcosts';
 import type { VehicleModel } from './vehicle-types';
 import type { NEdge } from './network';
 import { outAndBack } from './lines';
-import { consistRule, findRailRoute, railNext, ruleAllows, lineCompatibility } from './train';
+import { consistRule, findRailRoute, railNext, ruleAllows, lineCompatibility, Heap } from './train';
 import type { Cont, TrackRule } from './train';
 import { tramUsable } from './build-ops';
 import { simNow } from './fares';
@@ -799,31 +799,167 @@ function joinPreviewGame(g: Game, l: Line): Game {
 }
 
 /**
+ * A through route turns back when its departure from a station runs over the track it arrived on (the same edges, or
+ * a parallel track of the same line within `near` units travelled the opposite way: a loop beyond a terminus). Only
+ * the last / first `span` units of the two paths count.
+ */
+function turnsBack(g: Game, arrival: Cont[], departure: Cont[], span = 300, near = 1.0): boolean {
+  const used = new Set(arrival.map((c) => c.edge.id));
+  if (departure.some((c) => used.has(c.edge.id))) return true;
+  const net = g.world.net, C = 2, cells = new Map<number, number[]>(), X: number[] = [], Z: number[] = [], TX: number[] = [], TZ: number[] = [];
+  const key = (x: number, z: number) => Math.floor(x / C) * 65536 + Math.floor(z / C);
+  // samples of a path every unit or so, with the direction of travel; `from end`: the arrival's last units first
+  const sample = (path: Cont[], fromEnd: boolean, f: (x: number, z: number, tx: number, tz: number) => boolean | void): boolean => {
+    let walked = 0;
+    for (let k = 0; k < path.length && walked < span; k++) {
+      const c = path[fromEnd ? path.length - 1 - k : k], geo = net.geo(c.edge), step = Math.max(1, Math.round(geo.n / Math.max(1, geo.len)));
+      for (let i = 0; i < geo.n; i += step) {
+        const j = c.dir > 0 === !fromEnd ? i : geo.n - 1 - i;
+        if (f(geo.pts[j * 3], geo.pts[j * 3 + 2], geo.tan[j * 2] * c.dir, geo.tan[j * 2 + 1] * c.dir)) return true;
+      }
+      walked += geo.len;
+    }
+    return false;
+  };
+  sample(arrival, true, (x, z, tx, tz) => {
+    const i = X.length; X.push(x); Z.push(z); TX.push(tx); TZ.push(tz);
+    const k = key(x, z); let a = cells.get(k); if (!a) cells.set(k, a = []); a.push(i);
+  });
+  return sample(departure, false, (x, z, tx, tz) => {
+    for (let cx = Math.floor((x - near) / C); cx <= Math.floor((x + near) / C); cx++) for (let cz = Math.floor((z - near) / C); cz <= Math.floor((z + near) / C); cz++) {
+      for (const i of cells.get(cx * 65536 + cz) ?? []) if (Math.hypot(X[i] - x, Z[i] - z) <= near && TX[i] * tx + TZ[i] * tz < -0.8) return true;
+    }
+    return false;
+  });
+}
+
+/**
  * Follow successive calls from the platform reached by the previous hop. Testing each station pair separately
  * would incorrectly join two disconnected platform tracks carrying the same station id. Reversing at a
- * platform, including past its starter signal, is allowed just as it is in Train.planRoute.
+ * platform, including past its starter signal, is allowed just as it is in Train.planRoute, except at the calls of
+ * `through` (route indexes: where two lines meet): trains there run on the way they came, and never back over the
+ * track they arrived on (turnsBack). `reverse`: they could only go on by reversing or turning back there.
  */
-function railJoinRoute(g: Game, route: number[], owner: number, rule: TrackRule | null): string | null {
+function railJoinRoute(g: Game, route: number[], owner: number, rule: TrackRule | null, through: ReadonlySet<number> = new Set()): { gap: string; reverse: boolean } | null {
   const first = g.stations.get(route[0]), net = g.world.net;
-  let at: Cont[] = [];
+  let at: { c: Cont; path: Cont[] }[] = [];
   for (const eid of first?.rail?.edges ?? []) {
     const edge = net.edges.get(eid);
-    if (edge && g.canUse(owner, edge.owner) && ruleAllows(rule, edge)) for (const dir of [1, -1]) at.push({ edge, dir });
+    if (edge && g.canUse(owner, edge.owner) && ruleAllows(rule, edge)) for (const dir of [1, -1]) at.push({ c: { edge, dir }, path: [] });
   }
+  const gap = (i: number) => `${g.stations.get(route[i - 1])?.name ?? '?'} → ${g.stations.get(route[i])?.name ?? '?'}`;
   for (let i = 1; i < route.length; i++) {
-    const arrived = new Map<string, Cont>();
-    for (const c of at) {
-      for (const dir of [c.dir, -c.dir]) {
-        const start = railNext(g, c.edge, dir, owner, false, rule, dir !== c.dir);
-        const r = findRailRoute(g, start, route[i], owner, -1, 40000, false, rule);
-        const last = r?.conts[r.conts.length - 1];
-        if (last) arrived.set(last.edge.id + ':' + last.dir, last);
+    const straight = through.has(i - 1);
+    const hops = (free: boolean) => {
+      const arrived = new Map<string, { c: Cont; path: Cont[] }>();
+      for (const { c, path } of at) {
+        for (const dir of free ? [c.dir, -c.dir] : [c.dir]) {
+          const start = railNext(g, c.edge, dir, owner, false, rule, dir !== c.dir);
+          const r = findRailRoute(g, start, route[i], owner, -1, 40000, false, rule);
+          const last = r?.conts[r.conts.length - 1];
+          if (!r || !last || (!free && turnsBack(g, path, r.conts))) continue;
+          const k = last.edge.id + ':' + last.dir;
+          if (!arrived.has(k)) arrived.set(k, { c: last, path: r.conts });
+        }
       }
-    }
-    if (!arrived.size) return `${g.stations.get(route[i - 1])?.name ?? '?'} → ${g.stations.get(route[i])?.name ?? '?'}`;
+      return arrived;
+    };
+    const arrived = hops(!straight);
+    if (!arrived.size) return { gap: gap(i), reverse: straight && hops(true).size > 0 };
     at = [...arrived.values()];
   }
   return null;
+}
+
+// ---- road routes as the vehicles drive them (roadvehicle.ts findRoadRoute; its module imports the vehicle classes)
+interface RoadCont { edge: number; dir: number }
+/** Arc length of the point of edge `e` nearest to (x, z). */
+function roadS(g: Game, e: NEdge, x: number, z: number): number {
+  const geo = g.world.net.geo(e);
+  let best = 0, d = Infinity;
+  for (let i = 0; i < geo.n; i++) { const q = Math.hypot(geo.pts[i * 3] - x, geo.pts[i * 3 + 2] - z); if (q < d) { d = q; best = geo.cum[i]; } }
+  return best;
+}
+/**
+ * The road route from the end of lane (edge, dir) to a stop of station `target`, as findRoadRoute plans it for a
+ * vehicle of a line that is no loop (the same costs, U-turn penalty and dead ends); null when there is none.
+ */
+function roadRouteOf(g: Game, edge: NEdge, dir: number, target: number, tram: boolean, owner: number): RoadCont[] | null {
+  const net = g.world.net, st = g.stations.get(target), uturn = 40;
+  const allow = tram ? (e: NEdge) => tramUsable(g, e, owner) : undefined;
+  if (!st || !st.stops.length) return null;
+  const goals = new Set(st.stops.filter((p) => { const e = net.edges.get(p.edge); return !!e && (!allow || allow(e)); }).map((p) => p.edge));
+  if (!goals.size) return null;
+  const NE: number[] = [], ND: number[] = [], NG: number[] = [], NP: number[] = [], best = new Map<number, number>(), heap = new Heap();
+  const key = (e: number, d: number) => e * 2 + (d > 0 ? 1 : 0);
+  const cost = (e: NEdge) => e.len * (90 / (ROAD_TYPES[e.type] ?? ROAD_TYPES.road).speed) + 0.6;
+  const push = (e: NEdge, d: number, gc: number, parent: number) => {
+    const k = key(e.id, d);
+    if ((best.get(k) ?? Infinity) <= gc) return;
+    best.set(k, gc); NE.push(e.id); ND.push(d); NG.push(gc); NP.push(parent);
+    const n = net.nodes.get(d > 0 ? e.b : e.a)!;
+    heap.push(NE.length - 1, gc + Math.hypot(n.x - st.x, n.z - st.z) * 0.98);
+  };
+  const expand = (e: NEdge, d: number, gc: number, parent: number) => {
+    const nodeId = d > 0 ? e.b : e.a, node = net.nodes.get(nodeId);
+    if (!node) return;
+    let open = false;
+    if (allow) for (const fid of node.edges) { const f = net.edges.get(fid); if (fid !== e.id && f && f.depot < 0 && allow(f)) { open = true; break; } }
+    for (const fid of node.edges) {
+      const f = net.edges.get(fid);
+      if (fid === e.id || !f || f.depot >= 0 || (allow && !allow(f))) continue;
+      push(f, f.a === nodeId ? 1 : -1, gc + cost(f), parent);
+    }
+    if (e.depot < 0) push(e, -d, gc + cost(e) + (allow ? (open ? uturn : 2) : node.edges.length <= 1 ? 2 : uturn), parent);
+  };
+  expand(edge, dir, 0, -1);
+  for (let n = 0; heap.size && n <= 40000; n++) {
+    const i = heap.pop(), e = net.edges.get(NE[i])!, d = ND[i];
+    if ((best.get(key(e.id, d)) ?? Infinity) < NG[i]) continue;
+    if (goals.has(e.id)) {
+      const out: RoadCont[] = [];
+      for (let j = i; j >= 0; j = NP[j]) out.push({ edge: NE[j], dir: ND[j] });
+      return out.reverse();
+    }
+    expand(e, d, NG[i], i);
+  }
+  return null;
+}
+
+/**
+ * Do a line's road vehicles run straight through stop `route[j]` (the stop where two lines meet)? They arrive from
+ * route[j - 1] as they would drive, then go on to route[j + 1] without a U-turn and without running back over the
+ * roads they came by. True when there is no road between them at all (the continuity check reports that).
+ */
+function roadThrough(g: Game, route: number[], j: number, tram: boolean, owner: number): boolean {
+  const net = g.world.net, J = g.stations.get(route[j]), P = g.stations.get(route[j - 1]), N = g.stations.get(route[j + 1]);
+  if (!J || !P || !N) return true;
+  const usable = (sid: number) => (g.stations.get(sid)?.stops ?? []).flatMap((p) => {
+    const e = net.edges.get(p.edge); return e && e.kind === 'road' && (!tram || tramUsable(g, e, owner)) ? [{ e, p }] : [];
+  });
+  // the arrival as the vehicles drive it: the cheapest from either way along a stop of the previous call
+  let arrival: RoadCont[] | null = null, arrivalCost = Infinity;
+  for (const { e, p } of usable(P.id)) for (const dir of [1, -1]) {
+    const here = usable(J.id).find((q) => q.e.id === e.id);
+    // (the next stop on the same street ahead)
+    if (here && (roadS(g, e, here.p.x, here.p.z) - roadS(g, e, p.x, p.z)) * dir > 0.15) {
+      const r = [{ edge: e.id, dir }], c = Math.abs(roadS(g, e, here.p.x, here.p.z) - roadS(g, e, p.x, p.z));
+      if (c < arrivalCost) { arrival = r; arrivalCost = c; }
+      continue;
+    }
+    const r = roadRouteOf(g, e, dir, J.id, tram, owner);
+    if (!r) continue;
+    const c = r.reduce((n, x) => n + (net.edges.get(x.edge)?.len ?? 0), 0);
+    if (c < arrivalCost) { arrival = r; arrivalCost = c; }
+  }
+  if (!arrival) return true;
+  const lane = arrival[arrival.length - 1], e = net.edges.get(lane.edge)!;
+  const at = J.stops.find((p) => p.edge === e.id), next = usable(N.id).find((q) => q.e.id === e.id);
+  if (at && next && (roadS(g, e, next.p.x, next.p.z) - roadS(g, e, at.x, at.z)) * lane.dir > 0.15) return true;
+  const departure = roadRouteOf(g, e, lane.dir, N.id, tram, owner);
+  if (!departure) return true;
+  const came = new Set(arrival.map((c) => c.edge));
+  return !departure.some((c, i) => came.has(c.edge) || (i > 0 && departure[i - 1].edge === c.edge && departure[i - 1].dir === -c.dir));
 }
 
 /**
@@ -912,14 +1048,23 @@ export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJ
     rules.set(key, { owner: v.owner, rule, cars });
   }
   const jname = g.stations.get(junction)?.name ?? '?';
+  // Two lines become one only where the through route runs on the way it came: no reversal at the meeting station and
+  // no running back over the track or road just used (else they stay two lines meeting there).
+  const meets = route.flatMap((s, i) => i > 0 && i < route.length - 1 && meeting.has(s) ? [i] : []);
+  const reverses = `Trains would reverse at ${jname}: lines join straight through only`;
   for (const { owner, rule, cars } of rules.values()) {
     if (cars) {
       const why = lineCompatibility(joinPreviewGame(g, { ...proposed, owner }), proposed.id, cars);
       if (why) return no(why);
     }
     for (const stations of [route, [...route].reverse()]) {
-      const gap = proposed.kind === 'rail' ? railJoinRoute(g, stations, owner, rule) : roadJoinRoute(g, stations, proposed, owner);
+      const through = new Set(meets.map((i) => stations === route ? i : route.length - 1 - i));
+      const rail = proposed.kind === 'rail' ? railJoinRoute(g, stations, owner, rule, through) : null;
+      if (rail?.reverse) return no(proposed.kind === 'rail' ? reverses : `U-turn at ${jname}: lines connect straight through only`);
+      const gap = proposed.kind === 'rail' ? rail?.gap ?? null : roadJoinRoute(g, stations, proposed, owner);
       if (gap) return no(`No ${proposed.kind === 'rail' ? 'track' : proposed.kind === 'tram' ? 'tram track' : 'road'} continuity through ${jname}: ${gap}${cars ? ` (${cars[0]?.name ?? 'train'} cannot run through)` : ''}`);
+      if (proposed.kind !== 'rail' && [...through].some((i) => !roadThrough(g, stations, i, proposed.kind === 'tram', owner)))
+        return no(`U-turn at ${jname}: lines connect straight through only`);
     }
   }
   return { ok: true, junction, reason: null, route, into: keep.id, from: drop.id };
@@ -1013,6 +1158,92 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
       : `${drop.name} connected with ${keep.name} at ${junction.name}; existing runs kept` };
   if (opts.notify !== false) g.postNews(notice.text, 'info', junction.x, junction.z);
   return notice;
+}
+
+/**
+ * The first interior station of an out-and-back line where its vehicles reverse or turn back over the track (or road)
+ * they came by (canJoinLines' through rule), or null: such a line is two lines meeting there (splitLine).
+ */
+export function lineReversal(g: Game, l: Line): number | null {
+  const r = lineRoute(l);
+  if (r.loop || r.turn <= 0 || r.stations.length < 3) return null;
+  const owner = l.owner;
+  // (each interior call with its neighbours, both ways)
+  for (let i = 1; i < r.stations.length - 1; i++) for (const w of [[r.stations[i - 1], r.stations[i], r.stations[i + 1]], [r.stations[i + 1], r.stations[i], r.stations[i - 1]]]) {
+    if (l.kind === 'rail' ? railJoinRoute(g, w, owner, null, new Set([1]))?.reverse
+      : !roadJoinRoute(g, w, l, owner) && !roadThrough(g, w, 1, l.kind === 'tram', owner)) return r.stations[i];
+  }
+  return null;
+}
+
+/**
+ * Split an out-and-back line at an interior station `at` into two lines meeting there (the reverse of joinLines): the
+ * line keeps the stations up to `at` (its name, colour, code and history), a new line of the same owner runs from `at`
+ * on. Each vehicle stays on the half it is running in (by the call it heads for), with its service pattern restricted
+ * to that half; waiting passengers re-route. Only lines without partner operators or manual platforms.
+ */
+export function splitLine(g: Game, a: Line | number, at: number, opts: { notify?: boolean } = {}): { line: Line; part: Line; text: string } | string {
+  const l = typeof a === 'number' ? g.lines.map.get(a) : g.lines.map.get(a.id);
+  if (!l) return 'No such line';
+  const r = lineRoute(l), J = r.stations.indexOf(at);
+  if (r.loop || r.turn <= 0 || J <= 0 || J >= r.stations.length - 1) return 'Not an interior station of an out-and-back line';
+  if (l.operators?.length || l.platforms?.some((p) => p.manual)) return 'Shared line or manual platforms';
+  const first = r.stations.slice(0, J + 1), second = r.stations.slice(J);
+  const oldStops = [...l.stops], patterns = linePatterns(l).map((p) => ({ ...p, stops: [...servedFlags(l, l.patterns?.length ? p : null)] }));
+  const served = (pid: number | undefined) => {
+    const p = patterns.find((q) => q.id === pid) ?? patterns[0];
+    return new Set(oldStops.filter((_, i) => p.stops[i] !== false));
+  };
+  const firstSet = new Set(first), secondSet = new Set(second);
+  // each vehicle: the half its service runs in, else the half it is in now (the call it heads for and its direction)
+  const side = new Map<number, 0 | 1>();
+  for (const vid of l.vehicles) {
+    const v = g.vehicles.get(vid);
+    if (!v) continue;
+    const sv = served(v.pattern);
+    const i = ((v.stopIndex % oldStops.length) + oldStops.length) % oldStops.length, pos = r.stations.indexOf(oldStops[i]), out = i <= r.turn;
+    side.set(vid, [...sv].every((s) => firstSet.has(s)) ? 0 : [...sv].every((s) => secondSet.has(s)) ? 1
+      : pos < J ? 0 : pos > J ? 1 : out ? 0 : 1);
+  }
+  const part = g.lines.create(l.kind, l.owner);
+  const halves: { line: Line; stations: number[]; base: number }[] = [{ line: l, stations: first, base: 0 }, { line: part, stations: second, base: J }];
+  for (const [k, h] of halves.entries()) {
+    const stops = outAndBack(h.stations), m = h.stations.length - 1;
+    // the old service patterns of this half's vehicles, restricted to its stations
+    const pids = [...new Set(l.vehicles.filter((vid) => side.get(vid) === k).map((vid) => g.vehicles.get(vid)?.pattern))];
+    const list: ServicePattern[] = [];
+    for (const pid of pids) {
+      const sv = served(pid), p = patterns.find((q) => q.id === pid) ?? patterns[0];
+      list.push({ id: p.id, name: p.name, kind: p.kind, stops: stops.map((s) => sv.has(s)), ids: [...stops] });
+    }
+    const plain = list.every((p) => p.stops.every(Boolean));
+    for (const vid of l.vehicles) {
+      const v = g.vehicles.get(vid);
+      if (!v || side.get(vid) !== k) continue;
+      const i = ((v.stopIndex % oldStops.length) + oldStops.length) % oldStops.length, pos = r.stations.indexOf(oldStops[i]) - h.base;
+      const out = i <= r.turn && (k === 0 || pos > 0);
+      v.stopIndex = pos <= 0 ? 0 : pos >= m ? m : out ? pos : 2 * m - pos;
+      v.lineId = h.line.id;
+      if (plain) v.pattern = undefined;
+      v.resetSpacing();
+    }
+    h.line.stops = stops;
+    h.line.loop = false;
+    h.line.patterns = plain ? undefined : normalize(h.line, list);
+    if (k === 1) {
+      h.line.vehicles = l.vehicles.filter((vid) => side.get(vid) === 1);
+      h.line.color = l.color; h.line.autoColor = l.autoColor;
+    }
+  }
+  l.vehicles = l.vehicles.filter((vid) => side.get(vid) !== 1);
+  delete l.spacing; delete l.platforms; delete l.joinedName;
+  g.lines.refreshNames();
+  g.lines.rebuild();
+  for (const vid of [...l.vehicles, ...part.vehicles]) g.vehicles.get(vid)?.onLineChanged(true);
+  const st = g.stations.get(at)!;
+  const text = `${l.name} split at ${st.name}: ${part.name} runs on from there`;
+  if (opts.notify !== false) g.postNews(text, 'info', st.x, st.z);
+  return { line: l, part, text };
 }
 
 /** Merge line `b` into line `a` as service pattern(s) (b's route inside a's). */
