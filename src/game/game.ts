@@ -292,10 +292,14 @@ export class Game {
     return name;
   }
 
-  /** Legacy saves infer the city from an owned station before falling back to the stable town allocation. */
-  private initializeHeadquarters() {
+  /**
+   * Legacy saves infer the city from an owned station before falling back to the stable town allocation. `only`: the
+   * companies to settle (a current save keeps a company without headquarters as it was saved: loading must not assign
+   * one, or the reloaded game differs from the running one).
+   */
+  private initializeHeadquarters(only?: Set<number>) {
     for (const co of this.companies) {
-      if (this.headquartersOf(co.id)) continue;
+      if (this.headquartersOf(co.id) || (only && !only.has(co.id))) continue;
       const station = [...this.stations.map.values()].filter(st => st.owner === co.id && this.towns.list.some(t => t.id === st.townId))
         .sort((a, b) => a.id - b.id)[0];
       co.hqTown = station?.townId ?? this.nextHeadquarters()?.id;
@@ -1033,7 +1037,9 @@ export class Game {
     // which metro / light-rail stations stand in town now (their walking reach: stations.ts CITY_STATION)
     this.stations.updateCity();
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
-    if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
+    // (owed population work counts too: a game loaded with work owed has current inputs but pending populations, and
+    // must publish them on the same month as the running game, which still sees its inputs changed)
+    if (this.stations.catchmentInputsChanged() || this.stations.catchmentPopulationPending) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();
     this.deferCatchment = true;
     if (this.economy.money < 0 && m % 3 === 2) this.postNews('Company in debt: borrow or cut costs.', 'info');
@@ -1134,7 +1140,7 @@ export class Game {
 
   /** Restore the AI controllers once stations, lines and vehicles exist (an interrupted project is cleaned up). */
   restoreAIs(d: any) {
-    this.initializeHeadquarters();
+    this.initializeHeadquarters(new Set(((d.companies ?? []) as any[]).filter(c => c?.hqTown === undefined).map(c => c.id)));
     // Only recognized generated names in pre-HQ saves migrate; custom names, station codes and history stay intact.
     for (const co of this.companies) {
       const saved = ((d.companies ?? []) as any[]).find(c => c.id === co.id), hq = this.headquartersOf(co.id);

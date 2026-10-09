@@ -84,12 +84,23 @@ export function presetOf(c: AIConfig): (typeof AI_PRESETS)[number] | undefined {
     && near(p.config.focus.rail, c.focus.rail) && near(p.config.focus.road, c.focus.road) && near(p.config.focus.tram, c.focus.tram));
 }
 
-/** Configurations for a new game's AI companies by style ('mixed' = a different preset each). */
-export function aiConfigsFor(style: string, n: number, startMoney?: number): AIConfig[] {
+/** New-game transport preference of every rival: id, label, tooltip ('any' keeps each style's own focus). */
+export const AI_PREFERENCES: [string, string, string][] = [['any', 'Any', 'Each style’s own mix'], ['rail', 'Rail', 'Railways first'], ['road', 'Bus', 'Town buses and coaches first'], ['tram', 'Tram', 'Trams first']];
+/** Focus multipliers of a preference, on top of the style's focus (company window: the same Rail / Bus / Tram focus). */
+const PREFER_FOCUS: Record<string, AIConfig['focus']> = {
+  rail: { rail: 3, road: 0.35, tram: 0.35 },
+  road: { rail: 0.35, road: 3, tram: 0.6 },
+  tram: { rail: 0.5, road: 0.6, tram: 3 },
+};
+
+/** Configurations for a new game's AI companies by style ('mixed' = a different preset each) and preference. */
+export function aiConfigsFor(style: string, n: number, startMoney?: number, prefer = 'any'): AIConfig[] {
   const mixed = ['balanced', 'rail', 'bus', 'aggressive', 'tram', 'cautious', 'balanced'];
+  const m = PREFER_FOCUS[prefer];
   return Array.from({ length: n }, (_, i) => {
     const preset = (AI_PRESETS.find((p) => p.id === (style === 'mixed' ? mixed[i % mixed.length] : style)) ?? AI_PRESETS[0]).config;
-    return normalizeAIConfig(startMoney === undefined ? preset : { ...preset, startMoney });
+    const focus = m ? { rail: preset.focus.rail * m.rail, road: preset.focus.road * m.road, tram: preset.focus.tram * m.tram } : preset.focus;
+    return normalizeAIConfig({ ...preset, focus, ...(startMoney === undefined ? {} : { startMoney }) });
   });
 }
 

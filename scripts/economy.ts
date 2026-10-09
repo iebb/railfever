@@ -35,28 +35,29 @@ const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=
 // intercity 490.7/155.4 -> 514.9/233.1; busy bus 175.8/101.8 -> 203.6/129.3;
 // short bus 18.2/-15.6 -> 19.2/-14.6; village railway 242.1/-133.2 -> 211.2/-147.1.
 // Fare rates, demand rates, queue limits and the independent balance bands are unchanged.
+// Re-captured after the walks were halved again after 2.9 (stations.ts CATCHMENT_RADIUS) and walkers' trips raised by
+// WALK_TRIP_INTENSITY 3.2 (constants.ts), growth full reach 0.4 -> 0.3 (towns.ts). The helpers' 40-resident site test
+// became 10 (lib.ts: a quarter of the area), so the intercity pair is Weyport-Southmouth now (Oldwood-Coldden fails
+// it), and no village pair connects. Income / net k per year, 2.9 -> now: busy bus 222.2/148 -> 260.3/186.2 (Oldwood
+// 3,762 -> 3,503 after four years), short bus 20.5/-13 -> 25.9/-7.9; intercity (new pair) 543.1/264.2, full-capital
+// payback 32 years. Without the intensity (the preview) the busy bus carried about a third and the economy test crashed.
 const seed7Baseline = {
   "seed": 7,
   "results": [
     {
-      "name": "rail Oldwood-Coldden (104 u track)",
-      "income": 514864.720310897,
-      "net": 233125.12536591495
+      "name": "rail Weyport-Southmouth (75 u track)",
+      "income": 543102.8200669726,
+      "net": 264179.30889596936
     },
     {
       "name": "busy bus in Oldwood (2x Metro Articulated)",
-      "income": 203593.79856282176,
-      "net": 129341.33055072182
+      "income": 260259.79148007563,
+      "net": 186225.60036144755
     },
     {
       "name": "short bus in Oldwood (1x City Liner)",
-      "income": 19209.909479210273,
-      "net": -14586.78717859483
-    },
-    {
-      "name": "village rail Redwell(345)-Southley(237)",
-      "income": 211225.06880188952,
-      "net": -147051.26411279422
+      "income": 25886.964896858295,
+      "net": -7919.658560816406
     }
   ]
 };

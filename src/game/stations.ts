@@ -2,7 +2,7 @@
 // bus / tram stops on road edges, catchment areas per mode, road access and entrances, transfer complexes
 // (stations merged into one, or linked for walking transfers), station names, and rebuilding / relocating.
 import type { Game } from './game';
-import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf } from './constants';
+import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
 import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
@@ -16,12 +16,13 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
-import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, walkClaimShares, type WalkingCatchment } from './catchment';
+import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadSnapshot, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, walkClaimShares, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
 import { stationPose, stationLocal, stationStripRects } from './station-geometry';
 import type { RailStationAlignment, RailTrackGroup, RailTrackStep, StationGeometry } from './station-geometry';
+import type { RegionSnapshot } from './spatial';
 export type { RailTrackGroup, RailTrackStep } from './station-geometry';
 
 /**
@@ -1361,7 +1362,8 @@ export class Stations {
     for (const c of cand) {
       const close = !c.st.rail && c.st.stops.some((q) => rects.some((f) => distToRect(q.x, q.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN));
       if (!plan.join && close) plan.join = c.st;
-      else if (c.gap <= autoLinkRange(rmode, this.mode(c.st)) && c.st.id !== ign && !(ign !== undefined && this.consecutiveStops(ign, c.st.id))) plan.links.push(c.st);
+      else if (c.gap <= Math.min(autoLinkRange(rmode, this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale({ mode: rmode, city: plan.city }), c.st))
+        && c.st.id !== ign && !(ign !== undefined && this.consecutiveStops(ign, c.st.id))) plan.links.push(c.st);
     }
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
@@ -2364,13 +2366,31 @@ export class Stations {
   }
 
   /** Recompute the stations' road access after the network changed (cheap when nothing changed). */
+  /**
+   * Roads walked from the stations changed since the published share-out: compared with the road versions of the
+   * walks it used (not the walk cache's current entries, which reads refresh: a cache-dependent trigger diverged a
+   * loaded game from the running one). A loaded game owes the original's answer until its next share-out (save.ts
+   * catchmentAccessRoads), its walks being rebuilt on loading.
+   */
+  accessRoadsOwed = false;
+  private publishedRoads: RegionSnapshot[] = [];
+  publishedRoadsChanged(): boolean {
+    const roads = this.game.world.net.roadVersions;
+    return this.publishedRoads.some((r) => !roads.unchanged(r));
+  }
+  private publishRoads() {
+    this.accessRoadsOwed = false;
+    const out: RegionSnapshot[] = [];
+    for (const st of this.map.values()) { const r = walkRoadSnapshot(this.game, st); if (r) out.push(r); }
+    this.publishedRoads = out;
+  }
   refreshAccess(force = false) {
     this.game.world.syncCatchmentTerrain();
     const v = this.game.world.net.version;
     if (!force && v === this.accessVersion) return;
     this.accessVersion = v;
     this.walkVersion++;
-    let changed = walkRoadsChanged(this.game);
+    let changed = this.publishedRoadsChanged() || this.accessRoadsOwed;
     const direct = new Map<number, boolean>();
     for (const st of this.map.values()) direct.set(st.id, st.rail ? this.railReachable(st)
       : st.stops.some(s => { const e = this.game.world.net.edges.get(s.edge); return !!e && pedestrianRoad(e); }));
@@ -2440,7 +2460,7 @@ export class Stations {
     // within 80 m of an own rail station's platforms / building / entrances: the stop becomes part of it
     for (const c of near) if (c.st.rail && [...this.platformAreas(c.st), ...this.footprints(c.st)].some((f) => distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN)) { join = c.st; break; }
     if (!join) for (const c of near) if (!c.st.rail && c.st.stops.some((q) => Math.hypot(q.x - p.x, q.z - p.z) < 3)) { join = c.st; break; }
-    for (const c of near) if (c.st !== join && c.gap <= autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st))) links.push(c.st);
+    for (const c of near) if (c.st !== join && c.gap <= Math.min(autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS[e.tram ? 'tram' : 'bus'], c.st))) links.push(c.st);
     return { ok: true, edge: e, s: ne.s, px: p.x, pz: p.z, cost: 30000, join, links, mode: e.tram ? 'tram' : 'bus' };
   }
 
@@ -2533,6 +2553,11 @@ export class Stations {
 
   /** Intermediate transfer reach, distinct from either station's origin/destination walking coverage. */
   linkRange(a: Station, b: Station): number { return transferWalkLimit(this.game, a, b); }
+  /**
+   * linkRange of a planned part with walking radius `radius` and a built station: a plan lists only the passages its
+   * commit can make (canLink), so a preview never promises a transfer the built stop or station will not have.
+   */
+  private planLinkRange(radius: number, st: Station): number { return 0.5 * WALK_DETOUR * Math.min(radius, this.catchmentRadius(st)); }
 
   /** Automatic complexes stay compact: every existing part must be near every part being added. */
   private nearbyComplex(a: Station, b: Station): boolean {
@@ -2559,13 +2584,17 @@ export class Stations {
     return added;
   }
 
-  /** Load migration: retain valid explicit passages and group old nearby rail parts once. No physical assets move. */
+  /**
+   * Load migration: retain valid explicit passages and group old nearby rail parts once. No physical assets move.
+   * A current save (no migration) keeps its passages as the running game has them: a passage made when it was in
+   * range stays when a station's reach later shrinks (railWalkScale), and dropping it only on load diverged the replay.
+   */
   restoreComplexes(autoLink: boolean): boolean {
     let changed = false;
     for (const st of this.map.values()) {
       const kept = st.links.filter(id => {
         const other = this.map.get(id);
-        return !!other && other !== st && this.gap(st, other) <= this.linkRange(st, other);
+        return !!other && other !== st && (!autoLink || this.gap(st, other) <= this.linkRange(st, other));
       });
       if (kept.length !== st.links.length) { st.links = kept; changed = true; }
     }
@@ -3159,7 +3188,7 @@ export class Stations {
       if (members.length) this.shareSt.set(sid, { ids: members.map((m) => m[0]), w: members.map((m) => m[1]) });
       else this.shareSt.delete(sid);
     }
-    this.sharesReady = true; this.catchMaxB = maxB;
+    this.sharesReady = true; this.catchMaxB = maxB; this.publishRoads();
     this.catchInputs = this.currentCatchInputs();
     if (!wasReady || sharesChanged || servedChanged || this.pendingPop.size) this.catchVersion++;
   }
@@ -3223,7 +3252,7 @@ export class Stations {
     this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
     this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
     for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
-    this.pendingPop.clear(); this.pendingInputs = false; this.fullPreparation = null;
+    this.pendingPop.clear(); this.pendingInputs = false; this.fullPreparation = null; this.publishRoads();
     return true;
   }
 
@@ -3380,7 +3409,7 @@ export class Stations {
     // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
     // platforms alone must not invent thousands of waiting passengers.
     const space = st.rail ? st.rail.tracks * st.rail.length * 0.75 : 0;
-    max = Math.max(0, Math.floor(Math.min(max, 300, 12 + st.catchPop * 0.035 + space + st.stops.length * 4)));
+    max = Math.max(0, Math.floor(Math.min(max, 300, 12 + st.catchPop * 0.035 * WALK_TRIP_INTENSITY + space + st.stops.length * 4)));
     if (st.waitingTotal <= max) return;
     const f = max / st.waitingTotal;
     // Largest remainders retain exactly `max` people. Flooring every OD group independently can erase an entire

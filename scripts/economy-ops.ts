@@ -21,7 +21,7 @@ import {
   WAIT_CAP_HEADWAYS, SPEED_MAX, SPEED_MAX_SHORT, SPEED_MIN, fareCalibration,
 } from '../src/game/fares';
 import { estimateCostPerTrainKm, estimateVehicleYear, trackBasePerUnit, YEAR_S, KmCost } from '../src/game/opcosts';
-import { PASSENGER_RATE_SCALE } from '../src/game/constants';
+import { PASSENGER_RATE_SCALE, WALK_TRIP_INTENSITY } from '../src/game/constants';
 import {
   addPattern, setVehiclePattern, canonicalizeLines, linePatterns, patternStops, suggestExpress, patternHeadway,
   HOLD_MAX_S, PLATFORM_PASS_KMH, TRANSFER_PENALTY_S,
@@ -79,7 +79,8 @@ const syn = (id: string, o: Partial<VehicleModel>): VehicleModel => ({ id, name:
 // Small calibrated queues must retain people across many destinations and keep transfer counts bounded.
 {
   const h = flatGame(384), st = station(h, 60, 100, Math.PI / 2, 12, 2)!;
-  st.catchPop = 2000;
+  // (2,000 people's trips: since the walks were halved after 2.9, walkers travel WALK_TRIP_INTENSITY times as often)
+  st.catchPop = 2000 / WALK_TRIP_INTENSITY;
   for (let dest = 0; dest < 200; dest++) h.stations.addWaiting(st, 0, dest, dest, 1, 0, 10, dest % 2);
   h.stations.trimWaiting(st, 1000);
   const groups = [...st.waiting.values()];

@@ -1633,6 +1633,47 @@ export class AIController {
     return out;
   }
 
+  /**
+   * The public-transport market between two towns (trips a year: the OD potential at the coach capture of 25%) and
+   * the riders other services already carry between them (their last month, shared over the town pairs each line
+   * serves). A new service between the same towns can expect the market they leave, not a copy of their riders.
+   */
+  private pairMarket(D: TownDemand, A: number, B: number): { market: number; carried: number } {
+    const g = this.game;
+    let carried = 0;
+    for (const l of g.lines.map.values()) {
+      if (l.owner === this.companyId || l.kind === 'tram' || l.stops.length < 2 || !l.vehicles.length) continue;
+      const towns = new Set(l.stops.map((s) => g.stations.get(s)?.townId ?? -1).filter((t) => t >= 0));
+      if (!towns.has(A) || !towns.has(B)) continue;
+      carried += l.passLast * 12 / Math.max(1, towns.size * (towns.size - 1) / 2);
+    }
+    return { market: D.pair(A, B) * 0.25 * 12, carried };
+  }
+
+  /**
+   * Share of a planned stop's walking residents that no other company's service between the same two towns already
+   * holds: residents within 350 m (straight line) of such a service's stop or station in town T keep using it. A copy
+   * of an established coach or rail service near its stops expects few riders of its own; outer districts stay open.
+   */
+  private freeShare(site: P2, T: Town, other: Town): number {
+    const g = this.game, held: Station[] = [], hold = 35;
+    for (const l of g.lines.map.values()) {
+      if (l.owner === this.companyId || l.kind === 'tram' || l.stops.length < 2 || !l.vehicles.length) continue;
+      const towns = new Set(l.stops.map((s) => g.stations.get(s)?.townId ?? -1));
+      if (!towns.has(T.id) || !towns.has(other.id)) continue;
+      for (const id of l.stops) { const st = g.stations.get(id); if (st && st.townId === T.id) held.push(st); }
+    }
+    if (!held.length) return 1;
+    let all = 0, free = 0;
+    for (const bid of pointWalkingCatchment(g, site.x, site.z, 'bus').buildings.keys()) {
+      const b = g.world.buildings.get(bid);
+      if (!b || !(b.pop > 0)) continue;
+      all += b.pop;
+      if (!held.some((st) => Math.hypot(st.x - b.x, st.z - b.z) <= hold)) free += b.pop;
+    }
+    return all > 0 ? free / all : 0;
+  }
+
   private *chooseProject(): Generator<void, void> {
     const g = this.game, c = this.config, act = c.activeness, focus = c.focus;
     const avail = this.available();
@@ -1817,7 +1858,9 @@ export class AIController {
         if ((served.get(this.pairKey(A.id, B.id)) ?? 0) >= (trips > 300 ? 3 : 2)) continue;
         // two coaches of the year (opcosts / fares estimates, as for the railways)
         const sv = this.serviceYear([coach!], 2, d, d * 1.3, 'road');
-        const carried = Math.min(D.pair(A.id, B.id) * 0.25 * 12 * share(A.id, B.id), sv.seats);
+        // the riders the other services between these towns leave (pairMarket), not a copy of theirs
+        const pm = this.pairMarket(D, A.id, B.id);
+        const carried = Math.min(Math.max(0, pm.market - pm.carried) * share(A.id, B.id), sv.seats);
         const score = roi(carried * sv.perPax, sv.running + 12_000, 700_000);
         opts.push({ score: score * fw(focus.road), kind: 'coach', towns: [A.id, B.id], viable: carried * sv.perPax > sv.running + 12_000 && 700_000 <= avail });
       }
@@ -3132,13 +3175,22 @@ export class AIController {
     }
     if (yield* routeConflictGen(g, prof, 'rail', tracks, exclude, 40, hs)) return fail('route runs along other tracks or roads', 720);
     yield;
-    const e0 = net.nextEdge;
+    const e0 = net.nextEdge, chainWorth = this.eco.netWorth;
     const chain = aiChainGen(g, fAs[0], way, { kind: 'rail', type, tracks, heightOffset: 0, crossing: 'auto', owner, designSpeed: hs ? 180 : undefined, designGrade: hs ? 0.03 : 0.035 }, join ? null : fBs[0], prof);
     let r = chain.next();
     while (!r.done) { this.track(e0); yield; r = chain.next(); }
     this.track(e0);
     const res = r.value;
-    if (!res.ok) return fail('construction failed: ' + (res.error ?? ''), 720);
+    if (!res.ok) {
+      // A route that cannot be completed is rolled back as one transaction (as the network tasks' works are): its
+      // laid pieces come up again and are refunded, removal included, rather than leaving the company in debt for
+      // track it never used.
+      fail('construction failed: ' + (res.error ?? ''), 720);
+      // (net of loan steps the works borrowed, which stay borrowed)
+      const spent = chainWorth - this.eco.netWorth;
+      if (spent > 0) this.eco.spend(-spent, 'construction', true);
+      return;
+    }
     if (join) {
       // the last curve into the junction: a turnout in the station's approach track
       const J = join.J, je = net.edges.get(J.edge);
@@ -3205,6 +3257,9 @@ export class AIController {
       take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60, pair.entries, pair.corridor));
     for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
     for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    // Elevated or underground town approaches leave no ground near either station: a siding on any ground stretch of
+    // the new line serves both, rather than writing off the built railway.
+    for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, Infinity));
     this.track(d0);
     if (dep < 0) return fail('no depot site that serves both stations', 720);
     if (ownDepot) p.depots.push(dep);
@@ -5107,9 +5162,9 @@ export class AIController {
 
   // ---------------------------------------------------------------- long-distance coaches
   /** A stop for coaches in a town: at our rail station (a transfer hub) or on a central street. */
-  private *coachStopGen(T: Town): Generator<void, { x: number; z: number } | null> {
+  private *coachStopGen(T: Town, other?: Town): Generator<void, { x: number; z: number } | null> {
     const g = this.game, owner = this.companyId, net = g.world.net;
-    let best: { x: number; z: number; d: number } | null = null;
+    const cands: { x: number; z: number; d: number }[] = [];
     for (const e of g.towns.streets(T, 2)) {
       if (e.len < 4) continue;
       yield;
@@ -5117,8 +5172,26 @@ export class AIController {
       net.pointAt(e, e.len / 2, q);
       const bp = g.stations.planBusStop(q.x, q.z, owner);
       if (!bp.ok || (bp.join && !(bp.join.owner === owner && bp.join.townId === T.id))) continue;
-      const d = Math.hypot(q.x - T.x, q.z - T.z) - (bp.join?.rail ? 30 : 0);
-      if (!best || d < best.d) best = { x: q.x, z: q.z, d };
+      cands.push({ x: q.x, z: q.z, d: Math.hypot(q.x - T.x, q.z - T.z) - (bp.join?.rail ? 30 : 0) });
+    }
+    cands.sort((a, b) => a.d - b.d);
+    // Residents around another company's served stop already have a service: a stop beside it splits the same
+    // walkers (Stations.buildingShares). Of the central sites, take the one with the most residents of its own.
+    const rival = new Set<number>();
+    for (const st of g.stations.map.values()) {
+      if (st.owner === owner || st.townId !== T.id || !g.lines.stationServed(st.id)) continue;
+      for (const bid of walkingCatchment(g, st).buildings.keys()) rival.add(bid);
+      yield;
+    }
+    if (!rival.size) return cands[0] ?? null;
+    let best: { x: number; z: number; d: number } | null = null, bestScore = -Infinity;
+    for (const c of cands.slice(0, 12)) {
+      yield;
+      let pop = 0;
+      for (const bid of pointWalkingCatchment(g, c.x, c.z, 'bus').buildings.keys()) pop += (g.world.buildings.get(bid)?.pop ?? 0) * (rival.has(bid) ? 0.4 : 1);
+      // (residents an established service to the same town holds: freeShare)
+      const score = pop * (other ? this.freeShare(c, T, other) : 1) * (1 - Math.max(0, c.d) / (2 * T.radius + 20));
+      if (score > bestScore) { bestScore = score; best = c; }
     }
     return best;
   }
@@ -5134,9 +5207,28 @@ export class AIController {
     if (!model) return fail('no coaches available');
     if (!this.roadConnected(A, B)) return fail('no road between the towns', 720);
     yield;
-    const sa = yield* this.coachStopGen(A), sb = yield* this.coachStopGen(B);
+    const sa = yield* this.coachStopGen(A, B), sb = yield* this.coachStopGen(B, A);
     if (!sa || !sb) return fail('no stop sites');
     const cost = 2 * 30_000 + 80_000 + model.cost * 2;
+    // The stops' own walkers, shared with every competing stop and service as the passengers will share them: a copy of
+    // a rival's coach line between the same stops gets its split demand, and does not open when that does not pay.
+    let quoted = 0;
+    {
+      const d = Math.hypot(A.x - B.x, A.z - B.z), sv = this.serviceYear([model], 2, d, d * 1.3, 'road');
+      yield;
+      const sites = [sa, sb].map((s, i) => ({ x: s.x, z: s.z, townId: (i ? B : A).id, walk: pointWalkingCatchment(g, s.x, s.z, 'bus') }));
+      const f = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, owner, undefined, undefined, 'bus');
+      yield;
+      // Competition: the other services between these towns keep their riders (pairMarket); the stops' own forecast
+      // counts only the market they leave.
+      const pm = this.pairMarket(yield* this.townDemand(), A.id, B.id), room = Math.max(0, pm.market - pm.carried);
+      const free = (this.freeShare(sa, A, B) + this.freeShare(sb, B, A)) / 2;
+      yield;
+      const riders = Math.min(f.boardings * free, sv.seats, pm.carried > 0 ? room : Infinity);
+      const revenue = f.revenue * riders / Math.max(1, f.boardings), yearly = sv.running + 12_000 + cost * 0.12;
+      if (revenue < yearly) return fail(`forecast ${Math.round(revenue / 1000)}k/year below ${Math.round(yearly / 1000)}k`, 1080);
+      quoted = revenue;
+    }
     if (cost > this.available() || !this.borrowFor(cost)) return fail('no money', 360);
     this.state.phase = `building coaches ${A.name} - ${B.name}`;
     p.built = true;
@@ -5174,7 +5266,7 @@ export class AIController {
     this.lines.set(line.id, { kind: 'bus', towns: [A.id, B.id], depot: dep, maxVehicles: 4, opened: g.day });
     this.stats.lines++; this.stats.coaches++;
     g.postNews(`${this.name} starts coaches between ${A.name} and ${B.name}.`, 'ai', (A.x + B.x) / 2, (A.z + B.z) / 2);
-    this.note(`opened coach line ${A.name}-${B.name} (${Math.round(Math.hypot(A.x - B.x, A.z - B.z))} u, ${bought} coaches)`);
+    this.note(`opened coach line ${A.name}-${B.name} (${Math.round(Math.hypot(A.x - B.x, A.z - B.z))} u, ${bought} coaches, ${Math.round(quoted / 1000)}k/year quoted)`);
     this.canonical(line.id);
   }
 
@@ -5436,7 +5528,9 @@ export class AIController {
       // a line that lost its stops (track access ended, stations gone): close it (leave it, if it is another's),
       // as we do one we no longer run trains on
       if (new Set(l.stops).size < 2 || (info.kind !== 'rail' && info.joined && !vs.length && g.day - info.opened > 90)) {
-        if (info.kind === 'rail') { this.note(`${l.name}: service suspended until its stations are restored`); continue; }
+        // (trains on another company's railway that closed its network to us: nothing will be restored)
+        const lostAccess = info.shared !== undefined && info.shared !== this.companyId && !g.hasAccess(this.companyId, info.shared);
+        if (info.kind === 'rail' && !lostAccess) { this.note(`${l.name}: service suspended until its stations are restored`); continue; }
         for (const v of vs) { g.vehicles.sell(v.id); this.stats.sold++; }
         if (info.joined) g.lines.leave(lid, this.companyId); else g.lines.delete(lid);
         this.lines.delete(lid);

@@ -9,6 +9,7 @@ import { roadOpts } from './lib';
 import type { Town } from '../src/game/towns';
 import type { Vehicle } from '../src/game/vehicle';
 import type { Station, StationPlan } from '../src/game/stations';
+import { WALK_TRIP_INTENSITY } from '../src/game/constants';
 
 const near = (a: number, b: number) => Math.abs(a - b) < 1e-8;
 const flush = (g: Game) => { g.stations.refreshAccess(true); g.stations.recomputeCatchment(); g.demand.recomputeShares(); };
@@ -40,7 +41,8 @@ check(near(claims.w.reduce((n, w) => n + w, 0), 1), 'one building population is 
 const equal = walkClaimShares([{ group: 1, weight: 1 }, { group: 1, weight: 1 }, { group: 2, weight: 1 }]);
 check(near(equal[0] + equal[1], .5) && near(equal[2], .5), 'equal-distance two-part complex receives half against one rival');
 const mail = g.mail.forecastPops([A, B, rival], 0);
-check(near(mail[0] + mail[1] + mail[2], [h, outer].reduce((n, b) => n + b.pop, 0)), 'mail forecast allocates the union once');
+// (walkers post at WALK_TRIP_INTENSITY since the walks were halved after 2.9: mail.ts allocateMail)
+check(near(mail[0] + mail[1] + mail[2], [h, outer].reduce((n, b) => n + b.pop, 0) * WALK_TRIP_INTENSITY), 'mail forecast allocates the union once');
 check(g.demand.forecastLine([A, B], 'mainline', 50, 120).boardings === 0, 'same-complex physical endpoints do not sell pedestrian trips');
 B.townId = 1;
 check(forecastMailRevenue(g, [A, B], 50, 120, 40) === 0, 'cross-town member metadata cannot sell an internal-complex mail journey'); B.townId = 0;

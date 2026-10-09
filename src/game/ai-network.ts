@@ -58,12 +58,12 @@ import { findRailRoute, railNext, platformWaits, depotReaches, lineCongestion, t
 import type { Train } from './train';
 import { linearStops, outAndBack } from './lines';
 import { planEdge, commitProposal, findSnap } from './construction';
-import { removeEdges, nodeSnap } from './routing';
+import { removeEdges, nodeSnap, stationEnds } from './routing';
 import { terraformBrush } from './build-ops';
 import { BT_TOWER } from './towns';
 import { estimateLegTime, estimateLegFare } from './fares';
 import { fareFor, refTime, tripFactor } from './fares';
-import { TRACK_TYPES, ROAD_TYPES, TRAM, PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE, UNIT_M } from './constants';
+import { TRACK_TYPES, ROAD_TYPES, TRAM, PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE, UNIT_M, WALK_TRIP_INTENSITY } from './constants';
 import type { VehicleModel } from './vehicle-types';
 import { Network } from './network';
 import { findRoadRoute, makeLaneSeg, makeConn } from './roadvehicle';
@@ -109,7 +109,7 @@ interface PatternOps {
   canonicalizeLines?: (g: Game, lineId?: number, opts?: { sameOwnerOnly?: boolean }) => { from: number; into: number; text: string }[];
   subsetOf?: (g: Game, l: Line) => Line | null;
   linePatterns?: (l: Line) => { id: number; kind: string; stops: boolean[] }[];
-  patternHeadways?: (g: Game, l: Line) => { headway: number; cycle: number; vehicles: number }[];
+  patternHeadways?: (g: Game, l: Line) => { pid: number; headway: number; cycle: number; vehicles: number }[];
   canJoinLines?: (g: Game, a: Line | number, b: Line | number) =>
     { ok: false; reason: string } | { ok: true; junction: number; route: number[]; into: number; from: number };
   joinLines?: (g: Game, a: Line | number, b: Line | number, opts?: { notify?: boolean }) =>
@@ -883,7 +883,8 @@ class NetPlanner {
           const path = this.pathOf(l);
           if (!path || !l.vehicles.length || !this.joinAllowed(l)) continue;
           for (const sid of [path[0], path[path.length - 1]]) {
-            const key = `${l.kind}:${sid}`, list = ends.get(key) ?? [];
+            // (termini in one public station: its platform groups count as one terminus)
+            const key = `${l.kind}:${Math.min(...g.stations.complex(sid))}`, list = ends.get(key) ?? [];
             for (const id of list) {
               const a = g.lines.get(id)!;
               if (!this.fleet(a).ours.length && !this.fleet(l).ours.length) continue;
@@ -893,6 +894,8 @@ class NetPlanner {
             list.push(l.id); ends.set(key, list);
           }
         }
+        // joined lines we run whose trains still turn at the old junction: through running once it pays
+        for (const l of g.lines.all()) if (l.vehicles.length && this.joinAllowed(l) && this.turningHalves(l)) pairs.set('through' + l.id, { ids: [l.id] });
         const candidates = [...pairs.values()];
         const indexes = this.inventory(task, candidates.map((_, i) => i), 1, 8);
         return indexes.map((i) => candidates[i.ids[0]]);
@@ -1578,10 +1581,101 @@ class NetPlanner {
     return l.owner !== 0 && this.agrees(l.owner) && (l.owner === this.me || this.g.lines.partnerPolicy(l) === 'open');
   }
 
+  /**
+   * Link two termini of one station complex (separate platform groups, one public station) end to end: the free
+   * platform-track ends facing each other within 40 units, paired nearest first (each platform track of the shorter
+   * group gets its own plain track across, so trains arriving on any of them run on). True if any was laid.
+   */
+  private linkTermini([x, y]: number[]): boolean {
+    const g = this.g, net = g.world.net, X = g.stations.get(x), Y = g.stations.get(y);
+    if (!X?.rail || !Y?.rail || !this.agrees(X.owner) || !this.agrees(Y.owner)) return false;
+    const free = (st: Station) => stationEnds(g, st).flatMap((e) => [e.front, e.back]).filter((id) => net.nodes.get(id)?.edges.length === 1);
+    // (each end must point at the other: away from its own station centre)
+    const out = (n: { x: number; z: number }, st: Station, o: { x: number; z: number }) => (n.x - st.rail!.x) * (o.x - n.x) + (n.z - st.rail!.z) * (o.z - n.z) > 0;
+    const pairs: { a: number; b: number; d: number }[] = [];
+    for (const a of free(X)) for (const b of free(Y)) {
+      const na = net.nodes.get(a)!, nb = net.nodes.get(b)!, d = Math.hypot(na.x - nb.x, na.z - nb.z);
+      if (d < 40 && out(na, X, nb) && out(nb, Y, na)) pairs.push({ a, b, d });
+    }
+    pairs.sort((p, q) => p.d - q.d || p.a - q.a || p.b - q.b);
+    const used = new Set<number>(), plans: Proposal[] = [];
+    for (const c of pairs) {
+      if (used.has(c.a) || used.has(c.b) || c.d > pairs[0].d + 2) continue;
+      const p = planEdge(g, nodeSnap(g, c.a, 'rail'), nodeSnap(g, c.b, 'rail'), { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: this.me });
+      if (!p.ok || !this.proposalConsent(p) || !this.demolitionOk(p.demolish)) continue;
+      used.add(c.a); used.add(c.b); plans.push(p);
+    }
+    if (!plans.length || !this.canSpend(plans.reduce((t, p) => t + p.cost, 0) * 1.2, 0.35)) { this.considered('join.noLink'); return false; }
+    let laid = 0;
+    for (const p of plans) if (!commitProposal(g, p)) laid++;
+    if (!laid) { this.considered('join.noLink'); return false; }
+    this.considered('join.linked');
+    this.note(`linked the platforms of ${X.name} for through running (${laid} track${laid > 1 ? 's' : ''})`);
+    return true;
+  }
+
+  /** Trips a month between the towns of two sets of stations (pairs within one town left out). */
+  private tripsBetween(xs: number[], ys: number[]): number {
+    const g = this.g, seen = new Set<string>();
+    let trips = 0;
+    for (const x of xs) for (const y of ys) {
+      const X = g.stations.get(x), Y = g.stations.get(y);
+      if (!X || !Y || X.townId === Y.townId) continue;
+      const k = [X.townId, Y.townId].sort((a, b) => a - b).join(':');
+      if (seen.has(k)) continue;
+      seen.add(k); trips += this.townTrips(X.townId, Y.townId);
+    }
+    return trips;
+  }
+
+  /**
+   * A joined railway of ours whose trains still turn where its two former lines met: the through pattern, the two
+   * running short services and the stations only each of them calls at. Null otherwise.
+   */
+  private turningHalves(l: Line): { through: number; short: [number, number]; a: number[]; b: number[] } | null {
+    const g = this.g, ps = l.patterns;
+    if (l.kind !== 'rail' || !ps || ps.length < 3) return null;
+    const through = ps.find((p) => p.kind === 'local' && p.stops.length === l.stops.length && p.stops.every(Boolean));
+    if (!through) return null;
+    const pid = (id: number) => { const v = g.vehicles.get(id); return (ps.find((p) => p.id === v?.pattern) ?? ps[0]).id; };
+    const ours = this.fleet(l).ours;
+    if (!ours.length || ours.some((id) => pid(id) === through.id)) return null;
+    const used = ps.filter((p) => p !== through && l.vehicles.some((id) => pid(id) === p.id));
+    if (used.length !== 2) return null;
+    const S = used.map((p) => new Set(l.stops.filter((_, i) => p.stops[i])));
+    const a = [...S[0]].filter((s) => !S[1].has(s)), b = [...S[1]].filter((s) => !S[0].has(s));
+    if (!a.length || !b.length || l.stops.some((s) => !S[0].has(s) && !S[1].has(s)) || [...S[0]].filter((s) => S[1].has(s)).length > 2) return null;
+    return { through: through.id, short: [used[0].id, used[1].id], a, b };
+  }
+
+  /**
+   * Our trains on a joined line move from the two short services to the through one once the trips between the
+   * halves pay for it and the trains of both halves still come as often (each change of trains costs the rider 10%).
+   */
+  private promoteThrough(l: Line): boolean {
+    const g = this.g, h = this.turningHalves(l);
+    if (!h) return false;
+    const trips = this.tripsBetween(h.a, h.b);
+    if (trips < 10 * PASSENGER_RATE_SCALE) { this.considered('join.throughDemand'); return false; }
+    const hw = (PAT.patternHeadways?.(g, l) ?? []).filter((x) => x.pid === h.short[0] || x.pid === h.short[1]);
+    if (hw.length !== 2) return false;
+    const pid = (id: number) => { const v = g.vehicles.get(id); return (l.patterns!.find((p) => p.id === v?.pattern) ?? l.patterns![0]).id; };
+    const others = (p: number) => l.vehicles.filter((id) => g.vehicles.get(id)?.owner !== this.me && pid(id) === p).length;
+    const rate = this.fleet(l).ours.length / Math.max(1, hw[0].cycle + hw[1].cycle);
+    if (hw.some((x) => 1 / (rate + others(x.pid) / x.cycle) > x.headway * 1.1)) { this.considered('join.throughStock'); return false; }
+    for (const id of this.fleet(l).ours) { const v = g.vehicles.get(id); if (v) { v.pattern = h.through; v.onLineChanged(); } }
+    g.lines.rebuild();
+    if (l.owner === this.me) this.signal(l.id);
+    this.bump('netJoined');
+    this.note(`${l.name}: trains run through for ${trips.toFixed(1)} trips a month between its halves`);
+    return true;
+  }
+
   private *joinTask(ids: number[]): Generator<void, void> {
     // Recheck the optional exports each period (old builds / saves can still run the rest of the planner).
     if (!PAT.canJoinLines || !PAT.joinLines || this.cared('join:period')) return;
     const g = this.g, lines = this.selected(g.lines.map.values(), ids).filter((l) => l.vehicles.length && this.pathOf(l));
+    if (lines.length === 1) { if (this.joinAllowed(lines[0]) && this.promoteThrough(lines[0])) this.careFor('join:period', 90); return; }
     let work = 0;
     for (let i = 0; i < lines.length; i++) for (let j = i + 1; j < lines.length; j++) {
       if (++work % 8 === 0) yield;
@@ -1590,8 +1684,11 @@ class NetPlanner {
         || (!this.fleet(a).ours.length && !this.fleet(b).ours.length)) continue;
       const pa = this.pathOf(a), pb = this.pathOf(b);
       if (!pa || !pb || !this.joinAllowed(a) || !this.joinAllowed(b)) continue;
-      const junction = [pa[0], pa[pa.length - 1]].find((s) => s === pb[0] || s === pb[pb.length - 1]);
+      // a shared terminus, or termini that are parts of one public station (a merged complex)
+      const ends = [pb[0], pb[pb.length - 1]];
+      const junction = [pa[0], pa[pa.length - 1]].find((s) => ends.includes(s) || ends.some((e) => g.stations.complex(s).includes(e)));
       if (junction === undefined) continue;
+      const meeting = new Set([junction, ...ends.filter((e) => g.stations.complex(junction).includes(e))]);
       this.considered('join.termini');
       this.careFor(key, 180);
       const operators = [...new Set([...g.lines.operatorsOf(a), ...g.lines.operatorsOf(b)])];
@@ -1604,28 +1701,33 @@ class NetPlanner {
       const own = this.fleet(a).ours.length + this.fleet(b).ours.length;
       const rate = own / Math.max(1, ca + cb);
       const afterA = 1 / (rate + this.fleet(a).others / ca), afterB = 1 / (rate + this.fleet(b).others / cb);
-      if (afterA > ah[0].headway * 1.1 || afterB > bh[0].headway * 1.1) { this.considered('join.stock'); continue; }
-      const check = PAT.canJoinLines(g, a, b);
-      yield;
-      if (!check.ok) { this.considered('join.continuity'); continue; }
-      let trips = 0;
+      const stock = !(afterA > ah[0].headway * 1.1 || afterB > bh[0].headway * 1.1);
       // Trips between the two halves already served via a change still benefit; newTrips would discard them.
-      const seen = new Set<string>();
-      for (const x of pa.filter((s) => s !== junction)) for (const y of pb.filter((s) => s !== junction)) {
-        const X = g.stations.get(x), Y = g.stations.get(y);
-        if (!X || !Y || X.townId === Y.townId) continue;
-        const k = [X.townId, Y.townId].sort((a, b) => a - b).join(':');
-        if (seen.has(k)) continue;
-        seen.add(k); trips += this.townTrips(X.townId, Y.townId);
+      const trips = this.tripsBetween(pa.filter((s) => !meeting.has(s)), pb.filter((s) => !meeting.has(s)));
+      const demand = trips >= 10 * PASSENGER_RATE_SCALE, run = stock && demand;
+      // Two railways meeting end to end with no other line ending there are one line with two services even before
+      // through trains pay: the trains keep their runs (short turns of the joined line) until they do. With through
+      // demand but too few trains for the longer runs, the same: new trains run through (the joined line's default
+      // service), and ours move over once the halves keep their frequency (promoteThrough).
+      // (railways: road services join only to run through, as before)
+      const rail = a.kind === 'rail', alone = rail && [...meeting].every((s) => this.linesAt(s).every((l) => l === a || l === b));
+      if (!run && !(rail && demand) && !alone) { this.considered(demand ? 'join.stock' : 'join.demand'); continue; }
+      let check = PAT.canJoinLines(g, a, b);
+      yield;
+      // Termini of one public station whose platform tracks do not meet: lay the short link between their free ends
+      // (paid by us, with the partner's consent) when there are through trips to carry.
+      if (!check.ok && demand && /continuity/.test(check.reason ?? '') && meeting.size === 2 && this.linkTermini([...meeting])) {
+        yield;
+        check = PAT.canJoinLines(g, a, b);
       }
-      if (trips < 10 * PASSENGER_RATE_SCALE) { this.considered('join.demand'); continue; }
+      if (!check.ok) { this.considered('join.continuity'); continue; }
       const infos = g.ais.map((ai) => ({ ai, map: (ai as unknown as { lines?: Map<number, ManagedLine> }).lines })).map((o) => ({ ...o, info: o.map?.get(check.into) ?? o.map?.get(check.from) }));
       const res = PAT.joinLines(g, a, b, { notify: false });
       if (typeof res === 'string') continue;
       const joined = res.line;
       // The general join primitive preserves short turns. The AI's justified through service uses its local.
       const through = joined.patterns?.find((p) => p.kind === 'local' && p.stops.every(Boolean));
-      for (const vid of joined.vehicles) { const v = g.vehicles.get(vid); if (v?.owner === this.me && through) { v.pattern = through.id; v.onLineChanged(); } }
+      if (run) for (const vid of joined.vehicles) { const v = g.vehicles.get(vid); if (v?.owner === this.me && through) { v.pattern = through.id; v.onLineChanged(); } }
       this.forget(res.from);
       for (const o of infos) if (o.info && o.map) {
         o.map.set(res.into, { ...o.info, towns: [...new Set(check.route.map((s) => g.stations.get(s)?.townId ?? -1).filter((t) => t >= 0))],
@@ -1635,12 +1737,27 @@ class NetPlanner {
       g.lines.rebuild();
       if (joined.kind === 'rail' && joined.owner === this.me) this.signal(joined.id);
       this.careFor('dec' + joined.id, 360); this.careFor('join:period', 90);
-      this.bump('netJoined');
-      this.note(`${res.text}; through running for ${trips.toFixed(1)} trips a month`);
+      this.bump(run ? 'netJoined' : 'netLinesMerged');
+      this.note(run ? `${res.text}; through running for ${trips.toFixed(1)} trips a month` : `${res.text}; trains keep their runs until through trains pay (${trips.toFixed(1)} trips a month)`);
       const st = g.stations.get(junction);
-      this.news(`joins two services at ${st?.name ?? 'their terminus'}: ${joined.kind === 'rail' ? 'trains' : 'vehicles'} run through.`, st?.x, st?.z);
+      this.news(run ? `joins two services at ${st?.name ?? 'their terminus'}: ${joined.kind === 'rail' ? 'trains' : 'vehicles'} run through.`
+        : `makes its lines meeting at ${st?.name ?? 'one terminus'} one line with two services.`, st?.x, st?.z);
       return;
     }
+  }
+
+  /** Today's routed journey between two stations: its rides (walks excluded), how many ride our lines, its cost (s). */
+  private journeyOf(from: number, to: number): { legs: number; own: number; cost: number } {
+    const g = this.g;
+    let h = g.lines.routing.get(from)?.get(to), legs = 0, own = 0;
+    const cost = h?.cost ?? Infinity;
+    for (let guard = 0; h && guard < 12; guard++) {
+      const l = h.line >= 0 ? g.lines.get(h.line) : undefined;
+      if (l) { legs++; if (l.owner === this.me) own++; }
+      if (h.alight === to) break;
+      h = g.lines.routing.get(h.alight)?.get(to);
+    }
+    return { legs: Math.max(1, legs), own: Math.min(own, Math.max(1, legs)), cost };
   }
 
   /** Trips per month between two towns (both ways), from the regional demand model (local and long-distance). */
@@ -1679,10 +1796,13 @@ class NetPlanner {
       const k = sa.townId < sb.townId ? `${sa.townId}:${sb.townId}` : `${sb.townId}:${sa.townId}`;
       if (seen.has(k)) continue;
       const hop = g.lines.nextHop(a, b);
-      // A slow bus / transfer path must not suppress a worthwhile rail connection forever.
+      // A slow bus / transfer path must not suppress a worthwhile rail connection forever. Marginal riders only (as
+      // midconnect): what the faster trip attracts beyond today's riders, less our receipts from them (0.9 a change).
       const distance = Math.hypot(sa.x - sb.x, sa.z - sb.z);
       const time = estimateLegTime(distance, 70, headway, 1.3) + (direct ? 0 : 360);
-      const gain = hop ? hop.cost >= time * 1.4 ? Math.min(0.75, 1 - time / hop.cost) : 0 : 1;
+      const today = hop && hop.cost >= time * 1.4 ? this.journeyOf(a, b) : null;
+      const gain = !hop ? 1 : !today ? 0 : Math.min(0.75, Math.max(0, tripFactor(time, refTime(distance, 0)) / Math.max(1e-6, tripFactor(today.cost, refTime(distance, 0)))
+        - today.own / today.legs * Math.pow(TRANSFER_FARE_FACTOR, today.legs - 1) / (direct ? 1 : TRANSFER_FARE_FACTOR)));
       if (!gain) continue;
       seen.add(k);
       const added = this.townTrips(sa.townId, sb.townId) * gain;
@@ -1876,6 +1996,10 @@ class NetPlanner {
         }
         yield; continue;
       }
+      // A coach of ours between towns our trains now link stop to stop: its riders take the train (same walk, the
+      // faster ride), so the coaches only add running costs. The trains' capacity task covers the extra riders.
+      const train = !f.others && f.ours.length ? this.railCopy(l) : null;
+      if (train) { this.closeLine(l, `its riders take ${train.name} between the same stops`); yield; continue; }
       if (months < 6) continue;
       // partners run it too: they keep it going (and pay their share)
       if (f.others || !f.ours.length) { this.considered('decommission.partnerOrEmpty'); continue; }
@@ -1894,6 +2018,21 @@ class NetPlanner {
       yield;
     }
 
+  }
+
+  /**
+   * A running rail line of ours with a station within 350 m (straight line) of every stop of this intercity road line
+   * (stops in at least two towns): the coach copies the train. Null when none does.
+   */
+  private railCopy(l: Line): Line | null {
+    const g = this.g, stops = [...new Set(l.stops)].map((id) => g.stations.get(id)).filter((st): st is Station => !!st);
+    if (stops.length < 2 || new Set(stops.map((st) => st.townId)).size < 2) return null;
+    for (const m of g.lines.map.values()) {
+      if (m.kind !== 'rail' || m.owner !== this.me || !m.vehicles.length) continue;
+      const at = [...new Set(m.stops)].map((id) => g.stations.get(id)).filter((st): st is Station => !!st);
+      if (stops.every((s) => at.some((st) => Math.hypot(st.x - s.x, st.z - s.z) <= 35))) return m;
+    }
+    return null;
   }
 
   /**
@@ -2104,7 +2243,7 @@ class NetPlanner {
 
   /** Annual revenue per newly covered resident; observations already include the passenger calibration. */
   private residentValue(st: Station): number {
-    const perRes = st.catchPop > 20 && st.pickupLast > 0 ? Math.min(6 * PASSENGER_RATE_SCALE, (12 * st.pickupLast) / st.catchPop) : 2 * PASSENGER_RATE_SCALE;
+    const perRes = st.catchPop > 20 && st.pickupLast > 0 ? Math.min(6 * PASSENGER_RATE_SCALE * WALK_TRIP_INTENSITY, (12 * st.pickupLast) / st.catchPop) : 2 * PASSENGER_RATE_SCALE * WALK_TRIP_INTENSITY;
     let inc = 0, pax = 0;
     for (const l of this.linesAt(st.id)) { inc += l.incomeLast; pax += l.passLast * 12; }
     const fare = pax > 5 && inc > 0 ? Math.min(2000 / PASSENGER_RATE_SCALE, inc / pax) : 300 * PASSENGER_FARE_SCALE;
@@ -2975,7 +3114,11 @@ class NetPlanner {
           towns.add(pair);
           const hop = g.lines.nextHop(x, y), distance = Math.hypot(X.x - Y.x, X.z - Y.z);
           const time = estimateLegTime(distance, kmh, headway, 1.3);
-          const gain = hop ? Math.max(0, Math.min(0.6, (hop.cost - time + 360) / Math.max(1, hop.cost))) : 1;
+          // Marginal riders only: a journey the network already offers keeps its riders, who pay 0.9 a change on our
+          // trains today; the direct service adds what its faster trip attracts and the changes it saves on our legs.
+          const today = hop ? this.journeyOf(x, y) : null;
+          const gain = !today ? 1 : Math.max(0, tripFactor(time, refTime(distance, 0)) / Math.max(1e-6, tripFactor(today.cost, refTime(distance, 0)))
+            - today.own / today.legs * Math.pow(TRANSFER_FARE_FACTOR, today.legs - 1));
           const added = this.townTrips(X.townId, Y.townId) * gain;
           trips += added; revenue += added * 12 * estimateLegFare(distance, kmh, headway, 1, 1.3, true, false, { mode: 'rail' });
         }
@@ -2993,7 +3136,9 @@ class NetPlanner {
         // Incremental income pays for the curve, its upkeep and a real compatible train within our horizon.
         const running = estimateVehicleYear(t.cars, length / Math.max(1, path.length - 1), g.year, 0.4, kmh).total;
         const upkeep = plan.length * (TRACK_TYPES[c.a.edge.type]?.maintPerUnit ?? 300);
-        const foreign = [...A, ...B].filter((p) => p.edge.owner !== me).reduce((n, p) => n + g.edgeMaintenance(p.edge) * g.accessMultiplier(p.edge.owner), 0);
+        // The shared sections' slots are not free on our own track either: the trains of the lines already on them lose
+        // them. Price every section the service uses at the access rate a renter would pay.
+        const foreign = [...A, ...B].reduce((n, p) => n + g.edgeMaintenance(p.edge) * g.accessMultiplier(p.edge.owner), 0);
         const netIncome = revenue - running - upkeep - foreign;
         const capital = plan.cost + t.cars.reduce((n, m) => n + m.cost, 0), horizon = 8 + 12 * this.ai.config.risk;
         if (netIncome <= 0 || capital > netIncome * horizon) { this.considered('midconnect.payback'); continue; }
@@ -4182,7 +4327,8 @@ class NetPlanner {
       // existing parallel tracks; add another platform only when several trains need to pass here.
       const id = yield* this.insertAt(spots, platform, `no station site in ${town?.name ?? 'town'} on ${l.name}`, maxCost, { tracks: l.vehicles.length > 1 ? 2 : 1, mode, accept });
       if (id === -2) { this.careFor('ins' + l.id, 15); continue; }
-      if (id < 0) continue;
+      // (no site fits: each try plans up to 36 sites, and sites seldom open up within months; look again later)
+      if (id < 0) { this.careFor('ins' + l.id, 540); continue; }
       const st = g.stations.get(id)!;
       this.roadAccess(st);
       const served = this.addToLines(id, before);
@@ -4296,14 +4442,23 @@ class NetPlanner {
     const netRevenue = Math.max(0, best.revenue - lines.length * (20_000 + 2 * L * 500));
     const maxCost = networkOptions.interchangeTrips > 0 ? Math.min(3_500_000, netRevenue * 8 / lines.length) : 3_500_000;
     for (const l of lines) {
-      // (clear of the crossing: the station's throats need plain track on both sides)
+      // (clear of the crossing: the station's throats need plain track on both sides; close enough that the two
+      // halts lie within the short transfer walk of an intermediate change, Stations.linkRange)
       const first = made.length ? g.stations.get(made[0]) : undefined;
-      const spots = this.spotsNear(routeOf(l), best.p.x, best.p.z, 30).filter((sp) => sp.d >= L / 2 + 7 && (!first || this.spotGap(sp, first) > 4)).slice(0, 14);
-      // (a halt: one platform track on single track; the second within walking range of the first)
-      const accept = first ? (p: OnTrackPlanLike) => !!p.station && this.planGap(p.station, first) <= 12 : undefined;
+      const spots = this.spotsNear(routeOf(l), best.p.x, best.p.z, 30).filter((sp) => sp.d >= L / 2 + 5 && (!first || this.spotGap(sp, first) > 4)).slice(0, 14);
+      // (a halt: one platform track on single track; the second within walking range of the first: the transfer
+      // reach of the pair, Stations.linkRange, less a margin for the built platform geometry)
+      const reach = first ? Math.min(12, g.stations.linkRange(first, first) - 0.5) : 12;
+      const accept = first ? (p: OnTrackPlanLike) => !!p.station && this.planGap(p.station, first) <= reach : undefined;
       const id = yield* this.insertAt(spots, L, `no interchange site ${where}`, maxCost, { accept });
       if (id < 0) break;
       made.push(id);
+    }
+    // An interchange one of the lines cannot reach on foot is a halt nobody changes at: take it up again.
+    if (made.length && made.length < lines.length) {
+      for (const id of made) g.stations.removeStation(id);
+      this.note(`interchange ${where} given up: no second platform within the transfer walk`);
+      return;
     }
     if (!made.length) return;
     // a second line not on our track: our station is linked to theirs only if within walking range; else ours alone
@@ -4361,7 +4516,7 @@ class NetPlanner {
       const d = Math.hypot(a.x - b.x, a.z - b.z), walk = Math.min(1, d / 25);
       let x = 0;
       for (const [q, cov] of D.coverageSnapshot(b, false)) for (const [r, sr] of shares) if (r < n && q < n) x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
-      return a.catchPop * TRIPS_PER_MONTH * x * localTripMultiplier(g, a, 'rail', 1);
+      return a.catchPop * WALK_TRIP_INTENSITY * TRIPS_PER_MONTH * x * localTripMultiplier(g, a, 'rail', 1);
     };
     for (const x of new Set(as)) for (const y of new Set(bs)) {
       const A = g.stations.get(x), B = g.stations.get(y);

@@ -14,6 +14,7 @@ import type { NEdge } from '../src/game/network';
 import { railModeOf, railPartMode, planStationUpgrade, commitStationUpgrade, CATCHMENT_RADIUS } from '../src/game/stations';
 import { networkProfile, networkOptions, NETWORK_WORK_UNITS, networkDaily, saveNetwork, loadNetwork, midLineCrossovers, subsetLinePairs, networkPlanner, runNetworkTask, routeBetween, roadRouteBetween } from '../src/game/ai-network';
 import type { AIController } from '../src/game/ai';
+import { pickCoach } from '../src/game/ai';
 import type { Station } from '../src/game/stations';
 import type { Town } from '../src/game/towns';
 import { emptyRecord } from '../src/game/economy';
@@ -25,10 +26,10 @@ import { nodeSnap } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { MODELS } from '../src/game/vehicle-types';
 import { RoadVehicle, makeLaneSeg } from '../src/game/roadvehicle';
-import { outAndBack } from '../src/game/lines';
+import { outAndBack, type Line } from '../src/game/lines';
 import { canJoinLines, patternHeadways } from '../src/game/patterns';
 import * as Patterns from '../src/game/patterns';
-import { closestOnPolyline } from '../src/game/geom';
+import { closestOnPolyline, bezLine } from '../src/game/geom';
 import { aiWorld, sidingEdges } from './networks';
 import { fails, check, fmt, checkReservations, connectDouble, build, free, railOpts, roadOpts, edgeSnapAt, nodeNear, busStopSites, addBusStop, roadDepotNear, depotBehind } from './lib';
 import { station, endNode, newTrack, loco, depotFor, runTrains } from './stationlib';
@@ -428,15 +429,21 @@ function joinChecks() {
       }
     }
     check(canJoinLines(g, a, b).ok, 'join: stock and the whole corridor are compatible');
-    runNetworkTask(ai, 'join');
-    check(!stat(ai, 'netJoined'), 'join: no through demand leaves services alone');
-    fixtureFlows(g, [A, H, B], 8); g.day += 181;
     if (shared) {
       g.ais[1].config.accessPolicy = 'ask'; g.refreshAccess();
       runNetworkTask(ai, 'join');
-      check(!stat(ai, 'netJoined') && g.lines.map.size === 2, 'join: closed access prevents a joint service');
+      check(!stat(ai, 'netJoined') && !stat(ai, 'netLinesMerged') && g.lines.map.size === 2, 'join: closed access prevents a joint line');
       g.ais[1].config.accessPolicy = 'open'; g.refreshAccess(); g.day += 181;
     }
+    // The user's request (pic 2): lines connected end to end are one line with two services. Without through demand
+    // every train keeps its run, as a short turn of the one line (before: the two lines were left alone).
+    runNetworkTask(ai, 'join');
+    const one = [...g.lines.map.values()][0];
+    const runs = (l: Line) => l.vehicles.map((id) => l.patterns?.find((p) => p.id === g.vehicles.get(id)?.pattern) ?? l.patterns?.[0]);
+    console.log(`  no through demand: ${g.lines.map.size} line(s), services ${(one.patterns ?? []).map((p) => p.name).join(' | ')}`);
+    check(!stat(ai, 'netJoined') && stat(ai, 'netLinesMerged') === 1 && g.lines.map.size === 1 && runs(one).every((p) => !!p && !p.stops.every(Boolean)) && new Set(runs(one).map((p) => p?.id)).size === 2,
+      'join: without through demand the two lines become one line with two services; every train keeps its run');
+    fixtureFlows(g, [A, H, B], 8); g.day += 181;
     for (const id of new Set([me, other])) g.company(id).economy.money = 3_000_000;
     const cash = g.company(me).economy.money;
     runNetworkTask(ai, 'join');
@@ -465,6 +472,76 @@ function joinChecks() {
       && [...new Set([me, other])].every((id) => { const c = g.company(id); return c.economy.money > 1_000_000 && c.economy.loan <= c.economy.maxLoan && !c.defunct; }),
       'join: through trains route both ways and both companies keep healthy cash reserves');
     check(netReservations(g).length === 0, 'join: reservations remain consistent');
+  }
+}
+
+/**
+ * Pic 2 of the user's report: two lines end to end at one public station whose two platform groups (one company's
+ * each) do not share track. The planner lays the short link and joins them: one line, the through service and the
+ * two former services kept as short turns.
+ */
+function joinComplexChecks() {
+  console.log('join: termini in one station complex are linked and joined into one line');
+  const { g, ai, me } = aiFlat();
+  const other = g.addAICompany({ accessPolicy: 'open' }).id;
+  g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 10_000_000;
+  const A = station(g, 35, 128, Math.PI / 2, 10, 2, me)!, H1 = station(g, 116, 128, Math.PI / 2, 10, 2, me)!;
+  const H2 = station(g, 130, 128, Math.PI / 2, 10, 2, other)!, B = station(g, 221, 128, Math.PI / 2, 10, 2, other)!;
+  check(!!A && !!H1 && !!H2 && !!B, 'join complex: four stations placed');
+  const linked = g.stations.complex(H1.id).includes(H2.id) ? null : g.stations.link(H1.id, H2.id);
+  check(linked === null, `join complex: the two platform groups form one public station${linked ? ': ' + linked : ''}`);
+  let first = g.world.net.nextEdge;
+  build(g, nodeSnap(g, endNode(g, A, 0, true), 'rail'), nodeSnap(g, endNode(g, H1, 0, false), 'rail'), railOpts(me, 2), 'A-H1');
+  finishDoubleTrack(g, newTrack(g, first, me), me);
+  first = g.world.net.nextEdge;
+  build(g, nodeSnap(g, endNode(g, H2, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(other, 2), 'H2-B');
+  finishDoubleTrack(g, newTrack(g, first, other), other);
+  // our trains on both halves (the far half over the partner's open-access track and platforms)
+  const a = lineWithTrain(g, me, [A, H1], A), b = lineWithTrain(g, me, [H2, B], B);
+  const why = canJoinLines(g, a, b);
+  check(!why.ok && /continuity/.test(why.ok ? '' : why.reason), `join complex: no track joins the platform groups yet (${why.ok ? 'joinable' : why.reason})`);
+  fixtureFlows(g, [A, H1, B], 8);
+  H2.townId = H1.townId;
+  g.day += 181;
+  const edges = g.world.net.edges.size, cash = g.company(me).economy.money;
+  runNetworkTask(ai, 'join');
+  const l = g.lines.map.get(a) ?? g.lines.map.get(b);
+  const route = l ? [...new Set(l.stops)] : [];
+  console.log(`  joined ${stat(ai, 'netJoined')}, lines ${g.lines.map.size}, route ${route.map((id) => g.stations.get(id)?.name).join(' - ')}, patterns ${(l?.patterns ?? []).map((p) => p.name).join(' | ')}, link ${g.world.net.edges.size - edges} edge(s), ${fmt((cash - g.company(me).economy.money) / 1000, 0)}k`);
+  check(stat(ai, 'netJoined') === 1 && g.lines.map.size === 1 && route.join(',') === [A.id, H1.id, H2.id, B.id].join(','), 'join complex: one line runs A - H - H - B');
+  check(g.world.net.edges.size > edges && routes(g, A, B, me), 'join complex: a short link connects the platform groups, trains route through');
+  const pats = l?.patterns ?? [];
+  const served = (p: { stops: boolean[] }) => l!.stops.filter((_, i) => p.stops[i]);
+  check(pats.some((p) => p.stops.every(Boolean)) && pats.some((p) => !served(p).includes(B.id)) && pats.some((p) => !served(p).includes(A.id)),
+    'join complex: the through service and both former services are patterns of the one line');
+  startFleet(g, l ? l.vehicles.map((id) => g.vehicles.get(id)!) : []);
+  const visited = new Map((l?.vehicles ?? []).map((id) => [id, new Set<number>()]));
+  for (const until = g.day + 200; g.day < until;) { g.stepTick(); for (const [id, s] of visited) s.add(g.vehicles.get(id)!.opLastSt); }
+  check([...visited].filter(([id]) => g.vehicles.get(id)?.owner === me).every(([, s]) => s.has(A.id) && s.has(B.id)), 'join complex: our trains run through both platform groups to both ends');
+  check(netReservations(g).length === 0, 'join complex: reservations remain consistent');
+}
+
+/** Pic 1: a coach of ours that copies our railway stop to stop is wound down; one with stops of its own stays. */
+function railCopyChecks() {
+  console.log('decommission: our coach copying our railway stop to stop is closed');
+  for (const near of [true, false]) {
+    const { g, ai, me } = aiFlat(320);
+    const A = station(g, 60, 150, Math.PI / 2, 10, 2, me)!, B = station(g, 240, 150, Math.PI / 2, 10, 2, me)!;
+    check(straightTrack(g, endNode(g, A, 0, true), endNode(g, B, 0, false), me), 'rail copy: fixture track');
+    lineWithTrain(g, me, [A, B], A);
+    const opts = roadOpts(-1, 'road', { town: true, straight: true }), off = near ? 14 : 60;
+    build(g, free(g, 40, 150 + off), free(g, 260, 150 + off), opts, 'coach road');
+    const sa = g.stations.get(addBusStop(g, 62, 150 + off, me))!, sb = g.stations.get(addBusStop(g, 238, 150 + off, me))!;
+    fixtureFlows(g, [A, B], 20);
+    sa.townId = A.townId; sb.townId = B.townId;
+    const l = g.lines.create('road', me); l.stops = [sa.id, sb.id]; g.lines.rebuild();
+    const depot = roadDepotNear(g, 50, 150 + off, me);
+    check(depot >= 0 && typeof g.vehicles.buyRoad(depot, pickCoach(g.year)!, l.id) !== 'string', 'rail copy: fixture coach bought');
+    g.day += 400;
+    runNetworkTask(ai, 'decommission');
+    const open = g.lines.map.has(l.id);
+    console.log(`  stops ${off} units from the stations: coach line ${open ? 'kept' : 'closed'}${ai.log.length ? '; ' + ai.log.slice(-1).join('') : ''}`);
+    check(near ? !open && !l.vehicles.some((id) => g.vehicles.get(id)) : open, near ? 'rail copy: the coach beside our stations is closed and its coaches sold' : 'rail copy: a coach serving other streets stays');
   }
 }
 
@@ -658,6 +735,16 @@ function midConnectionChecks() {
     if (!path.every((sid) => visited.has(sid))) console.log('midconnect train diagnostics', through.stops, g.vehicles.trains().map((t) => ({ id: t.id, line: t.lineId, state: t.state, status: t.status, station: t.atStation, target: t.routeTarget, stuck: t.stuckTime, by: t.blockedBy, depot: t.depotId, segs: t.segs.map((s) => s.e), pending: t.pending.map((s) => s.e) })), [...g.world.net.nodes.values()].filter((n) => n.signal).map((n) => [n.id, n.x, n.z, n.signal, n.signalKind]));
     check(checkReservations(g).length === 0, 'midconnect: train reservations remain consistent');
     if (mode === 'shared') check([...g.world.net.edges.values()].some((e) => e.owner === other && e.kind === 'rail'), 'midconnect: partner retains its infrastructure ownership');
+    if (mode !== 'own') continue;
+    // X layout: two crossing lines and their junction curves must not grow into every combination of termini. A further
+    // combination is worth only its marginal riders: journeys the existing services already carry with a change pay
+    // 0.9 per change today, and the new trains take slots on the shared sections.
+    g.aiEnabled = true;
+    for (let round = 0; round < 4; round++) { g.day += 200; runNetworkTask(ai, 'midconnect'); }
+    const termini = (l: Line) => { const p = [...new Set(l.stops)]; return [p[0], p[p.length - 1]].sort((x, y) => x - y).join(':'); };
+    const combos = new Set(g.lines.all().filter((l) => l.kind === 'rail' && l.owner === me).map(termini));
+    console.log(`  midconnect X: ${g.lines.all().length} lines (${[...combos].join(', ')}), ${stat(ai, 'netMidConnections')} connections; ${ai.log.slice(-3).join('; ')}`);
+    check(combos.size <= 3, `midconnect X: two crossing lines keep at most one combination service (${combos.size} distinct services)`);
   }
 }
 
@@ -722,7 +809,8 @@ function xlinkBusyFixture(each = 2) {
   g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 30_000_000;
   const R = station(g, 100, 100, 0, 10, 2, other, { style: 'none' })!, S = station(g, 100, 320, 0, 10, 2, other)!;
   check(!!build(g, nodeSnap(g, endNode(g, R, 0, true), 'rail'), nodeSnap(g, endNode(g, S, 0, false), 'rail'), railOpts(other), 'red line'), 'xlink busy: red railway built');
-  const T = station(g, 118, 112, Math.PI / 2, 10, 2, me, { style: 'none' })!, Y = station(g, 330, 112, Math.PI / 2, 10, 2, me)!;
+  // (T beside R's end: within the short transfer walk of an intermediate change, Stations.linkRange)
+  const T = station(g, 110, 110, Math.PI / 2, 10, 2, me, { style: 'none' })!, Y = station(g, 330, 110, Math.PI / 2, 10, 2, me)!;
   check(!!build(g, nodeSnap(g, endNode(g, T, 0, true), 'rail'), nodeSnap(g, endNode(g, Y, 0, false), 'rail'), railOpts(me), 'blue line'), 'xlink busy: blue railway built');
   for (const st of [R, S, T, Y]) connectStationThroat(g, st.id, st.owner);
   const red = g.lines.get(lineWithTrain(g, other, [R, S], R))!, blue = g.lines.get(lineWithTrain(g, me, [Y, T], Y))!;
@@ -731,7 +819,8 @@ function xlinkBusyFixture(each = 2) {
     check(typeof g.vehicles.buyTrain(depot, loco(), l.id) !== 'string', 'xlink busy: a second train on each line');
   }
   townFlows(g, [[Y], [T, R], [S]], 240);
-  g.stations.link(T.id, R.id);
+  const walk = T.links.includes(R.id) ? null : g.stations.link(T.id, R.id);
+  check(!walk, 'xlink busy: blue and red linked for walking transfers' + (walk ? ': ' + walk : ''));
   return { g, ai, me, other, R, M2: null as Station | null, S, T, M1: null as Station | null, Y, W: null as Station | null, red, blue };
 }
 
@@ -752,7 +841,11 @@ function xlinkChecks() {
       if (mode === 'player') check(player() === before, 'xlink player: the player\'s track and nodes are untouched');
       // (full single track: no room for red's own train beside the direct one, and its fees cannot make up the riders
       // it would lose: no consent, counting no train that could not run)
-      if (mode === 'busy') check((networkProfile.decisions['xlink.consent'] ?? 0) > refused, 'xlink busy: red refuses a link that would take its riders when it could run no train of its own on it');
+      // Since the intermediate transfer walk was halved after 2.9 (73.5 m here), today's change at T/R is quick and
+      // frequent: the direct trains no longer pay blue ('demand': net <= 0 after the receipts it keeps today) before
+      // red's consent is asked. Either refusal is the economics working; no link is checked above.
+      if (mode === 'busy') check((networkProfile.decisions['xlink.consent'] ?? 0) > refused || (networkProfile.decisions['xlink.demand'] ?? 0) > 0,
+        'xlink busy: red refuses, or the direct trains do not pay once riders change on foot ' + JSON.stringify(Object.fromEntries(Object.entries(networkProfile.decisions).filter(([k]) => k.startsWith('xlink')))));
       continue;
     }
     check(stat(ai, 'netXLinks') === 1 && !!joint, `xlink ${mode}: the networks are linked and a direct service runs across (${JSON.stringify(Object.fromEntries(Object.entries(networkProfile.decisions).filter(([k]) => k.startsWith('xlink'))))})`);
@@ -1016,11 +1109,78 @@ function worksReplayChecks() {
   check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), 'station works: exact replay through a saved possession');
 }
 
+/**
+ * Coach market: two towns joined by a country road, each a small street grid with residents round its centre. With a
+ * rival's coach line already running between the town centres, our coaches between the same towns would split its
+ * riders beside its stops: the job is declined before anything is spent. Without the rival, the same job opens.
+ */
+function coachMarketChecks() {
+  console.log('coach market: no near-duplicate of a rival\'s coach line');
+  const street = (g: Game, x0: number, z0: number, x1: number, z1: number, type = 'street') => {
+    const net = g.world.net, a = net.nearestNode(x0, z0, 0.01, 'road') ?? net.addNode('road', x0, 3, z0, 0, 0, -1);
+    const b = net.nearestNode(x1, z1, 0.01, 'road') ?? net.addNode('road', x1, 3, z1, 0, 0, -1);
+    const len = Math.hypot(x1 - x0, z1 - z0);
+    net.addEdge('road', a.id, b.id, bezLine(x0, z0, x1, z1), new Float32Array(Math.ceil(len) + 1).fill(3), [], type, -1);
+  };
+  const place = (g: Game, x: number, z: number, name: string) => {
+    const t = fixtureTown(g, x, z, 0, 24);
+    t.name = name;
+    const xs = [-16, -8, 0, 8, 16].map((d) => x + d), zs = [-16, -8, 0, 8, 16].map((d) => z + d);
+    for (const rz of zs) for (let i = 1; i < xs.length; i++) street(g, xs[i - 1], rz, xs[i], rz);
+    for (const rx of xs) for (let i = 1; i < zs.length; i++) street(g, rx, zs[i - 1], rx, zs[i]);
+    for (const rz of zs) for (let rx = x - 14; rx < x + 16; rx += 4) { fixtureResidents(g, t, rx, rz + 1.2, 40); t.pop += 40; }
+    return t;
+  };
+  for (const rival of [true, false, 'rail'] as const) {
+    const { g, ai, me } = aiFlat(384);
+    const A = place(g, 80, 192, 'Westcombe'), B = place(g, 260, 192, 'Eastcombe');
+    street(g, 96, 192, 244, 192, 'road');
+    g.demand.rebuild(); g.stations.recomputeCatchment?.();
+    let railStations: Station[] = [];
+    if (rival === 'rail') {
+      // the user's pic 1: a rival railway between the two towns, its stations at the edge of each
+      const other = g.addAICompany({ accessPolicy: 'open' }).id;
+      g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 50_000_000;
+      const SA = station(g, 80, 168, Math.PI / 2, 10, 2, other)!, SB = station(g, 260, 168, Math.PI / 2, 10, 2, other)!;
+      check(!!SA && !!SB && straightTrack(g, endNode(g, SA, 0, true), endNode(g, SB, 0, false), other), 'coach market: rival railway built');
+      lineWithTrain(g, other, [SA, SB], SA);
+      railStations = [SA, SB];
+      for (let d = 0; d < 60; d++) { const day = g.day; while (g.day === day) g.stepTick(); }
+    } else if (rival) {
+      const other = g.addAICompany({ accessPolicy: 'open' }).id;
+      g.ais[1].state.cooldown = 1e9; g.company(other).economy.money = 50_000_000;
+      const sa = addBusStop(g, 82, 192, other), sb = addBusStop(g, 262, 192, other), depot = roadDepotNear(g, 84, 196, other);
+      const l = g.lines.create('road', other); l.stops = [sa, sb]; g.lines.rebuild();
+      for (let i = 0; i < 2; i++) {
+        const v = depot >= 0 && sa >= 0 && sb >= 0 ? g.vehicles.buyRoad(depot, pickCoach(g.year)!, l.id) : `depot ${depot}, stops ${sa} ${sb}`;
+        check(typeof v !== 'string', 'coach market: rival coaches bought' + (typeof v === 'string' ? ': ' + v : ''));
+      }
+      for (let d = 0; d < 60; d++) { const day = g.day; while (g.day === day) g.stepTick(); }
+    }
+    const money = g.company(me).economy.money, lines = g.lines.all().length;
+    g.aiEnabled = true;
+    for (const c of g.ais) c.state.cooldown = 1e9;
+    check(ai.startProject('coach', [A.id, B.id]), 'coach market: coach project starts');
+    for (let i = 0; ai.busy && i < 40000; i++) g.stepTick();
+    const ours = g.lines.all().filter((l) => l.owner === me && l.kind === 'road');
+    console.log(`  ${rival === 'rail' ? 'rival railway' : rival ? 'rival running' : 'no rival'}: ${ours.length} coach line(s); ${ai.log.slice(-1).join('')}`);
+    if (rival === 'rail') {
+      // a coach may serve the districts the railway leaves, never both of its stations' doorsteps
+      const copies = ours.filter((l) => l.stops.every((id) => { const st = g.stations.get(id)!; return railStations.some((r) => Math.hypot(r.x - st.x, r.z - st.z) < 30); }));
+      console.log(`    stops ${ours.flatMap((l) => l.stops.map((id) => { const st = g.stations.get(id)!; return Math.min(...railStations.map((r) => Math.hypot(r.x - st.x, r.z - st.z))).toFixed(0); })).join('/')} units from the rival's stations`);
+      check(!copies.length, 'coach market: no coach line copying the rival\'s railway beside both of its stations');
+    } else if (rival) check(!ours.length && g.lines.all().length === lines && g.company(me).economy.money === money, 'coach market: no copy of the rival\'s coach line beside its stops, nothing spent');
+    else check(ours.length === 1, 'coach market: the same coaches open where no rival runs');
+  }
+}
+
 export function scenarios() {
   networkOptions.enabled = false;
   if (process.argv[3] === 'xlink') { xlinkChecks(); networkOptions.enabled = true; return; }
-  roadChecks(); joinChecks(); stationPairChecks(); reviewChecks();
-  midConnectionChecks(); xlinkChecks(); railPatienceChecks(); worksReplayChecks();
+  // (the duplicate / end-to-end checks of the user's two screenshots on their own)
+  if (process.argv[3] === 'copies') { joinComplexChecks(); railCopyChecks(); coachMarketChecks(); networkOptions.enabled = true; return; }
+  roadChecks(); joinChecks(); joinComplexChecks(); railCopyChecks(); stationPairChecks(); reviewChecks();
+  midConnectionChecks(); xlinkChecks(); railPatienceChecks(); worksReplayChecks(); coachMarketChecks();
   // 1. pairing: two lines leave a station on its two platform tracks, side by side for 60 units, then part
   {
     console.log('pair: two single tracks side by side become one double track');

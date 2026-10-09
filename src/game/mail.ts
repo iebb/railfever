@@ -17,7 +17,7 @@ import type { Hop, Line } from './lines';
 import type { Town } from './towns';
 import { RNG } from './rng';
 import { GEN_RATE, type ForecastSite } from './demand';
-import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE } from './constants';
+import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE, WALK_TRIP_INTENSITY } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
 import { boarding, servesStation, patternHeadways, linePatterns, mailFleet, TRANSFER_PENALTY_S } from './patterns';
 import { readWalkingCatchment, planWalkingCatchment, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, type WalkingCatchment } from './catchment';
@@ -541,7 +541,8 @@ function allocateMail(g: Game, sites: AllocSite[]): Map<number, number> {
     if (!b || b.pop <= 0) continue;
     const list = reach.get(bid)!;
     const shares = walkClaimShares(list.map(([key, weight]) => ({ group: groups.get(key)!, weight })));
-    const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1);
+    // (walkers post at WALK_TRIP_INTENSITY, as they travel: the shorter walks after 2.9; the feeders below do not)
+    const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * WALK_TRIP_INTENSITY;
     list.forEach(([key], i) => out.set(key, (out.get(key) ?? 0) + mail * shares[i]));
   }
   // mail feeders: the town's buildings no site reaches on foot, by road from the railway stations with frequent mail

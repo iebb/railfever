@@ -2014,13 +2014,35 @@ function plainAround(g: Game, e0: NEdge, owner: number, reach: number): { steps:
  * tracks fan into the station tracks with smooth turnouts (on double track each line track feeds the station
  * tracks on its side, so one-way running continues). The track must be straight and level for the platforms.
  */
+/** Other rails running alongside this point of the track (within four track spacings, roughly parallel). */
+function parallelTracks(g: Game, e: NEdge, s: number): number {
+  const net = g.world.net, p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 }, q = { x: 0, y: 0, z: 0 }, dq = { x: 0, y: 0, z: 0 };
+  net.pointAt(e, Math.max(0, Math.min(e.len, s)), p, d);
+  const dl = Math.hypot(d.x, d.z) || 1, R = 6.4, offsets = new Set<number>();
+  for (const c of net.edgesNear(p.x - R, p.z - R, p.x + R, p.z + R)) {
+    if (c.id === e.id || c.kind !== 'rail' || c.a === e.a || c.a === e.b || c.b === e.a || c.b === e.b) continue;
+    const ne = net.nearestEdge(p.x, p.z, R, 'rail', (x) => x.id === c.id);
+    if (!ne || ne.d < 0.3) continue;
+    net.pointAt(c, ne.s, q, dq);
+    if (Math.abs((dq.x * d.x + dq.z * d.z) / ((Math.hypot(dq.x, dq.z) || 1) * dl)) <= 0.98) continue;
+    // (one running track can be several edges here: count each lateral offset once)
+    offsets.add(Math.round(((q.x - p.x) * d.z - (q.z - p.z) * d.x) / dl / 0.4));
+  }
+  return offsets.size;
+}
+
 export function planStationOnTrack(g: Game, edgeId: number, s: number, o: OnTrackOpts, owner: number): OnTrackPlan {
   const net = g.world.net;
   const plan: OnTrackPlan = { ok: true, warnings: [], cost: 0, owner, station: null, mains: [], feeds: [], feedTrack: [], throat: [] };
   const fail = (m: string) => { plan.ok = false; plan.error = m; return plan; };
   const e = net.edges.get(edgeId);
   if (!e || e.kind !== 'rail') return fail('No track here');
-  if (o.rebuildTrack !== true || o.reuseTrack || e.owner !== owner) return planNativeStationOnTrack(g, edgeId, s, o, owner);
+  // A station wider than the running tracks is laid around them and keeps them: the rebuild layout, unless asked not
+  // to. A single track gains a passing loop or through tracks; double track becomes the through tracks between new
+  // platforms. Over three or more running tracks (or no widening) every one stays as it is (the native layout).
+  const alongside = o.rebuildTrack === undefined ? parallelTracks(g, e, s) : -1;
+  const widens = alongside === 0 && ((o.tracks ?? 1) > 1 || (o.through ?? 0) > 0) || alongside === 1 && (o.through ?? 0) > 0;
+  if ((o.rebuildTrack !== true && !widens) || o.reuseTrack || e.owner !== owner) return planNativeStationOnTrack(g, edgeId, s, o, owner);
   if (e.station >= 0 || e.depot >= 0) return fail('Already a station or depot track');
   const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(o.mode ?? e.type)));
   const reach = L / 2 + 30;

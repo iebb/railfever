@@ -23,7 +23,7 @@ import { runNetworkTask, networkDaily, networkPlanner, saveNetwork, loadNetwork 
 import type { AIController } from '../src/game/ai';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { RoadVehicle } from '../src/game/roadvehicle';
-import { PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE } from '../src/game/constants';
+import { PASSENGER_RATE_SCALE, PASSENGER_FARE_SCALE, WALK_TRIP_INTENSITY } from '../src/game/constants';
 import { demolitionCost } from '../src/game/demolition';
 import { addBusStop, fails } from './lib';
 import { flatGame, station, endNode, loco, depotFor, check, build, railOpts, nodeSnap, done } from './stationlib';
@@ -55,11 +55,19 @@ function clearOfEverything(g: G, st: Station): string | null {
   const plat = { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length };
   const rects = r.entrances.flatMap((e, i) => entranceLandings(e).map((p) => ({ i, rect: landingRect(entranceKind('ground', e), p) })));
   for (const { i, rect } of rects) {
-    if (rectsOverlap(rect, plat, 0)) return `entrance ${i} overlaps the track area`;
-    if (rectsOverlap(rect, r.building, 0)) return `entrance ${i} overlaps the station building`;
+    // (an underground or elevated station's street entrances stand over or under its track area by design, and its
+    // first entrance stands for its building: stations.ts)
+    const ground = (r.level ?? 'ground') === 'ground', standsFor = i === 0 && !ground;
+    if (ground && rectsOverlap(rect, plat, 0)) return `entrance ${i} overlaps the track area`;
+    if (!standsFor && rectsOverlap(rect, r.building, 0)) return `entrance ${i} overlaps the station building`;
     for (const e of net.edgesNear(rect.x - 3, rect.z - 3, rect.x + 3, rect.z + 3)) {
       const geo = net.geo(e), hw = net.halfWidth(e);
-      for (let k = 0; k < geo.n; k++) if (distToRect(geo.pts[k * 3], geo.pts[k * 3 + 2], rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < hw - 0.06) return `entrance ${i} stands on ${e.kind} ${e.id}`;
+      for (let k = 0; k < geo.n; k++) {
+        const px = geo.pts[k * 3], py = geo.pts[k * 3 + 1], pz = geo.pts[k * 3 + 2];
+        // (a street entrance stands over a tunnel or under a viaduct, never on it)
+        if (Math.abs(py - g.world.heightAt(px, pz)) > 0.5) continue;
+        if (distToRect(px, pz, rect.x, rect.z, rect.angle, rect.w / 2, rect.d / 2) < hw - 0.06) return `entrance ${i} stands on ${e.kind} ${e.id}`;
+      }
     }
     for (const o of rects) if (o.i !== i && rectsOverlap(rect, o.rect, 0)) return `entrances ${i} and ${o.i} overlap`;
   }
@@ -78,7 +86,8 @@ function fixture(owner = 0) {
   road(50, 99.2, 142, 99.2); // south: the building's street
   road(50, 93.9, 142, 93.9); // north: beside the track area
   const north: number[] = [], south: number[] = [];
-  for (let x = 60; x <= 132; x += 4) { north.push(house(g, x, 92.3, 0).id); south.push(house(g, x, 100.6, Math.PI).id); }
+  // (houses every 2 units, 4 before the walks were halved after 2.9: as many within an entrance's shorter reach)
+  for (let x = 60; x <= 132; x += 2) { north.push(house(g, x, 92.3, 0).id); south.push(house(g, x, 100.6, Math.PI).id); }
   const S = station(g, 96, 96, Math.PI / 2, 10, 2, owner)!;
   return { g, S, north, south };
 }
@@ -118,7 +127,8 @@ function fixture(owner = 0) {
       if (i >= 0) live += loaded.world.buildings.get(id)!.pop * shares.w[i];
     }
     // Fixture has no observed pickups or income: the planner's fixed default annual value per resident.
-    const perResident = 2 * PASSENGER_RATE_SCALE * 300 * PASSENGER_FARE_SCALE * 1.5;
+    // (walkers travel WALK_TRIP_INTENSITY times as often since the walks were halved after 2.9)
+    const perResident = 2 * PASSENGER_RATE_SCALE * WALK_TRIP_INTENSITY * 300 * PASSENGER_FARE_SCALE * 1.5;
     const valued = ((best.gain + plan.cost) / (5 + 5 * ai.config.risk) + ENTRANCE_TYPES[plan.kind].upkeep) / perResident;
     console.log(`  entrance residents: valued ${valued}, live ${live}`);
     check(live > 0 && Math.abs(valued - live) < 1e-8, 'entrance resident valuation equals live best coverage and relative walking weights');
@@ -428,8 +438,9 @@ function aiFixture() {
   const road = streets(g);
   road(30, 99.2, 150, 99.2); road(30, 93.9, 150, 93.9);
   const north: number[] = [];
-  for (let x = 74; x <= 118; x += 4) north.push(house(g, x, 92.3, 0, 60).id);
-  for (let x = 74; x <= 118; x += 4) house(g, x, 100.6, Math.PI, 30);
+  // (houses every 2 units, 4 before the walks were halved after 2.9)
+  for (let x = 74; x <= 118; x += 2) north.push(house(g, x, 92.3, 0, 60).id);
+  for (let x = 74; x <= 118; x += 2) house(g, x, 100.6, Math.PI, 30);
   const H = station(g, 96, 96, Math.PI / 2, 10, 2, me)!, B = station(g, 160, 96, Math.PI / 2, 10, 2, me)!;
   build(g, nodeSnap(g, endNode(g, H, 0, true), 'rail'), nodeSnap(g, endNode(g, B, 0, false), 'rail'), railOpts(me), 'H-B');
   const l = g.lines.create('rail', me);
@@ -466,6 +477,11 @@ const stat = (ai: AIController, k: string) => (ai.stats as unknown as Record<str
   // nothing newly reached: no entrance
   const { g: g2, ai: ai2, H: H2 } = aiFixture();
   for (const id of [...g2.world.buildings.keys()]) if (g2.world.buildings.get(id)!.z < 96) g2.world.removeBuilding(id);
+  // (and the south houses beyond the forecourt's walk: since the walks were halved after 2.9 an entrance could newly
+  // reach those)
+  flush(g2);
+  const reached2 = walkingCatchment(g2, H2).buildings;
+  for (const id of [...g2.world.buildings.keys()]) if (!reached2.has(id)) g2.world.removeBuilding(id);
   flush(g2);
   runNetworkTask(ai2, 'capacity');
   check(stat(ai2, 'netEntrances') === 0 && H2.rail!.entrances.length === 0, 'no residents across the tracks: the AI adds no entrance');
