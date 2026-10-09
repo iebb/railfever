@@ -15,10 +15,11 @@ import { unloadMail, loadMail, fixMail, type MailLeg } from './mail';
  * Passengers aboard, by boarding stop / drop-off / destination. `day`: game day they boarded (older saves);
  * `t0`: sim time (s) they started waiting at the boarding stop (the leg's time = wait + ride); `transfers`: the changes
  * of vehicle they made earlier on this journey, in all (transfers / count each: each change takes 10% off the leg
- * ending in it and every later leg); `rail`: their rail fares so far (fares.ts railHistory). Groups never mix
- * different fare histories or change classes (fares.ts fareGroupKey).
+ * ending in it and every later leg); `rail`: their rail fares so far (fares.ts railHistory); `ic`: 1 for an inter-city
+ * trip, absent for a city trip (fares.ts setFlag). Groups never mix different fare histories, change classes or demand
+ * sets (fares.ts fareGroupKey).
  */
-export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number }
+export interface CargoGroup { alight: number; dest: number; count: number; from: number; day: number; t0?: number; transfers?: number; rail?: number; ic?: number }
 /**
  * Mail aboard, by loading station / drop-off / destination / origin (key from:alight:dest:o): `count` units
  * (MAIL_UNIT_T) and their journey (mail.ts MailJourney: origin `o`, its distance `od` to the destination, posting time
@@ -31,7 +32,7 @@ export function cargoGroups(groups: Iterable<CargoGroup>): Map<string, CargoGrou
   const out = new Map<string, CargoGroup>();
   for (const c of groups) {
     if (c.rail !== undefined) c.rail = railHistory(c.rail) || undefined;
-    const base = fareGroupKey(c.from, c.alight, c.dest, c.rail ?? 0, changeClass(c.transfers, c.count));
+    const base = fareGroupKey(c.from, c.alight, c.dest, c.rail ?? 0, changeClass(c.transfers, c.count), c.ic ?? 0);
     let key = base;
     for (let i = 1; out.has(key); i++) key = base + ':' + i;
     out.set(key, c);
@@ -224,7 +225,7 @@ export abstract class Vehicle {
         // changing here: they wait for their next leg, each with one change of vehicle more
         const rail = railHistory(mode === 'rail' ? before + distanceFare(dist) : before);
         const changes = (chargedChange ? 1 : 0) + (c.count > 0 ? Math.max(0, c.transfers ?? 0) / c.count : 0);
-        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n * changes, rail));
+        if (hop) g.lines.distribute(hop, c.count, (line, n) => g.stations.addWaiting(st, line, hop.alight, c.dest, n, 0, now, n * changes, rail, c.ic ?? 0));
       }
       moved += c.count;
       this.load -= c.count;
@@ -256,7 +257,7 @@ export abstract class Vehicle {
     // a mail-only vehicle takes no passengers; its call still counts as service (town growth: Station.lastCall)
     if (this.mailOnly) { st.lastCall = g.day; return 0; }
     // load: passengers for stops this vehicle's pattern serves (and for which it is a service worth taking)
-    let picked = 0;
+    let picked = 0, inter = 0;
     if (line) {
       const may = boarding(g, line, this.pattern, this.stopIndex, st.id);
       // the wait a leg counts: at most WAIT_CAP_HEADWAYS of this service's headway (a backlog is lost demand)
@@ -276,22 +277,28 @@ export abstract class Vehicle {
         if (wg.transfers) wg.transfers = Math.max(0, wg.transfers - tr);
         st.waitingTotal -= take;
         if (wg.count <= 0) st.waiting.delete(k); else partial = true;
-        const ck = fareGroupKey(st.id, wg.alight, wg.dest, wg.rail ?? 0, changeClass(tr, take));
+        const ic = wg.ic ?? 0, ck = fareGroupKey(st.id, wg.alight, wg.dest, wg.rail ?? 0, changeClass(tr, take), ic);
         const cg = this.cargo.get(ck);
         if (cg) {
           cg.day = (cg.day * cg.count + g.day * take) / (cg.count + take);
           cg.t0 = ((cg.t0 ?? now) * cg.count + t0 * take) / (cg.count + take);
           cg.transfers = (cg.transfers ?? 0) + tr;
           cg.count += take;
-          if (fareGroupKey(cg.from, cg.alight, cg.dest, cg.rail ?? 0, changeClass(cg.transfers, cg.count)) !== ck) stale = true;
-        } else this.cargo.set(ck, wg.rail ? { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr, rail: wg.rail }
-          : { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr });
+          if (fareGroupKey(cg.from, cg.alight, cg.dest, cg.rail ?? 0, changeClass(cg.transfers, cg.count), cg.ic ?? 0) !== ck) stale = true;
+        } else {
+          const c: CargoGroup = wg.rail ? { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr, rail: wg.rail }
+            : { alight: wg.alight, dest: wg.dest, count: take, from: st.id, day: g.day, t0, transfers: tr };
+          if (ic) c.ic = 1;
+          this.cargo.set(ck, c);
+        }
         this.load += take;
         picked += take;
+        if (ic) inter += take;
       }
       if (partial) g.stations.rekeyWaiting(st);
       if (stale) this.cargo = cargoGroups(this.cargo.values());
       line.passMonth += picked;
+      if (inter) line.icPassMonth = (line.icPassMonth ?? 0) + inter;
     }
     st.pickupMonth += picked;
     st.lastPickup = g.day;

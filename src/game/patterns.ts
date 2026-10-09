@@ -928,6 +928,8 @@ export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJ
 /** Current/previous accounting periods are the line's history; keep both when combining services. */
 function mergeLineStats(a: Line, b: Line) {
   a.passMonth += b.passMonth; a.passLast += b.passLast;
+  if (b.icPassMonth) a.icPassMonth = (a.icPassMonth ?? 0) + b.icPassMonth;
+  if (b.icPassLast) a.icPassLast = (a.icPassLast ?? 0) + b.icPassLast;
   a.incomeYear += b.incomeYear; a.incomeLast += b.incomeLast;
   a.costYear += b.costYear; a.costLast += b.costLast;
   if (b.mail) mergeLineMail(a, b);
@@ -939,7 +941,7 @@ function redirectWaiting(g: Game, from: number, into: number) {
     if (![...st.waiting.values()].some((w) => w.line === from)) continue;
     const old = [...st.waiting.values()];
     st.waiting.clear(); st.waitingTotal = 0;
-    for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+    for (const w of old) g.stations.addWaiting(st, w.line === from ? into : w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
   }
   redirectMail(g, from, into);
 }

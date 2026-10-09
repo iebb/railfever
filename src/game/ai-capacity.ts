@@ -8,6 +8,7 @@ import { capacityRouteBetween as routeBetween, capacityTopologyKey } from './rai
 import { linearStops } from './lines';
 import { patternOf, patternStops, patternHeadways, nextStopIndex, lineRoute, isLoopLine } from './patterns';
 import { fareFor, estimateLegTime, tripFactor, refTime } from './fares';
+import { plannedSet } from './demand';
 import { estimateVehicleYear, YEAR_S, trackBasePerUnit } from './opcosts';
 import { KMH_TO_UPS, TRACK_TYPES, RAIL, UNIT_M } from './constants';
 import { railPartMode } from './stations';
@@ -65,7 +66,7 @@ function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
   const key = `${c.line.id}:${c.line.owner}:${c.native!.path.join(',')}:${stock}:${kmh}:${headway}`;
   const old = memo.quotes.get(key); if (old) return old;
   const sites = c.native!.path.map(id => g.stations.get(id)!);
-  const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id);
+  const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id, undefined, 'rail', plannedSet(g, sites));
   const value = { revenue: f.revenue, boardings: f.boardings, peak: Math.max(1, ...f.legLoads) };
   if (memo.quotes.size >= 256) memo.quotes.clear();
   memo.quotes.set(key, value); return value;
@@ -181,7 +182,9 @@ function demand(g: Game, l: Line, cycle: number) {
   let distance = 1;
   for (const a of sites) for (const b of sites) distance = Math.max(distance, Math.hypot(a!.x - b!.x, a!.z - b!.z));
   const trains = fleet(g, l), kmh = Math.max(20, Math.min(100, ...trains.map(t => t.maxSpeedKmh * 0.6)));
-  const forecast = g.demand.forecastLine(sites as NonNullable<typeof sites[number]>[], sites[0]?.rail ? railPartMode(sites[0].rail) : 'mainline', kmh, cycle / Math.max(1, trains.length), l.owner, l.id);
+  const stations = sites as NonNullable<typeof sites[number]>[];
+  const forecast = g.demand.forecastLine(stations, sites[0]?.rail ? railPartMode(sites[0].rail) : 'mainline', kmh, cycle / Math.max(1, trains.length), l.owner, l.id,
+    undefined, 'rail', plannedSet(g, stations));
   const ride = estimateLegTime(distance, kmh, 0), seconds = estimateLegTime(distance, kmh, cycle / Math.max(1, trains.length));
   const fare = fareFor(distance, seconds, 1, { mode: 'rail' });
   let lost = 0;

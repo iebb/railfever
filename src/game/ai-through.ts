@@ -21,6 +21,7 @@ import { bezFromTangents, bezDeriv, tAtS } from './geom';
 import { SAVE_TREES, type Tree } from './world';
 import { railPartMode } from './stations';
 import { platformChoices } from './rail-platforms';
+import { plannedSet } from './demand';
 
 /** Local native turnout survey supplied by the existing two-network planner. */
 export interface ThroughLink {
@@ -215,7 +216,9 @@ export function quoteThrough(h: ThroughHost, ls: Line[], path: number[], cars: V
   const plans = prepared ?? links.map(s => h.plan(s)); if (plans.some(p => !p || !reversible(p))) return null;
   const speedCap = Math.min(Infinity, ...plans.map(p => curveSpeed(p!.minRadius, 'standard')));
   const service = cycle(g, cars, edges.legs, speedCap), kmh = service.kmh;
-  const forecast = g.demand.forecastLine(path.map(id => g.stations.get(id)!), 'mainline', kmh, service.seconds, h.me);
+  // (the through service and the lines it joins, on the demand the through service is planned on)
+  const on = plannedSet(g, path.map(id => g.stations.get(id)!));
+  const forecast = g.demand.forecastLine(path.map(id => g.stations.get(id)!), 'mainline', kmh, service.seconds, h.me, undefined, undefined, 'rail', on);
   const factor = forecastSeatFactor(forecast.legLoads, service.seconds, 1, cars.reduce((n, m) => n + m.capacity, 0));
   let oldReceipts = 0, lostLocal = 0, releasedRunning = 0;
   for (const l of ls.filter(l => l.owner === h.me)) {
@@ -227,7 +230,7 @@ export function quoteThrough(h: ThroughHost, ls: Line[], path: number[], cars: V
       const kept = services.filter(s => s && s.t.id !== without).map(s => s!), frequency = kept.reduce((n, s) => n + 1 / s.cost.seconds, 0);
       if (!frequency) return 0;
       const kmh = kept.reduce((n, s) => n + s.cost.kmh, 0) / kept.length;
-      const f = g.demand.forecastLine(p.map(id => g.stations.get(id)!), 'mainline', kmh, 1 / frequency, h.me, l.id);
+      const f = g.demand.forecastLine(p.map(id => g.stations.get(id)!), 'mainline', kmh, 1 / frequency, h.me, l.id, undefined, 'rail', on);
       const seats = kept.reduce((n, s) => n + s.t.capacity * YEAR_S / s.cost.seconds * .7, 0);
       return f.revenue * Math.min(1, seats / Math.max(1, ...f.legLoads));
     };

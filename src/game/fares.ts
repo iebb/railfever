@@ -135,12 +135,23 @@ export function simNow(g: Game): number { return (g.day + g.dayFrac) * DAY_SECON
 export function railHistory(rail: number | undefined): number { return Math.min(RAIL_FARE.minimum, Math.max(0, rail ?? 0)); }
 
 /**
- * Waiting (line) or cargo (boarding stop) identity. Different rail histories cannot share a fare minimum, nor
- * different changes of vehicle so far (`changes`: changeClass) a transfer reduction.
+ * The two sets of passenger demand (demand.ts): city trips (origin and destination in one town) and inter-city trips
+ * (between towns). A passenger keeps the set of the trip from generation to arrival, through every change.
  */
-export function fareGroupKey(lineOrFrom: number, alight: number, dest: number, rail = 0, changes = 0): string {
+export type DemandSet = 'city' | 'intercity';
+/** Set flag of a waiting or cargo group (`ic`): 1 for an inter-city trip, absent (0) for a city trip. */
+export const setFlag = (set: DemandSet): 0 | 1 => (set === 'intercity' ? 1 : 0);
+/** The demand set of a waiting or cargo group. */
+export const groupSet = (g: { ic?: number }): DemandSet => (g.ic ? 'intercity' : 'city');
+
+/**
+ * Waiting (line) or cargo (boarding stop) identity. Different rail histories cannot share a fare minimum, nor
+ * different changes of vehicle so far (`changes`: changeClass) a transfer reduction, nor city and inter-city trips
+ * (`ic`: setFlag) their statistics.
+ */
+export function fareGroupKey(lineOrFrom: number, alight: number, dest: number, rail = 0, changes = 0, ic = 0): string {
   const key = lineOrFrom + ':' + alight + ':' + dest, r = railHistory(rail), c = Math.min(CHANGE_CLASSES, Math.max(0, Math.round(changes)));
-  return (r ? key + ':rail:' + r : key) + (c ? ':x' + c : '');
+  return (r ? key + ':rail:' + r : key) + (c ? ':x' + c : '') + (ic ? ':i' : '');
 }
 
 const clamp = (x: number, a: number, b: number) => (x < a ? a : x > b ? b : x);

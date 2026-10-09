@@ -11,7 +11,7 @@ import type { Line } from '../game/lines';
 import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES, TRAM, KMH_TO_UPS } from '../game/constants';
-import { fmtLen, fmtPct, fmtAccessFactor, fmtMail, fmtMailLoad, stationShowsMail } from './format';
+import { fmtLen, fmtPct, fmtAccessFactor, fmtMail, fmtMailLoad, stationShowsMail, fmtSets } from './format';
 import { mailByTown, mailLostShare } from '../game/mail';
 import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
@@ -110,7 +110,7 @@ export function openStation(ui: UI, id: number) {
               ? h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => { ui.tools.roadType = 'street'; ui.tools.setTool('road'); const f = g.stations.forecourt(s); ui.centerOn(f?.x ?? s.x, f?.z ?? s.z, 30); ui.toast('Connect forecourt to road network', 'info'); } }, icon('road', 15), 'Build access road')
               : h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => startEntrance(ui, s.id) }, icon('entrance', 15), 'Add entrance'))) : null,
         !mine && s.owner >= 0 ? accessRows(ui, s.owner, s, () => { win.last = undefined; render(); }) : null,
-        ui.kv('New passengers', `${fmtInt(s.genLast)} last month`),
+        ui.kv('New passengers', `${fmtSets(s.genLast, s.icGenLast)} last month`),
         ui.kv('Boarded · arrived', `${fmtInt(s.pickupLast)} · ${fmtInt(s.arrivedLast)}`),
         ui.kv('Gave up waiting', h('span', {
           class: s.lostLast > 0 ? 'neg' : '',
@@ -128,12 +128,13 @@ export function openStation(ui: UI, id: number) {
       );
     } else if (win.tab === 'waiting') {
       const byDest = new Map<number, number>();
-      for (const wg of s.waiting.values()) byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count);
+      let inter = 0;
+      for (const wg of s.waiting.values()) { byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count); if (wg.ic) inter += wg.count; }
       const sorted = [...byDest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14);
       const towns = stationDemand(g, s.id).slice(0, 6);
       // mail: one destination station per town, so by town is the whole picture (the lines it waits for as dots)
       const mail = stationShowsMail(g, s) ? mailByTown(g, s.id) : [];
-      add(win.body, section('Waiting by destination town', `${fmtInt(s.waitingTotal)} total`));
+      add(win.body, section('Waiting by destination town', s.waitingTotal > 0 ? fmtSets(s.waitingTotal, inter) : `${fmtInt(s.waitingTotal)} total`));
       if (!sorted.length) add(win.body, h('div', { class: 'pad' }, mail.length ? 'No passengers are waiting here.' : 'Nobody is waiting here.'));
       else {
         add(win.body, h('div', { class: 'list' }, towns.map((e) => h('div', { class: 'row' },
@@ -214,6 +215,7 @@ export function openTown(ui: UI, id: number) {
         tile(sv.stations ? fmtPct(sv.transported) : '—', 'Transported', '', bar(sv.stations ? sv.transported : 0)),
         growth),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
+      town.passGenLast > 0 && town.icGenLast !== undefined ? ui.kv('Departing', fmtSets(town.passGenLast, town.icGenLast)) : null,
       ui.kv('Gave up waiting', h('span', { class: lost > 0 ? 'neg' : '' }, `${fmtInt(lost)} last month`)),
       // (Town.mail exists from the town's first mail on)
       town.mail ? ui.kv('Mail last month', `${fmtMail(town.mail.postedLast)} posted · ${fmtMail(town.mail.deliveredLast)} delivered`) : null,
@@ -243,7 +245,8 @@ function demandRows(ui: UI, id: number): HTMLElement | null {
   const pairs = d.pairs.filter((p) => p.a === id || p.b === id).slice(0, 4);
   const demandOn = ui.mapModes.mode === 'demand';
   return h('div', null,
-    ui.kv('Trip demand', h('span', null, `${fmtInt(t.potential)} / month · `, h('span', { style: `color:${hexCss(servedColor(share))}` }, `${fmtPct(share)} served`))),
+    ui.kv('Trip demand', h('span', { 'data-tip': `City ${fmtPct(t.localServed)} served · inter-city ${fmtPct(t.intercityServed)}` },
+      `${fmtSets(t.potential, t.intercity)} / mo · `, h('span', { style: `color:${hexCss(servedColor(share))}` }, `${fmtPct(share)} served`))),
     ui.kv('Coverage', `${fmtPct(t.served)} of residents near a served station`),
     section('Top destinations', h('button', { class: 'btn sm' + (demandOn ? ' on' : ''), onclick: () => ui.mapModes.toggle('demand') }, icon('demand', 15), 'Demand view')),
     pairs.length ? h('div', { class: 'list' }, pairs.map((p) => {

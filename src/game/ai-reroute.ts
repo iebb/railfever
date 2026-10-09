@@ -15,6 +15,7 @@ import { estimateVehicleYear, trackBasePerUnit, trackMaintenance, YEAR_S } from 
 import { TRACK_TYPES, UNIT_M } from './constants';
 import { forecastMailRevenue } from './ai-mail';
 import { demolitionCost } from './demolition';
+import { plannedSet } from './demand';
 
 export type RerouteHost = Pick<GrowHost, 'g' | 'me' | 'ai' | 'note' | 'news' | 'considered' | 'succeed' | 'cared' | 'careFor'
   | 'canSpend' | 'affordable' | 'managed' | 'setStops' | 'signal' | 'consent' | 'demolitionOk' | 'compensate'>
@@ -143,8 +144,10 @@ function value(h: RerouteHost, l: Line, path: number[], after: (Station | Statio
   const g = h.g, fleet = l.vehicles.map(id => g.vehicles.get(id) as Train), old = fleet.map(t => service(t.cars, oldLengths, g.year, oldSpeeds)), next = fleet.map(t => service(t.cars, newLengths, g.year, newSpeeds));
   const before = path.map(id => g.stations.get(id)!), oldRate = old.reduce((n, s) => n + 1 / s.cycle, 0), newRate = next.reduce((n, s) => n + 1 / s.cycle, 0);
   const oldHeadway = 1 / oldRate, headway = 1 / newRate, kmh = (lengths: number[], cycles: typeof old, rate: number) => lengths.reduce((n, x) => n + x, 0) * UNIT_M / 1000 / (cycles.length / rate / 3600);
-  const f0 = g.demand.forecastLine(before, 'mainline', kmh(oldLengths, old, oldRate), oldHeadway, h.me, l.id);
-  const f1 = g.demand.forecastLine(after, 'mainline', kmh(newLengths, next, newRate), headway, h.me, l.id);
+  // (both routes on one demand set: demand.ts plannedSet)
+  const on = plannedSet(g, [...before, ...after]);
+  const f0 = g.demand.forecastLine(before, 'mainline', kmh(oldLengths, old, oldRate), oldHeadway, h.me, l.id, undefined, 'rail', on);
+  const f1 = g.demand.forecastLine(after, 'mainline', kmh(newLengths, next, newRate), headway, h.me, l.id, undefined, 'rail', on);
   const carried = (f: typeof f0, cycles: typeof old) => f.revenue * Math.min(1, cycles.reduce((n, s) => n + YEAR_S / s.cycle * s.seats * .7, 0) / Math.max(1, ...f.legLoads));
   const gross = carried(f0, old), opened = h.managed()?.get(l.id)?.opened ?? g.day;
   const observed = g.day - opened >= 360 && gross > 0 ? Math.min(1, Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / gross) : .5;

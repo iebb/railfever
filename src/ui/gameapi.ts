@@ -37,7 +37,7 @@ export function mailDemandView(v: MailView): DemandView {
   return {
     towns: v.towns.map((t) => ({
       id: t.id, x: t.x, z: t.z, pop: t.pop, potential: t.potential, served: t.share, stations: t.stations,
-      generated: 0, transported: 0, local: 0, localServed: 0,
+      generated: 0, transported: 0, local: 0, localServed: 0, intercity: t.potential, intercityServed: t.share,
     })),
     pairs: v.pairs.map((p) => ({ a: p.a, b: p.b, dist: p.dist, potential: p.potential, served: p.share, mine: 0 })),
     regions: [], flows: [], maxPotential: v.maxPotential,

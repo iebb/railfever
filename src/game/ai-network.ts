@@ -4504,10 +4504,10 @@ class NetPlanner {
   }
 
   /**
-   * Trips a month and yearly revenue newly possible between two sets of stations in one town: the local demand from
-   * each station's walking regions to the regions the other set's stations cover (the regional OD model, as passenger
-   * generation shares it out, with the town's rail uplift), both ways, for station pairs routing serves badly or not
-   * at all today; each such journey makes a change of lines (TRANSFER_FARE_FACTOR).
+   * Trips a month and yearly revenue newly possible between two sets of stations in one town: the city demand from
+   * each station's walking regions to the regions of the town the other set's stations cover (the regional OD model,
+   * as passenger generation shares it out, with the town's rail uplift), both ways, for station pairs routing serves
+   * badly or not at all today; each such journey makes a change of lines (TRANSFER_FARE_FACTOR).
    */
   private cityTrips(as: number[], bs: number[], headway = 900): { trips: number; revenue: number } {
     const g = this.g, D = g.demand, n = D.regions.length, od = D.od;
@@ -4518,7 +4518,7 @@ class NetPlanner {
       if (!shares || !(a.catchPop > 0)) return 0;
       const d = Math.hypot(a.x - b.x, a.z - b.z), walk = Math.min(1, d / 25);
       let x = 0;
-      for (const [q, cov] of D.coverageSnapshot(b, false)) for (const [r, sr] of shares) if (r < n && q < n) x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
+      for (const [q, cov] of D.coverageSnapshot(b, false)) for (const [r, sr] of shares) if (r < n && q < n && D.sameTown(r, q)) x += sr * od[r * n + q] * cov * (r === q ? walk : 1);
       return a.catchPop * WALK_TRIP_INTENSITY * TRIPS_PER_MONTH * x * localTripMultiplier(g, a, 'rail', 1);
     };
     for (const x of new Set(as)) for (const y of new Set(bs)) {

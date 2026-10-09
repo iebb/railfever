@@ -113,6 +113,8 @@ export interface Town {
   nextGrowthDay: number;
   hasChurch: boolean;
   passGenMonth: number; passTransMonth: number; passGenLast: number; passTransLast: number;
+  /** the inter-city trips of passGenMonth / passGenLast (the rest are city trips; demand.ts DemandSet); unset in older saves */
+  icGenMonth?: number; icGenLast?: number;
   /** passengers who gave up waiting at the town's stations this / last month (Stations.trimWaiting; old saves: none) */
   passLostMonth?: number; passLostLast?: number;
   /** mail posted at and delivered to the town's stations (mail.ts), from its first mail on */

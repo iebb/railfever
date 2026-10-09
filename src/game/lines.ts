@@ -28,6 +28,8 @@ export interface Line {
   stops: number[];
   vehicles: number[];
   passMonth: number; passLast: number;
+  /** the inter-city trips of passMonth / passLast (boardings; the rest are city trips: demand.ts DemandSet); unset in older saves */
+  icPassMonth?: number; icPassLast?: number;
   incomeYear: number; incomeLast: number;
   costYear: number; costLast: number;
   /** number in the automatic name ("R2 …", "Bus 3 …"), per company and kind */
@@ -1080,8 +1082,8 @@ export class Lines {
       if (!hop) continue;
       // (they keep when they started waiting and whether they changed vehicles)
       const tr = (n: number) => (w.transfers ? (w.transfers * n) / Math.max(1, w.count) : 0);
-      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
-      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0));
+      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
+      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0, w.ic ?? 0));
     }
   }
 

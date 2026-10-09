@@ -39,6 +39,16 @@ export const fmtLen = (u: number) => (u >= 100 ? `${(u / 100).toFixed(2)} km` : 
 /** Height offset in world units as ±m. */
 export const fmtHeight = (h: number) => (h === 0 ? '±0 m' : `${h > 0 ? '+' : '−'}${Math.round(Math.abs(h) * 10)} m`);
 export const fmtPct = (f: number, digits = 0) => `${(f * 100).toFixed(digits)}%`;
+const fmtWhole = (n: number) => Math.round(n).toLocaleString('en-US');
+/**
+ * City and inter-city passengers of a total, "City 1,240 · Inter-city 380" (demand.ts DemandSet). `inter` unknown (a
+ * month counted by an older save) or nobody: the total alone.
+ */
+export function fmtSets(total: number, inter: number | undefined): string {
+  if (inter === undefined || !(total > 0)) return fmtWhole(total);
+  const ic = Math.min(total, Math.max(0, inter));
+  return `City ${fmtWhole(total - ic)} · Inter-city ${fmtWhole(ic)}`;
+}
 /** Track access multiplier: ×2, ×1.25, ×0.5. */
 export const fmtMult = (m: number) => `×${Number.isInteger(m) ? m : m.toFixed(2).replace(/0$/, '')}`;
 /** Fixed full-cost fraction at equal use; wear is reimbursed separately. */
