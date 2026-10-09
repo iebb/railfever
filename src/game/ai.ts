@@ -77,6 +77,23 @@ export function openingRailCall(g: Game, t: Train, preferredStation = -1): numbe
 }
 // At eight units/day this leaves six days of the 60-day planning target for choosing a project.
 const AI_RAIL_PLAN_UNITS = 432;
+/**
+ * Work units a city railway may spend planning (surveys, construction-site sweeps and their retries) before it is
+ * approved or given up. Counted on the project (Project.planned), so a reload resumes the same count.
+ */
+const URBAN_PLAN_UNITS = 720;
+/**
+ * Probes of a city railway's construction sweep (each a site, link or depot-yard plan of one alignment, typically under
+ * a millisecond) run in one work unit; at one probe a unit, a full sweep took most of a game year.
+ */
+const URBAN_SWEEP_PROBES = 4;
+/**
+ * The safety net under every project, access repair and through-service search (watchJob): one whose phase and works
+ * have not changed for AI_JOB_STALL_UNITS work units (150 days at the default eight a day), or that is still running
+ * after AI_JOB_MAX_UNITS, is given up like a failed project. Choosing a project is a bounded survey of its own.
+ */
+const AI_JOB_STALL_UNITS = 1200;
+const AI_JOB_MAX_UNITS = 2880;
 /** Saved failure-date key of a city-railway valuation that did not pay (chooseProject): its town and style. */
 const urbanQuoteMemo = (mode: 'metro' | 'lightrail', town: number) => `urbanq:${mode}:${town}`;
 /**
@@ -1124,6 +1141,10 @@ interface Project {
   access?: number;
   /** construction started (a failure then cost money; failed plans are retried sooner) */
   built?: boolean;
+  /** City railway: planning work units spent so far (URBAN_PLAN_UNITS). */
+  planned?: number;
+  /** City railway: the rejection that began the current re-plan, reported if the planning work limit ends it. */
+  urbanRetry?: { why: string; days: number };
   /** Joint tunnel: partner's work is reserved too; ownership and construction debits survive save cleanup. */
   joint?: { partner: number; spent: [number, number]; share: number };
 }
@@ -1227,6 +1248,12 @@ export interface LineInfo {
 /** A place on a station's approach track where a new line can join it (see approachJunctions). */
 interface JunctionSite { edge: number; s: number; x: number; z: number; y: number; tx: number; tz: number; owner: number; chain: number[]; dist: number }
 
+/**
+ * watchJob's record of the running job: which it is, its progress signature, the days it started and last progressed,
+ * its work units in all and since then, and the net worth its own work units spent (a rollback refunds it). Saved.
+ */
+interface JobWatch { key: string; sig: string; since: number; mark: number; units: number; idle: number; spent: number }
+
 export interface AIState {
   phase: string;
   cooldown: number;
@@ -1315,6 +1342,7 @@ export class AIController {
   private urbanTask: UrbanTask | null = null;
   private urbanSurvey: UrbanSurvey | null = null;
   private accessTask: AccessTask | null = null;
+  private watch: JobWatch | null = null;
   private errorLogged = false;
   private tram: TramPlanner | null = null;
   private lastAcq = -1e9;
@@ -1490,10 +1518,12 @@ export class AIController {
       if (units > 0 && networkOptions.enabled && !this.cooperationReserved() && sharedCapacityWork(this)) units--;
       for (; units > 0 && this.job; units--) {
         const t0 = AIController.profile ? performance.now() : 0;
-        const active: Generator<void, void> = this.job;
+        const active: Generator<void, void> = this.job, worth = this.eco.netWorth;
         if (active.next().done && this.job === active) this.job = null;
         if (AIController.profile) { const dt = performance.now() - t0; if (dt > AIController.slowMs) this.note(`slow step ${dt.toFixed(1)} ms in "${this.state.phase}"`); }
+        if (this.job) this.watchJob(worth - this.eco.netWorth);
       }
+      if (!this.job) this.watch = null;
       if (!this.job && this.project) this.endProject();
     } catch (e) { this.onError(e); }
   }
@@ -2058,7 +2088,64 @@ export class AIController {
       const info = double ? this.lines.get(double.line) : undefined;
       if (info && double?.finishFailed?.length) info.doubleFinish = [...new Set(double.finishFailed)];
       this.project = null; this.job = null; this.urbanTask = null; this.urbanSurvey = null; this.accessTask = null; delete this.state.through; delete this.state.doubleJob;
+      this.watch = null;
     }
+  }
+
+  /**
+   * After each work unit of a running job: its progress is its phase and its project's works (stations, track,
+   * depots, line). A planning search that never converges, a retry loop or a wait that never ends shows none, and
+   * the job is given up (giveUpJob) after AI_JOB_STALL_UNITS units; none runs more than AI_JOB_MAX_UNITS. Choosing a
+   * project (no project or task yet) is not watched.
+   */
+  private watchJob(spent: number) {
+    const g = this.game, p = this.project, repair = this.accessTask, through = this.state.through;
+    const key = p ? `${p.kind}@${p.started}` : repair ? `repair@${repair.station}` : through ? `through@${through.line}` : '';
+    if (!key) { this.watch = null; return; }
+    const sig = p ? `${this.state.phase}|${p.stations.length},${p.edges.length},${p.depots.length},${p.line},${p.built ? 1 : 0}` : this.state.phase;
+    let w = this.watch;
+    if (!w || w.key !== key) w = this.watch = { key, sig, since: g.day, mark: g.day, units: 0, idle: 0, spent: 0 };
+    w.units++; w.spent += spent;
+    if (w.sig !== sig) { w.sig = sig; w.mark = g.day; w.idle = 0; } else w.idle++;
+    if (w.idle >= AI_JOB_STALL_UNITS) this.giveUpJob(`no progress for ${g.day - w.mark} days`);
+    else if (w.units >= AI_JOB_MAX_UNITS) this.giveUpJob(`unfinished after ${g.day - w.since} days`);
+  }
+
+  /** The failure-memory key of a project's own failures, which chooseProject skips while it is marked. */
+  private projectKey(p: Project): string | null {
+    const [a, b] = p.towns, pair = b === undefined ? null : this.pairKey(a, b);
+    switch (p.kind) {
+      case 'rail': return pair;
+      case 'hsr': return pair && 'hsr' + pair;
+      case 'coach': return pair && 'coach' + pair;
+      case 'road': return pair && 'road' + pair;
+      case 'bus': return a === undefined ? null : 'bus' + a;
+      case 'tram': return a === undefined ? null : 'tram' + a;
+      case 'metro': case 'lightrail': return a === undefined ? null : 'urban' + p.kind + a;
+      case 'crosscity': return a === undefined ? null : 'xcity' + a;
+      default: return null;
+    }
+  }
+
+  /**
+   * Give the running job up as a failed project, its failure remembered. A new project is rolled back as one
+   * transaction, as a failed railway chain is: its unfinished works come up again (abandon) and what its own work units
+   * spent, removal included, is refunded. Works that stay (a usable line abandon keeps, completed second-track legs,
+   * an access road, a through junction) are not.
+   */
+  private giveUpJob(why: string) {
+    const g = this.game, e = this.eco, p = this.project, w = this.watch, double = this.state.doubleJob;
+    this.note(`gave up ${this.state.phase}: ${why}`);
+    const key = p && this.projectKey(p);
+    if (key) this.markFailed(key, 720); else this.stats.failed++;
+    const info = double ? this.lines.get(double.line) : undefined;
+    if (info) info.upgradeRetry = g.day + 360;
+    const worth = e.netWorth;
+    this.cancelJob();
+    const lost = (w?.spent ?? 0) + worth - e.netWorth;
+    if (p && p.kind !== 'double' && !(p.line >= 0 && g.lines.get(p.line)) && lost > 0) e.spend(-lost, 'construction', true);
+    this.state.phase = 'idle';
+    this.state.cooldown = Math.max(this.state.cooldown, 30);
   }
 
   /** Remove what an unfinished project built. */
@@ -4569,7 +4656,7 @@ export class AIController {
    * company can pay for. Closer stops reach more of a town whose stations walk half as far, but every stop costs its
    * building and upkeep: a subway's deep stations may not pay for it.
    */
-  private *urbanStep(T: Town, mode: 'metro' | 'lightrail', maxStops = 5, saved = false): Generator<void, ReturnType<AIController['urbanLayout']> & { quote?: ReturnType<AIController['urbanEconomics']> }> {
+  private *urbanStep(T: Town, mode: 'metro' | 'lightrail', maxStops = 5, saved = false, stop?: () => boolean): Generator<void, ReturnType<AIController['urbanLayout']> & { quote?: ReturnType<AIController['urbanEconomics']> }> {
     const g = this.game, close = this.urbanLayout(T, mode, undefined, maxStops);
     // A model introduced while this survey is pending must not change its quotes only after loading.
     const unit = (saved && this.urbanSurvey?.unit ? MODEL_BY_ID.get(this.urbanSurvey.unit) : undefined)
@@ -4609,6 +4696,8 @@ export class AIController {
     // Every trial, station adjustment, walk and forecast has a saved cursor when called by urbanJob.
     // Project selection uses the same quotes without retaining a construction cursor.
     while (true) {
+      // (urbanJob: the project's planning work limit ends the survey with the best layout priced so far)
+      if (stop?.()) return restore(cursor.best);
       const trial = cursor.trials[cursor.trial];
       if (!trial || trial.count !== cursor.stageCount) {
         // Price every opening stage. A viable five-stop line can still leave too little capital for its
@@ -4818,19 +4907,35 @@ export class AIController {
    * the ends, signals, and a line stopping at every station. The result is an ordinary rail line (main-line trains
    * may run through onto it, its trains onto the main line).
    */
-  /** Every yield ends a bounded work unit with all continuation data in urbanTask. */
+  /**
+   * Every yield ends a bounded work unit with all continuation data in urbanTask. Planning units (until construction
+   * is approved) count on the project against URBAN_PLAN_UNITS, across surveys, sweeps and retries.
+   */
   private *urbanJob(T: Town, mode: 'metro' | 'lightrail', maxStops = 5): Generator<void, void> {
+    const p = this.project!, work = this.urbanWork(T, mode, maxStops);
+    try {
+      while (!work.next().done) {
+        if (!p.built) p.planned = (p.planned ?? 0) + 1;
+        yield;
+      }
+    } finally { work.return(undefined); }
+  }
+
+  private *urbanWork(T: Town, mode: 'metro' | 'lightrail', maxStops = 5): Generator<void, void> {
     const g = this.game, me = this.companyId, net = g.world.net, p = this.project!;
     const what = mode === 'metro' ? 'subway-style city railway' : 'light-rail-style city railway';
     const fail = (why: string, days = 1500) => { this.note(`${what} in ${T.name} abandoned: ${why}`); this.markFailed('urban' + mode + T.id, days); this.abandon(p); this.urbanTask = null; this.urbanSurvey = null; };
+    // The planning work limit: a sweep then decides on the best plan found so far, and no further retry is begun.
+    const late = () => !p.built && (p.planned ?? 0) >= URBAN_PLAN_UNITS;
     if (!this.urbanTask) {
       this.state.phase = `planning a ${what} in ${T.name}`;
       if (this.urbanReserved(T.id)) return fail('another urban project is being built', 60);
       maxStops = this.urbanSurvey?.maxStops ?? maxStops;
       const handoff = !this.urbanSurvey ? this.urbanHandoffLayout(p.urbanLayout, maxStops) : null;
       delete p.urbanLayout;
-      const layout = handoff ?? (yield* this.urbanStep(T, mode, maxStops, true)), L = layout.L;
+      const layout = handoff ?? (yield* this.urbanStep(T, mode, maxStops, true, late)), L = layout.L;
       this.urbanSurvey = null;
+      if (late()) { const r = p.urbanRetry; return fail(`${r ? r.why + '; ' : ''}planning work limit (${p.planned} units)`, r?.days); }
       const range = (a: number) => { let mn = Infinity, mx = -Infinity; for (let t = -L / 2 - 8; t <= L / 2 + 8; t += 3) { const h = g.world.heightAt(layout.x + Math.sin(a) * t, layout.z + Math.cos(a) * t); mn = Math.min(mn, h); mx = Math.max(mx, h); } return mx - mn; };
       const through = (layout.towns?.length ?? 0) > 1;
       const angles = (layout.interchanges.length || through ? [0] : [0, Math.PI / 2, Math.PI / 6, -Math.PI / 6, Math.PI / 3, -Math.PI / 3])
@@ -4875,10 +4980,11 @@ export class AIController {
     const designGrade = TRACK_TYPES.electric.maxGrade;
     const retry = function* (self: AIController, why: string, days = 1500): Generator<void, void> {
       const count = task.maxStops ?? maxStops;
-      if (task.fromHandoff && !p.built) {
-        self.urbanTask = null; self.urbanSurvey = null;
-        yield* self.urbanJob(T, mode, count);
-      } else if (count > 3 && n > 3 && !p.built) { self.urbanTask = null; yield* self.urbanJob(T, mode, Math.min(count - 1, n - 1)); }
+      if (late()) fail(`${why}; planning work limit (${p.planned} units)`, days);
+      else if (task.fromHandoff && !p.built) {
+        self.urbanTask = null; self.urbanSurvey = null; p.urbanRetry = { why, days };
+        yield* self.urbanWork(T, mode, count);
+      } else if (count > 3 && n > 3 && !p.built) { self.urbanTask = null; p.urbanRetry = { why, days }; yield* self.urbanWork(T, mode, Math.min(count - 1, n - 1)); }
       else fail(why, days);
     };
     const ground = (x: number, z: number) => g.world.heightAt(x, z);
@@ -4915,7 +5021,7 @@ export class AIController {
     const nextCandidate = () => {
       task.candidate++; task.target = task.offset = task.link = task.links = task.yardAt = 0;
       task.previous = -1e9; task.skipped = false; task.got = []; task.yard = null; task.stage = 'sites';
-      if (task.tries > 1500) task.stage = 'approve';
+      if (task.tries > 1500 || late()) task.stage = 'approve';
     };
     const builtStations = () => task.stations.map((id) => g.stations.get(id)).filter((s): s is Station => !!s?.rail);
     const ends = (st: Station, ahead: boolean) => {
@@ -4928,9 +5034,13 @@ export class AIController {
       eco.money -= reserve;
       try { spend(); } finally { eco.money += reserve; }
     };
+    const sweep = (stage: UrbanTask['stage']) => stage === 'sites' || stage === 'links' || stage === 'yardUnder' || stage === 'yardRamp' || stage === 'evaluate';
+    let probes = 0;
     while (true) {
       const c = task.candidates[task.candidate];
       const targets = c?.targets ?? (c?.trim ? layout.targets.slice(1, -1) : layout.targets);
+      if (late() && sweep(task.stage) && task.stage !== 'evaluate') task.stage = 'approve';
+      const stage = task.stage;
       if (c?.trim) {
         const lat = stationLayout(2, 0, 'middle', 'side').trackOffsets;
         const D = Math.max(5, Math.min(12, Math.sqrt(60 * Math.abs(lat[1] - lat[0]) * Math.min(1, TRACK_TYPES.electric.minRadius / 12)) + 2));
@@ -4952,6 +5062,9 @@ export class AIController {
           else if (task.got.length >= Math.min(4, n)) task.stage = 'links'; else nextCandidate();
           continue;
         }
+        // Each remaining target adds at most one site: an alignment that can no longer reach the
+        // stops it needs is rejected now, not after trying every offset of its remaining targets.
+        if (task.got.length + targets.length - task.target < Math.min(4, n)) { nextCandidate(); continue; }
         if (task.offset >= offs.length) {
           if (task.got.length && (task.skipped || (layout.step ?? SP) >= SP || task.target === targets.length - 1)) task.target = targets.length;
           else { if (task.got.length) task.skipped = true; task.target++; task.offset = 0; }
@@ -4964,12 +5077,14 @@ export class AIController {
         const pl = site(c.a, c.lat, t, c.lv, task.got[task.got.length - 1]);
         if (pl) {
           const prev = task.got[task.got.length - 1];
+          let clear = true;
           if (c.trim && prev && (task.got.length === 1 || task.target === targets.length - 1)) {
             const lat = Math.abs(pl.layout.trackOffsets[1] - pl.layout.trackOffsets[0]);
             const D = Math.max(5, Math.min(12, Math.sqrt(60 * lat * Math.min(1, TRACK_TYPES.electric.minRadius / 12)) + 2));
-            if (Math.hypot(pl.x - prev.x, pl.z - prev.z) - PL < 2 * D + 4) { reject(task.siteRejects, 'terminal crossover clearance'); yield; continue; }
+            clear = Math.hypot(pl.x - prev.x, pl.z - prev.z) - PL >= 2 * D + 4;
+            if (!clear) reject(task.siteRejects, 'terminal crossover clearance');
           }
-          task.got.push(pl); task.previous = t; task.target++; task.offset = 0;
+          if (clear) { task.got.push(pl); task.previous = t; task.target++; task.offset = 0; }
         }
       } else if (task.stage === 'links') {
         if (task.link + 1 >= task.got.length) { task.stage = c.lv === 'underground' ? 'yardUnder' : 'yardRamp'; continue; }
@@ -5128,6 +5243,9 @@ export class AIController {
         yield* this.throughJob();
         return;
       }
+      // A sweep probe ends the work unit only after URBAN_SWEEP_PROBES of them; construction steps end one each.
+      if (sweep(stage) && ++probes < URBAN_SWEEP_PROBES) continue;
+      probes = 0;
       yield;
     }
   }
@@ -6199,7 +6317,7 @@ export class AIController {
       config: this.config,
       state: {
         ...this.state, rng: this.rng.state, failed: [...this.failed], stats: this.stats, lines: [...this.lines],
-        project: this.project, lastAcq: this.lastAcq, tram, relengthen: this.relengthen, stationCare: [...this.stationCare].sort((x, y) => x[0] - y[0]),
+        project: this.project, ...(this.watch ? { watch: { ...this.watch } } : {}), lastAcq: this.lastAcq, tram, relengthen: this.relengthen, stationCare: [...this.stationCare].sort((x, y) => x[0] - y[0]),
         accessCare: [...this.accessCare].sort((x, y) => x[0] - y[0]),
         ...(this.urbanSurvey ? { urbanSurvey: { ...this.urbanSurvey, sites: this.urbanSurvey.sites.map((p) => 'cost' in p
           ? { station: saveTaskStation(p) } : { site: { ...p, walk: { ...p.walk, buildings: [...p.walk.buildings] } } }) } } : {}),
@@ -6264,6 +6382,10 @@ export class AIController {
       this.state.phase = 'idle';
       this.state.cooldown = 5;
     }
+    // A resumed job keeps its progress watch (watchJob); older saves start a fresh one at its next work unit.
+    const w = s.watch;
+    this.watch = this.job && w && typeof w.key === 'string' && typeof w.sig === 'string'
+      ? { key: w.key, sig: w.sig, since: Number(w.since) || 0, mark: Number(w.mark) || 0, units: Number(w.units) || 0, idle: Number(w.idle) || 0, spent: Number(w.spent) || 0 } : null;
   }
 }
 
