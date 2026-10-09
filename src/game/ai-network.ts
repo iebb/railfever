@@ -2991,9 +2991,12 @@ class NetPlanner {
         if (!plan.ok || !this.mayAlter(plan.turnouts.map((t) => t.edge))) continue;
         if (plan.proposal && (!this.proposalConsent(plan.proposal) || !this.demolitionOk(plan.proposal.demolish))) continue;
         // Incremental income pays for the curve, its upkeep and a real compatible train within our horizon.
-        const running = estimateVehicleYear(t.cars, length / Math.max(1, path.length - 1), g.year, 0.4, kmh).total;
+        const service = estimateVehicleYear(t.cars, length / Math.max(1, path.length - 1), g.year, 0.4, kmh), running = service.total;
         const upkeep = plan.length * (TRACK_TYPES[c.a.edge.type]?.maintPerUnit ?? 300);
-        const foreign = [...A, ...B].filter((p) => p.edge.owner !== me).reduce((n, p) => n + g.edgeMaintenance(p.edge) * g.accessMultiplier(p.edge.owner), 0);
+        const foreignItems = [...A, ...B].map(p => p.edge);
+        const foreign = [...new Set([...foreignItems.map(e => e.owner), ...path.map(id => g.stations.get(id)!.owner)])].reduce((n, owner) => n
+          + g.accessChargeEstimate(me, owner, [...foreignItems, ...path.map(id => g.stations.get(id)!)], 1,
+            [...new Map(foreignItems.filter(e => e.owner === owner).map(e => [e.id, e])).values()].reduce((w, e) => w + e.len * service.trackWearPerUnit, 0)), 0);
         const netIncome = revenue - running - upkeep - foreign;
         const capital = plan.cost + t.cars.reduce((n, m) => n + m.cost, 0), horizon = 8 + 12 * this.ai.config.risk;
         if (netIncome <= 0 || capital > netIncome * horizon) { this.considered('midconnect.payback'); continue; }
@@ -3192,14 +3195,13 @@ class NetPlanner {
     return { trips, revenue, ourLeg, theirLeg };
   }
 
-  /** Annual access fees for `trains` trains of `user` (by count) running over `owner`'s stations and track `edges`: its usage share of their upkeep. */
-  private xlinkFees(owner: number, stations: number[], edges: Iterable<NEdge>, trains: number, ownerTrains: number): number {
-    const g = this.g, m = g.accessMultiplier(owner);
-    if (!(trains > 0) || m <= 0) return 0;
-    let upkeep = 0;
-    for (const sid of new Set(stations)) { const st = g.stations.get(sid); if (st?.owner === owner) upkeep += g.stationMaintenance(st); }
-    for (const e of edges) if (e.owner === owner) upkeep += g.edgeMaintenance(e);
-    return upkeep * m * trains / (Math.max(1, ownerTrains) + m * trains);
+  /** Annual full-cost charge: unweighted train share, per-item ceiling, own wear without markup. */
+  private xlinkFees(owner: number, stations: number[], edges: Iterable<NEdge>, trains: number, ownerTrains: number, user = this.me, wearPerUnit = 0): number {
+    if (!(trains > 0)) return 0;
+    const g = this.g, route = [...new Map([...edges].map(e => [e.id, e])).values()];
+    const stops = [...new Set(stations)].map(id => g.stations.get(id)).filter((st): st is Station => !!st);
+    const wear = route.filter(e => e.owner === owner).reduce((n, e) => n + e.len * wearPerUnit * trains, 0);
+    return g.accessChargeEstimate(user, owner, [...route, ...stops], trains / (Math.max(0, ownerTrains) + trains), wear);
   }
 
   /** A consist for a direct service over these legs and stations: one of the operators' consists that fits, else the year's train. */
@@ -3253,11 +3255,11 @@ class NetPlanner {
       // (riders beyond the trains' seats stay with today's journeys)
       const riders = value.trips * 12, carried = riders > 0 ? Math.min(1, perTrain * trains / riders) : 0;
       const revenue = value.revenue * carried;
-      const fees = this.xlinkFees(b.owner, right, bLegs.map((p) => p.edge), trains, this.fleet(b).others + this.fleet(b).ours.length);
+      const fees = this.xlinkFees(b.owner, right, bLegs.map((p) => p.edge), trains, this.fleet(b).others + this.fleet(b).ours.length, this.me, year.trackWearPerUnit);
       const running = year.total * trains;
       const net = revenue - value.ourLeg * carried - running - upkeep - fees;
       // the partner: fees in, the later legs it no longer carries out, and its option of one through train of its own
-      const theirFees = this.xlinkFees(this.me, left, aLegs.map((p) => p.edge), 1, trains);
+      const theirFees = this.xlinkFees(this.me, left, aLegs.map((p) => p.edge), 1, trains, b.owner, year.trackWearPerUnit);
       const more = riders > 0 ? Math.min(1, perTrain * (trains + 1) / riders) : 0;
       // (no option where its train could not run: no room beside ours, or no money, consist or depot for it)
       const option = partnerTrain && trains <= maxTrains ? value.revenue * more / (trains + 1) - year.total - theirFees - this.xlinkNeed(0, trainCost) : 0;
@@ -3872,7 +3874,7 @@ class NetPlanner {
     const kmh = Math.max(20, year.km / (YEAR_S / 3600)), cycle = 2 * length * UNIT_M / (kmh / 3.6);
     const perTrain = cars.reduce((s, m) => s + m.capacity, 0) * 0.8 * 2 * YEAR_S / Math.max(1, cycle);
     const share = riders > 0 ? revenue * Math.min(1, perTrain * (theirTrains + 1) / riders) / (theirTrains + 1) : 0;
-    const fees = this.xlinkFees(l.owner, path, legs.map((p) => p.edge), 1, theirTrains);
+    const fees = this.xlinkFees(l.owner, path, legs.map((p) => p.edge), 1, theirTrains, me, year.trackWearPerUnit);
     const cost = cars.reduce((s, m) => s + m.cost, 0);
     const net = share - year.total - fees;
     if (net <= this.xlinkNeed(0, cost)) { this.considered('xlink.partner.payback'); return false; }

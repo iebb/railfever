@@ -1,3 +1,4 @@
+import type { AccessItem } from '../game/access-cost';
 // Info windows: stations, towns, track/road edges, vehicles, depots and the purchase dialog (train composer).
 import type { UI } from './ui';
 import { PLAYER, type Game } from '../game/game';
@@ -10,7 +11,7 @@ import type { Line } from '../game/lines';
 import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES, TRAM, KMH_TO_UPS } from '../game/constants';
-import { fmtLen, fmtPct, fmtMult, equalUseShare, fmtMail, fmtMailLoad, stationShowsMail } from './format';
+import { fmtLen, fmtPct, fmtAccessFactor, fmtMail, fmtMailLoad, stationShowsMail } from './format';
 import { mailByTown, mailLostShare } from '../game/mail';
 import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
@@ -108,7 +109,7 @@ export function openStation(ui: UI, id: number) {
             s.rail.level === 'ground'
               ? h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => { ui.tools.roadType = 'street'; ui.tools.setTool('road'); const f = g.stations.forecourt(s); ui.centerOn(f?.x ?? s.x, f?.z ?? s.z, 30); ui.toast('Connect forecourt to road network', 'info'); } }, icon('road', 15), 'Build access road')
               : h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => startEntrance(ui, s.id) }, icon('entrance', 15), 'Add entrance'))) : null,
-        !mine && s.owner >= 0 ? accessRows(ui, s.owner, g.stationMaintenance(s), () => { win.last = undefined; render(); }) : null,
+        !mine && s.owner >= 0 ? accessRows(ui, s.owner, s, () => { win.last = undefined; render(); }) : null,
         ui.kv('New passengers', `${fmtInt(s.genLast)} last month`),
         ui.kv('Boarded · arrived', `${fmtInt(s.pickupLast)} · ${fmtInt(s.arrivedLast)}`),
         ui.kv('Gave up waiting', h('span', {
@@ -375,22 +376,18 @@ function sharedStopPanel(ui: UI, s: Station, lines: Line[]): HTMLElement | null 
     for (const owner of [l.owner, ...(l.operators ?? [])]) remember(owner, l);
     for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) remember(v.owner, l); }
   }
-  // TODO: expose Game.stationUsage(id); feature-detect its existing meter until a public per-stop API lands.
-  const meter = g as unknown as { stationUsage?: (id: number) => number[] | undefined; usage?: Map<number, number[]> };
-  const use = meter.stationUsage?.(s.id) ?? meter.usage?.get(s.id * 4 + 2);
-  if (use) for (let owner = 0; owner < use.length; owner++) if (use[owner] > 0) remember(owner);
+  const use = g.accessUsage(s);
+  for (let owner = 0; owner < use.length; owner++) if (use[owner] > 0) remember(owner);
   if (by.size < 2) return null;
-  const known = !!meter.stationUsage || meter.usage instanceof Map;
-  const mult = g.accessMultiplier(s.owner), monthly = g.stationMaintenance(s) / 12;
-  let guests = 0;
-  if (use) for (let owner = 0; owner < use.length; owner++) if (owner !== s.owner) guests += use[owner] || 0;
-  const W = (use?.[s.owner] ?? 0) + mult * guests;
-  const share = (owner: number) => W > 0 ? (owner === s.owner ? (use?.[owner] ?? 0) : mult * (use?.[owner] ?? 0)) / W : owner === s.owner ? 1 : 0;
+  const monthly = g.accessFullCost(s) / 12, total = use.reduce((n, x) => n + x, 0);
+  const share = (owner: number) => total > 0 ? (use[owner] ?? 0) / total : 0;
+  const fee = (owner: number) => g.accessChargeEstimate(owner, s.owner, [s], share(owner)) / 12;
+  const cost = (owner: number) => owner === s.owner ? monthly - [...by.keys()].reduce((n, user) => n + fee(user), 0) : fee(owner);
   return h('div', { class: 'stopshare' },
-    section('Shared stop upkeep', `${fmtMoney(monthly)} / month`),
-    h('div', { class: 'muted station-advice' }, known ? `Month so far · usage weight ${fmtMult(mult)} · final shares at month end` : 'No per-stop usage figures yet'),
+    section('Shared stop costs', `${fmtMoney(monthly)} / month`),
+    h('div', { class: 'muted station-advice' }, `Month so far · ${fmtAccessFactor(g.accessMultiplier(s.owner))} · 75% cap`),
     [...by].map(([owner, ls]) => h('div', { class: 'stopshare-company' },
-      h('div', { class: 'kv' }, ui.ownerTag(owner), h('span', { class: 'v', 'data-tip': 'Estimated upkeep share from this month’s calls' }, known ? `${fmtPct(share(owner))} · ${fmtMoneyFull(monthly * share(owner))}/mo` : '—')),
+      h('div', { class: 'kv' }, ui.ownerTag(owner), h('span', { class: 'v', 'data-tip': 'Real call share · estimated charge; owner shows cost after access income' }, `${fmtPct(share(owner))} · ${fmtMoneyFull(cost(owner))}/mo`)),
       h('div', { class: 'share-lines' }, ls.size ? [...ls].map((l) => lineTag(g, l, () => ui.openLine(l.id))) : h('span', { class: 'muted' }, owner === s.owner ? 'Stop owner' : 'No current line')))));
 }
 
@@ -587,16 +584,18 @@ function entranceCoverage(ui: UI, s: Station): { only: number; reach: number }[]
   }, 3000);
 }
 
-/** Owner, access status (with "Request access") and how the upkeep would be shared, for another company's item. */
-function accessRows(ui: UI, owner: number, upkeepYear: number, after: () => void): HTMLElement {
+/** Owner, access status and capped annual charge for a foreign item. */
+function accessRows(ui: UI, owner: number, item: AccessItem, after: () => void): HTMLElement {
   const g = ui.game;
   const st = accessState(g, owner);
-  const m = g.accessMultiplier(owner);
+  const m = g.accessMultiplier(owner), use = g.accessUsage(item), total = use.reduce((n, x) => n + x, 0);
+  const share = total > 0 ? (use[PLAYER] ?? 0) / total : 0.5;
+  const yearly = g.accessChargeEstimate(PLAYER, owner, [item], share);
   return h('div', null,
     ui.kv('Owner', h('span', { class: 'inline' }, ui.ownerTag(owner), h('button', { class: 'ibtn sm', 'data-tip': 'Track access', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 15)))),
     ui.kv('Track access', h('span', { class: 'inline' }, h('span', { class: st.kind === 'agreement' ? 'pos' : st.kind === 'blocked' || st.kind === 'closed' ? 'neg' : 'muted' }, st.kind === 'agreement' ? (g.hasAccess(PLAYER, owner) ? 'Agreement' : 'Open network') : st.kind === 'pending' ? 'Request pending' : st.kind === 'blocked' ? 'Blocked' : st.kind === 'closed' ? 'Refused' : policyText(g, owner)),
       st.kind === 'agreement' ? null : accessControl(ui, owner, after))),
-    ui.kv('Upkeep', h('span', { 'data-tip': `Usage weights: owner 1, users ${fmtMult(m)} · 50/50 use: users pay ${fmtPct(equalUseShare(m))}` }, `${fmtMoney(upkeepYear)}/yr · users pay ${fmtMult(m)}`)),
+    ui.kv('Access cost', h('span', { 'data-tip': `${fmtAccessFactor(m)} · ${total > 0 ? 'current' : 'equal'} usage · own wear extra` }, `${fmtMoney(yearly)}/yr est. · 75% cap`)),
     st.kind === 'agreement' ? h('div', { class: 'muted', style: 'margin-top:4px' }, st.text) : null);
 }
 
@@ -631,8 +630,8 @@ export function openEdge(ui: UI, id: number) {
       sec ? ui.kv('Structures', sec) : null,
       ed.tram ? ui.kv('Tram tracks', ed.tramOwner !== undefined && ed.tramOwner >= 0 ? g.company(ed.tramOwner).name : 'yes') : null,
       ed.station >= 0 ? ui.kv('Station', ui.stationLink(ed.station)) : null,
-      rail && ed.owner >= 0 && ed.owner !== PLAYER ? accessRows(ui, ed.owner, g.edgeMaintenance(ed), () => { win.last = undefined; render(); }) : null,
-      !rail && ed.tram && (ed.tramOwner ?? -1) >= 0 && ed.tramOwner !== PLAYER ? accessRows(ui, ed.tramOwner!, ed.len * TRAM.maintPerUnit, () => { win.last = undefined; render(); }) : null,
+      rail && ed.owner >= 0 && ed.owner !== PLAYER ? accessRows(ui, ed.owner, ed, () => { win.last = undefined; render(); }) : null,
+      !rail && ed.tram && (ed.tramOwner ?? -1) >= 0 && ed.tramOwner !== PLAYER ? accessRows(ui, ed.tramOwner!, { tram: ed }, () => { win.last = undefined; render(); }) : null,
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => { const p = { x: 0, y: 0, z: 0 }; g.world.net.pointAt(ed, ed.len / 2, p); ui.centerOn(p.x, p.z); } }, icon('target', 16), 'Center')),
     );
   };

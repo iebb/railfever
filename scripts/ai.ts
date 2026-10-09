@@ -71,5 +71,10 @@ check(errors === 0, 'no exceptions or AI errors');
 check(!nan, 'no NaN positions ' + (nan ?? ''));
 const res = checkReservations(g);
 check(res.length === 0, 'reservations consistent ' + res.slice(0, 3).join('; '));
+const cross = g.lines.all().filter((l) => l.vehicles.length && (l.stops.some((id) => { const s = g.stations.get(id); return s && s.owner >= 0 && s.owner !== l.owner; }) || l.operators?.some((id) => id !== l.owner)));
+console.log('ACCESS METRICS ' + JSON.stringify({ services: cross.length, trains: cross.reduce((n, l) => n + l.vehicles.filter((id) => g.vehicles.get(id)?.kind === 'train').length, 0),
+  agreements: g.access.length, feesPaid: g.access.reduce((n, a) => n + a.paidTotal, 0), byCompany: g.ais.map((ai) => ({ company: ai.companyId,
+    services: cross.filter((l) => l.owner === ai.companyId || l.operators?.includes(ai.companyId)).length,
+    feesPaid: g.access.filter((a) => a.user === ai.companyId).reduce((n, a) => n + a.paidTotal, 0) })) }));
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

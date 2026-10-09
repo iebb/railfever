@@ -269,7 +269,7 @@ export function openHelp(ui: UI) {
       <li>Buyouts transfer network, vehicles, cash and loan.</li>
       <li><b>Track access</b> (<kbd>K</kbd>): networks open by default; blocked companies excluded.</li>
       <li>Ask / Approve all / Reject all, company blocks, usage and agreements.</li>
-      <li>Upkeep split by usage × owner’s multiplier; 50/50 use at 2×: user pays 2/3.</li>
+      <li>Share full cost by usage × price factor, capped at 75%; pay your own wear.</li>
       <li><b>Shared lines</b> → Vehicles: invite / join open lines; operators must own a stop.</li>
       <li>Operators keep vehicles / fares; shared stops: lines and upkeep estimates.</li>
     </ul>

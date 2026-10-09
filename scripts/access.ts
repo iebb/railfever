@@ -151,36 +151,36 @@ if (isMain) {
   check(g.stations.get(E)!.lastPickup > 0 || pt.delivered > 0, 'train served the AI station');
   check(sawAI > sawDetour, 'with access the short way over AI track is preferred');
   {
-    // the maintenance split on single items: 50/50 at m = 2 -> 2/3; m = 0 -> nothing; owner idle -> all
+    // Full replacement cost replaces weighted upkeep: equal use is p/2, capped at 75%; no wear in these manual meters.
     g.billAccess(); // bill what was metered so far
     const e = net.edges.get(direct.find((id) => net.edges.get(id)!.len > 5)!)!;
-    const C = g.edgeMaintenance(e) / 12, sE = g.stations.get(E)!, CS = g.stationMaintenance(sE) / 12;
+    const C = g.accessFullCost(e) / 12, sE = g.stations.get(E)!, CS = g.accessFullCost(sE) / 12;
     const bill = (use: () => void) => { const p0 = total(P, 'trackFees'), q0 = total(Q, 'trackIncome'); use(); g.billAccess(); return { paid: p0 - total(P, 'trackFees'), earned: total(Q, 'trackIncome') - q0 }; };
-    check(g.accessMultiplier(ai) === 1 && g.accessMultiplier(PLAYER) === 2, 'default multipliers: AI 1x (permissive), player 2x');
+    check(g.accessMultiplier(ai) === 0.625 && g.accessMultiplier(PLAYER) === 1.25, 'default factors: permissive AI 0.625x, player 1.25x');
     let r = bill(() => { g.recordTrackUse(ai, e, 10); g.recordTrackUse(PLAYER, e, 10); });
-    check(Math.abs(r.paid - C / 2) < 0.01, '50/50 usage at the AI default m = 1: the user pays half');
+    check(Math.abs(r.paid - C * 0.3125) < 0.01, 'equal use at AI default p = 0.625: user pays 31.25% of full cost');
     g.setAccessMultiplier(ai, 2);
     r = bill(() => { g.recordTrackUse(ai, e, 10); g.recordTrackUse(PLAYER, e, 10); });
-    console.log(`  split: edge maintenance ${fmt(C, 0)}/month, 50/50 at m=2: paid ${fmt(r.paid, 1)} (${fmt(r.paid / C * 100, 1)}%)`);
-    check(Math.abs(r.paid - C * 2 / 3) < 0.01 && Math.abs(r.earned - r.paid) < 1e-6, '50/50 usage at m = 2: the user pays 2/3 of the maintenance');
+    console.log(`  split: edge full cost ${fmt(C, 0)}/month, 50/50 at p=2: paid ${fmt(r.paid, 1)} (${fmt(r.paid / C * 100, 1)}%)`);
+    check(Math.abs(r.paid - C * 0.75) < 0.01 && Math.abs(r.earned - r.paid) < 1e-6, 'equal use at p = 2: capped at 75% of full cost');
     check(Math.abs(g.agreement(PLAYER, ai)!.usageShareLastMonth - 0.5) < 1e-9, 'usage share 50%');
     g.setAccessMultiplier(ai, 0);
     r = bill(() => { g.recordTrackUse(ai, e, 10); g.recordTrackUse(PLAYER, e, 10); });
     check(r.paid === 0, 'm = 0: free');
     g.setAccessMultiplier(ai, 2);
     r = bill(() => { g.recordTrackUse(PLAYER, e, 7); });
-    check(Math.abs(r.paid - C) < 0.01, 'owner idle: the user pays all of it');
-    g.setAccessMultiplier(ai, 3);
+    check(Math.abs(r.paid - C * 0.75) < 0.01, 'owner idle: capped at 75% of full cost');
+    g.setAccessMultiplier(ai, 2);
     r = bill(() => { g.recordTrackUse(ai, e, 30); g.recordTrackUse(PLAYER, e, 10); });
-    check(Math.abs(r.paid - C * 30 / 60) < 0.01, 'm = 3, 75/25: the user pays 30/(30+30) = 1/2');
+    check(Math.abs(r.paid - C * 30 / 60) < 0.01, 'p = 2, 75/25: the user pays 25% × 2 = 50% of full cost');
     g.setAccessMultiplier(ai, 2);
     const aiVehicle = { owner: ai } as unknown as Vehicle;
     r = bill(() => { for (let i = 0; i < 4; i++) { g.recordStop(pt, sE); g.recordStop(aiVehicle, sE); } });
-    check(Math.abs(r.paid - CS * 2 / 3) < 0.01, 'station stops: 4/4 at m = 2 -> 2/3 of the station maintenance');
+    check(Math.abs(r.paid - CS * 0.75) < 0.01, 'station stops: equal use at p = 2 hits 75% full-cost cap');
     r = bill(() => { g.recordStop(pt, g.stations.get(A)!); g.recordTrackUse(PLAYER, net.edges.get(detour[0])!, 50); });
     check(r.paid === 0, 'own infrastructure is free');
     const est = g.estimateAccessShare(ai, PLAYER);
-    check(Math.abs(est.equalUseShare - 2 / 3) < 1e-9 && est.multiplier === 2, 'estimateAccessShare');
+    check(Math.abs(est.equalUseShare - 0.75) < 1e-9 && est.multiplier === 2, 'estimateAccessShare');
   }
 
   // ---- 3. the AI runs a train between the player's stations (needs access to the player's network); its line

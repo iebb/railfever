@@ -20,7 +20,7 @@ import { CROSS_LABEL, MarkerKind } from '../render/overlay';
 import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
-import { fmtLen, fmtHeight, fmtMult } from './format';
+import { fmtLen, fmtHeight, fmtAccessFactor } from './format';
 import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle, planWalkLimit, stationWalkLimit, CITY_REACH } from './gameapi';
 import { stopWalkingCatchment, walkLimit, walkingCatchment, entrancePlanCatchment } from '../game/catchment';
 import type { FootRect } from '../render/overlay';
@@ -1024,8 +1024,8 @@ export class Tools {
         const kindErr = !okKind ? (l?.kind === 'rail' ? 'No train platforms' : l?.kind === 'tram' ? 'No tram stop' : 'No bus stop') : '';
         const rows: [string, string][] = foreign ? [['company', esc(g.company(st.owner).name)]] : [];
         if (kindErr) this.tip({ title: esc(st.name), rows, err: [kindErr] }, 'err');
-        else if (!acc || acc.kind === 'agreement') this.tip({ title: esc(st.name), rows: acc ? [...rows, ['key', `Upkeep shared ${fmtMult(g.accessMultiplier(st.owner))}`]] : rows, ok: [`Add to ${l?.name ?? 'line'}`] }, 'ok');
-        else if (acc.kind === 'none') this.tip({ title: esc(st.name), rows: [...rows, ['key', `${policyText(g, st.owner)} · upkeep shared ${fmtMult(g.accessMultiplier(st.owner))}`]], hint: 'Click to request track access' }, 'info');
+        else if (!acc || acc.kind === 'agreement') this.tip({ title: esc(st.name), rows: acc ? [...rows, ['key', `Access ${fmtAccessFactor(g.accessMultiplier(st.owner))} · 75% cap`]] : rows, ok: [`Add to ${l?.name ?? 'line'}`] }, 'ok');
+        else if (acc.kind === 'none') this.tip({ title: esc(st.name), rows: [...rows, ['key', `${policyText(g, st.owner)} · ${fmtAccessFactor(g.accessMultiplier(st.owner))} · 75% cap`]], hint: 'Click to request track access' }, 'info');
         else this.tip({ title: esc(st.name), rows, err: [acc.text] }, 'err');
       } else this.hideTip();
       return;
@@ -1163,7 +1163,7 @@ export class Tools {
     ov.setMarker('hover0', b ? y(b) : null, 'node', pl.ok ? 0x5ff07a : 0xff5a4a);
     const endText = (e: DoublePlan['start']) => (e.kind === 'platform' ? 'into a platform' : e.kind === 'track' ? 'into the other junction track' : 'switch');
     const rows: [string, string][] = [
-      ['company', `Owned by <b>${esc(g.company(net.edges.get(chain[0])!.owner).name)}</b> · you pay construction; upkeep shared by use`],
+      ['company', `Owned by <b>${esc(g.company(net.edges.get(chain[0])!.owner).name)}</b> · you pay construction; access priced by use · 75% cap`],
       ['length', `<b>${fmtLen(pl.length)}</b> of new track${chain.length > 1 ? ` along ${chain.length} sections` : ''}`],
       ['parallel', `${pl.side > 0 ? 'Right' : 'Left'} side${this.dbl.flipped ? ' (the other side is blocked)' : ''}`],
       ['rail', `Ends: ${endText(pl.start)} · ${endText(pl.end)}`],
@@ -1739,11 +1739,11 @@ export class Tools {
     const so = this.snapOwner(sn);
     if (err && so !== null && !this.game.canUse(PLAYER, so)) {
       const st = accessState(this.game, so);
-      return { title: `${esc(this.game.company(so).name)}'s network`, rows: [['key', `${policyText(this.game, so)} · shared maintenance ${fmtMult(this.game.accessMultiplier(so))}`]], err: [st.kind === 'pending' ? 'Access request pending' : st.kind === 'blocked' ? 'You are blocked from this network' : st.kind === 'closed' ? 'The owner refuses access' : 'Request access first'], hint: st.kind === 'none' ? 'Click to request track access' : undefined };
+      return { title: `${esc(this.game.company(so).name)}'s network`, rows: [['key', `${policyText(this.game, so)} · ${fmtAccessFactor(this.game.accessMultiplier(so))} · 75% cap`]], err: [st.kind === 'pending' ? 'Access request pending' : st.kind === 'blocked' ? 'You are blocked from this network' : st.kind === 'closed' ? 'The owner refuses access' : 'Request access first'], hint: st.kind === 'none' ? 'Click to request track access' : undefined };
     }
     if (err) return { title: rail ? 'Track' : 'Road', err: [err] };
     const fo = this.foreignOwner(sn);
-    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track: yours; existing track: theirs`], ['coin', `Shared upkeep ${fmtMult(this.game.accessMultiplier(fo))} when used`]] };
+    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track: yours; existing track: theirs`], ['coin', `Access ${fmtAccessFactor(this.game.accessMultiplier(fo))} · 75% cap when used`]] };
     if (sn.kind === 'node') {
       const n = net.nodes.get(sn.node!);
       const cnt = sn.group?.length ?? 1;
@@ -1848,7 +1848,7 @@ export class Tools {
     }
     if (this.heightOffset && this.hoverSnap?.kind === 'free' && !title) rows.push(['height', `end ${fmtHeight(this.heightOffset)}`]);
     if (st.sharedSaving && st.sharedSaving > 0) rows.push(['coin', `<b>${fmtMoney(st.sharedSaving)}</b> saved: ${N > 1 ? 'the tracks share one formation' : 'shared formation with adjacent track'}`]);
-    for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (upkeep shared ${fmtMult(this.game.accessMultiplier(fo))})`]); break; } }
+    for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (access ${fmtAccessFactor(this.game.accessMultiplier(fo))} · 75% cap)`]); break; } }
     const warn = [...this.planWarnings(p), ...p.warnings.filter((w) => w !== 'Bridge end: extend to ground')];
     if (p.demolish.length) warn.unshift(`Demolishes ${plural(p.demolish.length, 'building')}`);
     const who = accessOwnerOf(this.game, p.errors[0]);
@@ -1922,7 +1922,7 @@ export class Tools {
       if (lk) rows.push(['plus', `Links with ${esc(lk)} (transfers)`]);
       if (pl.edge.owner >= 0 && pl.edge.owner !== PLAYER) rows.push(['company', `Road of ${esc(g.company(pl.edge.owner).name)}`]);
       const to = pl.edge.tramOwner ?? -1;
-      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> · shared upkeep ${fmtMult(g.accessMultiplier(to))}`]);
+      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> · ${fmtAccessFactor(g.accessMultiplier(to))} · 75% cap`]);
       this.tip({ title: tram ? 'Tram stop' : 'Bus stop', cost: pl.cost, rows, warn: g.economy.canAfford(pl.cost) ? [] : ['Not enough money'] }, 'ok');
     } else {
       ov.setFootprints(null);

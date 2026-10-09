@@ -180,6 +180,19 @@ export function structureFactor(kind: NetKind, type: 'bridge' | 'tunnel', h: num
   return kind === 'rail' ? 6.5 + 3.2 * k : 6.5 + 2.5 * k;
 }
 
+/** Undiscounted materials and wire per unit, shared by construction and replacement quotes. */
+export function trackMaterialCost(kind: NetKind, type: string, section: 'bridge' | 'tunnel' | null, height = 0): number {
+  const per = kind === 'rail' ? TRACK_TYPES.standard.costPerUnit : (ROAD_TYPES[type] ?? ROAD_TYPES.road).costPerUnit;
+  const wire = kind === 'rail' && TRACK_TYPES[type]?.electrified ? ELECTRIFY.costPerUnit : 0;
+  return per * (section ? structureFactor(kind, section, height) : 1) + wire;
+}
+
+/** Cut/fill price for a formation sample, before shared-formation discounts. */
+export function trackEarthworksCost(rise: number, halfWidth: number, length: number, formation = 1): number {
+  const h = Math.abs(rise);
+  return h * length * (halfWidth * 2 + 1.5 + h * 2) * 900 * formation;
+}
+
 /** A crossing's support window follows the physical road, including its existing segment boundaries. */
 function roadBridgeWorks(g: Game, prop: Proposal): { works: NonNullable<Proposal['roadBridges']>; cost: number; error?: string } {
   const net = g.world.net, works: NonNullable<Proposal['roadBridges']> = [], heights = new Map<number, number>();
@@ -1258,13 +1271,14 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
         const s0 = i * PSTEP, s1 = Math.min(tp.len, s0 + PSTEP), sm = (s0 + s1) / 2, ds = s1 - s0;
         let sec: 'bridge' | 'tunnel' | null = null;
         for (const x of tp.sections) if (sm >= x.s0 && sm <= x.s1) sec = x.type;
-        let prem = 0;
+        let prem = 0, height = 0;
         if (sec) {
           bezPoint(tp.bez, tAtS(tab, sm), q);
           const y = profAt(tp.prof, tp.len, sm), t = w.heightAt(q.x, q.z);
-          prem = structureFactor(kind, sec, sec === 'bridge' ? y - t : t - y) - 1;
+          height = sec === 'bridge' ? y - t : t - y;
+          prem = structureFactor(kind, sec, height) - 1;
         }
-        full += (per * (1 + prem) + wire) * ds;
+        full += trackMaterialCost(kind, opts.type, sec, height) * ds;
         const shared = kind === 'rail' && (ti > 0 || beside![ti][i] === 1);
         // Wire is an attribute of each track, priced like electrifying it later. It neither excavates
         // a second tunnel nor receives a formation discount beside the first track.
@@ -1282,7 +1296,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const fm = kind === 'rail' ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).formation : 1;
     for (let i = 0; i < M; i++) {
       if (type[i] !== 0) continue;
-      const v = Math.abs(y[i] - terr[i]) * PSTEP * (hw * 2 + 1.5 + Math.abs(y[i] - terr[i]) * 2) * 900 * fm;
+      const v = trackEarthworksCost(y[i] - terr[i], hw, PSTEP, fm);
       const k = b0 ? Math.min(b0.length - 1, Math.floor((sArr[i] / L) * b0.length)) : 0;
       full += v * N;
       const ev = kind === 'rail' ? v * ((b0 && b0[k] ? S.earthworks : 1) + S.earthworks * (N - 1)) : v;

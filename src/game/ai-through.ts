@@ -241,10 +241,12 @@ export function quoteThrough(h: ThroughHost, ls: Line[], path: number[], cars: V
       releasedRunning += services.find(s => s?.t.id === reuse.id)!.cost.running;
     }
   }
-  // An upper bound on the ordinary access bill: all foreign route upkeep, plus this train's track wear.
+  // Conservative sole-user charge, with the same ceiling and full own-passage wear as billing.
   let fees = 0;
-  for (const id of edges.ids) { const e = g.world.net.edges.get(id)!; if (e.owner !== h.me && e.owner >= 0) fees += (g.edgeMaintenance(e) + e.len * service.wear) * g.accessMultiplier(e.owner); }
-  for (const id of new Set(path)) { const s = g.stations.get(id)!; if (s.owner !== h.me && s.owner >= 0) fees += g.stationMaintenance(s) * g.accessMultiplier(s.owner); }
+  const feeEdges = edges.ids.map(id => g.world.net.edges.get(id)!);
+  const feeItems = [...feeEdges, ...path.map(id => g.stations.get(id)!)];
+  for (const owner of new Set(feeItems.map(item => item.owner))) fees += g.accessChargeEstimate(h.me, owner, feeItems, 1,
+    feeEdges.filter(e => e.owner === owner).reduce((n, e) => n + e.len * service.wear, 0));
   const trainCost = reuse ? 0 : cars.reduce((n, m) => n + m.cost, 0);
   const upkeep = built ? built.reduce((n, id) => { const e = g.world.net.edges.get(id); return n + (e?.owner === h.me ? g.edgeMaintenance(e) : 0); }, 0)
     : links.reduce((n, l) => n + l.d * 1.25 * 300, 0);

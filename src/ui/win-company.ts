@@ -7,7 +7,7 @@ import { AI_PRESETS, normalizeAIConfig } from '../game/ai';
 import { liveCompanies, aiCount, aiConfigOf, addAI, applyAIConfig, presetOf, MAX_AI, DEFAULT_AI } from './gameapi';
 import { fmtMoney, fmtMoneyFull, NON_PROFIT_CATEGORIES, PROFIT_CATEGORIES, CATEGORY_LABEL, COMPANY_COLORS, Economy, MonthRecord, Category, OPERATING_COSTS, operatingCosts } from '../game/economy';
 import { SHARE_COUNT, DIVIDEND_RATE } from '../game/shares';
-import { fmtLen, fmtMult, fmtPct, equalUseShare } from './format';
+import { fmtLen, fmtAccessFactor, fmtPct, equalUseShare } from './format';
 import { multSlider } from './win-access';
 import type { AccessPolicy } from '../game/game';
 import { chart } from './charts';
@@ -263,8 +263,8 @@ export function openAIConfig(ui: UI, id: number | null) {
       slider('Tram', st.cfg.focus.tram, 0, 3, 0.1, focusWord, (v) => (st.cfg.focus.tram = v)),
       section('Track access', 'network access requests'),
       field('Access', seg<AccessPolicy>([['open', 'Open'], ['ask', 'Judge each'], ['auto-approve', 'Approve all'], ['auto-reject', 'Refuse all']], st.cfg.accessPolicy, (v) => { st.cfg.accessPolicy = v; render(); }),
-        st.cfg.accessPolicy === 'open' ? 'Anyone may use its network' : st.cfg.accessPolicy === 'ask' ? 'Refuses competitors when cautious' : undefined),
-      multSlider('Users pay', st.mult, false, (v) => { st.mult = v; }, (v) => `${fmtMult(v)} · 50/50 usage → ${fmtPct(equalUseShare(v))}`),
+        st.cfg.accessPolicy === 'open' ? 'Anyone may use its network' : st.cfg.accessPolicy === 'ask' ? 'Fees must cover lost fares when cautious' : undefined),
+      multSlider('Price', st.mult, false, (v) => { st.mult = v; }, (v) => `${fmtAccessFactor(v)} · equal use ${fmtPct(equalUseShare(v))} · 75% cap`),
       co ? null : field('Start money', stepper(fmtMoney(st.cfg.startMoney),
         () => { st.cfg.startMoney = Math.max(1_000_000, st.cfg.startMoney - 1_000_000); render(); },
         () => { st.cfg.startMoney = Math.min(50_000_000, st.cfg.startMoney + 1_000_000); render(); }), 'Entire amount is a loan'),

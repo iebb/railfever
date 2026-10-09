@@ -12,6 +12,7 @@ import { estimateVehicleYear, YEAR_S, trackBasePerUnit } from './opcosts';
 import { KMH_TO_UPS, TRACK_TYPES, RAIL, UNIT_M } from './constants';
 import { railPartMode } from './stations';
 import { railCapacityOptions } from './rail-capacity-options';
+import { accessItemKey, accessItemOwner, type AccessItem } from './access-cost';
 
 export interface RailCapacityState {
   day: number;
@@ -32,6 +33,7 @@ interface Channel {
   line: Line; owner: number; pattern: number; cars: VehicleModel[]; trains: Train[];
   cycle: number; seats: number; running: number; capital: number; budget: number; boardings: number;
   use: Map<number, number>; limit: number;
+  access: Map<number, { item: AccessItem; use: number }>;
   /** Whole-route bid; mixed, partial and circular services retain the existing conservative model. */
   native?: { path: number[]; share: number; seats: number };
 }
@@ -52,7 +54,8 @@ const fleet = (g: Game, l: Line) => l.vehicles.map(id => g.vehicles.get(id)).fil
  * depends on a previous call, and route, stock, access, walking inputs and fixed simulation time invalidate it. */
 function quoteEpoch(g: Game): string {
   return `${g.day}:${g.tick}:${capacityTopologyKey(g)}:${g.lines.version}:${g.demand.version}:`
-    + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}`;
+    + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}:${g.stations.walkVersion}:`
+    + g.companies.map(c => g.accessMultiplier(c.id)).join(',');
 }
 function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
   const epoch = quoteEpoch(g);
@@ -241,15 +244,21 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       const indices = patternStops(l, c.pid);
       if (indices.length < 2 || !c.cars.length) continue;
       const carSpeed = Math.min(...c.cars.map(m => m.speed)), speed = Math.max(0.4, carSpeed * 0.6 * KMH_TO_UPS);
-      const use = new Map<number, number>(); let distance = 0;
+      const use = new Map<number, number>(), access = new Map<number, { item: AccessItem; use: number }>(); let distance = 0;
+      const meter = (item: AccessItem, amount: number) => {
+        const key = accessItemKey(item), old = access.get(key);
+        access.set(key, { item, use: (old?.use ?? 0) + amount });
+      };
       for (const i of indices) {
         const j = nextStopIndex(l, c.pid, i), a = l.stops[i], b = l.stops[j];
+        const st = g.stations.get(a); if (st) meter(st, 1);
         if (a === b) continue;
         const hop = c.owner === l.owner && j === (i + 1) % l.stops.length ? inv.routes.get(l.id)?.[i] ?? [] : routeBetween(g, a, b, c.owner) ?? [];
         const perHop = new Map<number, number>();
         for (const id of hop) {
           const e = net.edges.get(id), rid = inv.edgeResource.get(id);
           if (!e || rid === undefined || e.depot >= 0) continue;
+          meter(e, e.len);
           const r = inv.resources[rid], cap = Math.max(0.4, Math.min(speed, (TRACK_TYPES[e.type]?.speed ?? carSpeed) * 0.6 * KMH_TO_UPS));
           const seconds = r.kind === 'platform' ? 10 + c.cars.reduce((n, m) => n + m.length, 0) / cap
             : (r.kind === 'block' ? Math.max(e.len, 50) : e.len) / cap;
@@ -260,13 +269,14 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       }
       const pcycle = Math.max(1, headways.find(p => p.pid === c.pid)?.cycle ?? distance / speed + indices.length * 10);
       for (const [rid, seconds] of use) use.set(rid, seconds / pcycle);
+      for (const entry of access.values()) entry.use /= pcycle;
       const year = estimateVehicleYear(c.cars, distance / Math.max(1, indices.length), g.year, 0.5);
       const wear = distance / 2 * year.trackWearPerUnit;
       const part = weights.get(key)! / Math.max(1, sum);
       out.push({ line: l, owner: c.owner, pattern: c.pid, cars: c.cars, trains: c.trains,
         cycle: pcycle, seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * indices.length * 0.65,
         running: year.total + wear, capital: c.cars.reduce((n, m) => n + m.cost, 0), budget: d.revenue * part, boardings: d.boardings * part,
-        use, limit: use.size ? Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u)))) : 0,
+        use, access, limit: use.size ? Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u)))) : 0,
         ...(complete ? { native: { path: route.stations, share: part,
           seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * .65 } } : {}) });
     }
@@ -329,8 +339,31 @@ function receipts(g: Game, channels: Channel[], counts: number[], inv: RouteInve
   });
 }
 const fleetCount = (channels: Channel[], line: number) => channels.reduce((n, c) => n + (c.line.id === line ? c.trains.length : 0), 0);
+/** Quote each company's combined item usage, then allocate net fees across its service patterns.
+ * Own-passage wear is already in Channel.running; fixed fees vary with the proposed fleet/frequency. */
+function accessPayments(g: Game, channels: Channel[], counts: number[]): number[] {
+  const payments = channels.map(() => 0), traffic = new Map<number, { item: AccessItem; users: Map<number, number>; total: number }>();
+  channels.forEach((c, i) => {
+    for (const [key, entry] of c.access) {
+      const amount = entry.use * counts[i];
+      if (!(amount > 0)) continue;
+      const q = traffic.get(key) ?? { item: entry.item, users: new Map<number, number>(), total: 0 };
+      q.users.set(c.owner, (q.users.get(c.owner) ?? 0) + amount); q.total += amount; traffic.set(key, q);
+    }
+  });
+  for (const [key, q] of traffic) for (const [user, amount] of q.users) {
+    const owner = accessItemOwner(q.item), charge = g.accessChargeEstimate(user, owner, [q.item], amount / q.total);
+    if (!(charge > 0)) continue;
+    channels.forEach((c, i) => { if (c.owner === user) payments[i] += charge * (c.access.get(key)?.use ?? 0) * counts[i] / amount; });
+    // Fees are the participating owner's income. Keep outside owners' bills as a net cost to this pool.
+    const recipients = channels.map((c, i) => c.owner === owner ? i : -1).filter(i => i >= 0), ownUse = q.users.get(owner) ?? 0;
+    for (const i of recipients) payments[i] -= charge * (ownUse > 0 ? (channels[i].access.get(key)?.use ?? 0) * counts[i] / ownUse : 1 / recipients.length);
+  }
+  return payments;
+}
 const netValue = (g: Game, channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>) =>
-  receipts(g, channels, counts, inv, enlarged).reduce((n, r, i) => n + r - counts[i] * (channels[i].running + channels[i].capital * 0.03), 0);
+  receipts(g, channels, counts, inv, enlarged).reduce((n, r, i) => n + r - counts[i] * (channels[i].running + channels[i].capital * 0.03), 0)
+    - accessPayments(g, channels, counts).reduce((n, fee) => n + fee, 0);
 
 function connectedLines(g: Game, l: Line, inv: RouteInventory): Line[] {
   const ids = new Set<number>([l.id]), used = new Set<number>();
@@ -473,9 +506,10 @@ export function sharedUpgradeReturn(g: Game, l: Line, resourceIds: number[], mul
   // Capital's opportunity cost plus debt service, the same economic terms as through-link construction.
   const required = cost * (0.045 - 0.03 * risk + 0.03);
   const oldReceipts = receipts(g, e.channels, e.counts, e.inventory), newReceipts = receipts(g, e.channels, bestCounts, e.inventory, enlarged);
+  const oldFees = accessPayments(g, e.channels, e.counts), newFees = accessPayments(g, e.channels, bestCounts);
   const gains = new Map<number, number>();
   e.channels.forEach((c, i) => {
-    const gain = newReceipts[i] - oldReceipts[i] - (bestCounts[i] - e.counts[i]) * (c.running + c.capital * 0.03);
+    const gain = newReceipts[i] - oldReceipts[i] - (bestCounts[i] - e.counts[i]) * (c.running + c.capital * 0.03) - (newFees[i] - oldFees[i]);
     if (g.company(c.owner).ai) gains.set(c.owner, (gains.get(c.owner) ?? 0) + gain);
   });
   const positive = [...gains].filter(([, gain]) => gain > 0).sort(([a], [b]) => a - b), total = positive.reduce((n, [, gain]) => n + gain, 0);

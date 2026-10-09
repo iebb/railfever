@@ -4,7 +4,7 @@
 // plus time-based upkeep, and energy from the physics: traction energy at the wheels / efficiency (electric 0.85,
 // diesel 0.35, steam 0.07), hotel load, regenerative braking on electric stock, at era prices. Tracks: a base
 // maintenance per unit (wire upkeep when electrified) plus wear per train passage (axle load x (v/160)^2),
-// recorded per edge and billed monthly to the owner; track-access usage is metered by that wear.
+// recorded per edge and operator, billed to the owner and reimbursed by foreign operators in full.
 //
 // Calibration: under its kind's typical duty (in service all year, stops at the usual spacing) a consist costs
 // about what its models' `running` said (the time-based upkeep takes the remainder, at least 10%), so the old
@@ -354,15 +354,12 @@ export function passageWear(c: Consist, loadPax: number, units: number, kmh: num
   const loadUnits = c.axles > 0 ? (loadPax * PAX_T) / 16 : 0;
   return WEAR_RATE * units * (c.axleUnits + loadUnits) * wearSpeed(kmh);
 }
-/** Wear of a reference passage (14 axle-load units at 120 km/h): access usage is metered in such units. */
-const REF_WEAR_PER_UNIT = WEAR_RATE * 14 * wearSpeed(120);
-
-interface OpsState { wear: Map<number, number>; wearOwner: Map<number, number>; lastWear: Record<number, number> }
+interface OpsState { wear: Map<number, number>; wearOwner: Map<number, number>; wearUsers: Map<number, number[]>; lastWear: Record<number, number> }
 const states = new WeakMap<Game, OpsState>();
 function state(g: Game): OpsState {
   let s = states.get(g);
   if (!s) {
-    s = { wear: new Map(), wearOwner: new Map(), lastWear: {} };
+    s = { wear: new Map(), wearOwner: new Map(), wearUsers: new Map(), lastWear: {} };
     states.set(g, s);
     const st = s;
     // wear follows edges that are split
@@ -374,6 +371,13 @@ function state(g: Game): OpsState {
       const f = old.len > 0 ? e1.len / old.len : 0.5;
       st.wear.set(e1.id, (st.wear.get(e1.id) ?? 0) + w * f); st.wearOwner.set(e1.id, o);
       st.wear.set(e2.id, (st.wear.get(e2.id) ?? 0) + w * (1 - f)); st.wearOwner.set(e2.id, o);
+      const users = st.wearUsers.get(old.id);
+      st.wearUsers.delete(old.id);
+      if (users) for (const [edge, part] of [[e1.id, f], [e2.id, 1 - f]]) {
+        const use = st.wearUsers.get(edge) ?? [];
+        for (let i = 0; i < users.length; i++) use[i] = (use[i] ?? 0) + users[i] * part;
+        st.wearUsers.set(edge, use);
+      }
     });
   }
   return s;
@@ -381,7 +385,7 @@ function state(g: Game): OpsState {
 
 /**
  * A train has passed a whole track edge (train.ts meterTrack): its wear is recorded for the owner's monthly bill,
- * and the passage is metered for track access in reference-wear units (a fast, heavy train counts for more).
+ * and its actual distance is metered separately for the fixed access charge.
  */
 export function trackPassage(g: Game, t: Vehicle & { cars: VehicleModel[]; speed: number }, e: NEdge, units: number) {
   if (e.owner < 0 || e.depot >= 0) return;
@@ -391,7 +395,11 @@ export function trackPassage(g: Game, t: Vehicle & { cars: VehicleModel[]; speed
   const s = state(g);
   s.wear.set(e.id, (s.wear.get(e.id) ?? 0) + w);
   s.wearOwner.set(e.id, e.owner);
-  g.recordTrackUse(t.owner, e, units * Math.max(0.2, Math.min(20, w / Math.max(1e-9, REF_WEAR_PER_UNIT * units))));
+  const users = s.wearUsers.get(e.id) ?? [];
+  while (users.length <= t.owner) users.push(0);
+  if (t.owner >= 0) users[t.owner] += w;
+  s.wearUsers.set(e.id, users);
+  g.recordTrackUse(t.owner, e, units);
 }
 
 /** Track wear recorded this month on an edge (money). */
@@ -399,9 +407,9 @@ export function monthWear(g: Game, edgeId: number): number { return states.get(g
 
 /**
  * Month end (Game.billAccess): every owner pays the wear on its edges ('trackWear'); returns the wear per edge so
- * the access fees can share it out, and starts a new month.
+ * foreign operators reimburse their own wear in full, and starts a new month.
  */
-export function billTrackWear(g: Game): Map<number, number> {
+export function billTrackWear(g: Game, reimburse?: (user: number, owner: number, wear: number) => void): Map<number, number> {
   const s = state(g);
   const out = s.wear;
   const last: Record<number, number> = {};
@@ -412,8 +420,10 @@ export function billTrackWear(g: Game): Map<number, number> {
     if (!co || co.defunct) continue;
     co.economy.spend(w, 'trackWear', true);
     last[owner] = (last[owner] ?? 0) + w;
+    const users = s.wearUsers.get(id) ?? [];
+    for (let user = 0; user < users.length; user++) if (user !== owner && users[user] > 0) reimburse?.(user, owner, users[user]);
   }
-  s.wear = new Map(); s.wearOwner = new Map(); s.lastWear = last;
+  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.lastWear = last;
   return out;
 }
 /** Track wear each company paid last month. */
@@ -469,14 +479,20 @@ export function estimateVehicleYear(models: VehicleModel[], hopUnits: number, ye
 
 // ------------------------------------------------------------------------------ save
 /** Track wear of the month so far (save games). */
-export function saveOps(g: Game): { wear: [number, number, number][]; lastWear: Record<number, number> } {
+export function saveOps(g: Game): { wear: [number, number, number][]; wearUsers: [number, number[]][]; lastWear: Record<number, number> } {
   const s = state(g);
-  return { wear: [...s.wear].map(([id, w]) => [id, w, s.wearOwner.get(id) ?? -1]), lastWear: { ...s.lastWear } };
+  return { wear: [...s.wear].map(([id, w]) => [id, w, s.wearOwner.get(id) ?? -1]), wearUsers: [...s.wearUsers].map(([id, u]) => [id, [...u]]), lastWear: { ...s.lastWear } };
 }
 export function loadOps(g: Game, d: any) {
   const s = state(g);
-  s.wear = new Map(); s.wearOwner = new Map(); s.lastWear = {};
+  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.lastWear = {};
   if (!d) return;
   for (const [id, w, o] of (d.wear ?? []) as [number, number, number][]) { s.wear.set(id, Number(w) || 0); s.wearOwner.set(id, o); }
+  if (d.wearUsers) for (const [id, u] of d.wearUsers as [number, number[]][]) s.wearUsers.set(id, u.map(x => Number(x) || 0));
+  else for (const [id, w] of s.wear) {
+    // Legacy meters counted reference-wear units; recover operator wear from their proportions.
+    const edge = g.world.net.edges.get(id), use = edge ? g.accessUsage(edge) : [], total = use.reduce((n, x) => n + x, 0);
+    if (total > 0) s.wearUsers.set(id, use.map(x => w * x / total));
+  }
   if (d.lastWear) for (const [k, v] of Object.entries(d.lastWear)) s.lastWear[Number(k)] = Number(v) || 0;
 }

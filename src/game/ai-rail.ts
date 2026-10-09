@@ -95,14 +95,14 @@ export class RailPolicy {
         if (!e) continue;
         const cost = g.edgeMaintenance(e) / 12 + (wear.get(id) ?? 0);
         if (e.owner === this.me) own += cost / uses.get(id)!;
-        else if (e.owner >= 0) foreign += cost;
+        else if (e.owner >= 0) foreign += g.accessChargeEstimate(this.me, e.owner, [e], 1) / 12;
       }
       for (const sid of new Set(l.stops)) {
         const st = g.stations.get(sid);
         if (!st) continue;
         const cost = g.stationMaintenance(st) / 12;
         if (st.owner === this.me) own += cost / stationUses.get(sid)!;
-        else if (st.owner >= 0) foreign += cost;
+        else if (st.owner >= 0) foreign += g.accessChargeEstimate(this.me, st.owner, [st], 1) / 12;
       }
       const depot = this.info(l)?.depot ?? this.fleet(l)[0]?.depotId;
       if (depot !== undefined && g.depots.get(depot)?.owner === this.me) {

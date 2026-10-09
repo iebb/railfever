@@ -23,6 +23,9 @@ import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } fr
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 import { observeRailCapacity } from './ai-capacity';
+import { capacityRouteBetween } from './rail-capacity-routes';
+import { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP, accessChargeEstimate, accessFullCost, accessReplacementCost, accessItemKey, migrateAccessMultiplier, type AccessItem } from './access-cost';
+export { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP } from './access-cost';
 
 export interface NewGameOptions {
   size: number;
@@ -46,23 +49,20 @@ export interface News { day: number; text: string; kind: NewsKind; x?: number; z
 /**
  * A track access agreement: `user` may run trains and trams on `owner`'s tracks, tram tracks and stations.
  * Users pay for it monthly: every item (track edge, tram tracks, station) that carried other companies' traffic
- * has its monthly maintenance split by usage (distance travelled on tracks, stops at stations), the owner's own
- * usage counting once and each user's `accessMultiplier(owner)` times (0..3, default 2). So with m = 2 and a
- * 50/50 split the user pays 2/3 of the item's maintenance; m = 0 is free; an item only others used is paid in full.
+ * charges its real usage share (distance on tracks, calls at stations) of replacement capital's 30-year annuity
+ * plus base upkeep, times the owner's price factor (0..2, default 1.25). Each user is capped at 75% of that
+ * annual full cost, and reimburses its own passage wear in full. A zero factor waives the fixed charge.
  */
 export interface AccessAgreement {
   user: number;
   owner: number;
   since: number;
-  /** last month: the user's share of the traffic on the owner's items it used, weighted by their maintenance (0..1) */
+  /** last month: real traffic share on used items, weighted by their annual full cost (0..1) */
   usageShareLastMonth: number;
   /** fees paid for last month and in total */
   paidLastMonth: number;
   paidTotal: number;
 }
-
-export const DEFAULT_ACCESS_MULTIPLIER = 2;
-export const MAX_ACCESS_MULTIPLIER = 3;
 
 /**
  * How an owner shares its network: open (the default: every company not blocked may use it without asking; an
@@ -138,11 +138,11 @@ export class Game {
   private blockedKeys = new Set<number>();
   /** v2.2 saves: their default policies become open access when the AIs are restored */
   private legacyAccess = false;
-  /** weight of others' usage of a company's network (non-AI owners; AI owners keep it in their config) */
+  /** price factor for annual full cost (saved slot retains its legacy name; AI owners keep theirs in config) */
   private accessMult: Record<number, number> = {};
   /** usage this month: item key (rail edge id*4, tram tracks id*4+1, station id*4+2) -> amount by company id */
   private usage = new Map<number, number[]>();
-  /** owners whose infrastructure is metered this month (they have, or had, an agreement) */
+  /** Legacy saved roster of owners with an agreement; all owner traffic is metered from month start. */
   private metered = new Set<number>();
   options: NewGameOptions;
   /** Number of committed simulation ticks (40 per game day). */
@@ -355,8 +355,8 @@ export class Game {
     this.access.push({ user, owner, since: this.day, usageShareLastMonth: 0, paidLastMonth: 0, paidTotal: 0 });
     this.accessKeys.add(user * 4096 + owner);
     this.metered.add(owner);
-    if (owner === PLAYER) this.postNews(`${u.name} uses your open network and shares upkeep.`, 'info');
-    else if (user === PLAYER) this.postNews(`You use ${o.name}’s open network and share upkeep.`, 'info');
+    if (owner === PLAYER) this.postNews(`${u.name} uses your open network and pays access fees.`, 'info');
+    else if (user === PLAYER) this.postNews(`You use ${o.name}’s open network and pay access fees.`, 'info');
   }
 
   /** How `owner` answers access requests. */
@@ -418,11 +418,38 @@ export class Game {
     return false;
   }
 
+  /** A cautious owner compares the new net fixed-fee income with fares a competing entrant may displace.
+   * Wear reimbursements cancel the owner's extra wear bill, so they are not treated as profit here. */
+  private accessOfferPays(user: number, owner: number, risk: number): boolean {
+    const items = new Map<number, AccessItem>(), relevant = [...this.lines.map.values()].filter(l => l.owner === user);
+    let lost = 0, incoming = 0;
+    for (const line of this.lines.map.values()) {
+      if (line.owner !== owner) continue;
+      const towns = new Set(line.stops.map(id => this.stations.get(id)?.townId ?? -1).filter(id => id >= 0));
+      const rivals = relevant.filter(l => new Set(l.stops.map(id => this.stations.get(id)?.townId ?? -1).filter(id => towns.has(id))).size >= 2);
+      if (!rivals.length) continue;
+      const visitors = Math.max(1, rivals.reduce((n, l) => n + l.vehicles.length, 0)), share = visitors / (visitors + line.vehicles.length);
+      const receipts = Math.max(line.incomeLast, line.incomeYear * 360 / Math.max(30, this.day % 360));
+      lost += receipts * share * (1 - risk);
+      const used: AccessItem[] = line.stops.map(id => this.stations.get(id)).filter((st): st is Station => !!st);
+      if (line.kind === 'rail') for (let i = 1; i < line.stops.length; i++) {
+        for (const id of capacityRouteBetween(this, line.stops[i - 1], line.stops[i], owner) ?? []) {
+          const e = this.world.net.edges.get(id); if (e && e.depot < 0) used.push(e);
+        }
+      }
+      for (const item of used) {
+        const key = accessItemKey(item); if (items.has(key)) continue;
+        items.set(key, item); incoming += this.accessChargeEstimate(user, owner, [item], share);
+      }
+    }
+    return incoming > 0 && incoming >= lost;
+  }
+
   /**
    * Ask for a track access agreement (`user` would run trains and trams on `owner`'s tracks and stop at its
-   * stations, sharing their maintenance by usage). By the owner's policy: granted at once, refused, or (the
+   * stations, paying full-cost charges by usage). By the owner's policy: granted at once, refused, or (the
    * player's default, 'ask') pending until the owner approves or rejects it (or it expires). AI owners decide
-   * at once: yes, unless refusing everyone, or cautious and the requester competes with them.
+   * at once: cautious owners require the fees to cover fares a competitor may displace.
    */
   requestAccess(user: number, owner: number, reason?: string): AccessResult {
     if (user === owner || owner < 0) return 'rejected';
@@ -434,9 +461,8 @@ export class Game {
     const policy = this.accessPolicy(owner), ai = this.aiOf(owner);
     if (policy === 'auto-reject') return this.refused(user, owner);
     if (policy === 'open') return this.grant(user, owner);
-    // AI owners answer at once: auto-approve (their default) grants everyone; set to 'ask', a cautious AI keeps
-    // competitors off its tracks
-    if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) ? this.refused(user, owner) : this.grant(user, owner);
+    if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) && !this.accessOfferPays(user, owner, ai.config.risk)
+      ? this.refused(user, owner) : this.grant(user, owner);
     if (policy === 'auto-approve') return this.grant(user, owner);
     const q: AccessRequest = { id: this.nextRequestId++, user, owner, day: this.day };
     if (reason) q.reason = reason;
@@ -534,11 +560,11 @@ export class Game {
     return { lines, stops, vehicles, onTrack };
   }
 
-  /** Weight (0..3) of other companies' usage when the maintenance of `owner`'s shared items is split. */
+  /** Price factor (0..2) applied to users' real shares of annual full cost. */
   accessMultiplier(owner: number): number {
     const ai = this.aiOf(owner);
     const m = ai ? ai.config.accessMultiplier : this.accessMult[owner];
-    return typeof m === 'number' && m >= 0 ? Math.min(MAX_ACCESS_MULTIPLIER, m) : DEFAULT_ACCESS_MULTIPLIER;
+    return typeof m === 'number' && Number.isFinite(m) && m >= 0 ? Math.min(MAX_ACCESS_MULTIPLIER, m) : DEFAULT_ACCESS_MULTIPLIER;
   }
   setAccessMultiplier(owner: number, m: number) {
     const v = Math.max(0, Math.min(MAX_ACCESS_MULTIPLIER, Number.isFinite(m) ? m : DEFAULT_ACCESS_MULTIPLIER));
@@ -549,27 +575,34 @@ export class Game {
   /** Access fees `owner` earned last month and in total. */
   accessEarnings(owner: number): { lastMonth: number; total: number } { return this.accessEarned[owner] ?? { lastMonth: 0, total: 0 }; }
   /**
-   * What `user` pays for `owner`'s infrastructure: the multiplier, the share of an item's maintenance it pays
-   * when it uses the item as much as the owner (m / (1 + m)), or alone (all), and last month's actual figures.
+   * Fixed-cost fractions at equal/sole use, plus the last bill annualised (including own wear).
    */
-  estimateAccessShare(owner: number, user: number): { multiplier: number; equalUseShare: number; soleUserShare: number; usageShareLastMonth: number; paidLastMonth: number } {
+  estimateAccessShare(owner: number, user: number) {
     const m = this.accessMultiplier(owner), a = this.agreement(user, owner);
-    return { multiplier: m, equalUseShare: m / (1 + m), soleUserShare: m > 0 ? 1 : 0, usageShareLastMonth: a?.usageShareLastMonth ?? 0, paidLastMonth: a?.paidLastMonth ?? 0 };
+    return { multiplier: m, equalUseShare: Math.min(m / 2, ACCESS_CAP), soleUserShare: Math.min(m, ACCESS_CAP), cap: ACCESS_CAP,
+      usageShareLastMonth: a?.usageShareLastMonth ?? 0, paidLastMonth: a?.paidLastMonth ?? 0, yearlyCharge: (a?.paidLastMonth ?? 0) * 12 };
   }
+
+  /** Pure replacement and fee quotes shared by billing, AI planning and UI. Prices are cached derived data. */
+  accessReplacementCost(item: AccessItem): number { return accessReplacementCost(this, item); }
+  accessFullCost(item: AccessItem): number { return accessFullCost(this, item); }
+  accessChargeEstimate(user: number, owner: number, items: Iterable<AccessItem>, share: number | ((item: AccessItem) => number), annualWear = 0): number {
+    return accessChargeEstimate(this, user, owner, items, share, annualWear);
+  }
+  /** Real usage so far this month; reading it never changes the meter or simulation. */
+  accessUsage(item: AccessItem): readonly number[] { return this.usage.get(accessItemKey(item)) ?? []; }
 
   /** Metering: a vehicle of `user` travelled `units` on a rail edge (or its tram tracks). Own usage counts too. */
   recordTrackUse(user: number, e: NEdge, units: number, tram = false) {
     const owner = tram ? e.tramOwner ?? -1 : e.owner;
-    if (owner < 0 || user < 0 || e.depot >= 0) return;
+    if (owner < 0 || user < 0 || e.depot >= 0 || !(units > 0) || !Number.isFinite(units)) return;
     if (owner !== user && !this.accessKeys.has(user * 4096 + owner)) this.openAccess(user, owner);
-    if (!this.metered.has(owner)) return;
     this.addUsage(e.id * 4 + (tram ? 1 : 0), user, units);
   }
   /** Metering: a vehicle stops at a station (called when it serves the station). */
   recordStop(v: Vehicle, st: Station) {
     if (st.owner < 0 || v.owner < 0) return;
     if (st.owner !== v.owner && !this.accessKeys.has(v.owner * 4096 + st.owner)) this.openAccess(v.owner, st.owner);
-    if (!this.metered.has(st.owner)) return;
     this.addUsage(st.id * 4 + 2, v.owner, 1);
   }
   private addUsage(key: number, user: number, x: number) {
@@ -578,19 +611,6 @@ export class Game {
     while (a.length <= user) a.push(0);
     a[user] += x;
   }
-  /** Trams on metered tram tracks: distance sampled once a day (speed x one day). */
-  private meterTrams() {
-    if (!this.metered.size) return;
-    const net = this.world.net;
-    for (const v of this.vehicles.map.values()) {
-      if (v.kind !== 'road') continue;
-      const rv = v as RoadVehicle;
-      if (!rv.seg || !(rv.speed > 0) || rv.model?.kind !== 'tram') continue;
-      const e = net.edges.get(rv.seg.e);
-      if (e && e.tram) this.recordTrackUse(v.owner, e, rv.speed * DAY_SECONDS, true);
-    }
-  }
-
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
     // (ops) base upkeep including overhead wire; wear by train passages is billed on top monthly
@@ -605,39 +625,38 @@ export class Game {
   }
 
   /**
-   * Month end: users of other companies' items pay their usage share of each item's monthly maintenance to the
-   * owner. Weights: owner usage x 1, each user's usage x the owner's multiplier.
+   * Month end: capped, unweighted full-cost charges plus each user's own wear reimbursement.
    */
   billAccess() {
-    // (ops) owners pay the month's track wear; on shared track it counts towards the cost users share
-    const wear = billTrackWear(this);
     for (const a of this.access) { a.usageShareLastMonth = 0; a.paidLastMonth = 0; }
     for (const k in this.accessEarned) this.accessEarned[k].lastMonth = 0;
+    // Owners book gross wear; foreign passages reimburse it without a price factor or ceiling.
+    const wear = billTrackWear(this, (user, owner, amount) => this.payAccess(user, owner, this.accessChargeEstimate(user, owner, [], 0, amount * 12) / 12));
     if (this.usage.size) {
       const net = this.world.net;
-      /** per (user, owner): maintenance-weighted usage share numerator and the maintenance of the items used */
+      /** per (user, owner): full-cost-weighted real usage numerator and cost of used items */
       const shares = new Map<number, { u: number; c: number }>();
       for (const [key, arr] of this.usage) {
         const id = Math.floor(key / 4), kind = key % 4;
-        let owner = -1, cost = 0;
-        if (kind === 2) { const st = this.stations.get(id); if (!st) continue; owner = st.owner; cost = this.stationMaintenance(st) / 12; }
+        let owner = -1, item: AccessItem;
+        if (kind === 2) { const st = this.stations.get(id); if (!st) continue; owner = st.owner; item = st; }
         else {
           const e = net.edges.get(id);
           if (!e) continue;
-          if (kind === 1) { owner = e.tramOwner ?? -1; cost = (e.len * TRAM.maintPerUnit) / 12; } else { owner = e.owner; cost = this.edgeMaintenance(e) / 12 + (wear.get(id) ?? 0); }
+          if (kind === 1) { owner = e.tramOwner ?? -1; item = { tram: e }; } else { owner = e.owner; item = e; }
         }
         if (owner < 0 || !this.companies[owner] || this.companies[owner].defunct) continue;
         const uo = arr[owner] ?? 0;
         let su = 0;
         for (let i = 0; i < arr.length; i++) if (i !== owner) su += arr[i];
         if (!(su > 0)) continue;
-        const m = this.accessMultiplier(owner), W = uo + m * su;
+        const cost = this.accessFullCost(item);
         for (let i = 0; i < arr.length; i++) {
           if (i === owner || !(arr[i] > 0)) continue;
           const k = i * 4096 + owner, sh = shares.get(k) ?? { u: 0, c: 0 };
           sh.u += (cost * arr[i]) / (uo + su); sh.c += cost;
           shares.set(k, sh);
-          if (m > 0 && W > 0) this.payAccess(i, owner, (cost * m * arr[i]) / W);
+          this.payAccess(i, owner, this.accessChargeEstimate(i, owner, [item], arr[i] / (uo + su)) / 12);
         }
       }
       for (const [k, sh] of shares) {
@@ -931,7 +950,6 @@ export class Game {
 
   private onNewDay() {
     this.checkLost();
-    this.meterTrams();
     this.demand.daily();
     this.stations.daily();
     if (this.accessRequests.length) this.expireRequests();
@@ -1081,8 +1099,8 @@ export class Game {
       nextAccessRequest: this.nextRequestId,
       accessPolicies: { ...this.accessPolicies },
       accessBlocked: JSON.parse(JSON.stringify(this.blocked)),
-      // 2: open access is the default policy (v2.3)
-      accessVersion: 2,
+      // 3: full-cost price factors; previous multiplier values migrate once by 0.625.
+      accessVersion: 3,
       // a catchment recompute still pending (e.g. saved right after a buyout) happens in the loaded game too
       catchmentDirty: this.lines.catchmentDirty,
       demand: this.demand.toJSON(),
@@ -1111,7 +1129,7 @@ export class Game {
     this.rebuildAccessKeys();
     this.accessMult = {};
     for (const c of this.companies) if (!c.ai) this.accessMult[c.id] = DEFAULT_ACCESS_MULTIPLIER;
-    if (d.accessMult) for (const [k, v] of Object.entries(d.accessMult)) this.accessMult[Number(k)] = Number(v);
+    if (d.accessMult) for (const [k, v] of Object.entries(d.accessMult)) this.accessMult[Number(k)] = (d.accessVersion ?? 1) < 3 ? migrateAccessMultiplier(Number(v)) : Number(v);
     this.accessEarned = {};
     if (d.accessEarned) for (const [k, v] of Object.entries(d.accessEarned as Record<string, { lastMonth: number; total: number }>)) this.accessEarned[Number(k)] = { lastMonth: v.lastMonth ?? 0, total: v.total ?? 0 };
     this.usage = new Map(((d.accessUsage ?? []) as [number, number[]][]).map(([k, u]) => [k, u.map((x) => Number(x) || 0)]));
@@ -1153,6 +1171,7 @@ export class Game {
       const data = ((d.ais ?? []) as any[]).find((a) => a && a.companyId === c.id);
       const ai = new AIController(this, c.id, data?.config);
       if (data) { try { ai.load(data); } catch (e) { console.warn('AI state could not be restored', e); } }
+      if ((d.accessVersion ?? 1) < 3) ai.config = { ...ai.config, accessMultiplier: migrateAccessMultiplier(data?.config?.accessMultiplier ?? 1) };
       if (this.legacyAccess && ai.config.accessPolicy === 'auto-approve') ai.config = { ...ai.config, accessPolicy: 'open' };
       this.ais.push(ai);
     }

@@ -1,11 +1,11 @@
-// Track access window: requests to use your network, your answer policy and price multiplier, blocked companies,
+// Track access window: requests to use your network, your answer policy and price factor, blocked companies,
 // who uses your network, the networks you use and requests to other companies.
 import type { UI } from './ui';
 import type { Game, AccessPolicy, AccessResult } from '../game/game';
 import { PLAYER, MAX_ACCESS_MULTIPLIER, ACCESS_REQUEST_DAYS } from '../game/game';
 import { h, clear, add, tile, section, icon, toggle, seg, field } from './dom';
 import { fmtMoney } from '../game/economy';
-import { fmtMonthYear, fmtMult, fmtPct, equalUseShare, fmtLen } from './format';
+import { fmtMonthYear, fmtAccessFactor, fmtPct, equalUseShare, fmtLen } from './format';
 import { liveCompanies } from './gameapi';
 
 /** How an owner answers requests, in words (AI owners judge "ask" requests themselves, at once). */
@@ -17,10 +17,10 @@ export function policyText(g: Game, owner: number): string {
   return g.company(owner).ai ? 'Decides on request' : 'Asks each time';
 }
 
-/** Track access multiplier slider (0×–3× in 0.25 steps) with a live label; `set` runs on every change. */
+/** Track access price-factor slider (0×–2×); eighth steps retain the permissive AI default 0.625. */
 export function multSlider(label: string, value: number, disabled: boolean, set: (v: number) => void, word: (v: number) => string, hint?: string): HTMLElement {
   const out = h('span', { class: 'sl-v' }, word(value));
-  const r = h('input', { type: 'range', min: '0', max: String(MAX_ACCESS_MULTIPLIER), step: '0.25', value: String(value), class: 'range', 'aria-label': label, disabled }) as HTMLInputElement;
+  const r = h('input', { type: 'range', min: '0', max: String(MAX_ACCESS_MULTIPLIER), step: '0.125', value: String(value), class: 'range', 'aria-label': label, disabled }) as HTMLInputElement;
   r.addEventListener('input', () => { const v = Number(r.value); set(v); out.textContent = word(v); });
   return field(label, h('div', { class: 'slider wide' }, r, out), hint);
 }
@@ -30,7 +30,7 @@ export function requestAccessUI(ui: UI, owner: number): AccessResult {
   const g = ui.game;
   const co = g.company(owner);
   const r = g.requestAccess(PLAYER, owner);
-  if (r === 'granted') { ui.toast(`Access agreed with ${co.name} · upkeep ${fmtMult(g.accessMultiplier(owner))}`, 'good'); ui.sound('toggle', { pitch: 1.12 }); }
+  if (r === 'granted') { ui.toast(`Access agreed with ${co.name} · ${fmtAccessFactor(g.accessMultiplier(owner))}`, 'good'); ui.sound('toggle', { pitch: 1.12 }); }
   else if (r === 'pending') { ui.toast(`Request sent; ${co.name} will answer`, 'info'); ui.sound('click'); }
   else if (r === 'blocked') ui.toast(`${co.name} has blocked you from its network`, 'bad');
   else ui.toast(`${co.name} refuses access to its network`, 'bad');
@@ -58,14 +58,14 @@ function endAgreement(ui: UI, user: number, owner: number, verb: string): boolea
 /** The player's access to `owner`'s network, in short. */
 export function accessState(g: Game, owner: number): { kind: 'agreement' | 'pending' | 'blocked' | 'closed' | 'none'; text: string } {
   const a = g.agreement(PLAYER, owner);
-  if (a) return { kind: 'agreement', text: `${g.accessPolicy(owner) === 'open' ? 'Open network' : 'Agreement'} · upkeep ${fmtMult(g.accessMultiplier(owner))} · last month share ${fmtPct(a.usageShareLastMonth)} · paid ${fmtMoney(a.paidLastMonth)}` };
+  if (a) return { kind: 'agreement', text: `${g.accessPolicy(owner) === 'open' ? 'Open network' : 'Agreement'} · ${fmtAccessFactor(g.accessMultiplier(owner))} · ${fmtMoney(g.estimateAccessShare(owner, PLAYER).yearlyCharge)}/yr est. · 75% cap` };
   // an open network may be used without asking (the agreement for the fees starts with the first use)
-  if (g.canUse(PLAYER, owner)) return { kind: 'agreement', text: `Open network · upkeep ${fmtMult(g.accessMultiplier(owner))} on use` };
+  if (g.canUse(PLAYER, owner)) return { kind: 'agreement', text: `Open network · ${fmtAccessFactor(g.accessMultiplier(owner))} · 75% cap` };
   const q = g.requestsBy(PLAYER).find((r) => r.owner === owner);
   if (q) return { kind: 'pending', text: `Request pending · ${Math.max(0, ACCESS_REQUEST_DAYS - (g.day - q.day))} days left` };
   if (g.isBlocked(owner, PLAYER)) return { kind: 'blocked', text: 'You are blocked from this network' };
   if (g.accessPolicy(owner) === 'auto-reject') return { kind: 'closed', text: 'Refuses access to its network' };
-  return { kind: 'none', text: `No agreement · ${policyText(g, owner).toLowerCase()} · upkeep shared ${fmtMult(g.accessMultiplier(owner))}` };
+  return { kind: 'none', text: `No agreement · ${policyText(g, owner).toLowerCase()} · ${fmtAccessFactor(g.accessMultiplier(owner))} · 75% cap` };
 }
 
 /** "Request access" / pending / blocked control for another company's network (inspect cards, lists). */
@@ -75,7 +75,7 @@ export function accessControl(ui: UI, owner: number, after: () => void): HTMLEle
   if (st.kind === 'agreement') return h('span', { class: 'pos' }, g.hasAccess(PLAYER, owner) ? 'Agreement' : 'Open');
   if (st.kind === 'pending') return h('button', { class: 'btn sm', 'data-tip': 'Withdraw the request', onclick: () => { g.cancelAccessRequest(PLAYER, owner); ui.sound('click'); after(); } }, 'Withdraw');
   if (st.kind === 'blocked' || st.kind === 'closed') return h('span', { class: 'muted' }, st.kind === 'blocked' ? 'Blocked' : 'Closed');
-  return h('button', { class: 'btn sm', 'data-tip': `${policyText(g, owner)} · users share the upkeep ${fmtMult(g.accessMultiplier(owner))}`, onclick: () => { requestAccessUI(ui, owner); after(); } }, icon('key', 15), 'Request access');
+  return h('button', { class: 'btn sm', 'data-tip': `${policyText(g, owner)} · ${fmtAccessFactor(g.accessMultiplier(owner))} · 75% cap`, onclick: () => { requestAccessUI(ui, owner); after(); } }, icon('key', 15), 'Request access');
 }
 
 export function openTrackAccess(ui: UI) {
@@ -91,7 +91,7 @@ export function openTrackAccess(ui: UI) {
     const earned = g.accessEarnings(PLAYER);
     const others = liveCompanies(g).filter((c) => c.id !== PLAYER);
     const rerender = () => { win.last = undefined; render(); };
-    win.sub.textContent = reqs.length ? `${reqs.length} request${reqs.length > 1 ? 's' : ''} waiting` : `${policyText(g, PLAYER)} · users pay ${fmtMult(m)}`;
+    win.sub.textContent = reqs.length ? `${reqs.length} request${reqs.length > 1 ? 's' : ''} waiting` : `${policyText(g, PLAYER)} · users pay ${fmtAccessFactor(m)}`;
     add(win.body,
       h('div', { class: 'tiles' },
         tile(String(reqs.length), 'Requests waiting', reqs.length ? 'warn' : ''),
@@ -101,7 +101,7 @@ export function openTrackAccess(ui: UI) {
 
     // ---- incoming requests
     add(win.body, section('Incoming requests', reqs.length ? String(reqs.length) : null));
-    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No pending requests.' : policy === 'open' ? 'Open network · no request needed · blocked companies excluded · shared upkeep' : `Automatic answers: ${policy === 'auto-approve' ? 'approved' : 'rejected'}`));
+    if (!reqs.length) add(win.body, h('div', { class: 'pad muted' }, policy === 'ask' ? 'No pending requests.' : policy === 'open' ? 'Open network · no request needed · blocked companies excluded · 75% cap' : `Automatic answers: ${policy === 'auto-approve' ? 'approved' : 'rejected'}`));
     for (const r of reqs) {
       const name = g.company(r.user).name;
       const left = Math.max(0, ACCESS_REQUEST_DAYS - (g.day - r.day));
@@ -121,11 +121,11 @@ export function openTrackAccess(ui: UI) {
         g.setAccessPolicy(PLAYER, v);
         ui.sound('toggle', { pitch: v === 'auto-reject' ? 0.88 : 1.12 });
         rerender();
-      }), policy === 'open' ? `Open to all · users pay ${fmtMult(m)} of their usage share` : policy === 'auto-reject' ? 'Existing agreements continue; revoke below.' : undefined),
-      multSlider('Users pay', m, false, (v) => g.setAccessMultiplier(PLAYER, v), (v) => `${fmtMult(v)} · 50/50 usage → they pay ${fmtPct(equalUseShare(v))}`),
+      }), policy === 'open' ? `Open to all · users pay ${fmtAccessFactor(m)} by usage` : policy === 'auto-reject' ? 'Existing agreements continue; revoke below.' : undefined),
+      multSlider('Price', m, false, (v) => g.setAccessMultiplier(PLAYER, v), (v) => `${fmtAccessFactor(v)} · equal use ${fmtPct(equalUseShare(v))}`),
       h('div', { class: 'explain' },
-        h('p', null, 'Users ', h('b', null, 'share the upkeep'), ' by usage: monthly track, tram track and station upkeep; owner weight 1, users × owner’s multiplier.'),
-        h('p', { class: 'ex' }, icon('info', 15), h('span', null, `50/50 use at ${fmtMult(2)}: user 2/3, owner 1/3; ${fmtMult(0)}: free; solely used by others: they pay all.`))));
+        h('p', null, 'Capital + upkeep, shared by real usage. Each user pays at most ', h('b', null, '75% of owning'), '; own wear extra.'),
+        h('p', { class: 'ex' }, icon('info', 15), h('span', null, `Equal use at ×1.25: 62.5% of cost; sole use: 75%. ×0: no fixed charge. Wear paid in full.`))));
     if (others.length) {
       const grid = h('div', { class: 'blockgrid' });
       for (const co of others) {
@@ -170,14 +170,15 @@ export function openTrackAccess(ui: UI) {
     // ---- networks I use
     add(win.body, section('Networks I use'));
     if (using.length) {
-      const tbl = h('table', { class: 'tbl fin' }, h('tr', null, ['Owner', 'Rate', 'My share', 'Paid (month)', 'Total', ''].map((t) => h('th', null, t))));
+      const tbl = h('table', { class: 'tbl fin' }, h('tr', null, ['Owner', 'Rate', 'My share', 'Paid (month)', 'Est./yr', 'Total', ''].map((t) => h('th', null, t))));
       for (const a of using) {
         const om = g.accessMultiplier(a.owner);
         tbl.appendChild(h('tr', null,
           h('td', { class: 'ellip' }, ui.ownerTag(a.owner)),
-          h('td', { 'data-tip': `Equal use: you pay ${fmtPct(equalUseShare(om))} upkeep` }, fmtMult(om)),
+          h('td', { 'data-tip': `Equal use: ${fmtPct(equalUseShare(om))} of cost · 75% cap · own wear extra` }, fmtAccessFactor(om)),
           h('td', null, fmtPct(a.usageShareLastMonth)),
           h('td', { class: a.paidLastMonth ? 'neg' : 'muted' }, fmtMoney(a.paidLastMonth)),
+          h('td', { 'data-tip': 'Last month × 12, including wear · fixed charge capped at 75% of owning' }, fmtMoney(g.estimateAccessShare(a.owner, PLAYER).yearlyCharge)),
           h('td', { class: a.paidTotal ? 'neg' : 'muted' }, fmtMoney(a.paidTotal)),
           h('td', null, h('button', { class: 'btn sm', onclick: () => { if (endAgreement(ui, PLAYER, a.owner, 'End')) rerender(); } }, 'End'))));
       }
@@ -193,7 +194,7 @@ export function openTrackAccess(ui: UI) {
         const hd = networkSummary(g, co.id);
         add(win.body, h('div', { class: 'acc' },
           h('div', { class: 'acc-l' },
-            h('div', { class: 'acc-t' }, ui.ownerTag(co.id), h('span', { class: 'mult', 'data-tip': `Equal use: users pay ${fmtPct(equalUseShare(g.accessMultiplier(co.id)))} upkeep` }, fmtMult(g.accessMultiplier(co.id)))),
+            h('div', { class: 'acc-t' }, ui.ownerTag(co.id), h('span', { class: 'mult', 'data-tip': `Equal use: ${fmtPct(equalUseShare(g.accessMultiplier(co.id)))} of cost · 75% cap · own wear extra` }, fmtAccessFactor(g.accessMultiplier(co.id)))),
             h('div', { class: 'acc-s' }, [st.kind === 'none' ? policyText(g, co.id) : st.text, hd].filter(Boolean).join(' · '))),
           accessControl(ui, co.id, rerender)));
       }
