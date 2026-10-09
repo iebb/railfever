@@ -785,6 +785,22 @@ export class Lines {
     if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
   }
 
+  /**
+   * A road line upgraded to trams (or back): the same line, its stops and waiting passengers, with the number, automatic
+   * name and colour of its new mode. Its vehicles must have left it first (they run one mode).
+   */
+  retype(id: number, kind: Transport) {
+    const l = this.map.get(id);
+    if (!l || l.kind === kind) return;
+    l.kind = kind;
+    l.num = this.freeNumber(kind, l.owner, l.id);
+    delete l.spacing;
+    if (l.autoColor) l.color = this.pickColor(kind, l.owner, l.id);
+    if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
+    this.ensureCode(l);
+    this.rebuild();
+  }
+
   // ---------------------------------------------------------------- stops
   /** Can this station be added as a stop of the line? Null if yes, else the reason. */
   canAddStop(lineId: number, stationId: number): string | null {

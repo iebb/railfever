@@ -24,6 +24,8 @@ import { servicesTab, patternSelect, stopDots } from './win-services';
 import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
 import { stopsWithInserted, replaceLineStops, type StopPlace } from '../game/line-edit';
 import { platformChoices, platformPreference, setPlatformPreference } from '../game/rail-platforms';
+import { planTramUpgrade, buildTramUpgrade } from '../game/ai-bus';
+import { runGen } from '../game/routing';
 
 /** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
 const insertPlace = new Map<number, StopPlace>();
@@ -326,6 +328,7 @@ export function openLine(ui: UI, id: number) {
         }), setting === 'auto' ? `Now: ${loop ? 'loop' : 'out and back'}` : undefined));
       }
       if (mine) {
+        const trams = availableModels(g.year, 'tram').length > 0;
         add(win.body, field('Spacing', toggle('Even spacing', l.evenSpacing !== false, (enabled) => {
           g.lines.setEvenSpacing(l.id, enabled);
           ui.sound('toggle', { pitch: enabled ? 1.1 : 0.9 });
@@ -339,6 +342,8 @@ export function openLine(ui: UI, id: number) {
           h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops first' : l.kind === 'rail' ? 'Shared terminus for through running' : 'Connect at a shared stop', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), l.kind === 'rail' ? 'Join with line…' : 'Connect with line…'),
           l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Preview signals for this line', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
         if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Needs at least two stops.'));
+        if (l.kind === 'road' && new Set(l.stops).size >= 2 && trams) add(win.body, h('div', { class: 'btns' },
+          h('button', { class: 'btn', disabled: editing, 'data-tip': 'Tram tracks along the route; same stops', onclick: () => upgradeToTrams(ui, l, rerender) }, icon('tram', 16), 'To trams…')));
       }
       add(win.body, routePanel(ui, l));
     } else if (win.tab === 'services') {
@@ -520,4 +525,18 @@ export function openTowns(ui: UI) {
   };
   win.refresh = render;
   render();
+}
+
+/** A bus line of the player's upgraded to trams: the cost (tracks, depot, trams, the buses' sale) to confirm, then built. */
+function upgradeToTrams(ui: UI, l: Line, done: () => void) {
+  const g = ui.game, p = planTramUpgrade(g, l.id, PLAYER);
+  if (!p.ok || !p.model) { ui.toast(p.error ?? 'Not possible', 'bad'); return; }
+  const parts = [`tracks ${fmtInt(p.trackLength * 10)} m ${fmtMoney(p.trackCost)}`, p.depotCost ? `depot ~${fmtMoney(p.depotCost)}` : null,
+    `${p.trams} × ${p.model.name} ${fmtMoney(p.tramCost)}`, p.resale ? `buses sold +${fmtMoney(p.resale)}` : null].filter(Boolean);
+  if (!confirm(`Upgrade ${l.name} to trams? ${parts.join(' · ')}. Net ${p.depotCost ? '~' : ''}${fmtMoney(p.cost)}.`)) return;
+  const err = runGen(buildTramUpgrade(g, p, PLAYER));
+  if (err) { ui.toast(err, 'bad'); return; }
+  ui.sound('cash');
+  ui.toast(`${g.lines.get(l.id)?.name ?? l.name}: trams`, 'good');
+  done();
 }

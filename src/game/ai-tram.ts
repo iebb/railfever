@@ -9,6 +9,7 @@ import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
 import { runGen } from './routing';
+import { tramRouteValue, pays } from './ai-bus';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
 export interface TramProject {
@@ -150,6 +151,10 @@ export class TramPlanner {
     for (const id of fresh) trackLen += net.edges.get(id)!.len;
     const nTrams = Math.max(2, Math.min(5, Math.round(route.len / 22)));
     const cost = trackLen * TRAM.costPerUnit + route.stops.length * 30_000 + 200_000 + nTrams * model.cost;
+    // ---- the forecast (ai-bus.ts): riders shared with every served stop near the route, tram fares, against the works,
+    // trams, running and upkeep (a copy of another company's trams in the same streets does not pay)
+    const quote = yield* tramRouteValue(g, owner, route.stops, trackLen, model, nTrams);
+    if (!pays(quote)) return this.fail(`forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`);
     const e = this.eco;
     while (e.money < cost + 300_000 && e.borrow()) { /* borrow in steps */ }
     if (e.money < cost) return this.fail('too expensive');
