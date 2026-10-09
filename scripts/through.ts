@@ -171,14 +171,15 @@ function counter(trains: Train[]) {
   }
   const trains = deps.map((d) => g.vehicles.buyTrain(d, [M('diesel_b'), M('coach_ic')], line.id)).filter((t): t is Train => t instanceof Train);
   check(trains.length === 3 && new Set(trains.map((t) => t.owner)).size === 3 && g.lines.all().filter((l) => l.kind === 'rail').length === 1, 'three operators, one line (no duplicate)');
-  // a fourth company owns no station of the line: it may neither join nor buy trains for it
+  // a fourth company owns no station of the line: since the preview after 2.9 (the user's rule) it needs none, it
+  // joins the open line and buys a train, renting the platforms (it pays its usage share)
   const j3 = g.lines.join(line.id, 3);
   let d3 = -1;
   for (const e of [...net.edges.values()].filter((x) => x.kind === 'rail' && x.station < 0 && x.depot < 0 && x.len > 20)) for (const f of [0.4, 0.6]) if (d3 < 0) d3 = buildDepotOnLine(g, e.id, e.len * f, 3);
   g.lines.invite(line.id, 3);
   const b3 = d3 >= 0 ? g.vehicles.buyTrain(d3, [M('diesel_b'), M('coach_ic')], line.id) : 'no depot';
   console.log(`  company 3 (no station): join "${j3}", train "${typeof b3 === 'string' ? b3 : 'bought'}"`);
-  check(j3 !== null && typeof b3 === 'string' && !g.lines.canOperate(line, 3), 'a company without a station of the line cannot run trains on it');
+  check(j3 === null && typeof b3 !== 'string' && g.lines.canOperate(line, 3), 'a company without a station of the line may join it and run trains on it');
   startFleet(g, trains);
   const c = counter(trains);
   runDays(g, 360, () => c.tick());

@@ -39,7 +39,8 @@ g.aiAcquisitions = false;
 console.log(`map ${SIZE} seed ${seed}: ${g.towns.list.length} towns (biggest ${Math.max(...g.towns.list.map((t) => t.pop))}), pop ${g.towns.list.reduce((a, t) => a + t.pop, 0)}, ${g.ais.length} AI companies, gen ${fmt(performance.now() - T0, 0)} ms`);
 check(g.ais.length === 5 && g.companies.length === 6, '5 AI companies from aiConfigs');
 check(g.ais[1].config.activeness === 2 && g.ais[0].config.activeness === 0.25 && g.ais[3].config.focus.rail === 0, 'configs applied');
-check(g.company(2).economy.money === 8_000_000 && g.company(2).economy.loan === 5_000_000, 'start money: 8M cash, 5M of it borrowed');
+// (since the preview after 2.9, by the user's rule: every starting balance is fully borrowed, whatever the amount)
+check(g.company(2).economy.money === 8_000_000 && g.company(2).economy.loan === 8_000_000, 'start money: 8M cash, all of it borrowed');
 check(new Set(g.companies.map((c) => c.color)).size === 6 && new Set(g.companies.map((c) => c.name)).size === 6, 'distinct company names and colours');
 check(AI_PRESETS.length >= 4, 'AI presets');
 
@@ -429,10 +430,9 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     while (ai.busy) g.update(0.25);
     const al = g.lines.all().find((l) => l.owner === ai.companyId && l.stops.includes(pr.A.id) && l.stops.includes(pr.B.id));
     console.log(`  share: ${ai.log.slice(-3).join(' | ')}; agreement ${g.hasAccess(ai.companyId, PLAYER)}, line ${al?.name ?? '-'}`);
-    // (UPDATE 9k: a company running services on a line owns one of its stations: a line of the AI's between two of
-    // the player's stations is refused; track access fees are covered by access.ts and through.ts)
-    // (the agreement it no longer needs is ended again: endUnusedAccess)
-    check(!al && ai.log.some((x) => /no station of ours on the line/.test(x)), 'the AI asked for track access but runs no line without a station of its own');
+    // (9k required a station of one's own on the line; since the preview after 2.9 the user's rule is that a company
+    // needs none: it rents the platforms and pays its usage share, so the AI runs its line between the player's stations)
+    check(!!al, 'the AI asked for track access and runs its line between the player\'s stations (no station of its own needed)');
     if (al) {
     const inc0 = total(g.economy, 'trackIncome'), d0 = ptr.delivered;
     runDays(150);

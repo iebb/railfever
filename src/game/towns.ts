@@ -141,10 +141,13 @@ export const GROWTH_ACTIVE_DAYS = 90;
 /** Mean days between growth steps without public transport (about 1 % a year for a balanced town) and with the best service. */
 export const GROWTH_DAYS_UNSERVED = 100, GROWTH_DAYS_BEST = 6;
 /**
- * Share reached by frequent service at which reach counts fully: 0.4 with the shorter walks (0.3 in release 2.6).
+ * Share reached by frequent service at which reach counts fully: 0.4 with the shorter walks (0.3 in release 2.6),
+ * 0.3 since the walks were halved again after 2.9 (a quarter to a half of the residents in reach, travelling
+ * WALK_TRIP_INTENSITY times as often): about 2.9's growth for the same service (scripts/economy.ts seed 7: Oldwood
+ * 2,538 -> 3,762 in four years with 2.9; 3,388 at 0.4, 3,841 at 0.2; 0.2 sped up poorly served towns, scripts/growth.ts).
  * Coverage keeps mattering in larger towns; a station whose vehicles seldom call cannot fully serve a small town.
  */
-export const GROWTH_FULL_REACH = 0.4;
+export const GROWTH_FULL_REACH = 0.3;
 /** Service frequency that counts fully: vehicles called on this share of the last 30 days (Stations.callShare; 0.05: on two). */
 export const GROWTH_FULL_CALLS = 0.05;
 /** An active station without a call in the last 30 days still counts 8% (15% in release 2.6): sparse trains help less. */

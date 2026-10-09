@@ -866,19 +866,27 @@ export function canJoinLines(g: Game, a: Line | number, b: Line | number): LineJ
   const ra = lineRoute(la), rb = lineRoute(lb);
   if (la.loop === true || lb.loop === true || ra.loop || rb.loop) return no('Loop lines have no termini to join');
   if ([ra, rb].some((r) => r.stations.length < 2 || new Set(r.stations).size !== r.stations.length)) return no('Each line needs two distinct termini');
-  const ends = [ra.stations[0], ra.stations[ra.stations.length - 1]];
+  const ends = [ra.stations[0], ra.stations[ra.stations.length - 1]], bEnds = [rb.stations[0], rb.stations[rb.stations.length - 1]];
   const shared = ends.filter((s) => s === rb.stations[0] || s === rb.stations[rb.stations.length - 1]);
-  if (!shared.length) return no('No shared terminus');
-  junction = shared[0];
+  // Termini that are parts of one public station (a merged complex: separate platforms, one name) also meet: the
+  // joined route calls at both parts, one after the other.
+  let pair: [number, number] | null = null;
+  if (!shared.length) for (const x of ends) for (const y of bEnds) if (!pair && x !== y && g.stations.complex(x).includes(y)) pair = [x, y];
+  if (!shared.length && !pair) return no('No shared terminus');
+  junction = shared[0] ?? pair![0];
   if (shared.length > 1) return no('Both termini shared: use service patterns');
-  if (ra.stations.some((s) => s !== junction && rb.stations.includes(s))) return no('Routes overlap: join only at a terminus');
+  const meeting = new Set(pair ?? [junction]);
+  if (ra.stations.some((s) => !meeting.has(s) && rb.stations.includes(s)) || (pair && (ra.stations.includes(pair[1]) || rb.stations.includes(pair[0]))))
+    return no('Routes overlap: join only at a terminus');
   // The longer route survives; equal lengths keep the older line. Keep its original direction too.
   const keepA = ra.stations.length > rb.stations.length || (ra.stations.length === rb.stations.length && la.id < lb.id);
   const keep = keepA ? la : lb, drop = keepA ? lb : la;
   const kr = keepA ? ra.stations : rb.stations, dr = keepA ? rb.stations : ra.stations;
-  const atEnd = kr[kr.length - 1] === junction;
-  const other = (atEnd ? dr[0] === junction : dr[dr.length - 1] === junction) ? [...dr] : [...dr].reverse();
-  const route = atEnd ? [...kr, ...other.slice(1)] : [...other.slice(0, -1), ...kr];
+  // (the kept and the dropped line's own meeting terminus: the same station, or its partner in the complex)
+  const kj = pair ? (keepA ? pair[0] : pair[1]) : junction, dj = pair ? (keepA ? pair[1] : pair[0]) : junction;
+  const atEnd = kr[kr.length - 1] === kj;
+  const other = (atEnd ? dr[0] === dj : dr[dr.length - 1] === dj) ? [...dr] : [...dr].reverse();
+  const route = pair ? (atEnd ? [...kr, ...other] : [...other, ...kr]) : atEnd ? [...kr, ...other.slice(1)] : [...other.slice(0, -1), ...kr];
   const operators = [...new Set([...g.lines.operatorsOf(keep), ...g.lines.operatorsOf(drop)])];
   const proposed: Line = { ...keep, stops: outAndBack(route), loop: false, vehicles: [...keep.vehicles, ...drop.vehicles] };
   for (const owner of operators) {

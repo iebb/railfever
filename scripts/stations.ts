@@ -109,7 +109,9 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const sh = g.stations.catchmentShapes(S);
   // (a station building draws people from further away: +20% for the classic one)
   const RB = CATCHMENT_RADIUS.rail * (1 + styleOf(S.rail!.style).catchBonus);
-  check(S.rail!.style === 'classic' && Math.abs(RB - 28.224) < 1e-9, 'a classic station building extends the 235.2 m rail walking limit by 20%');
+  // (the walking limits were halved after 2.9 at the user's request: rail 235.2 -> 117.6 m, tram 215.6 -> 107.8 m,
+  // bus 156.8 -> 78.4 m)
+  check(S.rail!.style === 'classic' && Math.abs(RB - 14.112) < 1e-9, 'a classic station building extends the 117.6 m rail walking limit by 20%');
   const sf = g.stations.forecourt(S)!;
   check(sh.length === 1 && sh.every((c) => Math.abs(c.r - RB) < 1e-9 && c.mode === 'rail') && Math.abs(sh[0].x - sf.x) < 0.01 && Math.abs(sh[0].z - sf.z) < 0.01, 'ground rail access starts at the forecourt');
   const busId = g.stations.nextId;
@@ -123,7 +125,7 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
   const tram = g.stations.get(tramId)!;
   const rb = g.stations.catchmentShapes(bus)[0], rt = g.stations.catchmentShapes(tram)[0];
   console.log(`  radii: rail ${sh[0].r}, tram ${rt?.r} (${rt?.mode}), bus ${rb?.r} (${rb?.mode})`);
-  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 15.68 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 21.56 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '156.8 m bus and 215.6 m tram radii, rail > tram > bus');
+  check(rb.mode === 'bus' && rb.r === CATCHMENT_RADIUS.bus && rb.r === 7.84 && rt.mode === 'tram' && rt.r === CATCHMENT_RADIUS.tram && rt.r === 10.78 && CATCHMENT_RADIUS.rail > CATCHMENT_RADIUS.tram && CATCHMENT_RADIUS.tram > CATCHMENT_RADIUS.bus, '78.4 m bus and 107.8 m tram radii, rail > tram > bus');
   const hin = house(g, 138, 98), hout = house(g, 128, 144), hside = house(g, 128, 98);
   const cb = new Set(g.stations.catchmentBuildings(S));
   check(cb.has(hin.id) && cb.has(hside.id) && !cb.has(hout.id), 'street-front homes within the forecourt walking budget are covered');
@@ -257,11 +259,13 @@ let saveGame: Game | null = null;
   const buses = [0, 1].map(() => g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id) as RoadVehicle);
   for (let i = 0; i < 8 * 40; i++) g.update(0.25);
   const plan = g.stations.planRail(128, 104, Math.PI / 2, 8, 2, 0);
-  check(!plan.join && plan.links.includes(B1), `the new station links the stop within ${TRANSFER_RANGE * 10} m (not joined beyond 80 m)`);
+  // (since 2.9 the intermediate transfer walk is half the shorter endpoint walk, 49 m between a station and a bus stop:
+  // a stop within 80 m of the station joins it, one beyond is not linked either; merging it stays possible below)
+  check(!plan.join && !plan.links.includes(B1), `a stop just beyond the 80 m join distance is not linked: the transfer walk is ${fmt(g.stations.linkRange(B1, B1) * 10, 0)} m at most`);
   const sid = g.stations.nextId;
   g.stations.commitRail(plan, 0);
   const S = g.stations.get(sid)!;
-  check(S.links.includes(B1.id) && B1.links.includes(S.id), 'linked both ways');
+  check(!S.links.includes(B1.id) && !B1.links.includes(S.id), 'no passage either way');
   check(g.stations.canMerge(S.id, B2.id) !== null && g.stations.canMerge(S.id, B1.id) === null, 'canMerge: only the near stop');
   B1.waiting.clear(); B1.waitingTotal = 0;
   g.stations.addWaiting(B1, bl.id, B2.id, B2.id, 30);
@@ -328,7 +332,11 @@ let saveGame: Game | null = null;
   const names = g.stations.all().filter((s) => s.townId === T.id).map((s) => s.name);
   console.log(`  ${T.name} (${T.pop}): ${names.length} stations, e.g. ${names.slice(0, 8).join(', ')}`);
   check(names.length >= 30, '30+ stations in one town');
-  check(new Set(names).size === names.length && names.every((s) => !/\d/.test(s)), 'all names unique and without numbers');
+  // (parts of one public station share its name since the preview after 2.9: nearby stops merge into complexes)
+  const complexOf = (st: Station) => Math.min(...g.stations.complex(st.id));
+  const byName = new Map<string, Set<number>>();
+  for (const st of g.stations.all().filter((s) => s.townId === T.id)) { const k = byName.get(st.name) ?? new Set<number>(); k.add(complexOf(st)); byName.set(st.name, k); }
+  check([...byName.values()].every((c) => c.size === 1) && names.every((s) => !/\d/.test(s)), 'all names unique to one station (complex) and without numbers');
 }
 
 // ------------------------------------------------------------------ 7. rebuilding a station while its line runs, relocating

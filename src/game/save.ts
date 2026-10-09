@@ -23,7 +23,6 @@ import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
-import { walkRoadsChanged } from './catchment';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
 const VERSION = 3;
@@ -381,6 +380,10 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     catchmentInputsDirty: g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending,
     // A cold load must preserve whether saved road access already matched its network.
     catchmentAccessCurrent: (g.stations as any).accessVersion === w.net.version,
+    // ...and whether access refreshes still find walked roads changed since the last share-out (the running game's
+    // walk cache sees that until its next share-out; a loaded one's is rebuilt cold): written only when true, kept
+    // until the next share-out after loading (Stations.accessRoadsOwed).
+    ...(g.stations.accessRoadsOwed || g.stations.publishedRoadsChanged() ? { catchmentAccessRoads: true } : {}),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
@@ -403,7 +406,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     },
     networkDirty: !!(g as any).networkDirty,
     // A street edit still awaiting its network flush must invalidate catchments at that flush, not on load.
-    catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
+    catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && (g.stations.accessRoadsOwed || g.stations.publishedRoadsChanged())),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON),
@@ -690,6 +693,8 @@ export function deserialize(d: any): Game {
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
     g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
   S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  // (after the cold share-out primes above, which would clear it)
+  g.stations.accessRoadsOwed = d.catchmentAccessRoads === true;
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

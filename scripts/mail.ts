@@ -155,15 +155,27 @@ runDays(vans.g, 360 * 3, () => {
   // a stop by the station (joined to it or linked for walking), and one across town
   let s2 = -1, s1 = -1, bd = -1;
   for (const e of g.towns.streets(TA, 0)) {
-    for (let s = 1; s < e.len && s2 < 0; s += 2) {
+    // (every unit: since the walks were halved after 2.9 an intermediate change walks at most about 50 m)
+    for (let s = 0.5; s < e.len && s2 < 0; s += 1) {
       const p = { x: 0, y: 0, z: 0 };
       g.world.net.pointAt(e, s, p);
       const d = Math.hypot(p.x - A.x, p.z - A.z), bp = g.stations.planBusStop(p.x, p.z, 0);
-      if (d >= 4 && d <= 16 && bp.ok && !bp.join && bp.links.some((st) => st.id === A.id)) { s2 = addBusStop(g, p.x, p.z, 0); if (s2 === A.id) s2 = -1; }
+      if (d >= 2 && d <= 16 && bp.ok && !bp.join && bp.links.some((st) => st.id === A.id)) { s2 = addBusStop(g, p.x, p.z, 0); if (s2 === A.id) s2 = -1; }
     }
     if (s2 >= 0) break;
   }
-  if (s2 >= 0 && !g.stations.get(s2)!.links.includes(A.id)) g.stations.link(s2, A.id);
+  // (since the walks were halved after 2.9 a separate stop rarely lies within the ~50 m intermediate walk while
+  // clear of the 80 m in which a stop becomes part of the station: then a stop joined to it)
+  if (s2 < 0) for (const e of g.towns.streets(TA, 0)) {
+    for (let s = 0.5; s < e.len && s2 < 0; s += 1) {
+      const p = { x: 0, y: 0, z: 0 };
+      g.world.net.pointAt(e, s, p);
+      const bp = g.stations.planBusStop(p.x, p.z, 0);
+      if (bp.ok && bp.join?.id === A.id && addBusStop(g, p.x, p.z, 0) >= 0 && A.stops.length) s2 = A.id;
+    }
+    if (s2 >= 0) break;
+  }
+  if (s2 >= 0 && s2 !== A.id && !g.stations.get(s2)!.links.includes(A.id)) g.stations.link(s2, A.id);
   // across town: in the town, away from the station, nearest the town centre (its own catchment)
   const across: [number, number, number][] = [];
   for (const e of g.towns.streets(TA, 0)) {
@@ -174,7 +186,7 @@ runDays(vans.g, 360 * 3, () => {
   }
   across.sort((a, b) => a[2] - b[2]);
   if (across.length) { s1 = addBusStop(g, across[0][0], across[0][1], 0); bd = roadDepotNear(g, across[0][0], across[0][1], 0); }
-  check(s1 >= 0 && s2 >= 0 && bd >= 0 && g.stations.get(s2)!.links.includes(A.id), `a stop linked to ${A.name} and one across town`);
+  check(s1 >= 0 && s2 >= 0 && bd >= 0 && (s2 === A.id || g.stations.get(s2)!.links.includes(A.id)), `a stop joined or linked to ${A.name} and one across town`);
   if (s1 >= 0 && s2 >= 0 && bd >= 0) {
     const bl = g.lines.create('road', 0);
     bl.stops = [s1, s2];

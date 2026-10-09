@@ -306,6 +306,8 @@ class WalkingCache {
     for (const [key, c] of this.entries) if (key.startsWith('station:') && !this.sameRoads(c)) return true;
     return false;
   }
+  /** The road versions a station's walk was last computed against (its catchment group's entry), if cached. */
+  roadSnapshot(st: Station): RegionSnapshot | undefined { return this.entries.get(`station:${this.g.stations.catchmentGroup(st.id)}`)?.roads; }
 
   private roadState(ids: number[]): Map<number, [number, string, number, boolean, number]> {
     const net = this.g.world.net, out = new Map<number, [number, string, number, boolean, number]>();
@@ -595,6 +597,8 @@ export function readWalkingCatchment(g: Game, st: Station, without = -1): Walkin
 /** Prepare local caches once for a share update; unchanged regions and station paths survive. */
 export function refreshWalkBuildings(g: Game) { cache(g).refreshBuildings(); }
 export function walkRoadsChanged(g: Game): boolean { return cache(g).roadsChanged(); }
+/** The road versions of a station's last computed walk (Stations: the versions of the published share-out). */
+export function walkRoadSnapshot(g: Game, st: Station): RegionSnapshot | undefined { return cache(g).roadSnapshot(st); }
 export function prepareWalkingCatchment(g: Game, st: Station) { cache(g).prepare(st); }
 export function walkingCatchment(g: Game, st: Station): WalkingCatchment {
   g.stations.refreshAccess();

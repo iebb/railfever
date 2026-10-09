@@ -402,7 +402,7 @@ function openLineJoin(ui: UI, id: number) {
     win.sub.textContent = l.name;
     const choices = g.lines.all().filter((other) => other.id !== id).map((other) => ({ other, check: canJoinLines(g, l, other) }));
     const candidates = choices.filter((c) => c.check.ok);
-    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines at a shared terminus for through running.'));
+    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines ending at one station into one line.'));
     if (error) add(win.body, h('div', { class: 'alert warn', role: 'alert' }, error));
     if (!candidates.length) {
       add(win.body, h('div', { class: 'alert info' }, choices.length ? 'No joinable lines.' : 'No other lines.'));
@@ -410,7 +410,7 @@ function openLineJoin(ui: UI, id: number) {
       const rejected = choices.filter((c) => !c.check.ok).sort((a, b) => Number(b.check.junction !== null) - Number(a.check.junction !== null));
       if (rejected.length) add(win.body, h('div', { class: 'list linejoin-reasons' }, rejected.slice(0, 8).map(({ other, check }) => h('div', { class: 'linejoin-reason' },
         h('b', null, other.name), h('span', { class: 'muted' }, check.reason)))));
-      add(win.body, h('div', { class: 'muted linejoin-note' }, 'Same mode · shared terminus · connected route · each operator needs a station and route access'));
+      add(win.body, h('div', { class: 'muted linejoin-note' }, 'Same mode · ending at one station · connected track · each operator needs a station and route access'));
       return;
     }
     add(win.body, section('Joinable lines', `${candidates.length}`), h('div', { class: 'list linejoin-choices' }, candidates.map(({ other, check }) => h('button', {

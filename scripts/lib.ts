@@ -214,8 +214,9 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
     const B = g.stations.get(ib)!;
-    // both stations within reach of their towns' houses (a line between two fields carries nobody)
-    if (sitePop(g, A.x, A.z, 16) < 40 || sitePop(g, B.x, B.z, 16) < 40) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
+    // both stations within reach of their towns' houses (a line between two fields carries nobody); 10 residents
+    // since the walking limits were halved after 2.9 (a quarter of the area; it was 40)
+    if (sitePop(g, A.x, A.z, 16) < 10 || sitePop(g, B.x, B.z, 16) < 10) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
     return { A, B, TA, TB };
   }
   return null;
