@@ -24,7 +24,8 @@ export const CAR_GAP = 0.1;
 const HI_PX = 46;
 /** Below this many pixels a vehicle is not drawn at all (whole-map views of big maps). */
 const MIN_PX = 3;
-/** Exhaust and lamp sprites add no useful detail below this length on screen. */
+/** Exhaust and lamp sprites add no useful detail below this length on screen (a train's whole length: a plume or a
+ * headlight reads well beside a short locomotive). */
 const EFFECT_PX = 12;
 
 export interface V3 { x: number; y: number; z: number }
@@ -320,12 +321,12 @@ class Smoke {
     for (let i = 0; i < this.count; i++) {
       const L = this.maxLife[i], l = this.life[i] + dt;
       if (l > L) continue;
+      // Puffs that can never grow to a visible size go; puffs outside the view are kept (panning back must not
+      // find a train's plume cut off).
       if (frustum && camera) {
-        const size = this.size[i] + this.grow[i] * dt;
+        const largest = this.size[i] + this.grow[i] * (L - this.life[i]);
         smokeSphere.center.set(this.pos[i * 3], this.pos[i * 3 + 1], this.pos[i * 3 + 2]);
-        smokeSphere.radius = size + dt * Math.hypot(this.vel[i * 3], this.vel[i * 3 + 1], this.vel[i * 3 + 2]);
-        const largest = size + this.grow[i] * (L - l);
-        if (!frustum.intersectsSphere(smokeSphere) || largest * pxScale < MIN_PX * smokeSphere.center.distanceTo(camera)) continue;
+        if (largest * pxScale < MIN_PX * smokeSphere.center.distanceTo(camera)) continue;
       }
       if (j !== i) {
         this.maxLife[j] = L; this.grow[j] = this.grow[i]; this.shade[j] = this.shade[i];
@@ -649,7 +650,7 @@ vRfGlass = step(2.5, aPaint);`);
         const bb = this.bogies[m.bogieKind];
         writeBasis(bb.mat16, bb.push(t.id), q.x, q.y + RAIL_Y, q.z, d.x, d.y, d.z);
       }
-      if (active && this.effectVisible(p.x, p.y, p.z, sl.len)) {
+      if (active && this.effectVisible(p.x, p.y, p.z, sl.len, t.length)) {
         if (m.chimney) this.emitSteam(t.id, b.mat16, o, m.chimney, t.speed, p, dt, t.reversed);
         if (m.exhaust) this.emitExhaust(t.id, b.mat16, o, m.exhaust, t.speed, accel, dt);
       }
@@ -658,22 +659,22 @@ vRfGlass = step(2.5, aPaint);`);
       // white lamps on the leading face, red on the trailing face (hauled cars keep their orientation when the
       // train reverses; multiple-unit cab cars face out of the unit)
       const hs = slots[0], h = this.poses[0];
-      if (!h.hidden && this.effectVisible(h.x, h.y, h.z, hs.len)) {
+      if (!h.hidden && this.effectVisible(h.x, h.y, h.z, hs.len, t.length)) {
         const hm = this.slotGeo(hs);
         this.lamps(h, hs.emu ? hm.front : t.reversed ? hm.rear : hm.front, 1, 0.93, 0.78);
       }
       const rs = slots[n - 1], r = this.poses[n - 1];
-      if (!r.hidden && this.effectVisible(r.x, r.y, r.z, rs.len)) {
+      if (!r.hidden && this.effectVisible(r.x, r.y, r.z, rs.len, t.length)) {
         const rm = this.slotGeo(rs);
         this.lamps(r, rs.emu ? (rs.end < 0 ? rm.front : rm.rear) : t.reversed ? rm.front : rm.rear, 1, 0.06, 0.03);
       }
     }
   }
 
-  private effectVisible(x: number, y: number, z: number, len: number): boolean {
+  private effectVisible(x: number, y: number, z: number, len: number, visibleLen = len): boolean {
     if (!this.cull) return true;
     this.sphere.center.set(x, y, z); this.sphere.radius = len / 2 + 1.2;
-    return this.frustum.intersectsSphere(this.sphere) && len * this.pxScale > EFFECT_PX * this.sphere.center.distanceTo(this.camPos);
+    return this.frustum.intersectsSphere(this.sphere) && visibleLen * this.pxScale > EFFECT_PX * this.sphere.center.distanceTo(this.camPos);
   }
 
   /** Lamps given in model space of a posed car. */

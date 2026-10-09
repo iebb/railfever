@@ -95,6 +95,8 @@ export const TICKS_PER_DAY = Math.round(DAY_SECONDS / TICK);
 if (Math.abs(DAY_SECONDS / TICK - TICKS_PER_DAY) > 1e-9) throw new Error('DAY_SECONDS must contain an integer number of simulation ticks');
 /** Shared wall-time cap for simulation pacing, camera smoothing and visual effects. */
 export const MAX_FRAME_SECONDS = 8 * TICK;
+/** Tick of the day of the AI companies' shared-path reviews (half a day after their other daily decisions). */
+const SHARED_CAPACITY_TICK = TICKS_PER_DAY / 2;
 /** A frame may release fewer ticks when simulation work is expensive. */
 const FRAME_BUDGET_MS = 20;
 
@@ -899,6 +901,9 @@ export class Game {
     const tickOfDay = this.tick % TICKS_PER_DAY;
     // Finish this day's work before daily decisions can start a project for the next day.
     if (this.aiEnabled) for (const ai of [...this.ais]) ai.work(tickOfDay, tickOfDay + 1);
+    // Shared corridors: every operator's review at one tick of its own, away from the day's other work; they
+    // read one auction per corridor (performance: the order is a pure function of the clock, so saves replay it).
+    if (this.aiEnabled && tickOfDay === SHARED_CAPACITY_TICK) for (const ai of [...this.ais]) ai.sharedCapacityDaily();
     this.tick++;
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
@@ -973,9 +978,10 @@ export class Game {
     this.towns.daily();
     // capacity-integration: measure every operator before any of them makes today's fleet decision.
     if (this.aiEnabled) observeRailCapacity(this);
-    // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
+    // AI: daily decisions (the shared-path review at its own tick: stepTick); the monthly management on a day
+    // of its own per company (spreads the work)
     if (this.aiEnabled) for (const ai of [...this.ais]) {
-      ai.daily();
+      ai.daily(false);
       if (this.day % DAYS_PER_MONTH === (ai.companyId * 7) % DAYS_PER_MONTH) ai.monthly();
     }
   }

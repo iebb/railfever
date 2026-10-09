@@ -27,17 +27,27 @@ export interface FareContext {
   railBefore?: number;
 }
 export interface DemandSite { x: number; z: number; townId: number }
-const intensityCache = new WeakMap<Game, { key: string; values: Map<string, number> }>();
+interface IntensitySeen { townId: number; pop: number; radius: number; x: number; z: number; value: number }
+const intensityCache = new WeakMap<Game, { day: number; net: number; next: number; size: number; heights: number;
+  values: Map<string, number>; sites: WeakMap<object, IntensitySeen> }>();
 
 /** Actual nearby residents/jobs, rather than town-wide population as a proxy for a dense station neighbourhood. */
 export function urbanIntensity(g: Game, site: DemandSite): number {
   const t = g.towns.list[site.townId];
   if (!t || t.pop <= URBAN_DEMAND.minPop) return 0;
-  const key = `${g.day}:${g.world.net.version}:${g.world.nextBuildingId}:${g.world.buildings.size}:${g.world.heightsVersion}`;
+  const w = g.world;
   let cache = intensityCache.get(g);
-  if (!cache || cache.key !== key) { cache = { key, values: new Map() }; intensityCache.set(g, cache); }
+  if (!cache || cache.day !== g.day || cache.net !== w.net.version || cache.next !== w.nextBuildingId || cache.size !== w.buildings.size
+    || cache.heights !== w.heightsVersion) {
+    cache = { day: g.day, net: w.net.version, next: w.nextBuildingId, size: w.buildings.size, heights: w.heightsVersion, values: new Map(), sites: new WeakMap() };
+    intensityCache.set(g, cache);
+  }
+  // Forecast loops ask for the same site objects many times: check the object's own record before building a key.
+  const seen = cache.sites.get(site);
+  if (seen && seen.townId === site.townId && seen.pop === t.pop && seen.radius === t.radius && seen.x === site.x && seen.z === site.z) return seen.value;
   const id = `${site.townId}:${t.pop}:${t.radius}:${site.x}:${site.z}`;
-  const previous = cache.values.get(id); if (previous !== undefined) return previous;
+  const remember = (value: number) => { cache!.sites.set(site, { townId: site.townId, pop: t.pop, radius: t.radius, x: site.x, z: site.z, value }); return value; };
+  const previous = cache.values.get(id); if (previous !== undefined) return remember(previous);
   const size = clamp((t.pop - URBAN_DEMAND.minPop) / (URBAN_DEMAND.fullPop - URBAN_DEMAND.minPop), 0, 1);
   let pop = 0;
   const R = 20;
@@ -45,7 +55,7 @@ export function urbanIntensity(g: Game, site: DemandSite): number {
   const density = clamp(pop / (Math.PI * R * R * URBAN_DEMAND.density), 0, 1);
   const centre = clamp((t.radius * 1.25 - Math.hypot(site.x - t.x, site.z - t.z)) / Math.max(8, t.radius * 0.65), 0, 1);
   const value = size * density * centre;
-  cache.values.set(id, value); return value;
+  cache.values.set(id, value); return remember(value);
 }
 
 /** One context for real receipts and AI estimates (rail: the distance fare with its boarding minimum). */

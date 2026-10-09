@@ -161,6 +161,8 @@ class RouteHeap {
   }
 }
 
+interface RouteNode { best: number; first: { line: number; alight: number } | null; rode: boolean; walked: boolean; arrival: number | undefined }
+
 /**
  * First hops of the cheapest journeys from `src` over the routing graph (Dijkstra; transfers cost
  * TRANSFER_PENALTY_S, plus PLATFORM_CHANGE_S unless walked): Map(dest -> hop) for every station reached riding a line.
@@ -168,30 +170,29 @@ class RouteHeap {
 function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap,
   sameComplex: (a: number, b: number) => boolean = () => false): Map<number, Hop> {
   const table = new Map<number, Hop>();
-  const best = new Map<number, number>([[src, 0]]);
-  const first = new Map<number, { line: number; alight: number }>();
-  // did the best path ride a line? (stations reached on foot only are no destinations) Did it arrive on foot?
-  const rode = new Map<number, boolean>([[src, false]]);
-  const walked = new Map<number, boolean>([[src, false]]);
-  const arrival = new Map<number, number>();
+  // One record per reached station (insertion order = first relaxation, as the former per-field maps had):
+  // best cost, first hop, did the best path ride a line, did it arrive on foot, where it last alighted.
+  const state = new Map<number, RouteNode>([[src, { best: 0, first: null, rode: false, walked: false, arrival: undefined }]]);
   open.clear();
   open.push(0, src);
   while (open.size) {
-    const c = open.top(), u = open.pop();
-    if (c > (best.get(u) ?? Infinity)) continue;
+    const c = open.top(), u = open.pop(), su = state.get(u)!;
+    if (c > su.best) continue;
     // Every outgoing ride has the same transfer at this popped node. First boarding and walking
     // edges need no complex query; compute the penalty lazily for the first outgoing ride only.
     let transfer: number | undefined;
     for (const e of edges.get(u) ?? []) {
-      if (e.line !== WALK_LINE && rode.get(u) && transfer === undefined)
-        transfer = (sameComplex(arrival.get(u) ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (walked.get(u) ? 0 : PLATFORM_CHANGE_S);
+      if (e.line !== WALK_LINE && su.rode && transfer === undefined)
+        transfer = (sameComplex(su.arrival ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (su.walked ? 0 : PLATFORM_CHANGE_S);
       const nc = c + e.cost + (e.line === WALK_LINE ? 0 : transfer ?? 0);
-      if (nc < (best.get(e.to) ?? Infinity)) {
-        best.set(e.to, nc);
-        first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
-        rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
-        walked.set(e.to, e.line === WALK_LINE);
-        arrival.set(e.to, e.line === WALK_LINE ? arrival.get(u) ?? u : e.to);
+      let sv = state.get(e.to);
+      if (nc < (sv ? sv.best : Infinity)) {
+        if (!sv) { sv = { best: nc, first: null, rode: false, walked: false, arrival: undefined }; state.set(e.to, sv); }
+        sv.best = nc;
+        sv.first = u === src ? { line: e.line, alight: e.to } : su.first!;
+        sv.rode = su.rode || e.line !== WALK_LINE;
+        sv.walked = e.line === WALK_LINE;
+        sv.arrival = e.line === WALK_LINE ? su.arrival ?? u : e.to;
         open.push(nc, e.to);
       }
     }
@@ -204,9 +205,10 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
     const o = a.find((x) => x.line === e.line);
     if (o) o.cost = Math.min(o.cost, e.cost); else a.push({ line: e.line, cost: e.cost });
   }
-  for (const [d, f] of first) {
-    if (d === src || !rode.get(d)) continue;
-    const hop: Hop = { line: f.line, alight: f.alight, cost: best.get(d)! };
+  for (const [d, sd] of state) {
+    const f = sd.first;
+    if (!f || d === src || !sd.rode) continue;
+    const hop: Hop = { line: f.line, alight: f.alight, cost: sd.best };
     const leg = legs.get(f.alight);
     if (leg && leg.length > 1) {
       const own = leg.find((x) => x.line === f.line);
