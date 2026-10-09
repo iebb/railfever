@@ -31,10 +31,15 @@ export interface WinOpts {
   cls?: string;
 }
 
+/** Up to this width the stylesheet anchors windows above the dock (and phones show them as bottom sheets). */
+const DOCKED_LAYOUT = 1279;
+
 export class WindowManager {
   wins = new Map<string, Win>();
   /** sound hooks (opening a new window / closing one) */
   sfx = { open: () => {}, close: () => {} };
+  /** The dock, tool tray and tool card on screen (set by the HUD): windows above them end at their top. */
+  below: { left: number; right: number; top: number }[] = [];
   private silent = false;
   private z = 100;
   private cascade = 0;
@@ -50,7 +55,48 @@ export class WindowManager {
       const r = w.el.getBoundingClientRect();
       w.el.style.left = Math.max(0, Math.min(W - Math.min(r.width, W), r.left)) + 'px';
       w.el.style.top = Math.max(Math.min(top, Math.max(0, H - r.height)), Math.min(H - r.height - 8, r.top)) + 'px';
+      this.fit(w);
     }
+  }
+
+  /** Re-fit every window's height (the dock or tray changed). */
+  fitAll() { for (const w of this.wins.values()) this.fit(w); }
+
+  /**
+   * A window's height runs from its top to the dock below it (to the screen bottom beside the dock), so its own
+   * scroll area holds the rest and the dock stays usable.
+   */
+  private fit(w: Win) {
+    const el = w.el;
+    if (window.innerWidth <= DOCKED_LAYOUT) { el.style.maxHeight = ''; return; }
+    const top = parseFloat(el.style.top), left = parseFloat(el.style.left), width = el.offsetWidth;
+    if (!Number.isFinite(top) || !Number.isFinite(left) || !width) return;
+    let bottom = window.innerHeight - 10;
+    for (const d of this.below) if (left < d.right && left + width > d.left && d.top > top) bottom = Math.min(bottom, d.top - 8);
+    el.style.maxHeight = Math.max(200, Math.floor(bottom - top)) + 'px';
+  }
+
+  /**
+   * Left edge for a new window beside the open ones: right-aligned, or next to an open window, where it covers the
+   * least of the other windows and the left column (checklist, map card, minimap). Null: nothing open, cascade.
+   */
+  private slot(width: number, y: number): number | null {
+    if (!this.wins.size || window.innerWidth <= DOCKED_LAYOUT) return null;
+    const W = window.innerWidth, H = window.innerHeight, h = Math.min(560, H - y - 90);
+    const rects = [...this.wins.values()].map((w) => w.el.getBoundingClientRect());
+    const left = this.root.querySelector('.leftcol');
+    const panels = left ? Array.from(left.children).map((c) => c.getBoundingClientRect()).filter((r) => r.width > 0) : [];
+    const cover = (x: number) => [...rects, ...panels].reduce((s, r) =>
+      s + Math.max(0, Math.min(x + width, r.right) - Math.max(x, r.left)) * Math.max(0, Math.min(y + h, r.bottom) - Math.max(y, r.top)), 0);
+    const maxX = W - width - 16;
+    let best: number | null = null, bestCover = Infinity;
+    for (const x of [maxX, ...rects.flatMap((r) => [r.left - width - 10, r.right + 10])]) {
+      if (x < 8 || x > maxX) continue;
+      const c = cover(x);
+      if (c < bestCover - 1 || (Math.abs(c - bestCover) <= 1 && best !== null && x > best)) { best = x; bestCover = c; }
+    }
+    // only worth it when the window ends up covering clearly less than it would stacked on the others
+    return best !== null && bestCover < width * h * 0.35 ? Math.round(best) : null;
   }
 
   get narrow() { return window.innerWidth <= 720; }
@@ -89,8 +135,12 @@ export class WindowManager {
     el.style.width = `calc(${width}px * var(--uis, 1))`;
     const s = uiScale(), sw = width * s;
     const W = window.innerWidth, H = window.innerHeight;
-    const k = this.cascade++ % 6;
-    const x = Math.max(8, Math.min(W - sw - 10, opts.x ?? W - sw - 16 - k * 26));
+    // beside the open windows where there is room, else cascaded over them
+    const free = opts.x == null && opts.y == null ? this.slot(sw, 70 * s) : null;
+    // (the cascade starts over once every window is closed: a lone window opens at the top, at full height)
+    if (!this.wins.size) this.cascade = 0;
+    const k = free == null ? this.cascade++ % 6 : 0;
+    const x = Math.max(8, Math.min(W - sw - 10, opts.x ?? free ?? W - sw - 16 - k * 26));
     const y = Math.max(64 * s, Math.min(H - 320, opts.y ?? 70 * s + k * 26));
     el.style.left = x + 'px';
     el.style.top = y + 'px';
@@ -122,11 +172,12 @@ export class WindowManager {
         el.style.left = Math.max(-el.offsetWidth + 80, Math.min(window.innerWidth - 80, ox + ev.clientX - sx)) + 'px';
         el.style.top = Math.max(0, Math.min(window.innerHeight - 40, oy + ev.clientY - sy)) + 'px';
       };
-      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); };
+      const up = () => { window.removeEventListener('pointermove', move); window.removeEventListener('pointerup', up); this.fit(win); };
       window.addEventListener('pointermove', move);
       window.addEventListener('pointerup', up);
     });
     this.wins.set(id, win);
+    this.fit(win);
     this.focus(win);
     this.takeFocus(win, opener);
     if (!this.silent) this.sfx.open();
