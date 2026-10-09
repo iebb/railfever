@@ -44,6 +44,7 @@ import { usesSharedRail, sharedCapacityPlan, sharedCapacityWithdrawals, touchSha
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
 import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan, openingFundingBaseline, openingFundingAppraisal } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
+import { roadOptions, roadPlanJob, roadMarket, setRoadModels, roadFleetCap, roadVehiclePays, linkStopsToRail, coachUpgrades, retireToRail, type BusHost, type RoadPlan } from './ai-bus';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
@@ -1061,6 +1062,7 @@ export function pickBus(year: number, townPop = 3000): VehicleModel | null {
   const value = (m: VehicleModel) => (Math.min(m.capacity, townPop / 40) * Math.min(m.speed, 60)) / (m.cost + modelYearCost(m, year) * 8);
   return buses.sort((a, b) => value(b) - value(a))[0] ?? null;
 }
+setRoadModels(pickBus, pickCoach);
 
 export interface AIStats {
   railStations: number; busStops: number; track: number; road: number; bridges: number; tunnels: number;
@@ -1096,7 +1098,7 @@ export interface AIStats {
   hsr: number; express: number; crossCity: number;
 }
 
-type ProjectKind = 'rail' | 'bus' | 'road' | 'tram' | 'share' | 'coach' | 'double' | 'metro' | 'lightrail' | 'hsr' | 'crosscity';
+type ProjectKind = 'rail' | 'bus' | 'road' | 'tram' | 'share' | 'coach' | 'double' | 'metro' | 'lightrail' | 'hsr' | 'crosscity' | 'busjoin' | 'busext' | 'busrail';
 
 interface Project {
   kind: ProjectKind;
@@ -1658,7 +1660,7 @@ export class AIController {
     }
     // every option is scored by its expected return: yearly revenue from the regional OD demand at distance-based
     // fares, minus running costs and upkeep, over the outlay (focus and network effects on top)
-    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number; urbanLayout?: UrbanLayout; growth?: UrbanGrowthQuote; viable?: boolean; extensionScore?: number }[] = [];
+    const opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number; urbanLayout?: UrbanLayout; growth?: UrbanGrowthQuote; viable?: boolean; extensionScore?: number; road?: RoadPlan }[] = [];
     const operating = this.operatingTowns(), hq = g.headquartersOf(this.companyId)?.id;
     const D = yield* this.townDemand();
     // fares with the value of time (fares.ts): ~60% of the top speed on average, waiting half the headway (by
@@ -1671,7 +1673,9 @@ export class AIController {
     const roi = (revenue: number, yearly: number, outlay: number) => Math.sqrt(Math.max(0, (revenue - yearly) / Math.max(1, outlay))) + 0.15;
     const fw = (f: number) => f * f;
     const served = this.servedPairs();
-    const share = (a: number, b: number) => 1 / (1 + (served.get(this.pairKey(a, b)) ?? 0));
+    // (a busy coach line of ours a railway would replace is no rival service; the railway forgoes its surplus: ai-bus.ts)
+    const upgrades = coachUpgrades(this.busHost());
+    const share = (a: number, b: number) => 1 / (1 + Math.max(0, (served.get(this.pairKey(a, b)) ?? 0) - (upgrades.has(this.pairKey(a, b)) ? 1 : 0)));
     // intercity railways: preferably extending our network from a station we have (hubs and branches)
     const railModels = pickTrain(g.year, aiPlatformLength(2000, 2000, g.year), 150, 3) ?? [];
     if (focus.rail > 0 && considers(focus.rail) && avail > (railLines ? 750_000 : 3_000_000) && railModels.length) {
@@ -1729,7 +1733,8 @@ export class AIController {
           if (!hubsLive()) continue railPairs;
           const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, this.companyId);
           const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
-          const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap);
+          const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap)
+            - (upgrades.get(this.pairKey(A.id, B.id))?.profit ?? 0);
           const outlay = infrastructure + fleet * (models.reduce((s, m) => s + m.cost, 0) + mail.price);
           if (outlay <= avail) {
             // Conventional civil works have the same long life used by the detailed opening forecast.
@@ -1921,6 +1926,8 @@ export class AIController {
           viable: D.pair(A.id, B.id) * 0.2 * 12 * fareAt(d, 90) > 80_000 && 1_200_000 + d * 4000 <= avail });
       }
     }
+    // road services (ai-bus.ts): a partner on a busy line, a longer route or trams for a busy one of ours, by the forecast
+    if (focus.road > 0 && considers(focus.road)) yield* roadOptions(this.busHost(), opts as Parameters<typeof roadOptions>[1], avail, fw(focus.road));
     // a company with a clear favourite saves up for it rather than spending on kinds it barely cares for (unless
     // it has opened nothing for a year)
     const wOf = (k: ProjectKind) => fw(k === 'rail' || k === 'share' || k === 'metro' || k === 'hsr' || k === 'crosscity' ? focus.rail : k === 'lightrail' ? Math.max(focus.rail, focus.tram) : k === 'tram' ? focus.tram : focus.road);
@@ -1952,6 +1959,13 @@ export class AIController {
       if (!this.startTram(pick.towns[0])) { this.markFailed('tram', 120); this.state.cooldown = 20; }
       return;
     }
+    // road services (ai-bus.ts): a planned partner or extension, or a town bus / coach market planned when it is picked
+    if (pick.road || pick.kind === 'bus' || pick.kind === 'coach') {
+      this.project = { kind: pick.kind, towns: pick.towns, stations: [], edges: [], depots: [], line: -1, started: g.day };
+      this.job = this.roadPlanJob(pick.road ?? null, pick.kind);
+      this.state.projects++;
+      return;
+    }
     const towns = pick.towns.map((id) => g.towns.list[id]);
     this.project = { kind: pick.kind, towns: pick.towns, stations: [], edges: [], depots: [], line: -1, started: g.day,
       ...(pick.urbanLayout ? { urbanLayout: pick.urbanLayout } : {}) };
@@ -1964,9 +1978,8 @@ export class AIController {
       : pick.kind === 'hsr' ? this.railJob(railEnds[0], railEnds[1], -1, 'highspeed')
       : pick.kind === 'crosscity' ? this.crossCityJob(towns[0])
       : pick.kind === 'share' ? this.shareJob(pick.share![0], pick.share![1], pick.share![2], pick.share![3])
-      : pick.kind === 'coach' ? this.coachJob(originTowns[0], originTowns[1])
       : pick.kind === 'metro' || pick.kind === 'lightrail' ? this.urbanJob(towns[0], pick.kind)
-      : pick.kind === 'bus' ? this.busJob(towns[0]) : this.roadJob(originTowns[0], originTowns[1]);
+      : this.roadJob(originTowns[0], originTowns[1]);
     this.state.projects++;
   }
 
@@ -2438,6 +2451,8 @@ export class AIController {
     if (usesSharedRail(this.game, l)) return sharedCapacityPlan(this.game, l).limit;
     const own = this.lines.get(l.id);
     if (own && own.shared === undefined) return own.maxVehicles;
+    // (a road line: every operator's vehicles within its street ceiling)
+    if (l.kind === 'road') return roadFleetCap(this.game, l);
     const g = this.game;
     const sts = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((x): x is Station => !!x?.rail);
     const passing = sts.filter((x) => x.rail!.tracks >= 2).length;
@@ -3861,6 +3876,41 @@ export class AIController {
   }
 
   // ---------------------------------------------------------------- bus
+  /** What the road planner (ai-bus.ts) uses of the company. */
+  private busHost(): BusHost {
+    return {
+      g: this.game, me: this.companyId, managed: this.lines, stats: this.stats,
+      available: () => this.available(), project: () => this.project, note: (s) => this.note(s),
+      borrowFor: (a) => this.borrowFor(a), roadDepot: (x, z) => this.roadDepot(x, z), linkTransfers: (id) => this.linkTransfers(id),
+      canonical: (id) => this.canonical(id), isFailed: (k) => this.isFailed(k), markFailed: (k, d) => this.markFailed(k, d),
+    };
+  }
+
+  /**
+   * A road project (ai-bus.ts): a planned partner or extension, or for a town bus / coach market the best of a new line,
+   * a partner on a line serving it and an extension of ours to it (roadMarket).
+   */
+  private *roadPlanJob(planned: RoadPlan | null, kind: ProjectKind): Generator<void, void> {
+    const p = this.project!, T = p.towns.map((id) => this.game.towns.list[id]?.name ?? '?').join(' - ');
+    let plan = planned;
+    if (!plan) {
+      this.state.phase = `planning ${kind === 'coach' ? 'coaches' : 'buses'} ${T}`;
+      plan = yield* roadMarket(this.busHost(), kind === 'coach' ? 'coach' : 'bus', p.towns);
+      if (!plan) {
+        this.note(`${kind === 'coach' ? 'coaches' : 'buses'} ${T}: no plan pays`);
+        this.markFailed(kind === 'coach' ? 'coach' + this.pairKey(p.towns[0], p.towns[1]) : 'bus' + p.towns[0], 720);
+        this.abandon(p);
+        return;
+      }
+    }
+    this.state.phase = plan.kind === 'join' ? 'adding buses' : plan.kind === 'extend' ? 'extending a bus line' : plan.kind === 'tram' ? 'laying tram tracks'
+      : `building ${plan.towns.length >= 2 ? 'coaches' : 'buses'}`;
+    const result = yield* roadPlanJob(this.busHost(), plan);
+    this.note(result);
+    if (result.startsWith('road project failed')) { this.abandon(p); return; }
+    p.built = true;
+  }
+
   private *busJob(T: Town): Generator<void, void> {
     const g = this.game, owner = this.companyId, net = g.world.net;
     const p = this.project!;
@@ -5592,12 +5642,17 @@ export class AIController {
         }
       } else if (v0 instanceof RoadVehicle && v0.model) {
         const model = roadModel ?? v0.model;
+        // (a bus or coach must earn its keep: the forecast at one vehicle more and the riders giving up it wins back, ai-bus.ts)
+        if (info.kind === 'bus' && !roadVehiclePays(this.busHost(), l)) continue;
         if (!this.borrowFor(model.cost)) continue;
         const b = g.vehicles.buyRoad(info.depot, model, lid);
         if (typeof b !== 'string') { this.stats.vehicles++; this.note(`added a ${info.kind === 'tram' ? 'tram' : 'bus'} to ${l.name}`); }
       }
     }
     if (!this.job && g.access.length) this.endUnusedAccess();
+    // our bus stops beside rail stations join their complexes; coach lines our railways now replace (ai-bus.ts)
+    linkStopsToRail(this.busHost());
+    retireToRail(this.busHost());
     // a town the line passes: a station on the line there (through station; the line stops at it)
     if (!this.railPolicy.deepTrouble) {
       if (!this.job && this.rng.chance(0.35 * act)) this.addIntermediateStation();
