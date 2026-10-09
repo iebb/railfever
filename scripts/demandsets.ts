@@ -67,9 +67,10 @@ const townOf = (id: number) => g.stations.get(id)?.townId ?? -1;
   let city = 0, inter = 0;
   for (let r = 0; r < n; r++) for (let q = 0; q < n; q++) {
     const all = m.trips(r, q), c = m.trips(r, q, 'city'), i = m.trips(r, q, 'intercity'), same = R[r].town === R[q].town;
-    // the previous single model: local OD (urban uplift within a town) plus long-distance trips
+    // the previous single model: local OD (urban uplift within a town; the big-city effect between towns, BIG_CITY)
+    // plus long-distance trips
     const town = g.towns.list[R[r].town];
-    const previous = R[r].produced * m.od[r * n + q] * (same && town ? 1 + 6 * urbanIntensity(g, { ...R[r], townId: town.id }) : 1)
+    const previous = R[r].produced * m.od[r * n + q] * (same && town ? 1 + 6 * urbanIntensity(g, { ...R[r], townId: town.id }) : 1 + m.icBoost(r, q))
       + R[r].pop * m.ld[r * n + q];
     close(all, previous, 1e-12, `trips ${r}->${q} equal the previous model`);
     assert.equal(c + i, all, `trips ${r}->${q}: city + inter-city = all`);

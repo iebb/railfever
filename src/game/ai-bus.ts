@@ -260,18 +260,19 @@ function claimSites(g: Game, sites: RoadSite[], skip: Set<number>): Claimed[] {
  * OD (local) and long-distance trip shares from a population's regions to a destination's covered regions. `xc`: the
  * city trips of x (regions of one town: demand.ts DemandSet); the rest of x and all of y are inter-city trips.
  */
-function odShares(g: Game, from: Map<number, number>, fromPop: number, to: [number, number][], walk: number): { x: number; xc: number; y: number } {
+function odShares(g: Game, from: Map<number, number>, fromPop: number, to: [number, number][], walk: number): { x: number; xc: number; xb: number; y: number } {
   const D = g.demand, n = D.regions.length, od = D.od, ld = D.ld;
-  let x = 0, xc = 0, y = 0;
-  if (!(fromPop > 0)) return { x, xc, y };
+  let x = 0, xc = 0, xb = 0, y = 0;
+  if (!(fromPop > 0)) return { x, xc, xb, y };
   for (const [r, pop] of from) for (const [q, cov] of to) {
     if (r >= n || q >= n || !(cov > 0)) continue;
     const s = pop / fromPop, v = s * od[r * n + q] * cov * (r === q ? walk : 1);
     x += v;
-    if (D.sameTown(r, q)) xc += v;
+    // (xb: the big-city trips to other towns on top of the captured local rate, demand.ts icBoost)
+    if (D.sameTown(r, q)) xc += v; else xb += v * D.icBoost(r, q);
     y += s * (ld[r * n + q] ?? 0) * cov / TRIPS_PER_MONTH;
   }
-  return { x, xc, y };
+  return { x, xc, xb, y };
 }
 
 /** Covered share of each region by a claimed population: [region, coverage]. */
@@ -532,9 +533,9 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   // line (busCityForecast) on city trips and, on its legs within one town, the access legs of inter-city trips (riders to
   // and from the town's stations and coach stops: feeders); a coach line (coachIntercityForecast) on inter-city trips.
   // The share of a part's riders counted, by its count's own terms (tripCount).
-  const counted = (p: { x: number; xc: number; y: number }, f: number, k: number, mult: number, inTown: boolean) => {
+  const counted = (p: { x: number; xc: number; xb: number; y: number }, f: number, k: number, mult: number, inTown: boolean) => {
     if (purpose === 'all' || (purpose === 'city' && inTown)) return 1;
-    const city = p.xc * f * k * mult, all = p.x * f * k * mult + p.y * Math.max(0.3, Math.min(2, f));
+    const city = p.xc * f * k * mult, all = (p.x + p.xb) * f * k * mult + p.y * Math.max(0.3, Math.min(2, f));
     const share = !(city > 0) || !(all > 0) ? 0 : city >= all ? 1 : city / all;
     return purpose === 'city' ? share : 1 - share;
   };
@@ -600,7 +601,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   };
   const factorOf = (cost: number, d: number, centre: number) => tripFactor(Math.max(1, cost), refTime(d, centre)) / TF_TYPICAL;
   // ------------------------------------------------ the line's own stops: riders to its other stops and onwards
-  type Part = { x: number; xc: number; y: number; f: number[]; same: boolean; rail: boolean; j: number; to: number; hop?: Hop; at: number; d: number; share: number[] };
+  type Part = { x: number; xc: number; xb: number; y: number; f: number[]; same: boolean; rail: boolean; j: number; to: number; hop?: Hop; at: number; d: number; share: number[] };
   for (let i = 0; i < n; i++) {
     if (i % 3 === 2) yield;
     const s = sites[i], c = claims[i];
@@ -658,7 +659,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       const kCap = localF[m] > 0 ? localCapture(localX, localF[m]) / localF[m] : 0;
       for (const p of parts) {
         const mult = p.same ? localTripMultiplier(g, s, p.rail ? 'rail' : mode, p.f[m]) : 1;
-        const count = tripCount(gen, p.x, p.y, p.f[m], kCap, mult, !p.same && p.rail ? 1 + MAINLINE_FEEDER_SHARE : 1) * p.share[m]
+        const count = tripCount(gen, p.x + p.xb, p.y, p.f[m], kCap, mult, !p.same && p.rail ? 1 + MAINLINE_FEEDER_SHARE : 1) * p.share[m]
           * counted(p, p.f[m], kCap, mult, inTown(i, p.j));
         if (!(count > 0)) continue;
         if (p.to < 0) { ride(m, i, p.j, count, 1, false); continue; }
@@ -692,7 +693,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
     const genPop = D.generationPopulation(st), o = originOf(g, st), base = baseLocal(g, st, table);
     let localX = base.local;
     const localF = fleets.map(() => base.localF);
-    const parts: { j: number; x: number; xc: number; y: number; f: number[]; same: boolean; k: number; at: number; hop?: Hop; rail: boolean; share: number[] }[] = [];
+    const parts: { j: number; x: number; xc: number; xb: number; y: number; f: number[]; same: boolean; k: number; at: number; hop?: Hop; rail: boolean; share: number[] }[] = [];
     for (let j = 0; j < n; j++) {
       if (!(claims[j].pop > 0)) continue;
       let bestK: { k: number; cost: number; at: number; hop?: Hop } | null = null;
@@ -725,7 +726,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       const kCap = localF[m] > 0 ? localCapture(localX, localF[m]) / localF[m] : 0;
       for (const p of parts) {
         const mult = p.same ? localTripMultiplier(g, st, p.rail ? 'rail' : mode, p.f[m]) * walkers : 1;
-        const count = tripCount(gen, p.x, p.y, p.f[m], kCap, mult, !p.same && p.rail && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1) * p.share[m]
+        const count = tripCount(gen, p.x + p.xb, p.y, p.f[m], kCap, mult, !p.same && p.rail && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1) * p.share[m]
           * counted(p, p.f[m], kCap, mult, inTown(p.k, p.j));
         if (!(count > 0)) continue;
         // they arrive at `at` (the stop's station or one linked to it) and change there: free inside one complex; residents

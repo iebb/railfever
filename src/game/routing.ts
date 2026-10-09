@@ -1214,6 +1214,11 @@ export interface SiteOpts {
   accept?: (p: StationPlan) => boolean;
   /** a quicker search (AI): stop a few rings beyond the best site so far (unless a height is wanted) */
   quick?: boolean;
+  /**
+   * AI: what a site linked to one of these stations (its plan's walking links: one transfer complex) is worth, in
+   * site score units (20,000 of building cost each): the journeys the connection to that station's lines brings.
+   */
+  network?: ReadonlyMap<number, number>;
 }
 
 /** Run a generator to completion (synchronous use of the incremental helpers). */

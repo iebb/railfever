@@ -15,7 +15,8 @@
 //   (containment), attraction 0.4 residents + jobs of the districts in town, the strong local decay (odDecay), the
 //   urban uplift by mode (localTripMultiplier) and walking residents only at both ends;
 // - inter-city: the rest of the local trips (to districts of other towns: odDecay beyond the town) plus the
-//   long-distance trips (LD_RATE, ldDecay), attraction 0.4 residents + jobs at the far end, car feeders at both ends
+//   long-distance trips (LD_RATE, ldDecay; more per resident in big cities: BIG_CITY), attraction 0.4 residents + jobs
+//   at the far end, car feeders at both ends
 //   (feeder pools, MAINLINE_FEEDER_SHARE).
 // Each passenger keeps the set of the trip from generation to arrival (WaitGroup / CargoGroup `ic`), through one
 // routing network: an inter-city trip may ride a city bus to or from the station. API for planners and the UI:
@@ -123,6 +124,22 @@ export const ldDecay = (d: number) => {
 };
 /** Long-distance trips per inhabitant and month, per 1,000 attraction (jobs + 0.4 residents) at the far end, at 100 units. */
 export const LD_RATE = 0.0144 * PASSENGER_RATE_SCALE;
+/**
+ * Big-city effect on inter-city trips: a town of `residents` produces BIG_CITY.factor(residents) times the inter-city
+ * trips per resident of a small town (business, visits, connections), and attracts factor^attract times as many per
+ * unit of attraction: 1 up to about `from` residents (villages and market towns), then rising smoothly as
+ * (residents / from)^exp, at most `max`. A trip between two towns gets the origin's production and the destination's
+ * attraction factor, so trips between two big cities grow with both sizes while a small town's trips change little.
+ * It scales the long-distance matrix (ld) and, on top of a station's captured local rate, its trips to other towns
+ * (DemandModel.big: icBoost); city trips are unchanged.
+ */
+export const BIG_CITY = {
+  from: 3500, exp: 0.6, soft: 600, max: 3, attract: 0.5,
+  factor(residents: number): number {
+    const smax = (p: number) => (p + this.from + Math.sqrt((p - this.from) ** 2 + this.soft * this.soft)) / 2;
+    return Math.min(this.max, Math.pow(smax(Math.max(0, residents)) / smax(0), this.exp));
+  },
+};
 /** Trip factor of a typical service of the game (it leaves the demand as it was); fast direct services earn more. */
 export const TF_TYPICAL = 1.3;
 
@@ -324,6 +341,10 @@ export class DemandModel {
   ld = new Float32Array(0);
   /** town of each region (computeOD): trips between regions of one town are city trips, the others inter-city */
   private regionTown = new Int32Array(0);
+  /** BIG_CITY factor of each region's town (computeOD), and its attraction factor (^attract): a trip between towns r -> q
+   * makes big[r] x bigAttract[q] times the trips of small towns */
+  big = new Float32Array(0);
+  bigAttract = new Float32Array(0);
   /** per station: [region, share of its catchment population] */
   shares = new Map<number, [number, number][]>();
   /** bumped when regions or station shares change */
@@ -505,12 +526,18 @@ export class DemandModel {
       }
       if (sum > 0) for (let q = 0; q < n; q++) this.od[r * n + q] /= sum;
     }
-    // long-distance trips: gravity between regions of towns far apart (weak decay, by the far end's attraction)
+    // long-distance trips: gravity between regions of towns far apart (weak decay, by the far end's attraction), more of
+    // them per resident and per unit of attraction in big cities (BIG_CITY: by the residents of the regions' towns)
     if (this.ld.length !== n * n) this.ld = new Float32Array(n * n);
+    const residents = new Map<number, number>();
+    for (let r = 0; r < n; r++) residents.set(R[r].town, (residents.get(R[r].town) ?? 0) + R[r].pop);
+    if (this.big.length !== n) { this.big = new Float32Array(n); this.bigAttract = new Float32Array(n); }
+    const big = this.big, attract = this.bigAttract;
+    for (let r = 0; r < n; r++) { big[r] = BIG_CITY.factor(residents.get(R[r].town) ?? 0); attract[r] = Math.pow(big[r], BIG_CITY.attract); }
     for (let r = 0; r < n; r++) for (let q = 0; q < n; q++) {
       if (R[r].town === R[q].town) { this.ld[r * n + q] = 0; continue; }
       const d = Math.hypot(R[r].x - R[q].x, R[r].z - R[q].z);
-      this.ld[r * n + q] = LD_RATE * (R[q].attracted / 1000) * ldDecay(d);
+      this.ld[r * n + q] = LD_RATE * (R[q].attracted / 1000) * ldDecay(d) * big[r] * attract[q];
     }
   }
 
@@ -524,6 +551,15 @@ export class DemandModel {
   setOf(r: number, q: number): DemandSet { return this.sameTown(r, q) ? 'city' : 'intercity'; }
 
   /**
+   * Extra inter-city trips from region r to q as a share of their local (OD) trips: big[r] x big[q]^attract - 1 between
+   * towns (BIG_CITY), 0 within one. Added after a station's local capture: big cities make more trips to other towns.
+   */
+  icBoost(r: number, q: number): number {
+    const T = this.regionTown, B = this.big;
+    return r < 0 || q < 0 || r >= T.length || q >= T.length || T[r] === T[q] || B.length !== T.length ? 0 : B[r] * this.bigAttract[q] - 1;
+  }
+
+  /**
    * Potential trips per month from region r to region q (all modes): local (OD share of r's trips) plus long-distance.
    * `set`: only the trips of that set (city: r and q in one town; inter-city: in two towns), 'all' (default): both.
    */
@@ -533,7 +569,7 @@ export class DemandModel {
     if (set !== 'all' && (R[r].town === R[q].town) !== (set === 'city')) return 0;
     const town = this.g.towns.list[R[r].town];
     const local = R[r].town === R[q].town && town
-      ? 1 + 6 * urbanIntensity(this.g, { ...R[r], townId: town.id }) : 1;
+      ? 1 + 6 * urbanIntensity(this.g, { ...R[r], townId: town.id }) : 1 + this.icBoost(r, q);
     return R[r].produced * this.od[r * n + q] * local + R[r].pop * (this.ld[r * n + q] ?? 0);
   }
 
@@ -541,7 +577,7 @@ export class DemandModel {
    * regions and OD arrays, so a long-running planner must not mix rows from different updates. */
   tripSnapshot() {
     const regions = this.regions.map((r) => ({ ...r })), n = regions.length;
-    const od = this.od.slice(), ld = this.ld.slice();
+    const od = this.od.slice(), ld = this.ld.slice(), big = this.big.slice(), attract = this.bigAttract.slice();
     const local = regions.map((r) => {
       const town = this.g.towns.list[r.town];
       return town ? 1 + 6 * urbanIntensity(this.g, { ...r, townId: town.id }) : 1;
@@ -550,7 +586,7 @@ export class DemandModel {
       if (r < 0 || q < 0 || r >= n || q >= n) return 0;
       const from = regions[r], to = regions[q];
       if (set !== 'all' && (from.town === to.town) !== (set === 'city')) return 0;
-      return from.produced * od[r * n + q] * (from.town === to.town ? local[r] : 1)
+      return from.produced * od[r * n + q] * (from.town === to.town ? local[r] : big.length === n ? big[r] * attract[q] : 1)
         + from.pop * (ld[r * n + q] ?? 0);
     } };
   }
@@ -887,7 +923,7 @@ export class DemandModel {
     if (!table || !origin.length || !this.regions.length || !stationActive(g, st)) { this.cache.set(st.id, NO_DEMAND); return NO_DEMAND; }
     const n = this.regions.length, od = this.od, ld = this.ld, towns = this.regionTown;
     // (xc: the city trips of x, between regions of one town; the rest of x and all of y are inter-city trips)
-    const parts: { d: number; x: number; xc: number; y: number; f: number; local: number; feeder: number }[] = [];
+    const parts: { d: number; x: number; xc: number; xb: number; y: number; f: number; local: number; feeder: number }[] = [];
     let local = 0, localF = 0;
     const destinations: Station[] = [];
     for (const d of table.keys()) {
@@ -897,7 +933,7 @@ export class DemandModel {
     for (const { destination: ds, weight } of sampleDemandDestinations(st, g.day, destinations)) {
       const d = ds.id, hop = table.get(d)!;
       // local trips (the OD share) and long-distance trips (relative to the local trip rate) to d's regions
-      let x = 0, xc = 0, y = 0;
+      let x = 0, xc = 0, xb = 0, y = 0;
       const walk = Math.min(1, Math.hypot(ds.x - st.x, ds.z - st.z) / WALK);
       const sameTown = st.townId >= 0 && st.townId === ds.townId;
       const source = sameTown ? walkingOrigin ?? [] : origin;
@@ -909,18 +945,19 @@ export class DemandModel {
         if (r >= n || q >= n) continue;
         const v = sr * od[r * n + q] * cov * (r === q ? walk : 1);
         x += v;
-        if (towns[r] === towns[q]) xc += v;
+        if (towns[r] === towns[q]) xc += v; else xb += v * this.icBoost(r, q);
         y += sr * (ld[r * n + q] ?? 0) * cov;
       }
       x *= weight;
       xc *= weight;
+      xb *= weight;
       y /= TRIPS_PER_MONTH;
       y *= weight;
       if (!(x > 0) && !(y > 0)) continue;
       const f = this.serviceFactor(st, ds, hop);
       // the uplift and the car feeders of the service that carries the journey, not of the platforms the station has
       const mode = this.journeyMode(st.id, d, hop);
-      parts.push({ d, x, xc, y, f, local: sameTown ? localTripMultiplier(g, st, mode, f) * walkers / Math.max(1, originPop) : 1,
+      parts.push({ d, x, xc, xb, y, f, local: sameTown ? localTripMultiplier(g, st, mode, f) * walkers / Math.max(1, originPop) : 1,
         feeder: !sameTown && mode === 'rail' && st.roadAccess ? 1 + MAINLINE_FEEDER_SHARE : 1 });
       local += x; localF += x * f;
     }
@@ -931,7 +968,7 @@ export class DemandModel {
     const dest: number[] = [], w: number[] = [], city: number[] = [];
     let served = 0, cityServed = 0;
     for (const p of parts) {
-      const v = (p.x * p.f * k * p.local + p.y * Math.max(0.3, Math.min(2, p.f))) * p.feeder;
+      const v = ((p.x + p.xb) * p.f * k * p.local + p.y * Math.max(0.3, Math.min(2, p.f))) * p.feeder;
       if (!(v > 0)) continue;
       // (all city trips: the very same value, so that every such passenger is a city passenger)
       const c = p.xc <= 0 ? 0 : p.xc === p.x && !(p.y > 0) ? v : Math.min(v, p.xc * p.f * k * p.local * p.feeder);
@@ -1098,7 +1135,7 @@ export class DemandModel {
       const s = sites[i]; if (!s.pop) continue;
       // Trips as generationPopulation counts them: walkers at WALK_TRIP_INTENSITY, car feeders at the base rate.
       const gen = intensified(walking[i], s);
-      const parts: { count: number; city: number; ld: number; f: number; d: number; seconds: number; j: number; centre: number; sourceShare: number }[] = [];
+      const parts: { count: number; city: number; boost: number; ld: number; f: number; d: number; seconds: number; j: number; centre: number; sourceShare: number }[] = [];
       let local = 0, localF = 0;
       for (let j = 0; j < sites.length; j++) {
         if (i === j || groups[i] === groups[j] || !sites[j].pop) continue;
@@ -1106,18 +1143,18 @@ export class DemandModel {
         const sameTown = s.townId >= 0 && s.townId === t.townId;
         const source = sameTown ? walking[i] : gen, destination = sameTown ? walking[j] : t;
         if (!source.pop || !destination.pop) continue;
-        let x = 0, xc = 0, y = 0;
+        let x = 0, xc = 0, xb = 0, y = 0;
         for (const [r, origin] of source.regions) for (const [q, dest] of destination.regions) {
           const w = origin / source.pop * Math.min(1, dest / Math.max(1, this.regions[q].pop));
           const v = w * this.od[r * n + q] * (r === q ? walk : 1);
           x += v;
-          if (towns[r] === towns[q]) xc += v;
+          if (towns[r] === towns[q]) xc += v; else xb += v * this.icBoost(r, q);
           y += w * this.ld[r * n + q] / TRIPS_PER_MONTH;
         }
         const centre = s.townId === t.townId ? Math.min(urbanIntensity(g, s), urbanIntensity(g, t)) : 0;
         const seconds = estimateLegTime(d, kmh, headway, 1.05) + Math.max(0, Math.abs(rank[i] - rank[j]) - 1) * 8;
         const f = tripFactor(seconds, refTime(d, centre)) / TF_TYPICAL;
-        parts.push({ count: x, city: xc, ld: y, f, d, seconds, j, centre, sourceShare: sameTown ? walking[i].pop * WALK_TRIP_INTENSITY / gen.pop : 1 }); local += x; localF += x * f;
+        parts.push({ count: x, city: xc, boost: xb, ld: y, f, d, seconds, j, centre, sourceShare: sameTown ? walking[i].pop * WALK_TRIP_INTENSITY / gen.pop : 1 }); local += x; localF += x * f;
       }
       // Every reachable destination competes for local trips, as in weights(). Only this service's
       // own destinations receive direct receipts here; external transfer receipts are priced separately.
@@ -1145,9 +1182,9 @@ export class DemandModel {
         const sameTown = s.townId >= 0 && s.townId === sites[p.j].townId;
         const factor = sameTown ? localTripMultiplier(g, s, fareMode, p.f) * p.sourceShare : 1;
         const feeder = !sameTown && fareMode === 'rail' ? 1 + MAINLINE_FEEDER_SHARE : 1;
-        const count = gen.pop * TRIPS_PER_MONTH * 12 * (p.count * p.f * k * factor + p.ld * Math.max(0.3, Math.min(2, p.f))) * feeder;
+        const count = gen.pop * TRIPS_PER_MONTH * 12 * ((p.count + p.boost) * p.f * k * factor + p.ld * Math.max(0.3, Math.min(2, p.f))) * feeder;
         shares.push(p.city === p.count && !(p.ld > 0) ? cityShare(p.city, p.count)
-          : cityShare(p.city * p.f * k * factor, p.count * p.f * k * factor + p.ld * Math.max(0.3, Math.min(2, p.f))));
+          : cityShare(p.city * p.f * k * factor, (p.count + p.boost) * p.f * k * factor + p.ld * Math.max(0.3, Math.min(2, p.f))));
         return count;
       });
       // Passengers abandon queues between sparse physically timed trains. Use the very same useful queue ceiling as
@@ -1302,7 +1339,7 @@ export class DemandModel {
       const regionalPop = [...origin.regional.values()].reduce((sum, v) => sum + v, 0);
       // (walkers make WALK_TRIP_INTENSITY times the trips: generationPopulation)
       const regional = intensified({ pop: walkingPop, regions: origin.walking }, { pop: regionalPop, regions: origin.regional });
-      const parts: { to: number; pop: number; x: number; xc: number; y: number; f: number; local: boolean }[] = [];
+      const parts: { to: number; pop: number; x: number; xc: number; xb: number; y: number; f: number; local: boolean }[] = [];
       let local = 0, localF = 0;
       for (const [to, hop] of tables.get(from) ?? []) {
         const dest = locations.get(to); if (!dest) continue;
@@ -1311,18 +1348,18 @@ export class DemandModel {
         const target = sameTown ? dest.walking : dest.regional;
         const pop = sameTown ? walkingPop : regional.pop; if (!(pop > 0)) continue;
         const d = Math.hypot(origin.x - dest.x, origin.z - dest.z), walk = Math.min(1, d / WALK);
-        let x = 0, xc = 0, y = 0;
+        let x = 0, xc = 0, xb = 0, y = 0;
         for (const [r, residents] of source) for (const [q, covered] of target) {
           if (r >= n || q >= n) continue;
           const weight = residents / pop * Math.min(1, covered / Math.max(1, this.regions[q].pop));
           const v = weight * this.od[r * n + q] * (r === q ? walk : 1);
           x += v;
-          if (towns[r] === towns[q]) xc += v;
+          if (towns[r] === towns[q]) xc += v; else xb += v * this.icBoost(r, q);
           y += weight * this.ld[r * n + q] / TRIPS_PER_MONTH;
         }
         const centre = sameTown ? Math.min(urbanIntensity(g, origin), urbanIntensity(g, dest)) : 0;
         const f = tripFactor(hop.cost, refTime(d, centre)) / TF_TYPICAL;
-        parts.push({ to, pop: sameTown ? pop * WALK_TRIP_INTENSITY : pop, x, xc, y, f, local: sameTown }); local += x; localF += x * f;
+        parts.push({ to, pop: sameTown ? pop * WALK_TRIP_INTENSITY : pop, x, xc, xb, y, f, local: sameTown }); local += x; localF += x * f;
       }
       const capture = localF > 0 ? localCapture(local, localF) / localF : 0;
       for (const part of parts) {
@@ -1334,10 +1371,10 @@ export class DemandModel {
             return p && q ? distanceFare(Math.hypot(p.x - q.x, p.z - q.z)) : 0;
           }, context.sameComplex);
         if (!rides.length) continue;
-        const passengers = part.pop * TRIPS_PER_MONTH * 12 * (part.x * part.f * capture
+        const passengers = part.pop * TRIPS_PER_MONTH * 12 * ((part.x + part.xb) * part.f * capture
           + part.y * Math.max(0.3, Math.min(2, part.f))) * (part.local ? 1 : 1 + MAINLINE_FEEDER_SHARE);
         const share = part.xc === part.x && !(part.y > 0) ? cityShare(part.xc, part.x)
-          : cityShare(part.xc * part.f * capture, part.x * part.f * capture + part.y * Math.max(0.3, Math.min(2, part.f)));
+          : cityShare(part.xc * part.f * capture, (part.x + part.xb) * part.f * capture + part.y * Math.max(0.3, Math.min(2, part.f)));
         for (const ride of rides) {
           const a = indices.get(ride.from), b = indices.get(ride.to); if (a === undefined || b === undefined) continue;
           const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);
@@ -1427,21 +1464,21 @@ export class DemandModel {
       if (i === undefined) for (const [r, pop] of this.feeders.get(from)?.regions ?? []) origin.set(r, (origin.get(r) ?? 0) + pop);
       const pops = [...origin];
       const pop = pops.reduce((sum, [, v]) => sum + v, 0); if (!(pop > 0)) continue;
-      const parts: { to: number; x: number; xc: number; y: number; f: number; cost: number }[] = [];
+      const parts: { to: number; x: number; xc: number; xb: number; y: number; f: number; cost: number }[] = [];
       let local = 0, localF = 0;
       for (const [to, hop] of tables.get(from) ?? []) {
         const j = indices.get(to), dest = j !== undefined ? sites[j] : g.stations.get(to); if (!dest) continue;
-        let x = 0, xc = 0, y = 0;
+        let x = 0, xc = 0, xb = 0, y = 0;
         const walk = Math.min(1, Math.hypot(dest.x - site.x, dest.z - site.z) / WALK);
         for (const [r, origin] of pops) for (const [q, cov] of coverage.get(to) ?? []) {
           const v = origin / pop * this.od[r * n + q] * cov * (r === q ? walk : 1);
           x += v;
-          if (towns[r] === towns[q]) xc += v;
+          if (towns[r] === towns[q]) xc += v; else xb += v * this.icBoost(r, q);
           y += origin / pop * this.ld[r * n + q] * cov / TRIPS_PER_MONTH;
         }
         const centre = site.townId === dest.townId ? Math.min(urbanIntensity(g, site), urbanIntensity(g, dest)) : 0;
         const f = tripFactor(hop.cost, refTime(Math.hypot(dest.x - site.x, dest.z - site.z), centre)) / TF_TYPICAL;
-        parts.push({ to, x, xc, y, f, cost: hop.cost }); local += x; localF += x * f;
+        parts.push({ to, x, xc, xb, y, f, cost: hop.cost }); local += x; localF += x * f;
       }
       const k = localF > 0 ? localCapture(local, localF) / localF : 0;
       for (const part of parts) {
@@ -1453,10 +1490,10 @@ export class DemandModel {
             const to = indices.has(b) ? sites[indices.get(b)!] : g.stations.get(b);
             return from && to ? distanceFare(Math.hypot(from.x - to.x, from.z - to.z)) : 0;
           }, sameComplex);
-        const passengers = pop * TRIPS_PER_MONTH * 12 * (part.x * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)))
+        const passengers = pop * TRIPS_PER_MONTH * 12 * ((part.x + part.xb) * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)))
           * (1 + MAINLINE_FEEDER_SHARE);
         const share = part.xc === part.x && !(part.y > 0) ? cityShare(part.xc, part.x)
-          : cityShare(part.xc * part.f * k, part.x * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)));
+          : cityShare(part.xc * part.f * k, (part.x + part.xb) * part.f * k + part.y * Math.max(0.3, Math.min(2, part.f)));
         for (const leg of legs) {
           const a = indices.get(leg.from), b = indices.get(leg.to); if (a === undefined || b === undefined) continue;
           const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);

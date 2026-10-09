@@ -251,10 +251,11 @@ function run() {
   }
 
   // ---------------------------------------------------------------- coaches call at the towns on the way
+  // (six pairs: whether one pair's coach pays more calling on the way depends on the coaches already running there)
   {
     let tried = 0, calls = 0;
     for (const P of g.towns.list) for (const Q of g.towns.list) {
-      if (P.id >= Q.id || tried >= 3) continue;
+      if (P.id >= Q.id || tried >= 6) continue;
       const d = dist(P, Q);
       if (d < 90 || d > 240 || P.pop < 400 || Q.pop < 400) continue;
       const via = townsOnTheWay(g, P, Q, new Set([P.id, Q.id])).filter((t) => t.pop >= 400);

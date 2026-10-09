@@ -303,7 +303,7 @@ function stationAccessSafe(plan: StationPlan): boolean {
     && (t.start.kind === 'free' && s.s0 <= 0.1 || t.end.kind === 'free' && s.s1 >= t.len - 0.1)));
 }
 
-function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Generator<void, StationPlan | null> {
+export function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Generator<void, StationPlan | null> {
   const dirA = Math.atan2(toward.x - town.x, toward.z - town.z);
   const front = o.front ?? 16, back = o.back ?? 9;
   let best: StationPlan | null = null, bestScore = Infinity;
@@ -382,6 +382,8 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
         // WALK_TRIP_INTENSITY times the trips since the walks were halved after 2.9: weigh them by those trips, or
         // the fixed site terms outweigh a quarter of the residents and the search drifts to the edge of town.
         let score = plan.cost / 20000 + plan.demolish.length * 6 - pop * WALK_TRIP_INTENSITY / 8 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
+        // a site beside one of our stations (linked: one interchange) connects the new line to its lines' network
+        if (o.network?.size) score -= plan.links.reduce((m, st) => Math.max(m, o.network!.get(st.id) ?? 0), 0);
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
         if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
         if ((n += 8) >= AI_SITE_WORK) { n = 0; plans = 0; yield; }
@@ -2140,6 +2142,38 @@ export class AIController {
     return best;
   }
 
+  /**
+   * Our served rail stations in towns A and B, with what a new A-B railway gains by stopping beside one (a station linked
+   * to it: one interchange, Stations' automatic walking links): the journeys between the far town and the other towns
+   * that station's lines reach with one change of trains (inside one station complex: no fare reduction, vehicle.ts),
+   * half of them won, over eight years, in site score units (20,000 each; at most 75).
+   */
+  private networkSites(A: Town, B: Town): Map<number, number> {
+    const g = this.game, me = this.companyId, out = new Map<number, number>(), m = g.demand, R = m.regions;
+    // inter-city trips a month between two towns, both ways (demand.ts trips)
+    const pair = (a: number, b: number) => {
+      let n = 0;
+      for (let r = 0; r < R.length; r++) if (R[r].town === a) for (let q = 0; q < R.length; q++) if (R[q].town === b) n += m.trips(r, q, 'intercity') + m.trips(q, r, 'intercity');
+      return n;
+    };
+    for (const st of g.stations.map.values()) {
+      if (st.owner !== me || !st.rail || (st.townId !== A.id && st.townId !== B.id)) continue;
+      const far = st.townId === A.id ? B : A;
+      const towns = new Set<number>();
+      for (const l of g.lines.linesAt(st.id)) if (l.kind === 'rail' && l.vehicles.length) for (const sid of l.stops) {
+        const t = g.stations.get(sid)?.townId ?? -1;
+        if (t >= 0 && t !== A.id && t !== B.id) towns.add(t);
+      }
+      let revenue = 0;
+      for (const t of towns) {
+        const T = g.towns.list[t], d = Math.hypot(T.x - far.x, T.z - far.z);
+        revenue += pair(far.id, t) * 12 * 0.5 * estimateLegFare(d, 60, 600, 1, 1.3, true, false, { mode: 'rail' });
+      }
+      if (revenue > 0) out.set(st.id, Math.min(75, revenue * 8 / 20000));
+    }
+    return out;
+  }
+
   private railReusePriority(st: Station | null): number {
     return !st ? 0 : st.owner !== this.companyId ? 1 : this.railExtensionAt(st) ? 3 : 2;
   }
@@ -2897,7 +2931,11 @@ export class AIController {
       const pa = yield* aiStationSiteGen(g, A, pb, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, accept: (q) => leadsMeet(q, pb, LEAD), quick: true });
       if (pa && reach(pa, pb)) pr = { a: pa, b: pb };
     }
-    if (!pr && !hub) { hubB = null; if (hb) watched.delete(hb); pr = yield* aiRailPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true }); }
+    if (!pr && !hub) {
+      hubB = null; if (hb) watched.delete(hb);
+      const network = this.networkSites(A, B);
+      pr = yield* aiRailPairGen(g, A, B, { tracks: ST, length: PLATFORM, owner, front: LEAD + 2, back: 22, quick: true, network });
+    }
     if (!pr) return fail('no station sites');
     if (hs && !hub) {
       const existingA = this.townStation(A, pr.a);
