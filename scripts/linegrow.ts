@@ -68,7 +68,10 @@ function district(g: Game, t: Town, x0: number, x1: number, z: number, h: number
   for (const rx of xs) for (let i = 1; i < zs.length; i++) { if (!cross && zs[i - 1] < z && zs[i] > z) continue; road(g, rx, zs[i - 1], rx, zs[i]); }
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x0 + 2; rx < x1; rx += 4) {
-    if (strip && Math.abs(rz - z) < 7) continue;
+    // (User rule, 2.10: walking reach halved again, an in-city light-rail stop walking 74 m along streets. 2.9 kept both
+    // rows beside the line clear, lots from 109 m, which its stops no longer reach at all; lots now start beyond the row
+    // street north of the line, 51 m. Lots beside rail track or depots stay empty, as below.)
+    if (strip && Math.abs(rz + 1.1 - z) < 4) continue;
     const near = g.world.net.edgesNear(rx - 2.5, rz + 1.1 - 2.5, rx + 2.5, rz + 1.1 + 2.5).some((e) => e.kind === 'rail')
       || g.depots.near(rx, rz + 1.1, 3).length > 0;
     if (near) continue;
@@ -283,7 +286,10 @@ if (run('underground')) {
   console.log('  ' + ai.log.slice(-2).join(' | '));
   console.log(`  decisions: ${decisions()}`);
   check(stat(ai, 'netExtended') === 1 && added.length >= 1, `underground: the line runs on beyond ${east.name} (${before.length} -> ${after.length})`);
-  check(added.length >= 1 && added.every((sid) => g.stations.get(sid)?.rail?.level === 'underground'), 'underground: its new stations lie underground');
+  // (2.10: with the user's halved walking reach the survey also prices a viaduct over these blocks, 11.9M against the
+  // tunnel's 21.9M, and the viaduct pays better; either way the line runs on off the streets that cross its way.)
+  check(added.length >= 1 && added.every((sid) => ['underground', 'elevated'].includes(g.stations.get(sid)?.rail?.level ?? 'ground')),
+    `underground: its new stations lie off the street, in a tunnel or on a viaduct (${added.map((sid) => g.stations.get(sid)?.rail?.level).join(', ')})`);
   const seen = calls(g, line, 240);
   check(added.every((sid) => seen.has(sid)), 'underground: trains call there');
   check(checkReservations(g).length === 0, 'underground: reservations consistent');

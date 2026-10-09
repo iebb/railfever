@@ -160,7 +160,7 @@ console.log('FINAL_CACHE',JSON.stringify(stats()));
   console.log('BOUNDED_CACHE',JSON.stringify(sites.entranceMemoStats()));
 }
 
-// Generated native controls: Marcliff light rail truthfully rejects its missing yard; Dorminster
+// Generated native controls: Marcliff light rail truthfully rejects its missing (flooded) yard; Dorminster
 // metro funds, completes and calls at a station. No-cache and warm-cache worlds have the same
 // work cadence, money, stock and population. Each saved twin checks all 640 serialized ticks.
 for(const [name,mode,positive] of [['Marcliff','lightrail',false],['Dorminster','metro',true]] as const){
@@ -191,6 +191,14 @@ for(const [name,mode,positive] of [['Marcliff','lightrail',false],['Dorminster',
     }
     const cursor=ai.urbanSurvey,stage=cursor&&cursor.trial>0?'survey':ai.urbanTask?.stage==='stations'&&ai.urbanTask.at>0?'construction':undefined;
     if(stage&&!seen.has(stage)){
+      // (2.10: the urban survey now also prices trunks to neighbouring centres, and Marcliff's light rail finds a
+      // buildable yard on one. The negative control floods its approved yard site once construction has begun, a native
+      // terrain edit applied alike to every world at this tick: the same missing-yard rejection 2.9's site gave.)
+      if(!positive&&stage==='construction'){
+        const flood=(game:Game)=>{const y=(game.ais[0] as any).urbanTask.plannedYard;
+          for(let dx=-4;dx<=4;dx++)for(let dz=-4;dz<=4;dz++)game.world.setVertex(Math.round(y.x)+dx,Math.round(y.z)+dz,-2);};
+        flood(h);flood(control);for(const r of replays)if(r.left>0)flood(r.g);
+      }
       const data=JSON.stringify(serialize(h)),copy=deserialize(JSON.parse(data));
       check(JSON.stringify(serialize(copy))===data,name+'/'+stage+' immediate roundtrip');
       check(!(copy.stations as any).entranceMemoStats(),name+'/'+stage+' loaded instance starts cold');

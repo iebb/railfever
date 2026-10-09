@@ -77,7 +77,7 @@ import { TF_TYPICAL, TRIPS_PER_MONTH, localTripMultiplier } from './demand';
 import { TRANSFER_PENALTY_S, PLATFORM_CHANGE_S } from './patterns';
 import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
-import { walkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { walkingCatchment, planWalkingCatchment, stopWalkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
 import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
 import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
@@ -2213,32 +2213,28 @@ class NetPlanner {
     return extra * this.residentValue(st);
   }
 
-  /** A footbridge can improve access without a larger radius. Count residents its planned entrances
-   * newly reach, discount street detours and overlapping services, and keep an upkeep allowance. */
+  /** A concourse's footbridge can improve access without a larger radius: count residents its planned access newly
+   * reaches, discount overlapping services, and keep an upkeep allowance. The rebuilt station's access is
+   * priced by the same street walks passengers will take (planWalkingCatchment): a pavilion no street reaches
+   * adds nobody, and residents only an old forecourt reached are lost. */
   private accessBuildingValue(st: Station, plan: StationPlan): number {
     const g = this.g, w = g.world;
     const current = new Set(g.stations.catchmentBuildings(st)), removed = new Set(plan.demolish);
-    const shapes = g.stations.planCatchShapes(plan).filter((c) => c.active);
+    const after = new Set(planWalkingCatchment(g, plan).buildings.keys());
     // Merged road stops still give access to the platforms after a building change.
-    for (const p of st.stops) shapes.push({ x: p.x, z: p.z, r: g.stations.catchmentRadius(st), mode: 'rail', active: true });
-    const seen = new Set<number>();
+    for (const p of st.stops) for (const id of stopWalkingCatchment(g, p.edge, p.s, w.net.edges.get(p.edge)?.tram ? 'tram' : 'bus').buildings.keys()) after.add(id);
+    for (const id of removed) after.delete(id);
+    const others = (id: number) => g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
     let pop = 0;
-    for (const c of shapes) {
-      for (const id of w.bgrid.query(c.x - c.r, c.z - c.r, c.x + c.r, c.z + c.r)) {
-        if (seen.has(id) || current.has(id) || removed.has(id)) continue;
-        const b = w.buildings.get(id);
-        if (!b || Math.hypot(b.x - c.x, b.z - c.z) > c.r) continue;
-        seen.add(id);
-        const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
-        pop += b.pop * 0.5 / (1 + others);
-      }
+    for (const id of after) {
+      if (current.has(id)) continue;
+      const b = w.buildings.get(id);
+      if (b) pop += b.pop / (1 + others(id));
     }
     // Relocating an entrance can also lose passengers: include those losses in the same value estimate.
     for (const id of current) {
       const b = w.buildings.get(id);
-      if (!b || (!removed.has(id) && shapes.some((c) => Math.hypot(b.x - c.x, b.z - c.z) <= c.r))) continue;
-      const others = g.stations.stationsForBuilding(id).st.filter((s) => s !== st.id && g.lines.stationServed(s)).length;
-      pop -= b.pop / (1 + others);
+      if (b && !after.has(id)) pop -= b.pop / (1 + others(id));
     }
     return Math.max(0, pop * this.residentValue(st) - 5000);
   }
@@ -2412,7 +2408,10 @@ class NetPlanner {
       if (s === cur || !avail.has(s) || (s !== 'concourse' && (styleOf(s).catchBonus ?? 0) <= (styleOf(cur).catchBonus ?? 0))) continue;
       const plan = planStationUpgrade(g, st.id, { style: s });
       if (!plan.ok || (plan.plan && !this.demolitionOk(plan.plan.demolish))) continue;
-      const annual = Math.max(this.buildingValue(st, s), s === 'concourse' && plan.plan ? this.accessBuildingValue(st, plan.plan) : 0);
+      // A concourse moves the access to pavilions on both sides of the tracks: it is priced by the street walks from
+      // them (accessBuildingValue), never by a wider circle around the old forecourt, which a pavilion no street
+      // reaches cannot deliver. Other buildings widen the reach from the same forecourt (buildingValue).
+      const annual = s === 'concourse' && plan.plan ? this.accessBuildingValue(st, plan.plan) : this.buildingValue(st, s);
       const gain = annual * years - plan.cost;
       if (gain > 0 && (!cursor.best || gain > cursor.best.gain)) cursor.best = { style: s, gain };
     }
@@ -2424,7 +2423,7 @@ class NetPlanner {
     if (!best || best.style === cur || !avail.has(best.style)) return false;
     const plan = planStationUpgrade(g, st.id, { style: best.style });
     if (!plan.ok || (plan.plan && !this.demolitionOk(plan.plan.demolish))) return false;
-    const annual = Math.max(this.buildingValue(st, best.style), best.style === 'concourse' && plan.plan ? this.accessBuildingValue(st, plan.plan) : 0);
+    const annual = best.style === 'concourse' && plan.plan ? this.accessBuildingValue(st, plan.plan) : this.buildingValue(st, best.style);
     if (annual * years <= plan.cost || !this.canSpend(plan.cost, 0.15)) return false;
     const dem = plan.plan ? [...plan.plan.demolish] : [];
     const err = commitStationUpgrade(g, plan);
@@ -4586,7 +4585,9 @@ class NetPlanner {
       // the stop's own upkeep (its level: the line's there) must be repaid by the newly connected trips
       const accept = (p: OnTrackPlanLike) => {
         const st = p.station as StationPlan | null;
-        if (!st || this.planGap(st, to) > CITY_LINK_GAP || own.some((o) => Math.hypot(o.x - st.x, o.z - st.z) < st.length + 6)) return false;
+        // (the stop must be linkable: since 2.10 an intermediate transfer walks at most half the smaller street reach)
+        if (!st || this.planGap(st, to) > Math.min(CITY_LINK_GAP, g.stations.planLinkLimit(st, to))
+          || own.some((o) => Math.hypot(o.x - st.x, o.z - st.z) < st.length + 6)) return false;
         const upkeep = (20_000 + st.tracks * st.length * 500) * STATION_UPKEEP_FACTOR[st.level];
         return (value.revenue - upkeep) * CITY_LINK_YEARS >= p.cost;
       };
@@ -4595,6 +4596,8 @@ class NetPlanner {
       if (id < 0) continue;
       const st = g.stations.get(id)!;
       this.roadAccess(st);
+      // A stop that cannot be linked connects nothing: it is not opened.
+      if (!st.links.includes(to.id) && g.stations.canLink(st.id, to.id)) { g.stations.removeStation(id); this.considered('citylink.unlinkable'); continue; }
       const served = this.addToLines(id, before);
       if (!served.length) { g.stations.removeStation(id); this.considered('citylink.unserved'); continue; }
       if (!g.stations.get(st.id)?.links.includes(to.id) && !g.stations.canLink(st.id, to.id)) g.stations.link(st.id, to.id);

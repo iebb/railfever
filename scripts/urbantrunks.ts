@@ -54,7 +54,10 @@ function town(g: Game, name: string, x: number, z: number, pop: number, width = 
   }
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) {
-    if (Math.abs(rz - z) < 7) continue; // platforms and their entrances can be built without clearing the town
+    // platforms and their entrances can be built without clearing the town. (User rule, 2.10: walking reach halved again,
+    // an in-city stop walking 74 m along streets. 2.9 kept both rows beside the axis clear, lots from 109 m, which a
+    // centre stop no longer reaches at all; lots now start beyond the row street north of the axis, 51 m.)
+    if (Math.abs(rz + 1.1 - z) < 4) continue;
     lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
   }
   let remaining = pop;
@@ -155,7 +158,10 @@ if (isScenario('detour')) {
 if (isScenario('trunk')) {
 const g = flat(1), ai = g.ais[0], a = access(ai);
 g.aiEnabled = false; g.vehicles.ambientEnabled = false;
-const centres = [120, 240, 360].map((x, i) => town(g, 'Centre ' + i, x, 256, 6000, 32, 32, true));
+// (User rule, 2.10: walkers make WALK_TRIP_INTENSITY 3.2x the trips over the halved reach, so 6,000-resident centres
+// put about 1.8x 2.9's walking trips on this trunk and saturate it; its seat-bound extension then never pays against
+// more trains. The centres hold 3,300 and the next centre 8,800 (0.55x), 2.9's walking-trip level.)
+const centres = [120, 240, 360].map((x, i) => town(g, 'Centre ' + i, x, 256, 3300, 32, 32, true));
 const before = saved(g), geometric = urbanTrunks(g, centres[1], 26, 5);
 check(geometric.some(c => c.towns.length === 3 && c.targets.length === 3), 'three aligned native centres have a through corridor candidate');
 check(saved(g) === before, 'corridor search is pure');
@@ -206,7 +212,7 @@ if (line && path) {
     check(!!denied.error && saved(foreign)===foreignBefore,'foreign-track exclusion rejects without changing assets or accounts');
   }
 
-  const next = town(g, 'Next Centre', 464, 256, 16000, 64, 48, true);
+  const next = town(g, 'Next Centre', 464, 256, 8800, 64, 48, true);
   const start = g.day, growthRuns: { g: Game; day: number; exact: boolean }[] = [];
   let constructionSave = false, unchanged: Game | undefined, investmentStart = 0;
   let constructionStart = 0, vehiclesStart = 0, debtStart = 0;

@@ -16,28 +16,43 @@ if (!process.argv[1]?.endsWith('cargoroute.mjs')) throw new Error('bundle this t
 const seeds = (process.argv[2] ?? '7,23,51').split(',').map(Number);
 const M = (id: string) => MODEL_BY_ID.get(id)!;
 
-/** The former routing search (a sorted array as the open list), kept as the reference for the heap. */
-function referenceTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>): Map<number, Map<number, Hop>> {
+/**
+ * The former routing search (a sorted array as the open list), kept as the reference for the heap.
+ * User rule (2.10, d2b8e53): changing within one station complex (its platforms and linked parts, reached over
+ * internal walking passages or one native complex) skips the external TRANSFER_PENALTY_S; the platform change stays.
+ * The reference keeps its own membership: components of the internal walking edges, plus the same native callback.
+ */
+function referenceTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, native?: (a: number, b: number) => boolean): Map<number, Map<number, Hop>> {
   const out = new Map<number, Map<number, Hop>>();
+  const component = new Map<number, number>();
+  for (const start of edges.keys()) {
+    if (component.has(start) || !(edges.get(start) ?? []).some((e) => e.line === WALK_LINE && e.internalTransfer)) continue;
+    const stack = [start]; component.set(start, start);
+    while (stack.length) for (const e of edges.get(stack.pop()!) ?? []) if (e.line === WALK_LINE && e.internalTransfer && !component.has(e.to)) { component.set(e.to, start); stack.push(e.to); }
+  }
+  const same = (a: number, b: number) => (component.has(a) && component.get(a) === component.get(b)) || !!native?.(a, b);
   for (const src of sources) {
     const table = new Map<number, Hop>();
     const best = new Map<number, number>([[src, 0]]);
     const first = new Map<number, { line: number; alight: number }>();
     const rode = new Map<number, boolean>([[src, false]]);
     const walked = new Map<number, boolean>([[src, false]]);
+    const arrival = new Map<number, number>(); // where the best path last alighted (walking keeps it)
     const open: [number, number][] = [[0, src]];
     while (open.length) {
       open.sort((a, b) => a[0] - b[0]);
       const [c, u] = open.shift()!;
       if (c > (best.get(u) ?? Infinity)) continue;
       for (const e of edges.get(u) ?? []) {
-        const transfer = e.line !== WALK_LINE && rode.get(u) ? TRANSFER_PENALTY_S + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
+        const transfer = e.line !== WALK_LINE && rode.get(u) ? (same(arrival.get(u) ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
         const nc = c + e.cost + transfer;
         if (nc < (best.get(e.to) ?? Infinity)) {
           best.set(e.to, nc);
           first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
           rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
           walked.set(e.to, e.line === WALK_LINE);
+          const at = e.line === WALK_LINE ? arrival.get(u) : e.to;
+          if (at === undefined) arrival.delete(e.to); else arrival.set(e.to, at);
           open.push([nc, e.to]);
         }
       }
@@ -122,7 +137,9 @@ for (const seed of seeds) {
   for (const day of [300, 600, 900]) {
     runTo(g, day);
     const { edges } = routeGraph(g, 'pax');
-    const heap = routeTables(edges, edges.keys()), ref = referenceTables(edges, edges.keys());
+    // (the game routes with the native station-complex membership too: Lines.rebuild)
+    const native = (a: number, b: number) => g.stations.isSameStationComplex(a, b);
+    const heap = routeTables(edges, edges.keys(), new Map(), native), ref = referenceTables(edges, edges.keys(), native);
     const diff = difference(heap, ref), live = difference(heap, g.lines.routing);
     console.log(`seed ${seed} day ${day}: ${g.lines.map.size} lines, ${g.vehicles.map.size} vehicles, ${heap.size} sources, ${hops(heap)} hops`);
     check(!diff, `seed ${seed} day ${day}: heap Dijkstra equals the sort-based search${diff ? ' — ' + diff : ''}`);
@@ -167,7 +184,7 @@ if (aiGame) {
   console.log(`AI network: vans added to ${added} of ${hauled.length} locomotive-hauled trains at platforms`);
   check(added > 0, 'vans added to AI trains at platforms (recompose while loading)');
   const { edges } = routeGraph(g, 'mail');
-  const mail = routeTables(edges, edges.keys());
+  const mail = routeTables(edges, edges.keys(), new Map(), (a, b) => g.stations.isSameStationComplex(a, b));
   let compared = 0, shared = 0;
   for (const [src, table] of g.lines.mailRouting) {
     const ref = mail.get(src);
@@ -241,7 +258,7 @@ if (aiGame) {
       check(!!own && own !== g.lines.routing.get(pr.A.id) && !!own.get(pr.B.id), `a passenger-only bus in the transfer complex (${s1 === pr.A.id ? 'at the station' : 'a linked stop'}): mail routed on its own, still to the other end`);
       check(!g.lines.mailServed(s2), 'the bus stop is no mail station');
       const { edges } = routeGraph(g, 'mail');
-      const d = difference(new Map([...g.lines.mailRouting]), routeTables(edges, [...g.lines.mailRouting.keys()]));
+      const d = difference(new Map([...g.lines.mailRouting]), routeTables(edges, [...g.lines.mailRouting.keys()], new Map(), (a, b) => g.stations.isSameStationComplex(a, b)));
       check(!d, `the complex's mail routing equals an independent mail search${d ? ' — ' + d : ''}`);
       g.lines.delete(bl.id);
       check(g.lines.mailRouting.get(pr.A.id) === g.lines.routing.get(pr.A.id), 'without the bus line the complex shares the passenger tables again');
@@ -265,7 +282,7 @@ if (aiGame) {
   check(mailFleet(g, line) === 'some' && !!g.lines.mailRouting.get(pr.A.id)?.get(pr.B.id), 'mail routes by the mail train');
   runTo(g, g.day + 400);
   const { edges } = routeGraph(g, 'mail');
-  const d = difference(new Map([...g.lines.mailRouting].filter(([s]) => edges.has(s))), routeTables(edges, [...g.lines.mailRouting.keys()].filter((s) => edges.has(s))));
+  const d = difference(new Map([...g.lines.mailRouting].filter(([s]) => edges.has(s))), routeTables(edges, [...g.lines.mailRouting.keys()].filter((s) => edges.has(s)), new Map(), (a, b) => g.stations.isSameStationComplex(a, b)));
   check(!d, `mail routing equals an independent mail search${d ? ' — ' + d : ''}`);
   const st = g.stations.get(pr.A.id)!;
   console.log(`player line, 200 days: mail waiting at ${st.name} ${st.mail?.total ?? 0}, loaded ${line.mail?.month ?? 0}+${line.mail?.last ?? 0}, mail train ${mailTrain.mailLoad}/${mailTrain.mailCapacity} delivered ${mailTrain.mailDelivered}, passengers ${mailTrain.load}`);

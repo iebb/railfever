@@ -67,7 +67,9 @@ function checkHooks() {
   };
   const main = road(20, 60, 170, 60);
   const bus = (x: number) => { const id = g.stations.nextId; assert.equal(g.stations.commitBusStop(x, 60, 0), null); return g.stations.get(id)!; };
-  const A = bus(52), B = bus(72), C = bus(96);
+  // User rule (2.10): station walking reach halved again (bus 15.68 -> 7.84). The stops keep 2.9's relative
+  // geometry at half the distance (house at x 60: A 8 -> 4, B 12 -> 6), so the house is still shared by A and B.
+  const A = bus(56), B = bus(66), C = bus(96);
   const house = (x: number, z: number) => g.world.addBuilding({ townId: -1, x, z, angle: 0, w: .8, d: .8, floors: 2, pop: 10, type: 0, seed: 1, y: 3, built: 0 });
   let checks = 0;
   let recomputes = 0;

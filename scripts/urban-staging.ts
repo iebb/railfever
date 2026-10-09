@@ -115,7 +115,11 @@ check(exact,'saved urban survey/approval/construction phases resume the same nat
 check(!ai.busy&&!!newLine&&trains.length>0,'the affordable repriced smaller stage completes with actually purchased stock');
 check(!!firstQuote&&paid<=firstQuote.total*1.05&&trains.length===firstQuote.fleet,
  'actual native construction and purchased opening fleet fit the current approved complete quote');
-if(!snapshot)check(!!newLine&&[...new Set(newLine.stops)].every(id=>Math.abs(g.stations.get(id)!.rail!.angle-currentHeading!)<1e-8),
+// The ordinary current-axis family is the axis and its 30/60-degree turns (urbanJob's angles); the retained east-west
+// heading (the family's 90-degree turn) is only appended. (User rule, 2.10: with the halved walking reach a 30-degree
+// diagonal of the axis catches more of this grid than the axis itself, so the family, not its exact axis, is selected.)
+const family=[0,Math.PI/6,-Math.PI/6,Math.PI/3,-Math.PI/3].map(d=>currentHeading!+d);
+if(!snapshot)check(!!newLine&&[...new Set(newLine.stops)].every(id=>family.some(a=>Math.abs(g.stations.get(id)!.rail!.angle-a)<1e-8)),
  'a stronger ordinary current-axis family retains its native opening selection');
 if(newLine&&trains.length){
  const visits=new Set<number>(),target=g.day+3*360;let noRoute=0;

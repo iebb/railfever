@@ -49,7 +49,9 @@ function scenario() {
     for (const rz of zs) for (let i = 1; i < xs.length; i++) road(xs[i - 1], rz, xs[i], rz);
     for (const rx of xs) for (let i = 1; i < zs.length; i++) { if (zs[i - 1] < z && zs[i] > z) continue; road(rx, zs[i - 1], rx, zs[i]); }
     const lots: { x: number; z: number; angle: number }[] = [];
-    for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) if (Math.abs(rz - z) >= 7) lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
+    // (User rule, 2.10: walking reach halved again, an in-city subway stop walking 74 m along streets. 2.9 kept both rows
+    // beside the axis clear, lots from 109 m, which a centre line no longer reaches; lots start beyond the north row, 51 m.)
+    for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) if (Math.abs(rz + 1.1 - z) >= 4) lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
     let remaining = pop;
     lots.forEach((p, i) => {
       const count = Math.ceil(remaining / (lots.length - i)); remaining -= count;

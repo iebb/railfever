@@ -184,16 +184,16 @@ if (isMain) {
   }
 
   // ---- 3. the AI runs a train between the player's stations (needs access to the player's network); its line
-  // stops at its own station E too (a company running services on a line owns one of its stations)
+  // stops at its own station E too
   const aiLine = g.lines.create('rail', ai);
   aiLine.stops = [A, E, D, E];
-  const at = g.vehicles.buyTrain(depAI, [loco, coach], aiLine.id) as Train;
-  check(at instanceof Train, 'AI train bought');
-  // (without access it may serve its own station E, never the player's A and D nor their track)
-  const seenNoAccess = new Set<number>();
-  for (let k = 0; k < 80; k++) { g.update(0.25); if (at.atStation >= 0) seenNoAccess.add(at.atStation); if (pathEdges(at).some((id) => net.edges.get(id)?.owner === PLAYER)) seenNoAccess.add(-99); }
-  console.log(`  AI train without access: ${at.state} (${at.status}); served ${[...seenNoAccess].map((id) => g.stations.get(id)?.name ?? 'player track').join(', ') || 'nothing'}`);
-  check(!seenNoAccess.has(A) && !seenNoAccess.has(D) && !seenNoAccess.has(-99), 'AI train keeps off the player network without access');
+  // User rule (2.10, d2b8e53): an operator need not own a stop, but needs track access to every stop's owner
+  // (lines.operateError). Without access the AI therefore cannot put a train on a line calling at the player's
+  // stations at all; 2.9 bought one and kept it off the player's stops. Same protection, enforced at purchase.
+  const vehicles0 = g.vehicles.all().length, cash0 = Q.money;
+  const refused = g.vehicles.buyTrain(depAI, [loco, coach], aiLine.id);
+  check(typeof refused === 'string' && refused.includes('track access needed') && g.vehicles.all().length === vehicles0 && Q.money === cash0,
+    `AI train keeps off the player network without access: purchase refused, nothing spent (${typeof refused === 'string' ? refused : 'bought'})`);
   // the player is asked (policy 'ask'): a pending request, approved
   check(g.accessPolicy(PLAYER) === 'ask', 'the player is asked (policy ask)');
   check(g.requestAccess(ai, PLAYER, 'test') === 'pending' && g.requestAccess(ai, PLAYER) === 'pending', 'request pending (once)');
@@ -201,7 +201,10 @@ if (isMain) {
   check(rq.length === 1 && rq[0].user === ai && !g.hasAccess(ai, PLAYER), 'pending request listed for the player, no access yet');
   check(g.news.some((n) => n.text.includes('requests access to your tracks')), 'the player is told about the request');
   check(g.approveAccess(rq[0].id) === null && g.hasAccess(ai, PLAYER) && !g.requestsTo(PLAYER).length, 'approved: agreement signed');
-  const f1 = { pEarned: total(P, 'trackIncome'), qPaid: total(Q, 'trackFees') };
+  const at = g.vehicles.buyTrain(depAI, [loco, coach], aiLine.id) as Train;
+  check(at instanceof Train, 'AI train bought once access is granted: ' + (at instanceof Train ? 'ok' : at));
+  if (!(at instanceof Train)) { console.log(`\n${fails.length} FAILURES`); process.exit(1); }
+  const f1 ={ pEarned: total(P, 'trackIncome'), qPaid: total(Q, 'trackFees') };
   run(150);
   console.log(`  AI train with access: delivered ${at.delivered}, ${at.status}; player earned ${fmt(total(P, 'trackIncome') - f1.pEarned, 0)}, AI paid ${fmt(f1.qPaid - total(Q, 'trackFees'), 0)}`);
   check(total(P, 'trackIncome') > f1.pEarned && total(Q, 'trackFees') < f1.qPaid, 'fees flow from the AI to the player too');

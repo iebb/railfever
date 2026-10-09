@@ -1041,11 +1041,13 @@ export class Lines {
     for (const [from, arr] of medges) for (const e of arr) if (e.line !== WALK_LINE) { served.add(find(from)); if (own.has(e.line)) apart.add(find(from)); }
     for (const [from, arr] of edges) for (const e of arr) if (e.line !== WALK_LINE && !carrying.has(e.line)) apart.add(find(from));
     const open = new RouteHeap();
+    // The same transfer rule as the passenger tables a complex shares: no external penalty inside one station complex.
+    const stations = g.stations, sameComplex = transferComplexes(medges, (a, b) => stations.isSameStationComplex(a, b));
     for (const src of medges.keys()) {
       const root = find(src);
       if (!served.has(root)) continue;
       const shared = apart.has(root) ? undefined : this.routing.get(src);
-      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open));
+      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open, sameComplex));
     }
   }
 

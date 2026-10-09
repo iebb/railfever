@@ -10,6 +10,7 @@ import type { Town } from '../src/game/towns';
 import type { Vehicle } from '../src/game/vehicle';
 import type { Station, StationPlan } from '../src/game/stations';
 import { WALK_TRIP_INTENSITY } from '../src/game/constants';
+import { ACCESS_CAP } from '../src/game/access-cost';
 
 const near = (a: number, b: number) => Math.abs(a - b) < 1e-8;
 const flush = (g: Game) => { g.stations.refreshAccess(true); g.stations.recomputeCatchment(); g.demand.recomputeShares(); };
@@ -66,7 +67,7 @@ check(!!build(access, free(access, 16, 64), free(access, 112, 64), roadOpts(), '
 const stop = bus(access, 62, 64, 0), rail = station(access, 64, 68, Math.PI / 2, 8, 2, 1, { level: 'underground', depth: 4, style: 'none' })!;
 if (!rail) throw new Error('access rail fixture'); rail.rail!.entrances = []; rail.rail!.forecourt = undefined;
 flush(access); check(!rail.roadAccess, 'bare rail part has no direct landing');
-const maintenance = access.stationMaintenance(rail), physicalEdges = [...rail.rail!.edges];
+const maintenance = access.stationMaintenance(rail), fullCost = access.accessFullCost(rail), physicalEdges = [...rail.rail!.edges];
 access.blockCompany(1, 0);
 check(!access.stations.link(stop.id, rail.id), 'public walking merge does not require platform operating rights'); flush(access);
 check(rail.roadAccess && !access.canUse(0, 1), 'logical access follows the public landing while native train rights remain blocked');
@@ -79,8 +80,12 @@ const migrated = deserialize(old);
 check(migrated.stations.get(rail.id)!.roadAccess && migrated.lines.catchmentDirty, 'old saves refresh shared access and owe a normal population publication');
 access.unblockCompany(1, 0); access.refreshAccess();
 access.recordStop({ owner: 0 } as Vehicle, rail); access.billAccess();
-check(near(access.company(1).economy.current.trackIncome, maintenance / 12) && near(access.economy.current.trackFees, -maintenance / 12),
- 'native station use pays the physical rail owner exactly its separate monthly upkeep');
+// User rule (2.10, 599a903): access is charged at full cost (usage share x owner price factor, capped at 75%, of the
+// item's capital annuity plus upkeep; access-cost.ts), no longer the bare upkeep. The protected behaviour stays: the
+// sole user pays for the physical rail part alone, priced as before the public link (not the complex or the bus stop).
+const due = Math.min(access.accessMultiplier(1), ACCESS_CAP) * fullCost / 12;
+check(near(access.accessFullCost(rail), fullCost) && near(access.company(1).economy.current.trackIncome, due) && near(access.economy.current.trackFees, -due),
+ 'native station use pays the physical rail owner exactly its separate monthly full-cost charge');
 const unchangedNetwork = access.world.net.version; access.stations.unlink(stop.id, rail.id); flush(access);
 check(!rail.roadAccess && access.world.net.version === unchangedNetwork, 'unlink removes shared access without any physical track edit');
 

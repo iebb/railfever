@@ -46,7 +46,7 @@ function road(g: Game, x0: number, z0: number, x1: number, z1: number) {
  * on it). `crossStreets`: the grid's streets cross the alignment as well, as a real grid's do (else it is a free strip
  * that a street-level line could take without a single crossing street).
  */
-function town(g: Game, name: string, x: number, z: number, pop: number, width = 120, height = 64, crossStreets = false): Town {
+function town(g: Game, name: string, x: number, z: number, pop: number, width = 120, height = 64, crossStreets = false, strip = 7): Town {
   const t: Town = { id: g.towns.list.length, name, x, z, angle: 0, pop, radius: Math.max(width, height) * 0.6,
     buildings: new Set(), nextGrowthDay: 1e9, hasChurch: false, passGenMonth: 0, passTransMonth: 0,
     passGenLast: 0, passTransLast: 0, served: 0 };
@@ -60,7 +60,9 @@ function town(g: Game, name: string, x: number, z: number, pop: number, width = 
   }
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) {
-    if (Math.abs(rz - z) < 7) continue; // platforms and their entrances can be built without clearing the town
+    // platforms and their entrances can be built without clearing the town (`strip`: by the lot's own position, 1.1 north
+    // of its street; the usual 7 keeps exactly the rows beside the axis clear)
+    if (Math.abs(rz + 1.1 - z) < strip) continue;
     lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
   }
   let remaining = pop;
@@ -272,7 +274,9 @@ if (!arg('maps')) {
   function termini(ais: number, centralPop = 16000) {
     const g = flat(ais, 768), z = 384;
     const X = town(g, 'West Town', 110, z, 12000, 64, 48);
-    const C = town(g, 'Grand City', 384, z, centralPop, 208, 64);
+    // (User rule, 2.10: walking reach halved again, in-city subway stations walking 74 m along streets; a 7-unit clear
+    // strip left the axis subway's stops with no residents at all. The city lots start at the row street north of it.)
+    const C = town(g, 'Grand City', 384, z, centralPop, 208, 64, false, 4);
     const Y = town(g, 'East Town', 658, z, 12000, 64, 48);
     const west = station(g, X.x, z, 1, X.id), a = station(g, 296, z, 1, C.id);
     const b = station(g, 472, z, 2, C.id), east = station(g, Y.x, z, 2, Y.id);
@@ -357,10 +361,13 @@ if (!arg('maps')) {
     check([a, b].every((s) => metro.some((m) => s.links.includes(m.id) && m.links.includes(s.id))), 'both termini have explicit walking transfer complexes');
     const transferBoards = new Map<number, number>();
     const serve = Vehicle.prototype.serveStation;
+    // (User rule, 2.10: a change within one station complex is internal, without the 10% vehicle-change fare step, so
+    // its waiting group keeps transfers 0. Changers are those whose journey already has a rail leg: its fare history.)
+    const changed = (w: { transfers?: number; rail?: number }) => (w.transfers ?? 0) > 0 || (w.rail ?? 0) > 0;
     Vehicle.prototype.serveStation = function(st, perPax) {
-      const waiting = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
+      const waiting = [...st.waiting.values()].filter((w) => w.line === line.id && changed(w)).reduce((n, w) => n + w.count, 0);
       const result = serve.call(this, st, perPax);
-      const after = [...st.waiting.values()].filter((w) => w.line === line.id && (w.transfers ?? 0) > 0).reduce((n, w) => n + w.count, 0);
+      const after = [...st.waiting.values()].filter((w) => w.line === line.id && changed(w)).reduce((n, w) => n + w.count, 0);
       if (this.lineId === line.id && waiting > after) transferBoards.set(this.owner, (transferBoards.get(this.owner) ?? 0) + waiting - after);
       return result;
     };

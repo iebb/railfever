@@ -1384,6 +1384,9 @@ export class Stations {
       else if (c.gap <= Math.min(autoLinkRange(rmode, this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale({ mode: rmode, city: plan.city }), c.st))
         && c.st.id !== ign && !(ign !== undefined && this.consecutiveStops(ign, c.st.id))) plan.links.push(c.st);
     }
+    // A joined stop station keeps its id: commit (nearbyComplex) never links it to a consecutive stop of its lines,
+    // so the plan must not promise that passage either.
+    if (plan.join) { const j = plan.join.id; plan.links = plan.links.filter((o) => !this.consecutiveStops(j, o.id)); }
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
     const bc = (plan as StationPlan & { buildingCands?: BuildingCand[] }).buildingCands;
@@ -2479,7 +2482,8 @@ export class Stations {
     // within 80 m of an own rail station's platforms / building / entrances: the stop becomes part of it
     for (const c of near) if (c.st.rail && [...this.platformAreas(c.st), ...this.footprints(c.st)].some((f) => distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN)) { join = c.st; break; }
     if (!join) for (const c of near) if (!c.st.rail && c.st.stops.some((q) => Math.hypot(q.x - p.x, q.z - p.z) < 3)) { join = c.st; break; }
-    for (const c of near) if (c.st !== join && c.gap <= Math.min(autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS[e.tram ? 'tram' : 'bus'], c.st))) links.push(c.st);
+    for (const c of near) if (c.st !== join && c.gap <= Math.min(autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS[e.tram ? 'tram' : 'bus'], c.st))
+      && !(join && this.consecutiveStops(join.id, c.st.id))) links.push(c.st);
     return { ok: true, edge: e, s: ne.s, px: p.x, pz: p.z, cost: 30000, join, links, mode: e.tram ? 'tram' : 'bus' };
   }
 
@@ -2577,6 +2581,10 @@ export class Stations {
    * commit can make (canLink), so a preview never promises a transfer the built stop or station will not have.
    */
   private planLinkRange(radius: number, st: Station): number { return 0.5 * WALK_DETOUR * Math.min(radius, this.catchmentRadius(st)); }
+  /** linkRange of a planned rail part and a built station (the walk canLink admits once the plan is built). */
+  planLinkLimit(plan: Pick<StationPlan, 'style' | 'mode' | 'city'>, st: Station): number {
+    return this.planLinkRange(CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale(plan), st);
+  }
 
   /** Automatic complexes stay compact: every existing part must be near every part being added. */
   private nearbyComplex(a: Station, b: Station): boolean {

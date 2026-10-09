@@ -14,7 +14,7 @@ import * as Trackops from './trackops';
 import type { NEdge, Section } from './network';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
-import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf } from './constants';
+import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
 import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
@@ -77,6 +77,8 @@ export function openingRailCall(g: Game, t: Train, preferredStation = -1): numbe
 }
 // At eight units/day this leaves six days of the 60-day planning target for choosing a project.
 const AI_RAIL_PLAN_UNITS = 432;
+/** Saved failure-date key of a city-railway valuation that did not pay (chooseProject): its town and style. */
+const urbanQuoteMemo = (mode: 'metro' | 'lightrail', town: number) => `urbanq:${mode}:${town}`;
 /**
  * City railways (citycatch): in-city stops walk half as far (stations.ts CITY_WALK_SCALE), so between the end
  * stations they may stand this many of their walking reaches apart (walkLimit('rail') x CITY_WALK_SCALE), never closer
@@ -376,8 +378,10 @@ function* aiStationSiteGen(g: Game, town: Town, toward: P2, o: SiteOpts): Genera
         if (pointPop === undefined) { pointPop = walkSitePop(g, x, z, 'mainline'); scoreCache.pop.set(pointKey, pointPop); }
         const pop = caught + pointPop * 0.25;
         planningProbe.observe?.('walkSitePop', false);
-        // A covered resident's recurring trips matter more than a small saving on a remote station site.
-        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop / 8 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
+        // A covered resident's recurring trips matter more than a small saving on a remote station site. Walkers make
+        // WALK_TRIP_INTENSITY times the trips since the walks were halved after 2.9: weigh them by those trips, or
+        // the fixed site terms outweigh a quarter of the residents and the search drifts to the edge of town.
+        let score = plan.cost / 20000 + plan.demolish.length * 6 - pop * WALK_TRIP_INTENSITY / 8 + Math.abs(aa) * 20 + off * 25 + (backFree ? 0 : 40) + r * 0.3 + alongside * 12;
         if (o.prefY !== undefined) score += Math.max(0, Math.abs(plan.y - o.prefY) - (o.tolY ?? 1)) * 60;
         if (score < bestScore) { bestScore = score; best = plan; bestR = r; }
         if ((n += 8) >= AI_SITE_WORK) { n = 0; plans = 0; yield; }
@@ -1917,6 +1921,8 @@ export class AIController {
           // Price each construction style independently. A failed surface proposal says little
           // about a subway, and population alone does not decide whether its investment pays.
           if (this.isFailed('urban' + mode + T.id)) continue;
+          // A recent valuation that did not pay is not repeated until its saved date (urbanQuoteMemo).
+          if (this.isFailed(urbanQuoteMemo(mode, T.id))) continue;
           if (!considers(mode === 'metro' ? focus.rail : Math.max(focus.rail, focus.tram))) continue;
           cityOpportunities.push({ town: T, mode });
         }
@@ -1935,8 +1941,12 @@ export class AIController {
           // walkers and can reject a profitable alignment before the detailed job gets to prove it.
           const econ = layout.quote;
           const years = urbanPayback(mode, this.eco.interestRate);
-          if (!econ || econ.total * 1.05 > this.urbanAvailable() || econ.net * years < econ.total) continue;
+          // The full survey is the bulk of a company's planning time. Remember an opportunity that did not pay, in the
+          // saved failure dates (not a project failure): unaffordable for 120 days, unprofitable for 360.
+          if (!econ || econ.net * years < econ.total) { this.failed.set(urbanQuoteMemo(mode, T.id), g.day + 360); continue; }
+          if (econ.total * 1.05 > this.urbanAvailable()) { this.failed.set(urbanQuoteMemo(mode, T.id), g.day + 120); continue; }
           const score = roi(econ.forecast.revenue, econ.yearly + econ.total / years, econ.total) * years / 4.5;
+          if (!(score > 0)) this.failed.set(urbanQuoteMemo(mode, T.id), g.day + 360);
           if (score > 0) {
             const { quote: _, ...handoff } = layout;
             opts.push({ score: score * (mode === 'metro' ? fw(focus.rail) : Math.max(fw(focus.rail), fw(focus.tram))), kind: mode, towns: [T.id],
@@ -3837,11 +3847,14 @@ export class AIController {
     let dep = -1;
     {
       const q = { x: 0, y: 0, z: 0 };
+      // (only the owner's running line between the two stations: a siding off its own depot stub or a branch
+      // elsewhere leaves the trains no way to either station)
+      const route = new Set(this.lineTrack([a, b]));
       for (const st of [stA, stB]) {
         if (dep >= 0) break;
         const cands: { id: number; s: number; d: number }[] = [];
         for (const e of net.edgesNear(st.x - 90, st.z - 90, st.x + 90, st.z + 90)) {
-          if (e.kind !== 'rail' || e.owner !== owner || e.station >= 0 || e.depot >= 0 || e.len < 6) continue;
+          if (e.kind !== 'rail' || e.owner !== owner || e.station >= 0 || e.depot >= 0 || e.len < 6 || !route.has(e.id)) continue;
           for (let s = 3; s <= e.len - 3; s += 4) { if (net.sectionAt(e, s) !== 'ground') continue; net.pointAt(e, s, q); const d = Math.hypot(q.x - st.x, q.z - st.z); if (d > 16) cands.push({ id: e.id, s, d }); }
         }
         cands.sort((a, b) => a.d - b.d || a.id - b.id);
@@ -4463,7 +4476,7 @@ export class AIController {
    * of a walking reach apart, light-rail-style halts a little closer (cheaper stops, slower vehicles), never closer
    * than platforms and turnouts allow. Neighbouring catchments overlap: the forecast shares their buildings.
    */
-  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number, stopsWanted = 5, platform = mode === 'metro' ? 12 : 7): Omit<UrbanLayout, 'interchanges'> & { interchanges: Station[] } {
+  private urbanLayout(T: Town, mode: 'metro' | 'lightrail', stepWanted?: number, stopsWanted = 5, platform = mode === 'metro' ? 12 : 7, anchor = true): Omit<UrbanLayout, 'interchanges'> & { interchanges: Station[] } {
     // A light-rail terminus needs two crossover diagonals and their clearances between platforms. The walking
     // reach may shrink, but the 18-unit throat cannot: shorter gaps leave both tracks two-way and trains blocked.
     const end = platform + Math.max(TRACK_TYPES.electric.minRadius * 2 + 2, 18);
@@ -4483,7 +4496,7 @@ export class AIController {
         pair = [a, b]; dist = d; ownAnchors = anchors;
       }
     }
-    const single = !pair.length ? sts.find(s => own.has(s.id)) : undefined;
+    const single = anchor && !pair.length ? sts.find(s => own.has(s.id)) : undefined;
     const axis = this.townAxis(T);
     const angle = pair.length ? Math.atan2(pair[1].x - pair[0].x, pair[1].z - pair[0].z)
       : single && Math.hypot(T.x - single.x, T.z - single.z) > 1 ? Math.atan2(T.x - single.x, T.z - single.z) : Math.atan2(axis.x, axis.z);
@@ -4533,7 +4546,10 @@ export class AIController {
           const base = this.urbanLayout(T, mode, undefined, count, platform);
           for (const step of new Set([base.step, base.spacing])) {
             const local = this.urbanLayout(T, mode, step, count, platform);
-            const alternatives = [local, ...urbanTrunks(g, T, local.end, count)
+            // A single company interchange anchors one local alternative; the town's own centre stays another,
+            // priced alike (an interchange far out of the occupied town must not force the city line out there).
+            const centred = local.interchanges.length === 1 ? [this.urbanLayout(T, mode, step, count, platform, false)] : [];
+            const alternatives = [local, ...centred, ...urbanTrunks(g, T, local.end, count)
               .filter(c => c.targets.length === count && !c.towns.some(id => this.urbanReserved(id)))
               .filter(c => ![...this.lines.values()].some(info => info.urban &&
                 c.towns.filter(id => info.towns.includes(id)).length >= 2))
