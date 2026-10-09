@@ -67,7 +67,10 @@ for (const count of [2, 8, 24]) for (const reverse of [false, true]) for (const 
   const actual = run(candidate, kind, count, reverse), previous = control && run(control, kind, count, reverse);
   if (previous) assert.deepEqual(actual.result, previous.result, `${kind}/${count}/${reverse}: exact previous-function output`);
   if (kind === 'isolated') {
-    assert.deepEqual(actual.result, { boardings: 0, revenue: 0, legLoads: [0, 0] });
+    // (forecasts also carry the city / inter-city breakdown, demand sets: the totals are what this checks)
+    const { sets, ...totals } = actual.result as any;
+    assert.deepEqual(totals, { boardings: 0, revenue: 0, legLoads: [0, 0] });
+    if (sets) for (const part of Object.values(sets) as any[]) assert.equal(part.boardings, 0);
     assert.equal(actual.work.sources, 0); assert.equal(actual.work.populationSums, 0);
     if (previous) assert.equal(previous.work.sources, count + 2);
   } else {
