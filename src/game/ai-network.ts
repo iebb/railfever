@@ -1738,7 +1738,9 @@ class NetPlanner {
       if (joined.kind === 'rail' && joined.owner === this.me) this.signal(joined.id);
       this.careFor('dec' + joined.id, 360); this.careFor('join:period', 90);
       this.bump(run ? 'netJoined' : 'netLinesMerged');
-      this.note(run ? `${res.text}; through running for ${trips.toFixed(1)} trips a month` : `${res.text}; trains keep their runs until through trains pay (${trips.toFixed(1)} trips a month)`);
+      const veh = joined.kind === 'rail' ? 'trains' : joined.kind === 'tram' ? 'trams' : 'buses';
+      this.note(run ? (joined.kind === 'rail' ? `${res.text}; through running for ${trips.toFixed(1)} trips a month` : `${res.text}; ${veh} run the whole route for ${trips.toFixed(1)} trips a month`)
+        : `${res.text}; ${veh} keep their runs until the whole route pays (${trips.toFixed(1)} trips a month)`);
       const st = g.stations.get(junction);
       this.news(run ? `joins two services at ${st?.name ?? 'their terminus'}: ${joined.kind === 'rail' ? 'trains' : 'vehicles'} run through.`
         : `makes its lines meeting at ${st?.name ?? 'one terminus'} one line with two services.`, st?.x, st?.z);

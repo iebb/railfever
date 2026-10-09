@@ -1006,7 +1006,9 @@ export function joinLines(g: Game, a: Line | number, b: Line | number, opts: Joi
   for (const vid of keep.vehicles) g.vehicles.get(vid)?.onLineChanged(true);
   const junction = g.stations.get(check.junction)!;
   const notice: JoinNotice = { from: drop.id, into: keep.id, pattern: pid, line: keep, junction: check.junction,
-    text: `${drop.name} joined with ${keep.name} at ${junction.name}; existing services kept as short-turns` };
+    // (rail wording only for rail: a bus or tram line simply connects at the shared stop)
+    text: keep.kind === 'rail' ? `${drop.name} joined with ${keep.name} at ${junction.name}; existing services kept as short-turns`
+      : `${drop.name} connected with ${keep.name} at ${junction.name}; existing runs kept` };
   if (opts.notify !== false) g.postNews(notice.text, 'info', junction.x, junction.z);
   return notice;
 }
