@@ -23,7 +23,7 @@ import { RNG } from './rng';
 import { Economy, loanLimit } from './economy';
 import { availableModels, VehicleModel, MODEL_BY_ID, carriesMail } from './vehicle-types';
 import { estimateLegFare, estimateLegTime } from './fares';
-import { type ForecastSite } from './demand';
+import { plannedSet, type ForecastSite } from './demand';
 import { walkSitePop, walkLimit, planWalkingCatchment, walkingCatchment, walkingPopulation, pointWalkingCatchment, pedestrianRoad, stopSiteWalkingCatchment } from './catchment';
 import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import * as Patterns from './patterns';
@@ -1578,7 +1578,7 @@ export class AIController {
     return m;
   }
 
-  /** Trips per month between towns (both ways) and within a town, from the regional demand model. */
+  /** Trips per month between towns (both ways: inter-city demand) and within a town (city demand), from the regional demand model. */
   private *townDemand(): Generator<void, TownDemand> {
     const g = this.game, m = g.demand;
     if (!m.regions.length) m.rebuild();
@@ -1596,7 +1596,7 @@ export class AIController {
       for (let q = 0; q < R.length; q++) {
         const b = R[q].town;
         if (q === r || b < 0 || b >= nt) continue;
-        const t = snapshot.trips(r, q);
+        const t = snapshot.trips(r, q, a === b ? 'city' : 'intercity');
         P[a * nt + b] += t;
         if (a !== b) P[b * nt + a] += t;
       }
@@ -1772,7 +1772,7 @@ export class AIController {
           const sv = this.serviceYear(models, fleet, d, len);
           yield;
           if (!hubsLive()) continue railPairs;
-          const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, this.companyId);
+          const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, this.companyId, undefined, undefined, 'rail', plannedSet(g, sites));
           const mail = projectMail(g, sites, models, fleet, sv.kmh, sv.headway, L);
           const revenue = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + 0.7 * mail.revenue) * share(A.id, B.id) * (1 - 0.5 * overlap)
             - (upgrades.get(this.pairKey(A.id, B.id))?.profit ?? 0);
@@ -1835,7 +1835,7 @@ export class AIController {
           sites.push({ x: t.x, z: t.z, townId: t.id, walk: pointWalkingCatchment(g, t.x, t.z, 'rail', 0, 8) });
           yield;
         }
-        const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway);
+        const forecast = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, undefined, undefined, undefined, 'rail', plannedSet(g, sites));
         const revenue = forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) * share(A.id, B.id);
         const outlay = len * 2 * TRACK_TYPES.electric.costPerUnit * 1.5 + 2 * (PL * 2 * 12_000 + 300_000) + 2 * hsUnit.cost;
         const score = roi(revenue, sv.running + sv.trackUpkeep * 2 + 120_000, outlay);
@@ -2216,8 +2216,10 @@ export class AIController {
     const lengths = stations.slice(1).map((st, i) => Math.hypot(st.x - stations[i].x, st.z - stations[i].z) * 1.3);
     const before = fleet.map(t => this.railCycle(t.cars, lengths));
     const frequency = before.reduce((n, c) => n + 1 / c.seconds, 0), seats = before.reduce((n, c) => n + c.seats, 0);
+    // (both quotes on the demand the extended service is planned on)
+    const on = plannedSet(g, points);
     const baseline = fleet.length ? g.demand.forecastLine(stations, 'mainline', lengths.reduce((n, d) => n + d, 0) * UNIT_M / 1000
-      / (fleet.length / frequency / 3600), 2 / frequency, owner, line.id) : null;
+      / (fleet.length / frequency / 3600), 2 / frequency, owner, line.id, undefined, 'rail', on) : null;
     const baselineRevenue = baseline ? baseline.revenue * Math.min(1, seats / Math.max(1, baseline.boardings)) : 0;
     const baselineRunning = before.reduce((n, c) => n + c.running, 0), baselineWear = before.reduce((n, c) => n + c.wear, 0);
     const identity = this.railItineraryIdentity(line);
@@ -2234,7 +2236,7 @@ export class AIController {
       const totalFleet = addedTrains + after.length;
       const headway = 2 / rates, kmh = (lengths.reduce((n, d) => n + d, 0) + len) * UNIT_M / 1000 / (totalFleet / rates / 3600);
       const capacity = addedTrains * cycle.seats + after.reduce((n, c) => n + c.seats, 0);
-      const forecast = g.demand.forecastLine(points, 'mainline', kmh, headway, owner, line.id);
+      const forecast = g.demand.forecastLine(points, 'mainline', kmh, headway, owner, line.id, undefined, 'rail', on);
       const mail = fleet.length ? { revenue: 0, yearly: 0, price: 0 } : projectMail(g, points, cars, addedTrains, kmh, headway, length);
       const revenue = forecast.revenue * Math.min(1, capacity / Math.max(1, forecast.boardings)) - baselineRevenue + 0.7 * (mail.revenue - lostMail);
       const outlay = infrastructure + addedTrains * (cars.reduce((n, c) => n + c.cost, 0) + mail.price);
@@ -2952,7 +2954,8 @@ export class AIController {
           + (hubB ? 0 : (20_000 + pair.b.tracks * pair.b.length * 500) * (STATION_UPKEEP_FACTOR[pair.b.level] ?? 1)) + 12_000;
         for (const fleet of [1, 2]) {
           const sv = this.serviceYear(stock, fleet, dist, len, type, .4);
-          const forecast = g.demand.forecastLine([hub ?? pair.a, hubB ?? pair.b], 'mainline', sv.kmh, sv.headway, owner);
+          const forecast = g.demand.forecastLine([hub ?? pair.a, hubB ?? pair.b], 'mainline', sv.kmh, sv.headway, owner, undefined, undefined, 'rail',
+            plannedSet(g, [hub ?? pair.a, hubB ?? pair.b]));
           const mail = projectMail(g, [hub ?? pair.a, hubB ?? pair.b], stock, fleet, sv.kmh, sv.headway,
             Math.min(PLATFORM, pair.a.length, pair.b.length));
           const capital = infrastructure + (stock.reduce((n, c) => n + c.cost, 0) + mail.price) * fleet;
@@ -3072,7 +3075,8 @@ export class AIController {
         running: fleet * cycle.running + oldCycles.reduce((n, c) => n + c.running, 0),
         trackUpkeep: len * trackBasePerUnit(type) + fleet * cycle.wear + oldCycles.reduce((n, c) => n + c.wear, 0) }
         : this.serviceYear(stock, fleet, dist, len, type, .4, speedCap);
-      const forecast = g.demand.forecastLine(points, 'mainline', sv.kmh, sv.headway, owner, through ? full.extension?.[0] : undefined);
+      const on = plannedSet(g, points);
+      const forecast = g.demand.forecastLine(points, 'mainline', sv.kmh, sv.headway, owner, through ? full.extension?.[0] : undefined, undefined, 'rail', on);
       // Existing vans retain their traffic; do not sell it again as revenue of this extension.
       const mail = through && existingFleet.length ? { revenue: 0, potential: 0, yearly: 0, price: 0, cars: stock }
         : projectMail(g, points, stock, fleet, sv.kmh, through ? 2 * cycle.seconds / fleet : sv.headway,
@@ -3082,7 +3086,7 @@ export class AIController {
       if (through && existingFleet.length) {
         const baseline = existingFleet.map(t => this.railCycle(t.cars, oldLengths));
         const frequency = baseline.reduce((n, c) => n + 1 / c.seconds, 0), seats = baseline.reduce((n, c) => n + c.seats, 0);
-        const before = g.demand.forecastLine(full.old, 'mainline', oldLengths.reduce((n, l) => n + l, 0) * UNIT_M / 1000 / (baseline.length / frequency / 3600), 2 / frequency, owner, full.extension![0]);
+        const before = g.demand.forecastLine(full.old, 'mainline', oldLengths.reduce((n, l) => n + l, 0) * UNIT_M / 1000 / (baseline.length / frequency / 3600), 2 / frequency, owner, full.extension![0], undefined, 'rail', on);
         baselineRevenue = before.revenue * Math.min(1, seats / Math.max(1, before.boardings));
         baselineRunning = baseline.reduce((n, c) => n + c.running, 0); baselineWear = baseline.reduce((n, c) => n + c.wear, 0);
         lostMail = this.retainedMailLoss(g.lines.get(full.extension![0])!, full.old, existingFleet, baseline, oldCycles);
@@ -4146,12 +4150,14 @@ export class AIController {
     const totalLen = points.slice(1).reduce((s, p, i) => s + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
     const train = cars[0]?.cars ?? pickTrain(g.year, Math.min(a.st.rail!.length, b.st.rail!.length), totalLen, 2) ?? [];
     const sv = this.serviceYear(train, Math.max(2, cars.length), totalLen, totalLen, 'standard', 0.4);
-    const combined = g.demand.forecastLine(points, 'mainline', sv.kmh, sv.headway);
+    // (the joined line and the two it replaces, on the demand the joined line is planned on)
+    const on = plannedSet(g, points);
+    const combined = g.demand.forecastLine(points, 'mainline', sv.kmh, sv.headway, undefined, undefined, undefined, 'rail', on);
     const old = [a, b].map((end) => {
       const pts = end.path.map((id) => g.stations.get(id)!);
       const d = pts.slice(1).reduce((s, p, i) => s + Math.hypot(p.x - pts[i].x, p.z - pts[i].z), 0);
       const n = Math.max(1, end.line.vehicles.length), service = this.serviceYear(train, n, d, d, 'standard', 0.4);
-      return g.demand.forecastLine(pts, 'mainline', service.kmh, service.headway).revenue;
+      return g.demand.forecastLine(pts, 'mainline', service.kmh, service.headway, undefined, undefined, undefined, 'rail', on).revenue;
     });
     const electric = cars.some((v) => v.cars.some((m) => m.traction === 'electric'))
       || [a.st, b.st].some((st) => TRACK_TYPES[st.rail!.trackType ?? 'standard']?.electrified);
@@ -4721,7 +4727,7 @@ export class AIController {
     // retain the best return the company can fund. Six trains must not hide a viable two-train metro.
     for (let f = fleet; f <= f0 + 2; f++) {
       const headway = 2 * hop * Math.max(1, points.length - 1) / f;
-      const forecast = g.demand.forecastLine(points, mode, kmh, headway, this.companyId);
+      const forecast = g.demand.forecastLine(points, mode, kmh, headway, this.companyId, undefined, undefined, 'rail', plannedSet(g, points));
       const capacity = f * yr.trips * cars.reduce((a, m) => a + m.capacity, 0) * 0.7;
       forecast.revenue *= Math.min(1, capacity / Math.max(1, forecast.boardings));
       const fleetCost = f * cars.reduce((a, m) => a + m.cost, 0), total = works + fleetCost;
@@ -5303,7 +5309,7 @@ export class AIController {
       const d = Math.hypot(A.x - B.x, A.z - B.z), sv = this.serviceYear([model], 2, d, d * 1.3, 'road');
       yield;
       const sites = [sa, sb].map((s, i) => ({ x: s.x, z: s.z, townId: (i ? B : A).id, walk: pointWalkingCatchment(g, s.x, s.z, 'bus') }));
-      const f = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, owner, undefined, undefined, 'bus');
+      const f = g.demand.forecastLine(sites, 'mainline', sv.kmh, sv.headway, owner, undefined, undefined, 'bus', plannedSet(g, sites, 'bus'));
       yield;
       // Competition: the other services between these towns keep their riders (pairMarket); the stops' own forecast
       // counts only the market they leave.

@@ -259,7 +259,7 @@ export function openHelp(ui: UI) {
       <li><kbd>B</kbd>: Lines / Stations; opens Stations if the map is closed.</li>
       <li>Hover route / number: name; click route: open; touch: tap name, tap to open.</li>
       <li>Filter by mode and company; <kbd>Esc</kbd>: close map.</li>
-      <li><b>Demand</b> (<kbd>P</kbd>): Passengers / Mail; <kbd>Esc</kbd>: close.</li>
+      <li><b>Demand</b> (<kbd>P</kbd>): Passengers (All / City / Inter-city) / Mail; <kbd>Esc</kbd>: close.</li>
       <li>Town trips / served districts; orange dashed: unserved; blue solid: served.</li>
       <li>Mail width: potential t/month; colour / dashes: estimated carried share.</li>
       <li>Mail: orange short dashes 0%; blue solid 100%; estimate: routes, reach, ratings.</li>

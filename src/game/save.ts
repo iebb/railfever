@@ -184,9 +184,10 @@ const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffset
   'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost', 'alignment', 'groups', 'native'];
 /**
  * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
- * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike.
+ * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike
+ * (`ic`: the demand set, demand.ts).
  */
-const WAIT_KEYS = ['line', 'alight', 'dest', 'count', 't', 'transfers', 'rail'];
+const WAIT_KEYS = ['line', 'alight', 'dest', 'count', 't', 'transfers', 'rail', 'ic'];
 function waitJSON(w: object): object {
   const src = w as Record<string, unknown>, out: Record<string, unknown> = {};
   for (const k of WAIT_KEYS) if (k in src) out[k] = src[k];
@@ -373,6 +374,8 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
     stationComplexVersion: 1,
+    // waiting and cargo groups carry their demand set (`ic`: inter-city); older saves split theirs on loading
+    demandSets: 1,
     // Save owed walking population work independently of the scheduled demand publication flag.
     // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
     catchmentRulesVersion: CATCHMENT_RULES_VERSION,
@@ -531,13 +534,22 @@ export function deserialize(d: any): Game {
     g.towns.restoreCache(town, growth);
     return town;
   });
+  // Saves before the demand sets: a group's set from the towns of its station (aboard: its boarding stop) and of its
+  // destination; exact for passengers on their first leg, the others are counted by where they are now.
+  const legacySets = d.demandSets !== 1;
+  const stationTown = new Map<number, number>((d.stations as any[]).map((s) => [s.id, s.townId]));
+  const legacySet = (at: number, dest: number) => {
+    const a = stationTown.get(at) ?? -1;
+    return a >= 0 && a === (stationTown.get(dest) ?? -1) ? 0 : 1;
+  };
+  const waitSet = (s: any, wg: WaitGroup) => legacySets ? legacySet(s.id, wg.dest) : wg.ic ?? 0;
   for (const s of d.stations as any[]) {
     // station fields (levels, entrances, transfer links, road access) with defaults for older saves
     const st: Station = restoreStation(s);
     // daily() adds onPlat after its other sampling fields; preserve that insertion order in an early save.
     if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
-    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
+    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0, waitSet(s, wg));
     if (s.mail) {
       st.mail = restoreStationMail(s.mail);
       restoreMailQueue(g, st, s.mail.waiting ?? []);
@@ -638,6 +650,10 @@ export function deserialize(d: any): Game {
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
   if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
+  if (legacySets) for (const v of V.map.values()) if (v.cargo.size) {
+    for (const c of v.cargo.values()) { if (legacySet(c.from, c.dest)) c.ic = 1; else delete c.ic; }
+    v.cargo = cargoGroups(v.cargo.values());
+  }
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
   }
@@ -668,7 +684,7 @@ export function deserialize(d: any): Game {
   S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
-    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
+    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count), waitSet(s, wg)));
     if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }

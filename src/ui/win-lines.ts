@@ -13,7 +13,7 @@ import type { Game } from '../game/game';
 import { availableModels } from '../game/vehicle-types';
 import { findDepot } from './win-info';
 import { chart } from './charts';
-import { fmtPct, fmtAccessFactor, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail } from './format';
+import { fmtPct, fmtAccessFactor, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail, fmtSets } from './format';
 import type { Vehicle } from '../game/vehicle';
 import { renameLine, setLineColor, isAutoName, linePalette } from './gameapi';
 import { requestAccessUI } from './win-access';
@@ -257,7 +257,7 @@ export function openLine(ui: UI, id: number) {
       tile(String(l.stops.length), 'Stops'),
       tile(String(l.vehicles.length), meta.vehicles),
       // mail loaded last month under the passengers (lines that carry mail)
-      tile(fmtInt(l.passLast), 'Pax last month', '', carriesMail ? h('div', { class: 'tile-mail', 'data-tip': 'Mail loaded last month' }, icon('mail', 13), `${fmtMail(l.mail?.last ?? 0)} mail`) : null),
+      paxTile(tile(fmtInt(l.passLast), 'Pax last month', '', carriesMail ? h('div', { class: 'tile-mail', 'data-tip': 'Mail loaded last month' }, icon('mail', 13), `${fmtMail(l.mail?.last ?? 0)} mail`) : null), l),
       tile(fmtMoney(profit), 'Profit this year', profit < 0 ? 'neg' : 'pos')));
     const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
     if (win.tab === 'stops') {
@@ -380,6 +380,7 @@ export function openLine(ui: UI, id: number) {
         ui.kv('Running costs this year', fmtMoneyFull(l.costYear)),
         ui.kv('Profit last year', h('span', { class: l.incomeLast - l.costLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(l.incomeLast - l.costLast))),
         ui.kv('Load factor', cap ? fmtPct(load / cap) : '—'),
+        ui.kv('Passengers last month', fmtSets(l.passLast, l.icPassLast)),
         carriesMail ? ui.kv('Mail load factor', h('span', { 'data-tip': `${fmtMailLoad(mail, room)} on board` }, room ? fmtPct(mail / room) : '—')) : null,
         carriesMail ? ui.kv('Mail last month', `${fmtMail(lm?.last ?? 0)} loaded`) : null,
         faresPanel(ui, l));
@@ -539,4 +540,10 @@ function upgradeToTrams(ui: UI, l: Line, done: () => void) {
   ui.sound('cash');
   ui.toast(`${g.lines.get(l.id)?.name ?? l.name}: trams`, 'good');
   done();
+}
+
+/** The passengers tile of a line, with its city and inter-city passengers on hover. */
+function paxTile(el: HTMLElement, l: Line): HTMLElement {
+  if (l.passLast > 0 && l.icPassLast !== undefined) el.setAttribute('data-tip', fmtSets(l.passLast, l.icPassLast));
+  return el;
 }

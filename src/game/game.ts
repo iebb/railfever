@@ -18,7 +18,7 @@ import type { Station } from './stations';
 import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
-import { DemandModel, GEN_RATE } from './demand';
+import { DemandModel, GEN_RATE, splitCount } from './demand';
 import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
@@ -963,8 +963,9 @@ export class Game {
     this.stations.daily();
     if (this.accessRequests.length) this.expireRequests();
     // passenger generation: a station's residents travel to the regions the network reaches, as the regional
-    // demand says (local and long-distance trips, scaled by the trip factor of the service: demand.ts weights); its
-    // rate is their sum (a station reaching more of its demand, by better services, generates more)
+    // demand says (city and inter-city trips, scaled by the trip factor of the service: demand.ts weights); its
+    // rate is their sum (a station reaching more of its demand, by better services, generates more). Each passenger
+    // keeps the demand set of the trip (city: within one town, inter-city: between towns) to the destination.
     for (const st of this.stations.map.values()) {
       const table = this.lines.routing.get(st.id);
       if (!table || table.size === 0) continue;
@@ -976,7 +977,7 @@ export class Game {
       const n = Math.floor(st.genAccum);
       if (n <= 0) continue;
       st.genAccum -= n;
-      let given = 0;
+      let given = 0, inter = 0;
       for (let i = 0; i < dw.dest.length; i++) {
         const share = (n * dw.w[i]) / dw.served;
         let c = Math.floor(share);
@@ -984,12 +985,16 @@ export class Game {
         if (c <= 0) continue;
         const d = dw.dest[i], hop = table.get(d);
         if (!hop) continue;
-        this.lines.distribute(hop, c, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k));
-        given += c;
+        // the city trips among them (a destination reached by both sets: its city share, rounded at random)
+        const city = dw.city[i] >= dw.w[i] ? c : dw.city[i] > 0 ? splitCount(c, dw.city[i] / dw.w[i], this.rng) : 0;
+        if (city > 0) this.lines.distribute(hop, city, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k));
+        if (c > city) this.lines.distribute(hop, c - city, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k, 0, undefined, 0, 0, 1));
+        given += c; inter += c - city;
       }
       st.genMonth += given;
+      if (inter) st.icGenMonth = (st.icGenMonth ?? 0) + inter;
       const town = this.towns.list[st.townId];
-      if (town) town.passGenMonth += given;
+      if (town) { town.passGenMonth += given; if (inter) town.icGenMonth = (town.icGenMonth ?? 0) + inter; }
       const cap = 600 + (st.rail ? st.rail.tracks * st.rail.length * 12 : 0) + st.stops.length * 150;
       this.stations.trimWaiting(st, cap);
     }
@@ -1047,16 +1052,18 @@ export class Game {
     for (const co of this.companies) if (!co.defunct) co.economy.endMonth(y, m);
     for (const st of this.stations.map.values()) {
       st.genLast = st.genMonth; st.genMonth = 0;
+      st.icGenLast = st.icGenMonth ?? 0; st.icGenMonth = 0;
       st.pickupLast = st.pickupMonth; st.pickupMonth = 0;
       st.arrivedLast = st.arrivedMonth; st.arrivedMonth = 0;
       st.lostLast = st.lostMonth || 0; st.lostMonth = 0;
     }
     for (const t of this.towns.list) {
       t.passGenLast = t.passGenMonth; t.passGenMonth = 0;
+      t.icGenLast = t.icGenMonth ?? 0; t.icGenMonth = 0;
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
       t.passLostLast = t.passLostMonth ?? 0; t.passLostMonth = 0;
     }
-    for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
+    for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; l.icPassLast = l.icPassMonth ?? 0; l.icPassMonth = 0; }
     this.mail.monthly();
     // which metro / light-rail stations stand in town now (their walking reach: stations.ts CITY_STATION)
     this.stations.updateCity();

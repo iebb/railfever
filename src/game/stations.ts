@@ -35,6 +35,8 @@ export interface WaitGroup {
   line: number; alight: number; dest: number; count: number; t?: number; transfers?: number;
   /** the distance fares (per passenger) of the journey's rail legs so far: the rail minimum is paid once per journey */
   rail?: number;
+  /** 1: an inter-city trip, absent: a city trip (fares.ts setFlag / groupSet; demand.ts DemandSet) */
+  ic?: number;
 }
 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
@@ -462,6 +464,8 @@ export interface Station {
   catchPop: number;
   genAccum: number;
   genMonth: number; genLast: number;
+  /** the inter-city trips of genMonth / genLast (the rest are city trips; demand.ts DemandSet); unset in older saves */
+  icGenMonth?: number; icGenLast?: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
   /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
@@ -2758,6 +2762,8 @@ export class Stations {
     // statistics
     a.genMonth += b.genMonth; a.pickupMonth += b.pickupMonth; a.arrivedMonth += b.arrivedMonth;
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
+    if (b.icGenMonth) a.icGenMonth = (a.icGenMonth ?? 0) + b.icGenMonth;
+    if (b.icGenLast) a.icGenLast = (a.icGenLast ?? 0) + b.icGenLast;
     a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
     a.rating = Math.max(a.rating, b.rating);
@@ -2777,9 +2783,9 @@ export class Stations {
       if (!hit) continue;
       const old = [...st.waiting.values()];
       st.waiting.clear(); st.waitingTotal = 0;
-      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
     }
-    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
     // mail: b's queues and figures join a's; mail heading to or changing at b heads for a (also aboard vehicles)
     const mailDeliveries = absorbMail(g, a, b, re);
     for (const v of g.vehicles.map.values()) {
@@ -3374,22 +3380,24 @@ export class Stations {
 
   /**
    * Passengers wait at `st` for `line` to `alight` on their way to `dest`. A walking hop (WALK_LINE) takes them
-   * straight to the linked station `alight`, where they arrive or wait for their next leg.
+   * straight to the linked station `alight`, where they arrive or wait for their next leg. `ic`: their trip is an
+   * inter-city trip (fares.ts setFlag; 0: a city trip), kept through the whole journey.
    */
-  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0) {
+  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0, ic = 0) {
     if (count <= 0) return;
     rail = railHistory(rail);
-    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
+    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail, ic); return; }
     // ops: when they started waiting (weighted mean), their changes of vehicle so far, their rail fares so far; groups
-    // never mix fare histories or change classes (each pays its own minimum and transfer reduction)
+    // never mix fare histories or change classes (each pays its own minimum and transfer reduction), nor demand sets
     const at = t ?? simNow(this.game), tr = Math.max(0, transferred);
-    const key = fareGroupKey(line, alight, dest, rail, changeClass(tr, count));
+    const key = fareGroupKey(line, alight, dest, rail, changeClass(tr, count), ic);
     const g = st.waiting.get(key);
     if (g) {
       g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
     } else {
       const ng: WaitGroup = tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at };
       if (rail > 0) ng.rail = rail;
+      if (ic) ng.ic = 1;
       st.waiting.set(key, ng);
     }
     st.waitingTotal += count;
@@ -3399,7 +3407,7 @@ export class Stations {
    * Passengers walk to the linked station `toId`: they have arrived, or wait there for their next leg (the walk
    * counts towards that leg's time).
    */
-  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0) {
+  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0, ic = 0) {
     const g = this.game;
     const to = this.map.get(toId);
     if (!to || depth > 4) return;
@@ -3412,7 +3420,7 @@ export class Stations {
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
     const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to), this.isSameStationComplex(from.id, to.id)) : 0);
-    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail));
+    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail, ic));
   }
 
   /**
@@ -3467,7 +3475,7 @@ export class Stations {
    * loaded from a save keys every group afresh, so the running game must too, or later arrivals would merge differently.
    */
   rekeyWaiting(st: Station) {
-    const canonical = (w: WaitGroup) => fareGroupKey(w.line, w.alight, w.dest, w.rail ?? 0, changeClass(w.transfers, w.count));
+    const canonical = (w: WaitGroup) => fareGroupKey(w.line, w.alight, w.dest, w.rail ?? 0, changeClass(w.transfers, w.count), w.ic ?? 0);
     let stale = false;
     for (const [k, w] of st.waiting) if (canonical(w) !== k) { stale = true; break; }
     if (!stale) return;
@@ -3490,7 +3498,7 @@ export class Stations {
     st.waitingTotal = 0;
     for (const g of old) {
       const hop = lines.nextHop(st.id, g.dest);
-      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0);
+      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0, g.ic ?? 0);
     }
   }
 

@@ -26,6 +26,7 @@ import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, tra
 import { onwardCentres, urbanDistricts } from './ai-urban';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
+import { plannedSet } from './demand';
 import { linearStops, outAndBack } from './lines';
 import { depotFits, depotAtEnd, nodeSnap, nodeAt, stationEnds } from './routing';
 import { findRailRoute, railNext, depotServes, consistRule, platformDepartureFrontiers } from './train';
@@ -657,9 +658,11 @@ function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = []
 }
 
 const routeLength = (points: (Station | StationPlan)[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
-/** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern. */
+/** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern;
+ * every alternative of a line on the same demand set (the line's stops and these: demand.ts plannedSet). */
 const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service, extra = 0) =>
-  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line, sv.pid);
+  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line, sv.pid, 'rail',
+    plannedSet(g, [...points, ...(g.lines.get(sv.line)?.stops ?? []).flatMap((id) => { const st = g.stations.get(id); return st ? [st] : []; })]));
 /** The operator's share of receipts constrained by full-cycle seats on the busiest direction of an actual leg.
  * Long riders occupy every intervening segment; a physics estimate of annual average hops is not boarding capacity. */
 export const forecastSeatFactor = (legLoads: number[], cycle: number, trains: number, seats: number) =>
