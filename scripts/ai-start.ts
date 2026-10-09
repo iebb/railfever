@@ -1,6 +1,6 @@
 // New-game AI cash overrides, fifteen competitors, replacement ids and exact saves.
 import { Game, MAX_AI_COMPANIES, TICK } from '../src/game/game';
-import { aiConfigsFor } from '../src/ui/gameapi';
+import { aiConfigsFor, aiRailShares } from '../src/ui/gameapi';
 import { AI_PRESETS } from '../src/game/ai';
 import { COMPANY_COLORS } from '../src/game/economy';
 import { capacityTopologyKey } from '../src/game/rail-capacity-routes';
@@ -24,7 +24,8 @@ const g = Game.create({ ...options, aiCompanies: 15, aiConfigs: aiConfigsFor('mi
 g.aiEnabled = false; g.aiAcquisitions = false;
 check(g.ais.length === 15 && g.activeCompanies.length === 16, 'all fifteen configured competitors are created');
 check(g.ais.every(ai => ai.config.startMoney === 12.5e6 && g.company(ai.companyId).economy.money === 12.5e6
-  && g.company(ai.companyId).economy.loan === 5e6), 'starting cash and existing loan rules are applied separately');
+  // (user rule 2026-10-06: "starting balance shall apply to everyone and is a fully loan regardless of amount")
+  && g.company(ai.companyId).economy.loan === 12.5e6), 'the starting balance applies to every rival and is fully borrowed');
 check(new Set(g.companies.map(c => c.name)).size === 16 && new Set(g.companies.map(c => c.color)).size === 16
   && new Set(g.companies.map(c => c.code)).size === 16 && COMPANY_COLORS.length >= 16, 'rivals have distinct names, colours and station codes');
 let refused = false;
@@ -58,5 +59,19 @@ const unblocked = capacityTopologyKey(replacement);
 check(replacement.canUse(0, owner) && unblocked.slice(unblocked.indexOf('/') + 1) === before.slice(before.indexOf('/') + 1),
   'unblocking restores original permissions while keeping the topology revision');
 check(saved(replacement) === saved(deserialize(JSON.parse(saved(replacement)))), 'replacement history and high-id permissions save exactly');
+// New Game's Bus – Rail slider: each rival leans its own way (from the seed); the average is the slider's value.
+for (const n of [1, 2, 3, 8, 15]) for (const mean of [0, 0.25, 0.5, 0.8, 1]) for (const seed of [1, 7, 4242]) {
+  const r = aiRailShares(n, mean, seed), avg = r.reduce((a, b) => a + b, 0) / n;
+  check(Math.abs(avg - mean) < 1e-9 && r.every(x => x >= 0 && x <= 1), `rail shares of ${n} rivals average ${mean} and stay within 0..1 (seed ${seed})`);
+}
+check(JSON.stringify(aiRailShares(8, 0.6, 99)) === JSON.stringify(aiRailShares(8, 0.6, 99)), 'rail shares repeat for the same seed');
+check(new Set(aiRailShares(8, 0.5, 3).map(x => x.toFixed(3))).size > 4, 'rivals differ in their rail share');
+{
+  const railish = aiConfigsFor('balanced', 6, undefined, 0.9, 5), busish = aiConfigsFor('balanced', 6, undefined, 0.1, 5), even = aiConfigsFor('balanced', 1, undefined, 0.5, 5)[0];
+  const mean = (cs: typeof railish, k: 'rail' | 'road') => cs.reduce((a, c) => a + c.focus[k], 0) / cs.length;
+  check(mean(railish, 'rail') > mean(railish, 'road') && mean(busish, 'road') > mean(busish, 'rail'), 'the slider shifts the rivals towards rail or buses');
+  const bal = AI_PRESETS.find(p => p.id === 'balanced')!.config.focus;
+  check(Math.abs(even.focus.rail - bal.rail) < 1e-9 && Math.abs(even.focus.road - bal.road) < 1e-9, 'a single rival at the even setting keeps its style');
+}
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

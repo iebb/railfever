@@ -186,8 +186,8 @@ async function boot() {
   const wp = params.get('water');
   const water = (wp === 'low' || wp === 'medium' || wp === 'high' ? wp : 'medium') as NewGameOptions['water'];
   const aiCompanies = Math.max(0, Math.min(MAX_AI, Math.round(num('ai', 1))));
-  // ?aistyle=balanced|cautious|aggressive|rail|bus|tram|mixed, ?aifocus=any|rail|road|tram
-  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies, undefined, params.get('aifocus') ?? 'any');
+  // ?aistyle=balanced|cautious|aggressive|rail|bus|tram|mixed, ?airail=0..100 (the rivals' average rail share; 50 = even)
+  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies, undefined, Math.max(0, Math.min(100, num('airail', 50))) / 100, seed);
   // the autosave (IndexedDB) becomes the current game unless ?new asks for a fresh map
   showLoading('Loading…');
   await slotsReady;

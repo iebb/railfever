@@ -8,7 +8,7 @@ import type { UI } from './ui';
 import type { NewGameOptions } from '../game/game';
 import { h, icon, seg, stepper, field, add } from './dom';
 import { openSaveLoad, openSettings } from './win-menu';
-import { MAX_AI, aiConfigsFor, AI_PRESETS, AI_PREFERENCES } from './gameapi';
+import { MAX_AI, aiConfigsFor, AI_PRESETS } from './gameapi';
 import { inertBehind } from './windows';
 
 export interface TitleOpts {
@@ -96,7 +96,7 @@ export function showTitle(o: TitleOpts) {
 
   function openCard() {
     if (card) return;
-    const st = { size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', prefer: 'any', money: 5, seed: Math.floor(Math.random() * 99999) };
+    const st = { size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', rail: 50, money: 5, seed: Math.floor(Math.random() * 99999) };
     const c = h('div', { class: 'ng-card glass' });
     card = c;
     const render = () => {
@@ -104,6 +104,10 @@ export function showTitle(o: TitleOpts) {
       const towns = h('input', { type: 'range', min: '3', max: '64', value: String(st.towns), class: 'range', 'aria-label': 'Towns' }) as HTMLInputElement;
       const tv = h('span', { class: 'stp-v' }, String(st.towns));
       towns.addEventListener('input', () => { st.towns = Number(towns.value); tv.textContent = towns.value; });
+      const prefWord = (v: number) => (v === 50 ? 'Even' : `${v}% rail`);
+      const railPref = h('input', { type: 'range', min: '0', max: '100', step: '5', value: String(st.rail), class: 'range', 'aria-label': 'Rivals: bus or rail', 'aria-valuetext': prefWord(st.rail) }) as HTMLInputElement;
+      const rv = h('span', { class: 'stp-v' }, prefWord(st.rail));
+      railPref.addEventListener('input', () => { st.rail = Number(railPref.value); rv.textContent = prefWord(st.rail); railPref.setAttribute('aria-valuetext', prefWord(st.rail)); });
       const seed = h('input', { type: 'number', value: String(st.seed), class: 'input', style: 'width:110px', 'aria-label': 'Seed' }) as HTMLInputElement;
       seed.addEventListener('input', () => { st.seed = Number(seed.value) || 1; });
       const era = ERAS.find(([y]) => y === st.year);
@@ -119,7 +123,7 @@ export function showTitle(o: TitleOpts) {
         field('Competitors', stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(MAX_AI, st.ai + 1); render(); })),
         st.ai ? field('Style', seg([['cautious', 'Cautious'], ['balanced', 'Balanced'], ['aggressive', 'Aggressive'], ['mixed', 'Mixed']], st.style, (v) => { st.style = v; render(); }),
           st.style === 'mixed' ? 'Rail barons, bus operators, tram builders…' : AI_PRESETS.find((p) => p.id === st.style)?.hint) : null,
-        st.ai ? field('Prefer', seg(AI_PREFERENCES, st.prefer, (v) => { st.prefer = v; render(); })) : null,
+        st.ai ? field('Bus – Rail', h('div', { class: 'inline', style: 'flex:1' }, h('span', { class: 'muted' }, 'Bus'), railPref, h('span', { class: 'muted' }, 'Rail'), rv), st.ai > 1 ? 'Each rival varies · average as set' : undefined) : null,
         field('Starting balance', h('div', { class: 'inline' }, money, '$M'), 'Every company · fully borrowed'),
         field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', 'data-tip': 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
@@ -128,7 +132,7 @@ export function showTitle(o: TitleOpts) {
             if (!money.reportValidity()) return;
             const nt = Math.min(st.towns, Math.round((st.size * st.size) / 3000));
             // The shell returns success after confirmation, preservation, and world creation.
-            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, startMoney: st.money * 1_000_000, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai, st.money * 1_000_000, st.prefer) }) as unknown as Promise<boolean>);
+            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, startMoney: st.money * 1_000_000, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai, st.money * 1_000_000, st.rail / 100, st.seed || 1) }) as unknown as Promise<boolean>);
             if (started) close(false);
           } }, icon('play', 18), 'Start')),
       );
