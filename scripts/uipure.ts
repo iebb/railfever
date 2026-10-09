@@ -167,7 +167,7 @@ function sweep(g: Game, label: string) {
     show(`line ${l.id}`, () => openLine(ui, l.id));
     if (l.owner === PLAYER) {
       const body = ui.wm.get('line-' + l.id)!.body as unknown as DomElement;
-      const join = body.querySelectorAll('button').find((b) => b.textContent === 'Join with line…');
+      const join = body.querySelectorAll('button').find((b) => b.textContent === (l.kind === 'rail' ? 'Join with line…' : 'Connect with line…'));
       assert.ok(join); show(`join preview ${l.id}`, () => join.click());
     }
     allTabs(g, ui, 'line-' + l.id, `${label}: line ${l.id}`);

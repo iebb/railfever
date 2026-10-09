@@ -238,8 +238,10 @@ export function openLine(ui: UI, id: number) {
       nameEl,
       auto && !renaming ? h('span', { class: 'autobadge', 'data-tip': 'Named automatically from its stops' }, 'auto') : null,
       !mine ? ui.ownerTag(l.owner) : null));
-    if (route?.through || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
-      route?.through ? h('span', { class: 'flag thru', 'data-tip': 'Across operators’ networks' }, 'Through service') : null,
+    // (through service is a rail term: a bus or tram line simply connects its stops)
+    const thru = !!route?.through && l.kind === 'rail';
+    if (thru || nPat > 1 || nOps) add(win.body, h('div', { class: 'lineflags' },
+      thru ? h('span', { class: 'flag thru', 'data-tip': 'Across operators’ networks' }, 'Through service') : null,
       nPat > 1 ? h('span', { class: 'flag shared' }, `${nPat} services`) : null,
       nOps ? h('span', { class: 'flag shared', 'data-tip': g.lines.operatorsOf(l).map((o) => g.company(o).name).join(' · ') }, `Shared · ${nOps + 1} operators`) : null));
     if (palette && mine) {
@@ -334,7 +336,7 @@ export function openLine(ui: UI, id: number) {
         add(win.body, h('div', { class: 'btns' },
           firstVehicle ? h('button', { class: 'btn primary', onclick: () => { if (editing) ui.tools.setTool('inspect'); ui.openPurchase(l.kind, null, l.id); } }, icon('plus', 16), `Add ${meta.vehicle}`) : null,
           h('button', { class: 'btn' + (editing ? ' on' : ''), onclick: () => { if (editing) ui.tools.setTool('inspect'); else editLine(ui, l.id); rerender(); } }, icon(editing ? 'check' : 'plus', 16), editing ? 'Done adding stops' : 'Add stops on map'),
-          h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops first' : 'Shared terminus for through running', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), 'Join with line…'),
+          h('button', { class: 'btn', disabled: editing, 'data-tip': editing ? 'Finish adding stops first' : l.kind === 'rail' ? 'Shared terminus for through running' : 'Connect at a shared stop', onclick: () => openLineJoin(ui, l.id) }, icon('lines', 16), l.kind === 'rail' ? 'Join with line…' : 'Connect with line…'),
           l.kind === 'rail' && l.stops.length >= 2 ? h('button', { class: 'btn', 'data-tip': 'Preview signals for this line', onclick: () => ui.openAutoSignal({ line: l.id }) }, icon('signal', 16), 'Auto-signal') : null));
         if (l.stops.length < 2) add(win.body, h('div', { class: 'muted', style: 'margin-top:8px' }, 'Needs at least two stops.'));
       }
@@ -392,7 +394,8 @@ export function openLine(ui: UI, id: number) {
 function openLineJoin(ui: UI, id: number) {
   const g = ui.game, line = g.lines.get(id);
   if (!line || line.owner !== PLAYER) return;
-  const win = ui.wm.open('line-join-' + line.id, 'Join with line…', { width: 520, icon: 'lines', color: line.color, cls: 'linejoin-info' });
+  const rail = line.kind === 'rail';
+  const win = ui.wm.open('line-join-' + line.id, rail ? 'Join with line…' : 'Connect with line…', { width: 520, icon: 'lines', color: line.color, cls: 'linejoin-info' });
   let selected: number | undefined;
   let error = '';
   const render = () => {
@@ -402,7 +405,7 @@ function openLineJoin(ui: UI, id: number) {
     win.sub.textContent = l.name;
     const choices = g.lines.all().filter((other) => other.id !== id).map((other) => ({ other, check: canJoinLines(g, l, other) }));
     const candidates = choices.filter((c) => c.check.ok);
-    add(win.body, h('p', { class: 'linejoin-note' }, 'Join two lines ending at one station into one line.'));
+    add(win.body, h('p', { class: 'linejoin-note' }, rail ? 'Join two lines ending at one station into one line.' : 'Connect two lines ending at one stop into one line.'));
     if (error) add(win.body, h('div', { class: 'alert warn', role: 'alert' }, error));
     if (!candidates.length) {
       add(win.body, h('div', { class: 'alert info' }, choices.length ? 'No joinable lines.' : 'No other lines.'));
@@ -422,7 +425,7 @@ function openLineJoin(ui: UI, id: number) {
     if (!choice || !choice.check.ok) return;
     const preview = choice.check, survivor = g.lines.map.get(preview.into)!;
     const junctionName = g.stations.get(preview.junction)?.name ?? '?';
-    add(win.body, section('Joined route', 'out and back'), h('ol', { class: 'linejoin-route', style: `--linejoin-color:${survivor.color}`, 'aria-label': 'Joined route' },
+    add(win.body, section(rail ? 'Joined route' : 'Connected route', 'out and back'), h('ol', { class: 'linejoin-route', style: `--linejoin-color:${survivor.color}`, 'aria-label': 'Joined route' },
       preview.route.map((sid) => h('li', { class: sid === preview.junction ? 'junction' : '' },
         h('span', null, g.stations.get(sid)?.name ?? '?'), sid === preview.junction ? h('span', { class: 'flag thru' }, 'Junction') : null))),
       h('p', { class: 'linejoin-note' }, h('b', null, survivor.name), ': name, code and colour retained; vehicle owners unchanged; old sections become short-turns; new vehicles run the full route.'),

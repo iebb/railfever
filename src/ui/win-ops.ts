@@ -247,11 +247,11 @@ export function routePanel(ui: UI, l: Line): HTMLElement | null {
   const total = r.owners.reduce((s, o) => s + o.distance, 0) || 1;
   const own = (o: number) => (o < 0 ? { name: 'Town', color: '#9aa5b4' } : g.company(o));
   return h('div', null,
-    section(r.through ? 'Through service' : 'Route', r.owners.length > 1 ? `${r.owners.length} operators' track` : fmtLen(total)),
+    section(r.through && l.kind === 'rail' ? 'Through service' : 'Route', r.owners.length > 1 ? `${r.owners.length} operators' track` : fmtLen(total)),
     h('div', { class: 'opbar', role: 'img', 'aria-label': 'Track owners along the route' }, r.owners.map((o) => h('i', { style: `flex:${Math.max(0.02, o.share)};--c:${own(o.owner).color}`, 'data-tip': `${own(o.owner).name}: ${fmtLen(o.distance)} (${fmtPct(o.share)})` }))),
     h('div', { class: 'legend' }, r.owners.map((o) => h('span', { style: `--c:${own(o.owner).color}` }, h('i'), `${own(o.owner).name} ${fmtPct(o.share)}`))),
     r.types.size ? h('div', { class: 'muted', style: 'margin-top:6px' }, `Wire: ${fmtLen([...r.types].reduce((n, [t, len]) => n + (TRACK_TYPES[t]?.electrified ? len : 0), 0))} of ${fmtLen(total)}`) : null,
-    r.through ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Through running across networks · track fees by usage share') : null);
+    r.through && l.kind === 'rail' ? h('div', { class: 'muted', style: 'margin-top:6px;font-size:12px' }, 'Through running across networks · track fees by usage share') : null);
 }
 
 /** Vehicles of the line that find no route their track types allow, with "electrify the line" where wire is missing. */
