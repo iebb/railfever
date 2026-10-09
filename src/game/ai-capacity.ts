@@ -46,7 +46,7 @@ export interface SharedCapacityPlan {
 }
 
 const inventoryMemo = new WeakMap<Game, { key: string; value: RouteInventory }>();
-const planMemo = new WeakMap<Game, Map<number, { key: string; plan: SharedCapacityPlan; channels: Channel[]; counts: number[]; inventory: RouteInventory }>>();
+const planMemo = new WeakMap<Game, Map<number, PlanEntry>>();
 const forecastMemo = new WeakMap<Game, { epoch: string; quotes: Map<string, { revenue: number; boardings: number; peak: number }> }>();
 const fleet = (g: Game, l: Line) => l.vehicles.map(id => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train);
 
@@ -381,16 +381,21 @@ function connectedLines(g: Game, l: Line, inv: RouteInventory): Line[] {
   return [...ids].sort((a, b) => a - b).map(id => g.lines.map.get(id)!).filter(Boolean);
 }
 
-/** Every operator reads the same deterministic auction of paths, weighted by its traffic/access payments. */
-export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
+/** One auction per connected group and fixed tick. The addition pass is priced only when a caller needs the
+ * allocations: withdrawals depend on it only after the withdrawal pass found a train to cut (performance). */
+interface PlanEntry {
+  key: string; lines: Line[]; channels: Channel[]; counts: number[]; inventory: RouteInventory;
+  contribution: number[]; target: number[]; value: number; plan?: SharedCapacityPlan;
+}
+
+function planEntry(g: Game, l: Line): PlanEntry {
   const inv = inventory(g), lines = connectedLines(g, l, inv);
   const key = `${quoteEpoch(g)}:` + lines.map(x => `${x.id}/${x.owner}/${x.stops.join(',')}/${x.loop}/${x.patterns?.map(p => `${p.id},${p.stops.join(',')}`).join('/')}/`
     + `${fleet(g, x).map(t => `${t.id},${t.owner},${t.pattern},${t.delivered},${t.profitLast},${t.cars.map(c => `${c.id},${c.capacity},${c.speed},${c.length}`).join(':')}`).join('/')}/`
     + `${x.capacity?.delay}/${x.capacity?.held}/${x.capacity?.longest}/${JSON.stringify(x.capacity?.demand)}`).join(';');
   let m = planMemo.get(g); if (!m) { m = new Map(); planMemo.set(g, m); }
   const old = m.get(l.id);
-  if (old?.key === key) return { ...old.plan, limit: old.plan.allocations.filter(a => a.line === l.id).reduce((n, a) => n + a.trains, 0),
-    physical: Math.max(0, ...old.channels.filter(c => c.line.id === l.id).map(c => c.limit)) };
+  if (old?.key === key) return old;
   const channels = channelsFor(g, lines, inv), counts = channels.map(c => c.trains.length);
   const actual = netValue(g, channels, counts, inv);
   const contribution = channels.map((c, i) => {
@@ -412,6 +417,15 @@ export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
     if (best < 0) break;
     target[best]--; value += gain;
   }
+  const entry: PlanEntry = { key, lines, channels, counts, inventory: inv, contribution, target, value };
+  for (const x of lines) m.set(x.id, entry);
+  return entry;
+}
+
+function completePlan(g: Game, e: PlanEntry, l: Line): SharedCapacityPlan {
+  if (e.plan) return e.plan;
+  const { lines, channels, counts, contribution, inventory: inv } = e, target = [...e.target];
+  let value = e.value;
   // Each accepted path has positive marginal surplus after its delays to *all* services have been charged.
   for (;;) {
     let best = -1, gain = 0;
@@ -432,20 +446,47 @@ export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
   });
   withdraw.sort((a, b) => a.value - b.value || b.train - a.train || a.owner - b.owner);
   const used = new Set(channels.flatMap(c => [...c.use.keys()]));
-  const plan: SharedCapacityPlan = { lines: lines.map(x => x.id), resources: inv.resources.filter(r => used.has(r.id)),
+  e.plan = { lines: lines.map(x => x.id), resources: inv.resources.filter(r => used.has(r.id)),
     allocations: channels.map((c, i) => ({ line: c.line.id, owner: c.owner, pattern: c.pattern, trains: target[i], traffic: c.budget })),
     withdraw, limit: channels.reduce((n, c, i) => n + (c.line.id === l.id ? target[i] : 0), 0),
     physical: Math.max(0, ...channels.filter(c => c.line.id === l.id).map(c => c.limit)),
     revenue: receipts(g, channels, counts, inv).reduce((n, x) => n + x, 0), delay: Math.max(0, ...lines.map(x => x.capacity?.delay ?? 0)) };
-  const entry = { key, plan, channels, counts, inventory: inv };
-  for (const x of lines) m.set(x.id, entry);
-  return plan;
+  return e.plan;
+}
+
+/**
+ * Pricing the auction also takes each corridor line's monthly demand snapshot (saved; a later decision input) on its
+ * first use in a month. A caller that defers or skips the auction (performance) calls this where the auction was,
+ * so every snapshot is taken at the same moment and state as before.
+ */
+export function touchSharedCapacity(g: Game, l: Line): void {
+  for (const x of connectedLines(g, l, inventory(g))) {
+    const headways = patternHeadways(g, x);
+    demand(g, x, Math.max(1, ...headways.map(p => p.cycle), 2 * x.stops.length * 10));
+  }
+}
+
+/** Every operator reads the same deterministic auction of paths, weighted by its traffic/access payments. */
+export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
+  const e = planEntry(g, l), fresh = !e.plan, plan = completePlan(g, e, l);
+  if (fresh) return plan;
+  return { ...plan, limit: plan.allocations.filter(a => a.line === l.id).reduce((n, a) => n + a.trains, 0),
+    physical: Math.max(0, ...e.channels.filter(c => c.line.id === l.id).map(c => c.limit)) };
+}
+
+/** The auction's withdrawals (same as sharedCapacityPlan(g, l).withdraw). Additions can only keep a train the
+ * withdrawal pass removed, so without such a train the addition pass is not priced. */
+export function sharedCapacityWithdrawals(g: Game, l: Line): Pick<SharedCapacityPlan, 'lines' | 'withdraw'> {
+  const e = planEntry(g, l);
+  if (e.plan) return e.plan;
+  const candidate = e.channels.some((c, i) => g.company(c.owner).ai && e.counts[i] > e.target[i] && e.contribution[i] < -1e-6);
+  return candidate ? completePlan(g, e, l) : { lines: e.lines.map(x => x.id), withdraw: [] };
 }
 
 /** Read-only audit of the most recent decision; inspecting the plan must never change a demand snapshot. */
 export function observedCapacityAgreement(g: Game, l: Line) {
   const e = planMemo.get(g)?.get(l.id);
-  return e ? { day: Number(e.key.split(':')[0]), allocations: e.plan.allocations } : undefined;
+  return e?.plan ? { day: Number(e.key.split(':')[0]), allocations: e.plan.allocations } : undefined;
 }
 
 /** The private fare gain minus the delay/abandonment bill to everyone else, own trains included. */

@@ -40,7 +40,7 @@ import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLeng
 import { offloadMail } from './mail';
 import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn, upgradeRoute } from './dualtrack';
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
-import { usesSharedRail, sharedCapacityPlan, sharedTrainAllowed, marginalSharedConsist, priceSharedProject } from './ai-capacity';
+import { usesSharedRail, sharedCapacityPlan, sharedCapacityWithdrawals, touchSharedCapacity, sharedTrainAllowed, marginalSharedConsist, priceSharedProject } from './ai-capacity';
 import { relieveSharedCapacity, sharedCapacityWork } from './ai-capacity-works';
 import { initialSecondTrackCost, initialTrackChoice, initialTrackFinancing, layInitialDoubleTrack, openingThroatBaseline, openingThroatReturn, openingSignalPlan, openingFundingBaseline, openingFundingAppraisal } from './ai-initial-track';
 import { urbanTrunks } from './ai-urban';
@@ -1433,12 +1433,12 @@ export class AIController {
   }
 
   /** Called once per game day while AI is enabled. */
-  daily() {
+  daily(sharedCapacity = true) {
     if (this.disposed) return;
     this.checkConfig();
     try {
       this.railPolicy.daily();
-      if (networkOptions.enabled) this.manageSharedCapacity();
+      if (networkOptions.enabled) this.manageSharedCapacity(!sharedCapacity);
       if (this.cooperationReserved()) return;
       if (this.railPolicy.deepTrouble) this.recoverCash();
       if (this.relengthen.length) this.replaceTrains();
@@ -1488,6 +1488,16 @@ export class AIController {
       }
       if (!this.job && this.project) this.endProject();
     } catch (e) { this.onError(e); }
+  }
+
+  /**
+   * The daily shared-path review on its own (Game runs every company's at one tick, so a corridor's operators
+   * share one auction; daily(false) then skips it).
+   */
+  sharedCapacityDaily() {
+    if (this.disposed || !networkOptions.enabled) return;
+    this.checkConfig();
+    try { this.manageSharedCapacity(); } catch (e) { this.onError(e); }
   }
 
   /** Called once per game month while AI is enabled. */
@@ -2391,7 +2401,9 @@ export class AIController {
   }
 
   // capacity-integration: each operator honours the same agreement; the worst marginal train leaves first.
-  private manageSharedCapacity() {
+  // `snapshotsOnly`: the daily decisions take the corridors' monthly demand snapshots here; the auction itself
+  // runs later in the day (Game.stepTick, performance).
+  private manageSharedCapacity(snapshotsOnly = false) {
     const g = this.game, me = this.companyId;
     for (const l of [...g.lines.map.values()].sort((a, b) => a.id - b.id)) {
       if (!l.vehicles.some(id => g.vehicles.get(id)?.owner === me) || !usesSharedRail(g, l)) continue;
@@ -2400,7 +2412,8 @@ export class AIController {
       const p = this.project;
       if (this.job && p?.built && ['rail', 'hsr', 'share', 'metro', 'lightrail'].includes(p.kind)
         && l.owner === me && g.lines.get(p.openingLine ?? p.line)?.id === l.id) continue;
-      const plan = sharedCapacityPlan(g, l), cut = plan.withdraw[0];
+      if (snapshotsOnly) { touchSharedCapacity(g, l); continue; }
+      const plan = sharedCapacityWithdrawals(g, l), cut = plan.withdraw[0];
       if (!cut || cut.owner !== me || plan.lines.some(id => g.lines.get(id)?.capacity?.withdrawn === g.day)) continue;
       const t = g.vehicles.get(cut.train);
       if (!(t instanceof Train)) continue;
@@ -3679,7 +3692,8 @@ export class AIController {
       // An accessible open line may admit our trains without a station title; stock still pays its native usage fees.
       const joinable = g.lines.partnerPolicy(l) === 'open' && g.canUse(me, o);
       if (!joinable || l.stops.some(id => { const st = g.stations.get(id); return !st || !g.canUse(me, st.owner); })) continue;
-      if (l.vehicles.length >= this.lineCapacity(l)) continue;
+      // (the shared-path auction is the costly filter: priced last, its demand snapshots taken here as before)
+      if (usesSharedRail(g, l)) touchSharedCapacity(g, l);
       const sA = g.stations.get(l.stops[0]);
       if (!sA?.rail) continue;
       let sB: Station | undefined, bd = 0;
@@ -3692,6 +3706,7 @@ export class AIController {
       // a free platform for our train at both ends (each train waits for a free path, so this cannot jam)
       const room = Math.min(sA.rail.tracks, sB.rail.tracks) - Math.max(trainsAt.get(sA.id) ?? 0, trainsAt.get(sB.id) ?? 0);
       if (room < 1) continue;
+      if (l.vehicles.length >= this.lineCapacity(l)) continue;
       // Quote the actual shared route's full cost and our train's own wear.
       // joining: our train takes its share of the line's passengers (one more train among those running it)
       const part = joinable ? 1 / (l.vehicles.length + 1) * 2 : 1;

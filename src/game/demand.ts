@@ -94,6 +94,7 @@ const feederQuality = (headway: number) => Math.max(0, Math.min(1,
   (MAINLINE_FEEDERS.cutoffHeadway - headway) / (MAINLINE_FEEDERS.cutoffHeadway - MAINLINE_FEEDERS.fullHeadway)));
 interface FeederSite extends DemandSite { quality: number; access?: { x: number; z: number }[] }
 interface FeederPool { pop: number; regions: Map<number, number> }
+const feederPoolMemo = new WeakMap<DemandModel, { stamp: string; entries: { sig: number[]; covered: Set<number>; pools: FeederPool[] }[] }>();
 const feederSites = new WeakMap<DemandModel, { key: string; sites: Map<string, Map<number, number>> }>();
 const feederClaims = new WeakMap<DemandModel, {
   bids: number[]; sums: number[]; qualities: number[]; first: number[]; last: number[];
@@ -508,10 +509,36 @@ export class DemandModel {
     return buildings;
   }
 
+  /** Forecasts of one service at several frequencies repeat the same claim (a quality below the feeder
+   * threshold claims nothing). Reuse an identical claim within the same tick and world state (performance only). */
+  private feederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
+    const w = this.g.world;
+    const stamp = `${this.version}:${this.g.tick}:${this.feederGeometryKey()}:${w.lotVersions.version}`;
+    const sig: number[] = [];
+    for (const s of sites) {
+      sig.push(s.x, s.z, s.townId, s.quality, s.access?.length ?? -1);
+      for (const a of s.access ?? []) sig.push(a.x, a.z);
+    }
+    let memo = feederPoolMemo.get(this);
+    if (!memo || memo.stamp !== stamp) { memo = { stamp, entries: [] }; feederPoolMemo.set(this, memo); }
+    const copy = (pools: FeederPool[]) => pools.map((p) => ({ pop: p.pop, regions: new Map(p.regions) }));
+    for (const e of memo.entries) {
+      if (e.sig.length !== sig.length || e.covered.size !== covered.size) continue;
+      let same = true;
+      for (let i = 0; i < sig.length && same; i++) same = Object.is(e.sig[i], sig[i]);
+      if (same) for (const bid of covered) if (!e.covered.has(bid)) { same = false; break; }
+      if (same) return copy(e.pools);
+    }
+    const pools = this.claimFeederPools(sites, covered);
+    if (memo.entries.length >= 8) memo.entries.shift();
+    memo.entries.push({ sig, covered: new Set(covered), pools: copy(pools) });
+    return pools;
+  }
+
   /** A separate car feeder pool, never a wider walking catchment. Catchments with an existing intercity route
    * are excluded: those residents already enter through routed feeder transfers. A local-only bus does not
    * supply a railway it cannot reach. Competing main-line stations share every lot once. */
-  private feederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
+  private claimFeederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
     const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
     // Each lot has a numeric claim index, avoiding a claim object per lot on every forecast. Parallel arrays
     // retain first-claim insertion order and the linked site order, including the original floating-point sums.
