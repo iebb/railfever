@@ -37,7 +37,7 @@ export function mailDemandView(v: MailView): DemandView {
   return {
     towns: v.towns.map((t) => ({
       id: t.id, x: t.x, z: t.z, pop: t.pop, potential: t.potential, served: t.share, stations: t.stations,
-      generated: 0, transported: 0, local: 0, localServed: 0,
+      generated: 0, transported: 0, local: 0, localServed: 0, intercity: t.potential, intercityServed: t.share,
     })),
     pairs: v.pairs.map((p) => ({ a: p.a, b: p.b, dist: p.dist, potential: p.potential, served: p.share, mine: 0 })),
     regions: [], flows: [], maxPotential: v.maxPotential,
@@ -84,12 +84,37 @@ export function presetOf(c: AIConfig): (typeof AI_PRESETS)[number] | undefined {
     && near(p.config.focus.rail, c.focus.rail) && near(p.config.focus.road, c.focus.road) && near(p.config.focus.tram, c.focus.tram));
 }
 
-/** Configurations for a new game's AI companies by style ('mixed' = a different preset each). */
-export function aiConfigsFor(style: string, n: number, startMoney?: number): AIConfig[] {
+/**
+ * Rail share of each rival's rail-vs-bus preference (0 = buses only, 1 = rail only): spread from the seed around
+ * `mean`, centred so the average is exactly `mean`, and narrowed where needed to stay within 0..1.
+ */
+export function aiRailShares(n: number, mean: number, seed: number): number[] {
+  if (n <= 0) return [];
+  const m = Math.min(1, Math.max(0, Number.isFinite(mean) ? mean : 0.5));
+  let s = (Math.imul(seed | 0, 2654435761) >>> 0) || 1;
+  const rnd = () => { s = (s + 0x6d2b79f5) >>> 0; let t = s; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+  const d = Array.from({ length: n }, () => (rnd() - 0.5) * 0.6);
+  const avg = d.reduce((a, b) => a + b, 0) / n;
+  for (let i = 0; i < n; i++) d[i] -= avg;
+  let k = 1;
+  for (const x of d) { if (x > 1e-12) k = Math.min(k, (1 - m) / x); else if (x < -1e-12) k = Math.min(k, m / -x); }
+  return d.map((x) => m + x * k);
+}
+/** Focus factor of a share: 1 at 0.5, about 2.9x at 1 and 0.34x at 0 (rail uses the share, buses 1 - share). */
+const shareFactor = (x: number) => Math.pow(3 / 0.35, x - 0.5);
+
+/**
+ * Configurations for a new game's AI companies by style ('mixed' = a different preset each) and the rivals' average
+ * rail share (0.5 keeps each style's own mix on average; each rival leans its own way, from the seed).
+ */
+export function aiConfigsFor(style: string, n: number, startMoney?: number, railShare = 0.5, seed = 1): AIConfig[] {
   const mixed = ['balanced', 'rail', 'bus', 'aggressive', 'tram', 'cautious', 'balanced'];
+  const shares = aiRailShares(n, railShare, seed);
   return Array.from({ length: n }, (_, i) => {
     const preset = (AI_PRESETS.find((p) => p.id === (style === 'mixed' ? mixed[i % mixed.length] : style)) ?? AI_PRESETS[0]).config;
-    return normalizeAIConfig(startMoney === undefined ? preset : { ...preset, startMoney });
+    const r = shares[i];
+    const focus = { rail: preset.focus.rail * shareFactor(r), road: preset.focus.road * shareFactor(1 - r), tram: preset.focus.tram };
+    return normalizeAIConfig({ ...preset, focus, ...(startMoney === undefined ? {} : { startMoney }) });
   });
 }
 

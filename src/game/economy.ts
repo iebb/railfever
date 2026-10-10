@@ -79,12 +79,17 @@ function fullRecord(v: Partial<Record<Category, number>> | undefined): Record<Ca
   return r;
 }
 
+/** Base borrowing rate; infrastructure annuities do not follow a company's later rate changes. */
+export const BASE_INTEREST_RATE = 0.04;
+
 export class Economy {
   money = 5_000_000;
   loan = 5_000_000;
+  /** Remaining principal of the fully borrowed starting balance; saved, never free equity. */
+  initialLoan = 0;
   maxLoan = 25_000_000;
   loanStep = 500_000;
-  interestRate = 0.04;
+  interestRate = BASE_INTEREST_RATE;
   current: Record<Category, number> = emptyRecord();
   months: MonthRecord[] = [];
   yearTotals: { year: number; v: Record<Category, number> }[] = [];
@@ -116,6 +121,12 @@ export class Economy {
 
   canAfford(x: number) { return this.money >= x; }
 
+  startWithLoan(amount: number) {
+    const balance = Number.isFinite(amount) ? Math.max(0, Math.min(1e9, amount)) : 5_000_000;
+    this.money = this.loan = this.initialLoan = balance;
+    this.maxLoan = Math.max(this.maxLoan, balance);
+  }
+
   /** Spend money. Returns false (and spends nothing) if it can't be afforded and `force` is false. */
   spend(x: number, cat: Category, force = false): boolean {
     if (!force && x > this.money) return false;
@@ -139,6 +150,7 @@ export class Economy {
     const amt = Math.min(this.loanStep, this.loan);
     if (amt <= 0 || this.money < amt) return false;
     this.loan -= amt;
+    this.initialLoan = Math.min(this.initialLoan, this.loan);
     this.money -= amt;
     return true;
   }
@@ -163,9 +175,15 @@ export class Economy {
   }
 }
 
+/** Honour already-funded starting debt without treating it as permission for extra borrowing. */
+export const loanLimit = (e: { maxLoan: number; loan?: number; initialLoan?: number }, appetite: number) =>
+  Math.max(e.maxLoan * appetite, Math.min(e.initialLoan ?? 0, e.loan ?? e.initialLoan ?? 0));
+
 export interface Company {
   id: number;
   name: string;
+  /** Town hosting the company headquarters; stable across network growth and acquisitions. */
+  hqTown?: number;
   color: string;
   ai: boolean;
   economy: Economy;

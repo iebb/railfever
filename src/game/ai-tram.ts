@@ -8,7 +8,8 @@ import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize } from
 import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
-import { runGen } from './routing';
+import { runGen, roadDepotAtDeadEnd } from './routing';
+import { tramRouteValue, pays } from './ai-bus';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
 export interface TramProject {
@@ -74,9 +75,10 @@ export class TramPlanner {
   }
 
   /** Start a tram project in the best candidate town; false if there is none. */
-  start(): boolean {
+  start(townId?: number): boolean {
     if (this.job) return false;
-    const town = this.candidates()[0];
+    const candidates = this.candidates();
+    const town = townId === undefined ? candidates[0] : candidates.find(t => t.id === townId);
     if (!town || !pickTram(this.game.year, town.pop)) return false;
     this.project = { town: town.id, edges: [], stations: [], stops: [], depot: -1, line: -1 };
     this.reason = '';
@@ -149,6 +151,10 @@ export class TramPlanner {
     for (const id of fresh) trackLen += net.edges.get(id)!.len;
     const nTrams = Math.max(2, Math.min(5, Math.round(route.len / 22)));
     const cost = trackLen * TRAM.costPerUnit + route.stops.length * 30_000 + 200_000 + nTrams * model.cost;
+    // ---- the forecast (ai-bus.ts): riders shared with every served stop near the route, tram fares, against the works,
+    // trams, running and upkeep (a copy of another company's trams in the same streets does not pay)
+    const quote = yield* tramRouteValue(g, owner, route.stops, trackLen, model, nTrams);
+    if (!pays(quote)) return this.fail(`forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`);
     const e = this.eco;
     while (e.money < cost + 300_000 && e.borrow()) { /* borrow in steps */ }
     if (e.money < cost) return this.fail('too expensive');
@@ -244,11 +250,23 @@ export class TramPlanner {
   }
 }
 
-/** A tram depot beside a tram route near one of its ends that reaches the route's first stop (-1: none). */
+/**
+ * A tram depot beside a tram route near one of its ends, within the stretch its stops serve (never beyond the end stop,
+ * where it would end the route), that reaches the route's first stop (-1: none).
+ */
 export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number; s: number }[], stations: number[], owner: number): Generator<void, number> {
   const sz = depotSize('tram');
-  for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(pts.length - 2, 40); k += 2) {
-    const i = fromEnd ? pts.length - 1 - k : k;
+  // the route points nearest to its end stops
+  const at = stations.map((sid) => {
+    const st = g.stations.get(sid), q = st?.stops[0] ?? st;
+    if (!q) return -1;
+    let best = -1, bd = Infinity;
+    pts.forEach((p, i) => { const d = Math.hypot(p.x - q.x, p.z - q.z); if (d < bd) { bd = d; best = i; } });
+    return best;
+  }).filter((i) => i >= 0);
+  const lo = at.length ? Math.min(...at) : 0, hi = at.length ? Math.max(...at) : pts.length - 1;
+  for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(hi - lo - 2, 40); k += 2) {
+    const i = fromEnd ? hi - k : lo + k;
     const p = pts[i], q = pts[Math.min(pts.length - 1, i + 1)], o = pts[Math.max(0, i - 1)];
     const tx = q.x - o.x, tz = q.z - o.z, tl = Math.hypot(tx, tz) || 1;
     for (const side of [1, -1]) {
@@ -258,7 +276,8 @@ export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number
       const x = p.x + nx * off, z = p.z + nz * off;
       const plan = g.depots.plan('tram', x, z, Math.atan2(-nx, -nz), owner);
       yield;
-      if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2) continue;
+      if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2
+        || roadDepotAtDeadEnd(g, plan, true, owner)) continue;
       const id = g.depots.nextId;
       if (g.depots.commit('tram', plan, owner)) continue;
       const dp = g.depots.get(id);

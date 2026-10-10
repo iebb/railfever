@@ -29,9 +29,15 @@ flush();
 const headway = patternHeadways(g, line)[0].headway;
 const quote = (h = headway) => g.demand.forecastLine([A, B], 'mainline', 120, h, 0, line.id);
 const isolated = quote();
-// Frozen pre-fix ef67606 native construction quote: no other reachable destinations means exact parity.
-check(Math.abs(isolated.boardings - 214.7797683186935) < 1e-8
-  && Math.abs(isolated.revenue - 512340.1568116724) < 1e-6, 'no-background quote preserves previous direct arithmetic');
+// Frozen native construction quote: no other reachable destinations means exact parity with the direct arithmetic.
+// Re-frozen for 2.10 (ef67606 gave 214.7797683186935 / 512340.1568116724 for Wilmere - Shelminster): the user's halved
+// walking reach and WALK_TRIP_INTENSITY (3.2x walking trips) change the arithmetic, and the halved reach moves this
+// pair search to Weyden - Sunham. Same fixture, same exact-parity tolerance.
+// Re-frozen for 2.11 (2.10: 80.39908175050506 / 148704.3761182762): big cities make more inter-city trips per resident
+// (demand.ts BIG_CITY, 8a42549), a smooth factor that is about 1 for these small towns (+0.14% here). With the factor
+// held at 1 the 2.10 values come back exactly.
+check(Math.abs(isolated.boardings - 80.51396538924969) < 1e-8
+  && Math.abs(isolated.revenue - 148916.86237376273) < 1e-6, `no-background quote preserves previous direct arithmetic (${isolated.boardings}, ${isolated.revenue})`);
 
 // A real road service joins the railway station and serves a different district of the generated town.
 const candidates: { x: number; z: number; distance: number; join?: number }[] = [];
@@ -58,13 +64,20 @@ check(faster.boardings > network.boardings && faster.revenue > network.revenue,
   'new headway updates competition and retains a positive marginal frequency return');
 
 // Native rail plan joins the bus district and accepts a walking link to the existing railway station.
+// (2.10: a joined stop keeps its id and a station complex never links consecutive stops of a line, which would leave
+// the line inside one station; the background bus runs A - end, so the rail plan joins another district stop.)
+const other = candidates.find(p => p.distance > 25 && !p.join && Math.hypot(p.x - far.x, p.z - far.z) > 6);
+const district = other ? addBusStop(g, other.x, other.z, 0) : -1;
+check(district >= 0 && district !== end && district !== A.id && !g.stations.consecutiveStops(district, A.id), 'a second district stop off the background line');
+flush();
 let joined: StationPlan | null = null;
 for (const edge of g.towns.streets(TA, 0)) {
   const p = { x: 0, y: 0, z: 0 }; g.world.net.pointAt(edge, edge.len / 2, p);
   for (const offset of [3, 5, 8]) for (const angle of [0, Math.PI / 2, Math.PI / 4]) {
     const plan = g.stations.planRail(p.x + offset, p.z + offset, angle, 10, 2, 0,
       { mode: 'mainline', level: 'elevated', height: 5, style: 'modern' });
-    if (plan.ok && plan.roadAccess && plan.join?.id === end && plan.links.some(st => st.id === A.id)) { joined = plan; break; }
+    check(!(plan.join?.id === end && plan.links.some(st => st.id === A.id)), 'a plan joining a stop never promises a link to its consecutive stop');
+    if (plan.ok && plan.roadAccess && plan.join?.id === district && plan.links.some(st => st.id === A.id)) { joined = plan; break; }
   }
   if (joined) break;
 }
@@ -81,8 +94,8 @@ if (joined) {
   check(JSON.stringify(serialize(g)) === before, 'prospective join/link quotes leave the entire save unchanged');
   const funds = g.economy.money;
   check(!g.stations.commitRail(joined, 0), 'preflighted joined facility commits with native clearance');
-  check(Math.abs(funds - g.economy.money - joined.cost) < 1e-6 && g.stations.get(end)?.rail
-    && g.stations.get(end)?.links.includes(A.id), 'native join pays its complete cost and commits the accepted link');
+  check(Math.abs(funds - g.economy.money - joined.cost) < 1e-6 && g.stations.get(district)?.rail
+    && g.stations.get(district)?.links.includes(A.id), 'native join pays its complete cost and commits the accepted link');
   flush();
 }
 
@@ -139,8 +152,10 @@ if (middle) {
       const ride = lineTable(branch, branch.lines.get(linkedLine)!).edges.find(e => e.from === linkTarget && e.to === end)!.cost;
       check(gap > 0 && !!st.rail?.alignment && st.rail.alignment.tracks.some(t => t.pieces.length > 1),
         'curved native facility keeps a real nonzero transfer gap');
+      // (2.10, d2b8e53: a walk inside one station complex skips the external transfer base time)
+      const internal = branch.stations.isSameStationComplex(st.id, target.id);
       check(native?.line === WALK_LINE && Math.abs(prospectiveCost - native.cost) < 1e-8
-        && Math.abs(prospectiveCost - transferWalkTime(gap) - ride) < 1e-8,
+        && Math.abs(prospectiveCost - transferWalkTime(gap, internal) - ride) < 1e-8,
         'prospective curved link uses the same actual gap and ride cost as the committed native graph');
       console.log(`curved planned link: gap ${gap.toFixed(6)}u, proposed/native ${prospectiveCost.toFixed(6)}s`);
     }

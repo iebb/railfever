@@ -9,7 +9,7 @@ import { h, icon, clear, seg } from './dom';
 import { getFilter, validateFilter, lineMatches, filterBar, modeCounts, lineSymbol, lineMode, lineCodeOf, allBadges, MODE_META, LineFilter, Badge } from './lineid';
 import { computeLinePath, LinePath } from './linepaths';
 import { townDemandShare, mailDemandView, fmtMailTonnes, catchStreets, catchWalkLimit, drawCatchStreets, CATCH_COLOR, CatchMode, CITY_REACH, stationInCity } from './gameapi';
-import { demandView, DemandView } from '../game/demand';
+import { demandView, DemandView, type DemandSetFilter, type DemandFlow } from '../game/demand';
 import { ROUTE_LIFT } from '../render/overlay';
 import { mailView, type MailView } from '../game/mail-view';
 import type { Arc, ShareRing } from '../render/overlay';
@@ -82,6 +82,8 @@ export class MapModes {
   private rowOn: number | null = null;
   demand: DemandView | null = null;
   demandLayer: 'pax' | 'mail' = 'pax';
+  /** passenger demand shown: both sets, city trips or inter-city trips */
+  demandSet: DemandSetFilter = 'all';
   mailDemand: MailView | null = null;
   /** demand view: share of each town's trips the network can carry (by town id) */
   shares = new Map<number, number>();
@@ -419,6 +421,7 @@ export class MapModes {
     const order = (id: number) => (id === focus ? 0 : open.has(id) ? 1 : 2);
     for (const [sid, m] of out) {
       m.lines.sort((a, b) => order(a) - order(b));
+      m.order = Object.fromEntries(m.lines.map(id => [id, order(id)]));
       // (lines running through on one route share a number: shown once)
       m.badges = (badges.get(sid) ?? []).filter((b) => this.visIds.has(b.line)).sort((a, b) => order(a.line) - order(b.line))
         .filter((b, i, a) => a.findIndex((o) => o.code === b.code) === i);
@@ -483,10 +486,10 @@ export class MapModes {
     const numbered = new Set(lines.filter((l) => l.kind === 'rail').flatMap((l) => l.stops)).size;
     // (a line's name shows only while it is pointed at, or tapped on touch screens)
     const touch = typeof matchMedia === 'function' && matchMedia('(hover: none)').matches;
-    const show = touch ? 'Tap route or number: line name; tap again: open.' : 'Hover route or number: line name; click route: open.';
+    const show = touch ? 'tap: name · tap again: open' : 'hover: name · click: open';
     const note = this.display === 'lines'
-      ? `${numbered ? `${numbered} numbered stations` : 'Rail station numbers'} · company + line + station, e.g. AS01; zoomed out: first number +n · ${show}`
-      : `Pins: name, waiting passengers, numbers such as AS01 · ${show}`;
+      ? `${numbered ? `${numbered} stations · ` : ''}numbers: company, line, stop (AS01) · ${show}`
+      : `Pins: name, waiting, numbers · ${show}`;
     c.append(
       h('div', { class: 'mc-head' }, icon('map', 18), h('span', { class: 'mc-title' }, 'Lines map'), h('span', { class: 'mc-sub' }, `${lines.length}`),
         h('button', { class: 'ibtn sm', 'data-tip': 'Close', 'data-key': 'M', 'data-sfx': 'none', 'aria-label': 'Close lines map', onclick: () => this.set('none') }, icon('close', 16))),
@@ -610,7 +613,12 @@ export class MapModes {
     const sig = g.world.net.version + '|' + g.stations.catchVersion + '|' + mine.length + '|' + Math.floor(g.day / 30);
     if (sig === this.catchSig) return;
     this.catchSig = sig;
-    const segments = mine.flatMap((s) => catchStreets(g, s).segments);
+    const shown = new Set<number>();
+    const segments = mine.flatMap(s => {
+      const group = g.stations.catchmentGroup(s.id);
+      if (shown.has(group)) return [];
+      shown.add(group); return catchStreets(g, s).segments;
+    });
     drawCatchStreets(this.ui.renderer.overlay, 'map', { segments, buildings: new Map() });
     const inactive = mine.filter((s) => s.rail && !s.roadAccess).length;
     const reach = mine.reduce((a, s) => a + s.catchPop, 0);
@@ -649,13 +657,36 @@ export class MapModes {
     this.updateDemand(0);
   }
 
+  /** The passenger flows of the demand set shown (strongest first). */
+  demandFlows(d: DemandView): DemandFlow[] {
+    const set = this.demandSet;
+    return set === 'all' ? d.flows ?? [] : d.setFlows?.[set] ?? (d.flows ?? []).filter((f) => f.set === set);
+  }
+
+  setDemandSet(set: DemandSetFilter) {
+    if (set === this.demandSet) return;
+    this.demandSet = set;
+    this.demand = null; this.shares.clear(); this.demandT = 0;
+    if (this.mode !== 'demand' || this.demandLayer !== 'pax') return;
+    this.ui.sound('toggle', { pitch: set === 'city' ? 0.95 : set === 'intercity' ? 1.05 : 1 });
+    this.updateDemand(0);
+  }
+
   private demandToggle() {
     const toggle = seg<'pax' | 'mail'>([
       ['pax', 'Passengers', 'Potential trips · served share'],
       ['mail', 'Mail', 'Potential tonnes · estimated carried share'],
     ], this.demandLayer, (v) => this.setDemandLayer(v));
     toggle.setAttribute('aria-label', 'Demand cargo');
-    return h('div', { class: 'mc-modes mc-demand-toggle' }, toggle);
+    const row = h('div', { class: 'mc-modes mc-demand-toggle' }, toggle);
+    if (this.demandLayer !== 'pax') return row;
+    const sets = seg<DemandSetFilter>([
+      ['all', 'All', 'City and inter-city trips'],
+      ['city', 'City', 'Trips within a town'],
+      ['intercity', 'Inter-city', 'Trips between towns'],
+    ], this.demandSet, (v) => this.setDemandSet(v));
+    sets.setAttribute('aria-label', 'Demand set');
+    return [row, h('div', { class: 'mc-modes mc-demand-toggle' }, sets)];
   }
 
   /**
@@ -676,9 +707,10 @@ export class MapModes {
     ov.setShareRings(null);
     const regions = d.regions ?? [];
     const byId = new Map(regions.map((r) => [r.id, r]));
+    const set = this.demandSet, setFlows = this.demandFlows(d);
     // flows: the 50 strongest plus every served one; weak ones fade, strong ones on top
-    const flows = (d.flows ?? []).filter((f, i) => i < 50 || f.served > 0.01).slice(0, 140).reverse();
-    const maxT = Math.max(1, ...(d.flows ?? []).slice(0, 1).map((f) => f.trips));
+    const flows = setFlows.filter((f, i) => i < 50 || f.served > 0.01).slice(0, 140).reverse();
+    const maxT = Math.max(1, ...setFlows.slice(0, 1).map((f) => f.trips));
     const arcs: Arc[] = [];
     for (const f of flows) {
       const A = byId.get(f.a), B = byId.get(f.b);
@@ -686,7 +718,7 @@ export class MapModes {
       const k = Math.sqrt(f.trips / maxT), dist = Math.hypot(A.x - B.x, A.z - B.z);
       arcs.push({ ax: A.x, az: A.z, bx: B.x, bz: B.z, w: 1.5 + k * 6.5, alpha: 0.25 + k * 0.7, color: servedColor(f.served), dash: servedDash(f.served), h: 1.5 + dist * 0.2 });
     }
-    if (!regions.length) {
+    if (!regions.length && set !== 'city') {
       // older model without regions: town pairs
       const towns = new Map(d.towns.map((t) => [t.id, t]));
       const maxP = Math.max(1, d.maxPotential);
@@ -698,11 +730,12 @@ export class MapModes {
       }
     }
     ov.setArcs(arcs);
-    // district choropleth
-    const maxDem = Math.max(1, ...regions.map((r) => r.produced + r.attracted));
+    // district choropleth (one set: shaded by its trips)
+    const weight = (r: (typeof regions)[number]) => set === 'all' ? r.produced + r.attracted : r[set];
+    const maxDem = Math.max(1, ...regions.map(weight));
     const dark = new THREE.Color(0x2a3240);
     ov.setCatchments('demand', regions.map((r) => {
-      const c = new THREE.Color(servedColor(r.served)).lerp(dark, 0.65 * (1 - Math.sqrt((r.produced + r.attracted) / maxDem)));
+      const c = new THREE.Color(servedColor(r.served)).lerp(dark, 0.65 * (1 - Math.sqrt(weight(r) / maxDem)));
       return { x: r.x, z: r.z, r: Math.max(4, r.r), color: c.getHex() };
     }));
     // town labels
@@ -710,9 +743,10 @@ export class MapModes {
     info.clear();
     this.shares.clear();
     for (const t of d.towns) {
-      const frac = townDemandShare(d, t);
+      const frac = set === 'all' ? townDemandShare(d, t) : set === 'city' ? t.localServed : t.intercityServed;
+      const potential = set === 'all' ? t.potential : set === 'city' ? t.local : t.intercity;
       this.shares.set(t.id, frac);
-      info.set(t.id, `${Math.round(frac * 100)}% served · ${fmtInt(t.potential)}/mo`);
+      info.set(t.id, `${Math.round(frac * 100)}% served · ${fmtInt(potential)}/mo`);
     }
     this.renderDemandCard(d);
   }
@@ -789,10 +823,12 @@ export class MapModes {
     let best: (typeof d.regions)[number] | null = null, bd = Infinity;
     for (const r of d.regions) { const k = Math.hypot(r.x - x, r.z - z) / Math.max(4, r.r); if (k < 1 && k < bd) { bd = k; best = r; } }
     if (!best) return null;
-    const out = (d.flows ?? []).filter((f) => f.a === best!.id || f.b === best!.id).slice(0, 3);
+    const set = this.demandSet;
+    const out = this.demandFlows(d).filter((f) => f.a === best!.id || f.b === best!.id).slice(0, 3);
     const rows: [string, string][] = [
       ['people', `<b>${fmtInt(best.pop)}</b> residents · <b>${fmtInt(best.jobs)}</b> jobs`],
-      ['demand', `<b>${fmtInt(best.produced)}</b> trips/mo from here · <b>${fmtInt(best.attracted)}</b> to here`],
+      set === 'all' ? ['demand', `<b>${fmtInt(best.produced)}</b> trips/mo from here · <b>${fmtInt(best.attracted)}</b> to here`]
+        : ['demand', `<b>${fmtInt(best[set])}</b> ${set === 'city' ? 'city' : 'inter-city'} trips/mo from here`],
       ['catchment', `<b>${Math.round(best.served * 100)}%</b> of residents near a served station`],
     ];
     for (const f of out) {
@@ -806,13 +842,15 @@ export class MapModes {
     const g = this.ui.game;
     const c = this.card;
     clear(c);
+    const set = this.demandSet, city = set === 'city';
     let total = 0, carried = 0, mine = 0;
-    for (const p of d.pairs) { total += p.potential; carried += p.potential * p.served; mine += p.potential * p.served * p.mine; }
+    if (city) for (const t of d.towns) { total += t.local; carried += t.local * t.localServed; }
+    else for (const p of d.pairs) { total += p.potential; carried += p.potential * p.served; mine += p.potential * p.served * p.mine; }
     const regions = d.regions ?? [];
     const byId = new Map(regions.map((r) => [r.id, r]));
     const unserved = d.towns.filter((t) => t.stations === 0).length;
-    const flows = (d.flows ?? []).filter((f) => f.served < 0.5).slice(0, 5);
-    const pairs = regions.length ? [] : d.pairs.filter((p) => p.served < 0.5).slice(0, 5);
+    const flows = this.demandFlows(d).filter((f) => f.served < 0.5).slice(0, 5);
+    const pairs = regions.length || city ? [] : d.pairs.filter((p) => p.served < 0.5).slice(0, 5);
     const tname = (id: number) => g.towns.list[id]?.name ?? '?';
     const flowRow = (f: (typeof flows)[number]) => {
       const A = byId.get(f.a), B = byId.get(f.b);
@@ -831,11 +869,11 @@ export class MapModes {
         this.demandToggle(),
         h('div', { class: 'mc-grad', role: 'img', 'aria-label': 'Unserved: orange dashed · served: blue solid' }, h('span', null, 'unserved'), h('i'), h('span', null, 'served')),
         h('div', { class: 'mc-stats' },
-          h('div', null, h('b', null, fmtInt(total)), h('span', null, 'trips / month between towns')),
+          h('div', null, h('b', null, fmtInt(total)), h('span', null, city ? 'trips / month within towns' : 'trips / month between towns')),
           regions.length ? h('div', null, h('b', null, String(regions.length)), h('span', null, 'districts')) : null,
-          h('div', null, h('b', null, `${Math.round(carried > 0 ? (mine / carried) * 100 : 0)}%`), h('span', null, 'of carried trips start on your lines')),
+          city ? null : h('div', null, h('b', null, `${Math.round(carried > 0 ? (mine / carried) * 100 : 0)}%`), h('span', null, 'of carried trips start on your lines')),
           unserved ? h('div', null, h('b', null, String(unserved)), h('span', null, `town${unserved > 1 ? 's' : ''} without a station`)) : null),
-        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts; brighter: more trips · arcs: trips/mo; dashed: unserved; solid: served · hover: details' : 'Width: trips/mo · dashed: unserved · solid: served'),
+        h('div', { class: 'mc-note' }, regions.length ? 'Circles: districts · arcs: trips/mo, dashed unserved · hover: details' : 'Width: trips/mo · dashed: unserved'),
         flows.length || pairs.length ? h('div', { class: 'mc-sec' }, 'Biggest unserved flows') : null,
         flows.length ? h('div', { class: 'mc-list' }, flows.map(flowRow)) : null,
         pairs.length ? h('div', { class: 'mc-list' }, pairs.map((p) => h('div', {

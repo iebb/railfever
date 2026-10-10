@@ -136,6 +136,7 @@ export class ObjectsView {
   private boomMesh: THREE.InstancedMesh | null = null;
   private boomList: Boom[] = [];
   private boomPos = new Map<number, number>(); // crossing id -> raised fraction (1 up, 0 down)
+  private boomsDirty = false;
   private xlMesh: THREE.InstancedMesh | null = null;
   private xlList: XLight[] = [];
   private time = 0;
@@ -779,14 +780,14 @@ export class ObjectsView {
     const m4 = new THREE.Matrix4();
     if (this.lampList.length) {
       this.lampMesh = new THREE.InstancedMesh(this.lampGeo, this.mats.lamp, this.lampList.length);
-      this.lampList.forEach((l, i) => { m4.makeTranslation(l.x, l.y, l.z); this.lampMesh!.setMatrixAt(i, m4); this.lampMesh!.setColorAt(i, RED); });
+      this.lampList.forEach((l, i) => { m4.makeTranslation(l.x, l.y, l.z); this.lampMesh!.setMatrixAt(i, m4); });
       this.lampMesh.instanceMatrix.needsUpdate = true;
       this.lampMesh.computeBoundingSphere();
       this.group.add(this.lampMesh);
     }
     if (this.xlList.length) {
       this.xlMesh = new THREE.InstancedMesh(this.lampGeo, this.mats.lamp, this.xlList.length);
-      this.xlList.forEach((l, i) => { m4.makeTranslation(l.x, l.y, l.z); this.xlMesh!.setMatrixAt(i, m4); this.xlMesh!.setColorAt(i, XOFF); });
+      this.xlList.forEach((l, i) => { m4.makeTranslation(l.x, l.y, l.z); this.xlMesh!.setMatrixAt(i, m4); });
       this.xlMesh.instanceMatrix.needsUpdate = true;
       this.xlMesh.computeBoundingSphere();
       this.group.add(this.xlMesh);
@@ -795,8 +796,9 @@ export class ObjectsView {
       this.boomMesh = new THREE.InstancedMesh(this.boomGeo, this.mats.body, this.boomList.length);
       this.boomMesh.castShadow = false;
       this.group.add(this.boomMesh);
-      this.placeBooms();
+      this.boomsDirty = true;
     }
+    for (const mesh of [this.lampMesh, this.boomMesh, this.xlMesh]) if (mesh) mesh.visible = this.lampsOn;
     this.sigTimer = 0;
   }
 
@@ -815,12 +817,12 @@ export class ObjectsView {
     });
     mesh.instanceMatrix.needsUpdate = true;
     mesh.computeBoundingSphere();
+    this.boomsDirty = false;
   }
 
   /** LOD by camera distance, signals, level crossing barriers and warning lights. */
   animate(dt: number, night: number, camera?: THREE.Camera) {
     void night;
-    if (this.dynDirty) this.rebuildDynamic();
     this.time += dt;
     if (camera) {
       camera.updateMatrixWorld();
@@ -851,9 +853,11 @@ export class ObjectsView {
       this.lampsOn = this.camPos.y - gy < LAMP_DIST + (this.lampsOn ? 8 : -8);
       for (const m of [this.lampMesh, this.xlMesh, this.boomMesh]) if (m) m.visible = this.lampsOn;
     }
+    if (this.dynDirty) this.rebuildDynamic();
     const V = this.game.vehicles;
     this.sigTimer -= dt;
-    if (this.lampMesh && this.sigTimer <= 0) {
+    if (!this.lampsOn) this.sigTimer = 0; // hidden state owes a current repaint before reentry
+    if (this.lampsOn && this.lampMesh && this.sigTimer <= 0) {
       this.sigTimer = 0.1;
       this.lampList.forEach((l, i) => this.lampMesh!.setColorAt(i, V.getRes(l.edge) !== 0 ? RED : GREEN));
       if (this.lampMesh.instanceColor) this.lampMesh.instanceColor.needsUpdate = true;
@@ -870,9 +874,10 @@ export class ObjectsView {
         this.boomPos.set(b.crossing, target > cur ? Math.min(target, cur + dt * 0.6) : Math.max(target, cur - dt * 0.6));
         moved = true;
       }
-      if (moved) this.placeBooms();
+      this.boomsDirty ||= moved;
+      if (this.lampsOn && this.boomsDirty) this.placeBooms();
     }
-    if (this.xlMesh) {
+    if (this.lampsOn && this.xlMesh) {
       const blink = Math.floor(this.time * 2) & 1;
       this.xlList.forEach((l, i) => this.xlMesh!.setColorAt(i, V.crossingClosed.has(l.crossing) && blink === l.phase ? XRED : XOFF));
       if (this.xlMesh.instanceColor) this.xlMesh.instanceColor.needsUpdate = true;

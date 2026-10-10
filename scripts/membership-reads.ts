@@ -69,7 +69,8 @@ pureReference(zero,'unpublished zero horizon');
 check(!zero.stations.buildingShares(Z).ids.length&&!zero.stations.stationsForBuilding(z.id).st.length&&protectedState(zero)===zeroBefore,'getters never advance an unpublished zero horizon');
 publish(zero);check(zero.stations.buildingShares(Z).ids.includes(z.id),'the native publication advances the horizon and exposes the building');
 
-const served=flatGame(192),main=road(served,20,60,170,60),P=bus(served,52,60),Q=bus(served,72,60),R=bus(served,110,60),b=house(served,60,58);publish(served);
+// Both unserved stops lie within the current walking reach of the same house.
+const served=flatGame(192),main=road(served,20,60,170,60),P=bus(served,56,60),Q=bus(served,64,60),R=bus(served,110,60),b=house(served,60,58);publish(served);
 check(served.stations.stationsForBuilding(b.id).st.length===2,'native overlap initially shares between two unserved stops');
 const depot=roadDepotNear(served,52,60,0,[main.id]),line=served.lines.create('road',0);line.stops=[P.id,R.id];served.lines.rebuild();
 const vehicle=served.vehicles.buyRoad(depot,MODEL_BY_ID.get('bus_c')!,line.id);if(typeof vehicle==='string')throw new Error(vehicle);

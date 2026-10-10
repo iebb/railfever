@@ -37,6 +37,44 @@ export const FULL_COVER_WEIGHT = walkWeight(FULL_COVER_WALK);
  */
 export const coverOf = (best: number) => Math.min(1, best / FULL_COVER_WEIGHT);
 
+/** One building claim per public station, then split that claim among its physical serving members. */
+export function walkClaimShares(claims: { group: number; weight: number }[]): number[] {
+  const groups = new Map<number, { best: number; sum: number }>();
+  let best = 0;
+  for (const c of claims) {
+    const group = groups.get(c.group);
+    if (group) { group.best = Math.max(group.best, c.weight); group.sum += c.weight; }
+    else groups.set(c.group, { best: c.weight, sum: c.weight });
+    best = Math.max(best, c.weight);
+  }
+  let sum = 0; for (const group of groups.values()) sum += group.best;
+  const cover = coverOf(best);
+  return claims.map(c => {
+    const group = groups.get(c.group)!;
+    return sum > 0 && group.sum > 0 ? group.best / sum * cover * (c.weight / group.sum) : 0;
+  });
+}
+
+/** Prospective public identity from admitted plan joins/passages; physical stop IDs and route order stay intact. */
+export function prospectiveWalkGroups(g: Game, points: readonly (Station | StationPlan | { x: number; z: number })[]) {
+  const parents = new Map<number, number>();
+  const find = (id: number): number => {
+    const parent = parents.get(id);
+    if (parent === undefined || parent === id) return id;
+    const root = find(parent); parents.set(id, root); return root;
+  };
+  const join = (a: number, b: number) => { a = find(a); b = find(b); if (a !== b) parents.set(Math.max(a, b), Math.min(a, b)); };
+  const groups = points.map((p, i) => {
+    const built = 'id' in p ? p.id : 'join' in p ? p.join?.id : undefined;
+    return built === undefined ? -i - 1 : g.stations.catchmentGroup(built);
+  });
+  points.forEach((p, i) => {
+    if ('id' in p || !('links' in p)) return;
+    for (const st of p.links) if (g.stations.get(st.id)) join(groups[i], g.stations.catchmentGroup(st.id));
+  });
+  return { groups: groups.map(find), native: (id: number) => find(g.stations.catchmentGroup(id)) };
+}
+
 export function pedestrianRoad(e: NEdge): boolean {
   return e.kind === 'road' && e.depot < 0 && ROAD_TYPES[e.type]?.pedestrians !== false;
 }
@@ -247,6 +285,7 @@ class WalkingCache {
   private frontages = new Map<number, { x: number; z: number; roads: RegionSnapshot; roadFallback: number;
     terrain: RegionSnapshot; terrainFallback: number; point: RoadPoint | null }>();
   private accesses = new Map<number, StationAccess>();
+  private sharedAccess = new Map<number, { ids: number[]; inputs: Access[][]; points: Access[] }>();
   private complexGrid = new SpatialGrid(32);
   private complexEpoch = 0;
   private syncedStations = -1;
@@ -267,6 +306,8 @@ class WalkingCache {
     for (const [key, c] of this.entries) if (key.startsWith('station:') && !this.sameRoads(c)) return true;
     return false;
   }
+  /** The road versions a station's walk was last computed against (its catchment group's entry), if cached. */
+  roadSnapshot(st: Station): RegionSnapshot | undefined { return this.entries.get(`station:${this.g.stations.catchmentGroup(st.id)}`)?.roads; }
 
   private roadState(ids: number[]): Map<number, [number, string, number, boolean, number]> {
     const net = this.g.world.net, out = new Map<number, [number, string, number, boolean, number]>();
@@ -330,16 +371,34 @@ class WalkingCache {
     }
     for (const id of this.accesses.keys()) if (!g.stations.map.has(id)) {
       this.accesses.delete(id); this.complexGrid.remove(id); this.entries.delete(`station:${id}`); this.complexEpoch++;
+      this.sharedAccess.delete(id);
     }
   }
 
   access(st: Station): Access[] { this.syncStations(); return this.accesses.get(st.id)!.points; }
 
+  /** Every physical part uses one union of actual landings, each with its own unchanged walking budget. */
+  station(st: Station, without = -1): WalkingCatchment {
+    this.syncStations();
+    const ids = [...this.g.stations.catchmentMembers(st.id)].sort((a, b) => this.accesses.get(a)!.order - this.accesses.get(b)!.order);
+    const main = Math.min(...ids), key = without < 0 ? `station:${main}` : `without:${st.id}:${without}`;
+    const inputs = ids.map(id => id === st.id && without >= 0 ? stationAccess(this.g, st, without) : this.accesses.get(id)!.points);
+    const old = without < 0 ? this.sharedAccess.get(main) : undefined;
+    let points: Access[];
+    if (old && old.ids.length === ids.length && ids.every((id, i) => id === old.ids[i] && inputs[i] === old.inputs[i])) points = old.points;
+    else {
+      points = inputs.flat();
+      if (without < 0) this.sharedAccess.set(main, { ids, inputs, points });
+    }
+    if (!points.length) { this.entries.delete(key); return EMPTY; }
+    return this.calculate(key, points, true, without >= 0 ? { id: st.id, points: inputs[ids.indexOf(st.id)] } : undefined);
+  }
+
   /** Warm lots/terrain only. Observing pending road edits here would alter refreshAccess's dirty trigger. */
   prepare(st: Station) {
-    const key = `station:${st.id}`, c = this.entries.get(key);
+    const key = `station:${this.g.stations.catchmentGroup(st.id)}`, c = this.entries.get(key);
     if (!c || !this.g.world.net.roadVersions.unchanged(c.roads)) return;
-    this.calculate(key, this.access(st));
+    this.station(st);
   }
 
   private nearby(sources: Access[]): number[] {
@@ -533,20 +592,17 @@ function viewCache(g: Game): WalkingCache {
 }
 /** Current walking geometry without refreshing saved access or simulation dependencies; optionally omit an entrance. */
 export function readWalkingCatchment(g: Game, st: Station, without = -1): WalkingCatchment {
-  const c = viewCache(g);
-  if (without >= 0) {
-    const points = stationAccess(g, st, without);
-    return c.calculate(`without:${st.id}:${without}`, points, true, { id: st.id, points });
-  }
-  return c.calculate(`station:${st.id}`, c.access(st));
+  return viewCache(g).station(st, without);
 }
 /** Prepare local caches once for a share update; unchanged regions and station paths survive. */
 export function refreshWalkBuildings(g: Game) { cache(g).refreshBuildings(); }
 export function walkRoadsChanged(g: Game): boolean { return cache(g).roadsChanged(); }
+/** The road versions of a station's last computed walk (Stations: the versions of the published share-out). */
+export function walkRoadSnapshot(g: Game, st: Station): RegionSnapshot | undefined { return cache(g).roadSnapshot(st); }
 export function prepareWalkingCatchment(g: Game, st: Station) { cache(g).prepare(st); }
 export function walkingCatchment(g: Game, st: Station): WalkingCatchment {
   g.stations.refreshAccess();
-  return cache(g).calculate(`station:${st.id}`, cache(g).access(st));
+  return cache(g).station(st);
 }
 /**
  * A station's walking catchment without one of its entrances (the station window: what each entrance newly covers is
@@ -554,9 +610,7 @@ export function walkingCatchment(g: Game, st: Station): WalkingCatchment {
  */
 export function walkingCatchmentWithout(g: Game, st: Station, entrance: number): WalkingCatchment {
   g.stations.refreshAccess();
-  const points = stationAccess(g, st, entrance);
-  // (its own passages lead only between the access points it keeps)
-  return cache(g).calculate(`without:${st.id}:${entrance}`, points, true, { id: st.id, points });
+  return cache(g).station(st, entrance);
 }
 /**
  * Walking catchment from extra access points of a station on their own (an entrance being planned or valued, or one
@@ -617,7 +671,7 @@ function entranceStreetsCatchment(g: Game, st: Station, plan: EntrancePlan): Wal
 /** Independent cache, for exact incremental/full checks without mutating the live walking cache. */
 export function fullWalkingCatchments(g: Game): Map<number, WalkingCatchment> {
   const c = new WalkingCache(g), out = new Map<number, WalkingCatchment>();
-  for (const st of g.stations.map.values()) out.set(st.id, c.calculate(`station:${st.id}`, c.access(st)));
+  for (const st of g.stations.map.values()) out.set(st.id, c.station(st));
   return out;
 }
 export function walkingPopulation(g: Game, c: WalkingCatchment): number {
@@ -647,6 +701,11 @@ export function planWalkingCatchment(g: Game, plan: StationPlan): WalkingCatchme
     const p = accessSnap(g, sn, mode, bonus, plan.access.stats.len); if (p) sources.push(scale === 1 ? p : { ...p, limit });
   }
   if (plan.join) sources.push(...cache(g).access(plan.join).map((p) => ({ ...p, mode, limit })));
+  if (plan.join) for (const id of g.stations.catchmentMembers(plan.join.id)) if (id !== plan.join.id) sources.push(...cache(g).access(g.stations.get(id)!));
+  const linked = new Set<number>();
+  for (const st of plan.links) for (const id of g.stations.catchmentMembers(st.id)) if (!linked.has(id) && id !== plan.join?.id) {
+    linked.add(id); sources.push(...cache(g).access(g.stations.get(id)!));
+  }
   const value = cache(g).calculate(`preview:${plan.x}:${plan.z}:${plan.angle}:${plan.style}:${plan.level}`, sources);
   if (!plan.access && !plan.demolish.length) return value;
   const buildings = new Map(value.buildings), segments = [...value.segments], removed = new Set(plan.demolish);

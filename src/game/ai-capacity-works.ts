@@ -3,7 +3,7 @@ import type { AIController } from './ai';
 import type { Game } from './game';
 import type { Line } from './lines';
 import type { Proposal } from './construction';
-import { sharedCapacityPlan, sharedUpgradeReturn, capacityTrackUpkeep } from './ai-capacity';
+import { sharedCapacityPlan, sharedUpgradeReturn, capacityTrackUpkeep, touchSharedCapacity } from './ai-capacity';
 import { autoSignalLine } from './signals';
 import { planStationUpgrade, commitStationUpgrade } from './stations';
 import { planDoubleTrack, commitDoubleTrack, quoteDoubleTrackCompletion, type DoublePlan } from './trackops';
@@ -66,17 +66,20 @@ export function commitCapacityTrackUpgrade(g: Game, plan: DoublePlan, consent?: 
 /** The title holder acts for the whole corridor; other operators gain paths under their access agreement. */
 export function relieveSharedCapacity(ai: AIController, l: Line): boolean {
   const g = ai.game, me = ai.companyId;
-  const agreement = sharedCapacityPlan(g, l), s = l.capacity!;
+  touchSharedCapacity(g, l);
+  const s = l.capacity!;
   if (s.works || g.day - (s.tried ?? -1e9) < 30) return !!s.works;
+  const waiting = l.vehicles.map(id => g.vehicles.get(id)).some(t => t?.state === 'waiting' && (t as { stuckTime?: number }).stuckTime! > 30);
+  let queue = 0;
+  for (const sid of new Set(l.stops)) for (const w of g.stations.get(sid)?.waiting.values() ?? []) if (w.line === l.id) queue += w.count;
+  if (!waiting && queue === 0) return false;
+  // (the corridor auction is priced only for a line that may need works)
+  const agreement = sharedCapacityPlan(g, l);
   const resources = agreement.resources.filter(r => r.edges.some(id => {
     const e = g.world.net.edges.get(id);
     return e && !g.trackUpgradeError(me, e.owner);
   }));
   if (!resources.length) return false;
-  const waiting = l.vehicles.map(id => g.vehicles.get(id)).some(t => t?.state === 'waiting' && (t as { stuckTime?: number }).stuckTime! > 30);
-  let queue = 0;
-  for (const sid of new Set(l.stops)) for (const w of g.stations.get(sid)?.waiting.values() ?? []) if (w.line === l.id) queue += w.count;
-  if (!waiting && queue === 0) return false;
   s.tried = g.day;
   // Signals and platform tracks are cheaper than new formation; both are valued on all operators' recovered fares.
   const signal = autoSignalLine(g, l.id, me, { preview: true });

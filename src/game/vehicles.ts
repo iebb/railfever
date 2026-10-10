@@ -5,7 +5,7 @@ import { Train, CROSS_BASE, lineCompatibility, consistRule, type TSeg } from './
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
 import { VehicleModel } from './vehicle-types';
 import { RNG } from './rng';
-import { curvePoint, type NEdge, type Crossing } from './network';
+import { curvePoint, type Curve3, type NEdge, type Crossing } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
 import { chargeVehicles } from './opcosts';
 import { spacingSchedule } from './patterns';
@@ -41,7 +41,7 @@ function offloadPassengers(g: Game, v: Vehicle, count: number, st: Station | nul
     if (!st) continue;
     if (c.dest === st.id) { st.arrivedMonth += n; continue; }
     const hop = g.lines.nextHop(st.id, c.dest);
-    if (hop) g.lines.distribute(hop, n, (line, q) => g.stations.addWaiting(st, line, hop.alight, c.dest, q, 0, c.t0, transfers * q / n, c.rail ?? 0));
+    if (hop) g.lines.distribute(hop, n, (line, q) => g.stations.addWaiting(st, line, hop.alight, c.dest, q, 0, c.t0, transfers * q / n, c.rail ?? 0, c.ic ?? 0));
   }
   if (v.load < 1e-9) v.load = 0;
 }
@@ -78,6 +78,11 @@ export class Vehicles {
   private get ambientTimer() { return this.ambientTicks * this.game.tickSeconds; }
   private set ambientTimer(seconds: number) { this.ambientTicks = Math.max(0, Math.round(seconds / this.game.tickSeconds)); }
   private renderPoses = new WeakMap<Vehicle, RenderPose>();
+  /** Derived render demand; camera choices never change vehicle movement or saved state. */
+  private renderInterest: ReadonlySet<number> | null = null;
+  /** Derived counters of the last fixed tick, for viewport diagnostics. */
+  renderPoseCount = 0;
+  get renderInterestSize() { return this.renderInterest?.size ?? this.map.size + this.ambient.length; }
   private prevPoint = { x: 0, y: 0, z: 0 };
   private prevDir = { x: 0, y: 0, z: 0 };
   private renderPoint: RenderPoint<TSeg | RSeg> = { seg: null!, pos: 0 };
@@ -96,8 +101,13 @@ export class Vehicles {
 
   resetRenderPoses() { this.renderPoses = new WeakMap(); }
 
+  /** null retains every pose (headless/default); ids are read until the next call. */
+  setRenderInterest(ids: ReadonlySet<number> | null) { this.renderInterest = ids; }
+
   private rememberPose(v: Vehicle) {
+    if (this.renderInterest && !this.renderInterest.has(v.id)) return;
     if (!(v instanceof Train || v instanceof RoadVehicle)) return;
+    this.renderPoseCount++;
     let p = this.renderPoses.get(v);
     if (!p) { p = { segs: [], head: 0, pos: 0, reversed: false, length: 0, speed: 0, tick: 0 }; this.renderPoses.set(v, p); }
     p.segs.length = 0;
@@ -116,6 +126,12 @@ export class Vehicles {
   renderAcceleration(v: Train | RoadVehicle): number {
     const p = this.renderPoses.get(v);
     return p && p.tick === this.game.tick - 1 ? (v.speed - p.speed) / this.game.tickSeconds : 0;
+  }
+
+  /** Previous head curve used by interpolation; lets the view reject whole paths before sampling poses. */
+  previousRenderCurve(v: Train | RoadVehicle, length = v.length): Curve3 | null {
+    const p = this.renderPoses.get(v);
+    return p && p.tick === this.game.tick - 1 && p.length === length ? p.segs[p.head]?.curve ?? null : null;
   }
 
   /** Interpolate committed poses without changing simulation state. Returned metadata is scratch: consume before the next query. */
@@ -478,6 +494,7 @@ export class Vehicles {
   }
 
   update(dt: number) {
+    this.renderPoseCount = 0;
     if (this.replanQueue.length) this.replanSome(6);
     this.rebuildOcc();
     this.updateCrossings();

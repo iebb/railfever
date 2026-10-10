@@ -203,6 +203,11 @@ export class UI {
     if (k === 'j' || k === 'J') { T.setTool(T.tool === 'connect' ? 'inspect' : 'connect'); return; }
     if (k === 'b' || k === 'B') { this.mapModes.toggleDisplay(); return; }
     if (k === ' ') { e.preventDefault(); this.setSpeed(0); return; }
+    if (T.building && (k === 'PageUp' || k === ']' || k === '.' || k === 'PageDown' || k === '[' || k === ',')) {
+      e.preventDefault();
+      T.adjustHeight((k === 'PageUp' || k === ']' || k === '.' ? 1 : -1) * (e.shiftKey ? 0.1 : 0.5));
+      return;
+    }
     if (k === ',' || k === '.') {
       e.preventDefault();
       const speeds = [1, 2, 4, 8];
@@ -210,15 +215,11 @@ export class UI {
       this.setSpeed(speeds[Math.max(0, Math.min(speeds.length - 1, index + (k === '.' ? 1 : -1)))]);
       return;
     }
-    if ((k === 'r' || k === 'R') && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
-      T.rotate(e.shiftKey ? -1 : 1);
+    if (['r', 'n', 'm'].includes(k.toLowerCase()) && ['station', 'metro-station', 'depot-rail', 'depot-road', 'depot-tram'].includes(T.tool)) {
+      e.preventDefault();
+      T.rotate(k.toLowerCase() === 'r' ? (e.shiftKey ? -1 : 1) : (k.toLowerCase() === 'n' ? -1 : 1) * (e.shiftKey ? 1 / 15 : 1));
       this.hud.onToolChange();
       this.renderer.controls.keys.delete('r');
-      return;
-    }
-    if (T.building && (k === 'PageUp' || k === ']' || k === 'PageDown' || k === '[')) {
-      e.preventDefault();
-      T.adjustHeight(k === 'PageUp' || k === ']' ? 0.5 : -0.5);
       return;
     }
     const lk = k.toLowerCase();
@@ -341,9 +342,10 @@ export class UI {
     const g = this.game, lb = this.renderer.labels;
     lb.badges = allBadges(g);
     this.complexT -= dt;
-    if (this.complexT > 0) return;
+    const changed = !this.complexSig.startsWith(`${g.stations.walkVersion}:`);
+    if (this.complexT > 0 && !changed) return;
     this.complexT = 1;
-    let sig = '' + g.stations.map.size;
+    let sig = `${g.stations.walkVersion}:` + g.stations.map.size;
     for (const st of g.stations.map.values()) if (st.links?.length) sig += ',' + st.id + ':' + st.links.join('.');
     if (sig === this.complexSig && lb.complexOf) return;
     this.complexSig = sig;
@@ -531,8 +533,7 @@ export class UI {
     this.catchmentSig = `${g.world.net.version}:${g.stations.catchVersion}`;
     const st = id >= 0 ? g.stations.get(id) : undefined;
     if (!st) { drawCatchStreets(this.renderer.overlay, 'sel', null); return; }
-    const group = g.stations.complex(st.id).map((sid) => g.stations.get(sid)).filter((x): x is NonNullable<typeof x> => !!x);
-    drawCatchStreets(this.renderer.overlay, 'sel', { segments: group.flatMap((s) => catchStreets(g, s).segments), buildings: new Map() });
+    drawCatchStreets(this.renderer.overlay, 'sel', catchStreets(g, st));
   }
 
   /** Open the info window for a picked object. */

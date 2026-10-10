@@ -86,8 +86,8 @@ export class Checklist {
     }
     const locos = availableModels(g.year, 'loco'), coaches = availableModels(g.year, 'wagon', false);
     const train = (locos[locos.length - 1]?.cost ?? 0) + 2 * (coaches[coaches.length - 1]?.cost ?? 0);
-    const station = isFinite(this.stationEstimate) ? `an ${DEFAULT_PLATFORM_LENGTH * 10} m halt here ~${fmtMoney(this.stationEstimate)}` : 'check each halt’s preview price';
-    return `${station} · single track ~${fmtMoney(TRACK_TYPES.standard.costPerUnit * 100)}/km · starter train ~${fmtMoney(train)} · bridges and demolition extra`;
+    const station = isFinite(this.stationEstimate) ? `Halt ~${fmtMoney(this.stationEstimate)}` : 'Halt: see preview';
+    return `${station} · track ~${fmtMoney(TRACK_TYPES.standard.costPerUnit * 100)}/km · train ~${fmtMoney(train)}`;
   }
 
   private steps(): Step[] {
@@ -98,8 +98,8 @@ export class Checklist {
       { id: 'express', title: 'Try an express service', hint: '3+ stations → Services → Express → skip a stop → assign a train.', action: ['Open lines', () => this.ui.openLines()] },
     ];
     return [
-      { id: 'budget', title: 'Keep money for a train', hint: this.budget(), action: ['Budget noted', () => { this.done.add('budget'); this.sig = ''; this.timer = 0; }] },
-      { id: 'stations', title: 'Build two train stations', hint: 'One-platform halts near two towns; avoid streets and houses.', action: this.tool('station', 'Station tool') },
+      // (the budget rides along with the first step: no separate acknowledgement click)
+      { id: 'stations', title: 'Build two train stations', hint: `Close to houses in two towns, off streets.\n${this.budget()}`, action: this.tool('station', 'Station tool') },
       { id: 'track', title: 'Connect them with track', hint: 'Single track between platform ends; check the preview cost. Wire continues from wired track.', action: this.tool('rail', 'Track tool') },
       { id: 'depot', title: 'Add a train depot', hint: 'At a free track end.', action: this.tool('depot-rail', 'Depot tool') },
       { id: 'line', title: 'Create a rail line', hint: 'Lines → Rail line, then click both stations.', action: ['Open lines', () => this.ui.openLines()] },

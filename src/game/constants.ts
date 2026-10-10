@@ -12,6 +12,15 @@ export const MONTHS_PER_YEAR = 12;
  */
 export const PASSENGER_RATE_SCALE = 1 / 10;
 /**
+ * Trips per walking-catchment resident, relative to release 2.9. The walking limits were halved again after 2.9
+ * (stations.ts CATCHMENT_RADIUS: about a quarter of the area), which left a station with roughly a quarter of its
+ * riders and first lines unable to pay back. Residents within the shorter walk ride more often, so a station keeps
+ * about its 2.9 ridership while a town needs more stations to be covered. Only walkers ride more: car feeders
+ * (MAINLINE_FEEDERS), mail and the towns' regional trip potential keep their rates. demand.ts applies it wherever
+ * walking residents become trips (generation, weights, every forecast); Stations.trimWaiting to the useful queue.
+ */
+export const WALK_TRIP_INTENSITY = 3.2;
+/**
  * Fare compensation in game money (short / long legs). The old services were capacity constrained, so a 10x
  * fare would overpay: fewer passengers also shorten dwell and waits. A smooth distance blend preserves the
  * rail/bus income balance measured by scripts/economy.ts, while retaining the existing speed factor.
@@ -73,9 +82,11 @@ export const MAIL_UNIT_T = 0.1;
  * 2000) carry mail worth 15-21% of their passenger income, vans 0.44-0.58x as full as the coaches; the AI networks'
  * railways about 50% (their passengers are shared with bus stops and ride the trains only between towns). Below about
  * 0.18 a van no longer pays its way on a single line (the AI's margin: 1.5x its operating cost and price/8). Recalibrate
- * it with mailcal when passenger catchments or generation change (mail shares the walking catchments).
+ * it with mailcal when passenger catchments or generation change (mail shares the walking catchments). 0.2 -> 0.34 after
+ * the walks were halved again after 2.9 (walkers post at WALK_TRIP_INTENSITY; the single lines' mail fell to 6-16% of
+ * their passenger income, vans 0.23-0.59x as full as the coaches).
  */
-export const MAIL_PER_PAX = 0.2;
+export const MAIL_PER_PAX = 0.34;
 /**
  * Mail per person by year (piecewise linear; 1950 = 1): by weight about +30% from 1950 to 2000, then about flat
  * (letters halve, parcels grow two to three times).

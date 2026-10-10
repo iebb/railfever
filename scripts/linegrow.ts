@@ -68,7 +68,10 @@ function district(g: Game, t: Town, x0: number, x1: number, z: number, h: number
   for (const rx of xs) for (let i = 1; i < zs.length; i++) { if (!cross && zs[i - 1] < z && zs[i] > z) continue; road(g, rx, zs[i - 1], rx, zs[i]); }
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x0 + 2; rx < x1; rx += 4) {
-    if (strip && Math.abs(rz - z) < 7) continue;
+    // (User rule, 2.10: walking reach halved again, an in-city light-rail stop walking 74 m along streets. 2.9 kept both
+    // rows beside the line clear, lots from 109 m, which its stops no longer reach at all; lots now start beyond the row
+    // street north of the line, 51 m. Lots beside rail track or depots stay empty, as below.)
+    if (strip && Math.abs(rz + 1.1 - z) < 4) continue;
     const near = g.world.net.edgesNear(rx - 2.5, rz + 1.1 - 2.5, rx + 2.5, rz + 1.1 + 2.5).some((e) => e.kind === 'rail')
       || g.depots.near(rx, rz + 1.1, 3).length > 0;
     if (near) continue;
@@ -283,7 +286,10 @@ if (run('underground')) {
   console.log('  ' + ai.log.slice(-2).join(' | '));
   console.log(`  decisions: ${decisions()}`);
   check(stat(ai, 'netExtended') === 1 && added.length >= 1, `underground: the line runs on beyond ${east.name} (${before.length} -> ${after.length})`);
-  check(added.length >= 1 && added.every((sid) => g.stations.get(sid)?.rail?.level === 'underground'), 'underground: its new stations lie underground');
+  // (2.10: with the user's halved walking reach the survey also prices a viaduct over these blocks, 11.9M against the
+  // tunnel's 21.9M, and the viaduct pays better; either way the line runs on off the streets that cross its way.)
+  check(added.length >= 1 && added.every((sid) => ['underground', 'elevated'].includes(g.stations.get(sid)?.rail?.level ?? 'ground')),
+    `underground: its new stations lie off the street, in a tunnel or on a viaduct (${added.map((sid) => g.stations.get(sid)?.rail?.level).join(', ')})`);
   const seen = calls(g, line, 240);
   check(added.every((sid) => seen.has(sid)), 'underground: trains call there');
   check(checkReservations(g).length === 0, 'underground: reservations consistent');
@@ -387,7 +393,11 @@ if (run('busy')) {
   check(economicDeadline&&linePath(poor.line).join()===before,'busy: a losing economic premise gains no extension');
 
   // The approach can become occupied after a feasible fleet quote, before its saved purchase phase.
-  const selected=presholm('east','old',2,4500),sg=selected.g,sa=selected.ai;
+  // (2.10: presholm runs at least six trains, so the '2' this case asked for was six. At the halved walking reach a
+  // 4,500-resident district beyond the terminus pays better as two new stations: 28.0M against 24.2M for the same
+  // five trains on today's route. The line is not crowded: its trains run under 30% full and its forecast legs stay
+  // within seats with or without the extension. A 1,200-resident district keeps the fleet first, 24.3M against 16.9M.)
+  const selected=presholm('east','old',6,1200),sg=selected.g,sa=selected.ai;
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],null);
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],selected.line.id);
   sg.aiEnabled=true;scheduleNetworkTask(sa,'extend',0);
@@ -399,10 +409,15 @@ if (run('busy')) {
   }
   check(chosen,'busy: an ordinary survey reaches a saved feasible fleet-first purchase');
   if(chosen) {
-    sg.aiEnabled=false;runDays(sg,1);
-    const last=selected.sts[selected.sts.length-1],te=terminusOf(sg,last,outerEnd(last,selected.sts[selected.sts.length-2]),sa.companyId);
-    check(te?.kind==='lead'&&[...te.lead,...te.depots.map(id=>sg.depots.get(id)!.edge)].some(id=>sg.vehicles.isEdgeBusy(id)),
-      'busy: a running departure occupies the same approach by the purchase phase');
+    // (the saved job waits while the trains run their timetable, until one leaving or entering the depot occupies its
+    // approach: the purchase phase then meets it, whatever day the survey finished on)
+    sg.aiEnabled=false;
+    const last=selected.sts[selected.sts.length-1],approach=()=>{
+      const te=terminusOf(sg,last,outerEnd(last,selected.sts[selected.sts.length-2]),sa.companyId);
+      return te?.kind==='lead'&&[...te.lead,...te.depots.map(id=>sg.depots.get(id)!.edge)].some(id=>sg.vehicles.isEdgeBusy(id));
+    };
+    for(let k=0;k<60*TICKS_PER_DAY&&!approach();k++)sg.stepTick();
+    check(approach(),'busy: a running departure occupies the same approach by the purchase phase');
     const frozen=JSON.stringify(serialize(sg)),copy=deserialize(JSON.parse(frozen));
     const assets=()=>JSON.stringify({money:sa.eco.money,loan:sa.eco.loan,construction:sa.eco.thisYear.construction,
       vehicles:sa.eco.thisYear.vehicles,rails:[...sg.world.net.edges.keys()],stations:[...sg.stations.map.keys()],
@@ -642,7 +657,9 @@ if (run('relocate')) {
   check(!old || !old.lead.some((id) => g.world.net.edges.has(id)), 'relocate: the old lead is taken up');
   const last = g.stations.get(after[after.length - 1])!, nte = terminusOf(g, last, outerEnd(last, g.stations.get(after[after.length - 2])!), me);
   const way = nte ? wayOnFree(g, last, nte.end, 40, nte.tail) : 'no terminus';
-  check(nte?.kind === 'tail' && !way, `relocate: the depot's new yard leaves the new terminus extendable (${nte?.kind}; ${way ?? 'way on free'})`);
+  // (user rule, 2.11: no depot on the way on beyond a terminus: the depot stands on a siding beside the line and the
+  // new terminus is a free end; 2.10 moved it out to a yard beside the new terminus's way on)
+  check(nte?.kind === 'free' && !way && !nte.depots.includes(home), `relocate: the depot moved beside the line, the new terminus a free end (${nte?.kind}; ${way ?? 'way on free'})`);
   spare.setLine(line.id);
   // Start beside its relocated depot, then verify the service through subsequent stops.
   spare.stopIndex = line.stops.indexOf(last.id); spare.onLineChanged();
@@ -653,7 +670,7 @@ if (run('relocate')) {
 }
 
 if (run('tailend')) {
-  console.log('tailend: the line runs on from the terminus with its yard; the yard moves out to the new terminus');
+  console.log('tailend: the line runs on from the terminus with its yard; the depot moves beside the line');
   const { g, ai, me, line, sts, depot } = presholm('east', 'tail', 3, 4500);
   const east = sts[sts.length - 1], before = linePath(line);
   const te0 = terminusOf(g, east, outerEnd(east, sts[sts.length - 2]), me);
@@ -664,9 +681,13 @@ if (run('tailend')) {
   check(stat(ai, 'netExtended') === 1 && added.length >= 1 && after.indexOf(east.id) < after.length - 1, `tailend: the line runs on beyond ${east.name} (${before.length} -> ${after.length})`);
   const home = (g.vehicles.get(line.vehicles[0]) as Train).depotId;
   check(stat(ai, 'netDepotsMoved') === 1 && !g.depots.get(depot) && !!g.depots.get(home) && !te0?.lead.some((id) => g.world.net.edges.has(id)),
-    'tailend: the depot moved out to the new terminus, its old ramp taken up');
+    'tailend: the depot moved beside the line, its old ramp taken up');
+  // (user rule, 2.11: no depot on the way on beyond a terminus: the new terminus is a free end, the depot on a siding
+  // beside the line; 2.10 moved the yard out beside the new terminus's way on)
   const last = g.stations.get(after[after.length - 1])!, nte = terminusOf(g, last, outerEnd(last, g.stations.get(after[after.length - 2])!), me);
-  check(nte?.kind === 'tail' && nte.depots.includes(home), `tailend: the new terminus has the yard beside its way on (${nte?.kind})`);
+  const first = g.stations.get(after[0])!, fte = terminusOf(g, first, outerEnd(first, g.stations.get(after[1])!), me);
+  check(nte?.kind === 'free' && !wayOnFree(g, last, nte.end, 40), `tailend: the new terminus is a free end, its way on clear (${nte?.kind})`);
+  check(!nte?.depots.includes(home) && !fte?.depots.includes(home), 'tailend: the moved depot stands beside the line, beyond neither terminus');
   const seen = calls(g, line, 300), stuck = line.vehicles.map((id) => g.vehicles.get(id) as Train).filter((t) => t.state === 'noroute');
   check(after.every((sid) => seen.has(sid)), `tailend: trains call at every station (${seen.size}/${after.length})`);
   check(!stuck.length && line.vehicles.every((id) => (g.vehicles.get(id) as Train).depotId === home), `tailend: every train (the new ones too) finds its way from the depot (${stuck.map((t) => t.status).join('; ') || 'none stuck'})`);

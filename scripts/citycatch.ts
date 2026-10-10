@@ -11,8 +11,9 @@ import { Game } from '../src/game/game';
 import type { AIController } from '../src/game/ai';
 import type { Town } from '../src/game/towns';
 import type { Station, StationOpts } from '../src/game/stations';
-import { CATCHMENT_RADIUS, CITY_WALK_SCALE, CITY_STATION, CITY_TRANSFER_RANGE, railWalkScale, planWalkScale, railPartMode, TRANSFER_RANGE, stationComplex } from '../src/game/stations';
-import { walkingCatchment, walkingPopulation, walkWeight, coverOf, walkLimit, entranceCatchment, planWalkingCatchment, stopWalkingCatchment, pointWalkingCatchment, stopSiteWalkingCatchment, FULL_COVER_WALK } from '../src/game/catchment';
+import { CATCHMENT_RADIUS, CITY_WALK_SCALE, CITY_STATION, CITY_TRANSFER_RANGE, railWalkScale, planWalkScale, railPartMode, TRANSFER_RANGE, stationComplex, transferWalkLimit } from '../src/game/stations';
+import { walkingCatchment, walkingPopulation, walkWeight, coverOf, walkLimit, entranceCatchment, planWalkingCatchment, stopWalkingCatchment, pointWalkingCatchment, stopSiteWalkingCatchment, FULL_COVER_WALK, WALK_DETOUR } from '../src/game/catchment';
+import { WALK_TRIP_INTENSITY } from '../src/game/constants';
 import { styleOf } from '../src/game/station-styles';
 import { runNetworkTask, networkProfile } from '../src/game/ai-network';
 import { serialize, deserialize } from '../src/game/save';
@@ -68,7 +69,8 @@ function town(g: Game, name: string, x: number, z: number, pop: number, width = 
   for (const rx of xs) for (let i = 1; i < zs.length; i++) if (!(free && zs[i - 1] < z && zs[i] > z)) road(g, rx, zs[i - 1], rx, zs[i]);
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) {
-    if (free && Math.abs(rz - z) < free) continue;
+    // (by the lot's own position, 1.1 north of its street: the same lots as by street for the usual half-width 7)
+    if (free && Math.abs(rz + 1.1 - z) < free) continue;
     lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
   }
   let remaining = pop;
@@ -167,8 +169,9 @@ section(1, 'in-city metro and light-rail stations walk half as far', () => {
     check(g.stations.catchmentShapes(st, true).every((c) => c.mode === 'rail' && near(c.r, R)), `${tt}: every access shape (its ${st.rail!.entrances.length} entrances too) at the half reach`);
     const wb = [...walkingCatchment(g, st).buildings.values()], walks = wb.map((b) => b.distance);
     check(walks.length > 0 && walks.every((d) => d <= limit + 1e-6) && wb.every((b) => near(b.limit, limit)), `${tt}: every walk within the half limit (${fmt(Math.max(...walks), 2)} <= ${fmt(limit, 2)} units)`);
-    // one curve of the physical walk for every station: the half reach (147 m along streets) ends where the full
-    // coverage of the taper (FULL_COVER_WALK, 147 m) ends, so an in-city stop covers all it reaches, nothing beyond
+    // one curve of the physical walk for every station: the half reach ends within the full coverage of the taper
+    // (FULL_COVER_WALK, 147 m), so an in-city stop covers all it reaches. (2.9: the half reach was 147 m, ending exactly
+    // there; the user's 2.10 halving puts it at 73.5 m, still wholly fully covered.)
     const S2 = g.stations, own = wb.length;
     let checked = 0, ok = true;
     for (const [id, b] of walkingCatchment(g, st).buildings) {
@@ -177,7 +180,7 @@ section(1, 'in-city metro and light-rail stations walk half as far', () => {
       checked++;
       if (!near(sh.w[0], coverOf(walkWeight(b.distance)), 1e-9) || !near(sh.w[0], 1, 1e-9)) ok = false;
     }
-    check(near(limit, FULL_COVER_WALK) && checked > 0 && ok, `${tt}: covered by the walk as at every station, wholly within its reach (${checked}/${own} buildings it alone reaches, full coverage to ${fmt(FULL_COVER_WALK, 2)} units)`);
+    check(limit <= FULL_COVER_WALK + 1e-9 && checked > 0 && ok, `${tt}: covered by the walk as at every station, wholly within its reach (${checked}/${own} buildings it alone reaches, full coverage to ${fmt(FULL_COVER_WALK, 2)} units, reach ${fmt(limit, 2)})`);
   }
   console.log(`  walking residents: metro ${M.pop}, light rail ${L.pop}, main-line-style at the same place ${S.pop}; streets ${fmt(M.streets, 0)} / ${fmt(S.streets, 0)} units`);
   check(M.pop > 0 && M.pop < S.pop * 0.5 && M.streets < S.streets * 0.45, `a quarter of the area: the in-city metro reaches ${fmt(M.pop / S.pop * 100, 0)}% of the residents and ${fmt(M.streets / S.streets * 100, 0)}% of the streets of a main-line-style station at the same place`);
@@ -358,9 +361,14 @@ section(4, 'saved: a loaded game replays exactly', () => {
  * its station 260 m from the nearest (A's line passes 65 m from it).
  */
 function crossing(gap: 'near' | 'walk' | 'far', pop = 14000, demand = 1) {
-  const g = flat(2), t = town(g, 'Cross City', 256, 256, pop, 224, 160, 7);
+  // User rules (2.10): walking reach halved again (in-city light rail now reaches 74 m along streets) and an interchange
+  // walk is at most half the smaller part's street reach (37 m between in-city parts; 2.9 linked them up to 240 m).
+  // The light-rail line's district starts at the row street beside it (strip 4, not 7), so its stops reach residents;
+  // 'walk' is just inside the in-city interchange walk (36 m, 2.9: 150 m); 'far' puts the subway's central station
+  // 9 units north of the axis (2.9: 14), where a stop of the light-rail line can be linked to it.
+  const g = flat(2), t = town(g, 'Cross City', 256, 256, pop, 224, 160, 4);
   const [A, B] = g.ais.map((ai) => ai.companyId);
-  const ax = gap === 'far' ? [-90, -30, 30, 90] : [-80, -40, 0, 40, 80], bx = gap === 'near' ? 262 : gap === 'walk' ? 276 : 256, bz = gap === 'near' ? 8 : 14;
+  const ax = gap === 'far' ? [-90, -30, 30, 90] : [-80, -40, 0, 40, 80], bx = gap === 'near' ? 262 : gap === 'walk' ? 264 : 256, bz = gap === 'near' || gap === 'walk' ? 8 : 9;
   const a = ax.map((dx) => railStation(g, 256 + dx, 256, Math.PI / 2, 7, A, { trackType: 'lightrail', style: 'shelter' }));
   const b = [-64, -32, bz, bz + 32].map((dz) => railStation(g, bx, 256 + dz, 0, 12, B, { trackType: 'metro', level: 'underground', style: 'none' }));
   check(a.every(Boolean) && b.every(Boolean), `crossing (${gap}): both lines' stations built`);
@@ -395,12 +403,16 @@ section(5, 'two crossing city lines of two companies become one interchange', ()
     }
     g.lines.rebuild();
     check(!!g.lines.nextHop(a[0].id, b[0].id), `${gap}: passengers route between the two lines now`);
-    if (gap === 'walk') check(g.stations.linkRange(near0.x, b[2]) === CITY_TRANSFER_RANGE && g.stations.canLink(near0.x.id, b[2].id) === 'Already linked'
-      && g.stations.linkRange(a[0], a[0]) === CITY_TRANSFER_RANGE, 'walk: in-city stations link up to the longer in-city range');
+    if (gap === 'walk') check(near(g.stations.linkRange(near0.x, b[2]), transferWalkLimit(g, near0.x, b[2])) && near0.d > 0.9 * g.stations.linkRange(near0.x, b[2])
+      && g.stations.canLink(near0.x.id, b[2].id) === 'Already linked' && a[0].city === true
+      && near(g.stations.linkRange(a[0], a[0]), 0.5 * WALK_DETOUR * g.stations.catchmentRadius(a[0])),
+      `walk: in-city stations link up to the in-city interchange walk, half their street reach (${fmt(near0.d * 10, 0)} of ${fmt(g.stations.linkRange(near0.x, b[2]) * 10, 1)} m)`);
   }
   // an interchange stop is built only where its trips repay it: at the town's own demand this one does not
+  // (2.10: walkers make WALK_TRIP_INTENSITY times the trips, so today's own demand repays it; 2.9's walking trip rate,
+  // 1 / WALK_TRIP_INTENSITY of it, does not)
   {
-    const f = crossing('far', 24000), { g, a } = f, ai = g.aiOf(f.A)!;
+    const f = crossing('far', 24000, 1 / WALK_TRIP_INTENSITY), { g, a } = f, ai = g.aiOf(f.A)!;
     const money0 = g.company(f.A).economy.money, stations0 = g.stations.map.size;
     if (f.la >= 0 && f.lb >= 0) runNetworkTask(ai, 'citylink');
     console.log(`  far, the town's own demand: ${ai.log.slice(-1).join('')}`);
@@ -419,12 +431,16 @@ section(5, 'two crossing city lines of two companies become one interchange', ()
 section(6, 'a new city line stops beside an existing station of a crossing line', () => {
   // The same population is uneconomic when spread over a wider walking area; a denser district
   // supplies the profitable interchange case without increasing residents or bypassing quotes.
-  for (const height of [160, 96]) {
-  const g = flat(2), t = town(g, 'Wide City', 256, 256, 14000, 224, height, 7);
+  // (User rules, 2.10: halved walking reach, 3.2x walking trips, 37 m in-city interchange walks. The district starts at
+  // the row street beside the axis (strip 4, not 7) so the new line's stops reach residents; walkers' extra trips make
+  // a 160-high town pay, so the diffuse case spreads the same 14,000 residents over 224; B's central station moves from
+  // 16 to 10 units north of the axis, within an interchange walk of a stop on it.)
+  for (const height of [224, 96]) {
+  const g = flat(2), t = town(g, 'Wide City', 256, 256, 14000, 224, height, 4);
   const [A, B] = g.ais.map((ai) => ai.companyId);
   // B's subway runs north-south across the town's long (east-west) axis, its central station 6 units east of the centre
-  // (its central station's platforms end 10 units north of the axis: the street-level corridor along the axis stays free)
-  const b = [-64, -32, 16, 48].map((dz) => railStation(g, 262, 256 + dz, 0, 12, B, { trackType: 'metro', level: 'underground', style: 'none' }));
+  // (its central station's platforms end 4 units north of the axis: the street-level corridor along the axis stays free)
+  const b = [-64, -32, 10, 42].map((dz) => railStation(g, 262, 256 + dz, 0, 12, B, { trackType: 'metro', level: 'underground', style: 'none' }));
   const lb = b.every(Boolean) ? cityLine(g, B, b as Station[], 'metro_c', 2, 'metro') : -1;
   check(lb >= 0, 'anchor: the crossing line runs');
   for (let d = 0; d < 30; d++) for (let i = 0; i < g.ticksPerDay; i++) g.stepTick();
@@ -441,7 +457,7 @@ section(6, 'a new city line stops beside an existing station of a crossing line'
   while (ai.busy && ticks++ < 160000) g.stepTick();
   const line = g.lines.all().find((l) => l.owner === A && l.kind === 'rail');
   console.log('  ' + ai.log.slice(-3).join(' | '));
-  if (height === 160) {
+  if (height === 224) {
     check(!line && ai.log.some(text => text.includes('not profitable')) && g.companyAssets(A).total === assets
       && capitalSpent() === capital, 'anchor: diffuse districts reject the unprofitable native quote without paying for a new line');
     continue;
@@ -487,10 +503,13 @@ section(7, 'the AI still builds city railways in large towns', () => {
 // ------------------------------------------------------------------ 8. station types merge: main line, metro, light rail
 section(8, 'stations of every type merge: main line, metro and light rail', () => {
   // (in a town's core: main line at street level along the corridor, a subway under it, light rail on a viaduct beside)
+  // User rule (2.10): an interchange walk is at most half the smaller part's street reach (37 m for an in-city light-rail
+  // part; 2.9 linked city parts up to 240 m). The viaduct moves from x 262 (185 m from the main line) to x 246, beside
+  // the main-line platforms' end and over the subway, so every pair is within that walk.
   const g = flat(), t = town(g, 'Junction City', 256, 256, 9000, 192, 128, 7);
   const main = railStation(g, 236, 256, Math.PI / 2, 8, 0, { trackType: 'standard', style: 'none' });
   const metro = railStation(g, 242, 262, 0, 12, 0, { trackType: 'metro', level: 'underground', style: 'none' });
-  const light = railStation(g, 262, 254, Math.PI / 2, 7, 0, { trackType: 'lightrail', level: 'elevated', style: 'none' });
+  const light = railStation(g, 246, 256, Math.PI / 2, 7, 0, { trackType: 'lightrail', level: 'elevated', style: 'none' });
   check(!!main && !!metro && !!light, 'types: a main-line, a metro and a light-rail station in the core');
   if (!main || !metro || !light) return;
   const reach = (st: Station) => g.stations.catchmentRadius(st) / (CATCHMENT_RADIUS.rail * (1 + styleOf(st.rail!.style).catchBonus));

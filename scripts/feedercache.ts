@@ -55,7 +55,10 @@ const poolJSON = (p: any[]) => JSON.stringify(p.map(s => ({ pop: s.pop, regions:
 const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'flat', water: 'low', startYear: 1990,
   aiConfigs: [{ startMoney: 60_000_000, focus: { rail: 2, road: .3, tram: 1.5 } }] });
 g.aiEnabled = false; g.aiAcquisitions = false; g.vehicles.ambientEnabled = false; g.economy.money = 100_000_000;
-const pair = placeAndConnect(g, 65, 140, 0, new Set(), 1, () => {});
+// User rule (2.10): walking reach halved again, so station sites near small towns hold far fewer residents and the
+// 65-140 search now settles on Weyden (850) - Sunham, below the 1500 feeder cutoff this test needs at A. Reaching to
+// 150 picks Wilmere (1627) - Weyton Vale, an eligible feeder town as under 2.9 (Wilmere - Shelminster).
+const pair = placeAndConnect(g, 65, 150, 0, new Set(), 1, () => {});
 check(pair, 'generated native railway construction succeeds');
 if (!pair) process.exit(1);
 const { A, B, TA } = pair, depot = depotBehind(g, A, B), line = g.lines.create('rail', 0);
@@ -130,18 +133,21 @@ check(legacy.feederPools(excluded, covered).every((p: any) => p.pop === 0 && p.r
   'an empty query ignores retained scratch rows');
 check(poolJSON(legacy.feederPools(sites, covered)) === poolJSON(previousPools.call(legacy, sites, covered)),
   'a smaller id bound and empty intervening query do not retain old claim markers');
+// Since 6485587 feederPools first reuses an identical claim from the same tick and lot version (feederPoolMemo), so
+// these scratch checks drive the claim pass itself (claimFeederPools), which owns the scratch; the nested read still
+// goes through feederPools with a different site order, which misses the memo and claims anew.
 const regionOf = d.regionOf;
 let nested = false, nestedPool = '';
 d.regionOf = function (b: any) {
   if (!nested) { nested = true; nestedPool = poolJSON(this.feederPools([...sites].reverse(), covered)); }
   return regionOf.call(this, b);
 };
-const reentrant = d.feederPools(sites, covered); d.regionOf = regionOf;
+const reentrant = d.claimFeederPools(sites, covered); d.regionOf = regionOf;
 check(nested && nestedPool === poolJSON(previousPools.call(d, [...sites].reverse(), covered))
   && poolJSON(reentrant) === poolJSON(previousPools.call(d, sites, covered)), 'nested native demand reads cannot overwrite outer scratch');
 let threw = false;
 d.regionOf = () => { throw new Error('deliberate scratch interruption'); };
-try { d.feederPools(sites, covered); } catch { threw = true; } finally { d.regionOf = regionOf; }
+try { d.claimFeederPools(sites, covered); } catch { threw = true; } finally { d.regionOf = regionOf; }
 check(threw, 'a deliberately interrupted read exercises scratch disposal'); parity('after interrupted read');
 const liveLots = lots.filter(id => g.world.buildings.get(id)?.townId === site.townId).length;
 const largeSites = Array.from({ length: Math.ceil(17000 / liveLots) }, () => site);
@@ -152,10 +158,17 @@ parity('after large discarded scratch');
 // Live quantities must change the result even with the same cached geometry.
 const bid = lots.find(id => g.world.buildings.get(id)?.townId === TA.id)!;
 const building = g.world.buildings.get(bid)!;
+// Natively a lot's population, town or its town's size change only with a building edit, which bumps the lot version
+// (World.bgrid); the per-tick claim memo (feederPoolMemo, 6485587) keys on it. Edit lots the native way: the merged
+// walking geometry, keyed without lot versions, must stay cached while every claim is recomputed.
+const lotEdit = (b: typeof building) => {
+  const geometry = d.feederSiteWalk(site); g.world.touchBuilding(b);
+  check(d.feederSiteWalk(site) === geometry, 'a lot edit keeps the cached merged geometry');
+};
 const initialPool = poolJSON(d.feederPools(sites, covered)), population = building.pop;
-building.pop += 137;
+building.pop += 137; lotEdit(building);
 check(poolJSON(parity('live population')) !== initialPool, 'live population is not cached');
-building.pop = population;
+building.pop = population; lotEdit(building);
 const beforeQuality = poolJSON(d.feederPools(sites, covered)); site.quality = .25; rival.quality = .95;
 check(poolJSON(parity('live quality')) !== beforeQuality, 'quality and competing allocation are recomputed');
 const positiveQuality = site.quality; site.quality = 0; parity('first site excluded'); site.quality = positiveQuality;
@@ -163,10 +176,10 @@ const beforeCovered = poolJSON(d.feederPools(sites, covered)); covered.add(bid);
 check(poolJSON(parity('live covered lot')) !== beforeCovered, 'covered lots are excluded from warm geometry');
 covered.clear();
 const beforeTown = poolJSON(d.feederPools(sites, covered)), townId = building.townId;
-building.townId = -1;
-check(poolJSON(parity('live lot town')) !== beforeTown, 'lot town eligibility is recomputed'); building.townId = townId;
-const townPop = TA.pop; TA.pop = 1499;
-check(parity('live town eligibility')[0].pop === 0, 'native small-town cutoff remains live'); TA.pop = townPop;
+building.townId = -1; lotEdit(building);
+check(poolJSON(parity('live lot town')) !== beforeTown, 'lot town eligibility is recomputed'); building.townId = townId; lotEdit(building);
+const townPop = TA.pop; TA.pop = 1499; lotEdit(building);
+check(parity('live town eligibility')[0].pop === 0, 'native small-town cutoff remains live'); TA.pop = townPop; lotEdit(building);
 
 // Districts can be rebuilt without any access geometry version change.
 const version = d.feederGeometryKey(), oldRegion = d.regionOf(building), radius = TA.radius;

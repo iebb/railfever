@@ -1,3 +1,4 @@
+import type { AccessItem } from '../game/access-cost';
 // Info windows: stations, towns, track/road edges, vehicles, depots and the purchase dialog (train composer).
 import type { UI } from './ui';
 import { PLAYER, type Game } from '../game/game';
@@ -10,7 +11,7 @@ import type { Line } from '../game/lines';
 import { BUILDING_TYPES, townService, type TownService } from '../game/towns';
 import type { Vehicle } from '../game/vehicle';
 import { TRACK_TYPES, ROAD_TYPES, TRAM, KMH_TO_UPS } from '../game/constants';
-import { fmtLen, fmtPct, fmtMult, equalUseShare, fmtMail, fmtMailLoad, stationShowsMail } from './format';
+import { fmtLen, fmtPct, fmtAccessFactor, fmtMail, fmtMailLoad, stationShowsMail, fmtSets } from './format';
 import { mailByTown, mailLostShare } from '../game/mail';
 import { accessState, accessControl, policyText } from './win-access';
 import { cashPitch } from '../audio/engine';
@@ -22,7 +23,7 @@ import type { Station, StationLevel, UpgradePlan } from '../game/stations';
 import { DEFAULT_PLATFORM_LENGTH, WALK_LINE, planStationUpgrade, commitStationUpgrade, stationCapacity, stationComplex, railPartMode, lostShare, ENTRANCE_TYPES, GROUND_ENTRANCES, entranceCost, entranceKind, railModeOf, CITY_STATION } from '../game/stations';
 import type { EntranceKind } from '../game/stations';
 import { readWalkingCatchment, readEntranceCatchment } from '../game/catchment';
-import { connectStationThroat, canMerge, mergeStations } from '../game/trackops';
+import { connectStationThroat } from '../game/trackops';
 import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
 import { memo, expandPlan, commitExpand } from './win-ops';
@@ -50,8 +51,9 @@ export function openStation(ui: UI, id: number) {
   const g = ui.game;
   const st = g.stations.get(id);
   if (!st) return;
-  const co = g.company(st.owner);
-  const win = ui.wm.open('station-' + id, st.name, { width: 430, icon: st.rail ? 'station' : 'busstop', color: co.color, cls: 'station-info' });
+  const co = g.company(st.owner), complex = stationComplex(g, id), main = g.stations.get(complex.main)!;
+  for (const part of complex.parts) if (part !== complex.main) ui.wm.close('station-' + part);
+  const win = ui.wm.open('station-' + complex.main, main.name, { width: 430, icon: st.rail ? 'station' : 'busstop', color: co.color, cls: 'station-info' });
   /** pending rebuild (platform length / tracks / level) of the station window's Build tab */
   const up: StationBuild = { length: st.rail?.length ?? DEFAULT_PLATFORM_LENGTH, tracks: st.rail?.tracks ?? 2, through: st.rail?.through ?? 0, level: st.rail?.level ?? 'ground', side: 'auto' };
   const restyle: RestyleState = { current: styleOf(st.rail?.style).id, selected: styleOf(st.rail?.style).id };
@@ -69,10 +71,11 @@ export function openStation(ui: UI, id: number) {
     if (!s) { win.close(); return; }
     if (JSON.stringify(s.rail) !== railSig) syncBuild();
     const mine = s.owner === PLAYER;
-    ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine ? [['build', 'Build'] as [string, string]] : [])], render);
-    win.title.textContent = s.name;
+    const sharedWorks = !!s.rail && !g.trackUpgradeError(PLAYER, s.owner);
+    ui.wm.setTabs(win, [['overview', 'Overview'], ['waiting', 'Waiting'], ['lines', 'Lines'], ...(mine || sharedWorks ? [['build', 'Build'] as [string, string]] : [])], render);
+    win.title.textContent = g.stations.get(stationComplex(g, id).main)?.name ?? s.name;
     const town = g.towns.list[s.townId];
-    win.sub.textContent = [g.company(s.owner).name, town?.name].filter(Boolean).join(' · ');
+    win.sub.textContent = [complex.parts.length > 1 ? s.name : null, g.company(s.owner).name, town?.name].filter(Boolean).join(' · ');
     clear(win.body);
     const lines = g.lines.linesAt(s.id);
     const rerender = () => { win.last = undefined; render(); };
@@ -106,8 +109,8 @@ export function openStation(ui: UI, id: number) {
             s.rail.level === 'ground'
               ? h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => { ui.tools.roadType = 'street'; ui.tools.setTool('road'); const f = g.stations.forecourt(s); ui.centerOn(f?.x ?? s.x, f?.z ?? s.z, 30); ui.toast('Connect forecourt to road network', 'info'); } }, icon('road', 15), 'Build access road')
               : h('button', { class: 'btn sm', style: 'margin-top:6px', onclick: () => startEntrance(ui, s.id) }, icon('entrance', 15), 'Add entrance'))) : null,
-        !mine && s.owner >= 0 ? accessRows(ui, s.owner, g.stationMaintenance(s), () => { win.last = undefined; render(); }) : null,
-        ui.kv('New passengers', `${fmtInt(s.genLast)} last month`),
+        !mine && s.owner >= 0 ? accessRows(ui, s.owner, s, () => { win.last = undefined; render(); }) : null,
+        ui.kv('New passengers', `${fmtSets(s.genLast, s.icGenLast)} last month`),
         ui.kv('Boarded · arrived', `${fmtInt(s.pickupLast)} · ${fmtInt(s.arrivedLast)}`),
         ui.kv('Gave up waiting', h('span', {
           class: s.lostLast > 0 ? 'neg' : '',
@@ -117,20 +120,21 @@ export function openStation(ui: UI, id: number) {
         h('div', { class: 'btns' },
           h('button', { class: 'btn', onclick: () => ui.centerOn(s.x, s.z) }, icon('target', 16), 'Center'),
           h('button', { class: 'btn' + (ui.catchmentStation === id ? ' on' : ''), onclick: () => { ui.setCatchment(ui.catchmentStation === id ? -1 : id); win.last = undefined; render(); } }, icon('catchment', 16), 'Catchment'),
-          mine ? h('button', { class: 'btn ghost', onclick: () => { const n = prompt('Rename station', s.name); if (n) { s.name = n.slice(0, 40); render(); } } }, icon('edit', 16), 'Rename') : null),
+          mine ? h('button', { class: 'btn ghost', onclick: () => { const n = prompt('Rename station', s.name); if (n) { g.stations.renameComplex(s.id, n); render(); } } }, icon('edit', 16), 'Rename') : null),
         capacityPanel(ui, s, () => { syncBuild(); rerender(); }),
         complexParts(ui, s),
         sharedStopPanel(ui, s, lines),
-        mine ? transferSection(ui, s, () => { syncBuild(); rerender(); }) : null,
+        transferSection(ui, s, () => { syncBuild(); rerender(); }),
       );
     } else if (win.tab === 'waiting') {
       const byDest = new Map<number, number>();
-      for (const wg of s.waiting.values()) byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count);
+      let inter = 0;
+      for (const wg of s.waiting.values()) { byDest.set(wg.dest, (byDest.get(wg.dest) ?? 0) + wg.count); if (wg.ic) inter += wg.count; }
       const sorted = [...byDest.entries()].sort((a, b) => b[1] - a[1]).slice(0, 14);
       const towns = stationDemand(g, s.id).slice(0, 6);
       // mail: one destination station per town, so by town is the whole picture (the lines it waits for as dots)
       const mail = stationShowsMail(g, s) ? mailByTown(g, s.id) : [];
-      add(win.body, section('Waiting by destination town', `${fmtInt(s.waitingTotal)} total`));
+      add(win.body, section('Waiting by destination town', s.waitingTotal > 0 ? fmtSets(s.waitingTotal, inter) : `${fmtInt(s.waitingTotal)} total`));
       if (!sorted.length) add(win.body, h('div', { class: 'pad' }, mail.length ? 'No passengers are waiting here.' : 'Nobody is waiting here.'));
       else {
         add(win.body, h('div', { class: 'list' }, towns.map((e) => h('div', { class: 'row' },
@@ -194,7 +198,7 @@ export function openTown(ui: UI, id: number) {
   const g = ui.game;
   const town = g.towns.list[id];
   if (!town) return;
-  const win = ui.wm.open('town-' + id, town.name, { width: 350, icon: 'towns', color: '#eef2f7' });
+  const win = ui.wm.open('town-' + id, town.name, { width: 380, icon: 'towns', color: '#eef2f7' });
   const render = () => {
     clear(win.body);
     const counts = new Map<number, number>();
@@ -202,19 +206,21 @@ export function openTown(ui: UI, id: number) {
     const sv = townService(g, town);
     const lost = town.passLostLast ?? 0;
     win.sub.textContent = sv.stations ? `${sv.stations} active station${sv.stations > 1 ? 's' : ''}` : 'No public transport';
-    add(win.body, 
+    // (the subtitle counts the active stations; the growth tile explains itself on hover)
+    const growth = tile(sv.label[0].toUpperCase() + sv.label.slice(1), 'Growth', sv.score >= 0.2 ? 'pos' : '');
+    growth.setAttribute('data-tip', growthTip(sv));
+    add(win.body,
       h('div', { class: 'tiles' },
         tile(fmtInt(town.pop), 'Population'),
-        tile(fmtInt(town.buildings.size), 'Buildings'),
         tile(sv.stations ? fmtPct(sv.transported) : '—', 'Transported', '', bar(sv.stations ? sv.transported : 0)),
-        tile(sv.label[0].toUpperCase() + sv.label.slice(1), 'Growth', sv.score >= 0.2 ? 'pos' : '')),
-      ui.kv('Growth', h('span', { 'data-tip': growthTip(sv) }, growthText(sv))),
+        growth),
       ui.kv('Passengers last month', `${fmtInt(town.passGenLast)} departing · ${fmtInt(town.passTransLast)} arrived`),
+      town.passGenLast > 0 && town.icGenLast !== undefined ? ui.kv('Departing', fmtSets(town.passGenLast, town.icGenLast)) : null,
       ui.kv('Gave up waiting', h('span', { class: lost > 0 ? 'neg' : '' }, `${fmtInt(lost)} last month`)),
       // (Town.mail exists from the town's first mail on)
       town.mail ? ui.kv('Mail last month', `${fmtMail(town.mail.postedLast)} posted · ${fmtMail(town.mail.deliveredLast)} delivered`) : null,
       demandRows(ui, id),
-      section('Buildings'),
+      section('Buildings', fmtInt(town.buildings.size)),
       h('div', { class: 'list' }, [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([t, c]) => h('div', { class: 'row' }, h('span', null, BUILDING_TYPES[t]?.name ?? '?'), h('span', { class: 'num' }, String(c))))),
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => ui.centerOn(town.x, town.z) }, icon('target', 16), 'Center')),
     );
@@ -223,11 +229,6 @@ export function openTown(ui: UI, id: number) {
   render();
 }
 
-/** What drives a town's growth: "fast — 64% of passengers transported, 3 active stations". */
-function growthText(sv: TownService): string {
-  if (!sv.stations) return `${sv.label} · no active stations`;
-  return `${sv.label} · ${fmtPct(sv.transported)} transported · ${sv.stations} active station${sv.stations > 1 ? 's' : ''}`;
-}
 function growthTip(sv: TownService): string {
   if (!sv.stations) return 'Growth: stations called at within 3 months · frequency · passenger capacity';
   return `Active-station reach: ${fmtPct(sv.coverage)} · weighted by 30-day calls: ${fmtPct(sv.reach)} · mean rating ${fmtPct(sv.rating)} · ` +
@@ -244,7 +245,8 @@ function demandRows(ui: UI, id: number): HTMLElement | null {
   const pairs = d.pairs.filter((p) => p.a === id || p.b === id).slice(0, 4);
   const demandOn = ui.mapModes.mode === 'demand';
   return h('div', null,
-    ui.kv('Trip demand', h('span', null, `${fmtInt(t.potential)} / month · `, h('span', { style: `color:${hexCss(servedColor(share))}` }, `${fmtPct(share)} served`))),
+    ui.kv('Trip demand', h('span', { 'data-tip': `City ${fmtPct(t.localServed)} served · inter-city ${fmtPct(t.intercityServed)}` },
+      `${fmtSets(t.potential, t.intercity)} / mo · `, h('span', { style: `color:${hexCss(servedColor(share))}` }, `${fmtPct(share)} served`))),
     ui.kv('Coverage', `${fmtPct(t.served)} of residents near a served station`),
     section('Top destinations', h('button', { class: 'btn sm' + (demandOn ? ' on' : ''), onclick: () => ui.mapModes.toggle('demand') }, icon('demand', 15), 'Demand view')),
     pairs.length ? h('div', { class: 'list' }, pairs.map((p) => {
@@ -349,7 +351,7 @@ function restylePanel(ui: UI, s: Station, state: RestyleState, after: () => void
 function complexParts(ui: UI, s: Station): HTMLElement | null {
   const g = ui.game, c = stationComplex(g, s.id);
   if (c.parts.length < 2) return null;
-  return h('div', null, section('Complex parts', ui.stationLink(c.main)),
+  return h('div', null, section('Platform groups & stops', ui.stationLink(c.main)),
     h('div', { class: 'list' }, c.parts.map((id) => {
       const p = g.stations.get(id);
       if (!p) return null;
@@ -377,22 +379,18 @@ function sharedStopPanel(ui: UI, s: Station, lines: Line[]): HTMLElement | null 
     for (const owner of [l.owner, ...(l.operators ?? [])]) remember(owner, l);
     for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) remember(v.owner, l); }
   }
-  // TODO: expose Game.stationUsage(id); feature-detect its existing meter until a public per-stop API lands.
-  const meter = g as unknown as { stationUsage?: (id: number) => number[] | undefined; usage?: Map<number, number[]> };
-  const use = meter.stationUsage?.(s.id) ?? meter.usage?.get(s.id * 4 + 2);
-  if (use) for (let owner = 0; owner < use.length; owner++) if (use[owner] > 0) remember(owner);
+  const use = g.accessUsage(s);
+  for (let owner = 0; owner < use.length; owner++) if (use[owner] > 0) remember(owner);
   if (by.size < 2) return null;
-  const known = !!meter.stationUsage || meter.usage instanceof Map;
-  const mult = g.accessMultiplier(s.owner), monthly = g.stationMaintenance(s) / 12;
-  let guests = 0;
-  if (use) for (let owner = 0; owner < use.length; owner++) if (owner !== s.owner) guests += use[owner] || 0;
-  const W = (use?.[s.owner] ?? 0) + mult * guests;
-  const share = (owner: number) => W > 0 ? (owner === s.owner ? (use?.[owner] ?? 0) : mult * (use?.[owner] ?? 0)) / W : owner === s.owner ? 1 : 0;
+  const monthly = g.accessFullCost(s) / 12, total = use.reduce((n, x) => n + x, 0);
+  const share = (owner: number) => total > 0 ? (use[owner] ?? 0) / total : 0;
+  const fee = (owner: number) => g.accessChargeEstimate(owner, s.owner, [s], share(owner)) / 12;
+  const cost = (owner: number) => owner === s.owner ? monthly - [...by.keys()].reduce((n, user) => n + fee(user), 0) : fee(owner);
   return h('div', { class: 'stopshare' },
-    section('Shared stop upkeep', `${fmtMoney(monthly)} / month`),
-    h('div', { class: 'muted station-advice' }, known ? `Month so far · usage weight ${fmtMult(mult)} · final shares at month end` : 'No per-stop usage figures yet'),
+    section('Shared stop costs', `${fmtMoney(monthly)} / month`),
+    h('div', { class: 'muted station-advice' }, `Month so far · ${fmtAccessFactor(g.accessMultiplier(s.owner))} · 75% cap`),
     [...by].map(([owner, ls]) => h('div', { class: 'stopshare-company' },
-      h('div', { class: 'kv' }, ui.ownerTag(owner), h('span', { class: 'v', 'data-tip': 'Estimated upkeep share from this month’s calls' }, known ? `${fmtPct(share(owner))} · ${fmtMoneyFull(monthly * share(owner))}/mo` : '—')),
+      h('div', { class: 'kv' }, ui.ownerTag(owner), h('span', { class: 'v', 'data-tip': 'Real call share · estimated charge; owner shows cost after access income' }, `${fmtPct(share(owner))} · ${fmtMoneyFull(cost(owner))}/mo`)),
       h('div', { class: 'share-lines' }, ls.size ? [...ls].map((l) => lineTag(g, l, () => ui.openLine(l.id))) : h('span', { class: 'muted' }, owner === s.owner ? 'Stop owner' : 'No current line')))));
 }
 
@@ -401,30 +399,39 @@ function transferSection(ui: UI, s: Station, after: () => void): HTMLElement | n
   const g = ui.game;
   const opts = g.stations.transferOptions(s.id);
   if (!opts.length) return null;
+  const mergeCheck = (otherId: number) => {
+    const error = s.links.includes(otherId) ? null : g.stations.canLink(s.id, otherId);
+    return { ok: !error, kind: error ? null : 'complex' as const, reason: error ?? 'One station name; separate buildings, platform groups and owners' };
+  };
   const kindIcon = (o: Station | undefined) => (!o ? 'station' : o.rail ? 'station' : o.stops.some((p) => g.world.net.edges.get(p.edge)?.tram) ? 'tramstop' : 'busstop');
   const done = (err: string | null | void, ok: string) => { if (typeof err === 'string' && err) ui.toast(err, 'bad'); else { ui.toast(ok, 'good'); ui.sound('station', { x: s.x, z: s.z, pitch: 1.1 }); } after(); };
+  // stations neither linkable nor mergeable get one line instead of a card each with disabled buttons
+  const shown = opts.slice(0, 6), checks = new Map(shown.map((o) => [o.id, mergeCheck(o.id)]));
+  const usable = shown.filter((o) => o.linked || !o.link || checks.get(o.id)!.ok);
+  const far = shown.filter((o) => !usable.includes(o));
+  const farLine = far.length ? h('div', { class: 'muted station-advice', 'data-tip': far.map((o) => `${o.name}: ${checks.get(o.id)!.reason}`).join(' · ') },
+    `Too far to merge: ${far.slice(0, 2).map((o) => `${o.name} ${fmtLen(o.gap)}`).join(', ')}${far.length > 2 ? ` +${far.length - 2}` : ''}`) : null;
+  if (!usable.length) return h('div', null, farLine);
   return h('div', null,
-    section('Merge with nearby station'),
-    h('div', { class: 'list' }, opts.slice(0, 6).map((o) => {
+    section('Merge into one station'),
+    h('div', { class: 'list' }, usable.map((o) => {
       const other = g.stations.get(o.id);
-      const c = canMerge(g, s.id, o.id);
+      const c = mergeCheck(o.id);
       const linked = o.linked && c.kind === 'complex';
       return h('div', { class: 'merge-choice' },
         h('div', { class: 'inline wrap' }, icon(kindIcon(other), 15), ui.stationLink(o.id), h('span', { class: 'muted' }, fmtLen(o.gap)),
-          c.kind ? h('span', { class: 'flag' }, c.kind === 'rebuild' ? 'Rebuild' : 'Complex') : null),
+          c.kind ? h('span', { class: 'flag' }, 'Station complex') : null),
         h('div', { class: c.ok ? 'muted' : 'neg' }, c.reason),
         h('div', { class: 'btns' },
           o.linked
             ? h('button', { class: 'btn sm', 'data-tip': 'Ends walking transfers', onclick: () => { g.stations.unlink(s.id, o.id); done(null, `${o.name} unlinked`); } }, 'Unlink')
             : h('button', { class: 'btn sm', disabled: !!o.link, 'data-tip': o.link ?? 'Walking transfers between stations', onclick: () => done(g.stations.link(s.id, o.id), `${o.name} linked for transfers`) }, 'Link'),
           h('button', { class: 'btn sm primary', disabled: !c.ok || linked, 'data-tip': c.reason, onclick: () => {
-            const check = canMerge(g, s.id, o.id);
+            const check = mergeCheck(o.id);
             if (!check.ok) { done(check.reason, ''); return; }
-            if (check.kind === 'rebuild' && !confirm(`Merge ${o.name} into ${s.name}? Platforms, stops, queues and line stops move to ${s.name}.`)) return;
-            const result = mergeStations(g, s.id, o.id);
-            done(result.error, result.kind === 'complex' ? `${o.name} joined to the transfer complex` : `${o.name} merged into ${s.name}`);
-          } }, linked ? 'In complex' : c.kind === 'complex' ? 'Form complex' : 'Merge')));
-    })));
+            done(s.links.includes(o.id) ? null : g.stations.link(s.id, o.id), `${o.name} joined to ${s.name}`);
+          } }, linked ? 'In station' : c.kind === 'complex' ? 'Merge into station' : 'Merge')));
+    })), farLine);
 }
 
 /** Add-entrance mode of the entrance tool for a station (ground stations: of `kind`). */
@@ -444,6 +451,8 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
   const g = ui.game;
   const r = s.rail;
   if (!r) { add(body, h('div', { class: 'pad' }, 'Bus / tram stops: remove and rebuild to move.')); return; }
+  add(body, stationConnectionTools(ui, s));
+  if (s.owner !== PLAYER) return;
   const changed = up.length !== r.length || up.tracks !== r.tracks || up.through !== (r.through ?? 0) || up.level !== r.level;
   const pl = changed ? plan() : null;
   add(body,
@@ -530,6 +539,34 @@ function buildTab(ui: UI, s: Station, up: StationBuild, plan: () => UpgradePlan,
       : h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => startEntrance(ui, s.id) }, icon('plus', 16), 'Add entrance'), h('span', { class: 'muted' }, `${fmtMoney(entranceCost(r.level === 'elevated' ? 'tower' : 'pavilion', r))} each · own catchment`)));
 }
 
+/** Paid works retain the existing station's owner; nearby platforms are a new player-owned part. */
+function stationConnectionTools(ui: UI, s: Station): HTMLElement | null {
+  const g = ui.game, r = s.rail;
+  if (!r) return null;
+  const access = g.trackUpgradeError(PLAYER, s.owner);
+  const nearby = () => {
+    const T = ui.tools;
+    T.setTool(railPartMode(r) === 'mainline' ? 'station' : 'metro-station');
+    T.stationLen = r.length; T.stationTracks = Math.min(2, r.tracks); T.stationLevel = r.level;
+    T.stationType = railPartMode(r); T.stationStyle = styleOf(r.style).id;
+    T.stationHeight = r.height || T.stationHeight; T.stationDepth = r.depth || T.stationDepth;
+    T.stationThrough = 0; T.stationOnLine = true; T.stationAngle = r.angle; T.autoAlign = true;
+    T.refreshHover(); ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40);
+    ui.toast('Choose track beside the station for your platforms', 'info');
+  };
+  const level = (to: 'elevated' | 'underground') => {
+    ui.tools.setTool('relevel'); ui.tools.relevelTo = to; ui.tools.refreshHover();
+    ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40);
+  };
+  return h('div', null, section('Track connections'),
+    s.owner !== PLAYER ? h('div', { class: 'muted' }, 'You pay construction; station ownership stays.') : null,
+    h('div', { class: 'btns' },
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Lift station and approaches with ramps', onclick: () => level('elevated') }, icon('bridge', 15), 'Lift'),
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Bury station and approaches with ramps', onclick: () => level('underground') }, icon('tunnel', 15), 'Bury'),
+      h('button', { class: 'btn sm', disabled: !!access, 'data-tip': access ?? 'Player-owned platforms on nearby permitted track', onclick: nearby }, icon('station', 15), 'Nearby platforms'),
+      h('button', { class: 'btn sm', disabled: !!access, onclick: () => { ui.tools.setTool('connect'); ui.hud.onToolChange(); ui.centerOn(s.x, s.z, 40); } }, icon('connect', 15), 'Connect tracks')));
+}
+
 /**
  * Per entrance of a station: the residents only it brings within walking reach (the station's catchment less the
  * catchment without it) and those within its own reach.
@@ -550,16 +587,18 @@ function entranceCoverage(ui: UI, s: Station): { only: number; reach: number }[]
   }, 3000);
 }
 
-/** Owner, access status (with "Request access") and how the upkeep would be shared, for another company's item. */
-function accessRows(ui: UI, owner: number, upkeepYear: number, after: () => void): HTMLElement {
+/** Owner, access status and capped annual charge for a foreign item. */
+function accessRows(ui: UI, owner: number, item: AccessItem, after: () => void): HTMLElement {
   const g = ui.game;
   const st = accessState(g, owner);
-  const m = g.accessMultiplier(owner);
+  const m = g.accessMultiplier(owner), use = g.accessUsage(item), total = use.reduce((n, x) => n + x, 0);
+  const share = total > 0 ? (use[PLAYER] ?? 0) / total : 0.5;
+  const yearly = g.accessChargeEstimate(PLAYER, owner, [item], share);
   return h('div', null,
     ui.kv('Owner', h('span', { class: 'inline' }, ui.ownerTag(owner), h('button', { class: 'ibtn sm', 'data-tip': 'Track access', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 15)))),
     ui.kv('Track access', h('span', { class: 'inline' }, h('span', { class: st.kind === 'agreement' ? 'pos' : st.kind === 'blocked' || st.kind === 'closed' ? 'neg' : 'muted' }, st.kind === 'agreement' ? (g.hasAccess(PLAYER, owner) ? 'Agreement' : 'Open network') : st.kind === 'pending' ? 'Request pending' : st.kind === 'blocked' ? 'Blocked' : st.kind === 'closed' ? 'Refused' : policyText(g, owner)),
       st.kind === 'agreement' ? null : accessControl(ui, owner, after))),
-    ui.kv('Upkeep', h('span', { 'data-tip': `Usage weights: owner 1, users ${fmtMult(m)} · 50/50 use: users pay ${fmtPct(equalUseShare(m))}` }, `${fmtMoney(upkeepYear)}/yr · users pay ${fmtMult(m)}`)),
+    ui.kv('Access cost', h('span', { 'data-tip': `${fmtAccessFactor(m)} · ${total > 0 ? 'current' : 'equal'} usage · own wear extra` }, `${fmtMoney(yearly)}/yr est. · 75% cap`)),
     st.kind === 'agreement' ? h('div', { class: 'muted', style: 'margin-top:4px' }, st.text) : null);
 }
 
@@ -594,8 +633,8 @@ export function openEdge(ui: UI, id: number) {
       sec ? ui.kv('Structures', sec) : null,
       ed.tram ? ui.kv('Tram tracks', ed.tramOwner !== undefined && ed.tramOwner >= 0 ? g.company(ed.tramOwner).name : 'yes') : null,
       ed.station >= 0 ? ui.kv('Station', ui.stationLink(ed.station)) : null,
-      rail && ed.owner >= 0 && ed.owner !== PLAYER ? accessRows(ui, ed.owner, g.edgeMaintenance(ed), () => { win.last = undefined; render(); }) : null,
-      !rail && ed.tram && (ed.tramOwner ?? -1) >= 0 && ed.tramOwner !== PLAYER ? accessRows(ui, ed.tramOwner!, ed.len * TRAM.maintPerUnit, () => { win.last = undefined; render(); }) : null,
+      rail && ed.owner >= 0 && ed.owner !== PLAYER ? accessRows(ui, ed.owner, ed, () => { win.last = undefined; render(); }) : null,
+      !rail && ed.tram && (ed.tramOwner ?? -1) >= 0 && ed.tramOwner !== PLAYER ? accessRows(ui, ed.tramOwner!, { tram: ed }, () => { win.last = undefined; render(); }) : null,
       h('div', { class: 'btns' }, h('button', { class: 'btn', onclick: () => { const p = { x: 0, y: 0, z: 0 }; g.world.net.pointAt(ed, ed.len / 2, p); ui.centerOn(p.x, p.z); } }, icon('target', 16), 'Center')),
     );
   };
@@ -661,23 +700,26 @@ export function openVehicle(ui: UI, id: number) {
         room > 0 ? tile(fmtMailLoad(v2.mailLoad, room), 'Mail', 'mail', bar(v2.mailLoad / room, 'var(--mail)')) : null,
         tile(fmtMoney(v2.profitYear), 'Profit this year', v2.profitYear < 0 ? 'neg' : 'pos'),
         tile(`${v2.age.toFixed(1)}`, 'Years old')),
-      h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Line'), h('span', { class: 'v' }, lineEl)),
-      vehicleService(ui, v2, after),
-      mine && v2 instanceof Train ? mailVanControl(ui, v2, after) : null,
-      compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
+      // what it is doing now, then what to do with it; the service settings and the bills below
       ui.kv('Status', v2.status),
       target ? h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Next stop'), h('span', { class: 'v' }, ui.stationLink(target.id))) : null,
       v2 instanceof Train && Math.abs(v2.grade) > 0.004 ? ui.kv('Gradient', fmtPct(v2.grade, 1)) : null,
-      ui.kv('Profit last year', h('span', { class: v2.profitLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(v2.profitLast))),
-      ui.kv('Base running cost', fmtMoney(v2.runningCost) + ' / yr'),
-      ui.kv('Value', fmtMoney(g.vehicles.resaleValue(v2))),
-      vehicleCosts(v2),
+      compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
       h('div', { class: 'btns' },
         h('button', { class: 'btn' + (ui.following === id ? ' on' : ''), onclick: () => { if (ui.following === id) ui.centerOn(...ui.posOf(v2)); else ui.follow(v2); win.last = undefined; render(); } }, icon('target', 16), ui.following === id ? 'Following' : 'Follow'),
         v2.line ? h('button', { class: 'btn', onclick: () => ui.openLine(v2.lineId!) }, icon('lines', 16), 'Line') : null,
         mine && upgradeOption(ui, v2) ? h('button', { class: 'btn', title: upgradeOption(ui, v2)!.label, onclick: () => upgradeVehicle(ui, v2) }, icon('up', 16), 'Upgrade') : null,
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
+      section('Service'),
+      mine ? field('Line', lineEl) : h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Line'), h('span', { class: 'v' }, lineEl)),
+      vehicleService(ui, v2, after),
+      mine && v2 instanceof Train ? mailVanControl(ui, v2, after) : null,
+      section('Money'),
+      ui.kv('Profit last year', h('span', { class: v2.profitLast < 0 ? 'neg' : 'pos' }, fmtMoneyFull(v2.profitLast))),
+      ui.kv('Base running cost', fmtMoney(v2.runningCost) + ' / yr'),
+      ui.kv('Value', fmtMoney(g.vehicles.resaleValue(v2))),
+      vehicleCosts(v2),
     );
     if (scroll) win.body.scrollTop = scroll;
     if (focusedVanButton) {
@@ -705,7 +747,7 @@ function vehicleService(ui: UI, v: Vehicle, after: () => void): HTMLElement | nu
     after();
   });
   return h('div', null,
-    field('Service pattern', h('span', { class: 'vehicle-service' }, patBadge(cur.kind, cur.name), sel), `${n} stations · Services tab: stop / pass / short-turn`),
+    field('Service pattern', h('span', { class: 'vehicle-service' }, patBadge(cur.kind, cur.name), sel), `${n} stations`),
     h('div', { class: 'btns' }, h('button', { class: 'btn sm ghost', onclick: () => {
       ui.openLine(l.id);
       const w = ui.wm.get('line-' + l.id);
@@ -1035,8 +1077,13 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
       opError || !dp ? h('div', { class: 'warn' }, icon('warning', 16), opError ?? `No ${depotTitle(kind).toLowerCase()} ${line ? 'connected to line for selected model' : 'available'}; build one or choose another depot.`) : null,
       !g.economy.canAfford(cost) ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' },
         h('b', null, `Not enough money: need ${fmtMoney(cost)}, have ${fmtMoney(g.economy.money)}`), ui.financeActions(render))) : null,
-      h('div', { class: 'btns right' }, h('button', { class: 'btn primary', disabled: !cars.length || !dp || !!opError || dp.owner !== PLAYER || !g.economy.canAfford(cost), 'data-sfx': 'none', onclick: () => buy() }, icon('plus', 16), `Buy for ${fmtMoney(cost)}`)),
     );
+    // (last in the window and pinned to its bottom while the model lists scroll)
+    // (what blocks the purchase replaces the summary: the warnings above may be scrolled away)
+    const blocked = !cars.length ? 'Choose a model' : opError ? opError : !dp ? `No ${depotTitle(kind).toLowerCase()}` : !g.economy.canAfford(cost) ? 'Not enough money' : '';
+    const buyBar = h('div', { class: 'btns right buybar' },
+      h('span', { class: 'buybar-sum' + (warn || blocked ? ' neg' : ''), 'data-tip': blocked || undefined }, blocked || [cap ? `${cap} seats` : mailCap ? fmtMail(mailCap) : '', spd ? `${spd} km/h` : '', rail && cars.length ? `${Math.round(len * 10)} m` : ''].filter(Boolean).join(' · ')),
+      h('button', { class: 'btn primary', disabled: !!blocked || dp?.owner !== PLAYER, 'data-sfx': 'none', onclick: () => buy() }, icon('plus', 16), `Buy for ${fmtMoney(cost)}`));
     if (depotId != null && g.depots.get(depotId)?.owner === PLAYER) {
       add(win.body, h('div', { class: 'btns' }, h('span', { class: 'spacer' }), h('button', { class: 'btn ghost', 'data-tip': 'Move depot and vehicles', onclick: () => {
         const T = ui.tools;
@@ -1054,6 +1101,7 @@ export function openPurchase(ui: UI, kind: LineKind, depotId: number | null, lin
           h('div', { class: 'list' }, here.map((v) => h('div', { class: 'row link', onclick: () => openVehicle(ui, v.id) }, h('span', null, v.name), h('span', { class: 'muted' }, v.status)))));
       }
     }
+    add(win.body, buyBar);
     if (scroll) win.body.scrollTop = scroll;
     if (focusIndex >= 0) win.body.querySelectorAll<HTMLElement>('.model, .stp, .segb')[focusIndex]?.focus({ preventScroll: true });
     const buy = () => {

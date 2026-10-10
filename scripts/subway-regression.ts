@@ -216,8 +216,9 @@ if (run('jobs')) {
     check(saved(copy.game) === reference, `#1 save at tick ${copy.tick} replays to ${target} exactly`);
   }
 }
-// Subway + linegrow: the real saved urban job opens a tail/cavern terminus, then the saved daily
-// growth task carries its line through a dense new district and moves the cavern to the new end.
+// Subway + linegrow: the real saved urban job opens a line with its cavern on a siding beside it (2.11; 2.10 opened a
+// tail/cavern terminus), then the saved daily growth task carries its line on from a free terminus through a dense new
+// district.
 if (run('growth')) {
   const g = flatGame(1), T = denseQuarter(g, 'Growing Subway', 256, 256, 8000, 120, Math.PI / 4), ai = g.ais[0];
   const checkpoints = (label: string) => {
@@ -254,11 +255,14 @@ if (run('growth')) {
   while (ai.busy && ticks++ < 60000) {
     g.stepTick();
     const task = (ai as unknown as { urbanTask: { stage: string; fork?: number; at: number } | null }).urbanTask;
-    if (task && ['yardUnder', 'evaluate', 'approve', 'buildTail', 'buildYard', 'throat', 'finish', 'fleet'].includes(task.stage))
+    if (task && ['yardUnder', 'yardSide', 'evaluate', 'approve', 'buildTail', 'buildYard', 'throat', 'finish', 'sideDepot', 'fleet'].includes(task.stage))
       urban.capture(task.stage === 'fleet' ? `fleet:${task.at}` : task.stage);
   }
-  check(ai.stats.urban === 1 && urban.copies.some((c) => c.key === 'buildTail') && urban.copies.some((c) => c.key === 'buildYard'),
-    'growth: saved opening crosses both tail and cavern build boundaries');
+  // (2.11, the user's depot rule: no depot on the way on beyond a terminus. The opening plans its cavern siding beside
+  // the line ('yardSide') and builds it after directional running ('sideDepot'); 2.10 built a tail and a cavern beyond a
+  // terminus in 'buildTail' and 'buildYard'. The saves still cross the depot's planning and its build.)
+  check(ai.stats.urban === 1 && urban.copies.some((c) => c.key === 'yardSide') && urban.copies.some((c) => c.key === 'sideDepot'),
+    'growth: saved opening crosses both the cavern planning and the cavern build boundaries');
   console.log(`  opening: ${urban.copies.map((c) => c.key).join(', ')}; ${ai.log.slice(-2).join(' | ')}`);
   urban.replay();
   g.aiEnabled = false;
@@ -269,19 +273,35 @@ if (run('growth')) {
     const st = g.stations.get(path[i])!, neighbour = g.stations.get(path[j])!;
     return { st, index: i, te: terminusOf(g, st, outerEnd(st, neighbour), ai.companyId)! };
   }) : [];
-  const yard = ends.find((e) => e.te.kind === 'tail');
+  const oldDepot = line?.vehicles.length ? (g.vehicles.get(line.vehicles[0]) as Train).depotId : -1, cavern = g.depots.get(oldDepot);
+  // (the line grows from the terminus farther from its cavern)
+  const yard = cavern ? [...ends].sort((a, b) => Math.hypot(b.st.x - cavern.x, b.st.z - cavern.z) - Math.hypot(a.st.x - cavern.x, a.st.z - cavern.z))[0] : undefined;
   check(!!line && path.every((id) => g.stations.get(id)?.rail?.level === 'underground'), 'growth: AI opens an underground city line');
-  check(!!yard && Math.abs(yard.te.tail - 4) < 0.01 && yard.te.depots.length === 1,
-    'growth: its outer track has a level four-unit tail with a depot branch turned aside');
-  if (line && yard) {
-    const oldDepot = yard.te.depots[0], net = g.world.net;
-    check(g.depots.get(oldDepot)?.level === 'underground', 'growth: the branch ends in a cavern');
+  // (2.11: both termini are free ends and the cavern stands on a siding beside the line; 2.10: a level four-unit tail
+  // at one terminus with the cavern branch turned aside)
+  check(!!yard && ends.length === 2 && ends.every((e) => e.te.kind === 'free' && !e.te.depots.length),
+    'growth: both termini are free ends, no depot beyond either');
+  if (line && yard && cavern) {
+    const net = g.world.net;
+    check(cavern.level === 'underground', 'growth: the siding ends in a cavern');
     check(ends.every((e) => e.te.kind === 'tail' || e.te.kind === 'free'), 'growth: both initial termini remain extendable');
     const allTunnel = (ids: number[]) => ids.every((id) => {
       const e = net.edges.get(id);
       return !!e && e.sections.length === 1 && e.sections[0].type === 'tunnel' && e.sections[0].s0 < 0.01 && e.sections[0].s1 >= e.len - 0.01;
     });
-    check(allTunnel(yard.te.lead), 'growth: the original tail and cavern branch have no portals');
+    // the cavern's siding: from the depot track to its junction with the line
+    const siding: number[] = [];
+    for (let id = cavern.edge, node = -1, k = 0; k < 16; k++) {
+      const e = net.edges.get(id);
+      if (!e || e.station >= 0) break;
+      siding.push(id);
+      node = node < 0 ? ((net.nodes.get(e.a)?.edges.length ?? 0) === 1 ? e.b : e.a) : (e.a === node ? e.b : e.a);
+      const next = net.nodes.get(node)?.edges.filter((x) => x !== id) ?? [];
+      if (next.length !== 1) break;
+      id = next[0];
+    }
+    const lead = siding.filter((id) => net.edges.get(id)!.depot < 0);
+    check(lead.length > 0 && allTunnel(lead), `growth: the cavern siding has no portals (${lead.length} edges)`);
     // Serve the original district's demand before asking where to build: the growth fix compares
     // a new district with buying trains on the current route, and that alternative must be satisfied.
     const cars = (g.vehicles.get(line.vehicles[0]) as Train).cars;
@@ -325,17 +345,20 @@ if (run('growth')) {
     const running = [...net.edges.values()].filter((e) => e.id >= e0 && e.kind === 'rail' && e.owner === ai.companyId).map((e) => e.id);
     check(running.length > 0 && allTunnel(running), 'growth: every new link, tail and cavern stays in tunnel without portals');
     check(buildings.every((id) => g.world.buildings.has(id)), 'growth: buildings over the extension survive');
-    check(!g.depots.get(oldDepot), 'growth: the original cavern moves out of the running line');
+    // (2.11: the cavern beside the line stays where it is, nothing stands beyond the terminus the line runs on from;
+    // 2.10 moved the cavern out of the running line to the new end)
+    check(!!g.depots.get(oldDepot) && line.vehicles.every((id) => (g.vehicles.get(id) as Train).depotId === oldDepot),
+      'growth: the cavern beside the line stays, every train at home there');
     const last = g.stations.get(after[yard.index === 0 ? 0 : after.length - 1])!, next = g.stations.get(after[yard.index === 0 ? 1 : after.length - 2])!;
     const terminus = terminusOf(g, last, outerEnd(last, next), ai.companyId);
-    check(terminus?.kind === 'tail' && terminus.depots.every((id) => g.depots.get(id)?.level === 'underground'), 'growth: the new terminus remains extendable beside its relocated cavern');
-    check(growing.copies.some((c) => c.key.startsWith('build:') && !c.key.endsWith(':0')), 'growth: replay checkpoints include built links before the final depot move');
+    check(terminus?.kind === 'free' && !terminus.depots.length, `growth: the new terminus is a free end (${terminus?.kind})`);
+    check(growing.copies.some((c) => c.key.startsWith('build:') && !c.key.endsWith(':0')), 'growth: replay checkpoints include built links');
     const served = new Set<number>(), target = g.tick + 160 * TICKS_PER_DAY;
     while (g.tick < target) {
       g.stepTick();
       for (const id of line.vehicles) { const t = g.vehicles.get(id) as Train; if (t.state === 'loading') served.add(t.atStation); }
     }
-    check(after.every((id) => served.has(id)), 'growth: trains from the relocated cavern call at every old and new station');
+    check(after.every((id) => served.has(id)), 'growth: trains from the cavern beside the line call at every old and new station');
     check(checkReservations(g).length === 0, 'growth: reservations remain consistent');
     growing.replay();
     console.log(`  exact replay: ${urban.copies.length} opening checkpoints and ${growing.copies.length} growth checkpoints`);

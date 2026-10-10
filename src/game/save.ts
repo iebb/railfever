@@ -23,10 +23,11 @@ import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
 import { migrateElectricTrains } from './migrate';
-import { walkRoadsChanged } from './catchment';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
 const VERSION = 3;
+/** Catchment/transfer parameters changed: old saved populations refresh at the next native boundary. */
+const CATCHMENT_RULES_VERSION = 2;
 /** Save formats this build reads (v2: older single-record saves). */
 const READABLE = [2, VERSION];
 const TREE_CHUNK = SAVE_TREES;
@@ -183,9 +184,10 @@ const RAIL_PART_KEYS = ['x', 'z', 'y', 'angle', 'length', 'tracks', 'trackOffset
   'depth', 'height', 'entrances', 'piers', 'forecourt', 'cost', 'alignment', 'groups', 'native'];
 /**
  * Key order of a waiting group in saves: merging groups adds `transfers` and `rail` (the journey's rail fares so far)
- * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike.
+ * in whichever order the passengers came, a loaded group in the order it is restored: written in this order alike
+ * (`ic`: the demand set, demand.ts).
  */
-const WAIT_KEYS = ['line', 'alight', 'dest', 'count', 't', 'transfers', 'rail'];
+const WAIT_KEYS = ['line', 'alight', 'dest', 'count', 't', 'transfers', 'rail', 'ic'];
 function waitJSON(w: object): object {
   const src = w as Record<string, unknown>, out: Record<string, unknown> = {};
   for (const k of WAIT_KEYS) if (k in src) out[k] = src[k];
@@ -371,12 +373,20 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     options: g.options, tick: g.tick, day: g.day, dayFrac: g.dayFrac, visualTime: g.visualTime, rng: g.rng.state, aiEnabled: g.aiEnabled,
     // companies (defunct flags, economies), AI states and configs, track access agreements and rates
     ...g.saveCompanies(),
+    stationComplexVersion: 1,
+    // waiting and cargo groups carry their demand set (`ic`: inter-city); older saves split theirs on loading
+    demandSets: 1,
     // Save owed walking population work independently of the scheduled demand publication flag.
     // Priming a cold cache retains this work; native monthly/service refresh keeps its timing.
+    catchmentRulesVersion: CATCHMENT_RULES_VERSION,
     catchmentDirty: g.lines.catchmentDirty,
     catchmentInputsDirty: g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending,
     // A cold load must preserve whether saved road access already matched its network.
     catchmentAccessCurrent: (g.stations as any).accessVersion === w.net.version,
+    // ...and whether access refreshes still find walked roads changed since the last share-out (the running game's
+    // walk cache sees that until its next share-out; a loaded one's is rebuilt cold): written only when true, kept
+    // until the next share-out after loading (Stations.accessRoadsOwed).
+    ...(g.stations.accessRoadsOwed || g.stations.publishedRoadsChanged() ? { catchmentAccessRoads: true } : {}),
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
@@ -399,7 +409,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     },
     networkDirty: !!(g as any).networkDirty,
     // A street edit still awaiting its network flush must invalidate catchments at that flush, not on load.
-    catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && walkRoadsChanged(g)),
+    catchmentRoadsDirty: g.lines.catchmentRoadsDirty || (!!(g as any).networkDirty && (g.stations.accessRoadsOwed || g.stations.publishedRoadsChanged())),
     // towns (with their street grid) and their growth cache, so a loaded game grows exactly alike
     towns: g.towns.list.map((t) => ({ ...t, buildings: [...t.buildings], growth: g.towns.cacheOf(t) })),
     stations: [...g.stations.map.values()].map((s) => ({ ...s, rail: s.rail ? railPartJSON(s.rail) : s.rail, waiting: [...s.waiting.values()].map(waitJSON),
@@ -524,13 +534,22 @@ export function deserialize(d: any): Game {
     g.towns.restoreCache(town, growth);
     return town;
   });
+  // Saves before the demand sets: a group's set from the towns of its station (aboard: its boarding stop) and of its
+  // destination; exact for passengers on their first leg, the others are counted by where they are now.
+  const legacySets = d.demandSets !== 1;
+  const stationTown = new Map<number, number>((d.stations as any[]).map((s) => [s.id, s.townId]));
+  const legacySet = (at: number, dest: number) => {
+    const a = stationTown.get(at) ?? -1;
+    return a >= 0 && a === (stationTown.get(dest) ?? -1) ? 0 : 1;
+  };
+  const waitSet = (s: any, wg: WaitGroup) => legacySets ? legacySet(s.id, wg.dest) : wg.ic ?? 0;
   for (const s of d.stations as any[]) {
     // station fields (levels, entrances, transfer links, road access) with defaults for older saves
     const st: Station = restoreStation(s);
     // daily() adds onPlat after its other sampling fields; preserve that insertion order in an early save.
     if (st.onPlat === undefined) delete st.onPlat;
     st.waitingTotal = 0;
-    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0);
+    for (const wg of s.waiting as WaitGroup[]) g.stations.addWaiting(st, wg.line, wg.alight, wg.dest, wg.count, 0, wg.t, wg.transfers ?? 0, wg.rail ?? 0, waitSet(s, wg));
     if (s.mail) {
       st.mail = restoreStationMail(s.mail);
       restoreMailQueue(g, st, s.mail.waiting ?? []);
@@ -631,12 +650,18 @@ export function deserialize(d: any): Game {
   if (Array.isArray(d.lostSince)) (g as any).lostSince = new Map(d.lostSince as [number, number][]);
   if (Array.isArray(d.congestionTold)) (g as any).congestionTold = new Map(d.congestionTold as [number, number][]);
   V.ambient = (d.ambient as any[] ?? []).map(makeRoad).filter((a) => a.seg);
+  if (legacySets) for (const v of V.map.values()) if (v.cargo.size) {
+    for (const c of v.cargo.values()) { if (legacySet(c.from, c.dest)) c.ic = 1; else delete c.ic; }
+    v.cargo = cargoGroups(v.cargo.values());
+  }
   if (!d.opsVersion) {
     try { migrateElectricTrains(g); } catch (e) { console.warn('Save load: electric train migration failed', e); }
   }
   // older maps: town streets ending on a bridge are cut back to the ground (9i). Current saves keep their network as
   // saved (towns tidy their bridge ends as they grow): tidying here would make a loaded game differ from the running one.
   if (!d.opsVersion) try { g.towns.tidyBridgeEnds(); } catch (e) { console.warn('Save load: tidyBridgeEnds failed', e); }
+  // Public walking complexes preserve physical station IDs and owners; migrate old nearby platforms once.
+  const complexesChanged = g.stations.restoreComplexes(d.stationComplexVersion !== 1);
   // routing tables; keep the saved catchment populations until the next monthly update
   const catchPop = new Map((d.stations as any[]).map((s) => [s.id, s.catchPop]));
   g.stations.catchMaxB = typeof d.catchMaxB === 'number' ? d.catchMaxB : 0;
@@ -646,22 +671,24 @@ export function deserialize(d: any): Game {
   // slice a pending refresh while the running game's warm cache commits it immediately.
   // A pending share-out retains its next-tick road-access refresh; don't apply it early. Prime with saved access.
   const S = g.stations as any, accessVersion = S.accessVersion, savedAccessVersion = net.version;
+  const catchmentRulesChanged = d.catchmentRulesVersion !== CATCHMENT_RULES_VERSION;
+  if (catchmentRulesChanged || complexesChanged) g.stations.refreshAccess(true);
   // The explicit marker separates owed population work from a frequency-only demand refresh.
-  const populationPending = typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
-    : !!d.catchmentDirty || !!d.catchmentRoadsDirty;
+  const populationPending = catchmentRulesChanged || complexesChanged || (typeof d.catchmentInputsDirty === 'boolean' ? d.catchmentInputsDirty
+    : !!d.catchmentDirty || !!d.catchmentRoadsDirty);
   S.accessVersion = net.version;
   // A brand-new empty network has not run its first share-out. Historical horizon zero can also
   // be warm, so preserve the explicit cold hint instead of conflating the two states.
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
     g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
-  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // Rebuilding routing re-adds waiting groups; retain their saved transfer counts, including explicit zeroes.
   for (const s of d.stations as any[]) for (const wg of s.waiting as WaitGroup[]) {
-    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count)));
+    const restored = g.stations.get(s.id)?.waiting.get(fareGroupKey(wg.line, wg.alight, wg.dest, wg.rail ?? 0, changeClass(wg.transfers, wg.count), waitSet(s, wg)));
     if (restored && restored.count === wg.count && wg.transfers !== undefined) restored.transfers = wg.transfers;
   }
   for (const st of g.stations.map.values()) { const c = catchPop.get(st.id); if (typeof c === 'number') st.catchPop = c; }
-  g.lines.catchmentDirty = !!d.catchmentDirty;
+  g.lines.catchmentDirty = catchmentRulesChanged || complexesChanged || !!d.catchmentDirty;
   g.lines.catchmentRoadsDirty = !!d.catchmentRoadsDirty;
   // older saves: lines whose stops are a subset of another line's become its service patterns (9k)
   if (!d.opsVersion) {
@@ -681,7 +708,9 @@ export function deserialize(d: any): Game {
   S.accessVersion = net.version;
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
     g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
-  S.accessVersion = d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
+  // (after the cold share-out primes above, which would clear it)
+  g.stations.accessRoadsOwed = d.catchmentAccessRoads === true;
   if (!d.ambient) V.manageAmbient();
   // network changes made just before saving reach the vehicles at the next update, as they would have
   if (d.networkDirty) (g as any).networkDirty = true;

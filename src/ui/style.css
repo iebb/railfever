@@ -252,9 +252,11 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 
 /* window content */
 .sub { color: var(--text-2); margin-bottom: 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(98px, 1fr)); gap: 6px; margin: 2px 0 var(--sp-3); }
-.tile { padding: 10px 11px 9px; border-radius: var(--r); background: var(--raised); border: 1px solid var(--hairline); min-width: 0; }
-.tile-v { font: 600 25px/1 var(--font-display); letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* at most four tiles a row: four stats share one row instead of wrapping three + one */
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(max(72px, calc(25% - 4.5px)), 1fr)); gap: 6px; margin: 2px 0 var(--sp-3); }
+.tile { padding: 10px 11px 9px; border-radius: var(--r); background: var(--raised); border: 1px solid var(--hairline); min-width: 0; container-type: inline-size; }
+/* (narrow tiles shrink their number instead of cutting it off) */
+.tile-v { font: 600 25px/1 var(--font-display); font-size: clamp(18px, 30cqi, 25px); letter-spacing: 0.01em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .tile-k { margin-top: 5px; font: 600 var(--fs-11)/1.2 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; color: var(--text-3); }
 .tile.pos .tile-v { color: var(--pos); }
 .tile.neg .tile-v { color: var(--neg); }
@@ -294,6 +296,14 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .row.link { color: inherit; cursor: pointer; }
 .btns { display: flex; gap: 6px; margin-top: var(--sp-3); flex-wrap: wrap; align-items: center; }
 .btns.right { justify-content: flex-end; }
+/* line stops: per-stop options (platform) as slim rows under the stop */
+.stop-opts { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 8px 6px 44px; }
+.stop-opt { display: inline-flex; align-items: center; gap: 8px; color: var(--text-3); font-size: var(--fs-12); }
+.stop-opt .input { height: 28px; padding: 0 6px; font-size: var(--fs-12); }
+/* purchase: summary and Buy stay in view at the bottom of the window while the model lists scroll */
+.win-body .buybar { position: sticky; bottom: -14px; z-index: 2; margin: var(--sp-3) -14px -14px; padding: 10px 14px; flex-wrap: nowrap; background: var(--surface-solid); border-top: 1px solid var(--hairline); border-radius: 0 0 var(--r-l) var(--r-l); }
+.buybar-sum { flex: 1; min-width: 0; color: var(--text-2); font-size: var(--fs-13); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.buybar-sum.neg { color: var(--neg); }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; height: 28px; padding: 0 11px 0 9px; border-radius: 14px; background: var(--raised); border: 1px solid var(--hairline); font-weight: 600; font-size: var(--fs-13); cursor: pointer; white-space: nowrap; transition: background var(--t-fast), transform var(--t-fast); }
 .chip::before { content: ''; width: 9px; height: 9px; border-radius: 3px; background: var(--c); }
@@ -458,7 +468,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .finance-toast > .finance-actions { margin-left: auto; }
 .tooltip .finance-actions { pointer-events: auto; margin-top: 8px; }
 .news-date { font: 600 var(--fs-11)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; color: var(--text-3); white-space: nowrap; }
-.drawer { position: absolute; top: 64px; right: 10px; bottom: 92px; width: min(390px, calc(100vw - 20px)); z-index: 70; display: flex; flex-direction: column; border-radius: var(--r-l); animation: rise var(--t) var(--ease); }
+.drawer { position: absolute; top: 64px; right: 10px; bottom: var(--dock-clearance, 92px); width: min(390px, calc(100vw - 20px)); z-index: 70; display: flex; flex-direction: column; border-radius: var(--r-l); animation: rise var(--t) var(--ease); }
 .drawer-head { display: flex; align-items: center; gap: var(--sp-2); padding: 10px 8px 10px 14px; border-bottom: 1px solid var(--hairline); font: 700 17px/1 var(--font-display); letter-spacing: var(--tr-caps); text-transform: uppercase; }
 .drawer-head span { flex: 1; }
 .drawer-body { overflow-y: auto; padding: 6px 8px 10px; }
@@ -492,7 +502,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .cl-step.cur { background: var(--raised); }
 .cl-step.cur .ic { color: var(--accent); }
 .cl-t { font-weight: 600; font-size: var(--fs-13); line-height: 1.35; }
-.cl-h { grid-column: 2; color: var(--text-2); font-size: var(--fs-12); line-height: 1.4; }
+.cl-h { grid-column: 2; color: var(--text-2); font-size: var(--fs-12); line-height: 1.4; white-space: pre-line; }
 .cl-step .btn { grid-column: 2; justify-self: start; margin-top: 5px; }
 .checklist.collapsed .cl-steps { display: none; }
 .checklist.done .cl-head .ic { color: var(--pos); }
@@ -512,7 +522,7 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .mc-row:active { background: var(--raised-3); }
 .mc-row > i { width: 14px; height: 4px; border-radius: 2px; flex: none; }
 .mc-row > i.mc-ring { width: 12px; height: 12px; border-radius: 50%; background: color-mix(in srgb, var(--c) 22%, transparent); border: 2px solid var(--c); }
-.mc-row > span:not(.mc-own):not(.mc-num) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mc-row > span:not(.mc-own):not(.mc-num):not(.lsym):not(.lcolor) { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mc-row .ic { color: var(--text-3); }
 .mc-own { width: 8px; height: 8px; border-radius: 2px; background: var(--c); flex: none; }
 .mc-num { font: 600 var(--fs-12)/1 var(--font-display); color: var(--text-2); letter-spacing: 0.03em; }
@@ -970,9 +980,6 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 
 .hc-badges { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin: 5px 0 4px; }
 
-@media (min-width: 721px) {
-  .station-info, .purchase-info, .vehicle-info, .finances-info, .help-info { max-height: min(520px, calc(100vh - 240px)); }
-}
 
 /* Construction advice stays readable beside the crossing controls and in the cursor preview. */
 .tc-warnings { display: grid; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--hairline); }
@@ -1012,6 +1019,12 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .lbl.stn.compact .lbl-wait,
 .lbl.stn.compact .lbl-mark,
 .lbl.stn.compact .lbl-badges { display: none; }
+/* Other companies' bus and tram stops in the town view: a small stop symbol; the name on hover. */
+.lbl.stn.compact.minor { border-radius: 6px; box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4); }
+.lbl.stn.compact.minor .lbl-ico { width: 14px; height: 14px; }
+.lbl.stn.compact.minor .lbl-ico .ic { width: 12px; height: 12px; }
+.lbl.stn.compact.minor:hover { z-index: 240000; }
+.lbl.stn.compact.minor:hover .lbl-name { display: inline; font-size: 12px; }
 
 /* Joining lines: candidates, a complete route and the shared terminus before confirmation. */
 .linejoin-note { margin: 8px 0; font-size: var(--fs-12); line-height: 1.5; overflow-wrap: anywhere; }
@@ -1054,11 +1067,15 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 #app .win > *, #app .toolcard > *, #app .tooltip > *, #app .uitip > *, #app .hovercard > *, #app .labels .lbl > * { zoom: var(--uis); }
 #app .toolcard { padding: calc(8px * var(--uis)) calc(8px * var(--uis)) calc(10px * var(--uis)) calc(12px * var(--uis)); overflow-y: auto; overscroll-behavior: contain; }
 @media (min-width: 1280px) { #app .toolcard { width: calc(356px * var(--uis)); max-height: calc(100dvh - var(--dock-clearance, 90px) - 116px * var(--uis)); } }
+/* desktop: the active tool's card stays above open windows, so its controls stay reachable */
+@media (min-width: 1280px) { #app .toolcard { z-index: 5000; } }
 #app .tooltip { min-width: calc(160px * var(--uis)); max-width: calc(300px * var(--uis)); padding: calc(10px * var(--uis)) calc(12px * var(--uis)); }
 #app .uitip { gap: calc(8px * var(--uis)); padding: calc(6px * var(--uis)) calc(9px * var(--uis)) calc(6px * var(--uis)) calc(11px * var(--uis)); font-size: calc(var(--fs-13) * var(--uis)); max-width: calc(300px * var(--uis)); }
 #app .hovercard { min-width: calc(170px * var(--uis)); max-width: calc(260px * var(--uis)); padding: calc(9px * var(--uis)) calc(11px * var(--uis)) calc(10px * var(--uis)); }
 #app .lbl.tag { max-width: calc(170px * var(--uis)); }
 #app .lbl.stn.compact { width: calc(28px * var(--uis)); height: calc(28px * var(--uis)); padding: calc(4px * var(--uis)); }
+#app .lbl.stn.compact.minor { width: calc(20px * var(--uis)); height: calc(20px * var(--uis)); padding: calc(3px * var(--uis)); }
+#app .lbl.stn.compact.minor:hover { width: auto; }
 #app .float { font-size: calc(var(--fs-16) * var(--uis)); }
 #app .float.income { font-size: calc(18px * var(--uis)); }
 /* the top bar needs more room at larger sizes: the map buttons go (as below 1360 px), and the clock moves under the

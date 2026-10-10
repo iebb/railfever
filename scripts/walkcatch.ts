@@ -27,18 +27,21 @@ function bus(g: Game, x: number, z: number) {
 }
 function flush(g: Game) { g.stations.refreshAccess(true); g.lines.catchmentDirty = true; g.lines.flushCatchment(); }
 
-check(CATCHMENT_RADIUS.rail === 23.52 && CATCHMENT_RADIUS.tram === 21.56 && CATCHMENT_RADIUS.bus === 15.68 && FULL_COVER_WALK === 14.7 && Object.keys(CATCHMENT_RADIUS).join() === 'rail,tram,bus', 'walking and full-coverage limits reduced by 30%; one rail limit for every track type');
+// (2.7: walking limits -30%; after 2.9, at the user's request, halved again: rail 23.52 -> 11.76, tram 21.56 -> 10.78,
+// bus 15.68 -> 7.84; full coverage stays 14.7, so everything within the shorter walks is fully covered)
+check(CATCHMENT_RADIUS.rail === 11.76 && CATCHMENT_RADIUS.tram === 10.78 && CATCHMENT_RADIUS.bus === 7.84 && FULL_COVER_WALK === 14.7 && Object.keys(CATCHMENT_RADIUS).join() === 'rail,tram,bus', 'walking limits halved after 2.9, full coverage kept; one rail limit for every track type');
 check(near(2 * walkLimit('rail') ** 2 / (Math.PI * CATCHMENT_RADIUS.rail ** 2), 3.125 / Math.PI), '1.25 grid allowance preserves circular area to within 0.6%');
 check([0, 8, 21, 28, 42, 50.4].every((oldDistance) => near(walkWeight(oldDistance * 0.7), 1 / (1 + oldDistance / 8)) && near(coverOf(walkWeight(oldDistance * 0.7)), Math.min(1, (1 + 21 / 8) / (1 + oldDistance / 8)))), 'distance weights and the full-coverage taper keep the release-2.6 shape at 70% of the distances');
-check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLimit(mode) * 10)} m`).join(', ') === '294 m, 270 m, 196 m', 'mapmodes legend distances derive from the shorter walking limits, including the grid allowance');
+check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLimit(mode) * 10)} m`).join(', ') === '147 m, 135 m, 98 m', 'mapmodes legend distances derive from the shorter walking limits, including the grid allowance');
 
 {
   console.log('river barrier, long-edge origins and bidirectional country-road walks');
   const g = flatGame(128, 3, (x) => x >= 65 && x <= 67 ? -1 : 3), net = g.world.net;
-  const l0 = node(g, 62, 20), l1 = node(g, 62, 110), r0 = node(g, 70, 20), r1 = node(g, 70, 110);
-  const left = road(g, l0, l1), right = road(g, r0, r1), S = bus(g, 62, 60);
-  const across = house(g, 72, 60, -Math.PI / 2), down = house(g, 60, 68, Math.PI / 2), up = house(g, 60, 52, Math.PI / 2);
-  const farDoor = house(g, 57.5, 60, Math.PI / 2), beyond = house(g, 60, 90, Math.PI / 2), trimmed = house(g, 60, 82, Math.PI / 2);
+  // (the banks' roads 4 apart and the homes nearer: the bus walk is 98 m since the limits were halved after 2.9)
+  const l0 = node(g, 64, 20), l1 = node(g, 64, 110), r0 = node(g, 68, 20), r1 = node(g, 68, 110);
+  const left = road(g, l0, l1), right = road(g, r0, r1), S = bus(g, 64, 60);
+  const across = house(g, 70, 60, -Math.PI / 2), down = house(g, 62, 68, Math.PI / 2), up = house(g, 62, 52, Math.PI / 2);
+  const farDoor = house(g, 59.5, 60, Math.PI / 2), beyond = house(g, 62, 90, Math.PI / 2), trimmed = house(g, 62, 74, Math.PI / 2);
   flush(g);
   const c = walkingCatchment(g, S);
   check(Math.hypot(across.x - S.x, across.z - S.z) < CATCHMENT_RADIUS.bus && !c.buildings.has(across.id), 'across a river, inside the former circle, without a reachable bridge: not covered');
@@ -47,8 +50,8 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
   check(!c.buildings.has(trimmed.id), 'a street-connected home inside the old bus limit but outside the shorter limit is excluded');
   const origin = S.stops[0].z, limit = walkLimit('bus');
   check(c.segments.every((s) => s.edge === left.id && s.z0 >= origin - limit - 1e-8 && s.z1 <= origin + limit + 1e-8), 'isochrone clips a long road edge to the shorter budget even when neither endpoint is reachable');
-  const ra = net.addNode('rail', 62, 3, 60, 1, 0), rb = net.addNode('rail', 70, 3, 60, 1, 0);
-  net.addEdge('rail', ra.id, rb.id, bezLine(62, 60, 70, 60), new Float32Array(9).fill(3), [], 'standard', 0);
+  const ra = net.addNode('rail', 64, 3, 60, 1, 0), rb = net.addNode('rail', 68, 3, 60, 1, 0);
+  net.addEdge('rail', ra.id, rb.id, bezLine(64, 60, 68, 60), new Float32Array(5).fill(3), [], 'standard', 0);
   check(!walkingCatchment(g, S).buildings.has(across.id), 'a railway across the river never becomes a walking path');
   const ld = net.splitEdge(left.id, 75)!, rd = net.splitEdge(right.id, 75)!;
   road(g, ld.node, rd.node, 'road', true);
@@ -98,13 +101,14 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
 {
   console.log('strict distance shares, regional caches and exact save round trips');
   const g = flatGame(192), main = road(g, node(g, 20, 60), node(g, 160, 60));
-  const A = bus(g, 52, 60), B = bus(g, 72, 60), b = house(g, 60, 58);
+  // (both within the 98 m bus walk since the limits were halved after 2.9)
+  const A = bus(g, 54, 60), B = bus(g, 68, 60), b = house(g, 60, 58);
   flush(g);
   const sh = g.stations.stationsForBuilding(b.id), a = sh.w[sh.st.indexOf(A.id)], other = sh.w[sh.st.indexOf(B.id)];
   check(sh.st.length === 2 && near(a + other, 1) && a > other, `walking-nearer station gets more population (${a.toFixed(4)} / ${other.toFixed(4)})`);
   const ca = walkingCatchment(g, A), cb = walkingCatchment(g, B);
   console.log(`  door distances ${ca.buildings.get(b.id)?.distance} / ${cb.buildings.get(b.id)?.distance}; stop positions ${A.stops[0].x} / ${B.stops[0].x}`);
-  check(near(ca.buildings.get(b.id)!.distance, 9.6) && near(cb.buildings.get(b.id)!.distance, 13.6), 'shares use the measured street walk plus door leg');
+  check(near(ca.buildings.get(b.id)!.distance, 7.6) && near(cb.buildings.get(b.id)!.distance, 9.6), 'shares use the measured street walk plus door leg');
   check(near(A.catchPop + B.catchPop, b.pop) && near(g.stations.catchSum(A, (b) => b.pop), A.catchPop), 'strict shares conserve population and preserve catchSum');
   road(g, node(g, 130, 150), node(g, 170, 150));
   check(walkingCatchment(g, A) === ca, 'a distant road edit reuses the cached station catchment');
@@ -297,25 +301,26 @@ check((['rail', 'tram', 'bus'] as const).map((mode) => `${Math.round(catchWalkLi
 }
 
 {
-  // Coverage follows the best walk: a second stop just as far away shares the building's coverage, it adds none
-  // (a house about 18 units' walk from either stop is covered as from one stop at that distance).
+  // Coverage follows the best walk: a second stop just as far away shares the building's coverage, it adds none.
+  // (Since the walks were halved after 2.9 no stop reaches past FULL_COVER_WALK: only rail station buildings, +20%,
+  // reach the taper. A house about 8 units' walk from either stop is fully covered by one, and two share that.)
   const g = flatGame();
   const n = (x: number, z: number) => node(g, x, z);
   const w0 = n(20, 60), w1 = n(66, 60), w2 = n(160, 60), s0 = n(66, 110);
   road(g, w0, w1, 'street'); road(g, w1, w2, 'street'); road(g, w1, s0, 'street');
-  const h = house(g, 64, 71, Math.PI / 2, 100);
-  const A = bus(g, 60, 60), C = bus(g, 140, 60);
+  const h = house(g, 64, 63, Math.PI / 2, 100);
+  const A = bus(g, 63, 60), C = bus(g, 140, 60);
   const line = g.lines.create('road'); line.stops = [A.id, C.id];
   const depotId = roadDepotNear(g, 140, 60, 0);
   check(depotId >= 0 && typeof g.vehicles.buyRoad(depotId, MODEL_BY_ID.get('bus_c')!, line.id) !== 'string', 'a bus on the line');
   g.lines.rebuild(); flush(g);
   const one = g.stations.stationsForBuilding(h.id), cover1 = one.w.reduce((a, b) => a + b, 0);
-  const B = bus(g, 72, 60);
+  const B = bus(g, 69, 60);
   line.stops = [A.id, B.id, C.id]; g.lines.rebuild(); flush(g);
   const two = g.stations.stationsForBuilding(h.id), cover2 = two.w.reduce((a, b) => a + b, 0);
   const dA = walkingCatchment(g, A).buildings.get(h.id)?.distance ?? 0, dB = walkingCatchment(g, B).buildings.get(h.id)?.distance ?? 0;
   console.log(`  a house ${dA.toFixed(1)} / ${dB.toFixed(1)} units' walk from two stops: covered ${cover1.toFixed(4)} by one, ${cover2.toFixed(4)} by both (${two.w.map((x) => x.toFixed(4)).join(' + ')})`);
-  check(dA > FULL_COVER_WALK && near(dA, dB) && cover1 < 1 && near(cover1, cover2) && two.st.length === 2 && near(two.w[0], two.w[1]), 'a second stop as far away shares the coverage of the best walk, it adds none');
+  check(dA > 0 && dA <= walkLimit('bus') && near(dA, dB) && near(cover1, coverOf(walkWeight(dA))) && near(cover1, cover2) && two.st.length === 2 && near(two.w[0], two.w[1]), 'a second stop as far away shares the coverage of the best walk, it adds none');
 }
 
 done(T0);

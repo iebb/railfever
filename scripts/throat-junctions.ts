@@ -61,6 +61,9 @@ railJobCall(true);
 function fixture(foreignSpur=false){
   const g=flatGame(384),me=g.addAICompany({startMoney:100_000_000}).id,foreign=g.addAICompany({startMoney:100_000_000}).id;
   g.aiEnabled=false;g.aiAcquisitions=false;g.vehicles.ambientEnabled=false;
+  // User rule (2.10): the starting balance is fully a loan and the credit line only grows to it (maxLoan = balance), so
+  // a 100M start has no credit left. Keep 2.9's 20M of credit room (5M loan, 25M line) for the stepped-borrowing checks.
+  {const e=g.company(me).economy;e.maxLoan=e.loan+20_000_000;}
   const A=station(g,30,192,Math.PI/2,10,2,me)!,B=station(g,350,192,Math.PI/2,10,2,me)!;
   build(g,nodeSnap(g,endNode(g,A,0,true),'rail'),nodeSnap(g,endNode(g,B,0,false),'rail'),railOpts(me),'single main');
   const n=g.world.net.nodes.get(endNode(g,A,0,true))!,hit=g.world.net.nearestEdge(n.x+3,n.z,1,'rail',e=>e.station<0&&e.depot<0)!;

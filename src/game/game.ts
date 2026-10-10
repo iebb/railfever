@@ -1,6 +1,6 @@
 // The game: owns all simulation state and advances time.
 import { World } from './world';
-import { Towns } from './towns';
+import { Towns, type Town } from './towns';
 import { Stations, entranceUpkeep, lostShare, STATION_UPKEEP_FACTOR } from './stations';
 import { stationPlatformLength } from './station-geometry';
 import { Lines } from './lines';
@@ -18,11 +18,14 @@ import type { Station } from './stations';
 import type { RoadVehicle } from './roadvehicle';
 import type { NEdge } from './network';
 import { AIController, AI_NAMES, AIConfig, normalizeAIConfig } from './ai';
-import { DemandModel, GEN_RATE } from './demand';
+import { DemandModel, GEN_RATE, splitCount } from './demand';
 import { resolveDeadlocks, lineCongestion, DEADLOCK_WORK, type DeadlockScan } from './train';
 import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 import { observeRailCapacity } from './ai-capacity';
+import { capacityRouteBetween } from './rail-capacity-routes';
+import { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP, accessChargeEstimate, accessFullCost, accessReplacementCost, accessItemKey, migrateAccessMultiplier, type AccessItem } from './access-cost';
+export { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP } from './access-cost';
 
 export interface NewGameOptions {
   size: number;
@@ -35,6 +38,8 @@ export interface NewGameOptions {
   aiCompanies?: number;
   /** per-AI settings (entry i for the i-th AI company); missing entries and fields use the defaults */
   aiConfigs?: Partial<AIConfig>[];
+  /** Uniform, fully borrowed starting balance for the player and every initial rival. */
+  startMoney?: number;
   playerName?: string;
 }
 
@@ -44,23 +49,20 @@ export interface News { day: number; text: string; kind: NewsKind; x?: number; z
 /**
  * A track access agreement: `user` may run trains and trams on `owner`'s tracks, tram tracks and stations.
  * Users pay for it monthly: every item (track edge, tram tracks, station) that carried other companies' traffic
- * has its monthly maintenance split by usage (distance travelled on tracks, stops at stations), the owner's own
- * usage counting once and each user's `accessMultiplier(owner)` times (0..3, default 2). So with m = 2 and a
- * 50/50 split the user pays 2/3 of the item's maintenance; m = 0 is free; an item only others used is paid in full.
+ * charges its real usage share (distance on tracks, calls at stations) of replacement capital's 30-year annuity
+ * plus base upkeep, times the owner's price factor (0..2, default 1.25). Each user is capped at 75% of that
+ * annual full cost, and reimburses its own passage wear in full. A zero factor waives the fixed charge.
  */
 export interface AccessAgreement {
   user: number;
   owner: number;
   since: number;
-  /** last month: the user's share of the traffic on the owner's items it used, weighted by their maintenance (0..1) */
+  /** last month: real traffic share on used items, weighted by their annual full cost (0..1) */
   usageShareLastMonth: number;
   /** fees paid for last month and in total */
   paidLastMonth: number;
   paidTotal: number;
 }
-
-export const DEFAULT_ACCESS_MULTIPLIER = 2;
-export const MAX_ACCESS_MULTIPLIER = 3;
 
 /**
  * How an owner shares its network: open (the default: every company not blocked may use it without asking; an
@@ -93,6 +95,8 @@ export const TICKS_PER_DAY = Math.round(DAY_SECONDS / TICK);
 if (Math.abs(DAY_SECONDS / TICK - TICKS_PER_DAY) > 1e-9) throw new Error('DAY_SECONDS must contain an integer number of simulation ticks');
 /** Shared wall-time cap for simulation pacing, camera smoothing and visual effects. */
 export const MAX_FRAME_SECONDS = 8 * TICK;
+/** Tick of the day of the AI companies' shared-path reviews (half a day after their other daily decisions). */
+const SHARED_CAPACITY_TICK = TICKS_PER_DAY / 2;
 /** A frame may release fewer ticks when simulation work is expensive. */
 const FRAME_BUDGET_MS = 20;
 
@@ -136,11 +140,11 @@ export class Game {
   private blockedKeys = new Set<number>();
   /** v2.2 saves: their default policies become open access when the AIs are restored */
   private legacyAccess = false;
-  /** weight of others' usage of a company's network (non-AI owners; AI owners keep it in their config) */
+  /** price factor for annual full cost (saved slot retains its legacy name; AI owners keep theirs in config) */
   private accessMult: Record<number, number> = {};
   /** usage this month: item key (rail edge id*4, tram tracks id*4+1, station id*4+2) -> amount by company id */
   private usage = new Map<number, number[]>();
-  /** owners whose infrastructure is metered this month (they have, or had, an agreement) */
+  /** Legacy saved roster of owners with an agreement; all owner traffic is metered from month start. */
   private metered = new Set<number>();
   options: NewGameOptions;
   /** Number of committed simulation ticks (40 per game day). */
@@ -157,10 +161,14 @@ export class Game {
     this.tick = this.day * TICKS_PER_DAY + Math.floor(Math.max(0, f) * TICKS_PER_DAY + 1e-7);
   }
   speed = 1;
+  /** Browser-only pacing hook: yield after a complete tick when background planning was launched. */
+  runtimeFrameYield?: () => boolean;
   // Pause freezes the interpolation remainder and previous vehicle poses too.
   paused = false;
   /** Wall-time remainder belongs to the scheduler, never the saved simulation. */
   private accumulator = 0;
+  /** Whole ticks deferred to give a planning worker an event-loop turn; pacing only, absent from saves. */
+  private plannerTicks = 0;
   get alpha() { return this.accumulator / TICK; }
   rng: RNG;
   news: News[] = [];
@@ -186,7 +194,7 @@ export class Game {
   private deferCatchment = false;
 
   constructor(opts: NewGameOptions, world?: World) {
-    this.options = opts;
+    this.options = opts.startMoney === undefined ? opts : { ...opts, startMoney: Number.isFinite(opts.startMoney) ? Math.max(0, Math.min(1e9, opts.startMoney)) : 5_000_000 };
     this.world = world ?? new World(opts.size);
     this.rng = new RNG(opts.seed * 101 + 7);
     this.towns = new Towns(this);
@@ -197,6 +205,7 @@ export class Game {
     this.demand = new DemandModel(this);
     this.mail = new MailModel(this);
     this.companies.push({ id: PLAYER, name: opts.playerName || 'Railfever Transport', color: COMPANY_COLORS[0], ai: false, economy: new Economy() });
+    if (this.options.startMoney !== undefined) this.companies[PLAYER].economy.startWithLoan(this.options.startMoney);
     this.companies[PLAYER].code = this.freeCompanyCode(this.companies[PLAYER].name);
     this.allowAccess[PLAYER] = true;
     this.accessPolicies[PLAYER] = DEFAULT_ACCESS_POLICY;
@@ -218,6 +227,11 @@ export class Game {
     const g = new Game(opts);
     generateHeights(g.world, { seed: opts.seed, hilliness: opts.hilliness, water: opts.water });
     g.towns.generate(opts.towns, opts.seed);
+    g.initializeHeadquarters();
+    if (!opts.playerName && g.headquartersOf(PLAYER)) {
+      g.player.name = `${g.headquartersOf(PLAYER)!.name} Transport`;
+      g.player.code = g.freeCompanyCode(g.player.name, PLAYER);
+    }
     generateIntercityRoads(g);
     generateTrees(g.world, opts.seed);
     g.demand.rebuild();
@@ -225,7 +239,7 @@ export class Game {
     g.world.dirtyTerrain.clear();
     g.refreshAccess();
     const n = Math.max(0, Math.min(MAX_AI_COMPANIES, Math.max(opts.aiCompanies ?? 0, opts.aiConfigs?.length ?? 0)));
-    for (let i = 0; i < n; i++) g.addAICompany(opts.aiConfigs?.[i] ?? {});
+    for (let i = 0; i < n; i++) g.addAICompany({ ...opts.aiConfigs?.[i], ...(opts.startMoney !== undefined ? { startMoney: g.economy.initialLoan } : {}) });
     g.vehicles.manageAmbient();
     g.postNews(`Welcome to Railfever; F1 opens Help.`, 'info');
     return g;
@@ -239,16 +253,15 @@ export class Game {
   addAICompany(config: Partial<AIConfig> = {}, name?: string, color?: string): Company {
     if (!this.canAddAI()) throw new Error(`At most ${MAX_AI_COMPANIES} AI companies`);
     const id = this.companies.length;
-    const cfg = normalizeAIConfig(config);
+    const cfg = normalizeAIConfig({ ...config, ...(config.startMoney === undefined && this.options.startMoney !== undefined ? { startMoney: this.options.startMoney } : {}) });
     const live = this.activeCompanies;
-    const usedNames = new Set(this.companies.map((c) => c.name));
     const usedColors = new Set(live.map((c) => c.color.toLowerCase()));
-    const nm = name?.trim() || AI_NAMES.find((n) => !usedNames.has(n)) || `${AI_NAMES[(id - 1) % AI_NAMES.length]} ${id}`;
+    const hq = this.nextHeadquarters();
+    const nm = name?.trim() || this.headquartersName(hq, cfg.focus);
     const col = color || COMPANY_COLORS.slice(1).find((c) => !usedColors.has(c.toLowerCase())) || COMPANY_COLORS[1 + ((id - 1) % (COMPANY_COLORS.length - 1))];
     const economy = new Economy();
-    economy.money = cfg.startMoney;
-    economy.loan = Math.min(cfg.startMoney, 5_000_000);
-    const co: Company = { id, name: nm, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
+    economy.startWithLoan(cfg.startMoney);
+    const co: Company = { id, name: nm, hqTown: hq?.id, color: col, ai: true, economy, code: this.freeCompanyCode(nm) };
     this.companies.push(co);
     this.allowAccess[id] = cfg.accessPolicy !== 'auto-reject';
     this.ais.push(new AIController(this, id, cfg));
@@ -257,6 +270,43 @@ export class Game {
   }
 
   company(id: number): Company { return this.companies[id] ?? this.townCompany; }
+
+  /** The company's saved city base. Reading it never assigns or moves headquarters. */
+  headquartersOf(companyId: number): Town | undefined {
+    const id = this.companies[companyId]?.hqTown;
+    return id === undefined ? undefined : this.towns.list.find(t => t.id === id);
+  }
+
+  /** Share town bases only once each populated town has a company; larger towns are considered first. */
+  private nextHeadquarters(): Town | undefined {
+    const used = new Map<number, number>();
+    for (const co of this.companies) if (co.hqTown !== undefined) used.set(co.hqTown, (used.get(co.hqTown) ?? 0) + 1);
+    return this.towns.list.filter(t => t.pop > 0).sort((a, b) =>
+      (used.get(a.id) ?? 0) - (used.get(b.id) ?? 0) || b.pop - a.pop || a.id - b.id)[0];
+  }
+
+  private headquartersName(hq: Town | undefined, focus: AIConfig['focus'], except = -1): string {
+    const suffix = focus.rail > focus.road && focus.rail >= focus.tram ? 'Railways'
+      : focus.tram > focus.rail && focus.tram > focus.road ? 'Tramways' : 'Transport';
+    const base = `${hq?.name ?? 'Rival'} ${suffix}`, used = new Set(this.companies.filter(c => c.id !== except).map(c => c.name));
+    let name = base;
+    for (let n = 2; used.has(name); n++) name = `${base} ${n}`;
+    return name;
+  }
+
+  /**
+   * Legacy saves infer the city from an owned station before falling back to the stable town allocation. `only`: the
+   * companies to settle (a current save keeps a company without headquarters as it was saved: loading must not assign
+   * one, or the reloaded game differs from the running one).
+   */
+  private initializeHeadquarters(only?: Set<number>) {
+    for (const co of this.companies) {
+      if (this.headquartersOf(co.id) || (only && !only.has(co.id))) continue;
+      const station = [...this.stations.map.values()].filter(st => st.owner === co.id && this.towns.list.some(t => t.id === st.townId))
+        .sort((a, b) => a.id - b.id)[0];
+      co.hqTown = station?.townId ?? this.nextHeadquarters()?.id;
+    }
+  }
 
   /** A company letter for JR-style station numbers: its initials first, then its other letters, then any free one. */
   freeCompanyCode(name: string, except = -1): string {
@@ -311,8 +361,8 @@ export class Game {
     this.access.push({ user, owner, since: this.day, usageShareLastMonth: 0, paidLastMonth: 0, paidTotal: 0 });
     this.accessKeys.add(user * 4096 + owner);
     this.metered.add(owner);
-    if (owner === PLAYER) this.postNews(`${u.name} uses your open network and shares upkeep.`, 'info');
-    else if (user === PLAYER) this.postNews(`You use ${o.name}’s open network and share upkeep.`, 'info');
+    if (owner === PLAYER) this.postNews(`${u.name} uses your open network and pays access fees.`, 'info');
+    else if (user === PLAYER) this.postNews(`You use ${o.name}’s open network and pay access fees.`, 'info');
   }
 
   /** How `owner` answers access requests. */
@@ -374,11 +424,38 @@ export class Game {
     return false;
   }
 
+  /** A cautious owner compares the new net fixed-fee income with fares a competing entrant may displace.
+   * Wear reimbursements cancel the owner's extra wear bill, so they are not treated as profit here. */
+  private accessOfferPays(user: number, owner: number, risk: number): boolean {
+    const items = new Map<number, AccessItem>(), relevant = [...this.lines.map.values()].filter(l => l.owner === user);
+    let lost = 0, incoming = 0;
+    for (const line of this.lines.map.values()) {
+      if (line.owner !== owner) continue;
+      const towns = new Set(line.stops.map(id => this.stations.get(id)?.townId ?? -1).filter(id => id >= 0));
+      const rivals = relevant.filter(l => new Set(l.stops.map(id => this.stations.get(id)?.townId ?? -1).filter(id => towns.has(id))).size >= 2);
+      if (!rivals.length) continue;
+      const visitors = Math.max(1, rivals.reduce((n, l) => n + l.vehicles.length, 0)), share = visitors / (visitors + line.vehicles.length);
+      const receipts = Math.max(line.incomeLast, line.incomeYear * 360 / Math.max(30, this.day % 360));
+      lost += receipts * share * (1 - risk);
+      const used: AccessItem[] = line.stops.map(id => this.stations.get(id)).filter((st): st is Station => !!st);
+      if (line.kind === 'rail') for (let i = 1; i < line.stops.length; i++) {
+        for (const id of capacityRouteBetween(this, line.stops[i - 1], line.stops[i], owner) ?? []) {
+          const e = this.world.net.edges.get(id); if (e && e.depot < 0) used.push(e);
+        }
+      }
+      for (const item of used) {
+        const key = accessItemKey(item); if (items.has(key)) continue;
+        items.set(key, item); incoming += this.accessChargeEstimate(user, owner, [item], share);
+      }
+    }
+    return incoming > 0 && incoming >= lost;
+  }
+
   /**
    * Ask for a track access agreement (`user` would run trains and trams on `owner`'s tracks and stop at its
-   * stations, sharing their maintenance by usage). By the owner's policy: granted at once, refused, or (the
+   * stations, paying full-cost charges by usage). By the owner's policy: granted at once, refused, or (the
    * player's default, 'ask') pending until the owner approves or rejects it (or it expires). AI owners decide
-   * at once: yes, unless refusing everyone, or cautious and the requester competes with them.
+   * at once: cautious owners require the fees to cover fares a competitor may displace.
    */
   requestAccess(user: number, owner: number, reason?: string): AccessResult {
     if (user === owner || owner < 0) return 'rejected';
@@ -390,9 +467,8 @@ export class Game {
     const policy = this.accessPolicy(owner), ai = this.aiOf(owner);
     if (policy === 'auto-reject') return this.refused(user, owner);
     if (policy === 'open') return this.grant(user, owner);
-    // AI owners answer at once: auto-approve (their default) grants everyone; set to 'ask', a cautious AI keeps
-    // competitors off its tracks
-    if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) ? this.refused(user, owner) : this.grant(user, owner);
+    if (ai) return policy === 'ask' && ai.config.risk < 0.6 && this.competes(user, owner) && !this.accessOfferPays(user, owner, ai.config.risk)
+      ? this.refused(user, owner) : this.grant(user, owner);
     if (policy === 'auto-approve') return this.grant(user, owner);
     const q: AccessRequest = { id: this.nextRequestId++, user, owner, day: this.day };
     if (reason) q.reason = reason;
@@ -490,11 +566,11 @@ export class Game {
     return { lines, stops, vehicles, onTrack };
   }
 
-  /** Weight (0..3) of other companies' usage when the maintenance of `owner`'s shared items is split. */
+  /** Price factor (0..2) applied to users' real shares of annual full cost. */
   accessMultiplier(owner: number): number {
     const ai = this.aiOf(owner);
     const m = ai ? ai.config.accessMultiplier : this.accessMult[owner];
-    return typeof m === 'number' && m >= 0 ? Math.min(MAX_ACCESS_MULTIPLIER, m) : DEFAULT_ACCESS_MULTIPLIER;
+    return typeof m === 'number' && Number.isFinite(m) && m >= 0 ? Math.min(MAX_ACCESS_MULTIPLIER, m) : DEFAULT_ACCESS_MULTIPLIER;
   }
   setAccessMultiplier(owner: number, m: number) {
     const v = Math.max(0, Math.min(MAX_ACCESS_MULTIPLIER, Number.isFinite(m) ? m : DEFAULT_ACCESS_MULTIPLIER));
@@ -505,27 +581,34 @@ export class Game {
   /** Access fees `owner` earned last month and in total. */
   accessEarnings(owner: number): { lastMonth: number; total: number } { return this.accessEarned[owner] ?? { lastMonth: 0, total: 0 }; }
   /**
-   * What `user` pays for `owner`'s infrastructure: the multiplier, the share of an item's maintenance it pays
-   * when it uses the item as much as the owner (m / (1 + m)), or alone (all), and last month's actual figures.
+   * Fixed-cost fractions at equal/sole use, plus the last bill annualised (including own wear).
    */
-  estimateAccessShare(owner: number, user: number): { multiplier: number; equalUseShare: number; soleUserShare: number; usageShareLastMonth: number; paidLastMonth: number } {
+  estimateAccessShare(owner: number, user: number) {
     const m = this.accessMultiplier(owner), a = this.agreement(user, owner);
-    return { multiplier: m, equalUseShare: m / (1 + m), soleUserShare: m > 0 ? 1 : 0, usageShareLastMonth: a?.usageShareLastMonth ?? 0, paidLastMonth: a?.paidLastMonth ?? 0 };
+    return { multiplier: m, equalUseShare: Math.min(m / 2, ACCESS_CAP), soleUserShare: Math.min(m, ACCESS_CAP), cap: ACCESS_CAP,
+      usageShareLastMonth: a?.usageShareLastMonth ?? 0, paidLastMonth: a?.paidLastMonth ?? 0, yearlyCharge: (a?.paidLastMonth ?? 0) * 12 };
   }
+
+  /** Pure replacement and fee quotes shared by billing, AI planning and UI. Prices are cached derived data. */
+  accessReplacementCost(item: AccessItem): number { return accessReplacementCost(this, item); }
+  accessFullCost(item: AccessItem): number { return accessFullCost(this, item); }
+  accessChargeEstimate(user: number, owner: number, items: Iterable<AccessItem>, share: number | ((item: AccessItem) => number), annualWear = 0): number {
+    return accessChargeEstimate(this, user, owner, items, share, annualWear);
+  }
+  /** Real usage so far this month; reading it never changes the meter or simulation. */
+  accessUsage(item: AccessItem): readonly number[] { return this.usage.get(accessItemKey(item)) ?? []; }
 
   /** Metering: a vehicle of `user` travelled `units` on a rail edge (or its tram tracks). Own usage counts too. */
   recordTrackUse(user: number, e: NEdge, units: number, tram = false) {
     const owner = tram ? e.tramOwner ?? -1 : e.owner;
-    if (owner < 0 || user < 0 || e.depot >= 0) return;
+    if (owner < 0 || user < 0 || e.depot >= 0 || !(units > 0) || !Number.isFinite(units)) return;
     if (owner !== user && !this.accessKeys.has(user * 4096 + owner)) this.openAccess(user, owner);
-    if (!this.metered.has(owner)) return;
     this.addUsage(e.id * 4 + (tram ? 1 : 0), user, units);
   }
   /** Metering: a vehicle stops at a station (called when it serves the station). */
   recordStop(v: Vehicle, st: Station) {
     if (st.owner < 0 || v.owner < 0) return;
     if (st.owner !== v.owner && !this.accessKeys.has(v.owner * 4096 + st.owner)) this.openAccess(v.owner, st.owner);
-    if (!this.metered.has(st.owner)) return;
     this.addUsage(st.id * 4 + 2, v.owner, 1);
   }
   private addUsage(key: number, user: number, x: number) {
@@ -534,19 +617,6 @@ export class Game {
     while (a.length <= user) a.push(0);
     a[user] += x;
   }
-  /** Trams on metered tram tracks: distance sampled once a day (speed x one day). */
-  private meterTrams() {
-    if (!this.metered.size) return;
-    const net = this.world.net;
-    for (const v of this.vehicles.map.values()) {
-      if (v.kind !== 'road') continue;
-      const rv = v as RoadVehicle;
-      if (!rv.seg || !(rv.speed > 0) || rv.model?.kind !== 'tram') continue;
-      const e = net.edges.get(rv.seg.e);
-      if (e && e.tram) this.recordTrackUse(v.owner, e, rv.speed * DAY_SECONDS, true);
-    }
-  }
-
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
     // (ops) base upkeep including overhead wire; wear by train passages is billed on top monthly
@@ -561,39 +631,38 @@ export class Game {
   }
 
   /**
-   * Month end: users of other companies' items pay their usage share of each item's monthly maintenance to the
-   * owner. Weights: owner usage x 1, each user's usage x the owner's multiplier.
+   * Month end: capped, unweighted full-cost charges plus each user's own wear reimbursement.
    */
   billAccess() {
-    // (ops) owners pay the month's track wear; on shared track it counts towards the cost users share
-    const wear = billTrackWear(this);
     for (const a of this.access) { a.usageShareLastMonth = 0; a.paidLastMonth = 0; }
     for (const k in this.accessEarned) this.accessEarned[k].lastMonth = 0;
+    // Owners book gross wear; foreign passages reimburse it without a price factor or ceiling.
+    const wear = billTrackWear(this, (user, owner, amount) => this.payAccess(user, owner, this.accessChargeEstimate(user, owner, [], 0, amount * 12) / 12));
     if (this.usage.size) {
       const net = this.world.net;
-      /** per (user, owner): maintenance-weighted usage share numerator and the maintenance of the items used */
+      /** per (user, owner): full-cost-weighted real usage numerator and cost of used items */
       const shares = new Map<number, { u: number; c: number }>();
       for (const [key, arr] of this.usage) {
         const id = Math.floor(key / 4), kind = key % 4;
-        let owner = -1, cost = 0;
-        if (kind === 2) { const st = this.stations.get(id); if (!st) continue; owner = st.owner; cost = this.stationMaintenance(st) / 12; }
+        let owner = -1, item: AccessItem;
+        if (kind === 2) { const st = this.stations.get(id); if (!st) continue; owner = st.owner; item = st; }
         else {
           const e = net.edges.get(id);
           if (!e) continue;
-          if (kind === 1) { owner = e.tramOwner ?? -1; cost = (e.len * TRAM.maintPerUnit) / 12; } else { owner = e.owner; cost = this.edgeMaintenance(e) / 12 + (wear.get(id) ?? 0); }
+          if (kind === 1) { owner = e.tramOwner ?? -1; item = { tram: e }; } else { owner = e.owner; item = e; }
         }
         if (owner < 0 || !this.companies[owner] || this.companies[owner].defunct) continue;
         const uo = arr[owner] ?? 0;
         let su = 0;
         for (let i = 0; i < arr.length; i++) if (i !== owner) su += arr[i];
         if (!(su > 0)) continue;
-        const m = this.accessMultiplier(owner), W = uo + m * su;
+        const cost = this.accessFullCost(item);
         for (let i = 0; i < arr.length; i++) {
           if (i === owner || !(arr[i] > 0)) continue;
           const k = i * 4096 + owner, sh = shares.get(k) ?? { u: 0, c: 0 };
           sh.u += (cost * arr[i]) / (uo + su); sh.c += cost;
           shares.set(k, sh);
-          if (m > 0 && W > 0) this.payAccess(i, owner, (cost * m * arr[i]) / W);
+          this.payAccess(i, owner, this.accessChargeEstimate(i, owner, [item], arr[i] / (uo + su)) / 12);
         }
       }
       for (const [k, sh] of shares) {
@@ -713,8 +782,10 @@ export class Game {
     // The shares are already paid for; take over cash, loan and stakes in other companies.
     const be = b.economy, te = t.economy;
     if (te.money >= 0) be.earn(te.money, 'acquisition'); else be.spend(-te.money, 'acquisition', true);
+    be.initialLoan = Math.min(be.initialLoan, be.loan) + Math.min(te.initialLoan, te.loan);
     be.loan += te.loan;
-    te.money = 0; te.loan = 0;
+    be.maxLoan = Math.max(be.maxLoan, be.initialLoan);
+    te.money = 0; te.loan = 0; te.initialLoan = 0;
     this.shares.onMerge(buyer, target);
     // assets
     const w = this.world, net = w.net;
@@ -812,12 +883,20 @@ export class Game {
     if (!Number.isFinite(dtReal) || dtReal <= 0 || !Number.isFinite(this.speed) || this.speed <= 0) return;
     this.accumulator += Math.min(dtReal, MAX_FRAME_SECONDS) * this.speed;
     // A tiny tolerance prevents floating wall-time sums (e.g. three 1/60 frames) losing a whole tick.
-    const ticks = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    const due = Math.floor((this.accumulator + TICK * 1e-9) / TICK);
+    const ticks = due + this.plannerTicks;
+    this.plannerTicks = 0;
     // Keep only the fractional tick, even if the budget drops some of this frame's whole ticks.
-    this.accumulator = Math.max(0, this.accumulator - ticks * TICK);
+    this.accumulator = Math.max(0, this.accumulator - due * TICK);
     const started = performance.now();
     for (let i = 0; i < ticks && !this.paused; i++) {
       this.stepTick();
+      // Let the browser deliver a worker's derived result before releasing the next batch of ticks.
+      // The callback changes wall-time pacing only; every released tick still runs in full.
+      if (this.runtimeFrameYield?.()) {
+        this.plannerTicks = ticks - i - 1;
+        break;
+      }
       // Wall time controls release rate only; stepTick never reads this pacing clock.
       if (performance.now() - started >= FRAME_BUDGET_MS) break;
     }
@@ -845,6 +924,9 @@ export class Game {
     const tickOfDay = this.tick % TICKS_PER_DAY;
     // Finish this day's work before daily decisions can start a project for the next day.
     if (this.aiEnabled) for (const ai of [...this.ais]) ai.work(tickOfDay, tickOfDay + 1);
+    // Shared corridors: every operator's review at one tick of its own, away from the day's other work; they
+    // read one auction per corridor (performance: the order is a pure function of the clock, so saves replay it).
+    if (this.aiEnabled && tickOfDay === SHARED_CAPACITY_TICK) for (const ai of [...this.ais]) ai.sharedCapacityDaily();
     this.tick++;
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
@@ -877,13 +959,13 @@ export class Game {
 
   private onNewDay() {
     this.checkLost();
-    this.meterTrams();
     this.demand.daily();
     this.stations.daily();
     if (this.accessRequests.length) this.expireRequests();
     // passenger generation: a station's residents travel to the regions the network reaches, as the regional
-    // demand says (local and long-distance trips, scaled by the trip factor of the service: demand.ts weights); its
-    // rate is their sum (a station reaching more of its demand, by better services, generates more)
+    // demand says (city and inter-city trips, scaled by the trip factor of the service: demand.ts weights); its
+    // rate is their sum (a station reaching more of its demand, by better services, generates more). Each passenger
+    // keeps the demand set of the trip (city: within one town, inter-city: between towns) to the destination.
     for (const st of this.stations.map.values()) {
       const table = this.lines.routing.get(st.id);
       if (!table || table.size === 0) continue;
@@ -895,7 +977,7 @@ export class Game {
       const n = Math.floor(st.genAccum);
       if (n <= 0) continue;
       st.genAccum -= n;
-      let given = 0;
+      let given = 0, inter = 0;
       for (let i = 0; i < dw.dest.length; i++) {
         const share = (n * dw.w[i]) / dw.served;
         let c = Math.floor(share);
@@ -903,12 +985,16 @@ export class Game {
         if (c <= 0) continue;
         const d = dw.dest[i], hop = table.get(d);
         if (!hop) continue;
-        this.lines.distribute(hop, c, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k));
-        given += c;
+        // the city trips among them (a destination reached by both sets: its city share, rounded at random)
+        const city = dw.city[i] >= dw.w[i] ? c : dw.city[i] > 0 ? splitCount(c, dw.city[i] / dw.w[i], this.rng) : 0;
+        if (city > 0) this.lines.distribute(hop, city, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k));
+        if (c > city) this.lines.distribute(hop, c - city, (line, k) => this.stations.addWaiting(st, line, hop.alight, d, k, 0, undefined, 0, 0, 1));
+        given += c; inter += c - city;
       }
       st.genMonth += given;
+      if (inter) st.icGenMonth = (st.icGenMonth ?? 0) + inter;
       const town = this.towns.list[st.townId];
-      if (town) town.passGenMonth += given;
+      if (town) { town.passGenMonth += given; if (inter) town.icGenMonth = (town.icGenMonth ?? 0) + inter; }
       const cap = 600 + (st.rail ? st.rail.tracks * st.rail.length * 12 : 0) + st.stops.length * 150;
       this.stations.trimWaiting(st, cap);
     }
@@ -919,9 +1005,10 @@ export class Game {
     this.towns.daily();
     // capacity-integration: measure every operator before any of them makes today's fleet decision.
     if (this.aiEnabled) observeRailCapacity(this);
-    // AI: daily decisions; the monthly management on a day of its own per company (spreads the work)
+    // AI: daily decisions (the shared-path review at its own tick: stepTick); the monthly management on a day
+    // of its own per company (spreads the work)
     if (this.aiEnabled) for (const ai of [...this.ais]) {
-      ai.daily();
+      ai.daily(false);
       if (this.day % DAYS_PER_MONTH === (ai.companyId * 7) % DAYS_PER_MONTH) ai.monthly();
     }
   }
@@ -965,21 +1052,25 @@ export class Game {
     for (const co of this.companies) if (!co.defunct) co.economy.endMonth(y, m);
     for (const st of this.stations.map.values()) {
       st.genLast = st.genMonth; st.genMonth = 0;
+      st.icGenLast = st.icGenMonth ?? 0; st.icGenMonth = 0;
       st.pickupLast = st.pickupMonth; st.pickupMonth = 0;
       st.arrivedLast = st.arrivedMonth; st.arrivedMonth = 0;
       st.lostLast = st.lostMonth || 0; st.lostMonth = 0;
     }
     for (const t of this.towns.list) {
       t.passGenLast = t.passGenMonth; t.passGenMonth = 0;
+      t.icGenLast = t.icGenMonth ?? 0; t.icGenMonth = 0;
       t.passTransLast = t.passTransMonth; t.passTransMonth = 0;
       t.passLostLast = t.passLostMonth ?? 0; t.passLostMonth = 0;
     }
-    for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; }
+    for (const l of this.lines.map.values()) { l.passLast = l.passMonth; l.passMonth = 0; l.icPassLast = l.icPassMonth ?? 0; l.icPassMonth = 0; }
     this.mail.monthly();
     // which metro / light-rail stations stand in town now (their walking reach: stations.ts CITY_STATION)
     this.stations.updateCity();
     // catchments are shared out again at the start of the next tick (not on top of the month's other work)
-    if (this.stations.catchmentInputsChanged()) this.lines.catchmentDirty = true;
+    // (owed population work counts too: a game loaded with work owed has current inputs but pending populations, and
+    // must publish them on the same month as the running game, which still sees its inputs changed)
+    if (this.stations.catchmentInputsChanged() || this.stations.catchmentPopulationPending) this.lines.catchmentDirty = true;
     this.lines.markDemandSharesDirty();
     this.deferCatchment = true;
     if (this.economy.money < 0 && m % 3 === 2) this.postNews('Company in debt: borrow or cut costs.', 'info');
@@ -1012,7 +1103,7 @@ export class Game {
   saveCompanies() {
     return {
       companies: this.companies.map((c) => ({
-        id: c.id, name: c.name, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1, code: c.code ?? '',
+        id: c.id, name: c.name, hqTown: c.hqTown ?? -1, color: c.color, ai: c.ai, defunct: !!c.defunct, boughtBy: c.boughtBy ?? -1, code: c.code ?? '',
         economy: JSON.parse(JSON.stringify(c.economy)),
       })),
       ais: this.ais.map((a) => a.toJSON()),
@@ -1027,8 +1118,8 @@ export class Game {
       nextAccessRequest: this.nextRequestId,
       accessPolicies: { ...this.accessPolicies },
       accessBlocked: JSON.parse(JSON.stringify(this.blocked)),
-      // 2: open access is the default policy (v2.3)
-      accessVersion: 2,
+      // 3: full-cost price factors; previous multiplier values migrate once by 0.625.
+      accessVersion: 3,
       // a catchment recompute still pending (e.g. saved right after a buyout) happens in the loaded game too
       catchmentDirty: this.lines.catchmentDirty,
       demand: this.demand.toJSON(),
@@ -1039,6 +1130,7 @@ export class Game {
   restoreCompanies(d: any) {
     this.companies = ((d.companies ?? []) as any[]).map((c) => {
       const co: Company = { id: c.id, name: c.name, color: c.color, ai: !!c.ai, economy: Economy.fromJSON(c.economy) };
+      if (Number.isSafeInteger(c.hqTown) && c.hqTown >= 0) co.hqTown = c.hqTown;
       if (c.defunct) co.defunct = true;
       if (typeof c.boughtBy === 'number' && c.boughtBy >= 0) co.boughtBy = c.boughtBy;
       if (typeof c.code === 'string' && c.code) co.code = c.code;
@@ -1056,7 +1148,7 @@ export class Game {
     this.rebuildAccessKeys();
     this.accessMult = {};
     for (const c of this.companies) if (!c.ai) this.accessMult[c.id] = DEFAULT_ACCESS_MULTIPLIER;
-    if (d.accessMult) for (const [k, v] of Object.entries(d.accessMult)) this.accessMult[Number(k)] = Number(v);
+    if (d.accessMult) for (const [k, v] of Object.entries(d.accessMult)) this.accessMult[Number(k)] = (d.accessVersion ?? 1) < 3 ? migrateAccessMultiplier(Number(v)) : Number(v);
     this.accessEarned = {};
     if (d.accessEarned) for (const [k, v] of Object.entries(d.accessEarned as Record<string, { lastMonth: number; total: number }>)) this.accessEarned[Number(k)] = { lastMonth: v.lastMonth ?? 0, total: v.total ?? 0 };
     this.usage = new Map(((d.accessUsage ?? []) as [number, number[]][]).map(([k, u]) => [k, u.map((x) => Number(x) || 0)]));
@@ -1079,6 +1171,18 @@ export class Game {
 
   /** Restore the AI controllers once stations, lines and vehicles exist (an interrupted project is cleaned up). */
   restoreAIs(d: any) {
+    this.initializeHeadquarters(new Set(((d.companies ?? []) as any[]).filter(c => c?.hqTown === undefined).map(c => c.id)));
+    // Only recognized generated names in pre-HQ saves migrate; custom names, station codes and history stay intact.
+    for (const co of this.companies) {
+      const saved = ((d.companies ?? []) as any[]).find(c => c.id === co.id), hq = this.headquartersOf(co.id);
+      if (!hq || saved?.hqTown !== undefined) continue;
+      const genericAI = AI_NAMES.some(name => co.name === name || (co.name.startsWith(name + ' ') && /^\d+$/.test(co.name.slice(name.length + 1))))
+        || /^Rival Transport(?: \d+)?$/.test(co.name);
+      if (co.id === PLAYER ? !this.options.playerName && co.name === 'Railfever Transport' : co.ai && genericAI) {
+        const data = ((d.ais ?? []) as any[]).find(a => a?.companyId === co.id);
+        co.name = this.headquartersName(hq, normalizeAIConfig(data?.config).focus, co.id);
+      }
+    }
     if (!this.demandSaved) { this.demand.rebuild(); this.demand.recomputeShares(); this.demandSaved = true; }
     this.ais = [];
     for (const c of this.companies) {
@@ -1086,6 +1190,7 @@ export class Game {
       const data = ((d.ais ?? []) as any[]).find((a) => a && a.companyId === c.id);
       const ai = new AIController(this, c.id, data?.config);
       if (data) { try { ai.load(data); } catch (e) { console.warn('AI state could not be restored', e); } }
+      if ((d.accessVersion ?? 1) < 3) ai.config = { ...ai.config, accessMultiplier: migrateAccessMultiplier(data?.config?.accessMultiplier ?? 1) };
       if (this.legacyAccess && ai.config.accessPolicy === 'auto-approve') ai.config = { ...ai.config, accessPolicy: 'open' };
       this.ais.push(ai);
     }

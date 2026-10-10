@@ -2,7 +2,7 @@
 import type { Game } from './game';
 import type { Proposal } from './construction';
 import { doubleTrackCompletionReserve, quoteDoubleTrackCompletion, type DoublePlan } from './trackops';
-import type { Economy } from './economy';
+import { loanLimit, type Economy } from './economy';
 import { SHARED_TRACK, structureFactor } from './construction';
 import { TRACK_TYPES, UNIT_M, ELECTRIFY, WATER_Y } from './constants';
 import { trackBasePerUnit } from './opcosts';
@@ -177,7 +177,7 @@ export function openingThroatReturn(g: Game, before: OpeningThroatBaseline,
     && service.income - service.running - maintenance - annualInterest >= need, capital, maintenance, need, paid };
 }
 
-type OpeningEconomy = Pick<Economy, 'money' | 'loan' | 'maxLoan' | 'loanStep' | 'interestRate'>;
+type OpeningEconomy = Pick<Economy, 'money' | 'loan' | 'maxLoan' | 'loanStep' | 'interestRate'> & Partial<Pick<Economy, 'initialLoan'>>;
 export interface OpeningFundingBaseline { readonly fleet: number; readonly noRepairLoan: number }
 /** Original normal signalling and subsequent stock funding, before any optional loans or paid leads. */
 export function openingFundingBaseline(e: OpeningEconomy, fleet: number, normalSignals: number): OpeningFundingBaseline {
@@ -192,7 +192,7 @@ export function openingFundingAppraisal(e: OpeningEconomy, original: OpeningFund
   const annualInterest = incrementalLoan * e.interestRate;
   const affordable = [amount, target, endLoan, annualInterest, available].every(Number.isFinite) && completion >= 0
     && e.money + finance.totalLoan >= target && available >= target
-    && (finance.totalLoan === 0 || endLoan <= e.maxLoan * appetite);
+    && (finance.totalLoan === 0 || endLoan <= loanLimit(e, appetite));
   return { affordable, amount, target, endLoan, incrementalLoan, annualInterest };
 }
 

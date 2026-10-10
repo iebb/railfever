@@ -28,6 +28,8 @@ export interface Line {
   stops: number[];
   vehicles: number[];
   passMonth: number; passLast: number;
+  /** the inter-city trips of passMonth / passLast (boardings; the rest are city trips: demand.ts DemandSet); unset in older saves */
+  icPassMonth?: number; icPassLast?: number;
   incomeYear: number; incomeLast: number;
   costYear: number; costLast: number;
   /** number in the automatic name ("R2 …", "Bus 3 …"), per company and kind */
@@ -96,7 +98,24 @@ export interface PatternSpacing {
  */
 export interface Hop { line: number; alight: number; cost: number; lines?: number[] }
 /** An edge of the routing graph: to station `to` riding `line` (WALK_LINE: walking a transfer link), `cost` sim seconds. */
-export interface RouteEdge { to: number; line: number; cost: number }
+export interface RouteEdge { to: number; line: number; cost: number; internalTransfer?: boolean }
+
+/** Disposable prospective complex membership follows admitted internal passages, never station names. */
+export function transferComplexes(edges: Map<number, RouteEdge[]>, native?: (a: number, b: number) => boolean) {
+  const parent = new Map<number, number>();
+  const root = (id: number): number => {
+    let r = id;
+    while (parent.has(r) && parent.get(r) !== r) r = parent.get(r)!;
+    for (let at = id; at !== r;) { const next = parent.get(at)!; parent.set(at, r); at = next; }
+    return r;
+  };
+  for (const [from, links] of edges) for (const e of links) if (e.line === WALK_LINE && e.internalTransfer) {
+    const a = root(from), b = root(e.to); parent.set(a, b); parent.set(from, b); parent.set(e.to, b);
+  }
+  // Freeze this graph's admitted passage components once; no repeated traversal during Dijkstra.
+  for (const id of parent.keys()) parent.set(id, root(id));
+  return (a: number, b: number) => (parent.has(a) && parent.has(b) && parent.get(a) === parent.get(b)) || !!native?.(a, b);
+}
 
 function addEdge(edges: Map<number, RouteEdge[]>, from: number, e: RouteEdge) {
   let arr = edges.get(from);
@@ -144,31 +163,38 @@ class RouteHeap {
   }
 }
 
+interface RouteNode { best: number; first: { line: number; alight: number } | null; rode: boolean; walked: boolean; arrival: number | undefined }
+
 /**
  * First hops of the cheapest journeys from `src` over the routing graph (Dijkstra; transfers cost
  * TRANSFER_PENALTY_S, plus PLATFORM_CHANGE_S unless walked): Map(dest -> hop) for every station reached riding a line.
  */
-function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap): Map<number, Hop> {
+function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap,
+  sameComplex: (a: number, b: number) => boolean = () => false): Map<number, Hop> {
   const table = new Map<number, Hop>();
-  const best = new Map<number, number>([[src, 0]]);
-  const first = new Map<number, { line: number; alight: number }>();
-  // did the best path ride a line? (stations reached on foot only are no destinations) Did it arrive on foot?
-  const rode = new Map<number, boolean>([[src, false]]);
-  const walked = new Map<number, boolean>([[src, false]]);
+  // One record per reached station (insertion order = first relaxation, as the former per-field maps had):
+  // best cost, first hop, did the best path ride a line, did it arrive on foot, where it last alighted.
+  const state = new Map<number, RouteNode>([[src, { best: 0, first: null, rode: false, walked: false, arrival: undefined }]]);
   open.clear();
   open.push(0, src);
   while (open.size) {
-    const c = open.top(), u = open.pop();
-    if (c > (best.get(u) ?? Infinity)) continue;
+    const c = open.top(), u = open.pop(), su = state.get(u)!;
+    if (c > su.best) continue;
+    // Every outgoing ride has the same transfer at this popped node. First boarding and walking
+    // edges need no complex query; compute the penalty lazily for the first outgoing ride only.
+    let transfer: number | undefined;
     for (const e of edges.get(u) ?? []) {
-      // boarding again after a ride: a transfer (penalty, plus changing platforms unless they walked here)
-      const transfer = e.line !== WALK_LINE && rode.get(u) ? TRANSFER_PENALTY_S + (walked.get(u) ? 0 : PLATFORM_CHANGE_S) : 0;
-      const nc = c + e.cost + transfer;
-      if (nc < (best.get(e.to) ?? Infinity)) {
-        best.set(e.to, nc);
-        first.set(e.to, u === src ? { line: e.line, alight: e.to } : first.get(u)!);
-        rode.set(e.to, !!rode.get(u) || e.line !== WALK_LINE);
-        walked.set(e.to, e.line === WALK_LINE);
+      if (e.line !== WALK_LINE && su.rode && transfer === undefined)
+        transfer = (sameComplex(su.arrival ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (su.walked ? 0 : PLATFORM_CHANGE_S);
+      const nc = c + e.cost + (e.line === WALK_LINE ? 0 : transfer ?? 0);
+      let sv = state.get(e.to);
+      if (nc < (sv ? sv.best : Infinity)) {
+        if (!sv) { sv = { best: nc, first: null, rode: false, walked: false, arrival: undefined }; state.set(e.to, sv); }
+        sv.best = nc;
+        sv.first = u === src ? { line: e.line, alight: e.to } : su.first!;
+        sv.rode = su.rode || e.line !== WALK_LINE;
+        sv.walked = e.line === WALK_LINE;
+        sv.arrival = e.line === WALK_LINE ? su.arrival ?? u : e.to;
         open.push(nc, e.to);
       }
     }
@@ -181,9 +207,10 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
     const o = a.find((x) => x.line === e.line);
     if (o) o.cost = Math.min(o.cost, e.cost); else a.push({ line: e.line, cost: e.cost });
   }
-  for (const [d, f] of first) {
-    if (d === src || !rode.get(d)) continue;
-    const hop: Hop = { line: f.line, alight: f.alight, cost: best.get(d)! };
+  for (const [d, sd] of state) {
+    const f = sd.first;
+    if (!f || d === src || !sd.rode) continue;
+    const hop: Hop = { line: f.line, alight: f.alight, cost: sd.best };
     const leg = legs.get(f.alight);
     if (leg && leg.length > 1) {
       const own = leg.find((x) => x.line === f.line);
@@ -197,9 +224,23 @@ function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap
 }
 
 /** Routing tables from each source over a routing graph: Map(source -> Map(dest -> first hop)), filled into `out`. */
-export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>()): Map<number, Map<number, Hop>> {
+export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>(),
+  nativeComplex?: (a: number, b: number) => boolean): Map<number, Map<number, Hop>> {
   const open = new RouteHeap();
-  for (const src of sources) out.set(src, routeFrom(edges, src, open));
+  // Membership is a pure snapshot for this synchronous table build. Cache ordered pairs locally,
+  // including false answers; the next build observes any link/combined-platform change immediately.
+  const membership = new Map<number, Map<number, boolean>>();
+  const native = nativeComplex ? (a: number, b: number) => {
+    let row = membership.get(a);
+    const found = row?.get(b);
+    if (found !== undefined) return found;
+    const value = !!nativeComplex(a, b);
+    if (!row) { row = new Map(); membership.set(a, row); }
+    row.set(b, value);
+    return value;
+  } : undefined;
+  const sameComplex = transferComplexes(edges, native);
+  for (const src of sources) out.set(src, routeFrom(edges, src, open, sameComplex));
   return out;
 }
 
@@ -215,7 +256,9 @@ export function routeGraph(g: Game, cargo: Cargo = 'pax'): { edges: Map<number, 
   const stations = g.stations;
   for (const wl of stations.walkLinks()) {
     const sa = stations.get(wl.from), sb = stations.get(wl.to);
-    addEdge(edges, wl.from, { to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 });
+    const internal = stations.isSameStationComplex(wl.from, wl.to);
+    addEdge(edges, wl.from, { to: wl.to, line: WALK_LINE, internalTransfer: internal,
+      cost: sa && sb ? transferWalkTime(stations.gap(sa, sb), internal) : wl.cost * 4 });
   }
   return { edges, served };
 }
@@ -744,6 +787,22 @@ export class Lines {
     if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
   }
 
+  /**
+   * A road line upgraded to trams (or back): the same line, its stops and waiting passengers, with the number, automatic
+   * name and colour of its new mode. Its vehicles must have left it first (they run one mode).
+   */
+  retype(id: number, kind: Transport) {
+    const l = this.map.get(id);
+    if (!l || l.kind === kind) return;
+    l.kind = kind;
+    l.num = this.freeNumber(kind, l.owner, l.id);
+    delete l.spacing;
+    if (l.autoColor) l.color = this.pickColor(kind, l.owner, l.id);
+    if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
+    this.ensureCode(l);
+    this.rebuild();
+  }
+
   // ---------------------------------------------------------------- stops
   /** Can this station be added as a stop of the line? Null if yes, else the reason. */
   canAddStop(lineId: number, stationId: number): string | null {
@@ -808,23 +867,26 @@ export class Lines {
     return false;
   }
   /**
-   * May `company` put vehicles on the line? The lead operator, or one of its operators that owns at least one of
-   * the line's stations (a company running services on a line owns a station of it).
+   * May `company` put vehicles on the line? Operators need access to its physical stops, not ownership of them.
    */
-  canOperate(l: Line, company: number): boolean { return company === l.owner || (!!l.operators?.includes(company) && this.ownsStationOn(l, company)); }
+  canOperate(l: Line, company: number): boolean { return this.operateError(l, company) === null; }
   /**
-   * Why `company` may not put (more) vehicles on the line, or null: it must be the lead operator or an operator
-   * of it, and own at least one of the line's stations.
+   * Why `company` may not put vehicles on the line, or null. Actual track and consist routing remains native.
    */
   operateError(l: Line, company: number): string | null {
     const g = this.game;
     if (company !== l.owner && !l.operators?.includes(company)) return `${g.company(company).name} is not an operator of ${l.name}`;
-    if (l.stops.length && !this.ownsStationOn(l, company)) return `${g.company(company).name} needs a station it owns on ${l.name}`;
+    for (const sid of l.stops) {
+      const st = g.stations.get(sid);
+      if (!st) return 'No such station';
+      if (!g.canUse(company, st.owner)) return `${st.name}: track access needed from ${g.company(st.owner).name}`;
+      if (l.kind === 'tram' && !g.stations.tramStops(st, company).length) return 'No tram stop on accessible tracks';
+    }
     return null;
   }
   /**
    * `company` joins the line as a further operator (its vehicles then run it too): on an open line, or one it
-   * was invited to (it needs the right to use the lead operator's network: open access, or an agreement).
+   * was invited to, with access to the physical stops it uses.
    * Null = OK, else why not.
    */
   join(id: number, company: number): string | null {
@@ -833,18 +895,21 @@ export class Lines {
     if (company === l.owner) return null;
     const g = this.game, co = g.companies[company];
     if (!co || co.defunct) return 'No such company';
-    if (!this.ownsStationOn(l, company)) return `${co.name} needs a station it owns on ${l.name}`;
     // (invited: in already)
-    if (l.operators?.includes(company)) return null;
+    if (l.operators?.includes(company)) return this.operateError(l, company);
     if (this.partnerPolicy(l) !== 'open') return `${g.company(l.owner).name} runs ${l.name} alone`;
-    if (!g.canUse(company, l.owner)) return `No track access to ${g.company(l.owner).name}'s network`;
+    for (const sid of l.stops) {
+      const st = g.stations.get(sid);
+      if (!st || !g.canUse(company, st.owner)) return `No track access to ${g.company(st?.owner ?? l.owner).name}'s network`;
+      if (l.kind === 'tram' && !g.stations.tramStops(st, company).length) return 'No tram stop on accessible tracks';
+    }
     (l.operators ??= []).push(company);
     return null;
   }
   /** The lead operator lets `company` run vehicles on the line (whatever the policy). */
   invite(id: number, company: number) {
     const l = this.map.get(id);
-    if (l && !this.canOperate(l, company)) (l.operators ??= []).push(company);
+    if (l && company !== l.owner && !l.operators?.includes(company)) (l.operators ??= []).push(company);
   }
   /** `company` stops running the line: its vehicles there go back to their depots (no line). */
   leave(id: number, company: number) {
@@ -910,11 +975,13 @@ export class Lines {
     const walks: [number, RouteEdge][] = [];
     for (const wl of stations.walkLinks()) {
       const sa = stations.get(wl.from), sb = stations.get(wl.to);
-      const e: RouteEdge = { to: wl.to, line: WALK_LINE, cost: sa && sb ? transferWalkTime(stations.gap(sa, sb)) : wl.cost * 4 };
+      const internal = stations.isSameStationComplex(wl.from, wl.to);
+      const e: RouteEdge = { to: wl.to, line: WALK_LINE, internalTransfer: internal,
+        cost: sa && sb ? transferWalkTime(stations.gap(sa, sb), internal) : wl.cost * 4 };
       addEdge(edges, wl.from, e);
       walks.push([wl.from, e]);
     }
-    routeTables(edges, edges.keys(), this.routing);
+    routeTables(edges, edges.keys(), this.routing, (a, b) => stations.isSameStationComplex(a, b));
     this.mailRoutes(mailLines, edges, walks);
     const all = stations.all();
     for (const st of all) this.rerouteWaiting(st);
@@ -974,11 +1041,13 @@ export class Lines {
     for (const [from, arr] of medges) for (const e of arr) if (e.line !== WALK_LINE) { served.add(find(from)); if (own.has(e.line)) apart.add(find(from)); }
     for (const [from, arr] of edges) for (const e of arr) if (e.line !== WALK_LINE && !carrying.has(e.line)) apart.add(find(from));
     const open = new RouteHeap();
+    // The same transfer rule as the passenger tables a complex shares: no external penalty inside one station complex.
+    const stations = g.stations, sameComplex = transferComplexes(medges, (a, b) => stations.isSameStationComplex(a, b));
     for (const src of medges.keys()) {
       const root = find(src);
       if (!served.has(root)) continue;
       const shared = apart.has(root) ? undefined : this.routing.get(src);
-      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open));
+      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open, sameComplex));
     }
   }
 
@@ -1031,8 +1100,8 @@ export class Lines {
       if (!hop) continue;
       // (they keep when they started waiting and whether they changed vehicles)
       const tr = (n: number) => (w.transfers ? (w.transfers * n) / Math.max(1, w.count) : 0);
-      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
-      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0));
+      if (hop.alight === w.alight && (hop.line === w.line || hop.lines?.includes(w.line))) stations.addWaiting(st, w.line, w.alight, w.dest, w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
+      else this.distribute(hop, w.count, (line, n) => stations.addWaiting(st, line, hop.alight, w.dest, n, 0, w.t, tr(n), w.rail ?? 0, w.ic ?? 0));
     }
   }
 

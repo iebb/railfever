@@ -221,16 +221,16 @@ export class Minimap {
     // map views
     if (this.mode === 'demand' && this.ui.mapModes.demand?.regions?.length) {
       // districts by served share, the strongest flows between them
-      const d = this.ui.mapModes.demand;
+      const d = this.ui.mapModes.demand, flows = this.ui.mapModes.demandFlows(d);
       const byId = new Map(d.regions.map((r) => [r.id, r]));
       for (const r of d.regions) {
         ctx.beginPath(); ctx.arc(r.x * k, r.z * k, Math.max(1.5 * this.dpr, r.r * k), 0, Math.PI * 2);
         ctx.globalAlpha = 0.35; ctx.fillStyle = hexCss(servedColor(r.served)); ctx.fill();
       }
-      const maxT = Math.max(1, d.flows[0]?.trips ?? 1);
+      const maxT = Math.max(1, flows[0]?.trips ?? 1);
       ctx.lineCap = 'round';
-      for (let i = Math.min(d.flows.length, 200) - 1; i >= 0; i--) {
-        const f = d.flows[i];
+      for (let i = Math.min(flows.length, 200) - 1; i >= 0; i--) {
+        const f = flows[i];
         if (i >= 50 && !(f.served > 0.01)) continue;
         const A = byId.get(f.a), B = byId.get(f.b);
         if (!A || !B) continue;

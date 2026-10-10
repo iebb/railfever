@@ -87,6 +87,48 @@ export function stationPose(r: StationGeometry, off = 0, along = 0): StationPose
   return { ...p, x: p.x + p.fz * delta, z: p.z - p.fx * delta };
 }
 
+interface CoarseProjection {
+  track: RailGeometryTrack | undefined; pieces: RailGeometryPiece[]; inputs: number[]; xy: Float64Array;
+}
+const projections = new WeakMap<StationGeometry, CoarseProjection>();
+
+/** Every mutable input used by stationPose's zero-offset XY grid; profiles affect only its unused Y. */
+function projectionInputs(r: StationGeometry, track: RailGeometryTrack | undefined, visit: (value: number) => void) {
+  visit(r.length);
+  if (!track) { visit(r.x); visit(r.y); visit(r.z); visit(r.angle); return; }
+  visit(track.offset); visit(track.length); visit(track.pieces.length);
+  for (const p of track.pieces) {
+    const c = p.curve;
+    visit(p.length); visit(c.x0); visit(c.z0); visit(c.x1); visit(c.z1);
+    visit(c.x2); visit(c.z2); visit(c.x3); visit(c.z3);
+  }
+  visit(track.knots.length);
+  for (const k of track.knots) { visit(k.u); visit(k.s); }
+}
+
+function projectionSamples(r: StationGeometry, n: number): Float64Array {
+  const tracks = r.alignment?.tracks;
+  let track = tracks?.[0];
+  if (track) for (const t of tracks!) if (Math.abs(t.offset - 0) < Math.abs(track.offset - 0)) track = t;
+  const old = projections.get(r);
+  let same = !!old && old.track === track && old.pieces.length === (track?.pieces.length ?? 0)
+    && old.pieces.every((p, i) => p === track!.pieces[i]);
+  let at = 0;
+  if (same) {
+    projectionInputs(r, track, value => { if (!Object.is(old!.inputs[at++], value)) same = false; });
+    same &&= at === old!.inputs.length;
+  }
+  if (same) return old!.xy;
+  const inputs: number[] = []; projectionInputs(r, track, value => inputs.push(value));
+  const xy = new Float64Array((n + 1) * 2);
+  for (let i = 0; i <= n; i++) {
+    const a = -r.length / 2 + r.length * i / n, p = stationPose(r, 0, a);
+    xy[i * 2] = p.x; xy[i * 2 + 1] = p.z;
+  }
+  projections.set(r, { track, pieces: track?.pieces.slice() ?? [], inputs, xy });
+  return xy;
+}
+
 /** Closest reference coordinate and local offset (entrance attachment and picking). */
 export function stationLocal(r: StationGeometry, x: number, z: number): { along: number; off: number } {
   if (!r.alignment) {
@@ -95,9 +137,10 @@ export function stationLocal(r: StationGeometry, x: number, z: number): { along:
   }
   let best = Infinity, along = 0;
   const n = Math.max(1, Math.ceil(r.length / 0.25));
+  const xy = projectionSamples(r, n);
   for (let i = 0; i <= n; i++) {
-    const a = -r.length / 2 + r.length * i / n, p = stationPose(r, 0, a);
-    const d = (x - p.x) ** 2 + (z - p.z) ** 2;
+    const a = -r.length / 2 + r.length * i / n;
+    const d = (x - xy[i * 2]) ** 2 + (z - xy[i * 2 + 1]) ** 2;
     if (d < best) { best = d; along = a; }
   }
   // Refine inside the sampled interval, then preserve longitudinal distance beyond either terminus.

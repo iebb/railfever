@@ -8,6 +8,7 @@ import { loadFonts } from './ui/fonts';
 import { defaultTowns, DEFAULT_MAP_SIZE } from './ui/title';
 import { aiConfigsFor, MAX_AI } from './ui/gameapi';
 import { audio } from './audio/engine';
+import { enableCorridorWorker, disposeCorridorWorker, consumeCorridorWorkerLaunch } from './game/corridor-worker';
 
 const fontsReady = loadFonts();
 audio.loadSettings();
@@ -53,7 +54,13 @@ function afterPaint(fn: () => void) {
 }
 
 function setGame(g: Game, hasPlayed = false) {
+  if (game && game !== g) {
+    disposeCorridorWorker(game);
+    game.runtimeFrameYield = undefined;
+  }
   game = g;
+  enableCorridorWorker(g);
+  g.runtimeFrameYield = () => consumeCorridorWorkerLaunch(g);
   played = hasPlayed;
   renderer.setGame(g);
   ui.setGame(g);
@@ -128,11 +135,19 @@ window.addEventListener('pagehide', () => { autosave('pagehide'); });
 
 let last = performance.now();
 const focusV = new THREE.Vector3();
+const trackedVehicles: number[] = [];
 function loop(now: number) {
   const wallDt = Math.max(0, (now - last) / 1000);
   const dt = Math.min(MAX_FRAME_SECONDS, wallDt);
   last = now;
   if (game) {
+    trackedVehicles.length = 0;
+    if (ui.following !== null) trackedVehicles.push(ui.following);
+    for (const id of ui.wm.wins.keys()) if (id.startsWith('veh-')) {
+      const vehicle = Number(id.slice(4));
+      if (Number.isFinite(vehicle)) trackedVehicles.push(vehicle);
+    }
+    renderer.vehicles.setTrackedVehicleIds(trackedVehicles);
     const t0 = performance.now();
     try { game.update(dt); } catch (e) { console.error(e); }
     renderer.simMs = performance.now() - t0;
@@ -144,9 +159,13 @@ function loop(now: number) {
       }
       renderer.frame(dt);
     } catch (e) { console.error(e); }
+    const uiStart = performance.now();
     try { ui.update(dt); } catch (e) { console.error(e); }
-    renderer.loopMs = performance.now() - t0;
+    renderer.uiMs = performance.now() - uiStart;
+    const audioStart = performance.now();
     try { audio.update(dt, renderer.camera, renderer.controls.focusInto(focusV), renderer.controls.smoothDistance, renderer.night); } catch (e) { console.error(e); }
+    renderer.audioMs = performance.now() - audioStart;
+    renderer.loopMs = performance.now() - t0;
     // Opening Load from the preview title does not turn that preview into a played game.
     if (!ui.titleOpen && !game.paused && !ui.wm.get('saveload') && !switching) played = true;
     if (!played) autosaveTimer = 0;
@@ -167,8 +186,8 @@ async function boot() {
   const wp = params.get('water');
   const water = (wp === 'low' || wp === 'medium' || wp === 'high' ? wp : 'medium') as NewGameOptions['water'];
   const aiCompanies = Math.max(0, Math.min(MAX_AI, Math.round(num('ai', 1))));
-  // ?aistyle=balanced|cautious|aggressive|rail|bus|tram|mixed
-  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies);
+  // ?aistyle=balanced|cautious|aggressive|rail|bus|tram|mixed, ?airail=0..100 (the rivals' average rail share; 50 = even)
+  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies, undefined, Math.max(0, Math.min(100, num('airail', 50))) / 100, seed);
   // the autosave (IndexedDB) becomes the current game unless ?new asks for a fresh map
   showLoading('Loading…');
   await slotsReady;

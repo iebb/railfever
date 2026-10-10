@@ -84,7 +84,7 @@ const TOOL_SHORT: Partial<Record<ToolId, string>> = {
   'metro-station': 'Underground by default; street entrances.',
   electrify: 'Click track or drag along a line.',
   connect: 'Pick a point on each track.',
-  relevel: 'Click or drag along your track.',
+  relevel: 'Click or drag along permitted track.',
 };
 
 /** Longer tray tooltips where the name alone does not explain the tool. */
@@ -455,10 +455,18 @@ export class Hud {
   /** Keep the tool card above the dock and tray (bottom right; full width on phones). */
   private placeCard() {
     const H = window.innerHeight;
-    const dockTop = this.wrap.getBoundingClientRect().top;
+    const dock = this.wrap.getBoundingClientRect(), dockTop = dock.top;
     if (dockTop > 0 && dockTop < H) this.ui.root.style.setProperty('--dock-clearance', `${Math.ceil(H - dockTop + 8)}px`);
+    // windows end above the dock, tray and tool card (their own scroll area holds the rest)
+    const fitWindows = () => {
+      const below = dockTop > 0 && dockTop < H ? [{ left: dock.left, right: dock.right, top: dockTop }] : [];
+      const card = this.card.style.display === 'none' ? null : this.card.getBoundingClientRect();
+      if (card && card.width) below.push({ left: card.left, right: card.right, top: card.top });
+      this.ui.wm.below = below;
+      this.ui.wm.fitAll();
+    };
     this.ui.syncCompactPanels();
-    if (this.card.style.display === 'none') return;
+    if (this.card.style.display === 'none') { fitWindows(); return; }
     let top = this.dock.getBoundingClientRect().top;
     if (this.trayEl.style.display !== 'none') {
       // lift above the tray only where they would collide (narrow screens)
@@ -466,6 +474,7 @@ export class Hud {
       if (tr.right > cr.left - 8 && tr.left < cr.right + 8) top = Math.min(top, tr.top);
     }
     if (top > 0 && top < H) this.card.style.bottom = Math.round(H - top + 8) + 'px';
+    fitWindows();
   }
 
   /** Screen areas the cursor tooltip should not cover. */

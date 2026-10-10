@@ -212,12 +212,12 @@ console.log('cross-company join, access and numbering');
   check(east.joinedName === undefined && east.autoName && east.name === h.lines.autoNameOf(east), 'resetting the automatic name uses the full joined route');
 }
 
-console.log('through running with a platform reversal');
+console.log('a platform reversal is no through route');
 {
   const g = game(), net = g.world.net;
   const A = station(g, 60, 128, Math.PI / 2, 12, 1)!, J = station(g, 300, 192, Math.PI / 2, 12, 1)!, B = station(g, 60, 256, Math.PI / 2, 12, 1)!;
-  // Both branches enter the back of the same platform. Its front is a buffer stop: through service must
-  // reverse at the platform, rather than treat the two independently reachable station pairs as enough.
+  // Both branches enter the back of the same platform. Its front is a buffer stop: a through service would have to
+  // reverse at the platform and run back over the junction it came by. The two lines stay two lines meeting there.
   for (const st of [A, B]) {
     const a = net.nodes.get(endNode(g, st, 0, true))!, b = net.nodes.get(endNode(g, J, 0, false))!;
     const length = Math.hypot(b.x - a.x, b.z - a.z);
@@ -227,19 +227,9 @@ console.log('through running with a platform reversal');
   const left = g.lines.create('rail'), right = g.lines.create('rail');
   left.stops = [A.id, J.id]; right.stops = [B.id, J.id];
   g.lines.rebuild();
-  check(canJoinLines(g, left, right).ok, 'a reversal at the shared platform is an acceptable continuation');
-  const result = joinLines(g, left, right);
-  if (typeof result === 'string') throw new Error(result);
-  const t = train(g, depotFor(g, A, J), result.line);
-  const seen = new Set<number>();
-  let previousState = '', previousStation = -1, previousReversed = t.reversed, reversals = 0;
-  run(g, 400, () => {
-    if (t.state === 'loading') seen.add(t.atStation);
-    if (previousState === 'loading' && previousStation === J.id && t.state !== 'loading' && previousReversed !== t.reversed) reversals++;
-    previousState = t.state; previousStation = t.atStation; previousReversed = t.reversed;
-  });
-  check(seen.size === 3 && reversals >= 2, `through train reaches both branches and reverses at the shared platform (${reversals} reversals)`);
-  check(checkReservations(g).length === 0, 'platform reversals retain consistent reservations');
+  const before = json(g), preview = canJoinLines(g, left, right), attempt = joinLines(g, left, right);
+  check(!preview.ok && preview.junction === J.id && /reverse/.test(preview.reason), `a reversal at the shared platform is refused (${preview.ok ? 'allowed' : preview.reason})`);
+  check(typeof attempt === 'string' && json(g) === before && g.lines.all().length === 2, 'the refused join leaves both lines as they were');
 }
 
 console.log('refusals and disconnected platform tracks');

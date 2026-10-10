@@ -31,6 +31,14 @@ export function terrainFit(g: Game, edges?: Iterable<NEdge>, sites?: Sites): Fit
     const kind = e.kind === 'rail' ? 'rail' : e.type === 'street' ? 'street' : 'road';
     const na = net.nodes.get(e.a), nb = net.nodes.get(e.b);
     const flag = e.depot >= 0 ? 'depot' : e.station >= 0 ? 'station' : (na?.edges.length === 1 || nb?.edges.length === 1) ? 'dead end' : 'plain';
+    // (a rail edge ending at a tunnel mouth, the next edge running on in the bore: its portal stands at that end as a
+    // portal within an edge does, terraform.ts portalEnd; 2.11, where a second track laid up to the first one's portal
+    // keeps the hillside and the streets above it)
+    const mouth = (nid: number) => e.kind === 'rail' && (net.nodes.get(nid)?.edges ?? []).some((id) => {
+      const q = id === e.id ? undefined : net.edges.get(id);
+      return !!q && q.kind === 'rail' && net.sectionAt(q, q.a === nid ? 0 : q.len) === 'tunnel';
+    });
+    const mouthA = mouth(e.a), mouthB = mouth(e.b);
     for (let s = 0.25; s < e.len - 0.25; s += 0.5) {
       if (net.sectionAt(e, s) !== 'ground') continue;
       net.pointAt(e, s, p, d);
@@ -41,7 +49,7 @@ export function terrainFit(g: Game, edges?: Iterable<NEdge>, sites?: Sites): Fit
         r.samples++;
         const cov = kind === 'rail' && t > p.y - 0.02, flo = t < p.y - 0.35;
         if (!cov && !flo) continue;
-        if (e.sections.some((q) => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1)) { r.portal++; continue; }
+        if (e.sections.some((q) => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1) || (mouthA && s < 1) || (mouthB && s > e.len - 1)) { r.portal++; continue; }
         const key = `${cov ? 'covered' : 'floating'} ${kind} ${where} ${flag} ${clash(g, e, p.x + nx * o, p.z + nz * o, p.y, sites)}`;
         r.causes.set(key, (r.causes.get(key) ?? 0) + 1);
         if (key.endsWith('by station site')) { r.station++; continue; }

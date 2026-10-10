@@ -105,7 +105,9 @@ const connectedAt = (g: Game, st: Station, front: boolean) => g.stations.trackEn
   check(!g.stations.commitRail(ug, 0), 'underground station built (entrances only)');
   const U = g.stations.get(uid)!;
   const rs = planStationUpgrade(g, U.id, { style: 'classic' });
-  check(rs.ok && !!rs.restyleOnly && !commitStationUpgrade(g, rs) && U.rail!.style === 'classic' && U.rail!.level === 'underground' && Math.abs((g.stations.catchmentShapes(U)[0]?.r ?? 0) - 28.224) < 1e-6, `a street-level building added later (${rs.error ?? 'ok'}): walking limit 282.24 m before the grid allowance`);
+  // User rule (2.10): station walking reach halved again (CATCHMENT_RADIUS.rail 23.52 -> 11.76), so the classic
+  // building's +20% gives 11.76 x 1.2 = 14.112 (141.12 m), half of 2.9's 28.224.
+  check(rs.ok && !!rs.restyleOnly && !commitStationUpgrade(g, rs) && U.rail!.style === 'classic' && U.rail!.level === 'underground' && Math.abs((g.stations.catchmentShapes(U)[0]?.r ?? 0) - 14.112) < 1e-6, `a street-level building added later (${rs.error ?? 'ok'}): walking limit 141.12 m before the grid allowance`);
   const g3 = deserialize(JSON.parse(JSON.stringify(serialize(g))));
   check(JSON.stringify(g3.stations.catchmentShapes(g3.stations.get(U.id)!)) === JSON.stringify(g.stations.catchmentShapes(U)), 'save round trip keeps the building and its catchment');
   const odd = restoreStation(JSON.parse(JSON.stringify({ ...built[2], waiting: [], rail: { ...built[2].rail, style: 'gothic-revival' } })));
@@ -266,7 +268,9 @@ const connectedAt = (g: Game, st: Station, front: boolean) => g.stations.trackEn
   const r = runTrains(g, [t], 120);
   check((r.arrivals.get(t.id) ?? []).includes(M1.id), 'a train serves the merged station');
   // a station at an angle nearby: a transfer complex instead, shown as one
-  const N = station(g, 116, 169, PI2 + 0.6, 8, 1)!;
+  // (User rule, 2.10: intermediate transfer reach is half the smaller station's halved street reach, 88.2 m here;
+  // the angled station moves from x 116 (105 m walk, linked under 2.9's reach) to x 112 (about 72 m) to stay linkable.)
+  const N = station(g, 112, 169, PI2 + 0.6, 8, 1)!;
   const cn = canMerge(g, M1.id, N.id);
   console.log(`  at an angle: ${cn.kind} (${cn.reason})`);
   check(cn.ok && cn.kind === 'complex', 'not parallel: a transfer complex');

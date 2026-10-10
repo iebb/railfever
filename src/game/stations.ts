@@ -2,7 +2,7 @@
 // bus / tram stops on road edges, catchment areas per mode, road access and entrances, transfer complexes
 // (stations merged into one, or linked for walking transfers), station names, and rebuilding / relocating.
 import type { Game } from './game';
-import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf } from './constants';
+import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
 import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
@@ -16,12 +16,13 @@ import { STATION_STYLES, styleOf, CONCOURSE_PAVILION, stationCrossings } from '.
 import type { StationBuildingStyle, StylePlacement } from './station-styles';
 import { simNow, transferWalkTime, fareGroupKey, railHistory, changeClass } from './fares';
 import { cargoGroups } from './vehicle';
-import { walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadsChanged, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, type WalkingCatchment } from './catchment';
+import { WALK_DETOUR, walkingCatchment, readWalkingCatchment, prepareWalkingCatchment, fullWalkingCatchments, refreshWalkBuildings, walkRoadSnapshot, pedestrianRoad, walkableStreetNear, walkWeight, coverOf, walkClaimShares, type WalkingCatchment } from './catchment';
 import { addMail, trimMail, rerouteMail, absorbMail, settleMail, newJourney, type StationMail, type MailJourney } from './mail';
 import { demolitionCost, demolitionTotal } from './demolition';
 import { depotVolume } from './build-ops';
 import { stationPose, stationLocal, stationStripRects } from './station-geometry';
 import type { RailStationAlignment, RailTrackGroup, RailTrackStep, StationGeometry } from './station-geometry';
+import type { RegionSnapshot } from './spatial';
 export type { RailTrackGroup, RailTrackStep } from './station-geometry';
 
 /**
@@ -34,6 +35,8 @@ export interface WaitGroup {
   line: number; alight: number; dest: number; count: number; t?: number; transfers?: number;
   /** the distance fares (per passenger) of the journey's rail legs so far: the rail minimum is paid once per journey */
   rail?: number;
+  /** 1: an inter-city trip, absent: a city trip (fares.ts setFlag / groupSet; demand.ts DemandSet) */
+  ic?: number;
 }
 
 export interface Rect { x: number; z: number; angle: number; w: number; d: number }
@@ -58,21 +61,25 @@ export type CatchMode = 'rail' | 'tram' | 'bus';
 export type PlatformStyle = 'island' | 'side';
 
 /**
- * Nominal walking limit per mode (units, 1 = 10 m): 70% of release 2.6's limits. Rail is one mode:
+ * Nominal walking limit per mode (units, 1 = 10 m): half of release 2.9's limits. Rail is one mode:
  * main-line, metro and light-rail stations walk alike. catchment.ts applies the
  * street-grid allowance (and building bonuses) and measures paths along streets from forecourts, entrances and stops.
  */
-export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 23.52, tram: 21.56, bus: 15.68 };
+export const CATCHMENT_RADIUS: Record<CatchMode, number> = { rail: 11.76, tram: 10.78, bus: 7.84 };
 /**
  * In-city metro and light-rail stations walk half as far: a station of metro or light-rail style (railPartMode)
  * standing in a town (Station.city) gets this share of the rail walking limit (and of its building's bonus), at its
  * forecourts, entrances and the rail access of its stops: a quarter of the area. Walks stay physical: every station
  * shares buildings and covers them by one curve of the walk (catchment.ts walkWeight / coverOf: full coverage within
- * FULL_COVER_WALK, 147 m, then tapering), so the half reach (147 m along streets) is wholly fully covered and simply
+ * FULL_COVER_WALK, then tapering), so the smaller in-city reach is wholly fully covered and simply
  * cuts off the taper beyond; trips per building never depend on a station's type. Main-line-style stations, and
  * metro or light-rail stops out in the country, keep the full reach.
  */
 export const CITY_WALK_SCALE = 0.5;
+/** Intermediate interchange walks use half the standard endpoint street budget, without changing catchment coverage. */
+export function transferWalkLimit(g: Game, a: Station, b: Station): number {
+  return 0.5 * WALK_DETOUR * Math.min(g.stations.catchmentRadius(a), g.stations.catchmentRadius(b));
+}
 /**
  * When a station stands in a town (Stations.cityAt): its town has at least `pop` residents and the station's centre
  * lies within `core` x the town's compact core radius (Towns.maxRadius); once in town, a station keeps that until its
@@ -211,6 +218,23 @@ const FORECOURT = 0.85;
 const ACCESS_REACH = 40;
 /** Price of a station building of cost factor 1 (a 'classic' building; styles scale it). */
 const BUILDING_BASE = 60000;
+
+/** Platforms, tracks and access before level, building style and fit-out. Retained rail is priced separately. */
+export function stationPlatformCost(platformLength: number, throughLength: number, native: boolean): number {
+  return (platformLength + throughLength * 0.7) * (native ? 1500 : 9000) + 120000;
+}
+
+/** Civil structure price at the station's actual depth/height. */
+export function stationLevelCost(civil: number, level: StationLevel, depth: number, height: number): number {
+  if (level === 'underground') {
+    const k = Math.max(0, Math.min(1, (depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
+    return civil * (3.8 + 1.5 * k);
+  }
+  if (level === 'elevated') return civil * (3.4 + 0.5 * Math.min(1, Math.max(0, (height - STATION_HEIGHT.min) / 1.8)));
+  return civil;
+}
+
+export function stationBuildingCost(style: string | undefined): number { return BUILDING_BASE * styleOf(style).cost; }
 /** Style 'none': the ramp pad beside a platform end, and how far a road may be from its foot. */
 const NO_BUILDING_PAD = { w: 0.8, d: 0.5 };
 const NO_BUILDING_REACH = 1.6;
@@ -440,6 +464,8 @@ export interface Station {
   catchPop: number;
   genAccum: number;
   genMonth: number; genLast: number;
+  /** the inter-city trips of genMonth / genLast (the rest are city trips; demand.ts DemandSet); unset in older saves */
+  icGenMonth?: number; icGenLast?: number;
   pickupMonth: number; pickupLast: number;
   arrivedMonth: number; arrivedLast: number;
   /** passengers who gave up waiting (the queue outgrew the station: trimWaiting), this and last month */
@@ -776,6 +802,16 @@ interface EntranceMemo {
 const entranceRevisions = new WeakMap<Stations, number>();
 const entranceMemos = new WeakMap<Stations, EntranceMemo>();
 
+interface PlatformGeometryMemo { inputs: unknown[]; areas: Rect[] }
+interface PlatformGapMemo { a: PlatformGeometryMemo; b: PlatformGeometryMemo; distance: number }
+interface StationGeometryMemo {
+  net: Game['world']['net']; version: number; walk: number;
+  areas: WeakMap<Station, PlatformGeometryMemo>;
+  gaps: WeakMap<Station, WeakMap<Station, PlatformGapMemo>>;
+}
+// Geometry queries never publish simulation state; temporary forecast stations are keyed by object, not reused IDs.
+const stationGeometryMemos = new WeakMap<Stations, StationGeometryMemo>();
+
 export class Stations {
   map = new Map<number, Station>();
   nextId = 1;
@@ -937,6 +973,8 @@ export class Stations {
     for (const o of st.links) { const os = this.map.get(o); if (os) os.links = os.links.filter((x) => x !== id); }
     st.links = [];
     this.map.delete(id);
+    this.accessVersion = -1;
+    this.walkVersion++;
     this.game.lines.onStationRemoved(id);
     this.markStation(st);
   }
@@ -1166,7 +1204,7 @@ export class Stations {
     const platformLength = physical ? physical.filter((t) => layout.trackOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : tracks * length;
     const throughLength = physical ? physical.filter((t) => layout.throughOffsets.includes(t.offset)).reduce((n, t) => n + t.length, 0) : through * length;
     // Retained running rail (including its existing civil structure) is not the facility payer's asset.
-    const base = (platformLength + throughLength * 0.7) * (physical ? 1500 : 9000) + 120000;
+    const base = stationPlatformCost(platformLength, throughLength, !!physical);
     const doors = psd ? platformLength * 2500 : 0;
     const civil = base - BUILDING_BASE;
     const fixed = opts.fixedY;
@@ -1284,9 +1322,8 @@ export class Stations {
       if (fixed !== undefined) { plan.y = fixed; plan.depth = mn - fixed; if (plan.depth < STATION_DEPTH.min - 0.4) failp('Too shallow for underground station'); }
       const err = areas.map((f) => { const volume = undergroundStationVolume(f, plan.y); return this.rectConflict(volume, volume.y0 - (opts.alignment ? 0.15 : 0), volume.y1 + (opts.alignment ? 0.15 : 0), null, { ignoreStation: ign, ignoreEdges: opts.ignoreEdges }); }).find(Boolean);
       if (err) failp(err === 'Building in the way' ? 'Foundations in the way' : err);
-      const k = Math.max(0, Math.min(1, (plan.depth - STATION_DEPTH.min) / (STATION_DEPTH.max - STATION_DEPTH.min)));
       // Cut-and-cover box, excavation and fit-out, plus entrances below: roughly 4-6x a ground station.
-      plan.cost = civil * (3.8 + 1.5 * k);
+      plan.cost = stationLevelCost(civil, level, plan.depth, plan.height);
     } else {
       // elevated: the deck clears the ground, buildings, roads and tracks beneath
       plan.height = Math.max(STATION_HEIGHT.min, Math.min(STATION_HEIGHT.max, opts.height ?? STATION_HEIGHT.def));
@@ -1314,9 +1351,8 @@ export class Stations {
       const pr = opts.alignment ? this.curvedPiers(shape, layout.width, demolish, ign, opts.ignoreEdges) : this.viaductPiers(footprint, layout.width, demolish, ign, opts.ignoreEdges);
       if (pr.error) failp(pr.error);
       plan.piers = pr.piers;
-      const k = Math.min(1, Math.max(0, (plan.height - STATION_HEIGHT.min) / 1.8));
       // Deck, columns and elevated access, plus the towers below: roughly 3-4x a ground station.
-      plan.cost = civil * (3.4 + 0.5 * k);
+      plan.cost = stationLevelCost(civil, level, plan.depth, plan.height);
     }
     plan.cost += doors;
     if (opts.aiSurvey && !plan.ok && !plan.error?.startsWith('No room')) return plan;
@@ -1345,8 +1381,12 @@ export class Stations {
     for (const c of cand) {
       const close = !c.st.rail && c.st.stops.some((q) => rects.some((f) => distToRect(q.x, q.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN));
       if (!plan.join && close) plan.join = c.st;
-      else if (c.gap <= autoLinkRange(rmode, this.mode(c.st)) && c.st.id !== ign && !(ign !== undefined && this.consecutiveStops(ign, c.st.id))) plan.links.push(c.st);
+      else if (c.gap <= Math.min(autoLinkRange(rmode, this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale({ mode: rmode, city: plan.city }), c.st))
+        && c.st.id !== ign && !(ign !== undefined && this.consecutiveStops(ign, c.st.id))) plan.links.push(c.st);
     }
+    // A joined stop station keeps its id: commit (nearbyComplex) never links it to a consecutive stop of its lines,
+    // so the plan must not promise that passage either.
+    if (plan.join) { const j = plan.join.id; plan.links = plan.links.filter((o) => !this.consecutiveStops(j, o.id)); }
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
     const bc = (plan as StationPlan & { buildingCands?: BuildingCand[] }).buildingCands;
@@ -1425,8 +1465,43 @@ export class Stations {
     return r ? { x: r.x, z: r.z, angle: r.angle, w: railWidth(r), d: r.length } : null;
   }
 
+  private geometryMemo(): StationGeometryMemo {
+    const net = this.game.world.net;
+    let memo = stationGeometryMemos.get(this);
+    if (!memo || memo.net !== net || memo.version !== net.version || memo.walk !== this.walkVersion) {
+      memo = { net, version: net.version, walk: this.walkVersion, areas: new WeakMap(), gaps: new WeakMap() };
+      stationGeometryMemos.set(this, memo);
+    }
+    return memo;
+  }
+
+  private platformGeometry(st: Station, memo = this.geometryMemo()): PlatformGeometryMemo {
+    const r = st.rail, width = r ? railWidth(r) : 0;
+    const inputs: unknown[] = [r, r?.x, r?.z, r?.angle, r?.length, width, r?.alignment];
+    // stationStripRects uses the track nearest offset zero, its exact curves and reference-arc mapping.
+    let track = r?.alignment?.tracks[0];
+    for (const t of r?.alignment?.tracks ?? []) if (track && Math.abs(t.offset) < Math.abs(track.offset)) track = t;
+    inputs.push(track);
+    if (track) {
+      inputs.push(track.offset, track.length, track.pieces.length, track.knots.length);
+      for (const p of track.pieces) {
+        const c = p.curve;
+        inputs.push(p, p.length, c.x0, c.z0, c.x1, c.z1, c.x2, c.z2, c.x3, c.z3);
+      }
+      for (const k of track.knots) inputs.push(k.u, k.s);
+    }
+    // Gap also depends on road-stop positions, even for temporary stations sharing an ID.
+    for (const p of st.stops) inputs.push(p.x, p.z);
+    const old = memo.areas.get(st);
+    if (old && old.inputs.length === inputs.length && old.inputs.every((v, i) => Object.is(v, inputs[i]))) return old;
+    const current = { inputs, areas: r ? stationStripRects(r, 0, width) : [] };
+    memo.areas.set(st, current);
+    return current;
+  }
+
   platformAreas(st: Station): Rect[] {
-    return st.rail ? stationStripRects(st.rail, 0, railWidth(st.rail)) : [];
+    // Preserve the public fresh-array contract: callers cannot corrupt a later cached geometry query.
+    return this.platformGeometry(st).areas.map(r => ({ ...r }));
   }
 
   /**
@@ -1762,7 +1837,8 @@ export class Stations {
     const st = join ?? this.create(plan.x, plan.z, owner);
     this.buildRailPart(st, plan, owner);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
-    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.accessVersion = -1;
     g.onNetworkChanged();
     g.lines.rebuild();
@@ -1794,7 +1870,8 @@ export class Stations {
       g.world.removeTreesNear(f.x, f.z, Math.hypot(f.w, f.d) / 2 + 0.3);
     }
     this.repairSite(st);
-    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.markStation(st); this.accessVersion = -1;
     g.onNetworkChanged(); g.lines.rebuild();
     return { error: null, station: st.id };
@@ -2311,16 +2388,43 @@ export class Stations {
   }
 
   /** Recompute the stations' road access after the network changed (cheap when nothing changed). */
+  /**
+   * Roads walked from the stations changed since the published share-out: compared with the road versions of the
+   * walks it used (not the walk cache's current entries, which reads refresh: a cache-dependent trigger diverged a
+   * loaded game from the running one). A loaded game owes the original's answer until its next share-out (save.ts
+   * catchmentAccessRoads), its walks being rebuilt on loading.
+   */
+  accessRoadsOwed = false;
+  private publishedRoads: RegionSnapshot[] = [];
+  publishedRoadsChanged(): boolean {
+    const roads = this.game.world.net.roadVersions;
+    return this.publishedRoads.some((r) => !roads.unchanged(r));
+  }
+  private publishRoads() {
+    this.accessRoadsOwed = false;
+    const out: RegionSnapshot[] = [];
+    for (const st of this.map.values()) { const r = walkRoadSnapshot(this.game, st); if (r) out.push(r); }
+    this.publishedRoads = out;
+  }
   refreshAccess(force = false) {
     this.game.world.syncCatchmentTerrain();
     const v = this.game.world.net.version;
     if (!force && v === this.accessVersion) return;
     this.accessVersion = v;
     this.walkVersion++;
-    let changed = walkRoadsChanged(this.game);
+    let changed = this.publishedRoadsChanged() || this.accessRoadsOwed;
+    const direct = new Map<number, boolean>();
+    for (const st of this.map.values()) direct.set(st.id, st.rail ? this.railReachable(st)
+      : st.stops.some(s => { const e = this.game.world.net.edges.get(s.edge); return !!e && pedestrianRoad(e); }));
+    const seen = new Set<number>();
     for (const st of this.map.values()) {
-      const a = !st.rail || this.railReachable(st);
-      if (a !== st.roadAccess) { st.roadAccess = a; changed = true; }
+      if (seen.has(st.id)) continue;
+      const parts = this.catchmentMembers(st.id), accessible = parts.some(id => direct.get(id));
+      for (const id of parts) {
+        seen.add(id);
+        const part = this.map.get(id)!;
+        if (accessible !== part.roadAccess) { part.roadAccess = accessible; changed = true; }
+      }
     }
     if (changed) this.game.lines.catchmentDirty = true;
   }
@@ -2378,7 +2482,8 @@ export class Stations {
     // within 80 m of an own rail station's platforms / building / entrances: the stop becomes part of it
     for (const c of near) if (c.st.rail && [...this.platformAreas(c.st), ...this.footprints(c.st)].some((f) => distToRect(p.x, p.z, f.x, f.z, f.angle, f.w / 2, f.d / 2) < STOP_JOIN)) { join = c.st; break; }
     if (!join) for (const c of near) if (!c.st.rail && c.st.stops.some((q) => Math.hypot(q.x - p.x, q.z - p.z) < 3)) { join = c.st; break; }
-    for (const c of near) if (c.st !== join && c.gap <= autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st))) links.push(c.st);
+    for (const c of near) if (c.st !== join && c.gap <= Math.min(autoLinkRange(e.tram ? 'tram' : 'bus', this.mode(c.st)), this.planLinkRange(CATCHMENT_RADIUS[e.tram ? 'tram' : 'bus'], c.st))
+      && !(join && this.consecutiveStops(join.id, c.st.id))) links.push(c.st);
     return { ok: true, edge: e, s: ne.s, px: p.x, pz: p.z, cost: 30000, join, links, mode: e.tram ? 'tram' : 'bus' };
   }
 
@@ -2391,7 +2496,7 @@ export class Stations {
     const st = p.join ?? this.create(p.px!, p.pz!, owner);
     st.stops.push({ edge: p.edge!.id, s: p.s!, x: p.px!, z: p.pz! });
     if (!st.rail) { st.x = st.stops.reduce((a, q) => a + q.x, 0) / st.stops.length; st.z = st.stops.reduce((a, q) => a + q.z, 0) / st.stops.length; }
-    for (const o of p.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of p.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
     g.world.net.markEdge(p.edge!);
     this.accessVersion = -1;
     g.onNetworkChanged();
@@ -2419,14 +2524,22 @@ export class Stations {
   // ---------------------------------------------------------------- transfer complexes
   /** Walking distance between the platform areas / stops of two stations (0 when they overlap). */
   gap(a: Station, b: Station): number {
+    const memo = this.geometryMemo(), ga = this.platformGeometry(a, memo), gb = this.platformGeometry(b, memo);
+    const previous = memo.gaps.get(a)?.get(b);
+    if (previous?.a === ga && previous.b === gb) return previous.distance;
     let d = Infinity;
-    const ra = this.platformAreas(a), rb = this.platformAreas(b);
+    const ra = ga.areas, rb = gb.areas;
     for (const p of ra) for (const q of rb) d = Math.min(d, rectGap(p, q));
     for (const p of a.stops) {
       for (const q of rb) d = Math.min(d, distToRect(p.x, p.z, q.x, q.z, q.angle, q.w / 2, q.d / 2));
       for (const q of b.stops) d = Math.min(d, Math.hypot(p.x - q.x, p.z - q.z));
     }
     for (const p of ra) for (const q of b.stops) d = Math.min(d, distToRect(q.x, q.z, p.x, p.z, p.angle, p.w / 2, p.d / 2));
+    let forward = memo.gaps.get(a), reverse = memo.gaps.get(b);
+    if (!forward) { forward = new WeakMap(); memo.gaps.set(a, forward); }
+    if (!reverse) { reverse = new WeakMap(); memo.gaps.set(b, reverse); }
+    forward.set(b, { a: ga, b: gb, distance: d });
+    reverse.set(a, { a: gb, b: ga, distance: d });
     return d;
   }
 
@@ -2451,31 +2564,85 @@ export class Stations {
 
   /** Can two stations be linked for walking transfers? Null if yes, else the reason. */
   canLink(aId: number, bId: number): string | null {
-    const g = this.game;
     const a = this.map.get(aId), b = this.map.get(bId);
     if (!a || !b) return 'No such station';
     if (a === b) return 'The same station';
     if (a.links.includes(b.id)) return 'Already linked';
-    if (a.owner !== b.owner && !g.canUse(a.owner, b.owner) && !g.canUse(b.owner, a.owner)) return 'Foreign stations: needs track access';
+    // Passenger walking passages are public; operating either company's platforms still requires native rail access.
     const d = this.gap(a, b), range = this.linkRange(a, b);
     if (d > range) return `Walking transfer: ${Math.round(d * 10)} m > max ${range * 10} m`;
     return null;
   }
 
+  /** Intermediate transfer reach, distinct from either station's origin/destination walking coverage. */
+  linkRange(a: Station, b: Station): number { return transferWalkLimit(this.game, a, b); }
   /**
-   * How far apart two stations may be linked for walking transfers: TRANSFER_RANGE, or CITY_TRANSFER_RANGE when both
-   * stand in one town's core and one of them is an in-city metro / light-rail station (Station.city; the other in the
-   * core as cityAt says). Reads only the stations and their town: the same in the UI and the simulation.
+   * linkRange of a planned part with walking radius `radius` and a built station: a plan lists only the passages its
+   * commit can make (canLink), so a preview never promises a transfer the built stop or station will not have.
    */
-  linkRange(a: Station, b: Station): number {
-    if (a.townId < 0 || a.townId !== b.townId || !(a.city || b.city)) return TRANSFER_RANGE;
-    const town = this.game.towns.list[a.townId];
-    return [a, b].every((s) => s.city || this.cityAt(s.x, s.z, town)) ? CITY_TRANSFER_RANGE : TRANSFER_RANGE;
+  private planLinkRange(radius: number, st: Station): number { return 0.5 * WALK_DETOUR * Math.min(radius, this.catchmentRadius(st)); }
+  /** linkRange of a planned rail part and a built station (the walk canLink admits once the plan is built). */
+  planLinkLimit(plan: Pick<StationPlan, 'style' | 'mode' | 'city'>, st: Station): number {
+    return this.planLinkRange(CATCHMENT_RADIUS.rail * (1 + styleOf(plan.style).catchBonus) * planWalkScale(plan), st);
+  }
+
+  /** Automatic complexes stay compact: every existing part must be near every part being added. */
+  private nearbyComplex(a: Station, b: Station): boolean {
+    const left = this.complex(a.id), right = this.complex(b.id);
+    if (left.some(id => right.includes(id))) return false;
+    for (const x of left) for (const y of right) {
+      const p = this.map.get(x)!, q = this.map.get(y)!;
+      if (this.consecutiveStops(x, y) || this.gap(p, q) > Math.min(autoLinkRange(this.mode(p), this.mode(q)), this.linkRange(p, q))) return false;
+    }
+    return true;
+  }
+
+  /** Nearby rail platforms are one public interchange, retaining their separate track groups and owners. */
+  private autoLinkNearby(st: Station): number {
+    if (!st.rail) return 0;
+    const candidates = [...this.map.values()].filter(o => o !== st && o.rail && !st.links.includes(o.id))
+      .map(o => ({ st: o, gap: this.gap(st, o) })).sort((a, b) => a.gap - b.gap || a.st.id - b.st.id);
+    let added = 0;
+    for (const c of candidates) {
+      if (c.gap > Math.min(autoLinkRange(this.mode(st), this.mode(c.st)), this.linkRange(st, c.st))) continue;
+      if (!this.nearbyComplex(st, c.st) || this.canLink(st.id, c.st.id)) continue;
+      this.addLink(st, c.st); added++;
+    }
+    return added;
+  }
+
+  /**
+   * Load migration: retain valid explicit passages and group old nearby rail parts once. No physical assets move.
+   * A current save (no migration) keeps its passages as the running game has them: a passage made when it was in
+   * range stays when a station's reach later shrinks (railWalkScale), and dropping it only on load diverged the replay.
+   */
+  restoreComplexes(autoLink: boolean): boolean {
+    let changed = false;
+    for (const st of this.map.values()) {
+      const kept = st.links.filter(id => {
+        const other = this.map.get(id);
+        return !!other && other !== st && (!autoLink || this.gap(st, other) <= this.linkRange(st, other));
+      });
+      if (kept.length !== st.links.length) { st.links = kept; changed = true; }
+    }
+    if (autoLink) for (const st of [...this.map.values()].sort((a, b) => a.id - b.id)) if (this.autoLinkNearby(st)) changed = true;
+    const named = new Set<number>();
+    for (const st of this.map.values()) if (!named.has(st.id)) {
+      const group = stationComplex(this.game, st.id);
+      if (group.parts.length > 1) this.renameComplex(st.id, this.map.get(group.main)!.name);
+      for (const id of group.parts) named.add(id);
+    }
+    return changed;
   }
 
   private addLink(a: Station, b: Station) {
     if (!a.links.includes(b.id)) a.links.push(b.id);
     if (!b.links.includes(a.id)) b.links.push(a.id);
+    this.accessVersion = -1;
+    this.catchGroups.version = -1;
+    this.walkVersion++;
+    const main = this.map.get(stationComplex(this.game, a.id).main)!;
+    this.renameComplex(a.id, main.name);
   }
 
   /** Link two stations for walking transfers (both stay separate stations). Null = OK, else the reason. */
@@ -2493,7 +2660,23 @@ export class Stations {
     let n = 0;
     if (a && a.links.includes(bId)) { a.links = a.links.filter((x) => x !== bId); n++; }
     if (b && b.links.includes(aId)) { b.links = b.links.filter((x) => x !== aId); n++; }
-    if (n) this.game.lines.rebuild();
+    if (n) { this.accessVersion = -1; this.catchGroups.version = -1; this.walkVersion++; this.game.lines.rebuild(); }
+  }
+
+  /** One logical station, with physical platform IDs and track permissions kept separate. Pure membership read. */
+  isSameStationComplex(aId: number, bId: number): boolean {
+    const st = this.map.get(aId);
+    if (!st || !this.map.has(bId)) return false;
+    if (!st.links.length) return aId === bId && !!st.rail && st.stops.length > 0;
+    const parts = this.complex(aId);
+    return parts.includes(bId) && (parts.length > 1 || !!st.rail && st.stops.length > 0);
+  }
+
+  /** All platform groups of one public station share its actual saved name. */
+  renameComplex(id: number, name: string) {
+    const value = name.trim().slice(0, 40);
+    if (!value) return;
+    for (const part of this.catchmentMembers(id)) { const st = this.map.get(part); if (st) st.name = value; }
   }
 
   /** All stations of a station's transfer complex (itself and everything linked to it, transitively). */
@@ -2501,6 +2684,33 @@ export class Stations {
     const out = [id], seen = new Set(out);
     for (let i = 0; i < out.length; i++) for (const o of this.map.get(out[i])?.links ?? []) if (!seen.has(o) && this.map.has(o)) { seen.add(o); out.push(o); }
     return out;
+  }
+
+  private catchGroups = { version: -1, count: -1, ids: new Map<number, number>(), members: new Map<number, number[]>() };
+  /** Stable physical-complex identity for population claims; independent of display mode or ownership. */
+  catchmentGroup(id: number): number {
+    const cache = this.catchGroups;
+    if (cache.version !== this.walkVersion || cache.count !== this.map.size) {
+      cache.version = this.walkVersion; cache.count = this.map.size; cache.ids.clear(); cache.members.clear();
+      const adjacent = new Map<number, Set<number>>();
+      for (const st of this.map.values()) adjacent.set(st.id, new Set());
+      for (const st of this.map.values()) for (const to of st.links) if (this.map.has(to)) {
+        adjacent.get(st.id)!.add(to); adjacent.get(to)!.add(st.id);
+      }
+      for (const st of this.map.values()) if (!cache.ids.has(st.id)) {
+        const parts = [st.id], seen = new Set(parts);
+        for (let i = 0; i < parts.length; i++) for (const to of adjacent.get(parts[i])!) if (!seen.has(to)) { seen.add(to); parts.push(to); }
+        const group = Math.min(...parts);
+        cache.members.set(group, parts);
+        for (const member of parts) cache.ids.set(member, group);
+      }
+    }
+    return cache.ids.get(id) ?? id;
+  }
+
+  /** Logical member identity is undirected even for an asymmetric legacy passage; rail route edges stay physical. */
+  catchmentMembers(id: number): readonly number[] {
+    return this.catchGroups.members.get(this.catchmentGroup(id)) ?? [id];
   }
 
   /** Nearby stations for the merge / link controls: walking gap, linked, and why a merge / link is not possible. */
@@ -2519,7 +2729,7 @@ export class Stations {
   }
 
   /** Walking transfer cost between linked stations (Lines.rebuild adds its transfer penalty). */
-  walkCost(a: Station, b: Station): number { return WALK_BASE + WALK_PER_UNIT * this.gap(a, b); }
+  walkCost(a: Station, b: Station): number { return (this.isSameStationComplex(a.id, b.id) ? 0 : WALK_BASE) + WALK_PER_UNIT * this.gap(a, b); }
 
   /** Walking transfer edges of all transfer complexes (both directions), for the line graph. */
   walkLinks(): { from: number; to: number; cost: number }[] {
@@ -2560,6 +2770,8 @@ export class Stations {
     // statistics
     a.genMonth += b.genMonth; a.pickupMonth += b.pickupMonth; a.arrivedMonth += b.arrivedMonth;
     a.genLast += b.genLast; a.pickupLast += b.pickupLast; a.arrivedLast += b.arrivedLast;
+    if (b.icGenMonth) a.icGenMonth = (a.icGenMonth ?? 0) + b.icGenMonth;
+    if (b.icGenLast) a.icGenLast = (a.icGenLast ?? 0) + b.icGenLast;
     a.lostMonth += b.lostMonth; a.lostLast += b.lostLast;
     a.lastPickup = Math.max(a.lastPickup, b.lastPickup); a.lastSpeed = Math.max(a.lastSpeed, b.lastSpeed);
     a.rating = Math.max(a.rating, b.rating);
@@ -2579,9 +2791,9 @@ export class Stations {
       if (!hit) continue;
       const old = [...st.waiting.values()];
       st.waiting.clear(); st.waitingTotal = 0;
-      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+      for (const w of old) if (re(w.dest) !== st.id) this.addWaiting(st, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
     }
-    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0);
+    for (const w of moved) if (re(w.dest) !== a.id) this.addWaiting(a, w.line, re(w.alight), re(w.dest), w.count, 0, w.t, w.transfers ?? 0, w.rail ?? 0, w.ic ?? 0);
     // mail: b's queues and figures join a's; mail heading to or changing at b heads for a (also aboard vehicles)
     const mailDeliveries = absorbMail(g, a, b, re);
     for (const v of g.vehicles.map.values()) {
@@ -2896,6 +3108,7 @@ export class Stations {
   private coveredPop = new Map<number, number>();
   private shareMembers = new Map<number, Map<number, number>>();
   private served = new Map<number, boolean>();
+  private shareGroups = new Map<number, number>();
   private pendingPop = new Set<number>();
   /** Saved input work can remain owed even when there are no stations to put in pendingPop. */
   private pendingInputs = false;
@@ -2925,11 +3138,17 @@ export class Stations {
     let servedChanged = false;
     for (const [sid, old] of this.walkSt) if (!this.map.has(sid)) {
       for (const id of old.buildings.keys()) { this.covered.get(id)?.delete(sid); dirty.add(id); populations.add(id); }
-      this.walkSt.delete(sid); this.served.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
+      this.walkSt.delete(sid); this.served.delete(sid); this.shareGroups.delete(sid); this.shareMembers.delete(sid); this.shareSt.delete(sid);
     }
     for (const st of this.map.values()) {
       order.set(st.id, order.size);
       const walk = walkingCatchment(this.game, st), old = this.walkSt.get(st.id);
+      const group = this.catchmentGroup(st.id);
+      if (this.shareGroups.get(st.id) !== group) {
+        for (const id of old?.buildings.keys() ?? []) dirty.add(id);
+        for (const id of walk.buildings.keys()) dirty.add(id);
+        this.shareGroups.set(st.id, group);
+      }
       if (walk !== old) {
         for (const [id, before] of old?.buildings ?? []) {
           populations.add(id);
@@ -2970,11 +3189,10 @@ export class Stations {
       const reaches = b && b.pop > 0 && id <= maxB
         ? [...(this.covered.get(id) ?? [])].sort((a, b) => order.get(a[0])! - order.get(b[0])!) : [];
       const anyServed = reaches.some(([sid]) => this.served.get(sid));
-      let sum = 0, best = 0;
-      const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !this.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      if (sum > 0) for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(wt[k] / sum * cover); }
+      const weights = walkClaimShares(reaches.map(([sid, distance]) => ({ group: this.catchmentGroup(sid),
+        weight: anyServed && !this.served.get(sid) ? 0 : walkWeight(distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) { rec.st.push(reaches[k][0]); rec.w.push(weights[k]); }
       if (!this.covered.get(id)?.size) this.covered.delete(id);
       if (old && old.st.length === rec.st.length && old.st.every((sid, i) => sid === rec.st[i] && old.w[i] === rec.w[i])) continue;
       if (!old && !rec.st.length) continue;
@@ -2999,7 +3217,7 @@ export class Stations {
       if (members.length) this.shareSt.set(sid, { ids: members.map((m) => m[0]), w: members.map((m) => m[1]) });
       else this.shareSt.delete(sid);
     }
-    this.sharesReady = true; this.catchMaxB = maxB;
+    this.sharesReady = true; this.catchMaxB = maxB; this.publishRoads();
     this.catchInputs = this.currentCatchInputs();
     if (!wasReady || sharesChanged || servedChanged || this.pendingPop.size) this.catchVersion++;
   }
@@ -3042,12 +3260,11 @@ export class Stations {
       if (!b || b.pop <= 0 || id > job.maxB) continue;
       // covered was filled in station Map order, exactly as in the original share-out.
       const reaches = [...job.covered.get(id)!], anyServed = reaches.some(([sid]) => job!.served.get(sid));
-      let sum = 0, best = 0; const wt: number[] = [];
-      for (const [sid, distance] of reaches) { const v = anyServed && !job.served.get(sid) ? 0 : walkWeight(distance); wt.push(v); sum += v; if (v > best) best = v; }
-      if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sid = reaches[k][0], sh = wt[k] / sum * cover;
+      const weights = walkClaimShares(reaches.map(([sid, distance]) => ({ group: this.catchmentGroup(sid),
+        weight: anyServed && !job.served.get(sid) ? 0 : walkWeight(distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) {
+        const sid = reaches[k][0], sh = weights[k];
         rec.st.push(sid); rec.w.push(sh);
         let station = job.shareSt.get(sid), members = job.members.get(sid);
         if (!station) { station = { ids: [], w: [] }; job.shareSt.set(sid, station); }
@@ -3060,10 +3277,11 @@ export class Stations {
     if (job.building < job.ids.length) return false;
     // Publish all shares and populations together. Demand keeps its previous shares until this point too.
     this.walkSt = job.walks; this.covered = job.covered; this.coveredPop = job.pop; this.served = job.served;
+    this.shareGroups = new Map(job.stations.map(st => [st.id, this.catchmentGroup(st.id)]));
     this.shareSt = job.shareSt; this.shareB = job.shareB; this.shareMembers = job.members;
     this.catchMaxB = job.maxB; this.catchInputs = job.inputs; this.sharesReady = true; this.catchVersion++;
     for (const st of this.map.values()) st.catchPop = job.populations.get(st.id) ?? 0;
-    this.pendingPop.clear(); this.pendingInputs = false; this.fullPreparation = null;
+    this.pendingPop.clear(); this.pendingInputs = false; this.fullPreparation = null; this.publishRoads();
     return true;
   }
 
@@ -3081,12 +3299,11 @@ export class Stations {
     }
     for (const [id, reaches] of [...covered].sort((a, b) => a[0] - b[0])) {
       const anyServed = reaches.some((r) => this.game.lines.stationServed(r.sid));
-      let sum = 0, best = 0; const wt: number[] = [];
-      for (const r of reaches) { const v = anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance); wt.push(v); sum += v; if (v > best) best = v; }
-      if (!(sum > 0)) continue;
-      const rec = { st: [] as number[], w: [] as number[] }, cover = coverOf(best);
-      for (let k = 0; k < reaches.length; k++) if (wt[k] > 0) {
-        const sh = wt[k] / sum * cover, sid = reaches[k].sid, ps = stations.get(sid)!;
+      const weights = walkClaimShares(reaches.map(r => ({ group: this.catchmentGroup(r.sid),
+        weight: anyServed && !this.game.lines.stationServed(r.sid) ? 0 : walkWeight(r.distance) })));
+      const rec = { st: [] as number[], w: [] as number[] };
+      for (let k = 0; k < reaches.length; k++) if (weights[k] > 0) {
+        const sh = weights[k], sid = reaches[k].sid, ps = stations.get(sid)!;
         rec.st.push(sid); rec.w.push(sh); ps.ids.push(id); ps.w.push(sh);
       }
       buildings.set(id, rec);
@@ -3171,22 +3388,24 @@ export class Stations {
 
   /**
    * Passengers wait at `st` for `line` to `alight` on their way to `dest`. A walking hop (WALK_LINE) takes them
-   * straight to the linked station `alight`, where they arrive or wait for their next leg.
+   * straight to the linked station `alight`, where they arrive or wait for their next leg. `ic`: their trip is an
+   * inter-city trip (fares.ts setFlag; 0: a city trip), kept through the whole journey.
    */
-  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0) {
+  addWaiting(st: Station, line: number, alight: number, dest: number, count: number, depth = 0, t?: number, transferred = 0, rail = 0, ic = 0) {
     if (count <= 0) return;
     rail = railHistory(rail);
-    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail); return; }
+    if (line === WALK_LINE) { this.walkTo(alight, dest, count, depth, t, transferred, st, rail, ic); return; }
     // ops: when they started waiting (weighted mean), their changes of vehicle so far, their rail fares so far; groups
-    // never mix fare histories or change classes (each pays its own minimum and transfer reduction)
+    // never mix fare histories or change classes (each pays its own minimum and transfer reduction), nor demand sets
     const at = t ?? simNow(this.game), tr = Math.max(0, transferred);
-    const key = fareGroupKey(line, alight, dest, rail, changeClass(tr, count));
+    const key = fareGroupKey(line, alight, dest, rail, changeClass(tr, count), ic);
     const g = st.waiting.get(key);
     if (g) {
       g.t = ((g.t ?? at) * g.count + at * count) / (g.count + count); g.count += count; if (tr || g.transfers) g.transfers = (g.transfers ?? 0) + tr;
     } else {
       const ng: WaitGroup = tr ? { line, alight, dest, count, t: at, transfers: tr } : { line, alight, dest, count, t: at };
       if (rail > 0) ng.rail = rail;
+      if (ic) ng.ic = 1;
       st.waiting.set(key, ng);
     }
     st.waitingTotal += count;
@@ -3196,7 +3415,7 @@ export class Stations {
    * Passengers walk to the linked station `toId`: they have arrived, or wait there for their next leg (the walk
    * counts towards that leg's time).
    */
-  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0) {
+  private walkTo(toId: number, dest: number, count: number, depth: number, t?: number, transferred = 0, from?: Station, rail = 0, ic = 0) {
     const g = this.game;
     const to = this.map.get(toId);
     if (!to || depth > 4) return;
@@ -3208,8 +3427,8 @@ export class Stations {
     }
     const hop = g.lines.nextHop(toId, dest);
     if (!hop) return;
-    const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to)) : 0);
-    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail));
+    const at = (t ?? simNow(g)) - (from ? transferWalkTime(this.gap(from, to), this.isSameStationComplex(from.id, to.id)) : 0);
+    g.lines.distribute(hop, count, (l, n) => this.addWaiting(to, l, hop.alight, dest, n, depth + 1, at, Math.round((transferred * n) / count), rail, ic));
   }
 
   /**
@@ -3221,7 +3440,7 @@ export class Stations {
     // complex set the useful queue: tens at a village/stop, low hundreds at a large multi-platform hub. Enlarging
     // platforms alone must not invent thousands of waiting passengers.
     const space = st.rail ? st.rail.tracks * st.rail.length * 0.75 : 0;
-    max = Math.max(0, Math.floor(Math.min(max, 300, 12 + st.catchPop * 0.035 + space + st.stops.length * 4)));
+    max = Math.max(0, Math.floor(Math.min(max, 300, 12 + st.catchPop * 0.035 * WALK_TRIP_INTENSITY + space + st.stops.length * 4)));
     if (st.waitingTotal <= max) return;
     const f = max / st.waitingTotal;
     // Largest remainders retain exactly `max` people. Flooring every OD group independently can erase an entire
@@ -3264,7 +3483,7 @@ export class Stations {
    * loaded from a save keys every group afresh, so the running game must too, or later arrivals would merge differently.
    */
   rekeyWaiting(st: Station) {
-    const canonical = (w: WaitGroup) => fareGroupKey(w.line, w.alight, w.dest, w.rail ?? 0, changeClass(w.transfers, w.count));
+    const canonical = (w: WaitGroup) => fareGroupKey(w.line, w.alight, w.dest, w.rail ?? 0, changeClass(w.transfers, w.count), w.ic ?? 0);
     let stale = false;
     for (const [k, w] of st.waiting) if (canonical(w) !== k) { stale = true; break; }
     if (!stale) return;
@@ -3287,7 +3506,7 @@ export class Stations {
     st.waitingTotal = 0;
     for (const g of old) {
       const hop = lines.nextHop(st.id, g.dest);
-      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0);
+      if (hop) this.addWaiting(st, hop.line, hop.alight, g.dest, g.count, 0, g.t, g.transfers ?? 0, g.rail ?? 0, g.ic ?? 0);
     }
   }
 
@@ -3819,7 +4038,7 @@ export class Stations {
   relevelInPlace(stationId: number, plan: StationPlan) {
     const g = this.game;
     const st = this.map.get(stationId), r = st?.rail;
-    if (!st || !r || r.native) return;
+    if (!st || !r || r.native && !plan.alignment) return;
     this.markStation(st);
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     // added entrances: a ground station staying on the ground keeps them beside its platforms where they still fit
@@ -3827,6 +4046,7 @@ export class Stations {
     const added = r.entrances.filter((e) => e.kind), keep = (r.level ?? 'ground') === 'ground' && plan.level === 'ground';
     const addedCost = added.reduce((c, e) => c + (e.cost ?? 0), 0);
     r.level = plan.level; r.underground = plan.level === 'underground'; r.y = plan.y; r.depth = plan.depth; r.height = plan.height;
+    if (r.native) r.alignment = plan.alignment;
     r.entrances = plan.entrances.map((e) => ({ x: e.x, z: e.z, angle: e.angle }));
     r.piers = plan.piers.map((p) => ({ ...p }));
     r.style = plan.style; r.building = plan.building;
@@ -3935,7 +4155,8 @@ export class Stations {
     this.repairSite({ x: old.x, z: old.z, rail: old });
     this.buildRailPart(st, plan, st.owner);
     if (plan.access && plan.access.ok) commitProposal(g, plan.access);
-    for (const o of plan.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id)) this.addLink(st, o);
+    for (const o of plan.links) if (o !== st && this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
+    this.autoLinkNearby(st);
     this.accessVersion = -1;
     g.onNetworkChanged();
     g.lines.rebuild();
@@ -4023,7 +4244,7 @@ export function stationComplex(g: Game, id: number): { main: number; parts: numb
     const m = S.mode(st);
     return (st.rail ? 100 + st.rail.tracks * 10 : 0) + (m === 'mainline' ? 5 : m === 'metro' ? 3 : m === 'lightrail' ? 2 : 0) + Math.min(4.9, (st.pickupLast + st.arrivedLast) / 1000);
   };
-  const parts = S.complex(id).sort((a, b) => rank(b) - rank(a) || a - b);
+  const parts = [...S.catchmentMembers(id)].sort((a, b) => rank(b) - rank(a) || a - b);
   return { main: parts[0] ?? id, parts };
 }
 

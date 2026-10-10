@@ -20,7 +20,7 @@ import { CROSS_LABEL, MarkerKind } from '../render/overlay';
 import { distToRect } from '../game/world';
 import type { NNode, NEdge } from '../game/network';
 import { esc, svg } from './dom';
-import { fmtLen, fmtHeight, fmtMult } from './format';
+import { fmtLen, fmtHeight, fmtAccessFactor } from './format';
 import { planStation, StationLevel, catchWalkLimit, catchStreets, planCatchStreets, catchStreetPop, drawCatchStreets, catchBonusOf, stationStyles, autoStationStyle, planWalkLimit, stationWalkLimit, CITY_REACH } from './gameapi';
 import { stopWalkingCatchment, walkLimit, walkingCatchment, entrancePlanCatchment } from '../game/catchment';
 import type { FootRect } from '../render/overlay';
@@ -53,13 +53,13 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   inspect: { name: 'Inspect', hint: 'Click an object for details.' },
   rail: { name: 'Build track', hint: 'Click: start / build; snap: extend / branch; Shift: parallel copy; right-click / Esc / long press: end.' },
   road: { name: 'Build road', hint: 'Click: start / build; snap: junction; connect to town streets for buses.' },
-  station: { name: 'Train station', hint: 'Auto-aligns to track ends; R / Shift+R / Alt+wheel: rotate 15°; connect with track.' },
+  station: { name: 'Train station', hint: 'Auto-aligns to track ends; N / M (Shift: fine) / Alt+wheel: rotate 15°; connect with track.' },
   busstop: { name: 'Bus stop', hint: 'On a road; joins your nearby train station for transfers.' },
   tram: { name: 'Tram tracks', hint: 'Click or drag along roads; New road: road with wire; Remove: your tracks.' },
   tramstop: { name: 'Tram stop', hint: 'On tram tracks; joins your nearby station for transfers.' },
-  'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
-  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end (underground at a tunnel end); otherwise connect with track; R / Shift+R / Alt+wheel rotates.' },
-  'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: R / Shift+R / Alt+wheel rotates.' },
+  'depot-tram': { name: 'Tram depot', hint: 'Beside tram tracks: auto-connect; away from roads: N / M (Shift: fine) / Alt+wheel rotates.' },
+  'depot-rail': { name: 'Train depot', hint: 'Snaps to your free track end (underground at a tunnel end); otherwise connect with track; N / M (Shift: fine) / Alt+wheel rotates.' },
+  'depot-road': { name: 'Bus depot', hint: 'Roadside: auto-connect; away from roads: N / M (Shift: fine) / Alt+wheel rotates.' },
   signal: { name: 'Signals', hint: 'Own or accessible track · click: two-way → one-way → reversed → none; drag: series facing drag; right-click / Remove: remove.' },
   double: { name: 'Double track', hint: 'Own or accessible single track → second track through platforms and junctions; directional: signals and station crossovers.' },
   entrance: { name: 'Add entrance', hint: 'Ground: hall, footbridge, underpass or end gate; elevated / underground: roadside entrance; own catchment.' },
@@ -67,7 +67,7 @@ export const TOOL_INFO: Record<ToolId, { name: string; hint: string }> = {
   terraform: { name: 'Terraform', hint: 'Hold: raise / lower; Level: height where pressed.' },
   'line-edit': { name: 'Edit line', hint: 'Click stations or labels to add stops; Esc / Done: finish.' },
   metro: { name: 'Urban-style track', hint: 'Double track with wire · underground default · any level · any train (electric ones need the wire) · mixes with main-line track' },
-  'metro-station': { name: 'Urban-style station', hint: `Metro / light-rail style · street entrances · side platforms · ~1 km spacing · R / Shift+R / Alt+wheel rotates · any rail line · ${fmtLen(walkLimit('rail'))} street reach before building bonuses · standard fares` },
+  'metro-station': { name: 'Urban-style station', hint: `Metro / light-rail style · street entrances · side platforms · ~1 km spacing · N / M (Shift: fine) / Alt+wheel rotates · any rail line · ${fmtLen(walkLimit('rail'))} street reach before building bonuses · standard fares` },
   electrify: { name: 'Electrify', hint: 'Click or drag: overhead wire, platforms included; permitted foreign track keeps its owner.' },
   connect: { name: 'Connect tracks', hint: 'Pick two track points for a signalled curve with turnouts; click: build; Esc / right-click: restart.' },
   relevel: { name: 'Re-level', hint: 'Lift / sink with end ramps; stations move, lines and signals retained.' },
@@ -274,7 +274,7 @@ export class Tools {
 
   buildOptions(): BuildOptions {
     const rail = this.railBuild;
-    const o: BuildOptions = { kind: rail ? 'rail' : 'road', type: rail ? this.railType : this.roadType, tracks: rail ? this.tracks : 1, heightOffset: this.heightOffset, crossing: this.crossing, owner: PLAYER, tram: this.tool === 'tram' || undefined };
+    const o: BuildOptions = { kind: rail ? 'rail' : 'road', type: rail ? this.railType : this.roadType, tracks: rail ? this.tracks : 1, heightOffset: this.heightOffset, endHeightOnly: true, crossing: this.crossing, owner: PLAYER, tram: this.tool === 'tram' || undefined };
     if (rail && this.railLevel !== 'ground') { o.level = this.railLevel; o.levelHeight = this.levelHeight; o.levelDepth = this.levelDepth; }
     if (rail && this.railLevel === 'underground' && this.subwayOnly) o.subway = true;
     return o;
@@ -364,7 +364,7 @@ export class Tools {
   }
 
   adjustHeight(d: number) {
-    this.heightOffset = Math.max(-6, Math.min(6, Math.round((this.heightOffset + d) * 2) / 2));
+    this.heightOffset = Math.max(-6, Math.min(6, Math.round((this.heightOffset + d) * 10) / 10));
     this.onToolChange();
     this.refreshHover();
   }
@@ -841,7 +841,8 @@ export class Tools {
         const reach = Math.round(planWalkLimit(pl) * 10), inCity = Math.round(catchWalkLimit('rail', bonus) * 10) !== reach;
         const tt = TRACK_TYPES[pl.trackType];
         const rows: [string, string][] = [['station', `${plural(pl.tracks, 'platform track')}${pl.through ? ` + ${pl.through} through (${pl.throughMode === 'outer' ? 'outside' : 'in the middle'})` : ''} × ${pl.length * 10} m`], ['people', `<b>${pop.toLocaleString('en-US')}</b> residents within ${reach} m walking${pl.roadAccess ? '' : ' (not reached without road access)'}`]];
-        if (tt) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
+        // (a plain train station needs no row under the "Train station" title)
+        if (tt && (pl.mode === 'metro' || pl.mode === 'lightrail' || tt.electrified || pl.psd)) rows.push(['rail', `${pl.mode === 'metro' ? 'Metro station' : pl.mode === 'lightrail' ? 'Light-rail station' : 'Train station'}${tt.electrified ? ' · overhead wire' : ''}${pl.psd ? ' · platform doors' : ''}`]);
         if (inCity) rows.push(['walk', `In town: ${pl.mode === 'metro' ? 'metro' : 'light-rail'} reach <b>${Math.round(CITY_REACH * 100)}%</b> of other rail stations`]);
         const sty = STATION_STYLES[pl.style];
         if (sty) rows.push(['station', `${esc(sty.name)}${bonus ? ` · <b>+${Math.round(bonus * 100)}%</b> reach` : ''}`]);
@@ -1023,8 +1024,8 @@ export class Tools {
         const kindErr = !okKind ? (l?.kind === 'rail' ? 'No train platforms' : l?.kind === 'tram' ? 'No tram stop' : 'No bus stop') : '';
         const rows: [string, string][] = foreign ? [['company', esc(g.company(st.owner).name)]] : [];
         if (kindErr) this.tip({ title: esc(st.name), rows, err: [kindErr] }, 'err');
-        else if (!acc || acc.kind === 'agreement') this.tip({ title: esc(st.name), rows: acc ? [...rows, ['key', `Upkeep shared ${fmtMult(g.accessMultiplier(st.owner))}`]] : rows, ok: [`Add to ${l?.name ?? 'line'}`] }, 'ok');
-        else if (acc.kind === 'none') this.tip({ title: esc(st.name), rows: [...rows, ['key', `${policyText(g, st.owner)} · upkeep shared ${fmtMult(g.accessMultiplier(st.owner))}`]], hint: 'Click to request track access' }, 'info');
+        else if (!acc || acc.kind === 'agreement') this.tip({ title: esc(st.name), rows: acc ? [...rows, ['key', `Access ${fmtAccessFactor(g.accessMultiplier(st.owner))} · 75% cap`]] : rows, ok: [`Add to ${l?.name ?? 'line'}`] }, 'ok');
+        else if (acc.kind === 'none') this.tip({ title: esc(st.name), rows: [...rows, ['key', `${policyText(g, st.owner)} · ${fmtAccessFactor(g.accessMultiplier(st.owner))} · 75% cap`]], hint: 'Click to request track access' }, 'info');
         else this.tip({ title: esc(st.name), rows, err: [acc.text] }, 'err');
       } else this.hideTip();
       return;
@@ -1162,7 +1163,7 @@ export class Tools {
     ov.setMarker('hover0', b ? y(b) : null, 'node', pl.ok ? 0x5ff07a : 0xff5a4a);
     const endText = (e: DoublePlan['start']) => (e.kind === 'platform' ? 'into a platform' : e.kind === 'track' ? 'into the other junction track' : 'switch');
     const rows: [string, string][] = [
-      ['company', `Owned by <b>${esc(g.company(net.edges.get(chain[0])!.owner).name)}</b> · you pay construction; upkeep shared by use`],
+      ['company', `Owned by <b>${esc(g.company(net.edges.get(chain[0])!.owner).name)}</b> · you pay construction; access priced by use · 75% cap`],
       ['length', `<b>${fmtLen(pl.length)}</b> of new track${chain.length > 1 ? ` along ${chain.length} sections` : ''}`],
       ['parallel', `${pl.side > 0 ? 'Right' : 'Left'} side${this.dbl.flipped ? ' (the other side is blocked)' : ''}`],
       ['rail', `Ends: ${endText(pl.start)} · ${endText(pl.end)}`],
@@ -1364,10 +1365,10 @@ export class Tools {
   }
 
   // ------------------------------------------------------------------ re-level (lift / sink track in place)
-  /** Own track to lift / sink: the track under the cursor, or along it from the press point (stations on it go along). */
+  /** Permitted track to lift / sink; its stations and ownership stay with it. */
   private hoverRelevel(p: THREE.Vector3) {
     const g = this.game, net = g.world.net, ov = this.overlay;
-    const ok = (e: NEdge) => e.owner === PLAYER && e.depot < 0;
+    const ok = (e: NEdge) => !g.trackUpgradeError(PLAYER, e.owner) && e.depot < 0;
     const cur = net.nearestEdge(p.x, p.z, 1.4, 'rail', ok);
     let chain: number[] = [];
     const d = this.down;
@@ -1380,10 +1381,10 @@ export class Tools {
       this.rlv = null;
       ov.setProposal(null); ov.setHoverEdge(null);
       const other = net.nearestEdge(p.x, p.z, 1.4, 'rail');
-      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : `Track of ${g.company(other.edge.owner).name}`] } : { title, rows: [['relevel', 'Point at or drag along your track']] }, other ? 'err' : 'info');
+      this.tip(other ? { title, err: [other.edge.depot >= 0 ? 'Depot tracks stay on the ground' : g.trackUpgradeError(PLAYER, other.edge.owner) ?? 'Cannot rebuild this track'] } : { title, rows: [['relevel', 'Point at or drag along permitted track']] }, other ? 'err' : 'info');
       return;
     }
-    const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}`;
+    const key = `${chain.join(',')}|${this.relevelTo}|${this.levelHeight}|${this.levelDepth}|${g.networkVersion}|${g.world.heightsVersion}|${chain.map(id => g.canUse(PLAYER, net.edges.get(id)!.owner)).join(',')}`;
     if (this.rlv?.key !== key) {
       let plan: RelevelPlan;
       try { plan = planRelevel(g, chain, this.relevelTo, PLAYER, { height: this.levelHeight, depth: this.levelDepth }); }
@@ -1396,6 +1397,8 @@ export class Tools {
     let len = 0;
     for (const x of pl.edges.length ? pl.edges : chain.map((id) => ({ id }))) len += net.edges.get(x.id)?.len ?? 0;
     const rows: [string, string][] = [['length', `<b>${fmtLen(len)}</b> of track${pl.edges.length > 1 ? ` · ${pl.edges.length} sections` : ''}`]];
+    const foreign = new Set(pl.edges.map(e => net.edges.get(e.id)!.owner).filter(owner => owner !== PLAYER && owner >= 0));
+    if (foreign.size) rows.push(['company', `${[...foreign].map(owner => esc(g.company(owner).name)).join(', ')} · you pay construction`]);
     if (this.relevelTo !== 'ground') rows.push([this.relevelTo === 'elevated' ? 'bridge' : 'tunnel', this.relevelTo === 'elevated' ? `deck <b>${Math.round(this.levelHeight * 10)} m</b> up` : `<b>${Math.round(this.levelDepth * 10)} m</b> deep`]);
     if (pl.ramps.length) rows.push(['grade', `ramps ${pl.ramps.map((r) => fmtLen(r)).join(' · ')}`]);
     if (pl.stations.length) rows.push(['station', `${pl.stations.map((s) => esc(g.stations.get(s.id)?.name ?? '?')).join(', ')} go${pl.stations.length === 1 ? 'es' : ''} with it`]);
@@ -1736,11 +1739,11 @@ export class Tools {
     const so = this.snapOwner(sn);
     if (err && so !== null && !this.game.canUse(PLAYER, so)) {
       const st = accessState(this.game, so);
-      return { title: `${esc(this.game.company(so).name)}'s network`, rows: [['key', `${policyText(this.game, so)} · shared maintenance ${fmtMult(this.game.accessMultiplier(so))}`]], err: [st.kind === 'pending' ? 'Access request pending' : st.kind === 'blocked' ? 'You are blocked from this network' : st.kind === 'closed' ? 'The owner refuses access' : 'Request access first'], hint: st.kind === 'none' ? 'Click to request track access' : undefined };
+      return { title: `${esc(this.game.company(so).name)}'s network`, rows: [['key', `${policyText(this.game, so)} · ${fmtAccessFactor(this.game.accessMultiplier(so))} · 75% cap`]], err: [st.kind === 'pending' ? 'Access request pending' : st.kind === 'blocked' ? 'You are blocked from this network' : st.kind === 'closed' ? 'The owner refuses access' : 'Request access first'], hint: st.kind === 'none' ? 'Click to request track access' : undefined };
     }
     if (err) return { title: rail ? 'Track' : 'Road', err: [err] };
     const fo = this.foreignOwner(sn);
-    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track: yours; existing track: theirs`], ['coin', `Shared upkeep ${fmtMult(this.game.accessMultiplier(fo))} when used`]] };
+    if (fo !== null) return { title: `Junction on ${esc(this.game.company(fo).name)}'s network`, rows: [['company', `New track: yours; existing track: theirs`], ['coin', `Access ${fmtAccessFactor(this.game.accessMultiplier(fo))} · 75% cap when used`]] };
     if (sn.kind === 'node') {
       const n = net.nodes.get(sn.node!);
       const cnt = sn.group?.length ?? 1;
@@ -1845,7 +1848,7 @@ export class Tools {
     }
     if (this.heightOffset && this.hoverSnap?.kind === 'free' && !title) rows.push(['height', `end ${fmtHeight(this.heightOffset)}`]);
     if (st.sharedSaving && st.sharedSaving > 0) rows.push(['coin', `<b>${fmtMoney(st.sharedSaving)}</b> saved: ${N > 1 ? 'the tracks share one formation' : 'shared formation with adjacent track'}`]);
-    for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (upkeep shared ${fmtMult(this.game.accessMultiplier(fo))})`]); break; } }
+    for (const sn of [this.start, this.hoverSnap]) { const fo = this.foreignOwner(sn); if (fo !== null) { rows.push(['key', `joins ${esc(this.game.company(fo).name)}'s track (access ${fmtAccessFactor(this.game.accessMultiplier(fo))} · 75% cap)`]); break; } }
     const warn = [...this.planWarnings(p), ...p.warnings.filter((w) => w !== 'Bridge end: extend to ground')];
     if (p.demolish.length) warn.unshift(`Demolishes ${plural(p.demolish.length, 'building')}`);
     const who = accessOwnerOf(this.game, p.errors[0]);
@@ -1919,7 +1922,7 @@ export class Tools {
       if (lk) rows.push(['plus', `Links with ${esc(lk)} (transfers)`]);
       if (pl.edge.owner >= 0 && pl.edge.owner !== PLAYER) rows.push(['company', `Road of ${esc(g.company(pl.edge.owner).name)}`]);
       const to = pl.edge.tramOwner ?? -1;
-      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> · shared upkeep ${fmtMult(g.accessMultiplier(to))}`]);
+      if (tram && to >= 0 && to !== PLAYER) rows.push(['key', `Tram tracks of <b>${esc(g.company(to).name)}</b> · ${fmtAccessFactor(g.accessMultiplier(to))} · 75% cap`]);
       this.tip({ title: tram ? 'Tram stop' : 'Bus stop', cost: pl.cost, rows, warn: g.economy.canAfford(pl.cost) ? [] : ['Not enough money'] }, 'ok');
     } else {
       ov.setFootprints(null);

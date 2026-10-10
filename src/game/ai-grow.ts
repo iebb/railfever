@@ -1,14 +1,15 @@
 // City lines that grow with their towns (linegrow). A city railway's termini stay free ends it can be extended from
-// (ai.ts urbanJob: the depot ramp branches off a short tail beside the line's straight continuation; terminusOf tells
-// what lies beyond a terminus), and the AI network task 'extend' (ai-network.ts runs growTask) reviews the company's
-// city lines as their towns grow:
-//  - beyond a terminus: residents along the line's onward direction that no rail station reaches on foot get one to
-//    three new stations, and the terminus becomes a through stop (a depot lead in the way goes: its depot moves out to a
-//    yard beside the new terminus, the trains in the depot with it);
+// (ai.ts urbanJob: its depot stands on a siding beside the line, depot-sites.ts; terminusOf tells what lies beyond a
+// terminus, an older line's depot lead or tail yard too), and the AI network task 'extend' (ai-network.ts runs growTask)
+// reviews the company's city lines as their towns grow:
+//  - beyond a city terminus (including compatible electric through services): residents along the line's onward direction that no rail station reaches on foot get one to
+//    three new stations, and the terminus becomes a through stop (an older depot lead or yard there goes: its depot moves
+//    to a siding beside the line, the trains in the depot with it; only where no siding fits anywhere along the line, to
+//    the older layout's yard turning off beside the new terminus's way on);
 //  - infill: a stop in a long gap between two stations where the town has filled in;
 // each valued by the demand model's line forecast against its works, trains and upkeep (incentives, not rules: an
 // option is built when its operating surplus repays it within the urban payback horizon, the best one the company can
-// pay for now first), at the line's level or underground (nothing above to demolish) where that comes out better. The
+// pay for now first), with ground, elevated and underground works fully priced where each comes out better. The
 // work item's cursor (the survey, the options valued one a work unit, then the winner's build in steps: its stations
 // one a unit, the track to them, the line running on) is saved with the planner and replays exactly; a step that
 // fails takes up what the build laid and refunds it.
@@ -23,12 +24,14 @@ import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf, RAIL, ROAD_TYPES } from './constants';
-import { onwardCentres } from './ai-urban';
+import { onwardCentres, urbanDistricts } from './ai-urban';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
+import { plannedSet } from './demand';
 import { linearStops, outAndBack } from './lines';
 import { depotFits, depotAtEnd, nodeSnap, nodeAt, stationEnds } from './routing';
-import { findRailRoute, railNext, depotServes, consistRule } from './train';
+import { depotBusy, moveDepotHome, buildDepotBeside, quoteDepotBeside, planProspectiveSideDepot, plannedOnwardEnd, sideYardDistances, stopOfStation, runningSideOf, type SideYard } from './depot-sites';
+import { findRailRoute, railNext, depotServes, consistRule, platformDepartureFrontiers } from './train';
 import { marginalSharedTrain } from './ai-capacity';
 import { endTangent, arcTable, tAtS, bezPoint } from './geom';
 import { profAt } from './network';
@@ -39,6 +42,7 @@ import { EARTHWORKS } from './terraform';
 import { depotSize, depotUpkeep, UNDERGROUND_DEPOT } from './build-ops';
 import { finishDoubleTrack, planDoubleTrackFinish, doubleTrackCrossoverGap, planStationOnTrack, commitStationOnTrack } from './trackops';
 import { linePatterns, patternHeadways } from './patterns';
+import { platformChoices } from './rail-platforms';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import * as Subway from './subway';
 import { demolitionCost } from './demolition';
@@ -127,10 +131,10 @@ export interface TerminusEnd {
   /**
    * free: nothing beyond the platforms; tail: one outer track runs on straight and level to a fork whose branch (a spur
    * to depots of ours: the yard's ramp) turns off clear of the line's straight continuation, the other tracks end at
-   * the platforms; lead: own plain track to own depots only, in the way on; other: anything else (junctions, other
-   * companies' track).
+   * the platforms; lead: own plain track to own depots only, in the way on; branch: compatible running track stays
+   * beyond the platforms while native turnout proposals prove a new continuation; other: unsupported ends.
    */
-  kind: 'free' | 'tail' | 'lead' | 'other';
+  kind: 'free' | 'tail' | 'lead' | 'branch' | 'other';
   /** tail: the head it starts from (index into heads), the fork node and the tail's length */
   root: number; fork: number; tail: number;
   /** lead / tail: the spur's track beyond the platforms or the fork, and its depots (they move out when the line runs on) */
@@ -176,7 +180,14 @@ export function terminusOf(g: Game, st: Station, end: 'front' | 'back', owner: n
   }
   // a depot lead: own plain track to own depots only
   const spur = depotSpur(g, hs.map((h) => h.id), own, owner);
-  return spur ? { ...res, kind: 'lead', lead: spur.edges, depots: spur.depots } : { ...res, kind: 'other' };
+  if (spur) return { ...res, kind: 'lead', lead: spur.edges, depots: spur.depots };
+  // A connected timetable end can grow by a native turnout. Its existing running tracks
+  // remain; the ordinary proposal must prove that the new pair clears their formation.
+  const branch = hs.length === 2 && beyond.flat().every(id => {
+    const e = net.edges.get(id);
+    return !!e && e.kind === 'rail' && e.station < 0 && e.depot < 0 && g.canUse(owner, e.owner);
+  });
+  return { ...res, kind: branch ? 'branch' : 'other' };
 }
 
 /**
@@ -459,38 +470,8 @@ export function buildTerminusYard(g: Game, owner: number, y: YardPlan, ok: (p: P
   return g.depots.commit('rail', planned.dp, owner) ? undo() : id;
 }
 
-/** Is a vehicle on its way out of a depot (on its track, or entering the line from it)? */
-export function depotBusy(g: Game, depotId: number): boolean {
-  const d = g.depots.get(depotId);
-  if (!d) return true;
-  if (g.vehicles.isEdgeBusy(d.edge)) return true;
-  for (const v of g.vehicles.map.values()) {
-    const segs = (v as unknown as { segs?: { depot?: number; e: number }[] }).segs;
-    if (segs && segs.some((s) => s.depot === d.id || s.e === d.edge)) return true;
-  }
-  return false;
-}
-
-/**
- * The vehicles at home in depot `from` move to depot `to` (those inside move with it, those out on the line return
- * there later; trackops relocateDepot's rule), the companies' lines buy at `to`, and `from` is taken down. 'busy' while
- * a vehicle is on its way out of `from`; null when done.
- */
-export function moveDepotHome(g: Game, from: number, to: number): string | null {
-  const old = g.depots.get(from), nd = g.depots.get(to);
-  if (!old || !nd || old.kind !== nd.kind) return 'No such depot';
-  if (depotBusy(g, from)) return 'busy';
-  for (const v of g.vehicles.map.values()) {
-    const vd = v as unknown as { depotId?: number };
-    if (vd.depotId !== old.id) continue;
-    vd.depotId = nd.id;
-    v.homeX = nd.x; v.homeZ = nd.z;
-  }
-  for (const ai of g.ais) for (const info of (ai as unknown as { lines?: Map<number, { depot: number }> }).lines?.values() ?? []) if (info.depot === from) info.depot = to;
-  const err = g.depots.remove(old.id);
-  if (!err) g.company(old.owner).economy.spend(15000, 'construction', true);
-  return err;
-}
+// (depotBusy and moveDepotHome live with the other depot placement rules, depot-sites.ts)
+export { depotBusy, moveDepotHome };
 
 // ============================================================================ the network task 'extend'
 
@@ -499,6 +480,8 @@ export interface GrowOption {
   kind: 'ext' | 'fill';
   /** ext: the path end (0: the first station, 1: the last), the stations beyond, the first link's bearing off the axis (radians), the level */
   end?: 0 | 1; n?: number; turn?: number; level?: StationLevel;
+  /** The new station parts' actual style; absent on older cursors means the existing terminus's. */
+  mode?: RailMode;
   /** A priced continuation to a neighbouring centre; gap is from the existing ends to its platform start. */
   town?: number; gap?: number;
   /** fill: the consecutive stations and the point between them */
@@ -549,7 +532,24 @@ export function growLine(h: GrowHost, l: Line): number[] | null {
   const stations = path.map((sid) => g.stations.get(sid)!);
   const town = stations[0].townId;
   const urban = h.managed()?.get(l.id)?.urban || stations.every((s) => railPartMode(s.rail!) !== 'mainline');
-  return urban && town >= 0 && stations.every((s) => s.townId >= 0) ? path : null;
+  if (urban && town >= 0 && stations.every((s) => s.townId >= 0)) return path;
+  // An electric passenger unit can continue from a main-line city platform onto the same
+  // physical rail. Freight and intercity locomotive consists retain their trunk search.
+  const compatible = l.vehicles.some(id => {
+    const v = g.vehicles.get(id) as Train | undefined;
+    return v?.kind === 'train' && v.owner === h.me && v.carries('pax')
+      && v.cars.every(m => m.kind === 'emu' && m.traction === 'electric');
+  });
+  return compatible && [stations[0], stations[stations.length - 1]].some(s => s.owner === h.me && s.townId >= 0
+    && TRACK_TYPES[lineTrackAt(g, s).type].electrified) ? path : null;
+}
+
+/** Preserve an urban part's style; a through electric unit takes its real city-service style. */
+function growthMode(T: Station, sv: Service): RailMode | null {
+  const mode = railPartMode(T.rail!);
+  if (mode !== 'mainline') return mode;
+  if (!sv.cars.every(m => m.kind === 'emu' && m.traction === 'electric')) return null;
+  return sv.cars.every(m => m.id.startsWith('lrv_')) ? 'lightrail' : 'metro';
 }
 
 /** Resident counts of buildings within `r` of a point that no served rail station reaches on foot (each building once). */
@@ -630,9 +630,11 @@ function serviceOf(h: GrowHost, l: Line, path: number[], affected: number[] = []
 }
 
 const routeLength = (points: (Station | StationPlan)[]) => points.slice(1).reduce((sum, p, i) => sum + Math.hypot(p.x - points[i].x, p.z - points[i].z), 0);
-/** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern. */
+/** Forecast at this alternative's actual fleet frequency, shared with the other operator's trains on its pattern;
+ * every alternative of a line on the same demand set (the line's stops and these: demand.ts plannedSet). */
 const forecast = (g: Game, points: (Station | StationPlan)[], mode: RailMode, sv: Service, extra = 0) =>
-  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line, sv.pid);
+  g.demand.forecastLine(points, mode, sv.kmh, sv.cycle / (sv.totalTrains + extra), sv.owner, sv.line, sv.pid, 'rail',
+    plannedSet(g, [...points, ...(g.lines.get(sv.line)?.stops ?? []).flatMap((id) => { const st = g.stations.get(id); return st ? [st] : []; })]));
 /** The operator's share of receipts constrained by full-cycle seats on the busiest direction of an actual leg.
  * Long riders occupy every intervening segment; a physics estimate of annual average hops is not boarding capacity. */
 export const forecastSeatFactor = (legLoads: number[], cycle: number, trains: number, seats: number) =>
@@ -681,6 +683,8 @@ interface ExtPlan {
   crossoverTrack: number;
   demolish: number[];
   level: StationLevel;
+  /** where a depot beyond the terminus moves to: beside the line (its planned junction) */
+  side?: SideYard;
 }
 
 /**
@@ -713,10 +717,10 @@ function spurIgnore(g: Game, spur: number[], depots: number[]): NonNullable<Buil
  * as far out (a tail: the branch stays beside the line). Checked in today's world with the stations' and links'
  * previews. A reason when it does not fit.
  */
-function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn: number, level: StationLevel, destination?: Pick<GrowOption, 'town' | 'gap'>): ExtPlan | string {
+function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn: number, level: StationLevel, destination?: Pick<GrowOption, 'town' | 'gap' | 'mode'>): ExtPlan | string {
   const g = h.g, net = g.world.net, me = h.me, r = T.rail!;
   if (te.heads.length !== 2 || te.kind === 'other' || T.owner !== me) return 'terminus';
-  const track = lineTrackAt(g, T), grade = track.maxGrade * 0.8;
+  const track = { ...lineTrackAt(g, T), mode: destination?.mode ?? railPartMode(r) }, grade = track.maxGrade * 0.8;
   const PL = r.length, SP = cityStationSpacing(g, T.x, T.z, track, PL);
   // a depot beyond the terminus moves out to a yard at the new terminus, its spur taken up: a lead in the way on
   // (the track planned as if it were gone), or a tail's yard (it would join the line half way, on one running track)
@@ -755,7 +759,7 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     const reach = grade * Math.max(1, link);
     let lo = Infinity, hi = -Infinity;
     for (const k of [-0.5, 0, 0.5]) { const y = g.world.heightAt(x + ux * PL * k, z + uz * PL * k); lo = Math.min(lo, y); hi = Math.max(hi, y); }
-    // (the new station's style: the terminus's)
+    // New parts retain the quoted city style; the existing station is not restyled.
     let opt: Record<string, unknown> = { trackType: track.platform, mode: track.mode, level, ...(level !== 'ground' && g.stations.cityAt(x, z, g.towns.nearest(x, z)) ? { entrances: 4 } : {}) };
     if (level === 'underground') {
       const want = lo - Math.max(STATION_DEPTH.metro, (lv0 === 'underground' ? r.depth : 0)), y = Math.max(prevY - reach, Math.min(prevY + reach, want));
@@ -799,7 +803,7 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     px = pl.x + ux * PL / 2; pz = pl.z + uz * PL / 2;
   }
   // the links, each from the last station's outer end (the terminus's start nodes first) to the next one's inner end
-  let laid = 0, crossoverUpkeep = 0, crossoverTrack = 0;
+  let laid = 0, crossoverUpkeep = 0, crossoverTrack = 0, side: SideYard | null = null;
   const links: Proposal[] = [];
   for (let i = 0; i < plans.length; i++) {
     const p = plans[i], ux = Math.sin(p.angle), uz = Math.cos(p.angle), rx = uz, rz = -ux;
@@ -826,6 +830,10 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     });
     if (!pj.ok) return pj.errors[0] ?? 'track';
     if (!h.consent(pj, true) || !h.demolitionOk(pj.demolish)) return 'track consent';
+    // Connected running corridors remain intact if a later phase fails. Avoid proposals
+    // which install irreversible supports on those original tracks or roads.
+    if (te.kind === 'branch' && (pj.roadBridges?.length || pj.crossings.some(c => c.mode === 'under'
+      && !pj.tracks[c.track].sections.some(s => s.type === 'tunnel' && c.sNew >= s.s0 - .5 && c.sNew <= s.s1 + .5)))) return 'existing supports';
     links.push(pj);
     const fin = planDoubleTrackFinish(g, pj, me, plans);
     if (fin.error) return fin.error;
@@ -835,17 +843,45 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
     laid += pj.stats.len / 2;
   }
   if (te.depots.length) {
-    const yard = planProspectiveTerminusYard(g, me, plans[plans.length - 1], 'front', p => h.consent(p, true) && h.demolitionOk(p.demolish), plans, links, ignore);
-    if (!yard) return 'no yard at new terminus';
-    works += yard.cost;
+    // The depot beyond the terminus moves beside the line (never out to the new terminus's way on): a siding off the
+    // new double track, from the old terminus out first (depot-sites.ts; the same siding as a new city line's)
+    const stops = [stopOfStation(T), ...plans], last = plans[plans.length - 1], prior = stops[stops.length - 2];
+    const ok = (p: Proposal) => h.consent(p, true) && h.demolitionOk(p.demolish);
+    find: for (let i = 0; i + 1 < stops.length; i++) for (const d of sideYardDistances(stops, i, crossingRoom + 4, { first: false, last: true }))
+      for (const k of [0, last.layout.trackOffsets.length - 1]) {
+        side = planProspectiveSideDepot(g, me, stops, i, k, d, runningSideOf(stops, i, k), level, track.type, ok, ignore, [plannedOnwardEnd(last, prior)]);
+        if (side) break find;
+      }
+    // (else beside the line as it is, near the old terminus: a level siding first)
+    if (!side) {
+      const near = net.edgesNear(T.x - 250, T.z - 250, T.x + 250, T.z + 250).filter((e) => e.kind === 'rail' && e.owner === me && e.station < 0
+        && e.depot < 0 && !ignore?.edges.has(e.id) && !te.lead.includes(e.id) && g.stations.throughStationOf(e.id) < 0).map((e) => e.id).sort((a, b) => a - b);
+      const q = quoteDepotBeside(g, near, T.x, T.z, me, [T.id], { sections: ['ground', 'bridge', 'tunnel'], tries: 12, consent: ok, type: track.type });
+      if (q) {
+        const e = net.edges.get(q.edge)!, at = { x: 0, y: 0, z: 0 };
+        net.pointAt(e, q.s, at);
+        side = { index: -1, track: -1, d: 0, w: 1, jx: at.x, jz: at.z, x: at.x, z: at.z, cost: q.cost, length: q.length, under: q.under, upkeep: q.upkeep };
+      }
+    }
     // The old yard is taken up in the same successful atomic move. Its upkeep is no longer payable.
     const oldUpkeep = te.lead.reduce((sum, id) => sum + (net.edges.get(id) ? g.edgeMaintenance(net.edges.get(id)!) : 0), 0)
       + te.depots.reduce((sum, id) => sum + (g.depots.get(id) ? depotUpkeep(g.depots.get(id)!) : 0), 0);
-    crossoverUpkeep += yard.upkeep - oldUpkeep;
-    crossoverTrack += yard.track;
+    if (side) {
+      works += side.cost;
+      crossoverUpkeep += side.upkeep - oldUpkeep;
+      crossoverTrack += side.length;
+    } else {
+      // (no room beside the line anywhere near, as in a dense grid with streets along it: the older layout's yard
+      // turning off beside the new terminus's way on, clear of it, rather than a line that cannot grow)
+      const yard = planProspectiveTerminusYard(g, me, last, 'front', ok, plans, links, ignore);
+      if (!yard) return 'no depot site';
+      works += yard.cost;
+      crossoverUpkeep += yard.upkeep - oldUpkeep;
+      crossoverTrack += yard.track;
+    }
   }
   if (te.kind === 'tail') works += te.tail * track.costPerUnit * (LEVEL_TRACK[lv0] ?? 1);
-  return { stations: plans, works: Math.round(works), track: laid, crossoverUpkeep, crossoverTrack, demolish, level };
+  return { stations: plans, works: Math.round(works), track: laid, crossoverUpkeep, crossoverTrack, demolish, level, ...(side ? { side } : {}) };
 }
 
 /** The value of a planned extension or stop: annual revenue gained less the added costs a year, and the capital it needs. */
@@ -950,10 +986,12 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
     if (T.townId < 0 || T.owner !== me) continue;
     const te = terminusOf(g, T, outerEnd(T, N), me);
     if (!te || te.kind === 'other' || te.heads.length !== 2) { h.considered('extend.blockedEnd'); continue; }
-    const r = T.rail!, PL = r.length, track = lineTrackAt(g, T), mode = track.mode, SP = cityStationSpacing(g, T.x, T.z, track, PL);
+    const r = T.rail!, PL = r.length, base = lineTrackAt(g, T), mode = growthMode(T, sv);
+    if (!mode || (mode !== base.mode && !TRACK_TYPES[base.type].electrified)) continue;
+    const track = { ...base, mode }, SP = cityStationSpacing(g, T.x, T.z, track, PL);
     const rough = (lv: StationLevel) => (2 * PL * 9000 + 120000) * (lv === 'underground' ? 5 : lv === 'elevated' ? 3.5 : 1)
       + 2 * (SP - PL) * track.costPerUnit * (lv === 'underground' ? 7 : lv === 'elevated' ? 4.5 : 1.5);
-    const q = endCentre(g, te), a0 = te.kind === 'free' ? 0 : TAIL;
+    const q = endCentre(g, te), a0 = te.kind === 'tail' ? te.tail : 0;
     const sx = q.x + te.ux * a0, sz = q.z + te.uz * a0;
     const towns = new Set(sts.map(s => s.townId));
     for (const c of onwardCentres(g, sx, sz, te.ux, te.uz, towns, SP)) {
@@ -963,7 +1001,7 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
       for (const level of levelsFor(T)) {
         const factor = LEVEL_TRACK[level], capital = rough(level) + 2 * Math.max(0, c.along - SP) * track.costPerUnit * factor;
         const rank = pop * perRes * payback(h, mode) - .3 * capital;
-        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: 0, level, town: c.town, gap: c.along - PL / 2, pop, rank });
+        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: 0, level, mode, town: c.town, gap: c.along - PL / 2, pop, rank });
       }
     }
     for (const turn of [0, 0.2, -0.2, 0.4, -0.4]) {
@@ -980,8 +1018,17 @@ function survey(h: GrowHost, l: Line, path: number[]): GrowOption[] {
         pop += add;
         for (const level of levelsFor(T)) {
           const rank = pop * perRes * payback(h, mode) - 0.3 * rough(level) * (k + 1);
-          if (rank > 0) out.push({ kind: 'ext', end, n: k + 1, turn, level, pop, rank });
+          if (rank > 0) out.push({ kind: 'ext', end, n: k + 1, turn, level, mode, pop, rank });
         }
+      }
+    }
+    const nativeGap = Math.max(doubleTrackCrossoverGap(track.type), track.minRadius * 2 + 2, mode === 'lightrail' ? 18 : 0);
+    for (const c of urbanDistricts(g, T.townId, sx, sz, te.ux, te.uz, Math.max(nativeGap, SP - PL - a0), PL,
+      cityStationRadius(g, T.x, T.z, mode), covered)) {
+      for (const level of levelsFor(T)) {
+        const capital = rough(level) + 2 * Math.max(0, c.gap - (SP - PL)) * track.costPerUnit * LEVEL_TRACK[level];
+        const rank = c.pop * perRes * payback(h, mode) - .3 * capital;
+        if (rank > 0) out.push({ kind: 'ext', end, n: 1, turn: c.turn, level, mode, gap: c.gap, pop: c.pop, rank });
       }
     }
   }
@@ -1041,32 +1088,29 @@ function terminusAt(h: GrowHost, path: number[], end: 0 | 1): { T: Station; te: 
 }
 
 /**
- * Levels an extension may be built at: the terminus's own, underground (nothing above to demolish, a dense town), and
- * from a viaduct down to the ground too (out where the town thins, at a third of the price).
+ * Compare all native levels, including their paid approach ramps. The terminus's own level goes first.
  */
 function levelsFor(T: Station): StationLevel[] {
   const lv = (T.rail!.level ?? 'ground') as StationLevel;
-  // city-integration: the subway branch builds underground-only lines with underground depots (subway-api.md); its
-  // planner takes over here for underground extensions when merged.
-  return lv === 'underground' ? ['underground'] : lv === 'elevated' ? ['elevated', 'ground', 'underground'] : ['ground', 'underground'];
+  return [lv, ...(['ground', 'elevated', 'underground'] as StationLevel[]).filter(level => level !== lv)];
 }
 
 /** Value one option in today's world: the better level for an extension; null when it does not fit. */
-function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score: number; level: StationLevel; fleet: boolean } | 'busy' | null {
+function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score: number; net: number; capital: number; level: StationLevel; fleet: boolean } | 'busy' | null {
   const g = h.g, sv = serviceOf(h, l, path, o.kind === 'ext' ? [path[o.end ? path.length - 1 : 0]] : [o.a!, o.b!]);
   if (!sv) return null;
   const before = path.map((id) => g.stations.get(id)!);
-  const mode = railPartMode(before[0].rail!);
+  const mode = o.kind === 'ext' ? o.mode ?? railPartMode(before[0].rail!) : railPartMode(before[0].rail!);
   if (o.kind === 'ext') {
     const t = terminusAt(h, path, o.end!), level = o.level ?? 'ground';
-    if (!t) return null;
+    if (!t || o.mode && growthMode(t.T, sv) !== o.mode) return null;
     const p = planExtension(h, t.T, t.te, o.n!, o.turn!, level, o);
     if (typeof p === 'string') { h.considered('extend.ext.' + p.split(' ')[0]); return p === 'busy' ? 'busy' : null; }
     const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
     const v = value(h, l, before, after, p.works, p.track, p.stations, p.stations.length, sv, mode, level, p.crossoverUpkeep, p.crossoverTrack);
     h.considered('extend.ext.valued');
     const best = preference(h, 'ext', v);
-    return best ? { ...best, level } : null;
+    return best ? { ...best, net: best.fleet ? v.fleet.net : v.net, capital: best.fleet ? v.fleet.capital : v.capital, level } : null;
   }
   const f = planFill(h, l, path, o);
   if (typeof f === 'string') { h.considered('extend.fill.' + f.split(' ')[0]); return null; }
@@ -1078,7 +1122,41 @@ function evaluate(h: GrowHost, l: Line, path: number[], o: GrowOption): { score:
   const v = value(h, l, before, after, f.plan.cost + compensation(g, f.plan.station!.demolish), 0, [f.plan.station!], 0.2, sv, mode, lv);
   h.considered('extend.fill.valued');
   const best = preference(h, 'fill', v);
-  return best ? { ...best, level: lv } : null;
+  return best ? { ...best, net: best.fleet ? v.fleet.net : v.net, capital: best.fleet ? v.fleet.capital : v.capital, level: lv } : null;
+}
+
+export interface UrbanGrowthQuote {
+  line: number; cursor: GrowCursor; score: number; towns: number[]; mode: 'metro' | 'lightrail';
+}
+
+/** Cheap inventory only; actual native proposals and marginal service economics decide the handoff. */
+export function urbanGrowthCandidates(g: Game, owner: number): Line[] {
+  return g.lines.all().filter(l => l.kind === 'rail' && l.owner === owner && l.loop !== true && !!linearStops(l.stops)
+    && l.vehicles.some(id => { const t = g.vehicles.get(id) as Train | undefined;
+      return t?.kind === 'train' && t.owner === owner && t.carries('pax') && t.cars.every(m => m.kind === 'emu' && m.traction === 'electric'); })
+    && l.stops.some(id => { const s = g.stations.get(id); return s?.owner === owner && s.townId >= 0 && !!s.rail; }))
+    .sort((a, b) => a.id - b.id);
+}
+
+/** One rotating line, at most six alternatives; construction is repriced again in the saved task. */
+export function* probeUrbanGrowth(h: GrowHost, lineId: number): Generator<void, UrbanGrowthQuote | null> {
+  const l = h.g.lines.get(lineId), path = l ? growLine(h, l) : null;
+  if (!l || !path || h.ai.railPolicy.deepTrouble || (h.ai.railPolicy.accounts.get(l.id)?.step ?? 0) > 0) return null;
+  const opts = survey(h, l, path).filter(o => o.kind === 'ext');
+  let best: UrbanGrowthQuote | null = null;
+  for (let i = 0; i < opts.length; i++) {
+    yield;
+    const ev = evaluate(h, l, path, opts[i]);
+    if (!ev || ev === 'busy' || ev.fleet || !(ev.capital > 0)) continue;
+    const T = h.g.stations.get(path[opts[i].end ? path.length - 1 : 0])!, sv = serviceOf(h, l, path, [T.id]);
+    const mode = sv && growthMode(T, sv);
+    if (mode !== 'metro' && mode !== 'lightrail') continue;
+    const years = payback(h, mode), score = (Math.sqrt(Math.max(0, (ev.net - ev.capital / years) / ev.capital)) + .15) * years / 4.5;
+    if (!best || score > best.score) best = { line: l.id, score, mode,
+      towns: [...new Set(path.map(id => h.g.stations.get(id)!.townId).filter(id => id >= 0))],
+      cursor: { at: opts.length + 1, opts, best: { opt: i, score: ev.score } } };
+  }
+  return best;
 }
 
 /** A station cut into the line's track between two stops near the option's point; a reason when none fits. */
@@ -1147,9 +1225,41 @@ function lineTrack(g: Game, path: number[], owner: number): number[] {
 }
 
 /** Do the line's trains (every operator's) find their way between all consecutive stops, both ways? */
-function routesOk(g: Game, l: Line, path: number[]): boolean {
+function routesOk(g: Game, l: Line, path: number[], extendedFrom?: number): boolean {
   for (const owner of g.lines.operatorsOf(l)) for (let i = 0; i + 1 < path.length; i++) {
     if (!routeEdges(g, path[i], path[i + 1], owner) || !routeEdges(g, path[i + 1], path[i], owner)) return false;
+  }
+  if (extendedFrom === undefined) return true;
+  const patterns = linePatterns(l);
+  // A hop can be reachable by reversing on its source platform. At an intermediate
+  // call the native timetable instead requires arrival and forward departure on
+  // the same platform/direction. Align private pattern copies exactly as the edit will.
+  const proposed: Line = { ...l, stops: outAndBack(path), platforms: [], patterns: l.patterns?.map(p =>
+    ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) })) };
+  extendPatterns(proposed, extendedFrom, new Set(path.filter(id => !l.stops.includes(id))));
+  const proposedPatterns = linePatterns(proposed), active = new Set(l.vehicles.map(id => {
+    const t = g.vehicles.get(id);
+    return proposedPatterns.some(p => p.id === t?.pattern) ? t!.pattern! : proposedPatterns[0].id;
+  }));
+  for (const p of proposedPatterns) if (active.has(p.id)) for (let stop = 0; stop < proposed.stops.length; stop++)
+    if (p.stops[stop] !== false && !platformChoices(g, proposed, p.id, stop).length) return false;
+  for (const id of l.vehicles) {
+    const t = g.vehicles.get(id) as Train | undefined;
+    if (t?.kind !== 'train') return false;
+    const pattern = patterns.find(p => p.id === t.pattern) ?? patterns[0];
+    const serves = (sid: number) => l.stops.some((s, i) => s === sid && pattern.stops[i] !== false);
+    const calls = path.filter(sid => l.stops.includes(sid) ? serves(sid) : serves(extendedFrom));
+    const rule = consistRule(t.cars), length = t.length;
+    for (const reverse of [false, true]) for (let i = 0; i + 1 < calls.length; i++) {
+      const from = calls[reverse ? i + 1 : i], to = calls[reverse ? i : i + 1], A = g.stations.get(from)!;
+      const onward = reverse ? calls[i > 0 ? i - 1 : 1] : calls[i + 2 < calls.length ? i + 2 : calls.length - 2];
+      const reaches = g.stations.railTrackGroups(A).some(group => group.length >= length && [group.steps,
+        [...group.steps].reverse().map(s => ({ edge: s.edge, dir: -s.dir }))].some(steps => {
+          const f = platformDepartureFrontiers(g, steps, t.owner, rule, length);
+          return !!findRailRoute(g, [...f.forward, ...f.reverse], to, t.owner, -1, 80000, false, rule, true, { length, onward });
+        }));
+      if (!reaches) return false;
+    }
   }
   return true;
 }
@@ -1211,7 +1321,7 @@ function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolea
   let after: (Station | StationPlan)[], works: number, track: number, stations: StationPlan[], level: StationLevel, crossoverUpkeep = 0, crossoverTrack = 0;
   if (o.kind === 'ext') {
     const t = terminusAt(h, path, o.end!);
-    if (!t) return false;
+    if (!t || o.mode && growthMode(t.T, sv) !== o.mode) return false;
     const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground', o);
     if (typeof p === 'string') return p === 'busy' ? 'busy' : false;
     after = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
@@ -1223,7 +1333,7 @@ function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolea
     after = [...before]; after.splice(Math.max(path.indexOf(o.a!), path.indexOf(o.b!)), 0, station);
     works = f.plan.cost + compensation(g, station.demolish); track = 0; stations = [station]; level = station.level;
   }
-  const v = value(h, l, before, after, works, track, stations, stations.length, sv, railPartMode(before[0].rail!), level, crossoverUpkeep, crossoverTrack);
+  const v = value(h, l, before, after, works, track, stations, stations.length, sv, o.mode ?? railPartMode(before[0].rail!), level, crossoverUpkeep, crossoverTrack);
   if (!preference(h, o.kind, v)?.fleet) return false;
   // addTrains owns the reachability and borrowing check; no funds are borrowed before that check.
   const bought = addTrains(h, l, sv, v.fleet.trains);
@@ -1246,20 +1356,22 @@ export interface GrowBuild { sites: number[][]; stations: number[]; pieces: numb
   waits: number; moved: boolean; pid?: number;
   /** Construction debits with the assets they paid for: retained/busy works cannot be refunded. */
   debits?: { cost: number; edges: number[]; stations: number[]; depots: number[] }[];
-  /** the depot spur beyond the terminus (a lead in the way on, a tail's yard) and its depots: they move out to the new terminus */
-  spur: number[]; depots: number[] }
+  /** the depot spur beyond the terminus (a lead in the way on, a tail's yard) and its depots: they move beside the line */
+  spur: number[]; depots: number[];
+  /** the planned junction [x, z] of their siding beside the line */
+  side?: number[] }
 export const copyGrowBuild = (b: GrowBuild): GrowBuild => ({ ...b, sites: b.sites.map((q) => [...q]), stations: [...b.stations], pieces: [...b.pieces], starts: [...b.starts], links: [...b.links],
-  spur: [...b.spur], depots: [...b.depots], ...(b.debits ? { debits: b.debits.map((d) => ({ ...d, edges: [...d.edges], stations: [...d.stations], depots: [...d.depots] })) } : {}) });
+  spur: [...b.spur], depots: [...b.depots], ...(b.side ? { side: [...b.side] } : {}), ...(b.debits ? { debits: b.debits.map((d) => ({ ...d, edges: [...d.edges], stations: [...d.stations], depots: [...d.depots] })) } : {}) });
 
 /** An extension's plan and value in today's world (the funds it needs within the company's means), or a reason. */
 function extValued(h: GrowHost, l: Line, path: number[], o: GrowOption): { T: Station; te: TerminusEnd; p: ExtPlan; v: Valuation; sv: Service } | string {
   const g = h.g;
   const t = terminusAt(h, path, o.end!);
   const sv = serviceOf(h, l, path, t ? [t.T.id] : []);
-  if (!t || !sv) return 'changed';
+  if (!t || !sv || o.mode && growthMode(t.T, sv) !== o.mode) return 'changed';
   const p = planExtension(h, t.T, t.te, o.n!, o.turn!, o.level ?? 'ground', o);
   if (typeof p === 'string') return p;
-  const before = path.map((id) => g.stations.get(id)!), mode = railPartMode(t.T.rail!);
+  const before = path.map((id) => g.stations.get(id)!), mode = o.mode ?? railPartMode(t.T.rail!);
   const after: (Station | StationPlan)[] = o.end ? [...before, ...p.stations] : [...[...p.stations].reverse(), ...before];
   const v = value(h, l, before, after, p.works, p.track, p.stations, p.stations.length, sv, mode, p.level, p.crossoverUpkeep, p.crossoverTrack);
   if (v.score <= 0 || v.fleet.score > v.score) return 'unpaid';
@@ -1320,7 +1432,8 @@ function extStations(h: GrowHost, l: Line, path: number[], o: GrowOption, prev?:
     const { T, te, p, v, sv } = x;
     if (te.kind === 'other') return 'terminus';
     b = { sites: p.stations.map((q) => [q.x, q.z, q.angle, q.depth, q.height]), stations: [], pieces: [], starts: [], links: [], spent: 0,
-      trains: v.trains, revenue: v.revenue, net: v.net, capital: v.capital, waits: 0, moved: false, pid: sv.pid, debits: [], spur: [...te.lead], depots: [...te.depots] };
+      trains: v.trains, revenue: v.revenue, net: v.net, capital: v.capital, waits: 0, moved: false, pid: sv.pid, debits: [], spur: [...te.lead], depots: [...te.depots],
+      ...(p.side ? { side: [p.side.jx, p.side.jz] } : {}) };
     for (let k = 0; k < te.heads.length; k++) {
       if (te.kind !== 'tail') { b.starts.push(te.heads[k]); continue; }
       if (k === te.root) { b.starts.push(te.fork); continue; }
@@ -1335,12 +1448,11 @@ function extStations(h: GrowHost, l: Line, path: number[], o: GrowOption, prev?:
       b.starts.push(q.id);
     }
   } else b = copyGrowBuild(b);
-  // the next station, planned again on its site at the terminus's style
+  // The next station, planned again at its quoted level and style.
   const t = terminusAt(h, path, o.end!), site = b.sites.shift();
   if (!t || !site) { fail('the line changed'); return 'changed'; }
   const r = t.T.rail!, level = o.level ?? 'ground';
-  // (the terminus's style: city-integration, the one-track branch passes railPartMode as the station's style)
-  const re = g.stations.planRail(site[0], site[1], site[2], r.length, 2, me, { trackType: lineTrackAt(g, t.T).platform, mode: railPartMode(r), level, ...(level !== 'ground' && g.stations.cityAt(site[0], site[1], g.towns.nearest(site[0], site[1])) ? { entrances: 4 } : {}), ...(site[3] ? { depth: site[3] } : {}), ...(site[4] ? { height: site[4] } : {}) });
+  const re = g.stations.planRail(site[0], site[1], site[2], r.length, 2, me, { trackType: lineTrackAt(g, t.T).platform, mode: o.mode ?? railPartMode(r), level, ...(level !== 'ground' && g.stations.cityAt(site[0], site[1], g.towns.nearest(site[0], site[1])) ? { entrances: 4 } : {}), ...(site[3] ? { depth: site[3] } : {}), ...(site[4] ? { height: site[4] } : {}) });
   if (!re.ok || re.join?.rail || !h.demolitionOk(re.demolish)) { fail(re.error ?? 'station site'); return 'site'; }
   if (re.join) { re.links = [...new Set([...re.links, re.join])]; re.join = null; }
   const dem = [...re.demolish], residents = displacedResidents(g, dem), id = g.stations.nextId;
@@ -1389,12 +1501,8 @@ function extLinks(h: GrowHost, l: Line, path: number[], o: GrowOption, b: GrowBu
   const lead = move && b.starts.every((id) => te.heads.includes(id));
   const plans = linkPlans(h, T, made, b.starts, level, lead ? spurIgnore(g, b.spur, depots) : undefined);
   if (typeof plans === 'string') return fail(plans);
-  const last = made[made.length - 1], before = made.length > 1 ? made[made.length - 2] : T;
-  const yard = move ? planTerminusYard(g, me, last, outerEnd(last, before), null, ok) : null;
-  if (move) {
-    if (b.spur.some((id) => g.vehicles.isEdgeBusy(id)) || depots.some((d) => depotBusy(g, d))) return 'wait';
-    if (!yard) return fail('no yard at the new terminus');
-  }
+  // (the depot moves beside the line once the new track is directional: extConnect)
+  if (move && (b.spur.some((id) => g.vehicles.isEdgeBusy(id)) || depots.some((d) => depotBusy(g, d)))) return 'wait';
   for (const pj of plans) {
     const dem = [...pj.demolish], residents = displacedResidents(g, dem), e0 = net.nextEdge;
     if (commitProposal(g, pj)) return fail('track');
@@ -1421,28 +1529,39 @@ function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: Grow
   const ids = made.map((s) => s.id);
   const np = o.end ? [...path, ...ids] : [...[...ids].reverse(), ...path];
   // Revalidate the complete route and all depot moves before discarding any old asset.
-  if (!routesOk(g, l, np)) { extUndo(h, l.name, b, 'no way through'); return false; }
+  if (!routesOk(g, l, np, T.id)) { extUndo(h, l.name, b, 'no way through'); return false; }
   const depots = b.moved ? [] : b.depots;
   if (depots.some((id) => !g.depots.get(id))) { extUndo(h, l.name, b, 'depot changed'); return false; }
   if (depots.some((id) => depotBusy(g, id)) || b.spur.some((id) => g.vehicles.isEdgeBusy(id))) return 'wait';
   const construction = eco.thisYear.construction, edge0 = net.nextEdge, station0 = g.stations.nextId, depot0 = g.depots.nextId;
   const fail = (why: string) => { recordWorks(h, b, construction, edge0, station0, depot0); extUndo(h, l.name, b, why); return false; };
   let home = -1;
-  if (depots.length) {
-    const last = made[made.length - 1], prev = made.length > 1 ? made[made.length - 2] : T;
-    const ok = (q: Proposal) => h.consent(q) && h.demolitionOk(q.demolish);
-    const yard = planTerminusYard(g, me, last, outerEnd(last, prev), null, ok);
-    if (!yard) return fail('no yard at the new terminus');
-    home = buildTerminusYard(g, me, yard, ok);
-    if (home < 0) return fail('no yard at the new terminus');
-  }
   // Finish the complete new pair. Routes through the old trunk can select crossover legs and omit
   // its longer companion, which makes them unsuitable inputs for discovering two physical tracks.
   // The old trunk already has directional running and must retain it.
   const ignored = depots.length ? [...b.spur, ...depots.map(id => g.depots.get(id)!.edge)] : [];
   const fin = finishDoubleTrack(g, b.links, me, { ignoreEdges: ignored });
   if (fin.error) return fail('incomplete directional extension: ' + fin.error);
-  if (!routesOk(g, l, np)) return fail('no way through after directional running');
+  if (!routesOk(g, l, np, T.id)) return fail('no way through after directional running');
+  if (depots.length) {
+    // the depot beyond the old terminus moves beside the line: a siding off the new (directional) track nearest the old
+    // terminus that fits, trains leaving it in their running direction (depot-sites.ts)
+    const ok = (q: Proposal) => h.consent(q) && h.demolitionOk(q.demolish);
+    const skip = new Set(ignored), around = np.map((sid) => g.stations.get(sid)).filter((st): st is Station => !!st);
+    const x0 = Math.min(...around.map((s) => s.x)) - 30, x1 = Math.max(...around.map((s) => s.x)) + 30;
+    const z0 = Math.min(...around.map((s) => s.z)) - 30, z1 = Math.max(...around.map((s) => s.z)) + 30;
+    const plain = net.edgesNear(x0, z0, x1, z1).filter((e) => e.kind === 'rail' && e.owner === me && e.station < 0 && e.depot < 0
+      && !skip.has(e.id) && g.stations.throughStationOf(e.id) < 0).map((e) => e.id).sort((a, c) => a - c);
+    const at = b.side?.length === 2 ? { x: b.side[0], z: b.side[1] } : { x: T.x, z: T.z };
+    home = buildDepotBeside(g, plain, at.x, at.z, me, np, { sections: ['ground', 'bridge', 'tunnel'], tries: 16, consent: ok, type: lineTrackAt(g, T).type });
+    if (home < 0) {
+      // (no room beside the line: the older layout's yard turning off beside the new terminus's way on)
+      const last = made[made.length - 1], prev = made.length > 1 ? made[made.length - 2] : T;
+      const yard = planTerminusYard(g, me, last, outerEnd(last, prev), null, ok);
+      home = yard ? buildTerminusYard(g, me, yard, ok) : -1;
+    }
+    if (home < 0) return fail('no depot site');
+  }
   if (home >= 0) {
     const dp = g.depots.get(home)!;
     const homed = [...g.vehicles.map.values()].filter((v): v is Train => v.kind === 'train' && depots.includes((v as Train).depotId));
@@ -1456,7 +1575,8 @@ function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: Grow
     for (const id of b.spur) { const e = net.edges.get(id); if (e) { len += e.len; net.removeEdge(id); } }
     eco.spend(len * 400, 'construction', true);
     g.onNetworkChanged(); h.stat('netDepotsMoved');
-    h.note(`moved the depot at ${T.name} out to ${made[made.length - 1].name}: ${l.name} runs on beyond ${T.name}`);
+    const beside = !terminusOf(g, made[made.length - 1], outerEnd(made[made.length - 1], made.length > 1 ? made[made.length - 2] : T), me)?.depots.includes(home);
+    h.note(`moved the depot at ${T.name} ${beside ? 'beside the line' : 'out to ' + made[made.length - 1].name}: ${l.name} runs on beyond ${T.name}`);
   }
   recordWorks(h, b, construction, edge0, station0, depot0);
   h.setStops(l, outAndBack(np));

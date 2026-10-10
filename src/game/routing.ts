@@ -11,8 +11,11 @@ import { recomputeLocks, EARTHWORKS } from './terraform';
 import { depotSize } from './build-ops';
 import { distToRect } from './world';
 import { Heap } from './train';
-import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
+import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS, endTangent } from './geom';
 import { walkSitePop } from './catchment';
+import type { CorridorSnapshot } from './planning-corridor';
+import { onwardEnds, inOnward, rectPoints, type OnwardEnd } from './onward';
+import { requestCorridor, advanceCorridor, cancelCorridor } from './corridor-worker';
 
 /** Optional headless profiling observer. Never consulted by the planner's decisions or work schedule. */
 export const planningProbe: { observe?: (stage: string, begin: boolean, work?: number) => void } = {};
@@ -133,6 +136,51 @@ function nearestDir(tx: number, tz: number) {
   let bd = 0, bv = -2;
   DIRS.forEach(([dx, dz], i) => { const v = (dx * tx + dz * tz) / Math.hypot(dx, dz); if (v > bv) { bv = v; bd = i; } });
   return bd;
+}
+
+const corridorTerrain = new WeakMap<Game, { key: string; id: string; world: Game['world']; net: Game['world']['net']; h: Float32Array; lock: Uint8Array }>();
+let corridorTerrainId = 0;
+
+/** One detached terrain/formation revision, shared by requests and exact synchronous fallback. */
+export function captureCorridorSnapshot(g: Game, from: OPoint, to: OPoint, opts: CorridorOpts): CorridorSnapshot {
+  const w = g.world, key = `${w.size}:${w.heightsVersion}:${w.net.version}:${w.lotVersions.version}`;
+  let terrain = corridorTerrain.get(g);
+  if (!terrain || terrain.key !== key || terrain.world !== w || terrain.net !== w.net) {
+    terrain = { key, id: `${++corridorTerrainId}:${key}`, world: w, net: w.net, h: w.h.slice(), lock: w.lock.slice() };
+    corridorTerrain.set(g, terrain);
+  }
+  const forbid: CorridorSnapshot['forbid'] = [];
+  for (const st of g.stations.map.values()) for (const f of g.stations.footprints(st))
+    forbid.push({ x: f.x, z: f.z, a: f.angle, w: f.w / 2 + 1.5, d: f.d / 2 + 1.5, r: Math.hypot(f.w / 2 + 1.5, f.d / 2 + 1.5) });
+  for (const dp of g.depots.map.values()) forbid.push({ x: dp.x, z: dp.z, a: dp.angle, w: 2.5, d: 3.5, r: Math.hypot(2.5, 3.5) });
+  const revision = terrain.id + ':' + g.networkVersion + ':' + forbid.map(f => `${f.x},${f.z},${f.a},${f.w},${f.d},${f.r}`).join(';');
+  const railGrade = opts.type ? (TRACK_TYPES[opts.type] ?? TRACK_TYPES.standard).maxGrade * Math.min(1, Math.max(0.1, opts.gradeMargin ?? 0.85)) : 0.03;
+  return { revision, terrainId: terrain.id, size: w.size, h: terrain.h, lock: terrain.lock, waterLimit: WATER_Y + 0.05,
+    from: { ...from }, to: { ...to }, opts: { ...opts, avoid: opts.avoid?.map(a => ({ ...a })) }, forbid,
+    grade: opts.kind === 'rail' ? railGrade : 0.07, field: opts.parallel ? railField(g, opts.trackClass) : undefined };
+}
+
+/** Prefetch costs one logical unit in every environment. Worker timing only selects an exact derived cache. */
+function* plannedCorridor(g: Game, from: OPoint, to: OPoint, opts: CorridorOpts, budget: number): Generator<void, { path: P2[] | null; expanded: number }> {
+  const before = captureCorridorSnapshot(g, from, to, opts);
+  let job = requestCorridor(g, before, budget);
+  try {
+    yield;
+    const current = captureCorridorSnapshot(g, from, to, opts);
+    if (current.revision !== before.revision) {
+      cancelCorridor(job);
+      job = requestCorridor(g, current, budget);
+    }
+    while (true) {
+      planningProbe.observe?.('corridor', true);
+      const beforeExpanded = job.reply?.steps[job.index - 1]?.expanded ?? job.kernel?.expanded ?? 0;
+      let step: ReturnType<typeof advanceCorridor> | null = null;
+      try { step = advanceCorridor(job); }
+      finally { planningProbe.observe?.('corridor', false, step ? step.expanded - beforeExpanded : 0); }
+      if (step.state !== 'running') return { path: step.path, expanded: step.expanded };
+      yield;
+    }
+  } finally { cancelCorridor(job); }
 }
 
 /**
@@ -890,9 +938,15 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
     let path: P2[] | null = [{ x: from.x, z: from.z }, { x: to.x, z: to.z }], expanded = 0;
     if (attempt >= 0) {
-      const cs = new CorridorSearch(g, from, to, { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength });
-      while (cs.step(budget) === 'running') yield;
-      path = cs.path; expanded = cs.expanded;
+      const opts: CorridorOpts = { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength };
+      if (o.sliced && o.kind === 'rail') {
+        const result = yield* plannedCorridor(g, from, to, opts, budget);
+        path = result.path; expanded = result.expanded;
+      } else {
+        const cs = new CorridorSearch(g, from, to, opts);
+        while (cs.step(budget) === 'running') yield;
+        path = cs.path; expanded = cs.expanded;
+      }
     }
     if (!path) return why || 'no corridor';
     planningProbe.observe?.('alignment', true);
@@ -1161,6 +1215,11 @@ export interface SiteOpts {
   accept?: (p: StationPlan) => boolean;
   /** a quicker search (AI): stop a few rings beyond the best site so far (unless a height is wanted) */
   quick?: boolean;
+  /**
+   * AI: what a site linked to one of these stations (its plan's walking links: one transfer complex) is worth, in
+   * site score units (20,000 of building cost each): the journeys the connection to that station's lines brings.
+   */
+  network?: ReadonlyMap<number, number>;
 }
 
 /** Run a generator to completion (synchronous use of the incremental helpers). */
@@ -1330,11 +1389,13 @@ export function depotAtEnd(g: Game, nodeId: number, owner: number): number {
 
 /**
  * Would a rail depot fit with its door at (x,z) facing (fx,fz), demolishing only houses up to `maxPop`?
- * With `y` (the height of the track end it will sit on) the ground must also suit that height.
+ * With `y` (the height of the track end it will sit on) the ground must also suit that height. No other free track
+ * end within `endClear` of its middle (it would snap to that end instead: a depot planned with its own siding's end
+ * 2.15 from its middle needs only a little more).
  */
-export function depotFits(g: Game, x: number, z: number, fx: number, fz: number, owner: number, maxPop = 0, y?: number): boolean {
+export function depotFits(g: Game, x: number, z: number, fx: number, fz: number, owner: number, maxPop = 0, y?: number, endClear = 4.7): boolean {
   const cx = x - fx * 2.15, cz = z - fz * 2.15;
-  if (g.world.net.nearestNode(cx, cz, 4.7, 'rail', (nn) => nn.edges.length === 1)) return false;
+  if (g.world.net.nearestNode(cx, cz, endClear, 'rail', (nn) => nn.edges.length === 1)) return false;
   const p = g.depots.plan('rail', cx, cz, Math.atan2(fx, fz), owner);
   const dem = p.demolish ?? [];
   if (!p.ok || dem.length > (maxPop ? 2 : 0) || !dem.every((id) => (g.world.buildings.get(id)?.pop ?? 0) <= maxPop)) return false;
@@ -1387,28 +1448,47 @@ export function buildRailDepot(g: Game, st: Station, owner: number, frontDir?: P
   return -1;
 }
 
-/** Depot on a short siding branching off a rail edge near (x,z) (e.g. a main line outside town). */
-export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: number,
-  entry?: { dir: 1 | -1; side: 1 | -1; reserved?: readonly P2[] }): number {
+/** A short level siding planned off a rail edge (planDepotOnLine): its curve (built first), its straight end and the depot's. */
+export interface LineSidingPlan { edge: number; start: Snap; jx: number; jz: number; fx: number; fz: number; tx: number; tz: number; p1: Proposal; cost: number; length: number }
+
+/**
+ * Plan a depot on a short siding branching off rail edge `edgeId` at `s` (built by buildDepotOnLine): a 12-unit curve
+ * out to the side, a 6-unit straight and the depot. The siding and depot keep off the way on beyond any terminus
+ * (onward.ts; `ends`: prospective termini as well). Pure; null where nothing fits.
+ */
+export function planDepotOnLine(g: Game, edgeId: number, s: number, owner: number,
+  entry?: { dir: 1 | -1; side: 1 | -1; reserved?: readonly P2[] }, ends?: readonly OnwardEnd[], maxPop = 30): LineSidingPlan | null {
   const net = g.world.net;
   const e = net.edges.get(edgeId);
-  if (!e || e.station >= 0 || e.depot >= 0) return -1;
+  if (!e || e.station >= 0 || e.depot >= 0) return null;
   const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+  net.pointAt(e, s, p);
+  const way = [...onwardEnds(g, p.x, p.z, 30), ...(ends ?? [])];
   // A paired formation may need a specific departure direction; keep its future companion side clear.
-  for (const side of entry ? [entry.side] : [1, -1]) for (const dirSign of entry ? [-entry.dir] : [1, -1])
-    for (const offset of entry?.reserved ? [2.2, 3.2, 4.2, 5.2] : [2.2]) {
+  // (beside a double track, whose second track is already laid, a narrower or compact siding where its curves allow:
+  // between the close stations of a city line)
+  const wide: [number, number, number][] = entry?.reserved ? [2.2, 3.2, 4.2, 5.2].map((o) => [o, 12, 18] as [number, number, number]) : [[2.2, 12, 18]];
+  for (const side of entry ? [entry.side] : [1, -1]) for (const dirSign of entry ? [-entry.dir] : [1, -1]) {
+    net.pointAt(e, s, p, d);
+    const l0 = Math.hypot(d.x, d.z) || 1, ox = (d.z / l0) * dirSign * side, oz = (-d.x / l0) * dirSign * side;
+    const twin = !!net.nearestEdge(p.x + ox * 0.45, p.z + oz * 0.45, 0.25, 'rail', (q) => q.id !== edgeId);
+    const shapes: [number, number, number][] = twin && !entry?.reserved ? [...wide, [1.7, 12, 18], [2.2, 8, 11]] : wide;
+    for (const [offset, curve, len] of shapes) {
     net.pointAt(e, s, p, d);
     const l = Math.hypot(d.x, d.z) || 1;
     const tx = (d.x / l) * dirSign, tz = (d.z / l) * dirSign;
     // Diverge over 12 units, then a 6-unit straight siding. A reserved curve may need a wider outside yard.
-    const ex = p.x + tx * 12 - tz * offset * side, ez = p.z + tz * 12 + tx * offset * side;
-    const fx = p.x + tx * 18 - tz * offset * side, fz = p.z + tz * 18 + tx * offset * side;
+    const ex = p.x + tx * curve - tz * offset * side, ez = p.z + tz * curve + tx * offset * side;
+    const fx = p.x + tx * len - tz * offset * side, fz = p.z + tz * len + tx * offset * side;
     // Curves can bring the future companion back under an outward-facing yard. Reject its footprint
     // before building the siding, with construction's 0.32+0.6 clearance plus half a sample interval.
     const size = depotSize('rail');
     if (entry?.reserved?.some(q => distToRect(q.x, q.z, fx + tx * 2.15, fz + tz * 2.15,
       Math.atan2(-tx, -tz), size.w / 2, size.d / 2) <= 1.17)) continue;
-    if (!depotFits(g, fx, fz, -tx, -tz, owner, 30, net.heightAtS(e, s))) continue;
+    // never on the way on beyond a terminus: the line runs on from there
+    if (way.length && [{ x: ex, z: ez }, { x: fx, z: fz }, ...rectPoints(fx + tx * 2.15, fz + tz * 2.15, Math.atan2(-tx, -tz), size.w, size.d)]
+      .some((q) => inOnward(q, way))) continue;
+    if (!depotFits(g, fx, fz, -tx, -tz, owner, maxPop, net.heightAtS(e, s), 2.6)) continue;
     const start = findSnap(g, 'rail', p.x, p.z, 0.3);
     if (start.kind !== 'edge' || start.edge !== edgeId) continue;
     // (the siding is of the line's track type: electric trains and multiple units reach their depot under the wire;
@@ -1417,19 +1497,46 @@ export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: numb
     const j = biarcJunction({ x: p.x, z: p.z, tx, tz }, { x: ex, z: ez, tx, tz });
     if (!j) continue;
     const p1 = planEdge(g, start, { kind: 'free', x: j.x, z: j.z, y: 0 }, o);
-    if (!p1.ok || commitProposal(g, p1)) continue;
-    const n1 = nodeAt(g, 'rail', j.x, j.z);
-    if (!n1) continue;
-    const p2 = planEdge(g, nodeSnap(g, n1.id, 'rail'), { kind: 'free', x: fx, z: fz, y: 0 }, o);
-    if (p2.ok && !commitProposal(g, p2)) {
-      const n2 = nodeAt(g, 'rail', fx, fz);
-      const id = n2 ? depotAtEnd(g, n2.id, owner) : -1;
-      if (id >= 0) return id;
-      if (n2) removeEdges(g, [...n2.edges], owner);
+    if (!p1.ok) continue;
+    // (the rest of the siding planned on from the curve's end, and the depot as its end's direction sets it, before
+    // anything is built: a site that fails costs nothing)
+    const t1 = p1.tracks[0], jy = t1?.prof[t1.prof.length - 1] ?? p.y, jt = t1 ? endTangent(t1.bez) : { x: tx, z: tz };
+    const p2 = net.withTemporaryNodes('rail', [{ x: j.x, y: jy, z: j.z, dx: jt.x, dz: jt.z }], owner,
+      (ns) => planEdge(g, { kind: 'node', x: j.x, y: jy, z: j.z, node: ns[0].id }, { kind: 'free', x: fx, z: fz, y: 0 }, o));
+    if (!p2.ok || !p2.tracks.length) continue;
+    const t2 = p2.tracks[p2.tracks.length - 1], et = endTangent(t2.bez), fy = t2.prof[t2.prof.length - 1];
+    const cx = fx + et.x * 2.15, cz = fz + et.z * 2.15, ang = Math.atan2(-et.x, -et.z);
+    if (entry?.reserved?.some(q => distToRect(q.x, q.z, cx, cz, ang, size.w / 2, size.d / 2) <= 1.17)) continue;
+    if (way.length && rectPoints(cx, cz, ang, size.w, size.d).some((q) => inOnward(q, way))) continue;
+    if (!depotFits(g, fx, fz, -et.x, -et.z, owner, maxPop, fy, 2.6)) continue;
+    const dp = g.depots.plan('rail', cx, cz, ang, owner, { snap: false, y: fy });
+    if (!dp.ok) continue;
+    return { edge: edgeId, start, jx: j.x, jz: j.z, fx, fz, tx, tz, p1, cost: p1.cost + p2.cost + dp.cost, length: p1.stats.len + p2.stats.len };
     }
-    removeEdges(g, [...n1.edges].filter((x) => x !== edgeId), owner);
-    return -1;
   }
+  return null;
+}
+
+/**
+ * Depot on a short siding branching off a rail edge near (x,z) (e.g. a main line outside town), as planDepotOnLine
+ * plans it. Returns the depot id or -1 (nothing left behind but the turnout's split of the edge where the depot
+ * itself could not be placed).
+ */
+export function buildDepotOnLine(g: Game, edgeId: number, s: number, owner: number,
+  entry?: { dir: 1 | -1; side: 1 | -1; reserved?: readonly P2[] }, ends?: readonly OnwardEnd[], maxPop = 30): number {
+  const net = g.world.net, plan = planDepotOnLine(g, edgeId, s, owner, entry, ends, maxPop);
+  if (!plan || commitProposal(g, plan.p1)) return -1;
+  const n1 = nodeAt(g, 'rail', plan.jx, plan.jz);
+  if (!n1) return -1;
+  const o = plan.p1.opts;
+  const p2 = planEdge(g, nodeSnap(g, n1.id, 'rail'), { kind: 'free', x: plan.fx, z: plan.fz, y: 0 }, o);
+  if (p2.ok && !commitProposal(g, p2)) {
+    const n2 = nodeAt(g, 'rail', plan.fx, plan.fz);
+    const id = n2 ? depotAtEnd(g, n2.id, owner) : -1;
+    if (id >= 0) return id;
+    if (n2) removeEdges(g, [...n2.edges], owner);
+  }
+  removeEdges(g, [...n1.edges].filter((x) => x !== edgeId), owner);
   return -1;
 }
 
@@ -1459,6 +1566,18 @@ export function buildDepotNearLine(g: Game, edges: number[], x: number, z: numbe
   return -1;
 }
 
+/**
+ * Would a road (tram) depot planned with its door at (exitX, exitZ) join its street at a dead end, so that the street
+ * (or a route along it) ends in the depot? AI road depots stand beside a street instead.
+ */
+export function roadDepotAtDeadEnd(g: Game, plan: { exitX: number; exitZ: number }, tram = false, owner = -1): boolean {
+  const net = g.world.net;
+  const ne = net.nearestEdge(plan.exitX, plan.exitZ, 4, 'road', (ed) => ed.depot < 0 && (!tram || (!!ed.tram && g.canUse(owner, ed.tramOwner ?? -1))));
+  if (!ne) return false;
+  const node = ne.s < 0.8 ? ne.edge.a : ne.s > ne.edge.len - 0.8 ? ne.edge.b : -1;
+  return node >= 0 && (net.nodes.get(node)?.edges.length ?? 0) <= 1;
+}
+
 /** Road depot beside a street near (x,z), connected to it. Prefers sites that demolish nothing. */
 export function buildRoadDepot(g: Game, x: number, z: number, owner: number, maxR = 26, pred?: (e: NEdge) => boolean): number {
   return runGen(roadDepotGen(g, x, z, owner, maxR, pred));
@@ -1482,7 +1601,7 @@ export function* roadDepotGen(g: Game, x: number, z: number, owner: number, maxR
         const q = { x: 0, y: 0, z: 0 };
         net.pointAt(ne.edge, ne.s, q);
         const plan = g.depots.plan('road', px, pz, Math.atan2(q.x - px, q.z - pz), owner);
-        if (!plan.ok || !g.company(owner).economy.canAfford(plan.cost + 40000)) continue;
+        if (!plan.ok || !g.company(owner).economy.canAfford(plan.cost + 40000) || roadDepotAtDeadEnd(g, plan)) continue;
         const dem = plan.demolish ?? [];
         if (dem.length > (maxPop ? 1 : 0) || dem.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > maxPop)) continue;
         const id = g.depots.nextId;

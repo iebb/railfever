@@ -15,6 +15,8 @@ export interface NativeStationPlan {
   stamp: string;
   tracks: { steps: RailTrackStep[]; cut: [number, number]; through: boolean; offset: number }[];
 }
+// Scan one extra row so an unsupported wider formation is rejected rather than silently truncated.
+const NATIVE_TRACK_GAP = 1.6, NATIVE_TRACK_SPAN = 4 * NATIVE_TRACK_GAP;
 interface Chain { steps: RailTrackStep[]; length: number; seed: number }
 interface Point { x: number; y: number; z: number; fx: number; fz: number; edge: number; s: number }
 
@@ -55,7 +57,7 @@ function at(g: Game, c: Chain, u: number): Point {
 }
 function nearest(g: Game, c: Chain, x: number, z: number): number | null {
   const ids = new Set(c.steps.map((q) => q.edge));
-  const q = g.world.net.nearestEdge(x, z, 2, 'rail', (e) => ids.has(e.id));
+  const q = g.world.net.nearestEdge(x, z, NATIVE_TRACK_SPAN + 0.1, 'rail', (e) => ids.has(e.id));
   if (!q) return null;
   let u = 0;
   for (const st of c.steps) {
@@ -104,22 +106,28 @@ export function planNativeStationOnTrack(g: Game, edgeId: number, s: number, o: 
   const L = Math.max(4, Math.min(40, o.length ?? defaultPlatformLength(o.mode ?? e.type)));
   const A = chain(g, e, L / 2 + 3), uc = A.seed + Math.max(0, Math.min(e.len, s)), q = at(g, A, uc);
   if (uc - L / 2 < 0.3 || uc + L / 2 > A.length - 0.3) return fail(`Needs ${Math.round(L * 10)} m of plain track`);
-  const rows: { chain: Chain; lat: number }[] = [{ chain: A, lat: 0 }];
+  let rows: { chain: Chain; lat: number }[] = [{ chain: A, lat: 0 }];
   const used = new Set(A.steps.map((t) => t.edge));
-  for (const candidate of [...net.edgesNear(q.x - 1.7, q.z - 1.7, q.x + 1.7, q.z + 1.7)].sort((a, b) => a.id - b.id)) {
+  for (const candidate of [...net.edgesNear(q.x - NATIVE_TRACK_SPAN, q.z - NATIVE_TRACK_SPAN, q.x + NATIVE_TRACK_SPAN, q.z + NATIVE_TRACK_SPAN)].sort((a, b) => a.id - b.id)) {
     if (candidate.kind !== 'rail' || candidate.station >= 0 || candidate.depot >= 0 || used.has(candidate.id)) continue;
     const C = chain(g, candidate, L / 2 + 5), v = nearest(g, C, q.x, q.z);
     if (v === null) continue;
     const p = at(g, C, v), lat = (p.x - q.x) * q.fz - (p.z - q.z) * q.fx;
-    if (Math.abs(lat) < 0.3 || Math.abs(lat) > 1.6 || Math.abs(p.y - q.y) > 0.15 || Math.abs(p.fx * q.fx + p.fz * q.fz) < 0.99) continue;
+    if (Math.abs(lat) < 0.3 || Math.abs(lat) > NATIVE_TRACK_SPAN || Math.abs(p.y - q.y) > 0.15 || Math.abs(p.fx * q.fx + p.fz * q.fz) < 0.99) continue;
     if (p.fx * q.fx + p.fz * q.fz < 0) { C.steps.reverse(); for (const t of C.steps) t.dir = -t.dir as 1 | -1; C.seed = C.length - C.seed - candidate.len; }
     if (rows.some((r) => Math.abs(r.lat - lat) < 0.15)) continue;
     rows.push({ chain: C, lat }); for (const t of C.steps) used.add(t.edge);
   }
-  if (rows.length > 4) return fail('At most four existing running tracks');
   rows.sort((a, b) => a.lat - b.lat);
+  // Follow only the clicked close-spaced formation; disconnected parallel tracks remain untouched.
+  const seed = rows.findIndex(r => r.chain === A);
+  let first = seed, last = seed;
+  while (first > 0 && rows[first].lat - rows[first - 1].lat <= NATIVE_TRACK_GAP) first--;
+  while (last + 1 < rows.length && rows[last + 1].lat - rows[last].lat <= NATIVE_TRACK_GAP) last++;
+  rows = rows.slice(first, last + 1);
+  if (rows.length > 4) return fail('At most four existing running tracks');
   const mid = (rows[0].lat + rows[rows.length - 1].lat) / 2;
-  const P = Math.min(o.tracks ?? Math.min(2, rows.length), Math.min(2, rows.length));
+  const P = Math.max(rows.length - 2, Math.min(o.tracks ?? Math.min(2, rows.length), Math.min(2, rows.length)));
   if (P < 1 || rows.length - P > 2) return fail('Existing formation needs two outside platform tracks');
   if ((o.tracks ?? P) > 2 && rows.length > 2) return fail('Interior platforms need wider track spacing');
   if (o.platformStyle === 'island' && rows.length > 1) return fail('Existing close tracks need outside side platforms');

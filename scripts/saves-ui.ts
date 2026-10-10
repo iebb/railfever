@@ -24,7 +24,8 @@ const getGame = (page: Page) => page.evaluate(() => {
 async function newCard(page: Page, seed: number) {
   await page.evaluate(() => (window as any).__rf.ui.openNewGame());
   await page.locator('.ng-card .seg button').first().click(); // S / 512
-  await page.locator('.ng-card input[type=number]').fill(String(seed));
+  // (by label: the card also has a number field for the starting balance)
+  await page.getByRole('spinbutton', { name: 'Seed', exact: true }).fill(String(seed));
 }
 async function hidden(page: Page) {
   await page.evaluate(() => {
@@ -87,6 +88,8 @@ try {
     return new Promise<boolean>((r) => { const t = db.transaction('saves', 'readonly'), q = t.objectStore('saves').get('autosave'); t.oncomplete = () => { db.close(); r(!!q.result); }; });
   });
   assert.equal((await dbRecords(page)).find((r) => r.slot === 'autosave-previous').meta.money, 987654321);
+  // (the hidden-page autosave may still be writing when its record from the earlier save is found)
+  await page.locator('.savechip.saved').waitFor({ timeout: 10000 }).catch(() => {});
   assert(await page.locator('.savechip.saved').isVisible(), 'persistent saves can honestly say Saved');
   assert.equal(failures.length, 0, failures.join('\n'));
   await context.close();
@@ -102,7 +105,8 @@ try {
   assert((await mem.locator('.storage-banner').innerText()).includes("Session-only saves: lost on reload; Export to keep."));
   await hidden(mem);
   await mem.locator('.savechip.memory').waitFor();
-  assert((await mem.locator('.savechip').innerText()).includes('Session only'));
+  // (textContent: the chip is set in capitals by CSS, which innerText reflects)
+  assert((await mem.locator('.savechip').textContent())?.includes('Session only'));
   await mem.getByRole('button', { name: 'Dismiss storage notice' }).click();
   assert.equal(await mem.locator('.storage-banner').count(), 0);
   await hidden(mem); await mem.waitForTimeout(150);

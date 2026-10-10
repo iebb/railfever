@@ -9,7 +9,7 @@ import { networkPlanner, runNetworkTask } from '../src/game/ai-network';
 import { distanceFare, speedFactor, fareFor, simNow, transferFareFactor, FARE_LEVEL, TRANSFER_FARE_FACTOR } from '../src/game/fares';
 import { RAIL_FARE } from '../src/game/constants';
 import { fareFixture, fareTrain } from './fares';
-import { fails, check, fmt, connectStations, depotBehind, placeStationPair, busStopSites, addBusStop, roadDepotNear, checkReservations, checkNaN, Train } from './lib';
+import { fails, check, fmt, connectStations, depotBehind, placeStationPair, placeAndConnect, busStopSites, addBusStop, roadDepotNear, checkReservations, checkNaN, Train } from './lib';
 
 // Line/pattern edits may converge drop-offs, including groups with the same history but different clocks.
 {
@@ -81,8 +81,9 @@ const seed = Number(process.argv[2] ?? 7);
 const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 2 });
 g.economy.money = 40_000_000;
 // player network: a railway and a bus line
-const pr = placeStationPair(g, 60, 150, 0)!;
-connectStations(g, pr.A, pr.B, 0, 1, () => {});
+// (a pair that connects: since the walks were halved after 2.9 the first pair placed need not have a route)
+const pr = placeAndConnect(g, 60, 150, 0, new Set(), 1, () => {})!;
+check(!!pr, 'player railway placed and connected');
 const dep = depotBehind(g, pr.A, pr.B, 0);
 const line = g.lines.create('rail', 0);
 line.stops = [pr.A.id, pr.B.id];

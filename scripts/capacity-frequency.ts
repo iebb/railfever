@@ -47,7 +47,10 @@ function district(g: Game, t: Town, x0: number, x1: number, z: number, h: number
   for (const rx of xs) for (let i = 1; i < zs.length; i++) { if (!cross && zs[i - 1] < z && zs[i] > z) continue; road(g, rx, zs[i - 1], rx, zs[i]); }
   const lots: { x: number; z: number; angle: number }[] = [];
   for (const rz of zs) for (let rx = x0 + 2; rx < x1; rx += 4) {
-    if (strip && Math.abs(rz - z) < 7) continue;
+    // User rule (2.10): station walking reach halved again, and in-city light-rail stations walk half of that (about
+    // 59 m), so 2.9's nearest lots (rows 4 units off the line kept clear, lots from 109 m) reach nobody. Keep the strip
+    // over the platforms clear, but build the lots beyond the nearer row street (51 m) as a real district would.
+    if (strip && Math.abs(rz + 1.1 - z) < 4) continue;
     const near = g.world.net.edgesNear(rx - 2.5, rz + 1.1 - 2.5, rx + 2.5, rz + 1.1 + 2.5).some((e) => e.kind === 'rail')
       || g.depots.near(rx, rz + 1.1, 3).length > 0;
     if (near) continue;
@@ -157,10 +160,16 @@ check(Number.isFinite(coachBid)&&coachBid>0,
   'a seat-bound complete service values extra seats without buying another path');
 
 // Mixed operators share the same whole-route native frequency; each keeps its existing traffic/access weight.
-const shared=fixture(13500,6,'lrv_b',2),sq=quote(shared,6),sp=sharedCapacityPlan(shared.g,shared.l);
-check(near(sp.revenue,sq.revenue),'two complete operators recover one native revenue pool without duplication');
-check(sp.allocations.length===2&&near(sp.allocations.reduce((n,a)=>n+a.traffic,0),shared.l.capacity!.demand!.revenue),
+// (2.10: with lots inside the halved in-city reach and walkers' 3.2x trips, the 13,500-resident corridor fills the
+// lead operator's three trains, whose receipts are then seat-bound. The pool comparison needs seats to spare for
+// every operator, as 2.9's corridor had: a 4,000-resident district. The busier corridor keeps the bid checks.)
+const pool=fixture(4000,6,'lrv_b',2),pq=quote(pool,6),pp=sharedCapacityPlan(pool.g,pool.l);
+check(near(pp.revenue,pq.revenue),'two complete operators recover one native revenue pool without duplication');
+check(pp.allocations.length===2&&near(pp.allocations.reduce((n,a)=>n+a.traffic,0),pool.l.capacity!.demand!.revenue),
   'operator traffic weights conserve the saved corridor budget');
+const shared=fixture(13500,6,'lrv_b',2),sp=sharedCapacityPlan(shared.g,shared.l);
+check(sp.allocations.length===2&&near(sp.allocations.reduce((n,a)=>n+a.traffic,0),shared.l.capacity!.demand!.revenue),
+  'operator traffic weights conserve the saved corridor budget on the busier corridor');
 const accessBefore=JSON.stringify(shared.g.access);
 const shareBid=marginalSharedTrain(shared.g,shared.l,2,shared.cars);
 const leadBid=marginalSharedTrain(shared.g,shared.l,1,shared.cars);
