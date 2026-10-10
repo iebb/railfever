@@ -393,7 +393,11 @@ if (run('busy')) {
   check(economicDeadline&&linePath(poor.line).join()===before,'busy: a losing economic premise gains no extension');
 
   // The approach can become occupied after a feasible fleet quote, before its saved purchase phase.
-  const selected=presholm('east','old',2,4500),sg=selected.g,sa=selected.ai;
+  // (2.10: presholm runs at least six trains, so the '2' this case asked for was six. At the halved walking reach a
+  // 4,500-resident district beyond the terminus pays better as two new stations: 28.0M against 24.2M for the same
+  // five trains on today's route. The line is not crowded: its trains run under 30% full and its forecast legs stay
+  // within seats with or without the extension. A 1,200-resident district keeps the fleet first, 24.3M against 16.9M.)
+  const selected=presholm('east','old',6,1200),sg=selected.g,sa=selected.ai;
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],null);
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],selected.line.id);
   sg.aiEnabled=true;scheduleNetworkTask(sa,'extend',0);
@@ -405,10 +409,15 @@ if (run('busy')) {
   }
   check(chosen,'busy: an ordinary survey reaches a saved feasible fleet-first purchase');
   if(chosen) {
-    sg.aiEnabled=false;runDays(sg,1);
-    const last=selected.sts[selected.sts.length-1],te=terminusOf(sg,last,outerEnd(last,selected.sts[selected.sts.length-2]),sa.companyId);
-    check(te?.kind==='lead'&&[...te.lead,...te.depots.map(id=>sg.depots.get(id)!.edge)].some(id=>sg.vehicles.isEdgeBusy(id)),
-      'busy: a running departure occupies the same approach by the purchase phase');
+    // (the saved job waits while the trains run their timetable, until one leaving or entering the depot occupies its
+    // approach: the purchase phase then meets it, whatever day the survey finished on)
+    sg.aiEnabled=false;
+    const last=selected.sts[selected.sts.length-1],approach=()=>{
+      const te=terminusOf(sg,last,outerEnd(last,selected.sts[selected.sts.length-2]),sa.companyId);
+      return te?.kind==='lead'&&[...te.lead,...te.depots.map(id=>sg.depots.get(id)!.edge)].some(id=>sg.vehicles.isEdgeBusy(id));
+    };
+    for(let k=0;k<60*TICKS_PER_DAY&&!approach();k++)sg.stepTick();
+    check(approach(),'busy: a running departure occupies the same approach by the purchase phase');
     const frozen=JSON.stringify(serialize(sg)),copy=deserialize(JSON.parse(frozen));
     const assets=()=>JSON.stringify({money:sa.eco.money,loan:sa.eco.loan,construction:sa.eco.thisYear.construction,
       vehicles:sa.eco.thisYear.vehicles,rails:[...sg.world.net.edges.keys()],stations:[...sg.stations.map.keys()],

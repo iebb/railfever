@@ -83,6 +83,24 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
   }
 }
 
+/**
+ * The lowest a vertex shared with other rail formations may go and keep their tracks seated: 0.22 below the
+ * running height of every other ground track whose formation core reaches it (the 0.12 any shared vertex may move,
+ * from such a track's formation); Infinity beside a station or depot track (their own works level those sites).
+ */
+function seatFloor(w: World, x: number, z: number, own: ReadonlySet<number>): number {
+  const net = w.net, r = 2.2;
+  let floor = -Infinity;
+  for (const q of net.edgesNear(x - r, z - r, x + r, z + r)) {
+    if (q.kind !== 'rail' || own.has(q.id)) continue;
+    const n = net.nearestEdge(x, z, net.halfWidth(q) + EARTHWORKS.corePad + 0.05, 'rail', (k) => k.id === q.id);
+    if (!n || net.sectionAt(q, n.s) !== 'ground') continue;
+    if (q.station >= 0 || q.depot >= 0) return Infinity;
+    floor = Math.max(floor, net.heightAtS(q, n.s) - 0.22);
+  }
+  return floor;
+}
+
 /** Rounded min / max (the crest and toe of a slope), within `r` of where the two meet. */
 function roundMin(cur: number, line: number, r: number): number {
   const x = cur - line;
@@ -135,7 +153,13 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
     if (lock & LOCK.formation && Math.abs(nv - cur) > 0.12) {
       if (!(rail && !(lock & LOCK.rail))) {
         const near = w.net.nearestEdge(x, z, a.dmin + 0.05, rail ? 'rail' : undefined, (q) => !own.has(q.id));
-        if (near && w.net.sectionAt(near.edge, near.s) === 'ground') continue;
+        if (near && w.net.sectionAt(near.edge, near.s) === 'ground') {
+          // (a lower track takes the vertex down as far as the higher ones stay seated: a track diverging beside
+          // another's bridge abutment kept that formation's level over its own shoulder)
+          const floor = rail && nv < cur ? seatFloor(w, x, z, own) : Infinity;
+          if (!(floor < cur)) continue;
+          nv = Math.max(nv, floor);
+        }
       }
     }
     // never dig dry land below the water line (nor deepen water)

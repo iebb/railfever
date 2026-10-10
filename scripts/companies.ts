@@ -2,7 +2,7 @@ import { railPartMode } from '../src/game/stations';
 // Companies: AI configurations (activeness / focus / risk) over three years, a player buyout of an AI company
 // and an AI buying another one, automatic line names and colours, the demand model, and a save round trip of
 // the company state (configs, access agreements and fees, defunct companies, line naming).
-// npx esbuild scripts/companies.ts --bundle --platform=node --format=esm --outfile=$S/companies.mjs && node $S/companies.mjs [seed] [years] [size]
+// npx esbuild scripts/companies.ts --bundle --platform=node --format=esm --outfile=$S/companies.mjs && node $S/companies.mjs [seed] [years] [size] [--worlds=6]
 import { Game, PLAYER } from '../src/game/game';
 import { fmtMoney, CATEGORIES } from '../src/game/economy';
 import { Train, deadlockCycles } from '../src/game/train';
@@ -16,8 +16,22 @@ import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { fare } from '../src/game/vehicle';
 import type { Economy, Category } from '../src/game/economy';
 import { fails, check, fmt, checkReservations, checkNaN, placeAndConnect, depotBehind } from './lib';
+import { fork } from 'node:child_process';
 
-const seed = Number(process.argv[2] ?? 5), YEARS = Number(process.argv[3] ?? 3), SIZE = Number(process.argv[4] ?? 512);
+const pos = process.argv.slice(2).filter((s) => !s.startsWith('--'));
+const seed = Number(pos[0] ?? 5), YEARS = Number(pos[1] ?? 3), SIZE = Number(pos[2] ?? 512);
+// The personalities' line counts are compared over WORLDS maps (seed and the next ones): the other maps run the first
+// phase only (--personalities), in child processes alongside this one.
+const PERSONALITIES = process.argv.includes('--personalities');
+const WORLDS = Math.max(1, Number(process.argv.find((s) => s.startsWith('--worlds='))?.slice(9) ?? 6));
+type WorldLines = { seed: number; lines: { label: string; lines: number }[] | null; error?: string };
+const worlds: Promise<WorldLines[]> = PERSONALITIES ? Promise.resolve([]) : Promise.all(Array.from({ length: WORLDS - 1 }, (_, i) => new Promise<WorldLines>((done) => {
+  const s = seed + i + 1, child = fork(process.argv[1], [String(s), String(YEARS), String(SIZE), '--personalities'], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+  let lines: WorldLines['lines'] = null, err = '';
+  child.on('message', (m) => { lines = m as WorldLines['lines']; });
+  child.stderr!.on('data', (d) => { err += d; });
+  child.on('exit', (code) => done({ seed: s, lines: code === 0 ? lines : null, error: `exit ${code}: ${err.trim().split('\n').slice(-2).join(' | ')}` }));
+})));
 // Tram personalities may choose native light rail when its full investment quote pays better.
 // A station-style label alone is insufficient: the actual service must use light-rail units too.
 const isLightRail = (world: Game, l: Line) => l.kind === 'rail' && l.stops.length >= 2 && l.vehicles.length > 0
@@ -79,9 +93,18 @@ for (const [i, s] of sums.entries()) {
   console.log(`${s.label.padEnd(10)} ${co.name.padEnd(22)} act ${ai.config.activeness} risk ${ai.config.risk}: projects ${s.projects}, lines rail/bus/tram ${s.rail}/${s.bus}/${s.tram}, vehicles ${s.vehicles}, spent ${fmtMoney(s.built)}, assets ${fmtMoney(s.assets)}, value ${fmtMoney(s.value)}, cash ${fmtMoney(co.economy.money)}, loan ${fmtMoney(co.economy.loan)}; AI ${fmt(aiTime[i].t / Math.max(1, aiTime[i].n), 2)} ms/day (max ${fmt(aiTime[i].max, 1)})`);
   console.log('             ' + ai.log.slice(process.argv.includes('--log') ? 0 : -4).join(' | '));
 }
+const lineCounts = sums.map((s) => ({ label: s.label, lines: s.rail + s.bus + s.tram }));
+if (PERSONALITIES) { process.send!(lineCounts, () => process.exit(0)); await new Promise(() => {}); }
 const [passive, aggressive, railCo, busCo, tramCo] = sums;
 check(passive.built < aggressive.built * 0.6, `passive company builds little (${fmtMoney(passive.built)} vs aggressive ${fmtMoney(aggressive.built)})`);
-check(passive.rail + passive.bus + passive.tram < aggressive.rail + aggressive.bus + aggressive.tram, 'aggressive company runs more lines than the passive one');
+// (2.10: one map's counts are small numbers. Over seeds 1-12 the aggressive company ran more lines on nine maps, as
+// many on one and fewer on two, where it put its money into one large railway or its works failed: +1.2 lines a map,
+// spread 1.6. 3c7c85a had 3 and 3 on seed 5. Summed over WORLDS maps.)
+const mapLines = [{ seed, lines: lineCounts } as WorldLines, ...await worlds];
+for (const w of mapLines) if (!w.lines) check(false, `personalities on map ${w.seed} ran (${w.error})`);
+const linesOf = (label: string) => mapLines.reduce((n, w) => n + (w.lines?.find((x) => x.label === label)?.lines ?? 0), 0);
+console.log(`lines passive / aggressive by map: ${mapLines.map((w) => `seed ${w.seed} ${w.lines?.find((x) => x.label === 'passive')?.lines ?? '-'}/${w.lines?.find((x) => x.label === 'aggressive')?.lines ?? '-'}`).join(', ')}`);
+check(linesOf('passive') < linesOf('aggressive'), `aggressive company runs more lines than the passive one (${linesOf('passive')} / ${linesOf('aggressive')} over ${mapLines.length} maps)`);
 check(aggressive.rail + aggressive.bus + aggressive.tram >= 2, 'aggressive company expands to several lines');
 const sharedRailStock = g.vehicles.trains().filter(v => v.owner === railCo.id && v.onMap && v.line?.kind === 'rail'
   && v.line.owner !== railCo.id && v.delivered > 0 && v.state !== 'noroute'
@@ -444,7 +467,13 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     check(!!agr && agr.usageShareLastMonth > 0.05 && agr.paidTotal > 0, 'the AI pays its usage share of the shared railway');
     const access = g.stations.hasAccess(pr.A) && g.stations.hasAccess(pr.B);
     if (!access) console.log('  (the player stations have no road access: no passengers, delivery check skipped)');
-    check(!access || (!!at && at.delivered > 0 && ptr.delivered > d0), 'both trains carry passengers on the shared railway');
+    // (2.10: the halved walks leave these stations about 30 walkers each, and the trains, held behind each other on
+    // the shared line, finish one or two trips in 150 days: 0 or 1 delivered passengers decided the check. Each
+    // train must deliver passengers within the following year.)
+    const carried = () => !!at && at.delivered > 0 && ptr.delivered > d0, d1 = g.day;
+    while (access && !carried() && g.day < d1 + 360) runDays(1);
+    if (access) console.log(`  delivered by day ${g.day - d1 + 150}: AI train ${at?.delivered}, player train ${d0} -> ${ptr.delivered}`);
+    check(!access || carried(), 'both trains carry passengers on the shared railway');
     const errs = checkReservations(g);
     check(errs.length === 0, 'reservations consistent on the shared railway ' + errs.slice(0, 3).join('; '));
     // the player closes its network: the agreement ends, the AI closes the line and removes its depot
