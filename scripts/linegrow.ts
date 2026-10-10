@@ -648,7 +648,9 @@ if (run('relocate')) {
   check(!old || !old.lead.some((id) => g.world.net.edges.has(id)), 'relocate: the old lead is taken up');
   const last = g.stations.get(after[after.length - 1])!, nte = terminusOf(g, last, outerEnd(last, g.stations.get(after[after.length - 2])!), me);
   const way = nte ? wayOnFree(g, last, nte.end, 40, nte.tail) : 'no terminus';
-  check(nte?.kind === 'tail' && !way, `relocate: the depot's new yard leaves the new terminus extendable (${nte?.kind}; ${way ?? 'way on free'})`);
+  // (user rule, 2.11: no depot on the way on beyond a terminus: the depot stands on a siding beside the line and the
+  // new terminus is a free end; 2.10 moved it out to a yard beside the new terminus's way on)
+  check(nte?.kind === 'free' && !way && !nte.depots.includes(home), `relocate: the depot moved beside the line, the new terminus a free end (${nte?.kind}; ${way ?? 'way on free'})`);
   spare.setLine(line.id);
   // Start beside its relocated depot, then verify the service through subsequent stops.
   spare.stopIndex = line.stops.indexOf(last.id); spare.onLineChanged();
@@ -659,7 +661,7 @@ if (run('relocate')) {
 }
 
 if (run('tailend')) {
-  console.log('tailend: the line runs on from the terminus with its yard; the yard moves out to the new terminus');
+  console.log('tailend: the line runs on from the terminus with its yard; the depot moves beside the line');
   const { g, ai, me, line, sts, depot } = presholm('east', 'tail', 3, 4500);
   const east = sts[sts.length - 1], before = linePath(line);
   const te0 = terminusOf(g, east, outerEnd(east, sts[sts.length - 2]), me);
@@ -670,9 +672,13 @@ if (run('tailend')) {
   check(stat(ai, 'netExtended') === 1 && added.length >= 1 && after.indexOf(east.id) < after.length - 1, `tailend: the line runs on beyond ${east.name} (${before.length} -> ${after.length})`);
   const home = (g.vehicles.get(line.vehicles[0]) as Train).depotId;
   check(stat(ai, 'netDepotsMoved') === 1 && !g.depots.get(depot) && !!g.depots.get(home) && !te0?.lead.some((id) => g.world.net.edges.has(id)),
-    'tailend: the depot moved out to the new terminus, its old ramp taken up');
+    'tailend: the depot moved beside the line, its old ramp taken up');
+  // (user rule, 2.11: no depot on the way on beyond a terminus: the new terminus is a free end, the depot on a siding
+  // beside the line; 2.10 moved the yard out beside the new terminus's way on)
   const last = g.stations.get(after[after.length - 1])!, nte = terminusOf(g, last, outerEnd(last, g.stations.get(after[after.length - 2])!), me);
-  check(nte?.kind === 'tail' && nte.depots.includes(home), `tailend: the new terminus has the yard beside its way on (${nte?.kind})`);
+  const first = g.stations.get(after[0])!, fte = terminusOf(g, first, outerEnd(first, g.stations.get(after[1])!), me);
+  check(nte?.kind === 'free' && !wayOnFree(g, last, nte.end, 40), `tailend: the new terminus is a free end, its way on clear (${nte?.kind})`);
+  check(!nte?.depots.includes(home) && !fte?.depots.includes(home), 'tailend: the moved depot stands beside the line, beyond neither terminus');
   const seen = calls(g, line, 300), stuck = line.vehicles.map((id) => g.vehicles.get(id) as Train).filter((t) => t.state === 'noroute');
   check(after.every((sid) => seen.has(sid)), `tailend: trains call at every station (${seen.size}/${after.length})`);
   check(!stuck.length && line.vehicles.every((id) => (g.vehicles.get(id) as Train).depotId === home), `tailend: every train (the new ones too) finds its way from the depot (${stuck.map((t) => t.status).join('; ') || 'none stuck'})`);

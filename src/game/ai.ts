@@ -32,9 +32,9 @@ import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
-import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, scheduleNetworkTask, networkOptions, XLINK_REACH, previewUrbanGrowth, queueUrbanGrowth } from './ai-network';
-import { urbanGrowthCandidates, type UrbanGrowthQuote } from './ai-grow';
-import { planSubwayYard, buildSubwayYard, surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
+import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, scheduleNetworkTask, networkOptions, XLINK_REACH, previewUrbanGrowth, queueUrbanGrowth, networkPlanner } from './ai-network';
+import { urbanGrowthCandidates, outerEnd, type UrbanGrowthQuote } from './ai-grow';
+import { surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
 import { RailPolicy } from './ai-rail';
 import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLength } from './ai-mail';
 import { offloadMail } from './mail';
@@ -47,8 +47,10 @@ import { urbanTrunks } from './ai-urban';
 import { roadOptions, roadPlanJob, roadMarket, setRoadModels, roadFleetCap, roadVehiclePays, linkStopsToRail, coachUpgrades, retireToRail, type BusHost, type RoadPlan } from './ai-bus';
 import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
-  buildRailDepot, buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, depotAtEnd, depotFits, leadsMeet,
+  buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, leadsMeet, roadDepotAtDeadEnd,
 } from './routing';
+import { buildSideDepot, sidingSpots, buildDepotBeside, buildPlannedSideDepot, planProspectiveSideDepot, sideYardDistances, runningSideOf, endDepots, planPlainTail, quoteDepotBeside, moveEndDepot, type SideYard } from './depot-sites';
+import { terminalEnd } from './onward';
 
 export * from './routing';
 
@@ -1127,7 +1129,14 @@ interface Project {
 }
 
 type UrbanLevel = 'ground' | 'elevated' | 'underground';
-interface UrbanYard { index: number; dir: number; x: number; z: number; cost: number; track: number; straight: boolean; under?: SubwayYardPlan }
+/**
+ * A city line's planned depot. `side`: beside the line, a siding off planned link `index` (depot-sites.ts
+ * planProspectiveSideDepot); older cursors planned a yard beyond a terminus (a tail and a ramp or a cavern, `under`):
+ * the depot is built beside the line instead.
+ */
+interface UrbanYard { index: number; dir: number; x: number; z: number; cost: number; track: number; straight: boolean; under?: SubwayYardPlan; side?: SideYard;
+  /** the side yard's cost as the search ranks it (a site whose trains set off away from the nearer terminus ranks a little worse) */
+  rank?: number }
 interface UrbanTask {
   town: number; mode: 'metro' | 'lightrail';
   layout: UrbanLayout;
@@ -1135,7 +1144,7 @@ interface UrbanTask {
   /** A rejected selection layout retries the ordinary full survey before any construction. */
   fromHandoff?: boolean;
   candidates: { a: number; lat: number; lv: UrbanLevel; trim?: boolean; targets?: number[] }[];
-  stage: 'sites' | 'links' | 'yardUnder' | 'yardRamp' | 'evaluate' | 'approve' | 'stations' | 'buildLinks' | 'buildTail' | 'buildYard' | 'throat' | 'finish' | 'line' | 'fleet' | 'transfers' | 'open';
+  stage: 'sites' | 'links' | 'yardUnder' | 'yardRamp' | 'yardSide' | 'evaluate' | 'approve' | 'stations' | 'buildLinks' | 'buildTail' | 'buildYard' | 'throat' | 'finish' | 'sideDepot' | 'line' | 'fleet' | 'transfers' | 'open';
   candidate: number; target: number; offset: number; tries: number; previous: number;
   got: StationPlan[]; link: number; links: number; yardAt: number; yard: UrbanYard | null;
   plans: StationPlan[]; angle: number; level: UrbanLevel; connectionCost?: number; plannedYard?: UrbanYard;
@@ -1262,10 +1271,12 @@ const tramExt = (t: TramPlanner) => t as unknown as TramPlannerExt;
 
 const LEAD = 20;
 /**
- * (linegrow) A city railway's depot ramp branches off a straight tail this long (units) beyond a terminus's outer
- * platform track: the line can later run on from the tail's end and the other track's (ai-grow.ts terminusOf).
+ * (linegrow) An older city railway's depot ramp branched off a straight tail this long (units) beyond a terminus's outer
+ * platform track (ai-grow.ts terminusOf reads such ends); new city railways keep their depots beside the line.
  */
 export const URBAN_TAIL = 4;
+/** Residents a building a city railway's depot site may take (two at most, at their price): blocks of flats in town. */
+const URBAN_DEPOT_POP = 600;
 /** Smallest town that gets an AI bus network. */
 const BUS_MIN_POP = 1500;
 
@@ -1400,22 +1411,6 @@ export class AIController {
       .sort((a, b) => Number(b.id === hq) - Number(a.id === hq) || b.pop - a.pop || a.id - b.id);
   }
 
-  /** Is there room for a rail depot behind a planned station (stub or switch for multi-track)? */
-  private depotSiteFor(plan: StationPlan, toward: P2, tracks: number): boolean {
-    const g = this.game;
-    const ax = Math.sin(plan.angle), az = Math.cos(plan.angle);
-    const sgn = ax * (toward.x - plan.x) + az * (toward.z - plan.z) > 0 ? -1 : 1;
-    const bx = ax * sgn, bz = az * sgn;
-    const back = { x: plan.x + bx * plan.length / 2, z: plan.z + bz * plan.length / 2 };
-    const lens = tracks > 1 ? [18, 22, 26] : [5, 8, 11, 15, 20];
-    for (const L of lens) {
-      const x = back.x + bx * L, z = back.z + bz * L;
-      // single track can fall back to a siding off the line, so only the double-track stub needs level ground
-      if (g.world.inside(x, z, 8) && depotFits(g, x, z, -bx, -bz, this.companyId, 30, tracks > 1 ? plan.y : undefined)) return true;
-    }
-    return false;
-  }
-
   private note(s: string) {
     this.log.push(`${this.game.dateString()}: ${s}`);
     if (this.log.length > 40) this.log.shift();
@@ -1511,6 +1506,47 @@ export class AIController {
     if (this.disposed) return;
     this.checkConfig();
     try { if (!this.cooperationReserved() && !this.project?.joint) this.manage(); } catch (e) { this.onError(e); }
+    try { if (!this.job && !this.cooperationReserved()) this.moveEndDepots(); } catch (e) { this.onError(e); }
+  }
+
+  /**
+   * A depot of ours on the way on beyond a terminus of one of our city railways (an older layout: a stub, a terminal
+   * yard, a tail's ramp) moves to a siding beside the line when that is cheap and safe: its siding's price a small part
+   * of the company's means, no train on the lead or leaving the depot, the new depot serving every train at home there
+   * (depot-sites.ts moveEndDepot; trains inside move with it). The terminus is a free end again: the line can run on.
+   * One move a month at most; a terminus that does not qualify is looked at again a year later (saved with the
+   * company's failed keys).
+   */
+  private moveEndDepots() {
+    const g = this.game, me = this.companyId, net = g.world.net;
+    // (not while the company is in trouble, nor while one of its lines is being extended: that moves its depot itself)
+    if (this.railPolicy.deepTrouble || networkPlanner(this)?.task === 'extend') return;
+    const later = (key: string, days: number) => this.failed.set(key, g.day + days);
+    for (const [lid, info] of [...this.lines].sort(([a], [b]) => a - b)) {
+      const l = g.lines.get(lid);
+      if (info.kind !== 'rail' || !l || l.id !== lid || l.owner !== me || l.kind !== 'rail') continue;
+      const path = linearStops(l.stops);
+      // (city lines, which run on as their towns grow; a main line's terminus moves its depot when the line runs on)
+      if (!path || !(info.urban || path.every((sid) => { const st = g.stations.get(sid); return !!st?.rail && railPartMode(st.rail) !== 'mainline'; }))) continue;
+      for (const [i, j] of [[0, 1], [path.length - 1, path.length - 2]]) {
+        const T = g.stations.get(path[i]), N = g.stations.get(path[j]);
+        const key = 'enddepot' + (T?.id ?? -1);
+        if (!T?.rail || !N || T.owner !== me || this.isFailed(key)) continue;
+        const ed = endDepots(g, T, outerEnd(T, N), me);
+        if (!ed) continue;
+        const lead = new Set(ed.lead);
+        const edges = this.lineTrack(path).filter((id) => { const e = net.edges.get(id); return !!e && e.owner === me && e.station < 0 && e.depot < 0 && !lead.has(id); });
+        const quote = quoteDepotBeside(g, edges, T.x, T.z, me, path, { sections: ['ground', 'bridge', 'tunnel'], tries: 8 });
+        if (!quote || quote.cost > Math.min(1_500_000, this.available() * 0.1)) { later(key, 360); continue; }
+        const moved = moveEndDepot(g, ed, me, edges, path);
+        if (typeof moved === 'string') { later(key, moved === 'busy' ? 30 : 360); continue; }
+        this.stats.track += Math.round(quote.length);
+        // (the new junction gets the line's signals: a path signal before it on directional track, the depot's exit)
+        this.signalLine(lid);
+        this.note(`moved the depot beyond ${T.name} beside ${l.name}: the line can run on from there`);
+        return;
+      }
+    }
   }
 
   /** The company was bought: stop and remove a half-built project. */
@@ -3291,17 +3327,19 @@ export class AIController {
       this.removeDepotBranch(id);
       return false;
     };
-    // A terminal yard feeds either running track after pairing. An interior single-track siding can face
-    // against the pair's eventual one-way direction, so prefer the terminal yard for an initial pair.
-    if (initialBudget) for (const [st, o] of [[stA, stB], [stB, stA]] as [Station, Station][]) if (dep < 0)
-      take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
+    // Depots stand beside the line, never on its way on beyond a terminus nor as its end stub: the line can run on
+    // from either end (onward.ts). An initial pair's direction first: its siding joins the original track in the
+    // direction that track keeps after pairing, outside the second track.
     for (const pair of pairOptions) for (const st of [stB, stA]) if (dep < 0)
       take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60, pair.entries, pair.corridor));
     for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 60));
-    for (const [st, o] of [[stB, stA], [stA, stB]] as [Station, Station][]) if (dep < 0) take(yield* this.depotSwitch(st, { x: o.x - st.x, z: o.z - st.z }));
     // Elevated or underground town approaches leave no ground near either station: a siding on any ground stretch of
-    // the new line serves both, rather than writing off the built railway.
+    // the new line serves both, rather than writing off the built railway; else a ramp down off its viaduct or a
+    // cavern off its tunnel beside the line near a station.
+    for (const pair of pairOptions) for (const st of [stB, stA]) if (dep < 0)
+      take(yield* this.depotNearLine([...p.edges], st.x, st.z, Infinity, pair.entries, pair.corridor));
     for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, Infinity));
+    for (const st of [stB, stA]) if (dep < 0) take(yield* this.depotNearLine([...p.edges], st.x, st.z, 120, undefined, undefined, ['bridge', 'tunnel']));
     this.track(d0);
     if (dep < 0) return fail('no depot site that serves both stations', 720);
     if (ownDepot) p.depots.push(dep);
@@ -3654,8 +3692,12 @@ export class AIController {
     return false;
   }
 
-  /** A depot on a siding off our edges near (x, z) (as buildDepotNearLine, a try per step). */
-  private *depotNearLine(edges: number[], x: number, z: number, maxDist: number, entries?: Map<number, 1 | -1>, reserved?: P2[]): Generator<void, number> {
+  /**
+   * A depot on a siding off our edges near (x, z) (as buildDepotNearLine, a try per step): off ground track, or with
+   * `sections` a ramp off a viaduct / a cavern off a tunnel (depot-sites.ts). Never on the way on beyond a terminus.
+   */
+  private *depotNearLine(edges: number[], x: number, z: number, maxDist: number, entries?: Map<number, 1 | -1>, reserved?: P2[],
+    sections: readonly ('ground' | 'bridge' | 'tunnel')[] = ['ground']): Generator<void, number> {
     const g = this.game, net = g.world.net, owner = this.companyId;
     const cands: { id: number; s: number; d: number }[] = [];
     const p = { x: 0, y: 0, z: 0 };
@@ -3664,7 +3706,7 @@ export class AIController {
       const e = net.edges.get(id);
       if (!e || e.kind !== 'rail' || e.owner !== owner || e.station >= 0 || e.depot >= 0 || e.len < 8) continue;
       for (let s = 3; s <= e.len - 3; s += 5) {
-        if (net.sectionAt(e, s) !== 'ground') continue;
+        if (!sections.includes(net.sectionAt(e, s))) continue;
         net.pointAt(e, s, p);
         const d = Math.hypot(p.x - x, p.z - z);
         if (d <= maxDist) cands.push({ id, s, d });
@@ -3676,57 +3718,13 @@ export class AIController {
       if (!net.edges.has(c.id) || (entries && !entries.has(c.id))) continue;
       yield;
       const dir = entries?.get(c.id);
-      const dep = buildDepotOnLine(g, c.id, c.s, owner, dir === undefined ? undefined : { dir, side: -1, reserved });
+      const dep = net.sectionAt(net.edges.get(c.id)!, c.s) !== 'ground' ? buildSideDepot(g, c.id, c.s, owner, { dir, reserved })
+        : buildDepotOnLine(g, c.id, c.s, owner, dir === undefined ? undefined : { dir, side: -1, reserved });
       if (dep >= 0) return dep;
       if (++tries >= 12) break;
       yield;
     }
     return -1;
-  }
-
-  /** Depot for a multi-track terminus: a switch behind the back ends feeding every platform track. */
-  private *depotSwitch(st: Station, frontDir: P2): Generator<void, number> {
-    const g = this.game, net = g.world.net, owner = this.companyId;
-    const r = st.rail!;
-    const ax = Math.sin(r.angle), az = Math.cos(r.angle);
-    const sgn = ax * frontDir.x + az * frontDir.z > 0 ? -1 : 1; // direction of the back ends
-    const bx = ax * sgn, bz = az * sgn;
-    const ends = stationEnds(g, st).map((e) => (sgn > 0 ? e.front : e.back));
-    const type = sidingType(r.trackType);
-    const o = (h: number): BuildOptions => ({ kind: 'rail', type, tracks: 1, heightOffset: h, crossing: 'auto', owner });
-    const backC = { x: r.x + bx * r.length / 2, z: r.z + bz * r.length / 2 };
-    const e0 = net.nextEdge;
-    for (const L of [12, 16, 20]) {
-      yield;
-      const S = { x: backC.x + bx * L, z: backC.z + bz * L }, D = { x: S.x + bx * 6, z: S.z + bz * 6 };
-      if (!g.world.inside(D.x, D.z, 8) || !depotFits(g, D.x, D.z, -bx, -bz, owner, 30, r.y)) continue;
-      const n0 = net.nodes.get(ends[0]);
-      if (!n0 || n0.edges.length !== 1) return buildRailDepot(g, st, owner, frontDir);
-      const p1 = planEdge(g, nodeSnap(g, ends[0], 'rail'), { kind: 'free', x: S.x, z: S.z, y: 0 }, o(r.y - g.world.heightAt(S.x, S.z) || 1e-3));
-      yield;
-      if (!p1.ok || commitProposal(g, p1)) continue;
-      this.track(e0);
-      yield;
-      const sNode = nodeAt(g, 'rail', S.x, S.z);
-      if (!sNode) return -1;
-      const p2 = planEdge(g, nodeSnap(g, sNode.id, 'rail'), { kind: 'free', x: D.x, z: D.z, y: 0 }, o(r.y - g.world.heightAt(D.x, D.z) || 1e-3));
-      yield;
-      if (!p2.ok || commitProposal(g, p2)) { removeEdges(g, [...sNode.edges], owner); continue; }
-      this.track(e0);
-      yield;
-      for (let i = 1; i < ends.length; i++) {
-        const p3 = planEdge(g, nodeSnap(g, ends[i], 'rail'), nodeSnap(g, sNode.id, 'rail'), o(0));
-        yield;
-        if (p3.ok) commitProposal(g, p3);
-        this.track(e0);
-        yield;
-      }
-      const dNode = nodeAt(g, 'rail', D.x, D.z);
-      const id = dNode ? depotAtEnd(g, dNode.id, owner) : -1;
-      if (id >= 0) return id;
-      return -1;
-    }
-    return buildRailDepot(g, st, owner, frontDir);
   }
 
   /** roadDepotGen's search order, with each site and its commit in separate AI work units. */
@@ -3745,7 +3743,8 @@ export class AIController {
           net.pointAt(ne.edge, ne.s, q);
           const plan = g.depots.plan('road', px, pz, Math.atan2(q.x - px, q.z - pz), owner);
           yield;
-          if (!plan.ok || !this.eco.canAfford(plan.cost + 40000)) continue;
+          // (beside a street, never where a street ends in it)
+          if (!plan.ok || !this.eco.canAfford(plan.cost + 40000) || roadDepotAtDeadEnd(g, plan)) continue;
           const dem = plan.demolish ?? [];
           if (dem.length > (maxPop ? 1 : 0) || dem.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > maxPop)) continue;
           const id = g.depots.nextId;
@@ -3840,10 +3839,10 @@ export class AIController {
     if (!this.borrowFor(cost)) return fail('no money', 360);
     this.state.phase = `building a depot at ${stA.name}`;
     p.built = true;
-    // our depot on a stub behind one of the stations (the line's side stays free)
+    // our depot on a siding beside the owner's line (never on its way on beyond a terminus)
     const e0 = net.nextEdge;
     // a siding off the owner's line near a station (we may connect to its track: our trains then join the main
-    // line instead of waiting behind the owner's platforms), else a stub behind one of the stations
+    // line instead of waiting behind the owner's platforms), else farther along it
     let dep = -1;
     {
       const q = { x: 0, y: 0, z: 0 };
@@ -3862,10 +3861,20 @@ export class AIController {
         yield;
       }
     }
-    for (const [st, o] of [[stA, stB], [stB, stA]] as [Station, Station][]) {
-      if (dep >= 0) break;
-      dep = buildRailDepot(g, st, me, { x: o.x - st.x, z: o.z - st.z });
-      yield;
+    // (never a stub behind either station: the owner's line runs on from there) farther along the owner's line, a
+    // ramp off its viaduct or a cavern off its tunnel
+    if (dep < 0) {
+      const route = this.lineTrack([a, b]).filter((id) => net.edges.get(id)?.owner === owner);
+      for (const st of [stA, stB]) {
+        if (dep >= 0) break;
+        for (const c of sidingSpots(g, route, st.x, st.z, owner, Infinity, 16, ['ground', 'bridge', 'tunnel']).slice(0, 16)) {
+          if (!net.edges.has(c.id)) continue;
+          yield;
+          dep = buildSideDepot(g, c.id, c.s, me);
+          this.track(e0);
+          if (dep >= 0) break;
+        }
+      }
     }
     this.track(e0);
     if (dep < 0) return fail('no depot site');
@@ -4776,7 +4785,8 @@ export class AIController {
    * A city railway through the core of town T, built in one of the urban construction styles: subway style
    * (underground, metro units) or light-rail style (at grade, on a viaduct or
    * underground, light-rail vehicles): two-track stations with side platforms spaced by walking reach and turnout
-   * room, double track between them, a depot beyond one end (a cavern for a subway), directional running with crossovers before
+   * room, double track between them, a depot on a siding beside the line (a cavern for a subway: never beyond either
+   * end, which stays free for the line to run on), directional running with crossovers before
    * the ends, signals, and a line stopping at every station. The result is an ordinary rail line (main-line trains
    * may run through onto it, its trains onto the main line).
    */
@@ -4854,26 +4864,6 @@ export class AIController {
     for (let d = 1.5; d <= SP * 0.9; d += 1.5) { offs.push(d); if (d <= SP * 0.3) offs.push(-d); }
     const options = (lv: UrbanLevel, st: Pick<StationPlan, 'depth' | 'height'>): BuildOptions => ({ kind: 'rail', type: 'electric', tracks: 2, heightOffset: 0,
       crossing: lv === 'ground' ? 'over' : 'auto', owner: me, designGrade, level: lv, levelDepth: st.depth || undefined, levelHeight: st.height || undefined, subway: lv === 'underground' });
-    const yardEnds = (st: StationPlan, angle: number, dir: number, track: number, straight = false) => {
-      const ux = Math.sin(angle), uz = Math.cos(angle), off = st.layout.trackOffsets[track];
-      const start = { x: st.x + uz * off + ux * st.length / 2 * dir, z: st.z - ux * off + uz * st.length / 2 * dir,
-        y: st.y, dx: ux * dir, dz: uz * dir };
-      const tail = straight ? 0 : URBAN_TAIL;
-      return { start, fork: { ...start, x: start.x + start.dx * tail, z: start.z + start.dz * tail } };
-    };
-    // Fixed endpoint heights keep the tail level. Its temporary end becomes a free end for commit; the
-    // validated profile is retained, including strict subway cover across the whole bore.
-    const tailPlan = (start: { x: number; y: number; z: number; dx: number; dz: number; node?: number },
-      fork: { x: number; y: number; z: number }, lv: UrbanLevel, st: Pick<StationPlan, 'depth' | 'height'>) =>
-      net.withTemporaryNodes('rail', [...(start.node === undefined ? [start] : []), { ...fork, dx: -start.dx, dz: -start.dz }], me, (nodes) => {
-        const from = start.node === undefined ? nodes[0].id : start.node, to = nodes[nodes.length - 1].id;
-        const pr = planEdge(g, nodeSnap(g, from, 'rail'), { kind: 'node', ...fork, node: to }, { ...options(lv, st), tracks: 1, crossing: 'auto' });
-        for (const t of pr.tracks) {
-          if (start.node === undefined) t.start = { kind: 'free', x: start.x, y: start.y, z: start.z };
-          t.end = { kind: 'free', ...fork };
-        }
-        return pr;
-      });
     const nextCandidate = () => {
       task.candidate++; task.target = task.offset = task.link = task.links = task.yardAt = 0;
       task.previous = -1e9; task.skipped = false; task.got = []; task.yard = null; task.stage = 'sites';
@@ -4934,7 +4924,7 @@ export class AIController {
           task.got.push(pl); task.previous = t; task.target++; task.offset = 0;
         }
       } else if (task.stage === 'links') {
-        if (task.link + 1 >= task.got.length) { task.stage = c.lv === 'underground' ? 'yardUnder' : 'yardRamp'; continue; }
+        if (task.link + 1 >= task.got.length) { task.stage = 'yardSide'; task.yardAt = 0; continue; }
         const ux = Math.sin(c.a), uz = Math.cos(c.a);
         const end = (p: StationPlan, side: number) => p.layout.trackOffsets.map((off) => ({ x: p.x + uz * off + ux * p.length / 2 * side,
           z: p.z - ux * off + uz * p.length / 2 * side, y: p.y, dx: ux * side, dz: uz * side }));
@@ -4944,53 +4934,36 @@ export class AIController {
         });
         if (!pj.ok) { reject(task.linkRejects, pj.errors[0] ?? 'unknown track constraint'); nextCandidate(); }
         else { task.links += pj.cost; task.link++; }
-      } else if (task.stage === 'yardUnder') {
-        if (task.yardAt >= 16) {
-          // A subway keeps its yard underground. Compare compact branches as well as the wider ones:
-          // demanding an 80-120 m lateral detour can miss a perfectly buildable depot in a hilly town.
-          if (task.yard) task.stage = 'evaluate';
-          else if (mode === 'metro') { reject(task.linkRejects, 'no underground depot site'); nextCandidate(); }
-          else { task.yardAt = 0; task.stage = 'yardRamp'; }
-          continue;
-        }
-        const at = task.yardAt++, index = at < 8 ? 0 : task.got.length - 1, dir = index === 0 ? -1 : 1;
-        const st = task.got[index], track = Math.floor(at / 4) % 2 ? st.layout.trackOffsets.length - 1 : 0;
-        const { start, fork } = yardEnds(st, c.a, dir, track), tp = tailPlan(start, fork, c.lv, st);
-        if (!tp.ok) continue;
-        // lat is relative to the way out; turn to this outer track's side at either end, never straight on.
-        const lat = [4, 6, 8, 12][at % 4] * (track === 0 ? 1 : -1) * dir;
-        const yp = planSubwayYard(g, fork, me, { type: 'electric', depth: st.depth, lat, lengths: [8, 10, 12, 14, 18, 22] });
-        const cost = tp.cost + yp.cost;
-        if (yp.ok && (!task.yard || cost < task.yard.cost)) task.yard = { index, dir, x: yp.x, z: yp.z, cost, track, straight: false, under: yp };
-      } else if (task.stage === 'yardRamp') {
-        const scales = [1, 1.25, 0.85, 1.5, 2, 2.5], lats = [12, -12, 24, -24, 36, -36];
-        const sideways = 2 * scales.length * lats.length;
-        if (task.yardAt >= sideways + 2 * scales.length) {
+      } else if (task.stage === 'yardUnder' || task.stage === 'yardRamp') {
+        // (a cursor saved while it searched for a yard beyond a terminus: the depot goes beside the line instead)
+        task.stage = 'yardSide'; task.yardAt = 0; task.yard = null; continue;
+      } else if (task.stage === 'yardSide') {
+        // The depot stands beside the line, never on its way on beyond a terminus: a siding off a running track, on
+        // that track's outer side, the termini's links first (clear of the crossovers before their platforms), then
+        // the others (one candidate a work unit; the cheapest that fits).
+        const lat = stationLayout(2, 0, 'middle', 'side').trackOffsets;
+        const D = Math.max(5, Math.min(12, Math.sqrt(60 * Math.abs(lat[1] - lat[0]) * Math.min(1, TRACK_TYPES.electric.minRadius / 12)) + 2));
+        const combos: [number, number, number, 1 | -1][] = [], n = task.got.length;
+        // (the termini's links first, then the others: the cheapest site that fits on any of them)
+        const order = [...new Set([0, n - 2, ...Array.from({ length: Math.max(0, n - 1) }, (_, i) => i)])].filter((i) => i >= 0 && i + 1 < n);
+        for (const index of order) for (const d of sideYardDistances(task.got, index, 2 * D + 4))
+          for (const track of [0, task.got[index].layout.trackOffsets.length - 1]) combos.push([index, d, track, runningSideOf(task.got, index, track)]);
+        // (a site found by the termini's links: the others are not searched)
+        if (task.yardAt >= combos.length || (task.yard && combos[task.yardAt][0] !== 0 && combos[task.yardAt][0] !== n - 2)) {
           if (task.yard) task.stage = 'evaluate'; else { reject(task.linkRejects, 'no depot site'); nextCandidate(); }
           continue;
         }
-        const at = task.yardAt++, straight = at >= sideways, offset = straight ? at - sideways : at, width = straight ? 1 : lats.length;
-        const index = offset < scales.length * width ? 0 : task.got.length - 1, dir = index === 0 ? -1 : 1;
-        const k = scales[Math.floor(offset / width) % scales.length], lat = straight ? 0 : lats[offset % width], st = task.got[index];
-        const track = lat < 0 ? st.layout.trackOffsets.length - 1 : 0, ramp = c.lv === 'underground' ? 58 : c.lv === 'elevated' ? 26 : 10;
-        const { start, fork } = yardEnds(st, c.a, dir, track, straight);
-        const x = fork.x + fork.dx * ramp * k - Math.cos(c.a) * lat, z = fork.z + fork.dz * ramp * k + Math.sin(c.a) * lat;
-        if (!g.world.inside(x, z, 8)) continue;
-        const pr = net.withTemporaryNodes('rail', [fork], me, (nodes) => planEdge(g, { kind: 'node', x: fork.x, y: fork.y, z: fork.z, node: nodes[0].id },
-          { kind: 'free', x, z, y: ground(x, z) }, { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me, designGrade }));
-        if (pr.ok) {
-          const tp = straight ? null : tailPlan(start, fork, c.lv, st);
-          if (tp && !tp.ok) continue;
-          const end = pr.tracks[0], tangent = endTangent(end.bez), y = end.prof[end.prof.length - 1];
-          if (depotFits(g, x, z, -tangent.x, -tangent.z, me, 0, y)) {
-            const dp = g.depots.plan('rail', x + tangent.x * 2.15, z + tangent.z * 2.15, Math.atan2(-tangent.x, -tangent.z), me);
-            if (dp.ok) { const cost = (pr.cost + (tp?.cost ?? 0) + dp.cost) * 1.1; if (!task.yard || cost < task.yard.cost) task.yard = { index, dir, x, z, cost, track, straight }; task.stage = 'evaluate'; }
-          }
-        }
+        const [index, d, track, w] = combos[task.yardAt++];
+        // (in a town a depot site may take a block or two, at its price, as the line's stations may)
+        const y = planProspectiveSideDepot(g, me, task.got, index, track, d, w, c.lv, 'electric', undefined, undefined, undefined, URBAN_DEPOT_POP);
+        // (trains leaving towards the nearer terminus call there first and serve the whole line on their first run)
+        const rank = y ? y.cost * (w === (index < (n - 1) / 2 ? 1 : -1) ? 1 : 1.15) : Infinity;
+        if (y && (!task.yard || rank < (task.yard.rank ?? task.yard.cost)))
+          task.yard = { index, dir: 1, x: y.x, z: y.z, cost: y.cost * 1.1, rank, track, straight: false, side: y };
       } else if (task.stage === 'evaluate') {
         const vehicle = this.urbanUnit(mode, PL);
         if (vehicle && task.yard) {
-          const e = this.urbanEconomics(task.got, mode, c.lv, [vehicle], 2, task.links, task.yard.cost, task.yard.under?.length);
+          const e = this.urbanEconomics(task.got, mode, c.lv, [vehicle], 2, task.links, task.yard.cost, task.yard.side?.length ?? task.yard.under?.length);
           const ret = e.net / Math.max(1, e.total), pays = ret * urbanPayback(mode, this.eco.interestRate) >= 1;
           if (e.total * 1.05 < this.urbanAvailable() && ((pays && !task.bestPays) || (pays === task.bestPays && ret > task.bestReturn))) {
             task.bestReturn = ret; task.bestPays = pays; task.plans = task.got; task.angle = c.a; task.level = c.lv; task.connectionCost = task.links; task.plannedYard = task.yard;
@@ -5003,7 +4976,7 @@ export class AIController {
         if (layout.interchanges.some((id) => { const st = g.stations.get(id); return !st || !task.plans.some((q) => Math.hypot(q.x - st.x, q.z - st.z) < 14); })) return yield* retry(this, 'no walking interchange at both main-line stations', 360);
         const unit = this.urbanUnit(mode, PL);
         if (!unit) return fail('no vehicles');
-        const e = this.urbanEconomics(task.plans, mode, task.level, [unit], 2, task.connectionCost, task.plannedYard?.cost, task.plannedYard?.under?.length);
+        const e = this.urbanEconomics(task.plans, mode, task.level, [unit], 2, task.connectionCost, task.plannedYard?.cost, task.plannedYard?.side?.length ?? task.plannedYard?.under?.length);
         if (!AIController.forceBuild && e.net * urbanPayback(mode, this.eco.interestRate) < e.total) return yield* retry(this, `not profitable (${Math.round(e.net / 1000)}k/year on ${Math.round(e.total / 1000)}k over ${URBAN_PAYBACK[mode]} years; ${Math.round(e.forecast.covered)} covered, ${Math.round(e.forecast.boardings)} boardings, ${Math.round(e.forecast.revenue / 1000)}k revenue)`, 360);
         if (e.total * 1.05 > this.urbanAvailable() || !this.borrowFor(e.total * 1.05)) return yield* retry(this, 'too expensive', 720);
         task.estimate = e; task.unit = unit.id; task.at = 0; task.stage = 'stations'; p.built = true;
@@ -5017,38 +4990,15 @@ export class AIController {
         p.stations.push(id); task.stations.push(id); this.track(e0);
       } else if (task.stage === 'buildLinks') {
         const sts = builtStations();
-        if (task.at + 1 >= sts.length) { task.doubleEdges = p.edges.filter((id) => net.edges.get(id)?.station === -1); task.stage = 'buildTail'; yield; continue; }
+        if (task.at + 1 >= sts.length) { task.doubleEdges = p.edges.filter((id) => net.edges.get(id)?.station === -1); task.stage = 'throat'; yield; continue; }
         const a = ends(sts[task.at], true), b = ends(sts[task.at + 1], false), r = sts[task.at].rail!, e0 = net.nextEdge;
         const pj = planEdge(g, nodeSnap(g, a[0], 'rail'), nodeSnap(g, b[0], 'rail'), options(task.level, r));
         if (!pj.ok || this.eco.money - pj.cost < task.estimate!.fleetCost || commitProposal(g, pj)) return fail(`track ${sts[task.at].name}-${sts[task.at + 1].name}: ${pj.errors[0] ?? 'funded budget exceeded'}`, 720);
         this.track(e0); task.at++;
-      } else if (task.stage === 'buildTail') {
-        const yard = task.plannedYard!, st = builtStations()[yard.index], head = ends(st, yard.dir > 0)[yard.track], root = net.nodes.get(head);
-        if (!root) return fail('lost depot tail', 720);
-        task.fork = head;
-        if (!yard.straight) {
-          const dx = Math.sin(task.angle) * yard.dir, dz = Math.cos(task.angle) * yard.dir;
-          const fork = { x: root.x + dx * URBAN_TAIL, z: root.z + dz * URBAN_TAIL, y: root.y }, e0 = net.nextEdge;
-          const tp = tailPlan({ ...root, dx, dz, node: head }, fork, task.level, st.rail!);
-          if (!tp.ok || this.eco.money - yard.cost < task.estimate!.fleetCost || commitProposal(g, tp)) return fail('depot tail exceeded the funded budget or cannot be built', 720);
-          this.track(e0);
-          const node = nodeAt(g, 'rail', fork.x, fork.z);
-          if (!node) return fail('lost depot tail', 720);
-          task.fork = node.id;
-        }
-        task.stage = 'buildYard';
-      } else if (task.stage === 'buildYard') {
-        const yard = task.plannedYard!, sts = builtStations(), st = sts[yard.index], outer = ends(st, yard.dir > 0), e0 = net.nextEdge;
-        if (this.eco.money - yard.cost < task.estimate!.fleetCost) return fail('depot exceeded the funded budget', 720);
-        const fork = task.fork ?? outer[yard.track ?? 0];
-        if (yard.under) task.depot = buildSubwayYard(g, fork, yard.under, me, 'electric');
-        else {
-          const pr = planEdge(g, nodeSnap(g, fork, 'rail'), { kind: 'free', x: yard.x, z: yard.z, y: ground(yard.x, yard.z) }, { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me, designGrade });
-          if (pr.ok && !commitProposal(g, pr)) { const node = net.nearestNode(yard.x, yard.z, 0.1, 'rail', (n) => n.edges.length === 1); task.depot = node ? depotAtEnd(g, node.id, me) : -1; }
-        }
-        this.track(e0);
-        if (task.depot < 0) return fail('no depot site', 720);
-        p.depots.push(task.depot); task.end = st.id; task.stage = 'throat';
+      } else if (task.stage === 'buildTail' || task.stage === 'buildYard') {
+        // (a cursor saved before its yard beyond a terminus was built: the depot goes beside the line after the
+        // directional running instead; a tail already laid stays a plain track end the line can run on from)
+        task.stage = 'throat';
       } else if (task.stage === 'throat') {
         const e0 = net.nextEdge;
         if (task.plannedYard?.straight) keepFleet(() => Trackops.connectStationThroat(g, task.end, me));
@@ -5058,6 +5008,31 @@ export class AIController {
         keepFleet(() => { task.finish = finishDoubleTrack(g, task.doubleEdges, me,
           { log: AIController.profile ? (s) => this.note(s) : undefined }); }); this.track(e0);
         if (task.finish?.error) return fail(task.finish.error, 720);
+        task.stage = 'sideDepot';
+      } else if (task.stage === 'sideDepot') {
+        // the depot beside the line as it was planned and priced (the same siding from the planned junction, else another
+        // near it at the line's level; an older cursor's yard: beside the line near its terminus): trains leave it onto a
+        // running track and serve the line from there. A place that lost every site since approval fails the project.
+        if (task.depot < 0) {
+          const yard = task.plannedYard!, sts = builtStations(), T = sts[Math.min(yard.index, sts.length - 1)];
+          if (!T) return fail('stations could not be built', 720);
+          if (this.eco.money - yard.cost < task.estimate!.fleetCost) return fail('depot exceeded the funded budget', 720);
+          const e0 = net.nextEdge;
+          const plain = p.edges.filter((id) => { const e = net.edges.get(id); return !!e && e.station < 0 && e.depot < 0; });
+          const order = sts.map((s) => s.id);
+          const section = task.level === 'underground' ? 'tunnel' as const : task.level === 'elevated' ? 'bridge' as const : 'ground' as const;
+          keepFleet(() => {
+            // (the planned siding; else another beside the same stretch of line, at its level: the stretch the plan priced)
+            if (yard.side) task.depot = buildPlannedSideDepot(g, yard.side, task.level, me, order, 'electric', URBAN_DEPOT_POP);
+            if (task.depot < 0) task.depot = buildDepotBeside(g, plain, yard.side?.jx ?? T.x, yard.side?.jz ?? T.z, me, order,
+              { sections: [section], tries: 16, maxDist: yard.side ? 20 : 60, type: 'electric', maxPop: URBAN_DEPOT_POP });
+          });
+          this.track(e0);
+          if (task.depot < 0) return fail('no depot site', 720);
+          p.depots.push(task.depot);
+          const dp = g.depots.get(task.depot)!, ends = [sts[0], sts[sts.length - 1]];
+          task.end = ends.sort((a, b) => Math.hypot(a.x - dp.x, a.z - dp.z) - Math.hypot(b.x - dp.x, b.z - dp.z) || a.id - b.id)[0].id;
+        }
         task.stage = 'line';
       } else if (task.stage === 'line') {
         const line = g.lines.create('rail', me); line.stops = outAndBack(task.stations); p.line = line.id;
@@ -5074,6 +5049,9 @@ export class AIController {
         if (!unit) return fail('no vehicles');
         const train = g.vehicles.buyTrain(task.depot, [unit], p.line);
         if (typeof train === 'string') return fail(`forecast fleet could not be bought: ${train}`, 720);
+        // (from a depot beside the line its trains first call where they leave it towards)
+        const call = openingRailCall(g, train);
+        if (call >= 0 && call !== train.stopIndex) { train.stopIndex = call; train.onLineChanged(); }
         task.at++; task.bought++; this.stats.vehicles++;
       } else if (task.stage === 'transfers') {
         if (task.at >= task.stations.length) { task.stage = 'open'; continue; }
@@ -5117,13 +5095,19 @@ export class AIController {
     }
   }
 
-  /** Free platform ends of the termini of usable lines near the city line's depot end (same town), in a fixed order. */
-  private throughCandidates(t: ThroughJob): { line: number; term: number; node: number }[] {
+  /**
+   * Free platform ends of the termini of usable lines near one of the city line's termini (same town), in a fixed order:
+   * the connector joins the city terminus's free platform end (its way on), or a depot ramp beyond the terminus at the
+   * depot end of an older city line.
+   */
+  private throughCandidates(t: ThroughJob): { line: number; term: number; node: number; city: number }[] {
     const g = this.game, me = this.companyId, net = g.world.net, end = g.stations.get(t.end);
-    const out: { line: number; term: number; node: number }[] = [];
+    const out: { line: number; term: number; node: number; city: number }[] = [];
     if (!end || !g.lines.get(t.line)) return out;
     const info = this.lines.get(t.line);
     if (!info) return out;
+    const upath = linearStops(g.lines.get(t.line)!.stops);
+    const cities = [...new Set([t.end, ...(upath ? [upath[0], upath[upath.length - 1]] : [])])];
     for (const l of g.lines.map.values()) {
       if (l.kind !== 'rail' || l.id === t.line || g.trackUpgradeError(me, l.owner)) continue;
       const path = linearStops(l.stops);
@@ -5131,16 +5115,39 @@ export class AIController {
       for (const term of [path[0], path[path.length - 1]]) {
         const J = g.stations.get(term);
         if (!J?.rail || J.townId !== end.townId) continue;
-        // The connector joins a platform end to the yard lead, rather than either station's centre.
+        // The connector joins a platform end to the city line, rather than either station's centre.
         for (const node of stationEnds(g, J).flatMap((e) => [e.front, e.back])) {
           const n = net.nodes.get(node);
           if (n?.edges.length !== 1) continue;
-          const join = this.rampJoin(info.depot, node);
-          if (join && Math.hypot(n.x - join.x, n.z - join.z) <= 90) out.push({ line: l.id, term, node });
+          for (const city of cities) {
+            const join = this.throughJoin(t, info.depot, city, node);
+            // (a terminus's platform end lies a tail and part of a ramp nearer the city than an older line's depot ramp)
+            if (join && Math.hypot(n.x - join.x, n.z - join.z) <= (join.kind === 'node' ? 110 : 90)) out.push({ line: l.id, term, node, city });
+          }
         }
       }
     }
     return out;
+  }
+
+  /**
+   * Where a through connector from platform end `fromNode` joins the city line at its terminus `city`: that terminus's
+   * free platform end nearest to it (the line runs on there), or on the depot ramp (rampJoin) where the depot of an
+   * older city line still stands beyond its depot end.
+   */
+  private throughJoin(t: ThroughJob, depot: number, city: number, fromNode: number):
+    ({ kind: 'node'; node: number } | { kind: 'edge'; edge: number; s: number }) & { x: number; y: number; z: number } | null {
+    const g = this.game, net = g.world.net, T = g.stations.get(city), from = net.nodes.get(fromNode);
+    if (!T?.rail || !from) return null;
+    for (const end of ['front', 'back'] as const) {
+      if (!terminalEnd(g, T, end) || endDepots(g, T, end, this.companyId)) continue;
+      const heads = g.stations.trackEnds(T).map((q) => net.nodes.get(q[end])).filter((n): n is NonNullable<typeof n> => !!n && n.edges.length === 1)
+        .sort((a, b) => Math.hypot(a.x - from.x, a.z - from.z) - Math.hypot(b.x - from.x, b.z - from.z) || a.id - b.id);
+      if (heads.length) return { kind: 'node', node: heads[0].id, x: heads[0].x, y: heads[0].y, z: heads[0].z };
+    }
+    if (city !== t.end) return null;
+    const r = this.rampJoin(depot, fromNode);
+    return r ? { kind: 'edge', ...r } : null;
   }
 
   /**
@@ -5150,15 +5157,32 @@ export class AIController {
    * wire, the through line checked for its unit over the whole route, the unit, and the lines merged into one route.
    * A failure after the connector removes the connector only (the pieces of the ramp it split stay). True when built.
    */
-  private tryThrough(t: ThroughJob, c: { line: number; term: number; node: number }): boolean {
+  private tryThrough(t: ThroughJob, c: { line: number; term: number; node: number; city: number }): boolean {
     const g = this.game, me = this.companyId, net = g.world.net;
-    const ul = g.lines.get(t.line), l = g.lines.get(c.line), J = g.stations.get(c.term), end = g.stations.get(t.end), info = this.lines.get(t.line);
+    const ul = g.lines.get(t.line), l = g.lines.get(c.line), J = g.stations.get(c.term), end = g.stations.get(c.city), info = this.lines.get(t.line);
     const path = l ? linearStops(l.stops) : null, ustops = ul ? linearStops(ul.stops) : null;
     if (!ul || !l || !J || !end || !info || !path || !ustops || net.nodes.get(c.node)?.edges.length !== 1) return false;
-    const join = this.rampJoin(info.depot, c.node);
+    const join = this.throughJoin(t, info.depot, c.city, c.node);
     if (!join) return false;
-    const pj = planEdge(g, nodeSnap(g, c.node, 'rail'), { kind: 'edge', x: join.x, y: join.y, z: join.z, edge: join.edge, s: join.s },
-      { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me });
+    const co: BuildOptions = { kind: 'rail', type: 'electric', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me };
+    let pj = planEdge(g, nodeSnap(g, c.node, 'rail'), join.kind === 'node' ? nodeSnap(g, join.node, 'rail')
+      : { kind: 'edge', x: join.x, y: join.y, z: join.z, edge: join.edge, s: join.s }, co);
+    // (at a city terminus the connector may meet a plain straight track laid on from its platform end, at the
+    // platforms' level, as a line's way on is: room for a portal or a ramp clear of the streets above)
+    let tail: { plan: Proposal; x: number; z: number } | null = null;
+    const r = end.rail!, head = join.kind === 'node' ? net.nodes.get(join.node) : undefined;
+    const own = head?.edges.map((id) => net.edges.get(id)).find((e) => !!e && e.station === end.id);
+    if (!pj.ok && head && own) {
+      const ld = net.leaveDir(own, head.id), ux = -ld.x, uz = -ld.z;
+      for (const len of [6, 12, 18, 24]) {
+        const tp = planPlainTail(g, head.id, ux, uz, len, me, 'electric', r.level ?? 'ground', r.depth || 2.2);
+        if (!tp.ok) continue;
+        const fx = head.x + ux * len, fz = head.z + uz * len;
+        const q = net.withTemporaryNodes('rail', [{ x: fx, y: head.y, z: fz, dx: ux, dz: uz }], me,
+          (ns) => planEdge(g, nodeSnap(g, c.node, 'rail'), { kind: 'node', x: fx, y: head.y, z: fz, node: ns[0].id }, co));
+        if (q.ok) { pj = q; tail = { plan: tp, x: fx, z: fz }; break; }
+      }
+    }
     if (!pj.ok) return false;
     // the route: the main line to its terminus, the connector, the city line from the end the connector joins
     const mpath = c.term === path[path.length - 1] ? path : [...path].reverse();
@@ -5171,17 +5195,24 @@ export class AIController {
     // the main line's track and platforms to wire (ours, or an open network's at our cost): access and funds first
     const wire = this.lineTrack(path), dry = electrify(g, wire, me, true);
     if (dry.error && dry.error !== 'No unelectrified track here') { this.note(`through service at ${J.name}: ${dry.error}`); return false; }
-    const cost = pj.cost + (dry.changed ? dry.cost : 0) + unit.cost;
+    const cost = pj.cost + (tail?.plan.cost ?? 0) + (dry.changed ? dry.cost : 0) + unit.cost;
     if (cost > this.available() || !this.borrowFor(cost)) { this.note(`through service at ${J.name}: not enough money`); return false; }
     // the connector: the edges it lays, not the halves of the ramp it splits
     const t0 = net.nextEdge, pieces = new Set<number>();
     const onSplit = (old: NEdge, e1: NEdge, e2: NEdge) => { if (old.id < t0 || pieces.has(old.id)) { pieces.add(e1.id); pieces.add(e2.id); } };
+    const laid = () => { const out: number[] = []; for (let id = t0; id < net.nextEdge; id++) if (net.edges.has(id) && !pieces.has(id)) out.push(id); return out; };
     net.onSplit.push(onSplit);
-    let err: string | null;
-    try { err = commitProposal(g, pj); } finally { net.onSplit = net.onSplit.filter((f) => f !== onSplit); }
-    if (err) return false;
-    const connector: number[] = [];
-    for (let id = t0; id < net.nextEdge; id++) if (net.edges.has(id) && !pieces.has(id)) connector.push(id);
+    let err: string | null = null;
+    try {
+      if (tail) {
+        err = commitProposal(g, tail.plan);
+        const tn = err ? null : net.nearestNode(tail.x, tail.z, 0.1, 'rail', (q) => q.edges.length === 1);
+        if (!err && !tn) err = 'tail';
+        if (!err) { pj = planEdge(g, nodeSnap(g, c.node, 'rail'), nodeSnap(g, tn!.id, 'rail'), co); err = pj.ok ? commitProposal(g, pj) : 'connector'; }
+      } else err = commitProposal(g, pj);
+    } finally { net.onSplit = net.onSplit.filter((f) => f !== onSplit); }
+    if (err) { removeEdges(g, laid(), me); return false; }
+    const connector = laid();
     const undo = (why: string) => { removeEdges(g, connector, me); this.note(`through service at ${J.name} given up: ${why}`); return false; };
     if (dry.changed) {
       const el = electrify(g, wire, me);
