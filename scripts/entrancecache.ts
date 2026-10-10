@@ -180,7 +180,7 @@ for(const [name,mode,positive] of [['Marcliff','lightrail',false],['Dorminster',
   const urban=()=>{const entry=[...ai.lines.entries()].find(([,info]:any)=>info.urban);return entry&&h.lines.get(entry[0]);};
   const operating=()=>{const line=urban();return ai.stats.urban>0&&!ai.urbanTask&&!!line&&line.vehicles.some((id:number)=>(h.vehicles.get(id) as any)?.opLastSt>=0);};
   const rejected=()=>ai.stats.failed>0&&!ai.urbanTask&&!ai.urbanSurvey;
-  let ticks=0,controlExact=true;
+  let ticks=0,controlExact=true,flooded=false;
   while((!(positive?operating():rejected())||replays.some(r=>r.left>0))&&ticks++<16000){
     h.stepTick();control.stepTick();
     const expected=JSON.stringify(serialize(h));
@@ -189,12 +189,21 @@ for(const [name,mode,positive] of [['Marcliff','lightrail',false],['Dorminster',
       r.g.stepTick();r.left--;r.comparisons++;
       check(expected===JSON.stringify(serialize(r.g)),r.label+' exact saved/cold tick '+r.comparisons);
     }
+    // (2.11: a city line's depot stands on a siding beside the line, its site planned near a junction on the line: the
+    // negative control floods that ground, all but the laid track's own formation, once the track is laid and before
+    // the depot is built: the same missing-yard rejection.)
+    if(!positive&&!flooded&&ai.urbanTask?.stage==='sideDepot'&&ai.urbanTask.plannedYard?.side){
+      const flood=(game:Game)=>{const y=(game.ais[0] as any).urbanTask.plannedYard.side,net=game.world.net;
+        for(let x=Math.floor(y.jx)-75;x<=Math.ceil(y.jx)+75;x++)for(let z=Math.floor(y.jz)-75;z<=Math.ceil(y.jz)+75;z++)
+          if(Math.hypot(x-y.jx,z-y.jz)<=75&&!net.nearestEdge(x,z,1.6,'rail'))game.world.setVertex(x,z,-2);};
+      flood(h);flood(control);for(const r of replays)if(r.left>0)flood(r.g);flooded=true;
+    }
     const cursor=ai.urbanSurvey,stage=cursor&&cursor.trial>0?'survey':ai.urbanTask?.stage==='stations'&&ai.urbanTask.at>0?'construction':undefined;
     if(stage&&!seen.has(stage)){
       // (2.10: the urban survey now also prices trunks to neighbouring centres, and Marcliff's light rail finds a
       // buildable yard on one. The negative control floods its approved yard site once construction has begun, a native
       // terrain edit applied alike to every world at this tick: the same missing-yard rejection 2.9's site gave.)
-      if(!positive&&stage==='construction'){
+      if(!positive&&stage==='construction'&&!ai.urbanTask.plannedYard.side){
         const flood=(game:Game)=>{const y=(game.ais[0] as any).urbanTask.plannedYard;
           for(let dx=-4;dx<=4;dx++)for(let dz=-4;dz<=4;dz++)game.world.setVertex(Math.round(y.x)+dx,Math.round(y.z)+dz,-2);};
         flood(h);flood(control);for(const r of replays)if(r.left>0)flood(r.g);

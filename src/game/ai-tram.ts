@@ -8,7 +8,7 @@ import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize } from
 import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
-import { runGen } from './routing';
+import { runGen, roadDepotAtDeadEnd } from './routing';
 import { tramRouteValue, pays } from './ai-bus';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
@@ -250,11 +250,23 @@ export class TramPlanner {
   }
 }
 
-/** A tram depot beside a tram route near one of its ends that reaches the route's first stop (-1: none). */
+/**
+ * A tram depot beside a tram route near one of its ends, within the stretch its stops serve (never beyond the end stop,
+ * where it would end the route), that reaches the route's first stop (-1: none).
+ */
 export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number; s: number }[], stations: number[], owner: number): Generator<void, number> {
   const sz = depotSize('tram');
-  for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(pts.length - 2, 40); k += 2) {
-    const i = fromEnd ? pts.length - 1 - k : k;
+  // the route points nearest to its end stops
+  const at = stations.map((sid) => {
+    const st = g.stations.get(sid), q = st?.stops[0] ?? st;
+    if (!q) return -1;
+    let best = -1, bd = Infinity;
+    pts.forEach((p, i) => { const d = Math.hypot(p.x - q.x, p.z - q.z); if (d < bd) { bd = d; best = i; } });
+    return best;
+  }).filter((i) => i >= 0);
+  const lo = at.length ? Math.min(...at) : 0, hi = at.length ? Math.max(...at) : pts.length - 1;
+  for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(hi - lo - 2, 40); k += 2) {
+    const i = fromEnd ? hi - k : lo + k;
     const p = pts[i], q = pts[Math.min(pts.length - 1, i + 1)], o = pts[Math.max(0, i - 1)];
     const tx = q.x - o.x, tz = q.z - o.z, tl = Math.hypot(tx, tz) || 1;
     for (const side of [1, -1]) {
@@ -264,7 +276,8 @@ export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number
       const x = p.x + nx * off, z = p.z + nz * off;
       const plan = g.depots.plan('tram', x, z, Math.atan2(-nx, -nz), owner);
       yield;
-      if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2) continue;
+      if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2
+        || roadDepotAtDeadEnd(g, plan, true, owner)) continue;
       const id = g.depots.nextId;
       if (g.depots.commit('tram', plan, owner)) continue;
       const dp = g.depots.get(id);
