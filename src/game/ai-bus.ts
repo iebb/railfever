@@ -935,6 +935,8 @@ export function* moreValue(h: BusHost, l: Line): Generator<void, RoadPlan | null
   const sites = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s).map(siteOf);
   if (sites.length !== route.path.length) return null;
   const [before, after] = yield* lineForecast(g, me, sites, { model, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
+  // (the forecast spans work units: a stop taken away meanwhile ends this quote; its fees could not be priced)
+  if (route.path.some((id) => !g.stations.get(id)) || !g.lines.get(l.id)) return null;
   const cal = calibration(l, before, lineAge(g, l));
   const ours = l.owner === me;
   const running = runningCost(g, model, before.hop);

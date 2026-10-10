@@ -49,7 +49,7 @@ import {
   OPoint, P2, ChainProfile, ChainResult, SiteOpts, RoutePlan, biarcJunction, corridorFree, sitePop, trackClassOf, alignCorridor, routeConflictAt, chainProfile, chainProfileGen, routeConflictGen, routeGen, routeCurveSpeed, estimateChainCost, stationEnds, corridorOverlap, routeAlongside, planningProbe,
   buildDepotOnLine, removeEdges, nodeSnap, nodeAt, nodeTangent, sidingType, leadsMeet, roadDepotAtDeadEnd,
 } from './routing';
-import { buildSideDepot, sidingSpots, buildDepotBeside, buildPlannedSideDepot, planProspectiveSideDepot, sideYardDistances, runningSideOf, endDepots, planPlainTail, quoteDepotBeside, moveEndDepot, type SideYard } from './depot-sites';
+import { buildSideDepot, sidingSpots, buildDepotBeside, buildPlannedSideDepot, planProspectiveSideDepot, sideYardDistances, runningSideOf, endDepots, planPlainTail, quoteDepotBeside, moveEndDepot, rehomeDepot, type SideYard } from './depot-sites';
 import { terminalEnd } from './onward';
 
 export * from './routing';
@@ -1252,6 +1252,8 @@ export interface LineInfo {
   across?: boolean;
   /** rail mail: day of the last annual van review */
   mailLook?: number;
+  /** rail: day the line's depot was last checked to serve it (rehomeLineDepots); -1 after the track was doubled */
+  depotLook?: number;
 }
 
 /** A place on a station's approach track where a new line can join it (see approachJunctions). */
@@ -1539,6 +1541,39 @@ export class AIController {
     this.checkConfig();
     try { if (!this.cooperationReserved() && !this.project?.joint) this.manage(); } catch (e) { this.onError(e); }
     try { if (!this.job && !this.cooperationReserved()) this.moveEndDepots(); } catch (e) { this.onError(e); }
+    try { if (!this.job && !this.cooperationReserved()) this.rehomeLineDepots(); } catch (e) { this.onError(e); }
+  }
+
+  /**
+   * One railway line of ours a month, in turn (a line whose track was just doubled first: LineInfo.depotLook), has its
+   * depot checked: a depot that no longer sends the line's trains onto it (a siding left facing against the running
+   * direction its second track set) is replaced by a siding beside the line in the running direction, its trains with
+   * it (depot-sites.ts rehomeDepot), when the company can pay for the siding; else the line waits for its next turn.
+   */
+  private rehomeLineDepots() {
+    const g = this.game, me = this.companyId, net = g.world.net;
+    if (this.railPolicy.deepTrouble) return;
+    let pick: [number, LineInfo] | null = null;
+    for (const [lid, info] of [...this.lines].sort(([a], [b]) => a - b)) {
+      const l = g.lines.get(lid), dp = g.depots.get(info.depot);
+      if (info.kind !== 'rail' || !l || l.kind !== 'rail' || !l.vehicles.length || !dp || dp.owner !== me || dp.kind !== 'rail') continue;
+      if (!pick || (info.depotLook ?? -Infinity) < (pick[1].depotLook ?? -Infinity)) pick = [lid, info];
+    }
+    if (!pick) return;
+    const [lid, info] = pick, l = g.lines.get(lid)!, dp = g.depots.get(info.depot)!;
+    info.depotLook = g.day;
+    const path = linearStops(l.stops) ?? [...new Set(l.stops)];
+    if (path.length < 2 || path.some((sid, k) => k + 1 < path.length && depotServes(g, dp, sid, path[k + 1]) >= 0)) return;
+    const edges = this.lineTrack(path).filter((id) => { const e = net.edges.get(id); return !!e && e.owner === me && e.station < 0 && e.depot < 0; });
+    const opts = { sections: ['ground', 'bridge', 'tunnel'] as ('ground' | 'bridge' | 'tunnel')[], tries: 12 };
+    const quote = quoteDepotBeside(g, edges, dp.x, dp.z, me, path, opts);
+    if (!quote || !this.borrowFor(quote.cost * 1.1 + 15_000)) return;
+    const old = dp.id, home = rehomeDepot(g, old, me, edges, path, opts);
+    if (typeof home === 'string') return;
+    this.stats.track += Math.round(quote.length);
+    // (the new junction gets the line's signals: a path signal before it on directional track, the depot's exit)
+    this.signalLine(lid);
+    this.note(`${l.name}: a new depot beside the line, its trains leaving it in the running direction (depot ${old} no longer served the line)`);
   }
 
   /**
@@ -5025,11 +5060,14 @@ export class AIController {
       try { spend(); } finally { eco.money += reserve; }
     };
     const sweep = (stage: UrbanTask['stage']) => stage === 'sites' || stage === 'links' || stage === 'yardUnder' || stage === 'yardRamp' || stage === 'evaluate';
+    // (the side-depot search is a sweep too, which the planning work limit ends; its probes, a siding, ramp or cavern
+    // planned each, cost up to tens of milliseconds and keep a work unit each: they are not batched)
+    const search = (stage: UrbanTask['stage']) => sweep(stage) || stage === 'yardSide';
     let probes = 0;
     while (true) {
       const c = task.candidates[task.candidate];
       const targets = c?.targets ?? (c?.trim ? layout.targets.slice(1, -1) : layout.targets);
-      if (late() && sweep(task.stage) && task.stage !== 'evaluate') task.stage = 'approve';
+      if (late() && search(task.stage) && task.stage !== 'evaluate') task.stage = 'approve';
       const stage = task.stage;
       if (c?.trim) {
         const lat = stationLayout(2, 0, 'middle', 'side').trackOffsets;
@@ -6109,6 +6147,8 @@ export class AIController {
     info.doubleImpossible = !info.double && cursor.blocked && !cursor.deferred;
     info.upgradeRetry = info.double ? undefined : g.day + (cursor.deferred ? 30 : 180);
     if (cursor.built) {
+      // (directional running may leave the depot's siding facing against its track: rehomeLineDepots looks first)
+      info.depotLook = -1;
       this.stats.doubled++; this.stats.trackDouble += cursor.length; this.stats.signals += cursor.signals;
       if (!info.double) { info.loops = (info.loops ?? 0) + cursor.built; this.stats.loops += cursor.built; }
       else info.loops = undefined;

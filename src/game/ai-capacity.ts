@@ -6,7 +6,7 @@ import type { VehicleModel } from './vehicle-types';
 import { Train } from './train';
 import { capacityRouteBetween as routeBetween, capacityTopologyKey } from './rail-capacity-routes';
 import { linearStops } from './lines';
-import { patternOf, patternStops, patternHeadways, nextStopIndex, lineRoute, isLoopLine } from './patterns';
+import { patternOf, patternStops, patternHeadways, patternCycleFor, nextStopIndex, lineRoute, isLoopLine } from './patterns';
 import { fareFor, estimateLegTime, tripFactor, refTime } from './fares';
 import { plannedSet } from './demand';
 import { estimateVehicleYear, YEAR_S, trackBasePerUnit } from './opcosts';
@@ -270,7 +270,9 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
         }
         for (const [rid, seconds] of perHop) use.set(rid, (use.get(rid) ?? 0) + seconds);
       }
-      const pcycle = Math.max(1, headways.find(p => p.pid === c.pid)?.cycle ?? distance / speed + indices.length * 10);
+      // (a bidder's first train on a pattern that has none yet: the timetable it will keep once it runs, lineTable's,
+      // so that the entry quote and the auction that prices the running train a day later value one service)
+      const pcycle = Math.max(1, headways.find(p => p.pid === c.pid)?.cycle ?? (patternCycleFor(g, l, c.pid, c.cars) || distance / speed + indices.length * 10));
       for (const [rid, seconds] of use) use.set(rid, seconds / pcycle);
       for (const entry of access.values()) entry.use /= pcycle;
       const year = estimateVehicleYear(c.cars, distance / Math.max(1, indices.length), g.year, 0.5);

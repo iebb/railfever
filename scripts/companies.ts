@@ -236,13 +236,17 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
     const manage = ai.monthly.bind(ai);
     ai.monthly = () => { crowd(); manage(); };
     crowd();
+    // (2.11: the owner's own vehicles. Another company may join the busy line as a partner meanwhile (ai-bus.ts
+    // moreValue): its vehicle ended the wait before the owner's monthly review and failed the check on some maps.)
+    const own = () => l.vehicles.filter((id) => g.vehicles.get(id)?.owner === l.owner).length, o0 = own();
     const d0 = g.day;
-    while (g.day < d0 + 100 && l.vehicles.length <= n0 && !g.company(l.owner).defunct) g.update(0.25);
-    console.log(`  riders giving up on ${l.name} (${new Set(l.stops).size} stops, activeness ${ai.config.activeness}): limit ${m0} -> ${info.maxVehicles}, vehicles ${n0} -> ${l.vehicles.length}; ${ai.log.slice(-2).join(' | ')}`);
-    check(info.maxVehicles > m0 && l.vehicles.length > n0, 'riders giving up on a profitable bus or tram line at its limit raise the limit and add a vehicle');
+    while (g.day < d0 + 100 && own() <= o0 && !g.company(l.owner).defunct) g.update(0.25);
+    console.log(`  riders giving up on ${l.name} (${new Set(l.stops).size} stops, activeness ${ai.config.activeness}): limit ${m0} -> ${info.maxVehicles}, vehicles ${n0} -> ${l.vehicles.length} (the owner's ${o0} -> ${own()}); ${ai.log.slice(-2).join(' | ')}`);
+    check(info.maxVehicles > m0 && own() > o0, 'riders giving up on a profitable bus or tram line at its limit raise the limit and add a vehicle');
     // at the limit its stops set (a bus line: two vehicles a stop; trams: two more than its stops) the limit stays put
     const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length, model = (g.vehicles.get(l.vehicles[0]) as RoadVehicle).model!;
-    for (let k = 0; k < 12 && l.vehicles.length < hard; k++) g.vehicles.buyRoad(info.depot, model, l.id);
+    // (2.11: as many purchases as the limit needs; twelve left a ten-stop line at 17 of its 20)
+    for (let k = 0; k < 2 * hard && l.vehicles.length < hard; k++) g.vehicles.buyRoad(info.depot, model, l.id);
     info.maxVehicles = Math.max(info.maxVehicles, Math.ceil(hard / grow) + 1);
     const m1 = info.maxVehicles, n1 = l.vehicles.length;
     for (const d1 = g.day; g.day < d1 + 70 && !g.company(l.owner).defunct;) g.update(0.25);

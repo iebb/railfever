@@ -33,8 +33,11 @@ const isolated = quote();
 // Re-frozen for 2.10 (ef67606 gave 214.7797683186935 / 512340.1568116724 for Wilmere - Shelminster): the user's halved
 // walking reach and WALK_TRIP_INTENSITY (3.2x walking trips) change the arithmetic, and the halved reach moves this
 // pair search to Weyden - Sunham. Same fixture, same exact-parity tolerance.
-check(Math.abs(isolated.boardings - 80.39908175050506) < 1e-8
-  && Math.abs(isolated.revenue - 148704.3761182762) < 1e-6, `no-background quote preserves previous direct arithmetic (${isolated.boardings}, ${isolated.revenue})`);
+// Re-frozen for 2.11 (2.10: 80.39908175050506 / 148704.3761182762): big cities make more inter-city trips per resident
+// (demand.ts BIG_CITY, 8a42549), a smooth factor that is about 1 for these small towns (+0.14% here). With the factor
+// held at 1 the 2.10 values come back exactly.
+check(Math.abs(isolated.boardings - 80.51396538924969) < 1e-8
+  && Math.abs(isolated.revenue - 148916.86237376273) < 1e-6, `no-background quote preserves previous direct arithmetic (${isolated.boardings}, ${isolated.revenue})`);
 
 // A real road service joins the railway station and serves a different district of the generated town.
 const candidates: { x: number; z: number; distance: number; join?: number }[] = [];

@@ -246,7 +246,12 @@ if (!arg('maps')) {
   }
   // Full-capital payback (construction and units against the operating result): a realistic band for each style, so
   // that a recalibration cannot pass a city railway that repays in a year or never.
-  const PAYBACK_BAND = { lightrail: [3, 8], metro: [4, URBAN_PAYBACK.metro] } as const;
+  // (2.11: metro 4 -> 3 years at the low end, as light rail's. 2.10 measured this fixture at exactly 4.0 years. Its
+  // cavern now stands on a siding beside the line instead of a tail and cavern beyond a terminus (88e0c1f: the same
+  // forecast, 0.3M less capital, about a tenth more measured revenue from trains that leave the depot onto the line)
+  // and it repays in 3.5-3.6 years. The demand calibration is unchanged: one town, so the big-city inter-city factor
+  // plays no part.)
+  const PAYBACK_BAND = { lightrail: [3, 8], metro: [3, URBAN_PAYBACK.metro] } as const;
   for (const mode of ['lightrail', 'metro'] as const) {
     console.log(`8000-person centre ${mode}`);
     // (the grid's streets cross the line's corridor: a street-level line would cross one every 80 m)

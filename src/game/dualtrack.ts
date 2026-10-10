@@ -27,6 +27,12 @@ export interface DoubleJob {
   spent?: number;
   returnValue?: number;
   finishFailed?: number[];
+  /**
+   * A leg whose full plans found no buildable side goes on in the following work units (each plans one or two whole
+   * corridors, tens of milliseconds): 'repair', the deviations round the failed pieces of each side (`detours`), then
+   * 'stopgap', temporary loops on the clear parts. `at`: the leg it belongs to.
+   */
+  slice?: { at: number; stage: 'repair' | 'stopgap'; sides: { side: 1 | -1; detours: { at: number; reach: number }[] }[] };
 }
 
 /** Physical shortest route, independent of one-way signals; previews and retries use the same deterministic trace. */
@@ -205,21 +211,33 @@ export function doubleJobStep(g: Game, job: DoubleJob, user: number, fund: (cost
     g.stations.refreshAccess();
     return false; // the rebuild changed approach IDs: trace the same leg next unit
   }
-  if (route.every((id) => trackIsDouble(g, id, user)) && !job.finishFailed?.includes(job.at)) { job.at++; return false; }
-  const plans = [1, -1].map((side) => planDoubleTrack(g, route, side as 1 | -1, user));
-  let viable = plans.filter((p) => p.ok).sort((p, q) => p.cost - q.cost);
-  // A bridge removes flat-junction conflicts when its extra cost earns back enough saved train/passenger time.
-  if (viable[0]?.proposals.some((p) => p.crossings.some((c) => c.mode === 'diamond')) && congestionReturn(g, l) > 1_000_000) {
-    const flying = planDoubleTrack(g, route, viable[0].side, user, true, { flying: true });
-    if (flying.ok && flying.cost - viable[0].cost < congestionReturn(g, l) * 2 && worth(flying.cost)) viable.unshift(flying);
-  }
-  if (!viable.length) {
-    // The ground planner includes widening structures and demolition. Before settling for loops, try a short
-    // deviation round the failed pieces, on both sides. Its real earthworks/structure costs still have to pay.
-    for (const pl of plans) for (const extra of [0.65, 1.2]) {
-      const detours = pl.proposals.flatMap((p, i) => !p.ok && pl.points[i + 1] ? [{ at: (pl.points[i].u + pl.points[i + 1].u) / 2, reach: Math.min(40, pl.length / 3), extra }] : []);
-      if (!detours.length) continue;
-      const repair = planDoubleTrack(g, route, pl.side, user, true, { detours });
+  if (route.every((id) => trackIsDouble(g, id, user)) && !job.finishFailed?.includes(job.at)) { job.at++; delete job.slice; return false; }
+  // (a leg's later work units: its repairs, then its stopgaps; an older cursor's slice of another leg is dropped)
+  const slice = job.slice?.at === job.at ? job.slice : undefined;
+  delete job.slice;
+  const fullPlans = () => [1, -1].map((side) => planDoubleTrack(g, route, side as 1 | -1, user));
+  let plans: DoublePlan[] = [], viable: DoublePlan[] = [];
+  if (!slice) {
+    plans = fullPlans();
+    viable = plans.filter((p) => p.ok).sort((p, q) => p.cost - q.cost);
+    // A bridge removes flat-junction conflicts when its extra cost earns back enough saved train/passenger time.
+    if (viable[0]?.proposals.some((p) => p.crossings.some((c) => c.mode === 'diamond')) && congestionReturn(g, l) > 1_000_000) {
+      const flying = planDoubleTrack(g, route, viable[0].side, user, true, { flying: true });
+      if (flying.ok && flying.cost - viable[0].cost < congestionReturn(g, l) * 2 && worth(flying.cost)) viable.unshift(flying);
+    }
+    if (!viable.length) {
+      // The ground planner includes widening structures and demolition. Before settling for loops, try a short
+      // deviation round the failed pieces, on both sides (the next work unit). Its real earthworks/structure costs
+      // still have to pay.
+      const sides = plans.map((pl) => ({ side: pl.side, detours: pl.proposals.flatMap((p, i) => !p.ok && pl.points[i + 1]
+        ? [{ at: (pl.points[i].u + pl.points[i + 1].u) / 2, reach: Math.min(40, pl.length / 3) }] : []) }));
+      job.slice = { at: job.at, stage: sides.some((q) => q.detours.length) ? 'repair' : 'stopgap', sides };
+      return false;
+    }
+  } else if (slice.stage === 'repair') {
+    for (const q of slice.sides) for (const extra of [0.65, 1.2]) {
+      if (!q.detours.length) continue;
+      const repair = planDoubleTrack(g, route, q.side, user, true, { detours: q.detours.map((d) => ({ ...d, extra })) });
       if (repair.ok) viable.push(repair);
     }
     viable.sort((p, q) => p.cost - q.cost);
@@ -245,7 +263,10 @@ export function doubleJobStep(g: Game, job: DoubleJob, user: number, fund: (cost
     return true;
   };
   for (const pl of viable) { if (build(pl)) { built = true; break; } if (job.deferred) break; }
+  // (nothing built of the full or repaired plans: the stopgaps in the next work unit)
+  if (!built && !job.deferred && slice?.stage !== 'stopgap') { job.slice = { at: job.at, stage: 'stopgap', sides: slice?.sides ?? [] }; return false; }
   if (!built && !job.deferred) {
+    plans = fullPlans();
     job.error = plans[0].errors[0] ?? job.error;
     // Structures are widened/rebuilt by planEdge and payable demolitions are included in these plans.
     // An obstructed throat can reject a full plan before it even sketches the clear open line. In that case

@@ -1810,7 +1810,11 @@ export function throatFree(g: Game, stationId: number, end: 'front' | 'back', ow
   const reach = ladderReach(added);
   const z = throatCrossovers(g, stationId, end, owner, reach + 45);
   if (!z || !z.heads.length) return true;
+  const v0 = g.world.net.version;
   for (const id of z.line) fragment(g, id, 3);
+  // The cut pieces are new edges: routes, blocks and capacity inventories keyed by the network version must see them
+  // now, as a loaded game does (a station upgrade that then waits as 'busy' changes nothing else).
+  if (g.world.net.version !== v0) g.onNetworkChanged();
   const near = throatCrossovers(g, stationId, end, owner, reach)!;
   // crossovers in the ladder's way move out beyond it: then the line there must be free of trains as well
   const wide = near.legs.length ? throatCrossovers(g, stationId, end, owner, reach + 45)! : near;

@@ -457,6 +457,37 @@ export function moveEndDepot(g: Game, ed: EndDepot, owner: number, edges: Iterab
   return home;
 }
 
+/**
+ * A rail depot of ours that no longer sends its trains onto their lines (a siding left facing against the running
+ * direction a second track set, say) is replaced by one beside the line (`edges`: its plain track, nearest the old
+ * depot first; `stations`: its stops in order), trains leaving it in the running direction (buildDepotBeside): the
+ * trains at home there move with it (moveDepotHome) and the old siding is taken up. Within one call: the new depot must
+ * serve every homed train's line, else it is taken down again and the old one stays. 'busy' while a train is leaving
+ * the old depot; the new depot's id, or why not.
+ */
+export function rehomeDepot(g: Game, depotId: number, owner: number, edges: Iterable<number>, stations: readonly number[],
+  o: BesideOpts = {}): number | string {
+  const old = g.depots.get(depotId);
+  if (!old || old.owner !== owner || old.kind !== 'rail') return 'no depot';
+  if (depotBusy(g, depotId)) return 'busy';
+  const home = buildDepotBeside(g, edges, old.x, old.z, owner, stations, { sections: ['ground', 'bridge', 'tunnel'], tries: 12, ...o });
+  if (home < 0) return 'no siding';
+  const dp = g.depots.get(home)!;
+  const homed = [...g.vehicles.map.values()].filter((v): v is Train => v.kind === 'train' && (v as Train).depotId === depotId);
+  const serves = homed.every((v) => {
+    const path = v.line ? [...new Set(v.line.stops)] : stations;
+    return path.length < 2 || path.some((sid, i) => i + 1 < path.length && depotServes(g, { ...dp, owner: v.owner }, sid, path[i + 1], v.cars) >= 0);
+  });
+  if (!serves) { takeUpDepot(g, home, owner); return 'new depot cannot serve the lines'; }
+  const exit = old.node;
+  const err = moveDepotHome(g, depotId, home);
+  if (err) { takeUpDepot(g, home, owner); return 'old depot: ' + err; }
+  // (its siding up to the junction, paid as removed: removeEdges)
+  removeEdges(g, spurFrom(g, exit, owner), owner);
+  g.onNetworkChanged();
+  return home;
+}
+
 // ============================================================================ planned city lines
 
 /** What the side-depot planner reads of a planned station (a StationPlan, or a built station as one: stopOfStation). */

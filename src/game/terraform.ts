@@ -44,6 +44,33 @@ function groundSamples(w: World, e: NEdge): { x: number; y: number; z: number; s
   return out;
 }
 
+/**
+ * Does a rail edge's ground end at node `nid` stand at a tunnel mouth: the next edge there runs on in tunnel, or
+ * another track's portal lies beside it at about its height (a second track laid up to the first one's portal, its
+ * connection running on in the bore)? Its grading then stops there as at a portal within the edge.
+ */
+function portalEnd(w: World, e: NEdge, nid: number): boolean {
+  const net = w.net, n = net.nodes.get(nid);
+  if (!n || e.kind !== 'rail') return false;
+  // (where another track runs on from the node on the ground, its own formation continues there)
+  if (n.edges.some((id) => {
+    const q = id === e.id ? undefined : net.edges.get(id);
+    return !!q && net.sectionAt(q, q.a === nid ? 0 : q.len) === 'ground';
+  })) return false;
+  const p = { x: 0, y: 0, z: 0 }, r = 2.5;
+  for (const q of net.edgesNear(n.x - r, n.z - r, n.x + r, n.z + r)) {
+    if (q.id === e.id || q.kind !== 'rail') continue;
+    for (const t of q.sections) {
+      if (t.type !== 'tunnel') continue;
+      for (const s of [t.s0, t.s1]) {
+        net.pointAt(q, s, p);
+        if (Math.hypot(p.x - n.x, p.z - n.z) <= r && Math.abs(p.y - n.y) < 1.2) return true;
+      }
+    }
+  }
+  return false;
+}
+
 /** Collect, per vertex, the heights the edge's ground sections allow: flat formation, linear side slopes. */
 function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) {
   const net = w.net;
@@ -52,7 +79,11 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
   const fd = formationDepth(e);
   const k = e.kind === 'rail' ? EARTHWORKS.slopeRail : EARTHWORKS.slopeRoad;
   const s1 = w.size + 1;
-  const tunnels = e.sections.filter((sec) => sec.type === 'tunnel');
+  const tunnels: { s0: number; s1: number }[] = e.sections.filter((sec) => sec.type === 'tunnel');
+  // (a ground end at a tunnel mouth: the hillside beyond it stays, as behind a portal within the edge; else its end,
+  // laid before its connection on into the bore, cut away the slope and the streets over the portal)
+  if (e.kind === 'rail') for (const [nid, at] of [[e.a, 0], [e.b, e.len]] as const)
+    if (net.sectionAt(e, at) === 'ground' && portalEnd(w, e, nid)) tunnels.push(at === 0 ? { s0: -Infinity, s1: 0 } : { s0: e.len, s1: Infinity });
   const g = net.geo(e);
   for (const p of groundSamples(w, e)) {
     const target = p.y - fd;

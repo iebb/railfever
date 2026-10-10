@@ -25,7 +25,7 @@ for (const seed of seeds) {
   // City railway projects (the seed-7 light railway in Chalcott planned from day 175 used to run until day 733).
   const city = new Map<string, { company: number; from: number; to?: number }>();
   let longest = 0, longestWhat = '', last = -1, jobs = 0, watchUnits = 0, watchIdle = 0;
-  let replay: { g: Game; at: number } | null = null;
+  let replay: { g: Game; at: number } | null = null, induced = false;
   const close = (id: number, o: { from: number; what: string }) => {
     const days = g.day - o.from;
     jobs++;
@@ -48,6 +48,14 @@ for (const seed of seeds) {
     }
     if (g.day === last || g.day > end) continue;
     last = g.day;
+    // (2.11: depots beside the line changed the seed-7 world from its first railway on, and no company chose a city
+    // railway in three years any more. The Chalcott light railway (town 0) that used to stick is started instead on
+    // the first day from 176 that a company is free, when no city railway is under way by then: the planning work
+    // limit and the mid-planning save stay covered.)
+    if (seed === 7 && !induced && g.day >= 176 && !city.size) {
+      const free = g.ais.find((ai) => !ai.busy && (ai as any).startProject('lightrail', [0]));
+      if (free) { induced = true; console.log(`  day ${g.day}: company ${free.companyId} starts the Chalcott light railway (no city railway chosen by then)`); }
+    }
     for (const ai of g.ais) {
       const a = ai as any, job = a.job, o = open.get(ai.companyId);
       if (o && o.job !== job) { close(ai.companyId, o); open.delete(ai.companyId); }

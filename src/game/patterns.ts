@@ -402,6 +402,39 @@ function slowest(vs: Vehicle[]): VehicleModel[] {
 }
 
 /**
+ * The timetable of a pattern (its served stops `flags`) for a consist of `models`: hop[i], the time from served stop i
+ * to the next served one (0 for indices not served, and at a short-turn), and the cycle, their sum.
+ */
+function timePattern(g: Game, l: Line, flags: boolean[], models: VehicleModel[]): { hop: number[]; cycle: number } {
+  const n = l.stops.length, road = l.kind !== 'rail';
+  const c = models.length ? consistOf(models) : null;
+  const hop = new Array<number>(n).fill(0);
+  let cycle = 0;
+  for (let i = 0; i < n; i++) {
+    if (!flags[i]) continue;
+    let along = 0, j = i;
+    for (let k = 1; k <= n; k++) { const q = (i + k) % n; along += sdist(g, l.stops[j], l.stops[q]); j = q; if (flags[q]) break; }
+    if (l.stops[j] === l.stops[i]) { hop[i] = 0; continue; }
+    const d = Math.min(along, 1.3 * sdist(g, l.stops[i], l.stops[j])) * (road ? 1.3 : 1.15);
+    const t = c ? hopEstimate(c, d * UNIT_M, c.seats * 0.5, hopCap(g, l, l.stops[i], l.stops[j])).t : (d * UNIT_M) / (road ? 6 : 15);
+    hop[i] = t + (road ? DWELL.road : DWELL.rail);
+    cycle += hop[i];
+  }
+  return { hop, cycle };
+}
+
+/**
+ * The cycle (s) pattern `pid` of line l keeps with trains of `cars`, as lineTable times it once they run: what a
+ * bidder's first train on a pattern without vehicles will run (ai-capacity.ts channelsFor). 0 when it serves no hop.
+ */
+export function patternCycleFor(g: Game, l: Line, pid: number | undefined, cars: readonly VehicleModel[]): number {
+  if (l.stops.length < 2 || !cars.length) return 0;
+  // (the consist as it is made up, as slowest() reads a running train's)
+  const lead = cars.findIndex((m) => m.power > 0), models = lead > 0 && lead === cars.length - 1 ? [...cars].reverse() : [...cars];
+  return timePattern(g, l, servedFlags(l, l.patterns && l.patterns.length ? patternOf(l, pid) : null), models).cycle;
+}
+
+/**
  * Timetables, routing edges and boarding rules of a line for a cargo (cached per routing version): per running
  * pattern the time from each served stop to the next (running time of the hop from the physics of the vehicles that
  * carry the cargo, at most the track / road speed, plus the dwell), its cycle and frequency; per pair of stations the
@@ -442,21 +475,7 @@ export function lineTable(g: Game, l: Line, cargo: Cargo = 'pax'): LineTable {
     const vs = byPat.get(p.id) ?? [];
     if (!vs.length || n < 2) continue;
     const flags = servedFlags(l, l.patterns && l.patterns.length ? p : null);
-    const models = slowest(vs);
-    const c = models.length ? consistOf(models) : null;
-    // hop[i]: time from served stop i to the next served stop (0 for indices not served, and at a short-turn)
-    const hop = new Array<number>(n).fill(0);
-    let cycle = 0;
-    for (let i = 0; i < n; i++) {
-      if (!flags[i]) continue;
-      let along = 0, j = i;
-      for (let k = 1; k <= n; k++) { const q = (i + k) % n; along += sdist(g, l.stops[j], l.stops[q]); j = q; if (flags[q]) break; }
-      if (l.stops[j] === l.stops[i]) { hop[i] = 0; continue; }
-      const d = Math.min(along, 1.3 * sdist(g, l.stops[i], l.stops[j])) * (road ? 1.3 : 1.15);
-      const t = c ? hopEstimate(c, d * UNIT_M, c.seats * 0.5, hopCap(g, l, l.stops[i], l.stops[j])).t : (d * UNIT_M) / (road ? 6 : 15);
-      hop[i] = t + (road ? DWELL.road : DWELL.rail);
-      cycle += hop[i];
-    }
+    const { hop, cycle } = timePattern(g, l, flags, slowest(vs));
     if (!(cycle > 0)) continue;
     const route = (isLoopLine(l) ? 'loop:' : 'back:') + l.stops.map((id, i) => flags[i] ? id : `(${id})`).join(',');
     const timing = isLoopLine(l) ? [flags.indexOf(true)] : patternTermini(l, p.id);
