@@ -3,9 +3,13 @@
 // overheads, crew, energy, maintenance; track base upkeep + wear). Line maintenance below is the base upkeep of
 // the line's infrastructure (Game.edgeMaintenance / stationMaintenance); track wear is in the company totals.
 // npx esbuild scripts/economy.ts --bundle --platform=node --format=esm --outfile=$S/economy.mjs && node $S/economy.mjs [seed]
-// Seed 7 checks the catchment-calibrated incomes below. --json=/path/before.json saves another seed's exact results;
-// --baseline=/path/before.json checks each income stays within 15% of that baseline instead.
+// Seed 7 checks the catchment-calibrated incomes below. --json=/path/before.json saves another seed's results;
+// --baseline=/path/before.json checks them against that baseline instead (BANDS below).
+// The figures are the means of an ensemble (--runs=N, default RUNS; --jobs=N processes at once): the same map and
+// lines, member k > 0 reseeding Game.rng once the lines are built (member 0 is the plain run, its log printed).
 import { readFileSync, writeFileSync } from 'node:fs';
+import { fork } from 'node:child_process';
+import { availableParallelism } from 'node:os';
 import { Game } from '../src/game/game';
 import { MODEL_BY_ID, VehicleModel } from '../src/game/vehicle-types';
 import { CATEGORIES } from '../src/game/economy';
@@ -19,6 +23,31 @@ import { patternHeadways } from '../src/game/patterns';
 const seed = Number(process.argv.slice(2).find((s) => !s.startsWith('--')) ?? 7);
 const YEARS = 4;
 const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=`))?.slice(name.length + 3);
+const MEMBER = Number(flag('member') ?? 0), RUNS = Math.max(1, Number(flag('runs') ?? 40));
+type Result = { name: string; income: number; boardings: number; load: number; net: number; capital: number };
+/** Members 1..runs-1 in child processes (this process runs member 0), at most `jobs` processes at once. */
+function ensemble(runs: number, jobs: number): Promise<{ results: Result[][]; errors: string[] }> {
+  const results: Result[][] = [], errors: string[] = [];
+  let next = 1, running = 0;
+  return new Promise((done) => {
+    const start = () => {
+      while (running < jobs - 1 && next < runs) {
+        const k = next++, child = fork(process.argv[1], [String(seed), `--member=${k}`], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+        let got: Result[] | null = null, err = '';
+        running++;
+        child.on('message', (m) => { got = m as Result[]; });
+        child.stderr!.on('data', (d) => { err += d; });
+        child.on('exit', (code) => {
+          running--;
+          if (got && code === 0) results[k] = got; else errors.push(`member ${k} exit ${code}: ${err.trim().split('\n').slice(-3).join(' | ')}`);
+          if (next >= runs && !running) done({ results: results.filter(Boolean), errors }); else start();
+        });
+      }
+    };
+    if (runs <= 1) done({ results, errors }); else start();
+  });
+}
+const members = MEMBER ? null : ensemble(RUNS, Math.max(2, Math.min(Number(flag('jobs') ?? 4), availableParallelism() - 1)));
 // Re-captured after the independent load/payback/village/exploit bands and urban economics passed. Release 2.6
 // (d95e283) -> 70% walking limits: rail/tram/bus 33.6/30.8/22.4 -> 23.52/21.56/15.68 units, full coverage 21 -> 14.7,
 // weight scale 8 -> 5.6. Local/long-distance generation +20%; urban uplift 6/3/1.5 -> 8/4/2; separate car feeders
@@ -41,23 +70,34 @@ const flag = (name: string) => process.argv.find((s) => s.startsWith(`--${name}=
 // it), and no village pair connects. Income / net k per year, 2.9 -> now: busy bus 222.2/148 -> 260.3/186.2 (Oldwood
 // 3,762 -> 3,503 after four years), short bus 20.5/-13 -> 25.9/-7.9; intercity (new pair) 543.1/264.2, full-capital
 // payback 32 years. Without the intensity (the preview) the busy bus carried about a third and the economy test crashed.
+// 2.10: one run was one draw. Reseeding Game.rng once the lines are built (the same map and lines, other demand rounding
+// and town growth) moves one run's figures by (sd) rail income 1.5% / result 3%, busy bus 11.6% / 17%, short bus 13% /
+// 25%: busy bus income 179-316k over 144 draws; a x1.003 demand change moved the buses by about 20%. The baseline
+// above was an upper draw (busy bus 260.3k against a 225k mean). The 144-draw means were the same before and after
+// the big-city demand and network changes (3c7c85a 48 draws, busy bus median 230.0k; d02f822 229.7k): no drop in bus
+// economics. The test now takes the mean of 40 draws (member 0 the plain run); the baseline is the mean of 144
+// (node economy.mjs --runs=144 --json=...). The mean of 40 against it varies by about 0.3% / 0.5% (rail), 2.1% / 3.1%
+// (busy bus) and 2.3% / 4.5% (short bus), hence BANDS: rail 5%, bus incomes 10%, bus results 15% (over 3 sd).
+// Means, income / result k per year: rail 553.9 / 275.0, busy bus 225.4 / 151.3, short bus 22.3 / -11.5.
+/** Baseline bands [name prefix, income, operating result], from the ensemble's measured spread (above). */
+const BANDS: [string, number, number][] = [['rail ', 0.05, 0.05], ['busy bus', 0.1, 0.15], ['short bus', 0.1, 0.15]];
 const seed7Baseline = {
   "seed": 7,
   "results": [
     {
       "name": "rail Weyport-Southmouth (75 u track)",
-      "income": 543102.8200669726,
-      "net": 264179.30889596936
+      "income": 553930.69231476,
+      "net": 275019.0710973505
     },
     {
       "name": "busy bus in Oldwood (2x Metro Articulated)",
-      "income": 260259.79148007563,
-      "net": 186225.60036144755
+      "income": 225396.58771419586,
+      "net": 151283.54689874343
     },
     {
       "name": "short bus in Oldwood (1x City Liner)",
-      "income": 25886.964896858295,
-      "net": -7919.658560816406
+      "income": 22296.772237357443,
+      "net": -11510.460925066036
     }
   ]
 };
@@ -148,7 +188,8 @@ for (const [label, minD, maxD, n, model] of [['busy bus', 15, 24, 2, 'bus_c'], [
     cases.push({ name: `village rail ${pr.TA.name}(${pr.TA.pop})-${pr.TB.name}(${pr.TB.pop})`, line, cost: cars.reduce((a, c) => a + c.cost, 0), maint: lineMaintenance(newEdges(before), [pr.A.id, pr.B.id], [dep]), dist: Math.hypot(pr.A.x - pr.B.x, pr.A.z - pr.B.z), capital: money0 - g.economy.money });
   }
 }
-// ---- simulate
+// ---- simulate (an ensemble member draws its own demand rounding and town growth from here on)
+if (MEMBER) g.rng.state = Math.imul(MEMBER, 0x9e3779b1) >>> 0;
 const months = new Map<number, number[]>(), loads = new Map<number, number[]>();
 for (let y = 0; y < YEARS; y++) {
   // Measure a whole final year; a rail station may have zero visits in the last month alone.
@@ -165,7 +206,7 @@ for (let y = 0; y < YEARS; y++) {
   }
 }
 console.log(`economy (seed ${seed}), last full year ${g.year - 1}; fares.ts / opcosts.ts`);
-const results: { name: string; income: number; boardings: number; load: number; net: number; capital: number }[] = [];
+const results: Result[] = [];
 for (const c of cases) {
   const inc = c.line.incomeLast, run = c.line.costLast;
   const net = inc - run - c.maint;
@@ -178,9 +219,28 @@ for (const c of cases) {
 }
 const yr = g.economy.yearTotals[g.economy.yearTotals.length - 1];
 console.log(`company ${yr.year}: ` + CATEGORIES.filter((k) => yr.v[k]).map((k) => `${k} ${fmt(yr.v[k] / 1e3, 0)}k`).join(', '));
+if (MEMBER) {
+  if (process.send) process.send(results, () => process.disconnect()); else console.log('RESULT ' + JSON.stringify(results));
+} else {
+  // The checks below take the ensemble's means; member 0's log above is one draw of them.
+  const { results: others, errors } = await members!;
+  for (const e of errors) check(false, `ensemble ${e}`);
+  const all = [results, ...others];
+  check(all.every((r) => r.map((x) => x.name).join() === results.map((x) => x.name).join()), 'every ensemble member builds the same lines');
+  console.log(`ensemble of ${all.length} (member 0 above; mean, spread of one member, range):`);
+  for (const [i, r] of results.entries()) {
+    const of = (k: 'income' | 'net' | 'load' | 'boardings') => all.map((m) => m[i][k]);
+    const mean = (v: number[]) => v.reduce((a, b) => a + b, 0) / v.length;
+    const sd = (v: number[]) => Math.sqrt(v.reduce((a, b) => a + (b - mean(v)) ** 2, 0) / Math.max(1, v.length - 1));
+    const inc = of('income'), net = of('net');
+    console.log(`  ${r.name}: income ${fmt(mean(inc) / 1e3, 1)}k (sd ${fmt(sd(inc) / Math.abs(mean(inc)) * 100, 1)}%, ${fmt(Math.min(...inc) / 1e3, 1)}-${fmt(Math.max(...inc) / 1e3, 1)}k), `
+      + `result ${fmt(mean(net) / 1e3, 1)}k (sd ${fmt(sd(net) / 1e3, 1)}k, ${fmt(Math.min(...net) / 1e3, 1)} to ${fmt(Math.max(...net) / 1e3, 1)}k), load ${fmt(mean(of('load')) * 100, 1)}%`);
+    Object.assign(r, { income: mean(inc), net: mean(net), load: mean(of('load')), boardings: mean(of('boardings')) });
+  }
+}
 // Independent balance bands (not the captured baseline): loads, and paybacks of the full capital (track, stations,
 // depot and vehicles against the operating result), so that a recalibration cannot hide a regression.
-if (seed === 7) {
+if (seed === 7 && !MEMBER) {
   const r = (prefix: string) => results.find((x) => x.name.startsWith(prefix));
   const payback = (x: { net: number; capital: number }) => (x.net > 0 ? x.capital / x.net : Infinity);
   const ic = r('rail '), bus = r('busy bus'), village = r('village rail');
@@ -197,7 +257,7 @@ if (seed === 7) {
 }
 // Exploit check: one journey split over transfers earns about what the direct ride does (the rail minimum is paid
 // once per journey: fares.ts railLegFare, the journey's rail fares so far carried in its waiting and cargo groups).
-{
+if (!MEMBER) {
   const h = Game.create({ size: 256, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 2000 });
   h.aiEnabled = false; h.world.h.fill(4); h.world.heightsVersion++;
   const net = h.world.net, a = net.addNode('road', 20, 4, 60, 0, 0, -1), b = net.addNode('road', 200, 4, 60, 0, 0, -1);
@@ -234,21 +294,21 @@ if (seed === 7) {
     `splitting a journey over transfers earns no more than the distance fares make it (${fmt(split / direct, 2)}x; a minimum on every leg made it 4.25x)`);
 }
 const baselinePath = flag('baseline');
-const baseline = baselinePath ? JSON.parse(readFileSync(baselinePath, 'utf8')) as typeof seed7Baseline : seed === 7 ? seed7Baseline : undefined;
+const baseline = MEMBER ? undefined : baselinePath ? JSON.parse(readFileSync(baselinePath, 'utf8')) as typeof seed7Baseline : seed === 7 ? seed7Baseline : undefined;
 if (baseline) {
   check(baseline.seed === seed, 'income baseline uses the same seed');
   for (const r of results) {
     const b = baseline.results.find((s) => s.name === r.name);
     check(!!b, `baseline contains ${r.name}`);
     if (b) {
-      const ratio = r.income / Math.max(1, b.income);
-      console.log(`  income before -> after ${r.name}: ${fmt(b.income / 1000)}k -> ${fmt(r.income / 1000)}k (${fmt((ratio - 1) * 100, 1)}%)`);
-      check(ratio >= 0.85 && ratio <= 1.15, `${r.name} income within 15% of baseline`);
+      const ratio = r.income / Math.max(1, b.income), [, inc, res] = BANDS.find(([p]) => r.name.startsWith(p)) ?? ['', 0.15, 0.15];
       const profitChange = Math.abs(r.net - b.net) / Math.max(1, Math.abs(b.net));
-      check(profitChange <= 0.15, `${r.name} operating result within 15% of baseline`);
+      console.log(`  before -> after ${r.name}: income ${fmt(b.income / 1000)}k -> ${fmt(r.income / 1000)}k (${fmt((ratio - 1) * 100, 1)}%), result ${fmt(b.net / 1000)}k -> ${fmt(r.net / 1000)}k (${fmt(profitChange * 100, 1)}% off)`);
+      check(Math.abs(ratio - 1) <= inc, `${r.name} income within ${inc * 100}% of baseline`);
+      check(profitChange <= res, `${r.name} operating result within ${res * 100}% of baseline`);
     }
   }
 }
 const json = flag('json');
-if (json) writeFileSync(json, JSON.stringify({ seed, results }, null, 2) + '\n');
+if (json && !MEMBER) writeFileSync(json, JSON.stringify({ seed, results }, null, 2) + '\n');
 process.exitCode = fails.length ? 1 : 0;

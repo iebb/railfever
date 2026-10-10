@@ -366,11 +366,17 @@ function baseLocal(g: Game, st: Station, table: Map<number, Hop>): { local: numb
  * of another company's established service between the same two towns keep riding it.
  */
 const HOLD = 35;
-/** Share of a site's walking residents no other company's service between its town and town `to` holds (HOLD). */
+/**
+ * A service between towns whose riders a coach of `owner` would take rather than add: another company's (one we run no
+ * vehicles on), or a railway of ours (the coach would only move riders off our own trains: ai-network railCopy).
+ */
+const established = (l: Line, owner: number, replacing: number) => l.id !== replacing && l.kind !== 'tram' && l.vehicles.length > 0
+  && (l.kind === 'rail' || (l.owner !== owner && !l.operators?.includes(owner)));
+/** Share of a site's walking residents no established service between its town and town `to` holds (HOLD). */
 function freeFrom(g: Game, owner: number, site: RoadSite, to: number, walk: WalkingCatchment, replacing: number): number {
   const held: Station[] = [];
   for (const l of g.lines.map.values()) {
-    if (l.id === replacing || l.owner === owner || l.kind === 'tram' || l.operators?.includes(owner) || new Set(l.stops).size < 2 || !l.vehicles.length) continue;
+    if (!established(l, owner, replacing) || new Set(l.stops).size < 2) continue;
     let here = false, there = false;
     for (const id of l.stops) { const t = g.stations.get(id)?.townId; if (t === site.townId) here = true; if (t === to) there = true; }
     if (!here || !there) continue;
@@ -388,12 +394,12 @@ function freeFrom(g: Game, owner: number, site: RoadSite, to: number, walk: Walk
 }
 
 /**
- * Whether another company's established service between two towns has stops within HOLD of both sites: riders changing
- * onto a line of ours there to ride between those towns have that service already.
+ * Whether an established service between two towns has stops within HOLD of both sites: riders changing onto a line of
+ * ours there to ride between those towns have that service already.
  */
 function rivalNear(g: Game, owner: number, a: RoadSite, b: RoadSite, replacing: number): boolean {
   for (const l of g.lines.map.values()) {
-    if (l.id === replacing || l.owner === owner || l.kind === 'tram' || l.operators?.includes(owner) || !l.vehicles.length) continue;
+    if (!established(l, owner, replacing)) continue;
     let nearA = false, nearB = false;
     for (const id of l.stops) {
       const st = g.stations.get(id);
@@ -407,9 +413,10 @@ function rivalNear(g: Game, owner: number, a: RoadSite, b: RoadSite, replacing: 
 }
 
 /**
- * A coach route (in two towns or more) whose two ends lie near the stops of one line of another company (within HOLD):
- * a near-duplicate of that service. Its riders between the ends keep riding the established line, and the market for the
- * pair is that line's: a company runs vehicles on it as a partner instead (moreValue) rather than opening a copy.
+ * A coach route (in two towns or more) whose two ends lie near the stops of one established line (within HOLD; another
+ * company's, or a railway of ours): a near-duplicate of that service. Its riders between the ends keep riding the
+ * established line, and the market for the pair is that line's: a company runs vehicles on it as a partner instead
+ * (moreValue) rather than opening a copy.
  */
 function shadowed(g: Game, owner: number, sites: RoadSite[], replacing: number): boolean {
   if (sites.length < 2) return false;
@@ -442,14 +449,14 @@ function pairTrips(g: Game, a: number, b: number): number {
 
 /**
  * The public-transport market between two towns (their trips a year at a coach's 25% capture: AIController.pairMarket)
- * and the riders other companies' services carry between them now (their last month, shared over the town pairs each
- * serves): the share of the market a service of ours can still win. A second coach line between towns another company
- * serves well takes riders from it rather than adding any.
+ * and the riders established services carry between them now (their last month, shared over the town pairs each
+ * serves): the share of the market a service of ours can still win. A second coach line between towns another company,
+ * or a railway of ours, serves well takes riders from it rather than adding any.
  */
 function pairRoom(g: Game, owner: number, a: number, b: number, replacing: number): number {
   let carried = 0;
   for (const l of g.lines.map.values()) {
-    if (l.id === replacing || l.owner === owner || l.operators?.includes(owner) || l.kind === 'tram' || l.stops.length < 2 || !l.vehicles.length) continue;
+    if (!established(l, owner, replacing) || l.stops.length < 2) continue;
     const towns = new Set(l.stops.map((id) => g.stations.get(id)?.townId ?? -1).filter((t) => t >= 0));
     if (!towns.has(a) || !towns.has(b)) continue;
     carried += l.passLast * 12 / Math.max(1, towns.size * (towns.size - 1) / 2);
