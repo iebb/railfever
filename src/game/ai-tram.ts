@@ -4,7 +4,7 @@ import type { Game } from './game';
 import type { Town } from './towns';
 import type { NEdge } from './network';
 import { availableModels, VehicleModel } from './vehicle-types';
-import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize } from './build-ops';
+import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize, type DepotPlan } from './build-ops';
 import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
@@ -286,6 +286,34 @@ export function* tramDepotGen(g: Game, pts: { x: number; z: number; edge: number
     }
   }
   return -1;
+}
+
+/**
+ * The tram depot sites tramDepotGen tries, in its order, that pass its checks before building (their plans). Pure.
+ */
+export function tramDepotSites(g: Game, pts: { x: number; z: number; edge: number; s: number }[], stations: number[], owner: number): DepotPlan[] {
+  const sz = depotSize('tram'), out: DepotPlan[] = [];
+  const at = stations.map((sid) => {
+    const st = g.stations.get(sid), q = st?.stops[0] ?? st;
+    if (!q) return -1;
+    let best = -1, bd = Infinity;
+    pts.forEach((p, i) => { const d = Math.hypot(p.x - q.x, p.z - q.z); if (d < bd) { bd = d; best = i; } });
+    return best;
+  }).filter((i) => i >= 0);
+  const lo = at.length ? Math.min(...at) : 0, hi = at.length ? Math.max(...at) : pts.length - 1;
+  for (const fromEnd of [false, true]) for (let k = 2; k < Math.min(hi - lo - 2, 40); k += 2) {
+    const i = fromEnd ? hi - k : lo + k;
+    const p = pts[i], q = pts[Math.min(pts.length - 1, i + 1)], o = pts[Math.max(0, i - 1)];
+    const tx = q.x - o.x, tz = q.z - o.z, tl = Math.hypot(tx, tz) || 1;
+    for (const side of [1, -1]) {
+      const nx = (-tz / tl) * side, nz = (tx / tl) * side, off = 0.5 + 0.9 + sz.d / 2;
+      const plan = g.depots.plan('tram', p.x + nx * off, p.z + nz * off, Math.atan2(-nx, -nz), owner);
+      if (!plan.ok || plan.demolish.some((id) => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2
+        || roadDepotAtDeadEnd(g, plan, true, owner)) continue;
+      out.push(plan);
+    }
+  }
+  return out;
 }
 
 /** Points every unit along a path of road edges (in path order). */

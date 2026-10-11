@@ -788,8 +788,8 @@ export class Lines {
   }
 
   /**
-   * A road line upgraded to trams (or back): the same line, its stops and waiting passengers, with the number, automatic
-   * name and colour of its new mode. Its vehicles must have left it first (they run one mode).
+   * A road line upgraded to trams or rail (route-works.ts): the same line, its stops and waiting passengers, with the
+   * number, automatic name and colour of its new mode. Its vehicles must have left it first (they run one mode).
    */
   retype(id: number, kind: Transport) {
     const l = this.map.get(id);

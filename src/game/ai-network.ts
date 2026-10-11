@@ -85,6 +85,7 @@ import { distToRect } from './world';
 import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
 import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
 import { hubTask, hubPairs, copyHubCursor, type HubCursor, type HubHost } from './ai-hub';
+import { worksOn } from './route-works';
 
 // ============================================================================ optional primitives (feature-detected)
 
@@ -1639,7 +1640,7 @@ class NetPlanner {
 
   // ================================================================ joining end-to-end services
   private joinAllowed(l: Line): boolean {
-    return l.owner !== 0 && this.agrees(l.owner) && (l.owner === this.me || this.g.lines.partnerPolicy(l) === 'open');
+    return l.owner !== 0 && this.agrees(l.owner) && (l.owner === this.me || this.g.lines.partnerPolicy(l) === 'open') && !worksOn(this.g, l.id);
   }
 
   /**
@@ -2196,10 +2197,12 @@ class NetPlanner {
       if (d === undefined) { this.retire.set(k, g.day + wait); return false; }
       return d <= g.day;
     };
+    // (what route upgrade works of ours have built for the line they switch: route-works.ts)
+    const works = g.routeWorks.filter((w) => w.owner === me), building = new Set(works.flatMap((w) => [...w.built.stations, ...w.built.debits.map((d) => d.station)]));
     for (const st of !item || item.retire === 'all' ? [...g.stations.map.values()] : item.retire === 'stations' ? this.selected(g.stations.map.values(), item.ids) : []) {
       if (st.owner !== me) continue;
       const k = 'st' + st.id;
-      if (this.linesAt(st.id).length) { this.retire.delete(k); continue; }
+      if (this.linesAt(st.id).length || building.has(st.id)) { this.retire.delete(k); continue; }
       // (long unused: after a while; just left by a line: after its grace period)
       if (!due(k, g.day - st.built > 360 && g.day - st.lastPickup > 360 ? 60 : 360)) continue;
       const ends = st.rail ? g.stations.trackEnds(st, true).flatMap((t) => [t.front, t.back]) : [];
@@ -2216,6 +2219,7 @@ class NetPlanner {
     const used = new Set<number>();
     for (const v of g.vehicles.map.values()) { const d = (v as unknown as { depotId?: number }).depotId; if (typeof d === 'number') used.add(d); }
     for (const info of this.managed()?.values() ?? []) used.add(info.depot);
+    for (const w of works) used.add(w.built.depot);
     for (const d of !item || item.retire === 'all' ? [...g.depots.map.values()] : item.retire === 'depots' ? this.selected(g.depots.map.values(), item.ids) : []) {
       const k = 'dp' + d.id;
       if (d.owner !== me || used.has(d.id)) { this.retire.delete(k); continue; }
@@ -4866,8 +4870,11 @@ class NetPlanner {
     for (const a of stopOnly) {
       if (!ids.includes(a.id) || a.owner !== me || !g.stations.get(a.id)) continue;
       if (++k % 8 === 0) yield;
+      // (stops of a line under upgrade works stay as they are until the switch: route-works.ts)
+      const working = (st: Station) => g.routeWorks.length > 0 && this.linesAt(st.id).some((l) => !!worksOn(g, l.id));
+      if (working(a)) continue;
       for (const b of stopOnly) {
-        if (a === b || !g.stations.get(b.id) || !g.stations.get(a.id) || tram(a) !== tram(b)) continue;
+        if (a === b || !g.stations.get(b.id) || !g.stations.get(a.id) || tram(a) !== tram(b) || working(b)) continue;
         let gap = Infinity;
         for (const p of a.stops) for (const q of b.stops) gap = Math.min(gap, Math.hypot(p.x - q.x, p.z - q.z));
         if (gap > 8) continue;
