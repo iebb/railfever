@@ -7,7 +7,7 @@ import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { pickCoach, pickBus, type AIController } from '../src/game/ai';
 import {
-  roadForecast, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townsOnTheWay, planTramUpgrade, buildTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownLine, planExtensions, routeOf, worth, pays,
+  roadForecast, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townsOnTheWay, planTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownLine, planExtensions, routeOf, worth, pays,
   type BusHost, type RoadPlan, type ProjectOption,
 } from '../src/game/ai-bus';
 import type { Town } from '../src/game/towns';
@@ -17,6 +17,7 @@ import { outAndBack } from '../src/game/lines';
 import { fails, check, fmt, depotBehind, connectStations, townPairs, checkReservations, checkNaN, roadDepotNear, Train } from './lib';
 import { findRailPair } from '../src/game/routing';
 import type { Station } from '../src/game/stations';
+import { planRouteUpgrade, startRouteWorks, worksOn } from '../src/game/route-works';
 
 const seed = Number(process.argv[2] ?? 7);
 const drain = <T>(gen: Generator<void, T>): T => { let r = gen.next(); while (!r.done) r = gen.next(); return r.value; };
@@ -292,6 +293,9 @@ function run() {
       if (plan && pays(plan)) {
         const id = busy.id, stops = [...busy.stops], name = busy.name;
         console.log('  ' + build(A, plan));
+        // (staged works: route-works.ts; the buses run until the switch)
+        check(!!worksOn(g, id) && g.lines.get(id)?.kind === 'road', `${name}: tram works under way, still a bus line`);
+        for (let d = 0; d < 200 && worksOn(g, id); d++) days(g, 1);
         const L = g.lines.get(id);
         check(!!L && L.id === id && L.kind === 'tram', `${name} runs trams now (${L?.name})`);
         check(!!L && L.stops.join() === stops.join(), 'the same stops');
@@ -315,12 +319,13 @@ function run() {
           const pl = g.lines.create('road', 0);
           pl.stops = outAndBack(ids);
           g.lines.rebuild();
-          const up = planTramUpgrade(g, pl.id, 0);
-          console.log(`  player's line ${pl.name}: ${up.ok ? `${fmt(up.trackLength * 10, 0)} m of track ${Math.round(up.trackCost / 1000)}k, depot ${Math.round(up.depotCost / 1000)}k, ${up.trams} trams, net ${Math.round(up.cost / 1000)}k` : up.error}`);
+          const up = planRouteUpgrade(g, pl.id, 0, 'tram');
+          console.log(`  player's line ${pl.name}: ${up.ok ? `${fmt(up.trackLength * 10, 0)} m of track ${Math.round(up.track / 1000)}k, depot ${Math.round(up.depot / 1000)}k, ${up.vehicles} trams, net ${Math.round(up.cost / 1000)}k` : up.error}`);
           check(up.ok && up.cost > 0, "the player's bus line has a priced tram upgrade");
           g.economy.money += up.cost + 1_000_000;
-          const err = drain(buildTramUpgrade(g, up, 0));
-          check(!err && g.lines.get(pl.id)?.kind === 'tram' && pl.vehicles.length === up.trams, `the player's line runs trams${err ? ': ' + err : ''}`);
+          const err = startRouteWorks(g, up);
+          for (let d = 0; d < 200 && worksOn(g, pl.id); d++) days(g, 1);
+          check(!err && g.lines.get(pl.id)?.kind === 'tram' && pl.vehicles.length === up.vehicles, `the player's line runs trams${err ? ': ' + err : ''}`);
         }
       }
     }

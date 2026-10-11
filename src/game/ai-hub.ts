@@ -65,7 +65,13 @@ interface Point { x: number; y: number; z: number }
 interface Anchor extends Point { ux: number; uz: number; dist: number }
 /** A site for the new platforms: centre, axis, level, per line its platform track and end (0 back, 1 front), and where its branch leaves. */
 export interface HubOption { x: number; z: number; angle: number; level: StationLevel; length: number; track: number[]; end: number[]; anchors: Anchor[] }
-interface Debit { cost: number; edges: number[]; station: number; refundable: number }
+/**
+ * One unit of staged works as booked (record / recordWorks): what it cost, the edges of ours it left (followed through
+ * splits), a station or depot it built, tram tracks it laid in streets, and how much of it a roll-back refunds.
+ */
+export interface Debit { cost: number; edges: number[]; station: number; refundable: number; depot?: number; tram?: number[] }
+/** The booked units of staged works (hub works, route upgrades: route-works.ts). */
+export interface WorksLedger { spent: number; debits: Debit[] }
 export interface HubCursor {
   stage: 'value' | 'station' | 'branch' | 'throat' | 'switch' | 'remove';
   at: number; identity: string;
@@ -284,38 +290,74 @@ function quote(h: HubHost, lines: Line[], paths: number[][], X: Station[], o: Hu
 
 /** Run an operation, booking what it cost and the edges it left of ours (followed through splits). */
 function record(h: HubHost, b: NonNullable<HubCursor['built']>, operation: () => string | null, irreversible = 0, station = -1): string | null {
-  const net = h.g.world.net, retained = new Set(net.edges.keys()), start = net.nextEdge, eco = h.g.company(h.me).economy, construction = eco.thisYear.construction;
+  return recordWorks(h.g, h.me, b, operation, irreversible, station);
+}
+
+/**
+ * Run a unit of staged works for `owner`, booking what it cost (construction spending), the edges of ours it left
+ * (earlier units' edges followed through the splits it makes), the station it built and what of it a roll-back refunds.
+ */
+export function recordWorks(g: Game, owner: number, b: WorksLedger, operation: () => string | null, irreversible = 0, station = -1): string | null {
+  const net = g.world.net, retained = new Set(net.edges.keys()), start = net.nextEdge, eco = g.company(owner).economy, construction = eco.thisYear.construction;
   const split = (old: { id: number }, a: { id: number }, c: { id: number }) => {
     if (retained.delete(old.id)) { retained.add(a.id); retained.add(c.id); }
-    for (const d of b.debits) { const at = d.edges.indexOf(old.id); if (at >= 0) d.edges.splice(at, 1, a.id, c.id); }
+    for (const d of b.debits) {
+      const at = d.edges.indexOf(old.id); if (at >= 0) d.edges.splice(at, 1, a.id, c.id);
+      const t = d.tram?.indexOf(old.id) ?? -1; if (t >= 0) d.tram!.splice(t, 1, a.id, c.id);
+    }
   };
   net.onSplit.push(split); let error: string | null;
   try { error = operation(); } finally { net.onSplit = net.onSplit.filter((f) => f !== split); }
   const cost = Math.max(0, construction - eco.thisYear.construction), edges: number[] = [];
-  for (let id = start; id < net.nextEdge; id++) if (!retained.has(id) && net.edges.get(id)?.owner === h.me) edges.push(id);
-  b.spent += cost; b.debits.push({ cost, edges, station: station >= 0 && h.g.stations.get(station) ? station : -1, refundable: Math.max(0, cost - irreversible) });
+  for (let id = start; id < net.nextEdge; id++) if (!retained.has(id) && net.edges.get(id)?.owner === owner) edges.push(id);
+  b.spent += cost; b.debits.push({ cost, edges, station: station >= 0 && g.stations.get(station) ? station : -1, refundable: Math.max(0, cost - irreversible) });
   return error;
+}
+
+/** Is a train or vehicle on (or holding) track the works laid? */
+export function worksBusy(g: Game, b: WorksLedger): boolean {
+  return b.debits.some((d) => d.edges.some((id) => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id)));
+}
+
+/**
+ * Take staged works up again, last unit first (depots, track, tram tracks, stations), refunding each unit that could
+ * be taken up whole (its refundable part); what is occupied stays. Returns the refund.
+ */
+export function takeUpWorks(g: Game, owner: number, b: WorksLedger): number {
+  const net = g.world.net;
+  let refund = 0;
+  for (const d of [...b.debits].reverse()) {
+    let whole = true;
+    if (d.depot !== undefined && d.depot >= 0 && g.depots.get(d.depot)?.owner === owner && g.depots.remove(d.depot)) whole = false;
+    const removed = new Set<number>();
+    for (const id of d.edges) { const e = net.edges.get(id); if (e?.owner === owner && e.station < 0 && !g.vehicles.isEdgeBusy(id)) { net.removeEdge(id); removed.add(id); } }
+    for (const id of d.tram ?? []) {
+      const e = net.edges.get(id);
+      if (!e?.tram || e.tramOwner !== owner) continue;
+      if (g.vehicles.isEdgeBusy(id)) { whole = false; continue; }
+      delete e.tram; delete e.tramOwner; net.touchEdge(e);
+    }
+    if (d.station >= 0 && g.stations.get(d.station)?.owner === owner) g.stations.removeStation(d.station);
+    if (whole && d.edges.every((id) => removed.has(id) || !net.edges.has(id)) && (d.station < 0 || !g.stations.get(d.station))
+      && (d.depot === undefined || d.depot < 0 || !g.depots.get(d.depot))) refund += d.refundable;
+  }
+  if (refund) g.company(owner).economy.spend(-refund, 'construction', true);
+  g.onNetworkChanged(); g.lines.rebuild();
+  return refund;
 }
 
 /** Take the works up again before any line uses them (refunding what can be undone); occupied works stay. */
 function undo(h: HubHost, b: NonNullable<HubCursor['built']>, why: string) {
-  const g = h.g, net = g.world.net;
-  let refund = 0;
-  if (b.switched.length || g.lines.all().some((l) => l.stops.includes(b.station)) || b.debits.some((d) => d.edges.some((id) => g.vehicles.isEdgeBusy(id) || g.vehicles.getRes(id)))) {
+  const g = h.g;
+  if (b.switched.length || g.lines.all().some((l) => l.stops.includes(b.station)) || worksBusy(g, b)) {
     h.note(`hub works stopped: ${why}; works retained`); h.considered('hub.retained'); return;
   }
-  for (const d of [...b.debits].reverse()) {
-    const removed = new Set<number>();
-    for (const id of d.edges) { const e = net.edges.get(id); if (e?.owner === h.me && e.station < 0 && !g.vehicles.isEdgeBusy(id)) { net.removeEdge(id); removed.add(id); } }
-    if (d.station >= 0 && g.stations.get(d.station)?.owner === h.me) g.stations.removeStation(d.station);
-    if (d.edges.every((id) => removed.has(id) || !net.edges.has(id)) && (d.station < 0 || !g.stations.get(d.station))) refund += d.refundable;
-  }
-  if (refund) g.company(h.me).economy.spend(-refund, 'construction', true);
-  g.onNetworkChanged(); g.lines.rebuild(); h.note(`hub works given up: ${why}`); h.considered('hub.rollback');
+  takeUpWorks(g, h.me, b);
+  h.note(`hub works given up: ${why}`); h.considered('hub.rollback');
 }
 
 /** Waiting passengers and mail of an old terminus no line serves any more move to the new platforms; so do journeys to it. */
-function handOver(g: Game, X: Station, S: Station) {
+export function handOver(g: Game, X: Station, S: Station) {
   const re = (id: number) => id === X.id ? S.id : id;
   const moved = [...X.waiting.values()];
   X.waiting.clear(); X.waitingTotal = 0;

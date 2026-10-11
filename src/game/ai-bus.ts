@@ -11,7 +11,8 @@
 //  - longer routes: a stop beyond either end or inserted on the way (line-edit.ts), where it reaches residents no stop
 //    serves, a rail station (feeder) or a nearby village, priced as the forecast's gain against the stop, the extra
 //    vehicles that keep the headway and their running costs;
-//  - a busy town bus line becomes a tram line, a busy coach line gives way to a railway, where that pays (below);
+//  - a busy town bus line becomes a tram, light-rail or metro line (staged works: route-works.ts), a busy coach line
+//    gives way to a railway, where that pays (below);
 //  - new lines (town buses, feeders from rail stations, coaches) are quoted with the same forecast, so a copy of an
 //    existing service shares its residents and riders and does not pay, while joining or extending it does: a town bus or
 //    coach market the project choice picks is planned then (roadMarket: the best of a new line, a partner on a line
@@ -35,9 +36,14 @@ import { walkingCatchment, pointWalkingCatchment, walkClaimShares, walkWeight, t
 import { WALK_LINE, TRANSFER_RANGE } from './stations';
 import { consistOf, hopEstimate, estimateVehicleYear, YEAR_S } from './opcosts';
 import { patternHeadways } from './patterns';
-import { addTramTracks, removeTramTracks, roadPath as streetPath } from './build-ops';
-import { pickTram, pathPoints, tramDepotGen } from './ai-tram';
+import { addTramTracks, roadPath as streetPath } from './build-ops';
+import { pickTram } from './ai-tram';
 import { TRAM } from './constants';
+import { MODEL_BY_ID } from './vehicle-types';
+import { cityRailEconomics } from './ai';
+import { handOver } from './ai-hub';
+import { settleMail } from './mail';
+import { planRouteUpgrade, cityRailPlanGen, startRouteWorks, worksOn, upgradeBlock, type UpgradeQuote, type UpgradeLevel } from './route-works';
 
 // ============================================================================ forecast
 
@@ -790,9 +796,9 @@ export interface LineInfo {
 
 /** A road project the planner valued: our yearly receipts and costs from it and what it costs to open. */
 export interface RoadPlan {
-  kind: 'join' | 'extend' | 'line' | 'tram';
-  /** tram: the upgrade the line gets */
-  upgrade?: TramUpgrade;
+  kind: 'join' | 'extend' | 'line' | 'upgrade';
+  /** upgrade: the works the line gets (route-works.ts: trams, light rail or a metro) */
+  works?: UpgradeQuote;
   /** the existing line (join / extend) */
   line?: number;
   /** the new line's stops in route order, or (extend) the stop to add */
@@ -1388,7 +1394,7 @@ export interface ProjectOption { score: number; kind: string; towns: number[]; v
 function joinable(g: Game, me: number): Line[] {
   const out: { l: Line; v: number }[] = [];
   for (const l of g.lines.map.values()) {
-    if (l.kind !== 'road' || l.owner === me || l.owner === PLAYER_ID || l.operators?.includes(me) || !l.vehicles.length) continue;
+    if (l.kind !== 'road' || l.owner === me || l.owner === PLAYER_ID || l.operators?.includes(me) || !l.vehicles.length || worksOn(g, l.id)) continue;
     if (g.lines.partnerPolicy(l) !== 'open' || !routeOf(g, l)) continue;
     if (l.stops.some((id) => { const st = g.stations.get(id); return !st || !g.canUse(me, st.owner); })) continue;
     if (lineAge(g, l) < 30 || l.vehicles.length >= roadFleetCap(g, l)) continue;
@@ -1416,20 +1422,20 @@ export function* roadOptions(h: BusHost, opts: ProjectOption[], avail: number, w
     }
   }
   // a longer route for one of our lines, in turn
-  const own = [...g.lines.map.values()].filter((l) => l.kind === 'road' && l.owner === me && l.vehicles.length && !h.isFailed('roadext' + l.id)).sort((a, b) => a.id - b.id);
+  const own = [...g.lines.map.values()].filter((l) => l.kind === 'road' && l.owner === me && l.vehicles.length && !h.isFailed('roadext' + l.id) && !worksOn(g, l.id)).sort((a, b) => a.id - b.id);
   if (own.length && avail > 200_000) {
     const l = own[Math.floor(g.day / 30) % own.length];
     const plans = (yield* planExtensions(h, l)).filter(pays);
     for (const plan of plans) push(plan, 'busext');
     if (!plans.length) h.markFailed('roadext' + l.id, 180);
   }
-  // a busy town bus line of ours to trams (the busiest by riders a vehicle, one a choice)
+  // a busy town bus line of ours to trams, light rail or a metro (the busiest by riders a vehicle, one a choice)
   if (avail > 1_000_000) {
     const busy = [...g.lines.map.values()].filter((l) => l.kind === 'road' && l.owner === me && l.vehicles.length >= 3 && !h.isFailed('tramup' + l.id)
-      && l.incomeLast > l.costLast && new Set(l.stops.map((id) => g.stations.get(id)?.townId)).size === 1 && new Set(l.stops).size >= 3)
+      && l.incomeLast > l.costLast && new Set(l.stops.map((id) => g.stations.get(id)?.townId)).size === 1 && new Set(l.stops).size >= 3 && !worksOn(g, l.id))
       .sort((a, b) => b.passLast / b.vehicles.length - a.passLast / a.vehicles.length || a.id - b.id)[0];
     if (busy) {
-      const plan = yield* tramUpgradeValue(h, busy);
+      const plan = yield* routeUpgradeValue(h, busy);
       if (plan && pays(plan)) push(plan, 'busrail'); else h.markFailed('tramup' + busy.id, 360);
     }
   }
@@ -1458,7 +1464,7 @@ export function* roadMarket(h: BusHost, kind: 'bus' | 'coach', towns: number[]):
     if (l.kind !== 'road' || !l.vehicles.length || !routeOf(g, l)) return false;
     const t = townsOf(g, l);
     return kind === 'coach' ? t.includes(A.id) && t.includes(B!.id) : t.length === 1 && t[0] === A.id;
-  }).filter((l) => l.owner === me || l.operators?.includes(me) || joinable(g, me).includes(l))
+  }).filter((l) => !worksOn(g, l.id) && (l.owner === me || l.operators?.includes(me) || joinable(g, me).includes(l)))
     .sort((a, b) => b.incomeLast / b.vehicles.length - a.incomeLast / a.vehicles.length || a.id - b.id).slice(0, 2);
   for (const l of serving) { const p = yield* moreValue(h, l); if (p) plans.push(p); }
   if (kind === 'coach') {
@@ -1575,21 +1581,22 @@ export function* roadPlanJob(h: BusHost, plan: RoadPlan): Generator<void, string
     }
     return `${l.owner === me ? 'added a vehicle to' : 'joined'} ${l.name} (${plan.why})`;
   }
-  if (plan.kind === 'tram' && plan.upgrade) {
-    const l = g.lines.get(plan.line ?? -1);
+  if (plan.kind === 'upgrade' && plan.works) {
+    // staged works (route-works.ts): built over the coming weeks while the buses run, then switched
+    const l = g.lines.get(plan.line ?? -1), q = plan.works;
     if (!l || l.id !== plan.line) return fail('tramup' + plan.line, 'line gone');
-    const need = plan.upgrade.trackCost + plan.upgrade.depotCost + plan.upgrade.tramCost;
-    if (need > h.available() + plan.upgrade.resale + 300_000 || !h.borrowFor(need)) return fail('tramup' + l.id, 'no money', 360);
-    const oldName = l.name, built = { depots: [] as number[] };
-    const err = yield* buildTramUpgrade(g, plan.upgrade, me, built);
-    for (const d of built.depots) h.project()?.depots.push(d);
+    const block = upgradeBlock(g, l.id, me);
+    if (block) return fail('tramup' + l.id, block, 360);
+    // (paid as built: the credit for the works and the vehicles arranged now)
+    if (q.cost > h.available() + 300_000 || !h.borrowFor(Math.min(q.cost + q.resale, q.fleet + q.track))) return fail('tramup' + l.id, 'no money', 360);
+    const err = startRouteWorks(g, q);
     if (err) return fail('tramup' + l.id, err, 720);
-    const info = h.managed.get(l.id), dep = l.vehicles.map((id) => (g.vehicles.get(id) as RoadVehicle | undefined)?.depotId).find((d) => d !== undefined);
-    if (info) { info.kind = 'tram'; info.depot = dep ?? info.depot; info.maxVehicles = Math.max(4, l.vehicles.length); }
-    h.stats.trams++;
+    // (one upgrade at a time per line: the works decide; looked at again after they are done)
+    h.markFailed('tramup' + l.id, 720);
     const st = g.stations.get(l.stops[0]);
-    g.postNews(`${g.company(me).name} upgrades ${oldName} to trams (${l.name}).`, 'ai', st?.x, st?.z);
-    return `upgraded ${oldName} to trams as ${l.name} (${plan.why})`;
+    const word = q.mode === 'tram' ? 'trams' : q.mode === 'metro' ? 'a metro' : 'light rail';
+    g.postNews(`${g.company(me).name} starts works on ${l.name}: ${word}.`, 'ai', st?.x, st?.z);
+    return `started works on ${l.name}: ${word}, ${Math.round(q.cost / 1000)}k over ${q.days} days (${plan.why})`;
   }
   if (plan.kind === 'extend') {
     const l = g.lines.get(plan.line ?? -1), s = plan.sites[0];
@@ -1663,13 +1670,14 @@ export function* roadPlanJob(h: BusHost, plan: RoadPlan): Generator<void, string
   return `opened ${g.lines.get(id)?.name ?? line.name} (${ids.length} stops, ${bought} vehicles; ${plan.why})`;
 }
 
-// ============================================================================ a bus line upgraded to trams
+// ============================================================================ a bus line upgraded to trams, light rail or a metro
 /**
  * A town bus line becomes a tram line where its riders pay for it: tram tracks laid in the streets it runs on, stop to
  * stop, so its stops (and their station complexes) become tram stops; the same line (its stops, its waiting passengers,
  * a tram number and name: Lines.retype) runs trams from a tram depot; the buses are sold. Trams seat more and charge the
- * tram fare, so a full bus line gains riders it loses today and receipts per rider. The AI quotes it by the forecast
- * against the buses' earnings (tramUpgradeValue); players use the line window (planTramUpgrade / buildTramUpgrade).
+ * tram fare, so a full bus line gains riders it loses today and receipts per rider. Built as staged works
+ * (route-works.ts), as are light rail and a metro along the line (cityRailUpgradeValue); the AI quotes each by the
+ * forecast against the buses' earnings (routeUpgradeValue); players plan them in the line window.
  */
 export interface TramUpgrade {
   ok: boolean; error?: string;
@@ -1745,37 +1753,6 @@ export function planTramUpgrade(g: Game, lineId: number, owner: number, trams?: 
 }
 
 /**
- * Build a tram upgrade: the tracks, a depot when the route has none of ours, the line moved over to trams (Lines.retype)
- * and the buses sold. Returns null when done, else why not (tracks laid by it are taken up again). `built`: stations and
- * depots it builds (an AI project's record).
- */
-export function* buildTramUpgrade(g: Game, plan: TramUpgrade, owner: number, built?: { depots: number[] }): Generator<void, string | null> {
-  const check = planTramUpgrade(g, plan.line, owner, plan.trams);
-  if (!check.ok || !check.model) return check.error ?? 'Not possible';
-  const e = g.company(owner).economy, need = check.trackCost + check.depotCost + check.tramCost;
-  if (e.money < need) return 'Not enough money';
-  const laid = addTramTracks(g, check.fresh, owner);
-  if (laid.error && laid.changed === 0 && check.fresh.length) return laid.error;
-  yield;
-  const l = g.lines.get(plan.line)!, stations = [...new Set(l.stops)];
-  let dep = -1;
-  for (const d of g.depots.map.values()) if (d.owner === owner && d.kind === 'tram' && roadDepotReaches(g, d, stations[0])) { dep = d.id; break; }
-  if (dep < 0) {
-    dep = yield* tramDepotGen(g, pathPoints(g, check.edges), stations, owner);
-    if (dep >= 0) built?.depots.push(dep);
-  }
-  if (dep < 0 || !stations.every((sid) => roadDepotReaches(g, g.depots.get(dep)!, sid))) {
-    removeTramTracks(g, check.fresh.filter((id) => g.world.net.edges.get(id)?.tramOwner === owner), owner);
-    return 'No tram depot site on the route';
-  }
-  for (const v of fleetOf(g, l, owner).vehicles) g.vehicles.sell(v.id);
-  g.lines.retype(l.id, 'tram');
-  let bought = 0;
-  for (let i = 0; i < check.trams; i++) { if (typeof g.vehicles.buyRoad(dep, check.model, l.id) !== 'string') bought++; yield; }
-  return bought ? null : 'Could not buy trams';
-}
-
-/**
  * The tram upgrade of one of our town bus lines as a project: the trams' forecast (more seats, the tram fare) against
  * the buses' (both calibrated by the line's receipts), the tracks', depot's and trams' costs and upkeep against the
  * buses' running costs and resale. Null when the line cannot take trams.
@@ -1790,6 +1767,8 @@ export function* tramUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan
   const [before] = yield* busCityForecast(g, me, sites, { model: buses.model, vehicles: buses.vehicles.length, loop: route.loop }, undefined, l.id);
   const cal = calibration(l, before, lineAge(g, l));
   const busYear = buses.vehicles.length * runningCost(g, buses.model, before.hop);
+  const quote = planRouteUpgrade(g, l.id, me, 'tram');
+  if (!quote.ok) return null;
   let best: RoadPlan | null = null;
   const fleets = [base.trams, base.trams + 1];
   const fs = yield* busCityForecast(g, me, sites, { model: base.model, vehicles: base.trams, loop: route.loop }, fleets, l.id);
@@ -1798,14 +1777,78 @@ export function* tramUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan
     const f = fs[m];
     const gain = worth(f, cal) - worth(before, cal);
     // trams' running, the tracks' and depot's upkeep and capital (tracks written off over 30 years), less the buses'
-    const fixed = up.trackCost + up.depotCost;
+    const fixed = up.trackCost + quote.depot;
     const yearly = n * runningCost(g, base.model, f.hop) - busYear + up.trackLength * TRAM.maintPerUnit + (up.depot >= 0 ? 0 : 9000)
       + capital(g, me, n * base.model.cost) + fixed * (1 / 30 + (g.company(me).economy.interestRate ?? 0.05));
-    const plan: RoadPlan = { kind: 'tram', line: l.id, sites: [], model: base.model, vehicles: n, towns: [...new Set(sites.map((x) => x.townId))].filter((t) => t >= 0),
-      revenue: gain, yearly, outlay: Math.max(1, up.cost), upgrade: up,
-      why: `${l.name} to trams: +${Math.round(gain / 1000)}k/year against ${Math.round(yearly / 1000)}k, ${n} trams, ${Math.round(up.cost / 1000)}k` };
+    const works: UpgradeQuote = { ...quote, vehicles: n, fleet: up.tramCost, cost: quote.cost - quote.fleet + up.tramCost };
+    const plan: RoadPlan = { kind: 'upgrade', line: l.id, sites: [], model: base.model, vehicles: n, towns: [...new Set(sites.map((x) => x.townId))].filter((t) => t >= 0),
+      revenue: gain, yearly, outlay: Math.max(1, works.cost), works,
+      why: `${l.name} to trams: +${Math.round(gain / 1000)}k/year against ${Math.round(yearly / 1000)}k, ${n} trams, ${Math.round(works.cost / 1000)}k` };
     if (!best || plan.revenue - plan.yearly > best.revenue - best.yearly) best = plan;
   }
+  return best;
+}
+
+/** Diagnostics (tests): the city-rail valuation's numbers. */
+export const railUpgradeProbe: { log?: (s: string) => void } = {};
+/**
+ * Light rail (on the ground or a viaduct) or a metro along one of our town bus lines (route-works.ts plans its stations at
+ * or beside the stops: the city-rail planner's sites, half the walking reach in town), quoted as the city-rail planner
+ * quotes a city railway (ai.ts cityRailEconomics: its forecast with the bus line's riders free to move over, its works,
+ * fleet, running and upkeep) against what the buses are seen to earn (their forecast calibrated by the line's receipts),
+ * their running costs and the stops that go: the gain must repay the works (over 30 years) and the trains' capital.
+ * Null when it cannot be built.
+ */
+export function* cityRailUpgradeValue(h: BusHost, l: Line, mode: 'lightrail' | 'metro', level: UpgradeLevel): Generator<void, RoadPlan | null> {
+  const g = h.g, me = h.me, route = routeOf(g, l);
+  if (!route) return null;
+  const r = yield* cityRailPlanGen(g, l.id, me, mode, level);
+  const unit = MODEL_BY_ID.get(r.quote.cars[0] ?? '');
+  if (!r.quote.ok || !unit || !r.quote.yard) return null;
+  const buses = fleetOf(g, l, me);
+  if (!buses.model || !buses.vehicles.length) return null;
+  const sites = route.path.map((id) => siteOf(g.stations.get(id)!));
+  const [before] = yield* busCityForecast(g, me, sites, { model: buses.model, vehicles: buses.vehicles.length, loop: route.loop }, undefined, l.id);
+  const cal = calibration(l, before, lineAge(g, l));
+  const busYear = buses.vehicles.length * runningCost(g, buses.model, before.hop);
+  const e = cityRailEconomics(g, me, h.available(), r.plans, mode, level, [unit], 2, r.links, r.quote.yard.cost, r.quote.yard.length, l.id);
+  yield;
+  // (the city-rail planner's own forecast, as it opens a city railway; the buses at what they are seen to earn)
+  const gain = e.forecast.revenue - worth(before, cal);
+  if (railUpgradeProbe.log) railUpgradeProbe.log(`${mode} ${level}: rail ${Math.round(e.forecast.revenue / 1000)}k (${Math.round(e.forecast.boardings)} boardings, ${Math.round(e.forecast.covered)} covered), buses ${Math.round(worth(before, cal) / 1000)}k (cal ${cal.toFixed(2)}, seen ${Math.round(l.incomeLast / 1000)}k last year)`);
+  // the trains' running, the stations', track's and depot's upkeep, the works' capital (30 years) and the trains',
+  // less the buses' running and the upkeep of the stops that go
+  const works = e.total - e.fleetCost, rate = g.company(me).economy.interestRate ?? 0.05;
+  const removed = [...new Set(l.stops)].filter((id) => g.lines.linesAt(id).every((x) => x.id === l.id)).length;
+  const yearly = e.yearly - busYear - removed * STOP_UPKEEP + capital(g, me, e.fleetCost) + works * (1 / 30 + rate);
+  const q: UpgradeQuote = { ...r.quote, vehicles: e.fleet, fleet: e.fleetCost, track: works - r.quote.stations - r.quote.depot };
+  q.cost = q.track + q.stations + q.depot + q.fleet - q.resale;
+  const word = mode === 'metro' ? 'a metro' : `light rail (${level})`;
+  return { kind: 'upgrade', line: l.id, sites: [], model: unit, vehicles: e.fleet, towns: [...new Set(sites.map((x) => x.townId))].filter((t) => t >= 0),
+    revenue: gain, yearly, outlay: Math.max(1, q.cost), works: q,
+    why: `${l.name} to ${word}: +${Math.round(gain / 1000)}k/year against ${Math.round(yearly / 1000)}k, ${q.sites!.length} stations, ${e.fleet} trains, ${Math.round(q.cost / 1000)}k` };
+}
+
+/**
+ * The upgrade of a busy town bus line of ours that earns most over keeping its buses: trams, light rail on a viaduct or
+ * on the ground, or a metro, each by its forecast against its costs (incentives: no mode is preferred). The best that
+ * pays, else the best (the caller marks the line), or null when none can be built.
+ */
+export function* routeUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan | null> {
+  const plans: RoadPlan[] = [];
+  const tram = yield* tramUpgradeValue(h, l);
+  if (tram) plans.push(tram);
+  // (city railways are planned station by station: a line where none pays is looked at again in a year)
+  if (!h.isFailed('railup' + l.id)) {
+    let paid = false;
+    for (const [mode, level] of [['lightrail', 'elevated'], ['lightrail', 'ground'], ['metro', 'underground']] as const) {
+      const p = yield* cityRailUpgradeValue(h, l, mode, level);
+      if (p) { plans.push(p); paid ||= pays(p); }
+    }
+    if (!paid) h.markFailed('railup' + l.id, 360);
+  }
+  let best: RoadPlan | null = null;
+  for (const p of plans) if (!best || Number(pays(p)) - Number(pays(best)) > 0 || (pays(p) === pays(best) && p.revenue - p.yearly > best.revenue - best.yearly)) best = p;
   return best;
 }
 
@@ -1835,7 +1878,7 @@ export function coachUpgrades(h: BusHost): Map<string, { line: number; profit: n
  * A coach line of ours whose towns a railway of ours now links, station in each town: its stops join the stations'
  * complexes where the walk allows (Stations.link), and once every stop is in one (or within HOLD of a station), the
  * railway takes its riders: the coaches are withdrawn (sold), the railway keeps the line's name (a custom one) and
- * colour. Monthly (ai.ts manage); returns the lines retired.
+ * colour; the coach stops no line serves any more are taken up. Monthly (ai.ts manage); returns the lines retired.
  */
 export function retireToRail(h: BusHost): number {
   const g = h.g, me = h.me;
@@ -1862,9 +1905,19 @@ export function retireToRail(h: BusHost): number {
     if (!l.autoName && rail.autoName) g.lines.rename(rail.id, l.name);
     if (rail.autoColor) g.lines.setColor(rail.id, l.color);
     for (const v of fleetOf(g, l, me).vehicles) g.vehicles.sell(v.id);
-    const name = l.name;
+    const name = l.name, olds = [...new Set(l.stops)];
     g.lines.delete(l.id);
     h.managed.delete(l.id);
+    // the coach stops no line serves any more go (their waiting passengers and mail to the town's station)
+    for (const sid of olds) {
+      const X = g.stations.get(sid);
+      if (!X || X.owner !== me || X.rail || g.lines.all().some((x) => x.stops.includes(sid))) continue;
+      const S = stations.filter((r) => r.townId === X.townId).sort((a, b) => Number(!g.stations.complex(sid).includes(b.id)) - Number(!g.stations.complex(sid).includes(a.id))
+        || Math.hypot(a.x - X.x, a.z - X.z) - Math.hypot(b.x - X.x, b.z - X.z))[0];
+      const deliveries = S ? handOver(g, X, S) : [];
+      g.stations.removeStation(sid);
+      for (const d of deliveries) settleMail(g, d.st, d.count, d.j, null);
+    }
     h.note(`${name}: riders move to ${rail.name}, coaches withdrawn`);
     const st = g.stations.get(rail.stops[0]);
     g.postNews(`${g.company(me).name} replaces ${name} by ${rail.name}.`, 'ai', st?.x, st?.z);

@@ -24,6 +24,7 @@ import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 import { observeRailCapacity } from './ai-capacity';
 import { capacityRouteBetween } from './rail-capacity-routes';
+import { stepRouteWorks, type RouteWorks } from './route-works';
 import { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP, accessChargeEstimate, accessFullCost, accessReplacementCost, accessItemKey, migrateAccessMultiplier, type AccessItem } from './access-cost';
 export { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP } from './access-cost';
 
@@ -183,6 +184,8 @@ export class Game {
   networkVersion = 0;
   /** In-progress deterministic wait-graph work, included in saves. */
   deadlockScan: DeadlockScan | null = null;
+  /** Route upgrades under way (route-works.ts: a bus or coach line becoming a tram, light-rail, metro or railway line), saved. */
+  routeWorks: RouteWorks[] = [];
   private networkDirty = false;
   private lostSince = new Map<number, number>();
   /** day each congested player line was last reported */
@@ -959,6 +962,8 @@ export class Game {
 
   private onNewDay() {
     this.checkLost();
+    // route upgrades under way: one step each (construct, switch, remove)
+    if (this.routeWorks.length) stepRouteWorks(this);
     this.demand.daily();
     this.stations.daily();
     if (this.accessRequests.length) this.expireRequests();
