@@ -2391,10 +2391,12 @@ export class AIController {
     if (p.kind === 'tram') { this.tram?.cleanup(); return; }
     // A usable railway survives interruption before its first train is bought; registering a two-stop draft
     // alone does not complete it. Otherwise a failed depot search leaves an empty line attracting upgrades.
+    // A timetable on another company's railway (a share) is no railway of ours: given up before its first train, it
+    // goes with its depot siding and the access agreement it made.
     const live = p.line >= 0 ? g.lines.get(p.line) : undefined;
     const stops = live ? [...new Set(live.stops)] : [];
     const depots = [this.lines.get(live?.id ?? -1)?.depot ?? -1, ...p.depots];
-    const ready = stops.length >= 2 && depots.some(id => {
+    const ready = p.kind !== 'share' && stops.length >= 2 && depots.some(id => {
       const depot = g.depots.get(id);
       return !!depot && depotServes(g, depot, stops[0], stops[1]) >= 0;
     });
@@ -2419,7 +2421,7 @@ export class AIController {
     }
     for (const s of p.stations) { const st = g.stations.get(s); if (st && st.owner === this.companyId) g.stations.removeStation(s); }
     p.edges = []; p.stations = []; p.depots = [];
-    if (p.access !== undefined && p.access >= 0) { g.cancelAccessRequest(this.companyId, p.access); this.endUnusedAccess(p.access); p.access = -1; }
+    if (p.access !== undefined && p.access >= 0) { g.cancelAccessRequest(this.companyId, p.access); this.endUnusedAccess(p.access, p.started); p.access = -1; }
   }
 
   /** Record edges created since `fromId` (owned by this company) in the current project. */
@@ -4141,7 +4143,17 @@ export class AIController {
     const stA = g.stations.get(a), stB = g.stations.get(b);
     const oName = g.company(owner).name;
     const key = 'share' + owner + ':' + this.pairKey(a, b);
-    const fail = (why: string, days = 1500) => { this.note(`trains on ${oName}'s railway abandoned: ${why}`); this.markFailed(key, days); this.abandon(p); };
+    // (the depot works this job paid: a share given up is rolled back as one transaction, its depot and siding taken
+    // up again and refunded with their removal, as a failed railway's works are)
+    let works = 0;
+    const build = (f: () => number) => { const w = this.eco.netWorth, id = f(); works += w - this.eco.netWorth; return id; };
+    const fail = (why: string, days = 1500) => {
+      this.note(`trains on ${oName}'s railway abandoned: ${why}`); this.markFailed(key, days);
+      const w = this.eco.netWorth;
+      this.abandon(p);
+      const spent = works + w - this.eco.netWorth;
+      if (spent > 0 && !(p.line >= 0 && g.lines.get(p.line))) this.eco.spend(-spent, 'construction', true);
+    };
     if (!stA || !stB || !stA.rail || !stB.rail) return fail('stations gone');
     this.state.phase = `negotiating track access with ${oName}`;
     if (!g.hasAccess(me, owner)) {
@@ -4182,7 +4194,7 @@ export class AIController {
           for (let s = 3; s <= e.len - 3; s += 4) { if (net.sectionAt(e, s) !== 'ground') continue; net.pointAt(e, s, q); const d = Math.hypot(q.x - st.x, q.z - st.z); if (d > 16) cands.push({ id: e.id, s, d }); }
         }
         cands.sort((a, b) => a.d - b.d || a.id - b.id);
-        for (const c of cands.slice(0, 16)) { if (!net.edges.has(c.id)) continue; yield; dep = buildDepotOnLine(g, c.id, c.s, me); this.track(e0); if (dep >= 0) break; }
+        for (const c of cands.slice(0, 16)) { if (!net.edges.has(c.id)) continue; yield; dep = build(() => buildDepotOnLine(g, c.id, c.s, me)); this.track(e0); if (dep >= 0) break; }
         yield;
       }
     }
@@ -4195,7 +4207,7 @@ export class AIController {
         for (const c of sidingSpots(g, route, st.x, st.z, owner, Infinity, 16, ['ground', 'bridge', 'tunnel']).slice(0, 16)) {
           if (!net.edges.has(c.id)) continue;
           yield;
-          dep = buildSideDepot(g, c.id, c.s, me);
+          dep = build(() => buildSideDepot(g, c.id, c.s, me));
           this.track(e0);
           if (dep >= 0) break;
         }
@@ -4264,13 +4276,17 @@ export class AIController {
     if (ids.length) removeEdges(g, ids, me);
   }
 
-  /** End access agreements as user that no line of ours relies on any more. */
-  private endUnusedAccess(only = -1) {
-    const g = this.game, me = this.companyId;
+  /**
+   * End access agreements as user that no line of ours relies on any more. `since`: an agreement made on that day or
+   * later (by a job given up) ends on an open network too, when no train of ours has run on that network yet.
+   */
+  private endUnusedAccess(only = -1, since?: number) {
+    const g = this.game, me = this.companyId, net = g.world.net;
     for (const a of [...g.access]) {
       if (a.user !== me || (only >= 0 && a.owner !== only)) continue;
       // an open network: the agreement only books the fees of whatever we use (trains may pass through)
-      if (g.accessPolicy(a.owner) === 'open') continue;
+      if (g.accessPolicy(a.owner) === 'open' && (since === undefined || a.since < since || a.paidTotal > 0 || a.usageShareLastMonth > 0
+        || g.vehicles.trains().some((t) => t.owner === me && t.segs.some((q) => net.edges.get(q.e)?.owner === a.owner)))) continue;
       let used = false;
       for (const l of g.lines.map.values()) {
         if (l.owner !== me) continue;
@@ -5955,8 +5971,21 @@ export class AIController {
         const platform = Math.min(...sts.map((x) => x.rail!.length), 99), span = sts.reduce((m, x) => Math.max(m, Math.hypot(x.x - sts[0].x, x.z - sts[0].z)), 0);
         const unit = info.urban ? this.urbanUnit(info.urban, platform) : null;
         const cars = info.urban ? (unit ? [unit] : null) : pickTrain(g.year, platform, span * 1.3, 2);
-        const cost = cars ? cars.reduce((a, c) => a + c.cost, 0) : Infinity;
-        if (cars && sharedTrainAllowed(g, l, this.companyId, cars) && this.available() > cost + 300_000 && this.borrowFor(cost)) {
+        const cost = cars ? cars.reduce((a, c) => a + c.cost, 0) : Infinity, allowed = !!cars && sharedTrainAllowed(g, l, this.companyId, cars);
+        // A line without a train of ours for half a year whose first train the shared plan still refuses (a share or a
+        // through service given up as unprofitable and kept, as 2.10 did, or one whose trains were all withdrawn): we
+        // close it (leave another's), its depot siding goes and an agreement nothing uses ends; stations and track
+        // nobody uses any more are the decommissioning review's, after its grace period.
+        const foreign = info.joined || l.owner !== this.companyId;
+        if (cars && !allowed && (foreign || !l.vehicles.length) && g.day - Math.max(info.opened, info.lastSold ?? -1e9) > 180) {
+          if (foreign) g.lines.leave(lid, this.companyId); else g.lines.delete(lid);
+          this.lines.delete(lid);
+          this.removeDepotBranch(info.depot);
+          for (const o of new Set(sts.map((x) => x.owner))) if (o !== this.companyId) this.endUnusedAccess(o, -Infinity);
+          this.note(`closed ${l.name}: no train of ours pays on it`);
+          continue;
+        }
+        if (allowed && this.available() > cost + 300_000 && this.borrowFor(cost)) {
           const t = g.vehicles.buyTrain(info.depot, cars, lid);
           if (typeof t !== 'string') {
             const call = openingRailCall(g, t);

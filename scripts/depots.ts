@@ -6,6 +6,12 @@
 //   legacy   an older line's depot straight on beyond its terminus moves beside the line (cheap and safe), a train
 //            inside it with it, and the game replays exactly across the move
 //   extend   an older line's yard beyond its terminus moves beside the line when the line runs on
+//   cramped  the same in a grid whose streets run close along the line (no siding fits near it): never a yard at the new
+//            terminus; a tail's yard stays, a lead's depot moves to a siding off the new track, or the trains to a depot
+//            of ours that already serves the line
+//   demolish a siding beside a line lined with houses takes a building or two down, as quoted
+//   dropped  a share given up as unprofitable leaves no line, depot, siding or agreement behind, refunded; a share
+//            line left empty by an older version closes, with its depot and agreement
 //   ai       natural AI games (--seeds=7,11,23 --years=4): no AI depot on the way on beyond any line's terminus, every
 //            line served from its depot, road depots beside streets; a save replays exactly
 // Bundle into the scratch directory as depots.mjs and run node depots.mjs [section ...] [--seeds=..] [--years=..].
@@ -17,7 +23,7 @@ import type { Station } from '../src/game/stations';
 import type { Town } from '../src/game/towns';
 import { bezLine } from '../src/game/geom';
 import type { Line } from '../src/game/lines';
-import { stationEnds, nodeSnap, depotAtEnd } from '../src/game/routing';
+import { stationEnds, nodeSnap, depotAtEnd, buildDepotOnLine } from '../src/game/routing';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { finishDoubleTrack, connectStationThroat } from '../src/game/trackops';
 import { autoSignalLine } from '../src/game/signals';
@@ -28,7 +34,7 @@ import { serialize, deserialize } from '../src/game/save';
 import { depotSize } from '../src/game/build-ops';
 import { terminusOf, outerEnd } from '../src/game/ai-grow';
 import { scheduleNetworkTask, networkPlanner } from '../src/game/ai-network';
-import { buildDepotBeside, endDepots } from '../src/game/depot-sites';
+import { buildDepotBeside, quoteDepotBeside, endDepots } from '../src/game/depot-sites';
 import { onwardEnd, terminalEnd, inOnward, rectPoints } from '../src/game/onward';
 import { flat, newTown, district, cityLine, runDays, linePath, stat } from './linegrow-fixtures';
 import { check, fails, fmt, checkReservations } from './lib';
@@ -297,6 +303,125 @@ if (run('extend')) {
   check(!endDepotsOf(g, () => true).length, `extend: no depot on the way on (${endDepotsOf(g, () => true).join('; ')})`);
   const seen = calls(g, line, 300);
   check(after.every((sid) => seen.has(sid)), `extend: trains from the moved depot serve every station (${seen.size}/${after.length})`);
+}
+
+// ------------------------------------------------------------------------------------------------ a yard in a cramped grid
+if (run('cramped')) {
+  console.log('cramped: streets close along the line leave no siding near it; the line runs on, never with a yard at its new end');
+  // (the extend scenario's Presholm with a street 2.8 units either side of the track between the stations, also where
+  // the line will run on: only the stations' surroundings stay open)
+  const cases = [{ name: 'tail yard', yard: 'tail' as const, spare: false }, { name: 'lead', yard: 'old' as const, spare: false },
+    { name: 'tail yard, another depot', yard: 'tail' as const, spare: true }];
+  for (const c of cases) {
+    const { g, ai, me } = flat();
+    const t = newTown(g, 'Presholm', 220, 256);
+    cityDistrict(g, t, 150, 270, 256, 32, 7000);
+    const { line, sts, depot } = cityLine(g, me, [158, 183, 208, 233, 258], 256, 'east', c.yard, 6);
+    let spare = -1;
+    if (c.spare) {
+      const plain = [...g.world.net.edges.values()].filter((e) => e.kind === 'rail' && e.station < 0 && e.depot < 0).map((e) => e.id);
+      spare = buildDepotBeside(g, plain, 195, 256, me, linePath(line), { tries: 12 });
+    }
+    runDays(g, 30);
+    cityDistrict(g, t, 270, 342, 256, 32, 4500);
+    const cuts = [150, ...[158, 183, 208, 233, 258, 297, 332].flatMap((x) => [x - 6, x + 6]), 345];
+    for (let i = 0; i + 1 < cuts.length; i += 2) for (const z of [253.2, 258.8]) road(g, cuts[i], z, cuts[i + 1], z);
+    runDays(g, 5);
+    const east = sts[sts.length - 1], before = linePath(line), depots0 = [...g.depots.map.keys()];
+    const construction0 = g.company(me).economy.thisYear.construction;
+    g.aiEnabled = true;
+    scheduleNetworkTask(ai, 'extend', 0);
+    for (let d = 0; d < 300 && !stat(ai, 'netExtended'); d++) runDays(g, 1);
+    for (let d = 0; d < 30 && networkPlanner(ai)?.task === 'extend'; d++) runDays(g, 1);
+    g.aiEnabled = false;
+    const after = linePath(line), homes = new Set(line.vehicles.map((id) => (g.vehicles.get(id) as Train).depotId)), home = [...homes][0];
+    const built = [...g.depots.map.keys()].filter((id) => !depots0.includes(id));
+    console.log(`  ${c.name}: ${ai.log.slice(-2).join(' | ')}`);
+    console.log(`    depots ${[...g.depots.map.values()].map((d) => `${d.id}@${fmt(d.x)},${fmt(d.z)}`).join(' ')}; trains at home in ${[...homes].join(',')}; construction ${fmt((g.company(me).economy.thisYear.construction - construction0) / 1000, 0)}k`);
+    check(after.length > before.length && after.indexOf(east.id) > 0 && after.indexOf(east.id) < after.length - 1, `${c.name}: the line runs on beyond ${east.name} (${before.length} -> ${after.length})`);
+    check(!endDepotsOf(g, () => true).length, `${c.name}: no depot at either end of the line (${endDepotsOf(g, () => true).join('; ')})`);
+    check(homes.size === 1 && !!g.depots.get(home), `${c.name}: every train has one home depot`);
+    if (c.spare) check(home === spare && !g.depots.get(depot) && !built.length, `${c.name}: the trains move to the depot of ours that already serves the line; nothing new is built`);
+    else if (c.yard === 'tail') check(home === depot && !built.length, `${c.name}: the yard at the old terminus stays (no siding fits anywhere; nothing new is built)`);
+    else check(!g.depots.get(depot) && built.length === 1 && home === built[0], `${c.name}: the depot moves to a siding off the new track`);
+    const seen = calls(g, line, 240);
+    check(after.every((sid) => seen.has(sid)), `${c.name}: trains from their depot serve every station (${seen.size}/${after.length})`);
+    check(!checkReservations(g).length, `${c.name}: reservations consistent`);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ a siding through houses
+if (run('demolish')) {
+  console.log('demolish: houses along the whole line; a siding beside it takes a building or two down, as quoted');
+  const { g, me, sts, line } = plainLine('ground');
+  const net = g.world.net, t = newTown(g, 'Rowhouse', 208, 256);
+  // (a row of houses 3 units either side of the track, one every 4.8 units: a depot fits between none of them)
+  for (let x = 150, n = 0; x <= 266; x += 4.8) for (const z of [253, 259]) {
+    if (net.nearestEdge(x, z, 1.3, 'rail') || sts.some((st) => Math.abs(st.x - x) < 8)) continue;
+    const b = g.world.addBuilding({ townId: t.id, x, z, angle: 0, w: 1.4, d: 1.0, type: 1, floors: 2, pop: 40, seed: 700 + n++, y: 4, built: 0 });
+    t.buildings.add(b.id); t.pop += b.pop;
+  }
+  const edges = [...net.edges.values()].filter((e) => e.kind === 'rail' && e.station < 0 && e.depot < 0).map((e) => e.id);
+  const houses = () => [...t.buildings].filter((id) => g.world.buildings.has(id)).length, n0 = houses();
+  const ok = (ids: number[]) => ids.length <= 2 && ids.reduce((p, id) => p + (g.world.buildings.get(id)?.pop ?? 0), 0) <= 90;
+  check(!quoteDepotBeside(g, edges, 208, 256, me, line.stops, { tries: 40 }), 'demolish: no siding fits without taking a house down (a house has 40 residents)');
+  const q = quoteDepotBeside(g, edges, 208, 256, me, line.stops, { tries: 40, maxPop: 90, demolitionOk: ok });
+  check(!!q && q.demolish.length >= 1 && q.demolish.length <= 2, `demolish: the quote takes ${q?.demolish.length ?? 0} house(s) down`);
+  let site: number[] = [];
+  const dep = buildDepotBeside(g, edges, 208, 256, me, line.stops, { tries: 40, maxPop: 90, demolitionOk: ok, onSite: (s) => { site = s.demolish; } });
+  const d = g.depots.get(dep);
+  console.log(`  depot ${dep} ${d ? `at ${fmt(d.x)},${fmt(d.z)}` : '-'}; houses ${n0} -> ${houses()} (quoted ${q?.demolish.join(',')}, built ${site.join(',')})`);
+  check(!!d && JSON.stringify(site) === JSON.stringify(q?.demolish) && houses() === n0 - site.length && site.every((id) => !g.world.buildings.has(id)),
+    'demolish: the depot is built at the quoted siding, taking down exactly the quoted houses');
+  check(!!d && depotServes(g, d, sts[0].id, sts[1].id) >= 0, 'demolish: trains from the depot serve the line');
+  check(!endDepotsOf(g, () => true).length, 'demolish: no depot at either end of the line');
+}
+
+// ------------------------------------------------------------------------------------------------ a share given up
+if (run('dropped')) {
+  console.log('dropped: a share given up as unprofitable leaves nothing behind; an empty share line from 2.10 closes');
+  for (const policy of ['open', 'auto-approve'] as const) {
+    const { g } = flat(2);
+    const [owner, user] = [g.ais[0].companyId, g.ais[1].companyId], ai = g.ais[1];
+    g.setAccessPolicy(owner, policy);
+    const net = g.world.net, st: Station[] = [];
+    for (const x of [158, 258]) {
+      const id = g.stations.nextId, p = g.stations.planRail(x, 256, Math.PI / 2, 12, 2, owner, { trackType: 'standard', style: 'none' });
+      const err = p.ok ? g.stations.commitRail(p, owner) : p.error;
+      if (err) throw new Error(`station ${x}: ${err}`);
+      st.push(g.stations.get(id)!);
+    }
+    const pj = planEdge(g, nodeSnap(g, stationEnds(g, st[0])[0].front, 'rail'), nodeSnap(g, stationEnds(g, st[1])[0].back, 'rail'),
+      { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+    if (!pj.ok || commitProposal(g, pj)) throw new Error('track: ' + pj.errors[0]);
+    const eco = g.company(user).economy;
+    const assets = () => ({ lines: g.lines.all().filter((l) => l.owner === user || l.operators?.includes(user)).length,
+      depots: [...g.depots.map.values()].filter((d) => d.owner === user).length,
+      rail: [...net.edges.values()].filter((e) => e.kind === 'rail' && e.owner === user).length, agreement: !!g.agreement(user, owner) });
+    const before = JSON.stringify(assets()), works0 = eco.thisYear.construction;
+    // (a map without towns: no train of the share pays, so the shared plan refuses its first one)
+    check(ai.startShare(owner, st[0].id, st[1].id), `${policy}: the share starts`);
+    let depotSeen = false;
+    g.aiEnabled = true;
+    for (let i = 0; i < 40 * 60 && ai.busy; i++) { g.stepTick(); depotSeen ||= assets().depots > 0; }
+    g.aiEnabled = false;
+    console.log(`  ${policy}: ${ai.log.slice(-2).join(' | ')}; assets ${JSON.stringify(assets())}; construction ${fmt(eco.thisYear.construction - works0, 0)}`);
+    check(depotSeen && ai.log.some((s) => s.includes('shared paths would lose money')), `${policy}: the share built its depot, then was given up as unprofitable`);
+    check(JSON.stringify(assets()) === before, `${policy}: no line, depot, siding or agreement is left (${JSON.stringify(assets())})`);
+    check(Math.abs(eco.thisYear.construction - works0) < 1, `${policy}: the depot and siding are refunded with their removal`);
+    // An empty share line as 2.10 kept it: our line between the owner's stations, our depot beside its track, the agreement.
+    g.requestAccess(user, owner);
+    let d = -1;
+    for (const e of [...net.edges.values()].filter((e) => e.kind === 'rail' && e.owner === owner && e.station < 0 && e.len > 12).sort((a, c) => a.id - c.id)) {
+      for (let s = 4; d < 0 && s < e.len - 4 && net.edges.has(e.id); s += 3) d = buildDepotOnLine(g, e.id, s, user);
+      if (d >= 0) break;
+    }
+    const kept = g.lines.create('rail', user); kept.stops = [st[0].id, st[1].id]; g.lines.rebuild();
+    check(d >= 0 && !!g.agreement(user, owner), `${policy}: the 2.10 leftover is set up (depot ${d})`);
+    g.aiEnabled = true; runDays(g, 240); g.aiEnabled = false;
+    console.log(`  ${policy} leftover: ${ai.log.slice(-2).join(' | ')}; assets ${JSON.stringify(assets())}`);
+    check(!g.lines.get(kept.id) && !g.depots.get(d) && !g.agreement(user, owner), `${policy}: the empty share line closes with its depot and the unused agreement`);
+  }
 }
 
 // ------------------------------------------------------------------------------------------------ natural AI games

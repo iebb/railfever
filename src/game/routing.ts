@@ -1449,7 +1449,9 @@ export function buildRailDepot(g: Game, st: Station, owner: number, frontDir?: P
 }
 
 /** A short level siding planned off a rail edge (planDepotOnLine): its curve (built first), its straight end and the depot's. */
-export interface LineSidingPlan { edge: number; start: Snap; jx: number; jz: number; fx: number; fz: number; tx: number; tz: number; p1: Proposal; cost: number; length: number }
+export interface LineSidingPlan { edge: number; start: Snap; jx: number; jz: number; fx: number; fz: number; tx: number; tz: number; p1: Proposal; cost: number; length: number;
+  /** town buildings the siding and its depot take down */
+  demolish: number[] }
 
 /**
  * Plan a depot on a short siding branching off rail edge `edgeId` at `s` (built by buildDepotOnLine): a 12-unit curve
@@ -1511,7 +1513,8 @@ export function planDepotOnLine(g: Game, edgeId: number, s: number, owner: numbe
     if (!depotFits(g, fx, fz, -et.x, -et.z, owner, maxPop, fy, 2.6)) continue;
     const dp = g.depots.plan('rail', cx, cz, ang, owner, { snap: false, y: fy });
     if (!dp.ok) continue;
-    return { edge: edgeId, start, jx: j.x, jz: j.z, fx, fz, tx, tz, p1, cost: p1.cost + p2.cost + dp.cost, length: p1.stats.len + p2.stats.len };
+    return { edge: edgeId, start, jx: j.x, jz: j.z, fx, fz, tx, tz, p1, cost: p1.cost + p2.cost + dp.cost, length: p1.stats.len + p2.stats.len,
+      demolish: [...new Set([...p1.demolish, ...p2.demolish, ...dp.demolish])] };
     }
   }
   return null;

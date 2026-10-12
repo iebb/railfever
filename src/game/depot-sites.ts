@@ -8,6 +8,7 @@ import type { Game } from './game';
 import type { NEdge } from './network';
 import type { Station, StationPlan } from './stations';
 import type { Train } from './train';
+import type { VehicleModel } from './vehicle-types';
 import { planEdge, commitProposal, findSnap, type BuildOptions, type Proposal } from './construction';
 import { depotSize, UNDERGROUND_DEPOT } from './build-ops';
 import { trackBasePerUnit } from './opcosts';
@@ -100,7 +101,9 @@ function sideClear(g: Game, pts: P2[], depot: { x: number; z: number; angle: num
 }
 
 /** A siding planned beside the line (planSideDepot): its price, track length and base upkeep (the depot's too). */
-export interface SideQuote { edge: number; s: number; dir: 1 | -1; side: 1 | -1; cost: number; length: number; upkeep: number; under: boolean }
+export interface SideQuote { edge: number; s: number; dir: 1 | -1; side: 1 | -1; cost: number; length: number; upkeep: number; under: boolean;
+  /** town buildings the siding and its depot take down */
+  demolish: number[] }
 
 /** Native base upkeep of planned track (its structures too). */
 function trackUpkeep(p: Proposal): number {
@@ -114,7 +117,7 @@ function trackUpkeep(p: Proposal): number {
  * where nothing fits.
  */
 function planStructureDepot(g: Game, e: NEdge, s: number, owner: number, dir: 1 | -1, side: 1 | -1, opts: SideDepotOpts):
-  { pr: Proposal; x: number; z: number; cost: number } | null {
+  { pr: Proposal; x: number; z: number; cost: number; demolish: number[] } | null {
   const net = g.world.net, under = net.sectionAt(e, s) === 'tunnel';
   const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
   net.pointAt(e, s, p, d);
@@ -139,7 +142,7 @@ function planStructureDepot(g: Game, e: NEdge, s: number, owner: number, dir: 1 
     if ((mid.x - p.x) * nx + (mid.z - p.z) * nz < 0.3) continue;
     const dx = x + tan.x * 2.15, dz = z + tan.z * 2.15, angle = Math.atan2(-tan.x, -tan.z);
     if (!sideClear(g, proposalPoints(pr), { x: dx, z: dz, angle }, opts, 6)) continue;
-    let depot = 0;
+    let depot = 0, demolish: number[] = [];
     if (under) {
       const dp = g.depots.plan('rail', dx, dz, angle, owner, { level: 'underground', y, snap: false });
       if (!dp.ok) continue;
@@ -148,9 +151,9 @@ function planStructureDepot(g: Game, e: NEdge, s: number, owner: number, dir: 1 
       if (!depotFits(g, x, z, -tan.x, -tan.z, owner, opts.maxPop ?? 30, y, 2.6)) continue;
       const dp = g.depots.plan('rail', dx, dz, angle, owner, { snap: false, y });
       if (!dp.ok) continue;
-      depot = dp.cost;
+      depot = dp.cost; demolish = dp.demolish;
     }
-    return { pr, x, z, cost: pr.cost + depot };
+    return { pr, x, z, cost: pr.cost + depot, demolish: [...new Set([...pr.demolish, ...demolish])] };
   }
   return null;
 }
@@ -178,10 +181,10 @@ export function planSideDepot(g: Game, edgeId: number, s: number, owner: number,
   for (const dir of dirs) for (const side of sides) {
     if (sec === 'ground') {
       const q = planDepotOnLine(g, edgeId, s, owner, { dir, side: (side * -dir) as 1 | -1, reserved: opts.reserved }, opts.ends, opts.maxPop);
-      if (q) return { edge: edgeId, s, dir, side, cost: q.cost, length: q.length, upkeep: trackUpkeep(q.p1) * q.length / Math.max(1, q.p1.stats.len) + 12000, under: false };
+      if (q) return { edge: edgeId, s, dir, side, cost: q.cost, length: q.length, upkeep: trackUpkeep(q.p1) * q.length / Math.max(1, q.p1.stats.len) + 12000, under: false, demolish: q.demolish };
     } else {
       const q = planStructureDepot(g, e, s, owner, dir, side, opts);
-      if (q) return { edge: edgeId, s, dir, side, cost: q.cost, length: q.pr.stats.len, upkeep: trackUpkeep(q.pr) + (sec === 'tunnel' ? UNDERGROUND_DEPOT.upkeep : 12000), under: sec === 'tunnel' };
+      if (q) return { edge: edgeId, s, dir, side, cost: q.cost, length: q.pr.stats.len, upkeep: trackUpkeep(q.pr) + (sec === 'tunnel' ? UNDERGROUND_DEPOT.upkeep : 12000), under: sec === 'tunnel', demolish: q.demolish };
     }
   }
   return null;
@@ -247,6 +250,23 @@ export function sidingSpots(g: Game, edges: Iterable<number>, x: number, z: numb
 }
 
 /**
+ * Spots (sidingSpots' order) at least `spacing` apart along each track (a double track's two tracks, each with its own
+ * outer side, are thinned apart), so a search of few tries reaches along the whole line.
+ */
+function spaced(g: Game, spots: { id: number; s: number; d: number }[], spacing?: number): { id: number; s: number; d: number }[] {
+  if (!spacing) return spots;
+  const net = g.world.net, kept: { x: number; z: number; tx: number; tz: number }[] = [], out: typeof spots = [];
+  const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+  for (const c of spots) {
+    net.pointAt(net.edges.get(c.id)!, c.s, p, d);
+    const l = Math.hypot(d.x, d.z) || 1;
+    if (kept.some((q) => { const dx = p.x - q.x, dz = p.z - q.z; return Math.abs(dx * q.tx + dz * q.tz) < spacing && Math.abs(dx * q.tz - dz * q.tx) < 0.3; })) continue;
+    kept.push({ x: p.x, z: p.z, tx: d.x / l, tz: d.z / l }); out.push(c);
+  }
+  return out;
+}
+
+/**
  * A depot beside a directional (or single-track) line: on a siding off its plain track, trains leaving it in the
  * running direction of the track it joins, on that track's outer side. Level sidings off ground track first (the
  * cheapest, anywhere on the line), then ramps off viaducts and caverns off tunnels; each pass nearest to (x, z) first,
@@ -259,14 +279,22 @@ export function buildDepotBeside(g: Game, edges: Iterable<number>, x: number, z:
   const passes = sections.includes('ground') && sections.length > 1 ? [['ground'], sections.filter((q) => q !== 'ground')] : [sections];
   for (const pass of passes) {
     const tried = new Set<string>();
-    let tries = 0, spots = sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[]);
+    let tries = 0, spots = spaced(g, sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[]), o.spacing);
     for (let i = 0; i < spots.length && tries < (o.tries ?? 12); i++) {
       const c = spots[i], e = net.edges.get(c.id);
       if (!e || g.vehicles.isEdgeBusy(c.id)) continue;
       const at = { x: 0, y: 0, z: 0 };
       net.pointAt(e, c.s, at);
       tried.add(`${Math.round(at.x * 4)},${Math.round(at.z * 4)}`);
-      const dir = runningDir(g, e, owner, stations), side = outerSide(g, e, c.s), e0 = net.nextEdge;
+      let dir: 0 | 1 | -1 = runningDir(g, e, owner, stations), side: 0 | 1 | -1 = outerSide(g, e, c.s);
+      const e0 = net.nextEdge;
+      // (town buildings in the way: the siding the quote prices, built only where the caller accepts its demolition)
+      if (o.demolitionOk) {
+        const q = planSideDepot(g, c.id, c.s, owner, { dir: dir || undefined, side: side || undefined, consent: o.consent, type: o.type, maxPop: o.maxPop });
+        if (!q || !o.demolitionOk(q.demolish)) { tries++; continue; }
+        dir = q.dir; side = q.side;
+        o.onSite?.(q);
+      }
       const id = buildSideDepot(g, c.id, c.s, owner, { dir: dir || undefined, side: side || undefined, consent: o.consent, type: o.type, maxPop: o.maxPop });
       if (id >= 0) {
         const dp = g.depots.get(id)!;
@@ -278,12 +306,27 @@ export function buildDepotBeside(g: Game, edges: Iterable<number>, x: number, z:
       // (a turnout laid and taken up again splits the track: the spots on what is left, not those already tried)
       if (!net.edges.has(c.id)) {
         list = list.flatMap((id2) => (net.edges.has(id2) ? [id2] : [])).concat(newEdgesSince(g, e0, owner));
-        spots = sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[]).filter((q) => {
+        spots = spaced(g, sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[]).filter((q) => {
           const pt = { x: 0, y: 0, z: 0 }; net.pointAt(net.edges.get(q.id)!, q.s, pt); return !tried.has(`${Math.round(pt.x * 4)},${Math.round(pt.z * 4)}`);
-        });
+        }), o.spacing);
         i = -1;
       }
     }
+  }
+  return -1;
+}
+
+/**
+ * Another depot of ours whose trains already reach a line (every consist of `consists`, each from the depot to some
+ * consecutive pair of `stations`), for the line's trains to share rather than a new siding: the nearest to (x, z)
+ * within `maxDist` first, depots in `exclude` not. Pure; the depot id or -1.
+ */
+export function sharedDepot(g: Game, owner: number, stations: readonly number[], x: number, z: number, exclude: readonly number[],
+  consists: readonly (VehicleModel[] | undefined)[] = [undefined], maxDist = 400): number {
+  const near = [...g.depots.map.values()].filter((d) => d.kind === 'rail' && d.owner === owner && !exclude.includes(d.id)
+    && Math.hypot(d.x - x, d.z - z) <= maxDist).sort((a, b) => Math.hypot(a.x - x, a.z - z) - Math.hypot(b.x - x, b.z - z) || a.id - b.id);
+  for (const d of near.slice(0, 6)) {
+    if (consists.every((cars) => stations.some((sid, i) => i + 1 < stations.length && depotServes(g, d, sid, stations[i + 1], cars) >= 0))) return d.id;
   }
   return -1;
 }
@@ -299,6 +342,14 @@ function newEdgesSince(g: Game, since: number, owner: number): number[] {
 export interface BesideOpts {
   maxDist?: number; minDist?: number; tries?: number; sections?: readonly ('ground' | 'bridge' | 'tunnel')[];
   consent?: (p: Proposal) => boolean; type?: string; maxPop?: number;
+  /** spots tried at least this far apart along each track (a few tries along the whole line) */
+  spacing?: number;
+  /** town buildings a siding may take down (with `maxPop` above a house's): only sidings whose demolition it accepts */
+  demolitionOk?: (ids: number[]) => boolean;
+  /** buildDepotBeside: the quote of the siding about to be built (its demolition, for the caller's compensation) */
+  onSite?: (q: SideQuote) => void;
+  /** quoteDepotBeside: price track a train is on as well (the builder waits for it) */
+  includeBusy?: boolean;
 }
 
 /**
@@ -311,12 +362,12 @@ export function quoteDepotBeside(g: Game, edges: Iterable<number>, x: number, z:
   const passes = sections.includes('ground') && sections.length > 1 ? [['ground'], sections.filter((q) => q !== 'ground')] : [sections];
   for (const pass of passes) {
     let tries = 0;
-    for (const c of sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[])) {
+    for (const c of spaced(g, sidingSpots(g, list, x, z, owner, o.maxDist, o.minDist, pass as ('ground' | 'bridge' | 'tunnel')[]), o.spacing)) {
       const e = net.edges.get(c.id);
-      if (!e || g.vehicles.isEdgeBusy(c.id)) continue;
+      if (!e || (!o.includeBusy && g.vehicles.isEdgeBusy(c.id))) continue;
       const dir = runningDir(g, e, owner, stations), side = outerSide(g, e, c.s);
       const q = planSideDepot(g, c.id, c.s, owner, { dir: dir || undefined, side: side || undefined, consent: o.consent, type: o.type, maxPop: o.maxPop });
-      if (q) return q;
+      if (q && (!o.demolitionOk || o.demolitionOk(q.demolish))) return q;
       if (++tries >= (o.tries ?? 12)) break;
     }
   }

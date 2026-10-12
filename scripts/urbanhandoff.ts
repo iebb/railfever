@@ -7,22 +7,27 @@ import {serialize,deserialize} from '../src/game/save';
 import {railPartMode} from '../src/game/stations';
 import {TRACK_TYPES} from '../src/game/constants';
 import {check,done} from './stationlib';
-const g=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
-  aiConfigs:[{startMoney:60_000_000,focus:{rail:.2,road:0,tram:3}}]});g.aiAcquisitions=false;
+const world=()=>{const w=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
+  aiConfigs:[{startMoney:60_000_000,focus:{rail:.2,road:0,tram:3}}]});w.aiAcquisitions=false;return w;};
+const g=world();
 const a:any=g.ais[0];
 let sawChooser=false;
 while(g.day<650&&!a.project?.urbanLayout){g.stepTick();sawChooser||=a.state.phase==='evaluating projects';}
 check(sawChooser&&!!a.project?.urbanLayout,'ordinary native chooser selects a city-layout handoff');
 if(!a.project?.urbanLayout){done();process.exit(1);}
-const hint=a.project.urbanLayout,selected=JSON.stringify(serialize(g)),at=g.day;
+const hint=a.project.urbanLayout,selected=JSON.stringify(serialize(g)),at=g.day,atTick=g.tick;
 console.log(`  native ${a.project.kind} handoff ${g.towns.list[a.project.towns[0]].name} day${at}: ${hint.targets.length} stops`);
 check(a.project.kind==='lightrail'&&a.project.towns[0]===1,'native selected cohort is Dorminster light rail');
 check(!('quote' in hint)&&!('plans' in hint)&&hint.interchanges.every((id:unknown)=>typeof id==='number'),'handoff stores layout/IDs, without old price or station plans');
 check(!a.urbanTask&&!a.urbanSurvey&&a.project.stations.length===0,'selected handoff is saved before construction work');
 let twin=deserialize(JSON.parse(selected));
 check(JSON.stringify(serialize(twin))===selected,'selected handoff immediate full roundtrip');
-function replay(label:string){let exact=true;for(let i=0;i<640;i++){g.stepTick();twin.stepTick();if(JSON.stringify(serialize(g))!==JSON.stringify(serialize(twin)))exact=false;}check(exact,label+' full state is exact at every one of640 ticks');}
-replay('selected handoff');
+function replay(label:string,live=g){let exact=true;for(let i=0;i<640;i++){live.stepTick();twin.stepTick();if(JSON.stringify(serialize(live))!==JSON.stringify(serialize(twin)))exact=false;}check(exact,label+' full state is exact at every one of640 ticks');}
+// Since 2.9 the handoff builds within days of its selection, inside a 640-tick replay. The selection is
+// replayed on a second live world, regenerated to the same tick, so g stops at the partial construction.
+{const live=world();while(live.tick<atTick)live.stepTick();
+ check(JSON.stringify(serialize(live))===selected,'regenerated live world reaches the identical selected handoff');
+ replay('selected handoff',live);}
 while(g.day<at+120&&!(a.project?.stations.length>0))g.stepTick();
 check(!!a.urbanTask?.fromHandoff&&a.project?.stations.length>0,'handoff reaches actual native station construction');
 const during=JSON.stringify(serialize(g));twin=deserialize(JSON.parse(during));
@@ -109,8 +114,13 @@ for(const change of ['part','identity','owner'] as const){
 {
  const h=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
   aiConfigs:[{startMoney:60_000_000,focus:{rail:2,road:.3,tram:1.5}},{startMoney:60_000_000,focus:{rail:2,road:.3,tram:1.5}}]});h.aiAcquisitions=false;
- while(h.day<250)h.stepTick();
- const b:any=h.ais[0];b.cancelJob();const nativeHub=b.hubFor;let retained:any=null;
+ // Since 2.9 a rival remembers the railways it abandoned, and its early hubs come and go as lines grow: from day
+ // 200, wait for a rival whose chooser reaches a hub (a station with free ends toward a town not yet tried or linked).
+ const T=h.towns.list,linked=(A:number,B:number)=>h.lines.all().some(l=>l.kind==='rail'&&[A,B].every(t=>l.stops.some(id=>h.stations.get(id)?.townId===t)));
+ const hubReady=(ai:any)=>T.some(A=>T.some(B=>{const d=Math.hypot(A.x-B.x,A.z-B.z);
+  return A!==B&&A.pop>=250&&B.pop>=250&&d>=60&&d<=250&&!ai.isFailed(ai.pairKey(A.id,B.id))&&!linked(A.id,B.id)&&!!ai.hubFor(A,B);}));
+ while(h.day<720&&(h.day<200||h.tick%h.ticksPerDay!==0||!h.ais.some(hubReady)))h.stepTick();
+ const b:any=h.ais.find(hubReady)??h.ais[0];b.cancelJob();const nativeHub=b.hubFor;let retained:any=null;
  b.hubFor=function(...args:any[]){const st=nativeHub.apply(this,args);if(st)retained=st;return st;};
  const chooser=b.chooseProject();let reached=false,threw=false;
  try{for(let i=0;i<4000;i++){const r=chooser.next();if(r.done)break;if(retained){reached=true;break;}}

@@ -284,7 +284,9 @@ if (isMain && process.argv[2] !== 'metrics' && process.argv[2] !== 'pairs') {
     nl.stops = [C?.id ?? -1, B.id, A.id, B.id];
     const nt = dN >= 0 ? g.vehicles.buyTrain(dN, [loco(), coach()], nl.id) : 'no depot';
     check(joined && typeof nt !== 'string', `the newcomer runs a line from its own station onto the AI railway (${typeof nt === 'string' ? nt : 'train bought'})`);
-    g.aiEnabled = true;
+    // (Since shared rail fleets are priced (2.9), an AI operator withdraws a shared train that loses money, and on
+    // this map without towns every train does. The AIs stay paused: this checks the access rules, not the economics.)
+    g.aiEnabled = false;
     let visits = 0, prev = '';
     const tr = () => g.vehicles.all().find((v) => v.owner === nc.id && v instanceof Train) as Train | undefined;
     for (let k = 0; k < 12; k++) {
