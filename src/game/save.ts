@@ -22,6 +22,7 @@ import type { StoredSave } from './storage';
 import { saveOps, loadOps } from './opcosts';
 import { canonicalizeLines } from './patterns';
 import { saveNetwork, loadNetwork } from './ai-network';
+import { saveRouteWorks, loadRouteWorks } from './route-works';
 import { migrateElectricTrains } from './migrate';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
 
@@ -390,6 +391,7 @@ function serializeState(g: Game, world: any, binaryProfiles = false): any {
     shares: g.shares.toJSON(),
     aiNetwork: saveNetwork(g),
     ...(g.deadlockScan ? { deadlockScan: structuredClone(g.deadlockScan) } : {}),
+    ...(g.routeWorks.length ? { routeWorks: saveRouteWorks(g) } : {}),
     world: {
       ...world, size: w.size, freeTrees: w.freeTrees.slice(),
       buildings: buildingRecords(w, binaryProfiles), nextBuildingId: w.nextBuildingId,
@@ -520,6 +522,7 @@ export function deserialize(d: any): Game {
   g.rng.state = d.rng;
   g.aiEnabled = d.aiEnabled ?? true;
   g.deadlockScan = d.deadlockScan ? structuredClone(d.deadlockScan) : null;
+  loadRouteWorks(g, d.routeWorks);
   // companies and access agreements (the AI controllers are restored at the end, once everything exists)
   g.restoreCompanies(d);
   g.shares.load(d.shares);

@@ -131,7 +131,7 @@ function uiFor(g: Game): UI {
     tools: { tool: 'inspect', lineEditId: -1, setTool() {}, refreshHover() {} },
     mapModes: { mode: 'none', toggle() {} }, hud: { avoidRects: () => [], onToolChange() {} },
     checklist: { hidden: false }, reduceTransparency: false,
-    renderer: { camera, controls: { distance: 100 }, overlay: { setSignalGhosts() {} },
+    renderer: { camera, controls: { distance: 100 }, overlay: { setSignalGhosts() {}, setSegments() {}, setRings() {} },
       terrain: { uniforms: { uGrid: { value: 0 } } },
       settings: { shadows: true, shadowQuality: 'high', resolution: 'auto', pixelRatio: 1 }, applySettings() {} },
     sound() {}, toast() {}, centerOn() {}, follow() {}, setCatchment() {}, onLineEdited() {},
@@ -169,6 +169,14 @@ function sweep(g: Game, label: string) {
       const body = ui.wm.get('line-' + l.id)!.body as unknown as DomElement;
       const join = body.querySelectorAll('button').find((b) => b.textContent === (l.kind === 'rail' ? 'Join with line…' : 'Connect with line…'));
       assert.ok(join); show(`join preview ${l.id}`, () => join.click());
+      // the route upgrade planner: plans (and previews) every mode it offers without building anything
+      const up = body.querySelectorAll('button').find((b) => b.textContent === 'Upgrade route…');
+      assert.equal(!!up, l.kind === 'road' && new Set(l.stops).size >= 2, `upgrade button ${l.id}`);
+      if (up) {
+        show(`upgrade planner ${l.id}`, () => up.click());
+        const modes = () => (ui.wm.get('upgrade-' + l.id)!.body as unknown as DomElement).querySelectorAll('.segb');
+        for (const label of modes().map((b) => b.textContent)) show(`upgrade ${label} ${l.id}`, () => modes().find((b) => b.textContent === label)!.click());
+      }
     }
     allTabs(g, ui, 'line-' + l.id, `${label}: line ${l.id}`);
   }
