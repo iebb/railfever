@@ -22,7 +22,8 @@ for (const off of [5, -5, 10, -10, 15, -15]) {
 const id = g.stations.nextId, error = plan.ok ? g.stations.commitRail(plan, ai.companyId) : plan.error;
 if (error) throw new Error(error);
 const hub = g.stations.get(id)!; hub.townId = B.id;
-// A rival coach route already serves the small towns. The quick railway quote shares their unchanged demand.
+// Rival coach routes already serve the small towns. The quick railway quote shares their unchanged demand.
+// (Two of them since 2.10: walkers make 3.2x the trips, and against one coach the B-C railway now pays.)
 const stops = [B, C].map((town) => {
   let stop = -1;
   for (let dx = -10; dx <= 10 && stop < 0; dx += 2) for (let dz = -10; dz <= 10 && stop < 0; dz += 2)
@@ -30,7 +31,8 @@ const stops = [B, C].map((town) => {
   if (stop < 0) throw new Error(`No coach stop in ${town.name}`);
   g.stations.get(stop)!.townId = town.id; return stop;
 });
-const coach = g.lines.create('bus', 0); coach.stops = stops; g.lines.rebuild();
+for (let k = 0; k < 2; k++) g.lines.create('bus', 0).stops = [...stops];
+g.lines.rebuild();
 check(ai.hubFor(B, C) === hub, 'losing continuation has a real owned hub with free platform ends');
 check(ai.hubFor(B, g.towns.list[7]) === hub, 'funded continuation uses the same real hub');
 const before = serialize(g);
@@ -48,7 +50,9 @@ ai.state.corridor = [hub.id, C.id];
 const negativeSave = serialize(g), negative = choose(g), negativeReplay = choose(deserialize(negativeSave));
 check(pair(negative, C.id).length === 0, 'saved losing continuation cannot borrow another railway score');
 check(!negative.state.corridor, 'losing continuation is released for other opportunities');
-check(negative.lastOptions.some((o) => ['metro', 'lightrail'].includes(o.kind) && o.score > 0), 'viable city railway remains in the ordinary opportunity comparison');
+// (A company without lines compares its priced openings before surveying cities, since 2.9: the profitable
+// railway stands for the ordinary comparison here.)
+check(pair(negative, 7).length === 1, 'viable railway remains in the ordinary opportunity comparison');
 
 const goodWorld = deserialize(before), good = access(goodWorld);
 good.state.corridor = [hub.id, 7];
@@ -61,6 +65,6 @@ const decision = (a: AIController & Record<string, any>) => JSON.stringify({ opt
   project: a.project && { kind: a.project.kind, towns: a.project.towns }, state: a.state });
 check(decision(negative) === decision(negativeReplay), 'losing continuation makes the identical decision after saving/loading');
 check(decision(positive) === decision(positiveReplay), 'funded continuation makes the identical decision after saving/loading');
-console.log(`eligible rail return ${quote?.score.toFixed(3)}, funded continuation ${preferred[0]?.score.toFixed(3)}; ${pair(negative, C.id).length} losing corridor options; ${negative.lastOptions.filter((o) => ['metro', 'lightrail'].includes(o.kind)).length} viable city options`);
+console.log(`eligible rail return ${quote?.score.toFixed(3)}, funded continuation ${preferred[0]?.score.toFixed(3)}; ${pair(negative, C.id).length} losing corridor options; ${pair(negative, 7).length} viable railway options`);
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
