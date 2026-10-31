@@ -84,9 +84,11 @@ export const MAIL_UNIT_T = 0.1;
  * 0.18 a van no longer pays its way on a single line (the AI's margin: 1.5x its operating cost and price/8). Recalibrate
  * it with mailcal when passenger catchments or generation change (mail shares the walking catchments). 0.2 -> 0.34 after
  * the walks were halved again after 2.9 (walkers post at WALK_TRIP_INTENSITY; the single lines' mail fell to 6-16% of
- * their passenger income, vans 0.23-0.59x as full as the coaches).
+ * their passenger income, vans 0.23-0.59x as full as the coaches). In 2.12, lawful station access and supported
+ * approaches change the feasible native routes. The unchanged six single-line and six AI-world calibration
+ * permits 0.240-0.331; use 0.28 near its midpoint, retaining the existing share, load and loss targets.
  */
-export const MAIL_PER_PAX = 0.34;
+export const MAIL_PER_PAX = 0.28;
 /**
  * Mail per person by year (piecewise linear; 1950 = 1): by weight about +30% from 1950 to 2000, then about flat
  * (letters halve, parcels grow two to three times).
