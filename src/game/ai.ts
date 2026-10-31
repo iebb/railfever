@@ -3573,7 +3573,9 @@ export class AIController {
       if (!sp) continue;
       // a building of its time and town (a halt in a village, a concourse in a city)
       const style = defaultStationStyle(g.year, ST, sp.level ?? 'ground', 'mainline', (sp === pr.a ? A : B).pop);
-      const tt = { ...(hs ? { trackType: type } : {}), ...(sp.level && sp.level !== 'ground'
+      // Keep the surveyed rail height: growing a platform changes its mean ground height,
+      // but must not change the approach grade after that corridor has been priced.
+      const tt = { fixedY: sp.y, ...(hs ? { trackType: type } : {}), ...(sp.level && sp.level !== 'ground'
         ? { level: sp.level, depth: sp.depth || undefined, height: sp.height || undefined, entrances: sp.entrances.length } : {}) };
       let re = g.stations.planRail(sp.x, sp.z, sp.angle, PLATFORM, ST, owner, { style, ...tt });
       yield;
