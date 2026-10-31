@@ -1321,7 +1321,9 @@ export class Train extends Vehicle {
 export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: VehicleModel[]): boolean {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return false;
-  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000, false, cars ? consistRule(cars) : null);
+  const length = cars?.reduce((n, c) => n + c.length, 0) ?? 0;
+  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000, false,
+    cars ? consistRule(cars) : null, true, { length });
 }
 
 /**
@@ -1332,14 +1334,13 @@ export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: Vehic
 export function depotServes(g: Game, dp: Depot, a: number, b: number, cars?: VehicleModel[]): number {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return -1;
-  const rule = cars ? consistRule(cars) : null;
+  const rule = cars ? consistRule(cars) : null, length = cars?.reduce((n, c) => n + c.length, 0) ?? 0;
   for (const [x, y] of [[a, b], [b, a]]) {
-    const r = findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule);
-    const lc = r?.conts[r.conts.length - 1];
-    if (!lc) continue;
-    // on the way it came in, or turning back off the platform (past the one-way signal at its end, as trains do)
-    if (findRailRoute(g, railNext(g, lc.edge, lc.dir, dp.owner, false, rule), y, dp.owner, -1, 80000, false, rule)
-      || findRailRoute(g, railNext(g, lc.edge, -lc.dir, dp.owner, false, rule, lc.edge.station >= 0), y, dp.owner, -1, 80000, false, rule)) return x;
+    // Search all fitting arrival platforms with the runtime's actual-tail reversal and onward fit rules.
+    // A cheaper dead-end platform must not hide a lawful alternative; transient reservations do not change
+    // whether a depot can serve the line, and departure still acquires its normal reservations in operation.
+    if (findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule, true,
+      { length, onward: y })) return x;
   }
   return -1;
 }
