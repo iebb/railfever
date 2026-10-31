@@ -90,6 +90,15 @@ for (const shared of [false, true]) {
   check(blocked.has(0) && blocked.has(1) && !blocked.has(2), 'overlapping restricted groups cannot borrow a disjoint spare slot');
   check(!blockedTerminalCells([{ slots: [1, 2, 3], count: 1 }, { slots: [2, 3, 4], count: 2 }, { slots: [5, 6], count: 1 }]).size,
     'overlapping groups with a reachable spare keep their receipts');
+  const overbooked = blockedTerminalCells([{ slots: [1, 2], count: 3 }, { slots: [3, 4], count: 2 }]);
+  check(overbooked.size === 2 && overbooked.has(0) && overbooked.has(1),
+    'inherited overbooked stock cannot mask an unrelated full class');
+  const spare = blockedTerminalCells([{ slots: [1, 2], count: 3 }, { slots: [3, 4], count: 1 }]);
+  check(spare.size === 1 && spare.has(0), 'an unrelated class with a physical receiving spare keeps its receipts');
+  const newFull = blockedTerminalCells([{ slots: [1, 2], count: 3 }, { slots: [3], count: 1 }]);
+  check(newFull.has(1), 'an unrelated new candidate cannot hide its missing receiving space behind inherited overbooking');
+  const reordered = blockedTerminalCells([{ slots: [5, 6], count: 1 }, { slots: [3, 4], count: 2 }, { slots: [1, 2], count: 3 }]);
+  check(reordered.size === 2 && reordered.has(1) && reordered.has(2), 'blocked full classes and lawful spares do not depend on channel order');
 }
 
 {

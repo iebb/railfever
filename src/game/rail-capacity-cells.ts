@@ -7,28 +7,34 @@ import { capacityTopologyKey } from './rail-capacity-routes';
 export interface AtomicTerminalCell { key: string; slots: number[] }
 
 /** Strict receiving-space feasibility, including unions of overlapping restricted platform sets.
- * One extra copy of each active class must fit: this is Hall's condition with a spare for every class. */
+ * Each active class needs an extra matching slot. With a feasible baseline this is Hall's spare condition;
+ * excess inherited/depot stock cannot mask another full class or consume its unrelated spare. */
 export function blockedTerminalCells(cells: { slots: number[]; count: number }[]): Set<number> {
-  const blocked = new Set<number>();
+  const blocked = new Set<number>(), copies = cells.flatMap((c, i) => Array.from({ length: c.count }, () => i));
+  const place = (train: number, held: Map<number, number>): boolean => {
+    const seen = new Set<number>(), slots = new Set<number>();
+    const augment = (copy: number): boolean => {
+      if (seen.has(copy)) return false;
+      seen.add(copy);
+      for (const slot of cells[copies[copy]].slots) {
+        if (slots.has(slot)) continue;
+        slots.add(slot);
+        const prior = held.get(slot);
+        if (prior === undefined || augment(prior)) { held.set(slot, copy); return true; }
+      }
+      return false;
+    };
+    return augment(train);
+  };
+  // Find maximum occupied space even if inherited/depot stock already cannot fit. Stopping at its
+  // first failure would hide independent full classes before their own spare could be tested.
+  const baseline = new Map<number, number>();
+  for (let train = 0; train < copies.length; train++) place(train, baseline);
   for (let extra = 0; extra < cells.length; extra++) {
     if (!cells[extra].count) continue;
-    const copies = cells.flatMap((c, i) => Array.from({ length: c.count }, () => i)); copies.push(extra);
-    const held = new Map<number, number>();
-    for (let train = 0; train < copies.length; train++) {
-      const seen = new Set<number>(), slots = new Set<number>();
-      const place = (copy: number): boolean => {
-        if (seen.has(copy)) return false;
-        seen.add(copy);
-        for (const slot of cells[copies[copy]].slots) {
-          if (slots.has(slot)) continue;
-          slots.add(slot);
-          const prior = held.get(slot);
-          if (prior === undefined || place(prior)) { held.set(slot, copy); return true; }
-        }
-        return false;
-      };
-      if (!place(train)) { for (const copy of seen) blocked.add(copies[copy]); break; }
-    }
+    copies.push(extra);
+    if (!place(copies.length - 1, new Map(baseline))) blocked.add(extra);
+    copies.pop();
   }
   return blocked;
 }
