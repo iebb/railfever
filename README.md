@@ -123,7 +123,9 @@ src/ui/      HUD, tool dock, tools, windows, title screen, minimap, fonts, icons
 scripts/     build inliner, headless simulation tests and shared test helpers
 ```
 
-The headless tests run in Node:
+Run the complete release checks with `npm run gate`. The gate validates a committed ref in a unique temporary worktree, includes save/UI tests, prints each result and exits nonzero on functional failures. Logs remain in `.gate/`; benchmarks and browser checks run separately. Use `npm run gate -- <ref> <output-directory>` to choose a ref or log location.
+
+The individual headless tests run in Node:
 
 ```bash
 npx esbuild scripts/smoke.ts --bundle --platform=node --format=esm --outfile=/tmp/smoke.mjs && node /tmp/smoke.mjs
