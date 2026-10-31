@@ -9,31 +9,59 @@ import {autoSignalLine,setSignal} from '../src/game/signals';
 import {buildDepotOnLine} from '../src/game/routing';
 import {flatGame,station,endNode,nodeSnap,railOpts,build,loco,check,fails} from './stationlib';
 import {checkReservations} from './lib';
+import {controlledOpeningWorld} from './opening-fixtures';
 import * as Initial from '../src/game/ai-initial-track';
 const fleet=loco().reduce((n,c)=>n+c.cost,0)*2,fullTarget=fleet+600_000;
-function nativeOpening(constrained=false){
- const g=Game.create({size:512,seed:61,towns:13,hilliness:'hilly',water:'medium',startYear:1980,aiCompanies:3});g.aiEnabled=false;g.aiAcquisitions=false;
- const ai=g.aiOf(1)!,e=g.company(1).economy,spend=e.spend,borrow=e.borrow,sd=Object.getOwnPropertyDescriptor(e,'spend'),bd=Object.getOwnPropertyDescriptor(e,'borrow');
- const spends:{amount:number;kind:string;cash:number;loan:number;throat:boolean;buy:boolean}[]=[],loans:{before:number;after:number;caller:boolean}[]=[];let injected=false,atExpense=0;
- e.spend=function(...args:Parameters<typeof spend>){const stack=new Error().stack??'',ok=spend.apply(this,args);if(ok)spends.push({amount:args[0],kind:args[1],cash:this.money,loan:this.loan,throat:stack.includes('connectStationThroat'),buy:stack.includes('buyTrain')});return ok;};
- e.borrow=function(){const before=this.loan,stack=new Error().stack??'',ok=borrow.call(this);if(ok)loans.push({before,after:this.loan,caller:stack.includes('connectStationThroat')});return ok;};
- check(!AIController.forceBuild&&ai.startProject('rail',[1,4]),'unchanged native profitable opening begins without forceBuild');
- const project=(ai as any).project;const pd=Object.getOwnPropertyDescriptor(project,'openingLine');let openingLine=project.openingLine;if(constrained)Object.defineProperty(project,'openingLine',{configurable:true,enumerable:true,get:()=>openingLine,set:(value:number)=>{openingLine=value;if(!injected&&e.money>2_821_178.489077144){e.spend(e.money-2_821_178.489077144,'maintenance',true);injected=true;atExpense=e.loan;}}});
- let tick=0;try{for(;tick<400*g.ticksPerDay&&ai.busy;tick++){
-  const dayTick=g.tick%g.ticksPerDay;ai.work(dayTick,dayTick+1);
-  // The observer above forwards the actual openingLine assignment, then pays a native expense before appraisal.
-  g.stepTick();
- }}finally{if(constrained){if(pd)Object.defineProperty(project,'openingLine',pd);else{delete project.openingLine;if(openingLine!==undefined)project.openingLine=openingLine;}}if(sd)Object.defineProperty(e,'spend',sd);else delete(e as any).spend;if(bd)Object.defineProperty(e,'borrow',bd);else delete(e as any).borrow;}
- const line=[...g.lines.map.values()].find(l=>l.owner===1&&l.kind==='rail')!,choices=line?.stops.map((_,i)=>platformChoices(g,line,0,i).length)??[],buys=spends.filter(x=>x.buy),optional=spends.filter(x=>x.throat&&x.loan>atExpense);
- console.log('native opening '+JSON.stringify({constrained,tick,injected,atExpense,loan:e.loan,cash:e.money,choices,loans,throat:spends.filter(x=>x.throat),buys}));
- check(!ai.busy&&choices.length===2&&choices.every(x=>x===2)&&buys.length===2&&checkReservations(g).length===0,'native funded callback completes both legal platforms and purchases the full fleet');
- if(constrained)check(injected&&loans.some(x=>x.caller)&&optional.length===1&&e.loan===atExpense+1_000_000&&e.money>=600_000,
-  'complete optional quote funds native steps before construction, accounting for the baseline500k and extra500k debt');
- else check(e.loan===9_000_000&&spends.filter(x=>x.throat).some(x=>x.amount===120260)&&e.money>600_000,
-  'ample-cash9M-loan native opening keeps its original loan and priced lead');
- if(constrained){const replay=deserialize(JSON.parse(JSON.stringify(serialize(g))));let exact=true;for(let i=0;i<640;i++){g.stepTick();replay.stepTick();if(JSON.stringify(serialize(g))!==JSON.stringify(serialize(replay))){exact=false;break;}}check(exact&&checkReservations(g).length===0&&checkReservations(replay).length===0,'actual funded railJob has complete640 saved-state/RNG/reservation replay');}
+function nativeOpening(expectedStock?:ReturnType<typeof loco>){
+ const constrained=!!expectedStock,f=controlledOpeningWorld(),{g,ai,owner}=f,e=g.company(owner).economy,spend=e.spend,borrow=e.borrow,sd=Object.getOwnPropertyDescriptor(e,'spend'),bd=Object.getOwnPropertyDescriptor(e,'borrow');
+ const spends:{amount:number;kind:string;cash:number;loan:number;throat:boolean;buy:boolean;opening:boolean;order:number}[]=[],loans:{before:number;after:number;caller:boolean;order:number}[]=[];
+ let injected=false,atExpense=0,opening=false,order=0,original:ReturnType<typeof Initial.openingFundingBaseline>|undefined,approved:ReturnType<typeof Initial.openingFundingAppraisal>|undefined,quote:{cost:number;finishing:number;upkeep:number}|undefined;
+ e.spend=function(...args:Parameters<typeof spend>){const stack=new Error().stack??'',ok=spend.apply(this,args);if(ok)spends.push({amount:args[0],kind:args[1],cash:this.money,loan:this.loan,throat:stack.includes('connectStationThroat'),buy:stack.includes('buyTrain'),opening,order:order++});return ok;};
+ e.borrow=function(){const before=this.loan,stack=new Error().stack??'',ok=borrow.call(this);if(ok)loans.push({before,after:this.loan,caller:stack.includes('connectStationThroat'),order:order++});return ok;};
+ check(!AIController.forceBuild&&ai.startProject('rail',[0,1]),'controlled native profitable opening begins without forceBuild');
+ const project=(ai as any).project,pd=Object.getOwnPropertyDescriptor(project,'openingLine');let openingLine=project.openingLine;
+ Object.defineProperty(project,'openingLine',{configurable:true,enumerable:true,get:()=>openingLine,set:(value:number)=>{
+  openingLine=value;opening=true;atExpense=e.loan;
+  const line=g.lines.get(value)!,A=[...g.stations.map.values()].find(s=>s.owner===owner&&s.townId===0)!;
+  const before=JSON.stringify(serialize(g)),ordinary=connectStationThroat(g,A.id,owner);
+  check(ordinary.connected===0&&ordinary.failed.length>0&&JSON.stringify(serialize(g))===before,'controlled depot spur blocks the ordinary ladder without changing native state');
+  check(ai.stats.doubled===0&&f.blockers.every(id=>g.world.buildings.has(id)),'native demolition pricing preserves the developed narrow single formation instead of an initial pair');
+  if(!expectedStock)return;
+  const nativeFleet=expectedStock.reduce((n,c)=>n+c.cost,0)*2,normal=autoSignalLine(g,line.id,owner,{preview:true}).cost,signals=Initial.openingSignalPlan(g,line,project.depots[0],expectedStock,line.stops[0]);
+  if(!signals)throw Error('controlled native full-stock signalling quote');
+  // Declining this independent dry appraisal captures a genuine protected quote without funding or
+  // construction. The real railJob approve/fund closures execute immediately after this observer.
+  connectStationThroat(g,A.id,owner,{junctions:true,reserve:nativeFleet+600_000,signals,approve:(cost,upkeep,finishing)=>{quote??={cost,upkeep,finishing};return false;},fund:()=>{throw Error('preview must not fund');}});
+  check(!!quote&&JSON.stringify(serialize(g))===before,'native optional complete geometry and signalling quote is available without mutation');
+  if(!quote)throw Error('controlled optional quote unavailable');
+  const extra=quote.cost+quote.finishing-normal;
+  check(extra>0&&extra<500_000,'complete optional works add a positive sub-step price beyond ordinary signals');
+  const cash=nativeFleet+600_000+normal-500_000+extra/2;
+  check(e.money>cash,'explicit native expense can create the intended financing boundary');
+  if(e.money<=cash)throw Error('controlled expense requires ample original cash');
+  e.spend(e.money-cash,'maintenance',true);injected=true;
+  original=Initial.openingFundingBaseline(e,nativeFleet,normal);
+  approved=Initial.openingFundingAppraisal(e,original,quote.cost+quote.finishing,ai.loanAppetite,ai.available());
+  check(original.noRepairLoan===atExpense+500_000&&approved.affordable&&approved.incrementalLoan===500_000&&approved.endLoan===original.noRepairLoan+500_000&&approved.annualInterest===500_000*e.interestRate,'before borrowing, complete native quote adds exactly500k debt and actual interest beyond baseline stock/signals');
+ }});
+ let tick=0;try{for(;tick<400*g.ticksPerDay&&ai.busy;tick++){const dayTick=g.tick%g.ticksPerDay;ai.work(dayTick,dayTick+1);g.stepTick();}}
+ finally{if(pd)Object.defineProperty(project,'openingLine',pd);else{delete project.openingLine;if(openingLine!==undefined)project.openingLine=openingLine;}if(sd)Object.defineProperty(e,'spend',sd);else delete(e as any).spend;if(bd)Object.defineProperty(e,'borrow',bd);else delete(e as any).borrow;f.restore();}
+ const line=[...g.lines.map.values()].find(l=>l.owner===owner&&l.kind==='rail')!,choices=line?.stops.map((_,i)=>platformChoices(g,line,0,i).length)??[],buys=spends.filter(x=>x.buy),optional=spends.filter(x=>x.throat&&x.opening),trains=g.vehicles.trains().filter(t=>t.owner===owner),stock=trains[0]?.cars;
+ console.log('controlled native opening '+JSON.stringify({constrained,tick,injected,atExpense,loan:e.loan,cash:e.money,choices,original,approved,quote,loans,throat:spends.filter(x=>x.throat),buys,notes:ai.log.slice(-6)}));
+ check(!ai.busy&&choices.length===2&&choices.every(x=>x===2)&&buys.length===2&&trains.length===2&&checkReservations(g).length===0,'actual funded railJob completes both legal platforms and purchases the full two-train fleet');
+ check(optional.length===1&&e.money>=600_000,'actual optional callback completes one paid lead while preserving the full fleet plus600k reserve');
+ if(!stock)throw Error('controlled native opening did not purchase stock');
+ const stockIds=stock.map(c=>c.id);check(trains.every(t=>JSON.stringify(t.cars.map(c=>c.id))===JSON.stringify(stockIds)),'both opening trains receive the same full native stock');
+ if(expectedStock){
+  check(JSON.stringify(stockIds)===JSON.stringify(expectedStock.map(c=>c.id)),'constrained funding retains the complete native ample-case stock');
+  const funded=loans.filter(x=>x.caller);
+  check(injected&&funded.length===2&&funded.every(x=>x.after-x.before===500_000)&&funded.every(x=>x.order<optional[0]?.order)&&optional[0]?.amount===quote?.cost&&e.loan===approved?.endLoan&&e.loan===atExpense+1_000_000,'real railJob funding closure borrows baseline500k and extra500k before its approved paid works');
+  const replay=deserialize(JSON.parse(JSON.stringify(serialize(g))));let exact=true;for(let i=0;i<640;i++){g.stepTick();replay.stepTick();if(JSON.stringify(serialize(g))!==JSON.stringify(serialize(replay))){exact=false;break;}}
+  check(exact&&checkReservations(g).length===0&&checkReservations(replay).length===0,'actual funded railJob has complete640 saved-state/RNG/reservation replay');
+ }else check(e.loan===atExpense,'ample cash completes the native optional opening without adding debt');
+ return stock;
 }
-console.log('Actual railJob callback and unchanged ample cash');nativeOpening();nativeOpening(true);
+console.log('Actual railJob callback on controlled native geometry');const openingStock=nativeOpening();nativeOpening(openingStock);
 if(process.argv.includes('--native-only')){console.log(fails.length?`${fails.length} CHECKS FAILED`:'ALL CHECKS PASSED');process.exit(fails.length?1:0);}
 
 function fixture(old=false,foreignSpur=false){

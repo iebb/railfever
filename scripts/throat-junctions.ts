@@ -7,6 +7,7 @@ import {platformChoices} from '../src/game/rail-platforms';
 import {Train,findRailRoute,consistRule} from '../src/game/train';
 import {Game} from '../src/game/game';
 import {AIController} from '../src/game/ai';
+import {controlledOpeningWorld} from './opening-fixtures';
 import {serialize,deserialize} from '../src/game/save';
 import {checkReservations} from './lib';
 import {roadOpts} from './lib';
@@ -17,46 +18,49 @@ const openingThroatBaseline = (...args: Parameters<typeof InitialTrack.openingTh
 const openingThroatReturn = (...args: Parameters<typeof InitialTrack.openingThroatReturn>) =>
   (InitialTrack as unknown as { openingThroatReturn?: typeof InitialTrack.openingThroatReturn }).openingThroatReturn?.(...args);
 
-function railJobCall(expenseBoundary=false){
-  const g=Game.create({size:512,seed:61,towns:13,hilliness:'hilly',water:'medium',startYear:1980,aiCompanies:3});
-  g.aiEnabled=false;g.aiAcquisitions=false;
-  const ai=g.aiOf(1)!,eco=g.company(1).economy,spend=eco.spend,descriptor=Object.getOwnPropertyDescriptor(eco,'spend');
-  const events:{amount:number;category:string;cashBefore:number;cashAfter:number;loanBefore:number;loanAfter:number;throat:boolean;vehicle:boolean}[]=[];
+function railJobCall(nativeFleet?:number){
+  const expenseBoundary=nativeFleet!==undefined,f=controlledOpeningWorld(),{g,ai,owner}=f,eco=g.company(owner).economy,spend=eco.spend,descriptor=Object.getOwnPropertyDescriptor(eco,'spend');
+  const events:{amount:number;category:string;cashBefore:number;cashAfter:number;loanBefore:number;loanAfter:number;throat:boolean;vehicle:boolean;signals:boolean;opening:boolean}[]=[];
+  let opening=false;
   eco.spend=function(...args:Parameters<typeof spend>){
     const stack=new Error().stack??'',cashBefore=this.money,loanBefore=this.loan,accepted=spend.apply(this,args);
-    if(accepted&&stack.includes('railPlanJob'))events.push({amount:args[0],category:args[1],cashBefore,cashAfter:this.money,loanBefore,loanAfter:this.loan,throat:stack.includes('connectStationThroat'),vehicle:stack.includes('buyTrain')});
+    if(accepted&&stack.includes('railPlanJob'))events.push({amount:args[0],category:args[1],cashBefore,cashAfter:this.money,loanBefore,loanAfter:this.loan,throat:stack.includes('connectStationThroat'),vehicle:stack.includes('buyTrain'),signals:stack.includes('autoSignalLine'),opening});
     return accepted;
   };
-  check(!AIController.forceBuild&&ai.startProject('rail',[1,4]),'native profitable railJob begins with original company finance and no forceBuild override');
+  check(!AIController.forceBuild&&ai.startProject('rail',[0,1]),'controlled profitable railJob begins with native finance and no forceBuild override');
+  const project=(ai as any).project,pd=Object.getOwnPropertyDescriptor(project,'openingLine');let openingLine=project.openingLine;
+  Object.defineProperty(project,'openingLine',{configurable:true,enumerable:true,get:()=>openingLine,set:(value:number)=>{openingLine=value;opening=true;}});
   let tick=0,injected=false,loanAtExpense=0;
   try{for(;tick<400*g.ticksPerDay&&ai.busy;tick++){
     const t0=g.tick%g.ticksPerDay;ai.work(t0,t0+1);
-    if(expenseBoundary&&!injected&&events.some(e=>e.throat)&&events.some(e=>e.category==='construction'&&e.amount===9000&&!e.throat)&&!events.some(e=>e.vehicle)){
-      const target=2*loco().reduce((n,c)=>n+c.cost,0)+600_000;
+    if(expenseBoundary&&!injected&&events.some(e=>e.opening&&e.throat)&&events.some(e=>e.opening&&e.signals)&&!events.some(e=>e.vehicle)){
+      const target=nativeFleet!+600_000;
       if(eco.money>=target){eco.spend(eco.money-target+1,'maintenance',true);injected=true;loanAtExpense=eco.loan;}
     }
     g.stepTick();
   }}
-  finally{if(descriptor)Object.defineProperty(eco,'spend',descriptor);else delete(eco as any).spend;}
-  const l=[...g.lines.map.values()].find(l=>l.kind==='rail'&&l.owner===1)!,throat=events.filter(e=>e.throat),buys=events.filter(e=>e.vehicle);
-  const choices=l?.stops.map((_,i)=>platformChoices(g,l,0,i).length)??[];
+  finally{if(pd)Object.defineProperty(project,'openingLine',pd);else{delete project.openingLine;if(openingLine!==undefined)project.openingLine=openingLine;}if(descriptor)Object.defineProperty(eco,'spend',descriptor);else delete(eco as any).spend;f.restore();}
+  const l=[...g.lines.map.values()].find(l=>l.kind==='rail'&&l.owner===owner)!,throat=events.filter(e=>e.opening&&e.throat),buys=events.filter(e=>e.vehicle),choices=l?.stops.map((_,i)=>platformChoices(g,l,0,i).length)??[];
   if(expenseBoundary){
-    console.log('  resumed expense boundary '+JSON.stringify({ticks:tick,injected,loanAtExpense,loanAfter:eco.loan,buys:buys.length,logs:ai.log}));
+    console.log('  controlled expense boundary '+JSON.stringify({ticks:tick,injected,loanAtExpense,loanAfter:eco.loan,buys:buys.length,logs:ai.log}));
     check(injected&&eco.loan===loanAtExpense&&buys.length===0&&ai.log.some(s=>s.includes('fleet reserve changed before purchase')),
       'ordinary native expense after the signal yield cancels the paid opening before a repair-induced loan or purchase');
-    return;
+    return nativeFleet!;
   }
-  console.log('  railJob '+JSON.stringify({ticks:tick,day:g.day,choices,throat,buys,diamonds:g.world.net.crossings.size,phase:ai.phase}));
+  const fleet=buys.reduce((n,e)=>n+e.amount,0),paidAt=events.indexOf(throat[0]),firstBuy=events.findIndex(e=>e.vehicle);
+  console.log('  controlled railJob '+JSON.stringify({ticks:tick,day:g.day,choices,throat,buys,diamonds:g.world.net.crossings.size,phase:ai.phase}));
   check(!ai.busy&&!!l&&choices.length===2&&choices.every(n=>n===2),'actual railJob completes both legal receiving/return platform groups before opening');
-  check(throat.length===1&&throat[0].amount===120260&&buys.length===2
-    &&throat[0].cashAfter>=buys.reduce((n,e)=>n+e.amount,0)+300_000&&throat[0].loanBefore===throat[0].loanAfter,
-    'railJob reaches native approved diamond construction, paying once before both purchases with the complete fleet cushion');
-  check(g.world.net.crossings.size===1&&checkReservations(g).length===0,
-    'the real railJob opening registers its crossing resource and preserves native reservations');
+  check(throat.length===1&&throat[0].amount>0&&buys.length===2&&paidAt>=0&&paidAt<firstBuy
+    &&throat[0].cashAfter>=fleet+600_000&&throat[0].loanBefore===throat[0].loanAfter&&eco.money>=600_000,
+    'railJob pays one native approved diamond before both full-stock purchases while retaining the complete600k cushion');
+  const diamonds=[...g.world.net.crossings.values()].filter(c=>c.kind==='diamond');
+  check(diamonds.length===1&&[diamonds[0].e1,diamonds[0].e2].every(id=>g.world.net.edges.get(id)?.kind==='rail')&&checkReservations(g).length===0,
+    'the real railJob opening registers its physical diamond crossing resource and preserves native reservations');
+  return fleet;
 }
-console.log('Actual bounded railJob opening call path');railJobCall();
+console.log('Actual bounded railJob opening call path');const nativeFleet=railJobCall();
 if(process.argv.includes('--railjob-only')){console.log(fails.length?`${fails.length} CHECKS FAILED`:'ALL CHECKS PASSED');process.exit(fails.length?1:0);}
-railJobCall(true);
+railJobCall(nativeFleet);
 
 function fixture(foreignSpur=false){
   const g=flatGame(384),me=g.addAICompany({startMoney:100_000_000}).id,foreign=g.addAICompany({startMoney:100_000_000}).id;
