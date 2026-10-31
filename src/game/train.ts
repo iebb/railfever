@@ -619,6 +619,11 @@ export class Train extends Vehicle {
   }
 
   private extensionEnd(): number {
+    const held = this.segs[this.segs.length - 1], first = this.pending[0];
+    // The depot mouth is a safe holding boundary. Reserve its stub before asking for the running line,
+    // so an emerging train can queue and acquire a brief free path without fouling unreserved track.
+    if (held?.e === -1 && held.dir > 0 && first && this.pending.length > 1
+      && this.game.world.net.edges.get(first.e)?.depot === held.depot) return 1;
     const st = this.game.stations.get(this.routeTarget), last = this.pending[this.pending.length - 1];
     const platform = st && last ? this.game.stations.railTrackGroups(st).find(q => q.steps.some(s => s.edge === last.e)) : undefined;
     const edges = new Set(platform?.steps.map(s => s.edge));

@@ -163,7 +163,9 @@ export function usesSharedRail(g: Game, l: Line): boolean {
 
 export function observeRailCapacity(g: Game) {
   for (const l of g.lines.map.values()) {
-    if (!usesSharedRail(g, l)) continue;
+    // Private fleet growth uses the same marginal path pricing as shared services. Its own queues
+    // must feed that saved observation too, rather than appearing congestion-free indefinitely.
+    if (l.kind !== 'rail' || !railCapacityOptions.enabled) continue;
     const s = l.capacity ??= { day: -1, delay: 0, held: 0, longest: 0 };
     if (s.day === g.day) continue;
     const ts = fleet(g, l).filter(t => t.onMap), waiting = ts.filter(t => t.state === 'waiting');
