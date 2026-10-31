@@ -1,5 +1,5 @@
 // Earthworks along network edges, formation locks and terraform brushes.
-import { type World, distToRect } from './world';
+import { type World, distToRect, pointInRect } from './world';
 import { Network, type NEdge } from './network';
 import { WATER_Y } from './constants';
 
@@ -20,8 +20,43 @@ export const DRY_MIN = WATER_Y + 0.05;
  */
 export const LOCK = { formation: 1, building: 2, rail: 4 };
 
+/** Sparse, read-only clearance view: removed houses lose their locks, retained neighbours keep theirs. */
+export function previewDemolition(w: World, removed: Iterable<number>): World {
+  const ids = new Set(removed);
+  if (!ids.size) return w;
+  const locks = new Map<number, number>();
+  for (const id of ids) {
+    const b = w.buildings.get(id);
+    if (!b) continue;
+    const r = Math.hypot(b.w, b.d) / 2 + 0.5;
+    const nearby = w.buildingsNear(b.x, b.z, r + 2).filter(q => !ids.has(q.id));
+    for (let z = Math.max(0, Math.floor(b.z - r)); z <= Math.min(w.size, Math.ceil(b.z + r)); z++)
+      for (let x = Math.max(0, Math.floor(b.x - r)); x <= Math.min(w.size, Math.ceil(b.x + r)); x++) {
+        if (!pointInRect(x, z, b.x, b.z, b.angle, b.w / 2 + 0.6, b.d / 2 + 0.6)) continue;
+        const k = w.vi(x, z), retained = nearby.some(q => pointInRect(x, z, q.x, q.z, q.angle, q.w / 2 + 0.6, q.d / 2 + 0.6));
+        locks.set(k, retained ? w.lock[k] | LOCK.building : w.lock[k] & ~LOCK.building);
+      }
+  }
+  const view = Object.create(w) as World;
+  const lockView = new Proxy(w.lock, {
+    get: (target, key) => typeof key === 'string' && /^\d+$/.test(key) ? locks.get(Number(key)) ?? target[Number(key)] : Reflect.get(target, key, target),
+    set: () => { throw new Error('Clearance previews are read-only'); },
+  });
+  Object.defineProperty(view, 'lock', { value: lockView });
+  view.buildingsNear = (x, z, r) => w.buildingsNear(x, z, r).filter(b => !ids.has(b.id));
+  return view;
+}
+
 /** Per vertex: the height range the formations allow (flat core, slopes beside), and the nearest target. */
 interface Acc { lo: number; hi: number; dmin: number; tnear: number; core: boolean }
+
+/** Same triangle interpolation as World.heightAt, with sparse prospective vertex values. */
+function heightAtVertices(w: World, x: number, z: number, vertex: (k: number) => number): number {
+  x = Math.max(0, Math.min(w.size - 1e-4, x)); z = Math.max(0, Math.min(w.size - 1e-4, z));
+  const ix = Math.floor(x), iz = Math.floor(z), fx = x - ix, fz = z - iz, k = iz * (w.size + 1) + ix;
+  const h0 = vertex(k), h1 = vertex(k + 1), h2 = vertex(k + w.size + 2), h3 = vertex(k + w.size + 1);
+  return fx >= fz ? h0 + (h1 - h0) * fx + (h2 - h1) * fz : h0 + (h2 - h3) * fx + (h3 - h0) * fz;
+}
 
 /** Ground samples of an edge (every <= 0.4) with the graded end 1 unit past a dead end. */
 function groundSamples(w: World, e: NEdge): { x: number; y: number; z: number; s: number }[] {
@@ -115,43 +150,73 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
 }
 
 /**
- * Ground formations share terrain vertices. A retaining wall can separate their slopes, but cannot give one
- * vertex two different heights. Refuse works that would unseat an existing road or track at shared core vertices.
+ * Ground formations share terrain vertices. Check actual road cross-sections against the projected terrain,
+ * and shared rail cores against their running heights, before accepting works that could remove their support.
  * The preview network owns its geometry caches and nodes; surveying never writes the world's network or terrain.
  */
-export function formationSupportError(w: World, planned: Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'>[],
-  ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = []): string | null {
+export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'> & { start?: { kind: string }; end?: { kind: string } })[],
+  ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = [], terrain?: ReadonlyMap<number, number>): string | null {
   if (!planned.length) return null;
   const view = Object.create(w) as World;
   view.net = new Network(view);
+  const current = (k: number) => terrain?.get(k) ?? w.h[k];
+  if (terrain) view.heightAt = (x, z) => heightAtVertices(w, x, z, current);
   const stamps = new Map<number, Acc>();
-  const roadStamps = new Map<number, Acc>();
+  const roads: NEdge[] = [];
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
   const rail = planned.some(e => e.kind === 'rail');
   for (const p of planned) {
     const a = view.net.addNode(p.kind, p.bez.x0, p.prof[0], p.bez.z0);
     const b = view.net.addNode(p.kind, p.bez.x3, p.prof[p.prof.length - 1], p.bez.z3);
-    const e: NEdge = { ...p, id: a.id, a: a.id, b: b.id, sa: 1, sb: -1, owner: 0, station: -1, depot: -1, version: 0, len: 0 };
+    const e: NEdge = { ...p, id: -a.id, a: a.id, b: b.id, sa: 1, sb: -1, owner: 0, station: -1, depot: -1, version: 0, len: 0 };
     e.len = view.net.geo(e).len;
     a.edges.push(e.id); b.edges.push(e.id);
-    stampEdge(view, e, rail && e.kind !== 'rail' ? roadStamps : stamps, true);
+    // A snapped end joins the existing network: its formation does not extend a unit beyond that joint.
+    if (p.start && p.start.kind !== 'free') a.edges.push(-1);
+    if (p.end && p.end.kind !== 'free') b.edges.push(-1);
+    if (!rail || e.kind === 'rail') stampEdge(view, e, stamps, true);
+    if (e.kind === 'road') roads.push(e);
     const g = view.net.geo(e);
     for (let i = 0; i < g.n; i++) {
       x0 = Math.min(x0, g.pts[i * 3]); x1 = Math.max(x1, g.pts[i * 3]);
       z0 = Math.min(z0, g.pts[i * 3 + 2]); z1 = Math.max(z1, g.pts[i * 3 + 2]);
     }
   }
-  // A station's access road is planned before its platforms exist. Check their shared terrain together.
-  for (const [k, road] of roadStamps) {
+  // A road can share distant core vertices while its actual carriageway remains seated. Test the
+  // interpolated surface under the road, rather than assigning every corner the highest road sample nearby.
+  const roadTerrain = new Map(terrain);
+  if (roads.length) earthworks(w, roads, true, view, roadTerrain, terrain);
+  const vertex = (k: number) => {
     const track = stamps.get(k);
-    if (track?.core && road.lo + 0.04 - 0.35 > track.hi + 1e-5)
-      return 'Access road conflicts with the station formation';
-  }
+    if (track?.core && rail) return Math.fround(w.lock[k] & LOCK.rail ? Math.min(current(k), track.hi) : track.hi);
+    if (w.lock[k] & LOCK.rail) return current(k);
+    return roadTerrain.get(k) ?? current(k);
+  };
+  const height = (x: number, z: number) => heightAtVertices(w, x, z, vertex);
+  const roadUnsupported = (road: NEdge, net: Network, existing = false) => {
+    const p = { x: 0, y: 0, z: 0 }, d = { ...p }, hw = net.halfWidth(road);
+    for (let s = 0; s <= road.len + 1e-6; s += 0.25) {
+      if (net.sectionAt(road, s) !== 'ground' || existing && road.sections.some(q => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1)) continue;
+      net.pointAt(road, s, p, d);
+      const l = Math.hypot(d.x, d.z) || 1;
+      for (const off of [-hw, -hw / 2, 0, hw / 2, hw]) {
+        const x = p.x - d.z / l * off, z = p.z + d.x / l * off;
+        if (height(x, z) < Math.min(existing ? w.heightAt(x, z) : Infinity, p.y - 0.35) - 1e-5) return true;
+      }
+    }
+    return false;
+  };
+  for (const road of roads) if (roadUnsupported(road, view.net))
+    return rail ? 'Access road conflicts with the station formation' : 'Road formation cannot be supported here';
   const pad = 5;
   for (const original of w.net.edgesNear(x0 - pad, z0 - pad, x1 + pad, z1 + pad)) {
     if (ignore.has(original.id)) continue;
     const supported = bridges.filter(q => q.edge === original.id);
     const e = supported.length ? { ...original, sections: [...original.sections, ...supported.map(q => ({ ...q, type: 'bridge' as const }))] } : original;
+    if (e.kind === 'road') {
+      if (roadUnsupported(e, w.net, true)) return 'Too close to road at another height';
+      continue;
+    }
     const old = new Map<number, Acc>();
     stampEdge(w, e, old, true);
     const fd = formationDepth(e);
@@ -159,7 +224,7 @@ export function formationSupportError(w: World, planned: Pick<NEdge, 'kind' | 't
       const next = stamps.get(k);
       if (!a.core || !next?.core) continue;
       // Rails keep the lower core; roads cannot displace rail locks. Other new cores take their surveyed height.
-      const nv = w.lock[k] & LOCK.rail ? rail ? Math.min(w.h[k], next.hi) : w.h[k] : next.hi;
+      const nv = w.lock[k] & LOCK.rail ? rail ? Math.min(current(k), next.hi) : current(k) : next.hi;
       const oldFloor = a.lo + fd - 0.35;
       const newFloor = next.lo + (rail ? 0.1 : 0.04) - 0.35;
       if (nv < Math.min(w.h[k], oldFloor) - 1e-5 || nv < newFloor - 1e-5)
@@ -208,8 +273,13 @@ function roundMax(cur: number, line: number, r: number): number {
  * volume moved (vertex-height sum).
  */
 export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): number {
+  return earthworks(w, edges, dryRun);
+}
+
+/** The same lock/building/water decisions serve actual works and sparse read-only support forecasts. */
+function earthworks(w: World, edges: NEdge[], dryRun: boolean, geometryWorld = w, forecast?: Map<number, number>, terrain?: ReadonlyMap<number, number>): number {
   const stamps = new Map<number, Acc>();
-  for (const e of edges) stampEdge(w, e, stamps);
+  for (const e of edges) stampEdge(geometryWorld, e, stamps);
   let vol = 0;
   const s1 = w.size + 1, r = EARTHWORKS.round;
   const rail = edges.some((e) => e.kind === 'rail');
@@ -221,7 +291,7 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
     if (lock & LOCK.building || (lock & LOCK.formation && !a.core)) continue;
     const x = k % s1, z = (k / s1) | 0;
     if (x === 0 || z === 0 || x === w.size || z === w.size) continue;
-    const cur = w.h[k];
+    const cur = terrain?.get(k) ?? w.h[k];
     let nv: number;
     // Steep rail profiles can cross a grid cell at several heights. Keep every corner below the
     // lowest running height, so interpolated terrain cannot bury the common track's 7% grades.
@@ -260,6 +330,7 @@ export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): numbe
     vol += Math.abs(nv - cur);
     changes.push([k, nv]);
   }
+  if (forecast) for (const [k, v] of changes) forecast.set(k, Math.fround(v));
   if (!dryRun) {
     for (const [k, v] of changes) w.setVertex(k % s1, (k / s1) | 0, v);
     for (const e of edges) lockEdge(w, e);

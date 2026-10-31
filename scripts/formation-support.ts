@@ -6,6 +6,7 @@ import { serialize, deserialize } from '../src/game/save';
 import { flatGame, build, free, railOpts, nodeSnap, check, fails } from './stationlib';
 import { roadOpts } from './lib';
 import { terrainFit } from './terrainfit';
+import { previewDemolition } from '../src/game/terraform';
 
 // Exact first damaging railway from terrain-fit seed 5, construction step 1: a double-track cutting
 // beside a town street end. A priced retaining wall cannot give their shared grid corners two heights.
@@ -21,6 +22,54 @@ import { terrainFit } from './terrainfit';
   check(JSON.stringify(counters) === JSON.stringify([net.version, net.nextNode, net.nextEdge, g.world.heightsVersion]), 'survey/refusal preserves network allocators and terrain versions');
   const fit = terrainFit(g);
   check(fit.covered === 0 && fit.floating === 0 && fit.station === 0, 'street and railway formations remain seated after refusal');
+}
+
+// A distant corner shared by two formation cores need not lie under either carriageway. Interpolation
+// can seat this road safely, although flattening every shared vertex to the road's height is impossible.
+{
+  const g = flatGame(128), net = g.world.net;
+  check(!!build(g, free(g, 12, 66), free(g, 116, 66), roadOpts(), 'parallel road'), 'fixture parallel road');
+  const a = net.addNode('rail', 12, 2.6, 64), b = net.addNode('rail', 116, 2.6, 64);
+  const p = planEdge(g, nodeSnap(g, a.id, 'rail'), nodeSnap(g, b.id, 'rail'), railOpts(0, 1, { straight: true }));
+  check(p.ok, `interpolated road support permits the nearby cutting: ${p.errors.join(', ')}`);
+  check(commitProposal(g, p) === null, 'supported nearby cutting commits');
+  const fit = terrainFit(g);
+  check(fit.covered === 0 && fit.floating === 0, 'actual road and rail widths stay seated despite shared distant corners');
+}
+
+// Minimized seed-61 opening failure: a depot's dead-end grading reaches the access street behind its shed.
+// The ordinary building rectangle is clear; only the complete stub formation reveals the unsupported road.
+{
+  const g = flatGame(128, 3.4), net = g.world.net;
+  check(!!build(g, free(g, 64.24391328973646, 61.21519428449045), free(g, 56.2670778312495, 62.41537130749497), roadOpts(0, 'street'), 'yard access street'), 'fixture yard access');
+  const angle = 0.03962754411391082, fx = Math.sin(angle), fz = Math.cos(angle);
+  const exit = net.addNode('rail', 64 + fx * 2.15, 3, 64 + fz * 2.15, fx, fz);
+  const far = net.addNode('rail', exit.x + fx * 24, 3, exit.z + fz * 24, -fx, -fz);
+  check(!!build(g, nodeSnap(g, exit.id, 'rail'), nodeSnap(g, far.id, 'rail'), railOpts(), 'yard approach'), 'fixture yard approach');
+  const before = JSON.stringify(serialize(g));
+  const plan = g.depots.plan('rail', 64, 64, angle, 0);
+  check(!plan.ok && plan.error === 'Too close to road at another height', 'depot siting refuses the access-road cutting');
+  check(g.depots.commit('rail', plan, 0) !== null && JSON.stringify(serialize(g)) === before, 'depot refusal preserves cash, terrain, roads and allocators');
+  const safe = g.depots.plan('rail', far.x, far.z, angle, 0);
+  check(safe.ok && g.depots.commit('rail', safe, 0) === null, 'the other free end remains a valid native depot site');
+  const fit = terrainFit(g);
+  check(fit.covered === 0 && fit.floating === 0, 'completed safe depot keeps its access road and approach seated');
+}
+
+// Forecast the actual clearance of a legitimate occupied depot site, including overlapping lot lock margins.
+{
+  const g = flatGame(128), w = g.world;
+  const house = (x: number) => w.addBuilding({ townId: -1, x, z: 64, angle: 0, w: 2, d: 2, type: 0, floors: 1, pop: 0, seed: 1, y: 3, built: 0 });
+  const removed = house(64), retained = house(66.5), before = JSON.stringify(serialize(g));
+  const view = previewDemolition(w, [removed.id]), after = deserialize(serialize(g));
+  after.world.removeBuilding(removed.id);
+  check(w.lock.every((_, k) => view.lock[k] === after.world.lock[k]), 'sparse demolition lock forecast matches actual clearance, including retained neighbours');
+  check(view.buildingsNear(64, 64, 4).every(b => b.id !== removed.id) && view.buildingsNear(64, 64, 4).some(b => b.id === retained.id)
+    && JSON.stringify(serialize(g)) === before, 'clearance forecast preserves the live buildings, locks and saved state');
+  const plan = g.depots.plan('rail', 64, 64, 0, 0, { snap: false, y: 3 });
+  check(plan.ok && plan.demolish.includes(removed.id) && !plan.demolish.includes(retained.id) && plan.cost > 90_000, 'legitimate depot proposal prices only its required demolition');
+  check(g.depots.commit('rail', plan, 0) === null && !w.buildings.has(removed.id) && w.buildings.has(retained.id)
+    && terrainFit(g).covered === 0 && terrainFit(g).floating === 0, 'paid depot clearance keeps the neighbouring lot and seated physical formation');
 }
 
 // A cutting crossing a road junction can work when every branch has a complete bridge and its approaches.

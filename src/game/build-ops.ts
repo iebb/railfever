@@ -5,7 +5,7 @@ import { bezLine } from './geom';
 import { NEdge } from './network';
 import { distToRect, World } from './world';
 import { rectsOverlap } from './towns';
-import { applyEarthworks, recomputeLocks, brush, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
+import { applyEarthworks, recomputeLocks, brush, formationSupportError, previewDemolition, LOCK, DRY_MIN, EARTHWORKS } from './terraform';
 import { planEdge, commitProposal, nodeGroup, Snap, Proposal } from './construction';
 import { demolitionCost } from './demolition';
 
@@ -66,6 +66,30 @@ export function depotVolume(d: Pick<Depot, 'kind' | 'x' | 'z' | 'y' | 'angle' | 
 
 /** Network kind of a depot's track (tram depots sit on roads). */
 export const depotNetKind = (kind: DepotKind): NetKind => (kind === 'rail' ? 'rail' : 'road');
+
+/** The exact surface-depot stub and graded yard pad, checked before reserving or paying for the site. */
+function depotSupportError(g: Game, kind: DepotKind, plan: DepotPlan): string | null {
+  if (plan.level === 'underground') return null;
+  const w = previewDemolition(g.world, plan.demolish), sz = depotSize(kind), fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);
+  const x = plan.x - fx * (sz.d / 2 - 0.4), z = plan.z - fz * (sz.d / 2 - 0.4);
+  const exit = plan.snapNode >= 0 ? w.net.nodes.get(plan.snapNode) : { x: plan.exitX, z: plan.exitZ, y: plan.y };
+  if (!exit) return 'Track end changed: replan';
+  const len = Math.hypot(exit.x - x, exit.z - z), prof = new Float32Array(Math.max(2, Math.ceil(len) + 1)).fill(plan.y);
+  prof[prof.length - 1] = exit.y;
+  const pad = new Map<number, number>();
+  for (let zz = Math.max(1, Math.floor(plan.z - 4)); zz <= Math.min(w.size - 1, Math.ceil(plan.z + 4)); zz++)
+    for (let xx = Math.max(1, Math.floor(plan.x - 4)); xx <= Math.min(w.size - 1, Math.ceil(plan.x + 4)); xx++) {
+      const k = w.vi(xx, zz);
+      if (w.lock[k] & (LOCK.building | LOCK.formation)) continue;
+      const d = distToRect(xx, zz, plan.x, plan.z, plan.angle, sz.w / 2 + 0.3, sz.d / 2 + 0.3);
+      const weight = d <= 0 ? 1 : Math.max(0, 1 - d / 2), cur = w.h[k];
+      let value = cur + (plan.y - 0.08 - cur) * weight;
+      if (value < cur && value < DRY_MIN) value = Math.min(cur, DRY_MIN);
+      if (weight > 0) pad.set(k, Math.fround(value));
+    }
+  return formationSupportError(w, [{ kind: depotNetKind(kind), type: kind === 'rail' ? 'standard' : 'road',
+    bez: bezLine(x, z, exit.x, exit.z), prof, sections: [], end: { kind: plan.snapNode >= 0 ? 'node' : 'free' } }], undefined, undefined, pad);
+}
 
 /** May company `owner` run trams on this edge? (tram tracks it may use) */
 export function tramUsable(g: Game, e: NEdge, owner: number): boolean { return !!e.tram && g.canUse(owner, e.tramOwner ?? -1); }
@@ -195,6 +219,7 @@ export class Depots {
       else if (link) { for (const id of link.demolish) if (!plan.demolish.includes(id)) plan.demolish.push(id); plan.cost += link.cost; }
       else if (!net.nearestEdge(exitX, exitZ, 4, 'road', (ed) => ed.depot < 0 && (!tram || tramUsable(g, ed, owner)))) failp(tram ? 'No tram track nearby' : 'No road nearby');
     }
+    if (plan.ok) { const error = depotSupportError(g, kind, plan); if (error) failp(error); }
     return plan;
   }
 
@@ -271,6 +296,8 @@ export class Depots {
     const net = w.net;
     if (!plan.ok) return plan.error ?? 'Cannot build';
     if (plan.level === 'underground' && kind === 'rail') return this.commitUnderground(plan, owner);
+    const supportError = depotSupportError(g, kind, plan);
+    if (supportError) return supportError;
     if (!g.company(owner).economy.spend(plan.cost, 'construction')) return 'Not enough money';
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     const fx = Math.sin(plan.angle), fz = Math.cos(plan.angle);

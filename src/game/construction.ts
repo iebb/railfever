@@ -7,7 +7,7 @@ import {
 } from './geom';
 import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
 import { SpatialGrid } from './spatial';
-import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, formationSupportError, EARTHWORKS, DRY_MIN } from './terraform';
+import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, formationSupportError, previewDemolition, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
 import { demolitionTotal } from './demolition';
 
@@ -1281,7 +1281,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   if (roadBridges.error) fail(roadBridges.error);
   if (roadBridges.works.length) prop.roadBridges = roadBridges.works;
   if (!prop.errors.length && !opts.town) {
-    const error = formationSupportError(w, prop.tracks.map(tp => ({ ...tp, kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
+    const error = formationSupportError(previewDemolition(w, prop.demolish), prop.tracks.map(tp => ({ ...tp, kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
     if (error) fail(error);
   }
 
@@ -1384,7 +1384,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   const roadBridges = roadBridgeWorks(g, prop);
   if (roadBridges.error) return roadBridges.error;
   if (JSON.stringify(roadBridges.works) !== JSON.stringify(prop.roadBridges ?? [])) return 'Road bridge window changed: replan';
-  const supportError = !opts.town && formationSupportError(w, prop.tracks.map(tp => ({ ...tp, kind: opts.kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
+  const supportError = !opts.town && formationSupportError(previewDemolition(w, prop.demolish), prop.tracks.map(tp => ({ ...tp, kind: opts.kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
   if (supportError) return supportError;
   if (opts.infrastructureOwner !== undefined) {
     const err = g.trackUpgradeError(opts.owner, opts.infrastructureOwner);

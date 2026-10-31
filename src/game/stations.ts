@@ -5,7 +5,7 @@ import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
-import { applyEarthworks, repairFormations, formationSupportError, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
+import { applyEarthworks, repairFormations, formationSupportError, previewDemolition, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
 import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
@@ -1387,6 +1387,23 @@ export class Stations {
     // A joined stop station keeps its id: commit (nearbyComplex) never links it to a consecutive stop of its lines,
     // so the plan must not promise that passage either.
     if (plan.join) { const j = plan.join.id; plan.links = plan.links.filter((o) => !this.consecutiveStops(j, o.id)); }
+    const formationDemolish = new Set<number>();
+    if (level === 'ground') {
+      // Collect formation clearance before forecasting support: these houses and their locks will be gone.
+      const reach = 0.32 + EARTHWORKS.corePad + 1.42;
+      for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
+        const pt = pose(off, s), px = pt.x, pz = pt.z;
+        if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
+        for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) { demolish.add(b.id); formationDemolish.add(b.id); }
+      }
+    }
+    const ignoreFormations = new Set(opts.ignoreEdges);
+    if (ign !== undefined) for (const e of w.net.edges.values()) if (e.station === ign) ignoreFormations.add(e.id);
+    const stationFormations = level !== 'ground' ? [] : opts.alignment ? opts.alignment.tracks.flatMap(t => t.pieces.map(p => ({ kind: 'rail' as const, type: 'standard', bez: p.curve, prof: new Float32Array(p.profile), sections: [] })))
+      : [...layout.trackOffsets, ...layout.throughOffsets].map(off => {
+        const a = pose(off, -length / 2), b = pose(off, length / 2);
+        return { kind: 'rail' as const, type: 'standard', bez: bezLine(a.x, a.z, b.x, b.z), prof: new Float32Array(Math.max(2, Math.ceil(length) + 1)).fill(plan.y), sections: [] };
+      });
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
     const bc = (plan as StationPlan & { buildingCands?: BuildingCand[] }).buildingCands;
@@ -1395,11 +1412,12 @@ export class Stations {
       const chosen = bc[0], reach = styleOf(plan.style).placement === 'none' ? NO_BUILDING_REACH : 0.9;
       search: for (const c of bc.slice(0, 6)) {
         if (c.road > ACCESS_REACH) continue;
+        const candidateDemolition = [...demolish].filter(id => c === chosen || !chosen.dem.has(id) || c.dem.has(id) || formationDemolish.has(id)).concat([...c.dem]);
         // either forecourt of a concourse station will do (the one with the road becomes the main one)
         for (const [f1, f2] of c.fc2 ? [[c.fc, c.fc2], [c.fc2, c.fc]] : [[c.fc, undefined]]) {
           const swap = () => {
             if (c !== chosen) {
-              for (const id of chosen.dem) if (!c.dem.has(id)) demolish.delete(id);
+              for (const id of chosen.dem) if (!c.dem.has(id) && !formationDemolish.has(id)) demolish.delete(id);
               for (const id of c.dem) demolish.add(id);
             }
             plan.building = c.b; plan.forecourt = f1!; plan.forecourt2 = f2 ?? null;
@@ -1408,11 +1426,14 @@ export class Stations {
         }
         for (const [f1, f2] of c.fc2 ? [[c.fc, c.fc2], [c.fc2, c.fc]] : [[c.fc, undefined]]) {
           plan.building = c.b;
-          const acc = this.planAccessStreet(f1!.x, f1!.z, plan, owner, c.end);
+          const acc = this.planAccessStreet(f1!.x, f1!.z, plan, owner, c.end, [], undefined, ACCESS_REACH,
+            p => !stationFormations.length || !formationSupportError(previewDemolition(w, [...candidateDemolition, ...p.demolish]), [...stationFormations, ...p.tracks.map(t => ({ ...t, kind: 'road' as const, type: p.opts.type }))], ignoreFormations));
           plan.building = chosen.b;
+          // A road surveyed before the platforms exist must fit their prospective terrain too. Keep trying
+          // the other forecourts when this path cannot share their grid cells safely.
           if (acc) {
             if (c !== chosen) {
-              for (const id of chosen.dem) if (!c.dem.has(id)) demolish.delete(id);
+              for (const id of chosen.dem) if (!c.dem.has(id) && !formationDemolish.has(id)) demolish.delete(id);
               for (const id of c.dem) demolish.add(id);
             }
             plan.building = c.b; plan.forecourt = f1!; plan.forecourt2 = f2 ?? null;
@@ -1424,24 +1445,9 @@ export class Stations {
     }
     if (level === 'ground') {
       if (plan.ok) {
-        const ignore = new Set(opts.ignoreEdges);
-        if (ign !== undefined) for (const e of w.net.edges.values()) if (e.station === ign) ignore.add(e.id);
-        const tracks = opts.alignment ? opts.alignment.tracks.flatMap(t => t.pieces.map(p => ({ kind: 'rail' as const, type: 'standard', bez: p.curve, prof: new Float32Array(p.profile), sections: [] })))
-          : [...layout.trackOffsets, ...layout.throughOffsets].map(off => {
-            const a = pose(off, -length / 2), b = pose(off, length / 2);
-            return { kind: 'rail' as const, type: 'standard', bez: bezLine(a.x, a.z, b.x, b.z), prof: new Float32Array(Math.max(2, Math.ceil(length) + 1)).fill(plan.y), sections: [] };
-          });
         const access = plan.access?.tracks.map(t => ({ ...t, kind: 'road' as const, type: plan.access!.opts.type })) ?? [];
-        const error = formationSupportError(w, [...tracks, ...access], ignore);
+        const error = formationSupportError(previewDemolition(w, [...demolish, ...(plan.access?.demolish ?? [])]), [...stationFormations, ...access], ignoreFormations);
         if (error) failp(error);
-      }
-      // A rail formation reaches all the grid cells under its ballast. Houses sharing those cells must be
-      // cleared when it is regraded, including outside the platform rectangle and along through tracks.
-      const reach = 0.32 + EARTHWORKS.corePad + 1.42;
-      for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
-        const pt = pose(off, s), px = pt.x, pz = pt.z;
-        if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
-        for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) demolish.add(b.id);
       }
     }
     plan.demolish = [...demolish];
@@ -1520,7 +1526,7 @@ export class Stations {
    * Access street from a station forecourt to a nearby road: not through the station, and clear of the lead
    * corridors beyond both platform ends (where the line and its throat go).
    */
-  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; y?: number; angle: number; length: number; alignment?: RailStationAlignment; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH): Proposal | null {
+  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; y?: number; angle: number; length: number; alignment?: RailStationAlignment; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH, accept?: (proposal: Proposal) => boolean): Proposal | null {
     const g = this.game, net = g.world.net;
     const ax = Math.sin(plan.angle), az = Math.cos(plan.angle);
     const LEAD = 26, half = plan.layout.width / 2 + 1.2;
@@ -1569,7 +1575,7 @@ export class Stations {
         bezPoint(tp.bez, i / 24, p);
         if (Math.hypot(p.x - fx, p.z - fz) > 0.7 && blocked(p.x, p.z, 0.45)) hit = true;
       }
-      if (!hit) return prop;
+      if (!hit && (!accept || accept(prop))) return prop;
     }
     return null;
   }
