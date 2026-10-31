@@ -1,0 +1,36 @@
+name: Validate game
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run full headless gate
+        run: npm run gate -- HEAD "$RUNNER_TEMP/railfever-gate"
+      - name: Upload failed check logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/railfever-gate/**/*.log
+            ${{ runner.temp }}/railfever-gate/**/*.res
+          if-no-files-found: ignore
+          retention-days: 7

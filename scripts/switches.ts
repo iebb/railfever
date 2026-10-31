@@ -1,4 +1,4 @@
-// Bundle as switches.mjs using the adapters in saves-harness.ts (see saves.progress.md). Node + jsdom.
+// Run via npm run gate: switches.mjs uses saves-harness.ts adapters, Node and jsdom.
 import assert from 'node:assert/strict';
 import { JSDOM } from 'jsdom';
 import { indexedDB, IDBObjectStore } from 'fake-indexeddb';
@@ -78,7 +78,7 @@ try {
     const newCard = (seed: number) => {
       current().ui.openNewGame();
       (win.document.querySelector('.ng-card .seg button') as HTMLElement).click();
-      const input = win.document.querySelector('.ng-card input[type=number]') as HTMLInputElement;
+      const input = win.document.querySelector('.ng-card input[aria-label="Seed"]') as HTMLInputElement;
       input.value = String(seed); input.dispatchEvent(new win.Event('input'));
     };
     newCard(11); button(win.document.querySelector('.ng-card')!, 'Start').click();
