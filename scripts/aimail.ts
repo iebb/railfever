@@ -4,7 +4,7 @@
 import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { pickTrain, modelYearCost, type LineInfo } from '../src/game/ai';
-import { forecastMailRevenue, projectMail, mailVans, type MailQueue } from '../src/game/ai-mail';
+import { forecastMailRevenue, projectMail, mailVans, mailPlatformLength, mailPlatformsPay, type MailQueue } from '../src/game/ai-mail';
 import { MODEL_BY_ID, carriesMail } from '../src/game/vehicle-types';
 import { lineTable } from '../src/game/patterns';
 import { railPartMode } from '../src/game/stations';
@@ -62,6 +62,16 @@ function policyChecks() {
   check(g.mail.toJSON() === null && points.every((st) => !st.mail), 'forecasting creates no mail state and consumes no mail randomness');
   const opening = projectMail(g, points, cars, 1, t.maxSpeedKmh * 0.6, headway, 16);
   check(opening.revenue > 0 && opening.cars.filter(carriesMail).length === 1, 'a paying main-line project opens with one van');
+  const shortCars = pickTrain(1950, 8, 150, 2)!;
+  const longer = mailPlatformLength(1950, shortCars, 8);
+  check(longer === 10 && projectMail(g, points, shortCars, 1, 70, headway, 8).revenue === 0,
+    'short passenger platforms are compared with the actual room a compatible van needs');
+  const longerMail = projectMail(g, points, shortCars, 1, 70, headway, longer);
+  check(mailPlatformsPay(longerMail, 1, 72_000, 4_000, 0.5), 'profitable mail repays both longer platforms and its van');
+  const sparsePlatformMail = projectMail(g, points, shortCars, 1, 70, 10_000, longer);
+  check(!mailPlatformsPay(longerMail, 1, 10_000_000, 4_000, 0.5)
+    && !mailPlatformsPay(sparsePlatformMail, 1, 72_000, 4_000, 0.5), 'expensive platform works and sparse mail retain the shorter alternative');
+  check(mailPlatformLength(1950, [MODEL_BY_ID.get('hsr_a')!], 8) === 8, 'unit trains do not request mail platform works');
   const steam = ['steam_b', 'coach_steel', 'coach_steel'].map((id) => MODEL_BY_ID.get(id)!);
   check(projectMail(g, points, steam, 1, 70, headway, 10).cars.filter(carriesMail).length === 1,
     'a 9.7-unit steam consist with its van fits a 10-unit platform');

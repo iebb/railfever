@@ -36,7 +36,7 @@ import { networkDaily, finishNetworkReview, scheduleRailExpansionReview, schedul
 import { urbanGrowthCandidates, outerEnd, type UrbanGrowthQuote } from './ai-grow';
 import { surfaceDemolition, subwayCostPerUnit, type SubwayYardPlan } from './subway';
 import { RailPolicy } from './ai-rail';
-import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLength } from './ai-mail';
+import { MailPolicy, projectMail, forecastMailRevenue, keepMailVans, mailVanLength, mailPlatformLength, mailPlatformsPay } from './ai-mail';
 import { offloadMail } from './mail';
 import { DoubleJob, newDoubleJob, doubleJobStep, lineIsDouble, congestionReturn, upgradeRoute } from './dualtrack';
 // capacity-integration: shared fleet agreement and a single upgrade adapter for the track-rights branch.
@@ -3228,7 +3228,8 @@ export class AIController {
     const fail = (why: string, days = 900) => { this.note(`${what} ${A.name}-${B.name} abandoned: ${why}`); this.markFailed(key, days); this.abandon(p); };
     if (hub && !this.railHubLive(hub)) return fail('station or track access changed while planning', 360);
     if (hs && !hsUnit) return fail('no high-speed trains yet', 1800);
-    const PLATFORM = hs ? Math.max(12, Math.ceil(hsUnit!.length + 1)) : aiPlatformLength(A.pop, B.pop, g.year), ST = 2, tracks = 1;
+    let PLATFORM = hs ? Math.max(12, Math.ceil(hsUnit!.length + 1)) : aiPlatformLength(A.pop, B.pop, g.year);
+    const ST = 2, tracks = 1;
     const grade = (hs ? 0.03 : 0.035) * 0.8;
     // Aim above conventional speeds on the trunk; near a stop, a slower curve on HSR track is legal.
     // Derive the speed radius from curveSpeed, keeping margin for the planner's fitted Beziers.
@@ -3281,12 +3282,32 @@ export class AIController {
     // A central alignment is an economic alternative at every town size. Price the reachable pair,
     // including the structures needed to cross its streets, against the existing surface/hub layout.
     let underground = false, preferredRoute: RoutePlan | null = null;
-    if (!hs && centre) {
-      const base = pr, pairs = [base];
-      for (const level of ['ground', 'elevated', 'underground'] as const) {
+    if (!hs) {
+      const base = pr, pairs = [base], longerPairs = new Map<typeof base, typeof base>();
+      for (const level of centre ? ['ground', 'elevated', 'underground'] as const : []) {
         const a = hub ? base.a : yield* this.centreStation(A, base.b, PLATFORM, level);
         const b = hubB ? base.b : yield* this.centreStation(B, a ?? base.a, PLATFORM, level);
         if (a && b && reach(a, b) && leadsMeet(a, b, LEAD)) pairs.push({ a, b });
+      }
+      // Mail can repay longer platforms even where passenger demand opens with a short train.
+      // Keep the original pairs in the auction: the extra native construction and upkeep must
+      // beat their return, and existing hubs are never silently enlarged by a new-line quote.
+      const stock = pickTrain(g.year, PLATFORM, Math.hypot(A.x - B.x, A.z - B.z) * 1.3, openingCoaches(A.pop, B.pop));
+      const mailLength = stock ? mailPlatformLength(g.year, stock, PLATFORM) : PLATFORM;
+      if (mailLength > PLATFORM && mailLength <= 12 && (!hub || hub.rail!.length >= mailLength) && (!hubB || hubB.rail!.length >= mailLength)) {
+        for (const pair of [...pairs]) {
+          const longer = (sp: StationPlan, other: StationPlan, existing: Station | null) => {
+            // Grow away from the corridor so its platform front, approach and priced running track stay fixed.
+            const sign = Math.sin(sp.angle) * (other.x - sp.x) + Math.cos(sp.angle) * (other.z - sp.z) > 0 ? 1 : -1;
+            const shift = (mailLength - sp.length) / 2 * sign;
+            return existing ? sp : g.stations.planRail(sp.x - Math.sin(sp.angle) * shift, sp.z - Math.cos(sp.angle) * shift, sp.angle, mailLength, sp.tracks, owner,
+              { aiSurvey: true, trackType: sp.trackType, mode: sp.mode, level: sp.level, fixedY: sp.y, through: sp.through, throughMode: sp.throughMode,
+                platformStyle: sp.platformStyle, psd: sp.psd, style: sp.style, entrances: sp.entrances.length });
+          };
+          const a = longer(pair.a, pair.b, hub), b = longer(pair.b, pair.a, hubB);
+          yield;
+          if (a.ok && b.ok && reach(a, b) && leadsMeet(a, b, LEAD)) { const extended = { a, b }; pairs.push(extended); longerPairs.set(extended, pair); }
+        }
       }
       const routeFor = function* (pair: typeof base): Generator<void, RoutePlan | string> {
         const sa = hub && Math.sin(pair.a.angle) * (pair.b.x - pair.a.x) + Math.cos(pair.a.angle) * (pair.b.z - pair.a.z) < 0 ? -1 : 1;
@@ -3311,14 +3332,18 @@ export class AIController {
         return { way, prof, minR: aligned.minR, expanded: 0 };
       };
       let best = -Infinity;
+      const routes = new Map<typeof base, RoutePlan | string>();
       for (const pair of pairs) {
-        const route = yield* routeFor(pair);
+        // Growing the rear leaves the corridor unchanged; reuse its survey and planning budget.
+        const shorterPair = longerPairs.get(pair);
+        const route = shorterPair && routes.has(shorterPair) ? routes.get(shorterPair)! : yield* routeFor(pair);
+        routes.set(pair, route);
         if (typeof route === 'string') continue;
         const len = route.prof.s[route.prof.s.length - 1], dist = Math.hypot(pair.b.x - pair.a.x, pair.b.z - pair.a.z);
         if (len > dist * 1.55 + 25) continue;
         const overlap = routeAlongside(g, route.prof, Math.min(25, len / 5), trackClassOf(type));
         if (overlap > .3) continue;
-        const stock = pickTrain(g.year, Math.min(PLATFORM, pair.a.length, pair.b.length), len, openingCoaches(A.pop, B.pop));
+        const stock = pickTrain(g.year, Math.min(pair.a.length, pair.b.length), len, openingCoaches(A.pop, B.pop));
         if (!stock) continue;
         const works = estimateChainCost(route.prof, tracks, 'rail', type);
         const infrastructure = works.cost * 1.15 + (hub ? 0 : pair.a.cost) + (hubB ? 0 : pair.b.cost) + 260_000;
@@ -3330,7 +3355,14 @@ export class AIController {
           const forecast = g.demand.forecastLine([hub ?? pair.a, hubB ?? pair.b], 'mainline', sv.kmh, sv.headway, owner, undefined, undefined, 'rail',
             plannedSet(g, [hub ?? pair.a, hubB ?? pair.b]));
           const mail = projectMail(g, [hub ?? pair.a, hubB ?? pair.b], stock, fleet, sv.kmh, sv.headway,
-            Math.min(PLATFORM, pair.a.length, pair.b.length));
+            Math.min(pair.a.length, pair.b.length));
+          const shorter = longerPairs.get(pair);
+          if (shorter) {
+            const stationUpkeep = (q: typeof pair) => [q.a, q.b].reduce((n, sp, i) => n + ((i === 0 ? hub : hubB) ? 0
+              : (20_000 + sp.tracks * sp.length * 500) * (STATION_UPKEEP_FACTOR[sp.level] ?? 1)), 0);
+            const extraCost = (hub ? 0 : pair.a.cost - shorter.a.cost) + (hubB ? 0 : pair.b.cost - shorter.b.cost);
+            if (!mailPlatformsPay({ ...mail, revenue: mail.revenue * (1 - overlap) }, fleet, extraCost, stationUpkeep(pair) - stationUpkeep(shorter), this.config.risk)) continue;
+          }
           const capital = infrastructure + (stock.reduce((n, c) => n + c.cost, 0) + mail.price) * fleet;
           const income = (forecast.revenue * Math.min(1, sv.seats / Math.max(1, forecast.boardings)) + .7 * mail.revenue) * (1 - overlap);
           const net = income - sv.running - mail.yearly - sv.trackUpkeep - civilUpkeep;
@@ -3340,8 +3372,10 @@ export class AIController {
           yield;
         }
       }
+      PLATFORM = Math.max(PLATFORM, ...(hub ? [] : [pr.a.length]), ...(hubB ? [] : [pr.b.length]));
       underground = pr.a.level === 'underground' || pr.b.level === 'underground';
-      if (pr !== base) this.note(`${what} ${A.name}-${B.name}: central ${pr.a.level}/${pr.b.level} alignment pays better than the surface alternative`);
+      if (PLATFORM > base.a.length && PLATFORM > base.b.length) this.note(`${what} ${A.name}-${B.name}: longer platforms repay their cost with mail`);
+      if (pr.a.level !== base.a.level || pr.b.level !== base.b.level) this.note(`${what} ${A.name}-${B.name}: central ${pr.a.level}/${pr.b.level} alignment pays better than the surface alternative`);
     }
     const planning = this.state.phase;
     this.state.phase = `${planning}: route`;

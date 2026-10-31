@@ -60,6 +60,12 @@ export function pickMailVan(year: number, cars: VehicleModel[]): VehicleModel | 
     .sort((a, b) => value(b) - value(a))[0] ?? null;
 }
 
+/** Smallest whole-unit platform accommodating the passenger consist and one speed-compatible mail van. */
+export function mailPlatformLength(year: number, cars: VehicleModel[], platform: number): number {
+  const van = pickMailVan(year, cars);
+  return van ? Math.max(platform, Math.ceil(lengthOf(cars) + van.length + 0.1 + PLATFORM_CLEARANCE)) : platform;
+}
+
 const townOf = (g: Game, p: MailSite) => ('townId' in p ? p.townId : g.towns.nearest(p.x, p.z)?.id ?? -1);
 /** People can reach it: a station unless its road access is known to be missing (mail.ts), a plan with road access. */
 const reachableSite = (p: MailSite) => ('id' in p ? p.roadAccess !== false : !('roadAccess' in p) || !!p.roadAccess);
@@ -177,6 +183,13 @@ export function projectMail(g: Game, points: MailSite[], cars: VehicleModel[], f
   const yearly = modelYearCost(van, g.year) * fleet;
   if (revenue < MARGIN * (yearly + van.cost * fleet / 8)) return { ...none, potential: revenue };
   return { revenue, potential: revenue, yearly, price: van.cost, cars: withVans(cars, [van]) };
+}
+
+/** Incremental mail must repay its vans and longer station works under the ordinary railway capital allowance. */
+export function mailPlatformsPay(mail: ReturnType<typeof projectMail>, fleet: number, extraCost: number, extraYearly: number, risk: number): boolean {
+  const capital = Math.max(0, extraCost), upkeep = Math.max(0, extraYearly);
+  return mail.revenue > 0 && 0.7 * mail.revenue > mail.yearly + upkeep
+    + capital * (0.075 - 0.03 * risk) + mail.price * fleet * 0.03;
 }
 
 export class MailPolicy {
