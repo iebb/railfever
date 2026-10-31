@@ -451,12 +451,33 @@ export function deserialize(d: any): Game {
   // Older single-record saves must be complete too: typed-array set/subarray otherwise silently
   // zero-filled missing terrain and locks, or discarded trailing data, permanently changing the map.
   let legacy: { h: Float32Array; lock: Uint8Array; trees: Float32Array } | undefined;
+  let chunks: { h: Uint8Array[]; lock: Uint8Array[]; trees: Uint8Array[] } | undefined;
+  const vertices = (wd.size + 1) ** 2;
   if (d.version === 2) {
     legacy = { h: f32dec(wd.h), lock: unb64(wd.lock), trees: f32dec(wd.trees) };
-    const vertices = (wd.size + 1) ** 2;
     if (legacy.h.length !== vertices) throw new Error('Incomplete heightmap');
     if (legacy.lock.length !== vertices) throw new Error('Incomplete lock grid');
     if (legacy.trees.length % 5) throw new Error('Invalid tree chunk');
+  } else {
+    if (wd.encoding !== 'predict32-chunks' || wd.vertices !== SAVE_VERTICES || wd.treeChunk !== TREE_CHUNK)
+      throw new Error('Unsupported world chunk encoding');
+    const decode = (parts: unknown, width: number): Uint8Array[] => {
+      if (!Array.isArray(parts)) throw new Error('Invalid world chunks');
+      return parts.map((part) => {
+        const bytes = typeof part === 'string' ? unb64(part) : part;
+        if (!(bytes instanceof Uint8Array)) throw new Error('Invalid world chunk');
+        if (bytes.length % width) throw new Error(width === 20 ? 'Invalid tree chunk' : 'Invalid float chunk');
+        return bytes;
+      });
+    };
+    chunks = { h: decode(wd.h, 4), lock: decode(wd.lock, 1), trees: decode(wd.trees, 20) };
+    const count = (parts: Uint8Array[], width: number) => parts.reduce((sum, a) => sum + a.length / width, 0);
+    // Check the supplied data before allocating the declared world or tree array. A small corrupt
+    // header must not turn an otherwise recoverable import failure into a browser out-of-memory crash.
+    if (count(chunks.h, 4) !== vertices) throw new Error('Incomplete heightmap');
+    if (count(chunks.lock, 1) !== vertices) throw new Error('Incomplete lock grid');
+    if (!Number.isSafeInteger(wd.treeCount) || wd.treeCount < 0 || count(chunks.trees, 20) !== wd.treeCount)
+      throw new Error('Incomplete trees');
   }
   const w = new World(wd.size);
   let tr: Float32Array;
@@ -465,18 +486,16 @@ export function deserialize(d: any): Game {
     w.lock.set(legacy.lock);
     tr = legacy.trees;
   } else {
-    if (wd.encoding !== 'predict32-chunks' || wd.vertices !== SAVE_VERTICES || wd.treeChunk !== TREE_CHUNK)
-      throw new Error('Unsupported world chunk encoding');
-    const floats = (x: string | Uint8Array, stride = 0) => codec.unpackFloats(typeof x === 'string' ? unb64(x) : x, stride);
+    const floats = (x: Uint8Array, stride = 0) => codec.unpackFloats(x, stride);
     let at = 0;
-    for (const chunk of wd.h) { const a = floats(chunk, w.size + 1); w.h.set(a, at); at += a.length; }
+    for (const chunk of chunks!.h) { const a = floats(chunk, w.size + 1); w.h.set(a, at); at += a.length; }
     if (at !== w.h.length) throw new Error('Incomplete heightmap');
     at = 0;
-    for (const chunk of wd.lock) { const a = typeof chunk === 'string' ? unb64(chunk) : chunk; w.lock.set(a, at); at += a.length; }
+    for (const chunk of chunks!.lock) { w.lock.set(chunk, at); at += chunk.length; }
     if (at !== w.lock.length) throw new Error('Incomplete lock grid');
     tr = new Float32Array(wd.treeCount * 5);
     at = 0;
-    for (const chunk of wd.trees) {
+    for (const chunk of chunks!.trees) {
       const a = floats(chunk), n = a.length / 5;
       if (!Number.isInteger(n)) throw new Error('Invalid tree chunk');
       for (let i = 0; i < n; i++) for (let f = 0; f < 5; f++) tr[(at + i) * 5 + f] = a[f * n + i];
