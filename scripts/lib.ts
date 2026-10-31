@@ -2,7 +2,7 @@
 import { Game } from '../src/game/game';
 import { findSnap, planEdge, commitProposal, BuildOptions, Snap, Proposal } from '../src/game/construction';
 import { toggleSignal } from '../src/game/build-ops';
-import { finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
+import { connectStationThroat, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { Train, CROSS_BASE, findRailRoute, railNext, depotReaches } from '../src/game/train';
@@ -77,11 +77,13 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
   log(`  chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels} cost=${Math.round(res.cost)}`);
   for (const n of res.notes ?? []) log('   ' + n);
   if (!res.ok) return { ...fail, len: res.built };
-  // switches: track 1 joins the leads 14 units out
-  const s1 = edgeSnapAt(g, 'rail', a0.x + fA.x * 14, a0.z + fA.z * 14);
-  build(g, nodeSnap(g, endA(1), 'rail'), s1, railOpts(owner), 'throat A');
-  const s2 = edgeSnapAt(g, 'rail', b0.x + fB.x * 14, b0.z + fB.z * 14);
-  build(g, nodeSnap(g, endB(1), 'rail'), s2, railOpts(owner), 'throat B');
+  for (const st of [A, B]) {
+    const throat = connectStationThroat(g, st.id, owner);
+    if (throat.failed.length) {
+      log(`  throat ${st.name}: ${throat.failed.join(', ')}`);
+      return { ...fail, len: res.built };
+    }
+  }
   return { ok: true, len: res.built, bridges: res.bridges, tunnels: res.tunnels, minR: al.minR };
 }
 
@@ -210,7 +212,7 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     if (g.stations.commitRail(pr.a, owner)) continue;
     const A = g.stations.get(ia)!;
     // the second plan may conflict now; re-plan it at the same spot
-    const pb = g.stations.planRail(pr.b.x, pr.b.z, pr.b.angle, length, 2, owner);
+    const pb = g.stations.planRail(pr.b.x, pr.b.z, pr.b.angle, length, 2, owner, { fixedY: pr.b.y });
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
     const B = g.stations.get(ib)!;

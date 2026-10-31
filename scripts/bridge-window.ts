@@ -58,7 +58,15 @@ for(const boundary of ['branch','tunnel','end','stale'] as const){
   if(boundary==='end') net.removeEdge(cut.e1.id);
   if(boundary==='stale') {cut.e2.prof[0]+=0.2;net.touchEdge(cut.e2);}
   const before=JSON.stringify(serialize(b.g)), next=b.quote();
-  check(boundary==='stale' || !next.ok && /bridge window/i.test(next.errors.join(' ')), `${boundary}: incomplete road support is rejected during planning`);
+  if (boundary === 'branch') {
+    check(next.ok && (next.roadBridges?.length ?? 0) === 3,
+      'a feasible road junction quotes support on all three arms');
+    const supported = deserialize(serialize(b.g));
+    const quote = planEdge(supported, free(supported,116,106), free(supported,135,150), railOpts(0,1,{heightOffset:-0.65,crossing:'under'}));
+    check(!commitProposal(supported,quote), 'the complete junction support commits');
+    const fit = terrainFit(supported);
+    check(fit.covered === 0 && fit.floating === 0, 'the completed junction leaves no unsupported ground samples');
+  } else check(boundary==='stale' || !next.ok && /bridge window/i.test(next.errors.join(' ')), `${boundary}: incomplete road support is rejected during planning`);
   check(!!commitProposal(b.g,oldQuote) && JSON.stringify(serialize(b.g))===before, `${boundary}: stale work is rejected before any construction mutation`);
 }
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
