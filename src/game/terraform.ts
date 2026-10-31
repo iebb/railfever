@@ -59,7 +59,7 @@ function heightAtVertices(w: World, x: number, z: number, vertex: (k: number) =>
 }
 
 /** Ground samples of an edge (every <= 0.4) with the graded end 1 unit past a dead end. */
-function groundSamples(w: World, e: NEdge): { x: number; y: number; z: number; s: number }[] {
+function groundSamples(w: World, e: NEdge, continued?: ReadonlySet<number>): { x: number; y: number; z: number; s: number }[] {
   const net = w.net, g = net.geo(e), out: { x: number; y: number; z: number; s: number }[] = [];
   let lastS = -1;
   for (let i = 0; i < g.n; i++) {
@@ -72,7 +72,7 @@ function groundSamples(w: World, e: NEdge): { x: number; y: number; z: number; s
   // dead ends (track and road ends, depot stubs, access streets): the formation ends a unit past the node
   for (const [nid, i, sg] of [[e.a, 0, -1], [e.b, g.n - 1, 1]] as const) {
     const n = net.nodes.get(nid);
-    if (!n || n.edges.length !== 1 || net.sectionAt(e, sg < 0 ? 0 : e.len) !== 'ground') continue;
+    if (!n || continued?.has(nid) || n.edges.length !== 1 || net.sectionAt(e, sg < 0 ? 0 : e.len) !== 'ground') continue;
     const tx = g.tan[i * 2] * sg, tz = g.tan[i * 2 + 1] * sg;
     for (const k of [0.4, 0.8, 1]) out.push({ x: g.pts[i * 3] + tx * k, y: g.pts[i * 3 + 1], z: g.pts[i * 3 + 2] + tz * k, s: sg < 0 ? -k : e.len + k });
   }
@@ -107,7 +107,7 @@ function portalEnd(w: World, e: NEdge, nid: number): boolean {
 }
 
 /** Collect, per vertex, the heights the edge's ground sections allow: flat formation, linear side slopes. */
-function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) {
+function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, continued?: ReadonlySet<number>) {
   const net = w.net;
   const hw = net.halfWidth(e);
   const core = hw + EARTHWORKS.corePad;
@@ -120,7 +120,7 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
   if (e.kind === 'rail') for (const [nid, at] of [[e.a, 0], [e.b, e.len]] as const)
     if (net.sectionAt(e, at) === 'ground' && portalEnd(w, e, nid)) tunnels.push(at === 0 ? { s0: -Infinity, s1: 0 } : { s0: e.len, s1: Infinity });
   const g = net.geo(e);
-  for (const p of groundSamples(w, e)) {
+  for (const p of groundSamples(w, e, continued)) {
     const target = p.y - fd;
     const terr = w.heightAt(p.x, p.z);
     const ext = coreOnly ? 0 : Math.min(EARTHWORKS.reach, Math.abs(target - terr) / k + 1);
@@ -154,9 +154,12 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
  * and shared rail cores against their running heights, before accepting works that could remove their support.
  * The preview network owns its geometry caches and nodes; surveying never writes the world's network or terrain.
  */
-export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'> & { start?: { kind: string }; end?: { kind: string } })[],
+export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'> & { start?: { kind: string; node?: number }; end?: { kind: string; node?: number } })[],
   ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = [], terrain?: ReadonlyMap<number, number>): string | null {
   if (!planned.length) return null;
+  // An existing dead end joined by this proposal loses its cap, just as the snapped new end has no cap.
+  const joined = new Set<number>();
+  for (const p of planned) for (const sn of [p.start, p.end]) if (sn?.kind === 'node' && sn.node !== undefined) joined.add(sn.node);
   const view = Object.create(w) as World;
   view.net = new Network(view);
   const current = (k: number) => terrain?.get(k) ?? w.h[k];
@@ -223,7 +226,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
       continue;
     }
     const old = new Map<number, Acc>();
-    stampEdge(w, e, old, true);
+    stampEdge(w, e, old, true, joined);
     const fd = formationDepth(e);
     for (const [k, a] of old) {
       const next = stamps.get(k);
@@ -277,14 +280,14 @@ function roundMax(cur: number, line: number, r: number): number {
  * water (the renderer draws retaining walls there); dry land is never dug below DRY_MIN. Returns the earth
  * volume moved (vertex-height sum).
  */
-export function applyEarthworks(w: World, edges: NEdge[], dryRun = false): number {
-  return earthworks(w, edges, dryRun);
+export function applyEarthworks(w: World, edges: NEdge[], dryRun = false, continued?: ReadonlySet<number>): number {
+  return earthworks(w, edges, dryRun, w, undefined, undefined, continued);
 }
 
 /** The same lock/building/water decisions serve actual works and sparse read-only support forecasts. */
-function earthworks(w: World, edges: NEdge[], dryRun: boolean, geometryWorld = w, forecast?: Map<number, number>, terrain?: ReadonlyMap<number, number>): number {
+function earthworks(w: World, edges: NEdge[], dryRun: boolean, geometryWorld = w, forecast?: Map<number, number>, terrain?: ReadonlyMap<number, number>, continued?: ReadonlySet<number>): number {
   const stamps = new Map<number, Acc>();
-  for (const e of edges) stampEdge(geometryWorld, e, stamps);
+  for (const e of edges) stampEdge(geometryWorld, e, stamps, false, continued);
   let vol = 0;
   const s1 = w.size + 1, r = EARTHWORKS.round;
   const rail = edges.some((e) => e.kind === 'rail');
@@ -338,7 +341,7 @@ function earthworks(w: World, edges: NEdge[], dryRun: boolean, geometryWorld = w
   if (forecast) for (const [k, v] of changes) forecast.set(k, Math.fround(v));
   if (!dryRun) {
     for (const [k, v] of changes) w.setVertex(k % s1, (k / s1) | 0, v);
-    for (const e of edges) lockEdge(w, e);
+    for (const e of edges) lockEdge(w, e, continued);
   }
   return vol;
 }
@@ -387,9 +390,9 @@ export function coverTunnels(w: World, edges: NEdge[]): number {
 }
 
 /** Lock the formation zone of an edge (every vertex of the grid cells it covers) so later works leave it. */
-export function lockEdge(w: World, e: NEdge) {
+export function lockEdge(w: World, e: NEdge, continued?: ReadonlySet<number>) {
   const stamps = new Map<number, Acc>();
-  stampEdge(w, e, stamps, true);
+  stampEdge(w, e, stamps, true, continued);
   const bits = LOCK.formation | (e.kind === 'rail' ? LOCK.rail : 0);
   for (const [k, a] of stamps) if (a.core) w.lock[k] |= bits;
 }

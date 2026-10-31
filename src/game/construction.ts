@@ -1407,7 +1407,8 @@ function resolveNode(g: Game, sn: Snap, kind: NetKind, x: number, z: number, y: 
   return net.addNode(kind, x, y, z, kind === 'rail' ? tx : 0, kind === 'rail' ? tz : 0, owner);
 }
 
-export function commitProposal(g: Game, prop: Proposal): string | null {
+/** continued: endpoints whose following pieces belong to the same rollback-protected construction batch. */
+export function commitProposal(g: Game, prop: Proposal, continued?: ReadonlySet<number>): string | null {
   if (!prop.ok) return prop.errors[0] ?? 'Cannot build';
   const w = g.world;
   const net = w.net;
@@ -1554,7 +1555,7 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   // formation locks until its earthworks are complete, or its own fill is refused as existing rail.
   const ungraded = new Set(finalEdges.map((e) => e.id));
   for (const box of changedLocks) recomputeLocks(w, ...box, ungraded);
-  applyEarthworks(w, finalEdges);
+  applyEarthworks(w, finalEdges, false, continued);
   coverTunnels(w, finalEdges);
   g.onNetworkChanged();
   return null;

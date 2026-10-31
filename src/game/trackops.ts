@@ -729,6 +729,9 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       return net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, net.edges.get(sample.edge)!.owner).id;
     });
     if (nodes.includes(-1)) return rollback('Existing second track changed, plan again');
+    // These are intermediate joints of one quoted rail, not temporary dead ends. Grade and lock their
+    // final formation without a one-unit flat cap; a later failure rolls the new batch back together.
+    const continued = new Set(nodes);
     const first = net.nodes.get(nodes[0])!;
     const dropNodes = () => { for (const id of nodes) { const n = net.nodes.get(id); if (n && !n.edges.length) net.removeNode(id); } };
     for (let k = 0; k + 1 < pts.length; k++) {
@@ -738,7 +741,7 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
         const sample = sampleAt(original, (pts[k].u + pts[k + 1].u) / 2);
         const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, main), infrastructureOwner: net.edges.get(sample.edge)!.owner, junctionUpgrade: plan.complete, junctionWindows: plan.junctionWindows, ...extra }));
         if (!prop.ok || (consent && !consent(prop)) || money0 - eco.money + prop.cost > (opts.maxFormationSpend ?? Infinity)
-          || commitProposal(g, prop)) continue;
+          || commitProposal(g, prop, continued)) continue;
         ok = true;
         break;
       }
