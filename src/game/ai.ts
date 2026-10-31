@@ -2863,10 +2863,9 @@ export class AIController {
   lineCapacity(l: Line): number {
     // capacity-integration: the physical corridor and every operator's economic bid determine the shared plan.
     if (usesSharedRail(this.game, l)) return sharedCapacityPlan(this.game, l).limit;
+    if (l.kind === 'road') return roadFleetCap(this.game, l);
     const own = this.lines.get(l.id);
     if (own && own.shared === undefined) return own.maxVehicles;
-    // (a road line: every operator's vehicles within its street ceiling)
-    if (l.kind === 'road') return roadFleetCap(this.game, l);
     const g = this.game;
     const sts = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((x): x is Station => !!x?.rail);
     const passing = sts.filter((x) => x.rail!.tracks >= 2).length;
@@ -6063,9 +6062,6 @@ export class AIController {
         this.startDouble(l, info, congestionReturn(g, l));
         continue;
       }
-      const fleet = () => info.kind === 'bus' ? Math.min(Math.round(info.maxVehicles * grow), l.stops.length * 2)
-        : info.kind === 'tram' ? Math.min(Math.round(info.maxVehicles * grow), 2 + l.stops.length) : info.maxVehicles;
-      let maxV = fleet();
       // Price added road capacity with a vehicle of the current year. Repeating an old small model
       // leaves profitable lines crowded even after larger buses or articulated trams are available.
       const roadModel = v0 instanceof RoadVehicle && v0.model && v0.capacity > 0 ? info.kind === 'tram'
@@ -6073,16 +6069,20 @@ export class AIController {
           - a.capacity / (a.cost + modelYearCost(a, g.year) * 8))[0] ?? v0.model
         : (v0.model.style === 'coach' ? pickCoach(g.year) : pickBus(g.year,
           Math.max(...info.towns.map((id) => g.towns.list[id]?.pop ?? 3000), 3000))) ?? v0.model : null;
+      // One physical quote for the exact proposed bus, shared by this synchronous review's admission checks.
+      const hard = info.kind === 'bus' ? roadFleetCap(g, l, roadModel ?? undefined) : 2 + l.stops.length;
+      const fleet = () => info.kind === 'bus' ? hard
+        : info.kind === 'tram' ? Math.min(Math.round(info.maxVehicles * grow), hard) : info.maxVehicles;
+      let maxV = fleet();
       // Lost riders can fund another vehicle before losses reach two whole vehicle-loads in one
       // month. Compare their observed fare yield with operating cost and the same eight-year
       // vehicle horizon used in model selection; the street's fleet ceiling still applies.
-      const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
       const extraRevenue = gaveUp * Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / Math.max(1, l.passLast);
       const extraRunning = Math.max(l.costLast / Math.max(1, l.vehicles.length), roadModel ? modelYearCost(roadModel, g.year) : 0);
       if (roadModel && l.vehicles.length >= maxV && maxV < hard && gaveUp > 0
         && extraRevenue > extraRunning + roadModel.cost / 8) { info.maxVehicles++; maxV = fleet(); }
       // all operators' vehicles count towards what the line can take (no over-saturation of one track)
-      const cap = info.joined || (info.kind === 'rail' && usesSharedRail(g, l)) ? this.lineCapacity(l) : maxV;
+      const cap = info.kind === 'bus' ? maxV : info.joined || (info.kind === 'rail' && usesSharedRail(g, l)) ? this.lineCapacity(l) : maxV;
       if (l.vehicles.length >= cap || this.available() < v0.value * 1.5) continue;
       if (info.kind === 'rail' && v0 instanceof Train) {
         // capacity-integration: an extra train pays its congestion bill to all operators, including ourselves.
@@ -6099,10 +6099,10 @@ export class AIController {
       } else if (v0 instanceof RoadVehicle && v0.model) {
         const model = roadModel ?? v0.model;
         // (a bus or coach must earn its keep: the forecast at one vehicle more and the riders giving up it wins back, ai-bus.ts)
-        if (info.kind === 'bus' && !roadVehiclePays(this.busHost(), l)) continue;
+        if (info.kind === 'bus' && !roadVehiclePays(this.busHost(), l, model)) continue;
         if (!this.borrowFor(model.cost)) continue;
         const b = g.vehicles.buyRoad(info.depot, model, lid);
-        if (typeof b !== 'string') { this.stats.vehicles++; this.note(`added a ${info.kind === 'tram' ? 'tram' : 'bus'} to ${l.name}`); }
+        if (typeof b !== 'string') { info.maxVehicles = Math.max(info.maxVehicles, l.vehicles.length); this.stats.vehicles++; this.note(`added a ${info.kind === 'tram' ? 'tram' : 'bus'} to ${l.name}`); }
       }
     }
     if (!this.job && g.access.length) this.endUnusedAccess();

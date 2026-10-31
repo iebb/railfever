@@ -25,7 +25,7 @@ import type { NEdge } from './network';
 import type { VehicleModel } from './vehicle-types';
 import type { Town } from './towns';
 import type { RoadVehicle } from './roadvehicle';
-import { roadDepotReaches } from './roadvehicle';
+import { roadDepotReaches, findRoadRoute } from './roadvehicle';
 import { linearStops, outAndBack } from './lines';
 import { stopsWithInserted, replaceLineStops } from './line-edit';
 import * as Constants from './constants';
@@ -35,8 +35,9 @@ import { tripFactor, refTime, fareFor, urbanIntensity, transferWalkTime, TRANSFE
 import { walkingCatchment, pointWalkingCatchment, walkClaimShares, walkWeight, type WalkingCatchment } from './catchment';
 import { WALK_LINE, TRANSFER_RANGE } from './stations';
 import { consistOf, hopEstimate, estimateVehicleYear, YEAR_S } from './opcosts';
-import { patternHeadways } from './patterns';
-import { addTramTracks, roadPath as streetPath } from './build-ops';
+import { patternHeadways, patternStops } from './patterns';
+import { closestOnPolyline } from './geom';
+import { addTramTracks, roadPath as streetPath, tramUsable } from './build-ops';
 import { pickTram } from './ai-tram';
 import { TRAM } from './constants';
 import { MODEL_BY_ID } from './vehicle-types';
@@ -79,7 +80,11 @@ export interface RoadSite {
   road?: { x: number; z: number };
 }
 /** The service a forecast assumes: its vehicles, their seats, the timetable; the demand it is valued on (default all). */
-export interface RoadService { model: VehicleModel; vehicles: number; loop: boolean; purpose?: 'city' | 'intercity' | 'all' }
+export interface RoadService {
+  model: VehicleModel; vehicles: number; loop: boolean; purpose?: 'city' | 'intercity' | 'all';
+  /** Existing mixed fleet; further vehicles are of `model`, the exact proposed purchase. */
+  models?: VehicleModel[];
+}
 export interface RoadForecast {
   /** passengers boarding a year (direct and changing) */
   riders: number;
@@ -322,12 +327,12 @@ function lineMode(g: Game, lineId: number): FareMode { const l = g.lines.get(lin
 
 
 /** Per-day derived reads shared by the forecasts of one day (disposable: keyed by everything they depend on). */
-interface DayReads { key: string; cover: Map<number, [number, number][]>; regional: Map<number, [number, number][]>; base: Map<number, { local: number; localF: number }>; paths: Map<string, { length: number; seconds: number } | null>; pairs?: Float64Array }
+interface DayReads { key: string; cover: Map<number, [number, number][]>; regional: Map<number, [number, number][]>; base: Map<number, { local: number; localF: number }>; paths: Map<string, { length: number; seconds: number } | null>; curbs: Map<string, CurbRoute>; pairs?: Float64Array }
 const dayReads = new WeakMap<Game, DayReads>();
 function reads(g: Game): DayReads {
   const key = `${g.day}:${g.lines.version}:${g.demand.version}:${g.networkVersion}:${g.world.net.version}:${g.world.lotVersions.version}:${g.stations.map.size}`;
   let r = dayReads.get(g);
-  if (!r || r.key !== key) { r = { key, cover: new Map(), regional: new Map(), base: new Map(), paths: new Map() }; dayReads.set(g, r); }
+  if (!r || r.key !== key) { r = { key, cover: new Map(), regional: new Map(), base: new Map(), paths: new Map(), curbs: new Map() }; dayReads.set(g, r); }
   return r;
 }
 /** A station's walking coverage of each region (same-town trips) or its regional one with car feeders (cross-town). */
@@ -527,11 +532,27 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const n = sites.length, loop = service.loop && n >= 3, purpose = service.purpose ?? 'all';
   if (!D.regions.length) D.rebuild();
   // passengers plan by the timetable's estimate (routing: patterns.ts lineTable); fares and seats follow the road driven
-  const tt = roadTimetable(g, sites, service.model, loop), drive = roadDriving(g, sites, service.model, loop);
-  const headway = fleets.map((v) => tt.cycle / Math.max(1, v));
-  const realCycle = drive?.cycle ?? Infinity, realHeadway = fleets.map((v) => realCycle / Math.max(1, v));
+  const timings = new Map<VehicleModel, { tt: ReturnType<typeof roadTimetable>; drive: ReturnType<typeof roadDriving> }>();
+  const timing = (model: VehicleModel) => {
+    let t = timings.get(model);
+    if (!t) { t = { tt: roadTimetable(g, sites, model, loop), drive: roadDriving(g, sites, model, loop) }; timings.set(model, t); }
+    return t;
+  };
+  const schedules = fleets.map((count) => {
+    const models = service.models ? [...service.models.slice(0, count)] : [];
+    while (models.length < count) models.push(service.model);
+    const entries = models.map(model => ({ model, ...timing(model) }));
+    const frequency = entries.reduce((s, e) => s + 1 / Math.max(1, e.tt.cycle), 0);
+    const realFrequency = entries.reduce((s, e) => s + (e.drive ? 1 / Math.max(1, e.drive.cycle) : 0), 0);
+    const hops = timing(service.model).tt.hops.map((_, i) => entries.reduce((s, e) => s + e.tt.hops[i] / Math.max(1, e.tt.cycle), 0) / Math.max(1e-9, frequency));
+    const realHops = hops.map((_, i) => entries.reduce((s, e) => s + (e.drive ? e.drive.hops[i] / Math.max(1, e.drive.cycle) : 0), 0) / Math.max(1e-9, realFrequency));
+    return { hops, realHops, headway: 1 / frequency, realHeadway: 1 / realFrequency,
+      cycle: models.length / realFrequency, seats: entries.reduce((s, e) => s + (e.drive ? e.model.capacity / Math.max(1, e.drive.cycle) : 0), 0) * YEAR_S * SEAT_USE };
+  });
+  const tt = timing(service.model).tt, drive = timing(service.model).drive;
+  const headway = schedules.map(s => s.headway), realHeadway = schedules.map(s => s.realHeadway);
   const results: RoadForecast[] = fleets.map((_, m) => ({ riders: 0, revenue: 0, network: 0, transfers: 0, transferRevenue: 0, pops: sites.map(() => 0),
-    cycle: realCycle, headway: realHeadway[m], hop: drive ? drive.length / Math.max(1, loop ? n : 2 * (n - 1)) : 20, seats: 0, unserved: 0 }));
+    cycle: schedules[m].cycle, headway: realHeadway[m], hop: drive ? drive.length / Math.max(1, loop ? n : 2 * (n - 1)) : 20, seats: 0, unserved: 0 }));
   if (n < 2 || !(tt.cycle > 0) || !drive || !(drive.cycle > 0)) return results;
   const claims = claimSites(g, sites, new Set());
   for (const r of results) r.pops = claims.map((c) => c.pop);
@@ -592,8 +613,8 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
     return v;
   };
   // ride times without the wait (the wait is half the headway of each fleet size)
-  const rideOnly = (i: number, j: number) => rideTime(tt.hops, i, j, loop);
-  const driveT = (m: number, i: number, j: number) => realHeadway[m] / 2 + rideTime(drive.hops, i, j, loop);
+  const rideOnly = (i: number, j: number, m = 0) => rideTime(schedules[m].hops, i, j, loop);
+  const driveT = (m: number, i: number, j: number) => realHeadway[m] / 2 + rideTime(schedules[m].realHops, i, j, loop);
   // receipts our other lines get from the riders this line brings them, by line (capped below by their spare seats)
   const onwardBy = fleets.map(() => new Map<number, { riders: number; revenue: number }>());
   const network = (m: number, hop: Hop | undefined, d: number, count: number, factor: number) => {
@@ -633,7 +654,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       const free = same ? 1 : heldAt(i, t.townId);
       const centre = centreOf(s, t), f: number[] = [], share: number[] = [];
       for (let m = 0; m < M; m++) {
-        const cost = headway[m] / 2 + rideOnly(i, j);
+        const cost = headway[m] / 2 + rideOnly(i, j, m);
         share.push(racing(cost, theirs) * free);
         f.push(factorOf(Math.min(cost, theirs ?? Infinity), d, centre));
         localF[m] += sh.x * f[m];
@@ -755,7 +776,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
     // ------------------------------------------------ our other lines carry what their spare seats take
     for (const [id, o] of onwardBy[m]) r.network += o.revenue * Math.min(1, spareSeats(g, id) / Math.max(1, o.riders));
     // ------------------------------------------------ seats: riders beyond the busiest leg's capacity give up
-    r.seats = YEAR_S / Math.max(1, realCycle) * fleets[m] * service.model.capacity * SEAT_USE;
+    r.seats = schedules[m].seats;
     const maxLoad = Math.max(0, ...loads[m]);
     if (maxLoad > r.seats) {
       const fit = r.seats / maxLoad;
@@ -882,11 +903,113 @@ function lineAge(g: Game, l: Line): number {
   return g.day - first;
 }
 
-/**
- * Most vehicles a road line takes with partners on it (all operators): two per stop. (A line of ours alone may grow to
- * ai.ts manage's street ceiling, two per stop of its route out and back.)
- */
-export function roadFleetCap(g: Game, l: Line): number { return 2 * new Set(l.stops).size; }
+/** Native road loading plus the time for a stopped vehicle's rear to clear the following vehicle's 0.18u gap. */
+function curbSeconds(model: VehicleModel): number {
+  const mass = model.weight + model.capacity * 0.075;
+  const acceleration = Math.max(0.01, (Math.min(1.6, model.power / (mass * 3)) - 0.02) / 10);
+  return 2 + model.capacity * 2 * 0.05 + Math.sqrt(2 * (model.length + 0.18) / acceleration);
+}
+
+interface CurbRoute { calls: Map<string, number>; sites: RoadSite[] }
+function patternLineCopy(l: Line): Line {
+  return { ...l, patterns: l.patterns?.map(p => ({ ...p, stops: [...p.stops], ids: p.ids && [...p.ids] })) };
+}
+/** Native pattern itinerary and router select the actual lane and first berth reached at a station. */
+export function roadCurbRoute(g: Game, l: Line, pid?: number, operator = l.owner): CurbRoute {
+  const cache = reads(g).curbs, key = `${l.id}:${pid ?? ''}:${operator}`, known = cache.get(key);
+  if (known) return known;
+  // Pattern alignment is allowed to repair metadata. Align a copy to keep this quote a pure read.
+  const copy = patternLineCopy(l);
+  const ids = patternStops(copy, pid).map(i => l.stops[i]).filter((id, i, a) => i === 0 || id !== a[i - 1]);
+  if (ids.length > 1 && ids[0] === ids[ids.length - 1]) ids.pop();
+  const calls = new Map<string, number>();
+  const sites: RoadSite[] = [], first = g.stations.get(ids[0])?.stops[0];
+  let edge = first && g.world.net.edges.get(first.edge), dir = 1, at = first?.s ?? 0;
+  if (edge && first) {
+    const from = g.stations.get(ids[ids.length - 1]), a = { x: 0, y: 0, z: 0 }, b = { x: 0, y: 0, z: 0 };
+    g.world.net.pointAt(edge, Math.max(0, at - 0.1), a); g.world.net.pointAt(edge, Math.min(edge.len, at + 0.1), b);
+    if (from) dir = (first.x - from.x) * (b.x - a.x) + (first.z - from.z) * (b.z - a.z) >= 0 ? 1 : -1;
+  }
+  if (edge && ids.length >= 2) for (let i = 1; i <= ids.length * 2; i++) {
+    const st = g.stations.get(ids[i % ids.length]);
+    if (!st) break;
+    let stop = st.stops.filter(p => p.edge === edge!.id && dir * (p.s - at) > 0.15).sort((a, b) => dir * (a.s - b.s))[0];
+    if (!stop) {
+      const route = findRoadRoute(g, edge, dir, st.id, 40000, l.kind === 'tram' ? e => tramUsable(g, e, operator) : undefined, g.lines.isLoop(l) ? 600 : 40);
+      const arrival = route?.[route.length - 1];
+      if (!arrival) break;
+      const arrivingEdge = g.world.net.edges.get(arrival.edge);
+      if (!arrivingEdge) break;
+      edge = arrivingEdge; dir = arrival.dir;
+      stop = st.stops.filter(p => p.edge === edge!.id).sort((a, b) => dir * (a.s - b.s))[0];
+    }
+    if (!stop) break;
+    at = stop.s;
+    if (i <= ids.length) continue; // warm-up establishes the arrival direction of the cyclic native itinerary
+    const lane = g.world.net.lane(edge, dir), p = closestOnPolyline(stop.x, stop.z, lane.pts, 3, lane.cum.length);
+    const x = lane.pts[p.i * 3] + (lane.pts[(p.i + 1) * 3] - lane.pts[p.i * 3]) * p.f;
+    const y = lane.pts[p.i * 3 + 1] + (lane.pts[(p.i + 1) * 3 + 1] - lane.pts[p.i * 3 + 1]) * p.f;
+    const z = lane.pts[p.i * 3 + 2] + (lane.pts[(p.i + 1) * 3 + 2] - lane.pts[p.i * 3 + 2]) * p.f;
+    const berth = `${x.toFixed(3)},${y.toFixed(3)},${z.toFixed(3)}`;
+    calls.set(berth, (calls.get(berth) ?? 0) + 1);
+    sites.push({ ...siteOf(st), road: { x: stop.x, z: stop.z } });
+  }
+  const result = sites.length === ids.length ? { calls, sites } : { calls: new Map<string, number>(), sites: [] };
+  cache.set(key, result);
+  return result;
+}
+
+/** Road admission by shared curb workload; delay cost is the lost throughput of every affected line. Pure read. */
+export function roadCapacityQuote(g: Game, l: Line, model?: VehicleModel, operator = l.owner): { limit: number; delayCost: number } {
+  const stock = fleetOf(g, l), candidate = model ?? stock.model, route = routeOf(g, l), { calls, sites } = roadCurbRoute(g, l, undefined, operator);
+  const n = stock.vehicles.length;
+  if (!candidate || !route || !calls.size) return { limit: n, delayCost: Infinity };
+  const cycle = roadDriving(g, sites, candidate, true)?.cycle ?? 0;
+  if (!(cycle > 0)) return { limit: n, delayCost: Infinity };
+  const load = new Map<string, { work: number; second: number }>([...calls.keys()].map(k => [k, { work: 0, second: 0 }]));
+  const affected: { l: Line; calls: Map<string, number>; cycle: number; fraction: number }[] = [];
+  for (const other of g.lines.map.values()) {
+    if (other.kind === 'rail') continue;
+    const vehicles = fleetOf(g, other).vehicles, timings = new Map<string, number>();
+    for (const v of vehicles) {
+      if (!v.model) continue;
+      const { calls: otherCalls, sites: points } = roadCurbRoute(g, other, v.pattern, v.owner);
+      if (![...otherCalls.keys()].some(k => load.has(k))) continue;
+      const timingKey = `${v.model.id}:${v.pattern ?? ''}:${v.owner}`;
+      let t = timings.get(timingKey);
+      if (t === undefined) { t = roadDriving(g, points, v.model, true)?.cycle ?? 0; timings.set(timingKey, t); }
+      if (!(t > 0)) continue;
+      const dwell = curbSeconds(v.model);
+      for (const [key, visits] of otherCalls) {
+        const at = load.get(key);
+        if (at) { at.work += visits * dwell / t; at.second += visits * dwell * dwell / t; }
+      }
+      affected.push({ l: other, calls: otherCalls, cycle: t, fraction: 1 / vehicles.length });
+    }
+  }
+  const dwell = curbSeconds(candidate), delays = new Map<string, number>();
+  let extra = Infinity;
+  for (const [key, visits] of calls) {
+    const before = load.get(key)!, addition = visits * dwell / cycle;
+    extra = Math.min(extra, Math.max(0, Math.ceil((1 - before.work) / addition) - 1));
+    const after = before.work + addition;
+    if (after >= 1) return { limit: n, delayCost: Infinity };
+    // M/G/1 curb queue: arrivals consume their own loading/clearance time, including partners and other routes.
+    const waitBefore = before.second / (2 * Math.max(1e-9, 1 - before.work));
+    const waitAfter = (before.second + addition * dwell) / (2 * (1 - after));
+    delays.set(key, Math.max(0, waitAfter - waitBefore));
+  }
+  let delayCost = 0;
+  for (const other of affected) {
+    let seconds = 0;
+    for (const [key, visits] of other.calls) seconds += visits * (delays.get(key) ?? 0);
+    delayCost += Math.max(0, other.l.incomeLast - (other.l.mail?.incomeLast ?? 0)) * other.fraction * seconds / (other.cycle + seconds);
+  }
+  return { limit: n + extra, delayCost };
+}
+
+/** Fleet all operators can physically fit, after the calls of every route sharing its curbs. */
+export function roadFleetCap(g: Game, l: Line, model?: VehicleModel): number { return roadCapacityQuote(g, l, model).limit; }
 
 /** Road depot of ours that reaches the station (its vehicles can start there), nearest first; -1: none. */
 function ownDepotFor(g: Game, owner: number, stationId: number): number {
@@ -909,7 +1032,7 @@ function ownDepotFor(g: Game, owner: number, stationId: number): number {
  */
 /** Riders given up at a stop shared with other lines also give up for those lines' queues: half of them count. */
 const WIN_BACK_TRUST = 0.5;
-function winBack(g: Game, l: Line, n: number): number {
+function winBack(g: Game, l: Line, ratio: number): number {
   let lost = 0;
   for (const sid of new Set(l.stops)) {
     const st = g.stations.get(sid);
@@ -919,8 +1042,8 @@ function winBack(g: Game, l: Line, n: number): number {
     if (all > 0) lost += st.lostLast * mine / all;
   }
   const rode = l.passLast, arrived = rode + lost;
-  if (!(lost > 0) || !(rode > 0) || n < 1) return 0;
-  const p = lost / arrived, after = Math.max(0, 1 - (1 - p) * (n + 1) / n);
+  if (!(lost > 0) || !(rode > 0) || !(ratio > 1)) return 0;
+  const p = lost / arrived, after = Math.max(0, 1 - (1 - p) * ratio);
   const fare = Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / (12 * rode);
   return (p - after) * arrived * 12 * fare;
 }
@@ -932,15 +1055,22 @@ function winBack(g: Game, l: Line, n: number): number {
  * another company's open line, as a partner) the fees for the stops we use. A route whose demand wants more capacity
  * thus gets more vehicles, ours or a partner's, rather than a parallel line.
  */
-export function* moreValue(h: BusHost, l: Line): Generator<void, RoadPlan | null> {
+export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Generator<void, RoadPlan | null> {
   const g = h.g, me = h.me, route = routeOf(g, l);
   if (!route || l.kind !== 'road') return null;
   const all = fleetOf(g, l), n = all.vehicles.length;
-  const model = all.model, alone = l.owner === me && !(l.operators?.length);
-  if (!model || !n || n >= (alone ? 2 * l.stops.length : roadFleetCap(g, l))) return null;
+  // This demand forecast prices one full-route service. Short-turn/express fleets need a pattern-aware quote;
+  // claiming every vehicle serves every stop would invent marginal riders and can fund an unprofitable purchase.
+  const patternLine = patternLineCopy(l);
+  if (patternStops(patternLine).length !== l.stops.length || all.vehicles.some(v => patternStops(patternLine, v.pattern).length !== l.stops.length)) return null;
+  const model = purchase ?? (all.model?.style === 'coach' ? coachModel(g.year) : pickBusFor(g.year, Math.max(3000, ...townsOf(g, l).map(id => g.towns.list[id]?.pop ?? 0)))) ?? all.model;
+  if (!model || !n) return null;
+  const capacity = roadCapacityQuote(g, l, model, me);
+  if (n >= capacity.limit) return null;
   const sites = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s).map(siteOf);
   if (sites.length !== route.path.length) return null;
-  const [before, after] = yield* lineForecast(g, me, sites, { model, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
+  const models = all.vehicles.flatMap(v => v.model ? [v.model] : []);
+  const [before, after] = yield* lineForecast(g, me, sites, { model, models, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
   // (the forecast spans work units: a stop taken away meanwhile ends this quote; its fees could not be priced)
   if (route.path.some((id) => !g.stations.get(id)) || !g.lines.get(l.id)) return null;
   const cal = calibration(l, before, lineAge(g, l));
@@ -950,14 +1080,14 @@ export function* moreValue(h: BusHost, l: Line): Generator<void, RoadPlan | null
   // The riders the vehicle adds to the line (a shorter headway, seats for those left behind): what it must pay for, ours
   // or a partner's. (A partner's vehicle earns its share of all riders, but taking riders from the vehicles already there
   // adds nothing to the route: on a route with room to spare, a further operator's vehicle does not pay.)
-  revenue = Math.max(0, worth(after, cal) - worth(before, cal)) + WIN_BACK_TRUST * winBack(g, l, n);
+  revenue = Math.max(0, worth(after, cal) - worth(before, cal)) + WIN_BACK_TRUST * winBack(g, l, after.seats / Math.max(1, before.seats));
   if (!ours) {
     const items = route.path.map((id) => g.stations.get(id)!).filter((st) => st.owner !== me);
     for (const owner of new Set(items.map((st) => st.owner))) fees += g.accessChargeEstimate(me, owner, items.filter((st) => st.owner === owner), 1 / (n + 1));
   }
   let depotUpkeep = 0;
   if (!route.path.some((id) => ownDepotFor(g, me, id) >= 0)) { outlay += DEPOT_COST; depotUpkeep = DEPOT_UPKEEP; }
-  const yearly = running + fees + depotUpkeep + capital(g, me, model.cost) + (outlay - model.cost) * 0.05;
+  const yearly = running + fees + depotUpkeep + capital(g, me, model.cost) + (outlay - model.cost) * 0.05 + capacity.delayCost;
   const towns = [...new Set(sites.map((s) => s.townId).filter((t) => t >= 0))];
   return { kind: 'join', line: l.id, sites: [], model, vehicles: 1, towns, revenue, yearly, outlay,
     why: `${ours ? 'one more vehicle' : 'partner'}: ${Math.round(revenue / 1000)}k/year against ${Math.round(yearly / 1000)}k (line ${Math.round(worth(after, cal) / 1000)}k with ${n + 1})` };
@@ -967,8 +1097,8 @@ export function* moreValue(h: BusHost, l: Line): Generator<void, RoadPlan | null
  * Does one more vehicle of ours on this road line (our own, or one we run as a partner) earn more than it costs? The
  * monthly fleet review (ai.ts manage) asks before it buys one for passengers left waiting.
  */
-export function roadVehiclePays(h: BusHost, l: Line): boolean {
-  const t0 = performance.now(), gen = moreValue(h, l);
+export function roadVehiclePays(h: BusHost, l: Line, model?: VehicleModel): boolean {
+  const t0 = performance.now(), gen = moreValue(h, l, model);
   let r = gen.next();
   while (!r.done) r = gen.next();
   busProfile.fleetChecks++; busProfile.fleetMs += performance.now() - t0;
