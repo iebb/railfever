@@ -8,6 +8,8 @@ import { Train, makeSeg } from '../src/game/train';
 import type { Town } from '../src/game/towns';
 import { flatGame, station, endNode, depotFor, loco, check, fails, build, free, railOpts, nodeSnap } from './stationlib';
 import { roadOpts, checkReservations } from './lib';
+import { planEdge, commitProposal } from '../src/game/construction';
+import { terrainFit } from './terrainfit';
 
 const g = flatGame(384);
 g.addAICompany({ startMoney: 100e6, focus: { rail: 1, road: 0, tram: 0 }, risk: .7 });
@@ -73,6 +75,19 @@ check(quotes[0]!.value.capital < quotes[1]!.value.capital && quotes[1]!.value.ca
   'ground/elevated/underground compare real civil costs');
 check(quotes[0]!.value.revenue < 5e6 - 2e6 && quotes[0]!.value.headway > 0, 'whole retained receipts are subtracted and longer-cycle stock capacity is priced');
 
+// Level changes must leave the retained rail formation before changing height. Exercise each original
+// option through the real saved scheduler and commits, not only a permissive quotation or synthetic profile.
+for (const level of ['ground', 'elevated', 'underground'] as const) {
+  const world = fresh(); step(world);
+  const network = saveNetwork(world), item = network.companies.find(([id]) => id === owner)![1].job!.items![0];
+  item.reroute!.options = item.reroute!.options.filter(o => o.level === level);
+  check(item.reroute!.options.length > 0, 'native survey retains the requested level: ' + level);
+  loadNetwork(world, network); until(world);
+  check(world.lines.get(line.id)!.stops.length === 4 && corridor(world), 'native level diversion completes while retaining the original corridor: ' + level);
+  const fit = terrainFit(world);
+  check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'original and diverted rails retain actual-width terrain support: ' + level);
+}
+
 const replay = fresh(); let phases = 0;
 while (working(replay) && phases < 20) {
   const saved = structuredClone(serialize(replay)), loaded = deserialize(saved); receipts(loaded);
@@ -132,6 +147,19 @@ const beforeRetain = edited.company(owner).economy.money, retainedCount = edited
 step(edited);
 check(!working(edited) && edited.company(owner).economy.money === beforeRetain && edited.world.net.edges.size === retainedCount && corridor(edited),
   'external edit invalidates staged assets without an unearned refund or original-corridor removal');
+
+// A four-unit stub cannot both clear the old dead-end formation and gain 1.5 units at the legal grade.
+// Keeping the overlap level must produce a pure refusal rather than a floating ramp or an invalid promise.
+{
+  const world = flatGame(128), net = world.world.net;
+  check(!!build(world, free(world, 20, 64), free(world, 80, 64), railOpts()), 'short-ramp original formation');
+  const end = [...net.nodes.values()].find(n => Math.abs(n.x - 80) < 0.01)!;
+  const before = snapshot(world);
+  const p = net.withTemporaryNodes('rail', [{ x: 84, z: 64, y: 4.5, dx: -1, dz: 0 }], 0,
+    nodes => planEdge(world, nodeSnap(world, end.id, 'rail'), nodeSnap(world, nodes[0].id, 'rail'), railOpts(0, 1, { level: 'elevated', levelHeight: 1.5 })));
+  check(!p.ok && p.errors.some(e => e.startsWith('Too steep')), 'insufficient runout refuses a level change');
+  check(commitProposal(world, p) !== null && snapshot(world) === before, 'impossible ramp quotation and commit preserve all saved state');
+}
 
 console.log(`native diversion ${phases} saved phases, three levels, unpaid fallback, turnaround and two cancellation controls`);
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');

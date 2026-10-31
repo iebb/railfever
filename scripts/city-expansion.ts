@@ -12,6 +12,7 @@ import { demolitionCost } from '../src/game/demolition';
 import { check, fails, checkReservations } from './lib';
 import type { Game } from '../src/game/game';
 import type { AIController } from '../src/game/ai';
+import { terrainFit } from './terrainfit';
 function host(g: Game, ai: AIController): GrowHost {
   const me = ai.companyId, eco = g.company(me).economy;
   return { g, ai, me, note: s => ai.log.push(s), news() {}, considered() {}, succeed() {}, cared: () => false, careFor() {},
@@ -91,6 +92,8 @@ for (const level of ['elevated', 'underground'] as const) {
   check(last.rail?.level === level && railPartMode(last.rail!) === option.mode && sts.every(s => s.rail!.level === 'ground'), 'old and new parts keep their actual levels/styles: ' + level);
   check(construction - eco.thisYear.construction > 0, 'mixed-level works pay native construction costs: ' + level);
   check(saved(loaded) === saved(g), 'saved mixed-level construction resumes exactly: ' + level);
+  const fit = terrainFit(g);
+  check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'native mixed-level approaches and retained rails stay physically supported: ' + level);
   if (saved(loaded) !== saved(g)) console.log('construction fields differing', level, JSON.stringify(differences(serialize(g), serialize(loaded)).slice(0, 12)));
 }
 

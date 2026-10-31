@@ -649,6 +649,36 @@ export function fitCurve(a: Frame, b: Frame): Bez {
 
 interface Constraint { i: number; kind: 'eq' | 'ge' | 'le'; v: number }
 
+/** A level-changing ramp first leaves the ground formation it joins, then climbs or descends. */
+function retainJoinedGround(g: Game, prop: Proposal, xs: number[], zs: number[], desired: number[], cons: Constraint[], spread: number) {
+  const net = g.world.net, opts = prop.opts;
+  for (const reverse of [false, true]) {
+    const connected = new Set<number>();
+    for (const tp of prop.tracks) {
+      const sn = reverse ? tp.end : tp.start;
+      const ids = sn.kind === 'edge' ? [sn.edge!] : sn.kind === 'node' ? net.nodes.get(sn.node!)?.edges ?? [] : [];
+      for (const id of ids) {
+        const e = net.edges.get(id);
+        if (e?.kind === 'rail' && e.owner === opts.owner && !opts.ignore?.edges.has(id)) connected.add(id);
+      }
+    }
+    if (!connected.size) continue;
+    const width = halfWidthOf(opts) + spread + Math.max(...[...connected].map(id => net.halfWidth(net.edges.get(id)!))) + 2 * EARTHWORKS.corePad;
+    // Only a contiguous endpoint overlap may constrain the ramp, never a later crossing or unrelated track.
+    for (let j = 0; j < xs.length; j++) {
+      const i = reverse ? xs.length - 1 - j : j;
+      const near = net.nearestEdge(xs[i], zs[i], width + 1, 'rail', e => connected.has(e.id));
+      if (!near || net.sectionAt(near.edge, near.s) !== 'ground') break;
+      const dead = near.s < 0.01 && net.nodes.get(near.edge.a)?.edges.length === 1
+        || near.edge.len - near.s < 0.01 && net.nodes.get(near.edge.b)?.edges.length === 1;
+      // Existing dead-end grading extends one unit beyond the last running sample.
+      if (near.d > width + (dead ? 1 : 0)) break;
+      const height = net.heightAtS(near.edge, near.s);
+      desired[i] = height; cons.push({ i, kind: 'eq', v: height });
+    }
+  }
+}
+
 /** Grade-limited height profile through constraints, following the desired heights. */
 function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: number): { y: number[]; ok: boolean; bad: number } {
   const n = desired.length;
@@ -878,6 +908,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     }
   }
   const cons: Constraint[] = [];
+  if (kind === 'rail' && level !== 'ground' && !subway) retainJoinedGround(g, prop, xs, zs, desired, cons, spread);
   // the height offset applies to the end being placed; a free start sits on the ground (or at the level)
   const atLevel = (t: number) => (level === 'elevated' ? Math.max(t, WATER_Y) : t) + levelOff;
   const startY = fa.y ?? atLevel(subway ? cover[0] : terr[0]);
