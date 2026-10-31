@@ -1848,13 +1848,15 @@ export class Stations {
     if (!plan.ok) return plan.error ?? 'Cannot build';
     const co = g.company(owner);
     if (!co.economy.canAfford(plan.cost)) return 'Not enough money';
+    // Access and platform formations were surveyed together. Commit the priced street before the platforms
+    // reshape its terrain; a changed/busy connection must fail before charging or creating the station.
+    if (plan.access) { const error = commitProposal(g, plan.access); if (error) return error; }
     const accessCost = plan.access ? plan.access.cost : 0;
     co.economy.spend(plan.cost - accessCost, 'construction');
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     const join = plan.join && this.map.get(plan.join.id) === plan.join ? plan.join : null;
     const st = join ?? this.create(plan.x, plan.z, owner);
     this.buildRailPart(st, plan, owner);
-    if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
     this.autoLinkNearby(st);
     this.accessVersion = -1;
