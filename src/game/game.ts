@@ -24,7 +24,7 @@ import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 import { observeRailCapacity } from './ai-capacity';
 import { capacityRouteBetween } from './rail-capacity-routes';
-import { stepRouteWorks, type RouteWorks } from './route-works';
+import { stepRouteWorks, splitRouteWorks, type RouteWorks } from './route-works';
 import { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP, accessChargeEstimate, accessFullCost, accessReplacementCost, accessItemKey, migrateAccessMultiplier, type AccessItem } from './access-cost';
 export { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP } from './access-cost';
 
@@ -215,6 +215,7 @@ export class Game {
     this.accessMult[PLAYER] = DEFAULT_ACCESS_MULTIPLIER;
     // metered usage follows edges that are split
     this.world.net.onSplit.push((old, e1, e2) => {
+      splitRouteWorks(this, old.id, e1.id, e2.id);
       for (const k of [0, 1]) {
         const u = this.usage.get(old.id * 4 + k);
         if (!u) continue;

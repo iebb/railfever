@@ -104,6 +104,16 @@ const fail = (base: Pick<UpgradeQuote, 'line' | 'owner' | 'mode' | 'level'>, err
 /** Works under way on a line (or null). */
 export function worksOn(g: Game, lineId: number): RouteWorks | null { return g.routeWorks.find((w) => w.line === lineId) ?? null; }
 
+/** Junctions, signals and other works may split our track between daily construction steps, including after loading. */
+export function splitRouteWorks(g: Game, old: number, a: number, b: number) {
+  for (const w of g.routeWorks) for (const d of w.built.debits) {
+    for (const edges of [d.edges, d.tram]) {
+      const at = edges?.indexOf(old) ?? -1;
+      if (at >= 0) edges!.splice(at, 1, a, b);
+    }
+  }
+}
+
 /** The line's buses (the owner's road vehicles on it), the seats they have and what they fetch. */
 function busesOf(g: Game, l: Line, owner: number) {
   const vs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is RoadVehicle => v instanceof RoadVehicle && v.owner === owner);

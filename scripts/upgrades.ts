@@ -189,15 +189,33 @@ function playerCancel(g: Game) {
   const eco = g.economy, year0 = g.year, built0 = eco.thisYear.construction, stations0 = g.stations.map.size, stops = L.stops.join(), buses = L.vehicles.join();
   const rail0 = [...g.world.net.edges.values()].filter((e) => e.kind === 'rail').length, trams = () => [...g.world.net.edges.values()].filter((e) => e.tram && e.tramOwner === 0).length, tram0 = trams();
   check(startRouteWorks(g, q) === null, 'works started');
+  // Wait for running track as well as stations: junctions or signals added between work units split it.
+  const plain = () => worksOn(g, L.id)?.built.debits.flatMap((x) => x.edges).find((id) => {
+    const e = g.world.net.edges.get(id);
+    return e?.kind === 'rail' && e.station < 0 && e.depot < 0 && e.len > 1;
+  });
   let d = 0;
-  for (; d < 200 && (worksOn(g, L.id)?.built.debits.length ?? 0) < 2; d++) days(g, 1);
+  for (; d < 200 && plain() === undefined && worksOn(g, L.id)?.stage === 'build'; d++) days(g, 1);
   const w = worksOn(g, L.id);
-  check(!!w && w.built.debits.length >= 2 && w.stage === 'build', `two units built after ${d} days`);
-  if (!w) return;
+  check(!!w && plain() !== undefined && w.stage === 'build', `stations and track built after ${d} days`);
+  if (!w || plain() === undefined) return;
+  const edge = g.world.net.edges.get(plain()!)!;
+  const split = g.world.net.splitEdge(edge.id, edge.len / 2)!;
+  g.onNetworkChanged();
+  check(w.built.debits.some((x) => x.edges.includes(split.e1.id) && x.edges.includes(split.e2.id)), 'works follow a track split between work units');
+  const twin = deserialize(JSON.parse(JSON.stringify(serialize(g))));
+  for (const game of [g, twin]) {
+    const e = game.world.net.edges.get(split.e2.id)!;
+    const again = game.world.net.splitEdge(e.id, e.len / 2)!;
+    game.onNetworkChanged();
+    check(worksOn(game, L.id)!.built.debits.some((x) => x.edges.includes(again.e1.id) && x.edges.includes(again.e2.id)), 'works follow another split, including after loading');
+  }
+  check(JSON.stringify(serialize(twin)) === JSON.stringify(serialize(g)), 'split works load and continue exactly');
   const spent = built0 - eco.thisYear.construction;
   check(spent > 0 && Math.abs(spent - w.built.spent) < 1 && spent < q.cost, `paid as built (${k(spent)} of ${k(q.cost)})`);
   check(cancelRouteWorks(g, w.id, 1) !== null, 'another company cannot cancel them');
   check(cancelRouteWorks(g, w.id, 0) === null && !worksOn(g, L.id), 'cancelled');
+  check(cancelRouteWorks(twin, w.id, 0) === null && JSON.stringify(serialize(twin)) === JSON.stringify(serialize(g)), 'cancelling split works replays exactly after loading');
   const lost = w.built.debits.reduce((a, b) => a + b.cost - b.refundable, 0), net = built0 - eco.thisYear.construction;
   console.log(`  refunded: ${k(spent)} spent, ${k(net)} after the refund (${k(lost)} of demolition not refundable)`);
   check(g.year !== year0 || Math.abs(net - lost) < 1, 'what was built is refunded (all but the demolished buildings)');
@@ -207,6 +225,41 @@ function playerCancel(g: Game) {
   const del = delivered(g, L);
   days(g, 20);
   check(delivered(g, L) > del, 'and carries passengers');
+}
+
+function playerCancelTram(g: Game) {
+  console.log('player: cancel tram works after a street junction splits their tracks');
+  const T = [...g.towns.list].sort((a, b) => b.pop - a.pop)[3];
+  const L = playerLine(g, T, 2);
+  check(!!L, `a player bus line in ${T.name}`);
+  if (!L) return;
+  const q = planRouteUpgrade(g, L.id, 0, 'tram');
+  check(q.ok && startRouteWorks(g, q) === null, 'tram works started');
+  if (!q.ok) return;
+  let id: number | undefined;
+  for (let d = 0; d < 100 && worksOn(g, L.id)?.stage === 'build'; d++) {
+    days(g, 1);
+    id = worksOn(g, L.id)?.built.debits.flatMap((x) => x.tram ?? []).find((eid) => {
+      const e = g.world.net.edges.get(eid);
+      return !!e && e.depot < 0 && e.len > 1 && !g.vehicles.isEdgeBusy(eid);
+    });
+    if (id !== undefined) break;
+  }
+  const w = worksOn(g, L.id);
+  check(!!w && id !== undefined && w.stage === 'build', 'tram tracks laid before the switch');
+  if (!w || id === undefined) return;
+  const e = g.world.net.edges.get(id)!;
+  const split = g.world.net.splitEdge(e.id, e.len / 2)!;
+  g.onNetworkChanged();
+  const tracks = [split.e1.id, split.e2.id];
+  check(w.built.debits.some((x) => tracks.every((eid) => x.tram?.includes(eid))), 'works follow tram tracks when the street is split');
+  const twin = deserialize(JSON.parse(JSON.stringify(serialize(g))));
+  for (const game of [g, twin]) {
+    check(cancelRouteWorks(game, w.id, 0) === null, 'tram works cancelled');
+    check(tracks.every((eid) => game.world.net.edges.has(eid) && !game.world.net.edges.get(eid)!.tram), 'split tram tracks removed while the street stays');
+    check(game.lines.get(L.id)?.kind === 'road' && game.lines.get(L.id)?.vehicles.length === 2, 'the bus service stays');
+  }
+  check(JSON.stringify(serialize(twin)) === JSON.stringify(serialize(g)), 'tram cancellation replays exactly after loading');
 }
 
 function playerCoach() {
@@ -332,6 +385,7 @@ const t0 = performance.now();
   aiTram(g);
   playerTram(g);
   playerCancel(g);
+  playerCancelTram(g);
 }
 playerCoach();
 aiCityRail();
