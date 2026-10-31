@@ -110,7 +110,9 @@ export function planNativeStationOnTrack(g: Game, edgeId: number, s: number, o: 
   const used = new Set(A.steps.map((t) => t.edge));
   for (const candidate of [...net.edgesNear(q.x - NATIVE_TRACK_SPAN, q.z - NATIVE_TRACK_SPAN, q.x + NATIVE_TRACK_SPAN, q.z + NATIVE_TRACK_SPAN)].sort((a, b) => a.id - b.id)) {
     if (candidate.kind !== 'rail' || candidate.station >= 0 || candidate.depot >= 0 || used.has(candidate.id)) continue;
-    const C = chain(g, candidate, L / 2 + 5), v = nearest(g, C, q.x, q.z);
+    // A nearby companion fragment can start a full search span away from the clicked centre.
+    // Include that offset as well as the platform half-length when walking its split chain.
+    const C = chain(g, candidate, L / 2 + NATIVE_TRACK_SPAN + 5), v = nearest(g, C, q.x, q.z);
     if (v === null) continue;
     const p = at(g, C, v), lat = (p.x - q.x) * q.fz - (p.z - q.z) * q.fx;
     if (Math.abs(lat) < 0.3 || Math.abs(lat) > NATIVE_TRACK_SPAN || Math.abs(p.y - q.y) > 0.15 || Math.abs(p.fx * q.fx + p.fz * q.fz) < 0.99) continue;

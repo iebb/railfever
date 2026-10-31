@@ -5,6 +5,7 @@
 import type { Game } from './game';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
+import { linePatterns } from './patterns';
 import { findRailRoute, railNext } from './train';
 
 /** Where a new stop goes: where it fits, first, last, or after the stop at this index of Line.stops. */
@@ -90,6 +91,9 @@ export function replaceLineStops(g: Game, l: Line, stops: number[]): void {
     if (v.spacing.departureIndex >= 0) v.spacing.departureIndex = remap(v.spacing.departureIndex);
   }
   l.stops = stops;
+  // Align the service before rebuilding its physical calls: an inserted stop outside a short-turn
+  // must not briefly invalidate that service's existing manual turnback platform.
+  linePatterns(l);
   delete l.spacing;
   g.lines.rebuild();
   for (const id of l.vehicles) g.vehicles.get(id)?.onLineChanged(true);

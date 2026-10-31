@@ -109,6 +109,35 @@ let exact = true;
 for (let i = 0; i < 640; i++) { g.stepTick(); copy.stepTick(); if (JSON.stringify(serialize(g)) !== JSON.stringify(serialize(copy))) { exact = false; console.log('replay divergence', i); break; } }
 check(exact, 'all640 subsequent full serializations remain identical');
 
+// Route edits must align short-turn flags before physical platform validation sees the new calls.
+{
+  const n = flatGame(256); n.aiEnabled = false;
+  const stops = [30, 90, 150, 220].map(x => station(n, x, 100, Math.PI / 2, 12, 2)!);
+  const first = n.world.net.nextEdge;
+  for (let leg = 0; leg < 3; leg++) for (let track = 0; track < 2; track++)
+    build(n, nodeSnap(n, endNode(n, stops[leg], track, true), 'rail'),
+      nodeSnap(n, endNode(n, stops[leg + 1], track, false), 'rail'), railOpts(0), 'short-turn insertion strand');
+  const rails = [...n.world.net.edges.values()].filter(e => e.id >= first && e.kind === 'rail' && e.station < 0).map(e => e.id);
+  const directional = finishDoubleTrack(n, rails, 0, { turnbackStations: [stops[1].id] });
+  check(!directional.error, 'short-turn platform fixture has native directional running tracks and turnback crossovers');
+  const l = n.lines.create('rail'); l.stops = [stops[0].id, stops[1].id, stops[3].id, stops[1].id]; n.lines.rebuild();
+  check(!setPatterns(n, l.id, [{ id: 0, name: 'Through', kind: 'local', stops: [true, true, true, true] },
+    { id: 1, name: 'Short', kind: 'local', stops: [true, true, false, true] }]), 'short-turn fixture creates actual saved patterns');
+  const manual = platformPreference(l, 1, 3)!;
+  check(!!manual && !setPlatformPreference(n, l, 1, 3, manual.group), 'short-turn return call accepts its native manual platform');
+  replaceLineStops(n, l, [stops[0].id, stops[1].id, stops[2].id, stops[3].id, stops[2].id, stops[1].id]);
+  const retained = platformPreference(l, 1, 5);
+  check(retained?.manual && retained.occurrence === 1 && retained.group === manual.group,
+    'insertion beyond short-turn retains the valid manual return platform through its first rebuild');
+  check(!l.platforms?.some(p => p.pattern === 1 && p.station === stops[2].id)
+    && l.platforms?.filter(p => !p.manual).every(p => platformChoices(n, l, p.pattern, p.stop).some(q => q.id === p.group)),
+    'aligned insertion excludes phantom short-turn calls and validates all Auto calls');
+  const chosen = n.stations.railTrackGroups(stops[1]).find(q => q.id === manual.group)!;
+  for (const step of chosen.steps) n.world.net.removeEdge(step.edge);
+  n.lines.rebuild(false);
+  check(!l.platforms?.some(p => p.group === manual.group), 'a genuinely removed platform still invalidates its retained preference');
+}
+
 // Explicit pattern and stop edits preserve each valid physical preference and remove unserved calls.
 check(setPatterns(g, local.id, [{ id: 5, name: 'Local', kind: 'local', stops: [true, true] }]) === null, 'service edit creates its own saved call allocations');
 check(local.platforms!.every(p => p.pattern === 5), 'removed patterns leave no stale platform entries');
