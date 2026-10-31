@@ -95,6 +95,9 @@ const DEPOT_DAYS = 5, FLEET_DAYS = 6, FINISH_DAYS = 4, MAIN_STATION_DAYS = 8;
 const MAX_WAIT = 180;
 /** A city railway's depot may take a block or two (ai.ts URBAN_DEPOT_POP). */
 const URBAN_DEPOT_POP = 600;
+/** Conventional main-line trains use the same gentle grades as newly opened AI railways. */
+const MAINLINE_GRADE = 0.035;
+const MAINLINE_PROFILE_GRADE = MAINLINE_GRADE / TRACK_TYPES.standard.maxGrade * 0.85;
 
 // ============================================================================ planning
 
@@ -394,7 +397,7 @@ function mainRoute(g: Game, a: { x: number; z: number; y: number; angle: number;
     { x0: eb.x - eb.tx * 4, z0: eb.z - eb.tz * 4, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
   ];
   return { plan: runGen(routeGen(g, from, to, { kind: 'rail', owner, tracks: 1, y0: a.y, y1: b.y, pre: [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }],
-    post: [{ x: eb.x, z: eb.z, tx: -eb.tx, tz: -eb.tz }], avoid, exclude, retries: 3 })), ea, eb };
+    post: [{ x: eb.x, z: eb.z, tx: -eb.tx, tz: -eb.tz }], avoid, exclude, gradeMargin: MAINLINE_PROFILE_GRADE, retries: 3 })), ea, eb };
 }
 
 /**
@@ -668,7 +671,8 @@ function mainLink(g: Game, w: RouteWorks, A: Station, B: Station): string | null
   const ea = trackEnd(a, c, 0), eb = trackEnd(c, a, 0), saved = w.quote.ways?.[0];
   let way: OPoint[] | null = null, prof: ChainProfile | null = null;
   if (saved?.length) {
-    const p = chainProfile(g, [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }, ...saved], 1, A.rail!.y, B.rail!.y, 'rail', own);
+    const p = chainProfile(g, [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }, ...saved], 1, A.rail!.y, B.rail!.y, 'rail', own,
+      false, undefined, 'standard', MAINLINE_PROFILE_GRADE);
     if (p && !routeConflictAt(g, p, 'rail', 1, own)) { way = saved; prof = p; }
   }
   if (!way || !prof) {
@@ -679,7 +683,7 @@ function mainLink(g: Game, w: RouteWorks, A: Station, B: Station): string | null
   }
   const estimate = estimateChainCost(prof, 1, 'rail', 'standard').cost;
   if (!fund(g, me, estimate * 1.2 + 200_000)) return 'wait';
-  const opts: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me };
+  const opts: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me, designGrade: MAINLINE_GRADE };
   return recordWorks(g, me, b, () => {
     const res = buildChain(g, a0, way!, opts, b0, prof);
     if (!res.ok) return `track ${A.name} – ${B.name}: ${res.error ?? 'blocked'}`;

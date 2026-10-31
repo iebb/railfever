@@ -12,13 +12,15 @@ import {
   planTownLine, planCoach, roadPlanJob, tramUpgradeValue, cityRailUpgradeValue, routeUpgradeValue, pays,
   type BusHost, type RoadPlan,
 } from '../src/game/ai-bus';
-import { planRouteUpgrade, startRouteWorks, cancelRouteWorks, worksOn, worksStatus, upgradeModes } from '../src/game/route-works';
+import { planRouteUpgrade, startRouteWorks, cancelRouteWorks, worksOn, worksStatus, upgradeModes, type RouteWorks } from '../src/game/route-works';
 import type { Town } from '../src/game/towns';
 import type { Line } from '../src/game/lines';
 import { outAndBack } from '../src/game/lines';
 import { buildRoadDepot } from '../src/game/routing';
 import { bezLine } from '../src/game/geom';
 import { RoadVehicle } from '../src/game/roadvehicle';
+import { consistRule, platformDepartureFrontiers, findRailRoute } from '../src/game/train';
+import { terrainFit, fitLine } from './terrainfit';
 import { fails, check, fmt, checkReservations, checkNaN, Train } from './lib';
 
 const seed = Number(process.argv[2] ?? 7);
@@ -60,12 +62,14 @@ function playerLine(g: Game, T: Town, buses: number): Line | null {
 }
 
 /** Run a line's works to the end (at most `max` days): the days they took and whether the buses ran meanwhile. */
-function runWorks(g: Game, l: Line, max = 400) {
+function runWorks(g: Game, l: Line, max = 400, saveAt?: (w: RouteWorks) => boolean) {
   const w0 = worksOn(g, l.id)!;
   const stops0 = l.stops.join(), buses0 = l.vehicles.length, del0 = delivered(g, l);
   let d = 0, during = true, labels = new Set<string>(), switched = -1;
+  let saved: { game: Game; day: number } | undefined;
   for (; d < max && worksOn(g, l.id); d++) {
     const w = worksOn(g, l.id)!;
+    if (!saved && saveAt?.(w)) saved = { game: deserialize(JSON.parse(JSON.stringify(serialize(g)))), day: d };
     labels.add(worksStatus(w).label.replace(/ · \d+%/, ''));
     if (w.stage === 'build') {
       // the bus line runs as it was until the switch
@@ -73,7 +77,7 @@ function runWorks(g: Game, l: Line, max = 400) {
     } else if (switched < 0) switched = d;
     days(g, 1);
   }
-  return { days: d, during, ran: delivered(g, l) > del0 || switched > 0, labels: [...labels], total: w0.total, done: !worksOn(g, l.id) };
+  return { days: d, during, ran: delivered(g, l) > del0 || switched > 0, labels: [...labels], total: w0.total, done: !worksOn(g, l.id), saved };
 }
 
 // ------------------------------------------------------------------------------ natural world
@@ -294,17 +298,55 @@ function coachWorld(s: number): boolean {
   for (let i = 0; i < 3; i++) g.vehicles.buyRoad(dep, coach, L.id);
   days(g, 60);
   check(upgradeModes(g, L.id).includes('rail') && !upgradeModes(g, L.id).includes('metro'), 'a coach line offers a railway');
+  const savedBeforeQuote = JSON.stringify(serialize(g));
   const q = planRouteUpgrade(g, L.id, 0, 'rail');
+  check(JSON.stringify(serialize(g)) === savedBeforeQuote, 'the main-line upgrade survey preserves saved state');
   check(q.ok && q.sites?.length === 2 && q.vehicles >= 1, 'the planner prices stations, track, depot and trains');
   if (!q.ok) return true;
+  const initialMisfits = new Map([...g.world.net.edges.values()].map((e) => {
+    const fit = terrainFit(g, [e]);
+    return [e.id, fit.covered + fit.floating + fit.station];
+  }));
   const olds = [...new Set(L.stops)], money0 = g.economy.money;
   check(startRouteWorks(g, q) === null, 'works started');
-  const r = runWorks(g, L, 600);
+  const works = worksOn(g, L.id)!;
+  // Keep the original natural Foxmouth–Lower Penwell case: both flat platforms exist when the final
+  // graded approach is fitted. Saving here must not change either the construction or its cost.
+  let savedState = '';
+  const r = runWorks(g, L, 600, (w) => {
+    if (w.stage !== 'build' || w.built.stations.length !== 2) return false;
+    savedState = JSON.stringify(serialize(g)); return true;
+  });
+  check(!!r.saved, 'the main-line works were saved with both stations built before their approaches');
+  if (r.saved) {
+    check(JSON.stringify(serialize(r.saved.game)) === savedState, 'the main-line construction baseline loads exactly');
+    days(r.saved.game, r.days - r.saved.day);
+    check(JSON.stringify(serialize(r.saved.game)) === JSON.stringify(serialize(g)), 'the loaded main-line works build and switch exactly');
+  }
   console.log(`  works: ${r.days} days, ${r.labels.join(' > ')}; spent ${k(money0 - g.economy.money)} (quoted ${k(q.cost)}); ${g.news[g.news.length - 1]?.text}`);
   check(r.done && r.during, 'the coaches ran until the switch');
   check(L.kind === 'rail' && new Set(L.stops).size === 2 && L.vehicles.length === q.vehicles && L.vehicles.every((v) => g.vehicles.get(v) instanceof Train), 'the line runs trains between the two stations');
   check(olds.every((id) => !g.stations.get(id)), 'the coach stops are taken up');
   check(L.stops.every((id) => !!g.stations.get(id)?.rail), 'its stops are railway stations');
+  check(works.built.spent + q.fleet <= q.cost + q.resale, 'the full native construction and fleet fit their quoted gross reserve');
+  const fit = terrainFit(g);
+  console.log(`  railway formation: ${fitLine(fit)}`);
+  // The natural map already contains an unrelated street misfit. Require every new edge to be seated,
+  // and check every retained edge separately so repairing another edge cannot hide new damage.
+  for (const e of g.world.net.edges.values()) {
+    const report = terrainFit(g, [e]);
+    check(report.covered + report.floating + report.station <= (initialMisfits.get(e.id) ?? 0), `native railway works add no terrain misfits on edge ${e.id}`);
+  }
+  const cars = L.vehicles.map((id) => g.vehicles.get(id)).find((v): v is Train => v instanceof Train)?.cars;
+  check(!!cars, 'the completed railway has its native quoted consist');
+  if (cars) for (const id of [...new Set(L.stops)]) {
+    const st = g.stations.get(id)!, target = L.stops.find((sid) => sid !== id)!;
+    const length = cars.reduce((n, c) => n + c.length + 0.1, 0), rule = consistRule(cars);
+    for (const group of g.stations.railTrackGroups(st)) {
+      const front = platformDepartureFrontiers(g, group.steps, 0, rule, length);
+      check(!!findRailRoute(g, [...front.forward, ...front.reverse], target, 0, -1, 20000, false, rule, true, { length }), 'every platform throat serves the other station with the full native consist');
+    }
+  }
   const del = delivered(g, L);
   days(g, 200);
   check(delivered(g, L) > del, `the trains carry passengers (${delivered(g, L) - del} in 200 days)`);
