@@ -978,9 +978,28 @@ export function roadCapacityQuote(g: Game, l: Line, model?: VehicleModel, operat
   const cycle = roadDriving(g, sites, candidate, true)?.cycle ?? 0;
   if (!(cycle > 0)) return { limit: n, delayCost: Infinity };
   const load = new Map<string, { work: number; second: number }>([...calls.keys()].map(k => [k, { work: 0, second: 0 }]));
+  const berths = [...calls.keys()].map(key => { const [x, , z] = key.split(',').map(Number); return { x, z }; });
+  const margins = new Map<number, number>();
+  const mayShareCurb = (other: Line) => {
+    const point = { x: 0, y: 0, z: 0 };
+    for (const sid of new Set(other.stops)) for (const stop of g.stations.get(sid)?.stops ?? []) {
+      const edge = g.world.net.edges.get(stop.edge);
+      if (!edge) continue;
+      let margin = margins.get(edge.id);
+      if (margin === undefined) {
+        // Native lane offset plus both junction trims bounds projection/clamping near a split or junction.
+        margin = g.world.net.halfWidth(edge) + g.world.net.junctionRadius(edge.a) + g.world.net.junctionRadius(edge.b) + 0.01;
+        margins.set(edge.id, margin);
+      }
+      g.world.net.pointAt(edge, stop.s, point);
+      const radius = margin + Math.hypot(stop.x - point.x, stop.z - point.z);
+      if (berths.some(b => Math.abs(b.x - stop.x) <= radius && Math.abs(b.z - stop.z) <= radius)) return true;
+    }
+    return false;
+  };
   const affected: { l: Line; calls: Map<string, number>; cycle: number; fraction: number }[] = [];
   for (const other of g.lines.map.values()) {
-    if (other.kind === 'rail') continue;
+    if (other.kind === 'rail' || !mayShareCurb(other)) continue;
     const vehicles = fleetOf(g, other).vehicles, timings = new Map<string, number>();
     for (const v of vehicles) {
       if (!v.model) continue;

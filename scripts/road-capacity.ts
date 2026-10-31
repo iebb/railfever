@@ -93,6 +93,27 @@ const old = MODEL_BY_ID.get('bus_a')!, modern = MODEL_BY_ID.get('bus_b')!;
   const patternSave = JSON.stringify(serialize(h));
   assert.equal(drain(moreValue(host(h), clockwise, modern)), null, 'no fabricated full-route revenue quote for a short-turn fleet');
   assert.equal(JSON.stringify(serialize(h)), patternSave, 'pattern quote aligns metadata only on copies');
+  const nearJunction = (s: number, owner: number) => {
+    const ids = stops.map(sid => {
+      const source = h.stations.get(sid)!, edge = net.edges.get(source.stops[0].edge)!;
+      const point = { x: 0, y: 0, z: 0 }; net.pointAt(edge, s, point);
+      const station = { ...source, id: h.stations.nextId++, owner, x: point.x, z: point.z,
+        stops: [{ edge: edge.id, s, x: point.x, z: point.z }] };
+      h.stations.map.set(station.id, station); return station.id;
+    });
+    const line = h.lines.create('road', owner); line.stops = ids; line.loop = true;
+    return line;
+  };
+  const nearA = nearJunction(0.05, 1), nearB = nearJunction(0.1, 0);
+  assert.deepEqual([...roadCurbRoute(h, nearA).calls.keys()].sort(), [...roadCurbRoute(h, nearB).calls.keys()].sort(), 'distinct raw stop coordinates clamp to the same native junction berths');
+  const putVehicle = (line: typeof clockwise) => {
+    const bus = new RoadVehicle(h, h.vehicles.nextId++, old, -1); bus.owner = line.owner; bus.lineId = line.id;
+    h.vehicles.map.set(bus.id, bus); line.vehicles.push(bus.id);
+  };
+  putVehicle(nearA);
+  const aloneNearJunction = roadCapacityQuote(h, nearA, modern);
+  for (let i = 0; i < 3; i++) putVehicle(nearB);
+  assert(roadCapacityQuote(h, nearA, modern).limit < aloneNearJunction.limit, 'geometric prefilter retains shared traffic whose raw coordinates differ at junction trims');
 }
 
 const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1965, aiCompanies: 1 });
