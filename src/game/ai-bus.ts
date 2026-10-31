@@ -327,12 +327,12 @@ function lineMode(g: Game, lineId: number): FareMode { const l = g.lines.get(lin
 
 
 /** Per-day derived reads shared by the forecasts of one day (disposable: keyed by everything they depend on). */
-interface DayReads { key: string; cover: Map<number, [number, number][]>; regional: Map<number, [number, number][]>; base: Map<number, { local: number; localF: number }>; paths: Map<string, { length: number; seconds: number } | null>; curbs: Map<string, CurbRoute>; pairs?: Float64Array }
+interface DayReads { key: string; cover: Map<number, [number, number][]>; regional: Map<number, [number, number][]>; base: Map<number, { local: number; localF: number }>; paths: Map<string, { length: number; seconds: number } | null>; pairs?: Float64Array }
 const dayReads = new WeakMap<Game, DayReads>();
 function reads(g: Game): DayReads {
   const key = `${g.day}:${g.lines.version}:${g.demand.version}:${g.networkVersion}:${g.world.net.version}:${g.world.lotVersions.version}:${g.stations.map.size}`;
   let r = dayReads.get(g);
-  if (!r || r.key !== key) { r = { key, cover: new Map(), regional: new Map(), base: new Map(), paths: new Map(), curbs: new Map() }; dayReads.set(g, r); }
+  if (!r || r.key !== key) { r = { key, cover: new Map(), regional: new Map(), base: new Map(), paths: new Map() }; dayReads.set(g, r); }
   return r;
 }
 /** A station's walking coverage of each region (same-town trips) or its regional one with car feeders (cross-town). */
@@ -911,13 +911,24 @@ function curbSeconds(model: VehicleModel): number {
 }
 
 interface CurbRoute { calls: Map<string, number>; sites: RoadSite[] }
+const curbRoutes = new WeakMap<Game, WeakMap<Line, Map<string, { signature: string; route: CurbRoute }>>>();
 function patternLineCopy(l: Line): Line {
   return { ...l, patterns: l.patterns?.map(p => ({ ...p, stops: [...p.stops], ids: p.ids && [...p.ids] })) };
 }
 /** Native pattern itinerary and router select the actual lane and first berth reached at a station. */
 export function roadCurbRoute(g: Game, l: Line, pid?: number, operator = l.owner): CurbRoute {
-  const cache = reads(g).curbs, key = `${l.id}:${pid ?? ''}:${operator}`, known = cache.get(key);
-  if (known) return known;
+  let lines = curbRoutes.get(g);
+  if (!lines) { lines = new WeakMap(); curbRoutes.set(g, lines); }
+  let cache = lines.get(l);
+  if (!cache) { cache = new Map(); lines.set(l, cache); }
+  const key = `${pid ?? ''}:${operator}`;
+  // Itineraries do not depend on day, demand or receipts. Access changes advance networkVersion; edits to
+  // graph geometry advance net.version. Include the native stop/pattern inputs, including uncommitted edits.
+  const signature = JSON.stringify([g.networkVersion, g.world.net.version, l.kind, l.loop,
+    l.stops, l.patterns?.map(p => [p.id, p.stops, p.ids]),
+    [...new Set(l.stops)].map(id => { const st = g.stations.get(id); return st ? [id, st.x, st.z, st.townId, st.stops.map(p => [p.edge, p.s, p.x, p.z])] : [id]; })]);
+  const known = cache.get(key);
+  if (known?.signature === signature) return known.route;
   // Pattern alignment is allowed to repair metadata. Align a copy to keep this quote a pure read.
   const copy = patternLineCopy(l);
   const ids = patternStops(copy, pid).map(i => l.stops[i]).filter((id, i, a) => i === 0 || id !== a[i - 1]);
@@ -955,7 +966,7 @@ export function roadCurbRoute(g: Game, l: Line, pid?: number, operator = l.owner
     sites.push({ ...siteOf(st), road: { x: stop.x, z: stop.z } });
   }
   const result = sites.length === ids.length ? { calls, sites } : { calls: new Map<string, number>(), sites: [] };
-  cache.set(key, result);
+  cache.set(key, { signature, route: result });
   return result;
 }
 
