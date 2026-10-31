@@ -1,6 +1,6 @@
 // Cargo routing: the heap Dijkstra of Lines.rebuild gives exactly the tables of the former sort-based search (seeds
-// 7 / 23 / 51 with AI networks); games without mail vehicles have no mail tables or mail state; where every vehicle of a
-// transfer complex carries both cargoes mail shares the passenger tables (the same Map objects); a mail fleet of its
+// 7 / 23 / 51 with natural AI networks); an explicitly passenger-only railway has no mail tables or mail state; where
+// every vehicle of a transfer complex carries both cargoes mail shares the passenger tables (the same Map objects); a mail fleet of its
 // own (passenger-only trains beside mixed ones, mail-only trains) gets tables of its own, equal to an independent mail
 // search; rebuild timing.
 // npx esbuild scripts/cargoroute.ts --bundle --platform=node --format=esm --outfile=$S/cargoroute.mjs && node $S/cargoroute.mjs [seeds]
@@ -129,7 +129,33 @@ function timing(edges: Map<number, RouteEdge[]>): { heap: number; ref: number } 
   check(!bad, `random graphs with ties: heap Dijkstra equals the sort-based search${bad ? ' — ' + bad : ''}`);
 }
 
-// ---- AI networks: identical tables, no mail state without mail vehicles
+// ---- passenger-only railways: explicitly purchased stock, independent of profitable AI mail decisions
+for (const seed of seeds) {
+  const g = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 0 });
+  g.economy.money = 1e9;
+  check(g.ais.length === 0, `passenger-only seed ${seed}: no autonomous fleet purchases`);
+  const pr = placeAndConnect(g, 80, 160, 0, new Set(), 1, () => {});
+  check(!!pr, `passenger-only seed ${seed}: railway built`);
+  if (pr) {
+    const line = g.lines.create('rail', 0);
+    line.stops = [pr.A.id, pr.B.id];
+    const train = g.vehicles.buyTrain(depotBehind(g, pr.A, pr.B, 0), [M('diesel_b'), M('coach_ic'), M('coach_ic')], line.id);
+    check(train instanceof Train && train.capacity > 0 && !train.carries('mail'), `passenger-only seed ${seed}: passenger train bought without mail capacity`);
+    if (train instanceof Train) {
+      for (const day of [300, 600, 900]) {
+        runTo(g, day);
+        check(g.lines.mailRouting.size === 0 && g.lines.mailStations.size === 0 && !g.lines.mailActive, `passenger-only seed ${seed} day ${day}: no mail tables without mail vehicles`);
+        check([...g.lines.map.values()].every((l) => mailFleet(g, l) === 'none' && !l.mail), `passenger-only seed ${seed} day ${day}: no line carries mail`);
+        check([...g.stations.map.values()].every((st) => !st.mail) && g.mail.toJSON() === null, `passenger-only seed ${seed} day ${day}: no station mail state, mail's random stream unused`);
+        check(g.economy.months.every((m) => m.v.mailIncome === 0) && !('mailIncome' in (JSON.parse(JSON.stringify(g.economy)).current)), `passenger-only seed ${seed} day ${day}: no mail income; saves leave the zero category out`);
+        console.log(`passenger-only seed ${seed} day ${day}: ${train.delivered} passengers delivered, no mail state or tables`);
+      }
+      check(train.delivered > 0 && !!g.lines.routing.get(pr.A.id)?.get(pr.B.id), `passenger-only seed ${seed}: operates and routes passengers`);
+    }
+  }
+}
+
+// ---- natural AI networks: identical passenger tables, regardless of economically selected mail vans
 const timings: { heap: number; ref: number; sources: number; hops: number }[] = [];
 let aiGame: Game | null = null;
 for (const seed of seeds) {
@@ -144,10 +170,6 @@ for (const seed of seeds) {
     console.log(`seed ${seed} day ${day}: ${g.lines.map.size} lines, ${g.vehicles.map.size} vehicles, ${heap.size} sources, ${hops(heap)} hops`);
     check(!diff, `seed ${seed} day ${day}: heap Dijkstra equals the sort-based search${diff ? ' — ' + diff : ''}`);
     check(!live, `seed ${seed} day ${day}: the game's routing equals the search${live ? ' — ' + live : ''}`);
-    check(g.lines.mailRouting.size === 0 && g.lines.mailStations.size === 0 && !g.lines.mailActive, `seed ${seed} day ${day}: no mail tables without mail vehicles`);
-    check([...g.lines.map.values()].every((l) => mailFleet(g, l) === 'none' && !l.mail), `seed ${seed} day ${day}: no line carries mail`);
-    check([...g.stations.map.values()].every((st) => !st.mail) && g.mail.toJSON() === null, `seed ${seed} day ${day}: no station mail state, mail's random stream unused`);
-    check(g.economy.months.every((m) => m.v.mailIncome === 0) && !('mailIncome' in (JSON.parse(JSON.stringify(g.economy)).current)), `seed ${seed} day ${day}: no mail income; saves leave the zero category out`);
   }
   const { edges } = routeGraph(g, 'pax');
   const t = timing(edges);
