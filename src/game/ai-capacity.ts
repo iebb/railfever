@@ -14,6 +14,7 @@ import { KMH_TO_UPS, TRACK_TYPES, RAIL, UNIT_M } from './constants';
 import { railPartMode } from './stations';
 import { railCapacityOptions } from './rail-capacity-options';
 import { accessItemKey, accessItemOwner, type AccessItem } from './access-cost';
+import { atomicTerminalCell, blockedTerminalCells, type AtomicTerminalCell } from './rail-capacity-cells';
 
 export interface RailCapacityState {
   day: number;
@@ -37,6 +38,7 @@ interface Channel {
   access: Map<number, { item: AccessItem; use: number }>;
   /** Whole-route bid; mixed, partial and circular services retain the existing conservative model. */
   native?: { path: number[]; share: number; seats: number };
+  cell?: AtomicTerminalCell;
 }
 export interface CapacityAllocation { line: number; owner: number; pattern: number; trains: number; traffic: number }
 export interface SharedCapacityPlan {
@@ -280,15 +282,31 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       const year = estimateVehicleYear(c.cars, distance / Math.max(1, indices.length), g.year, 0.5);
       const wear = distance / 2 * year.trackWearPerUnit;
       const part = weights.get(key)! / Math.max(1, sum);
+      const proposed = candidate?.line.id === l.id && candidate.owner === c.owner && (patternOf(l, candidate.pattern)?.id ?? 0) === c.pid;
+      const cell = channelTerminalCell(g, l, c.pid, c.owner,
+        [...c.trains.map(t => t.cars), ...(proposed ? [candidate!.cars] : []), c.cars]);
       out.push({ line: l, owner: c.owner, pattern: c.pid, cars: c.cars, trains: c.trains,
         cycle: pcycle, seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * indices.length * 0.65,
         running: year.total + wear, capital: c.cars.reduce((n, m) => n + m.cost, 0), budget: d.revenue * part, boardings: d.boardings * part,
-        use, access, limit: use.size ? Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u)))) : 0,
+        use, access, limit: use.size ? Math.min(cell ? Math.max(0, cell.slots.length - 1) : Infinity,
+          Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u))))) : 0,
+        ...(cell ? { cell } : {}),
         ...(complete ? { native: { path: route.stations, share: part,
           seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * .65 } } : {}) });
     }
   }
   return out.sort((a, b) => a.line.id - b.line.id || a.owner - b.owner || a.pattern - b.pattern);
+}
+
+function channelTerminalCell(g: Game, l: Line, pattern: number, owner: number, consists: VehicleModel[][]): AtomicTerminalCell | null {
+  if (isLoopLine(l)) return null;
+  const stations = patternStops(l, pattern).map(i => l.stops[i]);
+  const cells = consists.map(cars => atomicTerminalCell(g, stations, owner, cars));
+  const first = cells.find((c): c is AtomicTerminalCell => !!c);
+  if (!first) return null;
+  // Fare channels retain their representative stock. Physical space is conservative: every incumbent
+  // and the exact proposed stock must be able to use a slot before this pooled bid may count it.
+  return { key: first.key, slots: first.slots.filter(id => cells.every(c => c?.slots.includes(id))) };
 }
 
 function loads(channels: Channel[], counts: number[]): Map<number, number> {
@@ -297,11 +315,29 @@ function loads(channels: Channel[], counts: number[]): Map<number, number> {
   return out;
 }
 
+function blockedTerminalChannels(channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>): Set<number> {
+  const blocked = new Set<number>(), cells = new Map<string, number[]>();
+  channels.forEach((c, i) => { if (c.cell) { const group = cells.get(c.cell.key) ?? []; group.push(i); cells.set(c.cell.key, group); } });
+  for (const indices of cells.values()) {
+    const candidates = indices.map(i => {
+      const ids = channels[i].cell!.slots, slots = [...ids];
+      const platforms = new Set(ids.map(id => inv.edgeResource.get(id)).filter((id): id is number => id !== undefined));
+      for (const id of platforms) {
+        const added = Math.floor(Math.max(0, (enlarged?.get(id) ?? inv.resources[id].available) - inv.resources[id].available) + 1e-6);
+        for (let n = 0; n < added; n++) slots.push(-(id + 1) * 1_000_000 - n);
+      }
+      return { slots, count: counts[i] };
+    });
+    for (const i of blockedTerminalCells(candidates)) blocked.add(indices[i]);
+  }
+  return blocked;
+}
+
 /** More holds mean fewer round trips, lower time-valued fares, and more passengers abandoning the queue. */
 function receipts(g: Game, channels: Channel[], counts: number[], inv: RouteInventory, enlarged?: ReadonlyMap<number, number>): number[] {
-  const load = loads(channels, counts);
+  const load = loads(channels, counts), blocked = blockedTerminalChannels(channels, counts, inv, enlarged);
   return channels.map((c, i) => {
-    if (!counts[i]) return 0;
+    if (!counts[i] || blocked.has(i)) return 0;
     let delay = 0;
     for (const [rid, u] of c.use) {
       const available = enlarged?.get(rid) ?? inv.resources[rid].available;
@@ -506,7 +542,18 @@ export function marginalSharedTrain(g: Game, l: Line, owner: number, cars: Vehic
 }
 
 export function sharedTrainAllowed(g: Game, l: Line, owner: number, cars: VehicleModel[], pattern?: number): boolean {
-  if (!usesSharedRail(g, l)) return true;
+  if (!usesSharedRail(g, l)) {
+    // Private openings retain their project's fare/cost approval, but cannot bypass a physical closed
+    // cell shared with other routed stock. Count paid depot stock too: parking it is no extra service.
+    const pid = patternOf(l, pattern)?.id ?? 0;
+    const represented = fleet(g, l).filter(t => t.owner === owner && (patternOf(l, t.pattern)?.id ?? 0) === pid).map(t => t.cars);
+    if (!railCapacityOptions.enabled || !channelTerminalCell(g, l, pid, owner, [...represented, cars])) return true;
+    const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv, { line: l, owner, cars, pattern });
+    const i = channels.findIndex(c => c.line.id === l.id && c.owner === owner && c.pattern === pid);
+    if (i < 0) return false;
+    const counts = channels.map(c => c.trains.length); counts[i]++;
+    return !blockedTerminalChannels(channels, counts, inv).has(i);
+  }
   const plan = sharedCapacityPlan(g, l), pid = patternOf(l, pattern)?.id ?? 0;
   const allocated = plan.allocations.find(a => a.line === l.id && a.owner === owner && a.pattern === pid);
   const existing = fleet(g, l).filter(t => t.owner === owner && (patternOf(l, t.pattern)?.id ?? 0) === pid).length;
@@ -516,7 +563,19 @@ export function sharedTrainAllowed(g: Game, l: Line, owner: number, cars: Vehicl
 
 /** Extra coaches buy seats without buying another path; their extra cost/clearance time must still pay. */
 export function marginalSharedConsist(g: Game, l: Line, t: Train, cars: VehicleModel[]): number {
-  if (!usesSharedRail(g, l)) return Infinity;
+  const stations = patternStops(l, t.pattern).map(i => l.stops[i]);
+  const priorCell = !isLoopLine(l) ? atomicTerminalCell(g, stations, t.owner, t.cars) : null;
+  const cell = !isLoopLine(l) ? atomicTerminalCell(g, stations, t.owner, cars) : null;
+  if (priorCell && !cell) return -Infinity;
+  if (!usesSharedRail(g, l)) {
+    if (!priorCell && !cell) return Infinity;
+    const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv);
+    const pid = patternOf(l, t.pattern)?.id ?? 0, i = channels.findIndex(c => c.line.id === l.id && c.owner === t.owner && c.pattern === pid);
+    if (i < 0) return -Infinity;
+    const c = channels[i];
+    c.cell = channelTerminalCell(g, l, pid, t.owner, [...c.trains.filter(v => v.id !== t.id).map(v => v.cars), cars]) ?? undefined;
+    return blockedTerminalChannels(channels, channels.map(c => c.trains.length), inv).has(i) ? -Infinity : Infinity;
+  }
   const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv);
   const i = channels.findIndex(c => c.line.id === l.id && c.owner === t.owner && c.pattern === (patternOf(l, t.pattern)?.id ?? 0));
   if (i < 0) return -Infinity;
@@ -525,9 +584,11 @@ export function marginalSharedConsist(g: Game, l: Line, t: Train, cars: VehicleM
   const oldYear = estimateVehicleYear(t.cars, hop, g.year, 0.5), newYear = estimateVehicleYear(cars, hop, g.year, 0.5);
   const extraSeats = cars.reduce((s, m) => s + m.capacity, 0) - t.capacity;
   const oldCost = t.cars.reduce((s, m) => s + m.cost, 0), newCost = cars.reduce((s, m) => s + m.cost, 0);
+  if (c.cell && !cell) return -Infinity;
   channels[i] = { ...c, seats: c.seats + extraSeats * YEAR_S / c.cycle * legs * 0.65 / n,
     running: c.running + (newYear.total - oldYear.total) / n, capital: c.capital + (newCost - oldCost) / n,
-    cycle: c.cycle * (1 + Math.max(0, oldYear.trips / Math.max(1, newYear.trips) - 1) / n), use: new Map(c.use) };
+    cycle: c.cycle * (1 + Math.max(0, oldYear.trips / Math.max(1, newYear.trips) - 1) / n), use: new Map(c.use),
+    cell: channelTerminalCell(g, l, c.pattern, t.owner, [...c.trains.filter(v => v.id !== t.id).map(v => v.cars), cars]) ?? undefined };
   // Stock speed changes retain the existing cycle-cost estimate; frequency fares use the saved reference speed.
   if (c.native) channels[i].native = { ...c.native,
     seats: (c.native.seats + extraSeats * YEAR_S / c.cycle * .65 / n) * c.cycle / channels[i].cycle };
