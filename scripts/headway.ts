@@ -1,6 +1,7 @@
 // Headway audit. Bundle as headway.mjs in the scratch directory, then run with node there.
 // --baseline records the unregulated simulation before implementation; --quick skips full AI games.
-import { writeFileSync } from 'node:fs';
+// --matched-only runs the natural OFF worlds and their controlled same-fleet comparisons.
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { Game } from '../src/game/game';
 import { Vehicle } from '../src/game/vehicle';
 import { Train } from '../src/game/train';
@@ -9,7 +10,7 @@ import { Lines, outAndBack, type Line } from '../src/game/lines';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { simNow } from '../src/game/fares';
-import { nextStopIndex, patternOf, patternHeadway, vehiclesByPattern, holdForSpacing, spacingSchedule, isTimingPoint, SPACING_HOLD, setVehiclePattern } from '../src/game/patterns';
+import { nextStopIndex, patternOf, patternStops, patternHeadway, vehiclesByPattern, holdForSpacing, spacingSchedule, isTimingPoint, SPACING_HOLD, setVehiclePattern } from '../src/game/patterns';
 import { autoSignalLine } from '../src/game/signals';
 import { planDoubleTrack, commitDoubleTrack, connectStationThroat, finishDoubleTrack } from '../src/game/trackops';
 import { busStopSites, addBusStop, roadDepotNear, check, fails, checkReservations } from './lib';
@@ -17,6 +18,9 @@ import { flatGame, station, endNode, newTrack, loco, depotFor, build, railOpts, 
 
 const baseline = process.argv.includes('--baseline');
 const quick = process.argv.includes('--quick');
+const matchedOnly = process.argv.includes('--matched-only');
+const snapshots = process.argv.find(a => a.startsWith('--snapshots='))?.slice(12);
+if (matchedOnly && (quick || baseline)) throw new Error('--matched-only cannot be combined with --quick or --baseline');
 const mean = (xs: number[]) => xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 0;
 const cv = (xs: number[]) => { const m = mean(xs); return m > 0 ? Math.sqrt(mean(xs.map((x) => (x - m) ** 2))) / m : 0; };
 const fmt = (n: number) => n.toFixed(3);
@@ -189,7 +193,51 @@ function ai(seed: number, spacing: boolean) {
   }).join(', ')}`);
   check(lines.length > 0, `AI seed ${seed}: measured multi-vehicle headways`);
   check(checkReservations(g).length === 0, `AI seed ${seed}: reservations consistent`);
-  return result;
+  return { result, g };
+}
+
+/** Compare the same native AI-built fleet, rather than different autonomous investment histories. */
+function matched(seed: number, native: Game) {
+  const data = JSON.stringify(serialize(native));
+  if (snapshots) { mkdirSync(snapshots, { recursive: true }); writeFileSync(`${snapshots}/headway-${seed}-day-${native.day}.json`, data); }
+  const off = deserialize(JSON.parse(data)), on = deserialize(JSON.parse(data));
+  // Spacing changes receipts and hence autonomous route/purchase decisions. Keep the original four-year ON/OFF
+  // worlds as natural coverage, but measure regulation causally on copies of one naturally built network.
+  off.aiEnabled = false; on.aiEnabled = false;
+  check(JSON.stringify(serialize(off)) === JSON.stringify(serialize(on)), `matched seed ${seed}: identical saved starting worlds`);
+  const roster = (g: Game) => JSON.stringify([...g.lines.map.values()].map(l => [l.id, l.kind, l.owner, l.stops, l.patterns,
+    l.vehicles.map(id => { const v = g.vehicles.get(id)!; return [id, v.owner, v.pattern, v instanceof Train ? v.madeUp.map(c => c.id) : (v as RoadVehicle).model?.id]; })]));
+  const stock = roster(off), channels = new Map<string, number>();
+  // Choose every current multi-vehicle channel before either outcome, including all its served directions.
+  // Requiring samples on both copies prevents a missing or stranded service from improving the reported CV.
+  for (const l of off.lines.map.values()) for (const [pid, fleet] of vehiclesByPattern(off, l)) if (fleet.length >= 2) {
+    for (const i of patternStops(l, pid)) channels.set(`${l.id}:${pid}:${l.stops[i]}:${l.stops[nextStopIndex(l, pid, i)]}:${l.stops.join(',')}:${fleet.map(v => v.id).join(',')}`, l.id);
+  }
+  check(channels.size > 0, `matched seed ${seed}: native fleet has multi-vehicle service channels`);
+  for (const l of off.lines.map.values()) off.lines.setEvenSpacing(l.id, false);
+  for (const l of on.lines.map.values()) on.lines.setEvenSpacing(l.id, true);
+  // Match the natural audit's two-year exposure. Long native routes can take most of a year per circuit;
+  // discarding a settling year would omit real operated directions. Recovery after enabling remains measured.
+  const end = off.day + 720, since = simNow(off);
+  const measure = (g: Game, enabled: boolean) => {
+    const audit = run(g, end), samples = new Map(gaps(audit.arrivals.filter(a => a.multi), since, undefined, 3).map(s => [s.key, s.gaps]));
+    const complete = [...channels.keys()].every(key => samples.has(key));
+    check(complete, `matched seed ${seed} ${enabled ? 'on' : 'off'}: at least three two-year gaps on every fixed channel`);
+    const lines = [...new Set(channels.values())].map(id => ({ id,
+      cv: mean([...channels].filter(([, line]) => line === id).map(([key]) => cv(samples.get(key) ?? []))) }));
+    const deliveries = g.companies.slice(1).map(c => audit.deliveries[c.id] ?? 0);
+    const result = { cv: complete ? mean(lines.map(l => l.cv)) : Infinity, lines, channels: channels.size, deliveries,
+      total: deliveries.reduce((a, b) => a + b, 0) };
+    check(roster(g) === stock, `matched seed ${seed} ${enabled ? 'on' : 'off'}: original native stock and routes retained`);
+    check(checkReservations(g).length === 0, `matched seed ${seed} ${enabled ? 'on' : 'off'}: reservations consistent`);
+    replay(g, `matched seed ${seed} ${enabled ? 'on' : 'off'}`);
+    return result;
+  };
+  const unregulated = measure(off, false), regulated = measure(on, true);
+  console.log(`matched AI seed ${seed}: ${channels.size} fixed channels, CV ${fmt(unregulated.cv)} -> ${fmt(regulated.cv)}, two-year deliveries ${unregulated.total} -> ${regulated.total}`);
+  check(regulated.cv < unregulated.cv, `matched AI seed ${seed}: mean headway CV improves on the same channels`);
+  check(regulated.total >= unregulated.total, `matched AI seed ${seed}: regulation preserves / increases same-fleet deliveries`);
+  return { off: unregulated, on: regulated };
 }
 
 function replay(g: Game, label: string) {
@@ -284,23 +332,28 @@ function rulesAndSaves() {
 }
 
 const reports: Record<string, unknown> = {};
-const busOff = bus(false); reports.busOff = busOff;
-if (!baseline) {
-  const busOn = bus(true); reports.busOn = busOn;
-  check(busOn.total >= busOff.total, 'bus regulation preserves / increases total deliveries');
-}
-for (const double of [false, true]) {
-  reports[double ? 'doubleOff' : 'singleOff'] = rail(false, double);
-  if (!baseline) reports[double ? 'doubleOn' : 'singleOn'] = rail(true, double);
-}
-if (!quick) for (const seed of [7, 23]) {
-  const off = ai(seed, false); reports[`ai${seed}Off`] = off;
+if (!matchedOnly) {
+  const busOff = bus(false); reports.busOff = busOff;
   if (!baseline) {
-    const on = ai(seed, true); reports[`ai${seed}On`] = on;
-    check(on.cv < off.cv, `AI seed ${seed}: mean headway CV improves`);
+    const busOn = bus(true); reports.busOn = busOn;
+    check(busOn.total >= busOff.total, 'bus regulation preserves / increases total deliveries');
+  }
+  for (const double of [false, true]) {
+    reports[double ? 'doubleOff' : 'singleOff'] = rail(false, double);
+    if (!baseline) reports[double ? 'doubleOn' : 'singleOn'] = rail(true, double);
   }
 }
-if (!baseline) { reports.busRecovery = busRecovery(); rulesAndSaves(); }
+if (!quick) for (const seed of [7, 23]) {
+  const off = ai(seed, false); reports[`ai${seed}Off`] = off.result;
+  if (!baseline) {
+    if (!matchedOnly) {
+      const on = ai(seed, true); reports[`ai${seed}On`] = on.result;
+      console.log(`AI seed ${seed}: autonomous investment comparison reported separately (${off.result.lines.length} off / ${on.result.lines.length} on measured lines)`);
+    }
+    reports[`ai${seed}Matched`] = matched(seed, off.g);
+  }
+}
+if (!baseline && !matchedOnly) { reports.busRecovery = busRecovery(); rulesAndSaves(); }
 const json = process.argv.find((a) => a.startsWith('--json='))?.slice(7);
 if (json) writeFileSync(json, JSON.stringify(reports, null, 2) + '\n');
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
