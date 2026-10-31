@@ -4,8 +4,11 @@ import assert from 'node:assert/strict';
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { planTownLine, roadPlanJob, roadCapacityQuote, roadCurbRoute, roadForecasts, moreValue, pays, routeOf, type BusHost } from '../src/game/ai-bus';
-import { RoadVehicle } from '../src/game/roadvehicle';
+import { planTownLine, roadPlanJob, roadCapacityQuote, roadCurbRoute, roadForecasts, roadDriving, moreValue, pays, routeOf, type BusHost } from '../src/game/ai-bus';
+import { nativeRoadItinerary, evaluateNativeRoadCycle } from '../src/game/road-physics';
+import { YEAR_S } from '../src/game/opcosts';
+import { RoadVehicle, makeLaneSeg } from '../src/game/roadvehicle';
+import { simNow, fareFor, stationFareContext } from '../src/game/fares';
 import { bezLine } from '../src/game/geom';
 import { addPattern } from '../src/game/patterns';
 import { outAndBack } from '../src/game/lines';
@@ -14,6 +17,37 @@ import { roadDepotNear } from './lib';
 function drain<T>(g: Generator<void, T>): T { let r = g.next(); while (!r.done) r = g.next(); return r.value; }
 const host = (g: Game): BusHost => (g.ais[0] as unknown as { busHost(): BusHost }).busHost();
 const old = MODEL_BY_ID.get('bus_a')!, modern = MODEL_BY_ID.get('bus_b')!;
+
+// Zero-wait riders board before origin handling and pay at alighting, before destination handling.
+function nativeRiderTime(includeOriginHandling: boolean) {
+  const g = Game.create({ size: 128, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1965 });
+  g.aiEnabled = false; g.vehicles.ambientEnabled = false; g.vehicles.ambient = [];
+  g.world.h.fill(2); g.world.heightsVersion++;
+  const net = g.world.net, a = net.addNode('road', 20, 2, 64), b = net.addNode('road', 110, 2, 64);
+  net.addEdge('road', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(91).fill(2), [], 'road', -1);
+  const ids: number[] = [];
+  for (const x of [45, 85]) { assert.equal(g.stations.commitBusStop(x, 64, 0), null); ids.push(g.stations.nextId - 1); }
+  const line = g.lines.create('road', 0); line.stops = ids; line.loop = false; line.evenSpacing = false;
+  const route = nativeRoadItinerary(g, line)!; assert(route);
+  const v = new RoadVehicle(g, g.vehicles.nextId++, old, -1);
+  v.owner = 0; v.lineId = line.id; line.vehicles = [v.id]; g.vehicles.map.set(v.id, v);
+  const first = route.legs[0].parts[0]; v.stopIndex = line.stops.indexOf(route.stops[0]);
+  v.placeAt(makeLaneSeg(g, net.edges.get(first.seg.e)!, first.seg.dir), first.from); g.lines.rebuild();
+  const from = g.stations.get(route.stops[0])!, to = g.stations.get(route.stops[1])!;
+  g.stations.addWaiting(from, line.id, to.id, to.id, 1, 0, simNow(g));
+  const dwell = v.serveStation(from, 0.05), t0 = [...v.cargo.values()][0]?.t0;
+  assert.equal(v.load, 1); assert.equal(t0, simNow(g), 'zero-wait rider clock starts before origin handling');
+  if (includeOriginHandling) { v.state = 'loading'; v.loadTimer = dwell; } else v.depart();
+  for (let tick = 0; tick < 30000 && !v.delivered; tick++) g.stepTick();
+  assert.equal(v.delivered, 1);
+  const elapsed = simNow(g) - t0!;
+  const fare = fareFor(Math.hypot(from.x - to.x, from.z - to.z), elapsed, 1, stationFareContext(g, from, to, 'bus'));
+  assert(Math.abs(v.incomeYear - fare) < 1e-9, 'native fare is charged before destination handling');
+  return { elapsed, dwell, tick: g.tickSeconds };
+}
+const riding = nativeRiderTime(false), boarded = nativeRiderTime(true);
+assert(Math.abs(boarded.elapsed - riding.elapsed - boarded.dwell) <= boarded.tick,
+  'native fare clock retains origin handling; equal native destination bases must not be subtracted');
 
 // A bidirectional triangular street has independent curbs on each side. Native routing chooses them.
 {
@@ -81,6 +115,9 @@ const old = MODEL_BY_ID.get('bus_a')!, modern = MODEL_BY_ID.get('bus_b')!;
   h.setAccessPolicy(1, 'auto-reject');
   assert.equal(roadCurbRoute(h, tram, undefined, 1).calls.size, 3, 'tram owner reaches its own native curbs');
   assert.equal(roadCurbRoute(h, tram, undefined, 0).calls.size, 0, 'partner without tram access has no complete curb itinerary');
+  const tramSites = stops.map(id => ({ ...h.stations.get(id)!, station: h.stations.get(id)! }));
+  const denied = drain(roadForecasts(h, 0, tramSites, { model: MODEL_BY_ID.get('tram_b')!, vehicles: 1, loop: true }, [1]))[0];
+  assert.equal(denied.cycle, Infinity, 'committed native targets without operator access cannot use an undirected survey fallback');
   h.setAccessPolicy(1, 'open');
   assert.equal(roadCurbRoute(h, tram, undefined, 0).calls.size, 3, 'opening access invalidates operator-specific curb cache');
   // Native vehicles need no depot for this stationary planning fixture.
@@ -135,6 +172,17 @@ const forecasts = drain(roadForecasts(g, 1, sites, { model: modern, models: curr
 const baseline = drain(roadForecasts(g, 1, sites, { model: old, vehicles: n, loop: route.loop }, [n], line.id))[0];
 assert(Math.abs(forecasts[0].seats - baseline.seats) < 1e-7, 'existing old fleet capacity is retained when pricing a modern purchase');
 assert(forecasts[1].seats > forecasts[0].seats, 'proposed model adds actual seat throughput');
+const oldCycle = evaluateNativeRoadCycle(g, line, old)!, newCycle = evaluateNativeRoadCycle(g, line, modern)!;
+assert(Math.abs(forecasts[0].cycle - oldCycle.cycle) < 1e-7, 'existing service uses its directed native free-flow cycle');
+assert(Math.abs(forecasts[1].headway - 1 / (n / oldCycle.cycle + 1 / newCycle.cycle)) < 1e-7,
+  'mixed fleet frequency sums its exact native model cycles');
+assert(Math.abs(forecasts[1].seats - (n * old.capacity / oldCycle.cycle + modern.capacity / newCycle.cycle) * YEAR_S * 0.85) < 1e-7,
+  'seat throughput follows native free-flow time without counting congestion as physical capacity');
+const survey = sites.map(({ station, ...site }) => site);
+const surveyed = drain(roadForecasts(g, 1, survey, { model: old, vehicles: n, loop: route.loop }, [n], line.id))[0];
+assert.equal(surveyed.cycle, roadDriving(g, survey, old, route.loop)!.cycle, 'uncommitted survey targets retain the explicit routing fallback');
+const emptyFleet = drain(roadForecasts(g, 1, sites, { model: old, vehicles: 0, loop: route.loop }, [0], line.id))[0];
+assert.equal(emptyFleet.seats, 0); assert.equal(emptyFleet.riders, 0); assert(Number.isFinite(emptyFleet.cycle));
 const quote = drain(moreValue(host(g), line, modern));
 assert(quote && quote.model.id === modern.id && quote.outlay >= modern.cost, 'purchase quote uses exactly the bus being bought');
 assert(pays(quote), 'additional modern bus earns its costs on the naturally busy town route');
@@ -158,6 +206,21 @@ const firstStop = g.stations.get(line.stops[0])!;
 const foreignDepot = roadDepotNear(g, firstStop.x, firstStop.z, 0);
 assert(foreignDepot >= 0, 'native partner depot is buildable');
 const ownQuote = roadCapacityQuote(g, line, modern);
+const truck = MODEL_BY_ID.get('mailtruck_b')!;
+const mailPartner = g.lines.create('road', 0); mailPartner.stops = [...line.stops]; mailPartner.loop = line.loop;
+const mailVehicles: RoadVehicle[] = [];
+for (let i = 0; i < 3; i++) {
+  const v = g.vehicles.buyRoad(foreignDepot, truck, mailPartner.id);
+  assert(v instanceof RoadVehicle); mailVehicles.push(v);
+}
+const mailShared = roadCapacityQuote(g, line, modern);
+assert(mailShared.limit < ownQuote.limit, 'catalog mail trucks consume the same native passenger curbs');
+for (const v of mailVehicles) v.model = { ...truck, mail: 0 };
+const emptyTrucks = roadCapacityQuote(g, line, modern);
+assert(mailShared.limit < emptyTrucks.limit, 'full native mail handling reduces curb capacity beyond empty-truck clearance');
+for (const v of mailVehicles) { v.model = truck; g.vehicles.sell(v.id); }
+g.lines.delete(mailPartner.id);
+assert.deepEqual(roadCapacityQuote(g, line, modern), ownQuote, 'removing native shared mail traffic restores available capacity');
 for (let i = 0; i < 3; i++) {
   const v = g.vehicles.buyRoad(foreignDepot, modern, partner.id);
   assert(v instanceof RoadVehicle);

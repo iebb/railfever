@@ -17,7 +17,7 @@
 //    existing service shares its residents and riders and does not pay, while joining or extending it does: a town bus or
 //    coach market the project choice picks is planned then (roadMarket: the best of a new line, a partner on a line
 //    serving it and an extension of ours to it), and each project choice weighs one partner and one extension of ours.
-// Pure reads apart from the build steps (roadPlanJob), which run as an AI project; caches are derived data of the day.
+// Pure reads apart from the build steps (roadPlanJob), which run as an AI project; caches are disposable derived data.
 import type { Game } from './game';
 import type { Station } from './stations';
 import type { Line, Hop } from './lines';
@@ -25,7 +25,8 @@ import type { NEdge } from './network';
 import type { VehicleModel } from './vehicle-types';
 import type { Town } from './towns';
 import type { RoadVehicle } from './roadvehicle';
-import { roadDepotReaches, findRoadRoute } from './roadvehicle';
+import { roadDepotReaches } from './roadvehicle';
+import { nativeRoadItinerary, evaluateNativeRoadCycle } from './road-physics';
 import { linearStops, outAndBack } from './lines';
 import { stopsWithInserted, replaceLineStops } from './line-edit';
 import * as Constants from './constants';
@@ -36,8 +37,7 @@ import { walkingCatchment, pointWalkingCatchment, walkClaimShares, walkWeight, t
 import { WALK_LINE, TRANSFER_RANGE } from './stations';
 import { consistOf, hopEstimate, estimateVehicleYear, YEAR_S } from './opcosts';
 import { patternHeadways, patternStops } from './patterns';
-import { closestOnPolyline } from './geom';
-import { addTramTracks, roadPath as streetPath, tramUsable } from './build-ops';
+import { addTramTracks, roadPath as streetPath } from './build-ops';
 import { pickTram } from './ai-tram';
 import { TRAM } from './constants';
 import { MODEL_BY_ID } from './vehicle-types';
@@ -84,6 +84,8 @@ export interface RoadService {
   model: VehicleModel; vehicles: number; loop: boolean; purpose?: 'city' | 'intercity' | 'all';
   /** Existing mixed fleet; further vehicles are of `model`, the exact proposed purchase. */
   models?: VehicleModel[];
+  /** An existing full-route service whose native directed driving can be quoted without changing the world. */
+  nativeLine?: Line;
 }
 export interface RoadForecast {
   /** passengers boarding a year (direct and changing) */
@@ -532,21 +534,56 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const n = sites.length, loop = service.loop && n >= 3, purpose = service.purpose ?? 'all';
   if (!D.regions.length) D.rebuild();
   // passengers plan by the timetable's estimate (routing: patterns.ts lineTable); fares and seats follow the road driven
-  const timings = new Map<VehicleModel, { tt: ReturnType<typeof roadTimetable>; drive: ReturnType<typeof roadDriving> }>();
+  const nativeIds = sites.map(site => site.station?.id ?? -1);
+  // Existing stops can be native targets on a prospective service too. The route descriptor allocates no world IDs.
+  const nativeLine = service.nativeLine ?? (nativeIds.every(id => id >= 0 && g.stations.get(id)?.stops.length)
+    ? { id: -1, owner, kind: service.model.kind === 'tram' ? 'tram' : 'road', stops: loop ? nativeIds : outAndBack(nativeIds), loop } as Line : null);
+  const timings = new Map<VehicleModel, { tt: ReturnType<typeof roadTimetable>; drive: ReturnType<typeof roadDriving>; trips: number[] }>();
   const timing = (model: VehicleModel) => {
     let t = timings.get(model);
-    if (!t) { t = { tt: roadTimetable(g, sites, model, loop), drive: roadDriving(g, sites, model, loop) }; timings.set(model, t); }
+    if (!t) {
+      const native = nativeLine ? evaluateNativeRoadCycle(g, nativeLine, model, undefined, owner) : null;
+      const drive = native ?? (nativeLine ? null : roadDriving(g, sites, model, loop));
+      const trips = new Array<number>(n * n).fill(0);
+      for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+        if (i === j) continue;
+        let seconds = Infinity;
+        if (native) {
+          for (let start = 0; start < native.stops.length; start++) if (native.stops[start] === nativeIds[i]) {
+            let elapsed = 0;
+            for (let step = 0; step < native.stops.length; step++) {
+              const at = (start + step) % native.stops.length;
+              elapsed += native.hops[at];
+              if (native.stops[(at + 1) % native.stops.length] === nativeIds[j]) {
+                // Boarding precedes origin handling, and alighting precedes destination handling. The summed
+                // native 2s destination bases therefore replace the equal origin base, retaining the fare clock.
+                seconds = Math.min(seconds, elapsed); break;
+              }
+            }
+          }
+        } else if (drive) seconds = rideTime(drive.hops, i, j, loop);
+        trips[i * n + j] = seconds;
+      }
+      t = { tt: roadTimetable(g, sites, model, loop), drive, trips }; timings.set(model, t);
+    }
     return t;
   };
   const schedules = fleets.map((count) => {
     const models = service.models ? [...service.models.slice(0, count)] : [];
     while (models.length < count) models.push(service.model);
+    if (!models.length) {
+      const empty = timing(service.model);
+      return { hops: empty.tt.hops, trips: empty.trips, headway: empty.tt.cycle, realHeadway: empty.drive?.cycle ?? Infinity,
+        cycle: empty.drive?.cycle ?? Infinity, seats: 0 };
+    }
     const entries = models.map(model => ({ model, ...timing(model) }));
-    const frequency = entries.reduce((s, e) => s + 1 / Math.max(1, e.tt.cycle), 0);
+    // Native lineTable plans the whole pattern with its slowest model. Real mixed-fleet throughput is separate.
+    const plannedModel = models.reduce((slowest, model) => model.speed < slowest.speed ? model : slowest);
+    const planned = timing(plannedModel).tt;
     const realFrequency = entries.reduce((s, e) => s + (e.drive ? 1 / Math.max(1, e.drive.cycle) : 0), 0);
-    const hops = timing(service.model).tt.hops.map((_, i) => entries.reduce((s, e) => s + e.tt.hops[i] / Math.max(1, e.tt.cycle), 0) / Math.max(1e-9, frequency));
-    const realHops = hops.map((_, i) => entries.reduce((s, e) => s + (e.drive ? e.drive.hops[i] / Math.max(1, e.drive.cycle) : 0), 0) / Math.max(1e-9, realFrequency));
-    return { hops, realHops, headway: 1 / frequency, realHeadway: 1 / realFrequency,
+    const hops = planned.hops;
+    const trips = new Array<number>(n * n).fill(0).map((_, i) => entries.reduce((s, e) => s + (e.drive ? e.trips[i] / Math.max(1, e.drive.cycle) : 0), 0) / Math.max(1e-9, realFrequency));
+    return { hops, trips, headway: planned.cycle / models.length, realHeadway: 1 / realFrequency,
       cycle: models.length / realFrequency, seats: entries.reduce((s, e) => s + (e.drive ? e.model.capacity / Math.max(1, e.drive.cycle) : 0), 0) * YEAR_S * SEAT_USE };
   });
   const tt = timing(service.model).tt, drive = timing(service.model).drive;
@@ -614,7 +651,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   };
   // ride times without the wait (the wait is half the headway of each fleet size)
   const rideOnly = (i: number, j: number, m = 0) => rideTime(schedules[m].hops, i, j, loop);
-  const driveT = (m: number, i: number, j: number) => realHeadway[m] / 2 + rideTime(schedules[m].realHops, i, j, loop);
+  const driveT = (m: number, i: number, j: number) => realHeadway[m] / 2 + schedules[m].trips[i * n + j];
   // receipts our other lines get from the riders this line brings them, by line (capped below by their spare seats)
   const onwardBy = fleets.map(() => new Map<number, { riders: number; revenue: number }>());
   const network = (m: number, hop: Hop | undefined, d: number, count: number, factor: number) => {
@@ -905,77 +942,26 @@ function lineAge(g: Game, l: Line): number {
 
 /** Native road loading plus the time for a stopped vehicle's rear to clear the following vehicle's 0.18u gap. */
 function curbSeconds(model: VehicleModel): number {
-  const mass = model.weight + model.capacity * 0.075;
+  const mail = model.mail ?? 0, mass = model.weight + model.capacity * 0.075 + mail * Constants.MAIL_UNIT_T;
   const acceleration = Math.max(0.01, (Math.min(1.6, model.power / (mass * 3)) - 0.02) / 10);
-  return 2 + model.capacity * 2 * 0.05 + Math.sqrt(2 * (model.length + 0.18) / acceleration);
+  return 2 + Math.max(model.capacity * 2 * 0.05, mail * 2 * 0.05 * 1.5) + Math.sqrt(2 * (model.length + 0.18) / acceleration);
 }
 
 interface CurbRoute { calls: Map<string, number>; sites: RoadSite[] }
-const curbRoutes = new WeakMap<Game, WeakMap<Line, Map<string, { signature: string; route: CurbRoute }>>>();
 function patternLineCopy(l: Line): Line {
   return { ...l, patterns: l.patterns?.map(p => ({ ...p, stops: [...p.stops], ids: p.ids && [...p.ids] })) };
 }
-/** Native pattern itinerary and router select the actual lane and first berth reached at a station. */
+/** The same canonical native itinerary drives physical curb admission and operating-cycle forecasts. */
 export function roadCurbRoute(g: Game, l: Line, pid?: number, operator = l.owner): CurbRoute {
-  let lines = curbRoutes.get(g);
-  if (!lines) { lines = new WeakMap(); curbRoutes.set(g, lines); }
-  let cache = lines.get(l);
-  if (!cache) { cache = new Map(); lines.set(l, cache); }
-  const key = `${pid ?? ''}:${operator}`;
-  // Itineraries do not depend on day, demand or receipts. Access changes advance networkVersion; edits to
-  // graph geometry advance net.version. Include the native stop/pattern inputs, including uncommitted edits.
-  const signature = JSON.stringify([g.networkVersion, g.world.net.version, l.kind, l.loop,
-    l.stops, l.patterns?.map(p => [p.id, p.stops, p.ids]),
-    [...new Set(l.stops)].map(id => { const st = g.stations.get(id); return st ? [id, st.x, st.z, st.townId, st.stops.map(p => [p.edge, p.s, p.x, p.z])] : [id]; })]);
-  const known = cache.get(key);
-  if (known?.signature === signature) return known.route;
-  // Pattern alignment is allowed to repair metadata. Align a copy to keep this quote a pure read.
-  const copy = patternLineCopy(l);
-  const ids = patternStops(copy, pid).map(i => l.stops[i]).filter((id, i, a) => i === 0 || id !== a[i - 1]);
-  if (ids.length > 1 && ids[0] === ids[ids.length - 1]) ids.pop();
-  const calls = new Map<string, number>();
-  const sites: RoadSite[] = [], first = g.stations.get(ids[0])?.stops[0];
-  let edge = first && g.world.net.edges.get(first.edge), dir = 1, at = first?.s ?? 0;
-  if (edge && first) {
-    const from = g.stations.get(ids[ids.length - 1]), a = { x: 0, y: 0, z: 0 }, b = { x: 0, y: 0, z: 0 };
-    g.world.net.pointAt(edge, Math.max(0, at - 0.1), a); g.world.net.pointAt(edge, Math.min(edge.len, at + 0.1), b);
-    if (from) dir = (first.x - from.x) * (b.x - a.x) + (first.z - from.z) * (b.z - a.z) >= 0 ? 1 : -1;
-  }
-  if (edge && ids.length >= 2) for (let i = 1; i <= ids.length * 2; i++) {
-    const st = g.stations.get(ids[i % ids.length]);
-    if (!st) break;
-    let stop = st.stops.filter(p => p.edge === edge!.id && dir * (p.s - at) > 0.15).sort((a, b) => dir * (a.s - b.s))[0];
-    if (!stop) {
-      const route = findRoadRoute(g, edge, dir, st.id, 40000, l.kind === 'tram' ? e => tramUsable(g, e, operator) : undefined, g.lines.isLoop(l) ? 600 : 40);
-      const arrival = route?.[route.length - 1];
-      if (!arrival) break;
-      const arrivingEdge = g.world.net.edges.get(arrival.edge);
-      if (!arrivingEdge) break;
-      edge = arrivingEdge; dir = arrival.dir;
-      stop = st.stops.filter(p => p.edge === edge!.id).sort((a, b) => dir * (a.s - b.s))[0];
-    }
-    if (!stop) break;
-    at = stop.s;
-    if (i <= ids.length) continue; // warm-up establishes the arrival direction of the cyclic native itinerary
-    const lane = g.world.net.lane(edge, dir), p = closestOnPolyline(stop.x, stop.z, lane.pts, 3, lane.cum.length);
-    const x = lane.pts[p.i * 3] + (lane.pts[(p.i + 1) * 3] - lane.pts[p.i * 3]) * p.f;
-    const y = lane.pts[p.i * 3 + 1] + (lane.pts[(p.i + 1) * 3 + 1] - lane.pts[p.i * 3 + 1]) * p.f;
-    const z = lane.pts[p.i * 3 + 2] + (lane.pts[(p.i + 1) * 3 + 2] - lane.pts[p.i * 3 + 2]) * p.f;
-    const berth = `${x.toFixed(3)},${y.toFixed(3)},${z.toFixed(3)}`;
-    calls.set(berth, (calls.get(berth) ?? 0) + 1);
-    sites.push({ ...siteOf(st), road: { x: stop.x, z: stop.z } });
-  }
-  const result = sites.length === ids.length ? { calls, sites } : { calls: new Map<string, number>(), sites: [] };
-  cache.set(key, { signature, route: result });
-  return result;
+  return nativeRoadItinerary(g, l, pid, operator) ?? { calls: new Map(), sites: [] };
 }
 
 /** Road admission by shared curb workload; delay cost is the lost throughput of every affected line. Pure read. */
 export function roadCapacityQuote(g: Game, l: Line, model?: VehicleModel, operator = l.owner): { limit: number; delayCost: number } {
-  const stock = fleetOf(g, l), candidate = model ?? stock.model, route = routeOf(g, l), { calls, sites } = roadCurbRoute(g, l, undefined, operator);
+  const stock = fleetOf(g, l), candidate = model ?? stock.model, route = routeOf(g, l), { calls } = roadCurbRoute(g, l, undefined, operator);
   const n = stock.vehicles.length;
   if (!candidate || !route || !calls.size) return { limit: n, delayCost: Infinity };
-  const cycle = roadDriving(g, sites, candidate, true)?.cycle ?? 0;
+  const cycle = evaluateNativeRoadCycle(g, l, candidate, undefined, operator)?.cycle ?? 0;
   if (!(cycle > 0)) return { limit: n, delayCost: Infinity };
   const load = new Map<string, { work: number; second: number }>([...calls.keys()].map(k => [k, { work: 0, second: 0 }]));
   const berths = [...calls.keys()].map(key => { const [x, , z] = key.split(',').map(Number); return { x, z }; });
@@ -1003,11 +989,11 @@ export function roadCapacityQuote(g: Game, l: Line, model?: VehicleModel, operat
     const vehicles = fleetOf(g, other).vehicles, timings = new Map<string, number>();
     for (const v of vehicles) {
       if (!v.model) continue;
-      const { calls: otherCalls, sites: points } = roadCurbRoute(g, other, v.pattern, v.owner);
+      const { calls: otherCalls } = roadCurbRoute(g, other, v.pattern, v.owner);
       if (![...otherCalls.keys()].some(k => load.has(k))) continue;
       const timingKey = `${v.model.id}:${v.pattern ?? ''}:${v.owner}`;
       let t = timings.get(timingKey);
-      if (t === undefined) { t = roadDriving(g, points, v.model, true)?.cycle ?? 0; timings.set(timingKey, t); }
+      if (t === undefined) { t = evaluateNativeRoadCycle(g, other, v.model, v.pattern, v.owner)?.cycle ?? 0; timings.set(timingKey, t); }
       if (!(t > 0)) continue;
       const dwell = curbSeconds(v.model);
       for (const [key, visits] of otherCalls) {
@@ -1100,7 +1086,7 @@ export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Genera
   const sites = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s).map(siteOf);
   if (sites.length !== route.path.length) return null;
   const models = all.vehicles.flatMap(v => v.model ? [v.model] : []);
-  const [before, after] = yield* lineForecast(g, me, sites, { model, models, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
+  const [before, after] = yield* lineForecast(g, me, sites, { model, models, nativeLine: l, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
   // (the forecast spans work units: a stop taken away meanwhile ends this quote; its fees could not be priced)
   if (route.path.some((id) => !g.stations.get(id)) || !g.lines.get(l.id)) return null;
   const cal = calibration(l, before, lineAge(g, l));
