@@ -112,9 +112,11 @@ try {
     console.log(result);
     return { rc, output };
   }
-  // Two lanes; print each result immediately. Timing-sensitive tests run after both lanes finish.
-  const lanes = await Promise.allSettled([0, 1].map(async (offset) => {
-    for (let i = offset; i < jobs.length && !interrupted; i += 2) if ((await run(jobs[i])).rc !== 0) failed = true;
+  // Two workers take the next independent check when ready, so a long simulation cannot leave
+  // half the battery waiting behind it. Timing-sensitive tests run after both workers finish.
+  let nextJob = 0;
+  const lanes = await Promise.allSettled([0, 1].map(async () => {
+    while (nextJob < jobs.length && !interrupted) if ((await run(jobs[nextJob++])).rc !== 0) failed = true;
   }));
   for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
   if (scripts.includes('ai') && !interrupted) {
