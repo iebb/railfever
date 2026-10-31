@@ -40,7 +40,7 @@ function command(program, args, cwd, log, seconds = 1800) {
   });
 }
 const excluded = new Map([
-  ...['lib', 'stationlib', 'saves-harness', 'linegrow-fixtures', 'sectionlib', 'section-structurelib'].map((n) => [n, 'shared test helper']),
+  ...['lib', 'stationlib', 'saves-harness', 'linegrow-fixtures', 'opening-fixtures', 'sectionlib', 'section-structurelib'].map((n) => [n, 'shared test helper']),
   ['saves-ui', 'browser/Chrome integration, run separately'],
   ...['perf', 'perfbench', 'scale', 'huge-displays'].map((n) => [n, 'manual benchmark']),
 ]);
