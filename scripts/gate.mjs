@@ -73,7 +73,7 @@ try {
   }
   const scripts = readdirSync(join(work, 'scripts')).filter((f) => f.endsWith('.ts')).map((f) => f.slice(0, -3)).sort();
   for (const name of scripts) if (excluded.has(name)) console.log(`skip ${name}: ${excluded.get(name)}`);
-  const jobs = scripts.filter((n) => !excluded.has(n) && n !== 'ai' && n !== 'catchperf').flatMap((script) => {
+  const jobs = scripts.filter((n) => !excluded.has(n) && !['ai', 'catchperf', 'savesize'].includes(n)).flatMap((script) => {
     switch (script) {
       case 'smoke': return [7, 11, 23].map((n) => ({ name: `smoke${n}`, script, args: [String(n)] }));
       case 'replay': return [7, 23].map((n) => ({ name: `replay${n}`, script, args: [String(n)] }));
@@ -110,7 +110,8 @@ try {
       options.loader = { '.css': 'empty', '.woff': 'empty', '.woff2': 'empty' };
     }
     let rc;
-    const diagnostics = script === 'growth' ? [`--snapshots=${join(dir, 'worlds')}`, `--out=${join(dir, 'report.json')}`]
+    const diagnostics = script === 'headway' ? [`--snapshots=${join(dir, 'worlds')}`, `--json=${join(dir, 'report.json')}`]
+      : script === 'growth' ? [`--snapshots=${join(dir, 'worlds')}`, `--out=${join(dir, 'report.json')}`]
       : script === 'growthcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--checkpoint=${join(dir, 'investment.json')}`]
       : script === 'throughcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--json=${join(dir, 'report.json')}`] : [];
     try { await build(options); rc = await command(process.execPath, [`${script}.mjs`, ...args, ...diagnostics], dir, log); }
@@ -129,6 +130,9 @@ try {
     while (nextJob < jobs.length && !interrupted) if ((await run(jobs[nextJob++])).rc !== 0) failed = true;
   }));
   for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
+  // Save capture has frame-time budgets as well as integrity assertions. Measure those after the
+  // simulation workers exit so unrelated map generation and garbage collection cannot distort them.
+  if (scripts.includes('savesize') && !interrupted && (await run({ name: 'savesize', script: 'savesize', args: [] })).rc !== 0) failed = true;
   if (scripts.includes('ai') && !interrupted) {
     const timingOnly = ({ rc, output }) => {
       const failures = output.split('\n').filter((l) => l.includes('FAIL:'));

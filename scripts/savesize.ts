@@ -99,7 +99,7 @@ try {
     assert.equal(afterDirect.chunks.filter((c, i) => c !== afterBulk.chunks[i]).length, 1, 'legacy direct tree deletion invalidates its saved chunk');
     const maxWarmMs = Math.max(...warm.map((ms, i) => ms + posts[i]));
     if (!process.argv.includes('--no-worker')) {
-      assert(maxWarmMs < (size === 1536 ? 40 : 16), 'autosave main-thread capture + posting meets budget');
+      assert(maxWarmMs < (size === 1536 ? 40 : 16), `autosave main-thread capture + posting meets budget: ${size} map, ${maxWarmMs.toFixed(2)} ms`);
       assert(editedMainMs < (size === 1536 ? 40 : 16), `edited autosave meets budget: ${editedSnapshotMs.toFixed(2)} snapshot + ${(postMs + saveStats.lastPostMs).toFixed(2)} posting`);
     }
     console.log(JSON.stringify({ size, towns, before: baseline[size as keyof typeof baseline], coldSnapshotMs: +coldMs.toFixed(2), coldPostMs: +coldPostMs.toFixed(2), coldEncodeMs: +coldEncodeMs.toFixed(2), warmSnapshotMs: warm.map((n) => +n.toFixed(2)), warmMainMaxMs: +maxWarmMs.toFixed(2), editedMainMs: +editedMainMs.toFixed(2), storedMB: +storedMB.toFixed(3), dynamicKB: +(bytes(rec.data) / 1000).toFixed(1), exportMB: +(file.size / 1e6).toFixed(3), v3JsonMB: +(json.length / 1e6).toFixed(3), v3JsonGzipMB: +(gzipSync(json).length / 1e6).toFixed(3), unchangedEncodedChunks: saveStats.encodedChunks - beforeEncoded - 3, initialChunkMB: +(initialParts / 1e6).toFixed(3), storage: storageMode() }));
