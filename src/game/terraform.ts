@@ -186,11 +186,16 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   // interpolated surface under the road, rather than assigning every corner the highest road sample nearby.
   const roadTerrain = new Map(terrain);
   if (roads.length) earthworks(w, roads, true, view, roadTerrain, terrain);
+  // Cross-sections repeatedly sample the same terrain cells. This projection is immutable for the survey.
+  const heights = new Map<number, number>();
   const vertex = (k: number) => {
+    const cached = heights.get(k);
+    if (cached !== undefined) return cached;
     const track = stamps.get(k);
-    if (track?.core && rail) return Math.fround(w.lock[k] & LOCK.rail ? Math.min(current(k), track.hi) : track.hi);
-    if (w.lock[k] & LOCK.rail) return current(k);
-    return roadTerrain.get(k) ?? current(k);
+    const value = track?.core && rail ? Math.fround(w.lock[k] & LOCK.rail ? Math.min(current(k), track.hi) : track.hi)
+      : w.lock[k] & LOCK.rail ? current(k) : roadTerrain.get(k) ?? current(k);
+    heights.set(k, value);
+    return value;
   };
   const height = (x: number, z: number) => heightAtVertices(w, x, z, vertex);
   const roadUnsupported = (road: NEdge, net: Network, existing = false) => {
