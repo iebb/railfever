@@ -55,10 +55,10 @@ const poolJSON = (p: any[]) => JSON.stringify(p.map(s => ({ pop: s.pop, regions:
 const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'flat', water: 'low', startYear: 1990,
   aiConfigs: [{ startMoney: 60_000_000, focus: { rail: 2, road: .3, tram: 1.5 } }] });
 g.aiEnabled = false; g.aiAcquisitions = false; g.vehicles.ambientEnabled = false; g.economy.money = 100_000_000;
-// User rule (2.10): walking reach halved again, so station sites near small towns hold far fewer residents and the
-// 65-140 search now settles on Weyden (850) - Sunham, below the 1500 feeder cutoff this test needs at A. Reaching to
-// 150 picks Wilmere (1627) - Weyton Vale, an eligible feeder town as under 2.9 (Wilmere - Shelminster).
-const pair = placeAndConnect(g, 65, 150, 0, new Set(), 1, () => {});
+// The native 65..150 search now selects Weyden (858), below the unchanged 1500 feeder cutoff. Use the longer
+// native corridor range, which supplies Oldthorpe and its street-connected lots; eligibility is checked below
+// before any cache or forecast result is compared. Construction, demolition and population stay native.
+const pair = placeAndConnect(g, 150, 220, 0, new Set(), 1, () => {});
 check(pair, 'generated native railway construction succeeds');
 if (!pair) process.exit(1);
 const { A, B, TA } = pair, depot = depotBehind(g, A, B), line = g.lines.create('rail', 0);
