@@ -84,6 +84,8 @@ export interface BuildOptions {
   infrastructureOwner?: number;
   /** Flat junction upgrades may cross at the shallow angle of an existing turnout. */
   junctionUpgrade?: boolean;
+  /** Flying junctions support crossing-raised ramps on structures rather than filling a shared ground bank. */
+  bridgeApproaches?: boolean;
   /** Clearance around diamonds in neighbouring pieces of a complete junction plan. */
   junctionWindows?: { edge: number; x: number; z: number; r: number }[];
   /** towns build for free and never demolish */
@@ -939,6 +941,7 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   }
   let sol = solveProfile(desired, ds, cons, grade);
   if (!sol.ok) { fail(subway ? 'Surfaces here: go deeper' : 'Too steep: lengthen route or change height'); }
+  const beforeCrossings = sol.y;
 
   // ---- crossings with existing edges
   const exclude = new Set<number>();
@@ -1090,6 +1093,12 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     const wdt = (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(c.angle)) + 0.3;
     const sc = centreS(c.track, c.sNew);
     for (let i = idxOf(sc - wdt); i <= idxOf(sc + wdt); i++) forcedBridge[i] = true;
+  }
+  if (kind === 'rail' && opts.bridgeApproaches && crossings.some(c => c.mode === 'over')) {
+    // The lower retained rail owns a shared bank. A flyover ramp cannot fill it to the higher rail's
+    // profile; carry the crossing's induced lift on the same structure as its central span instead.
+    // Keep ordinary terrain profiles and cuttings unchanged, and price every added structural sample below.
+    for (let i = 0; i < M; i++) if (y[i] > beforeCrossings[i] + 1e-6 && y[i] >= terr[i]) forcedBridge[i] = true;
   }
   for (let i = 0; i < M; i++) {
     const d = y[i] - terr[i];

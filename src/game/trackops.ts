@@ -619,7 +619,7 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
   net.withTemporaryNodes('rail', pts.map((p) => ({ x: p.x, y: p.y, z: p.z, dx: -p.tx, dz: -p.tz })), owner, (tmp) => {
     for (let k = 0; k + 1 < pts.length; k++) {
       const mid = offAt((pts[k].u + pts[k + 1].u) / 2);
-      const prop = planEdge(g, plan.reuse![k] ?? nodeSnapOf(g, tmp[k].id), plan.reuse![k + 1] ?? nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps), infrastructureOwner: net.edges.get(sampleAt(S, mid.u).edge)!.owner, junctionUpgrade: complete, junctionWindows: plan.junctionWindows, crossing: options.flying ? 'over' : 'auto' }));
+      const prop = planEdge(g, plan.reuse![k] ?? nodeSnapOf(g, tmp[k].id), plan.reuse![k + 1] ?? nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps), infrastructureOwner: net.edges.get(sampleAt(S, mid.u).edge)!.owner, junctionUpgrade: complete, junctionWindows: plan.junctionWindows, crossing: options.flying ? 'over' : 'auto', bridgeApproaches: options.flying }));
       if (complete && plan.reuse![k] && plan.reuse![k + 1] && twinAt(mid)) { plan.skipped!.push(k); prop.ok = true; prop.errors = []; prop.cost = 0; prop.tracks = []; }
       plan.proposals.push(prop);
       if (!prop.ok) fail(`New track (${m10(pts[k].u)}-${m10(pts[k + 1].u)} m of ${m10(U)} m): ${prop.errors[0] ?? 'cannot build'}`);
@@ -739,7 +739,7 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       let ok = false;
       for (const extra of (plan.flying ? [{ crossing: 'over' as const }] : [{}, { crossing: 'level' as const }, { crossing: 'over' as const }, { crossing: 'under' as const }])) {
         const sample = sampleAt(original, (pts[k].u + pts[k + 1].u) / 2);
-        const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, main), infrastructureOwner: net.edges.get(sample.edge)!.owner, junctionUpgrade: plan.complete, junctionWindows: plan.junctionWindows, ...extra }));
+        const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, main), infrastructureOwner: net.edges.get(sample.edge)!.owner, junctionUpgrade: plan.complete, junctionWindows: plan.junctionWindows, bridgeApproaches: plan.flying, ...extra }));
         if (!prop.ok || (consent && !consent(prop)) || money0 - eco.money + prop.cost > (opts.maxFormationSpend ?? Infinity)
           || commitProposal(g, prop, continued)) continue;
         ok = true;

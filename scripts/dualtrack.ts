@@ -2,7 +2,7 @@
 // Bundle as dualtrack.mjs and run from the requested scratch directory.
 import { Game, PLAYER } from '../src/game/game';
 import { AIController, type LineInfo } from '../src/game/ai';
-import { planDoubleTrack, commitDoubleTrack, connectStationThroat, planConnection, commitConnection } from '../src/game/trackops';
+import { planDoubleTrack, commitDoubleTrack, connectStationThroat, planConnection, commitConnection, quoteDoubleTrackCompletion } from '../src/game/trackops';
 import { lineIsDouble, upgradeRoute, trackIsDouble, congestionReturn } from '../src/game/dualtrack';
 import { autoSignalLine, setSignal } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
@@ -14,6 +14,7 @@ import { routeBetween } from '../src/game/ai-network';
 import { bezLine, bezFromTangents, arcTable } from '../src/game/geom';
 import { RAIL, PSTEP } from '../src/game/constants';
 import { electrify } from '../src/game/build-ops';
+import { terrainFit } from './terrainfit';
 
 if (!process.argv[1]?.endsWith('dualtrack.mjs')) throw new Error('bundle this test as dualtrack.mjs');
 
@@ -76,6 +77,7 @@ scenario('2. loop completion and cash deferral', () => {
   const cut = net.splitEdge(longest.id, 60)!; const cut2 = net.splitEdge(cut.e2.id, cut.e2.len - 60)!;
   const loop = planDoubleTrack(f.g, [cut2.e1.id], -1, 1, false);
   check(loop.ok && !commitDoubleTrack(f.g, loop).error, 'stopgap loop built');
+  check(!lineIsDouble(f.g, f.l, 1), 'an actual merging loop still leaves single station approaches');
   f.info.loops = 1; f.info.congestion = 2;
   const trains = congest(f);
   f.g.company(1).economy.money = 0; f.g.company(1).economy.loan = f.g.company(1).economy.maxLoan;
@@ -84,6 +86,12 @@ scenario('2. loop completion and cash deferral', () => {
   f.g.company(1).economy.money = 1e8; f.g.day += 30;
   f.ai.relieveCongestion(f.l, f.info); finish(f.ai);
   check(f.info.double && lineIsDouble(f.g, f.l, 1), 'AI retries despite loops and completes the remaining single stretches');
+  const fit = terrainFit(f.g);
+  check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'completed native loop approaches retain physical ground support');
+  // The completed lead crosses just before a signal-split approach. Classification needs its real diamond,
+  // including on the adjacent continuation; mere near-overlap or a merging loop is not a second track.
+  const unprotected = deserialize(serialize(f.g)); unprotected.world.net.crossings.clear();
+  check(!lineIsDouble(unprotected, unprotected.lines.get(f.l.id)!, 1), 'a crossing approach without its native diamond is never classified as fully double');
   check(trains.every((t) => f.g.vehicles.get(t.id)), 'loop completion precedes congestion cuts');
 });
 
@@ -195,12 +203,33 @@ scenario('7. a short deviation completes an obstructed formation without alterin
 scenario('8. bridge-supported flying movement is an alternative to a flat diamond', () => {
   const f = fixture(), { g } = f, net = g.world.net;
   check(!!build(g, free(g, 190, 145), free(g, 190, 225), { ...railOpts(1), crossing: 'level' }, 'crossing railway'), 'crossing track built');
+  g.flushNetworkChanges(); g.lines.rebuild(); g.lines.flushCatchment();
   const route = upgradeRoute(g, f.A.id, f.B.id, 1);
+  const snapshot = JSON.stringify(serialize(g)), flat = planDoubleTrack(g, route, 1, 1);
   const pl = planDoubleTrack(g, route, 1, 1, true, { flying: true });
   check(pl.ok && pl.proposals.some((p) => p.crossings.some((c) => c.mode === 'over')), 'flying option previews a grade-separated movement with room for its ramps');
+  const budget = quoteDoubleTrackCompletion(g, pl);
+  check(flat.ok && pl.cost > flat.cost && JSON.stringify(serialize(g)) === snapshot, 'flyover preview pays for its supported ramps and leaves the complete save unchanged');
+  const twin = deserialize(JSON.parse(snapshot)), twinLine = twin.lines.get(f.l.id)!;
+  const cold = planDoubleTrack(twin, upgradeRoute(twin, f.A.id, f.B.id, 1), 1, 1, true, { flying: true });
+  check(JSON.stringify(cold) === JSON.stringify(pl), 'cold native flying preview preserves every profile, structure and price');
+  const cash = g.company(1).economy.money;
   const res = commitDoubleTrack(g, pl);
   check(!res.error && !res.finishError && res.edges.some((id) => net.edges.get(id)?.sections.some((s) => s.type === 'bridge')), 'flying movement, directional signals and station crossovers build');
   check(lineIsDouble(g, f.l, 1), 'bridge profile counts as a complete second track rather than a single-track gap');
+  check(cash - g.company(1).economy.money === res.cost && res.cost <= budget.cost,
+    'native flying construction charges its full structures and finishing within the complete quote');
+  const fit = terrainFit(g);
+  check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'native flyover ramps leave both original ground railways and new approaches supported');
+  const replayed = commitDoubleTrack(twin, cold);
+  check(JSON.stringify(replayed) === JSON.stringify(res) && lineIsDouble(twin, twinLine, 1)
+    && JSON.stringify(serialize(g)) === JSON.stringify(serialize(twin)), 'flying construction, signals, costs and final classification replay exactly after loading');
+  let exact = true;
+  for (let i = 0; i < 80; i++) {
+    g.stepTick(); twin.stepTick();
+    if (JSON.stringify(serialize(g)) !== JSON.stringify(serialize(twin))) { exact = false; break; }
+  }
+  check(exact, 'fixed native ticks after building the flying junction replay exactly');
 });
 
 scenario('9. station approaches can reach companion platforms on opposite sides', () => {
