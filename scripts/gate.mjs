@@ -83,6 +83,13 @@ try {
       default: return [{ name: script, script, args: [] }];
     }
   });
+  // Report focused contract failures before long native-world sweeps occupy both workers.
+  // Every job still runs with the same seeds, horizons, assertions and timeout.
+  const sweeps = new Set(['aijobs', 'aimail', 'aiplan', 'airail', 'capacity-frequency', 'cargoroute',
+    'citylines', 'companies', 'deadlock', 'depots', 'doubleconn', 'economy', 'entrances', 'entrancecache',
+    'growth', 'growthcap', 'linegrow', 'platforms', 'replay', 'smoke', 'terrain-fit', 'throughcap',
+    'townfit', 'uipure', 'urban', 'urbanecon', 'urbanhandoff', 'urban-staging', 'urbantrunks']);
+  jobs.sort((a, b) => Number(sweeps.has(a.script)) - Number(sweeps.has(b.script)));
   async function run({ name, script, args }) {
     const dir = join(logs, name), log = join(logs, `${name}.log`);
     mkdirSync(dir);
