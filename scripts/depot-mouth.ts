@@ -2,19 +2,29 @@
 import { serialize, deserialize } from '../src/game/save';
 import { Train } from '../src/game/train';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
-import { observeRailCapacity, marginalSharedTrain, usesSharedRail } from '../src/game/ai-capacity';
+import { observeRailCapacity, marginalSharedTrain, sharedTrainAllowed, usesSharedRail } from '../src/game/ai-capacity';
+import { atomicTerminalCell } from '../src/game/rail-capacity-cells';
+import { planDoubleTrack, commitDoubleTrack } from '../src/game/trackops';
+import { autoSignalLine } from '../src/game/signals';
 import { checkReservations } from './lib';
 import { flatGame, station, endNode, nodeSnap, build, railOpts, loco, depotFor, check, done } from './stationlib';
 
 function need(v: unknown, label: string): asserts v { if (!v) throw new Error('fixture setup: ' + label); }
-for (const reverse of [false, true]) for (const long of [false, true]) {
+for (const passing of [false, true]) for (const reverse of [false, true]) for (const long of [false, true]) {
   const g = flatGame(256), net = g.world.net; g.aiEnabled = false; g.vehicles.ambientEnabled = false;
   const a = station(g, 40, 128, Math.PI / 2, 24, 1)!, b = station(g, 210, 128, Math.PI / 2, 24, 1)!;
   need(a && b && build(g, nodeSnap(g, endNode(g, a, 0, true), 'rail'),
     nodeSnap(g, endNode(g, b, 0, false), 'rail'), railOpts(), 'depot mouth line'), 'connected stations');
+  if (passing) {
+    for (const x of [95, 155]) { const n = net.nearestEdge(x, 128, .5, 'rail')!; net.splitEdge(n.edge.id, n.s); }
+    const mid = net.nearestEdge(125, 128, .5, 'rail')!;
+    const plan = planDoubleTrack(g, [mid.edge.id], 1, 0), built = commitDoubleTrack(g, plan, false);
+    need(plan.ok && !built.error, `legal passing loop: ${plan.error ?? built.error ?? ''}`);
+  }
   const home = reverse ? b : a, other = reverse ? a : b, depot = depotFor(g, home, other), dp = g.depots.get(depot)!;
   need(dp, 'depot');
   const line = g.lines.create('rail', 0); line.stops = [home.id, other.id]; line.evenSpacing = false; g.lines.rebuild();
+  if (passing) need(autoSignalLine(g, line.id, 0).signals.some(s => s.role === 'loop'), 'native loop holding boundaries');
   const blocker = g.vehicles.buyTrain(depot, loco(), line.id); need(blocker instanceof Train, 'blocking train');
   for (let i = 0; i < 10000 && blocker.state !== 'loading'; i++) g.stepTick();
   need(blocker.state === 'loading' && blocker.atStation === home.id, 'native arrival at home platform');
@@ -23,7 +33,7 @@ for (const reverse of [false, true]) for (const long of [false, true]) {
   const first = g.vehicles.buyTrain(depot, cars, line.id), second = g.vehicles.buyTrain(depot, cars, line.id);
   need(first instanceof Train && second instanceof Train, 'queued trains');
   need(long ? first.length > stub.len : first.length < stub.len, 'both sides of stub-length boundary');
-  const label = `${reverse ? 'westbound' : 'eastbound'} ${long ? 'long consist' : 'short consist'}`;
+  const label = `${reverse ? 'westbound' : 'eastbound'} ${long ? 'long consist' : 'short consist'} ${passing ? 'with passing loop' : 'closed terminals'}`;
   // A legacy facing block guard still protects every branch, including the occupied platform.
   const inner = net.nodes.get(stub.a)!;
   inner.signal = 1; inner.signalKind = 'block'; net.version++; g.networkVersion++;
@@ -32,6 +42,8 @@ for (const reverse of [false, true]) for (const long of [false, true]) {
   inner.signal = 0; net.version++; g.networkVersion++;
   line.incomeLast = 12_000_000; line.passLast = 500;
   const priceBefore = marginalSharedTrain(g, line, 0, cars);
+  check(passing ? atomicTerminalCell(g, line.stops, 0, cars) === null : !!atomicTerminalCell(g, line.stops, 0, cars),
+    `${label}: physical holding topology determines whether this is a closed terminal cell`);
   let safe = true, single = true, held = true;
   for (let i = 0; i < 200 * 40; i++) {
     g.stepTick();
@@ -48,9 +60,11 @@ for (const reverse of [false, true]) for (const long of [false, true]) {
     `${label}: the depot train physically queues at its mouth while the real station occupant remains`);
   check(safe && single && held && g.vehicles.getRes(dp.edge) === first.id,
     `${label}: only one train emerges, retaining its stub resources and whole body behind the reserved boundary`);
+  const priceAfter = marginalSharedTrain(g, line, 0, cars);
   check(!usesSharedRail(g, line) && line.capacity!.day === g.day && line.capacity!.delay > 0
-    && marginalSharedTrain(g, line, 0, cars) < priceBefore,
-    `${label}: actual private queues reduce the saved marginal price of another departure`);
+    && (passing ? priceAfter < priceBefore : priceAfter <= priceBefore && !sharedTrainAllowed(g, line, 0, cars)),
+    passing ? `${label}: actual private queues strictly reduce the saved marginal price of another departure`
+      : `${label}: observed queues cannot improve an already physically refused departure's price`);
   const data = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(data));
   let exact = data === JSON.stringify(serialize(loaded));
   for (let i = 0; i < 200; i++) { g.stepTick(); loaded.stepTick(); }

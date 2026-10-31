@@ -11,9 +11,11 @@ import { WALK_LINE } from '../src/game/stations';
 import { MODEL_BY_ID, type VehicleModel } from '../src/game/vehicle-types';
 import { fails, check, fmt, placeAndConnect, depotBehind, addBusStop, roadDepotNear, Train, RoadVehicle } from './lib';
 import { RNG } from '../src/game/rng';
+import { walkingCatchment, walkingPopulation } from '../src/game/catchment';
 
 if (!process.argv[1]?.endsWith('cargoroute.mjs')) throw new Error('bundle this test as cargoroute.mjs');
-const seeds = (process.argv[2] ?? '7,23,51').split(',').map(Number);
+const seeds = (process.argv.slice(2).find(a => !a.startsWith('--')) ?? '7,23,51').split(',').map(Number);
+const fixturesOnly = process.argv.includes('--fixtures-only');
 const M = (id: string) => MODEL_BY_ID.get(id)!;
 
 /**
@@ -137,6 +139,8 @@ for (const seed of seeds) {
   const pr = placeAndConnect(g, 80, 160, 0, new Set(), 1, () => {});
   check(!!pr, `passenger-only seed ${seed}: railway built`);
   if (pr) {
+    check([pr.A, pr.B].every(st => walkingPopulation(g, walkingCatchment(g, st)) > 0),
+      `passenger-only seed ${seed}: both stations reach real walking homes`);
     const line = g.lines.create('rail', 0);
     line.stops = [pr.A.id, pr.B.id];
     const train = g.vehicles.buyTrain(depotBehind(g, pr.A, pr.B, 0), [M('diesel_b'), M('coach_ic'), M('coach_ic')], line.id);
@@ -156,6 +160,7 @@ for (const seed of seeds) {
 }
 
 // ---- natural AI networks: identical passenger tables, regardless of economically selected mail vans
+if (!fixturesOnly) {
 const timings: { heap: number; ref: number; sources: number; hops: number }[] = [];
 let aiGame: Game | null = null;
 for (const seed of seeds) {
@@ -226,6 +231,7 @@ if (aiGame) {
   console.log(`  300 days on: mail income ${fmt(income / 1000, 1)}k, mail delivered ${g.vehicles.all().reduce((a, v) => a + v.mailDelivered, 0)} units`);
   check(income > 0, 'AI trains with vans earn mail income');
 }
+}
 
 // ---- a line of our own: mixed trains share the passenger tables; a passenger-only or mail-only train does not
 {
@@ -241,6 +247,8 @@ if (aiGame) {
   check(mailFleet(g, line) === 'all' && lineTable(g, line, 'mail') === lineTable(g, line), 'every train carries both: the mail table is the passenger table');
   check(g.lines.mailRouting.get(pr.A.id) === g.lines.routing.get(pr.A.id) && !!g.lines.mailRouting.get(pr.A.id)?.get(pr.B.id), 'mixed trains: mail shares the passenger routing (the same tables)');
   check(g.lines.mailServed(pr.A.id) && g.lines.mailServed(pr.B.id), 'both stations are mail stations');
+  check([pr.A, pr.B].every(st => walkingPopulation(g, walkingCatchment(g, st)) > 0 && g.mail.accepts(st)),
+    'both mixed-service stations have native walking homes and accept mail');
   // a second railway elsewhere without mail: a part of the network of its own (the first keeps sharing)
   const pr2 = placeAndConnect(g, 60, 200, 0, new Set([pr.TA.id, pr.TB.id]), 1, () => {});
   if (pr2) {

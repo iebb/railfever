@@ -9,12 +9,13 @@ import { MODEL_BY_ID, carriesMail } from '../src/game/vehicle-types';
 import { lineTable } from '../src/game/patterns';
 import { railPartMode } from '../src/game/stations';
 import { addMail, newJourney, stationMail } from '../src/game/mail';
+import { walkingCatchment, walkingPopulation } from '../src/game/catchment';
 import type { Line } from '../src/game/lines';
 import { fails, check, fmt, placeAndConnect, depotBehind, Train, checkNaN, checkReservations } from './lib';
 
 if (!process.argv[1]?.endsWith('aimail.mjs')) throw new Error('bundle this test as aimail.mjs');
 // (2.7: seed 23's AIs build no railway in six years whose mail forecast pays for vans; seed 5's do)
-const seeds = (process.argv[2] ?? '7,5').split(',').map(Number);
+const seeds = (process.argv.slice(2).find(a => !a.startsWith('--')) ?? '7,5').split(',').map(Number);
 const YEARS = 6;
 const saved = (g: Game) => JSON.stringify(serialize(g));
 const seats = (t: Train) => t.cars.filter((m) => m.capacity > 0).length;
@@ -280,6 +281,8 @@ function forecastChecks() {
     g.vehicles.sell(plain.id);
     const t = g.vehicles.buyTrain(depot, [cars[0], van, ...cars.slice(1)], l.id);
     if (!(t instanceof Train)) { check(false, `${year} seed ${seed}: train with a van bought`); continue; }
+    check(points.every(st => walkingPopulation(g, walkingCatchment(g, st)) > 0 && g.mail.accepts(st)),
+      `${year} seed ${seed}: both built stations have native walking homes and accept mail`);
     let routed = 0;
     for (let d = 0; d < 3 * 360; d++) {
       if (d === 2 * 360) { const s = service(); routed = forecastMailRevenue(g, points, s.kmh, s.headway, van.mail!, l); }
@@ -292,8 +295,9 @@ function forecastChecks() {
   }
 }
 
-policyChecks();
+const forecastOnly = process.argv.includes('--forecast-only');
+if (!forecastOnly) policyChecks();
 forecastChecks();
-for (const seed of seeds) naturalRun(seed);
+if (!forecastOnly) for (const seed of seeds) naturalRun(seed);
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
