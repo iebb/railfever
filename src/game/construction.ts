@@ -1413,6 +1413,12 @@ export function commitProposal(g: Game, prop: Proposal, continued?: ReadonlySet<
   const w = g.world;
   const net = w.net;
   const opts = prop.opts;
+  // Another committed proposal may have split a quoted connection. Resolve these dependencies before spending,
+  // demolishing or creating the free endpoint; discovering a stale snap inside resolveNode is too late to refuse.
+  for (const tp of prop.tracks) for (const sn of [tp.start, tp.end]) {
+    if (sn.kind === 'node' && !net.nodes.has(sn.node!) || sn.kind === 'edge' && !net.edges.has(sn.edge!))
+      return 'Network changed, try again';
+  }
   const roadBridges = roadBridgeWorks(g, prop);
   if (roadBridges.error) return roadBridges.error;
   if (JSON.stringify(roadBridges.works) !== JSON.stringify(prop.roadBridges ?? [])) return 'Road bridge window changed: replan';

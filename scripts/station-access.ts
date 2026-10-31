@@ -3,6 +3,7 @@ import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { walkingCatchment, walkingPopulation } from '../src/game/catchment';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { planEdge, commitProposal } from '../src/game/construction';
 import { check, fails, roadOpts, addBusStop, roadDepotNear, RoadVehicle } from './lib';
 import { flatGame, build, free } from './stationlib';
 import { terrainFit, fitLine } from './terrainfit';
@@ -76,6 +77,47 @@ const flush = (g: Game) => { g.flushNetworkChanges(); g.lines.flushCatchment(); 
   check(saved(g) === data, 'a refused access street leaves cash, buildings, station IDs, roads and terrain untouched');
   const h = deserialize(JSON.parse(data));
   check(h.stations.commitRail(plan, 0) === err && saved(h) === data, 'cold loading preserves the same atomic access refusal');
+}
+
+// Sequential access streets split their common road. An earlier quote must refuse its stale snap atomically;
+// refreshing the same station quote against the current network must still build its priced native connection.
+{
+  const g = flatGame(192); g.aiEnabled = false; g.vehicles.ambientEnabled = false;
+  need(build(g, free(g, 10, 117), free(g, 182, 117), roadOpts(0, 'road')), 'shared road');
+  const first = g.stations.planRail(28, 123, Math.PI / 2, 10, 2, 0, { style: 'none' });
+  const second = g.stations.planRail(92, 123, Math.PI / 2, 10, 2, 0, { style: 'classic' });
+  need(first.ok && first.access && second.ok && second.access, 'two native priced access quotes');
+  need(g.stations.commitRail(first, 0) === null, 'first access splits the common road');
+  const snaps = second.access.tracks.flatMap(t => [t.start, t.end]).filter(s => s.kind === 'edge');
+  check(snaps.some(s => !g.world.net.edges.has(s.edge!)), 'the first native street invalidates the earlier second quote');
+  const data = saved(g), h = deserialize(JSON.parse(data));
+  check(g.stations.commitRail(second, 0) === 'Network changed, try again', 'a stale native access quote requests a replan');
+  check(saved(g) === data, 'stale access refusal preserves every saved balance, object, ID and terrain value');
+  check(h.stations.commitRail(second, 0) === 'Network changed, try again' && saved(h) === data,
+    'cold stale access refusal is equally atomic');
+  const fresh = g.stations.planRail(second.x, second.z, second.angle, second.length, second.tracks, 0,
+    { style: second.style, fixedY: second.y });
+  const id = g.stations.nextId;
+  check(fresh.ok && fresh.roadAccess && g.stations.commitRail(fresh, 0) === null,
+    'the same station and style build with a fresh native access quote');
+  flush(g);
+  check(g.stations.get(id)?.roadAccess, 'the refreshed quote produces real native road access');
+}
+
+// Direct native construction has the same contract when a quoted node disappears, rather than an edge splitting.
+{
+  const g = flatGame(192);
+  const road = build(g, free(g, 10, 100), free(g, 100, 100), roadOpts(0, 'road'));
+  need(road, 'road ending at the planned extension');
+  const n = g.world.net.nearestNode(100, 100, .1, 'road')!;
+  const plan = planEdge(g, free(g, 150, 100), { kind: 'node', x: n.x, y: n.y, z: n.z, node: n.id }, roadOpts(0, 'road'));
+  need(plan.ok, 'native extension quote');
+  g.world.net.removeNode(n.id); g.onNetworkChanged();
+  const data = saved(g), h = deserialize(JSON.parse(data));
+  check(commitProposal(g, plan) === 'Network changed, try again', 'a removed quoted node requests a native replan');
+  check(saved(g) === data, 'removed-node refusal creates no free endpoint or construction charge');
+  check(commitProposal(h, plan) === 'Network changed, try again' && saved(h) === data,
+    'cold native removed-node refusal preserves the same saved state');
 }
 
 console.log(fails.length ? `${fails.length} FAILURES` : 'ALL CHECKS PASSED');
