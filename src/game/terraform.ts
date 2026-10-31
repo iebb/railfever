@@ -1,6 +1,6 @@
 // Earthworks along network edges, formation locks and terraform brushes.
 import { type World, distToRect } from './world';
-import type { NEdge } from './network';
+import { Network, type NEdge } from './network';
 import { WATER_Y } from './constants';
 
 /** Depth of the formation (terrain surface) below the edge's running height. */
@@ -112,6 +112,61 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false) 
       }
     }
   }
+}
+
+/**
+ * Ground formations share terrain vertices. A retaining wall can separate their slopes, but cannot give one
+ * vertex two different heights. Refuse works that would unseat an existing road or track at shared core vertices.
+ * The preview network owns its geometry caches and nodes; surveying never writes the world's network or terrain.
+ */
+export function formationSupportError(w: World, planned: Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'>[],
+  ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = []): string | null {
+  if (!planned.length) return null;
+  const view = Object.create(w) as World;
+  view.net = new Network(view);
+  const stamps = new Map<number, Acc>();
+  const roadStamps = new Map<number, Acc>();
+  let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+  const rail = planned.some(e => e.kind === 'rail');
+  for (const p of planned) {
+    const a = view.net.addNode(p.kind, p.bez.x0, p.prof[0], p.bez.z0);
+    const b = view.net.addNode(p.kind, p.bez.x3, p.prof[p.prof.length - 1], p.bez.z3);
+    const e: NEdge = { ...p, id: a.id, a: a.id, b: b.id, sa: 1, sb: -1, owner: 0, station: -1, depot: -1, version: 0, len: 0 };
+    e.len = view.net.geo(e).len;
+    a.edges.push(e.id); b.edges.push(e.id);
+    stampEdge(view, e, rail && e.kind !== 'rail' ? roadStamps : stamps, true);
+    const g = view.net.geo(e);
+    for (let i = 0; i < g.n; i++) {
+      x0 = Math.min(x0, g.pts[i * 3]); x1 = Math.max(x1, g.pts[i * 3]);
+      z0 = Math.min(z0, g.pts[i * 3 + 2]); z1 = Math.max(z1, g.pts[i * 3 + 2]);
+    }
+  }
+  // A station's access road is planned before its platforms exist. Check their shared terrain together.
+  for (const [k, road] of roadStamps) {
+    const track = stamps.get(k);
+    if (track?.core && road.lo + 0.04 - 0.35 > track.hi + 1e-5)
+      return 'Access road conflicts with the station formation';
+  }
+  const pad = 5;
+  for (const original of w.net.edgesNear(x0 - pad, z0 - pad, x1 + pad, z1 + pad)) {
+    if (ignore.has(original.id)) continue;
+    const supported = bridges.filter(q => q.edge === original.id);
+    const e = supported.length ? { ...original, sections: [...original.sections, ...supported.map(q => ({ ...q, type: 'bridge' as const }))] } : original;
+    const old = new Map<number, Acc>();
+    stampEdge(w, e, old, true);
+    const fd = formationDepth(e);
+    for (const [k, a] of old) {
+      const next = stamps.get(k);
+      if (!a.core || !next?.core) continue;
+      // Rails keep the lower core; roads cannot displace rail locks. Other new cores take their surveyed height.
+      const nv = w.lock[k] & LOCK.rail ? rail ? Math.min(w.h[k], next.hi) : w.h[k] : next.hi;
+      const oldFloor = a.lo + fd - 0.35;
+      const newFloor = next.lo + (rail ? 0.1 : 0.04) - 0.35;
+      if (nv < Math.min(w.h[k], oldFloor) - 1e-5 || nv < newFloor - 1e-5)
+        return e.kind === 'rail' ? 'Too close to track at another height' : 'Too close to road at another height';
+    }
+  }
+  return null;
 }
 
 /**

@@ -7,7 +7,7 @@ import {
 } from './geom';
 import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
 import { SpatialGrid } from './spatial';
-import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, EARTHWORKS, DRY_MIN } from './terraform';
+import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, formationSupportError, EARTHWORKS, DRY_MIN } from './terraform';
 import { distToRect } from './world';
 import { demolitionTotal } from './demolition';
 
@@ -193,10 +193,40 @@ export function trackEarthworksCost(rise: number, halfWidth: number, length: num
   return h * length * (halfWidth * 2 + 1.5 + h * 2) * 900 * formation;
 }
 
-/** A crossing's support window follows the physical road, including its existing segment boundaries. */
+/** A support window follows the physical road, including its existing segment boundaries. */
+function roadBridgeWindow(g: Game, e: NEdge, s: number, width: number): { works: NonNullable<Proposal['roadBridges']>; error?: string } {
+  const net = g.world.net, works: NonNullable<Proposal['roadBridges']> = [];
+  const bad = (error: string) => ({ works, error });
+  const queue = [{ e, s0: s - width, s1: s + width }], seen = new Map<number, [number, number]>();
+  while (queue.length) {
+  const q = queue.shift()!;
+  const previous = seen.get(q.e.id);
+  if (previous && q.s0 >= previous[0] - 1e-6 && q.s1 <= previous[1] + 1e-6) continue;
+  seen.set(q.e.id, [Math.min(previous?.[0] ?? Infinity, q.s0), Math.max(previous?.[1] ?? -Infinity, q.s1)]);
+  const s0 = Math.max(0, q.s0), s1 = Math.min(q.e.len, q.s1);
+  if (q.e.sections.some(s => s.type !== 'bridge' && s.s0 < s1 - 1e-6 && s.s1 > s0 + 1e-6))
+    return bad('Road structure blocks underpass bridge window');
+  works.push({ edge: q.e.id, s0, s1, version: q.e.version });
+  for (const [node, remain] of [[q.e.a, -q.s0], [q.e.b, q.s1 - q.e.len]]) {
+    if (remain <= 1e-6) continue;
+    const n = net.nodes.get(node);
+    if (!n || n.edges.length < 2) return bad('Road end blocks underpass bridge window');
+    // A junction needs a supported apron and every arm, rather than a floating unconverted branch.
+    for (const id of n.edges) {
+      if (id === q.e.id) continue;
+      const next = net.edges.get(id);
+      if (!next || next.kind !== 'road' || next.depot >= 0 || next.station >= 0)
+        return bad('Road facility blocks underpass bridge window');
+      queue.push({ e: next, s0: next.a === node ? 0 : next.len - remain, s1: next.a === node ? remain : next.len });
+    }
+  }
+  }
+  return { works };
+}
+
+/** A crossing's supports are validated during planning and checked again before any money or terrain changes. */
 function roadBridgeWorks(g: Game, prop: Proposal): { works: NonNullable<Proposal['roadBridges']>; cost: number; error?: string } {
   const net = g.world.net, works: NonNullable<Proposal['roadBridges']> = [], heights = new Map<number, number>();
-  const bad = (error: string) => ({ works, cost: 0, error });
   for (const c of prop.crossings) {
     const e = net.edges.get(c.edge), tp = prop.tracks[c.track];
     if (c.mode !== 'under' || !e || e.kind !== 'road' || !tp || net.sectionAt(e, c.sOld) === 'tunnel'
@@ -204,33 +234,22 @@ function roadBridgeWorks(g: Game, prop: Proposal): { works: NonNullable<Proposal
     const dh = Math.max(0, net.heightAtS(e, c.sOld) - profAt(tp.prof, tp.len, c.sNew));
     const hw = halfWidthOf(prop.opts) + (prop.tracks.length - 1) * RAIL.spacing * 0.5;
     const slope = prop.opts.kind === 'rail' ? EARTHWORKS.slopeRail : EARTHWORKS.slopeRoad;
-    const width = Math.min(12, (hw + EARTHWORKS.corePad + dh / slope) / Math.max(0.35, Math.sin(c.angle)) + 0.3);
-    const queue = [{ e, s0: c.sOld - width, s1: c.sOld + width }], seen = new Set<number>();
-    while (queue.length) {
-      const q = queue.shift()!;
-      if (seen.has(q.e.id)) return bad('Road loops inside underpass bridge window');
-      seen.add(q.e.id);
-      const s0 = Math.max(0, q.s0), s1 = Math.min(q.e.len, q.s1);
-      if (q.e.sections.some(s => s.type !== 'bridge' && s.s0 < s1 - 1e-6 && s.s1 > s0 + 1e-6))
-        return bad('Road structure blocks underpass bridge window');
-      works.push({ edge: q.e.id, s0, s1, version: q.e.version });
-      heights.set(q.e.id, Math.max(heights.get(q.e.id) ?? 0, dh));
-      for (const [node, remain] of [[q.e.a, -q.s0], [q.e.b, q.s1 - q.e.len]]) {
-        if (remain <= 1e-6) continue;
-        const n = net.nodes.get(node);
-        if (!n || n.edges.length !== 2) return bad('Road junction or end blocks underpass bridge window');
-        const next = net.edges.get(n.edges.find(id => id !== q.e.id)!);
-        if (!next || next.kind !== 'road' || next.depot >= 0 || next.station >= 0)
-          return bad('Road facility blocks underpass bridge window');
-        queue.push({ e: next, s0: next.a === node ? 0 : next.len - remain, s1: next.a === node ? remain : next.len });
-      }
-    }
+    const width = Math.min(12, (hw + EARTHWORKS.corePad + dh / slope) / Math.max(0.35, Math.sin(c.angle)) + 0.3 + 2 * EARTHWORKS.corePad);
+    const window = roadBridgeWindow(g, e, c.sOld, width);
+    if (window.error) return { works, cost: 0, error: window.error };
+    works.push(...window.works);
+    for (const q of window.works) heights.set(q.edge, Math.max(heights.get(q.edge) ?? 0, dh));
   }
   // Multiple crossings/tracks may quote the same support. Charge only newly supported ground once.
   const merged: typeof works = [];
   for (const q of works.sort((a, b) => a.edge - b.edge || a.s0 - b.s0)) {
     const last = merged[merged.length - 1];
-    if (last && last.edge === q.edge && q.s0 <= last.s1 + 1e-6) last.s1 = Math.max(last.s1, q.s1);
+    // Two nearby bridge abutments cannot leave a tiny ground island sharing the cutting's terrain cells.
+    if (last && last.edge === q.edge && q.s0 <= last.s1 + 2 * EARTHWORKS.corePad) {
+      if (net.edges.get(q.edge)!.sections.some(s => s.type !== 'bridge' && s.s0 < q.s0 && s.s1 > last.s1))
+        return { works: [], cost: 0, error: 'Road structure blocks underpass bridge window' };
+      last.s1 = Math.max(last.s1, q.s1);
+    }
     else merged.push({ ...q });
   }
   let cost = 0;
@@ -988,7 +1007,17 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
       const choices = [...new Set([mode, ...(levelOk ? [levelMode] : []), 'under', 'over'] as CrossingPlan['mode'][])];
       for (const choice of choices) {
         const trial = solveProfile(desired, ds, [...cons, constraint(choice)], grade);
-        if (trial.ok) { mode = choice; sol = trial; break; }
+        if (!trial.ok) continue;
+        // An open cutting needs a supportable road bridge. Check it before adding irreversible profile
+        // constraints, so auto can still choose a feasible level crossing or flyover near road junctions.
+        if (choice === 'under' && e.kind === 'road' && secOld !== 'tunnel' && terr[ci] - trial.y[ci] < TUNNEL_DEEP) {
+          const dh = Math.max(0, yo - trial.y[ci]);
+          const hw = halfWidthOf(opts) + spread;
+          const slope = kind === 'rail' ? EARTHWORKS.slopeRail : EARTHWORKS.slopeRoad;
+          const width = Math.min(12, (hw + EARTHWORKS.corePad + dh / slope) / Math.max(0.35, Math.sin(c.angle)) + 0.3 + 2 * EARTHWORKS.corePad);
+          if (roadBridgeWindow(g, e, c.sOld, width).error) continue;
+        }
+        mode = choice; sol = trial; break;
       }
     }
     c.mode = mode;
@@ -1251,6 +1280,10 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
   const roadBridges = roadBridgeWorks(g, prop);
   if (roadBridges.error) fail(roadBridges.error);
   if (roadBridges.works.length) prop.roadBridges = roadBridges.works;
+  if (!prop.errors.length && !opts.town) {
+    const error = formationSupportError(w, prop.tracks.map(tp => ({ ...tp, kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
+    if (error) fail(error);
+  }
 
   // ---- cost: track materials (bridges x6, tunnels x9) and earthworks. The first track of a formation pays
   // them in full; further tracks built with it, and stretches of track laid beside an existing one (at the
@@ -1351,6 +1384,8 @@ export function commitProposal(g: Game, prop: Proposal): string | null {
   const roadBridges = roadBridgeWorks(g, prop);
   if (roadBridges.error) return roadBridges.error;
   if (JSON.stringify(roadBridges.works) !== JSON.stringify(prop.roadBridges ?? [])) return 'Road bridge window changed: replan';
+  const supportError = !opts.town && formationSupportError(w, prop.tracks.map(tp => ({ ...tp, kind: opts.kind, type: opts.type })), opts.ignore?.edges, prop.roadBridges);
+  if (supportError) return supportError;
   if (opts.infrastructureOwner !== undefined) {
     const err = g.trackUpgradeError(opts.owner, opts.infrastructureOwner);
     if (err) return err;

@@ -5,7 +5,7 @@ import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
-import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
+import { applyEarthworks, repairFormations, formationSupportError, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
 import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
@@ -1423,6 +1423,18 @@ export class Stations {
       }
     }
     if (level === 'ground') {
+      if (plan.ok) {
+        const ignore = new Set(opts.ignoreEdges);
+        if (ign !== undefined) for (const e of w.net.edges.values()) if (e.station === ign) ignore.add(e.id);
+        const tracks = opts.alignment ? opts.alignment.tracks.flatMap(t => t.pieces.map(p => ({ kind: 'rail' as const, type: 'standard', bez: p.curve, prof: new Float32Array(p.profile), sections: [] })))
+          : [...layout.trackOffsets, ...layout.throughOffsets].map(off => {
+            const a = pose(off, -length / 2), b = pose(off, length / 2);
+            return { kind: 'rail' as const, type: 'standard', bez: bezLine(a.x, a.z, b.x, b.z), prof: new Float32Array(Math.max(2, Math.ceil(length) + 1)).fill(plan.y), sections: [] };
+          });
+        const access = plan.access?.tracks.map(t => ({ ...t, kind: 'road' as const, type: plan.access!.opts.type })) ?? [];
+        const error = formationSupportError(w, [...tracks, ...access], ignore);
+        if (error) failp(error);
+      }
       // A rail formation reaches all the grid cells under its ballast. Houses sharing those cells must be
       // cleared when it is regraded, including outside the platform rectangle and along through tracks.
       const reach = 0.32 + EARTHWORKS.corePad + 1.42;
