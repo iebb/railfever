@@ -197,7 +197,8 @@ export async function listSaves(): Promise<{ slot: string; meta: unknown }[]> {
   } catch (e) { if (!fallBack(e)) throw e; return [...memory.values()].map(({ slot, meta }) => ({ slot, meta })); }
 }
 
-/** Move old localStorage saves only after their IndexedDB transaction commits. */
+/** Move old localStorage saves only after their IndexedDB transaction commits.
+ * An existing durable slot wins; keep a colliding legacy save as a visible backup. */
 export async function migrateLegacy(): Promise<number> {
   let legacy: Storage;
   try { if (typeof localStorage === 'undefined') return 0; legacy = localStorage; }
@@ -215,7 +216,14 @@ export async function migrateLegacy(): Promise<number> {
     let meta: unknown = null;
     try { meta = metaRaw ? JSON.parse(metaRaw) : null; } catch { /* keep unknown metadata */ }
     try {
-      await putSave({ slot, data, meta });
+      const old = meta && typeof meta === 'object' ? meta as Record<string, unknown> : {};
+      let target = slot, suffix = 0;
+      while (!await putSaveOnce({ slot: target, data, meta: { ...old, slot: target,
+        ...(target === slot ? {} : { name: `${typeof old.name === 'string' ? old.name : slot} (legacy backup)` }) } })) {
+        if (storageMode() !== 'persistent') break;
+        suffix++;
+        target = slot + '-legacy' + (suffix === 1 ? '' : '-' + suffix);
+      }
       if (storageMode() !== 'persistent') break;
       legacy.removeItem(LEGACY_PREFIX + slot); legacy.removeItem(LEGACY_PREFIX + slot + '.meta'); n++;
     } catch { /* keep the legacy copy */ }

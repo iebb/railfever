@@ -276,6 +276,7 @@ function f32enc(a: Float32Array): string {
 }
 function f32dec(s: string): Float32Array {
   const u8 = unb64(s);
+  if (u8.length % 4) throw new Error('Invalid float chunk');
   const n = u8.length >> 2, out = new Float32Array(n);
   const dst = new Uint8Array(out.buffer);
   for (let i = 0; i < n; i++) for (let b = 0; b < 4; b++) dst[i * 4 + b] = u8[b * n + i];
@@ -445,12 +446,24 @@ export function deserialize(d: any): Game {
   const why = saveIncompatibility({ version: d.version, game: d.game });
   if (why || d.version === undefined) throw new Error(why ?? 'Not a Railfever save');
   const wd = d.world;
+  if (!wd || !Number.isSafeInteger(wd.size) || wd.size <= 0 || !Number.isSafeInteger((wd.size + 1) ** 2))
+    throw new Error('Invalid world size');
+  // Older single-record saves must be complete too: typed-array set/subarray otherwise silently
+  // zero-filled missing terrain and locks, or discarded trailing data, permanently changing the map.
+  let legacy: { h: Float32Array; lock: Uint8Array; trees: Float32Array } | undefined;
+  if (d.version === 2) {
+    legacy = { h: f32dec(wd.h), lock: unb64(wd.lock), trees: f32dec(wd.trees) };
+    const vertices = (wd.size + 1) ** 2;
+    if (legacy.h.length !== vertices) throw new Error('Incomplete heightmap');
+    if (legacy.lock.length !== vertices) throw new Error('Incomplete lock grid');
+    if (legacy.trees.length % 5) throw new Error('Invalid tree chunk');
+  }
   const w = new World(wd.size);
   let tr: Float32Array;
-  if (d.version === 2) {
-    w.h.set(f32dec(wd.h).subarray(0, w.h.length));
-    w.lock.set(unb64(wd.lock).subarray(0, w.lock.length));
-    tr = f32dec(wd.trees);
+  if (legacy) {
+    w.h.set(legacy.h);
+    w.lock.set(legacy.lock);
+    tr = legacy.trees;
   } else {
     if (wd.encoding !== 'predict32-chunks' || wd.vertices !== SAVE_VERTICES || wd.treeChunk !== TREE_CHUNK)
       throw new Error('Unsupported world chunk encoding');
@@ -465,6 +478,7 @@ export function deserialize(d: any): Game {
     at = 0;
     for (const chunk of wd.trees) {
       const a = floats(chunk), n = a.length / 5;
+      if (!Number.isInteger(n)) throw new Error('Invalid tree chunk');
       for (let i = 0; i < n; i++) for (let f = 0; f < 5; f++) tr[(at + i) * 5 + f] = a[f * n + i];
       at += n;
     }
