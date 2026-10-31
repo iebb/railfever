@@ -103,7 +103,10 @@ try {
       options.loader = { '.css': 'empty', '.woff': 'empty', '.woff2': 'empty' };
     }
     let rc;
-    try { await build(options); rc = await command(process.execPath, [`${script}.mjs`, ...args], dir, log); }
+    const diagnostics = script === 'growth' ? [`--snapshots=${join(dir, 'worlds')}`, `--out=${join(dir, 'report.json')}`]
+      : script === 'growthcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--checkpoint=${join(dir, 'investment.json')}`]
+      : script === 'throughcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--json=${join(dir, 'report.json')}`] : [];
+    try { await build(options); rc = await command(process.execPath, [`${script}.mjs`, ...args, ...diagnostics], dir, log); }
     catch (error) { writeFileSync(log, `${error.stack}\n`); rc = 1; }
     const output = readFileSync(log, 'utf8');
     const summary = output.split('\n').filter((l) => /ALL CHECKS PASSED|ALL INVARIANTS HELD|ALL PASSED|ALL \d+ .*PASSED|^PASS|PURITY PASSED|checks passed|\d+ FAILURES?|FAIL/.test(l)).at(-1)?.slice(0, 140) || '';

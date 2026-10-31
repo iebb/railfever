@@ -5,8 +5,10 @@
 // npx esbuild scripts/growth.ts --bundle --platform=node --format=esm --outfile=$S/growth.mjs && node $S/growth.mjs [seeds] [years] [size]
 //   [--ai=3] [--year=1950] [--out=runs.json: dump the monthly samples] [--report=runs.json,...: report earlier dumps only]
 //   [--check-report: run checks on dumps] [--legacy-activity: compare the original 30-day cohort]
-import { readFileSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Game } from '../src/game/game';
+import { serialize } from '../src/game/save';
 import type { Station } from '../src/game/stations';
 import { townService, GROWTH_ACTIVE_DAYS } from '../src/game/towns';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
@@ -41,6 +43,9 @@ const opt = (k: string) => argv.find((a) => a.startsWith(`--${k}=`))?.slice(k.le
 const seeds = (pos[0] ?? '7,23').split(',').map(Number);
 const YEARS = Number(pos[1] ?? 20), SIZE = Number(pos[2] ?? 768), NAI = Number(opt('ai') ?? 3);
 const START = Number(opt('year') ?? 1950);
+// Optional native checkpoints make late failures reproducible without another twenty-year run.
+const snapshots = opt('snapshots');
+if (snapshots) mkdirSync(snapshots, { recursive: true });
 // Diagnostic comparison with the original 30-day activity cohort; normal checks follow townService.
 const legacyActivity = argv.includes('--legacy-activity');
 const defaultTowns = (size: number) => Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2)));
@@ -98,6 +103,7 @@ function simulate(seed: number): Run {
       yGen += town.passGenLast;
     }
     lostSt.clear(); lostTown.clear(); calls.clear();
+    if (snapshots && g.day % 720 === 0) writeFileSync(join(snapshots, `seed-${seed}-day-${g.day}.json`), JSON.stringify(serialize(g)));
     if (g.day % 360 === 0) {
       const y: Year = { year: START + g.day / 360 - 1, gen: yGen, lost: yLost, ms: yMs, ticks: yTicks, ambient: g.vehicles.ambient.length, vehicles: g.vehicles.map.size, pop: g.towns.list.reduce((a, t) => a + t.pop, 0) };
       yearly.push(y);

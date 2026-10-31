@@ -1,6 +1,7 @@
 // Fleet-only city growth must price physical paths, and replay a saved investment decision exactly.
 import { pathToFileURL } from 'node:url';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { networkPlanner, saveNetwork, networkDaily } from '../src/game/ai-network';
@@ -84,6 +85,9 @@ async function natural() {
   let saved: { data: string; owner: number; line: number } | undefined;
   const batches: { day: number; before: number; after: number }[] = [];
   const operation = new Map<number, { owner: number; opened: number; active: number; waiting: number; longest: number; sustained: number; waits: Map<number, number> }>();
+  const diagnostics = process.argv.find(a => a.startsWith('--diagnostics='))?.slice('--diagnostics='.length);
+  const recordedHolds = new Set<number>();
+  if (diagnostics) mkdirSync(diagnostics, { recursive: true });
   // Observe nine years from the first natural city opening, bounded by eighteen world years.
   // Select the first real fleet investment across operators, independently of its hold results.
   // Track every city from opening so selection retains its earlier operation and congestion history.
@@ -136,7 +140,13 @@ async function natural() {
       if (v.state !== 'waiting') { stats.waits.delete(v.id); continue; }
       const ticks = (stats.waits.get(v.id) ?? 0) + 1, seconds = ticks * g.tickSeconds;
       stats.waits.set(v.id, ticks); stats.waiting += g.tickSeconds; stats.longest = Math.max(stats.longest, seconds);
-      if (seconds >= 120 && (ticks - 1) * g.tickSeconds < 120) stats.sustained++;
+      if (seconds >= 120 && (ticks - 1) * g.tickSeconds < 120) {
+        stats.sustained++;
+        if (diagnostics && !recordedHolds.has(v.lineId!)) {
+          recordedHolds.add(v.lineId!);
+          writeFileSync(join(diagnostics, `hold-line-${v.lineId}-day-${g.day}.json`), JSON.stringify(api.serialize(g)));
+        }
+      }
     }
     for (const [line, stats] of operation) for (const id of stats.waits.keys()) if (live.get(id) !== line) stats.waits.delete(id);
     if (saved && process.argv.includes('--replay-only')) break;

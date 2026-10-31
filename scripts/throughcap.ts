@@ -1,5 +1,6 @@
 // Shared-corridor capacity audit. Bundle as throughcap.mjs and run from the scratch directory.
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Game } from '../src/game/game';
 import { Train, deadlockCycles } from '../src/game/train';
 import { serialize, deserialize } from '../src/game/save';
@@ -161,6 +162,8 @@ const quick = process.argv.includes('--quick');
 const years = Number(process.argv.find(a => a.startsWith('--years='))?.slice(8) ?? 8);
 const output = process.argv.find(a => a.startsWith('--json='))?.slice(7);
 const snapshot = process.argv.find(a => a.startsWith('--snapshot='))?.slice(11);
+const diagnostics = process.argv.find(a => a.startsWith('--diagnostics='))?.slice('--diagnostics='.length);
+if (diagnostics) mkdirSync(diagnostics, { recursive: true });
 
 function scenario(seed = 2026, size = 768, requireShared = true) {
   const label = `8 companies (${seed}/${size})`;
@@ -169,6 +172,7 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
       risk: 0.6, startMoney: 50_000_000, accessMultiplier: 1, accessPolicy: 'open' as const })) });
   let revenue = 0, delivered = 0, samples = 0, held120 = 0, longest = 0, deadlocks = 0, longestDeadlock = 0;
   let allSamples = 0, allHeld120 = 0, allLongest = 0;
+  let capturedCycle = false;
   let nonRailFleet = false;
   // All earning fleets in this scenario are rail. Company books also retain mail paid to an earlier
   // carrier at somebody else's unloading stop, and receipts of trains sold during the audit.
@@ -219,6 +223,10 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
       if (cycles.length) {
         deadlocks += cycles.length;
         longestDeadlock = Math.max(longestDeadlock, ...cycles.flat().map(t => t.stuckTime));
+        if (diagnostics && !capturedCycle) {
+          capturedCycle = true;
+          writeFileSync(join(diagnostics, `cycle-seed-${seed}-size-${size}-day-${g.day}.json`), JSON.stringify(serialize(g)));
+        }
       }
       if (snapshot && seed === 2026 && size === 768 && g.day === 720) writeFileSync(snapshot, JSON.stringify(serialize(g)));
       if (g.day % 360 === 0) {
