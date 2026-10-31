@@ -29,7 +29,7 @@ export interface NativeRoadItinerary {
 }
 export interface NativeRoadCycle {
   stops: number[];
-  /** Directed leg times including 2 s handling at the destination; subtract that handling for ride-only fares. */
+  /** Directed leg times including 2 s destination handling. For fares this replaces equal origin handling. */
   hops: number[];
   cycle: number; length: number;
 }
