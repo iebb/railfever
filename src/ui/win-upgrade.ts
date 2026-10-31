@@ -32,14 +32,32 @@ function showPreview(ui: UI, q: UpgradeQuote | null) {
 export function openRouteUpgrade(ui: UI, lineId: number, done?: () => void) {
   const g = ui.game, l0 = g.lines.get(lineId);
   if (!l0 || l0.owner !== PLAYER) return;
-  const modes = upgradeModes(g, lineId);
+  let modes = upgradeModes(g, lineId);
   let mode: UpgradeMode = modes.includes('lightrail') ? 'tram' : modes[modes.length - 1];
   let level: UpgradeLevel = 'elevated';
   let quote: UpgradeQuote | null = null, key = '';
   const win = ui.wm.open('upgrade-' + lineId, 'Upgrade route', { width: 420, icon: 'upgrade', color: l0.color, sub: l0.name, onClose: () => showPreview(ui, null) });
-  const plan = () => {
-    const k = `${mode}:${level}`;
-    if (k === key && quote) return quote;
+  const plan = (force = false) => {
+    const l = g.lines.get(lineId);
+    // Geometry is expensive: invalidate on construction, route/fleet edits and model availability, not each tick.
+    // Resale is cheap and changes as buses age, even when the route itself is unchanged.
+    const fleet = l?.vehicles.map((id) => {
+      const v = g.vehicles.get(id);
+      return `${id}:${v?.owner}:${v?.capacity}:${v?.value}`;
+    }).join(',');
+    const towns = l?.stops.map((id) => g.stations.get(id)?.townId ?? -1);
+    const townState = towns?.map((id) => { const t = g.towns.list[id]; return t ? `${t.pop}:${t.radius}:${t.x}:${t.z}` : ''; }).join(',');
+    const k = `${mode}:${level}:${g.year}:${g.networkVersion}:${g.world.net.version}:${g.world.heightsVersion}:${g.world.lotVersions.version}:${g.stations.walkVersion}:${l?.owner}:${l?.kind}:${l?.loop}:${l?.stops.join(',')}:${fleet}:${townState}`;
+    if (!force && k === key && quote) {
+      if (quote.ok && l) {
+        const resale = l.vehicles.reduce((sum, id) => {
+          const v = g.vehicles.get(id);
+          return sum + (v?.kind === 'road' && v.owner === PLAYER ? g.vehicles.resaleValue(v) : 0);
+        }, 0);
+        if (resale !== quote.resale) quote = { ...quote, resale, cost: quote.cost + quote.resale - resale };
+      }
+      return quote;
+    }
     key = k;
     quote = planRouteUpgrade(g, lineId, PLAYER, mode, mode === 'lightrail' ? level : undefined);
     showPreview(ui, quote);
@@ -47,7 +65,10 @@ export function openRouteUpgrade(ui: UI, lineId: number, done?: () => void) {
   };
   const render = () => {
     const l = g.lines.get(lineId);
-    if (!l || l.id !== lineId || l.kind !== 'road' || worksOn(g, lineId)) { win.close(); return; }
+    if (!l || l.id !== lineId || l.kind !== 'road' || l.owner !== PLAYER || worksOn(g, lineId)) { win.close(); return; }
+    modes = upgradeModes(g, lineId);
+    if (!modes.includes(mode)) mode = modes[0];
+    win.sub.textContent = l.name;
     clear(win.body);
     add(win.body, field('Mode', seg<UpgradeMode>(modes.map((m) => [m, MODE_LABEL[m], MODE_TIP[m]]), mode, (m) => { mode = m; render(); })));
     if (mode === 'lightrail') add(win.body, field('Level', seg<UpgradeLevel>([['elevated', 'Viaduct'], ['ground', 'Ground']], level, (v) => { level = v; render(); })));
@@ -77,7 +98,14 @@ export function openRouteUpgrade(ui: UI, lineId: number, done?: () => void) {
       h('div', { class: 'btns right' },
         h('button', { class: 'btn ghost', onclick: () => win.close() }, 'Cancel'),
         h('button', { class: 'btn primary', 'data-tip': short > 0 ? `Short ${fmtMoney(short)}: works wait for funds` : undefined, onclick: () => {
-          const err = startRouteWorks(g, q);
+          // A build or line edit may have happened since the last UI refresh. Show the revised plan before buying.
+          // Read the current quote here: unchanged DOM controls may retain their original event listener.
+          // Compare money to whole dollars so harmless floating point differences do not demand another review.
+          const signature = (q: UpgradeQuote | null) => JSON.stringify(q, (k, v) => k === 'cost' || k === 'resale' ? Math.round(v) : v);
+          const reviewed = signature(quote);
+          const fresh = plan(true);
+          if (signature(fresh) !== reviewed) { render(); ui.toast('Plan changed. Review before starting.', 'info'); return; }
+          const err = startRouteWorks(g, fresh);
           if (err) { ui.toast(err, 'bad'); return; }
           ui.sound('cash');
           ui.toast(`${l.name}: works started`, 'good');
