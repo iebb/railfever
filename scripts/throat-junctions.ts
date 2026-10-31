@@ -152,7 +152,11 @@ check(noReturn.connected===0&&fullState(roi.g)===roiBefore,'a declined actual co
 const held=fixture();autoSignalLine(held.g,held.l.id,held.me);
 const otherLine=held.g.lines.create('rail',held.me);otherLine.stops=[held.A.id,held.B.id];held.g.lines.rebuild();
 const t=held.g.vehicles.buyTrain(held.depot,loco(),otherLine.id) as Train;t.stopIndex=0;held.g.stepTick();
-check(t.onMap&&held.g.vehicles.getRes(held.spur)===t.id&&!t.occupiedEdges().includes(held.spur),
+// Depot admission first reserves its safe yard stub. Observe the subsequent guarded onward acquisition, while
+// the real spur is still ahead of the body, rather than assuming that acquisition occurs on the purchase tick.
+const ahead=()=>t.onMap&&held.g.vehicles.getRes(held.spur)===t.id&&!t.occupiedEdges().includes(held.spur);
+for(let tick=0;tick<600&&!ahead();tick++)held.g.stepTick();
+check(ahead(),
   'actual departing train holds the crossed spur ahead of its body');
 const futureBefore=fullState(held.g),future=connectStationThroat(held.g,held.A.id,held.me,{junctions:true,reserve,signals:signalsFor(held)});
 check(future.connected===0&&fullState(held.g)===futureBefore,'native reserved future crossed-spur path defers before spending or geometry edits');
