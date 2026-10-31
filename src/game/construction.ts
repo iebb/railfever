@@ -1428,6 +1428,20 @@ export function commitProposal(g: Game, prop: Proposal, continued?: ReadonlySet<
     if (sn.kind === 'node' && !net.nodes.has(sn.node!) || sn.kind === 'edge' && !net.edges.has(sn.edge!))
       return 'Network changed, try again';
   }
+  // Native previews can outlive an access agreement (AI construction yields between quoting and committing).
+  // Joining usable infrastructure retains its owner; ordinary public-road and separated crossings need no access.
+  if (!opts.town && opts.owner >= 0) {
+    if (opts.kind === 'rail' || opts.tram) for (const tp of prop.tracks) for (const sn of [tp.start, tp.end]) {
+      for (const owner of snapOwners(g, sn, opts.kind)) if (owner >= 0 && owner !== opts.owner && !g.canUse(opts.owner, owner))
+        return `${opts.kind === 'rail' ? 'Track' : 'Tram tracks'} of ${g.company(owner).name}: needs track access`;
+    }
+    for (const c of prop.crossings) {
+      const e = net.edges.get(c.edge);
+      if (opts.kind === 'rail' && e?.kind === 'rail' && c.mode === 'diamond'
+        && e.owner >= 0 && e.owner !== opts.owner && !g.canUse(opts.owner, e.owner))
+        return `Track of ${g.company(e.owner).name}: needs track access`;
+    }
+  }
   const roadBridges = roadBridgeWorks(g, prop);
   if (roadBridges.error) return roadBridges.error;
   if (JSON.stringify(roadBridges.works) !== JSON.stringify(prop.roadBridges ?? [])) return 'Road bridge window changed: replan';
