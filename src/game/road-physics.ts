@@ -40,30 +40,35 @@ const routes = new WeakMap<Game, WeakMap<Line, Map<string, Entry>>>();
  * The same directed itinerary serves curb workload and running time. Uncommitted/missing/disconnected stops
  * return null: prospective-site callers must use their explicit survey fallback, never add temporary stations.
  * Cache only geometry/access/pattern inputs; time, demand, queues and unrelated terrain do not change a lane.
+ * A priced tram project may supply fresh streets; existing foreign tracks still require current native access.
  */
-export function nativeRoadItinerary(g: Game, l: Line, pid?: number, operator = l.owner): NativeRoadItinerary | null {
+export function nativeRoadItinerary(g: Game, l: Line, pid?: number, operator = l.owner, futureTramEdges?: readonly number[]): NativeRoadItinerary | null {
   if (l.kind !== 'road' && l.kind !== 'tram') return null;
   let lines = routes.get(g);
   if (!lines) { lines = new WeakMap(); routes.set(g, lines); }
   let cache = lines.get(l);
   if (!cache) { cache = new Map(); lines.set(l, cache); }
   const key = `${pid ?? ''}:${operator}`;
-  const signature = JSON.stringify([g.networkVersion, g.world.net.version, l.kind, l.loop,
+  const signature = JSON.stringify([g.networkVersion, g.world.net.version, l.kind, l.loop, futureTramEdges && [...new Set(futureTramEdges)].sort((a, b) => a - b),
     l.stops, l.patterns?.map(p => [p.id, p.stops, p.ids]),
     [...new Set(l.stops)].map(id => { const st = g.stations.get(id); return st ? [id, st.x, st.z, st.townId, st.stops.map(p => [p.edge, p.s, p.x, p.z])] : [id]; })]);
   const known = cache.get(key);
   if (known?.signature === signature) return known.route;
-  const route = buildItinerary(g, l, pid, operator);
+  const route = buildItinerary(g, l, pid, operator, futureTramEdges);
   cache.set(key, { signature, route });
   return route;
 }
 
-function buildItinerary(g: Game, l: Line, pid: number | undefined, operator: number): NativeRoadItinerary | null {
+function buildItinerary(g: Game, l: Line, pid: number | undefined, operator: number, futureTramEdges?: readonly number[]): NativeRoadItinerary | null {
   // Native pattern alignment repairs metadata. Survey a copy to preserve the live/save state exactly.
   const copy = { ...l, patterns: l.patterns?.map(p => ({ ...p, stops: [...p.stops], ids: p.ids && [...p.ids] })) };
   const ids = patternStops(copy, pid).map(i => l.stops[i]).filter((id, i, a) => i === 0 || id !== a[i - 1]);
   if (ids.length > 1 && ids[0] === ids[ids.length - 1]) ids.pop();
-  const net = g.world.net, first = g.stations.get(ids[0])?.stops[0];
+  const net = g.world.net, future = new Set(futureTramEdges);
+  // Future works buy only fresh lawful streets. Existing foreign tram track never becomes ours through a quote.
+  const allow = l.kind === 'tram' ? (e: Parameters<typeof tramUsable>[1]) => tramUsable(g, e, operator)
+    || (future.has(e.id) && !e.tram && e.kind === 'road' && e.depot < 0 && g.canUse(operator, e.owner)) : undefined;
+  const first = g.stations.get(ids[0])?.stops.find(p => { const e = net.edges.get(p.edge); return e && (!allow || allow(e)); });
   let edge = first && net.edges.get(first.edge), dir = 1, at = first?.s ?? 0;
   if (!edge || !first || ids.length < 2) return null;
   const previous = g.stations.get(ids[ids.length - 1]), a = { x: 0, y: 0, z: 0 }, b = { ...a };
@@ -83,7 +88,7 @@ function buildItinerary(g: Game, l: Line, pid: number | undefined, operator: num
     let stop = st.stops.filter(p => p.edge === edge!.id && dir * (p.s - at) > 0.15).sort((a, b) => dir * (a.s - b.s))[0];
     let path: ReturnType<typeof findRoadRoute> = [];
     if (!stop) {
-      path = findRoadRoute(g, edge, dir, st.id, 40000, l.kind === 'tram' ? e => tramUsable(g, e, operator) : undefined, g.lines.isLoop(l) ? 600 : 40);
+      path = findRoadRoute(g, edge, dir, st.id, 40000, allow, g.lines.isLoop(l) ? 600 : 40);
       const arrival = path?.[path.length - 1];
       if (!arrival) return null;
       const next = net.edges.get(arrival.edge);
@@ -181,8 +186,8 @@ function heightBehind(route: NativeRoadItinerary, k: number, s: number): number 
 
 const cycles = new WeakMap<NativeRoadItinerary, Map<string, NativeRoadCycle>>();
 /** Pure half-full, free-flow cycle; traffic/holds are excluded so congestion cannot reward buying more buses. */
-export function evaluateNativeRoadCycle(g: Game, l: Line, model: VehicleModel, pid?: number, operator = l.owner): NativeRoadCycle | null {
-  const route = nativeRoadItinerary(g, l, pid, operator);
+export function evaluateNativeRoadCycle(g: Game, l: Line, model: VehicleModel, pid?: number, operator = l.owner, futureTramEdges?: readonly number[]): NativeRoadCycle | null {
+  const route = nativeRoadItinerary(g, l, pid, operator, futureTramEdges);
   if (!route || !(model.weight > 0 && model.power > 0 && model.speed > 0 && model.length > 0)) return null;
   let cache = cycles.get(route);
   if (!cache) { cache = new Map(); cycles.set(route, cache); }

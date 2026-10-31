@@ -86,6 +86,8 @@ export interface RoadService {
   models?: VehicleModel[];
   /** An existing full-route service whose native directed driving can be quoted without changing the world. */
   nativeLine?: Line;
+  /** Fresh tram streets in a valid, priced construction quote; existing track still needs native access. */
+  futureTramEdges?: readonly number[];
 }
 export interface RoadForecast {
   /** passengers boarding a year (direct and changing) */
@@ -172,7 +174,7 @@ class MinHeap {
  * null when no road joins them within `maxLen`. Cached for the day (derived from the network).
  */
 export function roadPath(g: Game, a: { x: number; z: number }, b: { x: number; z: number }, kmh = 90, maxLen = 1500): { length: number; seconds: number } | null {
-  const key = `${a.x.toFixed(2)},${a.z.toFixed(2)}>${b.x.toFixed(2)},${b.z.toFixed(2)}@${kmh}`, cache = reads(g).paths;
+  const key = `${a.x},${a.z}>${b.x},${b.z}@${kmh}/${maxLen}`, cache = reads(g).paths;
   if (cache.has(key)) return cache.get(key)!;
   const net = g.world.net, ok = (e: { kind: string; depot: number }) => e.kind === 'road' && e.depot < 0;
   const ea = net.nearestEdge(a.x, a.z, 4, 'road', ok), eb = net.nearestEdge(b.x, b.z, 4, 'road', ok);
@@ -542,7 +544,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const timing = (model: VehicleModel) => {
     let t = timings.get(model);
     if (!t) {
-      const native = nativeLine ? evaluateNativeRoadCycle(g, nativeLine, model, undefined, owner) : null;
+      const native = nativeLine ? evaluateNativeRoadCycle(g, nativeLine, model, undefined, owner, service.futureTramEdges) : null;
       const drive = native ?? (nativeLine ? null : roadDriving(g, sites, model, loop));
       const trips = new Array<number>(n * n).fill(0);
       for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
@@ -1303,11 +1305,21 @@ export function townRoutes(T: Town, sites: StopSite[]): { stops: StopSite[]; loo
   return out;
 }
 
-/** The best town bus line for T by the forecast (a feeder, a line across the centre or a ring), with its economics. */
-export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generator<void, RoadPlan | null> {
+/** Feasible town bus candidates with the same fares, vehicle costs and construction quote used by project choice. */
+export function* planTownCandidates(h: BusHost, T: Town, model: VehicleModel): Generator<void, RoadPlan[]> {
   const g = h.g, sites = yield* stopSites(g, h.me, T.x, T.z, T.radius + 6, T.id);
-  let best: RoadPlan | null = null, bestScore = -Infinity;
-  for (const r of townRoutes(T, sites)) {
+  const plans: RoadPlan[] = [];
+  for (const candidate of townRoutes(T, sites)) {
+    let r = candidate;
+    // A geometric chain can append a nearby district reached only by a long road detour. Preserve its
+    // longest connected prefix rather than letting that tail discard an otherwise useful paid service.
+    if (!r.loop) {
+      const least = r.why === 'feeder' ? 3 : 2;
+      let end = r.stops.length;
+      while (end >= least && !roadDriving(g, r.stops.slice(0, end), model, false)) end--;
+      if (end < least) continue;
+      if (end < r.stops.length) r = { ...r, stops: r.stops.slice(0, end) };
+    }
     const probe = roadTimetable(g, r.stops, model, r.loop);
     // a frequent service or a sparser one: whichever earns more on its outlay
     const fleets = [...new Set([fleetFor(probe.cycle, TOWN_HEADWAY, r.loop ? 6 : 5), fleetFor(probe.cycle, 2 * TOWN_HEADWAY, 4)])];
@@ -1316,13 +1328,19 @@ export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generat
     const f = fs[m];
     if (!(f.cycle > 0) || !Number.isFinite(f.cycle)) continue;
     const e = lineEconomics(g, h.me, f, r.stops, model, vehicles);
-    const score = e.revenue > e.yearly ? roadScore(e.revenue, e.yearly, e.outlay) : (e.revenue - e.yearly) / Math.max(1, e.outlay);
-    if (score > bestScore) {
-      bestScore = score;
-      best = { kind: 'line', sites: r.stops, loop: r.loop, model, vehicles, towns: [T.id], ...e,
-        why: `${r.why} in ${T.name}: ${r.stops.length} stops, ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` };
+    plans.push({ kind: 'line', sites: r.stops, loop: r.loop, model, vehicles, towns: [T.id], ...e,
+      why: `${r.why} in ${T.name}: ${r.stops.length} stops, ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` });
     }
-    }
+  }
+  return plans;
+}
+
+/** The best town bus line for T by the forecast (a feeder, a line across the centre or a ring), with its economics. */
+export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generator<void, RoadPlan | null> {
+  let best: RoadPlan | null = null, bestScore = -Infinity;
+  for (const plan of yield* planTownCandidates(h, T, model)) {
+    const score = plan.revenue > plan.yearly ? roadScore(plan.revenue, plan.yearly, plan.outlay) : (plan.revenue - plan.yearly) / Math.max(1, plan.outlay);
+    if (score > bestScore) { bestScore = score; best = plan; }
   }
   return best;
 }
@@ -1917,7 +1935,8 @@ export function* tramUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan
   if (!quote.ok) return null;
   let best: RoadPlan | null = null;
   const fleets = [base.trams, base.trams + 1];
-  const fs = yield* busCityForecast(g, me, sites, { model: base.model, vehicles: base.trams, loop: route.loop }, fleets, l.id);
+  const fs = yield* busCityForecast(g, me, sites, { model: base.model, vehicles: base.trams, loop: route.loop,
+    futureTramEdges: quote.fresh }, fleets, l.id);
   for (const [m, n] of fleets.entries()) {
     const up = n === base.trams ? base : planTramUpgrade(g, l.id, me, n);
     const f = fs[m];
