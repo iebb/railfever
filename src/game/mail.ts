@@ -16,6 +16,7 @@ import type { Vehicle, MailGroup } from './vehicle';
 import type { Hop, Line } from './lines';
 import type { Town } from './towns';
 import { RNG } from './rng';
+import { successorCompanyId } from './economy';
 import { GEN_RATE, type ForecastSite } from './demand';
 import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE, WALK_TRIP_INTENSITY } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
@@ -155,9 +156,8 @@ function cargoGroup(alight: number, dest: number, count: number, from: number, j
 
 /** Receipts go to the vehicle's owner, else the recorded operator (a bought company: its buyer); the line is a legacy fallback. */
 function payee(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number): number {
-  let who = v ? v.owner : g.companies[owner] ? owner : line ? line.owner : owner;
-  for (let k = 0; k < 8 && g.companies[who]?.defunct && g.companies[who].boughtBy !== undefined; k++) who = g.companies[who].boughtBy!;
-  return who;
+  const who = v ? v.owner : g.companies[owner] ? owner : line ? line.owner : owner;
+  return successorCompanyId(g.companies, who);
 }
 /** Book a share of mail receipts: the company ('mailIncome'), the vehicle, its line (total and mail part), the AI's rail ledger. */
 function book(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number, amount: number) {

@@ -17,6 +17,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { NEdge } from './network';
 import { TRACK_TYPES, ROAD_TYPES, DAY_SECONDS, DAYS_PER_MONTH, MONTHS_PER_YEAR, UNIT_M, MAIL_UNIT_T } from './constants';
 import { simNow } from './fares';
+import { successorCompanyId } from './economy';
 
 /** Sim seconds in a game year (a vehicle in service all year runs this long). */
 export const YEAR_S = DAY_SECONDS * DAYS_PER_MONTH * MONTHS_PER_YEAR;
@@ -415,13 +416,17 @@ export function billTrackWear(g: Game, reimburse?: (user: number, owner: number,
   const last: Record<number, number> = {};
   for (const [id, w] of out) {
     if (!(w > 0)) continue;
-    const owner = g.world.net.edges.get(id)?.owner ?? s.wearOwner.get(id) ?? -1;
+    const owner = successorCompanyId(g.companies, g.world.net.edges.get(id)?.owner ?? s.wearOwner.get(id) ?? -1);
     const co = g.companies[owner];
     if (!co || co.defunct) continue;
     co.economy.spend(w, 'trackWear', true);
     last[owner] = (last[owner] ?? 0) + w;
     const users = s.wearUsers.get(id) ?? [];
-    for (let user = 0; user < users.length; user++) if (user !== owner && users[user] > 0) reimburse?.(user, owner, users[user]);
+    for (let user = 0; user < users.length; user++) if (users[user] > 0) {
+      // Merger ownership changes do not rewrite these saved meters; settle the old operator's debt with its buyer.
+      const payer = successorCompanyId(g.companies, user);
+      if (payer !== owner) reimburse?.(payer, owner, users[user]);
+    }
   }
   s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.lastWear = last;
   return out;
