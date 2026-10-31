@@ -80,29 +80,31 @@ async function natural() {
   const g: Game = api.Game.create({ size: 768, seed: 23, towns: Math.round(768 / 42), hilliness: 'hilly', water: 'medium', startYear: 1985,
     aiConfigs: Array.from({ length: 3 }, () => ({ focus: { rail: 2.5, road: 1.2, tram: 0.5 } })) });
   g.aiAcquisitions = false;
-  let longest = 0, sustained = 0, active = 0, waiting = 0, purchaseMs = 0, pricedUnits = 0;
+  let purchaseMs = 0, pricedUnits = 0;
   let saved: { data: string; owner: number; line: number } | undefined;
   const batches: { day: number; before: number; after: number }[] = [];
-  const waits = new Map<number, number>();
-  // Native centre/site feasibility can change which town wins. Follow the first real local city railway,
-  // rather than requiring the historical owner-2 Linwick opening; Greenden is now the viable alternative.
-  let retainedCity: number | undefined;
+  const operation = new Map<number, { owner: number; opened: number; active: number; waiting: number; longest: number; sustained: number; waits: Map<number, number> }>();
+  // Observe nine years from the first natural city opening, bounded by eighteen world years.
+  // Select the first real fleet investment across operators, independently of its hold results.
+  // Track every city from opening so selection retains its earlier operation and congestion history.
+  let retainedCity: number | undefined, firstCityDay: number | undefined;
   const cityService = (l: Line | undefined) => {
-    if (!l) return false;
+    if (!l || l.kind !== 'rail' || !g.aiOf(l.owner)) return false;
+    const first = g.stations.get(l.stops[0]);
+    if (!first?.rail || railPartMode(first.rail) === 'mainline') return false;
     const stops = l.stops.map(id => g.stations.get(id));
-    return l.owner === 2 && l.kind === 'rail' && stops.length >= 2
+    return stops.length >= 2
       && stops.every(s => s?.rail && railPartMode(s.rail) !== 'mainline' && g.towns.list.some(t => t.id === s.townId))
       && new Set(stops.map(s => s?.townId)).size === 1;
   };
-  while (g.day < 9 * 360) {
-    retainedCity ??= [...g.lines.map.values()].find(l => cityService(l)
-      && g.vehicles.trains().some(t => t.lineId === l.id && t.onMap))?.id;
+  while (g.day < Math.min(18 * 360, (firstCityDay ?? 9 * 360) + 9 * 360)) {
     const planners = g.ais.filter(ai => api.networkPlanner(ai)?.task === 'extend');
     let pending = false;
     if (planners.length) for (const [owner, state] of api.saveNetwork(g).companies) {
       const job = state.job, item = job?.items?.[job.cursor], c = item?.grow;
       if (job?.task !== 'extend' || !c?.best?.fleet || c.at <= (c.opts?.length ?? 0)
-        || item.ids[0] !== retainedCity || !cityService(g.lines.get(item.ids[0]))) continue;
+        || !cityService(g.lines.get(item.ids[0])) || retainedCity !== undefined && item.ids[0] !== retainedCity) continue;
+      retainedCity ??= item.ids[0];
       pending = true;
       if (!saved) {
         saved = { data: JSON.stringify(api.serialize(g)), owner, line: item.ids[0] };
@@ -117,22 +119,36 @@ async function natural() {
     g.stepTick();
     if (pending) { purchaseMs = Math.max(purchaseMs, performance.now() - started); pricedUnits++; }
     if (pending && city && city.vehicles.length > before) batches.push({ day: g.day, before, after: city.vehicles.length });
+    const live = new Map<number, number>(), services = new Map<number, boolean>();
     for (const v of g.vehicles.trains()) {
-      if (v.owner !== 2 || v.lineId !== retainedCity || !cityService(v.line) || !v.onMap) { waits.delete(v.id); continue; }
-      active += g.tickSeconds;
-      if (v.state !== 'waiting') { waits.delete(v.id); continue; }
-      const ticks = (waits.get(v.id) ?? 0) + 1, seconds = ticks * g.tickSeconds;
-      waits.set(v.id, ticks); waiting += g.tickSeconds; longest = Math.max(longest, seconds);
-      if (seconds >= 120 && (ticks - 1) * g.tickSeconds < 120) sustained++;
+      if (!v.onMap || v.lineId === null) continue;
+      let service = services.get(v.lineId);
+      if (service === undefined) { service = cityService(v.line); services.set(v.lineId, service); }
+      if (!service) continue;
+      live.set(v.id, v.lineId!);
+      let stats = operation.get(v.lineId!);
+      if (!stats) {
+        stats = { owner: v.line!.owner, opened: g.day, active: 0, waiting: 0, longest: 0, sustained: 0, waits: new Map() };
+        operation.set(v.lineId!, stats); firstCityDay ??= g.day;
+        console.log(`natural city opening: day ${g.day}, owner ${stats.owner}, line ${v.lineId}, town ${g.stations.get(v.line!.stops[0])?.townId}`);
+      }
+      stats.active += g.tickSeconds;
+      if (v.state !== 'waiting') { stats.waits.delete(v.id); continue; }
+      const ticks = (stats.waits.get(v.id) ?? 0) + 1, seconds = ticks * g.tickSeconds;
+      stats.waits.set(v.id, ticks); stats.waiting += g.tickSeconds; stats.longest = Math.max(stats.longest, seconds);
+      if (seconds >= 120 && (ticks - 1) * g.tickSeconds < 120) stats.sustained++;
     }
+    for (const [line, stats] of operation) for (const id of stats.waits.keys()) if (live.get(id) !== line) stats.waits.delete(id);
     if (saved && process.argv.includes('--replay-only')) break;
   }
-  console.log(JSON.stringify({ seed: 23, size: 768, years: g.day / 360, cityOwner: 2, cityLine: retainedCity, town: g.stations.get(g.lines.get(retainedCity ?? -1)?.stops[0] ?? -1)?.townId, active, waiting, longest, sustained, batches, purchaseMs, pricedUnits }));
+  const stats = operation.get(retainedCity ?? -1), { active = 0, waiting = 0, longest = 0, sustained = 0 } = stats ?? {};
+  console.log(JSON.stringify({ seed: 23, size: 768, years: g.day / 360, firstCityDay, cityOwner: stats?.owner, cityLine: retainedCity, town: g.stations.get(g.lines.get(retainedCity ?? -1)?.stops[0] ?? -1)?.townId, active, waiting, longest, sustained, batches, purchaseMs, pricedUnits,
+    cities: [...operation].map(([line, { waits: _waits, ...data }]) => ({ line, ...data })) }));
   if (!process.argv.includes('--replay-only')) {
     check(active > 10_000, 'natural retained city service stays in operation');
     const retained = g.lines.get(retainedCity ?? -1);
     check(cityService(retained) && !!retained?.vehicles.length && g.vehicles.trains().some(t => t.lineId === retainedCity && t.onMap),
-      'natural retained city service still has a live operating train at year nine');
+      'natural retained city service still has a live operating train at the end of the observation window');
     check(sustained === 0 && longest < 120, 'natural fleet investment cannot overcrowd the retained city route into sustained holds');
   }
   check(!!saved && saved.line === retainedCity, 'natural survey exercises a saved fleet-only growth decision on the retained city service');
