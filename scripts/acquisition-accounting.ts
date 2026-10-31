@@ -9,7 +9,10 @@ import type { Vehicle } from '../src/game/vehicle';
 import { serialize, deserialize } from '../src/game/save';
 import { settleMail, stationMail } from '../src/game/mail';
 import { mailFare, simNow } from '../src/game/fares';
-import { placeAndConnect, depotBehind } from './lib';
+import { RoadVehicle, roadDepotReaches } from '../src/game/roadvehicle';
+import { nativeRoadItinerary } from '../src/game/road-physics';
+import { readWalkingCatchment } from '../src/game/catchment';
+import { addBusStop, roadDepotNear } from './lib';
 
 const stock = [MODEL_BY_ID.get('diesel_b')!, MODEL_BY_ID.get('coach_ic')!];
 const near = (actual: number, expected: number, label: string) => assert(Math.abs(actual - expected) < 1e-7, `${label}: ${actual} != ${expected}`);
@@ -70,15 +73,27 @@ const tests: [string, () => void][] = [
     near(g.companies[0].economy.current.trackFees, 0, 'no self fee');
   }],
   ['retired mail leg pays the final buyer across all fifteen acquisitions', () => {
-    const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 15 });
+    const g = Game.create({ size: 256, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980, aiCompanies: 15 });
     g.aiEnabled = false; g.aiAcquisitions = false; g.economy.money = 1e9;
-    const pr = placeAndConnect(g, 80, 160, 0, new Set(), 1, () => {});
-    assert(pr);
-    const depot = depotBehind(g, pr.A, pr.B, 0), line = g.lines.create('rail', 0);
-    line.stops = [pr.A.id, pr.B.id];
-    assert(g.vehicles.buyTrain(depot, [stock[0], MODEL_BY_ID.get('van_ic')!], line.id));
-    g.lines.rebuild();
-    assert(g.mail.accepts(pr.B), 'actual mail service accepts at destination');
+    // Settlement is mode-independent. A surveyed flat street with native stops/depot and walking residents
+    // establishes acceptance directly, without depending on an unrelated hilly rail/throat search.
+    g.world.h.fill(4); g.world.heightsVersion++;
+    const net = g.world.net, a = net.addNode('road', 20, 4, 60, 0, 0, -1), b = net.addNode('road', 220, 4, 60, 0, 0, -1);
+    net.addEdge('road', a.id, b.id, bezLine(20, 60, 220, 60), new Float32Array(201).fill(4), [], 'street', -1);
+    const homes = [60, 180].map(x => g.world.addBuilding({ townId: -1, x, z: 59.6, angle: 0, w: 0.8, d: 0.8,
+      type: 0, floors: 2, pop: 1000, seed: 1, y: 4, built: 0 }));
+    const ids = [60, 180].map(x => addBusStop(g, x, 60, 0)), depot = roadDepotNear(g, 100, 60, 0);
+    assert(ids.every(id => id >= 0) && ids[0] !== ids[1], 'native mail stops build separately');
+    assert(depot >= 0, 'native mail depot builds');
+    const line = g.lines.create('road', 0); line.stops = ids;
+    const truck = g.vehicles.buyRoad(depot, MODEL_BY_ID.get('mailtruck_b')!, line.id);
+    assert(truck instanceof RoadVehicle, `native mail truck purchase: ${typeof truck === 'string' ? truck : 'vehicle'}`);
+    g.flushNetworkChanges(); g.lines.flushCatchment();
+    const pr = { A: g.stations.get(ids[0])!, B: g.stations.get(ids[1])! };
+    assert([pr.A, pr.B].every((st, i) => readWalkingCatchment(g, st).buildings.has(homes[i].id)), 'residents reach each served stop by native walking paths');
+    assert(ids.every(id => roadDepotReaches(g, g.depots.get(depot)!, id)), 'native depot reaches both mail stops');
+    assert.equal(nativeRoadItinerary(g, line)?.stops.length, 2, 'native service completes both directed mail calls');
+    assert(g.mail.accepts(pr.A) && g.mail.accepts(pr.B), 'actual mail service accepts at both resident destinations');
     for (let target = 1; target < 15; target++) merge(g, target + 1, target);
     merge(g, 0, 15);
     const saved = serialize(g), loaded = deserialize(saved);
@@ -95,6 +110,8 @@ const tests: [string, () => void][] = [
       near(stationMail(h, destination).arrivedMonth - deliveries, count, 'delivered units conserved');
     }
     assert.equal(JSON.stringify(serialize(loaded)), JSON.stringify(serialize(g)));
+    for (let tick = 0; tick < 64; tick++) { g.stepTick(); loaded.stepTick(); }
+    assert.equal(JSON.stringify(serialize(loaded)), JSON.stringify(serialize(g)), 'native service replays exactly after acquired-leg settlement');
   }],
 ];
 for (const [label, run] of tests) {
