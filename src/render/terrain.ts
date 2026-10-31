@@ -860,8 +860,10 @@ export class TerrainView {
     this.heightTex.dispose();
     this.waterMat.dispose();
     this.material.dispose();
+    this.depthMat.dispose();
     (this.base.material as THREE.Material).dispose();
     if (this.skirt) (this.skirt.material as THREE.Material).dispose();
+    if (this.waterSides) (this.waterSides.material as THREE.Material).dispose();
   }
 }
 
