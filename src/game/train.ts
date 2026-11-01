@@ -1512,7 +1512,8 @@ export function deadlockCycles(g: Game, minWait = 20): Train[][] {
 function recoverCycles(g: Game, cycles: Train[][]): boolean {
   let any = false;
   for (const cyc of cycles) {
-    const order = [...cyc].sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id);
+    // The shorter waiter yields so the longest-blocked service retains right of way.
+    const order = [...cyc].sort((a, b) => a.stuckTime - b.stuckTime || a.id - b.id);
     const queued = new Set(order.map(t => t.id));
     for (let i = 0; i < order.length; i++) {
       const t = order[i], blockers = new Set<number>();
@@ -1596,8 +1597,9 @@ function scanDeadlocks(g: Game, minWait: number, budget: number): boolean {
     if (!s.recovery) {
       const ids = s.groups.pop();
       if (!ids) { g.deadlockScan = null; return false; }
+      // Match synchronous recovery: moving aside must not penalize the longest waiter.
       const order = ids.map(id => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train)
-        .sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id).map(t => t.id);
+        .sort((a, b) => a.stuckTime - b.stuckTime || a.id - b.id).map(t => t.id);
       s.recovery = { cycle: ids, order, next: 0 };
     }
     const recovery = s.recovery, cycle = recovery.cycle.map(id => g.vehicles.get(id))
