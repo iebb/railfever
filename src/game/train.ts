@@ -353,10 +353,13 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     const n = net.nodes.get(d > 0 ? e.b : e.a)!;
     return Math.hypot(n.x - tx, n.z - tz) * 0.98;
   };
-  const cost = (e: NEdge, d: number) => {
+  const cost = (e: NEdge, d: number, previousOwner = 0) => {
     let c = e.len;
-    const r = V.getRes(e.id);
-    if (!ignoreOccupancy && r && r !== selfId) c += 40;
+    if (!ignoreOccupancy) {
+      const r = V.getRes(e.id);
+      // One obstruction per contiguous held stretch: degree-two track splits do not add trains or waiting.
+      if (r && r !== selfId && r !== previousOwner) c += 40;
+    }
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
@@ -395,7 +398,7 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
       return { conts, cost: NG[i] };
     }
     if (++n > maxExpand) break;
-    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge, c.dir), i);
+    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge, c.dir, ignoreOccupancy ? 0 : V.getRes(e.id)), i);
   }
   return null;
 }

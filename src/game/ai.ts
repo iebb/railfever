@@ -229,7 +229,7 @@ export function openingRailCall(g: Game, t: Pick<Train, 'line' | 'depotId' | 'ow
 // At eight units/day this leaves six days of the 60-day planning target for choosing a project.
 const AI_RAIL_PLAN_UNITS = 432;
 /**
- * Work units a city railway may spend planning (surveys, construction-site sweeps and their retries) before it is
+ * Planning steps a city railway may spend (site-offset groups, construction sweeps and their retries) before it is
  * approved or given up. Counted on the project (Project.planned), so a reload resumes the same count.
  */
 const URBAN_PLAN_UNITS = 720;
@@ -5057,7 +5057,10 @@ export class AIController {
     const p = this.project!, work = this.urbanWork(T, mode, maxStops);
     try {
       while (!work.next().done) {
-        if (!p.built) p.planned = (p.planned ?? 0) + 1;
+        // A site's fixed offsets still cost the original single planning unit. Their intermediate
+        // CPU slices yield separately; the fifth refusal and the following fallback are separate units.
+        const partialSite = this.urbanSurvey && this.urbanSurvey.offset > 0 && this.urbanSurvey.offset < 5;
+        if (!p.built) p.planned = (p.planned ?? 0) + (partialSite ? 0 : 1);
         yield;
       }
     } finally { work.return(undefined); }

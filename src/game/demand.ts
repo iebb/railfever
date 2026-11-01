@@ -177,6 +177,10 @@ const tally = (stops: number): Tally => ({ boardings: 0, revenue: 0, legLoads: n
  * trunk legs are the rest. `addSets` takes a part of the totals whose city share is `city` (0..1).
  */
 interface SetTallies { city: Tally; cityTown: Tally; access: Tally }
+/** Uncaptured journeys share the useful queue of their actual boarding facility, across OD and demand sets. */
+interface ForecastRide {
+  from: number; to: number; passengers: number; fare: (count: number) => number; city: number; sameTown: boolean; connecting: boolean;
+}
 const setTallies = (stops: number): SetTallies => ({ city: tally(stops), cityTown: tally(stops), access: tally(stops) });
 function addTally(t: Tally, stops: number, from: number, to: number, passengers: number, revenue: number) {
   t.boardings += passengers; t.revenue += revenue; addLegLoad(t.legLoads, stops, from, to, passengers);
@@ -747,7 +751,14 @@ export class DemandModel {
 
   /** Frequency variants share only ordered, eligible lot geometry. Quality-dependent weights and every sum
    * remain in the claim pass below. Publish a complete preparation only; nested/failed reads own their work. */
-  private prepareFeederClaims(sites: FeederSite[], covered: Set<number>): FeederClaimGeometry {
+  private prepareFeederClaims(sites: FeederSite[], covered: Set<number>): FeederClaimGeometry | null {
+    // Non-retained queries use the original single claim pass, without allocating prepared rows or lots.
+    if (sites.length > 256 || covered.size > 8192) return null;
+    let signatureSize = 0;
+    for (const s of sites) {
+      signatureSize += 4 + 2 * (s.access?.length ?? 0);
+      if (signatureSize > 4096) return null;
+    }
     const w = this.g.world, stamp = `${this.version}:${this.g.tick}:${this.feederGeometryKey()}:${w.lotVersions.version}`;
     let memo = feederClaimGeometry.get(this);
     if (!memo || memo.stamp !== stamp || memo.regionOf !== this.regionOf || memo.siteWalk !== this.feederSiteWalk) {
@@ -793,8 +804,9 @@ export class DemandModel {
    * are excluded: those residents already enter through routed feeder transfers. A local-only bus does not
    * supply a railway it cannot reach. Competing main-line stations share every lot once. */
   private claimFeederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
-    const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
     const geometry = this.prepareFeederClaims(sites, covered);
+    if (!geometry) return this.claimUnpreparedFeederPools(sites, covered);
+    const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
     // Each lot has a numeric claim index, avoiding a claim object per lot on every forecast. Parallel arrays
     // retain first-claim insertion order and the linked site order, including the original floating-point sums.
     const buffers = feederClaims.get(this) ?? { bids: [], sums: [], qualities: [], first: [], last: [], indices: [], weights: [], next: [], claimById: new Uint32Array(256) };
@@ -836,6 +848,61 @@ export class DemandModel {
       const bid = bids[claim];
       if (bid >= 0 && bid < claimById.length && Number.isInteger(bid)) claimById[bid] = 0;
       const { building: b, region: r } = geometry.lots.get(bid)!; if (r < 0) continue;
+      for (let k = first[claim]; k >= 0; k = next[k]) {
+        const pop = b.pop * MAINLINE_FEEDERS.share * qualities[claim] * weights[k] / sums[claim], pool = result[indices[k]];
+        pool.pop += pop; pool.regions.set(r, (pool.regions.get(r) ?? 0) + pop);
+      }
+    }
+    // Retain ordinary query buffers only; a large UI query cannot pin unbounded scratch in the game.
+    if (next.length <= 16384 && bids.length <= 8192) feederClaims.set(this, buffers);
+    return result;
+  }
+
+  /** Original ordered numeric claim pass for queries too large to retain; no prepared row/lot allocation. */
+  private claimUnpreparedFeederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
+    const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
+    // Each lot has a numeric claim index, avoiding a claim object per lot on every forecast. Parallel arrays
+    // retain first-claim insertion order and the linked site order, including the original floating-point sums.
+    const buffers = feederClaims.get(this) ?? { bids: [], sums: [], qualities: [], first: [], last: [], indices: [], weights: [], next: [], claimById: new Uint32Array(256) };
+    // A nested read gets independent scratch; an exception simply discards this disposable buffer.
+    feederClaims.delete(this);
+    // Native lot ids are dense. Bound the lookup table, and keep sparse or non-integer legacy ids in a Map.
+    // Zero means unclaimed; touched entries are cleared before scratch can be reused, without an aging stamp.
+    const limit = this.g.world.nextBuildingId <= 65536 ? this.g.world.nextBuildingId : 0;
+    if (limit > buffers.claimById.length) {
+      let size = buffers.claimById.length;
+      while (size < limit) size *= 2;
+      buffers.claimById = new Uint32Array(size);
+    }
+    const { bids, sums, qualities, first, last, indices, weights, next } = buffers;
+    const claimById = buffers.claimById;
+    let sparse: Map<number, number> | undefined;
+    let claimCount = 0, rowCount = 0;
+    sites.forEach((s, i) => {
+      if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500) return;
+      const buildings = this.feederSiteWalk(s);
+      for (const [bid, distance] of buildings) {
+        const b = this.g.world.buildings.get(bid);
+        if (!b || b.townId !== s.townId || covered.has(bid)) continue;
+        const dense = bid >= 0 && bid < claimById.length && Number.isInteger(bid);
+        const claim = dense ? claimById[bid] - 1 : sparse?.get(bid) ?? -1;
+        const k = rowCount++, weight = s.quality / (1 + distance / 30);
+        indices[k] = i; weights[k] = weight; next[k] = -1;
+        if (claim >= 0) {
+          sums[claim] += weight; qualities[claim] = Math.max(qualities[claim], s.quality);
+          next[last[claim]] = k; last[claim] = k;
+        } else {
+          const c = claimCount++;
+          if (dense) claimById[bid] = c + 1;
+          else (sparse ??= new Map()).set(bid, c);
+          bids[c] = bid; sums[c] = weight; qualities[c] = s.quality; first[c] = k; last[c] = k;
+        }
+      }
+    });
+    for (let claim = 0; claim < claimCount; claim++) {
+      const bid = bids[claim];
+      if (bid >= 0 && bid < claimById.length && Number.isInteger(bid)) claimById[bid] = 0;
+      const b = this.g.world.buildings.get(bid)!, r = this.regionOf(b); if (r < 0) continue;
       for (let k = first[claim]; k >= 0; k = next[k]) {
         const pop = b.pop * MAINLINE_FEEDERS.share * qualities[claim] * weights[k] / sums[claim], pool = result[indices[k]];
         pool.pop += pop; pool.regions.set(r, (pool.regions.get(r) ?? 0) + pop);
@@ -1185,7 +1252,9 @@ export class DemandModel {
     let boardings = 0, revenue = 0, transfers = 0;
     const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
     // the city trips and the inter-city access legs among them (the inter-city trips: the totals less the city trips)
-    const sets = setTallies(sites.length), towns = this.regionTown;
+    let sets = setTallies(sites.length);
+    const towns = this.regionTown;
+    const joint: ForecastRide[] | null = fareMode === 'rail' && city && context && replacingPattern === undefined ? [] : null;
     for (let i = 0; i < sites.length; i++) {
       const s = sites[i]; if (!s.pop) continue;
       // Trips as generationPopulation counts them: walkers at WALK_TRIP_INTENSITY, car feeders at the base rate.
@@ -1260,14 +1329,48 @@ export class DemandModel {
         const fare = fareFor(p.d, p.seconds, count, { mode: fareMode, centre: p.centre });
         revenue += fare;
         addSets(sets, sites.length, i, p.j, count, fare, shares[j], s.townId >= 0 && s.townId === sites[p.j].townId);
+        if (joint) joint.push({ from: i, to: p.j, passengers: wanted[j],
+          fare: count => fareFor(p.d, p.seconds, count, { mode: fareMode, centre: p.centre }),
+          city: shares[j], sameTown: s.townId >= 0 && s.townId === sites[p.j].townId, connecting: false });
       }
     }
     let connected: SetTallies | null = null;
-    if (fareMode !== 'rail') { /* road services: direct riders only */ } else if (city) {
-      const connecting = this.forecastTransfers(points, sites, kmh, headway, _style, owner, replacingLine);
-      transfers = connecting.boardings; boardings += connecting.boardings; revenue += connecting.revenue;
-      connecting.legLoads.forEach((load, i) => { legLoads[i] += load; });
-      connected = connecting.sets;
+    if (fareMode !== 'rail') { /* road services: direct riders only */ } else if (city && replacingPattern === undefined) {
+      // Native public complexes and road/tram services can feed a city railway without a separate rail station.
+      // Use the same graph, actual paid leg and fare history as through-line connections.
+      const connecting = context ? this.forecastMainlineConnections(sites, walking, background, context, kmh, headway,
+        { rides: joint!, localTrips: true }) : this.forecastTransfers(points, sites, kmh, headway, _style, owner, replacingLine);
+      if (joint && connecting.boardings > 0) {
+        const wanted = new Map<number, number>();
+        for (const ride of joint) {
+          const id = identities[ride.from]; wanted.set(id, (wanted.get(id) ?? 0) + ride.passengers);
+        }
+        const capture = new Map<number, number>();
+        for (const [id, total] of wanted) {
+          const i = first.get(id)!, point = points[i], built = forecastStation(point);
+          const length = 'rail' in point ? point.rail?.length ?? 0 : 'length' in point ? point.length ?? PLATFORM_LENGTH.mainline : PLATFORM_LENGTH.mainline;
+          const tracks = 'rail' in point ? point.rail?.tracks ?? 0 : 'tracks' in point ? point.tracks ?? 2 : 2;
+          const surface = built?.stops.length ?? 0;
+          // Stations.trimWaiting's exact integer footprint ceiling, with the existing endpoint/interior call rate.
+          const legacy = 600 + tracks * length * 12 + surface * 150;
+          const queue = Math.max(0, Math.floor(Math.min(legacy, 300,
+            12 + walking[i].pop * .035 * WALK_TRIP_INTENSITY + tracks * length * .75 + surface * 4)));
+          const calls = rank[i] === 0 || rank[i] === ranks.length - 1 ? 1 : 2;
+          capture.set(id, Math.min(1, queue * (360 * DAY_SECONDS) / Math.max(1, headway) * calls / Math.max(1, total)));
+        }
+        boardings = revenue = transfers = 0; legLoads.fill(0); sets = setTallies(sites.length); connected = setTallies(sites.length);
+        for (const ride of joint) {
+          const count = ride.passengers * capture.get(identities[ride.from])!, fare = ride.fare(count);
+          boardings += count; revenue += fare; if (ride.connecting) transfers += count;
+          addLegLoad(legLoads, sites.length, ride.from, ride.to, count);
+          addSets(ride.connecting ? connected : sets, sites.length, ride.from, ride.to, count, fare, ride.city, ride.sameTown);
+        }
+      } else {
+        // No connecting journeys: retain the original direct-only arithmetic, including its floating-point order.
+        transfers = connecting.boardings; boardings += connecting.boardings; revenue += connecting.revenue;
+        connecting.legLoads.forEach((load, i) => { legLoads[i] += load; });
+        connected = connecting.sets;
+      }
     // A partial-pattern attractive set contains unmodified services too; its whole-line receipts
     // cannot all be assigned to the one pattern being requoted.
     } else if (context && replacingPattern === undefined) {
@@ -1367,7 +1470,8 @@ export class DemandModel {
     x: number; z: number; townId: number; pop: number; regions: Map<number, number>;
   }[], walking: { pop: number; regions: Map<number, number> }[], background: Map<number, {
     walking: Map<number, number>; regional: Map<number, number>;
-  }>, context: NonNullable<ReturnType<DemandModel['forecastRoutes']>>, kmh: number, headway: number
+  }>, context: NonNullable<ReturnType<DemandModel['forecastRoutes']>>, kmh: number, headway: number,
+    cityQuote?: { rides: ForecastRide[]; localTrips: boolean }
   ): { boardings: number; revenue: number; legLoads: number[]; sets: SetTallies } {
     const g = this.g, indices = new Map<number, number>(), n = this.regions.length, towns = this.regionTown;
     const sets = setTallies(sites.length);
@@ -1430,10 +1534,15 @@ export class DemandModel {
             return p && q ? distanceFare(Math.hypot(p.x - q.x, p.z - q.z)) : 0;
           }, context.sameComplex);
         if (!rides.length) continue;
-        const passengers = part.pop * TRIPS_PER_MONTH * 12 * ((part.x + part.xb) * part.f * capture
+        const localOD = (part.x + part.xb) * part.f * capture;
+        // As in weights(), the full-route urban quality boosts local OD, never long-distance trips whose
+        // regions happen to be covered by two station facilities in the same town.
+        const localFactor = cityQuote?.localTrips && part.local ? localTripMultiplier(g, origin, 'rail', part.f) : 1;
+        const localTrips = localOD * localFactor;
+        const passengers = part.pop * TRIPS_PER_MONTH * 12 * (localTrips
           + part.y * Math.max(0.3, Math.min(2, part.f))) * (part.local ? 1 : 1 + MAINLINE_FEEDER_SHARE);
         const share = part.xc === part.x && !(part.y > 0) ? cityShare(part.xc, part.x)
-          : cityShare(part.xc * part.f * capture, (part.x + part.xb) * part.f * capture + part.y * Math.max(0.3, Math.min(2, part.f)));
+          : cityShare(part.xc * part.f * capture * localFactor, localTrips + part.y * Math.max(0.3, Math.min(2, part.f)));
         for (const ride of rides) {
           const a = indices.get(ride.from), b = indices.get(ride.to); if (a === undefined || b === undefined) continue;
           const d = Math.hypot(sites[a].x - sites[b].x, sites[a].z - sites[b].z);
@@ -1444,6 +1553,11 @@ export class DemandModel {
             * Math.pow(TRANSFER_FARE_FACTOR, ride.changes);
           revenue += fare;
           addSets(sets, sites.length, a, b, passengers, fare, share, sites[a].townId >= 0 && sites[a].townId === sites[b].townId);
+          cityQuote?.rides.push({ from: a, to: b, passengers, city: share,
+            sameTown: sites[a].townId >= 0 && sites[a].townId === sites[b].townId, connecting: true,
+            fare: count => fareFor(d, seconds, count,
+              { mode: 'rail', centre: Math.min(urbanIntensity(g, sites[a]), urbanIntensity(g, sites[b])), railBefore: ride.railBefore })
+              * Math.pow(TRANSFER_FARE_FACTOR, ride.changes) });
         }
       }
     }

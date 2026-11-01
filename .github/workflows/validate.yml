@@ -45,6 +45,7 @@ jobs:
             ${{ runner.temp }}/railfever-gate/**/*.log
             ${{ runner.temp }}/railfever-gate/**/*.res
             ${{ runner.temp }}/railfever-gate/**/*.json
+            !${{ runner.temp }}/railfever-gate/**/node_modules/**
           if-no-files-found: ignore
           retention-days: 7
   gate:

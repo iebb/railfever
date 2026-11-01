@@ -43,8 +43,10 @@ console.log(`  opens/runs day${g.day}; ${line?.vehicles.length??0} actual trains
 // Stale ownership/removed-interchange hints use the same ordinary full survey, before any spend.
 {
  const h=deserialize(JSON.parse(selected)),b:any=h.ais[0],p=b.project;
+ // A chooser can finish just before midnight; allow one complete fixed-step day for its next work slot.
+ const deadline=h.tick+h.ticksPerDay;
  p.urbanLayout.interchanges=[Number.MAX_SAFE_INTEGER];h.stepTick();
- while(h.day<at+1&&!b.urbanSurvey)h.stepTick();
+ while(h.tick<deadline&&!b.urbanSurvey)h.stepTick();
  check(!!b.urbanSurvey&&!b.urbanTask&&p.stations.length===0,'missing native interchange rejects stale hint and starts full saved survey');
  const hh={...hint,interchanges:[...g.stations.map.values()].find(s=>!!s.rail)?.id===undefined?[]:[...g.stations.map.values()].filter(s=>!!s.rail).slice(0,1).map(s=>s.id)};
  const st=hh.interchanges.length?g.stations.get(hh.interchanges[0]):undefined;

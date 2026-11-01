@@ -1,4 +1,4 @@
-// Failed native urban station attempts consume separate deterministic work units and resume at the next offset.
+// Failed native urban station attempts yield separately, retaining their original site-group budget and saved offset.
 // Bundle as ai-slicing.mjs. This fixture uses the actual five road-support refusals behind seed23's day94 spike.
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
@@ -32,26 +32,26 @@ function observe(game: Game) {
   };
   return calls;
 }
-// One generator.next is exactly one native project work unit (AIController.work uses the same boundary).
+// One generator.next is one scheduler slice; the planning allowance charges complete fixed site groups.
 function unit(game: Game) { const a = game.ais[0] as any; check(!a.job.next().done, 'the pending urban job yields after its bounded work unit'); }
 const calls = observe(g);
 for (let at = 1; at <= 2; at++) {
   const n = calls.length; unit(g);
-  check(calls.length === n + 1 && ai.urbanSurvey.offset === at && ai.urbanSurvey.site === 0 && ai.project.planned === at,
-    `failed site offset${at} uses one native quote and saves the exact next offset/work count`);
+  check(calls.length === n + 1 && ai.urbanSurvey.offset === at && ai.urbanSurvey.site === 0 && ai.project.planned === 0,
+    `failed site offset${at} uses one native quote and retains the pending original site-work group`);
 }
 const mid = saved(g), cold = deserialize(JSON.parse(mid)), ca = cold.ais[0] as any, coldCalls = observe(cold);
 check(saved(cold) === mid && ca.urbanSurvey.offset === 2, 'a real mid-offset native job save reloads exactly without restarting its search');
 for (let at = 3; at <= 5; at++) {
   const n = calls.length, cn = coldCalls.length; unit(g); unit(cold);
-  check(calls.length === n + 1 && coldCalls.length === cn + 1 && ai.urbanSurvey.offset === at && ca.urbanSurvey.offset === at,
-    `warm/cold offset${at} each executes only the next original native site`);
+  check(calls.length === n + 1 && coldCalls.length === cn + 1 && ai.urbanSurvey.offset === at && ca.urbanSurvey.offset === at && ai.project.planned === +(at === 5) && ca.project.planned === +(at === 5),
+    `warm/cold offset${at} each executes only the next native site without charging partial offsets as extra planning units`);
   check(saved(g) === saved(cold), `native job state, RNG, cash and cursor continue exactly after offset${at}`);
 }
 check(calls.every((p, i) => p.x === x + Math.sin(angle) * offsets[i] && p.z === z + Math.cos(angle) * offsets[i]
   && !p.ok && p.error === quotes[i].error), 'all five native offsets, their original order and physical refusals are retained');
 const n = calls.length; unit(g); unit(cold);
-check(calls.length === n && ai.urbanSurvey.site === 1 && ai.urbanSurvey.offset === 0 && ai.urbanSurvey.sites.length === 1,
+check(calls.length === n && ai.urbanSurvey.site === 1 && ai.urbanSurvey.offset === 0 && ai.urbanSurvey.sites.length === 1 && ai.project.planned === 2,
   'after all five refusals the original local forecast-site fallback consumes its own unit without an extra native attempt');
 check(saved(g) === saved(cold) && ai.eco.money === initialCash && ai.eco.loan === initialLoan,
   'warm/cold fallback preserves exact state and survey work spends no cash or credit');

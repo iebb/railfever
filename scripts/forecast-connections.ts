@@ -53,7 +53,7 @@ const fixture = (kind: Kind, count = 8, reverse = false) => {
   demand.regions = [0, 1].map(id => ({ id, town: id, kind: 'town', x: id * 80, z: 0, r: 30,
     pop: 600, jobs: 200, produced: 1, attracted: 1 }));
   demand.od = new Float32Array([.7, .3, .4, .6]); demand.ld = new Float32Array([0, .03, .02, 0]);
-  const context = { ids, edges, proposed, sameComplex: () => false };
+  const context = { ids, edges, proposed, tables: new Map(), sameComplex: () => false };
   return { work, demand, args: [sites, walking, background, context, 80, 120], origins: count + sites.length };
 };
 const run = (fn: typeof candidate, kind: Kind, count: number, reverse: boolean) => {

@@ -10,6 +10,7 @@ import type { Vehicle as StartupVehicle } from '../src/game/vehicle';
 // Initialise pattern/routing helpers before Game's vehicle classes (which also consume patterns).
 import '../src/game/patterns';
 import { Game } from '../src/game/game';
+import { DAY_SECONDS } from '../src/game/constants';
 import type { NEdge } from '../src/game/network';
 import { railModeOf, railPartMode, planStationUpgrade, commitStationUpgrade, CATCHMENT_RADIUS } from '../src/game/stations';
 import { networkProfile, networkOptions, NETWORK_WORK_UNITS, networkDaily, saveNetwork, loadNetwork, midLineCrossovers, subsetLinePairs, networkPlanner, runNetworkTask, routeBetween, roadRouteBetween } from '../src/game/ai-network';
@@ -516,9 +517,27 @@ function joinComplexChecks() {
     'join complex: the through service and both former services are patterns of the one line');
   startFleet(g, l ? l.vehicles.map((id) => g.vehicles.get(id)!) : []);
   const visited = new Map((l?.vehicles ?? []).map((id) => [id, new Set<number>()]));
-  for (const until = g.day + 200; g.day < until;) { g.stepTick(); for (const [id, s] of visited) s.add(g.vehicles.get(id)!.opLastSt); }
+  // Startup can finish at either interior platform group. The native through timetable can take longer
+  // than 200 days for a complete cycle; fix the completion exposure before observing any arrivals.
+  const operatingTicks = Math.max(Math.ceil(200 * DAY_SECONDS / g.tickSeconds),
+    Math.ceil(Math.max(0, ...startupTable(g, l!).pats.map(p => p.cycle)) / g.tickSeconds));
+  const endTick = g.tick + operatingTicks, originalEnd = g.day + 200;
+  const replay = deserialize(serialize(g)); let exact = true, safe = true;
+  const observe = () => {
+    g.stepTick(); replay.stepTick();
+    if (g.tick % g.ticksPerDay === 0) {
+      exact &&= JSON.stringify(serialize(g)) === JSON.stringify(serialize(replay));
+      safe &&= netReservations(g).length === 0 && netReservations(replay).length === 0;
+    }
+    for (const [id, seen] of visited) seen.add(g.vehicles.get(id)!.opLastSt);
+  };
+  while (g.day < originalEnd) observe();
+  check([...visited.values()].every(seen => seen.has(H1.id) && seen.has(H2.id)) && safe,
+    'join complex: every train operates through both platform groups safely during the original 200 days');
+  while (g.tick < endTick) observe();
   check([...visited].filter(([id]) => g.vehicles.get(id)?.owner === me).every(([, s]) => s.has(A.id) && s.has(B.id)), 'join complex: our trains run through both platform groups to both ends');
-  check(netReservations(g).length === 0, 'join complex: reservations remain consistent');
+  check(safe && netReservations(g).length === 0, 'join complex: reservations remain consistent');
+  check(exact && JSON.stringify(serialize(g)) === JSON.stringify(serialize(replay)), 'join complex: full native operating window replays exactly');
 }
 
 /** Pic 1: a coach of ours that copies our railway stop to stop is wound down; one with stops of its own stays. */

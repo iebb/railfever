@@ -240,9 +240,13 @@ if (line && path) {
       const oldRail=[...copy.world.net.edges.values()].filter(e=>e.kind==='rail'&&!created.has(e.id)&&!b.stations.includes(e.station)).map(e=>e.id);
       const oldNodes=new Set(oldRail.flatMap(id=>{const e=copy.world.net.edges.get(id)!;return[e.a,e.b]}));
       const oldSignals=JSON.stringify([...oldNodes].map(id=>{const n=copy.world.net.nodes.get(id)!;return[id,n.signal,n.signalKind,n.signalPass]}));
-      // Another investment consumes the funds after the saved quote, leaving enough for one native elevated
-      // crossover but not its partner. The fin must refund it, remove its new splits, and retain the old service.
-      copy.company(ai.companyId).economy.spend(Math.max(0,copy.company(ai.companyId).economy.money-300000),'construction',true);
+      // Another investment consumes cash AND the remaining credit after the saved quote. Native finishing
+      // can restore cash reclaimed by loan repayments; unused borrowing must not masquerade as lost funding.
+      const economy = copy.company(ai.companyId).economy;
+      while (economy.borrow()) { /* Exhaust real loan steps before the competing investment spends them. */ }
+      economy.spend(Math.max(0,economy.money-300000),'construction',true);
+      check(economy.money===300000 && economy.loan+economy.loanStep>economy.maxLoan && copy.ais[0].available()<0,
+        'competing investment truly exhausts cash and native credit before extension finishing');
       failedFinishRecovery={g:copy,oldRail,oldSignals,paid:b.spent,construction:copy.company(ai.companyId).economy.thisYear.construction,day:copy.day};
     }
     if (g.tick % g.ticksPerDay === 0 && networkPlanner(ai)?.task === 'extend' && (growthRuns.length < 6 || partial && !constructionSave)) {
@@ -287,17 +291,19 @@ if (line && path) {
   check(checkReservations(g).length===0,'extended trunk reservations remain consistent');
   if(failedFinishRecovery) {
     const f=failedFinishRecovery,h=f.g,controller=h.ais[0];
-    while(h.day<f.day+20&&!controller.log.some(s=>s.includes('incomplete directional extension')))h.stepTick();
+    while(h.day<f.day+20&&!controller.log.some(s=>s.includes('remaining works are no longer affordable')))h.stepTick();
     h.aiEnabled=false;
     const retained=[...h.world.net.edges.values()].filter(e=>e.kind==='rail').map(e=>e.id),oldNodes=new Set(f.oldRail.flatMap(id=>{const e=h.world.net.edges.get(id);return e?[e.a,e.b]:[]}));
     const signals=JSON.stringify([...oldNodes].map(id=>{const n=h.world.net.nodes.get(id)!;return[id,n.signal,n.signalKind,n.signalPass]}));
     const refund=h.company(ai.companyId).economy.thisYear.construction-f.construction;
     console.log('failed directional recovery',JSON.stringify({notes:controller.log.slice(-2),oldEdges:f.oldRail.length,retained:retained.length,refund,paid:f.paid}));
-    check(controller.log.some(s=>s.includes('incomplete directional extension'))&&linearStops(h.lines.get(line.id)!.stops)?.length===3,
+    check(controller.log.some(s=>s.includes('remaining works are no longer affordable'))&&linearStops(h.lines.get(line.id)!.stops)?.length===3,
       'loss of funds between stages rejects incomplete directional construction and retains the old stopping route');
     check(retained.length===f.oldRail.length&&retained.every(id=>f.oldRail.includes(id))&&signals===f.oldSignals,
       'failed finish removes every new fragment/crossover and preserves old track directions and depot access');
     check(refund>0&&refund<=f.paid,'rollback refunds only the removed paid draft once');
+    h.stepTick();
+    check(h.company(ai.companyId).economy.thisYear.construction-f.construction===refund, 'the next native tick cannot refund an abandoned draft twice');
     check(checkReservations(h).length===0,'failed-direction recovery retains valid old-service reservations');
   } else check(false,'actual final-construction stage was sampled for failed-direction recovery');
   let cycles=0,arrivals=0,maxWait=0;const states=new Map<number,string>();
