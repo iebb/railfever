@@ -7,7 +7,7 @@ import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { pickCoach, pickBus, type AIController } from '../src/game/ai';
 import {
-  roadForecast, roadPath, roadDriving, roadScore, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townRoutes, townsOnTheWay, planTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownCandidates, planTownLine, planExtensions, routeOf, worth, pays,
+  roadForecast, roadPath, roadDriving, roadScore, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townRoutes, townsOnTheWay, planTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownCandidates, planTownLine, planExtensions, routeOf, worth, pays, lineEconomics,
   type BusHost, type RoadPlan, type ProjectOption,
 } from '../src/game/ai-bus';
 import type { Town } from '../src/game/towns';
@@ -297,7 +297,14 @@ function run() {
     check(!!plan, `a town line for ${T.name}`);
     if (plan) {
       // a short start: its first stops only, then the extensions compete with a new line
-      const short: RoadPlan = { ...plan, sites: plan.sites.slice(0, 3), loop: false, vehicles: 2, revenue: Infinity };
+      // Changing the quoted stops and fleet changes both receipts and costs. Price that actual short
+      // service; retaining the full line's yearly cost would reject a lawful two-bus start.
+      const sites = plan.sites.slice(0, 3), vehicles = 2;
+      const forecast = drain(roadForecast(g, A.companyId, sites, { model: bus, vehicles, loop: false, purpose: 'city' }));
+      const economics = lineEconomics(g, A.companyId, forecast, sites, bus, vehicles);
+      check(Number.isFinite(economics.revenue) && pays(economics), 'the native three-stop, two-bus start pays its actual construction and operating costs');
+      const short: RoadPlan = { ...plan, sites, loop: false, vehicles, ...economics,
+        why: `short start in ${T.name}: ${Math.round(economics.revenue / 1000)}k/year against ${Math.round(economics.yearly / 1000)}k` };
       console.log('  ' + build(A, short));
       LT = [...g.lines.map.values()].find((l) => l.owner === A.companyId && l.kind === 'road' && townsOf(g, l).length === 1 && townsOf(g, l)[0] === T.id);
       check(!!LT, `A runs a town line in ${T.name}`);

@@ -1228,7 +1228,7 @@ const far = (a: { x: number; z: number }, list: { x: number; z: number }[], d = 
 function fleetFor(cycle: number, headway: number, max = 5): number { return Math.max(2, Math.min(max, Math.round(cycle / headway))); }
 
 /** The yearly figures of a new line: receipts, running and upkeep, and the outlay (stops, depot, vehicles). */
-function lineEconomics(g: Game, owner: number, f: RoadForecast, sites: RoadSite[], model: VehicleModel, vehicles: number) {
+export function lineEconomics(g: Game, owner: number, f: RoadForecast, sites: RoadSite[], model: VehicleModel, vehicles: number) {
   // stops to build: every site without a stop of its station (an own rail station gets one; a shared stop costs none)
   const newStops = sites.filter((s) => !s.station || !s.station.stops.length).length;
   const running = vehicles * runningCost(g, model, f.hop);
