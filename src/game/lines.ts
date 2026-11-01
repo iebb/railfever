@@ -1109,6 +1109,10 @@ export class Lines {
   static restore(d: any): Line {
     const l: Line = { ...d, stops: [...(d.stops ?? [])], vehicles: [...(d.vehicles ?? [])] };
     if (d.mail) l.mail = { ...d.mail };
+    // Native in-memory loads must not publish their observations or work edits into the source game.
+    if (d.capacity) l.capacity = { ...d.capacity,
+      ...(d.capacity.demand ? { demand: { ...d.capacity.demand } } : {}),
+      ...(d.capacity.works ? { works: { ...d.capacity.works, edges: [...d.capacity.works.edges] } } : {}) };
     if (d.growth) l.growth = Object.fromEntries(Object.entries(d.growth as Record<string, GrowthObservation>).map(([key, p]) => [key, { ...p }]));
     if (typeof l.num !== 'number') {
       const m = /(\d+)\s*$/.exec(String(l.name ?? ''));

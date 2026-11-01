@@ -69,6 +69,23 @@ check(JSON.stringify(marginalTrainInvestment(loaded, loadedLine, ai.companyId, o
 check(saved(loaded) === quoted, 'cold quote does not change an existing saved observation');
 marginalTrainInvestment(g, line, ai.companyId, old.madeUp, old.pattern);
 check(saved(g) === quoted, 'warm quote is a pure read');
+// An in-memory load must own its saved decision state, just like a JSON-loaded game. Native
+// monthly pricing in one fork must not publish a new demand observation into its source.
+const directFork = deserialize(serialize(g)), isolatedFork = cold(g);
+const directLine = directFork.lines.get(line.id)!, isolatedLine = isolatedFork.lines.get(line.id)!;
+check(!!line.capacity?.demand && directLine.capacity !== line.capacity
+  && directLine.capacity!.demand !== line.capacity.demand, 'in-memory restore owns capacity and its demand observation');
+let independent = true;
+for (let i = 0; i < 30 * g.ticksPerDay; i++) {
+  directFork.stepTick(); isolatedFork.stepTick();
+  independent &&= saved(directFork) === saved(isolatedFork) && saved(g) === quoted;
+}
+check(independent, 'in-memory fork has exact independently owned native monthly continuation');
+const directQuote = marginalTrainInvestment(directFork, directLine, ai.companyId, old.madeUp, old.pattern);
+const isolatedQuote = marginalTrainInvestment(isolatedFork, isolatedLine, ai.companyId, old.madeUp, old.pattern);
+check(JSON.stringify(directQuote) === JSON.stringify(isolatedQuote) && saved(directFork) === saved(isolatedFork)
+  && saved(g) === quoted && directLine.capacity!.demand!.month > line.capacity.demand.month,
+  'next-month native quote matches JSON isolation and leaves source full save unchanged');
 pending(g);
 const pendingSave = saved(g), twin = cold(g), n = g.vehicles.map.size, cash = g.company(ai.companyId).economy.money;
 check(saved(twin) === pendingSave, 'pending standalone cursor round-trips exactly');
