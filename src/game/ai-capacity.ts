@@ -30,7 +30,7 @@ export interface CapacityResource {
   id: number; kind: 'single' | 'block' | 'platform'; edges: number[]; owners: number[];
   length: number; available: number;
 }
-interface RouteInventory { resources: CapacityResource[]; edgeResource: Map<number, number>; routes: Map<number, number[][]> }
+interface RouteInventory { resources: CapacityResource[]; edgeResource: Map<number, number>; routes: Map<number, number[][]>; joinedBlocks: Set<number> }
 interface Channel {
   line: Line; owner: number; pattern: number; cars: VehicleModel[]; trains: Train[];
   cycle: number; seats: number; running: number; capital: number; budget: number; boardings: number;
@@ -53,15 +53,19 @@ const planMemo = new WeakMap<Game, Map<number, PlanEntry>>();
 const forecastMemo = new WeakMap<Game, { epoch: string; quotes: Map<string, { revenue: number; boardings: number; peak: number }> }>();
 const fleet = (g: Game, l: Line) => l.vehicles.map(id => g.vehicles.get(id)).filter((v): v is Train => v instanceof Train);
 
-/** Native queue capture and fares at this exact service frequency. The memo is disposable: no decision
- * depends on a previous call, and route, stock, access, walking inputs and fixed simulation time invalidate it. */
-function quoteEpoch(g: Game): string {
-  return `${g.day}:${g.tick}:${capacityTopologyKey(g)}:${g.lines.version}:${g.demand.version}:`
+/** Scheduled forecasts read the day, geometry, demand and fleet, not live vehicle movement or queues.
+ * The auction below still invalidates every fixed tick and on its saved operating observations. */
+function forecastInputs(g: Game): string {
+  return `${capacityTopologyKey(g)}:${g.lines.version}:${g.demand.version}:`
     + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}:${g.stations.walkVersion}:`
     + g.companies.map(c => g.accessMultiplier(c.id)).join(',');
 }
+function forecastEpoch(g: Game): string { return `${g.day}:${forecastInputs(g)}`; }
+function quoteEpoch(g: Game): string {
+  return `${g.day}:${g.tick}:${forecastInputs(g)}`;
+}
 function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
-  const epoch = quoteEpoch(g);
+  const epoch = forecastEpoch(g);
   let memo = forecastMemo.get(g);
   if (!memo || memo.epoch !== epoch) { memo = { epoch, quotes: new Map() }; forecastMemo.set(g, memo); }
   const stock = fleet(g, c.line).map(t => `${t.id}/${t.pattern}/${t.cars.map(m => `${m.id},${m.capacity},${m.speed}`).join(';')}`).join('|');
@@ -90,6 +94,137 @@ function parallel(g: Game, e: NEdge): number[] {
   return out.sort((a, b) => a - b);
 }
 
+interface PlainChain {
+  steps: { edge: NEdge; dir: number }[]; cum: number[]; length: number;
+}
+
+/** A degree-two geometry vertex is not a signal. Join only complete, unambiguous parallel plain chains;
+ * staggered signals, switches, facilities and changes of owner/type retain the conservative edge inventory. */
+function plainBlockGroups(g: Game, twins: Map<number, number[]>): PlainChain[][] {
+  const net = g.world.net, chains: PlainChain[] = [], byEdge = new Map<number, number>();
+  const facilities = new Set(g.stations.all().flatMap(s => [...(s.rail?.edges ?? []), ...(s.rail?.throughEdges ?? [])]));
+  const plain = (e: NEdge) => e.kind === 'rail' && e.station < 0 && e.depot < 0 && !facilities.has(e.id);
+  const chainOf = (edgeId: number): number | undefined => {
+    const old = byEdge.get(edgeId); if (old !== undefined) return old;
+    const seed = net.edges.get(edgeId); if (!seed || !plain(seed)) return undefined;
+    const seen = new Set<number>([seed.id]);
+    const extend = (direction: number) => {
+      const steps: PlainChain['steps'] = []; let e = seed, dir = direction;
+      for (;;) {
+        const at = dir > 0 ? e.b : e.a, n = net.nodes.get(at);
+        if (!n || n.signal || n.edges.length !== 2) break;
+        const next = net.edges.get(n.edges.find(id => id !== e.id)!);
+        if (!next || !plain(next) || next.owner !== seed.owner || next.type !== seed.type || seen.has(next.id)) break;
+        seen.add(next.id); dir = next.a === at ? 1 : -1; e = next; steps.push({ edge: e, dir });
+      }
+      return steps;
+    };
+    const back = extend(-1), forward = extend(1);
+    const steps = [...back.reverse().map(s => ({ edge: s.edge, dir: -s.dir })), { edge: seed, dir: 1 }, ...forward];
+    const cum = [0]; for (const s of steps) cum.push(cum[cum.length - 1] + s.edge.len);
+    const c = { steps, cum, length: cum[cum.length - 1] }, id = chains.length;
+    chains.push(c); for (const s of steps) byEdge.set(s.edge.id, id); return id;
+  };
+  const point = (c: PlainChain, fraction: number) => {
+    const s = Math.max(0, Math.min(c.length, fraction * c.length)); let low = 0, high = c.steps.length - 1;
+    while (low < high) { const mid = (low + high) >>> 1; if (c.cum[mid + 1] < s) low = mid + 1; else high = mid; }
+    const i = low;
+    const step = c.steps[i], local = s - c.cum[i], p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+    net.pointAt(step.edge, step.dir > 0 ? local : step.edge.len - local, p, d);
+    const norm = Math.hypot(d.x, d.z) || 1;
+    return { ...p, dx: d.x * step.dir / norm, dz: d.z * step.dir / norm };
+  };
+  const ends = new Map<PlainChain, [ReturnType<typeof point>, ReturnType<typeof point>]>();
+  const endpoints = (c: PlainChain) => {
+    let p = ends.get(c); if (!p) { p = [point(c, 0), point(c, 1)]; ends.set(c, p); } return p;
+  };
+  const compatible = (p: ReturnType<typeof point>, q: ReturnType<typeof point>, reverse: boolean) => {
+    const dx = q.x - p.x, dz = q.z - p.z, distance = Math.hypot(dx, dz), sign = reverse ? -1 : 1;
+    return distance >= .2 && distance <= 2 * RAIL.spacing + .1 && Math.abs(p.y - q.y) < .3
+      && (p.dx * q.dx + p.dz * q.dz) * sign > .95 && Math.abs(dx * p.dx + dz * p.dz) <= .1;
+  };
+  const spanDirection = (a: PlainChain, b: PlainChain): boolean | null => {
+    if (a.steps[0].edge.owner !== b.steps[0].edge.owner || a.steps[0].edge.type !== b.steps[0].edge.type) return null;
+    const [a0, a1] = endpoints(a), [b0, b1] = endpoints(b);
+    const reverse = Math.hypot(a0.x - b1.x, a0.z - b1.z) < Math.hypot(a0.x - b0.x, a0.z - b0.z);
+    return compatible(a0, reverse ? b1 : b0, reverse) && compatible(a1, reverse ? b0 : b1, reverse) ? reverse : null;
+  };
+  // The native spatial query supplies candidate chains. Following its connected candidates also detects
+  // partially overlapping / staggered neighbours, which must not be silently dropped from a paired pool.
+  const canJoin = (id: number) => {
+    const e = net.edges.get(id); if (!e || !plain(e)) return false;
+    return [e.a, e.b].some(at => {
+      const n = net.nodes.get(at); if (!n || n.signal || n.edges.length !== 2) return false;
+      const other = net.edges.get(n.edges[0] === id ? n.edges[1] : n.edges[0]);
+      return !!other && plain(other) && other.owner === e.owner && other.type === e.type;
+    });
+  };
+  const relevant = [...new Set([...new Set([...twins.keys(), ...[...twins.values()].flat()])].filter(canJoin)
+    .map(chainOf).filter((id): id is number => id !== undefined))];
+  // Most real station approaches end at staggered signals or turnouts. Reject those from their existing
+  // twin candidates before traversing a component or allocating curve samples.
+  const neighbours = new Map<number, Set<number>>(), pending = relevant.filter(id => chains[id].steps.length > 1
+    && chains[id].steps.some(s => (twins.get(s.edge.id) ?? []).some(edge => {
+      const other = chainOf(edge); return other !== undefined && other !== id && spanDirection(chains[id], chains[other]) !== null;
+    })));
+  const candidates = new Map(twins);
+  for (let at = 0; at < pending.length; at++) {
+    const id = pending[at]; if (neighbours.has(id)) continue;
+    const near = new Set<number>(); neighbours.set(id, near);
+    for (const s of chains[id].steps) {
+      const e = s.edge, p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 };
+      net.pointAt(e, e.len / 2, p, d); const norm = Math.hypot(d.x, d.z) || 1;
+      let peers = candidates.get(e.id);
+      if (!peers) { peers = parallel(g, e); candidates.set(e.id, peers); }
+      for (const edge of peers) {
+        // Nearby serial pieces on the same alignment are not another lane.
+        const hit = net.nearestEdge(p.x, p.z, 2 * RAIL.spacing + .1, 'rail', o => o.id === edge);
+        if (!hit) continue;
+        const q = { x: 0, y: 0, z: 0 }; net.pointAt(hit.edge, hit.s, q);
+        if (Math.abs((q.x - p.x) * d.x + (q.z - p.z) * d.z) / norm > .1) continue;
+        const other = chainOf(edge); if (other === undefined || other === id) continue;
+        near.add(other);
+        if (!neighbours.has(other)) pending.push(other);
+      }
+    }
+  }
+  // Make the candidate relation symmetric even when one short edge's midpoint falls outside its neighbour.
+  for (const [id, near] of neighbours) for (const other of near) neighbours.get(other)!.add(id);
+  const matches = (a: PlainChain, b: PlainChain) => {
+    const reverse = spanDirection(a, b); if (reverse === null) return false;
+    // Check the whole native curves and height profiles, including every piece/profile boundary, rather
+    // than accepting two tracks merely because their endpoints or midpoints happen to be parallel.
+    const fractions = new Set<number>([0, 1]);
+    for (const [c, flip] of [[a, false], [b, reverse]] as const) {
+      for (let i = 0; i < c.steps.length; i++) {
+        const e = c.steps[i].edge, n = Math.max(1, Math.ceil(e.len), e.prof.length - 1);
+        // Large/ambiguous contexts keep the original conservative inventory rather than pinning a quote
+        // to unbounded geometry work. Default native signal blocks are only 50 units long.
+        if (n > 8192 || fractions.size + n > 8192) return false;
+        for (let j = 0; j <= n; j++) {
+          const f = (c.cum[i] + e.len * j / n) / c.length; fractions.add(flip ? 1 - f : f);
+        }
+      }
+    }
+    for (const f of fractions) {
+      if (!compatible(point(a, f), point(b, reverse ? 1 - f : f), reverse)) return false;
+    }
+    return true;
+  };
+  const visited = new Set<number>(), groups: PlainChain[][] = [];
+  for (const seed of neighbours.keys()) {
+    if (visited.has(seed)) continue;
+    const ids: number[] = [], queue = [seed]; visited.add(seed);
+    while (queue.length) {
+      const id = queue.pop()!; ids.push(id);
+      for (const other of neighbours.get(id)!) if (!visited.has(other)) { visited.add(other); queue.push(other); }
+    }
+    if (ids.length < 2 || ids.length > 8 || !ids.some(id => chains[id].steps.length > 1)) continue;
+    if (ids.every((id, i) => ids.slice(i + 1).every(other => matches(chains[id], chains[other])))) groups.push(ids.map(id => chains[id]));
+  }
+  return groups;
+}
+
 /** Resources are exclusive single-track stretches, directional blocks and connected platform tracks. */
 function inventory(g: Game): RouteInventory {
   const lines = [...g.lines.map.values()].filter(l => l.kind === 'rail' && l.stops.length >= 2).sort((a, b) => a.id - b.id);
@@ -112,9 +247,16 @@ function inventory(g: Game): RouteInventory {
     const e = net.edges.get(id);
     if (e && e.station < 0 && e.depot < 0) twins.set(id, parallel(g, e));
   }
-  const resources: CapacityResource[] = [], edgeResource = new Map<number, number>();
+  const resources: CapacityResource[] = [], edgeResource = new Map<number, number>(), joinedBlocks = new Set<number>();
+  for (const group of plainBlockGroups(g, twins)) {
+    const ids = group.flatMap(c => c.steps.map(s => s.edge.id)).sort((a, b) => a - b);
+    const r: CapacityResource = { id: resources.length, kind: 'block', edges: ids,
+      owners: [...new Set(ids.map(id => net.edges.get(id)!.owner))].sort((a, b) => a - b),
+      length: Math.max(...group.map(c => c.length)), available: Math.max(2, group.length) };
+    resources.push(r); joinedBlocks.add(r.id); for (const id of ids) edgeResource.set(id, r.id);
+  }
   const single = new Set([...twins].filter(([, t]) => !t.length).map(([id]) => id));
-  const seen = new Set<number>();
+  const seen = new Set<number>(edgeResource.keys());
   for (const seed of [...single].sort((a, b) => a - b)) {
     if (seen.has(seed)) continue;
     const queue = [seed], ids: number[] = []; seen.add(seed);
@@ -150,7 +292,7 @@ function inventory(g: Game): RouteInventory {
       available: Math.max(1, Math.min(rail.tracks, connected)) };
     resources.push(r); for (const id of ids) edgeResource.set(id, r.id);
   }
-  const value = { resources, edgeResource, routes }; inventoryMemo.set(g, { key, value }); return value;
+  const value = { resources, edgeResource, routes, joinedBlocks }; inventoryMemo.set(g, { key, value }); return value;
 }
 
 export function usesSharedRail(g: Game, l: Line): boolean {
@@ -262,16 +404,28 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
         if (a === b) continue;
         const hop = c.owner === l.owner && j === (i + 1) % l.stops.length ? inv.routes.get(l.id)?.[i] ?? [] : routeBetween(g, a, b, c.owner) ?? [];
         const perHop = new Map<number, number>();
+        let joinedId = -1, joinedSeconds = 0, joinedFloor = 0;
+        const finishJoined = () => {
+          if (joinedId >= 0) perHop.set(joinedId, (perHop.get(joinedId) ?? 0) + Math.max(joinedSeconds, joinedFloor));
+          joinedId = -1; joinedSeconds = 0; joinedFloor = 0;
+        };
         for (const id of hop) {
           const e = net.edges.get(id), rid = inv.edgeResource.get(id);
-          if (!e || rid === undefined || e.depot >= 0) continue;
+          if (!e || rid === undefined || e.depot >= 0) { finishJoined(); continue; }
           meter(e, e.len);
           const r = inv.resources[rid], cap = Math.max(0.4, Math.min(speed, (TRACK_TYPES[e.type]?.speed ?? carSpeed) * 0.6 * KMH_TO_UPS));
+          const joined = inv.joinedBlocks.has(rid);
           const seconds = r.kind === 'platform' ? 10 + c.cars.reduce((n, m) => n + m.length, 0) / cap
-            : (r.kind === 'block' ? Math.max(e.len, 50) : e.len) / cap;
-          perHop.set(rid, (perHop.get(rid) ?? 0) + seconds);
+            : (r.kind === 'block' && !joined ? Math.max(e.len, 50) : e.len) / cap;
+          if (joined) {
+            // Re-entering a resource later in this hop occupies it again; the allowance belongs to
+            // each contiguous traversal, not to the resource's first occurrence in the whole hop.
+            if (joinedId !== rid) { finishJoined(); joinedId = rid; }
+            joinedSeconds += seconds; joinedFloor = Math.max(joinedFloor, 50 / cap);
+          } else { finishJoined(); perHop.set(rid, (perHop.get(rid) ?? 0) + seconds); }
           if (e.station < 0) distance += e.len;
         }
+        finishJoined();
         for (const [rid, seconds] of perHop) use.set(rid, (use.get(rid) ?? 0) + seconds);
       }
       // (a bidder's first train on a pattern that has none yet: the timetable it will keep once it runs, lineTable's,
