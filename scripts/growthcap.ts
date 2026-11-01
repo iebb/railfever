@@ -152,6 +152,7 @@ async function natural() {
     if (saved && process.argv.includes('--replay-only')) break;
   }
   const stats = operation.get(retainedCity ?? -1), { active = 0, waiting = 0, longest = 0, sustained = 0 } = stats ?? {};
+  if (diagnostics) writeFileSync(join(diagnostics, `final-day-${g.day}.json`), JSON.stringify(api.serialize(g)));
   console.log(JSON.stringify({ seed: 23, size: 768, years: g.day / 360, firstCityDay, cityOwner: stats?.owner, cityLine: retainedCity, town: g.stations.get(g.lines.get(retainedCity ?? -1)?.stops[0] ?? -1)?.townId, active, waiting, longest, sustained, batches, purchaseMs, pricedUnits,
     cities: [...operation].map(([line, { waits: _waits, ...data }]) => ({ line, ...data })) }));
   if (!process.argv.includes('--replay-only')) {

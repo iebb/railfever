@@ -61,10 +61,10 @@ function gaps(arrivals: Arrival[], since: number, stationId?: number, minGaps = 
   return [...groups].map(([key, ts]) => ({ key, gaps: ts.slice(1).map((t, i) => t - ts[i]) })).filter((s) => s.gaps.length >= minGaps);
 }
 
-function run(g: Game, days: number): Audit {
+function run(g: Game, days: number, checkpoint?: { day: number; inspect: (audit: Audit, advance: () => void) => void }): Audit {
   const audit: Audit = { g, arrivals: [], deliveries: [], blockedHolds: 0, releases: new Map(), worstWait: 0 }; active = audit;
   const waiting = new Map<number, number>();
-  while (g.day < days) {
+  const advance = () => {
     g.stepTick();
     const now = simNow(g);
     for (const v of g.vehicles.map.values()) {
@@ -75,6 +75,11 @@ function run(g: Game, days: number): Audit {
         audit.worstWait = Math.max(audit.worstWait, now - start);
       } else waiting.delete(v.id);
     }
+  };
+  let inspected = false;
+  while (g.day < days) {
+    advance();
+    if (checkpoint && !inspected && g.day >= checkpoint.day) { inspected = true; checkpoint.inspect(audit, advance); }
   }
   active = undefined;
   check(audit.blockedHolds === 0, 'no spacing hold while another vehicle waits behind / for its platform');
@@ -208,6 +213,7 @@ function matched(seed: number, native: Game) {
   const roster = (g: Game) => JSON.stringify([...g.lines.map.values()].map(l => [l.id, l.kind, l.owner, l.stops, l.patterns,
     l.vehicles.map(id => { const v = g.vehicles.get(id)!; return [id, v.owner, v.pattern, v instanceof Train ? v.madeUp.map(c => c.id) : (v as RoadVehicle).model?.id]; })]));
   const stock = roster(off), channels = new Map<string, number>();
+  const fleet = [...off.vehicles.map.values()].filter(v => v.line).map(v => ({ id: v.id, delivered: v.delivered }));
   // Choose every current multi-vehicle channel before either outcome, including all its served directions.
   // Requiring samples on both copies prevents a missing or stranded service from improving the reported CV.
   for (const l of off.lines.map.values()) for (const [pid, fleet] of vehiclesByPattern(off, l)) if (fleet.length >= 2) {
@@ -216,17 +222,34 @@ function matched(seed: number, native: Game) {
   check(channels.size > 0, `matched seed ${seed}: native fleet has multi-vehicle service channels`);
   for (const l of off.lines.map.values()) off.lines.setEvenSpacing(l.id, false);
   for (const l of on.lines.map.values()) on.lines.setEvenSpacing(l.id, true);
-  // Match the natural audit's two-year exposure. Long native routes can take most of a year per circuit;
-  // discarding a settling year would omit real operated directions. Recovery after enabling remains measured.
-  const end = off.day + 720, since = simNow(off);
+  // A native long-distance bus circuit can exceed two operating years. Use four fixed years for both seeds and
+  // both copies, without dropping slow channels or extending the window based on the resulting CV. Require real
+  // progress from every paid vehicle and channel at two years, then at least three gaps everywhere at four years.
+  const halfway = off.day + 720, end = off.day + 1440, since = simNow(off);
   const measure = (g: Game, enabled: boolean) => {
-    const audit = run(g, end), samples = new Map(gaps(audit.arrivals.filter(a => a.multi), since, undefined, 3).map(s => [s.key, s.gaps]));
+    const label = `matched seed ${seed} ${enabled ? 'on' : 'off'}`;
+    let midpoint: { vehicles: number; deliveredVehicles: number; channels: number; total: number } | null = null;
+    const audit = run(g, end, { day: halfway, inspect: (a, advance) => {
+      const calls = new Set(a.arrivals.map(v => v.vehicle)), seen = new Set(a.arrivals.filter(v => v.multi).map(v => v.key));
+      midpoint = { vehicles: fleet.filter(v => calls.has(v.id)).length,
+        deliveredVehicles: fleet.filter(v => (g.vehicles.get(v.id)?.delivered ?? v.delivered) > v.delivered).length,
+        channels: [...channels.keys()].filter(key => seen.has(key)).length, total: a.deliveries.reduce((n, v) => n + v, 0) };
+      console.log(`${label} at two years: calls ${midpoint.vehicles}/${fleet.length} vehicles, deliveries ${midpoint.deliveredVehicles}/${fleet.length}, channels ${midpoint.channels}/${channels.size}, total ${midpoint.total}`);
+      check(midpoint.vehicles === fleet.length && midpoint.deliveredVehicles === fleet.length && midpoint.total > 0,
+        `${label}: every original vehicle makes real calls and delivers passengers within two years`);
+      check(midpoint.channels === channels.size, `${label}: every fixed channel has a real arrival within two years`);
+      check(roster(g) === stock && a.blockedHolds === 0 && checkReservations(g).length === 0,
+        `${label}: two-year progress retains stock/routes and lawful holds/reservations`);
+      // Audit the live replayed steps too; only the loaded observer copy is excluded from the arrival stream.
+      replay(g, `${label} two-year checkpoint`, advance);
+    } });
+    const samples = new Map(gaps(audit.arrivals.filter(a => a.multi), since, undefined, 3).map(s => [s.key, s.gaps]));
     const complete = [...channels.keys()].every(key => samples.has(key));
-    check(complete, `matched seed ${seed} ${enabled ? 'on' : 'off'}: at least three two-year gaps on every fixed channel`);
+    check(complete, `${label}: at least three four-year gaps on every fixed channel`);
     const lines = [...new Set(channels.values())].map(id => ({ id,
       cv: mean([...channels].filter(([, line]) => line === id).map(([key]) => cv(samples.get(key) ?? []))) }));
     const deliveries = g.companies.slice(1).map(c => audit.deliveries[c.id] ?? 0);
-    const result = { cv: complete ? mean(lines.map(l => l.cv)) : Infinity, lines, channels: channels.size, deliveries,
+    const result = { cv: complete ? mean(lines.map(l => l.cv)) : Infinity, lines, channels: channels.size, deliveries, midpoint,
       total: deliveries.reduce((a, b) => a + b, 0) };
     check(roster(g) === stock, `matched seed ${seed} ${enabled ? 'on' : 'off'}: original native stock and routes retained`);
     check(checkReservations(g).length === 0, `matched seed ${seed} ${enabled ? 'on' : 'off'}: reservations consistent`);
@@ -234,16 +257,21 @@ function matched(seed: number, native: Game) {
     return result;
   };
   const unregulated = measure(off, false), regulated = measure(on, true);
-  console.log(`matched AI seed ${seed}: ${channels.size} fixed channels, CV ${fmt(unregulated.cv)} -> ${fmt(regulated.cv)}, two-year deliveries ${unregulated.total} -> ${regulated.total}`);
+  console.log(`matched AI seed ${seed}: ${channels.size} fixed channels, CV ${fmt(unregulated.cv)} -> ${fmt(regulated.cv)}, four-year deliveries ${unregulated.total} -> ${regulated.total}`);
   check(regulated.cv < unregulated.cv, `matched AI seed ${seed}: mean headway CV improves on the same channels`);
   check(regulated.total >= unregulated.total, `matched AI seed ${seed}: regulation preserves / increases same-fleet deliveries`);
   return { off: unregulated, on: regulated };
 }
 
-function replay(g: Game, label: string) {
+function replay(g: Game, label: string, advance?: () => void) {
   const saved = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(saved));
   check(JSON.stringify(serialize(loaded)) === saved, `${label}: exact JSON round trip`);
-  for (let i = 0; i < 1200; i++) { g.stepTick(); loaded.stepTick(); }
+  const observer = active;
+  for (let i = 0; i < 1200; i++) {
+    if (advance) advance(); else g.stepTick();
+    active = undefined;
+    try { loaded.stepTick(); } finally { active = observer; }
+  }
   check(JSON.stringify(serialize(g)) === JSON.stringify(serialize(loaded)), `${label}: exact continuation for 60 simulation seconds`);
 }
 
