@@ -348,16 +348,30 @@ if(cityLine) {
   console.log('mature two-town urban trunk',JSON.stringify({income:cityLine.incomeLast,cost:cityLine.costLast,upkeep:cityCopy.maintenanceOf(cityAI.companyId),net}));
   check(net>0,'two-town urban trunk earns positive actual surplus after all upkeep');
 }
-const centralAccess = access(centralAI), tested: { town: number; level: string; pop: number; x: number; z: number }[] = [];
-const centreSite = centralAccess.centreStation;
-centralAccess.centreStation = function*(t: Town, to: {x:number;z:number}, length: number, level: string) {
-  const p = yield* centreSite.call(this,t,to,length,level);
-  if(p) tested.push({town:t.id,level,pop:[...planWalkingCatchment(central,p).buildings].reduce((n,[id])=>n+(central.world.buildings.get(id)?.pop??0),0),x:p.x,z:p.z});
-  return p;
+const tested: { town: number; level: string; pop: number; x: number; z: number }[] = [];
+// Observe the native economic quotation: the durable controller surveys central sites directly.
+// Keeping the forecast call unchanged also covers future planner implementations.
+const centreForecast = central.demand.forecastLine;
+const priced = new Set<string>();
+central.demand.forecastLine = function(...args: Parameters<typeof centreForecast>) {
+  const result = centreForecast.apply(this, args);
+  for (const site of args[0]) {
+    if (!('ok' in site) || !site.ok || !('entrances' in site)) continue;
+    const p = site as import('../src/game/stations').StationPlan;
+    const t = [ca, cb].find(t => Math.hypot(p.x-t.x,p.z-t.z)<15);
+    if (!t) continue;
+    const key = [t.id,p.level,p.x,p.z,p.angle].join(':');
+    if (priced.has(key)) continue;
+    priced.add(key);
+    tested.push({town:t.id,level:p.level,pop:[...planWalkingCatchment(central,p).buildings].reduce((n,[id])=>n+(central.world.buildings.get(id)?.pop??0),0),x:p.x,z:p.z});
+  }
+  return result;
 };
 check(centralAI.startProject('rail', [ca.id, cb.id]), 'a screenshot-sized two-town railway can survey central alternatives');
 central.aiEnabled = true;
-let ct = 0; while (centralAI.busy && ct++ < 40000) central.stepTick();
+let ct = 0;
+try { while (centralAI.busy && ct++ < 40000) central.stepTick(); }
+finally { central.demand.forecastLine = centreForecast; }
 central.aiEnabled = false;
 console.log('central railway', JSON.stringify({ticks:ct,alternatives:tested,notes:centralAI.log.slice(-8),stations:[...central.stations.map.values()].map(st=>({x:st.x,z:st.z,level:st.rail?.level,pop:st.catchPop}))}));
 const centralLine = [...central.lines.map.values()].find(l=>l.kind==='rail'&&l.owner===centralAI.companyId);
