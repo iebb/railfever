@@ -7,7 +7,7 @@ import {
 } from './geom';
 import { NEdge, NNode, Section, profAt, type EdgeGeo } from './network';
 import { SpatialGrid } from './spatial';
-import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, formationSupportError, previewDemolition, EARTHWORKS, DRY_MIN } from './terraform';
+import { applyEarthworks, recomputeLocks, coverTunnels, formationDepth, formationSupportError, previewDemolition, EARTHWORKS, DRY_MIN, type RoadFormationConflict } from './terraform';
 import { distToRect } from './world';
 import { demolitionTotal } from './demolition';
 
@@ -202,6 +202,7 @@ function roadBridgeWindow(g: Game, e: NEdge, s: number, width: number): { works:
   const queue = [{ e, s0: s - width, s1: s + width }], seen = new Map<number, [number, number]>();
   while (queue.length) {
   const q = queue.shift()!;
+  if (q.e.depot >= 0 || q.e.station >= 0) return bad('Road facility blocks underpass bridge window');
   const previous = seen.get(q.e.id);
   if (previous && q.s0 >= previous[0] - 1e-6 && q.s1 <= previous[1] + 1e-6) continue;
   seen.set(q.e.id, [Math.min(previous?.[0] ?? Infinity, q.s0), Math.max(previous?.[1] ?? -Infinity, q.s1)]);
@@ -241,6 +242,22 @@ function roadBridgeWorks(g: Game, prop: Proposal): { works: NonNullable<Proposal
     if (window.error) return { works, cost: 0, error: window.error };
     works.push(...window.works);
     for (const q of window.works) heights.set(q.edge, Math.max(heights.get(q.edge) ?? 0, dh));
+  }
+  if (prop.opts.kind === 'rail' && !prop.opts.town && !prop.errors.length && prop.tracks.some(t =>
+    t.sections.some(s => s.type === 'tunnel') && t.sections.reduce((n, s) => n + s.s1 - s.s0, 0) < t.len - 1e-6)) {
+    // The open cutting beside a tunnel portal can undermine a connected street without crossing its axis.
+    // Find the actual unsupported cross-sections using the same pure terrain projection as the final guard.
+    // Fully covered bores need no such road works; only affected ground intervals acquire paid supports.
+    const conflicts = new Map<number, RoadFormationConflict>();
+    formationSupportError(previewDemolition(g.world, prop.demolish), prop.tracks.map(t => ({ ...t, kind: prop.opts.kind, type: prop.opts.type })),
+      prop.opts.ignore?.edges, works, undefined, conflicts);
+    for (const [id, q] of conflicts) {
+      const e = net.edges.get(id)!;
+      const window = roadBridgeWindow(g, e, (q.s0 + q.s1) / 2, (q.s1 - q.s0) / 2 + 2 * EARTHWORKS.corePad);
+      if (window.error) return { works, cost: 0, error: window.error };
+      works.push(...window.works);
+      for (const span of window.works) heights.set(span.edge, Math.max(heights.get(span.edge) ?? 0, q.height));
+    }
   }
   // Multiple crossings/tracks may quote the same support. Charge only newly supported ground once.
   const merged: typeof works = [];

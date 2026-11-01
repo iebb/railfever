@@ -149,13 +149,16 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, 
   }
 }
 
+/** Actual ground-road intervals losing support, collected only when quoting portal-cutting structures. */
+export interface RoadFormationConflict { s0: number; s1: number; height: number }
 /**
  * Ground formations share terrain vertices. Check actual road cross-sections against the projected terrain,
  * and shared rail cores against their running heights, before accepting works that could remove their support.
  * The preview network owns its geometry caches and nodes; surveying never writes the world's network or terrain.
  */
 export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'> & { start?: { kind: string; node?: number }; end?: { kind: string; node?: number } })[],
-  ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = [], terrain?: ReadonlyMap<number, number>): string | null {
+  ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = [], terrain?: ReadonlyMap<number, number>,
+  roadConflicts?: Map<number, RoadFormationConflict>): string | null {
   if (!planned.length) return null;
   // An existing dead end joined by this proposal loses its cap, just as the snapped new end has no cap.
   const joined = new Set<number>();
@@ -203,26 +206,38 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   const height = (x: number, z: number) => heightAtVertices(w, x, z, vertex);
   const roadUnsupported = (road: NEdge, net: Network, existing = false) => {
     const p = { x: 0, y: 0, z: 0 }, d = { ...p }, hw = net.halfWidth(road);
+    let unsupported = false;
     for (let s = 0; s <= road.len + 1e-6; s += 0.25) {
       if (net.sectionAt(road, s) !== 'ground' || existing && road.sections.some(q => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1)) continue;
       net.pointAt(road, s, p, d);
       const l = Math.hypot(d.x, d.z) || 1;
       for (const off of [-hw, -hw / 2, 0, hw / 2, hw]) {
         const x = p.x - d.z / l * off, z = p.z + d.x / l * off;
-        if (height(x, z) < Math.min(existing ? w.heightAt(x, z) : Infinity, p.y - 0.35) - 1e-5) return true;
+        const projected = height(x, z);
+        if (projected < Math.min(existing ? w.heightAt(x, z) : Infinity, p.y - 0.35) - 1e-5) {
+          if (!existing || !roadConflicts) return true;
+          unsupported = true;
+          const old = roadConflicts.get(road.id);
+          roadConflicts.set(road.id, { s0: Math.min(old?.s0 ?? Infinity, s), s1: Math.max(old?.s1 ?? -Infinity, s),
+            height: Math.max(old?.height ?? 0, p.y - projected) });
+        }
       }
     }
-    return false;
+    return unsupported;
   };
   for (const road of roads) if (roadUnsupported(road, view.net))
     return rail ? 'Access road conflicts with the station formation' : 'Road formation cannot be supported here';
   const pad = 5;
+  let unsupportedRoad = false;
   for (const original of w.net.edgesNear(x0 - pad, z0 - pad, x1 + pad, z1 + pad)) {
     if (ignore.has(original.id)) continue;
     const supported = bridges.filter(q => q.edge === original.id);
     const e = supported.length ? { ...original, sections: [...original.sections, ...supported.map(q => ({ ...q, type: 'bridge' as const }))] } : original;
     if (e.kind === 'road') {
-      if (roadUnsupported(e, w.net, true)) return 'Too close to road at another height';
+      if (roadUnsupported(e, w.net, true)) {
+        if (!roadConflicts) return 'Too close to road at another height';
+        unsupportedRoad = true;
+      }
       continue;
     }
     const old = new Map<number, Acc>();
@@ -239,7 +254,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
         return e.kind === 'rail' ? 'Too close to track at another height' : 'Too close to road at another height';
     }
   }
-  return null;
+  return unsupportedRoad ? 'Too close to road at another height' : null;
 }
 
 /**

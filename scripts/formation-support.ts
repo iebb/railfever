@@ -3,7 +3,7 @@
 import { Game } from '../src/game/game';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { serialize, deserialize } from '../src/game/save';
-import { flatGame, build, free, railOpts, nodeSnap, check, fails } from './stationlib';
+import { flatGame, build, free, railOpts, nodeSnap, station, endNode, check, fails } from './stationlib';
 import { roadOpts } from './lib';
 import { terrainFit } from './terrainfit';
 import { previewDemolition } from '../src/game/terraform';
@@ -22,6 +22,78 @@ import { previewDemolition } from '../src/game/terraform';
   check(JSON.stringify(counters) === JSON.stringify([net.version, net.nextNode, net.nextEdge, g.world.heightsVersion]), 'survey/refusal preserves network allocators and terrain versions');
   const fit = terrainFit(g);
   check(fit.covered === 0 && fit.floating === 0 && fit.station === 0, 'street and railway formations remain seated after refusal');
+}
+
+// Seed-5's native first profitable opening: its tunnel portal cutting misses the side street's axis,
+// but reaches the street's bank. Every affected side arm needs a priced support before excavation.
+{
+  const g = Game.create({ size: 384, seed: 5, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1950, aiCompanies: 2 });
+  g.aiEnabled = false; g.company(1).economy.money = 1e8;
+  const st = station(g, 102.06736792903394, 233.30575226806104, 1.116883383580246, 10, 2, 1,
+    { level: 'underground', fixedY: 1.5318828582763673, style: 'none', depth: 2.4 });
+  check(!!st, 'native seed-5 underground station commits before its approach');
+  if (st) {
+    g.flushNetworkChanges(); g.stations.recomputeCatchment(); g.lines.flushCatchment();
+    const quote = (world: Game) => planEdge(world, nodeSnap(world, endNode(world, world.stations.get(st.id)!, 1, true), 'rail'),
+      free(world, 124.53582337504682, 244.26789210800717), railOpts(1, 1, { designGrade: 0.035, heightOffset: -0.503645100065027 }));
+    const snapshot = JSON.stringify(serialize(g)), baseline = terrainFit(g), p = quote(g);
+    const roads = [166, 209, 239, 240];
+    check(p.ok && roads.every(id => p.roadBridges?.some(q => q.edge === id)) && (p.stats.costSplit?.bridges ?? 0) > 0,
+      'portal cutting quotes paid supports on the actual undermined street and all affected side arms');
+    check(JSON.stringify(serialize(g)) === snapshot, 'portal support survey preserves the entire live save');
+    const loaded = deserialize(JSON.parse(snapshot)), cold = quote(loaded);
+    check(JSON.stringify(p) === JSON.stringify(cold) && JSON.stringify(serialize(loaded)) === snapshot,
+      'cold portal survey preserves native geometry, support intervals, prices and saved state');
+    const blocked = deserialize(JSON.parse(snapshot));
+    blocked.world.net.edges.get(239)!.depot = 7;
+    const blockedBefore = JSON.stringify(serialize(blocked)), refusal = quote(blocked);
+    check(!refusal.ok && refusal.errors.includes('Road facility blocks underpass bridge window'), 'portal support refuses a facility on a required side arm');
+    check(commitProposal(blocked, refusal) !== null && JSON.stringify(serialize(blocked)) === blockedBefore,
+      'blocked portal construction preserves roads, terrain, money and saved allocators');
+    const end = free(g, 115.71227352760565, 239.5540822006755);
+    const bore = planEdge(g, nodeSnap(g, endNode(g, st, 1, true), 'rail'), end,
+      railOpts(1, 1, { designGrade: 0.035, heightOffset: 1.8802162408828735 - end.y }));
+    check(bore.ok && bore.tracks.every(t => t.sections.some(s => s.type === 'tunnel' && s.s0 === 0 && s.s1 >= t.len))
+      && !bore.roadBridges?.length, 'a fully covered tunnel keeps the native street bank without unnecessary bridge works');
+    const cash = g.company(1).economy.money;
+    check(commitProposal(g, p) === null && cash - g.company(1).economy.money === p.cost,
+      'native portal construction pays its complete quoted structure and track cost');
+    const fit = terrainFit(g), streetFit = terrainFit(g, roads.map(id => g.world.net.edges.get(id)!));
+    check(fit.station === baseline.station && fit.covered === baseline.covered && fit.floating === baseline.floating
+      && JSON.stringify(fit.examples) === JSON.stringify(baseline.examples) && streetFit.covered === 0 && streetFit.floating === 0,
+      'the completed native portal and all supported street widths add zero terrain misfits');
+    check(commitProposal(loaded, cold) === null && JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)),
+      'cold portal construction charges identical costs and creates identical roads, terrain and IDs');
+    let exact = true;
+    for (let tick = 0; tick < 40; tick++) {
+      g.stepTick(); loaded.stepTick();
+      if (JSON.stringify(serialize(g)) !== JSON.stringify(serialize(loaded))) { exact = false; break; }
+    }
+    check(exact, 'native ticks after portal support construction replay exactly');
+  }
+}
+
+// A support window wholly inside one road never traverses a neighbouring arm. The starting edge itself
+// must also reject facility conversion, even when the cutting misses the road's axis.
+{
+  const g = flatGame(128, 3, x => 4 - Math.max(0, Math.min(20, x - 40)) * 0.1), net = g.world.net;
+  check(!!build(g, free(g, 10, 66), free(g, 118, 66), roadOpts(0, 'street'), 'portal-side road'), 'fixture long portal-side road');
+  const road = [...net.edges.values()].find(e => e.kind === 'road')!;
+  const a = net.addNode('rail', 40, 1.6, 64, 1, 0), b = net.addNode('rail', 70, 2, 64, -1, 0);
+  const quote = () => planEdge(g, nodeSnap(g, a.id, 'rail'), nodeSnap(g, b.id, 'rail'), railOpts(0, 1, { designGrade: 0.035 }));
+  const clear = quote(), window = clear.roadBridges?.[0];
+  check(clear.ok && clear.crossings.length === 0 && clear.roadBridges?.length === 1 && window?.edge === road.id
+    && window.s0 > 0 && window.s1 < road.len, 'portal bank support starts and ends inside its sole affected road');
+  for (const field of ['depot', 'station'] as const) {
+    road[field] = 7;
+    const before = JSON.stringify(serialize(g)), blocked = quote();
+    check(!blocked.ok && blocked.errors.includes('Road facility blocks underpass bridge window'), `initial affected ${field} road refuses its own support window`);
+    check(commitProposal(g, blocked) !== null && JSON.stringify(serialize(g)) === before, `initial ${field} refusal preserves all native state`);
+    road[field] = -1;
+  }
+  check(commitProposal(g, clear) === null, 'the same portal bank support commits when its starting road is clear');
+  const fit = terrainFit(g);
+  check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'supported starting road and portal cutting remain physically seated');
 }
 
 // A distant corner shared by two formation cores need not lie under either carriageway. Interpolation
