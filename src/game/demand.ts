@@ -27,6 +27,7 @@ import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
 import { WALK_LINE, PLATFORM_LENGTH, stationLayout } from './stations';
 import { routeGraph, routeTables, transferComplexes, type Hop, type RouteEdge } from './lines';
+import { forecastReachIndex } from './forecast-reach';
 import { tripFactor, refTime, urbanIntensity, estimateLegTime, fareFor, distanceFare, railHistory, transferWalkTime, TRANSFER_FARE_FACTOR, type DemandSite, type FareMode, type DemandSet } from './fares';
 import type { RNG } from './rng';
 import type { Building } from './world';
@@ -1586,11 +1587,15 @@ export class DemandModel {
     for (const [id, shares] of background) {
       const st = g.stations.get(id); if (st) locations.set(id, { x: st.x, z: st.z, townId: st.townId, ...shares });
     }
+    // Unrelated origins contribute no connecting receipts. Relevant origins still compare every
+    // competing destination below, including journeys that never board this proposed service.
+    const relevant = forecastReachIndex(tables, locations.keys(), context.proposed);
     let boardings = 0, revenue = 0;
     const legLoads = new Array(Math.max(0, 2 * (sites.length - 1))).fill(0);
     for (const [from, origin] of locations) {
       const walkingPop = [...origin.walking.values()].reduce((sum, v) => sum + v, 0);
       const regionalPop = [...origin.regional.values()].reduce((sum, v) => sum + v, 0);
+      if (relevant && !relevant.hasFrom(from)) continue;
       // (walkers make WALK_TRIP_INTENSITY times the trips: generationPopulation)
       const regional = intensified({ pop: walkingPop, regions: origin.walking }, { pop: regionalPop, regions: origin.regional });
       const parts: { to: number; pop: number; x: number; xc: number; xb: number; y: number; f: number; local: boolean }[] = [];
@@ -1619,6 +1624,7 @@ export class DemandModel {
       for (const part of parts) {
         // Direct journeys between our own stops were priced above, once per physical station claim.
         if (indices.has(from) && indices.has(part.to)) continue;
+        if (relevant && !relevant.has(from, part.to)) continue;
         const rides = forecastTransferJourney(tables, from, part.to, context.proposed,
           line => line === context.proposed || g.lines.get(line)?.kind === 'rail', (a, b) => {
             const p = locations.get(a) ?? g.stations.get(a), q = locations.get(b) ?? g.stations.get(b);
