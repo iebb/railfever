@@ -1467,7 +1467,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     const throat = (u: number) => (!!zs0 && (kindAt(true) === 'station' || kindAt(true) === 'depot') && u < zs0.z0) || (!!ze0 && (kindAt(false) === 'station' || kindAt(false) === 'depot') && u > ze0.z1);
     for (const [ti, L] of lists.entries()) for (const st of L) for (const nid of [startNode(g, st), endNode(g, st)]) {
       const n = net.nodes.get(nid);
-      if (!n || !n.signal || n.edges.length !== 2 || n.edges.some((id) => net.edges.get(id)!.station >= 0)) continue;
+      if (!n || !n.signal || n.edges.length < 2 || n.edges.some((id) => net.edges.get(id)!.station >= 0)) continue;
       if (n.edges.some((id) => g.trackUpgradeError(owner, net.edges.get(id)!.owner))) continue;
       const u = SA[nearestSample(SA, n.x, n.z).i].u;
       // Finishing a loop on the other side can reverse the original track's running direction. Its old
@@ -1475,7 +1475,9 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
       const e = net.edges.get(st.edge)!, dir = st.dir * ((ti === 0 ? !bForward : bForward) ? 1 : -1);
       const side = net.sideAt(e, nid) * ((dir > 0 ? e.a : e.b) === nid ? 1 : -1);
       const opposed = n.signal >= 2 && !n.signalPass && net.signalFor(n, side) < 0;
-      if (!opposed && !zones.some((z) => u > z.z0 - 0.8 && u < z.z1 + 0.8) && !(throat(u) && n.signal >= 2 && !n.signalPass)) continue;
+      // A new lead can consume a former plain-track signal. At a switch its block guard
+      // floods every turnout arm, including opposing platforms; finalise only after formation succeeds.
+      if (n.edges.length === 2 && !opposed && !zones.some((z) => u > z.z0 - 0.8 && u < z.z1 + 0.8) && !(throat(u) && n.signal >= 2 && !n.signalPass)) continue;
       n.signal = 0; delete n.signalKind; delete n.signalPass;
       g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2);
       net.version++;
