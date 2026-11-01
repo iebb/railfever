@@ -73,7 +73,7 @@ try {
   }
   const scripts = readdirSync(join(work, 'scripts')).filter((f) => f.endsWith('.ts')).map((f) => f.slice(0, -3)).sort();
   for (const name of scripts) if (excluded.has(name)) console.log(`skip ${name}: ${excluded.get(name)}`);
-  const jobs = scripts.filter((n) => !excluded.has(n) && !['ai', 'catchperf', 'savesize'].includes(n)).flatMap((script) => {
+  const jobs = scripts.filter((n) => !excluded.has(n) && !['ai', 'catchperf', 'savesize', 'companies'].includes(n)).flatMap((script) => {
     switch (script) {
       case 'smoke': return [7, 11, 23].map((n) => ({ name: `smoke${n}`, script, args: [String(n)] }));
       case 'replay': return [7, 23].map((n) => ({ name: `replay${n}`, script, args: [String(n)] }));
@@ -121,6 +121,8 @@ try {
     const result = `${name}: ${rc === 0 ? 'ok' : `FAILED rc=${rc}`} (${((Date.now() - start) / 1000).toFixed(1)}s) ${summary}`;
     writeFileSync(join(logs, `${name}.res`), `${result}\n`);
     console.log(result);
+    if (rc !== 0) console.log(output.split('\n').filter(l => /FAIL|Error|Exception|Assertion|Gate timed out/.test(l))
+      .slice(-30).map(l => l.slice(0, 1500)).join('\n'));
     return { rc, output };
   }
   // Two workers take the next independent check when ready, so a long simulation cannot leave
@@ -130,6 +132,8 @@ try {
     while (nextJob < jobs.length && !interrupted) if ((await run(jobs[nextJob++])).rc !== 0) failed = true;
   }));
   for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
+  // The company audit also runs a child world. Keep its two-world budget separate from the queue.
+  if (scripts.includes('companies') && !interrupted && (await run({ name: 'companies', script: 'companies', args: [] })).rc !== 0) failed = true;
   // Save capture has frame-time budgets as well as integrity assertions. Measure those after the
   // simulation workers exit so unrelated map generation and garbage collection cannot distort them.
   if (scripts.includes('savesize') && !interrupted && (await run({ name: 'savesize', script: 'savesize', args: [] })).rc !== 0) failed = true;

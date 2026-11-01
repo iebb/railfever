@@ -21,17 +21,22 @@ import { fork } from 'node:child_process';
 const pos = process.argv.slice(2).filter((s) => !s.startsWith('--'));
 const seed = Number(pos[0] ?? 5), YEARS = Number(pos[1] ?? 3), SIZE = Number(pos[2] ?? 512);
 // The personalities' line counts are compared over WORLDS maps (seed and the next ones): the other maps run the first
-// phase only (--personalities), in child processes alongside this one.
+// phase only (--personalities). One child runs alongside this world, then the remaining worlds run in order.
 const PERSONALITIES = process.argv.includes('--personalities');
 const WORLDS = Math.max(1, Number(process.argv.find((s) => s.startsWith('--worlds='))?.slice(9) ?? 6));
 type WorldLines = { seed: number; lines: { label: string; lines: number }[] | null; error?: string };
-const worlds: Promise<WorldLines[]> = PERSONALITIES ? Promise.resolve([]) : Promise.all(Array.from({ length: WORLDS - 1 }, (_, i) => new Promise<WorldLines>((done) => {
-  const s = seed + i + 1, child = fork(process.argv[1], [String(s), String(YEARS), String(SIZE), '--personalities'], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
+const readWorld = (s: number) => new Promise<WorldLines>((done) => {
+  const child = fork(process.argv[1], [String(s), String(YEARS), String(SIZE), '--personalities'], { stdio: ['ignore', 'ignore', 'pipe', 'ipc'] });
   let lines: WorldLines['lines'] = null, err = '';
   child.on('message', (m) => { lines = m as WorldLines['lines']; });
   child.stderr!.on('data', (d) => { err += d; });
   child.on('exit', (code) => done({ seed: s, lines: code === 0 ? lines : null, error: `exit ${code}: ${err.trim().split('\n').slice(-2).join(' | ')}` }));
-})));
+});
+const worlds: Promise<WorldLines[]> = PERSONALITIES ? Promise.resolve([]) : (async () => {
+  const results: WorldLines[] = [];
+  for (let i = 1; i < WORLDS; i++) results.push(await readWorld(seed + i));
+  return results;
+})();
 // Tram personalities may choose native light rail when its full investment quote pays better.
 // A station-style label alone is insufficient: the actual service must use light-rail units too.
 const isLightRail = (world: Game, l: Line) => l.kind === 'rail' && l.stops.length >= 2 && l.vehicles.length > 0
