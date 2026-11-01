@@ -145,7 +145,7 @@ try {
   let nextJob = 0;
   // Run long endurance and frame-time checks without the queue competing for CPU. Growth
   // owns at most two native child worlds; its full combined assertions and deadline remain intact.
-  const isolated = new Set(['airail', 'growth', 'linegrow']);
+  const isolated = new Set(['airail', 'growth', 'linegrow', 'tram-planner-parity']);
   const selected = jobs.filter(j => assigned.has(j.name) && !isolated.has(j.name));
   const lanes = await Promise.allSettled([0, 1].map(async () => {
     while (nextJob < selected.length && !interrupted) if ((await run(selected[nextJob++])).rc !== 0) failed = true;
