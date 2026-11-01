@@ -98,6 +98,52 @@ const initialWalkCalls = walkCalls;
 for (let i = 0; i < 20; i++) d.feederPools(sites, covered);
 check(walkCalls === initialWalkCalls, 'repeated pool queries reuse the merged geometry without walking or merging access maps');
 parity('warm');
+
+// Changing a timetable must rebuild its weights, not the same eligible lot geometry. Keep a zero-quality
+// first site lazy until it becomes useful; a later first-positive site still keeps the literal claim order.
+const nativeSiteWalk = d.feederSiteWalk, nativeRegion = d.regionOf, qualities = sites.map(s => s.quality);
+let preparedWalks = 0, preparedRegions = 0;
+d.feederSiteWalk = function(s: any) { preparedWalks++; return nativeSiteWalk.call(this, s); };
+d.regionOf = function(b: any) { preparedRegions++; return nativeRegion.call(this, b); };
+site.quality = 0;
+let prepared = d.claimFeederPools(sites, covered);
+check(preparedWalks > 0 && preparedRegions > 0, 'positive native feeder sites prepare actual eligible lots and regions');
+for (const quality of [.2, .9, .35]) {
+  const walks = preparedWalks, regions = preparedRegions;
+  rival.quality = quality;
+  prepared = d.claimFeederPools(sites, covered);
+  check(preparedWalks === walks && preparedRegions === regions, 'different quality reuses only the prepared native lot geometry');
+  check(poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+    'changed quality recomputes exact literal weights, totals and region order');
+}
+const beforePositive = preparedWalks; site.quality = .6;
+prepared = d.claimFeederPools(sites, covered);
+check(preparedWalks === beforePositive + 1 && prepared[0].pop > 0,
+  'first positive quality prepares the previously excluded site lazily');
+check(poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+  'new first-positive site retains native claim insertion and floating-point order');
+const nativeIds = [...d.feederSiteWalk(site).keys()];
+for (const id of nativeIds.slice(0, 5)) d.claimFeederPools(sites, new Set([id]));
+const beforeEvicted = preparedWalks; d.claimFeederPools(sites, covered);
+check(preparedWalks > beforeEvicted, 'bounded preparation contexts evict and rebuild an earlier covered-set query');
+const many = Array.from({ length: 300 }, () => site);
+d.claimFeederPools(many, covered);
+const beforeLarge = preparedWalks; d.claimFeederPools(many, covered);
+check(preparedWalks > beforeLarge, 'an oversized preparation is not retained between reads');
+let attempts = 0, preparationThrew = false;
+d.regionOf = function(b: any) {
+  if (++attempts === 2) throw new Error('deliberate preparation interruption');
+  return nativeRegion.call(this, b);
+};
+try { d.claimFeederPools(sites, covered); } catch { preparationThrew = true; }
+const interruptedWalks = preparedWalks;
+prepared = d.claimFeederPools(sites, covered);
+check(preparationThrew && preparedWalks > interruptedWalks
+  && poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+  'interrupted preparation publishes no partial rows and retries exactly with the same reader');
+sites.forEach((s, i) => { s.quality = qualities[i]; });
+d.feederSiteWalk = nativeSiteWalk; d.regionOf = nativeRegion;
+parity('after quality-independent preparation');
 const inherited: any = Object.create(d), parentWalk = d.feederSiteWalk(site), beforePreview = walkCalls;
 check(JSON.stringify([...inherited.feederSiteWalk(site)]) === JSON.stringify([...parentWalk])
   && inherited.feederSiteWalk(site) !== parentWalk && walkCalls > beforePreview,

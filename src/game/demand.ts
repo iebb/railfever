@@ -238,6 +238,17 @@ interface FeederSite extends DemandSite { quality: number; access?: { x: number;
 interface FeederPool { pop: number; regions: Map<number, number> }
 const feederPoolMemo = new WeakMap<DemandModel, { stamp: string; entries: { sig: number[]; covered: Set<number>; pools: FeederPool[] }[] }>();
 const feederSites = new WeakMap<DemandModel, { key: string; sites: Map<string, Map<number, number>> }>();
+interface FeederClaimGeometry {
+  sig: number[]; covered: Set<number>;
+  rows: ({ bids: number[]; denominators: number[] } | undefined)[];
+  lots: Map<number, { building: Building; region: number }>;
+  count: number;
+}
+const feederClaimGeometry = new WeakMap<DemandModel, {
+  stamp: string; regionOf: DemandModel['regionOf']; siteWalk: (s: FeederSite) => Map<number, number>;
+  entries: FeederClaimGeometry[];
+}>();
+
 const feederClaims = new WeakMap<DemandModel, {
   bids: number[]; sums: number[]; qualities: number[]; first: number[]; last: number[];
   indices: number[]; weights: number[]; next: number[];
@@ -734,11 +745,56 @@ export class DemandModel {
     return pools;
   }
 
+  /** Frequency variants share only ordered, eligible lot geometry. Quality-dependent weights and every sum
+   * remain in the claim pass below. Publish a complete preparation only; nested/failed reads own their work. */
+  private prepareFeederClaims(sites: FeederSite[], covered: Set<number>): FeederClaimGeometry {
+    const w = this.g.world, stamp = `${this.version}:${this.g.tick}:${this.feederGeometryKey()}:${w.lotVersions.version}`;
+    let memo = feederClaimGeometry.get(this);
+    if (!memo || memo.stamp !== stamp || memo.regionOf !== this.regionOf || memo.siteWalk !== this.feederSiteWalk) {
+      memo = { stamp, regionOf: this.regionOf, siteWalk: this.feederSiteWalk, entries: [] };
+      feederClaimGeometry.set(this, memo);
+    }
+    const sig: number[] = [];
+    for (const s of sites) {
+      sig.push(s.x, s.z, s.townId, s.access?.length ?? -1);
+      for (const a of s.access ?? []) sig.push(a.x, a.z);
+    }
+    const old = memo.entries.find(e => e.sig.length === sig.length && e.covered.size === covered.size
+      && sig.every((v, i) => Object.is(v, e.sig[i])) && [...covered].every(id => e.covered.has(id)));
+    let value = old;
+    for (let i = 0; i < sites.length; i++) {
+      const s = sites[i];
+      if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500 || value?.rows[i]) continue;
+      if (!value || value === old) value = { sig, covered: new Set(covered), rows: old ? [...old.rows] : new Array(sites.length),
+        lots: new Map(old?.lots), count: old?.count ?? 0 };
+      const bids: number[] = [], denominators: number[] = [];
+      for (const [bid, distance] of this.feederSiteWalk(s)) {
+        const b = w.buildings.get(bid);
+        if (!b || b.townId !== s.townId || covered.has(bid)) continue;
+        bids.push(bid); denominators.push(1 + distance / 30);
+        if (!value.lots.has(bid)) value.lots.set(bid, { building: b, region: this.regionOf(b) });
+      }
+      value.rows[i] = { bids, denominators }; value.count += bids.length;
+    }
+    value ??= { sig, covered: new Set(covered), rows: new Array(sites.length), lots: new Map(), count: 0 };
+    if (value !== old) {
+      // A large query cannot retain its site signature, rows or buildings. Ordinary contexts are bounded per tick.
+      const index = old ? memo.entries.indexOf(old) : -1;
+      if (index >= 0) memo.entries.splice(index, 1);
+      if (value.count <= 8192 && covered.size <= 8192 && sites.length <= 256 && sig.length <= 4096) {
+        if (memo.entries.length >= 4) memo.entries.shift();
+        memo.entries.push(value);
+      }
+    }
+    return value;
+  }
+
   /** A separate car feeder pool, never a wider walking catchment. Catchments with an existing intercity route
    * are excluded: those residents already enter through routed feeder transfers. A local-only bus does not
    * supply a railway it cannot reach. Competing main-line stations share every lot once. */
   private claimFeederPools(sites: FeederSite[], covered: Set<number>): FeederPool[] {
     const result = sites.map(() => ({ pop: 0, regions: new Map<number, number>() }));
+    const geometry = this.prepareFeederClaims(sites, covered);
     // Each lot has a numeric claim index, avoiding a claim object per lot on every forecast. Parallel arrays
     // retain first-claim insertion order and the linked site order, including the original floating-point sums.
     const buffers = feederClaims.get(this) ?? { bids: [], sums: [], qualities: [], first: [], last: [], indices: [], weights: [], next: [], claimById: new Uint32Array(256) };
@@ -758,13 +814,12 @@ export class DemandModel {
     let claimCount = 0, rowCount = 0;
     sites.forEach((s, i) => {
       if (s.quality <= 0 || (this.g.towns.list[s.townId]?.pop ?? 0) < 1500) return;
-      const buildings = this.feederSiteWalk(s);
-      for (const [bid, distance] of buildings) {
-        const b = this.g.world.buildings.get(bid);
-        if (!b || b.townId !== s.townId || covered.has(bid)) continue;
+      const row = geometry.rows[i]!;
+      for (let j = 0; j < row.bids.length; j++) {
+        const bid = row.bids[j];
         const dense = bid >= 0 && bid < claimById.length && Number.isInteger(bid);
         const claim = dense ? claimById[bid] - 1 : sparse?.get(bid) ?? -1;
-        const k = rowCount++, weight = s.quality / (1 + distance / 30);
+        const k = rowCount++, weight = s.quality / row.denominators[j];
         indices[k] = i; weights[k] = weight; next[k] = -1;
         if (claim >= 0) {
           sums[claim] += weight; qualities[claim] = Math.max(qualities[claim], s.quality);
@@ -780,7 +835,7 @@ export class DemandModel {
     for (let claim = 0; claim < claimCount; claim++) {
       const bid = bids[claim];
       if (bid >= 0 && bid < claimById.length && Number.isInteger(bid)) claimById[bid] = 0;
-      const b = this.g.world.buildings.get(bid)!, r = this.regionOf(b); if (r < 0) continue;
+      const { building: b, region: r } = geometry.lots.get(bid)!; if (r < 0) continue;
       for (let k = first[claim]; k >= 0; k = next[k]) {
         const pop = b.pop * MAINLINE_FEEDERS.share * qualities[claim] * weights[k] / sums[claim], pool = result[indices[k]];
         pool.pop += pop; pool.regions.set(r, (pool.regions.get(r) ?? 0) + pop);
@@ -1325,7 +1380,11 @@ export class DemandModel {
     }
     if (!connected) return { boardings: 0, revenue: 0, legLoads: new Array(Math.max(0, 2 * (sites.length - 1))).fill(0), sets };
     const ranks = [...indices.keys()], rank = context.ids.map(id => ranks.indexOf(id));
-    const tables = routeTables(context.edges, context.edges.keys(), new Map(), context.sameComplex);
+    // forecastRoutes already built the proposed stops' rows from this exact immutable graph.
+    // Complete only the other rows, retaining the graph's source order and each native hop table.
+    const sources = [...context.edges.keys()];
+    const missing = routeTables(context.edges, sources.filter(id => !context.tables.has(id)), new Map(), context.sameComplex);
+    const tables = new Map(sources.map(id => [id, context.tables.get(id) ?? missing.get(id)!]));
     const locations = new Map<number, { x: number; z: number; townId: number;
       walking: Map<number, number>; regional: Map<number, number> }>();
     for (const [id, i] of indices) locations.set(id, { ...sites[i], walking: walking[i].regions, regional: sites[i].regions });
