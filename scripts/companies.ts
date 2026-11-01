@@ -20,7 +20,7 @@ import { serialize, deserialize } from '../src/game/save';
 import { MODEL_BY_ID, availableModels, carriesMail } from '../src/game/vehicle-types';
 import { fare } from '../src/game/vehicle';
 import type { Economy, Category } from '../src/game/economy';
-import { fails, check, fmt, checkReservations, checkNaN, placeAndConnect, depotBehind } from './lib';
+import { fails, check, fmt, checkReservations, checkNaN, placeAndConnect, depotBehind, observeAITiming } from './lib';
 import { fork } from 'node:child_process';
 
 const pos = process.argv.slice(2).filter((s) => !s.startsWith('--'));
@@ -69,12 +69,8 @@ check(new Set(g.companies.map((c) => c.color)).size === 6 && new Set(g.companies
 check(AI_PRESETS.length >= 4, 'AI presets');
 
 // ------------------------------------------------------------------ 1. five AI personalities over the years
-const aiTime = g.ais.map(() => ({ t: 0, n: 0, max: 0 }));
+const aiTime = observeAITiming(g);
 const AIS = [...g.ais];
-AIS.forEach((ai, i) => {
-  const f = ai.daily.bind(ai);
-  ai.daily = () => { const t = performance.now(); f(); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].n++; aiTime[i].max = Math.max(aiTime[i].max, dt); };
-});
 let errors = 0;
 const origWarn = console.warn;
 console.warn = (...a: unknown[]) => { errors++; origWarn('WARN', ...a); };

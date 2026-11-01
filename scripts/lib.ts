@@ -16,6 +16,36 @@ export const fails: string[] = [];
 export function check(cond: any, msg: string) { if (!cond) { fails.push(msg); console.log('  FAIL: ' + msg); } }
 export const fmt = (x: number, d = 1) => x.toFixed(d);
 
+type AIEntry = 'daily' | 'work' | 'sharedCapacityDaily' | 'monthly';
+export interface AITiming {
+  t: number; n: number; max: number; peak: string;
+  calls: Record<AIEntry, number>;
+}
+
+/** Observe every AI entry point used by Game without changing arguments or scheduling. Only daily()
+ * advances the denominator; scheduled capacity reviews and monthly management are part of that cost. */
+export function observeAITiming(g: Game, now: () => number = () => performance.now()): AITiming[] {
+  return g.ais.map(ai => {
+    const timing: AITiming = { t: 0, n: 0, max: 0, peak: '', calls: { daily: 0, work: 0, sharedCapacityDaily: 0, monthly: 0 } };
+    const measure = <T>(entry: AIEntry, run: () => T): T => {
+      const start = now();
+      try { return run(); }
+      finally {
+        const elapsed = now() - start;
+        timing.t += elapsed; timing.calls[entry]++;
+        if (entry === 'daily') timing.n++;
+        if (elapsed > timing.max) { timing.max = elapsed; timing.peak = `${entry}: ${g.day} ${ai.state.phase}`; }
+      }
+    };
+    const daily = ai.daily.bind(ai), work = ai.work.bind(ai), shared = ai.sharedCapacityDaily.bind(ai), monthly = ai.monthly.bind(ai);
+    ai.daily = (...args: Parameters<typeof daily>) => measure('daily', () => daily(...args));
+    ai.work = (...args: Parameters<typeof work>) => measure('work', () => work(...args));
+    ai.sharedCapacityDaily = (...args: Parameters<typeof shared>) => measure('sharedCapacityDaily', () => shared(...args));
+    ai.monthly = (...args: Parameters<typeof monthly>) => measure('monthly', () => monthly(...args));
+    return timing;
+  });
+}
+
 export function railOpts(owner = 0, tracks = 1, extra: Partial<BuildOptions> = {}): BuildOptions {
   return { kind: 'rail', type: 'standard', tracks, heightOffset: 0, crossing: 'auto', owner, ...extra };
 }
