@@ -6550,7 +6550,11 @@ export class AIController {
     if (Array.isArray(s.accessCare)) this.accessCare = new Map(s.accessCare);
     if (Array.isArray(s.relengthen)) this.relengthen = s.relengthen.map((q: [number, number, string[]]) => [q[0], q[1], [...q[2]]]);
     // Urban construction and access repair retain the exact next work unit, including partial works.
-    if (s.project && (s.project.kind === 'metro' || s.project.kind === 'lightrail')) {
+    if (s.project?.kind === 'tram' && s.tram?.continuation?.version === 1) {
+      this.project = structuredClone(s.project);
+      this.tramPlanner().restore(s.tram);
+      this.job = this.tramJob(this.game.towns.list[this.project!.towns[0]]);
+    } else if (s.project && (s.project.kind === 'metro' || s.project.kind === 'lightrail')) {
       this.project = { ...s.project, towns: s.project.towns ?? [], stations: s.project.stations ?? [], edges: s.project.edges ?? [], depots: s.project.depots ?? [] };
       if (s.urbanSurvey) this.urbanSurvey = { ...s.urbanSurvey, sites: s.urbanSurvey.sites.map((p: any) => p.station ? loadTaskStation(this.game, p.station)
         : { ...p.site, walk: { ...p.site.walk, buildings: new Map(p.site.walk.buildings) } }) };
@@ -6568,7 +6572,7 @@ export class AIController {
         line: s.project.line ?? -1, started: s.project.started ?? 0, access: s.project.access ?? -1, joint: s.project.joint,
       };
       try {
-        if (p.kind === 'tram') { if (s.tram) TramPlanner.abandon(this.game, this.companyId, s.tram); }
+        if (p.kind === 'tram') { if (s.tram) TramPlanner.abandon(this.game, this.companyId, structuredClone(s.tram)); }
         else this.abandon(p);
       } catch { /* ignore */ }
       this.state.phase = 'idle';
