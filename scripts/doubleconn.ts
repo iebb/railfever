@@ -3,6 +3,7 @@
 import { writeFileSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { Game } from '../src/game/game';
+import { AIController } from '../src/game/ai';
 import { Train, lineCongestion, depotServes } from '../src/game/train';
 import { initialTrackChoice, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { lineIsDouble, trackIsDouble, upgradeRoute } from '../src/game/dualtrack';
@@ -13,6 +14,7 @@ import { autoSignalLine } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
 import { station, endNode, nodeSnap, railOpts, build, check, done, depotFor, loco, runTrains } from './stationlib';
 import { checkReservations } from './lib';
+import { controlledOpeningWorld } from './opening-fixtures';
 
 if (!process.argv[1]?.endsWith('doubleconn.mjs')) throw new Error('bundle as doubleconn.mjs');
 const traffic: InitialTrackTraffic = { revenue: 6_000_000, boardings: 120_000, seats: 100_000, trains: 4,
@@ -186,13 +188,18 @@ function openingDirections() {
 
 /** Exercise the real opening job when no depot builder can supply a usable site. */
 function failedOpening() {
-  const g = Game.create({ size: 512, seed: 11, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
-  g.aiAcquisitions = false;
-  const ai = g.ais[0] as any;
+  // Keep this injected depot failure independent of whether a natural survey reaches construction.
+  // The ordinary native quote, financing and rail job still have to accept and build the corridor.
+  const f = controlledOpeningWorld(), { g } = f, ai = f.ai as any;
   ai.depotNearLine = ai.depotSwitch = function* () { return -1; };
-  while (g.day < 720 && !ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations'))) g.stepTick();
+  check(!AIController.forceBuild && ai.startProject('rail', [0, 1]), 'a native paying railway starts before the depot fault');
+  try {
+    for (let tick = 0; tick < 2400 && ai.busy; tick++) {
+      const phase = g.tick % g.ticksPerDay; ai.work(phase, phase + 1); g.stepTick();
+    }
+  } finally { f.restore(); }
   check(ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations')),
-    'natural railway job reaches a failed depot opening');
+    'the bounded native railway job reaches its failed depot opening');
   check(ai.stats.doubled === 0 && ![...ai.lines.values()].some((info: any) => info.kind === 'rail')
     && !g.lines.all().some(l => l.owner === ai.companyId && l.kind === 'rail'),
     'failed depot opening pays no initial pair and retains no phantom railway');
