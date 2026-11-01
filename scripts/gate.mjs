@@ -161,8 +161,8 @@ try {
     if (result.rc !== 0 && timingOnly(result)) {
       console.log('ai: timing-only failures; rerunning once (original log preserved)');
       result = await run({ name: 'ai-rerun', script: 'ai', args: ['23', '3', '512', '3'] });
-      if (result.rc !== 0 && timingOnly(result)) console.log(`ai: repeated timing-only failure at load ${loadavg().map((n) => n.toFixed(2)).join(' ')}; reported, not blocking`);
-      else if (result.rc !== 0) failed = true;
+      if (result.rc !== 0 && timingOnly(result)) console.log(`ai: repeated timing-only failure at load ${loadavg().map((n) => n.toFixed(2)).join(' ')}; both logs retained for diagnosis`);
+      if (result.rc !== 0) failed = true;
     } else if (result.rc !== 0) failed = true;
   }
   if (assigned.has('catchperf') && !interrupted && (await run({ name: 'catchperf', script: 'catchperf', args: [] })).rc !== 0) failed = true;
