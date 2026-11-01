@@ -54,9 +54,10 @@ const legacyActivity = argv.includes('--legacy-activity');
 const defaultTowns = (size: number) => Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2)));
 
 /** One seed: AI companies build their networks; monthly samples of every town. */
-function simulate(seed: number): Run {
+function simulate(seed: number, created?: (townCount: number) => void): Run {
   const T0 = performance.now();
   const g = Game.create({ size: SIZE, seed, towns: defaultTowns(SIZE), hilliness: 'hilly', water: 'medium', startYear: START, aiCompanies: NAI });
+  created?.(g.towns.list.length);
   const genMs = performance.now() - T0;
   // passengers who gave up waiting, counted independently of the game's counters (the queue cap: trimWaiting)
   const lostSt = new Map<number, number>(), lostTown = new Map<number, number>();
@@ -246,7 +247,7 @@ function report(runs: Run[], checks: boolean) {
 /** Only complete native samples from the requested worker can enter the combined report. */
 function workerRun(value: unknown, seed: number): Run | null {
   if (!value || typeof value !== 'object') return null;
-  const envelope = value as { version?: number; start?: number; ai?: number; failures?: unknown; run?: Run };
+  const envelope = value as { version?: number; start?: number; ai?: number; actualTownCount?: number; failures?: unknown; run?: Run };
   const r = envelope.run;
   // The native loop completes whole days, including the final day of a fractional horizon.
   const days = Math.max(0, Math.ceil(YEARS * 360));
@@ -254,11 +255,12 @@ function workerRun(value: unknown, seed: number): Run | null {
   if (envelope.version !== 1 || envelope.start !== START || envelope.ai !== NAI ||
       !Array.isArray(envelope.failures) || !envelope.failures.every((f) => typeof f === 'string') ||
       !r || r.seed !== seed || r.size !== SIZE || r.years !== YEARS ||
-      !Array.isArray(r.towns) || r.towns.length !== defaultTowns(SIZE) ||
+      !Number.isInteger(envelope.actualTownCount) || envelope.actualTownCount! < 0 || envelope.actualTownCount! > defaultTowns(SIZE) ||
+      !Array.isArray(r.towns) || r.towns.length !== envelope.actualTownCount ||
       !Array.isArray(r.yearly) || r.yearly.length !== Math.floor(days / 360)) return null;
   const ids = new Set<number>();
   for (const t of r.towns) {
-    if (!t || !Number.isInteger(t.id) || ids.has(t.id) || typeof t.name !== 'string' ||
+    if (!t || !Number.isInteger(t.id) || t.id !== ids.size || ids.has(t.id) || typeof t.name !== 'string' ||
         typeof t.profile !== 'string' || !finite(t.pop0) || !Array.isArray(t.months) || t.months.length !== Math.floor(days / 30)) return null;
     ids.add(t.id);
     for (const m of t.months) if (!m || !['pop', 'act', 'act90', 'catch', 'gen', 'trans', 'lost', 'boarded', 'rating', 'calls', 'score', 'speed']
@@ -329,8 +331,9 @@ async function parallelRuns(): Promise<Run[] | null> {
 const workerOutput = opt('growth-worker');
 if (workerOutput) {
   if (seeds.length !== 1) throw new Error('A native growth worker requires exactly one seed');
-  const run = simulate(seeds[0]);
-  writeFileSync(workerOutput, JSON.stringify({ version: 1, start: START, ai: NAI, failures: fails, run }));
+  let actualTownCount = -1;
+  const run = simulate(seeds[0], (count) => { actualTownCount = count; });
+  writeFileSync(workerOutput, JSON.stringify({ version: 1, start: START, ai: NAI, actualTownCount, failures: fails, run }));
   process.exitCode = fails.length ? 1 : 0;
 } else {
   // --report=a.json,b.json: report earlier dumps; --check-report also runs history and report assertions.

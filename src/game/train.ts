@@ -10,7 +10,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
 import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, nextStopIndex, stopsAt } from './patterns';
 import { trackPassage } from './opcosts';
-import { platformPreference } from './rail-platforms';
+import { platformPreference, platformFlowCosts } from './rail-platforms';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
 export const CROSS_BASE = 50_000_000;
@@ -252,8 +252,10 @@ export interface RailRouteTarget {
   group?: number; preferred?: number; length?: number; direction?: 1 | -1;
   /** A service arrival must also be able to leave this platform for its next served station. */
   onward?: number;
-  /** Auto breaks geometry ties; an explicit manual preference accepts a modest legal detour. */
+  /** Auto prices opposing platform flows; an explicit manual choice accepts a modest legal detour. */
   manual?: boolean;
+  /** Actual opposing running-path exposure at each candidate platform. */
+  flowCosts?: ReadonlyMap<number, number>;
   /** Contiguous target-platform path already held before the route's initial frontier. */
   prefix?: { edge: number; dir: number; length: number };
 }
@@ -358,9 +360,10 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
-    // Prefer the saved platform, but a reserved platform costs more than a legal free alternative.
+    // Geometry, actual occupancy and opposing flows price Auto arrivals; preferences never bypass reservations.
     const group = ends.get(key(e.id, d));
     if (group !== undefined && platform.preferred !== undefined && group !== platform.preferred) c += platform.manual ? 12 : 1e-4;
+    if (group !== undefined && !platform.manual) c += platform.flowCosts?.get(group) ?? 0;
     return c;
   };
   const push = (e: NEdge, d: number, gc: number, parent: number) => {
@@ -978,7 +981,8 @@ export class Train extends Vehicle {
     this.routeTarget = target.id;
     const rule = this.rule;
     const savedPlatform = this.line ? platformPreference(this.line, this.pattern, this.stopIndex) : undefined;
-    const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length };
+    const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length,
+      ...(this.line && !savedPlatform?.manual ? { flowCosts: platformFlowCosts(g, this.line, this.pattern, this.stopIndex) } : {}) };
     if (this.line) platform.onward = this.line.stops[nextStopIndex(this.line, this.pattern, this.stopIndex)];
     const last = this.segs[this.segs.length - 1];
     const group = last && g.stations.railTrackGroups(target).find(q => q.steps.some(s => s.edge === last.e));

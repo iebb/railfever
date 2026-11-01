@@ -1030,12 +1030,12 @@ export function roadCapacityQuote(g: Game, l: Line, model?: VehicleModel, operat
 export function roadFleetCap(g: Game, l: Line, model?: VehicleModel): number { return roadCapacityQuote(g, l, model).limit; }
 
 /** Road depot of ours that reaches the station (its vehicles can start there), nearest first; -1: none. */
-function ownDepotFor(g: Game, owner: number, stationId: number): number {
+function ownDepotFor(g: Game, owner: number, stationId: number, kind: 'road' | 'tram' = 'road'): number {
   const st = g.stations.get(stationId);
   if (!st) return -1;
   let best = -1, bd = Infinity;
   for (const d of g.depots.map.values()) {
-    if (d.owner !== owner || d.kind !== 'road') continue;
+    if (d.owner !== owner || d.kind !== kind) continue;
     const dist = Math.hypot(d.x - st.x, d.z - st.z);
     if (dist < bd && dist < 90 && roadDepotReaches(g, d, stationId)) { bd = dist; best = d.id; }
   }
@@ -1075,14 +1075,15 @@ function winBack(g: Game, l: Line, ratio: number): number {
  */
 export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Generator<void, RoadPlan | null> {
   const g = h.g, me = h.me, route = routeOf(g, l);
-  if (!route || l.kind !== 'road') return null;
+  if (!route || (l.kind !== 'road' && l.kind !== 'tram')) return null;
   const all = fleetOf(g, l), n = all.vehicles.length;
   // This demand forecast prices one full-route service. Short-turn/express fleets need a pattern-aware quote;
   // claiming every vehicle serves every stop would invent marginal riders and can fund an unprofitable purchase.
   const patternLine = patternLineCopy(l);
   if (patternStops(patternLine).length !== l.stops.length || all.vehicles.some(v => patternStops(patternLine, v.pattern).length !== l.stops.length)) return null;
-  const model = purchase ?? (all.model?.style === 'coach' ? coachModel(g.year) : pickBusFor(g.year, Math.max(3000, ...townsOf(g, l).map(id => g.towns.list[id]?.pop ?? 0)))) ?? all.model;
-  if (!model || !n) return null;
+  const model = purchase ?? (l.kind === 'tram' ? all.model : all.model?.style === 'coach' ? coachModel(g.year)
+    : pickBusFor(g.year, Math.max(3000, ...townsOf(g, l).map(id => g.towns.list[id]?.pop ?? 0)))) ?? all.model;
+  if (!model || !n || (l.kind === 'tram' && model.kind !== 'tram')) return null;
   const capacity = roadCapacityQuote(g, l, model, me);
   if (n >= capacity.limit) return null;
   const sites = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s).map(siteOf);
@@ -1104,7 +1105,11 @@ export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Genera
     for (const owner of new Set(items.map((st) => st.owner))) fees += g.accessChargeEstimate(me, owner, items.filter((st) => st.owner === owner), 1 / (n + 1));
   }
   let depotUpkeep = 0;
-  if (!route.path.some((id) => ownDepotFor(g, me, id) >= 0)) { outlay += DEPOT_COST; depotUpkeep = DEPOT_UPKEEP; }
+  if (!route.path.some((id) => ownDepotFor(g, me, id, l.kind === 'tram' ? 'tram' : 'road') >= 0)) {
+    // Monthly tram growth buys from its existing paid yard; no unplanned road depot can launch a tram.
+    if (l.kind === 'tram') return null;
+    outlay += DEPOT_COST; depotUpkeep = DEPOT_UPKEEP;
+  }
   const yearly = running + fees + depotUpkeep + capital(g, me, model.cost) + (outlay - model.cost) * 0.05 + capacity.delayCost;
   const towns = [...new Set(sites.map((s) => s.townId).filter((t) => t >= 0))];
   return { kind: 'join', line: l.id, sites: [], model, vehicles: 1, towns, revenue, yearly, outlay,

@@ -204,7 +204,7 @@ check(aiTrains.every(t => !t.line || patternStops(t.line, t.pattern).every(stop 
 {
   // Capacity management uses actual saved native services. Pause daily investment on each branch so a route
   // merger cannot change the measured stops, stock or managed-line record during the monthly capacity test.
-  // Buses use physical shared-curb admission; trams retain the rounded personality cap and stop ceiling.
+  // Both use physical shared-curb admission; trams also retain their rounded personality cap and stop ceiling.
   for (const kind of ['bus', 'tram'] as const) {
     const branch = deserialize(JSON.parse(personalitySnapshot)); branch.aiEnabled = false; branch.aiAcquisitions = false;
     const managed = (ai: AIController) => (ai as unknown as { lines: Map<number, LineInfo> }).lines;
@@ -223,8 +223,8 @@ check(aiTrains.every(t => !t.line || patternStops(t.line, t.pattern).every(stop 
           && new Set(l.stops).size >= 2 && !worksOn(branch, l.id) && branch.lines.operateError(l, ai.companyId) === null
           && l.vehicles.every(id => branch.vehicles.get(id) instanceof RoadVehicle)
           && (() => { const n = l.vehicles.length, grow = Math.sqrt(ai.config.activeness), model = modelFor(ai, l, info);
-            return !!model && (kind === 'bus' ? n < roadFleetCap(branch, l, model)
-              : n < 2 + l.stops.length && Math.round(Math.max(1, Math.round(n / grow)) * grow) === n); })());
+            return !!model && n < roadFleetCap(branch, l, model) && (kind === 'bus'
+              || n < 2 + l.stops.length && Math.round(Math.max(1, Math.round(n / grow)) * grow) === n); })());
       if (pick) break;
     }
     check(!!pick, `crowded ${kind} growth has an existing native managed service below its capacity ceiling`);
@@ -235,7 +235,7 @@ check(aiTrains.every(t => !t.line || patternStops(t.line, t.pattern).every(stop 
     const v0 = branch.vehicles.get(l.vehicles[0])!, grow = Math.sqrt(ai.config.activeness);
     info.lastSold = -1e9;
     if (kind === 'tram') info.maxVehicles = Math.max(1, Math.round(n0 / grow));
-    const hard0 = kind === 'bus' ? roadFleetCap(branch, l, model) : 2 + l.stops.length;
+    const hard0 = Math.min(roadFleetCap(branch, l, model), kind === 'tram' ? 2 + l.stops.length : Infinity);
     const policyCap = kind === 'bus' ? hard0 : Math.min(Math.round(info.maxVehicles * grow), hard0);
     check(kind === 'bus' ? n0 < policyCap : policyCap === n0 && n0 < hard0,
       `crowded ${kind} growth starts below its physical ceiling${kind === 'tram' ? ' and exactly at its rounded fleet cap' : ''} (${n0} of ${policyCap}, hard ${hard0})`);
@@ -261,32 +261,30 @@ check(aiTrains.every(t => !t.line || patternStops(t.line, t.pattern).every(stop 
     };
     crowd();
     const host = (ai as unknown as { busHost(): BusHost }).busHost();
-    if (kind === 'bus') {
-      const quote = moreValue(host, l, model); let next = quote.next(); while (!next.done) next = quote.next();
-      console.log(`  crowded bus native marginal quote: ${next.value?.why ?? 'none'}, physical cap ${hard0}, model ${model.id}`);
-      check(!!next.value && pays(next.value), 'the crowded native bus service has a positive real marginal investment quote');
-    }
+    const quote = moreValue(host, l, model); let next = quote.next(); while (!next.done) next = quote.next();
+    console.log(`  crowded ${kind} native marginal quote: ${next.value?.why ?? 'none'}, physical cap ${hard0}, model ${model.id}`);
+    check(!!next.value && pays(next.value), `the crowded native ${kind} service has a positive real marginal investment quote`);
     runMonthly(100, () => own() > o0);
     console.log(`  riders giving up on ${l.name} (${kind}, ${new Set(l.stops).size} stops): limit ${m0} -> ${info.maxVehicles}, owner fleet ${o0} -> ${own()}`);
     check(own() > o0 && (kind === 'bus' || info.maxVehicles > m0),
       `riders giving up on a profitable ${kind} service add a vehicle${kind === 'tram' ? ' and raise its rounded limit' : ''}`);
     // Occupy the actual ceiling with native paid purchases, then prove the real monthly manager refuses more.
-    // Recompute the bus quote as each exact current model joins the existing mixed stock and shared curbs.
-    const ceiling = () => kind === 'bus' ? roadFleetCap(branch, l, model) : 2 + l.stops.length;
+    // Recompute the quote as each exact current model joins the existing mixed stock and shared curbs.
+    const ceiling = () => Math.min(roadFleetCap(branch, l, model), kind === 'tram' ? 2 + l.stops.length : Infinity);
     const budget = 2 * ceiling();
     for (let k = 0; k < budget && l.vehicles.length < ceiling(); k++) branch.vehicles.buyRoad(info.depot, model, l.id);
     const hard = ceiling(), n1 = l.vehicles.length;
     if (kind === 'tram') info.maxVehicles = Math.max(info.maxVehicles, Math.ceil(hard / grow) + 1);
     const m1 = info.maxVehicles;
     crowd();
-    if (kind === 'bus') {
-      const physical = roadCapacityQuote(branch, l, model);
-      check(n1 === physical.limit && !roadVehiclePays(host, l, model), 'the real native bus quote refuses an additional vehicle at its physical curb ceiling');
-    }
+    const physical = roadCapacityQuote(branch, l, model);
+    check(n1 === Math.min(physical.limit, kind === 'tram' ? 2 + l.stops.length : Infinity)
+      && (n1 < physical.limit || !roadVehiclePays(host, l, model)),
+      `the real native ${kind} quote refuses an additional vehicle when the physical curb ceiling binds`);
     runMonthly(70);
     console.log(`  ${kind} capacity ceiling: ${n1}/${hard} paid vehicles, final fleet ${l.vehicles.length}, limit ${m1} -> ${info.maxVehicles}`);
     check(n1 === hard && info.maxVehicles === m1 && l.vehicles.length === n1,
-      `a crowded ${kind} service at its ${kind === 'bus' ? 'physical curb' : 'stop'} ceiling raises nothing more (${n1} of ${hard}, limit ${m1} -> ${info.maxVehicles})`);
+      `a crowded ${kind} service at its physical curb or stop ceiling raises nothing more (${n1} of ${hard}, limit ${m1} -> ${info.maxVehicles})`);
     check(JSON.stringify([l.stops, l.patterns]) === topology && branch.lines.get(l.id) === l && managed(ai).get(l.id) === info,
       `the ${kind} capacity audit retains the same native route, patterns and management record`);
     check(checkReservations(branch).length === 0, `${kind} capacity management keeps reservations consistent`);

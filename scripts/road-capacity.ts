@@ -3,16 +3,18 @@
 import assert from 'node:assert/strict';
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
-import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { MODEL_BY_ID, availableModels } from '../src/game/vehicle-types';
 import { planTownLine, roadPlanJob, roadCapacityQuote, roadCurbRoute, roadForecasts, roadDriving, moreValue, pays, routeOf, type BusHost } from '../src/game/ai-bus';
 import { nativeRoadItinerary, evaluateNativeRoadCycle } from '../src/game/road-physics';
 import { YEAR_S } from '../src/game/opcosts';
-import { RoadVehicle, makeLaneSeg } from '../src/game/roadvehicle';
+import { RoadVehicle, makeLaneSeg, roadDepotReaches } from '../src/game/roadvehicle';
 import { simNow, fareFor, stationFareContext } from '../src/game/fares';
 import { bezLine } from '../src/game/geom';
 import { addPattern } from '../src/game/patterns';
 import { outAndBack } from '../src/game/lines';
 import { roadDepotNear } from './lib';
+import { TramPlanner } from '../src/game/ai-tram';
+import { modelYearCost, type LineInfo } from '../src/game/ai';
 
 function drain<T>(g: Generator<void, T>): T { let r = g.next(); while (!r.done) r = g.next(); return r.value; }
 const host = (g: Game): BusHost => (g.ais[0] as unknown as { busHost(): BusHost }).busHost();
@@ -245,4 +247,98 @@ for (const h of [g, deserialize(JSON.parse(saved))]) {
 const replay = deserialize(JSON.parse(saved));
 for (let tick = 0; tick < g.ticksPerDay * 3; tick++) { g.stepTick(); replay.stepTick(); }
 assert.equal(JSON.stringify(serialize(g)), JSON.stringify(serialize(replay)), 'shared saturated fleets replay exactly');
+// A literal tram service uses the same exact-model economic and shared-curb admission in monthly management.
+{
+  const h = Game.create({ size: 384, seed: 11, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1965,
+    aiConfigs: [{ activeness: 1, focus: { rail: 0, road: 0, tram: 1 } }] });
+  h.aiEnabled = false; h.aiAcquisitions = false;
+  const ai = h.ais[0], eco = h.company(ai.companyId).economy;
+  eco.money += 50_000_000;
+  while (eco.loan > 0 && eco.repay()) { /* settle the native opening loan before comparing purchase charges */ }
+  const planner = new TramPlanner(h, ai.companyId);
+  assert(planner.start());
+  let result = planner.step(1), units = 1;
+  while (result === 'running' && units++ < 2000) result = planner.step(1);
+  assert.equal(result, 'done', planner.reason);
+  const project = planner.project!, line = h.lines.get(project.line)!;
+  assert.equal(line.kind, 'tram'); assert(line.vehicles.length >= 2);
+  const manager = ai as unknown as { lines: Map<number, LineInfo>; manage(): void };
+  const info: LineInfo = { kind: 'tram', towns: [project.town], depot: project.depot, maxVehicles: line.vehicles.length, opened: h.day };
+  manager.lines.set(line.id, info);
+  h.flushNetworkChanges(); h.stations.recomputeCatchment(); h.lines.flushCatchment();
+  const model = availableModels(h.year, 'tram').sort((a, b) => b.capacity / (b.cost + modelYearCost(b, h.year) * 8)
+    - a.capacity / (a.cost + modelYearCost(a, h.year) * 8))[0];
+  assert(model);
+  const crowd = () => {
+    line.incomeLast = line.costLast * 2 + 1_000_000; line.passLast = 100;
+    for (const sid of new Set(line.stops)) {
+      const st = h.stations.get(sid)!, to = line.stops.find(id => id !== sid)!;
+      h.stations.addWaiting(st, line.id, to, to, 20); st.lostLast = 4 * model.capacity;
+    }
+  };
+  crowd();
+  const quiet = drain(moreValue(host(h), line, model));
+  assert(quiet && pays(quiet), 'a native quiet tram has a positive exact-model marginal quote');
+  console.log(`tram admission, quiet: ${quiet.why}; existing yard, ${model.cost} paid`);
+  assert.equal(quiet.outlay, model.cost, 'the existing paid tram depot is reused without a phantom road-depot charge');
+  assert.equal(drain(moreValue(host(h), line, modern)), null, 'a bus cannot be quoted for a tram line');
+  const n0 = line.vehicles.length, cash0 = eco.money;
+  manager.manage();
+  assert.equal(line.vehicles.length, n0 + 1, 'monthly review buys the profitable tram');
+  assert.equal((h.vehicles.get(line.vehicles.at(-1)!) as RoadVehicle).model, model, 'monthly quote and purchase use the same current tram');
+  assert(Math.abs(cash0 - eco.money - model.cost) < 1e-7, 'the admitted tram is paid at its native price');
+
+  // Another paid operator shares these berths. Its fare losses must count before physical saturation.
+  const partner = h.lines.create('road', 0); partner.stops = [...line.stops]; partner.loop = line.loop;
+  h.economy.money += 20_000_000;
+  const stop = h.stations.get(line.stops[0])!.stops[0];
+  const partnerDepot = roadDepotNear(h, stop.x, stop.z, 0);
+  assert(partnerDepot >= 0); partner.incomeLast = 2_000_000;
+  assert(roadDepotReaches(h, h.depots.get(partnerDepot)!, line.stops[0]) && roadCurbRoute(h, line, undefined, 0).calls.size > 0);
+  assert.equal(drain(moreValue({ ...host(h), me: 0 }, line, model)), null,
+    'a reachable road depot cannot fund a tram purchase without an owned native tram yard');
+  let economicSave = '';
+  while (roadCapacityQuote(h, line, model).limit >= 2 + line.stops.length || !economicSave) {
+    assert(h.vehicles.buyRoad(partnerDepot, modern, partner.id) instanceof RoadVehicle);
+    assert(partner.vehicles.length < 100);
+    const quote = drain(moreValue(host(h), line, model));
+    if (quote && !pays(quote)) {
+      console.log(`tram admission, shared: ${quote.why}; curb delay ${Math.round(roadCapacityQuote(h, line, model).delayCost)}`);
+      economicSave = JSON.stringify(serialize(h));
+    }
+    if (roadCapacityQuote(h, line, model).limit === line.vehicles.length) break;
+  }
+  assert(economicSave, 'foreign curb delay can make a physical tram slot uneconomic');
+
+  // Paid stock occupies its real curbs before the legacy stop-count limit is reached.
+  while (roadCapacityQuote(h, line, model).limit > line.vehicles.length) {
+    assert(h.vehicles.buyRoad(project.depot, model, line.id) instanceof RoadVehicle);
+    assert(line.vehicles.length < 100);
+  }
+  assert(line.vehicles.length < 2 + line.stops.length, 'physical tram capacity is stricter than the old stop-count ceiling');
+  info.maxVehicles = 2 + line.stops.length;
+  crowd();
+  const saved = JSON.stringify(serialize(h));
+  for (const world of [deserialize(JSON.parse(economicSave)), h, deserialize(JSON.parse(saved))]) {
+    const l = world.lines.get(line.id)!, before = JSON.stringify(serialize(world));
+    const quote = drain(moreValue(host(world), l, model));
+    assert(!quote || !pays(quote), 'native trams refuse saturated or uneconomic shared curbs');
+    assert.equal(JSON.stringify(serialize(world)), before, 'tram refusal quotes are pure with cold and warm caches');
+    const controller = world.ais[0] as unknown as { lines: Map<number, LineInfo>; manage(): void };
+    const assets = () => JSON.stringify([world.company(ai.companyId).economy.toJSON(), world.vehicles.nextId, l.vehicles,
+      l.stops, l.patterns, controller.lines.get(l.id), [...world.vehicles.map.values()].map(v => [v.id, v.owner, v.lineId])]);
+    const prior = assets(); controller.manage();
+    assert.equal(assets(), prior, 'monthly curb refusal spends nothing and preserves stock, owners, routes and fleet limits');
+  }
+  h.flushNetworkChanges(); h.stations.recomputeCatchment(); h.lines.flushCatchment();
+  const loaded = deserialize(JSON.parse(JSON.stringify(serialize(h))));
+  for (let tick = 0; tick < h.ticksPerDay * 3; tick++) {
+    h.stepTick(); loaded.stepTick();
+    const a = JSON.stringify(serialize(h)), b = JSON.stringify(serialize(loaded));
+    if (a !== b) {
+      let at = 0; while (at < Math.min(a.length, b.length) && a[at] === b[at]) at++;
+      assert.fail(`native tram replay tick ${tick}, byte ${at}: ${a.slice(at - 60, at + 100)} vs ${b.slice(at - 60, at + 100)}`);
+    }
+  }
+}
 console.log('PASS actual mixed fleet and purchase model; quiet/shared/saturated physical admission; foreign delay costs; pure reads and exact replay');

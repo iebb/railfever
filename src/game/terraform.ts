@@ -107,7 +107,8 @@ function portalEnd(w: World, e: NEdge, nid: number): boolean {
 }
 
 /** Collect, per vertex, the heights the edge's ground sections allow: flat formation, linear side slopes. */
-function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, continued?: ReadonlySet<number>) {
+function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, continued?: ReadonlySet<number>,
+  bounds?: { x0: number; z0: number; x1: number; z1: number }) {
   const net = w.net;
   const hw = net.halfWidth(e);
   const core = hw + EARTHWORKS.corePad;
@@ -122,15 +123,15 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, 
   const g = net.geo(e);
   for (const p of groundSamples(w, e, continued)) {
     const target = p.y - fd;
-    const terr = w.heightAt(p.x, p.z);
-    const ext = coreOnly ? 0 : Math.min(EARTHWORKS.reach, Math.abs(target - terr) / k + 1);
+    const ext = coreOnly ? 0 : Math.min(EARTHWORKS.reach, Math.abs(target - w.heightAt(p.x, p.z)) / k + 1);
     const R = core + ext;
+    if (bounds && (p.x + R < bounds.x0 || p.x - R > bounds.x1 || p.z + R < bounds.z0 || p.z - R > bounds.z1)) continue;
     // grading stops at tunnel portals so the hillside behind them stays intact
     const nearTunnel = tunnels.some((t) => p.s > t.s0 - R - 0.5 && p.s < t.s1 + R + 0.5);
     let tx = 0, tz = 0;
     if (nearTunnel) { const i = Math.max(0, Math.min(g.n - 1, Math.round((p.s / Math.max(0.01, e.len)) * (g.n - 1)))); tx = g.tan[i * 2]; tz = g.tan[i * 2 + 1]; }
-    for (let z = Math.max(0, Math.floor(p.z - R)); z <= Math.min(w.size, Math.ceil(p.z + R)); z++) {
-      for (let x = Math.max(0, Math.floor(p.x - R)); x <= Math.min(w.size, Math.ceil(p.x + R)); x++) {
+    for (let z = Math.max(0, Math.floor(p.z - R), bounds?.z0 ?? 0); z <= Math.min(w.size, Math.ceil(p.z + R), bounds?.z1 ?? w.size); z++) {
+      for (let x = Math.max(0, Math.floor(p.x - R), bounds?.x0 ?? 0); x <= Math.min(w.size, Math.ceil(p.x + R), bounds?.x1 ?? w.size); x++) {
         const d = Math.hypot(x - p.x, z - p.z);
         if (d > R) continue;
         if (nearTunnel) {
@@ -193,6 +194,15 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   // interpolated surface under the road, rather than assigning every corner the highest road sample nearby.
   const roadTerrain = new Map(terrain);
   if (roads.length) earthworks(w, roads, true, view, roadTerrain, terrain);
+  const bounds = { x0: Infinity, z0: Infinity, x1: -Infinity, z1: -Infinity };
+  const include = (key: number, box: typeof bounds) => {
+    const x = key % (w.size + 1), z = Math.floor(key / (w.size + 1));
+    box.x0 = Math.min(box.x0, x); box.x1 = Math.max(box.x1, x);
+    box.z0 = Math.min(box.z0, z); box.z1 = Math.max(box.z1, z);
+  };
+  for (const key of stamps.keys()) include(key, bounds);
+  const changed = { ...bounds };
+  for (const key of roadTerrain.keys()) include(key, changed);
   // Cross-sections repeatedly sample the same terrain cells. This projection is immutable for the survey.
   const heights = new Map<number, number>();
   const vertex = (k: number) => {
@@ -205,12 +215,19 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
     return value;
   };
   const height = (x: number, z: number) => heightAtVertices(w, x, z, vertex);
+  const clamp = (v: number) => Math.max(0, Math.min(w.size - 1e-4, v));
   const roadUnsupported = (road: NEdge, net: Network, existing = false) => {
     const p = { x: 0, y: 0, z: 0 }, d = { ...p }, hw = net.halfWidth(road);
     let unsupported = false;
     for (let s = 0; s <= road.len + 1e-6; s += 0.25) {
       if (net.sectionAt(road, s) !== 'ground' || existing && road.sections.some(q => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1)) continue;
       net.pointAt(road, s, p, d);
+      // Outside every changed vertex's adjoining cells, the projected road is exactly its old
+      // terrain. Clamp the full width just as heightAt does at the world boundary.
+      if (existing) {
+        if (clamp(p.x + hw) < changed.x0 - 1 || clamp(p.x - hw) > changed.x1 + 1
+          || clamp(p.z + hw) < changed.z0 - 1 || clamp(p.z - hw) > changed.z1 + 1) continue;
+      }
       const l = Math.hypot(d.x, d.z) || 1;
       for (const off of [-hw, -hw / 2, 0, hw / 2, hw]) {
         const x = p.x - d.z / l * off, z = p.z + d.x / l * off;
@@ -258,6 +275,8 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
     }
     return false;
   };
+  // Only shared prospective corners can conflict. A nearby retained edge may run for kilometres;
+  // keep its identical stamp values at those corners without grading its distant geometry again.
   const pad = 5;
   let unsupportedRoad = false;
   for (const original of w.net.edgesNear(x0 - pad, z0 - pad, x1 + pad, z1 + pad)) {
@@ -272,7 +291,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
       continue;
     }
     const old = new Map<number, Acc>();
-    stampEdge(w, e, old, true, joined);
+    stampEdge(w, e, old, true, joined, bounds);
     const fd = formationDepth(e);
     let checkedRailSupport = false;
     for (const [k, a] of old) {

@@ -4949,18 +4949,16 @@ export class AIController {
       if (cursor.site < layout.targets.length) {
         const t = layout.targets[cursor.site], x = layout.x + Math.sin(layout.angle) * t, z = layout.z + Math.cos(layout.angle) * t;
         if (cursor.offset < 5) {
-          // At most five fixed native attempts; the saved offset still resumes the next one.
-          for (let attempt = 0; attempt < 5 && cursor.offset < 5; attempt++) {
-            const d = [0, 1.5, -1.5, 3, -3][cursor.offset++], px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
-            const through = (layout.towns?.length ?? 0) > 1;
-            const native = through ? this.urbanSitePlan(T, layout, mode, length, layout.angle, 0, t + d, level,
-              cursor.sites[cursor.sites.length - 1] as StationPlan | undefined) : null;
-            const plan = through ? (native && typeof native !== 'string' ? native : null)
-              : g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
-                { aiSurvey: true, trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
-                  ...(level !== 'ground' && g.stations.cityAt(px, pz, g.towns.nearest(px, pz)) ? { entrances: CITY_ENTRANCES } : {}) });
-            if (plan?.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; break; }
-          }
+          // One native attempt per work unit; the saved offset resumes all five fixed sites.
+          const d = [0, 1.5, -1.5, 3, -3][cursor.offset++], px = x + Math.sin(layout.angle) * d, pz = z + Math.cos(layout.angle) * d;
+          const through = (layout.towns?.length ?? 0) > 1;
+          const native = through ? this.urbanSitePlan(T, layout, mode, length, layout.angle, 0, t + d, level,
+            cursor.sites[cursor.sites.length - 1] as StationPlan | undefined) : null;
+          const plan = through ? (native && typeof native !== 'string' ? native : null)
+            : g.stations.planRail(px, pz, layout.angle, length, 2, this.companyId,
+              { aiSurvey: true, trackType: 'electric', mode, level, depth: 2.2, height: 1.5,
+                ...(level !== 'ground' && g.stations.cityAt(px, pz, g.towns.nearest(px, pz)) ? { entrances: CITY_ENTRANCES } : {}) });
+          if (plan?.ok && !plan.join?.rail) { cursor.sites.push(plan); cursor.site++; cursor.offset = 0; }
         } else if ((layout.towns?.length ?? 0) > 1) {
           // A constrained centre corridor cannot borrow demand from an unbuildable virtual stop.
           // Skip this trial in one saved work unit; local alignments retain their broader site search.
@@ -6069,8 +6067,9 @@ export class AIController {
           - a.capacity / (a.cost + modelYearCost(a, g.year) * 8))[0] ?? v0.model
         : (v0.model.style === 'coach' ? pickCoach(g.year) : pickBus(g.year,
           Math.max(...info.towns.map((id) => g.towns.list[id]?.pop ?? 3000), 3000))) ?? v0.model : null;
-      // One physical quote for the exact proposed bus, shared by this synchronous review's admission checks.
-      const hard = info.kind === 'bus' ? roadFleetCap(g, l, roadModel ?? undefined) : 2 + l.stops.length;
+      // One physical quote for the exact proposed road vehicle, shared by this review's admission checks.
+      const hard = info.kind === 'bus' ? roadFleetCap(g, l, roadModel ?? undefined)
+        : info.kind === 'tram' ? Math.min(2 + l.stops.length, roadFleetCap(g, l, roadModel ?? undefined)) : 2 + l.stops.length;
       const fleet = () => info.kind === 'bus' ? hard
         : info.kind === 'tram' ? Math.min(Math.round(info.maxVehicles * grow), hard) : info.maxVehicles;
       let maxV = fleet();
@@ -6079,8 +6078,12 @@ export class AIController {
       // vehicle horizon used in model selection; the street's fleet ceiling still applies.
       const extraRevenue = gaveUp * Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0)) / Math.max(1, l.passLast);
       const extraRunning = Math.max(l.costLast / Math.max(1, l.vehicles.length), roadModel ? modelYearCost(roadModel, g.year) : 0);
+      let roadPays: boolean | undefined;
+      const paysForRoad = (model: VehicleModel) => roadPays ??= roadVehiclePays(this.busHost(), l, model);
       if (roadModel && l.vehicles.length >= maxV && maxV < hard && gaveUp > 0
-        && extraRevenue > extraRunning + roadModel.cost / 8) { info.maxVehicles++; maxV = fleet(); }
+        && extraRevenue > extraRunning + roadModel.cost / 8 && (info.kind !== 'tram' || paysForRoad(roadModel))) {
+        info.maxVehicles++; maxV = fleet();
+      }
       // all operators' vehicles count towards what the line can take (no over-saturation of one track)
       const cap = info.kind === 'bus' ? maxV : info.joined || (info.kind === 'rail' && usesSharedRail(g, l)) ? this.lineCapacity(l) : maxV;
       if (l.vehicles.length >= cap || this.available() < v0.value * 1.5) continue;
@@ -6098,8 +6101,8 @@ export class AIController {
         }
       } else if (v0 instanceof RoadVehicle && v0.model) {
         const model = roadModel ?? v0.model;
-        // (a bus or coach must earn its keep: the forecast at one vehicle more and the riders giving up it wins back, ai-bus.ts)
-        if (info.kind === 'bus' && !roadVehiclePays(this.busHost(), l, model)) continue;
+        // Buses and trams must pay for their added service and delay to every operator sharing their curbs.
+        if (!paysForRoad(model)) continue;
         if (!this.borrowFor(model.cost)) continue;
         const b = g.vehicles.buyRoad(info.depot, model, lid);
         if (typeof b !== 'string') { info.maxVehicles = Math.max(info.maxVehicles, l.vehicles.length); this.stats.vehicles++; this.note(`added a ${info.kind === 'tram' ? 'tram' : 'bus'} to ${l.name}`); }
