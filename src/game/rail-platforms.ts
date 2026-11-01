@@ -180,7 +180,7 @@ function topologyEpoch(g: Game): number {
 }
 
 function signature(g: Game, l: Line, topology: number): string {
-  return JSON.stringify([topology, l.stops, l.patterns, l.loop, l.vehicles.map(id => { const t = g.vehicles.get(id); return t?.kind === 'train' ? [t.owner, t.pattern, (t as Train).cars.map(c => c.id)] : null; }),
+  return JSON.stringify([topology, l.owner, l.stops, l.patterns, l.loop, l.vehicles.map(id => { const t = g.vehicles.get(id); return t?.kind === 'train' ? [t.owner, t.pattern, (t as Train).cars.map(c => c.id)] : null; }),
     l.stops.map(id => { const s = g.stations.get(id); return s && g.stations.railTrackGroups(s).map(q => [q.id, q.back, q.front, q.length]); })]);
 }
 

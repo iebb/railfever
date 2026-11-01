@@ -1,7 +1,7 @@
 // Opposing calls at an inline station price the actual running path they would share.
 import { serialize, deserialize } from '../src/game/save';
 import { Train, deadlockCycles } from '../src/game/train';
-import { platformFlowCosts, platformPreference, reconcilePlatforms, setPlatformPreference } from '../src/game/rail-platforms';
+import { platformFlowCosts, platformChoices, platformPreference, reconcilePlatforms, setPlatformPreference } from '../src/game/rail-platforms';
 import { replaceLineStops } from '../src/game/line-edit';
 import { finishDoubleTrack, planStationOnTrack, commitStationOnTrack } from '../src/game/trackops';
 import { setSignal } from '../src/game/signals';
@@ -95,6 +95,35 @@ const paidPeer = JSON.stringify(serialize(shared));
 crossLineChange(shared, 'peer stock sale', () => shared.vehicles.sell(peerTrain!.id));
 const revoked = deserialize(JSON.parse(paidPeer));
 crossLineChange(revoked, 'peer access revocation', () => { revoked.setAccessPolicy(0, 'ask'); revoked.refreshAccess(); });
+
+// A line-only acquisition need not change any physical rail, train or access-table row.
+// Its empty fleet nevertheless changes from the old owner's permissions to the buyer's.
+const transferred = deserialize(JSON.parse(before));
+transferred.addAICompany({ startMoney: 50_000_000, accessPolicy: 'open' }); transferred.aiEnabled = false;
+transferred.setAccessPolicy(0, 'open'); transferred.refreshAccess();
+const empty = transferred.lines.create('rail', 1);
+empty.stops = [A.id, M.id, B.id, M.id]; transferred.lines.rebuild();
+check(platformChoices(transferred, empty, 0, 1).length > 0, 'empty peer line initially has native open access to fitting platforms');
+transferred.setAccessPolicy(0, 'ask'); transferred.refreshAccess();
+for (let i = 0; i < 3; i++) reconcilePlatforms(transferred);
+platformFlowCosts(transferred, empty, 0, 1);
+check(!empty.vehicles.length && !empty.platforms?.length && platformChoices(transferred, empty, 0, 1).length === 0,
+  'native access revocation warms an empty draft with no lawful platform choices');
+const accessMatrix = () => JSON.stringify(transferred.companies.map(c => transferred.companies.map(o => transferred.canUse(c.id, o.id))));
+const matrix = accessMatrix(), network = [transferred.networkVersion, transferred.world.net.version];
+transferred.lines.transfer(empty, 0);
+check(matrix === accessMatrix() && JSON.stringify(network) === JSON.stringify([transferred.networkVersion, transferred.world.net.version]),
+  'native line-only transfer leaves physical network and access permissions unchanged');
+const acquired = deserialize(JSON.parse(JSON.stringify(serialize(transferred))));
+reconcilePlatforms(transferred); reconcilePlatforms(acquired);
+check(empty.owner === 0 && empty.platforms?.length === 4 && platformChoices(transferred, empty, 0, 1).length > 0,
+  "the buyer's native own-track access replaces the old empty fleet's cached refusal");
+let transferExact = JSON.stringify(serialize(transferred)) === JSON.stringify(serialize(acquired));
+for (let i = 0; i < 128 && transferExact; i++) {
+  transferred.stepTick(); acquired.stepTick(); transferExact = JSON.stringify(serialize(transferred)) === JSON.stringify(serialize(acquired));
+}
+check(transferExact && checkReservations(transferred).length === 0,
+  'empty-fleet owner transfer preserves complete warm/cold allocation and exact native replay');
 
 const arrivals = new Map<number, Set<number>>(), directions = new Map<number, Set<number>>(), prior = new Map<number, string>();
 let cycles = 0, longest = 0;
