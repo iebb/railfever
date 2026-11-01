@@ -56,6 +56,12 @@ try {
   }
   const { build } = require('esbuild');
   const ref = process.argv[2] || 'HEAD';
+  const shardArg = process.argv.slice(4).find(a => a.startsWith('--shard='));
+  const shardMatch = shardArg?.match(/^--shard=([1-9]\d*)\/([1-9]\d*)$/);
+  if (process.argv.length > 5 || process.argv.slice(4).some(a => a !== shardArg) || shardArg && !shardMatch)
+    throw new Error('Usage: gate.mjs [ref] [logs] [--shard=index/count]');
+  const shard = shardMatch ? { index: Number(shardMatch[1]), count: Number(shardMatch[2]) } : { index: 1, count: 1 };
+  if (shard.index > shard.count || shard.count > 16) throw new Error('Invalid gate shard; use 1 <= index <= count <= 16.');
   const outputParent = resolve(root, process.argv[3] || '.gate');
   mkdirSync(outputParent, { recursive: true });
   const logs = mkdtempSync(join(outputParent, 'run-'));
@@ -90,6 +96,12 @@ try {
     'growth', 'growthcap', 'linegrow', 'platforms', 'replay', 'smoke', 'terrain-fit', 'throughcap',
     'townfit', 'uipure', 'urban', 'urbanecon', 'urbanhandoff', 'urban-staging', 'urbantrunks']);
   jobs.sort((a, b) => Number(sweeps.has(a.script)) - Number(sweeps.has(b.script)));
+  const inventory = [...jobs.map(j => j.name), ...['companies', 'savesize', 'ai', 'catchperf'].filter(n => scripts.includes(n))];
+  const assigned = new Set(inventory.filter((_, i) => i % shard.count === shard.index - 1));
+  const coverage = { revision: git(['rev-parse', 'HEAD'], work), shard, inventory, assigned: [...assigned], completed: [] };
+  const coverageFile = join(logs, 'coverage.json');
+  writeFileSync(coverageFile, JSON.stringify(coverage, null, 2));
+  console.log(`shard ${shard.index}/${shard.count}: ${assigned.size}/${inventory.length} checks; coverage: ${coverageFile}`);
   async function run({ name, script, args }) {
     const dir = join(logs, name), log = join(logs, `${name}.log`);
     mkdirSync(dir);
@@ -120,6 +132,8 @@ try {
     const summary = output.split('\n').filter((l) => /ALL CHECKS PASSED|ALL INVARIANTS HELD|ALL PASSED|ALL \d+ .*PASSED|^PASS|PURITY PASSED|checks passed|\d+ FAILURES?|FAIL/.test(l)).at(-1)?.slice(0, 140) || '';
     const result = `${name}: ${rc === 0 ? 'ok' : `FAILED rc=${rc}`} (${((Date.now() - start) / 1000).toFixed(1)}s) ${summary}`;
     writeFileSync(join(logs, `${name}.res`), `${result}\n`);
+    coverage.completed.push({ name, rc });
+    writeFileSync(coverageFile, JSON.stringify(coverage, null, 2));
     console.log(result);
     if (rc !== 0) console.log(output.split('\n').filter(l => /FAIL|Error|Exception|Assertion|Gate timed out/.test(l))
       .slice(-30).map(l => l.slice(0, 1500)).join('\n'));
@@ -128,16 +142,17 @@ try {
   // Two workers take the next independent check when ready, so a long simulation cannot leave
   // half the battery waiting behind it. Timing-sensitive tests run after both workers finish.
   let nextJob = 0;
+  const selected = jobs.filter(j => assigned.has(j.name));
   const lanes = await Promise.allSettled([0, 1].map(async () => {
-    while (nextJob < jobs.length && !interrupted) if ((await run(jobs[nextJob++])).rc !== 0) failed = true;
+    while (nextJob < selected.length && !interrupted) if ((await run(selected[nextJob++])).rc !== 0) failed = true;
   }));
   for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
   // The company audit also runs a child world. Keep its two-world budget separate from the queue.
-  if (scripts.includes('companies') && !interrupted && (await run({ name: 'companies', script: 'companies', args: [] })).rc !== 0) failed = true;
+  if (assigned.has('companies') && !interrupted && (await run({ name: 'companies', script: 'companies', args: [] })).rc !== 0) failed = true;
   // Save capture has frame-time budgets as well as integrity assertions. Measure those after the
   // simulation workers exit so unrelated map generation and garbage collection cannot distort them.
-  if (scripts.includes('savesize') && !interrupted && (await run({ name: 'savesize', script: 'savesize', args: [] })).rc !== 0) failed = true;
-  if (scripts.includes('ai') && !interrupted) {
+  if (assigned.has('savesize') && !interrupted && (await run({ name: 'savesize', script: 'savesize', args: [] })).rc !== 0) failed = true;
+  if (assigned.has('ai') && !interrupted) {
     const timingOnly = ({ rc, output }) => {
       const failures = output.split('\n').filter((l) => l.includes('FAIL:'));
       return rc === 1 && failures.length > 0 && failures.every((l) => l.includes('stays sliced')) && !/\b(?:Error|Exception):/.test(output);
@@ -150,7 +165,8 @@ try {
       else if (result.rc !== 0) failed = true;
     } else if (result.rc !== 0) failed = true;
   }
-  if (scripts.includes('catchperf') && !interrupted && (await run({ name: 'catchperf', script: 'catchperf', args: [] })).rc !== 0) failed = true;
+  if (assigned.has('catchperf') && !interrupted && (await run({ name: 'catchperf', script: 'catchperf', args: [] })).rc !== 0) failed = true;
+  if ([...assigned].some(name => !coverage.completed.some(r => r.name === name))) failed = true;
   if (interrupted) failed = true;
 } catch (error) {
   console.error(error.stack); failed = true;
