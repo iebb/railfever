@@ -7,12 +7,17 @@ import { Game, PLAYER } from '../src/game/game';
 import { fmtMoney, CATEGORIES } from '../src/game/economy';
 import { Train, deadlockCycles } from '../src/game/train';
 import { RoadVehicle } from '../src/game/roadvehicle';
-import { AIController, AIConfig, AI_PRESETS, pickTrain } from '../src/game/ai';
+import { AIController, AIConfig, AI_PRESETS, pickTrain, pickBus, pickCoach, modelYearCost, type LineInfo } from '../src/game/ai';
+import { moreValue, pays, roadCapacityQuote, roadFleetCap, roadVehiclePays, type BusHost } from '../src/game/ai-bus';
+import { mailVanLength } from '../src/game/ai-mail';
+import { worksOn } from '../src/game/route-works';
+import { patternOf, patternStops } from '../src/game/patterns';
+import { platformChoices } from '../src/game/rail-platforms';
 import { TramPlanner } from '../src/game/ai-tram';
 import { colorDistance, LINE_PALETTES, type Line } from '../src/game/lines';
 import { demandView, stationDemand } from '../src/game/demand';
 import { serialize, deserialize } from '../src/game/save';
-import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { MODEL_BY_ID, availableModels, carriesMail } from '../src/game/vehicle-types';
 import { fare } from '../src/game/vehicle';
 import type { Economy, Category } from '../src/game/economy';
 import { fails, check, fmt, checkReservations, checkNaN, placeAndConnect, depotBehind } from './lib';
@@ -146,10 +151,14 @@ check(errors === 0, 'no exceptions or AI errors');
 const b0 = AIS[0].budget;
 AIS[0].config = { ...AIS[0].config, activeness: 1.5 };
 check(AIS[0].budget > b0, `runtime config change takes effect (budget ${b0} -> ${AIS[0].budget})`);
-// AI trains open short: loco + 2-3 coaches
+// Passenger coaches are distinct from mail vans and single-unit urban stock.
+const passengerCoaches = (t: Train) => t.cars.filter(m => m.kind === 'wagon' && !carriesMail(m)).length;
 const aiTrains = g.vehicles.all().filter((v): v is Train => v instanceof Train && v.owner > 0);
-console.log(`  AI trains: ${aiTrains.map((t) => t.cars.length - 1).join(',')} coaches; AI stations ${g.stations.all().filter((st) => st.owner > 0 && st.rail).map((st) => st.rail!.length).join(',')} long`);
-check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((st) => st.owner <= 0 || !st.rail || st.rail.length <= 12), 'AI trains and stations are compact');
+console.log(`  AI trains: ${aiTrains.map((t) => passengerCoaches(t)).join(',')} coaches; AI stations ${g.stations.all().filter((st) => st.owner > 0 && st.rail).map((st) => st.rail!.length).join(',')} long`);
+check(aiTrains.every((t) => passengerCoaches(t) <= 5) && g.stations.all().every((st) => st.owner <= 0 || !st.rail || st.rail.length <= 12), 'AI trains and stations are compact');
+check(aiTrains.every(t => !t.line || patternStops(t.line, t.pattern).every(stop =>
+  platformChoices(g, t.line!, patternOf(t.line!, t.pattern)?.id ?? 0, stop).some(group => group.length + 1e-6 >= t.length + 0.05))),
+  'every full AI consist, including mail vans, fits a lawful physical platform at every served call');
 {
   const aiRail = g.stations.all().filter((st) => st.owner > 0 && st.rail);
   const withAccess = aiRail.filter((st) => g.stations.hasAccess(st)).length;
@@ -159,11 +168,12 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
 }
 {
   // passengers piling up on an AI railway: its train is replaced by a longer one (up to the platforms)
-  const t0 = aiTrains.find((t) => t.line && t.line.owner > 0 && t.cars.length - 1 < 3 && g.ais.some((a) => a.companyId === t.owner));
+  const t0 = aiTrains.find((t) => t.line && t.line.owner === t.owner && t.cars.some(m => m.kind === 'loco') && passengerCoaches(t) < 3
+    && g.ais.some((a) => a.companyId === t.owner && a.managedLines().includes(t.line!.id)));
   if (!t0) console.log('  (no short AI train to lengthen)');
   if (t0 && t0.line) {
     const l = t0.line, ai = g.ais.find((a) => a.companyId === l.owner)!;
-    const n0 = t0.cars.length - 1;
+    const n0 = passengerCoaches(t0);
     g.company(l.owner).economy.money += 5_000_000;
     l.incomeLast = l.costLast * 2 + 1_000_000; // a line that pays
     // (no new project meanwhile: the money is for the longer platforms and train)
@@ -181,82 +191,105 @@ check(aiTrains.every((t) => t.cars.length - 1 <= 5) && g.stations.all().every((s
       for (const sid of l.stops) { const st = g.stations.get(sid)!; const other = l.stops.find((x) => x !== sid)!; g.stations.addWaiting(st, l.id, other, other, 400 - Math.min(400, st.waitingTotal)); }
       const d0 = g.day;
       while (g.day === d0) g.update(0.25);
-      for (const id of l.vehicles) { const tr = g.vehicles.get(id); if (tr instanceof Train && tr.cars.length - 1 > n0) longer = tr.cars.length - 1; }
+      for (const id of l.vehicles) { const tr = g.vehicles.get(id); if (tr instanceof Train && tr.owner === ai.companyId && passengerCoaches(tr) > n0) longer = passengerCoaches(tr); }
     }
     ai.monthly = manage;
     const platform = Math.min(...l.stops.map((sid) => g.stations.get(sid)?.rail?.length ?? 99));
-    const fits = pickTrain(g.year, platform, 150, 5)!.length - 1;
+    const fits = pickTrain(g.year, platform - mailVanLength(t0), 150, 5)!.filter(m => m.kind === 'wagon' && !carriesMail(m)).length;
     console.log(`  lengthening: ${l.name} ${n0} -> ${longer} coaches (platforms ${platform} take ${fits}); ${ai.log.slice(-1)[0]}`);
     check(longer > n0 || fits <= n0, 'a crowded AI railway gets a longer train (as long as its platforms allow)');
   }
 }
 
 {
-  // riders giving up waiting on a profitable bus or tram line at its fleet limit: the limit rises and a vehicle is added
-  type Info = { kind: string; depot: number; maxVehicles: number; lastSold?: number };
-  let pick: { ai: AIController; l: NonNullable<ReturnType<typeof g.lines.get>>; info: Info } | undefined;
-  for (const ai of AIS) {
-    if (g.company(ai.companyId).defunct) continue;
-    // Finish the project before selecting a line for capacity management.
-    for (let d = g.day + 720; ai.busy && g.day < d;) g.update(0.25);
-    if (ai.busy) continue;
-    pick = ai.managedLines().map((lid) => ({ ai, l: g.lines.get(lid)!, info: (ai as unknown as { lines: Map<number, Info> }).lines.get(lid)! }))
-      .find(({ l, info }) => l && info && l.kind !== 'rail' && l.owner === ai.companyId && l.vehicles.length > 0 && new Set(l.stops).size >= 2
-        // (a line whose stops all belong to others now takes no more vehicles of ours: lines.ts operateError)
-        && g.lines.operateError(l, ai.companyId) === null
-        // Some fleets have no integer inverse of the rounded activeness cap (two at sqrt(2), for example).
-        // Select an existing service that really starts at its rounded cap, with room below its stop limit.
-        && (() => { const n = l.vehicles.length, grow = Math.sqrt(ai.config.activeness);
-          const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
-          return n < hard && Math.round(Math.max(1, Math.round(n / grow)) * grow) === n; })());
-    if (pick) break;
-  }
-  check(!!pick, 'crowded growth has an existing bus or tram fleet with an exact rounded cap below its stop limit');
-  if (!pick) console.log('  (no AI bus or tram line to crowd)');
-  else {
-    const { ai, l, info } = pick;
-    ai.state.cooldown = Math.max(ai.state.cooldown, 400);
-    const n0 = l.vehicles.length, v0 = g.vehicles.get(l.vehicles[0])!;
-    const grow = Math.sqrt(ai.config.activeness);
-    // Match the policy's rounded fleet cap. Flooring the inverse put four vehicles above a cap of three.
-    info.maxVehicles = Math.max(1, Math.round(n0 / grow)); info.lastSold = -1e9;
-    const policyHard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length;
-    const policyCap = Math.min(Math.round(info.maxVehicles * grow), policyHard);
-    check(policyCap === n0 && n0 < policyHard, `crowded growth starts exactly at its rounded fleet cap (${n0} of ${policyCap}, hard ${policyHard})`);
+  // Capacity management uses actual saved native services. Pause daily investment on each branch so a route
+  // merger cannot change the measured stops, stock or managed-line record during the monthly capacity test.
+  // Buses use physical shared-curb admission; trams retain the rounded personality cap and stop ceiling.
+  for (const kind of ['bus', 'tram'] as const) {
+    const branch = deserialize(JSON.parse(personalitySnapshot)); branch.aiEnabled = false; branch.aiAcquisitions = false;
+    const managed = (ai: AIController) => (ai as unknown as { lines: Map<number, LineInfo> }).lines;
+    const modelFor = (ai: AIController, l: Line, info: LineInfo) => {
+      const v = branch.vehicles.get(l.vehicles[0]);
+      if (!(v instanceof RoadVehicle) || !v.model) return null;
+      return kind === 'tram' ? availableModels(branch.year, 'tram').sort((a, b) =>
+        b.capacity / (b.cost + modelYearCost(b, branch.year) * 8) - a.capacity / (a.cost + modelYearCost(a, branch.year) * 8))[0] ?? v.model
+        : (v.model.style === 'coach' ? pickCoach(branch.year) : pickBus(branch.year,
+          Math.max(3000, ...info.towns.map(id => branch.towns.list[id]?.pop ?? 3000)))) ?? v.model;
+    };
+    let pick: { ai: AIController; l: Line; info: LineInfo } | undefined;
+    for (const ai of branch.ais) {
+      pick = ai.managedLines().map(lid => ({ ai, l: branch.lines.get(lid)!, info: managed(ai).get(lid)! }))
+        .find(({ l, info }) => l && info?.kind === kind && l.owner === ai.companyId && l.vehicles.length > 0
+          && new Set(l.stops).size >= 2 && !worksOn(branch, l.id) && branch.lines.operateError(l, ai.companyId) === null
+          && l.vehicles.every(id => branch.vehicles.get(id) instanceof RoadVehicle)
+          && (() => { const n = l.vehicles.length, grow = Math.sqrt(ai.config.activeness), model = modelFor(ai, l, info);
+            return !!model && (kind === 'bus' ? n < roadFleetCap(branch, l, model)
+              : n < 2 + l.stops.length && Math.round(Math.max(1, Math.round(n / grow)) * grow) === n); })());
+      if (pick) break;
+    }
+    check(!!pick, `crowded ${kind} growth has an existing native managed service below its capacity ceiling`);
+    if (!pick) continue;
+    const { ai, l, info } = pick, model = modelFor(ai, l, info)!;
+    const topology = JSON.stringify([l.stops, l.patterns]), n0 = l.vehicles.length;
+    const own = () => l.vehicles.filter(id => branch.vehicles.get(id)?.owner === ai.companyId).length, o0 = own();
+    const v0 = branch.vehicles.get(l.vehicles[0])!, grow = Math.sqrt(ai.config.activeness);
+    info.lastSold = -1e9;
+    if (kind === 'tram') info.maxVehicles = Math.max(1, Math.round(n0 / grow));
+    const hard0 = kind === 'bus' ? roadFleetCap(branch, l, model) : 2 + l.stops.length;
+    const policyCap = kind === 'bus' ? hard0 : Math.min(Math.round(info.maxVehicles * grow), hard0);
+    check(kind === 'bus' ? n0 < policyCap : policyCap === n0 && n0 < hard0,
+      `crowded ${kind} growth starts below its physical ceiling${kind === 'tram' ? ' and exactly at its rounded fleet cap' : ''} (${n0} of ${policyCap}, hard ${hard0})`);
     const m0 = info.maxVehicles;
-    g.company(l.owner).economy.money += 50_000_000;
-    // (at the decision instant: queues are trimmed before monthly management; last month's riders who gave up)
+    branch.company(ai.companyId).economy.money += 50_000_000;
+    // Add the same profitable books and lost-rider pressure at each decision instant. Daily queue trimming
+    // still runs normally; monthly management sees the deliberate stress instead of an already-trimmed queue.
     const crowd = () => {
       l.incomeLast = l.costLast * 2 + 1_000_000;
-      // The profitable-line fixture needs matching annual fleet books: line-only income leaves the
-      // ageing vehicle loss-sale stage active before crowded capacity can be considered.
       const profit = (l.incomeLast - l.costLast) / l.vehicles.length;
-      for (const id of l.vehicles) { const v = g.vehicles.get(id); if (v) v.profitLast = profit; }
+      for (const id of l.vehicles) { const v = branch.vehicles.get(id); if (v) v.profitLast = profit; }
       for (const sid of new Set(l.stops)) {
-        const st = g.stations.get(sid)!, other = l.stops.find((x) => x !== sid)!;
-        g.stations.addWaiting(st, l.id, other, other, 20);
-        st.lostLast = 4 * v0.capacity;
+        const st = branch.stations.get(sid)!, other = l.stops.find(x => x !== sid)!;
+        branch.stations.addWaiting(st, l.id, other, other, 20); st.lostLast = 4 * v0.capacity;
       }
     };
-    const manage = ai.monthly.bind(ai);
-    ai.monthly = () => { crowd(); manage(); };
+    const runMonthly = (days: number, done: () => boolean = () => false) => {
+      const end = branch.day + days;
+      while (branch.day < end && !done()) {
+        const day = branch.day; branch.stepTick();
+        if (branch.day !== day && branch.day % 30 === (ai.companyId * 7) % 30) { crowd(); ai.monthly(); }
+      }
+    };
     crowd();
-    // (2.11: the owner's own vehicles. Another company may join the busy line as a partner meanwhile (ai-bus.ts
-    // moreValue): its vehicle ended the wait before the owner's monthly review and failed the check on some maps.)
-    const own = () => l.vehicles.filter((id) => g.vehicles.get(id)?.owner === l.owner).length, o0 = own();
-    const d0 = g.day;
-    while (g.day < d0 + 100 && own() <= o0 && !g.company(l.owner).defunct) g.update(0.25);
-    console.log(`  riders giving up on ${l.name} (${new Set(l.stops).size} stops, activeness ${ai.config.activeness}): limit ${m0} -> ${info.maxVehicles}, vehicles ${n0} -> ${l.vehicles.length} (the owner's ${o0} -> ${own()}); ${ai.log.slice(-2).join(' | ')}`);
-    check(info.maxVehicles > m0 && own() > o0, 'riders giving up on a profitable bus or tram line at its limit raise the limit and add a vehicle');
-    // at the limit its stops set (a bus line: two vehicles a stop; trams: two more than its stops) the limit stays put
-    const hard = info.kind === 'bus' ? l.stops.length * 2 : 2 + l.stops.length, model = (g.vehicles.get(l.vehicles[0]) as RoadVehicle).model!;
-    // (2.11: as many purchases as the limit needs; twelve left a ten-stop line at 17 of its 20)
-    for (let k = 0; k < 2 * hard && l.vehicles.length < hard; k++) g.vehicles.buyRoad(info.depot, model, l.id);
-    info.maxVehicles = Math.max(info.maxVehicles, Math.ceil(hard / grow) + 1);
-    const m1 = info.maxVehicles, n1 = l.vehicles.length;
-    for (const d1 = g.day; g.day < d1 + 70 && !g.company(l.owner).defunct;) g.update(0.25);
-    ai.monthly = manage;
-    check(n1 === hard && info.maxVehicles === m1 && l.vehicles.length <= hard, `a crowded line at the limit its stops set raises nothing more (${n1} of ${hard} vehicles, limit ${m1} -> ${info.maxVehicles})`);
+    const host = (ai as unknown as { busHost(): BusHost }).busHost();
+    if (kind === 'bus') {
+      const quote = moreValue(host, l, model); let next = quote.next(); while (!next.done) next = quote.next();
+      console.log(`  crowded bus native marginal quote: ${next.value?.why ?? 'none'}, physical cap ${hard0}, model ${model.id}`);
+      check(!!next.value && pays(next.value), 'the crowded native bus service has a positive real marginal investment quote');
+    }
+    runMonthly(100, () => own() > o0);
+    console.log(`  riders giving up on ${l.name} (${kind}, ${new Set(l.stops).size} stops): limit ${m0} -> ${info.maxVehicles}, owner fleet ${o0} -> ${own()}`);
+    check(own() > o0 && (kind === 'bus' || info.maxVehicles > m0),
+      `riders giving up on a profitable ${kind} service add a vehicle${kind === 'tram' ? ' and raise its rounded limit' : ''}`);
+    // Occupy the actual ceiling with native paid purchases, then prove the real monthly manager refuses more.
+    // Recompute the bus quote as each exact current model joins the existing mixed stock and shared curbs.
+    const ceiling = () => kind === 'bus' ? roadFleetCap(branch, l, model) : 2 + l.stops.length;
+    const budget = 2 * ceiling();
+    for (let k = 0; k < budget && l.vehicles.length < ceiling(); k++) branch.vehicles.buyRoad(info.depot, model, l.id);
+    const hard = ceiling(), n1 = l.vehicles.length;
+    if (kind === 'tram') info.maxVehicles = Math.max(info.maxVehicles, Math.ceil(hard / grow) + 1);
+    const m1 = info.maxVehicles;
+    crowd();
+    if (kind === 'bus') {
+      const physical = roadCapacityQuote(branch, l, model);
+      check(n1 === physical.limit && !roadVehiclePays(host, l, model), 'the real native bus quote refuses an additional vehicle at its physical curb ceiling');
+    }
+    runMonthly(70);
+    console.log(`  ${kind} capacity ceiling: ${n1}/${hard} paid vehicles, final fleet ${l.vehicles.length}, limit ${m1} -> ${info.maxVehicles}`);
+    check(n1 === hard && info.maxVehicles === m1 && l.vehicles.length === n1,
+      `a crowded ${kind} service at its ${kind === 'bus' ? 'physical curb' : 'stop'} ceiling raises nothing more (${n1} of ${hard}, limit ${m1} -> ${info.maxVehicles})`);
+    check(JSON.stringify([l.stops, l.patterns]) === topology && branch.lines.get(l.id) === l && managed(ai).get(l.id) === info,
+      `the ${kind} capacity audit retains the same native route, patterns and management record`);
+    check(checkReservations(branch).length === 0, `${kind} capacity management keeps reservations consistent`);
   }
 }
 
