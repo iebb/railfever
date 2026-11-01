@@ -267,6 +267,31 @@ check(d.feederSiteWalk(site) !== retained, 'bounded site cache evicts and recomp
 // Full forecasts use native fares, headways, routed coverage and mutable outputs.
 const forecast = (h = 140, kmh = 120) => g.demand.forecastLine([A, B], 'mainline', kmh, h, 0, line.id);
 forecast();
+// Vehicle movement leaves eligible feeder lot geometry unchanged. Keep weighted pools tick-local,
+// but reuse their ordered geometry across native ticks, recomputing every quality-dependent sum.
+g.flushNetworkChanges(); g.lines.flushCatchment();
+const movementWalk = d.feederSiteWalk, movementRegion = d.regionOf;
+let movementWalks = 0, movementRegions = 0;
+d.feederSiteWalk = function(s: any) { movementWalks++; return movementWalk.call(this, s); };
+d.regionOf = function(b: any) { movementRegions++; return movementRegion.call(this, b); };
+d.claimFeederPools(sites, covered);
+const movementEpoch = () => `${d.version}:${d.feederGeometryKey()}:${g.world.lotVersions.version}`;
+const unchangedEpoch = movementEpoch();
+let reusedTicks = 0;
+for (let tick = 0; tick < 12; tick++) {
+  g.stepTick();
+  const before = JSON.stringify(serialize(g)), walks = movementWalks, regions = movementRegions;
+  const variant = sites.map((s, i) => ({ ...s, quality: .2 + (tick + i) % 7 / 10 }));
+  const pools = d.claimFeederPools(variant, covered);
+  check(movementEpoch() === unchangedEpoch && movementWalks === walks && movementRegions === regions,
+    'native movement reuses eligible geometry while quality changes at tick ' + g.tick);
+  check(poolJSON(pools) === poolJSON(previousPools.call(d, variant, covered)),
+    'movement and changing quality preserve literal weighted claims at tick ' + g.tick);
+  check(JSON.stringify(serialize(g)) === before, 'movement-time geometry reads preserve the full save');
+  reusedTicks++;
+}
+d.feederSiteWalk = movementWalk; d.regionOf = movementRegion;
+check(reusedTicks === 12, 'geometry reuse is exercised across twelve native simulation ticks');
 g.aiEnabled = true;
 const urbanTown = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
 check(g.ais[0].startProject('lightrail', [urbanTown.id]), 'funded native AI city project starts before the saved replay');

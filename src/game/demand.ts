@@ -750,7 +750,8 @@ export class DemandModel {
   }
 
   /** Frequency variants share only ordered, eligible lot geometry. Quality-dependent weights and every sum
-   * remain in the claim pass below. Publish a complete preparation only; nested/failed reads own their work. */
+   * remain in the claim pass below. Vehicle movement changes none of these inputs; weighted pool results
+   * above remain tick-local. Publish a complete preparation only; nested/failed reads own their work. */
   private prepareFeederClaims(sites: FeederSite[], covered: Set<number>): FeederClaimGeometry | null {
     // Non-retained queries use the original single claim pass, without allocating prepared rows or lots.
     if (sites.length > 256 || covered.size > 8192) return null;
@@ -759,7 +760,7 @@ export class DemandModel {
       signatureSize += 4 + 2 * (s.access?.length ?? 0);
       if (signatureSize > 4096) return null;
     }
-    const w = this.g.world, stamp = `${this.version}:${this.g.tick}:${this.feederGeometryKey()}:${w.lotVersions.version}`;
+    const w = this.g.world, stamp = `${this.version}:${this.feederGeometryKey()}:${w.lotVersions.version}`;
     let memo = feederClaimGeometry.get(this);
     if (!memo || memo.stamp !== stamp || memo.regionOf !== this.regionOf || memo.siteWalk !== this.feederSiteWalk) {
       memo = { stamp, regionOf: this.regionOf, siteWalk: this.feederSiteWalk, entries: [] };
@@ -789,7 +790,7 @@ export class DemandModel {
     }
     value ??= { sig, covered: new Set(covered), rows: new Array(sites.length), lots: new Map(), count: 0 };
     if (value !== old) {
-      // A large query cannot retain its site signature, rows or buildings. Ordinary contexts are bounded per tick.
+      // A large query cannot retain its site signature, rows or buildings. Ordinary contexts are bounded per input epoch.
       const index = old ? memo.entries.indexOf(old) : -1;
       if (index >= 0) memo.entries.splice(index, 1);
       if (value.count <= 8192 && covered.size <= 8192 && sites.length <= 256 && sig.length <= 4096) {
