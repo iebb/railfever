@@ -5,7 +5,7 @@ import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
 import { NEdge, Section } from './network';
-import { applyEarthworks, repairFormations, formationSupportError, previewDemolition, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
+import { applyEarthworks, repairFormations, formationSupportError, FormationCorePreparation, previewDemolition, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
 import { distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
@@ -1404,6 +1404,7 @@ export class Stations {
         const a = pose(off, -length / 2), b = pose(off, length / 2);
         return { kind: 'rail' as const, type: 'standard', bez: bezLine(a.x, a.z, b.x, b.z), prof: new Float32Array(Math.max(2, Math.ceil(length) + 1)).fill(plan.y), sections: [] };
       });
+    let formationPreparation: FormationCorePreparation | undefined;
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
     const bc = (plan as StationPlan & { buildingCands?: BuildingCand[] }).buildingCands;
@@ -1427,7 +1428,8 @@ export class Stations {
         for (const [f1, f2] of c.fc2 ? [[c.fc, c.fc2], [c.fc2, c.fc]] : [[c.fc, undefined]]) {
           plan.building = c.b;
           const acc = this.planAccessStreet(f1!.x, f1!.z, plan, owner, c.end, [], undefined, ACCESS_REACH,
-            p => !stationFormations.length || !formationSupportError(previewDemolition(w, [...candidateDemolition, ...p.demolish]), [...stationFormations, ...p.tracks.map(t => ({ ...t, kind: 'road' as const, type: p.opts.type }))], ignoreFormations));
+            p => !stationFormations.length || !formationSupportError(previewDemolition(w, [...candidateDemolition, ...p.demolish]), [...stationFormations, ...p.tracks.map(t => ({ ...t, kind: 'road' as const, type: p.opts.type }))], ignoreFormations,
+              undefined, undefined, undefined, formationPreparation ??= new FormationCorePreparation()));
           plan.building = chosen.b;
           // A road surveyed before the platforms exist must fit their prospective terrain too. Keep trying
           // the other forecourts when this path cannot share their grid cells safely.
@@ -1446,7 +1448,8 @@ export class Stations {
     if (level === 'ground') {
       if (plan.ok) {
         const access = plan.access?.tracks.map(t => ({ ...t, kind: 'road' as const, type: plan.access!.opts.type })) ?? [];
-        const error = formationSupportError(previewDemolition(w, [...demolish, ...(plan.access?.demolish ?? [])]), [...stationFormations, ...access], ignoreFormations);
+        const error = formationSupportError(previewDemolition(w, [...demolish, ...(plan.access?.demolish ?? [])]), [...stationFormations, ...access], ignoreFormations,
+          undefined, undefined, undefined, formationPreparation ??= new FormationCorePreparation());
         if (error) failp(error);
       }
     }

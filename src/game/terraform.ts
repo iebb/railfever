@@ -152,14 +152,28 @@ function stampEdge(w: World, e: NEdge, out: Map<number, Acc>, coreOnly = false, 
 
 /** Actual ground-road intervals losing support, collected only when quoting portal-cutting structures. */
 export interface RoadFormationConflict { s0: number; s1: number; height: number }
+type PlannedFormation = Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'>
+  & { start?: { kind: string; node?: number }; end?: { kind: string; node?: number } };
+
+/** Owned by one synchronous quote, whose planned rail descriptors remain immutable. Never stores world views. */
+export class FormationCorePreparation {
+  private entry?: { size: number; rails: readonly PlannedFormation[]; core: ReadonlyMap<number, Readonly<Acc>> };
+  read(size: number, rails: readonly PlannedFormation[]): ReadonlyMap<number, Readonly<Acc>> | undefined {
+    const e = this.entry;
+    return e?.size === size && rails.length === e.rails.length && rails.every((p, i) => p === e.rails[i]) ? e.core : undefined;
+  }
+  remember(size: number, rails: readonly PlannedFormation[], core: ReadonlyMap<number, Readonly<Acc>>) {
+    this.entry = { size, rails: [...rails], core };
+  }
+}
 /**
  * Ground formations share terrain vertices. Check actual road cross-sections against the projected terrain,
  * and shared rail cores against their running heights, before accepting works that could remove their support.
  * The preview network owns its geometry caches and nodes; surveying never writes the world's network or terrain.
  */
-export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | 'type' | 'bez' | 'prof' | 'sections'> & { start?: { kind: string; node?: number }; end?: { kind: string; node?: number } })[],
+export function formationSupportError(w: World, planned: PlannedFormation[],
   ignore: ReadonlySet<number> = new Set(), bridges: { edge: number; s0: number; s1: number }[] = [], terrain?: ReadonlyMap<number, number>,
-  roadConflicts?: Map<number, RoadFormationConflict>): string | null {
+  roadConflicts?: Map<number, RoadFormationConflict>, preparation?: FormationCorePreparation): string | null {
   if (!planned.length) return null;
   // An existing dead end joined by this proposal loses its cap, just as the snapped new end has no cap.
   const joined = new Set<number>();
@@ -168,10 +182,13 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   view.net = new Network(view);
   const current = (k: number) => terrain?.get(k) ?? w.h[k];
   if (terrain) view.heightAt = (x, z) => heightAtVertices(w, x, z, current);
-  const stamps = new Map<number, Acc>();
   const roads: NEdge[] = [], rails: NEdge[] = [];
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
   const rail = planned.some(e => e.kind === 'rail');
+  const railInputs = rail && preparation ? planned.filter(p => p.kind === 'rail') : undefined;
+  const prepared = railInputs && preparation!.read(w.size, railInputs);
+  const fresh = prepared ? undefined : new Map<number, Acc>();
+  const stamps = prepared ?? fresh!;
   for (const p of planned) {
     const a = view.net.addNode(p.kind, p.bez.x0, p.prof[0], p.bez.z0);
     const b = view.net.addNode(p.kind, p.bez.x3, p.prof[p.prof.length - 1], p.bez.z3);
@@ -181,7 +198,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
     // A snapped end joins the existing network: its formation does not extend a unit beyond that joint.
     if (p.start && p.start.kind !== 'free') a.edges.push(-1);
     if (p.end && p.end.kind !== 'free') b.edges.push(-1);
-    if (!rail || e.kind === 'rail') stampEdge(view, e, stamps, true);
+    if (fresh && (!rail || e.kind === 'rail')) stampEdge(view, e, fresh, true);
     if (e.kind === 'road') roads.push(e);
     else rails.push(e);
     const g = view.net.geo(e);
@@ -190,6 +207,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
       z0 = Math.min(z0, g.pts[i * 3 + 2]); z1 = Math.max(z1, g.pts[i * 3 + 2]);
     }
   }
+  if (fresh && railInputs) preparation!.remember(w.size, railInputs, fresh);
   // A road can share distant core vertices while its actual carriageway remains seated. Test the
   // interpolated surface under the road, rather than assigning every corner the highest road sample nearby.
   const roadTerrain = new Map(terrain);
