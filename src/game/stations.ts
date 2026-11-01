@@ -4,9 +4,9 @@
 import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
-import { NEdge, Section } from './network';
+import { Network, NEdge, Section } from './network';
 import { applyEarthworks, repairFormations, formationSupportError, FormationCorePreparation, previewDemolition, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
-import { distToRect, Building } from './world';
+import { World, distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
@@ -1566,6 +1566,14 @@ export class Stations {
     // Adjacent road edges can snap to the same joint. Keep the original candidate order/budget,
     // but survey identical roads only once within this immutable synchronous access quote.
     const proposals = new Map<string, Proposal>();
+    // Reject only roads which the unchanged downstream curve exclusion would discard.
+    const curveClear = nativeAccessCurveContext(g.world, keepOut) ? (bez: Parameters<typeof bezPoint>[0]) => {
+      for (let i = 1; i <= 24; i++) {
+        bezPoint(bez, i / 24, p);
+        if (Math.hypot(p.x - fx, p.z - fz) > 0.7 && blocked(p.x, p.z, 0.45)) return false;
+      }
+      return true;
+    } : undefined;
     for (const c of cands.slice(0, 6)) {
       let end: Snap;
       if (c.s < 0.8 || c.s > c.e.len - 0.8) { const n = net.nodes.get(c.s < 0.8 ? c.e.a : c.e.b)!; end = { kind: 'node', x: n.x, z: n.z, y: n.y, node: n.id }; }
@@ -1574,7 +1582,7 @@ export class Stations {
       const opts = { kind: 'road' as const, type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto' as const, owner };
       const key = JSON.stringify([start, end, opts]);
       let prop = proposals.get(key);
-      if (!prop) { prop = planEdge(g, start, end, opts); proposals.set(key, prop); }
+      if (!prop) { prop = planEdge(g, start, end, opts, curveClear); proposals.set(key, prop); }
       if (!prop.ok) continue;
       // (an entrance's street is walked: at ground level from its door, no cutting below the ground into a tunnel)
       if (side && prop.tracks.some((t) => t.sections.length || Math.abs(t.prof[0] - start.y) > 0.3)) continue;
@@ -4283,3 +4291,25 @@ export function stationCapacity(g: Game, stationId: number): StationCapacity | n
 export function relocateStation(g: Game, stationId: number, plan: StationPlan): string | null { return g.stations.relocate(stationId, plan); }
 
 export { ROAD_TYPES };
+
+
+// Literal reader behavior is retained for custom evaluators/getters; no answer survives this invocation.
+const accessWorldPrototype = Object.getOwnPropertyDescriptors(World.prototype);
+const accessNetworkPrototype = Object.getOwnPropertyDescriptors(Network.prototype);
+function nativeAccessCurveContext(w: World, areas: Rect[]) {
+  const native = (value: object, prototype: object, descriptors: PropertyDescriptorMap) => {
+    if (Object.getPrototypeOf(value) !== prototype) return false;
+    const own = Object.getOwnPropertyDescriptors(value), current = Object.getOwnPropertyDescriptors(prototype);
+    const keys = Reflect.ownKeys(descriptors);
+    if (Reflect.ownKeys(current).length !== keys.length) return false;
+    for (const key of Reflect.ownKeys(own)) if (!('value' in own[key as string])) return false;
+    for (const key of keys) {
+      const expected = descriptors[key as string], actual = current[key as string], override = Object.getOwnPropertyDescriptor(value, key);
+      if (!actual || actual.value !== expected.value || actual.get !== expected.get || actual.set !== expected.set
+        || override && (!('value' in expected) || override.value !== expected.value)) return false;
+    }
+    return true;
+  };
+  return native(w, World.prototype, accessWorldPrototype) && native(w.net, Network.prototype, accessNetworkPrototype)
+    && areas.every(r => Object.getPrototypeOf(r) === Object.prototype && Object.values(Object.getOwnPropertyDescriptors(r)).every(d => 'value' in d));
+}

@@ -732,7 +732,7 @@ function solveProfile(desired: number[], ds: number[], cons: Constraint[], g: nu
 
 // ------------------------------------------------------------------------------------ planning
 
-export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): Proposal {
+export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions, curveClear?: (bez: TrackPlan['bez']) => boolean): Proposal {
   const baseEndProfile = opts.endHeightOnly && opts.heightOffset && end.kind === 'free'
     ? planEdge(g, start, end, { ...opts, heightOffset: 0, endHeightOnly: false }).tracks[0]
     : undefined;
@@ -833,6 +833,8 @@ export function planEdge(g: Game, start: Snap, end: Snap, opts: BuildOptions): P
     prop.stats.speed = Math.min(prop.stats.speed, curveSpeed(bestR, kind === 'rail' ? opts.type : undefined));
     if (bestR < minRadiusOf(opts) && minR >= minRadiusOf(opts)) fail(`Radius ${Math.round(bestR * 10)} m < min ${minRadiusOf(opts) * 10} m`);
   }
+  // A private survey filter may refuse its own geometry before terrain work; accepted roads keep every guard.
+  if (curveClear && opts.kind === 'road' && !curveClear(prop.tracks[0].bez)) { fail('Access street crosses reserved space'); return prop; }
   const spread = N > 1 ? Math.max(Math.abs(offsets[0]), Math.abs(offsets[N - 1])) : 0;
   const subway = opts.level === 'underground' && !!opts.subway;
 
