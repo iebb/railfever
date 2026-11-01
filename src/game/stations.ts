@@ -1560,12 +1560,18 @@ export class Stations {
       if (best) cands.push({ e, ...best });
     }
     cands.sort((a, b) => a.d - b.d);
+    // Adjacent road edges can snap to the same joint. Keep the original candidate order/budget,
+    // but survey identical roads only once within this immutable synchronous access quote.
+    const proposals = new Map<string, Proposal>();
     for (const c of cands.slice(0, 6)) {
       let end: Snap;
       if (c.s < 0.8 || c.s > c.e.len - 0.8) { const n = net.nodes.get(c.s < 0.8 ? c.e.a : c.e.b)!; end = { kind: 'node', x: n.x, z: n.z, y: n.y, node: n.id }; }
       else { net.pointAt(c.e, c.s, p); end = { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: c.e.id, s: c.s }; }
       const start: Snap = { kind: 'free', x: fx, z: fz, y: g.world.heightAt(fx, fz) };
-      const prop = planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+      const opts = { kind: 'road' as const, type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto' as const, owner };
+      const key = JSON.stringify([start, end, opts]);
+      let prop = proposals.get(key);
+      if (!prop) { prop = planEdge(g, start, end, opts); proposals.set(key, prop); }
       if (!prop.ok) continue;
       // (an entrance's street is walked: at ground level from its door, no cutting below the ground into a tunnel)
       if (side && prop.tracks.some((t) => t.sections.length || Math.abs(t.prof[0] - start.y) > 0.3)) continue;
