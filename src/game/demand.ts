@@ -50,6 +50,24 @@ export interface Region {
   produced: number; attracted: number;
 }
 
+/** The scalar inputs retained by an incremental demand aggregation, independent of daily updates. */
+export interface TripSnapshotData {
+  regions: Region[]; od: number[]; ld: number[]; big: number[]; attract: number[]; local: number[];
+}
+
+/** The same calculation as trips(), using the planner's captured inputs. */
+export type SnapshotTripInputs = Omit<TripSnapshotData, 'od' | 'ld' | 'big' | 'attract'> & {
+  od: ArrayLike<number>; ld: ArrayLike<number>; big: ArrayLike<number>; attract: ArrayLike<number>;
+};
+export function snapshotTrips(s: SnapshotTripInputs, r: number, q: number, set: DemandSetFilter = 'all'): number {
+  const n = s.regions.length;
+  if (r < 0 || q < 0 || r >= n || q >= n) return 0;
+  const from = s.regions[r], to = s.regions[q];
+  if (set !== 'all' && (from.town === to.town) !== (set === 'city')) return 0;
+  return from.produced * s.od[r * n + q] * (from.town === to.town ? s.local[r] : s.big.length === n ? s.big[r] * s.attract[q] : 1)
+    + from.pop * (s.ld[r * n + q] ?? 0);
+}
+
 export type { DemandSet } from './fares';
 export { setFlag, groupSet } from './fares';
 /** The demand sets, city first. */
@@ -608,20 +626,19 @@ export class DemandModel {
 
   /** A consistent demand snapshot for planners that yield across days. Daily aggregation mutates both
    * regions and OD arrays, so a long-running planner must not mix rows from different updates. */
-  tripSnapshot() {
-    const regions = this.regions.map((r) => ({ ...r })), n = regions.length;
-    const od = this.od.slice(), ld = this.ld.slice(), big = this.big.slice(), attract = this.bigAttract.slice();
+  tripSnapshotData(): TripSnapshotData {
+    const regions = this.regions.map((r) => ({ ...r }));
+    const od = Array.from(this.od), ld = Array.from(this.ld), big = Array.from(this.big), attract = Array.from(this.bigAttract);
     const local = regions.map((r) => {
       const town = this.g.towns.list[r.town];
       return town ? 1 + 6 * urbanIntensity(this.g, { ...r, townId: town.id }) : 1;
     });
-    return { regions, trips: (r: number, q: number, set: DemandSetFilter = 'all') => {
-      if (r < 0 || q < 0 || r >= n || q >= n) return 0;
-      const from = regions[r], to = regions[q];
-      if (set !== 'all' && (from.town === to.town) !== (set === 'city')) return 0;
-      return from.produced * od[r * n + q] * (from.town === to.town ? local[r] : big.length === n ? big[r] * attract[q] : 1)
-        + from.pop * (ld[r * n + q] ?? 0);
-    } };
+    return { regions, od, ld, big, attract, local };
+  }
+
+  tripSnapshot() {
+    const data = this.tripSnapshotData();
+    return { regions: data.regions, trips: (r: number, q: number, set: DemandSetFilter = 'all') => snapshotTrips(data, r, q, set) };
   }
 
   // ---------------------------------------------------------------- service quality (trip factor)

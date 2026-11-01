@@ -25,6 +25,7 @@ import { saveNetwork, loadNetwork } from './ai-network';
 import { saveRouteWorks, loadRouteWorks } from './route-works';
 import { migrateElectricTrains } from './migrate';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
+import { withPlannerInputCapture, withPlannerInputRestore } from './ai-task-inputs';
 
 const VERSION = 3;
 /** Catchment/transfer parameters changed: old saved populations refresh at the next native boundary. */
@@ -365,6 +366,10 @@ function depotSeg(g: Game, dp: Depot, length: number): TSeg | null {
 // ------------------------------------------------------------------------------ serialize
 
 function serializeState(g: Game, world: any, binaryProfiles = false): any {
+  const captured = withPlannerInputCapture(g, () => serializeStateWithoutPlannerInputs(g, world, binaryProfiles));
+  return captured.inputs ? { ...captured.value, aiPlannerInputs: captured.inputs } : captured.value;
+}
+function serializeStateWithoutPlannerInputs(g: Game, world: any, binaryProfiles = false): any {
   const w = g.world, net = w.net;
   const edges = [...net.edges.values()];
   const profiles = binaryProfiles ? new Float32Array(edges.reduce((n, e) => n + e.prof.length, 0)) : null;
@@ -732,7 +737,7 @@ export function deserialize(d: any): Game {
     catch (e) { console.warn('Save load: canonicalizeLines failed', e); }
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
-  try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  try { withPlannerInputRestore(g, d.aiPlannerInputs, () => g.restoreAIs(d)); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
   // Legacy project cleanup can remove stations, passages and roads after the first share-cache prime.
   // Those are real input edits, even when the saved world had no population update pending. Retain
   // that work before loadNetwork aligns disposable road versions and the second prime consumes it.

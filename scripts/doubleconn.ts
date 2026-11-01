@@ -194,6 +194,7 @@ function failedOpening() {
   // The ordinary native quote, financing and rail job still have to accept and build the corridor.
   const f = controlledOpeningWorld(), { g } = f, ai = f.ai as any;
   ai.depotNearLine = ai.depotSwitch = function* () { return -1; };
+  ai.advanceRailDepotSearch = () => ({ done: true, value: -1 });
   check(!AIController.forceBuild && ai.startProject('rail', [0, 1]), 'a native paying railway starts before the depot fault');
   try {
     for (let tick = 0; tick < 2400 && ai.busy; tick++) {

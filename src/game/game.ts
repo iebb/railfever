@@ -780,6 +780,9 @@ export class Game {
     const err = this.shares.canMerge(buyer, target);
     if (err) return err;
     const b = this.companies[buyer], t = this.companies[target];
+    // A partner's half-built project still owns paid work on this company's land. Cancel it while both
+    // investors and their original ownership exist, so removals and refunds precede the takeover transfer.
+    for (const ai of this.ais) if (ai.companyId !== target) ai.partnerAcquired(target);
     // the target's AI stops (a half-built project is removed first)
     for (const ai of this.ais) if (ai.companyId === target) ai.dispose();
     this.ais = this.ais.filter((a) => a.companyId !== target);

@@ -83,6 +83,9 @@ try {
     switch (script) {
       case 'smoke': return [7, 11, 23].map((n) => ({ name: `smoke${n}`, script, args: [String(n)] }));
       case 'replay': return [7, 23].map((n) => ({ name: `replay${n}`, script, args: [String(n)] }));
+      case 'road-controller-replay': return [
+        'bus', 'coach', 'road', 'market-bus', 'market-coach', 'selector', 'plan-join', 'plan-extend', 'plan-upgrade',
+      ].map((kind) => ({ name: `${script}-${kind}`, script, args: [`--case=${kind}`] }));
       case 'growth': return [{ name: script, script, args: ['--parallel'] }];
       case 'ainet': return [{ name: script, script, args: ['scenarios'] }];
       case 'migrate': return [{ name: script, script, args: [join(work, 'scripts/fixtures/saves')] }];
@@ -95,7 +98,10 @@ try {
   const sweeps = new Set(['aijobs', 'aimail', 'aiplan', 'airail', 'capacity-frequency', 'cargoroute',
     'citylines', 'companies', 'deadlock', 'depots', 'doubleconn', 'economy', 'entrances', 'entrancecache',
     'growth', 'growthcap', 'linegrow', 'platforms', 'replay', 'smoke', 'terrain-fit', 'throughcap',
-    'townfit', 'uipure', 'urban', 'urbanecon', 'urbanhandoff', 'urban-staging', 'urbantrunks']);
+    'townfit', 'uipure', 'urban', 'urbanecon', 'urbanhandoff', 'urban-staging', 'urbantrunks',
+    'ai-selection', 'ai-selection-quotes', 'rail-continuation', 'hsr-continuation', 'road-project-continuation',
+    'road-controller-replay', 'road-build-variants', 'road-project-cancellation', 'road-cleanup-titles',
+    'share-continuation', 'crosscity-continuation']);
   jobs.sort((a, b) => Number(sweeps.has(a.script)) - Number(sweeps.has(b.script)));
   const inventory = [...jobs.map(j => j.name), ...['companies', 'savesize', 'ai', 'catchperf'].filter(n => scripts.includes(n))];
   const assigned = new Set(inventory.filter((_, i) => i % shard.count === shard.index - 1));

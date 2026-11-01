@@ -2551,6 +2551,10 @@ export class Stations {
     const stop = st.stops[idx];
     if (!stop) return;
     st.stops.splice(idx, 1);
+    if (!st.rail && st.stops.length) {
+      st.x = st.stops.reduce((sum, p) => sum + p.x, 0) / st.stops.length;
+      st.z = st.stops.reduce((sum, p) => sum + p.z, 0) / st.stops.length;
+    }
     const e = this.game.world.net.edges.get(stop.edge);
     if (e) this.game.world.net.markEdge(e);
     if (!st.stops.length && !st.rail) this.deleteStation(st.id);

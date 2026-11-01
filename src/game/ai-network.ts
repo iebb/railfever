@@ -82,7 +82,7 @@ import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
 import { walkingCatchment, planWalkingCatchment, stopWalkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
-import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
+import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, resumeUrbanGrowthProbe, type UrbanGrowthProbe, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
 import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
 import { hubTask, hubPairs, copyHubCursor, type HubCursor, type HubHost } from './ai-hub';
 import { worksOn } from './route-works';
@@ -432,12 +432,24 @@ export function saveNetwork(g: Game): NetworkSave {
 /** Old saves have no aiNetwork field and keep the initial, company-staggered schedule. */
 export function loadNetwork(g: Game, data?: NetworkSave): void {
   if (data?.version !== 1 || !Array.isArray(data.companies)) return;
+  // AI task graphs have already rebound native rail/managed identities. Restore serialization order without
+  // replacing those objects: a replacement here would turn an unchanged restored hub or line into a stale input.
+  const orderFields = (record: Record<string, unknown>, keys: string[], keepRest = false) => {
+    const own = Object.getOwnPropertyDescriptors(record), order = keepRest ? [...new Set([...keys, ...Object.keys(record)])] : keys;
+    const entries = order.map(key => {
+      const property = own[key];
+      if (property && !('value' in property)) throw new Error('Invalid native planner field accessor');
+      return [key, property?.value] as const;
+    });
+    for (const key of Object.keys(record)) delete record[key];
+    for (const [key, value] of entries) Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true });
+  };
   if (data.stationWorks) g.stations.loadWorks(data.stationWorks);
   for (const [sid, keys] of data.stationFields ?? []) {
     const st = g.stations.get(sid), r = st?.rail;
     if (st && r) {
       const record = r as unknown as Record<string, unknown>;
-      st.rail = Object.fromEntries(keys.map((key) => [key, record[key]])) as unknown as NonNullable<Station['rail']>;
+      orderFields(record, keys);
     }
   }
   // Road-change detection compares warm walking entries with later street edits. Rebuild those derived
@@ -459,7 +471,7 @@ export function loadNetwork(g: Game, data?: NetworkSave): void {
       const info = lines?.get(id);
       if (!info) continue;
       const record = info as unknown as Record<string, unknown>;
-      lines!.set(id, { ...Object.fromEntries(keys.map((key) => [key, record[key]])), ...info } as unknown as ManagedLine);
+      orderFields(record, keys, true);
     }
   }
   for (const [id, state] of data.companies) {
@@ -488,11 +500,11 @@ export function networkDaily(ai: AIController, reviewExpansion = false): boolean
 export function finishNetworkReview(ai: AIController): void { planners.get(ai)?.finishReview(); }
 
 /** A chooser's bounded city growth quote uses the same host and native saved build task. */
-export function* previewUrbanGrowth(ai: AIController, lineId: number): Generator<void, UrbanGrowthQuote | null> {
+export function* previewUrbanGrowth(ai: AIController, lineId: number, cursor?: UrbanGrowthProbe): Generator<void, UrbanGrowthQuote | null> {
   if (ai.disposed) return null;
   let p = planners.get(ai);
   if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
-  return yield* p.previewUrbanGrowth(lineId);
+  return yield* p.previewUrbanGrowth(lineId, cursor);
 }
 export function queueUrbanGrowth(ai: AIController, quote: UrbanGrowthQuote): boolean {
   if (ai.disposed) return false;
@@ -860,9 +872,9 @@ class NetPlanner {
 
   start(task: Task): void { this.job = { task, items: null, cursor: 0, done: 0 }; }
 
-  *previewUrbanGrowth(lineId: number): Generator<void, UrbanGrowthQuote | null> {
-    if (this.job) return null;
-    return yield* probeUrbanGrowth(this.growHost(), lineId);
+  *previewUrbanGrowth(lineId: number, cursor?: UrbanGrowthProbe): Generator<void, UrbanGrowthQuote | null> {
+    if (this.job && (!cursor || cursor.stage === 'init')) return null;
+    return yield* (cursor ? resumeUrbanGrowthProbe(this.growHost(), lineId, cursor) : probeUrbanGrowth(this.growHost(), lineId));
   }
   queueUrbanGrowth(quote: UrbanGrowthQuote): boolean {
     const line = this.g.lines.get(quote.line);

@@ -98,7 +98,29 @@ export interface WalkingCatchment {
   segments: WalkSegment[];
   buildings: Map<number, WalkBuilding>;
 }
+// Native constructors close over captured walking inputs. Their lazy geometry can be materialized
+// for a pending planner's save without consulting a later world or accepting arbitrary record accessors.
+const nativeLazyWalks = new WeakSet<WalkingCatchment>();
+function lazyWalkingCatchment(segments: () => WalkSegment[], buildings: Map<number, WalkBuilding>): WalkingCatchment {
+  const value = { get segments() { return segments(); }, buildings };
+  nativeLazyWalks.add(value);
+  return value;
+}
+export function plannerWalkSnapshot(value: object): WalkingCatchment | null {
+  if (!nativeLazyWalks.has(value as WalkingCatchment)) return null;
+  const walk = value as WalkingCatchment;
+  return { segments: walk.segments, buildings: walk.buildings };
+}
 const EMPTY: WalkingCatchment = { segments: [], buildings: new Map() };
+
+/** A durable task owns each captured walk; disposable cache wrappers and EMPTY sharing are not task identities. */
+export function ownPlannerWalk(walk: WalkingCatchment): WalkingCatchment {
+  if (walk !== EMPTY && !nativeLazyWalks.has(walk)) throw new Error('Planner walk requires native captured inputs');
+  const buildings = new Map([...walk.buildings].map(([id, entry]) => [id, { ...entry }]));
+  let segments: WalkSegment[] | undefined;
+  return lazyWalkingCatchment(() => segments ??= walk.segments.map(segment => ({ ...segment })), buildings);
+}
+
 
 /** Short surface connectors cannot jump across water or attach to an overhead/underground road. */
 function dryLeg(g: Game, x: number, z: number, qx: number, qz: number): boolean {
@@ -555,7 +577,7 @@ class WalkingCache {
 
   private value(c: Cached, buildings: Map<number, WalkBuilding>): WalkingCatchment {
     const self = this;
-    return { get segments() { return c.segments ??= self.segments(c.reaches, c.portals, c.byEdge, c.geometry); }, buildings };
+    return lazyWalkingCatchment(() => c.segments ??= self.segments(c.reaches, c.portals, c.byEdge, c.geometry), buildings);
   }
 
   private segments(reaches: Reach[], portals: Portal[], byEdge: Map<number, number[]>, geometry: Cached['geometry']): WalkSegment[] {
@@ -649,7 +671,7 @@ export function entrancePlanCatchment(g: Game, st: Station, plan: EntrancePlan):
   if (!gone.some((id) => walk.buildings.has(id))) return walk;
   const buildings = new Map(walk.buildings);
   for (const id of gone) buildings.delete(id);
-  return { get segments() { return walk.segments; }, buildings };
+  return lazyWalkingCatchment(() => walk.segments, buildings);
 }
 function entranceStreetsCatchment(g: Game, st: Station, plan: EntrancePlan): WalkingCatchment {
   const r = st.rail;

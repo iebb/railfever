@@ -24,7 +24,8 @@ function railJobCall(nativeFleet?:number){
   let opening=false;
   eco.spend=function(...args:Parameters<typeof spend>){
     const stack=new Error().stack??'',cashBefore=this.money,loanBefore=this.loan,accepted=spend.apply(this,args);
-    if(accepted&&stack.includes('railPlanJob'))events.push({amount:args[0],category:args[1],cashBefore,cashAfter:this.money,loanBefore,loanAfter:this.loan,throat:stack.includes('connectStationThroat'),vehicle:stack.includes('buyTrain'),signals:stack.includes('autoSignalLine'),opening});
+    // Observe either native opening controller; the atomic expense and ledger predicates below are unchanged.
+    if(accepted&&(stack.includes('railPlanJob')||stack.includes('advanceRailContinuation')||stack.includes('finalizeRailTimetable')))events.push({amount:args[0],category:args[1],cashBefore,cashAfter:this.money,loanBefore,loanAfter:this.loan,throat:stack.includes('connectStationThroat'),vehicle:stack.includes('buyTrain'),signals:stack.includes('autoSignalLine'),opening});
     return accepted;
   };
   check(!AIController.forceBuild&&ai.startProject('rail',[0,1]),'controlled profitable railJob begins with native finance and no forceBuild override');

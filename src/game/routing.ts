@@ -1,3 +1,4 @@
+import { retainPlannerInput, preparePlannerInput, type PlannerInput } from './ai-task-inputs';
 // Route building on the free-form network, shared by world generation (intercity roads) and the AI:
 // coarse terrain A* corridors, railway-style alignments, crossing-aware height profiles, chained
 // construction with planEdge/commitProposal, station sites and depots.
@@ -11,14 +12,21 @@ import { recomputeLocks, EARTHWORKS } from './terraform';
 import { depotSize } from './build-ops';
 import { distToRect } from './world';
 import { Heap } from './train';
-import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS, endTangent } from './geom';
+import { segIntersect, angleBetween, bezMinRadius, bezPoint, arcTable, tAtS, endTangent, type Bez, type ArcTable } from './geom';
 import { walkSitePop } from './catchment';
-import type { CorridorSnapshot } from './planning-corridor';
+import { createCorridorKernel, corridorFrontierCodec, type CorridorSnapshot, type CorridorKernelState, type PackedCorridorKernelState } from './planning-corridor';
 import { onwardEnds, inOnward, rectPoints, type OnwardEnd } from './onward';
-import { requestCorridor, advanceCorridor, cancelCorridor } from './corridor-worker';
+import { requestCorridor, advanceCorridor, cancelCorridor, type CorridorJob } from './corridor-worker';
 
 /** Optional headless profiling observer. Never consulted by the planner's decisions or work schedule. */
 export const planningProbe: { observe?: (stage: string, begin: boolean, work?: number) => void } = {};
+
+/** A cursor's next unit has the same observer boundary as the old generator's next(). */
+export function planningStep<T>(stage: string, step: () => T): T {
+  planningProbe.observe?.(stage, true);
+  try { return step(); }
+  finally { planningProbe.observe?.(stage, false); }
+}
 
 /** Observe individual units, including generators that pause in a costly sub-step. */
 export function* planningGen<T>(stage: string, job: Generator<void, T>): Generator<void, T> {
@@ -189,11 +197,24 @@ function* plannedCorridor(g: Game, from: OPoint, to: OPoint, opts: CorridorOpts,
  * which keeps the corridor drivable with large curve radii. Costs: distance, slope, water (bridges),
  * buildings, existing network; stations and depots are forbidden.
  */
+export interface CorridorSearchState extends CorridorKernelState {
+  forbid: CorridorSnapshot['forbid'];
+  field: RailField | null;
+}
+export interface PackedCorridorSearchState extends PackedCorridorKernelState {
+  forbid: CorridorSnapshot['forbid']; field: RailField | null;
+}
+const frontierCodec = corridorFrontierCodec();
+
 export class CorridorSearch {
   readonly C: number;
   readonly n: number;
   private info: Uint8Array;   // per vertex: 1 known, 2 water, 4 building, 8 network, 16 forbidden
   private hgt: Float32Array;
+  private knownCells: number[] = [];
+  private knownStates: number[] = [];
+  private knownParallel: number[] = [];
+  private packedBytes: Uint8Array | null = null;
   private gcost: Float32Array;
   private parent: Int32Array;
   private closed: Uint8Array;
@@ -212,7 +233,7 @@ export class CorridorSearch {
   state: 'running' | 'done' | 'failed' = 'running';
   path: P2[] | null = null;
 
-  constructor(private g: Game, private from: OPoint, private to: OPoint, private opts: CorridorOpts) {
+  constructor(private g: Game, private from: OPoint, private to: OPoint, private opts: CorridorOpts, saved?: CorridorSearchState | PackedCorridorSearchState) {
     const size = g.world.size;
     this.C = opts.cell ?? Math.max(4, Math.ceil(size / 96));
     // Two 45-degree corners share a straight: each needs R*tan(22.5 degrees).
@@ -236,9 +257,49 @@ export class CorridorSearch {
     DIRS.forEach(([dx, dz], i) => { if ((dx * to.tx + dz * to.tz) / Math.hypot(dx, dz) > 0.64) this.goalDirs.add(i); });
     const h0 = nearestDir(from.tx, from.tz);
     const st = (s0 * 8 + h0) * this.runs + 1;
-    this.gcost[st] = 0;
+    this.gcost[st] = 0; this.knownStates.push(st);
     this.heap.push(st, this.heur(s0));
+    if (saved) this.restore(saved);
   }
+
+  /** Copy the actual frontier, never rerun earlier slices against a newer world. */
+  record(): CorridorSearchState {
+    const cells: CorridorKernelState['cells'] = [], states: CorridorKernelState['states'] = [];
+    for (const i of this.knownCells) cells.push(i, this.info[i], this.hgt[i]);
+    for (const i of this.knownStates)
+      states.push(i, this.gcost[i], this.parent[i], this.closed[i]);
+    const parallel: CorridorKernelState['parallel'] = this.par ? [] : null;
+    if (this.par) for (const i of this.knownParallel) parallel!.push(i, this.par[i]);
+    return { version: 1, dimensions: [this.C, this.n, this.runs], cells, states,
+      heap: { f: [...this.heap.f], v: [...this.heap.v] }, parallel, expanded: this.expanded,
+      state: this.state, path: this.path?.map(p => ({ ...p })) ?? null, forbid: this.forbid, field: this.field };
+  }
+
+  packedRecord(): PackedCorridorSearchState {
+    this.packedBytes ??= frontierCodec.pack({ dimensions: [this.C, this.n, this.runs], cells: this.knownCells, info: this.info,
+      height: this.hgt, states: this.knownStates, cost: this.gcost, parent: this.parent, closed: this.closed,
+      heap: this.heap, parallel: this.par ? this.knownParallel : null, parallelValues: this.par });
+    return { version: 1, packed: this.packedBytes, expanded: this.expanded, state: this.state,
+      path: this.path?.map(p => ({ ...p })) ?? null, forbid: this.forbid, field: this.field };
+  }
+
+  restore(input: CorridorSearchState | PackedCorridorSearchState) {
+    this.packedBytes = null;
+    const saved = 'packed' in input ? { ...frontierCodec.unpack(input), forbid: input.forbid, field: input.field } : input;
+    if (saved.version !== 1 || saved.dimensions[0] !== this.C || saved.dimensions[1] !== this.n || saved.dimensions[2] !== this.runs)
+      throw new Error('Incompatible corridor continuation');
+    this.info.fill(0); this.hgt.fill(0); this.gcost.fill(Infinity); this.parent.fill(-1); this.closed.fill(0);
+    this.knownCells = []; this.knownStates = []; this.knownParallel = [];
+    for (let k = 0; k < saved.cells.length; k += 3) { const i = saved.cells[k]; this.knownCells.push(i); this.info[i] = saved.cells[k + 1]; this.hgt[i] = saved.cells[k + 2]; }
+    for (let k = 0; k < saved.states.length; k += 4) { const i = saved.states[k]; this.knownStates.push(i); this.gcost[i] = saved.states[k + 1]; this.parent[i] = saved.states[k + 2]; this.closed[i] = saved.states[k + 3]; }
+    this.heap.f = [...saved.heap.f]; this.heap.v = [...saved.heap.v];
+    this.par = saved.parallel ? new Uint8Array(this.n * this.n * 4) : null;
+    if (saved.parallel) for (let k = 0; k < saved.parallel.length; k += 2) { const i = saved.parallel[k]; this.knownParallel.push(i); this.par![i] = saved.parallel[k + 1]; }
+    this.field = saved.field; this.forbid = saved.forbid;
+    this.expanded = saved.expanded; this.state = saved.state;
+    this.path = saved.path?.map(p => ({ ...p })) ?? null;
+  }
+
 
   private vertex(x: number, z: number) {
     const i = Math.max(1, Math.min(this.n - 2, Math.round(x / this.C))), j = Math.max(1, Math.min(this.n - 2, Math.round(z / this.C)));
@@ -287,12 +348,13 @@ export class CorridorSearch {
       const t = Math.max(0, Math.min(1, ((cx - a.x0) * dx + (cz - a.z0) * dz) / l2));
       if (Math.hypot(a.x0 + dx * t - cx, a.z0 + dz * t - cz) < a.r) { f |= 16; break; }
     }
-    this.info[v] = f;
+    this.info[v] = f; this.knownCells.push(v);
     return f;
   }
 
   /** Run up to `budget` expansions; returns the state. */
   step(budget: number): 'running' | 'done' | 'failed' {
+    this.packedBytes = null;
     planningProbe.observe?.('corridor', true);
     const before = this.expanded;
     try { return this.expand(budget); }
@@ -339,7 +401,8 @@ export class CorridorSearch {
         if (this.opts.parallel && this.alongside(v, di)) c += d * this.opts.parallel;
         const nc = this.gcost[s] + c;
         if (nc >= this.gcost[ns]) continue;
-        this.gcost[ns] = nc;
+        if (!Number.isFinite(this.gcost[ns])) this.knownStates.push(ns);
+          this.gcost[ns] = nc;
         this.parent[ns] = s;
         this.heap.push(ns, nc + this.heur(v));
       }
@@ -354,6 +417,7 @@ export class CorridorSearch {
     if (!this.par) { this.par = new Uint8Array(this.n * this.n * 4); this.field = railField(this.g, this.opts.trackClass); }
     const k = v * 4 + (di & 3);
     if (!this.par[k]) {
+        this.knownParallel.push(k);
       const [dx, dz] = DIRS[di], l = Math.hypot(dx, dz);
       this.par[k] = parallelRailAt(this.field!, (v % this.n) * this.C, Math.floor(v / this.n) * this.C, dx / l, dz / l) ? 2 : 1;
     }
@@ -691,7 +755,8 @@ export function chainProfile(g: Game, way: OPoint[], tracks: number, y0: number,
 }
 
 /** Identical sampling, crossing order and height solutions, with deterministic optional pauses. */
-export function* chainProfileGen(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', step = 0, gradeMargin = 0.85, wideCurves = type === 'highspeed'): Generator<void, ChainProfile | null> {
+export function* chainProfileGen(g: Game, way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind, exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', step = 0, gradeMargin = 0.85, wideCurves = type === 'highspeed', cursor?: ProfileCursor): Generator<void, ChainProfile | null> {
+  if (cursor) return yield* planningGen('terrain fit', profileCursorGen(g, cursor));
   return yield* planningGen('terrain fit', chainProfileWork(g, way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, step, gradeMargin, wideCurves));
 }
 
@@ -836,6 +901,167 @@ function* chainProfileWork(g: Game, way: OPoint[], tracks: number, y0: number, y
   return { s: ss, x: xs, z: zs, y, terr: tr, crossings };
 }
 
+type ProfileMode = 'level' | 'over' | 'under';
+interface ProfileCrossing { i: number; sc: number; x: number; z: number; yo: number; levelOk: boolean; tunnel: boolean; span: number; edge: number }
+/** A profile retains its sampled terrain, original crossing order and next combination, not a generator frame. */
+export interface ProfileCursor {
+  version: 1; phase: 'start' | 'samples' | 'desired' | 'crossings' | 'solve' | 'combinations' | 'finish' | 'done';
+  way: OPoint[]; tracks: number; y0: number; y1: number; kind: NetKind; exclude: Set<number>;
+  roadJunctions: boolean; diag?: { crossings: P2[] }; type: string; slice: number; gradeMargin: number; wideCurves: boolean;
+  xs: number[]; zs: number[]; ss: number[]; terrain: number[]; acc: number; work: number; index: number;
+  part: { a: OPoint; b: OPoint; bez: Bez | null; tab: ArcTable | null; length: number; count: number; next: number } | null;
+  desired: number[]; low: number[]; high: number[]; steps: number[]; grade: number; heights: number[] | null;
+  edges: NEdge[]; crossings: ProfileCrossing[]; base: ProfileMode[]; modes: ProfileMode[];
+  combinations: ProfileMode[][]; combination: number; solves: number; solution: number[] | null;
+  result: ChainProfile | null;
+}
+export function newProfileCursor(way: OPoint[], tracks: number, y0: number, y1: number, kind: NetKind,
+  exclude: Set<number> = new Set(), roadJunctions = false, diag?: { crossings: P2[] }, type = 'standard', slice = 0,
+  gradeMargin = 0.85, wideCurves = type === 'highspeed'): ProfileCursor {
+  return { version: 1, phase: 'start', way, tracks, y0, y1, kind, exclude, roadJunctions, diag, type, slice, gradeMargin, wideCurves,
+    xs: [], zs: [], ss: [], terrain: [], acc: 0, work: 0, index: 1, part: null, desired: [], low: [], high: [], steps: [],
+    grade: 0, heights: null, edges: [], crossings: [], base: [], modes: [], combinations: [], combination: 1, solves: 0, solution: null, result: null };
+}
+function* profileCursorGen(g: Game, cursor: ProfileCursor): Generator<void, ChainProfile | null> {
+  while (true) { const result = stepProfileCursor(g, cursor); if (result.done) return result.value; yield; }
+}
+export function stepProfileCursor(g: Game, t: ProfileCursor): IteratorResult<void, ChainProfile | null> {
+  const finish = (result: ChainProfile | null): IteratorResult<void, ChainProfile | null> => { t.phase = 'done'; t.result = result; return { done: true, value: result }; };
+  const pause = (): IteratorResult<void, ChainProfile | null> => ({ done: false, value: undefined });
+  const solve = (modes: (ProfileMode | undefined)[]) => {
+    const low = t.low.slice(), high = t.high.slice(), clearance = RAIL.clearance + 0.15;
+    t.crossings.forEach((c, j) => {
+      if (!modes[j]) return;
+      for (let k = Math.max(0, c.i - 3); k <= Math.min(t.xs.length - 1, c.i + 3); k++) {
+        if (modes[j] === 'over') low[k] = Math.max(low[k], c.yo + clearance);
+        else if (modes[j] === 'under') high[k] = Math.min(high[k], c.yo - clearance);
+        else { const slack = t.grade * 0.9 * Math.abs(t.ss[k] - c.sc) + 0.004; low[k] = Math.max(low[k], c.yo - slack); high[k] = Math.min(high[k], c.yo + slack); }
+      }
+    });
+    return solveHeights(t.desired, t.steps, low, high, t.grade);
+  };
+  while (true) {
+    if (t.phase === 'done') return { done: true, value: t.result };
+    if (t.phase === 'start') {
+      if (t.wideCurves) t.way = t.way.flatMap((b, i) => i ? chainPieces(t.way[i - 1], b).slice(1) : [b]);
+      t.phase = 'samples';
+    }
+    if (t.phase === 'samples') {
+      while (t.index < t.way.length) {
+        if (!t.part) {
+          const a = t.way[t.index - 1], b = t.way[t.index];
+          const bez = t.wideCurves ? fitCurve({ ...a, fixed: true, y: null }, { ...b, fixed: true, y: null }) : null;
+          const tab = bez ? arcTable(bez) : null, length = tab?.len ?? Math.hypot(b.x - a.x, b.z - a.z);
+          t.part = { a, b, bez, tab, length, count: Math.max(1, Math.ceil(length)), next: t.index === 1 ? 0 : 1 };
+        }
+        const p = t.part;
+        while (p.next <= p.count) {
+          const f = p.next++ / p.count, { a, b, length: length } = p;
+          const h00 = 2 * f ** 3 - 3 * f * f + 1, h10 = f ** 3 - 2 * f * f + f, h01 = -2 * f ** 3 + 3 * f * f, h11 = f ** 3 - f * f;
+          const point = p.bez ? bezPoint(p.bez, tAtS(p.tab!, f * length)) : null;
+          const x = point?.x ?? h00 * a.x + h10 * a.tx * length + h01 * b.x + h11 * b.tx * length;
+          const z = point?.z ?? h00 * a.z + h10 * a.tz * length + h01 * b.z + h11 * b.tz * length;
+          if (t.xs.length) t.acc += Math.hypot(x - t.xs[t.xs.length - 1], z - t.zs[t.zs.length - 1]);
+          t.xs.push(x); t.zs.push(z); t.ss.push(t.acc); t.terrain.push(terrRef(g, x, z, a.tx, a.tz, t.tracks));
+          if (t.slice && ++t.work >= t.slice) { t.work = 0; return pause(); }
+        }
+        t.index++; t.part = null;
+      }
+      t.phase = 'desired'; t.index = 0;
+    }
+    if (t.phase === 'desired') {
+      const n = t.xs.length, window = t.kind === 'rail' ? 10 : 3;
+      while (t.index < n) {
+        const i = t.index++; let sum = 0, count = 0;
+        for (let j = Math.max(0, i - window); j <= Math.min(n - 1, i + window); j++) { sum += Math.max(t.terrain[j], WATER_Y + 0.15); count++; }
+        t.desired.push(sum / count); t.low.push(t.terrain[i] < WATER_Y + 0.05 ? WATER_Y + 0.95 : -1e9); t.high.push(1e9);
+        if (t.slice && ++t.work >= t.slice) { t.work = 0; return pause(); }
+      }
+      t.low[0] = t.high[0] = t.y0; t.low[n - 1] = t.high[n - 1] = t.y1;
+      t.steps = t.ss.map((s, i) => i ? s - t.ss[i - 1] : 0);
+      t.grade = (t.kind === 'rail' ? (TRACK_TYPES[t.type] ?? TRACK_TYPES.standard).maxGrade : ROAD_TYPES.road.maxGrade) * Math.min(1, Math.max(0.1, t.gradeMargin));
+      t.heights = solveHeights(t.desired, t.steps, t.low, t.high, t.grade);
+      if (!t.heights) return finish(null);
+      let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
+      for (let i = 0; i < n; i++) { x0 = Math.min(x0, t.xs[i]); x1 = Math.max(x1, t.xs[i]); z0 = Math.min(z0, t.zs[i]); z1 = Math.max(z1, t.zs[i]); }
+      t.edges = g.world.net.edgesNear(x0 - 1, z0 - 1, x1 + 1, z1 + 1); t.index = 0; t.phase = 'crossings';
+    }
+    if (t.phase === 'crossings') {
+      const net = g.world.net, n = t.xs.length;
+      while (t.index < t.edges.length) {
+        const e = t.edges[t.index++]; let counted = false;
+        planningProbe.observe?.('crossings', true);
+        try {
+          if (t.exclude.has(e.id)) continue;
+          const box = net.grid.box(e.id); if (!box) continue;
+          const ge = net.geo(e);
+          for (let i = 0; i < n - 1; i++) {
+            const ax = t.xs[i], az = t.zs[i], bx = t.xs[i + 1], bz = t.zs[i + 1];
+            if (Math.max(ax, bx) < box[0] || Math.min(ax, bx) > box[2] || Math.max(az, bz) < box[1] || Math.min(az, bz) > box[3]) continue;
+            const ids = crossingSegments(ge, ax, az, bx, bz);
+            for (let k = 0, count = ids?.length ?? ge.n - 1; k < count; k++) {
+              const j = ids ? ids[k] : k, hit = segIntersect(ax, az, bx, bz, ge.pts[j * 3], ge.pts[j * 3 + 2], ge.pts[j * 3 + 3], ge.pts[j * 3 + 5]);
+              if (!hit) continue;
+              const oldS = ge.cum[j] + (ge.cum[j + 1] - ge.cum[j]) * hit[1];
+              const angle = angleBetween(bx - ax, bz - az, ge.pts[j * 3 + 3] - ge.pts[j * 3], ge.pts[j * 3 + 5] - ge.pts[j * 3 + 2]), section = net.sectionAt(e, oldS);
+              t.crossings.push({ i: hit[0] < 0.5 ? i : i + 1, sc: t.ss[i] + (t.ss[i + 1] - t.ss[i]) * hit[0], x: ax + (bx - ax) * hit[0], z: az + (bz - az) * hit[0], yo: net.heightAtS(e, oldS),
+                levelOk: !t.wideCurves && Math.min(angle, Math.PI - angle) > 0.45 && section === 'ground' && e.depot < 0 && e.station < 0 && !(t.kind === 'rail' && e.kind === 'rail') && !(t.kind === 'road' && e.kind === 'road' && !t.roadJunctions),
+                tunnel: section === 'tunnel', span: (net.halfWidth(e) + EARTHWORKS.corePad) / Math.max(0.35, Math.sin(angle)) + 0.3, edge: e.id });
+            }
+          }
+          counted = true;
+        } finally { planningProbe.observe?.('crossings', false); }
+        if (counted && t.slice && (t.work += 32) >= t.slice) { t.work = 0; return pause(); }
+      }
+      t.phase = 'solve';
+    }
+    if (t.phase === 'solve') {
+      if (!t.crossings.length) return finish({ s: t.ss, x: t.xs, z: t.zs, y: t.heights!, terr: t.terrain, crossings: [] });
+      t.base = t.crossings.map(c => !c.tunnel && Math.abs(t.heights![c.i] - c.yo) < 0.35 && c.levelOk ? 'level' : t.heights![c.i] >= c.yo ? 'over' : 'under');
+      t.modes = t.base; t.solution = solve(t.base);
+      if (!t.solution && t.wideCurves) for (const mode of ['over', 'under'] as const) {
+        const modes = t.crossings.map(() => mode), solution = solve(modes);
+        if (solution) { t.solution = solution; t.modes = modes; break; }
+      }
+      if (!t.solution && t.crossings.length <= 6) {
+        const alternatives = t.crossings.map((c, j) => (['level', 'over', 'under'] as ProfileMode[]).filter(m => m !== t.base[j] && (m !== 'level' || c.levelOk && !c.tunnel)));
+        t.combinations = [[]];
+        t.crossings.forEach((_, j) => { const next: ProfileMode[][] = []; for (const modes of t.combinations) for (const mode of [t.base[j], ...alternatives[j]]) next.push([...modes, mode]); t.combinations.splice(0, t.combinations.length, ...next); });
+        const changes = (modes: ProfileMode[]) => modes.reduce((sum, mode, j) => sum + Number(mode !== t.base[j]), 0);
+        t.combinations.sort((a, b) => changes(a) - changes(b)); t.phase = 'combinations';
+      } else t.phase = 'finish';
+    }
+    if (t.phase === 'combinations') {
+      while (t.combination < Math.min(250, t.combinations.length)) {
+        const modes = t.combinations[t.combination++], solution = solve(modes);
+        if (solution) { t.solution = solution; t.modes = modes; break; }
+        if (t.slice && ++t.solves % 8 === 0) return pause();
+      }
+      t.phase = 'finish';
+    }
+    if (t.phase === 'finish') {
+      const n = t.xs.length;
+      if (!t.solution && t.kind === 'rail' && (t.gradeMargin > 0.85 || t.y0 < t.terrain[0] - 1.9 || t.y1 < t.terrain[n - 1] - 1.9) && t.crossings.length > 6 && t.crossings.length <= 32) {
+        let beam: { modes: (ProfileMode | undefined)[]; changes: number; y: number[] }[] = [{ modes: new Array(t.crossings.length), changes: 0, y: t.heights! }];
+        const order = t.crossings.map((_, i) => i).sort((a, b) => t.crossings[a].sc - t.crossings[b].sc || a - b);
+        for (const j of order) {
+          const next: typeof beam = [];
+          for (const b of beam) for (const mode of [t.base[j], ...(['level', 'over', 'under'] as ProfileMode[]).filter(mode => mode !== t.base[j])]) {
+            if (mode === 'level' && (!t.crossings[j].levelOk || t.crossings[j].tunnel)) continue;
+            const modes = b.modes.slice(); modes[j] = mode; const y = solve(modes);
+            if (y) next.push({ modes, changes: b.changes + Number(mode !== t.base[j]), y });
+          }
+          beam = next.sort((a, b) => a.changes - b.changes).slice(0, 8); if (!beam.length) break;
+        }
+        if (beam.length) { t.solution = beam[0].y; t.modes = beam[0].modes as ProfileMode[]; }
+      }
+      if (!t.solution) { if (t.diag) t.diag.crossings = t.crossings.map(c => ({ x: c.x, z: c.z })); return finish(null); }
+      const crossings = t.crossings.map((c, j) => ({ x: c.x, z: c.z, mode: t.modes[j], edge: c.edge, s: c.sc, span: c.tunnel ? 0 : c.span }));
+      return finish({ s: t.ss, x: t.xs, z: t.zs, y: t.solution, terr: t.terrain, crossings });
+    }
+  }
+}
+
 /**
  * Would the profiled route run alongside (too close to) existing edges anywhere except at its crossings?
  * Mirrors the planner's parallel-conflict rule so failures are found before anything is built.
@@ -893,6 +1119,70 @@ export function* routeConflictGen(g: Game, prof: ChainProfile, kind: NetKind, tr
   return null;
 }
 
+/** Explicit next operation for a sliced physical-clearance survey. Inputs and partial work survive saves. */
+export interface ConflictCursor {
+  version: 1;
+  phase: 'self' | 'selfCheck' | 'existing' | 'existingCheck' | 'done';
+  prof: ChainProfile; kind: NetKind; tracks: number; exclude: number[]; slice: number; structures: boolean;
+  index: number; result: P2 | null;
+}
+export function newConflictCursor(prof: ChainProfile, kind: NetKind, tracks: number, exclude: Set<number> = new Set(), slice = 0, structures = false): ConflictCursor {
+  return { version: 1, phase: 'self', prof, kind, tracks, exclude: [...exclude], slice, structures, index: 0, result: null };
+}
+export function stepConflictCursor(g: Game, task: ConflictCursor): IteratorResult<void, P2 | null> {
+  const { prof, kind, tracks, slice, structures } = task, net = g.world.net, n = prof.x.length;
+  const hw = (kind === 'rail' ? 0.32 : ROAD_TYPES.road.half) + (tracks - 1) * RAIL.spacing * 0.5;
+  const finish = (result: P2 | null): IteratorResult<void, P2 | null> => { task.phase = 'done'; task.result = result; return { done: true, value: result }; };
+  while (true) {
+    if (task.phase === 'done') return { done: true, value: task.result };
+    if (task.phase === 'self') {
+      if (task.index >= n) { task.phase = 'existing'; task.index = 0; continue; }
+      task.phase = 'selfCheck';
+      if (slice && task.index % (slice * 3) === 0 && task.index) return { done: false, value: undefined };
+    }
+    if (task.phase === 'selfCheck') {
+      const i = task.index;
+      for (let j = i + 12; j < n; j += 3) {
+        if (prof.s[j] - prof.s[i] < 12) continue;
+        if (Math.hypot(prof.x[i] - prof.x[j], prof.z[i] - prof.z[j]) < hw * 2 + 1.5) return finish({ x: prof.x[j], z: prof.z[j] });
+      }
+      task.index += 3; task.phase = 'self'; continue;
+    }
+    if (task.phase === 'existing') {
+      if (task.index >= n) return finish(null);
+      task.phase = 'existingCheck';
+      if (slice && task.index % (slice * 2) === 0) return { done: false, value: undefined };
+    }
+    if (task.phase === 'existingCheck') {
+      const i = task.index, x = prof.x[i], z = prof.z[i];
+      task.index += 2; task.phase = 'existing';
+      if (prof.s[i] < 2 || prof.s[n - 1] - prof.s[i] < 2) continue;
+      if (structures) {
+        for (const st of g.stations.footprintsNear(x, z, hw + 0.2)) for (const f of g.stations.footprints(st)) {
+          if (distToRect(x, z, f.x, f.z, f.angle, f.w / 2, f.d / 2) > hw + 0.2) continue;
+          if (f.y0 !== undefined && f.y1 !== undefined && (prof.y[i] + RAIL.clearance <= f.y0 || prof.y[i] - 0.2 >= f.y1)) continue;
+          return finish({ x, z });
+        }
+        if (g.depots.near(x, z, hw + 0.6).length) return finish({ x, z });
+      }
+      for (const e of net.edgesNear(x - hw - 1.2, z - hw - 1.2, x + hw + 1.2, z + hw + 1.2)) {
+        const box = net.grid.box(e.id);
+        if (box && (x < box[0] - hw || x > box[2] + hw || z < box[1] - hw || z > box[3] + hw)) continue;
+        if (task.exclude.includes(e.id)) continue;
+        if (prof.crossings.some(c => c.edge === e.id && Math.hypot(c.x - x, c.z - z) < 3)) continue;
+        const need = e.kind === 'rail' && kind === 'rail' ? RAIL.spacing - 0.02 : hw + net.halfWidth(e), ge = net.geo(e);
+        const ranges = geometryPointRanges(ge, x, z, need);
+        let best = Infinity, bi = 0;
+        for (const start of ranges ?? [0]) for (let j = start, end = ranges ? Math.min(ge.n, start + 32) : ge.n; j < end; j++) {
+          const d = (ge.pts[j * 3] - x) ** 2 + (ge.pts[j * 3 + 2] - z) ** 2;
+          if (d < best) { best = d; bi = j; }
+        }
+        if (Math.sqrt(best) < need && Math.abs(ge.pts[bi * 3 + 1] - prof.y[i]) < RAIL.clearance) return finish({ x, z });
+      }
+    }
+  }
+}
+
 export interface RouteOpts {
   kind: NetKind; owner: number; tracks: number;
   /** heights at the start and the end of the profiled route */
@@ -926,7 +1216,10 @@ export interface RoutePlan { way: OPoint[]; prof: ChainProfile; minR: number; ex
  * along other edges, the corridor is searched again keeping away from those spots. Returns the plan or
  * the reason it failed.
  */
-export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budget = 2000): Generator<void, RoutePlan | string> {
+export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budget = 2000, cursor?: RouteCursor): Generator<void, RoutePlan | string> {
+  if (cursor) {
+    while (true) { const result = stepRouteCursor(g, cursor); if (result.done) return result.value; yield; }
+  }
   const wideCurves = o.trackClass === 'highspeed' || o.type === 'highspeed';
   const extra: { x0: number; z0: number; x1: number; z1: number; r: number }[] = [];
   const nearEnds = (p: P2, r = 8) => Math.hypot(p.x - from.x, p.z - from.z) < r || Math.hypot(p.x - to.x, p.z - to.z) < r;
@@ -985,6 +1278,158 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     return { way, prof, minR: al.minR, expanded };
   }
   return why;
+}
+
+/** The exact next route-planning unit; search instances have explicit record/restore state below. */
+export interface RouteCursor {
+  version: 1; phase: 'attempt' | 'prefetch' | 'corridor' | 'alignment' | 'profile' | 'conflict' | 'done';
+  from: OPoint; to: OPoint; options: RouteOpts; budget: number; attempt: number; why: string;
+  extra: NonNullable<CorridorOpts['avoid']>; coarseOptions: CorridorOpts | null;
+  search: CorridorSearch | null; worker: CorridorJob | null;
+  path: P2[] | null; expanded: number; way: OPoint[]; fullWay: OPoint[]; minR: number;
+  profile: ProfileCursor | null; conflict: ConflictCursor | null; result: RoutePlan | string | null;
+}
+export function newRouteCursor(from: OPoint, to: OPoint, options: RouteOpts, budget = 2000): RouteCursor {
+  return { version: 1, phase: 'attempt', from, to, options, budget,
+    attempt: options.trackClass === 'highspeed' || options.type === 'highspeed' ? -1 : 0, why: '', extra: [], coarseOptions: null,
+    search: null, worker: null, path: null, expanded: 0, way: [], fullWay: [], minR: Infinity, profile: null, conflict: null, result: null };
+}
+interface SavedRouteWorker {
+  snapshot: Omit<CorridorSnapshot, 'revision' | 'terrainId' | 'h' | 'lock'> & { h: PlannerInput<Float32Array>; lock: PlannerInput<Uint8Array> };
+  budget: number; index: number; reply: CorridorJob['reply']; kernel: CorridorKernelState | SavedPackedFrontier | null;
+}
+type SavedPackedFrontier = Omit<PackedCorridorKernelState, 'packed'> & { packed: PlannerInput<Uint8Array> };
+type SavedPackedSearch = SavedPackedFrontier & { forbid: CorridorSnapshot['forbid']; field: RailField | null };
+export interface SavedRouteCursor extends Omit<RouteCursor, 'search' | 'worker'> {
+  search: CorridorSearchState | SavedPackedSearch | null; worker: SavedRouteWorker | null;
+}
+/** Plain graph data for savePlannerTask: no runtime, generator, worker handle or unrecorded frontier. */
+export function saveRouteCursor(t: RouteCursor): SavedRouteCursor {
+  return { ...t, search: t.search ? (() => { const { packed, ...state } = t.search!.packedRecord(); return { ...state, packed: retainPlannerInput(packed) }; })() : null, worker: t.worker ? {
+    snapshot: (() => { const { revision: _, terrainId: __, h, lock, ...rest } = t.worker!.snapshot;
+      return { ...rest, h: retainPlannerInput(h), lock: retainPlannerInput(lock) }; })(), budget: t.worker.budget,
+    index: t.worker.index, reply: t.worker.reply, kernel: t.worker.kernel ? (() => {
+      const { packed, ...state } = t.worker!.kernel!.packedRecord(); return { ...state, packed: retainPlannerInput(packed) };
+    })() : null } : null };
+}
+export function loadRouteCursor(g: Game, saved: SavedRouteCursor): RouteCursor {
+  const t = saved as unknown as RouteCursor;
+  if (saved.version !== 1) throw new Error('Incompatible route continuation');
+  const search = saved.search, worker = saved.worker;
+  t.search = search ? new CorridorSearch(g, t.from, t.to, t.coarseOptions!, 'packed' in search ? { ...search, packed: search.packed.value } : search) : null;
+  if (worker) {
+    const snapshot = { ...worker.snapshot, h: worker.snapshot.h.value, lock: worker.snapshot.lock.value,
+      revision: 'restored-planner-input', terrainId: 'restored-planner-input' };
+    t.worker = requestCorridor(g, snapshot, worker.budget, false);
+    t.worker.index = worker.index; t.worker.reply = worker.reply;
+    t.worker.kernel = worker.kernel ? createCorridorKernel(snapshot, 'packed' in worker.kernel ? { ...worker.kernel, packed: worker.kernel.packed.value } : worker.kernel) : null;
+  } else t.worker = null;
+  return t;
+}
+function sameCorridorInput(a: CorridorSnapshot, b: CorridorSnapshot): boolean {
+  const arrays = (a: ArrayLike<number>, b: ArrayLike<number>) => {
+    if (a === b) return true;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (!Object.is(a[i], b[i])) return false;
+    return true;
+  };
+  if (a.size !== b.size || a.waterLimit !== b.waterLimit || a.grade !== b.grade || !arrays(a.h, b.h) || !arrays(a.lock, b.lock)) return false;
+  if (JSON.stringify([a.from, a.to, a.opts, a.forbid]) !== JSON.stringify([b.from, b.to, b.opts, b.forbid])) return false;
+  if (!a.field || !b.field) return a.field === b.field;
+  return arrays(a.field.x, b.field.x) && arrays(a.field.z, b.field.z) && arrays(a.field.tx, b.field.tx) && arrays(a.field.tz, b.field.tz)
+    && JSON.stringify([...a.field.cells]) === JSON.stringify([...b.field.cells]);
+}
+function prepareCorridorInput(snapshot: CorridorSnapshot): CorridorSnapshot {
+  // These copies belong permanently to this quote. Only their lossless encoding is
+  // derived; the saved input and frontier remain the authority after loading.
+  preparePlannerInput(retainPlannerInput(snapshot.h));
+  preparePlannerInput(retainPlannerInput(snapshot.lock));
+  return snapshot;
+}
+export function stepRouteCursor(g: Game, t: RouteCursor): IteratorResult<void, RoutePlan | string> {
+  const o = t.options, from = t.from, to = t.to;
+  const wide = o.trackClass === 'highspeed' || o.type === 'highspeed';
+  const physicalR = o.kind === 'rail' ? TRACK_TYPES[o.type ?? 'standard']?.minRadius ?? 0 : 0;
+  const minR = Math.max(physicalR, o.minR ?? 0), approachR = Math.max(physicalR, o.approachR ?? minR);
+  const near = (p: P2, radius = 8) => Math.hypot(p.x - from.x, p.z - from.z) < radius || Math.hypot(p.x - to.x, p.z - to.z) < radius;
+  const pause = (): IteratorResult<void, RoutePlan | string> => ({ done: false, value: undefined });
+  const finish = (result: RoutePlan | string): IteratorResult<void, RoutePlan | string> => { t.phase = 'done'; t.result = result; if (t.worker) cancelCorridor(t.worker); return { done: true, value: result }; };
+  const retry = () => { if (t.worker) cancelCorridor(t.worker); t.worker = null; t.search = null; t.profile = null; t.conflict = null; t.attempt++; t.phase = 'attempt'; };
+  while (true) {
+    if (t.phase === 'done') return { done: true, value: t.result! };
+    if (t.phase === 'attempt') {
+      if (t.attempt > (o.retries ?? 2)) return finish(t.why);
+      t.path = [{ x: from.x, z: from.z }, { x: to.x, z: to.z }]; t.expanded = 0;
+      if (t.attempt >= 0) {
+        const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
+        t.coarseOptions = { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...t.extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost,
+          maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin,
+          minR: wide ? minR : undefined, approachLength: o.approachLength };
+        if (o.sliced && o.kind === 'rail') {
+          t.worker = requestCorridor(g, prepareCorridorInput(captureCorridorSnapshot(g, from, to, t.coarseOptions)), t.budget, false);
+          t.phase = 'prefetch'; return pause();
+        }
+        t.search = new CorridorSearch(g, from, to, t.coarseOptions); t.phase = 'corridor';
+      } else t.phase = 'alignment';
+    }
+    if (t.phase === 'prefetch') {
+      const current = captureCorridorSnapshot(g, from, to, t.coarseOptions!);
+      if (!sameCorridorInput(t.worker!.snapshot, current)) { cancelCorridor(t.worker!); t.worker = requestCorridor(g, prepareCorridorInput(current), t.budget, false); }
+      t.phase = 'corridor';
+    }
+    if (t.phase === 'corridor') {
+      if (t.worker) {
+        planningProbe.observe?.('corridor', true);
+        const previous = t.worker.reply?.steps[t.worker.index - 1]?.expanded ?? t.worker.kernel?.expanded ?? 0;
+        let step: ReturnType<typeof advanceCorridor>;
+        try { step = advanceCorridor(t.worker); }
+        finally { planningProbe.observe?.('corridor', false, (t.worker.reply?.steps[t.worker.index - 1]?.expanded ?? t.worker.kernel?.expanded ?? 0) - previous); }
+        if (step.state === 'running') return pause();
+        t.path = step.path; t.expanded = step.expanded; cancelCorridor(t.worker); t.worker = null;
+      } else {
+        if (t.search!.step(t.budget) === 'running') return pause();
+        t.path = t.search!.path; t.expanded = t.search!.expanded; t.search = null;
+      }
+      t.phase = 'alignment';
+    }
+    if (t.phase === 'alignment') {
+      if (!t.path) return finish(t.why || 'no corridor');
+      planningProbe.observe?.('alignment', true);
+      const alignment = alignCorridor(t.path, from, to, o.rmax, o.rgood);
+      planningProbe.observe?.('alignment', false);
+      t.way = [...alignment.way, ...(o.post ?? [])]; t.fullWay = [...(o.pre ?? []), ...t.way]; t.minR = alignment.minR;
+      const hit = wide ? curveConflict(t.fullWay, minR, approachR, o.approachLength ?? 0) : null;
+      if (hit || !wide && alignment.minR < (o.minR ?? 0)) {
+        t.why = 'curves too tight'; const at = hit?.at ?? alignment.minAt;
+        if (t.attempt < 0) { retry(); continue; }
+        if (!at || near(at, 6)) return finish(t.why);
+        t.extra.push({ x0: at.x, z0: at.z, x1: at.x, z1: at.z, r: 5 }); retry(); continue;
+      }
+      t.profile = newProfileCursor(t.fullWay, o.tracks, o.y0, o.y1, o.kind, o.exclude, o.roadJunctions, { crossings: [] }, o.type, o.sliced ? 256 : 0, o.gradeMargin, wide);
+      t.phase = 'profile'; return pause();
+    }
+    if (t.phase === 'profile') {
+      const result = planningStep('terrain fit', () => stepProfileCursor(g, t.profile!));
+      if (!result.done) return pause();
+      if (!result.value) {
+        t.why = 'too steep'; const add = t.profile!.diag!.crossings.filter(p => !near(p));
+        if (!add.length) { if (t.attempt < 0) { retry(); continue; } return finish(t.why); }
+        for (const p of add) t.extra.push({ x0: p.x, z0: p.z, x1: p.x, z1: p.z, r: 5 }); retry(); continue;
+      }
+      t.conflict = newConflictCursor(result.value, o.kind, o.tracks, o.exclude, o.sliced || wide ? 40 : 0, wide);
+      t.phase = 'conflict'; return pause();
+    }
+    if (t.phase === 'conflict') {
+      const result = planningStep('conflicts', () => stepConflictCursor(g, t.conflict!));
+      if (!result.done) return pause();
+      if (result.value) {
+        const hit = result.value; t.why = 'route runs along other tracks or roads';
+        if (near(hit, 3)) { if (t.attempt < 0) { retry(); continue; } return finish(t.why); }
+        t.extra.push({ x0: hit.x, z0: hit.z, x1: hit.x, z1: hit.z, r: near(hit) ? 2.5 : 4 }); retry(); continue;
+      }
+      return finish({ way: t.way, prof: t.profile!.result!, minR: t.minR, expanded: t.expanded });
+    }
+  }
 }
 
 /** Rough construction cost of a profiled chain (track, structures, earthworks). */

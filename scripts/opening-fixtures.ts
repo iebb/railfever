@@ -22,21 +22,27 @@ export function controlledOpeningWorld(){
  // separate from the short, clear optional throat. The blocks remain clear of the single formation.
  const blockers:number[]=[];
  for(const z of [187.3,196.7])for(let x=152;x<=232;x+=4)blockers.push(g.world.addBuilding({townId:-1,x,z,angle:0,w:2.2,d:2.2,type:6,floors:38,pop:50,seed:x,y:3,built:0}).id);
- const survey=g.stations.planRail,depot=(ai as any).depotNearLine,surveyOwn=Object.getOwnPropertyDescriptor(g.stations,'planRail'),depotOwn=Object.getOwnPropertyDescriptor(ai,'depotNearLine');
+ const survey=g.stations.planRail,depot=(ai as any).depotNearLine,surveyOwn=Object.getOwnPropertyDescriptor(g.stations,'planRail'),depotOwn=Object.getOwnPropertyDescriptor(ai,'depotNearLine'),stepOwn=Object.getOwnPropertyDescriptor(ai,'advanceRailDepotSearch');
  g.stations.planRail=function(x,z,angle,length,tracks,payer,opts){
   // This is only a controlled proposal generator. Once construction starts, the real planner
   // revalidates the unchanged coordinates, stock clearance, access, costs and physical commits.
   if(payer===owner&&!(ai as any).project?.built){const t=towns[x<192?0:1];return survey.call(this,t.x,t.z,t.id===0?Math.PI/2:-Math.PI/2,length,tracks,payer);}
   return survey.call(this,x,z,angle,length,tracks,payer,opts);
  };
- (ai as any).depotNearLine=function*(){
+ const controlledDepot=()=>{
   const A=[...g.stations.map.values()].find(st=>st.owner===owner&&st.townId===0);
   if(!A)throw Error('controlled native source station');
   const n=g.world.net.nodes.get(endNode(g,A,0,true))!,hit=g.world.net.nearestEdge(n.x+3,n.z,1,'rail',e=>e.station<0&&e.depot<0);
   if(!hit)throw Error('controlled native depot approach');
   const id=buildDepotOnLine(g,hit.edge.id,hit.s,owner,{dir:-1,side:1});
   if(id<0)throw Error('controlled native depot proposal');
-  yield;return id;
+  return id;
  };
- return{g,ai,owner,blockers,restore(){if(surveyOwn)Object.defineProperty(g.stations,'planRail',surveyOwn);else delete(g.stations as any).planRail;if(depotOwn)Object.defineProperty(ai,'depotNearLine',depotOwn);else delete(ai as any).depotNearLine;}};
+ // Both controllers receive the same actual paid proposal; only their continuation representation differs.
+ (ai as any).depotNearLine=function*(){const id=controlledDepot();yield;return id;};
+ (ai as any).advanceRailDepotSearch=(cursor:import('../src/game/ai-rail-job').RailDepotCursor)=>{
+  if(cursor.phase==='done')return{done:true,value:cursor.result};
+  cursor.result=controlledDepot();cursor.phase='done';return{done:false,value:undefined};
+ };
+ return{g,ai,owner,blockers,restore(){if(surveyOwn)Object.defineProperty(g.stations,'planRail',surveyOwn);else delete(g.stations as any).planRail;if(depotOwn)Object.defineProperty(ai,'depotNearLine',depotOwn);else delete(ai as any).depotNearLine;if(stepOwn)Object.defineProperty(ai,'advanceRailDepotSearch',stepOwn);else delete(ai as any).advanceRailDepotSearch;}};
 }

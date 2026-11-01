@@ -33,7 +33,7 @@ import * as Constants from './constants';
 import { UNIT_M, LOCAL_SERVED_SHARE, MAINLINE_FEEDER_SHARE } from './constants';
 import { TF_TYPICAL, TRIPS_PER_MONTH, localTripMultiplier, stationActive } from './demand';
 import { tripFactor, refTime, fareFor, urbanIntensity, transferWalkTime, TRANSFER_FARE_FACTOR, type FareMode } from './fares';
-import { walkingCatchment, pointWalkingCatchment, walkClaimShares, walkWeight, type WalkingCatchment } from './catchment';
+import { walkingCatchment, pointWalkingCatchment, walkClaimShares, walkWeight, ownPlannerWalk, type WalkingCatchment } from './catchment';
 import { WALK_LINE, TRANSFER_RANGE } from './stations';
 import { consistOf, hopEstimate, estimateVehicleYear, YEAR_S } from './opcosts';
 import { patternHeadways, patternStops } from './patterns';
@@ -44,7 +44,8 @@ import { MODEL_BY_ID } from './vehicle-types';
 import { cityRailEconomics } from './ai';
 import { handOver } from './ai-hub';
 import { settleMail } from './mail';
-import { planRouteUpgrade, cityRailPlanGen, startRouteWorks, worksOn, upgradeBlock, type UpgradeQuote, type UpgradeLevel } from './route-works';
+import { planRouteUpgrade, cityRailPlanGen, newCityRailPlanCursor, type CityRailPlanCursor, startRouteWorks, worksOn, upgradeBlock, type UpgradeQuote, type UpgradeLevel } from './route-works';
+import { newRoadDepotCursor, type RoadDepotCursor, newRoadMapCursor, nextRoadMapValue, type RoadMapCursor } from './ai-road-task';
 
 // ============================================================================ forecast
 
@@ -105,6 +106,22 @@ export interface RoadForecast {
   /** passengers who would ride and do not fit */
   unserved: number;
 }
+
+/** The live routing scan's rebuild epoch is rebound by the selection save codec. */
+interface RoadRoutingEpoch { selectionRoutingEpoch: number }
+interface RoadOnward { at: number; walk: number; table: Map<number, Hop> }
+interface RoadReach { k: number; cost: number; at: number; hop?: Hop }
+export interface RoadForecastCursor {
+  input?: { owner: number; sites: RoadSite[]; service: RoadService; fleets: number[]; replacing: number };
+  stage: 'init' | 'claims' | 'stops' | 'foreign' | 'finish' | 'done';
+  state?: ReturnType<typeof forecastSetup>;
+  own?: Set<number>; onward?: RoadOnward[][]; loads?: number[][];
+  held?: Map<number, number>; legs?: Map<number, number>; onwardBy?: Map<number, { riders: number; revenue: number }>[];
+  i: number; pending: boolean; entries?: Map<number, { k: number; walk: number }[]>;
+  foreign?: { epoch: RoadRoutingEpoch; sources: [number, Map<number, Hop>][]; index: number; work: number;
+    current?: { from: number; table: Map<number, Hop>; st: Station; reach: RoadReach[] } };
+}
+export const newRoadForecastCursor = (): RoadForecastCursor => ({ stage: 'init', i: 0, pending: false });
 
 /** Time of each hop of the route (s, ride and dwell) and the cycle: lineTable's road estimate for the model. */
 export function roadTimetable(g: Game, sites: { x: number; z: number; townId: number }[], model: VehicleModel, loop: boolean): { hops: number[]; cycle: number } {
@@ -505,8 +522,10 @@ export function* roadForecast(g: Game, owner: number, sites: RoadSite[], service
 }
 
 /** The same forecast for several fleet sizes in one pass (the demand is read once; headways, fares and seats differ). */
-export function* roadForecasts(g: Game, owner: number, sites: RoadSite[], service: RoadService, fleets: number[], replacing = -1): Generator<void, RoadForecast[]> {
-  const gen = forecastSteps(g, owner, sites, service, fleets.length ? fleets : [service.vehicles], replacing);
+export function* roadForecasts(g: Game, owner: number, sites: RoadSite[], service: RoadService, fleets: number[], replacing = -1, cursor?: RoadForecastCursor): Generator<void, RoadForecast[]> {
+  const sizes = fleets.length ? fleets : [service.vehicles];
+  const input = cursor ? cursor.input ??= { owner, sites, service, fleets: sizes, replacing } : undefined;
+  const gen = cursor ? resumeForecastSteps(g, input!.owner, input!.sites, input!.service, input!.fleets, input!.replacing, cursor) : forecastSteps(g, owner, sites, service, sizes, replacing);
   for (;;) {
     const t0 = performance.now(), r = gen.next();
     busProfile.ms += performance.now() - t0;
@@ -532,6 +551,10 @@ export function* lineForecast(g: Game, owner: number, sites: RoadSite[], service
 }
 
 function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: RoadService, fleets: number[], replacing: number): Generator<void, RoadForecast[]> {
+  return yield* resumeForecastSteps(g, owner, sites, service, fleets, replacing, newRoadForecastCursor());
+}
+
+function forecastSetup(g: Game, owner: number, sites: RoadSite[], service: RoadService, fleets: number[], replacing: number) {
   const D = g.demand, K = walkIntensity(), M = fleets.length;
   const n = sites.length, loop = service.loop && n >= 3, purpose = service.purpose ?? 'all';
   if (!D.regions.length) D.rebuild();
@@ -592,12 +615,24 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const headway = schedules.map(s => s.headway), realHeadway = schedules.map(s => s.realHeadway);
   const results: RoadForecast[] = fleets.map((_, m) => ({ riders: 0, revenue: 0, network: 0, transfers: 0, transferRevenue: 0, pops: sites.map(() => 0),
     cycle: schedules[m].cycle, headway: realHeadway[m], hop: drive ? drive.length / Math.max(1, loop ? n : 2 * (n - 1)) : 20, seats: 0, unserved: 0 }));
-  if (n < 2 || !(tt.cycle > 0) || !drive || !(drive.cycle > 0)) return results;
-  const claims = claimSites(g, sites, new Set());
-  for (const r of results) r.pops = claims.map((c) => c.pop);
-  yield;
+  const valid = !(n < 2 || !(tt.cycle > 0) || !drive || !(drive.cycle > 0));
+  const claims = valid ? claimSites(g, sites, new Set()).map(claim => ({ ...claim, walk: ownPlannerWalk(claim.walk) })) : [];
+  if (valid) for (const r of results) r.pops = claims.map(c => c.pop);
+  return { K, M, n, loop, purpose, schedules, tt, drive, headway, realHeadway, results, claims, valid };
+}
+
+
+/** Explicit state for a forecast used by the durable project selector. No nested generator is drained. */
+function* resumeForecastSteps(g: Game, owner: number, sites: RoadSite[], service: RoadService, fleets: number[], replacing: number, c: RoadForecastCursor): Generator<void, RoadForecast[]> {
+  if (c.stage === 'init') {
+    c.state = forecastSetup(g, owner, sites, service, fleets, replacing);
+    if (!c.state.valid) { c.stage = 'done'; return c.state.results; }
+    c.stage = 'claims'; yield;
+  }
+  if (c.stage === 'done') return c.state!.results;
+  const { K, M, n, loop, purpose, schedules, tt, drive, headway, realHeadway, results, claims } = c.state!, D = g.demand;
   const stationOf = (i: number) => sites[i].station?.id ?? -1;
-  const own = new Set(sites.flatMap((s) => s.station ? [s.station.id] : []));
+  const own = c.own ??= new Set(sites.flatMap((s) => s.station ? [s.station.id] : []));
   const mode: FareMode = service.model.kind === 'tram' ? 'tram' : 'bus';
   const centreOf = (a: { x: number; z: number; townId: number }, b: { x: number; z: number; townId: number }) =>
     a.townId >= 0 && a.townId === b.townId ? Math.min(urbanIntensity(g, a), urbanIntensity(g, b)) : 0;
@@ -614,7 +649,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   };
   const inTown = (a: number, b: number) => sites[a].townId >= 0 && sites[a].townId === sites[b].townId;
   // where each stop's riders can change: the stop's own station and the stations a planned stop will be linked to
-  const onward: { at: number; walk: number; table: Map<number, Hop> }[][] = sites.map((s) => {
+  const onward = c.onward ??= sites.map((s) => {
     const out: { at: number; walk: number; table: Map<number, Hop> }[] = [];
     const add = (id: number, walk: number) => { const t = g.lines.routing.get(id) ?? new Map<number, Hop>(); if (!out.some((o) => o.at === id)) out.push({ at: id, walk, table: t }); };
     if (s.station) add(s.station.id, 0);
@@ -627,8 +662,8 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   // a change at stop k onto a service boarding at `boarding`: free inside one station complex (vehicle.ts); a planned
   // stop is linked to the stations it changes at
   const freeAt = (k: number, other: number) => stationOf(k) < 0 || g.stations.isSameStationComplex(stationOf(k), other);
-  const hopsN = tt.hops.length, loads = fleets.map(() => new Array(loop ? n : 2 * (n - 1)).fill(0));
-  const held = new Map<number, number>(), legs = new Map<number, number>();
+  const hopsN = tt.hops.length, loads = c.loads ??= fleets.map(() => new Array(loop ? n : 2 * (n - 1)).fill(0));
+  const held = c.held ??= new Map<number, number>(), legs = c.legs ??= new Map<number, number>();
   // (coach riders near another company's service between two towns keep riding it, and the riders it carries there
   // leave less of the towns' market: the residents of stop i riding to town `to`, also on to other services from there)
   const heldAt = (i: number, to: number) => {
@@ -655,7 +690,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const rideOnly = (i: number, j: number, m = 0) => rideTime(schedules[m].hops, i, j, loop);
   const driveT = (m: number, i: number, j: number) => realHeadway[m] / 2 + schedules[m].trips[i * n + j];
   // receipts our other lines get from the riders this line brings them, by line (capped below by their spare seats)
-  const onwardBy = fleets.map(() => new Map<number, { riders: number; revenue: number }>());
+  const onwardBy = c.onwardBy ??= fleets.map(() => new Map<number, { riders: number; revenue: number }>());
   const network = (m: number, hop: Hop | undefined, d: number, count: number, factor: number) => {
     if (!hop || hop.line === WALK_LINE) return;
     const share = ownShare(g, hop.line, owner);
@@ -675,10 +710,13 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
   const factorOf = (cost: number, d: number, centre: number) => tripFactor(Math.max(1, cost), refTime(d, centre)) / TF_TYPICAL;
   // ------------------------------------------------ the line's own stops: riders to its other stops and onwards
   type Part = { x: number; xc: number; xb: number; y: number; f: number[]; same: boolean; rail: boolean; j: number; to: number; hop?: Hop; at: number; d: number; share: number[] };
-  for (let i = 0; i < n; i++) {
-    if (i % 3 === 2) yield;
-    const s = sites[i], c = claims[i];
-    if (!(c.pop > 0)) continue;
+  if (c.stage === 'claims') c.stage = 'stops';
+  for (; c.stage === 'stops' && c.i < n; c.i++) {
+    const i = c.i;
+    if (i % 3 === 2 && !c.pending) { c.pending = true; yield; }
+    c.pending = false;
+    const s = sites[i], claim = claims[i];
+    if (!(claim.pop > 0)) continue;
     const parts: Part[] = [];
     const localF = fleets.map(() => 0);
     let localX = 0;
@@ -686,7 +724,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
     for (let j = 0; j < n; j++) {
       if (j === i || !(claims[j].pop > 0) || (stationOf(i) >= 0 && stationOf(i) === stationOf(j))) continue;
       const t = sites[j], d = Math.hypot(s.x - t.x, s.z - t.z), same = s.townId >= 0 && s.townId === t.townId;
-      const sh = odShares(g, c.walking, c.pop, coverageOf(g, claims[j].walking), Math.min(1, d / WALK));
+      const sh = odShares(g, claim.walking, claim.pop, coverageOf(g, claims[j].walking), Math.min(1, d / WALK));
       if (!(sh.x > 0) && !(sh.y > 0)) continue;
       // (another service between the same two stations takes its share)
       const other = stationOf(j) >= 0 ? mine?.get(stationOf(j)) : undefined, theirs = other && !skipHop(other) ? other.cost : undefined;
@@ -715,7 +753,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       const ds = g.stations.get(dest);
       if (!ds || !stationActive(g, ds)) continue;
       const same = s.townId >= 0 && s.townId === ds.townId, d = Math.hypot(s.x - ds.x, s.z - ds.z);
-      const sh = odShares(g, c.walking, c.pop, coverOf(g, ds, !same), Math.min(1, d / WALK));
+      const sh = odShares(g, claim.walking, claim.pop, coverOf(g, ds, !same), Math.min(1, d / WALK));
       if (!(sh.x > 0) && !(sh.y > 0)) continue;
       const centre = centreOf(s, ds), rest = b.k === i ? b.cost : b.cost - headway[0] / 2;
       const f = fleets.map((_, m) => factorOf(b.k === i ? b.cost : rest + headway[m] / 2, d, centre));
@@ -727,7 +765,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       if (!(keep > 0)) continue;
       parts.push({ ...sh, f, same, rail, j: b.k, to: dest, hop: b.hop, at: b.at, d: Math.hypot(sites[b.k].x - ds.x, sites[b.k].z - ds.z), share: fleets.map(() => keep) });
     }
-    const gen = c.pop * K * TRIPS_PER_MONTH * 12;
+    const gen = claim.pop * K * TRIPS_PER_MONTH * 12;
     for (let m = 0; m < M; m++) {
       const kCap = localF[m] > 0 ? localCapture(localX, localF[m]) / localF[m] : 0;
       for (const p of parts) {
@@ -744,25 +782,39 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
     }
   }
   // ------------------------------------------------ riders from elsewhere changing onto the line at its stops
-  const entries = new Map<number, { k: number; walk: number }[]>();
-  for (let k = 0; k < n; k++) for (const o of onward[k]) {
-    const list = entries.get(o.at) ?? [];
-    list.push({ k, walk: o.walk });
-    entries.set(o.at, list);
-  }
-  let work = 0;
-  for (const [from, table] of g.lines.routing) {
-    if (own.has(from)) continue;
-    const st = g.stations.get(from);
-    if (!st || !stationActive(g, st) || !(st.catchPop > 0)) continue;
-    let reach: { k: number; cost: number; at: number; hop?: Hop }[] | null = null;
-    for (const [at, list] of entries) {
-      const hop = at === from ? undefined : table.get(at);
-      if (at !== from && (!hop || skipHop(hop))) continue;
-      for (const e of list) (reach ??= []).push({ k: e.k, cost: (hop?.cost ?? 0) + e.walk, at, hop });
+  if (c.stage === 'stops') {
+    const entries = new Map<number, { k: number; walk: number }[]>();
+    for (let k = 0; k < n; k++) for (const o of onward[k]) {
+      const list = entries.get(o.at) ?? []; list.push({ k, walk: o.walk }); entries.set(o.at, list);
     }
-    if (!reach) continue;
-    if (++work % 10 === 0) yield;
+    c.entries = entries;
+    c.foreign = { epoch: { selectionRoutingEpoch: g.lines.version }, sources: [...g.lines.routing], index: 0, work: 0 };
+    c.stage = 'foreign';
+  }
+  const entries = c.entries!, scan = c.foreign!;
+  while (c.stage === 'foreign') {
+    if (!scan.current) {
+      if (scan.epoch.selectionRoutingEpoch !== g.lines.version) {
+        scan.epoch.selectionRoutingEpoch = g.lines.version; scan.sources = [...g.lines.routing]; scan.index = 0;
+      }
+      if (scan.index >= scan.sources.length) { c.stage = 'finish'; break; }
+      const [from, table] = scan.sources[scan.index++];
+      if (own.has(from)) continue;
+      const st = g.stations.get(from);
+      if (!st || !stationActive(g, st) || !(st.catchPop > 0)) continue;
+      let reach: RoadReach[] | null = null;
+      for (const [at, list] of entries) {
+        const hop = at === from ? undefined : table.get(at);
+        if (at !== from && (!hop || skipHop(hop))) continue;
+        for (const e of list) (reach ??= []).push({ k: e.k, cost: (hop?.cost ?? 0) + e.walk, at, hop });
+      }
+      if (!reach) continue;
+      scan.current = { from, table, st, reach };
+      if (++scan.work % 10 === 0) yield;
+    }
+    const { from, table, st, reach } = scan.current;
+    // Clear the pending item before any synchronous continue in the original body.
+    delete scan.current;
     const genPop = D.generationPopulation(st), o = originOf(g, st), base = baseLocal(g, st, table);
     let localX = base.local;
     const localF = fleets.map(() => base.localF);
@@ -823,6 +875,7 @@ function* forecastSteps(g: Game, owner: number, sites: RoadSite[], service: Road
       r.riders *= fit; r.revenue *= fit; r.network *= fit; r.transfers *= fit; r.transferRevenue *= fit;
     }
   }
+  c.stage = 'done';
   return results;
 }
 
@@ -837,10 +890,10 @@ export interface BusHost {
   /** the company's managed lines (AIController.lines) */
   managed: Map<number, LineInfo>;
   /** the project being built (stations and depots it laid are taken up if it is abandoned) */
-  project(): { stations: number[]; depots: number[] } | null;
+  project(): { stations: number[]; depots: number[]; roadLine?: number; roadJoin?: number; roadVehicles?: number[]; roadStops?: { station: number; x: number; z: number }[]; roadExtension?: { line: number; beforeStops: number[]; afterStops: number[] } } | null;
   note(s: string): void;
   borrowFor(amount: number): boolean;
-  roadDepot(x: number, z: number): Generator<void, number>;
+  roadDepot(x: number, z: number, cursor?: RoadDepotCursor): Generator<void, number>;
   linkTransfers(id: number): void;
   canonical(id: number): number;
   stats: { lines: number; vehicles: number; busStops: number; coaches: number; joined: number; grown: number; trams: number };
@@ -1073,7 +1126,14 @@ function winBack(g: Game, l: Line, ratio: number): number {
  * another company's open line, as a partner) the fees for the stops we use. A route whose demand wants more capacity
  * thus gets more vehicles, ours or a partner's, rather than a parallel line.
  */
-export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Generator<void, RoadPlan | null> {
+export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel, cursor?: MoreValueCursor): Generator<void, RoadPlan | null> {
+  const c = cursor ?? newMoreValueCursor(), input = c.input ??= { line: l, purchase };
+  return yield* resumeMoreValue(h, input.line, input.purchase, c);
+}
+
+export interface MoreValueCursor { input?: { line: Line; purchase?: VehicleModel }; state?: ReturnType<typeof moreValueSetup>; forecast: RoadForecastCursor }
+export const newMoreValueCursor = (): MoreValueCursor => ({ forecast: newRoadForecastCursor() });
+function moreValueSetup(h: BusHost, l: Line, purchase?: VehicleModel) {
   const g = h.g, me = h.me, route = routeOf(g, l);
   if (!route || (l.kind !== 'road' && l.kind !== 'tram')) return null;
   const all = fleetOf(g, l), n = all.vehicles.length;
@@ -1089,7 +1149,15 @@ export function* moreValue(h: BusHost, l: Line, purchase?: VehicleModel): Genera
   const sites = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s).map(siteOf);
   if (sites.length !== route.path.length) return null;
   const models = all.vehicles.flatMap(v => v.model ? [v.model] : []);
-  const [before, after] = yield* lineForecast(g, me, sites, { model, models, nativeLine: l, vehicles: n, loop: route.loop }, [n, n + 1], l.id);
+  return { route, n, model, capacity, sites, models };
+}
+
+function* resumeMoreValue(h: BusHost, l: Line, purchase: VehicleModel | undefined, c: MoreValueCursor): Generator<void, RoadPlan | null> {
+  if (c.state === undefined) c.state = moreValueSetup(h, l, purchase);
+  if (!c.state) return null;
+  const g = h.g, me = h.me, { route, n, model, capacity, sites, models } = c.state;
+  const purpose = new Set(sites.map(s => s.townId)).size >= 2 ? 'intercity' : 'city';
+  const [before, after] = yield* roadForecasts(g, me, sites, { model, models, nativeLine: l, vehicles: n, loop: route.loop, purpose }, [n, n + 1], l.id, c.forecast);
   // (the forecast spans work units: a stop taken away meanwhile ends this quote; its fees could not be priced)
   if (route.path.some((id) => !g.stations.get(id)) || !g.lines.get(l.id)) return null;
   const cal = calibration(l, before, lineAge(g, l));
@@ -1160,7 +1228,18 @@ export interface StopSite extends RoadSite { pop: number; free: number; rail: bo
  * residents its walk reaches, those no served station holds yet (Stations' share-out), and whether it changes to a rail
  * service (a served rail station of its complex, or one within transfer reach it will be linked to).
  */
-export function* stopSites(g: Game, owner: number, x: number, z: number, r: number, townId?: number): Generator<void, StopSite[]> {
+export function* stopSites(g: Game, owner: number, x: number, z: number, r: number, townId?: number, cursor?: StopSitesCursor): Generator<void, StopSite[]> {
+  const c = cursor ?? newStopSitesCursor(), input = c.input ??= { x, z, r, townId };
+  return yield* resumeStopSites(g, owner, input.x, input.z, input.r, input.townId, c);
+}
+
+export interface StopSitesCursor {
+  input?: { x: number; z: number; r: number; townId?: number };
+  state?: ReturnType<typeof stopSitesSetup>; index: number; work: number; done: boolean;
+  pending?: { e: NEdge; at: number; q: { x: number; y: number; z: number } };
+}
+export const newStopSitesCursor = (): StopSitesCursor => ({ index: 0, work: 0, done: false });
+function stopSitesSetup(g: Game, owner: number, x: number, z: number, r: number, townId?: number) {
   const net = g.world.net, out: StopSite[] = [], q = { x: 0, y: 0, z: 0 }, seen = new Set<number>();
   const linkCands = [...g.stations.map.values()].filter((st) => (st.owner === owner || !!st.rail) && Math.hypot(st.x - x, st.z - z) < r + 40);
   // street points: the middle of each street, and the street points nearest the forecourts of the rail stations around (a
@@ -1177,11 +1256,21 @@ export function* stopSites(g: Game, owner: number, x: number, z: number, r: numb
       if (ne && !points.some((o) => o.e === ne.edge && Math.abs(o.s - ne.s) < 2)) points.push({ e: ne.edge, s: Math.max(2, Math.min(ne.edge.len - 2, ne.s)) });
     }
   }
-  let work = 0;
-  for (const { e, s: at } of points) {
-    net.pointAt(e, at, q);
-    if (Math.hypot(q.x - x, q.z - z) > r) continue;
-    if (++work % 8 === 0) yield;
+  return { points, linkCands, out, seen };
+}
+
+function* resumeStopSites(g: Game, owner: number, x: number, z: number, r: number, townId: number | undefined, c: StopSitesCursor): Generator<void, StopSite[]> {
+  const net = g.world.net, { points, linkCands, out, seen } = c.state ??= stopSitesSetup(g, owner, x, z, r, townId);
+  while (c.index < points.length || c.pending) {
+    if (!c.pending) {
+      const { e, s: at } = points[c.index++], q = { x: 0, y: 0, z: 0 };
+      net.pointAt(e, at, q);
+      if (Math.hypot(q.x - x, q.z - z) > r) continue;
+      c.pending = { e, at, q };
+      if (++c.work % 8 === 0) yield;
+    }
+    const { e, at, q } = c.pending;
+    delete c.pending;
     const t = g.towns.nearest(q.x, q.z);
     if (townId !== undefined && t?.id !== townId) continue;
     let station: Station | undefined, links: number[] = [];
@@ -1217,6 +1306,7 @@ export function* stopSites(g: Game, owner: number, x: number, z: number, r: numb
     out.push({ x: station ? station.x : q.x, z: station ? station.z : q.z, townId: t?.id ?? -1, station, links: station ? undefined : links, pop, free, rail,
       road: { x: q.x, z: q.z } });
   }
+  c.done = true;
   return out;
 }
 
@@ -1311,39 +1401,14 @@ export function townRoutes(T: Town, sites: StopSite[]): { stops: StopSite[]; loo
 }
 
 /** Feasible town bus candidates with the same fares, vehicle costs and construction quote used by project choice. */
-export function* planTownCandidates(h: BusHost, T: Town, model: VehicleModel): Generator<void, RoadPlan[]> {
-  const g = h.g, sites = yield* stopSites(g, h.me, T.x, T.z, T.radius + 6, T.id);
-  const plans: RoadPlan[] = [];
-  for (const candidate of townRoutes(T, sites)) {
-    let r = candidate;
-    // A geometric chain can append a nearby district reached only by a long road detour. Preserve its
-    // longest connected prefix rather than letting that tail discard an otherwise useful paid service.
-    if (!r.loop) {
-      const least = r.why === 'feeder' ? 3 : 2;
-      let end = r.stops.length;
-      while (end >= least && !roadDriving(g, r.stops.slice(0, end), model, false)) end--;
-      if (end < least) continue;
-      if (end < r.stops.length) r = { ...r, stops: r.stops.slice(0, end) };
-    }
-    const probe = roadTimetable(g, r.stops, model, r.loop);
-    // a frequent service or a sparser one: whichever earns more on its outlay
-    const fleets = [...new Set([fleetFor(probe.cycle, TOWN_HEADWAY, r.loop ? 6 : 5), fleetFor(probe.cycle, 2 * TOWN_HEADWAY, 4)])];
-    const fs = yield* busCityForecast(g, h.me, r.stops, { model, vehicles: fleets[0], loop: r.loop }, fleets);
-    for (const [m, vehicles] of fleets.entries()) {
-    const f = fs[m];
-    if (!(f.cycle > 0) || !Number.isFinite(f.cycle)) continue;
-    const e = lineEconomics(g, h.me, f, r.stops, model, vehicles);
-    plans.push({ kind: 'line', sites: r.stops, loop: r.loop, model, vehicles, towns: [T.id], ...e,
-      why: `${r.why} in ${T.name}: ${r.stops.length} stops, ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` });
-    }
-  }
-  return plans;
+export function* planTownCandidates(h: BusHost, T: Town, model: VehicleModel, cursor: TownPlanCursor = newTownPlanCursor()): Generator<void, RoadPlan[]> {
+  return yield* resumeTownCandidates(h, T, model, cursor);
 }
 
 /** The best town bus line for T by the forecast (a feeder, a line across the centre or a ring), with its economics. */
-export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generator<void, RoadPlan | null> {
+export function* planTownLine(h: BusHost, T: Town, model: VehicleModel, cursor?: TownPlanCursor): Generator<void, RoadPlan | null> {
   let best: RoadPlan | null = null, bestScore = -Infinity;
-  for (const plan of yield* planTownCandidates(h, T, model)) {
+  for (const plan of yield* planTownCandidates(h, T, model, cursor)) {
     const score = plan.revenue > plan.yearly ? roadScore(plan.revenue, plan.yearly, plan.outlay) : (plan.revenue - plan.yearly) / Math.max(1, plan.outlay);
     if (score > bestScore) { bestScore = score; best = plan; }
   }
@@ -1351,8 +1416,8 @@ export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generat
 }
 
 /** The stop for a coach line in a town: its rail interchange or a central street, where it reaches most residents of its own. */
-function* coachSite(g: Game, owner: number, T: Town): Generator<void, StopSite | null> {
-  const sites = yield* stopSites(g, owner, T.x, T.z, Math.max(10, T.radius * 0.7), T.id);
+function* coachSite(g: Game, owner: number, T: Town, cursor?: StopSitesCursor): Generator<void, StopSite | null> {
+  const sites = yield* stopSites(g, owner, T.x, T.z, Math.max(10, T.radius * 0.7), T.id, cursor);
   let best: StopSite | null = null, bv = -Infinity;
   for (const s of sites) {
     const d = Math.hypot(s.x - T.x, s.z - T.z);
@@ -1382,40 +1447,106 @@ export function townsOnTheWay(g: Game, a: { x: number; z: number }, b: { x: numb
  * five coaches, by the forecast on the trips between towns. The design that earns most a year after its costs (capital
  * charges included) is taken.
  */
-export function* planCoach(h: BusHost, A: Town, B: Town, model: VehicleModel): Generator<void, RoadPlan | null> {
-  const g = h.g, sa = yield* coachSite(g, h.me, A), sb = yield* coachSite(g, h.me, B);
-  if (!sa || !sb || shadowed(g, h.me, [sa, sb], -1)) return null;
-  const quote = function* (sites: StopSite[]): Generator<void, { plan: RoadPlan; score: number } | null> {
-    const fleets = [2, 3, 4, 5];
-    const fs = yield* coachIntercityForecast(g, h.me, sites, { model, vehicles: 2, loop: false }, fleets);
-    let out: { plan: RoadPlan; score: number } | null = null;
+export function* planCoach(h: BusHost, A: Town, B: Town, model: VehicleModel, cursor: CoachPlanCursor = newCoachPlanCursor()): Generator<void, RoadPlan | null> {
+  return yield* resumePlanCoach(h, A, B, model, cursor);
+}
+
+/** New-town planning retains the native candidate and fleet before entering a sliced forecast. */
+export interface TownPlanCursor {
+  stop: StopSitesCursor; routes?: ReturnType<typeof townRoutes>; at: number; plans: RoadPlan[];
+  active?: { route: ReturnType<typeof townRoutes>[number]; fleets: number[]; forecast: RoadForecastCursor };
+}
+export const newTownPlanCursor = (): TownPlanCursor => ({ stop: newStopSitesCursor(), at: 0, plans: [] });
+function* resumeTownCandidates(h: BusHost, T: Town, model: VehicleModel, c: TownPlanCursor): Generator<void, RoadPlan[]> {
+  const g = h.g;
+  if (!c.routes) c.routes = townRoutes(T, yield* stopSites(g, h.me, T.x, T.z, T.radius + 6, T.id, c.stop));
+  while (c.at < c.routes.length) {
+    if (!c.active) {
+      let r = c.routes[c.at];
+      if (!r.loop) {
+        const least = r.why === 'feeder' ? 3 : 2;
+        let end = r.stops.length;
+        while (end >= least && !roadDriving(g, r.stops.slice(0, end), model, false)) end--;
+        if (end < least) { c.at++; continue; }
+        if (end < r.stops.length) r = { ...r, stops: r.stops.slice(0, end) };
+      }
+      const probe = roadTimetable(g, r.stops, model, r.loop);
+      const fleets = [...new Set([fleetFor(probe.cycle, TOWN_HEADWAY, r.loop ? 6 : 5), fleetFor(probe.cycle, 2 * TOWN_HEADWAY, 4)])];
+      c.active = { route: r, fleets, forecast: newRoadForecastCursor() };
+    }
+    const { route: r, fleets, forecast } = c.active;
+    const fs = yield* roadForecasts(g, h.me, r.stops, { model, vehicles: fleets[0], loop: r.loop, purpose: 'city' }, fleets, -1, forecast);
     for (const [m, vehicles] of fleets.entries()) {
       const f = fs[m];
-      if (!(f.cycle > 0) || !Number.isFinite(f.cycle)) return null;
-      const e = lineEconomics(g, h.me, f, sites, model, vehicles);
-      // (the yearly surplus after running, upkeep and capital charges)
-      const score = e.revenue - e.yearly;
-      const names = sites.map((s) => g.towns.list[s.townId]?.name ?? '?');
-      if (!out || score > out.score) out = { score, plan: { kind: 'line', sites, loop: false, model, vehicles, towns: [...new Set(sites.map((s) => s.townId))], ...e,
-        why: `coaches ${names.join(' - ')}: ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` } };
+      if (!(f.cycle > 0) || !Number.isFinite(f.cycle)) continue;
+      const e = lineEconomics(g, h.me, f, r.stops, model, vehicles);
+      c.plans.push({ kind: 'line', sites: r.stops, loop: r.loop, model, vehicles, towns: [T.id], ...e,
+        why: `${r.why} in ${T.name}: ${r.stops.length} stops, ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` });
     }
-    return out;
-  };
-  const first: { plan: RoadPlan; score: number } | null = yield* quote([sa, sb]);
-  if (!first) return null;
-  let best: { plan: RoadPlan; score: number } = first;
-  // towns on the way, one at a time where it pays more (ordered along the route)
-  for (const T of townsOnTheWay(g, A, B, new Set([A.id, B.id]))) {
-    const site = yield* coachSite(g, h.me, T);
-    if (!site) continue;
-    const sites: RoadSite[] = [...best.plan.sites];
-    const along = (s: { x: number; z: number }) => (s.x - A.x) * (B.x - A.x) + (s.z - A.z) * (B.z - A.z);
-    let at = sites.length - 1;
-    while (at > 0 && along(sites[at - 1]) > along(site)) at--;
-    const q: { plan: RoadPlan; score: number } | null = yield* quote([...sites.slice(0, at), site, ...sites.slice(at)] as StopSite[]);
-    if (q && q.score > best.score + 5000) best = q;
+    delete c.active; c.at++;
   }
-  return best.plan;
+  return c.plans;
+}
+
+export interface CoachPlanCursor {
+  stage: 'a' | 'b' | 'first' | 'town' | 'site' | 'quote' | 'done';
+  stop: StopSitesCursor; sa?: StopSite | null; sb?: StopSite | null;
+  towns?: number[]; at: number; next?: number;
+  sites?: StopSite[]; forecast?: RoadForecastCursor;
+  best?: { plan: RoadPlan; score: number }; result?: RoadPlan | null;
+}
+export const newCoachPlanCursor = (): CoachPlanCursor => ({ stage: 'a', stop: newStopSitesCursor(), at: 0 });
+function* resumeCoachQuote(h: BusHost, sites: StopSite[], model: VehicleModel, forecast: RoadForecastCursor): Generator<void, { plan: RoadPlan; score: number } | null> {
+  const g = h.g, fleets = [2, 3, 4, 5];
+  const fs = yield* roadForecasts(g, h.me, sites, { model, vehicles: 2, loop: false, purpose: 'intercity' }, fleets, -1, forecast);
+  let out: { plan: RoadPlan; score: number } | null = null;
+  for (const [m, vehicles] of fleets.entries()) {
+    const f = fs[m];
+    if (!(f.cycle > 0) || !Number.isFinite(f.cycle)) return null;
+    const e = lineEconomics(g, h.me, f, sites, model, vehicles), score = e.revenue - e.yearly;
+    const names = sites.map(s => g.towns.list[s.townId]?.name ?? '?');
+    if (!out || score > out.score) out = { score, plan: { kind: 'line', sites, loop: false, model, vehicles, towns: [...new Set(sites.map(s => s.townId))], ...e,
+      why: `coaches ${names.join(' - ')}: ${Math.round(f.riders)} riders, ${Math.round(e.revenue / 1000)}k/year against ${Math.round(e.yearly / 1000)}k` } };
+  }
+  return out;
+}
+function* resumePlanCoach(h: BusHost, A: Town, B: Town, model: VehicleModel, c: CoachPlanCursor): Generator<void, RoadPlan | null> {
+  const g = h.g;
+  while (true) {
+    if (c.stage === 'done') return c.result!;
+    if (c.stage === 'a') { c.sa = yield* coachSite(g, h.me, A, c.stop); c.stop = newStopSitesCursor(); c.stage = 'b'; continue; }
+    if (c.stage === 'b') {
+      c.sb = yield* coachSite(g, h.me, B, c.stop);
+      if (!c.sa || !c.sb || shadowed(g, h.me, [c.sa, c.sb], -1)) { c.result = null; c.stage = 'done'; continue; }
+      c.sites = [c.sa, c.sb]; c.forecast = newRoadForecastCursor(); c.stage = 'first'; continue;
+    }
+    if (c.stage === 'first') {
+      const first = yield* resumeCoachQuote(h, c.sites!, model, c.forecast!);
+      if (!first) { c.result = null; c.stage = 'done'; continue; }
+      c.best = first; c.towns = townsOnTheWay(g, A, B, new Set([A.id, B.id])).map(T => T.id);
+      c.stage = 'town'; continue;
+    }
+    if (c.stage === 'town') {
+      if (c.at >= c.towns!.length) { c.result = c.best!.plan; c.stage = 'done'; continue; }
+      c.next = c.towns![c.at++]; c.stop = newStopSitesCursor(); c.stage = 'site'; continue;
+    }
+    if (c.stage === 'site') {
+      const site = yield* coachSite(g, h.me, g.towns.list[c.next!], c.stop);
+      if (!site) { c.stage = 'town'; continue; }
+      const sites = [...c.best!.plan.sites];
+      const along = (s: { x: number; z: number }) => (s.x - A.x) * (B.x - A.x) + (s.z - A.z) * (B.z - A.z);
+      let at = sites.length - 1;
+      while (at > 0 && along(sites[at - 1]) > along(site)) at--;
+      c.sites = [...sites.slice(0, at), site, ...sites.slice(at)] as StopSite[];
+      c.forecast = newRoadForecastCursor(); c.stage = 'quote'; continue;
+    }
+    if (c.stage === 'quote') {
+      const q = yield* resumeCoachQuote(h, c.sites!, model, c.forecast!);
+      if (q && q.score > c.best!.score + 5000) c.best = q;
+      c.stage = 'town'; continue;
+    }
+    throw new Error('Invalid coach market continuation stage');
+  }
 }
 
 // ---------------------------------------------------------------------------- extensions
@@ -1424,7 +1555,18 @@ export function* planCoach(h: BusHost, A: Town, B: Town, model: VehicleModel): G
  * (calibrated by the line's receipts; partners' vehicles take their share) with the fleet as it is or the vehicles that
  * keep the headway, whichever earns more, against the stop and the vehicles' costs. `before`: the line's forecast now.
  */
-export function* extendPlan(h: BusHost, l: Line, site: RoadSite, place: 'start' | 'end' | number, at: number, why: string, before?: RoadForecast): Generator<void, RoadPlan | null> {
+export function* extendPlan(h: BusHost, l: Line, site: RoadSite, place: 'start' | 'end' | number, at: number, why: string, before?: RoadForecast, cursor?: ExtendPlanCursor): Generator<void, RoadPlan | null> {
+  const c = cursor ?? newExtendPlanCursor(), input = c.input ??= { line: l, site, place, at, why, before };
+  return yield* resumeExtendPlan(h, input.line, input.site, input.place, input.at, input.why, input.before, c);
+}
+
+export interface ExtendPlanCursor {
+  input?: { line: Line; site: RoadSite; place: 'start' | 'end' | number; at: number; why: string; before?: RoadForecast };
+  state?: ReturnType<typeof extendPlanSetup>; stage: 'before' | 'prepare' | 'after'; baseline?: RoadForecastCursor; forecast: RoadForecastCursor;
+  after?: { cal: number; keep: number; newStop: number; fleets: number[] };
+}
+export const newExtendPlanCursor = (): ExtendPlanCursor => ({ stage: 'before', baseline: newRoadForecastCursor(), forecast: newRoadForecastCursor() });
+function extendPlanSetup(h: BusHost, l: Line, site: RoadSite, place: 'start' | 'end' | number, at: number, why: string, before?: RoadForecast) {
   const g = h.g, me = h.me, route = routeOf(g, l);
   if (!route || l.kind !== 'road' || l.owner !== me) return null;
   const { vehicles, model } = fleetOf(g, l);
@@ -1439,23 +1581,38 @@ export function* extendPlan(h: BusHost, l: Line, site: RoadSite, place: 'start' 
   if (from && shadowed(g, me, [from, site], l.id)) return null;
   // (valued on one demand before and after: a town line growing into another town on all of it)
   const coachNow = towns.size >= 2, coachNext = new Set(next.map((s) => s.townId)).size >= 2;
-  const purpose = coachNow !== coachNext ? 'all' : coachNow ? 'intercity' : 'city';
-  if (!before || coachNow !== coachNext) before = (yield* roadForecasts(g, me, sites, { model, vehicles: n, loop: route.loop, purpose }, [n], l.id))[0];
-  const cal = calibration(l, before, lineAge(g, l));
-  const drive = roadDriving(g, next, model, route.loop);
-  if (!drive || !(before.cycle > 0)) return null;
-  // the fleet as it is, or the vehicles that keep the headway on the longer route: whichever earns more
-  const keep = Math.min(roadFleetCap(g, l) + 2, Math.max(n, Math.round(n * drive.cycle / before.cycle)));
-  const newStop = !site.station || !site.station.stops.length ? 1 : 0, T = g.towns.list[site.townId];
+  const purpose: RoadService['purpose'] = coachNow !== coachNext ? 'all' : coachNow ? 'intercity' : 'city';
+  return { route, model, n, ours, sites, next, towns, purpose, before, needsBefore: !before || coachNow !== coachNext };
+}
+
+function* resumeExtendPlan(h: BusHost, l: Line, site: RoadSite, place: 'start' | 'end' | number, at: number, why: string, before: RoadForecast | undefined, c: ExtendPlanCursor): Generator<void, RoadPlan | null> {
+  if (c.state === undefined) c.state = extendPlanSetup(h, l, site, place, at, why, before);
+  if (!c.state) return null;
+  const g = h.g, me = h.me, state = c.state, { route, model, n, ours, sites, next, towns, purpose } = state;
+  if (c.stage === 'before') {
+    if (state.needsBefore) state.before = (yield* roadForecasts(g, me, sites, { model, vehicles: n, loop: route.loop, purpose }, [n], l.id, c.baseline ??= newRoadForecastCursor()))[0];
+    delete c.baseline;
+    c.stage = 'prepare';
+  }
+  if (c.stage === 'prepare') {
+    const before = state.before!, cal = calibration(l, before, lineAge(g, l));
+    const drive = roadDriving(g, next, model, route.loop);
+    if (!drive || !(before.cycle > 0)) return null;
+    // the fleet as it is, or the vehicles that keep the headway on the longer route: whichever earns more
+    const keep = Math.min(roadFleetCap(g, l) + 2, Math.max(n, Math.round(n * drive.cycle / before.cycle)));
+    const newStop = !site.station || !site.station.stops.length ? 1 : 0;
+    const fleets = keep > n ? [n, keep] : [n];
+    c.after = { cal, keep, newStop, fleets }; c.stage = 'after';
+  }
+  const { cal, newStop, fleets } = c.after!, baseline = state.before!, T = g.towns.list[site.townId];
+  const fs = yield* roadForecasts(g, me, next, { model, vehicles: n, loop: route.loop, purpose }, fleets, l.id, c.forecast);
   let best: RoadPlan | null = null;
-  const fleets = keep > n ? [n, keep] : [n];
-  const fs = yield* roadForecasts(g, me, next, { model, vehicles: n, loop: route.loop, purpose }, fleets, l.id);
   for (const [m, nv] of fleets.entries()) {
     const f = fs[m];
     const extra = nv - n;
     // (partners' vehicles share the riders: ours take our share of them)
-    const gain = worth(f, cal) * (ours + extra) / nv - worth(before, cal) * ours / n;
-    const yearly = ((ours + extra) * runningCost(g, model, f.hop) - ours * runningCost(g, model, before.hop)) + newStop * STOP_UPKEEP
+    const gain = worth(f, cal) * (ours + extra) / nv - worth(baseline, cal) * ours / n;
+    const yearly = ((ours + extra) * runningCost(g, model, f.hop) - ours * runningCost(g, model, baseline.hop)) + newStop * STOP_UPKEEP
       + capital(g, me, extra * model.cost) + newStop * STOP_COST * 0.05;
     const outlay = newStop * STOP_COST + extra * model.cost;
     if (!best || gain - yearly > best.revenue - best.yearly) best = { kind: 'extend', line: l.id, sites: [site], place, model, vehicles: extra,
@@ -1472,14 +1629,32 @@ export function* extendPlan(h: BusHost, l: Line, site: RoadSite, place: 'start' 
  * by the forecast's gain (calibrated by the line's receipts) against the stop, the vehicles that keep the headway and
  * their running costs. The best few candidates by residents are forecast.
  */
-export function* planExtensions(h: BusHost, l: Line, maxForecasts = 3): Generator<void, RoadPlan[]> {
+export function* planExtensions(h: BusHost, l: Line, maxForecasts = 3, cursor?: ExtensionsCursor): Generator<void, RoadPlan[]> {
+  const c = cursor ?? newExtensionsCursor(), input = c.input ??= { line: l, maxForecasts };
+  return yield* resumeExtensions(h, input.line, input.maxForecasts, c);
+}
+
+
+interface ExtensionCandidate { site: StopSite; place: 'start' | 'end' | number; at: number; value: number; why: string }
+export interface ExtensionsCursor {
+  input?: { line: Line; maxForecasts: number };
+  state?: ReturnType<typeof extensionsSetup>;
+  stage: 'init' | 'end' | 'endSites' | 'endTowns' | 'endCoach' | 'leg' | 'legTowns' | 'legCoach' | 'legSites' | 'before' | 'candidates' | 'done';
+  end: number; town: number; k: number; nextTown: number; along?: { end: 'start' | 'end'; t: RoadSite; ux: number; uz: number };
+  leg?: { a: RoadSite; b: RoadSite; d: number; towns: number[]; at: number };
+  stop?: StopSitesCursor; baseline?: RoadForecastCursor; before?: RoadForecast;
+  candidate: number; tried: Set<string>; active?: { candidate: ExtensionCandidate; cursor: ExtendPlanCursor }; out: RoadPlan[];
+}
+export const newExtensionsCursor = (): ExtensionsCursor => ({ stage: 'init', end: 0, town: 0, k: 0, nextTown: -1,
+  baseline: newRoadForecastCursor(), candidate: 0, tried: new Set(), out: [] });
+function extensionsSetup(h: BusHost, l: Line, maxForecasts = 3) {
   const g = h.g, me = h.me, route = routeOf(g, l);
-  if (!route || l.kind !== 'road' || l.owner !== me) return [];
+  if (!route || l.kind !== 'road' || l.owner !== me) return null;
   const { vehicles, model } = fleetOf(g, l);
   const n = vehicles.length, ours = vehicles.filter((v) => v.owner === me).length;
-  if (!model || !ours || route.path.length >= 8) return [];
+  if (!model || !ours || route.path.length >= 8) return null;
   const stations = route.path.map((id) => g.stations.get(id)).filter((s): s is Station => !!s);
-  if (stations.length !== route.path.length) return [];
+  if (stations.length !== route.path.length) return null;
   const sites = stations.map(siteOf);
   const towns = new Set(stations.map((s) => s.townId));
   const coach = towns.size >= 2;
@@ -1493,66 +1668,109 @@ export function* planExtensions(h: BusHost, l: Line, maxForecasts = 3): Generato
     if ([...towns].filter((t) => ot.has(t)).length < 2) continue;
     for (const id of o.stops) { const st = g.stations.get(id); if (st) rivals.push(st); }
   }
+  return { route, model, n, ours, stations, sites, towns, coach, cands, rivals };
+}
+
+function* resumeExtensions(h: BusHost, l: Line, maxForecasts: number, c: ExtensionsCursor): Generator<void, RoadPlan[]> {
+  if (c.state === undefined) c.state = extensionsSetup(h, l, maxForecasts);
+  if (!c.state) return [];
+  const g = h.g, me = h.me, { route, model, n, sites, towns, coach, cands, rivals } = c.state;
   const add = (site: StopSite, place: 'start' | 'end' | number, at: number, why: string, bonus = 1) => {
     if (!far(site, sites) || !far(site, rivals, HOLD)) return;
     if (site.station && route.path.includes(site.station.id)) return;
-    cands.push({ site, place, at, value: (site.free + 0.2 * site.pop) * (site.rail ? 1.5 : 1) * bonus, why });
+    cands.push({ site, place, at, value: (site.free + .2 * site.pop) * (site.rail ? 1.5 : 1) * bonus, why });
   };
-  // beyond the ends of a line out and back
-  if (!route.loop) for (const end of ['start', 'end'] as const) {
-    const i = end === 'start' ? 0 : sites.length - 1, j = end === 'start' ? 1 : sites.length - 2;
-    const t = sites[i], p = sites[j], d0 = Math.hypot(t.x - p.x, t.z - p.z) || 1, ux = (t.x - p.x) / d0, uz = (t.z - p.z) / d0;
-    yield;
-    for (const s of yield* stopSites(g, me, t.x, t.z, 34)) {
-      const d = Math.hypot(s.x - t.x, s.z - t.z);
-      if (d < 12 || ((s.x - t.x) * ux + (s.z - t.z) * uz) / d < 0.35) continue;
-      add(s, end, end === 'start' ? 0 : sites.length, s.rail ? 'to the rail station' : 'beyond the terminus');
+  if (c.stage === 'init') c.stage = route.loop ? 'leg' : 'end';
+  while (c.stage !== 'done') {
+    if (c.stage === 'end') {
+      if (c.end >= 2) { c.stage = 'leg'; continue; }
+      const end = c.end === 0 ? 'start' : 'end', i = end === 'start' ? 0 : sites.length - 1, j = end === 'start' ? 1 : sites.length - 2;
+      const t = sites[i], p = sites[j], d0 = Math.hypot(t.x - p.x, t.z - p.z) || 1;
+      c.along = { end, t, ux: (t.x - p.x) / d0, uz: (t.z - p.z) / d0 };
+      c.stop = newStopSitesCursor(); c.stage = 'endSites'; yield;
     }
-    // coaches: the next town on (a village or town that no stop of the line serves)
-    if (coach) for (const T of g.towns.list) {
-      if (towns.has(T.id) || T.pop < 250) continue;
-      const d = Math.hypot(T.x - t.x, T.z - t.z);
-      if (d < 50 || d > 160 || ((T.x - t.x) * ux + (T.z - t.z) * uz) / d < 0.5) continue;
-      yield;
-      const s = yield* coachSite(g, me, T);
-      if (s) add(s, end, end === 'start' ? 0 : sites.length, `on to ${T.name}`, 1.5);
-    }
-  }
-  // on the way: a stop between two stops a short detour away
-  const legs = route.loop ? sites.length : sites.length - 1;
-  for (let k = 0; k < legs; k++) {
-    const a = sites[k], b = sites[(k + 1) % sites.length], d = Math.hypot(a.x - b.x, a.z - b.z);
-    // between two towns: a town on the way (a coach calling there picks up the trips to and from it)
-    if (a.townId !== b.townId) {
-      for (const T of townsOnTheWay(g, a, b, towns, 2)) {
-        yield;
-        const s = yield* coachSite(g, me, T);
-        if (s) add(s, k, k + 1, `via ${T.name}`, 1.5);
+    if (c.stage === 'endSites') {
+      const { end, t, ux, uz } = c.along!;
+      for (const site of yield* stopSites(g, me, t.x, t.z, 34, undefined, c.stop)) {
+        const d = Math.hypot(site.x - t.x, site.z - t.z);
+        if (d < 12 || ((site.x - t.x) * ux + (site.z - t.z) * uz) / d < .35) continue;
+        add(site, end, end === 'start' ? 0 : sites.length, site.rail ? 'to the rail station' : 'beyond the terminus');
       }
-      continue;
+      c.town = 0; c.stage = 'endTowns'; delete c.stop;
     }
-    if (d < 22) continue;
-    yield;
-    for (const s of yield* stopSites(g, me, (a.x + b.x) / 2, (a.z + b.z) / 2, d / 2)) {
-      const detour = Math.hypot(a.x - s.x, a.z - s.z) + Math.hypot(s.x - b.x, s.z - b.z) - d;
-      if (detour > Math.max(6, d * 0.3)) continue;
-      add(s, route.loop ? k : k, k + 1, s.rail ? 'via the rail station' : 'a stop on the way');
+    if (c.stage === 'endTowns') {
+      const { t, ux, uz } = c.along!;
+      if (coach) while (c.town < g.towns.list.length) {
+        const T = g.towns.list[c.town++];
+        if (towns.has(T.id) || T.pop < 250) continue;
+        const d = Math.hypot(T.x - t.x, T.z - t.z);
+        if (d < 50 || d > 160 || ((T.x - t.x) * ux + (T.z - t.z) * uz) / d < .5) continue;
+        c.nextTown = T.id; c.stop = newStopSitesCursor(); c.stage = 'endCoach'; yield; break;
+      }
+      if (c.stage === 'endTowns') { c.end++; c.stage = 'end'; continue; }
+    }
+    if (c.stage === 'endCoach') {
+      const T = g.towns.list[c.nextTown], { end } = c.along!;
+      const site = yield* coachSite(g, me, T, c.stop);
+      if (site) add(site, end, end === 'start' ? 0 : sites.length, `on to ${T.name}`, 1.5);
+      delete c.stop; c.stage = 'endTowns'; continue;
+    }
+    if (c.stage === 'leg') {
+      const legs = route.loop ? sites.length : sites.length - 1;
+      if (c.k >= legs) {
+        if (!cands.length) { c.stage = 'done'; return []; }
+        cands.sort((x, y) => y.value - x.value); c.stage = 'before'; continue;
+      }
+      const a = sites[c.k], b = sites[(c.k + 1) % sites.length], d = Math.hypot(a.x - b.x, a.z - b.z);
+      c.leg = { a, b, d, towns: [], at: 0 };
+      if (a.townId !== b.townId) {
+        c.leg.towns = townsOnTheWay(g, a, b, towns, 2).map(T => T.id); c.stage = 'legTowns'; continue;
+      }
+      if (d < 22) { c.k++; continue; }
+      c.stop = newStopSitesCursor(); c.stage = 'legSites'; yield;
+    }
+    if (c.stage === 'legTowns') {
+      const leg = c.leg!;
+      if (leg.at >= leg.towns.length) { c.k++; c.stage = 'leg'; continue; }
+      c.nextTown = leg.towns[leg.at++]; c.stop = newStopSitesCursor(); c.stage = 'legCoach'; yield;
+    }
+    if (c.stage === 'legCoach') {
+      const T = g.towns.list[c.nextTown], site = yield* coachSite(g, me, T, c.stop);
+      if (site) add(site, c.k, c.k + 1, `via ${T.name}`, 1.5);
+      delete c.stop; c.stage = 'legTowns'; continue;
+    }
+    if (c.stage === 'legSites') {
+      const { a, b, d } = c.leg!;
+      for (const site of yield* stopSites(g, me, (a.x + b.x) / 2, (a.z + b.z) / 2, d / 2, undefined, c.stop)) {
+        const detour = Math.hypot(a.x - site.x, a.z - site.z) + Math.hypot(site.x - b.x, site.z - b.z) - d;
+        if (detour > Math.max(6, d * .3)) continue;
+        add(site, route.loop ? c.k : c.k, c.k + 1, site.rail ? 'via the rail station' : 'a stop on the way');
+      }
+      delete c.stop; c.k++; c.stage = 'leg'; continue;
+    }
+    if (c.stage === 'before') {
+      const purpose = new Set(sites.map(site => site.townId)).size >= 2 ? 'intercity' : 'city';
+      c.before = (yield* roadForecasts(g, me, sites, { model, vehicles: n, loop: route.loop, purpose }, [n], l.id, c.baseline ??= newRoadForecastCursor()))[0];
+      delete c.baseline;
+      c.stage = 'candidates';
+    }
+    if (c.stage === 'candidates') {
+      while (c.candidate < cands.length || c.active) {
+        if (!c.active) {
+          if (c.tried.size >= maxForecasts) break;
+          const candidate = cands[c.candidate++], key = `${candidate.site.x.toFixed(1)},${candidate.site.z.toFixed(1)}`;
+          if (c.tried.has(key)) continue;
+          c.tried.add(key); c.active = { candidate, cursor: newExtendPlanCursor() };
+        }
+        const { candidate, cursor } = c.active;
+        const plan = yield* extendPlan(h, l, candidate.site, candidate.place, candidate.at, candidate.why, c.before, cursor);
+        if (plan) c.out.push(plan);
+        delete c.active;
+      }
+      c.stage = 'done';
     }
   }
-  if (!cands.length) return [];
-  cands.sort((x, y) => y.value - x.value);
-  const [before] = yield* lineForecast(g, me, sites, { model, vehicles: n, loop: route.loop }, [n], l.id);
-  const out: RoadPlan[] = [];
-  const tried = new Set<string>();
-  for (const c of cands) {
-    if (tried.size >= maxForecasts) break;
-    const key = `${c.site.x.toFixed(1)},${c.site.z.toFixed(1)}`;
-    if (tried.has(key)) continue;
-    tried.add(key);
-    const plan = yield* extendPlan(h, l, c.site, c.place, c.at, c.why, before);
-    if (plan) out.push(plan);
-  }
-  return out;
+  return c.out;
 }
 
 // ---------------------------------------------------------------------------- the options of a project choice
@@ -1578,35 +1796,52 @@ const PLAYER_ID = 0;
  * and the town bus and coach options re-quoted with the forecast (their sites and fleets planned), so that an existing
  * route's partner or extension competes with a new line by what each earns. `weight`: the company's road focus weight.
  */
-export function* roadOptions(h: BusHost, opts: ProjectOption[], avail: number, weight: number): Generator<void, void> {
+export function* roadOptions(h: BusHost, opts: ProjectOption[], avail: number, weight: number, cursor?: RoadOptionsCursor): Generator<void, void> {
+  const c = cursor ?? newRoadOptionsCursor(), input = c.input ??= { avail, weight };
+  return yield* resumeRoadOptions(h, opts, input.avail, input.weight, c);
+}
+
+export interface RoadOptionsCursor {
+  input?: { avail: number; weight: number };
+  stage: 'joinInit' | 'join' | 'extensionInit' | 'extension' | 'upgradeInit' | 'upgrade' | 'done';
+  line?: Line; join?: MoreValueCursor; extension?: ExtensionsCursor; upgrade?: RouteUpgradeCursor;
+}
+export const newRoadOptionsCursor = (): RoadOptionsCursor => ({ stage: 'joinInit' });
+
+/** Original ordered option search, preserving each child quote and each failure-memory write. */
+function* resumeRoadOptions(h: BusHost, opts: ProjectOption[], avail: number, weight: number, c: RoadOptionsCursor): Generator<void, void> {
   const g = h.g, me = h.me;
   const push = (plan: RoadPlan, kind: string) => opts.push({ score: planScore(plan) * weight, kind, towns: plan.towns, viable: pays(plan) && plan.outlay <= avail, road: plan });
-  // a partner on the busiest open line of another company that may take one more vehicle (one a choice: a line where it
-  // does not pay is looked at again in half a year)
-  if (avail > 300_000) {
-    const l = joinable(g, me).find((x) => !h.isFailed('roadjoin' + x.id));
-    if (l) {
-      const plan = yield* moreValue(h, l);
-      if (plan && pays(plan)) push(plan, 'busjoin'); else h.markFailed('roadjoin' + l.id, 180);
-    }
+  if (c.stage === 'joinInit') {
+    const line = avail > 300_000 ? joinable(g, me).find(l => !h.isFailed('roadjoin' + l.id)) : undefined;
+    if (line) { c.line = line; c.join = newMoreValueCursor(); c.stage = 'join'; } else c.stage = 'extensionInit';
   }
-  // a longer route for one of our lines, in turn
-  const own = [...g.lines.map.values()].filter((l) => l.kind === 'road' && l.owner === me && l.vehicles.length && !h.isFailed('roadext' + l.id) && !worksOn(g, l.id)).sort((a, b) => a.id - b.id);
-  if (own.length && avail > 200_000) {
-    const l = own[Math.floor(g.day / 30) % own.length];
-    const plans = (yield* planExtensions(h, l)).filter(pays);
+  if (c.stage === 'join') {
+    const line = c.line!, plan = yield* moreValue(h, line, undefined, c.join);
+    if (plan && pays(plan)) push(plan, 'busjoin'); else h.markFailed('roadjoin' + line.id, 180);
+    delete c.line; delete c.join; c.stage = 'extensionInit';
+  }
+  if (c.stage === 'extensionInit') {
+    const own = [...g.lines.map.values()].filter(l => l.kind === 'road' && l.owner === me && l.vehicles.length && !h.isFailed('roadext' + l.id) && !worksOn(g, l.id)).sort((a, b) => a.id - b.id);
+    if (own.length && avail > 200_000) { c.line = own[Math.floor(g.day / 30) % own.length]; c.extension = newExtensionsCursor(); c.stage = 'extension'; }
+    else c.stage = 'upgradeInit';
+  }
+  if (c.stage === 'extension') {
+    const line = c.line!, plans = (yield* planExtensions(h, line, 3, c.extension)).filter(pays);
     for (const plan of plans) push(plan, 'busext');
-    if (!plans.length) h.markFailed('roadext' + l.id, 180);
+    if (!plans.length) h.markFailed('roadext' + line.id, 180);
+    delete c.line; delete c.extension; c.stage = 'upgradeInit';
   }
-  // a busy town bus line of ours to trams, light rail or a metro (the busiest by riders a vehicle, one a choice)
-  if (avail > 1_000_000) {
-    const busy = [...g.lines.map.values()].filter((l) => l.kind === 'road' && l.owner === me && l.vehicles.length >= 3 && !h.isFailed('tramup' + l.id)
-      && l.incomeLast > l.costLast && new Set(l.stops.map((id) => g.stations.get(id)?.townId)).size === 1 && new Set(l.stops).size >= 3 && !worksOn(g, l.id))
-      .sort((a, b) => b.passLast / b.vehicles.length - a.passLast / a.vehicles.length || a.id - b.id)[0];
-    if (busy) {
-      const plan = yield* routeUpgradeValue(h, busy);
-      if (plan && pays(plan)) push(plan, 'busrail'); else h.markFailed('tramup' + busy.id, 360);
-    }
+  if (c.stage === 'upgradeInit') {
+    const busy = avail > 1_000_000 ? [...g.lines.map.values()].filter(l => l.kind === 'road' && l.owner === me && l.vehicles.length >= 3 && !h.isFailed('tramup' + l.id)
+      && l.incomeLast > l.costLast && new Set(l.stops.map(id => g.stations.get(id)?.townId)).size === 1 && new Set(l.stops).size >= 3 && !worksOn(g, l.id))
+      .sort((a, b) => b.passLast / b.vehicles.length - a.passLast / a.vehicles.length || a.id - b.id)[0] : undefined;
+    if (busy) { c.line = busy; c.upgrade = newRouteUpgradeCursor(); c.stage = 'upgrade'; } else c.stage = 'done';
+  }
+  if (c.stage === 'upgrade') {
+    const line = c.line!, plan = yield* routeUpgradeValue(h, line, c.upgrade);
+    if (plan && pays(plan)) push(plan, 'busrail'); else h.markFailed('tramup' + line.id, 360);
+    delete c.line; delete c.upgrade; c.stage = 'done';
   }
 }
 
@@ -1619,50 +1854,85 @@ export function planScore(plan: RoadPlan): number { return pays(plan) ? roadScor
  * our lines extended from a town of the pair to the other. A served pair thus gets a partner or a longer line rather than
  * a near-copy (the copy's riders near the served stops keep riding the service they know: HOLD). Null when none pays.
  */
-export function* roadMarket(h: BusHost, kind: 'bus' | 'coach', towns: number[]): Generator<void, RoadPlan | null> {
-  const g = h.g, me = h.me, plans: RoadPlan[] = [];
-  const A = g.towns.list[towns[0]], B = kind === 'coach' ? g.towns.list[towns[1]] : undefined;
-  if (!A || (kind === 'coach' && !B)) return null;
-  // (another company already planning or building coaches between these towns: its plan comes first)
-  if (kind === 'coach' && g.ais.some((ai) => {
-    const p = (ai as unknown as { project?: { kind: string; towns: number[] } | null }).project;
-    return ai.companyId !== me && !ai.disposed && p?.kind === 'coach' && p.towns.includes(A.id) && p.towns.includes(B!.id);
-  })) return null;
-  // lines already serving the market (others' open ones we may join; ours, one vehicle more)
-  const serving = [...g.lines.map.values()].filter((l) => {
-    if (l.kind !== 'road' || !l.vehicles.length || !routeOf(g, l)) return false;
-    const t = townsOf(g, l);
-    return kind === 'coach' ? t.includes(A.id) && t.includes(B!.id) : t.length === 1 && t[0] === A.id;
-  }).filter((l) => !worksOn(g, l.id) && (l.owner === me || l.operators?.includes(me) || joinable(g, me).includes(l)))
-    .sort((a, b) => b.incomeLast / b.vehicles.length - a.incomeLast / a.vehicles.length || a.id - b.id).slice(0, 2);
-  for (const l of serving) { const p = yield* moreValue(h, l); if (p) plans.push(p); }
-  if (kind === 'coach') {
-    const model = coachModel(g.year);
-    if (model) { const p = yield* planCoach(h, A, B!, model); if (p) plans.push(p); }
-    // one of our lines ending in one town of the pair, extended to the other
-    for (const l of g.lines.map.values()) {
+export function* roadMarket(h: BusHost, kind: 'bus' | 'coach', towns: number[], cursor: RoadMarketCursor = newRoadMarketCursor()): Generator<void, RoadPlan | null> {
+  return yield* resumeRoadMarket(h, kind, towns, cursor);
+}
+
+/** A market's native iterator, quotes and decision captured before/after every nested work unit. */
+export interface RoadMarketCursor {
+  stage: 'init' | 'serving' | 'new' | 'extensions' | 'end' | 'site' | 'extend' | 'finish' | 'done';
+  plans: RoadPlan[]; serving: Line[]; at: number; scan: RoadMapCursor; end: number;
+  more?: MoreValueCursor; town?: TownPlanCursor; coach?: CoachPlanCursor; model?: VehicleModel | null;
+  line?: Line; route?: { path: number[]; loop: boolean }; to?: number; stop?: StopSitesCursor;
+  site?: StopSite; extension?: ExtendPlanCursor; result?: RoadPlan | null;
+}
+export const newRoadMarketCursor = (): RoadMarketCursor => ({ stage: 'init', plans: [], serving: [], at: 0, scan: newRoadMapCursor(), end: 0 });
+function* resumeRoadMarket(h: BusHost, kind: 'bus' | 'coach', towns: number[], c: RoadMarketCursor): Generator<void, RoadPlan | null> {
+  const g = h.g, me = h.me, A = g.towns.list[towns[0]], B = kind === 'coach' ? g.towns.list[towns[1]] : undefined;
+  while (true) {
+    if (c.stage === 'done') return c.result!;
+    if (c.stage === 'init') {
+      if (!A || kind === 'coach' && !B) { c.stage = 'done'; c.result = null; continue; }
+      if (kind === 'coach' && g.ais.some(ai => { const p = (ai as unknown as { project?: { kind: string; towns: number[] } | null }).project;
+        return ai.companyId !== me && !ai.disposed && p?.kind === 'coach' && p.towns.includes(A.id) && p.towns.includes(B!.id); })) { c.stage = 'done'; c.result = null; continue; }
+      c.serving = [...g.lines.map.values()].filter(l => {
+        if (l.kind !== 'road' || !l.vehicles.length || !routeOf(g, l)) return false;
+        const t = townsOf(g, l); return kind === 'coach' ? t.includes(A.id) && t.includes(B!.id) : t.length === 1 && t[0] === A.id;
+      }).filter(l => !worksOn(g, l.id) && (l.owner === me || l.operators?.includes(me) || joinable(g, me).includes(l)))
+        .sort((a, b) => b.incomeLast / b.vehicles.length - a.incomeLast / a.vehicles.length || a.id - b.id).slice(0, 2);
+      c.stage = 'serving'; continue;
+    }
+    if (c.stage === 'serving') {
+      if (c.at >= c.serving.length) { c.model = kind === 'coach' ? coachModel(g.year) : pickBusFor(g.year, A.pop); c.stage = 'new'; continue; }
+      c.more ??= newMoreValueCursor();
+      const p = yield* moreValue(h, c.serving[c.at], undefined, c.more);
+      if (p) c.plans.push(p); c.at++; delete c.more; continue;
+    }
+    if (c.stage === 'new') {
+      if (c.model) {
+        let p: RoadPlan | null;
+        if (kind === 'coach') { c.coach ??= newCoachPlanCursor(); p = yield* planCoach(h, A, B!, c.model, c.coach); }
+        else { c.town ??= newTownPlanCursor(); p = yield* planTownLine(h, A, c.model, c.town); }
+        if (p) c.plans.push(p);
+      }
+      delete c.coach; delete c.town;
+      c.stage = kind === 'coach' ? 'extensions' : 'finish'; continue;
+    }
+    if (c.stage === 'extensions') {
+      // Lines are allocated monotonically. A live Map iterator sees lines appended during nested quotes too.
+      const l = nextRoadMapValue(g.lines.map, c.scan);
+      if (!l) { c.stage = 'finish'; continue; }
       if (l.kind !== 'road' || l.owner !== me || !l.vehicles.length) continue;
       const route = routeOf(g, l);
       if (!route || route.loop || route.path.length >= 8) continue;
       const t = townsOf(g, l);
       if (t.includes(A.id) && t.includes(B!.id)) continue;
-      for (const end of ['start', 'end'] as const) {
-        const st = g.stations.get(end === 'start' ? route.path[0] : route.path[route.path.length - 1]);
-        const to = st?.townId === A.id ? B! : st?.townId === B!.id ? A : null;
-        if (!st || !to) continue;
-        const site = yield* coachSite(g, me, to);
-        if (!site) continue;
-        const p = yield* extendPlan(h, l, site, end, end === 'start' ? 0 : route.path.length, `on to ${to.name}`);
-        if (p) plans.push(p);
-      }
+      c.line = l; c.route = route; c.end = 0; c.stage = 'end'; continue;
     }
-  } else {
-    const model = pickBusFor(g.year, A.pop);
-    if (model) { const p = yield* planTownLine(h, A, model); if (p) plans.push(p); }
+    if (c.stage === 'end') {
+      if (c.end >= 2) { c.stage = 'extensions'; continue; }
+      const path = c.route!.path, st = g.stations.get(c.end === 0 ? path[0] : path[path.length - 1]);
+      const to = st?.townId === A.id ? B! : st?.townId === B!.id ? A : null;
+      if (!st || !to) { c.end++; continue; }
+      c.to = to.id; c.stop = newStopSitesCursor(); c.stage = 'site'; continue;
+    }
+    if (c.stage === 'site') {
+      const site = yield* coachSite(g, me, g.towns.list[c.to!], c.stop!);
+      if (!site) { c.end++; c.stage = 'end'; continue; }
+      c.site = site; c.extension = newExtendPlanCursor(); c.stage = 'extend'; continue;
+    }
+    if (c.stage === 'extend') {
+      const end = c.end === 0 ? 'start' : 'end';
+      const p = yield* extendPlan(h, c.line!, c.site!, end, c.end === 0 ? 0 : c.route!.path.length, `on to ${g.towns.list[c.to!].name}`, undefined, c.extension!);
+      if (p) c.plans.push(p); delete c.extension; c.end++; c.stage = 'end'; continue;
+    }
+    if (c.stage === 'finish') {
+      let best: RoadPlan | null = null;
+      for (const p of c.plans) if (pays(p) && (!best || planScore(p) > planScore(best))) best = p;
+      c.result = best; c.stage = 'done'; continue;
+    }
+    throw new Error('Invalid road market continuation stage');
   }
-  let best: RoadPlan | null = null;
-  for (const p of plans) if (pays(p) && (!best || planScore(p) > planScore(best))) best = p;
-  return best;
 }
 
 /** Towns a line's stops are in. */
@@ -1685,31 +1955,65 @@ function stationAt(g: Game, owner: number, x: number, z: number, before: number)
   return bd < 4 ? sid : -1;
 }
 
-/** Build a stop at a planned site (or use the station there): its station id, or -1. New stations go to the project. */
-function* buildStop(h: BusHost, s: RoadSite): Generator<void, number> {
+/**
+ * Carry out a road plan as the company's project: run vehicles on the line (as a partner where it is another's), extend
+ * one of our lines by its stop, or open the new line. Returns a note of the outcome; failures mark the option for a while.
+ */
+export function* roadPlanJob(h: BusHost, plan: RoadPlan, cursor: RoadBuildCursor = newRoadBuildCursor()): Generator<void, string> {
+  return yield* resumeRoadPlanJob(h, plan, cursor);
+}
+
+/** Native paid work cursor. Asset IDs and counters advance before each native yield, never on save. */
+export interface RoadBuildCursor {
+  version: 1;
+  stage: 'init' | 'joinDepot' | 'joinBuy' | 'extendStop' | 'extendLine' | 'extendVehicles' | 'extendFinish'
+    | 'quote' | 'lineStops' | 'lineDepot' | 'lineReach' | 'lineReachCheck' | 'lineVehicles' | 'lineFinish' | 'done';
+  line?: Line; info?: LineInfo; depot: number; capturedDepot?: NonNullable<ReturnType<Game['depots']['get']>>; ids: number[]; at: number; bought: number;
+  stop?: { before: number; error: string | null; x: number; z: number };
+  stopResult?: number; depotSearch?: RoadDepotCursor; forecast?: RoadForecastCursor;
+  oldName?: string; result?: string;
+}
+export const newRoadBuildCursor = (): RoadBuildCursor => ({ version: 1, stage: 'init', depot: -1, ids: [], at: 0, bought: 0 });
+
+function* resumeBuildStop(h: BusHost, s: RoadSite, c: RoadBuildCursor): Generator<void, number> {
   const g = h.g, me = h.me;
-  if (s.station && g.stations.get(s.station.id) && s.station.stops.length) return s.station.id;
-  const before = g.stations.nextId, at = s.road ?? s;
-  const err = g.stations.commitBusStop(at.x, at.z, me);
-  yield;
-  if (err) {
-    // a stop came here meanwhile: ours or an open neighbour's is used
-    const shared = g.stations.findSharedStop(at.x, at.z, me);
+  if (!c.stop) {
+    if (s.station && g.stations.get(s.station.id) && s.station.stops.length) return s.station.id;
+    const before = g.stations.nextId, at = s.road ?? s, project = h.project();
+    const priorParts = project ? new Set([...g.stations.map.values()].filter(st => st.owner === me).flatMap(st => st.stops)) : null;
+    const error = g.stations.commitBusStop(at.x, at.z, me);
+    // Cleanup owns the paid asset immediately; linking and stop statistics retain their native next unit.
+    if (!error && project) {
+      if (g.stations.nextId > before) project.stations.push(before);
+      else for (const st of g.stations.map.values()) if (st.owner === me) for (const part of st.stops) if (!priorParts!.has(part))
+        (project.roadStops ??= []).push({ station: st.id, x: part.x, z: part.z });
+    }
+    c.stop = { before, error, x: at.x, z: at.z };
+    yield;
+  }
+  const stop = c.stop;
+  delete c.stop;
+  if (stop.error) {
+    const shared = g.stations.findSharedStop(stop.x, stop.z, me);
     return shared && (shared.owner === me || g.accessPolicy(shared.owner) === 'open') ? shared.id : -1;
   }
-  const sid = stationAt(g, me, at.x, at.z, before);
-  if (g.stations.nextId > before) { h.project()?.stations.push(before); h.linkTransfers(before); }
+  const sid = stationAt(g, me, stop.x, stop.z, stop.before);
+  if (g.stations.nextId > stop.before) h.linkTransfers(stop.before);
   h.stats.busStops++;
   return sid;
 }
 
-/** A road depot of ours reaching the station, or a new one near it (-1: none). */
-function* depotFor(h: BusHost, stationId: number): Generator<void, number> {
-  const g = h.g, have = ownDepotFor(g, h.me, stationId);
-  if (have >= 0) return have;
-  const st = g.stations.get(stationId);
-  if (!st) return -1;
-  const dep = yield* h.roadDepot(st.stops[0]?.x ?? st.x, st.stops[0]?.z ?? st.z);
+function* resumeDepotFor(h: BusHost, stationId: number, c: RoadBuildCursor): Generator<void, number> {
+  const g = h.g;
+  if (!c.depotSearch) {
+    const have = ownDepotFor(g, h.me, stationId);
+    if (have >= 0) return have;
+    const st = g.stations.get(stationId);
+    if (!st) return -1;
+    c.depotSearch = newRoadDepotCursor(st.stops[0]?.x ?? st.x, st.stops[0]?.z ?? st.z);
+  }
+  const dep = yield* h.roadDepot(c.depotSearch.x, c.depotSearch.z, c.depotSearch);
+  delete c.depotSearch;
   if (dep >= 0) {
     h.project()?.depots.push(dep);
     const dp = g.depots.get(dep);
@@ -1718,125 +2022,167 @@ function* depotFor(h: BusHost, stationId: number): Generator<void, number> {
   return dep;
 }
 
-/**
- * Carry out a road plan as the company's project: run vehicles on the line (as a partner where it is another's), extend
- * one of our lines by its stop, or open the new line. Returns a note of the outcome; failures mark the option for a while.
- */
-export function* roadPlanJob(h: BusHost, plan: RoadPlan): Generator<void, string> {
+function ownRoadPurchase(h: BusHost, id: number) {
+  const project = h.project();
+  if (project) (project.roadVehicles ??= []).push(id);
+}
+
+function* resumeRoadPlanJob(h: BusHost, plan: RoadPlan, c: RoadBuildCursor): Generator<void, string> {
   const g = h.g, me = h.me;
-  const fail = (key: string, why: string, days = 360) => { h.markFailed(key, days); return `road project failed: ${why}`; };
-  if (plan.kind === 'join') {
-    const l = g.lines.get(plan.line ?? -1);
-    if (!l || l.id !== plan.line || l.kind !== 'road') return fail('roadjoin' + plan.line, 'line gone');
-    if (l.owner !== me) { const err = g.lines.join(l.id, me); if (err) return fail('roadjoin' + l.id, err, 720); }
-    let dep = -1;
-    for (const sid of new Set(l.stops)) { dep = ownDepotFor(g, me, sid); if (dep >= 0) break; }
-    if (dep < 0) {
-      if (!h.borrowFor(DEPOT_COST + plan.model.cost)) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no money', 180); }
-      dep = yield* depotFor(h, l.stops[0]);
-    }
-    if (dep < 0) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no depot site', 720); }
-    if (!h.borrowFor(plan.model.cost)) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no money', 180); }
-    const v = g.vehicles.buyRoad(dep, plan.model, l.id);
-    if (typeof v === 'string') { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, v, 720); }
-    h.stats.vehicles++;
-    const ours = l.vehicles.filter((id) => g.vehicles.get(id)?.owner === me).length;
-    const info = h.managed.get(l.id);
-    if (info) info.maxVehicles = Math.max(info.maxVehicles, ours);
-    else {
-      h.managed.set(l.id, { kind: 'bus', towns: [...plan.towns], depot: dep, maxVehicles: Math.max(2, ours), opened: g.day, joined: true, shared: l.owner });
-      h.stats.joined++;
-      g.postNews(`${g.company(me).name} runs buses on ${g.company(l.owner).name}'s ${l.name} too.`, 'ai', g.stations.get(l.stops[0])?.x, g.stations.get(l.stops[0])?.z);
-    }
-    return `${l.owner === me ? 'added a vehicle to' : 'joined'} ${l.name} (${plan.why})`;
-  }
-  if (plan.kind === 'upgrade' && plan.works) {
-    // staged works (route-works.ts): built over the coming weeks while the buses run, then switched
-    const l = g.lines.get(plan.line ?? -1), q = plan.works;
-    if (!l || l.id !== plan.line) return fail('tramup' + plan.line, 'line gone');
-    const block = upgradeBlock(g, l.id, me);
-    if (block) return fail('tramup' + l.id, block, 360);
-    // (paid as built: the credit for the works and the vehicles arranged now)
-    if (q.cost > h.available() + 300_000 || !h.borrowFor(Math.min(q.cost + q.resale, q.fleet + q.track))) return fail('tramup' + l.id, 'no money', 360);
-    const err = startRouteWorks(g, q);
-    if (err) return fail('tramup' + l.id, err, 720);
-    // (one upgrade at a time per line: the works decide; looked at again after they are done)
-    h.markFailed('tramup' + l.id, 720);
-    const st = g.stations.get(l.stops[0]);
-    const word = q.mode === 'tram' ? 'trams' : q.mode === 'metro' ? 'a metro' : 'light rail';
-    g.postNews(`${g.company(me).name} starts works on ${l.name}: ${word}.`, 'ai', st?.x, st?.z);
-    return `started works on ${l.name}: ${word}, ${Math.round(q.cost / 1000)}k over ${q.days} days (${plan.why})`;
-  }
-  if (plan.kind === 'extend') {
-    const l = g.lines.get(plan.line ?? -1), s = plan.sites[0];
-    if (!l || l.id !== plan.line || l.owner !== me || !s) return fail('roadext' + plan.line, 'line gone');
-    const cost = (s.station?.stops.length ? 0 : STOP_COST) + plan.vehicles * plan.model.cost;
-    if (cost > h.available() + 200_000 || !h.borrowFor(cost)) return fail('roadext' + l.id, 'no money', 180);
-    const sid = yield* buildStop(h, s);
-    if (sid < 0) return fail('roadext' + l.id, 'no stop site', 360);
-    if (l.stops.includes(sid)) return fail('roadext' + l.id, 'stop already served', 360);
-    // (a line out and back stays one: two stops and a third between them are A, X, B, X, not a loop)
-    const route = routeOf(g, l), place = plan.place ?? 'auto';
-    let stops: number[] | null = null;
-    if (route && !route.loop && place !== 'auto') {
-      const at = place === 'start' ? 0 : place === 'end' ? route.path.length : place + 1;
-      stops = outAndBack([...route.path.slice(0, at), sid, ...route.path.slice(at)]);
-    } else stops = stopsWithInserted(g, l, sid, place)?.stops ?? null;
-    if (!stops || new Set(stops).size < 3) return fail('roadext' + l.id, 'stop does not fit', 360);
-    const oldName = l.name;
-    replaceLineStops(g, l, stops);
-    yield;
-    const info = h.managed.get(l.id);
-    let bought = 0;
-    for (let i = 0; i < plan.vehicles; i++) {
-      const dep = info?.depot ?? -1;
-      const v = dep >= 0 ? g.vehicles.buyRoad(dep, plan.model, l.id) : 'no depot';
-      if (typeof v !== 'string') { bought++; h.stats.vehicles++; }
-      yield;
-    }
-    if (info) {
-      info.towns = [...new Set([...info.towns, ...plan.towns])];
-      info.maxVehicles = Math.max(info.maxVehicles, l.vehicles.filter((id) => g.vehicles.get(id)?.owner === me).length);
-    }
-    h.stats.grown++;
-    const st = g.stations.get(sid);
-    g.postNews(`${g.company(me).name} extends ${oldName} to ${st?.name ?? 'a new stop'}.`, 'ai', st?.x, st?.z);
-    return `extended ${oldName} to ${st?.name ?? sid}, ${bought} more vehicles (${plan.why})`;
-  }
-  // a new line
+  const finish = (result: string) => { c.stage = 'done'; c.result = result; return result; };
+  const fail = (key: string, why: string, days = 360) => { h.markFailed(key, days); return finish(`road project failed: ${why}`); };
   const key = plan.towns.length >= 2 ? 'coach' + Math.min(plan.towns[0], plan.towns[1]) + '-' + Math.max(plan.towns[0], plan.towns[1]) : 'bus' + plan.towns[0];
-  if (!pays(plan)) return fail(key, `forecast ${Math.round(plan.revenue / 1000)}k/year below ${Math.round(plan.yearly / 1000)}k`, 720);
-  // Quoted again before building: another company may have opened a service in these towns while we planned (its
-  // riders near its stops keep riding it), and a copy of it would not pay.
-  {
-    const [f] = yield* lineForecast(g, me, plan.sites, { model: plan.model, vehicles: plan.vehicles, loop: !!plan.loop });
-    const again = { revenue: worth(f), yearly: plan.yearly };
-    if (!pays(again)) return fail(key, `forecast now ${Math.round(again.revenue / 1000)}k/year below ${Math.round(plan.yearly / 1000)}k`, 720);
+  while (true) {
+    if (c.stage === 'done') return c.result!;
+    if (c.stage === 'init') {
+      if (plan.kind === 'join') {
+        const l = g.lines.get(plan.line ?? -1);
+        if (!l || l.id !== plan.line || l.kind !== 'road') return fail('roadjoin' + plan.line, 'line gone');
+        c.line = l;
+        if (l.owner !== me) {
+          const joining = !l.operators?.includes(me), err = g.lines.join(l.id, me);
+          if (err) return fail('roadjoin' + l.id, err, 720);
+          const project = h.project(); if (joining && project) project.roadJoin = l.id;
+        }
+        for (const sid of new Set(l.stops)) { c.depot = ownDepotFor(g, me, sid); if (c.depot >= 0) break; }
+        if (c.depot < 0) {
+          if (!h.borrowFor(DEPOT_COST + plan.model.cost)) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no money', 180); }
+          c.stage = 'joinDepot';
+        } else c.stage = 'joinBuy';
+        continue;
+      }
+      if (plan.kind === 'upgrade' && plan.works) {
+        // This branch has no native yield: retain the same one-unit transaction.
+        const l = g.lines.get(plan.line ?? -1), q = plan.works;
+        if (!l || l.id !== plan.line) return fail('tramup' + plan.line, 'line gone');
+        const block = upgradeBlock(g, l.id, me);
+        if (block) return fail('tramup' + l.id, block, 360);
+        if (q.cost > h.available() + 300_000 || !h.borrowFor(Math.min(q.cost + q.resale, q.fleet + q.track))) return fail('tramup' + l.id, 'no money', 360);
+        const err = startRouteWorks(g, q);
+        if (err) return fail('tramup' + l.id, err, 720);
+        h.markFailed('tramup' + l.id, 720);
+        const st = g.stations.get(l.stops[0]);
+        const word = q.mode === 'tram' ? 'trams' : q.mode === 'metro' ? 'a metro' : 'light rail';
+        g.postNews(`${g.company(me).name} starts works on ${l.name}: ${word}.`, 'ai', st?.x, st?.z);
+        return finish(`started works on ${l.name}: ${word}, ${Math.round(q.cost / 1000)}k over ${q.days} days (${plan.why})`);
+      }
+      if (plan.kind === 'extend') {
+        const l = g.lines.get(plan.line ?? -1), s = plan.sites[0];
+        if (!l || l.id !== plan.line || l.owner !== me || !s) return fail('roadext' + plan.line, 'line gone');
+        c.line = l;
+        const cost = (s.station?.stops.length ? 0 : STOP_COST) + plan.vehicles * plan.model.cost;
+        if (cost > h.available() + 200_000 || !h.borrowFor(cost)) return fail('roadext' + l.id, 'no money', 180);
+        c.stage = 'extendStop'; continue;
+      }
+      if (!pays(plan)) return fail(key, `forecast ${Math.round(plan.revenue / 1000)}k/year below ${Math.round(plan.yearly / 1000)}k`, 720);
+      c.forecast = newRoadForecastCursor(); c.stage = 'quote'; continue;
+    }
+    if (c.stage === 'joinDepot') {
+      const l = c.line!;
+      c.depot = yield* resumeDepotFor(h, l.stops[0], c);
+      if (c.depot < 0) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no depot site', 720); }
+      c.stage = 'joinBuy'; continue;
+    }
+    if (c.stage === 'joinBuy') {
+      const l = c.line!;
+      if (!h.borrowFor(plan.model.cost)) { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, 'no money', 180); }
+      const v = g.vehicles.buyRoad(c.depot, plan.model, l.id);
+      if (typeof v === 'string') { if (l.owner !== me) g.lines.leave(l.id, me); return fail('roadjoin' + l.id, v, 720); }
+      ownRoadPurchase(h, v.id); h.stats.vehicles++;
+      const ours = l.vehicles.filter(id => g.vehicles.get(id)?.owner === me).length, info = h.managed.get(l.id);
+      if (info) info.maxVehicles = Math.max(info.maxVehicles, ours);
+      else {
+        h.managed.set(l.id, { kind: 'bus', towns: [...plan.towns], depot: c.depot, maxVehicles: Math.max(2, ours), opened: g.day, joined: true, shared: l.owner });
+        h.stats.joined++;
+        g.postNews(`${g.company(me).name} runs buses on ${g.company(l.owner).name}'s ${l.name} too.`, 'ai', g.stations.get(l.stops[0])?.x, g.stations.get(l.stops[0])?.z);
+      }
+      return finish(`${l.owner === me ? 'added a vehicle to' : 'joined'} ${l.name} (${plan.why})`);
+    }
+    if (c.stage === 'extendStop') {
+      const l = c.line!, sid = yield* resumeBuildStop(h, plan.sites[0], c);
+      if (sid < 0) return fail('roadext' + l.id, 'no stop site', 360);
+      if (l.stops.includes(sid)) return fail('roadext' + l.id, 'stop already served', 360);
+      c.stopResult = sid;
+      const route = routeOf(g, l), place = plan.place ?? 'auto';
+      let stops: number[] | null = null;
+      if (route && !route.loop && place !== 'auto') {
+        const at = place === 'start' ? 0 : place === 'end' ? route.path.length : place + 1;
+        stops = outAndBack([...route.path.slice(0, at), sid, ...route.path.slice(at)]);
+      } else stops = stopsWithInserted(g, l, sid, place)?.stops ?? null;
+      if (!stops || new Set(stops).size < 3) return fail('roadext' + l.id, 'stop does not fit', 360);
+      c.oldName = l.name;
+      const project = h.project(), beforeStops = [...l.stops];
+      replaceLineStops(g, l, stops);
+      if (project) project.roadExtension = { line: l.id, beforeStops, afterStops: [...stops] };
+      c.stage = 'extendLine'; yield; continue;
+    }
+    if (c.stage === 'extendLine') { c.info = h.managed.get(c.line!.id); c.stage = 'extendVehicles'; continue; }
+    if (c.stage === 'extendVehicles') {
+      if (c.at >= plan.vehicles) { c.stage = 'extendFinish'; continue; }
+      const dep = c.info?.depot ?? -1, v = dep >= 0 ? g.vehicles.buyRoad(dep, plan.model, c.line!.id) : 'no depot';
+      if (typeof v !== 'string') { ownRoadPurchase(h, v.id); c.bought++; h.stats.vehicles++; }
+      c.at++; yield; continue;
+    }
+    if (c.stage === 'extendFinish') {
+      const l = c.line!, info = c.info;
+      if (info) { info.towns = [...new Set([...info.towns, ...plan.towns])]; info.maxVehicles = Math.max(info.maxVehicles, l.vehicles.filter(id => g.vehicles.get(id)?.owner === me).length); }
+      h.stats.grown++;
+      const st = g.stations.get(c.stopResult!);
+      g.postNews(`${g.company(me).name} extends ${c.oldName} to ${st?.name ?? 'a new stop'}.`, 'ai', st?.x, st?.z);
+      return finish(`extended ${c.oldName} to ${st?.name ?? c.stopResult}, ${c.bought} more vehicles (${plan.why})`);
+    }
+    if (c.stage === 'quote') {
+      const purpose = new Set(plan.sites.map(s => s.townId)).size >= 2 ? 'intercity' : 'city';
+      const [f] = yield* roadForecasts(g, me, plan.sites, { model: plan.model, vehicles: plan.vehicles, loop: !!plan.loop, purpose }, [plan.vehicles], -1, c.forecast!);
+      delete c.forecast;
+      const again = { revenue: worth(f), yearly: plan.yearly };
+      if (!pays(again)) return fail(key, `forecast now ${Math.round(again.revenue / 1000)}k/year below ${Math.round(plan.yearly / 1000)}k`, 720);
+      if (plan.outlay > h.available() + 200_000 || !h.borrowFor(plan.outlay)) return fail(key, 'no money', 360);
+      c.stage = 'lineStops'; continue;
+    }
+    if (c.stage === 'lineStops') {
+      if (c.at >= plan.sites.length) { c.at = 0; c.stage = 'lineDepot'; continue; }
+      const sid = yield* resumeBuildStop(h, plan.sites[c.at], c);
+      if (sid < 0 || c.ids.includes(sid)) return fail(key, 'stop sites taken', 360);
+      c.ids.push(sid); c.at++; continue;
+    }
+    if (c.stage === 'lineDepot') {
+      c.depot = yield* resumeDepotFor(h, c.ids[0], c);
+      if (c.depot < 0) return fail(key, 'no depot site', 720);
+      c.capturedDepot = g.depots.get(c.depot)!;
+      c.stage = 'lineReach'; c.at = 0;
+      continue;
+    }
+    if (c.stage === 'lineReach') {
+      if (c.at < c.ids.length) { c.stage = 'lineReachCheck'; yield; continue; }
+      const line = g.lines.create('road', me); c.line = line;
+      const project = h.project(); if (project) project.roadLine = line.id;
+      line.stops = plan.loop ? [...c.ids] : outAndBack(c.ids);
+      if (plan.loop) line.loop = true;
+      c.at = 0; c.stage = 'lineVehicles'; continue;
+    }
+    if (c.stage === 'lineReachCheck') {
+      if (!roadDepotReaches(g, c.capturedDepot!, c.ids[c.at])) return fail(key, 'no road route', 720);
+      c.at++; c.stage = 'lineReach'; continue;
+    }
+    if (c.stage === 'lineVehicles') {
+      if (c.at >= plan.vehicles) { c.stage = 'lineFinish'; continue; }
+      const v = g.vehicles.buyRoad(c.depot, plan.model, c.line!.id);
+      if (typeof v !== 'string') { ownRoadPurchase(h, v.id); c.bought++; h.stats.vehicles++; }
+      c.at++; yield; continue;
+    }
+    if (c.stage === 'lineFinish') {
+      const line = c.line!;
+      if (!c.bought) { g.lines.delete(line.id); return fail(key, 'could not buy vehicles', 360); }
+      h.managed.set(line.id, { kind: 'bus', towns: [...plan.towns], depot: c.depot, maxVehicles: Math.max(plan.vehicles + 1, plan.loop ? 6 : 5), opened: g.day });
+      h.stats.lines++; if (plan.towns.length >= 2) h.stats.coaches++;
+      const A = g.towns.list[plan.towns[0]], B = g.towns.list[plan.towns[1]];
+      g.postNews(B ? `${g.company(me).name} starts coaches between ${A?.name} and ${B.name}.` : `${g.company(me).name} starts a bus line in ${A?.name ?? 'town'}.`, 'ai', A?.x, A?.z);
+      const id = h.canonical(line.id);
+      return finish(`opened ${g.lines.get(id)?.name ?? line.name} (${c.ids.length} stops, ${c.bought} vehicles; ${plan.why})`);
+    }
+    throw new Error('Invalid road build continuation stage');
   }
-  if (plan.outlay > h.available() + 200_000 || !h.borrowFor(plan.outlay)) return fail(key, 'no money', 360);
-  const ids: number[] = [];
-  for (const s of plan.sites) {
-    const sid = yield* buildStop(h, s);
-    if (sid < 0 || ids.includes(sid)) return fail(key, 'stop sites taken', 360);
-    ids.push(sid);
-  }
-  const dep = yield* depotFor(h, ids[0]);
-  if (dep < 0) return fail(key, 'no depot site', 720);
-  const dp = g.depots.get(dep)!;
-  for (const sid of ids) { yield; if (!roadDepotReaches(g, dp, sid)) return fail(key, 'no road route', 720); }
-  const line = g.lines.create('road', me);
-  line.stops = plan.loop ? [...ids] : outAndBack(ids);
-  if (plan.loop) line.loop = true;
-  let bought = 0;
-  for (let i = 0; i < plan.vehicles; i++) { const v = g.vehicles.buyRoad(dep, plan.model, line.id); if (typeof v !== 'string') { bought++; h.stats.vehicles++; } yield; }
-  if (!bought) { g.lines.delete(line.id); return fail(key, 'could not buy vehicles', 360); }
-  h.managed.set(line.id, { kind: 'bus', towns: [...plan.towns], depot: dep, maxVehicles: Math.max(plan.vehicles + 1, plan.loop ? 6 : 5), opened: g.day });
-  h.stats.lines++;
-  if (plan.towns.length >= 2) h.stats.coaches++;
-  const A = g.towns.list[plan.towns[0]], B = g.towns.list[plan.towns[1]];
-  g.postNews(B ? `${g.company(me).name} starts coaches between ${A?.name} and ${B.name}.` : `${g.company(me).name} starts a bus line in ${A?.name ?? 'town'}.`, 'ai', A?.x, A?.z);
-  const id = h.canonical(line.id);
-  return `opened ${g.lines.get(id)?.name ?? line.name} (${ids.length} stops, ${bought} vehicles; ${plan.why})`;
 }
 
 // ============================================================================ a bus line upgraded to trams, light rail or a metro
@@ -1926,32 +2272,55 @@ export function planTramUpgrade(g: Game, lineId: number, owner: number, trams?: 
  * the buses' (both calibrated by the line's receipts), the tracks', depot's and trams' costs and upkeep against the
  * buses' running costs and resale. Null when the line cannot take trams.
  */
-export function* tramUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan | null> {
+export function* tramUpgradeValue(h: BusHost, l: Line, cursor?: TramValueCursor): Generator<void, RoadPlan | null> {
+  const c = cursor ?? newTramValueCursor(), input = c.line ??= l;
+  return yield* resumeTramValue(h, input, c);
+}
+
+export interface TramValueCursor {
+  line?: Line;
+  state?: ReturnType<typeof tramValueSetup>; stage: 'before' | 'after'; baseline?: RoadForecastCursor; forecast: RoadForecastCursor;
+  before?: RoadForecast; after?: { cal: number; busYear: number; quote: UpgradeQuote; fleets: number[] };
+}
+export const newTramValueCursor = (): TramValueCursor => ({ stage: 'before', baseline: newRoadForecastCursor(), forecast: newRoadForecastCursor() });
+function tramValueSetup(h: BusHost, l: Line) {
   const g = h.g, me = h.me, route = routeOf(g, l);
   const base = planTramUpgrade(g, l.id, me);
   if (!base.ok || !base.model || !route) return null;
   const buses = fleetOf(g, l, me);
   if (!buses.model || !buses.vehicles.length) return null;
   const sites = route.path.map((id) => siteOf(g.stations.get(id)!));
-  const [before] = yield* busCityForecast(g, me, sites, { model: buses.model, vehicles: buses.vehicles.length, loop: route.loop }, undefined, l.id);
-  const cal = calibration(l, before, lineAge(g, l));
-  const busYear = buses.vehicles.length * runningCost(g, buses.model, before.hop);
-  const quote = planRouteUpgrade(g, l.id, me, 'tram');
-  if (!quote.ok) return null;
+  return { route, base, busModel: buses.model, busCount: buses.vehicles.length, sites };
+}
+
+function* resumeTramValue(h: BusHost, l: Line, c: TramValueCursor): Generator<void, RoadPlan | null> {
+  if (c.state === undefined) c.state = tramValueSetup(h, l);
+  if (!c.state) return null;
+  const g = h.g, me = h.me, { route, base, busModel, busCount, sites } = c.state;
+  if (c.stage === 'before') {
+    c.before = (yield* roadForecasts(g, me, sites, { model: busModel, vehicles: busCount, loop: route.loop, purpose: 'city' }, [busCount], l.id, c.baseline ??= newRoadForecastCursor()))[0];
+    delete c.baseline;
+    const before = c.before;
+    const cal = calibration(l, before, lineAge(g, l));
+    const busYear = busCount * runningCost(g, busModel, before.hop);
+    const quote = planRouteUpgrade(g, l.id, me, 'tram');
+    if (!quote.ok) return null;
+    const fleets = [base.trams, base.trams + 1];
+    c.after = { cal, busYear, quote, fleets }; c.stage = 'after';
+  }
+  const before = c.before!, { cal, busYear, quote, fleets } = c.after!;
   let best: RoadPlan | null = null;
-  const fleets = [base.trams, base.trams + 1];
-  const fs = yield* busCityForecast(g, me, sites, { model: base.model, vehicles: base.trams, loop: route.loop,
-    futureTramEdges: quote.fresh }, fleets, l.id);
+  const fs = yield* roadForecasts(g, me, sites, { model: base.model!, vehicles: base.trams, loop: route.loop, purpose: 'city', futureTramEdges: quote.fresh }, fleets, l.id, c.forecast);
   for (const [m, n] of fleets.entries()) {
     const up = n === base.trams ? base : planTramUpgrade(g, l.id, me, n);
     const f = fs[m];
     const gain = worth(f, cal) - worth(before, cal);
     // trams' running, the tracks' and depot's upkeep and capital (tracks written off over 30 years), less the buses'
     const fixed = up.trackCost + quote.depot;
-    const yearly = n * runningCost(g, base.model, f.hop) - busYear + up.trackLength * TRAM.maintPerUnit + (up.depot >= 0 ? 0 : 9000)
-      + capital(g, me, n * base.model.cost) + fixed * (1 / 30 + (g.company(me).economy.interestRate ?? 0.05));
+    const yearly = n * runningCost(g, base.model!, f.hop) - busYear + up.trackLength * TRAM.maintPerUnit + (up.depot >= 0 ? 0 : 9000)
+      + capital(g, me, n * base.model!.cost) + fixed * (1 / 30 + (g.company(me).economy.interestRate ?? 0.05));
     const works: UpgradeQuote = { ...quote, vehicles: n, fleet: up.tramCost, cost: quote.cost - quote.fleet + up.tramCost };
-    const plan: RoadPlan = { kind: 'upgrade', line: l.id, sites: [], model: base.model, vehicles: n, towns: [...new Set(sites.map((x) => x.townId))].filter((t) => t >= 0),
+    const plan: RoadPlan = { kind: 'upgrade', line: l.id, sites: [], model: base.model!, vehicles: n, towns: [...new Set(sites.map((x) => x.townId))].filter((t) => t >= 0),
       revenue: gain, yearly, outlay: Math.max(1, works.cost), works,
       why: `${l.name} to trams: +${Math.round(gain / 1000)}k/year against ${Math.round(yearly / 1000)}k, ${n} trams, ${Math.round(works.cost / 1000)}k` };
     if (!best || plan.revenue - plan.yearly > best.revenue - best.yearly) best = plan;
@@ -1969,20 +2338,42 @@ export const railUpgradeProbe: { log?: (s: string) => void } = {};
  * their running costs and the stops that go: the gain must repay the works (over 30 years) and the trains' capital.
  * Null when it cannot be built.
  */
-export function* cityRailUpgradeValue(h: BusHost, l: Line, mode: 'lightrail' | 'metro', level: UpgradeLevel): Generator<void, RoadPlan | null> {
-  const g = h.g, me = h.me, route = routeOf(g, l);
-  if (!route) return null;
-  const r = yield* cityRailPlanGen(g, l.id, me, mode, level);
-  const unit = MODEL_BY_ID.get(r.quote.cars[0] ?? '');
-  if (!r.quote.ok || !unit || !r.quote.yard) return null;
-  const buses = fleetOf(g, l, me);
-  if (!buses.model || !buses.vehicles.length) return null;
-  const sites = route.path.map((id) => siteOf(g.stations.get(id)!));
-  const [before] = yield* busCityForecast(g, me, sites, { model: buses.model, vehicles: buses.vehicles.length, loop: route.loop }, undefined, l.id);
-  const cal = calibration(l, before, lineAge(g, l));
-  const busYear = buses.vehicles.length * runningCost(g, buses.model, before.hop);
-  const e = cityRailEconomics(g, me, h.available(), r.plans, mode, level, [unit], 2, r.links, r.quote.yard.cost, r.quote.yard.length, l.id);
-  yield;
+export function* cityRailUpgradeValue(h: BusHost, l: Line, mode: 'lightrail' | 'metro', level: UpgradeLevel, cursor?: CityValueCursor): Generator<void, RoadPlan | null> {
+  const c = cursor ?? newCityValueCursor(), input = c.input ??= { line: l, mode, level };
+  return yield* resumeCityValue(h, input.line, input.mode, input.level, c);
+}
+
+export interface CityValueCursor {
+  input?: { line: Line; mode: 'lightrail' | 'metro'; level: UpgradeLevel };
+  stage: 'init' | 'plan' | 'before' | 'finish'; route?: NonNullable<ReturnType<typeof routeOf>>;
+  plan?: CityRailPlanCursor; planned?: { r: import('./route-works').CityRailPlan; unit: VehicleModel; busModel: VehicleModel; busCount: number; sites: RoadSite[] };
+  baseline?: RoadForecastCursor; after?: { before: RoadForecast; cal: number; busYear: number; e: ReturnType<typeof cityRailEconomics> };
+}
+export const newCityValueCursor = (): CityValueCursor => ({ stage: 'init', plan: newCityRailPlanCursor(), baseline: newRoadForecastCursor() });
+function* resumeCityValue(h: BusHost, l: Line, mode: 'lightrail' | 'metro', level: UpgradeLevel, c: CityValueCursor): Generator<void, RoadPlan | null> {
+  const g = h.g, me = h.me;
+  if (c.stage === 'init') { const route = routeOf(g, l); if (!route) return null; c.route = route; c.stage = 'plan'; }
+  const route = c.route!;
+  if (c.stage === 'plan') {
+    const r = yield* cityRailPlanGen(g, l.id, me, mode, level, c.plan ??= newCityRailPlanCursor());
+    delete c.plan;
+    const unit = MODEL_BY_ID.get(r.quote.cars[0] ?? '');
+    if (!r.quote.ok || !unit || !r.quote.yard) return null;
+    const buses = fleetOf(g, l, me);
+    if (!buses.model || !buses.vehicles.length) return null;
+    const sites = route.path.map((id) => siteOf(g.stations.get(id)!));
+    c.planned = { r, unit, busModel: buses.model, busCount: buses.vehicles.length, sites }; c.stage = 'before';
+  }
+  const { r, unit, busModel, busCount, sites } = c.planned!;
+  if (c.stage === 'before') {
+    const before = (yield* roadForecasts(g, me, sites, { model: busModel, vehicles: busCount, loop: route.loop, purpose: 'city' }, [busCount], l.id, c.baseline ??= newRoadForecastCursor()))[0];
+    delete c.baseline;
+    const cal = calibration(l, before, lineAge(g, l));
+    const busYear = busCount * runningCost(g, busModel, before.hop);
+    const e = cityRailEconomics(g, me, h.available(), r.plans, mode, level, [unit], 2, r.links, r.quote.yard!.cost, r.quote.yard!.length, l.id);
+    c.after = { before, cal, busYear, e }; c.stage = 'finish'; yield;
+  }
+  const { before, cal, busYear, e } = c.after!;
   // (the city-rail planner's own forecast, as it opens a city railway; the buses at what they are seen to earn)
   const gain = e.forecast.revenue - worth(before, cal);
   if (railUpgradeProbe.log) railUpgradeProbe.log(`${mode} ${level}: rail ${Math.round(e.forecast.revenue / 1000)}k (${Math.round(e.forecast.boardings)} boardings, ${Math.round(e.forecast.covered)} covered), buses ${Math.round(worth(before, cal) / 1000)}k (cal ${cal.toFixed(2)}, seen ${Math.round(l.incomeLast / 1000)}k last year)`);
@@ -2004,21 +2395,33 @@ export function* cityRailUpgradeValue(h: BusHost, l: Line, mode: 'lightrail' | '
  * on the ground, or a metro, each by its forecast against its costs (incentives: no mode is preferred). The best that
  * pays, else the best (the caller marks the line), or null when none can be built.
  */
-export function* routeUpgradeValue(h: BusHost, l: Line): Generator<void, RoadPlan | null> {
-  const plans: RoadPlan[] = [];
-  const tram = yield* tramUpgradeValue(h, l);
-  if (tram) plans.push(tram);
-  // (city railways are planned station by station: a line where none pays is looked at again in a year)
-  if (!h.isFailed('railup' + l.id)) {
-    let paid = false;
-    for (const [mode, level] of [['lightrail', 'elevated'], ['lightrail', 'ground'], ['metro', 'underground']] as const) {
-      const p = yield* cityRailUpgradeValue(h, l, mode, level);
-      if (p) { plans.push(p); paid ||= pays(p); }
-    }
-    if (!paid) h.markFailed('railup' + l.id, 360);
+export function* routeUpgradeValue(h: BusHost, l: Line, cursor?: RouteUpgradeCursor): Generator<void, RoadPlan | null> {
+  const c = cursor ?? newRouteUpgradeCursor(), input = c.line ??= l;
+  return yield* resumeRouteUpgrade(h, input, c);
+}
+
+export interface RouteUpgradeCursor {
+  line?: Line;
+  stage: 'tram' | 'railInit' | 'city' | 'done'; plans: RoadPlan[]; tram?: TramValueCursor; city?: CityValueCursor; at: number; paid: boolean;
+}
+export const newRouteUpgradeCursor = (): RouteUpgradeCursor => ({ stage: 'tram', plans: [], tram: newTramValueCursor(), at: 0, paid: false });
+function* resumeRouteUpgrade(h: BusHost, l: Line, c: RouteUpgradeCursor): Generator<void, RoadPlan | null> {
+  if (c.stage === 'tram') {
+    const tram = yield* tramUpgradeValue(h, l, c.tram ??= newTramValueCursor());
+    if (tram) c.plans.push(tram); delete c.tram; c.stage = 'railInit';
+  }
+  if (c.stage === 'railInit') c.stage = h.isFailed('railup' + l.id) ? 'done' : 'city';
+  while (c.stage === 'city') {
+    const modes = [['lightrail', 'elevated'], ['lightrail', 'ground'], ['metro', 'underground']] as const;
+    if (c.at >= modes.length) { if (!c.paid) h.markFailed('railup' + l.id, 360); c.stage = 'done'; break; }
+    const [mode, level] = modes[c.at]; c.city ??= newCityValueCursor();
+    const plan = yield* cityRailUpgradeValue(h, l, mode, level, c.city);
+    if (plan) { c.plans.push(plan); c.paid ||= pays(plan); }
+    c.at++; delete c.city;
   }
   let best: RoadPlan | null = null;
-  for (const p of plans) if (!best || Number(pays(p)) - Number(pays(best)) > 0 || (pays(p) === pays(best) && p.revenue - p.yearly > best.revenue - best.yearly)) best = p;
+  for (const plan of c.plans) if (!best || Number(pays(plan)) - Number(pays(best)) > 0
+    || (pays(plan) === pays(best) && plan.revenue - plan.yearly > best.revenue - best.yearly)) best = plan;
   return best;
 }
 

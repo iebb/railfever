@@ -216,7 +216,14 @@ check(opening.g.vehicles.get(opening.tr.id) === opening.tr && JSON.stringify(ser
 const savedProject = serialize(opening.g).ais.find((a: any) => a.companyId === opening.me)!.state.project;
 check(savedProject.openingLine === opening.l.id && savedProject.line === -1,
   'the final timetable relation is saved separately from project cleanup ownership');
-const loaded = deserialize(JSON.parse(openingSave)), loadedAI = loaded.aiOf(opening.me)! as any;
+const resumedOpening = deserialize(JSON.parse(openingSave)), resumedAI = resumedOpening.aiOf(opening.me)! as any;
+resumedAI.manageSharedCapacity();
+check(resumedAI.busy && resumedAI.project?.openingLine === opening.l.id && !!resumedOpening.vehicles.get(opening.tr.id),
+  'saved shared continuation retains its active opening relation and existing stock');
+// Reproduce the older format explicitly: it has the project relation, but no shared-job continuation.
+const legacyOpening = JSON.parse(openingSave), legacyState = legacyOpening.ais.find((a: any) => a.companyId === opening.me).state;
+delete legacyState.share; delete legacyState.splitPieces;
+const loaded = deserialize(legacyOpening), loadedAI = loaded.aiOf(opening.me)! as any;
 check(!loadedAI.busy && loadedAI.project === null && loaded.lines.get(opening.l.id)?.stops.join(',') === opening.l.stops.join(','),
   'legacy load cleanup cancels opening deferral and retains the established timetable');
 loadedAI.manageSharedCapacity();

@@ -1196,6 +1196,51 @@ export interface UrbanGrowthQuote {
   line: number; cursor: GrowCursor; score: number; towns: number[]; mode: 'metro' | 'lightrail';
 }
 
+/** A chooser's marginal survey, distinct from the paid growTask construction cursor. */
+export interface UrbanGrowthProbe {
+  stage: 'init' | 'fleet' | 'extensions' | 'done'; line?: Line; path?: number[];
+  fleets?: GrowOption[]; opts?: GrowOption[]; at: number; pending: boolean; fleetScore: number; best: UrbanGrowthQuote | null;
+}
+
+export function newUrbanGrowthProbe(): UrbanGrowthProbe {
+  return { stage: 'init', at: 0, pending: false, fleetScore: 0, best: null };
+}
+
+/** Same yield-before-evaluate cadence as probeUrbanGrowth, with no retained generator-only input. */
+export function* resumeUrbanGrowthProbe(h: GrowHost, lineId: number, c: UrbanGrowthProbe): Generator<void, UrbanGrowthQuote | null> {
+  if (c.stage === 'init') {
+    const l = h.g.lines.get(lineId), path = l ? growLine(h, l) : null;
+    if (!l || !path || h.ai.railPolicy.deepTrouble || (h.ai.railPolicy.accounts.get(l.id)?.step ?? 0) > 0) { c.stage = 'done'; return null; }
+    const surveyed = survey(h, l, path);
+    c.line = l; c.path = path; c.opts = surveyed.filter(o => o.kind === 'ext'); c.fleets = surveyed.filter(o => o.kind === 'fleet'); c.stage = 'fleet';
+  }
+  const l = c.line!, path = c.path!;
+  while (c.stage === 'fleet') {
+    if (c.at >= c.fleets!.length) { c.at = 0; c.stage = 'extensions'; break; }
+    if (!c.pending) { c.pending = true; yield; }
+    const ev = evaluate(h, l, path, c.fleets![c.at]);
+    if (ev && ev !== 'busy') c.fleetScore = Math.max(c.fleetScore, ev.score);
+    c.at++; c.pending = false;
+  }
+  while (c.stage === 'extensions') {
+    if (c.at >= c.opts!.length) { c.stage = 'done'; break; }
+    if (!c.pending) { c.pending = true; yield; }
+    const i = c.at, opts = c.opts!, ev = evaluate(h, l, path, opts[i]);
+    if (ev && ev !== 'busy' && !ev.fleet && ev.capital > 0 && !(ev.score <= c.fleetScore)) {
+      const T = h.g.stations.get(path[opts[i].end ? path.length - 1 : 0])!, sv = serviceOf(h, l, path, [T.id]);
+      const mode = sv && growthMode(T, sv);
+      if (mode === 'metro' || mode === 'lightrail') {
+        const years = payback(h, mode), score = (Math.sqrt(Math.max(0, (ev.net - ev.capital / years) / ev.capital)) + .15) * years / 4.5;
+        if (!c.best || score > c.best.score) c.best = { line: l.id, score, mode,
+          towns: [...new Set(path.map(id => h.g.stations.get(id)!.townId).filter(id => id >= 0))],
+          cursor: { at: opts.length + 1, opts, best: { opt: i, score: ev.score } } };
+      }
+    }
+    c.at++; c.pending = false;
+  }
+  return c.best;
+}
+
 /** Cheap inventory only; actual native proposals and marginal service economics decide the handoff. */
 export function urbanGrowthCandidates(g: Game, owner: number): Line[] {
   return g.lines.all().filter(l => l.kind === 'rail' && l.owner === owner && l.loop !== true && !!linearStops(l.stops)
@@ -1207,29 +1252,7 @@ export function urbanGrowthCandidates(g: Game, owner: number): Line[] {
 
 /** One rotating line, at most six alternatives; construction is repriced again in the saved task. */
 export function* probeUrbanGrowth(h: GrowHost, lineId: number): Generator<void, UrbanGrowthQuote | null> {
-  const l = h.g.lines.get(lineId), path = l ? growLine(h, l) : null;
-  if (!l || !path || h.ai.railPolicy.deepTrouble || (h.ai.railPolicy.accounts.get(l.id)?.step ?? 0) > 0) return null;
-  const surveyed = survey(h, l, path), opts = surveyed.filter(o => o.kind === 'ext');
-  let fleetScore = 0;
-  for (const o of surveyed.filter(o => o.kind === 'fleet')) {
-    yield;
-    const ev = evaluate(h, l, path, o);
-    if (ev && ev !== 'busy') fleetScore = Math.max(fleetScore, ev.score);
-  }
-  let best: UrbanGrowthQuote | null = null;
-  for (let i = 0; i < opts.length; i++) {
-    yield;
-    const ev = evaluate(h, l, path, opts[i]);
-    if (!ev || ev === 'busy' || ev.fleet || !(ev.capital > 0) || ev.score <= fleetScore) continue;
-    const T = h.g.stations.get(path[opts[i].end ? path.length - 1 : 0])!, sv = serviceOf(h, l, path, [T.id]);
-    const mode = sv && growthMode(T, sv);
-    if (mode !== 'metro' && mode !== 'lightrail') continue;
-    const years = payback(h, mode), score = (Math.sqrt(Math.max(0, (ev.net - ev.capital / years) / ev.capital)) + .15) * years / 4.5;
-    if (!best || score > best.score) best = { line: l.id, score, mode,
-      towns: [...new Set(path.map(id => h.g.stations.get(id)!.townId).filter(id => id >= 0))],
-      cursor: { at: opts.length + 1, opts, best: { opt: i, score: ev.score } } };
-  }
-  return best;
+  return yield* resumeUrbanGrowthProbe(h, lineId, newUrbanGrowthProbe());
 }
 
 /** A station cut into the line's track between two stops near the option's point; a reason when none fits. */
