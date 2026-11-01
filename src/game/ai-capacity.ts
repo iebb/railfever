@@ -541,6 +541,24 @@ export function marginalSharedTrain(g: Game, l: Line, owner: number, cars: Vehic
   counts[i]++; return netValue(g, channels, counts, inv) - before;
 }
 
+/** The same proposed departure's pooled surplus and the investor's own net. Fees paid to a routed
+ * partner cancel in the pool, but must still be repaid by the company buying the train. */
+export function marginalTrainInvestment(g: Game, l: Line, owner: number, cars: VehicleModel[], pattern?: number): { pooled: number; investor: number } {
+  const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv, { line: l, owner, cars, pattern });
+  const pid = patternOf(l, pattern)?.id ?? 0, i = channels.findIndex(c => c.line.id === l.id && c.owner === owner && c.pattern === pid);
+  if (i < 0) return { pooled: -Infinity, investor: -Infinity };
+  const counts = channels.map(c => c.trains.length);
+  const value = () => {
+    const fares = receipts(g, channels, counts, inv), fees = accessPayments(g, channels, counts);
+    const net = (onlyInvestor: boolean) => fares.reduce((n, r, j) => onlyInvestor && channels[j].owner !== owner ? n
+      : n + r - counts[j] * (channels[j].running + channels[j].capital * 0.03), 0)
+      - fees.reduce((n, fee, j) => n + (onlyInvestor && channels[j].owner !== owner ? 0 : fee), 0);
+    return { pooled: net(false), investor: net(true) };
+  };
+  const before = value(); counts[i]++; const after = value();
+  return { pooled: after.pooled - before.pooled, investor: after.investor - before.investor };
+}
+
 export function sharedTrainAllowed(g: Game, l: Line, owner: number, cars: VehicleModel[], pattern?: number): boolean {
   if (!usesSharedRail(g, l)) {
     // Private openings retain their project's fare/cost approval, but cannot bypass a physical closed

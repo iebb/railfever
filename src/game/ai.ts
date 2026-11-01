@@ -210,7 +210,7 @@ export function cityRailEconomics(g: Game, owner: number, available: number, poi
 }
 
 /** A paid opening train starts at a served call its actual depot/consist can reach and leave lawfully. */
-export function openingRailCall(g: Game, t: Train, preferredStation = -1): number {
+export function openingRailCall(g: Game, t: Pick<Train, 'line' | 'depotId' | 'owner' | 'pattern' | 'rule' | 'length' | 'id'>, preferredStation = -1): number {
   const l = t.line, dp = g.depots.get(t.depotId), stub = dp && g.world.net.edges.get(dp.edge);
   if (!l || !dp || !stub || dp.kind !== 'rail' || stub.kind !== 'rail' || dp.owner !== t.owner
     || g.lines.operateError(l, t.owner)) return -1;
