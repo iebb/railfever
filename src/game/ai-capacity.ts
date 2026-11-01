@@ -1,4 +1,5 @@
 // An operating agreement for shared railway capacity. All amounts are annual fares/costs, not fleet quotas.
+import { nativeQueueTimetable, nativeQueueFootprint, stockKey } from './queue-forecast';
 import type { Game } from './game';
 import type { Line } from './lines';
 import type { NEdge } from './network';
@@ -37,7 +38,7 @@ interface Channel {
   use: Map<number, number>; limit: number;
   access: Map<number, { item: AccessItem; use: number }>;
   /** Whole-route bid; mixed, partial and circular services retain the existing conservative model. */
-  native?: { path: number[]; share: number; seats: number };
+  native?: { path: number[]; share: number; seats: number; sameQuoteStock?: boolean };
   cell?: AtomicTerminalCell;
 }
 export interface CapacityAllocation { line: number; owner: number; pattern: number; trains: number; traffic: number }
@@ -64,15 +65,21 @@ function forecastEpoch(g: Game): string { return `${g.day}:${forecastInputs(g)}`
 function quoteEpoch(g: Game): string {
   return `${g.day}:${g.tick}:${forecastInputs(g)}`;
 }
-function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
+function nativeQuote(g: Game, c: Channel, headway: number, kmh: number, quotedFleet: number) {
   const epoch = forecastEpoch(g);
   let memo = forecastMemo.get(g);
   if (!memo || memo.epoch !== epoch) { memo = { epoch, quotes: new Map() }; forecastMemo.set(g, memo); }
   const stock = fleet(g, c.line).map(t => `${t.id}/${t.pattern}/${t.cars.map(m => `${m.id},${m.capacity},${m.speed}`).join(';')}`).join('|');
-  const key = `${c.line.id}:${c.line.owner}:${c.native!.path.join(',')}:${stock}:${kmh}:${headway}`;
+  const cars = c.trains.find(t => t.cars === c.cars)?.madeUp ?? c.cars;
+  // The epoch covers native line/pattern/fleet, access, geometry, walking and demand edits. Explicit
+  // quoted stock/fleet/support and queue footprints also distinguish speculative frequency/consist bids.
+  const key = `${c.line.id}:${c.line.owner}:${c.native!.path.join(',')}:${stock}:${kmh}:${headway}:`
+    + `${quotedFleet}:${c.native!.sameQuoteStock !== false}:${c.line.loop}:${stockKey(cars)}:`
+    + c.native!.path.map(id => nativeQueueFootprint(g, id)).join(',');
   const old = memo.quotes.get(key); if (old) return old;
+  const timetable = c.native!.sameQuoteStock === false ? undefined : nativeQueueTimetable(g, c.line, quotedFleet, headway, cars, kmh);
   const sites = c.native!.path.map(id => g.stations.get(id)!);
-  const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id, undefined, 'rail', plannedSet(g, sites));
+  const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id, undefined, 'rail', { ...plannedSet(g, sites), queueTimetable: timetable });
   const value = { revenue: f.revenue, boardings: f.boardings, peak: Math.max(1, ...f.legLoads) };
   if (memo.quotes.size >= 256) memo.quotes.clear();
   memo.quotes.set(key, value); return value;
@@ -330,7 +337,7 @@ function demand(g: Game, l: Line, cycle: number) {
   const trains = fleet(g, l), kmh = Math.max(20, Math.min(100, ...trains.map(t => t.maxSpeedKmh * 0.6)));
   const stations = sites as NonNullable<typeof sites[number]>[];
   const forecast = g.demand.forecastLine(stations, sites[0]?.rail ? railPartMode(sites[0].rail) : 'mainline', kmh, cycle / Math.max(1, trains.length), l.owner, l.id,
-    undefined, 'rail', plannedSet(g, stations));
+    undefined, 'rail', { ...plannedSet(g, stations), queueTimetable: nativeQueueTimetable(g, l, trains.length, cycle / Math.max(1, trains.length), undefined, kmh) });
   const ride = estimateLegTime(distance, kmh, 0), seconds = estimateLegTime(distance, kmh, cycle / Math.max(1, trains.length));
   const fare = fareFor(distance, seconds, 1, { mode: 'rail' });
   let lost = 0;
@@ -445,7 +452,8 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
         use, access, limit: use.size ? Math.min(cell ? Math.max(0, cell.slots.length - 1) : Infinity,
           Math.ceil(Math.min(...[...use].map(([rid, u]) => inv.resources[rid].available / Math.max(0.001, u))))) : 0,
         ...(cell ? { cell } : {}),
-        ...(complete ? { native: { path: route.stations, share: part,
+        ...(complete ? { native: { path: route.stations, share: part, sameQuoteStock: !candidate || candidate.line.id !== l.id
+          || stockKey(candidate.cars) === stockKey(c.trains[0]?.madeUp ?? c.cars),
           seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * .65 } } : {}) });
     }
   }
@@ -515,9 +523,9 @@ function receipts(g: Game, channels: Channel[], counts: number[], inv: RouteInve
       // Derive them for old saves too, rather than letting a warm cache choose a different baseline.
       const referenceHeadway = Math.max(1, 2 * (d.seconds - d.ride));
       const kmh = Math.max(1, d.distance * UNIT_M * 1.15 * 3.6 / Math.max(1, d.ride));
-      const reference = nativeQuote(g, c, referenceHeadway, kmh);
+      const reference = nativeQuote(g, c, referenceHeadway, kmh, actual);
       if (reference.revenue > 0) {
-        const quote = nativeQuote(g, c, 1 / frequency + 2 * delay, kmh);
+        const quote = nativeQuote(g, c, 1 / frequency + 2 * delay, kmh, proposed);
         // A protected observed/lost-demand boarding floor carries people too. Preserve a higher fare-only
         // budget without inventing riders, but scale native leg occupation when the saved boarding floor is larger.
         const boardingFloor = Math.max(1, d.boardings / Math.max(1, reference.boardings));

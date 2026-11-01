@@ -22,6 +22,7 @@
 // routing network: an inter-city trip may ride a city bus to or from the station. API for planners and the UI:
 // trips(r, q, set), tripSnapshot(), stationDemand(st, set), forecastLine(..., { set, access }) (its `sets` breakdown),
 // demandView() (towns, regions and flows by set).
+import { queueCapture, nativeQueueFootprint, nativeQueueTimetable } from './queue-forecast';
 import type { Game } from './game';
 import type { Station, StationPlan, RailMode } from './stations';
 import { WALK_LINE, PLATFORM_LENGTH, stationLayout } from './stations';
@@ -85,6 +86,7 @@ export interface CityForecast extends SetForecast { town: SetForecast }
 export interface InterCityForecast extends SetForecast { access: SetForecast }
 /** Options of forecastLine. */
 export interface ForecastOptions {
+  queueTimetable?: import('./queue-forecast').NativeQueueTimetable;
   /**
    * The demand the service is planned on: 'city' (city lines), 'intercity' (coaches and railways between towns) or
    * 'all' (default: both, as one total). The totals (boardings, revenue, transfers, legLoads) count that set only;
@@ -1180,6 +1182,17 @@ export class DemandModel {
     // shares one physical population claim and origin; it is not another passenger destination.
     const identities = points.map((p, i) => forecastStation(p)?.id ?? -i - 1);
     const first = new Map<number, number>(); identities.forEach((id, i) => { if (!first.has(id)) first.set(id, i); });
+    const candidateQueue = options.queueTimetable;
+    const queueLine = candidateQueue && replacingLine !== undefined ? this.g.lines.get(replacingLine) : undefined;
+    const currentQueue = candidateQueue && queueLine
+      ? nativeQueueTimetable(this.g, queueLine, candidateQueue.fleet, headway, undefined, kmh) : undefined;
+    const queueTimetable = fareMode === 'rail' && replacingPattern === undefined && candidateQueue !== undefined
+      && candidateQueue.line === replacingLine && Math.abs(candidateQueue.kmh - kmh) <= 1e-9 * Math.max(1, kmh)
+      && candidateQueue.headway === headway && candidateQueue.effectiveCycle === headway * candidateQueue.fleet
+      && candidateQueue.path.length === identities.length
+      && candidateQueue.path.every((id, i) => id === identities[i] && points[i] === this.g.stations.get(id))
+      && currentQueue?.key === candidateQueue.key
+      ? currentQueue : undefined;
     const ranks = [...first.keys()], rank = identities.map(id => ranks.indexOf(id));
     points = points.map((p, i) => first.get(identities[i]) === i
       ? points.find(q => 'join' in q && q.join?.id === identities[i]) ?? p : p);
@@ -1264,6 +1277,7 @@ export class DemandModel {
     // Keep the walking-only population for intra-town trips: car feeders provide regional access, not extra
     // local residents at the platforms. This matches weights() when a through railway has several city stops.
     const walking = sites.map((s) => ({ pop: s.pop, regions: new Map(s.regions) }));
+    const queueFootprintsMatch = queueTimetable?.footprints?.every((cap, i) => cap === nativeQueueFootprint(this.g, identities[i], walking[i].pop)) ?? false;
     // A city line has no cross-town trips, hence no car feeders (as in weights(): only cross-town service has a pool).
     const city = sites.every((s) => s.townId >= 0 && s.townId === sites[0].townId);
     const backgroundFeeders = new Map<number, FeederPool>();
@@ -1379,8 +1393,10 @@ export class DemandModel {
       const queue = Math.min(300, 12 + walking[i].pop * 0.035 * WALK_TRIP_INTENSITY + (fareMode === 'rail' ? tracks * length * 0.75 : 4));
       const slots = queue * (360 * DAY_SECONDS) / Math.max(1, headway) * (rank[i] === 0 || rank[i] === ranks.length - 1 ? 1 : 2);
       const capture = Math.min(1, slots / Math.max(1, sum));
+      const physical = queueFootprintsMatch ? queueCapture(queueTimetable, identities[i],
+        parts.map(p => identities[p.j]), wanted, queue + (forecastStation(points[i])?.stops.length ?? 0) * 4) : null;
       for (let j = 0; j < parts.length; j++) {
-        const p = parts[j], count = wanted[j] * capture;
+        const p = parts[j], count = physical ? physical[j] : wanted[j] * capture;
         boardings += count;
         addLegLoad(legLoads, sites.length, i, p.j, count);
         // (direct rides on the line: the full fare; a leg ending in a change or after one pays TRANSFER_FARE_FACTOR, as below)
