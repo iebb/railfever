@@ -83,6 +83,7 @@ try {
     switch (script) {
       case 'smoke': return [7, 11, 23].map((n) => ({ name: `smoke${n}`, script, args: [String(n)] }));
       case 'replay': return [7, 23].map((n) => ({ name: `replay${n}`, script, args: [String(n)] }));
+      case 'growth': return [{ name: script, script, args: ['--parallel'] }];
       case 'ainet': return [{ name: script, script, args: ['scenarios'] }];
       case 'migrate': return [{ name: script, script, args: [join(work, 'scripts/fixtures/saves')] }];
       case 'switches': return [[], ['--memory'], ['--resume']].map((args) => ({ name: `switches${args[0] || ''}`, script, args }));
@@ -142,11 +143,16 @@ try {
   // Two workers take the next independent check when ready, so a long simulation cannot leave
   // half the battery waiting behind it. Timing-sensitive tests run after both workers finish.
   let nextJob = 0;
-  const selected = jobs.filter(j => assigned.has(j.name));
+  // Run long endurance and frame-time checks without the queue competing for CPU. Growth
+  // owns at most two native child worlds; its full combined assertions and deadline remain intact.
+  const isolated = new Set(['airail', 'growth', 'linegrow']);
+  const selected = jobs.filter(j => assigned.has(j.name) && !isolated.has(j.name));
   const lanes = await Promise.allSettled([0, 1].map(async () => {
     while (nextJob < selected.length && !interrupted) if ((await run(selected[nextJob++])).rc !== 0) failed = true;
   }));
   for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
+  for (const job of jobs.filter(j => assigned.has(j.name) && isolated.has(j.name)))
+    if (!interrupted && (await run(job)).rc !== 0) failed = true;
   // The company audit also runs a child world. Keep its two-world budget separate from the queue.
   if (assigned.has('companies') && !interrupted && (await run({ name: 'companies', script: 'companies', args: [] })).rc !== 0) failed = true;
   // Save capture has frame-time budgets as well as integrity assertions. Measure those after the
@@ -155,7 +161,7 @@ try {
   if (assigned.has('ai') && !interrupted) {
     const timingOnly = ({ rc, output }) => {
       const failures = output.split('\n').filter((l) => l.includes('FAIL:'));
-      return rc === 1 && failures.length > 0 && failures.every((l) => l.includes('stays sliced')) && !/\b(?:Error|Exception):/.test(output);
+      return rc === 1 && failures.length > 0 && failures.every((l) => l.includes('stays sliced') || l.includes('AI time per day < 5 ms')) && !/\b(?:Error|Exception):/.test(output);
     };
     let result = await run({ name: 'ai', script: 'ai', args: ['23', '3', '512', '3'] });
     if (result.rc !== 0 && timingOnly(result)) {

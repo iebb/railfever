@@ -1624,6 +1624,10 @@ function extConnect(h: GrowHost, l: Line, path: number[], o: GrowOption, b: Grow
   if (turnout && g.vehicles.isEdgeBusy(turnout.edge.id)) return 'wait';
   const construction = eco.thisYear.construction, edge0 = net.nextEdge, station0 = g.stations.nextId, depot0 = g.depots.nextId;
   const fail = (why: string) => { recordWorks(h, b, construction, edge0, station0, depot0); extUndo(h, l.name, b, why); return false; };
+  // Daily loan repayment may have reclaimed the cash reserved by an earlier work unit. Restore
+  // only the approved capital still unspent (including its margin) before native finishing/site commits.
+  const remaining = Math.max(0, b.capital * 1.1 - b.spent);
+  if (remaining + 300_000 > h.ai.available() || !h.canSpend(remaining, 1)) return fail('remaining works are no longer affordable');
   let home = -1;
   // Finish the complete new pair. Routes through the old trunk can select crossover legs and omit
   // its longer companion, which makes them unsuitable inputs for discovering two physical tracks.

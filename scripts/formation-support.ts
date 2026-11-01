@@ -4,7 +4,7 @@ import { Game } from '../src/game/game';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { serialize, deserialize } from '../src/game/save';
 import { flatGame, build, free, railOpts, nodeSnap, station, endNode, check, fails } from './stationlib';
-import { roadOpts } from './lib';
+import { roadOpts, placeStationPair } from './lib';
 import { terrainFit } from './terrainfit';
 import { previewDemolition } from '../src/game/terraform';
 
@@ -22,6 +22,42 @@ import { previewDemolition } from '../src/game/terraform';
   check(JSON.stringify(counters) === JSON.stringify([net.version, net.nextNode, net.nextEdge, g.world.heightsVersion]), 'survey/refusal preserves network allocators and terrain versions');
   const fit = terrainFit(g);
   check(fit.covered === 0 && fit.floating === 0 && fit.station === 0, 'street and railway formations remain seated after refusal');
+}
+
+// Seed 11: a legal uphill departure shares distant grid corners with its level station.
+// The actual rail widths remain seated even though the core's highest sample exceeds a corner's height.
+{
+  const g = Game.create({ size: 384, seed: 11, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
+  g.aiEnabled = false; g.economy.money = 80_000_000;
+  const quiet = new Set(g.towns.list.filter(t => t.pop < 500).map(t => t.id));
+  const pair = placeStationPair(g, 60, 150, 0, quiet);
+  check(pair?.TA.name === 'Oldbury Cross' && pair.TB.name === 'Greenhurst', 'native seed-11 graded station pair retains its original sites');
+  if (pair) {
+    const quote = (world: Game) => {
+      const node = world.world.net.nearestNode(289.21402002923054, 143.13228494153756, 0.01, 'rail')!;
+      return planEdge(world, nodeSnap(world, node.id, 'rail'), free(world, 269.80163428836755, 147.9446938859165), railOpts());
+    };
+    const before = JSON.stringify(serialize(g)), baseline = terrainFit(g), proposal = quote(g);
+    check(proposal.ok && proposal.stats.maxGrade > 0.06, 'a legal steep departure is accepted using actual rail support');
+    check(JSON.stringify(serialize(g)) === before, 'exact rail-support survey preserves the complete live save');
+    const loaded = deserialize(JSON.parse(before)), cold = quote(loaded);
+    check(JSON.stringify(proposal) === JSON.stringify(cold) && JSON.stringify(serialize(loaded)) === before,
+      'cold support survey returns identical geometry and prices without state mutation');
+    const cash = g.economy.money;
+    check(commitProposal(g, proposal) === null && cash - g.economy.money === proposal.cost,
+      'supported graded departure commits at its full native price');
+    const fit = terrainFit(g);
+    check(fit.station === baseline.station && fit.covered === baseline.covered && fit.floating === baseline.floating
+      && JSON.stringify(fit.examples) === JSON.stringify(baseline.examples), 'graded departure adds no unsupported or covered rail and road surfaces');
+    check(commitProposal(loaded, cold) === null && JSON.stringify(serialize(loaded)) === JSON.stringify(serialize(g)),
+      'cold graded-departure construction preserves exact saved state');
+    let exact = true;
+    for (let tick = 0; tick < 40; tick++) {
+      g.stepTick(); loaded.stepTick();
+      if (JSON.stringify(serialize(g)) !== JSON.stringify(serialize(loaded))) { exact = false; break; }
+    }
+    check(exact, 'graded-departure state continues exactly after loading');
+  }
 }
 
 // Seed-5's native first profitable opening: its tunnel portal cutting misses the side street's axis,

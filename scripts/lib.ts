@@ -203,7 +203,7 @@ export function townPairs(g: Game, minD: number, maxD: number, exclude: Set<numb
 }
 
 /** Place a pair of 2-track stations for a rail link (feasible heights, good catchment, free leads). */
-export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16, skipPairs: Set<string> = new Set()): { A: Station; B: Station; TA: Town; TB: Town } | null {
+export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16, skipPairs: Set<string> = new Set(), nativeCatchment = false): { A: Station; B: Station; TA: Town; TB: Town } | null {
   for (const [TA, TB] of townPairs(g, minD, maxD, exclude)) {
     if (skipPairs.has(TA.id + ':' + TB.id)) continue;
     const pr = findRailPair(g, TA, TB, { tracks: 2, length, owner, front: 22 });
@@ -216,20 +216,23 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
     const B = g.stations.get(ib)!;
-    // A prospective site walk does not guarantee access from the built entrances; service tests check that too. 10 residents
-    // since the walking limits were halved after 2.9 (a quarter of the area; it was 40)
-    if (sitePop(g, A.x, A.z, 16) < 10 || sitePop(g, B.x, B.z, 16) < 10) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
+    // The centre-point walk is a cheap general-fixture screen. Village controls can use actual
+    // entrances; both retain ten residents, and service tests still require delivered passengers.
+    if (nativeCatchment) { g.flushNetworkChanges(); g.stations.recomputeCatchment(); }
+    const popA = nativeCatchment ? A.catchPop : sitePop(g, A.x, A.z, 16);
+    const popB = nativeCatchment ? B.catchPop : sitePop(g, B.x, B.z, 16);
+    if (popA < 10 || popB < 10) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
     return { A, B, TA, TB };
   }
   return null;
 }
 
 /** A connected rail link: station pairs are tried until one connects (failed attempts are removed again). */
-export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log):
+export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log, nativeCatchment = false):
   { A: Station; B: Station; TA: Town; TB: Town; con: ReturnType<typeof connectStations> } | null {
   const skip = new Set<string>();
   for (let attempt = 0; attempt < 10; attempt++) {
-    const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip);
+    const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip, nativeCatchment);
     if (!pr) return null;
     const e0 = g.world.net.nextEdge;
     const con = connectStations(g, pr.A, pr.B, owner, tracks, log);

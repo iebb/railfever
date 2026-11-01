@@ -125,7 +125,7 @@ scripts/     build inliner, headless simulation tests and shared test helpers
 
 Run the complete release checks with `npm run gate`. The gate validates a committed ref in a unique temporary worktree, includes save/UI tests, prints each result and exits nonzero on functional failures. Logs remain in `.gate/`; benchmarks and browser checks run separately. Use `npm run gate -- <ref> <output-directory>` to choose a ref or log location.
 
-CI distributes the same battery across four independent runners with `--shard=1/4` through `--shard=4/4`. Every shard retains the original seeds, simulation windows and assertions, and records its complete inventory, assignment and results in `coverage.json`. All four shards must pass; a single shard is a partial check. The default local command runs the whole battery.
+CI distributes the same battery across four independent runners with `--shard=1/4` through `--shard=4/4`. Every shard retains the original seeds, simulation windows and assertions, and records its complete inventory, assignment and results in `coverage.json`. All four shards must pass; a single shard is a partial check. The default local command runs the whole battery. The railway endurance sweep and extension frame-time check run after the worker queue, each without a competing simulation. The growth audit also runs separately, with at most two native child worlds before applying its original combined assertions. Original deadlines, seeds and simulation windows remain unchanged.
 
 The individual headless tests run in Node:
 

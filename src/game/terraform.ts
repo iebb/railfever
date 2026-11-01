@@ -168,7 +168,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   const current = (k: number) => terrain?.get(k) ?? w.h[k];
   if (terrain) view.heightAt = (x, z) => heightAtVertices(w, x, z, current);
   const stamps = new Map<number, Acc>();
-  const roads: NEdge[] = [];
+  const roads: NEdge[] = [], rails: NEdge[] = [];
   let x0 = Infinity, z0 = Infinity, x1 = -Infinity, z1 = -Infinity;
   const rail = planned.some(e => e.kind === 'rail');
   for (const p of planned) {
@@ -182,6 +182,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
     if (p.end && p.end.kind !== 'free') b.edges.push(-1);
     if (!rail || e.kind === 'rail') stampEdge(view, e, stamps, true);
     if (e.kind === 'road') roads.push(e);
+    else rails.push(e);
     const g = view.net.geo(e);
     for (let i = 0; i < g.n; i++) {
       x0 = Math.min(x0, g.pts[i * 3]); x1 = Math.max(x1, g.pts[i * 3]);
@@ -227,6 +228,36 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
   };
   for (const road of roads) if (roadUnsupported(road, view.net))
     return rail ? 'Access road conflicts with the station formation' : 'Road formation cannot be supported here';
+  // Shared grid corners overestimate the height needed under a sloping rail. Only if that
+  // broad check conflicts, project the actual earthworks and test both full rail widths.
+  let railTerrain: Map<number, number> | undefined;
+  let plannedRailsSupported: boolean | undefined;
+  const railUnsupported = (edge: NEdge, net: Network, existing: boolean) => {
+    if (!railTerrain) {
+      railTerrain = new Map(terrain);
+      earthworks(w, rails, true, view, railTerrain, terrain);
+    }
+    const projected = (x: number, z: number) => heightAtVertices(w, x, z, k => railTerrain!.get(k) ?? current(k));
+    const p = { x: 0, y: 0, z: 0 }, d = { ...p }, hw = net.halfWidth(edge);
+    const mouth = (nid: number) => existing && (net.nodes.get(nid)?.edges ?? []).some(id => {
+      const q = id === edge.id ? undefined : net.edges.get(id);
+      return q?.kind === 'rail' && net.sectionAt(q, q.a === nid ? 0 : q.len) === 'tunnel';
+    });
+    const mouthA = mouth(edge.a), mouthB = mouth(edge.b);
+    for (let s = 0.25; s < edge.len - 0.25; s += 0.25) {
+      if (net.sectionAt(edge, s) !== 'ground' || edge.sections.some(q => Math.abs(s - q.s0) < 1 || Math.abs(s - q.s1) < 1)
+        || mouthA && s < 1 || mouthB && s > edge.len - 1) continue;
+      net.pointAt(edge, s, p, d);
+      const l = Math.hypot(d.x, d.z) || 1;
+      for (const off of [-hw, -hw / 2, 0, hw / 2, hw]) {
+        const x = p.x - d.z / l * off, z = p.z + d.x / l * off, next = projected(x, z);
+        const old = existing ? w.heightAt(x, z) : undefined;
+        if (next < Math.min(old ?? Infinity, p.y - 0.35) - 1e-5
+          || next > Math.max(old ?? -Infinity, p.y - 0.02) + 1e-5) return true;
+      }
+    }
+    return false;
+  };
   const pad = 5;
   let unsupportedRoad = false;
   for (const original of w.net.edgesNear(x0 - pad, z0 - pad, x1 + pad, z1 + pad)) {
@@ -243,6 +274,7 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
     const old = new Map<number, Acc>();
     stampEdge(w, e, old, true, joined);
     const fd = formationDepth(e);
+    let checkedRailSupport = false;
     for (const [k, a] of old) {
       const next = stamps.get(k);
       if (!a.core || !next?.core) continue;
@@ -250,8 +282,17 @@ export function formationSupportError(w: World, planned: (Pick<NEdge, 'kind' | '
       const nv = w.lock[k] & LOCK.rail ? rail ? Math.min(current(k), next.hi) : current(k) : next.hi;
       const oldFloor = a.lo + fd - 0.35;
       const newFloor = next.lo + (rail ? 0.1 : 0.04) - 0.35;
-      if (nv < Math.min(w.h[k], oldFloor) - 1e-5 || nv < newFloor - 1e-5)
-        return e.kind === 'rail' ? 'Too close to track at another height' : 'Too close to road at another height';
+      // Retained rails must also survive later batch regrading, when formation locks are rebuilt.
+      // Keep their conservative floor; use interpolation only for support under the new running surface.
+      if (nv < Math.min(w.h[k], oldFloor) - 1e-5) return 'Too close to track at another height';
+      if (nv < newFloor - 1e-5 && !checkedRailSupport) {
+        // Facilities also level their entire footprint. Their formation-only descriptors do not
+        // carry the endpoint snaps needed to predict that transaction; retain their broad guard.
+        if (!rail || planned.some(q => q.kind === 'rail' && (!q.start || !q.end))) return 'Too close to track at another height';
+        plannedRailsSupported ??= !rails.some(q => railUnsupported(q, view.net, false));
+        if (!plannedRailsSupported || railUnsupported(e, w.net, true)) return 'Too close to track at another height';
+        checkedRailSupport = true;
+      }
     }
   }
   return unsupportedRoad ? 'Too close to road at another height' : null;

@@ -33,7 +33,7 @@ import { subwayOpts } from '../src/game/subway';
 import { serialize, deserialize } from '../src/game/save';
 import { depotSize } from '../src/game/build-ops';
 import { terminusOf, outerEnd } from '../src/game/ai-grow';
-import { scheduleNetworkTask, networkPlanner } from '../src/game/ai-network';
+import { scheduleNetworkTask, networkPlanner, networkItem } from '../src/game/ai-network';
 import { buildDepotBeside, quoteDepotBeside, endDepots } from '../src/game/depot-sites';
 import { onwardEnd, terminalEnd, inOnward, rectPoints } from '../src/game/onward';
 import { flat, newTown, district, cityLine, runDays, linePath, stat } from './linegrow-fixtures';
@@ -329,10 +329,33 @@ if (run('cramped')) {
     runDays(g, 5);
     const east = sts[sts.length - 1], before = linePath(line), depots0 = [...g.depots.map.keys()];
     const construction0 = g.company(me).economy.thisYear.construction;
+    let financeReplay: Game | undefined, financeSaved = false, financeExact = true, financeBought = false, loanAtSave = 0;
+    const continueFinance = () => {
+      financeReplay?.stepTick();
+      if (c.yard !== 'old' || financeBought) return;
+      const cursor = networkItem(ai)?.grow, build = cursor?.made;
+      if (!financeSaved && build && cursor!.at === (cursor!.opts?.length ?? 0) + 3) {
+        const remaining = Math.max(0, build.capital * 1.1 - build.spent), eco = g.company(me).economy;
+        check(eco.money < remaining && ai.available() > remaining + 300_000,
+          'lead finance: daily repayment leaves low cash but enough real credit for approved remaining works');
+        const checkpoint = saved(g); financeReplay = deserialize(JSON.parse(checkpoint));
+        financeExact &&= saved(financeReplay) === checkpoint; financeSaved = true; loanAtSave = eco.loan;
+      }
+      if (financeReplay && g.tick % g.ticksPerDay === 0) financeExact &&= saved(g) === saved(financeReplay);
+      if (financeSaved && linePath(line).length > before.length) {
+        financeExact &&= saved(g) === saved(financeReplay!);
+        check(g.company(me).economy.loan > loanAtSave, 'lead finance: native final works draw their approved remaining credit before committing');
+        financeBought = true; financeReplay = undefined;
+      }
+    };
     g.aiEnabled = true;
     scheduleNetworkTask(ai, 'extend', 0);
-    for (let d = 0; d < 300 && !stat(ai, 'netExtended'); d++) runDays(g, 1);
-    for (let d = 0; d < 30 && networkPlanner(ai)?.task === 'extend'; d++) runDays(g, 1);
+    for (let d = 0; d < 300 && !stat(ai, 'netExtended'); d++) runDays(g, 1, continueFinance);
+    for (let d = 0; d < 30 && networkPlanner(ai)?.task === 'extend'; d++) runDays(g, 1, continueFinance);
+    if (c.yard === 'old') {
+      check(financeSaved && financeBought, 'lead finance: saved low-cash construction actually completes its paid native depot move');
+      check(financeExact, 'lead finance: final funding, works, purchases and accounting resume exactly with cold caches');
+    }
     g.aiEnabled = false;
     const after = linePath(line), homes = new Set(line.vehicles.map((id) => (g.vehicles.get(id) as Train).depotId)), home = [...homes][0];
     const built = [...g.depots.map.keys()].filter((id) => !depots0.includes(id));
