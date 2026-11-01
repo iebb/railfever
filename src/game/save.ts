@@ -733,6 +733,10 @@ export function deserialize(d: any): Game {
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
   try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  // Legacy project cleanup can remove stations, passages and roads after the first share-cache prime.
+  // Those are real input edits, even when the saved world had no population update pending. Retain
+  // that work before loadNetwork aligns disposable road versions and the second prime consumes it.
+  const restoredPopulationPending = populationPending || g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending;
   // New saves preserve pending/current access metadata while the AI warms derived walking entries.
   const protectNetworkWarm = typeof d.catchmentAccessCurrent === 'boolean', networkAccessVersion = S.accessVersion;
   if (protectNetworkWarm) S.accessVersion = net.version;
@@ -743,7 +747,7 @@ export function deserialize(d: any): Game {
   // Prime only derived memberships with saved access; do not refresh pending access while loading.
   S.accessVersion = net.version;
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
-    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+    g.stations.restoreCatchmentShares(d.catchMaxB, restoredPopulationPending);
   S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // (after the cold share-out primes above, which would clear it)
   g.stations.accessRoadsOwed = d.catchmentAccessRoads === true;
