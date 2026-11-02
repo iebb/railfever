@@ -217,7 +217,7 @@ function natural() {
   // Fixed seeds/window were declared before observing outcomes. Balanced complements the existing focused cohort.
   const seeds = balanced ? [5] : NETWORK_COHORT.seeds;
   for (const seed of seeds) {
-    // Balanced mode reproduces the original literal runner's option insertion order and fixed-tick boundary.
+    // Balanced mode reproduces the original literal runner's option insertion order; every cohort uses exact ticks.
     const options = balanced ? { seed, size: 512, towns: 12, startYear: 1985, hilliness: 'hilly' as const, water: 'medium' as const, aiCompanies: 5 }
       : { size: 512, seed, towns: 12, hilliness: 'hilly' as const, water: 'medium' as const, startYear: 1985, aiConfigs: NETWORK_COHORT.aiConfigs };
     const g = Game.create(options);
@@ -226,7 +226,7 @@ function natural() {
     let day = -1;
     const started = performance.now();
     while (g.day < 6 * 360) {
-      if (balanced) g.stepTick(); else g.update(0.25);
+      g.stepTick();
       if (g.day !== day) {
         day = g.day;
         if (day > 0 && day % 30 === 0) monthly.push({ day, reservations: checkReservations(g), nonFinite: checkNaN(g), network: networkSnapshot(g, observed) });

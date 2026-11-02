@@ -6,6 +6,8 @@ import type { Game, AccessPolicy } from './game';
 import { roadDepotSteps, newRoadDepotCursor, type RoadDepotCursor, type RoadControllerTask, type RoadMarketTask, type NativeBusTask, type NativeCoachTask, type CoachStopCursor, newCoachStopCursor, type NativeRoadTask, townExitSteps, newTownExitCursor, nextRoadMapValue } from './ai-road-task';
 import { newAIChainCursor, aiChainCursorGen, stepAIChainCursor, type AIChainCursor } from './ai-chain-job';
 import { newShareTask, type ShareTask } from './ai-share-task';
+import { newShareOptionsCursor, resumeShareOptions, priceSharedBid, sharedBidLine, proveSharedCall, proveSharedOpening, validSharedWitness, railInvestmentScore,
+  type ShareBid, type ShareOptionsCursor, type ShareOptionsHost } from './ai-share-options';
 import { newCrossCityTask, type CrossCityTask } from './ai-crosscity-task';
 import { newCentreStationCursor, stepCentreStationCursor, stepRailDepotCursor, newRailDepotCursor, newCentralRouteCursor, stepCentralRouteCursor, type CentralRouteCursor, type CentreStationCursor, type RailDepotCursor } from './ai-rail-job';
 import type { Town } from './towns';
@@ -13,7 +15,7 @@ import type { Station, StationPlan } from './stations';
 import { planStationUpgrade, commitStationUpgrade, relocateStation, railModeOf, railPartMode, stationLayout, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
 import { defaultStationStyle } from './station-styles';
 import { finishDoubleTrack, DoublePlan, DoubleEnd, DoubleResult, FinishOpts, Step } from './trackops';
-import { electrify, UNDERGROUND_DEPOT, type Depot } from './build-ops';
+import { electrify, UNDERGROUND_DEPOT, depotUpkeep, type Depot } from './build-ops';
 import * as Signals from './signals';
 import * as Trackops from './trackops';
 import type { NEdge, Section } from './network';
@@ -1508,7 +1510,7 @@ interface UrbanSurvey {
 }
 
 interface SelectionOption {
-  score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number; join?: number;
+  score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; shareBid?: ShareBid; hub?: number; join?: number;
   urbanLayout?: UrbanLayout; growth?: UrbanGrowthQuote; viable?: boolean; extensionScore?: number; road?: RoadPlan;
 }
 /** Object identity guards remain live references in memory; the save codec records whether they are still current. */
@@ -1529,7 +1531,7 @@ interface SelectionRail {
 }
 interface SelectionTask {
   version: 1;
-  stage: 'init' | 'demand' | 'rail' | 'crosscity' | 'hsr' | 'alternatives' | 'growth' | 'urbanChoice' | 'urbanStart' | 'urban' | 'late' | 'road' | 'rank';
+  stage: 'init' | 'demand' | 'rail' | 'crosscity' | 'hsr' | 'alternatives' | 'sharing' | 'surfaceAlternatives' | 'growth' | 'urbanChoice' | 'urbanStart' | 'urban' | 'late' | 'road' | 'rank';
   context?: {
     config: AIConfig; focus: AIConfig['focus']; act: number; avail: number; own: [number, LineInfo][]; lastInvestment: number; preferredWeight: number;
     railLines: number; busLines: number; tramLines: number; operating: number[]; hq?: number;
@@ -1541,6 +1543,7 @@ interface SelectionTask {
   urban?: { town: number; mode: 'metro' | 'lightrail'; survey?: UrbanSurvey };
   growth?: { line: number; cursor: UrbanGrowthProbe };
   road?: RoadOptionsCursor;
+  sharing?: ShareOptionsCursor;
 }
 interface AccessTask { station: number; stage: 'road' | 'roadCommit' | 'rebuild' | 'rebuildCommit'; side: number; road?: Proposal; plan?: StationPlan }
 
@@ -2025,10 +2028,10 @@ export class AIController {
   }
 
   /** Debug/test hook: run trains on `owner`'s railway between its stations a and b (track access). */
-  startShare(owner: number, a: number, b: number, joinLine = -1): boolean {
+  startShare(owner: number, a: number, b: number, joinLine = -1, bid?: ShareBid): boolean {
     if (this.job || this.disposed) return false;
     this.project = { kind: 'share', towns: [], stations: [], edges: [], depots: [], line: -1, started: this.game.day };
-    this.job = this.shareJob(owner, a, b, joinLine);
+    this.job = this.shareJob(owner, a, b, joinLine, bid);
     this.state.projects++;
     return true;
   }
@@ -2267,7 +2270,7 @@ export class AIController {
           const capital = outlay * .03 + p.infrastructure * amortisation;
           const upkeep = (p.hub !== undefined || p.joined !== undefined ? 1 : 2) * (20_000 + 2 * p.L * 500) + 12_000 + p.trackCost * .01;
           const yearly = sv.running + mail.yearly + sv.trackUpkeep + upkeep + capital;
-          if (revenue > yearly) p.score = Math.max(p.score, (Math.sqrt(Math.max(0, (revenue - yearly) / Math.max(1, outlay))) + .15) * years / 9);
+          if (revenue > yearly) p.score = Math.max(p.score, railInvestmentScore(revenue - yearly, outlay, this.config.risk));
         }
         p.fleet++; p.stage = 'fleet'; continue;
       }
@@ -2453,8 +2456,21 @@ export class AIController {
             else this.state.corridor = undefined;
           } else this.state.corridor = undefined;
         }
-        // trains on another company's railway (track access): much cheaper than building
-        if (focus.rail > 0 && avail > 1_800_000) this.shareOptions(opts, own, D);
+        t.stage = 'sharing';
+        yield;
+      }
+      if (t.stage === 'sharing') {
+        if (focus.rail > 0 && avail > 0) {
+          const cursor = t.sharing ??= newShareOptionsCursor(g);
+          while (cursor.at < cursor.lines.length) {
+            const found = yield* resumeShareOptions(this.sharedServiceHost(avail, own), cursor);
+            opts.push(...found);
+            yield;
+          }
+        }
+        delete t.sharing; t.stage = 'surfaceAlternatives';
+      }
+      if (t.stage === 'surfaceAlternatives') {
         // long-distance coaches over the country roads between towns
         const coach = pickCoach(g.year);
         if (focus.road > 0 && avail > 900_000 && coach) {
@@ -2642,7 +2658,7 @@ export class AIController {
       this.job = pick.kind === 'rail' ? this.railJob(railEnds[0], railEnds[1], pick.hub ?? -1, 'standard', true, pick.join ?? -1)
         : pick.kind === 'hsr' ? this.railJob(railEnds[0], railEnds[1], -1, 'highspeed')
         : pick.kind === 'crosscity' ? this.crossCityJob(towns[0])
-        : pick.kind === 'share' ? this.shareJob(pick.share![0], pick.share![1], pick.share![2], pick.share![3])
+        : pick.kind === 'share' ? this.shareJob(pick.share![0], pick.share![1], pick.share![2], pick.share![3], pick.shareBid)
         : pick.kind === 'metro' || pick.kind === 'lightrail' ? this.urbanJob(towns[0], pick.kind)
         : this.roadJob(originTowns[0], originTowns[1]);
       this.state.projects++;
@@ -2680,6 +2696,7 @@ export class AIController {
         // transaction even though the normal reachability stage has not appended it to Project.depots yet.
         const depot = this.shareTask?.depot;
         if (this.project.kind === 'share' && depot !== undefined && depot >= 0
+          && this.shareTask?.bid?.depot.kind !== 'existing'
           && this.game.depots.get(depot)?.owner === this.companyId && !this.project.depots.includes(depot)) this.project.depots.push(depot);
         this.abandon(this.project);
       }
@@ -4710,58 +4727,16 @@ export class AIController {
   }
 
   // ---------------------------------------------------------------- trains on another company's railway
-  /** Railways of other companies (that grant access) between two towns we don't connect: [owner, station A, station B]. */
-  private shareOptions(opts: { score: number; kind: ProjectKind; towns: number[]; share?: [number, number, number, number]; hub?: number }[], own: LineInfo[], D: { pair: (a: number, b: number) => number }) {
-    const g = this.game, me = this.companyId;
-    const trainsAt = new Map<number, number>();
-    for (const l of g.lines.map.values()) {
-      if (l.kind !== 'rail') continue;
-      for (const s of new Set(l.stops)) trainsAt.set(s, (trainsAt.get(s) ?? 0) + l.vehicles.length);
-    }
-    for (const l of g.lines.map.values()) {
-      if (l.kind !== 'rail' || l.owner === me || l.stops.length < 2 || !l.vehicles.length || g.lines.canOperate(l, me)) continue;
-      const o = l.owner, co = g.companies[o];
-      if (!co || co.defunct || g.accessPolicy(o) === 'auto-reject' || g.isBlocked(o, me) || g.requestsBy(me).some((q) => q.owner === o)) continue;
-      // An accessible open line may admit our trains without a station title; stock still pays its native usage fees.
-      const joinable = g.lines.partnerPolicy(l) === 'open' && g.canUse(me, o);
-      if (!joinable || l.stops.some(id => { const st = g.stations.get(id); return !st || !g.canUse(me, st.owner); })) continue;
-      // (the shared-path auction is the costly filter: priced last, its demand snapshots taken here as before)
-      if (usesSharedRail(g, l)) touchSharedCapacity(g, l);
-      const sA = g.stations.get(l.stops[0]);
-      if (!sA?.rail) continue;
-      let sB: Station | undefined, bd = 0;
-      for (const sid of l.stops) { const s = g.stations.get(sid); const d = s ? Math.hypot(s.x - sA.x, s.z - sA.z) : 0; if (s && d > bd) { bd = d; sB = s; } }
-      if (!sB?.rail || bd < 60 || bd > 260) continue;
-      const A = g.towns.list[sA.townId], B = g.towns.list[sB.townId];
-      if (!A || !B || A === B) continue;
-      const key = 'share' + o + ':' + this.pairKey(sA.id, sB.id);
-      if (this.isFailed(key) || own.some((x) => x.kind === 'rail' && x.towns.includes(A.id) && x.towns.includes(B.id))) continue;
-      // a free platform for our train at both ends (each train waits for a free path, so this cannot jam)
-      const room = Math.min(sA.rail.tracks, sB.rail.tracks) - Math.max(trainsAt.get(sA.id) ?? 0, trainsAt.get(sB.id) ?? 0);
-      if (room < 1) continue;
-      if (l.vehicles.length >= this.lineCapacity(l)) continue;
-      // Quote the actual shared route's full cost and our train's own wear.
-      // joining: our train takes its share of the line's passengers (one more train among those running it)
-      const part = joinable ? 1 / (l.vehicles.length + 1) * 2 : 1;
-      // (one train of the year's models: its fares by the time the trip takes, its running costs; opcosts / fares)
-      const stock = pickTrain(g.year, Math.min(sA.rail.length, sB.rail.length), bd * 1.3, 2) ?? [];
-      const rails = stock.length ? this.quotedRailLeg(sA, sB, stock) : null;
-      if (!rails) continue;
-      const items = [...new Set(rails)].map(id => g.world.net.edges.get(id)!).filter(e => e.depot < 0);
-      const length = items.reduce((n, e) => n + e.len, 0);
-      const sv = this.serviceYear(stock, 1, bd, length);
-      const wear = estimateVehicleYear(stock, length / 1.15, g.year, 0.7).trackWearPerUnit;
-      const feeItems = [...items, ...[...new Set(l.stops)].map(id => g.stations.get(id)!).filter(Boolean)];
-      const fees = [...new Set(feeItems.map(item => item.owner))].reduce((n, owner) => n + g.accessChargeEstimate(me, owner, feeItems, 1 / (l.vehicles.length + 1), items.filter(e => e.owner === owner).reduce((w, e) => w + e.len * wear, 0)), 0);
-      const net = Math.min(D.pair(A.id, B.id) * 0.3 * 12 * Math.min(1, part), sv.seats) * sv.perPax - sv.running * 0.5 - 100_000 - fees;
-      const score = Math.sqrt(Math.max(0, net / 1_000_000)) * this.config.focus.rail * this.config.focus.rail;
-      opts.push({ score, kind: 'share', towns: [A.id, B.id], hub: sA.id, share: [o, sA.id, sB.id, joinable ? l.id : -1] });
-    }
+  /** Quote-only host: the same cash reserve, physical corridor and failure memory as project construction. */
+  private sharedServiceHost(limit = Infinity, own = [...this.lines.values()]): ShareOptionsHost {
+    return { g: this.game, owner: this.companyId, risk: this.config.risk, focus: this.config.focus.rail,
+      available: () => Math.min(limit, this.available()), capacity: l => this.lineCapacity(l),
+      failed: key => this.isFailed(key), serves: (a, b) => own.some(l => l.kind === 'rail' && l.towns.includes(a) && l.towns.includes(b)) };
   }
 
   /** Run our own trains between two stations of another company under a track access agreement. */
-  private shareJob(owner: number, a: number, b: number, joinLine = -1): Generator<void, void> {
-    const c = this.shareTask ??= newShareTask(owner, a, b, joinLine);
+  private shareJob(owner: number, a: number, b: number, joinLine = -1, bid?: ShareBid): Generator<void, void> {
+    const c = this.shareTask ??= newShareTask(owner, a, b, joinLine, bid);
     return this.resumeShare(c);
   }
 
@@ -4803,6 +4778,13 @@ export class AIController {
         c.stage = 'fund'; yield; continue;
       }
       if (c.stage === 'fund') {
+        if (c.bid) {
+          if (c.bid.owner !== me || c.bid.line !== c.joinLine || !sharedBidLine(g, c.bid)) return fail('shared bid changed', 90);
+          c.cars = c.bid.cars.map(id => MODEL_BY_ID.get(id)!).filter(Boolean);
+          if (c.cars.length !== c.bid.cars.length) return fail('no trains available', 360);
+          c.proofAt = 0; c.proofFor = 'fund'; delete c.proof; c.stage = 'bidProof';
+          yield; continue;
+        }
         const a = c.stA!, b = c.stB!;
         const span = Math.hypot(a.x - b.x, a.z - b.z), A = g.towns.list[a.townId], B = g.towns.list[b.townId];
         const cars = pickTrain(g.year, Math.min(a.rail!.length, b.rail!.length), span * 1.25, openingCoaches(A?.pop ?? 0, B?.pop ?? 0));
@@ -4816,6 +4798,60 @@ export class AIController {
         c.firstEdge = net.nextEdge;
         c.route = [...new Set(this.lineTrack([c.a, c.b]))];
         c.station = 0; c.stage = 'groundSites'; continue;
+      }
+      if (c.stage === 'bidProof') {
+        const l = sharedBidLine(g, c.bid!, false);
+        if (!l) return fail('shared itinerary changed', 90);
+        const calls = Patterns.patternStops(l, c.bid!.pattern), index = calls[c.proofAt ?? 0];
+        const proof = proveSharedCall(g, l, c.bid!.pattern, index, me, c.cars, c.proof);
+        if (!proof) return fail('shared platform no longer fits', 90);
+        c.proof = proof; c.proofAt = (c.proofAt ?? 0) + 1;
+        if (c.proofAt === calls.length) {
+          c.proofAt = 0; c.stage = c.proofFor === 'fund' ? 'bidFund' : 'bidOpening';
+        }
+        yield; continue;
+      }
+      if (c.stage === 'bidFund') {
+        const l = sharedBidLine(g, c.bid!, false);
+        if (!l || !c.proof || !validSharedWitness(g, c.proof)) return fail('shared route changed', 90);
+        const q = priceSharedBid(this.sharedServiceHost(), l, c.cars, c.bid!.pattern, c.bid!.depot);
+        if (!q) return fail('shared investment no longer pays', 90);
+        if (!this.borrowFor(q.capital)) return fail('no money', 360);
+        c.bid = { ...q, witness: c.proof }; c.firstEdge = net.nextEdge;
+        p.built = true;
+        if (q.depot.kind === 'existing') { c.depot = q.depot.id; c.proofAt = 0; c.stage = 'bidOpening'; }
+        else c.stage = 'bidBuild';
+        yield; continue;
+      }
+      if (c.stage === 'bidBuild') {
+        const d = c.bid!.depot;
+        if (d.kind !== 'planned') return fail('invalid shared depot', 90);
+        // Reprice immediately before native construction; no quote grants permission to alter changed track.
+        const l = sharedBidLine(g, c.bid!, false);
+        if (!l || !c.proof || !validSharedWitness(g, c.proof)
+          || !priceSharedBid(this.sharedServiceHost(), l, c.cars, c.bid!.pattern, d)) return fail('shared depot quote changed', 90);
+        const before = new Set(net.edges.keys());
+        c.depot = build(() => buildSideDepot(g, d.edge, d.s, me, { dir: d.dir, side: d.side }));
+        this.track(c.firstEdge);
+        c.bidEdges = [...net.edges.values()].filter(e => !before.has(e.id) && e.owner === me).map(e => e.id);
+        if (c.depot < 0) return fail('no depot site', 360);
+        p.depots.push(c.depot);
+        c.proofAt = 0; c.proofFor = 'purchase'; delete c.proof; c.stage = 'bidProof';
+        yield; continue;
+      }
+      if (c.stage === 'bidOpening') {
+        const l = sharedBidLine(g, c.bid!, false), dp = g.depots.get(c.depot);
+        if (!l || !dp || dp.owner !== me || dp.kind !== 'rail' || !c.proof || !validSharedWitness(g, c.proof)) return fail('shared entry changed', 90);
+        const calls = Patterns.patternStops(l, c.bid!.pattern), index = calls[c.proofAt ?? 0];
+        const proof = proveSharedOpening(g, l, c.cars, me, dp.edge, index, c.proof, c.bid!.pattern);
+        if (proof) {
+          c.proof = proof;
+          c.opening = index; c.reachesA = l.stops[index] === c.a; c.stage = 'purchase';
+        } else {
+          c.proofAt = (c.proofAt ?? 0) + 1;
+          if (c.proofAt === calls.length) return fail('depot does not serve shared stock', 90);
+        }
+        yield; continue;
       }
       if (c.stage === 'groundSites') {
         if (c.depot >= 0 || c.station >= 2) { c.stage = 'sideStart'; continue; }
@@ -4876,15 +4912,25 @@ export class AIController {
         c.stage = 'purchase'; yield; continue;
       }
       if (c.stage === 'purchase') {
+        if (c.bid) {
+          const l = sharedBidLine(g, c.bid, false), dp = g.depots.get(c.depot);
+          const upkeep = c.bid.depot.kind === 'planned' && dp
+            ? depotUpkeep(dp) + (c.bidEdges ?? []).reduce((n, id) => n + (net.edges.has(id) ? g.edgeMaintenance(net.edges.get(id)!) : 0), 0) : 0;
+          if (!l || !dp || !c.proof || !validSharedWitness(g, c.proof)
+            || !priceSharedBid(this.sharedServiceHost(), l, c.cars, c.bid.pattern, c.bid.depot, { cost: c.works, upkeep }))
+            return fail('completed shared investment no longer pays', 90);
+        }
         const a = c.stA!, b = c.stB!, jl = c.joinLine >= 0 ? g.lines.get(c.joinLine) : undefined;
         const joined = !!jl && jl.owner === c.owner && g.lines.join(jl.id, me) === null;
+        if (c.bid && !joined) return fail('shared permission changed', 90);
         let line: Line;
         if (joined) line = jl!;
         else { line = g.lines.create('rail', me); line.stops = c.reachesA ? [c.a, c.b] : [c.b, c.a]; p.line = line.id; }
-        if (!sharedTrainAllowed(g, line, me, c.cars)) { if (joined) g.lines.leave(line.id, me); return fail('shared paths would lose money', 360); }
+        if (!sharedTrainAllowed(g, line, me, c.cars, c.bid?.pattern)) { if (joined) g.lines.leave(line.id, me); return fail('shared paths would lose money', 360); }
         const t = g.vehicles.buyTrain(c.depot, c.cars, line.id);
         if (typeof t === 'string') { if (joined) g.lines.leave(line.id, me); return fail('could not buy a train: ' + t, 360); }
-        const call = openingRailCall(g, t, c.reachesA ? c.a : c.b);
+        if (c.bid) { t.pattern = c.bid.pattern; t.onLineChanged(); }
+        const call = openingRailCall(g, t, c.bid && c.opening !== undefined ? line.stops[c.opening] : c.reachesA ? c.a : c.b);
         if (call < 0) { g.vehicles.sell(t.id); if (joined) g.lines.leave(line.id, me); return fail('depot no longer serves the final timetable', 360); }
         t.stopIndex = call;
         this.stats.vehicles++;

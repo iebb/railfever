@@ -6,7 +6,11 @@ import { isLoopLine, turnIndex } from './patterns';
 import type { Train, TrackRule } from './train';
 import { consistRule, findRailRoute, platformDepartureFrontiers, railNext, ruleAllows } from './train';
 
-interface PlatformOption extends RailTrackGroup { routeCost: number; flow: Map<number, number> }
+interface PlatformOption extends RailTrackGroup {
+  routeCost: number; flow: Map<number, number>;
+  witnessEdges?: number[]; witnessAccess?: [number, number][];
+}
+export interface ProposedRailStock { owner: number; rule: TrackRule | null; length: number }
 // Geometry rounding alone should not spread an Auto call onto a different directional approach.
 const DIRECT_ROUTE_EPS = 1e-4;
 interface Call { pattern: number; stop: number; station: number; occurrence: number; previous: number; next: number; turn: boolean }
@@ -63,10 +67,10 @@ function stock(g: Game, l: Line, pattern: number): { owner: number; rule: TrackR
 }
 
 /** A candidate must connect the incoming and outgoing served hops on the same physical platform/direction. */
-function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
+function candidates(g: Game, l: Line, c: Call, proposed?: ProposedRailStock): PlatformOption[] {
   const st = g.stations.get(c.station), prev = g.stations.get(c.previous), next = g.stations.get(c.next), net = g.world.net;
   if (!st?.rail || !prev?.rail || !next?.rail || prev.id === st.id || next.id === st.id) return [];
-  const fleet = stock(g, l, c.pattern).map(s => ({ ...s, incoming: g.stations.railTrackGroups(prev).flatMap(from => {
+  const fleet = [...stock(g, l, c.pattern), ...(proposed ? [proposed] : [])].map(s => ({ ...s, incoming: g.stations.railTrackGroups(prev).flatMap(from => {
     const first = from.steps[0], last = from.steps[from.steps.length - 1];
     return [[first.edge, -first.dir], [last.edge, last.dir]].flatMap(([id, dir]) => {
       const e = net.edges.get(id); return e && g.canUse(s.owner, e.owner) && ruleAllows(s.rule, e)
@@ -76,10 +80,13 @@ function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
   return g.stations.railTrackGroups(st).flatMap(group => {
     let routeCost = 0;
     const flow = new Map<number, number>();
+    const witnessEdges = proposed ? new Set(group.steps.map(s => s.edge)) : null;
+    const witnessAccess: [number, number][] | undefined = proposed ? [] : undefined;
     for (const { owner, rule, length, incoming } of fleet) {
       if (group.length + 1e-6 < length + 0.05 || group.steps.some(s => { const e = net.edges.get(s.edge); return !e || !g.canUse(owner, e.owner) || !ruleAllows(rule, e); })) return [];
       let best = Infinity;
       let bestFlow: { edge: { id: number; station: number; depot: number }; dir: number }[] = [];
+      let bestWitness: number[] | undefined;
       for (const direction of [1, -1] as const) {
         const arrival = findRailRoute(g, incoming, st.id, owner, -1, 20000, false, rule, true, { group: group.id, direction, length });
         if (!arrival) continue;
@@ -92,9 +99,15 @@ function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
           best = arrival.cost + departure;
           const leaving = (onward?.cost ?? Infinity) <= (reverse?.cost ?? Infinity) ? onward : reverse;
           bestFlow = c.turn ? [] : [...arrival.conts, ...(leaving?.conts ?? [])];
+          if (witnessEdges) bestWitness = [...arrival.conts, ...(leaving?.conts ?? [])].map(q => q.edge.id);
         }
       }
       if (!Number.isFinite(best)) return [];
+      if (witnessEdges && bestWitness) for (const id of bestWitness) witnessEdges.add(id);
+      if (witnessAccess) for (const id of [...group.steps.map(s => s.edge), ...(bestWitness ?? [])]) {
+        const infrastructure = net.edges.get(id)!.owner;
+        if (!witnessAccess.some(([user, lead]) => user === owner && lead === infrastructure)) witnessAccess.push([owner, infrastructure]);
+      }
       // All operators/consists must have a legal arrival and departure; avoid a detour for any of them.
       routeCost = Math.max(routeCost, best);
       for (const { edge, dir } of bestFlow) if (edge.station < 0 && edge.depot < 0) {
@@ -102,7 +115,7 @@ function candidates(g: Game, l: Line, c: Call): PlatformOption[] {
         flow.set(edge.id, previous === undefined || previous === dir ? dir : 0);
       }
     }
-    return [{ ...group, routeCost, flow }];
+    return [{ ...group, routeCost, flow, ...(witnessEdges ? { witnessEdges: [...witnessEdges], witnessAccess } : {}) }];
   });
 }
 
@@ -158,6 +171,14 @@ export function platformFlowCosts(g: Game, l: Line, pattern: number | undefined,
 export function platformChoices(g: Game, l: Line, pattern: number, stop: number): RailTrackGroup[] {
   const c = calls(l).find(c => c.pattern === pattern && c.stop === stop);
   return c ? candidates(g, l, c) : [];
+}
+
+/** Quote an additional real consist without inserting stock or warming the native option cache. */
+export function platformChoicesForStock(g: Game, l: Line, pattern: number, stop: number,
+  proposed: ProposedRailStock): (RailTrackGroup & { witnessEdges: number[]; witnessAccess: [number, number][] })[] {
+  const c = calls(l).find(c => c.pattern === pattern && c.stop === stop);
+  return c ? candidates(g, l, c, proposed).map(q => ({ ...q, steps: q.steps.map(s => ({ ...s })),
+    witnessEdges: [...q.witnessEdges!], witnessAccess: q.witnessAccess!.map(p => [...p]) })) : [];
 }
 
 /** Pure train/UI lookup: an unknown pattern follows the first service, just like the timetable. */
