@@ -2,7 +2,8 @@
 // Bundle as capacity-frequency.mjs and run with Node.
 import { Game } from '../src/game/game';
 import type { Town } from '../src/game/towns';
-import { Train } from '../src/game/train';
+import { Train, consistRule } from '../src/game/train';
+import { platformChoicesForStock } from '../src/game/rail-platforms';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
 import { bezLine } from '../src/game/geom';
 import { outAndBack } from '../src/game/lines';
@@ -15,7 +16,7 @@ import { capacityRouteBetween } from '../src/game/rail-capacity-routes';
 import { railPartMode } from '../src/game/stations';
 import { estimateVehicleYear, YEAR_S } from '../src/game/opcosts';
 import { serialize, deserialize } from '../src/game/save';
-import { marginalSharedTrain, marginalSharedConsist, sharedCapacityPlan } from '../src/game/ai-capacity';
+import { marginalSharedTrain, marginalSharedConsist, marginalTrainInvestment, sharedCapacityPlan } from '../src/game/ai-capacity';
 import { check, fails, checkReservations } from './lib';
 
 if (!process.argv[1]?.endsWith('capacity-frequency.mjs')) throw new Error('bundle this test as capacity-frequency.mjs');
@@ -159,7 +160,8 @@ const coachBid=marginalSharedConsist(consist.g,consist.l,bt,[...consist.cars,...
 check(Number.isFinite(coachBid)&&coachBid>0,
   'a seat-bound complete service values extra seats without buying another path');
 
-// Mixed operators share the same whole-route native frequency; each keeps its existing traffic/access weight.
+// Homogeneous operators share one native fare/carrying pool. Historical traffic remains diagnostic
+// metadata; current access charges remain distinct private costs and participating-owner income.
 // (2.10: with lots inside the halved in-city reach and walkers' 3.2x trips, the 13,500-resident corridor fills the
 // lead operator's three trains, whose receipts are then seat-bound. The pool comparison needs seats to spare for
 // every operator, as 2.9's corridor had: a 4,000-resident district. The busier corridor keeps the bid checks.)
@@ -174,7 +176,23 @@ const accessBefore=JSON.stringify(shared.g.access);
 const shareBid=marginalSharedTrain(shared.g,shared.l,2,shared.cars);
 const leadBid=marginalSharedTrain(shared.g,shared.l,1,shared.cars);
 console.log(JSON.stringify({case:'weighted operators',leadBid,partnerBid:shareBid,allocations:sp.allocations}));
-check(leadBid>0&&shareBid<leadBid&&JSON.stringify(shared.g.access)===accessBefore,'partner and lead bids retain distinct traffic weights, access fees and rights');
+check(leadBid>0&&near(shareBid,leadBid)&&JSON.stringify(shared.g.access)===accessBefore,
+  'identical useful departures have equal positive pooled physical economics without changing rights');
+check(sp.allocations[0].traffic!==sp.allocations[1].traffic,'historical traffic metadata remains distinct from ticket entitlement');
+const privateLead=marginalTrainInvestment(shared.g,shared.l,1,shared.cars),privatePartner=marginalTrainInvestment(shared.g,shared.l,2,shared.cars);
+check(near(privateLead.pooled,leadBid)&&near(privatePartner.pooled,shareBid),
+  'both private investment quotes retain the canonical pooled physical surplus');
+const freePool=deserialize(JSON.parse(saved(shared.g)));freePool.setAccessMultiplier(1,0);freePool.setAccessMultiplier(2,0);
+const freeLead=marginalTrainInvestment(freePool,freePool.lines.get(shared.l.id)!,1,shared.cars);
+const freePartner=marginalTrainInvestment(freePool,freePool.lines.get(shared.l.id)!,2,shared.cars);
+check(privateLead.investor<freeLead.investor&&privatePartner.investor<freePartner.investor
+  &&near(privateLead.pooled,freeLead.pooled)&&near(privatePartner.pooled,freePartner.pooled),
+  'real access bills and foregone owner fees reduce private surplus while conserving the participating pool');
+const spec={owner:2,length:shared.cars.reduce((n,c)=>n+c.length+.1,0),rule:consistRule(shared.cars)};
+check(platformChoicesForStock(shared.g,shared.l,0,0,spec).length>0,'proposed partner stock has a real native full-fit call before access revocation');
+const denied=deserialize(JSON.parse(saved(shared.g)));denied.blockCompany(1,2);
+check(platformChoicesForStock(denied,denied.lines.get(shared.l.id)!,0,0,spec).length===0,
+  'equal fare entitlement cannot bypass native platform/track access denial');
 
 for(const kind of ['loop','declared-loop','short-turn','mixed'] as const){
   const partial=fixture(13500,2);const {g,l,cars}=partial;

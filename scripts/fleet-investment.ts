@@ -5,11 +5,16 @@ import { serialize, deserialize } from '../src/game/save';
 import { marginalSharedTrain, marginalTrainInvestment } from '../src/game/ai-capacity';
 import { openingRailCall } from '../src/game/ai';
 import { outerEnd, planTerminusYard, buildTerminusYard, copyGrowCursor } from '../src/game/ai-grow';
-import { networkItem, runNetworkTask, stepNetworkTask, networkDaily } from '../src/game/ai-network';
+import { networkItem, networkPlanner, runNetworkTask, stepNetworkTask, networkDaily } from '../src/game/ai-network';
 import { Train } from '../src/game/train';
 import { toggleSignal } from '../src/game/build-ops';
 import { addPattern, setVehiclePattern } from '../src/game/patterns';
-import type { Game } from '../src/game/game';
+import { Game } from '../src/game/game';
+import { outAndBack } from '../src/game/lines';
+import { stationEnds, nodeSnap } from '../src/game/routing';
+import { planEdge, commitProposal } from '../src/game/construction';
+import { finishDoubleTrack } from '../src/game/trackops';
+import { autoSignalLine } from '../src/game/signals';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { checkReservations } from './lib';
@@ -167,10 +172,85 @@ shared.g.setAccessMultiplier(2, 2);
 const paid = marginalTrainInvestment(shared.g, shared.line, 1, shared.v.madeUp);
 check(shared.v.delivered > 0 && shared.line.vehicles.every(id => (shared.g.vehicles.get(id) as Train).delivered > 0),
   'both operators really deliver native passengers on the shared line');
-check(free.investor > 0 && paid.investor < 0 && paid.pooled > 0 && paid.pooled === free.pooled,
-  'maximum lawful access price makes payer unprofitable despite positive unchanged pooled surplus');
-const sharedBefore = ledger(shared.g); runNetworkTask(shared.ai, 'extend');
-check(ledger(shared.g) === sharedBefore, 'internal recipient income cannot fund a loss-making payer purchase');
+check(free.investor > paid.investor && paid.investor > 0 && paid.pooled > 0 && Math.abs(paid.pooled - free.pooled) < 1e-6,
+  'maximum lawful access price reduces actual positive private economics and conserves the participating pool');
+const sharedTwin = cold(shared.g), sharedCount = shared.g.vehicles.map.size, sharedCash = shared.g.company(1).economy.money;
+runNetworkTask(shared.ai, 'extend'); runNetworkTask(sharedTwin.aiOf(1)!, 'extend');
+check(shared.g.vehicles.map.size === sharedCount + 1 && shared.g.company(1).economy.money === sharedCash - shared.v.madeUp.reduce((n, c) => n + c.cost, 0),
+  'ordinary NetPlanner pays exactly for the genuinely profitable native payer departure');
+check(saved(shared.g) === saved(sharedTwin), 'positive paid-access investment is exactly cold-replayable');
+
+/** A predeclared costly inherited railway: real maximum-depth civil work and full-size platforms,
+ * ordinary catalogue consists, native walking entrances, and supported repayable starting loans.
+ * Its density/tariff/geometry are fixed before quotes; no demand or fare is injected. */
+function costlySharedFixture() {
+  const g = Game.create({ size: 768, seed: 5, towns: 0, hilliness: 'flat', water: 'low', startYear: 2000,
+    aiConfigs: [{ startMoney: 150_000_000, accessPolicy: 'open' },
+      { startMoney: 150_000_000, accessPolicy: 'open', accessMultiplier: 2 }] });
+  g.world.h.fill(4); g.world.heightsVersion++; g.aiEnabled = false; g.aiAcquisitions = false;
+  for (const ai of g.ais) ai.state.cooldown = 1e9;
+  const town = newTown(g, 'Inherited deep corridor', 360, 384); district(g, town, 150, 570, 384, 64, 0);
+  const sts = [180, 240, 300, 360, 420, 480, 540].map(x => {
+    const p = g.stations.planRail(x, 384, Math.PI / 2, 40, 4, 2,
+      { mode: 'lightrail', trackType: 'electric', level: 'underground', depth: 4, style: 'none' });
+    check(p.ok, 'costly native platform quote is physically valid');
+    const id = g.stations.nextId; check(!g.stations.commitRail(p, 2), 'real infrastructure owner pays the complete deep station quote');
+    return g.stations.get(id)!;
+  });
+  const net = g.world.net, first = net.nextEdge;
+  for (let i = 0; i + 1 < sts.length; i++) {
+    const p = planEdge(g, nodeSnap(g, stationEnds(g, sts[i])[0].front, 'rail'), nodeSnap(g, stationEnds(g, sts[i + 1])[0].back, 'rail'),
+      { kind: 'rail', type: 'electric', tracks: 4, heightOffset: 0, crossing: 'level', owner: 2,
+        level: 'underground', levelDepth: 4, subway: true });
+    check(p.ok && !commitProposal(g, p), 'owner pays real four-track tunnel works without changing support guards');
+  }
+  finishDoubleTrack(g, [...net.edges.values()].filter(e => e.id >= first && e.kind === 'rail').map(e => e.id), 2);
+  const depots = [[0, 1], [6, 2]].map(([i, owner]) => {
+    const y = planTerminusYard(g, owner, sts[i], outerEnd(sts[i], sts[i ? 5 : 1]), null, () => true);
+    check(y, 'each operator has a legal whole-consist native yard');
+    const id = buildTerminusYard(g, owner, y, () => true); check(id >= 0, 'each operator pays its owned yard'); return id;
+  });
+  const line = g.lines.create('rail', 1); line.stops = outAndBack(sts.map(st => st.id));
+  g.lines.invite(line.id, 2); g.lines.rebuild(); autoSignalLine(g, line.id, 2);
+  const cars = Array.from({ length: 4 }, () => M('lrv_b'));
+  const trains = [depots[0], depots[1], depots[1], depots[1]].map(d => {
+    const t = g.vehicles.buyTrain(d, cars, line.id); check(t instanceof Train, 'pre-existing matching catalogue stock is fully paid');
+    t.stopIndex = openingRailCall(g, t); check(t.stopIndex >= 0, 'actual long consist has a directed full-fit opening'); return t;
+  });
+  for (const st of sts) {
+    const entrance = st.rail!.entrances.find(e => g.stations.entranceAccess(st, e)); check(entrance, 'deep station has a native street-contact entrance');
+    const hit = net.nearestEdge(entrance.x, entrance.z, 3, 'road')!; check(hit, 'native entrance reaches the actual pedestrian grid');
+    const p = { x: 0, y: 0, z: 0 }; net.pointAt(hit.edge, hit.s, p);
+    for (const dx of [-.8, 0, .8]) for (const dz of [1.1, 1.9, 2.7]) {
+      const b = g.world.addBuilding({ townId: town.id, x: p.x + dx, z: p.z + dz, angle: 0,
+        w: .6, d: .6, type: 4, floors: 8, pop: 50, seed: 10000 + town.buildings.size, y: 4, built: 0 });
+      town.buildings.add(b.id); town.pop += b.pop;
+    }
+  }
+  g.stations.recomputeCatchment(); g.demand.rebuild(); runDays(g, 450);
+  check(trains.every(t => t.delivered > 0) && sts.every(st => st.catchPop > 0), 'all paid units deliver through real native walking catchments');
+  check(!checkReservations(g).length, 'costly railway operates with consistent reservations');
+  const ai = g.aiOf(1)!; (ai as any).adoptLines(); return { g, ai, line, cars };
+}
+const costly = costlySharedFixture(), costlyQuote = marginalTrainInvestment(costly.g, costly.line, 1, costly.cars);
+check(costlyQuote.pooled > 0 && costlyQuote.investor < 0,
+  'genuine native infrastructure fees make the buyer lose despite positive participating-owner surplus');
+const costlyData = saved(costly.g), costlyCold = cold(costly.g), costlyLedger = ledger(costly.g);
+check(JSON.stringify(marginalTrainInvestment(costlyCold, costlyCold.lines.get(costly.line.id)!, 1, costly.cars)) === JSON.stringify(costlyQuote)
+  && saved(costlyCold) === costlyData && saved(costly.g) === costlyData, 'costly private/pool quotes are pure with warm and independent cold caches');
+check(runNetworkTask(costly.ai, 'extend', 0) && runNetworkTask(costlyCold.aiOf(1)!, 'extend', 0), 'both native planners start their ordinary existing-line review');
+let costlyUnits = 0, costlyFleetSeen = false, costlyExact = true;
+while (networkPlanner(costly.ai)?.task) {
+  check(++costlyUnits < 4096, 'costly native review remains bounded');
+  stepNetworkTask(costly.ai, 'extend'); stepNetworkTask(costlyCold.aiOf(1)!, 'extend');
+  const c = networkItem(costly.ai)?.grow; costlyFleetSeen ||= !!c?.opts?.some(o => o.kind === 'fleet');
+  check(!c?.best?.fleet, 'private-negative native departure cannot become the planner selected fleet bid');
+  costlyExact &&= saved(costly.g) === saved(costlyCold);
+}
+check(costlyFleetSeen && ledger(costly.g) === costlyLedger && costlyExact,
+  'NetPlanner evaluates the real standalone bid and refuses without changing any paid asset or debt, exactly cold');
+for (let i = 0; i < 128; i++) { costly.g.stepTick(); costlyCold.stepTick(); costlyExact &&= saved(costly.g) === saved(costlyCold); }
+check(costlyExact && !checkReservations(costly.g).length, 'private refusal preserves exact 128-tick native continuation and reservations');
 const routed = deserialize(JSON.parse(quoted)), routeLine = routed.lines.get(line.id)!;
 // A two-way corridor permits the inner-city short-turn on a real intermediate platform.
 for (const node of [...routed.world.net.nodes.values()]) if (node.kind === 'rail' && node.signal) {

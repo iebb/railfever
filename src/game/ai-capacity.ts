@@ -38,10 +38,14 @@ interface Channel {
   use: Map<number, number>; limit: number;
   access: Map<number, { item: AccessItem; use: number }>;
   /** Whole-route bid; mixed, partial and circular services retain the existing conservative model. */
-  native?: { path: number[]; share: number; seats: number; sameQuoteStock?: boolean };
+  native?: { path: number[]; share: number; seats: number; sameQuoteStock?: boolean; settlement?: boolean };
   cell?: AtomicTerminalCell;
 }
-export interface CapacityAllocation { line: number; owner: number; pattern: number; trains: number; traffic: number }
+export interface CapacityAllocation {
+  line: number; owner: number; pattern: number; trains: number;
+  /** Historical traffic/catchment/access budget metadata, not a homogeneous service's fare entitlement. */
+  traffic: number;
+}
 export interface SharedCapacityPlan {
   lines: number[]; resources: CapacityResource[]; allocations: CapacityAllocation[];
   /** The lowest contribution leaves first, including a partner's sole train when it displaces better traffic. */
@@ -387,7 +391,8 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       const traffic = c.trains.reduce((n, t) => n + t.delivered * 360 / Math.max(30, g.day - t.boughtDay), 0);
       const catchment = [...served].reduce((n, id) => { const st = g.stations.get(id); return n + (st?.owner === c.owner ? Math.max(1, st.catchPop, st.genLast * 12) : 0); }, 0);
       const payments = g.access.filter(a => a.user === c.owner).reduce((n, a) => n + a.paidLastMonth * 12, 0);
-      // Traffic and paid access buy the right to useful paths. An entrant bids with the demand at its stations.
+      // Retain historical traffic/access metadata and the conservative heterogeneous-service budgets.
+      // Homogeneous complete services below settle tickets by useful service, not station title/history.
       weights.set(key, Math.max(1, traffic + catchment * 0.1 + payments / Math.max(1, d.fare)));
     }
     const sum = [...weights.values()].reduce((n, x) => n + x, 0);
@@ -396,11 +401,19 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
       && new Set(route.stations).size === route.stations.length
       && new Set([...groups.values()].map(c => c.pid)).size === 1
       && [...groups.values()].every(c => patternStops(l, c.pid).length === l.stops.length);
+    // History remains useful auction metadata, but it is not a ticket entitlement. Only pool
+    // interchangeable complete services: qualify the full actual roster AND exact proposed stock
+    // once, before either side of a count counterfactual (including an owner with zero trains).
+    const signature = ts[0] ? stockKey(ts[0].madeUp) : candidate?.line.id === l.id ? stockKey(candidate.cars) : undefined;
+    let settlement = complete && signature !== undefined && ts.every(t => !t.mailOnly && stockKey(t.madeUp) === signature)
+      && (!candidate || candidate.line.id !== l.id || stockKey(candidate.cars) === signature);
+    const first = out.length, paths: number[][][] = [];
     for (const [key, c] of groups) {
       const indices = patternStops(l, c.pid);
       if (indices.length < 2 || !c.cars.length) continue;
       const carSpeed = Math.min(...c.cars.map(m => m.speed)), speed = Math.max(0.4, carSpeed * 0.6 * KMH_TO_UPS);
       const use = new Map<number, number>(), access = new Map<number, { item: AccessItem; use: number }>(); let distance = 0;
+      const hops: number[][] = [];
       const meter = (item: AccessItem, amount: number) => {
         const key = accessItemKey(item), old = access.get(key);
         access.set(key, { item, use: (old?.use ?? 0) + amount });
@@ -410,6 +423,7 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
         const st = g.stations.get(a); if (st) meter(st, 1);
         if (a === b) continue;
         const hop = c.owner === l.owner && j === (i + 1) % l.stops.length ? inv.routes.get(l.id)?.[i] ?? [] : routeBetween(g, a, b, c.owner) ?? [];
+        if (settlement) hops.push(hop);
         const perHop = new Map<number, number>();
         let joinedId = -1, joinedSeconds = 0, joinedFloor = 0;
         const finishJoined = () => {
@@ -455,7 +469,19 @@ function channelsFor(g: Game, lines: Line[], inv: RouteInventory, candidate?: { 
         ...(complete ? { native: { path: route.stations, share: part, sameQuoteStock: !candidate || candidate.line.id !== l.id
           || stockKey(candidate.cars) === stockKey(c.trains[0]?.madeUp ?? c.cars),
           seats: c.cars.reduce((n, m) => n + m.capacity, 0) * YEAR_S / pcycle * .65 } } : {}) });
+      paths.push(hops);
     }
+    const base = out[first];
+    const baseUse = base && [...base.use];
+    settlement &&= out.length - first === groups.size && !!base && paths[0].every(h => h.length > 0)
+      && out.slice(first).every((c, i) => c.cycle === base.cycle && c.native?.seats === base.native?.seats
+        && (c.cell === undefined && base.cell === undefined || !!c.cell && !!base.cell
+          && c.cell.key === base.cell.key && c.cell.slots.length === base.cell.slots.length
+          && c.cell.slots.every(id => base.cell!.slots.includes(id)))
+        && c.use.size === base.use.size && [...c.use].every(([id, u], j) => baseUse[j][0] === id && baseUse[j][1] === u)
+        && paths[i].length === paths[0].length && paths[i].every((h, j) => h.length === paths[0][j].length
+          && h.every((id, k) => id === paths[0][j][k])));
+    if (settlement) for (let i = first; i < out.length; i++) out[i].native!.settlement = true;
   }
   return out.sort((a, b) => a.line.id - b.line.id || a.owner - b.owner || a.pattern - b.pattern);
 }
@@ -529,6 +555,18 @@ function receipts(g: Game, channels: Channel[], counts: number[], inv: RouteInve
         // A protected observed/lost-demand boarding floor carries people too. Preserve a higher fare-only
         // budget without inventing riders, but scale native leg occupation when the saved boarding floor is larger.
         const boardingFloor = Math.max(1, d.boardings / Math.max(1, reference.boardings));
+        if (c.native.settlement) {
+          // Boardings pay the arriving operator. One common fare/carrying pool is divided by
+          // useful departures, rather than independently capping static historical owner budgets.
+          // Equal stock, paths, use and cycle were proved together above; all physical/delay and
+          // terminal-cell checks still apply to this exact counterfactual fleet.
+          const supplied = channels.reduce((n, other, j) => n + (other.line.id === c.line.id
+            && other.native?.settlement && !blocked.has(j) ? other.native.seats * counts[j] * availability : 0), 0);
+          if (!(supplied > 0)) return 0;
+          const carried = Math.min(1, supplied / Math.max(1, quote.peak * boardingFloor));
+          return d.revenue * quote.revenue / reference.revenue * carried * availability
+            * (c.native.seats * counts[i] * availability / supplied);
+        }
         const carried = Math.min(1, c.native.seats * counts[i] * availability / Math.max(1, quote.peak * boardingFloor * c.native.share));
         // Native receipts recover sparse-call queue abandonment and reprice the actual OD fares together.
         // The observed-receipt/lost-demand floor remains in c.budget; do not also apply the old fare/capture.
@@ -671,7 +709,8 @@ export function touchSharedCapacity(g: Game, l: Line): void {
   }
 }
 
-/** Every operator reads the same deterministic auction of paths, weighted by its traffic/access payments. */
+/** Every operator reads the same deterministic physical/economic auction. Allocation traffic is
+ * historical diagnostic metadata; compatible complete services settle their common tickets by supply. */
 export function sharedCapacityPlan(g: Game, l: Line): SharedCapacityPlan {
   const e = planEntry(g, l), fresh = !e.plan, plan = completePlan(g, e, l);
   if (fresh) return plan;
@@ -759,6 +798,10 @@ export function marginalSharedConsist(g: Game, l: Line, t: Train, cars: VehicleM
   const inv = inventory(g), channels = channelsFor(g, connectedLines(g, l, inv), inv);
   const i = channels.findIndex(c => c.line.id === l.id && c.owner === t.owner && c.pattern === (patternOf(l, t.pattern)?.id ?? 0));
   if (i < 0) return -Infinity;
+  // A changed consist must use the same conservative model before AND after replacement.
+  // Otherwise changing stock would compare two different settlement rules, rather than its value.
+  if (stockKey(t.madeUp) !== stockKey(cars)) for (const c of channels)
+    if (c.line.id === l.id && c.native) c.native.settlement = false;
   const counts = channels.map(c => c.trains.length), before = netValue(g, channels, counts, inv), c = channels[i], n = Math.max(1, counts[i]);
   const legs = patternStops(l, c.pattern).length, hop = c.line.capacity!.demand!.distance / Math.max(1, legs / 2);
   const oldYear = estimateVehicleYear(t.cars, hop, g.year, 0.5), newYear = estimateVehicleYear(cars, hop, g.year, 0.5);

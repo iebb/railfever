@@ -5,7 +5,7 @@ import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import type { TramProject } from '../src/game/ai-tram';
 
-type Probe = { startTram(town?: number): boolean; project: { kind: string } | null; tram: { record(): TramProject | null } | null };
+type Probe = { startTram(town?: number): boolean; project: { kind: string } | null; tram: { status: string; reason: string; record(): TramProject | null } | null };
 const probe = (g: Game) => g.ais[0] as unknown as Probe;
 const saved = (g: Game) => JSON.stringify(serialize(g));
 function same(a: Game, b: Game, label: string) {
@@ -118,4 +118,32 @@ for (let tick = 0; probe(failure).project && tick < 80; tick++) { failure.stepTi
 assert.equal(probe(failure).project, null, 'native invalidated project finishes its failure cleanup');
 same(failure, resumedFailure, 'native failure and cleanup replay exactly');
 assert(![...failure.lines.map.values()].some(l => l.owner === 1 && l.kind === 'tram'));
-console.log(`PASS ${stages.size} live-source tram checkpoints, mid-day saves, independent future projects after warm/cold history, legacy cleanup/population work, native track failure and exact post-opening replay; maximum source tick ${maxUnitMs.toFixed(2)}ms`);
+// An inactive planner is deliberately absent from saves. A new native start must publish its own
+// caption before the first work unit, rather than retaining a previous failed project's caption.
+const previousStatus = probe(failure).tram!.status, previousReason = probe(failure).tram!.reason;
+assert(previousStatus.startsWith('failed: ') && previousReason.length > 0,
+  'warm planner really retains the preceding native construction failure');
+const previousLog = [...failure.ais[0].log], retry = deserialize(JSON.parse(saved(failure)));
+assert.equal(probe(retry).tram, null, 'cold controller has no inactive planner or inherited failure caption');
+assert(probe(failure).startTram() && probe(retry).startTram(),
+  'warm failed and independently cold controllers both start the next eligible native tram project');
+const restarted = probe(failure).tram!.record()!, restoredStart = probe(retry).tram!.record()!;
+assert.equal(restarted.continuation!.task!.stage, 'axis', 'new start is captured before its first work unit');
+assert.equal(restarted.continuation!.status, `planning trams in ${failure.towns.list[restarted.town].name}`);
+assert.equal(restarted.continuation!.reason, '', 'new project clears only its current reason');
+assert.deepEqual(failure.ais[0].log.slice(0, previousLog.length), previousLog,
+  'new planning caption preserves the existing native failure log');
+assert.deepEqual(restarted, restoredStart, 'new current native record is independent of prior inactive planner history');
+same(failure, retry, 'native restart before first work has exact full-save equality');
+let restartTicks = 0;
+while (probe(failure).project && restartTicks++ < 6000) {
+  failure.stepTick(); retry.stepTick();
+  same(failure, retry, 'native restart source/cold equality at tick ' + restartTicks);
+}
+assert.equal(probe(failure).project, null, 'native restarted project completes or cleans up within its existing work budget');
+for (let tick = 0; tick < 80; tick++) {
+  failure.stepTick(); retry.stepTick();
+  same(failure, retry, 'native post-restart source/cold tick ' + tick);
+}
+
+console.log(`PASS ${stages.size} live-source tram checkpoints, mid-day saves, independent future projects after warm/cold history, legacy cleanup/population work, native track failure/restart before first work and exact post-opening replay; maximum source tick ${maxUnitMs.toFixed(2)}ms`);

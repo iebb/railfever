@@ -96,6 +96,7 @@ export class TramPlanner {
     const town = townId === undefined ? candidates[0] : candidates.find(t => t.id === townId);
     if (!town || !pickTram(this.game.year, town.pop)) return false;
     this.project = { town: town.id, edges: [], stations: [], stops: [], depot: -1, line: -1 };
+    this.status = `planning trams in ${town.name}`;
     this.reason = '';
     this.result = 'running';
     this.task = { stage: 'axis', model: '', routes: [], fresh: [], nTrams: 0, cost: 0, ids: [], at: 0, bought: 0 };

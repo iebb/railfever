@@ -494,13 +494,41 @@ const total = (e: Economy, cat: Category) => e.yearTotals.reduce((a, y) => a + y
     check(!!al, 'the AI asked for track access and runs its line between the player\'s stations (no station of its own needed)');
     if (al) {
     const inc0 = total(g.economy, 'trackIncome'), d0 = ptr.delivered;
-    runDays(150);
+    // A slow train can have a genuinely empty final month. Observe completed native bills during
+    // the original window, rather than requiring that its last month happened to contain a passage.
+    const billingRows: { day: number; usage: number; paid: number }[] = [];
+    const payments: { amount: number; debit: number; credit: number }[] = [];
+    const billing = g as unknown as { payAccess(user: number, owner: number, amount: number): void };
+    const billAccess = g.billAccess, payAccess = billing.payAccess;
+    g.billAccess = function (...args) {
+      const result = billAccess.apply(this, args), agreement = this.agreement(ai.companyId, PLAYER);
+      billingRows.push({ day: this.day, usage: agreement?.usageShareLastMonth ?? 0, paid: agreement?.paidLastMonth ?? 0 });
+      return result;
+    };
+    billing.payAccess = function (...args) {
+      const [user, owner, amount] = args;
+      if (user !== ai.companyId || owner !== PLAYER) return payAccess.apply(this, args);
+      const payer = g.company(user).economy, payee = g.company(owner).economy;
+      const fees = total(payer, 'trackFees'), income = total(payee, 'trackIncome');
+      const result = payAccess.apply(this, args);
+      payments.push({ amount, debit: total(payer, 'trackFees') - fees, credit: total(payee, 'trackIncome') - income });
+      return result;
+    };
+    const paid0 = g.agreement(ai.companyId, PLAYER)?.paidTotal ?? 0;
+    try { runDays(150); } finally { g.billAccess = billAccess; billing.payAccess = payAccess; }
     const at = al ? g.vehicles.get(al.vehicles[0]) : undefined;
     console.log(`  150 days: player earned ${fmtMoney(total(g.economy, 'trackIncome') - inc0)} in fees; AI train ${at?.status} delivered ${at?.delivered}; player train delivered ${d0} -> ${ptr.delivered}`);
     check(total(g.economy, 'trackIncome') > inc0, 'the player earns track access fees from the AI train');
     const agr = g.agreement(ai.companyId, PLAYER);
     console.log(`  agreement: usage share last month ${fmt((agr?.usageShareLastMonth ?? 0) * 100, 0)}%, paid last month ${fmtMoney(agr?.paidLastMonth ?? 0)}, total ${fmtMoney(agr?.paidTotal ?? 0)}; player earned ${fmtMoney(g.accessEarnings(PLAYER).total)}`);
-    check(!!agr && agr.usageShareLastMonth > 0.05 && agr.paidTotal > 0, 'the AI pays its usage share of the shared railway');
+    const paid = payments.reduce((sum, payment) => sum + payment.amount, 0);
+    console.log(`  completed bills: ${billingRows.map(row => `${row.day}: ${fmt(row.usage * 100, 0)}% / ${fmtMoney(row.paid)}`).join(', ')}`);
+    check(!!agr && billingRows.some(row => row.usage > 0.05 && row.paid > 0) && paid > 0 && agr.paidTotal > paid0,
+      'the AI pays its usage share of the shared railway in an active billed month');
+    check(payments.every(payment => Math.abs(payment.debit + payment.amount) < 1e-6
+      && Math.abs(payment.credit - payment.amount) < 1e-6)
+      && Math.abs(paid - ((agr?.paidTotal ?? 0) - paid0)) < 1e-6,
+      'the actual pair\'s access payments match its payer debits, owner credits and agreement total');
     const access = g.stations.hasAccess(pr.A) && g.stations.hasAccess(pr.B);
     if (!access) console.log('  (the player stations have no road access: no passengers, delivery check skipped)');
     // (2.10: the halved walks leave these stations about 30 walkers each, and the trains, held behind each other on
