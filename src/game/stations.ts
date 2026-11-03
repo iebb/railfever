@@ -2638,6 +2638,43 @@ export class Stations {
     return true;
   }
 
+  /** Direct passages a single new rail facility would gain at commit. Keep the explicit own
+   * passages first, then the native automatic order; an admitted complex can exclude a later one.
+   * This local view never inserts a station or changes existing links/operating permissions. */
+  prospectiveRailLinks(plan: StationPlan): Station[] {
+    if (!plan.ok) return [];
+    const joined = plan.join && this.map.get(plan.join.id) === plan.join ? plan.join : null;
+    const future = { ...(joined ?? { id: this.nextId, stops: [], links: [] }),
+      x: plan.x, z: plan.z, rail: this.partOf(plan, [], []), links: [...(joined?.links ?? [])] } as Station;
+    if (planWalkScale(plan) !== 1) future.city = true; else delete future.city;
+    const extra = new Map<number, number[]>(), accepted: Station[] = [];
+    const get = (id: number) => id === future.id ? future : this.map.get(id);
+    const complex = (id: number) => {
+      const out = [id], seen = new Set(out);
+      for (let i = 0; i < out.length; i++) for (const next of [...(get(out[i])?.links ?? []), ...(extra.get(out[i]) ?? [])])
+        if (!seen.has(next) && get(next)) { seen.add(next); out.push(next); }
+      return out;
+    };
+    const admit = (st: Station) => {
+      if (st.id === future.id || future.links.includes(st.id) || this.gap(future, st) > this.linkRange(future, st)) return;
+      const left = complex(future.id), right = complex(st.id);
+      if (left.some(id => right.includes(id))) return;
+      for (const x of left) for (const y of right) {
+        const a = get(x)!, b = get(y)!;
+        if (this.consecutiveStops(x, y) || this.gap(a, b) > Math.min(autoLinkRange(this.mode(a), this.mode(b)), this.linkRange(a, b))) return;
+      }
+      future.links.push(st.id);
+      const reverse = extra.get(st.id) ?? []; reverse.push(future.id); extra.set(st.id, reverse);
+      accepted.push(st);
+    };
+    for (const st of plan.links) if (this.map.get(st.id) === st) admit(st);
+    const automatic = [...this.map.values()].filter(st => st.id !== future.id && st.rail && !future.links.includes(st.id))
+      .map(st => ({ st, gap: this.gap(future, st) })).sort((a, b) => a.gap - b.gap || a.st.id - b.st.id);
+    for (const candidate of automatic)
+      if (!(candidate.gap > Math.min(autoLinkRange(this.mode(future), this.mode(candidate.st)), this.linkRange(future, candidate.st)))) admit(candidate.st);
+    return accepted;
+  }
+
   /** Nearby rail platforms are one public interchange, retaining their separate track groups and owners. */
   private autoLinkNearby(st: Station): number {
     if (!st.rail) return 0;

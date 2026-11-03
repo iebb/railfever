@@ -2328,7 +2328,7 @@ class NetPlanner {
   private accessBuildingValue(st: Station, plan: StationPlan): number {
     const g = this.g, w = g.world;
     const current = new Set(g.stations.catchmentBuildings(st)), removed = new Set(plan.demolish);
-    const after = new Set(planWalkingCatchment(g, plan).buildings.keys());
+    const after = new Set(planWalkingCatchment(g, plan, plan.links).buildings.keys());
     // Merged road stops still give access to the platforms after a building change.
     for (const p of st.stops) for (const id of stopWalkingCatchment(g, p.edge, p.s, w.net.edges.get(p.edge)?.tram ? 'tram' : 'bus').buildings.keys()) after.add(id);
     for (const id of removed) after.delete(id);

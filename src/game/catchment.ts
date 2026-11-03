@@ -55,8 +55,17 @@ export function walkClaimShares(claims: { group: number; weight: number }[]): nu
   });
 }
 
+export type ForecastRailLinks = ReadonlyMap<StationPlan, readonly Station[]>;
+/** A single future facility has an unambiguous native commit. Multiple distinct plans retain
+ * literal passages: their construction order and evolving shared complexes are not specified here. */
+export function forecastRailLinks(g: Game, points: readonly (Station | StationPlan | { x: number; z: number })[]): ForecastRailLinks {
+  const plans = new Set(points.filter((p): p is StationPlan => !('id' in p) && 'layout' in p && 'links' in p));
+  return new Map([...plans].map(plan => [plan, plans.size === 1 ? g.stations.prospectiveRailLinks(plan) : [...plan.links]]));
+}
+
 /** Prospective public identity from admitted plan joins/passages; physical stop IDs and route order stay intact. */
-export function prospectiveWalkGroups(g: Game, points: readonly (Station | StationPlan | { x: number; z: number })[]) {
+export function prospectiveWalkGroups(g: Game, points: readonly (Station | StationPlan | { x: number; z: number })[],
+  railLinks: ForecastRailLinks = forecastRailLinks(g, points)) {
   const parents = new Map<number, number>();
   const find = (id: number): number => {
     const parent = parents.get(id);
@@ -70,7 +79,7 @@ export function prospectiveWalkGroups(g: Game, points: readonly (Station | Stati
   });
   points.forEach((p, i) => {
     if ('id' in p || !('links' in p)) return;
-    for (const st of p.links) if (g.stations.get(st.id)) join(groups[i], g.stations.catchmentGroup(st.id));
+    for (const st of railLinks.get(p as StationPlan) ?? p.links) if (g.stations.get(st.id)) join(groups[i], g.stations.catchmentGroup(st.id));
   });
   return { groups: groups.map(find), native: (id: number) => find(g.stations.catchmentGroup(id)) };
 }
@@ -712,8 +721,9 @@ function accessSnap(g: Game, sn: Snap, mode: CatchMode, bonus: number, leg: numb
 }
 
 /** Read-only hover estimate. Proposed access streets debit their length before reaching existing roads. */
-export function planWalkingCatchment(g: Game, plan: StationPlan): WalkingCatchment {
+export function planWalkingCatchment(g: Game, plan: StationPlan, links?: readonly Station[]): WalkingCatchment {
   if (!plan.roadAccess) return EMPTY;
+  const passages = links ?? g.stations.prospectiveRailLinks(plan);
   // (an in-city metro / light-rail station walks half as far: planWalkScale)
   const mode: CatchMode = 'rail', bonus = styleOf(plan.style).catchBonus, scale = planWalkScale(plan), limit = walkLimit(mode, bonus) * scale, sources: Access[] = [];
   const add = (p: { x: number; z: number } | null | undefined, reach: number) => { if (p) { const q = snapRoad(g, p.x, p.z, reach); if (q) sources.push({ ...q, mode, limit }); } };
@@ -725,7 +735,7 @@ export function planWalkingCatchment(g: Game, plan: StationPlan): WalkingCatchme
   if (plan.join) sources.push(...cache(g).access(plan.join).map((p) => ({ ...p, mode, limit })));
   if (plan.join) for (const id of g.stations.catchmentMembers(plan.join.id)) if (id !== plan.join.id) sources.push(...cache(g).access(g.stations.get(id)!));
   const linked = new Set<number>();
-  for (const st of plan.links) for (const id of g.stations.catchmentMembers(st.id)) if (!linked.has(id) && id !== plan.join?.id) {
+  for (const st of passages) for (const id of g.stations.catchmentMembers(st.id)) if (!linked.has(id) && id !== plan.join?.id) {
     linked.add(id); sources.push(...cache(g).access(g.stations.get(id)!));
   }
   const value = cache(g).calculate(`preview:${plan.x}:${plan.z}:${plan.angle}:${plan.style}:${plan.level}`, sources);

@@ -34,7 +34,7 @@ import type { Building } from './world';
 import type { Town } from './towns';
 import { DAY_SECONDS, DAYS_PER_MONTH, PASSENGER_RATE_SCALE, WALK_TRIP_INTENSITY, LOCAL_DEMAND_DISTANCE, LOCAL_DEMAND_EXP, LOCAL_SERVED_SHARE, URBAN_DEMAND, MAINLINE_FEEDER_SHARE, MAINLINE_FEEDERS } from './constants';
 import { BT_SHOP, BT_OFFICE, BT_TOWER } from './towns';
-import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, type WalkingCatchment } from './catchment';
+import { planWalkingCatchment, walkingCatchment, pointWalkingCatchment, walkLimit, pedestrianRoad, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, forecastRailLinks, type ForecastRailLinks, type WalkingCatchment } from './catchment';
 import { patternHeadways, linePatterns, lineTable } from './patterns';
 import { sampleDemandDestinations } from './demand-sampling';
 
@@ -1212,6 +1212,8 @@ export class DemandModel {
       && currentQueue?.key === candidateQueue.key
       ? currentQueue : undefined;
     const ranks = [...first.keys()], rank = identities.map(id => ranks.indexOf(id));
+    // Count original plan objects before duplicate joined identities are canonicalized below.
+    const railLinks = forecastRailLinks(this.g, points);
     points = points.map((p, i) => first.get(identities[i]) === i
       ? points.find(q => 'join' in q && q.join?.id === identities[i]) ?? p : p);
     const g = this.g;
@@ -1221,12 +1223,12 @@ export class DemandModel {
       const built = 'id' in p;
       const townId = forecastTown(g, p);
       return { x: p.x, z: p.z, townId, pop: 0, regions: new Map<number, number>(),
-        walk: 'walk' in p ? p.walk : built ? walkingCatchment(g, p) : planWalkingCatchment(g, p) };
+        walk: 'walk' in p ? p.walk : built ? walkingCatchment(g, p) : planWalkingCatchment(g, p, railLinks.get(p)) };
     });
     const own = new Set(points.flatMap(p => { const st = forecastStation(p); return st ? [st.id] : []; }));
     const ownStation = (id: number) => own.has(id);
     // Forecast the same one-claim-per-complex allocation as the committed station share-out.
-    const prospective = prospectiveWalkGroups(g, points), groups = prospective.groups;
+    const prospective = prospectiveWalkGroups(g, points, railLinks), groups = prospective.groups;
     const competing = new Map<number, WalkingCatchment>(), native: NativeWalk[] = [];
     for (const st of g.stations.map.values()) {
       if (!g.lines.stationServed(st.id)) continue;
@@ -1319,7 +1321,7 @@ export class DemandModel {
         for (const [r, pop] of pools[i].regions) s.regions.set(r, (s.regions.get(r) ?? 0) + pop);
       });
     }
-    const context = this.forecastRoutes(points, kmh, headway, owner, replacingLine, replacingPattern);
+    const context = this.forecastRoutes(points, kmh, headway, owner, replacingLine, replacingPattern, railLinks);
     const background = new Map<number, { walking: Map<number, number>; regional: Map<number, number> }>();
     if (context) {
       this.refreshFeeders();
@@ -1476,7 +1478,7 @@ export class DemandModel {
 
   /** Disposable passenger graph for the proposed timetable. Never edits a live line, pattern or vehicle. */
   private forecastRoutes(points: ForecastPoint[], kmh: number, headway: number, owner?: number,
-    replacingLine?: number, replacingPattern?: number) {
+    replacingLine?: number, replacingPattern?: number, railLinks: ForecastRailLinks = forecastRailLinks(this.g, points)) {
     const g = this.g, ids = points.map((p, i) => forecastStation(p)?.id ?? -i - 1), own = new Set(ids);
     const unique = [...own], rank = ids.map(id => unique.indexOf(id));
     // No other destinations: retain the previous direct forecast arithmetic exactly.
@@ -1532,10 +1534,10 @@ export class DemandModel {
     }
     for (let i = 0; i < points.length; i++) {
       const p = points[i]; if (ids.indexOf(ids[i]) !== i || !('links' in p)) continue;
-      // A built point already has these graph links. StationPlan.links is the native preflight's
-      // exact accepted transfer set; a join reuses its station and inherited links.
+      // Built points already have their graph links. A single future rail part also gains the
+      // native automatic public passages, after its explicit own links; ambiguous batches stay literal.
       if ('id' in p) continue;
-      const links = new Map(p.links.map(st => [st.id, st]));
+      const links = new Map((railLinks.get(p) ?? p.links).map(st => [st.id, st]));
       for (const id of p.join?.links ?? []) { const st = g.stations.get(id); if (st) links.set(id, st); }
       for (const st of links.values()) {
         if (st.id === ids[i]) continue;
