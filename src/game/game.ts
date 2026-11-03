@@ -98,6 +98,8 @@ if (Math.abs(DAY_SECONDS / TICK - TICKS_PER_DAY) > 1e-9) throw new Error('DAY_SE
 export const MAX_FRAME_SECONDS = 8 * TICK;
 /** Tick of the day of the AI companies' shared-path reviews (half a day after their other daily decisions). */
 const SHARED_CAPACITY_TICK = TICKS_PER_DAY / 2;
+/** Gameplay recovery eligibility; an in-flight scan retains its saved threshold. */
+const DEADLOCK_RECOVERY_WAIT = 10;
 /** A frame may release fewer ticks when simulation work is expensive. */
 const FRAME_BUDGET_MS = 20;
 
@@ -938,8 +940,9 @@ export class Game {
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
     }
-    // Start a complete scan every three days and finish it in bounded fixed-tick slices.
-    if (this.deadlockScan || (this.tick % TICKS_PER_DAY === 0 && this.day % 3 === 0)) resolveDeadlocks(this, 40, DEADLOCK_WORK);
+    // Start daily; finish the complete saved scan in bounded fixed-tick slices.
+    if (this.deadlockScan || this.tick % TICKS_PER_DAY === 0)
+      resolveDeadlocks(this, this.deadlockScan?.minWait ?? DEADLOCK_RECOVERY_WAIT, DEADLOCK_WORK);
     if (this.tick % TICKS_PER_DAY === 0) {
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();
