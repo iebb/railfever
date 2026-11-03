@@ -37,7 +37,7 @@ import { savePlannerTask, loadPlannerTask, type PlannerTaskData } from './ai-tas
 import { walkSitePop, walkLimit, planWalkingCatchment, walkingCatchment, walkingPopulation, pointWalkingCatchment, pedestrianRoad, stopSiteWalkingCatchment, ownPlannerWalk } from './catchment';
 import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import * as Patterns from './patterns';
-import { platformPreference, platformChoices } from './rail-platforms';
+import { platformPreference, platformChoices, platformChoicesForStock } from './rail-platforms';
 import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
@@ -229,7 +229,18 @@ export function openingRailCall(g: Game, t: Pick<Train, 'line' | 'depotId' | 'ow
   const pattern = Patterns.patternOf(l, t.pattern)?.id ?? l.patterns?.[0]?.id ?? 0, indices = Patterns.patternStops(l, pattern);
   // The next-hop route alone cannot prove a later foreign call fits the same actual fleet/pattern.
   // Native platform choices prove lawful incoming/outgoing full-fit paths at every served occurrence.
-  if (indices.some(index => !platformChoices(g, l, pattern, index).length)) return -1;
+  // Only native stock already included by rail-platforms.stock can reuse its existing proof.
+  // Picks (even with a registered id), subclasses and custom operand getters need the proposed-stock proof.
+  const represented = Object.getPrototypeOf(t) === Train.prototype
+    && ['kind', 'id', 'owner', 'pattern', 'cars', 'lineId'].every(key => {
+      const d = Object.getOwnPropertyDescriptor(t, key);
+      return d ? 'value' in d && (key !== 'kind' || d.value === 'train') : key === 'pattern';
+    })
+    && ['line', 'rule', 'length'].every(key => !Object.prototype.hasOwnProperty.call(t, key))
+    && (g.vehicles.get(t.id) as unknown) === t && l.vehicles.includes(t.id)
+    && (l.patterns?.some(p => p.id === t.pattern) ? t.pattern : l.patterns?.[0]?.id ?? 0) === pattern;
+  if (indices.some(index => !(represented ? platformChoices(g, l, pattern, index)
+    : platformChoicesForStock(g, l, pattern, index, { owner: t.owner, rule: t.rule, length: t.length })).length)) return -1;
   indices.sort((a, b) => Number(l.stops[b] === preferredStation) - Number(l.stops[a] === preferredStation) || a - b);
   for (const index of indices) {
     const saved = platformPreference(l, t.pattern, index), onward = l.stops[Patterns.nextStopIndex(l, t.pattern, index)];
