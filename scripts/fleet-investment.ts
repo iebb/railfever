@@ -5,7 +5,8 @@ import { serialize, deserialize } from '../src/game/save';
 import { marginalSharedTrain, marginalTrainInvestment } from '../src/game/ai-capacity';
 import { openingRailCall } from '../src/game/ai';
 import { outerEnd, planTerminusYard, buildTerminusYard, copyGrowCursor } from '../src/game/ai-grow';
-import { networkItem, networkPlanner, runNetworkTask, stepNetworkTask, networkDaily } from '../src/game/ai-network';
+import { FLEET_REPURCHASE_HOLD_DAYS } from '../src/game/constants';
+import { networkItem, networkPlanner, runNetworkTask, stepNetworkTask, networkDaily, scheduleNetworkTask } from '../src/game/ai-network';
 import { Train } from '../src/game/train';
 import { toggleSignal } from '../src/game/build-ops';
 import { addPattern, setVehiclePattern } from '../src/game/patterns';
@@ -18,6 +19,7 @@ import { autoSignalLine } from '../src/game/signals';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { checkReservations } from './lib';
+import { bezLine } from '../src/game/geom';
 
 let checks = 0;
 function check(ok: unknown, label: string): asserts ok { assert(ok, label); checks++; }
@@ -74,6 +76,165 @@ check(JSON.stringify(marginalTrainInvestment(loaded, loadedLine, ai.companyId, o
 check(saved(loaded) === quoted, 'cold quote does not change an existing saved observation');
 marginalTrainInvestment(g, line, ai.companyId, old.madeUp, old.pattern);
 check(saved(g) === quoted, 'warm quote is a pure read');
+
+/** A real paid extra train is sold by the native policy, which records the common post-sale hold. */
+function nativeCut(world: Game, serviceId = line.id) {
+  const service = world.lines.get(serviceId)!, owner = world.aiOf(service.owner)!;
+  const train = world.vehicles.get(service.vehicles[0]) as Train;
+  const info = (owner as any).lines.get(service.id), count = service.vehicles.length;
+  const before = world.vehicles.map.size, money = owner.eco.money;
+  const extra = world.vehicles.buyTrain(info.depot, train.madeUp, service.id);
+  check(extra instanceof Train && owner.eco.money === money - train.madeUp.reduce((n, m) => n + m.cost, 0),
+    'hold setup really pays the native full stock price');
+  check(owner.railPolicy.fewer(service, 1, 'fewer trains for congestion'), 'native policy sells actual surplus stock');
+  check(world.vehicles.map.size === before && info.lastSold === world.day
+    && owner.railPolicy.events.at(-1)?.text.endsWith(`(${count + 1} → ${count})`),
+    'native sale restores the original fleet and records its real day and cut event');
+  return info;
+}
+
+const cutControl = deserialize(JSON.parse(quoted)); nativeCut(cutControl);
+const cutTrain = cutControl.vehicles.get(line.vehicles[0]) as Train;
+check(marginalTrainInvestment(cutControl, cutControl.lines.get(line.id)!, ai.companyId, cutTrain.madeUp).investor > 0,
+  'sale hold fixture retains genuinely positive native economics');
+const cutSave = saved(cutControl);
+for (const age of [FLEET_REPURCHASE_HOLD_DAYS - 1, FLEET_REPURCHASE_HOLD_DAYS, undefined]) {
+  const world = deserialize(JSON.parse(cutSave)), owner = world.aiOf(ai.companyId)!;
+  const info = (owner as any).lines.get(line.id);
+  if (age === undefined) delete info.lastSold; else info.lastSold = world.day - age;
+  const finances = ledger(world), ceiling = info.maxVehicles, size = world.vehicles.map.size, cursor = survey(world);
+  check(cursor?.opts?.length === 1 && cursor.opts[0].kind === 'fleet', 'sale hold preserves the actual native standalone option');
+  stepNetworkTask(owner, 'extend');
+  if (age === FLEET_REPURCHASE_HOLD_DAYS - 1) {
+    check(!cursor.best, 'day 179: positive unchanged-route fleet investment is unavailable during the sale hold');
+    stepNetworkTask(owner, 'extend');
+    check(ledger(world) === finances && info.maxVehicles === ceiling,
+      'day 179: held valuation and completion do not borrow, purchase, change assets or raise the fleet ceiling');
+  } else {
+    check(cursor.best?.fleet, age === undefined ? 'absent sale day retains native positive eligibility' : 'day 180: native positive eligibility returns at the exact boundary');
+    const twin = cold(world); networkDaily(owner); networkDaily(twin.aiOf(ai.companyId)!);
+    check(world.vehicles.map.size === size + 1 && saved(world) === saved(twin),
+      `${age === undefined ? 'absent sale day' : 'day 180'}: actual funded purchase and cold continuation agree`);
+  }
+}
+
+// A sale can occur after a positive option was valued and saved, before the purchase work unit.
+const stale = deserialize(JSON.parse(quoted)); pending(stale); nativeCut(stale);
+const staleCold = cold(stale), staleFunds = ledger(stale), staleCapacity = JSON.stringify(stale.lines.get(line.id)!.capacity),
+  staleCeiling = (stale.aiOf(ai.companyId) as any).lines.get(line.id).maxVehicles;
+networkDaily(stale.aiOf(ai.companyId)!); networkDaily(staleCold.aiOf(ai.companyId)!);
+check(ledger(stale) === staleFunds && JSON.stringify(stale.lines.get(line.id)!.capacity) === staleCapacity
+  && (stale.aiOf(ai.companyId) as any).lines.get(line.id).maxVehicles === staleCeiling,
+  'a native cut after the saved standalone quote rejects commit before funding or demand repricing');
+check(saved(stale) === saved(staleCold), 'held stale standalone decision round-trips and rejects identically after load');
+let heldReplay = true;
+for (let i = 0; i < 128; i++) { stale.stepTick(); staleCold.stepTick(); heldReplay &&= saved(stale) === saved(staleCold); }
+check(heldReplay && !checkReservations(stale).length, 'held stale bid has exact native 128-tick continuation and reservations');
+
+// The original ext/fill-only survey can also prefer unchanged-route fleet. Capture that actual
+// native legacy bid, rather than manufacturing a score or replacing its option with a standalone one.
+// These literal helpers preserve the existing original linegrow.ts legacy fixture, whose
+// street-facing rows differ from the historical linegrow-fixtures.ts helper.
+function legacyRoad(g: Game, x0: number, z0: number, x1: number, z1: number) {
+  const net = g.world.net, a = net.nearestNode(x0, z0, 0.01, 'road') ?? net.addNode('road', x0, 4, z0, 0, 0, -1);
+  const b = net.nearestNode(x1, z1, 0.01, 'road') ?? net.addNode('road', x1, 4, z1, 0, 0, -1);
+  const len = Math.hypot(x1 - x0, z1 - z0);
+  net.addEdge('road', a.id, b.id, bezLine(x0, z0, x1, z1), new Float32Array(Math.ceil(len) + 1).fill(4), [], 'street', -1);
+}
+function legacyDistrict(g: Game, t: Town, x0: number, x1: number, z: number, h: number, pop: number, cross = false, strip = true) {
+  const xs: number[] = [];
+  for (let x = x0; x <= x1 + 1e-6; x += 8) xs.push(x);
+  const zs: number[] = [];
+  for (let k = 0; k * 8 <= h + 1e-6; k++) zs.push(z - h / 2 + k * 8 + 4);
+  for (const rz of zs) for (let i = 1; i < xs.length; i++) legacyRoad(g, xs[i - 1], rz, xs[i], rz);
+  for (const rx of xs) for (let i = 1; i < zs.length; i++) { if (!cross && zs[i - 1] < z && zs[i] > z) continue; legacyRoad(g, rx, zs[i - 1], rx, zs[i]); }
+  const lots: { x: number; z: number; angle: number }[] = [];
+  for (const rz of zs) for (let rx = x0 + 2; rx < x1; rx += 4) {
+    // (User rule, 2.10: walking reach halved again, an in-city light-rail stop walking 74 m along streets. 2.9 kept both
+    // rows beside the line clear, lots from 109 m, which its stops no longer reach at all; lots now start beyond the row
+    // street north of the line, 51 m. Lots beside rail track or depots stay empty, as below.)
+    if (strip && Math.abs(rz + 1.1 - z) < 4) continue;
+    const near = g.world.net.edgesNear(rx - 2.5, rz + 1.1 - 2.5, rx + 2.5, rz + 1.1 + 2.5).some((e) => e.kind === 'rail')
+      || g.depots.near(rx, rz + 1.1, 3).length > 0;
+    if (near) continue;
+    lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
+  }
+  let remaining = pop;
+  lots.forEach((p, i) => {
+    const count = Math.ceil(remaining / (lots.length - i)); remaining -= count;
+    const b = g.world.addBuilding({ townId: t.id, ...p, w: 1.4, d: 1.4, type: 4, floors: 8, pop: count, seed: i + t.buildings.size, y: 4, built: 0 });
+    t.buildings.add(b.id);
+  });
+  t.pop += pop;
+  let x = 0, zz = 0, n = 0;
+  for (const id of t.buildings) { const b = g.world.buildings.get(id)!; x += b.x; zz += b.z; n++; }
+  if (n) { t.x = x / n; t.z = zz / n; }
+  t.radius = Math.max(t.radius, (x1 - x0) * 0.6);
+  g.demand.rebuild();
+}
+
+// Literal original linegrow.ts busy fixture: its districts are 32 units deep; the older
+// linegrow-fixtures.ts helper has 64-unit districts and a different economic premise.
+const fallbackBase = flat(), fallbackWorld = fallbackBase.g;
+const fallbackTown = newTown(fallbackWorld, 'Presholm', 220, 256);
+legacyDistrict(fallbackWorld, fallbackTown, 150, 270, 256, 32, 7000);
+const fallback = { ...fallbackBase, ...cityLine(fallbackWorld, fallbackBase.me,
+  [158, 183, 208, 233, 258], 256, 'east', 'old', 6) };
+runDays(fallbackWorld, 30);
+legacyDistrict(fallbackWorld, fallbackTown, 270, 342, 256, 32, 1200); runDays(fallbackWorld, 5);
+check(fallbackWorld.vehicles.buyTrain(fallback.depot, [M('lrv_b')], null) instanceof Train
+  && fallbackWorld.vehicles.buyTrain(fallback.depot, [M('lrv_b')], fallback.line.id) instanceof Train,
+  'legacy fallback uses the original paid seven-train/depot-traffic scenario');
+fallbackWorld.aiEnabled = true; scheduleNetworkTask(fallback.ai, 'extend', 0);
+let legacyBid = false;
+const legacyUntil = fallbackWorld.day + 150;
+while (fallbackWorld.day < legacyUntil && !legacyBid) {
+  runDays(fallbackWorld, 1, () => {
+    const cursor = networkItem(fallback.ai)?.grow;
+    if (cursor?.at === 1) cursor.opts = cursor.opts?.filter(o => o.kind !== 'fleet');
+  });
+  const next = networkItem(fallback.ai)?.grow;
+  legacyBid = !!next?.best?.fleet && next.at > (next.opts?.length ?? 0)
+    && next.opts?.[next.best.opt]?.kind !== 'fleet';
+}
+fallbackWorld.aiEnabled = false;
+const legacyCursor = networkItem(fallback.ai)?.grow;
+check(legacyBid && legacyCursor?.best?.fleet, 'native ext/fill valuation supplies a genuine saved fleet-only fallback');
+const legacyBeforeCut = saved(fallbackWorld);
+nativeCut(fallbackWorld, fallback.line.id);
+const legacyHeld = cold(fallbackWorld), legacyFunds = ledger(fallbackWorld), legacyObservation = JSON.stringify(fallback.line.capacity),
+  legacyCeiling = (fallback.ai as any).lines.get(fallback.line.id).maxVehicles;
+// Observe the real native geometry query, forwarding exactly and restoring its prior descriptor.
+// A held saved commit must return before service/depot/forecast revaluation, even if lower guards
+// would also prevent a purchase. This isolates the outer commit guard from those lower guards.
+function geometryCalls(world: Game, run: () => void): number {
+  const stations = world.stations, own = Object.getOwnPropertyDescriptor(stations, 'railTrackGroups'), native = stations.railTrackGroups;
+  let calls = 0;
+  Object.defineProperty(stations, 'railTrackGroups', { configurable: true, writable: true,
+    value: function(this: typeof stations, ...args: Parameters<typeof native>) { calls++; return native.apply(this, args); } });
+  try { run(); }
+  finally { if (own) Object.defineProperty(stations, 'railTrackGroups', own); else Reflect.deleteProperty(stations, 'railTrackGroups'); }
+  return calls;
+}
+const legacyGeometry = geometryCalls(fallbackWorld, () => networkDaily(fallback.ai));
+const legacyColdGeometry = geometryCalls(legacyHeld, () => networkDaily(legacyHeld.aiOf(fallback.me)!));
+check(legacyGeometry === 0 && legacyColdGeometry === 0, 'held stale legacy commit performs no native service/depot geometry revaluation');
+check(ledger(fallbackWorld) === legacyFunds && JSON.stringify(fallback.line.capacity) === legacyObservation
+  && (fallback.ai as any).lines.get(fallback.line.id).maxVehicles === legacyCeiling,
+  'a native sale after an extension-derived fleet quote blocks stale fallback before funding or repricing');
+check(saved(fallbackWorld) === saved(legacyHeld), 'held legacy fallback rejects identically with cold saved continuation');
+
+// Revalue the same real ext/fill options during the hold. Civil options remain present; only
+// their unchanged-route fleet substitute is ineligible, independently of the commit recheck.
+const revalue = deserialize(JSON.parse(legacyBeforeCut)); nativeCut(revalue, fallback.line.id);
+const revalueCursor = networkItem(revalue.aiOf(fallback.me)!)!.grow!;
+revalueCursor.at = 1; delete revalueCursor.best;
+const revalueFunds = ledger(revalue), optionCount = revalueCursor.opts!.length;
+check(optionCount > 0 && revalueCursor.opts!.every(o => o.kind === 'ext' || o.kind === 'fill'),
+  'held review preserves the native legacy civil options');
+for (let i = 0; i < optionCount; i++) stepNetworkTask(revalue.aiOf(fallback.me)!, 'extend');
+check(!revalueCursor.best?.fleet && ledger(revalue) === revalueFunds,
+  'held ext/fill valuation cannot replace real civil work with an unchanged-route fleet bid');
 // An in-memory load must own its saved decision state, just like a JSON-loaded game. Native
 // monthly pricing in one fork must not publish a new demand observation into its source.
 const directFork = deserialize(serialize(g)), isolatedFork = cold(g);

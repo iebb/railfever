@@ -61,6 +61,8 @@ export const ROAD_FARES = { tram: { boarding: 80, distance: 0.9 }, bus: { boardi
  * Cross-city joins retain their existing fifteen-year gate.
  */
 export const URBAN_PAYBACK = { metro: 25, lightrail: 20, crosscity: 15 };
+/** After selling stock, let the current service settle before buying its fleet back. Civil works price their own capacity. */
+export const FLEET_REPURCHASE_HOLD_DAYS = 180;
 /** Present value of one year's surplus repeated over an investment horizon, at the actual borrowing rate. */
 export function discountedPayback(years: number, interestRate: number): number {
   return interestRate > 0 ? (1 - Math.pow(1 + interestRate, -years)) / interestRate : years;

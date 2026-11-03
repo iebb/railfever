@@ -22,7 +22,7 @@ import type { NEdge, Section } from './network';
 import type { Line } from './lines';
 import { linearStops, outAndBack } from './lines';
 import { replaceLineStops } from './line-edit';
-import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
+import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf, WALK_TRIP_INTENSITY, FLEET_REPURCHASE_HOLD_DAYS } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
 import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
@@ -6804,7 +6804,7 @@ export class AIController {
       // more capacity when passengers pile up on a line that pays (active companies expand sooner): railways
       // first get longer trains (up to the platforms), then more trains
       const grow = Math.sqrt(act);
-      if (!vs.length || g.day - (info.lastSold ?? -1e9) < 180) continue;
+      if (!vs.length || g.day - (info.lastSold ?? -1e9) < FLEET_REPURCHASE_HOLD_DAYS) continue;
       const young = g.day - info.opened < 360;
       if (!young && l.incomeLast < l.costLast * 1.2 + 10_000) continue;
       let waiting = 0;

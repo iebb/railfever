@@ -25,7 +25,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Train } from './train';
 import type { OnTrackPlan } from './trackops';
 import { CATCHMENT_RADIUS, railPartMode, STATION_DEPTH, STATION_HEIGHT, CITY_WALK_SCALE, STATION_UPKEEP_FACTOR } from './stations';
-import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf, RAIL, ROAD_TYPES } from './constants';
+import { TRACK_TYPES, UNIT_M, URBAN_PAYBACK, discountedPayback, DAY_SECONDS, trackTypeOf, RAIL, ROAD_TYPES, FLEET_REPURCHASE_HOLD_DAYS } from './constants';
 import { onwardCentres, urbanDistricts } from './ai-urban';
 import { planEdge, commitProposal } from './construction';
 import { WALK_DETOUR, walkingCatchment } from './catchment';
@@ -516,7 +516,7 @@ export interface GrowHost {
   /** canSpend's test without its borrowing: `cost` within `share` of what the company can commit now */
   affordable(cost: number, share?: number): boolean;
   fleet(l: Line): { ours: number[]; others: number };
-  managed(): Map<number, { depot: number; maxVehicles: number; towns: number[]; opened: number; urban?: string }> | null;
+  managed(): Map<number, { depot: number; maxVehicles: number; towns: number[]; opened: number; urban?: string; lastSold?: number }> | null;
   setStops(l: Line, stops: number[]): void;
   signal(lineId: number): number;
   canon(lineId: number): void;
@@ -934,9 +934,15 @@ function planExtension(h: GrowHost, T: Station, te: TerminusEnd, n: number, turn
 interface Investment { score: number; net: number; capital: number; revenue: number; trains: number }
 interface Valuation extends Investment { fleet: Investment }
 
+/** Match monthly management's sale hold only for added stock on the unchanged route. */
+function fleetPurchaseAllowed(h: GrowHost, l: Line): boolean {
+  return !(h.g.day - (h.managed()?.get(l.id)?.lastSold ?? -1e9) < FLEET_REPURCHASE_HOLD_DAYS);
+}
+
 /** One real departure, independent of whether a station extension happens to fit. The native path quote
  * includes the operator's costs, access and congestion it imposes on all other services. */
 function fleetInvestment(h: GrowHost, l: Line, path: number[], pattern?: number) {
+  if (!fleetPurchaseAllowed(h, l)) return null;
   const sv = serviceOf(h, l, path, [], pattern);
   if (!sv || fleetOpeningCall(h, l, sv) < 0 || !h.affordable(sv.price * 1.1, 0.3)) return null;
   const quote = marginalTrainInvestment(h.g, l, h.me, sv.cars, sv.pid), net = quote.investor;
@@ -962,7 +968,7 @@ function value(h: GrowHost, l: Line, beforeRoute: Station[], afterRoute: (Statio
   const fleetCapital = extra * sv.price;
   // A hypothetical fleet which cannot admit even its first departure must not displace a viable extension.
   // The purchase loop still reprices each actual added train against the physical resources it consumes.
-  const fleetAllowed = extra > 0 && marginalSharedTrain(g, l, h.me, sv.cars, sv.pid) > 0;
+  const fleetAllowed = fleetPurchaseAllowed(h, l) && extra > 0 && marginalSharedTrain(g, l, h.me, sv.cars, sv.pid) > 0;
   const fleet = { score: fleetAllowed ? fleetNet * payback(h, mode) - fleetCapital : 0, net: fleetNet, capital: fleetCapital,
     revenue: fleetRevenue, trains: fleetAllowed ? extra : 0 };
   const revenue = (carried(forecast(g, after, mode, next, extra), next, extra) - today) * rate;
@@ -1404,6 +1410,8 @@ function observeCurrent(h: GrowHost, l: Line, path: number[], pid: number): void
 
 /** Revalue a chosen fleet-only alternative in today's world and buy only when it still wins on incentives. */
 function buildFleet(h: GrowHost, l: Line, path: number[], o: GrowOption): boolean | 'busy' {
+  // A native sale can happen after this option was valued or saved. Recheck before quoting or borrowing.
+  if (!fleetPurchaseAllowed(h, l)) return false;
   if (o.kind === 'fleet') {
     const v = fleetInvestment(h, l, path, o.pattern);
     if (!v || !(v.score > 0) || !funds(h, 'ext', v.capital, false)) return false;
