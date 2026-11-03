@@ -25,7 +25,7 @@ import { replaceLineStops } from './line-edit';
 import { WATER_Y, TRACK_TYPES, UNIT_M, RAIL, PSTEP, NetKind, URBAN_PAYBACK, URBAN_DEMAND, ELECTRIFY, discountedPayback, trackTypeOf, WALK_TRIP_INTENSITY, FLEET_REPURCHASE_HOLD_DAYS } from './constants';
 import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
-import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
+import { Train, depotReaches, depotServes, consistRule, ruleAllows, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
 import { RNG } from './rng';
 import { Economy, loanLimit } from './economy';
@@ -1357,6 +1357,9 @@ export function coachesFitting(platform: number, loco: VehicleModel, wag: Vehicl
 
 /** Coaches of a new AI train: short at opening (2, or 3 between big towns); trains grow when passengers pile up. */
 export function openingCoaches(popA: number, popB: number): number { return Math.sqrt(Math.max(0, popA * popB)) >= 4500 ? 3 : 2; }
+
+/** Necessary fit inputs before an ordinary railway's actual route length is known. */
+interface OrdinaryHubStock { platform: number; coaches: number }
 
 /**
  * Platform length (units) of a new AI railway's stations by demand: 8–10, 12 only for heavy demand (10 where the
@@ -2857,7 +2860,7 @@ export class AIController {
    * Our rail station in town T whose platform ends towards `toward` are all free (a hub a new line can start from),
    * with its axis pointing roughly that way.
    */
-  hubFor(T: Town, toward: P2): Station | null {
+  hubFor(T: Town, toward: P2, stock?: OrdinaryHubStock): Station | null {
     const g = this.game, net = g.world.net, me = this.companyId;
     // ours first; else another AI company's whose network is open to ours and ours to it (mutual open access: our track
     // joins its station; never the player's) — its line can be continued by our trains
@@ -2872,10 +2875,30 @@ export class AIController {
       if (Math.abs(along) < 0.55) continue; // the line would have to turn too sharply
       const ends = stationEnds(g, st).map((e) => (along > 0 ? e.front : e.back));
       if (!ends.length || !ends.every((id) => net.nodes.get(id)?.edges.length === 1)) continue;
+      if (!this.ordinaryHubFits(st, stock)) continue;
       const rank = this.railReusePriority(st);
       if (rank > priority) { best = st; priority = rank; }
     }
     return best;
+  }
+
+  /** Local whole-body fit only; construction still proves the actual complete route and opening stock. */
+  private ordinaryHubFits(st: Station, stock?: OrdinaryHubStock): boolean {
+    if (!stock) return true; // HSR and unrelated hub lookups retain their existing rules.
+    if (!st.rail) return false;
+    const g = this.game, net = g.world.net, groups = g.stations.railTrackGroups(st);
+    // The eventual other hub/join can lower the platform cap and coach count. Keep every native
+    // lower-cap outcome in both span regimes until the actual route and its stock are priced.
+    const coaches = Array.from({ length: stock.coaches }, (_, i) => i + 1);
+    return [220, 221].some(span => coaches.some(count => {
+      const cars = pickTrain(g.year, Math.min(stock.platform, st.rail!.length), span, count);
+      if (!cars) return false;
+      const length = cars.reduce((n, c) => n + c.length + .1, 0), rule = consistRule(cars);
+      return groups.some(group => group.length + 1e-6 >= length + .05 && group.steps.every(step => {
+        const edge = net.edges.get(step.edge);
+        return !!edge && g.canUse(this.companyId, edge.owner) && ruleAllows(rule, edge);
+      }));
+    }));
   }
 
   /**
@@ -2916,10 +2939,11 @@ export class AIController {
 
   /** Compare ownership at both town ends; station iteration order never decides whose line grows. */
   private railReuseEnds(A: Town, B: Town) {
-    const a = this.hubFor(A, B), b = this.hubFor(B, A);
+    const stock = { platform: aiPlatformLength(A.pop, B.pop, this.game.year), coaches: openingCoaches(A.pop, B.pop) };
+    const a = this.hubFor(A, B, stock), b = this.hubFor(B, A, stock);
     // A foreign free end also competes with our paid junction at the other end.
     const branches = Math.max(this.railReusePriority(a), this.railReusePriority(b)) < 3;
-    const ba = branches ? this.branchStation(A, B) : null, bb = branches ? this.branchStation(B, A) : null;
+    const ba = branches ? this.branchStation(A, B, stock) : null, bb = branches ? this.branchStation(B, A, stock) : null;
     const branchRank = Math.max(this.railReusePriority(ba), this.railReusePriority(bb));
     const freeA = this.railReusePriority(a) >= this.railReusePriority(b) && this.railReusePriority(a) >= branchRank ? a : null;
     const freeB = freeA ? null : b;
@@ -2929,11 +2953,11 @@ export class AIController {
   }
 
   /** A paid station approached by an existing railway: build a real junction, not a duplicate town terminus. */
-  private branchStation(T: Town, toward: P2): Station | null {
+  private branchStation(T: Town, toward: P2, stock?: OrdinaryHubStock): Station | null {
     let best: Station | null = null, distance = Infinity;
     for (const st of this.game.stations.map.values()) {
       if (st.townId !== T.id || !st.rail || railPartMode(st.rail) !== 'mainline' || !this.railHubLive(st)
-        || !this.game.lines.stationServed(st.id) || !this.approachJunctions(st, toward).length) continue;
+        || !this.ordinaryHubFits(st, stock) || !this.game.lines.stationServed(st.id) || !this.approachJunctions(st, toward).length) continue;
       const d = Math.hypot(st.x - toward.x, st.z - toward.z);
       if (this.railReusePriority(st) > this.railReusePriority(best)
         || this.railReusePriority(st) === this.railReusePriority(best) && d < distance) { best = st; distance = d; }
@@ -3975,11 +3999,14 @@ export class AIController {
     if (hub && !this.railHubLive(hub)) { this.failRailContinuation(task, 'station or track access changed while planning', 360); return null; }
     if (hs && !hsUnit) { this.failRailContinuation(task, 'no high-speed trains yet', 1800); return null; }
     const PLATFORM = hs ? Math.max(12, Math.ceil(hsUnit!.length + 1)) : aiPlatformLength(A.pop, B.pop, g.year);
+    const stock = hs ? undefined : { platform: PLATFORM, coaches: openingCoaches(A.pop, B.pop) };
+    if (hub && !this.ordinaryHubFits(hub, stock)) { this.failRailContinuation(task, 'existing station platforms cannot take opening stock', 360); return null; }
     const ST = 2, tracks = 1, grade = (hs ? .03 : .035) * .8;
     const speedR = (Math.min(180, hsUnit?.speed ?? 180) / curveSpeed(1, 'highspeed')) ** 2;
     const curve = hs ? { type, minR: Math.max(44, speedR), rmax: Math.max(500, (hsUnit!.speed / curveSpeed(1, type)) ** 2), rgood: speedR,
       approachR: 44, approachLength: 60, trackClass: 'highspeed' as const, cell: Math.max(12, Math.ceil(g.world.size / 48)) } : { minR: 14 };
-    const hb = joinId >= 0 ? null : this.hubFor(B, hub ?? A);
+    const secondaryStock = stock && { ...stock, platform: Math.min(stock.platform, hub?.rail?.length ?? stock.platform) };
+    const hb = joinId >= 0 ? null : this.hubFor(B, hub ?? A, secondaryStock);
     const hubB = hb && hb !== hub && hb.rail && railPartMode(hb.rail) === 'mainline' && (!hs || hb.rail.length >= hsUnit!.length + .4) ? hb : null;
     if (hubB) watched.set(hubB, { rail: hubB.rail, owner: hubB.owner, access: true });
     if (hubB && !this.railHubLive(hubB)) { this.failRailContinuation(task, 'station or track access changed while planning', 360); return null; }
