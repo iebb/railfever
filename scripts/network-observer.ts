@@ -154,10 +154,29 @@ export function observeNetwork(g: Game) {
   });
   hook(g.stations, 'rekeyWaiting', original => function(this: typeof g.stations, st: Station, ...args: any[]) {
     for (const frame of boards) if (frame.station === st) captureTaken(frame);
-    for (const w of st.waiting.values()) provenance.delete(w);
-    const result = original.call(this, st, ...args);
-    for (const w of st.waiting.values()) provenance.delete(w);
-    return result;
+    const priorMap = provenance, unchanged = new Map<WaitGroup, Provenance>();
+    for (const w of st.waiting.values()) {
+      const origin = known(w);
+      // Snapshot the CURRENT count, not the older provenance ceiling: a partially boarded12→8
+      // group must not regain its old identity if native rekey then merges2unknown riders into it.
+      if (origin) unchanged.set(w, { origin, count: w.count, signature: signature(w) });
+      provenance.delete(w);
+    }
+    let completed = false;
+    try {
+      const result = original.call(this, st, ...args);
+      completed = true;
+      return result;
+    } finally {
+      for (const w of st.waiting.values()) {
+        provenance.delete(w);
+        const before = unchanged.get(w);
+        // Native rekey merges only upwards; a surviving object with equal count/signature was
+        // neither merged nor rerouted. A line rebuild or incomplete/throwing rekey stays unknown.
+        if (completed && provenance === priorMap && before && w.count === before.count && signature(w) === before.signature)
+          provenance.set(w, before);
+      }
+    }
   });
   hook(g.lines, 'rebuild', original => function(this: typeof g.lines, ...args: any[]) {
     provenance = new WeakMap(); // Routing/line changes never inherit guessed queue provenance.

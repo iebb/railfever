@@ -106,6 +106,100 @@ function classificationChecks() {
     check(save(g) === json && !Object.hasOwn(g, 'recordStop') && !Object.hasOwn(ta, 'serveStation'), 'observer: disposal restores native methods without world changes');
   }
 }
+
+function rekeyChecks() {
+  const f = transferFixture(false), literal = deserialize(JSON.parse(save(f.g)));
+  const twin: typeof f = { g: literal, A: literal.stations.get(f.A.id)!, H: literal.stations.get(f.H.id)!,
+    Q: literal.stations.get(f.Q.id)!, B: literal.stations.get(f.B.id)!, a: literal.lines.get(f.a.id)!, b: literal.lines.get(f.b.id)!,
+    ta: literal.vehicles.get(f.ta.id) as Train, tb: literal.vehicles.get(f.tb.id) as Train };
+  const observed = observeNetwork(f.g);
+  check(save(f.g) === save(literal), 'observer rekey: independent native paid fixture initially byte-exact');
+  const both = <T>(act: (world: typeof f) => T): T => {
+    const result = act(f), plain = act(twin);
+    check(save(f.g) === save(literal), 'observer rekey: complete native world equals literal before counter comparisons');
+    check(JSON.stringify(result) === JSON.stringify(plain), 'observer rekey: native return/result equals literal');
+    return result;
+  };
+  const enqueue = (count: number) => both(({ g, A, H, B, ta }) => {
+    // Declared passenger fixture, as in classificationChecks; native paid vehicles perform the handoff.
+    ta.cargo.clear(); ta.cargo.set('rekey-probe', { from: A.id, alight: H.id, dest: B.id, count, day: g.day }); ta.load = count;
+    ta.serveStation(H, 0.03);
+    return [...H.waiting.values()].find(w => w.line === f.b.id)?.count;
+  });
+  const deliver = () => both(({ tb, B }) => tb.serveStation(B, 0.03));
+
+  enqueue(12);
+  check(both(({ g, H, b }) => {
+    const group = [...H.waiting.values()].find(w => w.line === b.id)!;
+    g.stations.rekeyWaiting(H);
+    return H.waiting.size === 1 && [...H.waiting.values()][0] === group && group.count === 12;
+  }), 'observer rekey: native no-op retains the exact live twelve-rider group');
+  check(both(({ tb, H }) => board(tb, H)) === 12 && observed.counters.confirmedRailTransfers === 12,
+    'observer rekey: native no-op cannot erase twelve confirmed second boardings');
+  deliver();
+
+  enqueue(6);
+  both(({ g, H, A, a, ta }) => g.stations.addWaiting(H, a.id, A.id, A.id, ta.capacity + 3));
+  check(both(({ g, H, b, ta }) => {
+    const group = [...H.waiting.values()].find(w => w.line === b.id)!;
+    const taken = board(ta, H); // Partial boarding of the OTHER line invokes native rekeyWaiting.
+    return taken === ta.capacity && [...H.waiting.values()].includes(group) && group.count === 6
+      && [...H.waiting.values()].some(w => w.line === ta.lineId && w.count === 3);
+  }), 'observer rekey: unrelated native partial boarding leaves the known transfer object/count unchanged');
+  check(both(({ tb, H }) => board(tb, H)) === 6 && observed.counters.confirmedRailTransfers === 18,
+    'observer rekey: unrelated partial boarding cannot erase six known rail transfers');
+  deliver();
+
+  enqueue(12);
+  both(({ tb, Q, B, g }) => {
+    const count = tb.capacity - 4;
+    tb.cargo.set('declared-room-fixture', { from: Q.id, alight: B.id, dest: B.id, count, day: g.day }); tb.load = count;
+  });
+  check(both(({ tb, H }) => board(tb, H)) === 4 && observed.counters.confirmedRailTransfers === 22,
+    'observer rekey: actual partial boarding captures four before native queue rekey');
+  check(both(({ H, b }) => [...H.waiting.values()].find(w => w.line === b.id)!.count) === 8,
+    'observer rekey: remaining known cohort is CURRENTLY eight, not its older twelve-rider ceiling');
+  deliver();
+  both(({ g, H, b }) => {
+    const known = [...H.waiting.values()].find(w => w.line === b.id)!;
+    g.stations.addWaiting(H, known.line, known.alight, known.dest, 2, 0, known.t, 4, known.rail ?? 0, known.ic ?? 0);
+    const unknown = [...H.waiting.values()].find(w => w.line === b.id && w !== known)!;
+    // Controlled stale-class metadata, not a native-emergence claim: native rekey itself must merge
+    // the two unknown riders into the surviving known object. No provenance internals are accessed.
+    unknown.transfers = (known.transfers ?? 0) * unknown.count / known.count;
+    g.stations.rekeyWaiting(H);
+    return known.count;
+  });
+  check(both(({ H, b }) => [...H.waiting.values()].filter(w => w.line === b.id).map(w => w.count)).join(',') === '10',
+    'observer rekey: real native merge changes the surviving eight-rider object to ten');
+  check(both(({ tb, H }) => board(tb, H)) === 10 && observed.counters.confirmedRailTransfers === 22,
+    'observer rekey: partial12→8 then merge2→10 never inherits the old twelve-rider provenance ceiling');
+  deliver();
+
+  enqueue(3);
+  both(({ g, H, b }) => {
+    const group = [...H.waiting.values()].find(w => w.line === b.id)!;
+    group.rail = (group.rail ?? 0) + 1; // Explicit changed-signature negative.
+    g.stations.rekeyWaiting(H);
+  });
+  check(both(({ tb, H }) => board(tb, H)) === 3 && observed.counters.confirmedRailTransfers === 22,
+    'observer rekey: changed fare signature remains unattributed after native key movement');
+  deliver();
+
+  enqueue(3);
+  check(both(({ g, H, b }) => {
+    const [key, group] = [...H.waiting].find(([, w]) => w.line === b.id)!;
+    group.transfers = (group.transfers ?? 0) + group.count * 2;
+    g.stations.rekeyWaiting(H);
+    return H.waiting.get(key) !== group && [...H.waiting.values()].includes(group) && group.count === 3;
+  }), 'observer rekey: nonmerging native key movement preserves the same object/count/signature');
+  check(both(({ tb, H }) => board(tb, H)) === 3 && observed.counters.confirmedRailTransfers === 25,
+    'observer rekey: unchanged unmerged riders retain their known origin across a native key move');
+  deliver();
+  const final = save(f.g); observed.dispose();
+  check(save(f.g) === final && final === save(literal), 'observer rekey: final full world and disposal remain byte-exact');
+}
+
 function movementChecks() {
   const { g } = transferFixture(false), observed = observeNetwork(g);
   while (g.day < 240) g.update(0.25);
@@ -164,6 +258,39 @@ function forwardingChecks() {
   check(error === thrown && callCount === 2 && exactArgs, 'observer: original throw identity propagates without retry');
   observed.dispose(); delete (g as unknown as { recordStop?: unknown }).recordStop;
   check(g.recordStop === original, 'observer: inherited native function restored after custom-reader control');
+
+  const f = transferFixture(false), stations = f.g.stations, nativeRekey = stations.rekeyWaiting;
+  const descriptor = Object.getOwnPropertyDescriptor(stations, 'rekeyWaiting'), extra = {}, rekeyMarker = {}, rekeyThrow = new Error('observer rekey throw');
+  let rekeys = 0, failRekey = false, rekeyArgs = true;
+  const forward = function(this: typeof stations, ...args: Parameters<typeof stations.rekeyWaiting>) {
+    const passed: unknown[] = args;
+    rekeys++; rekeyArgs &&= this === stations && passed.length === 2 && passed[0] === f.H && passed[1] === extra;
+    if (failRekey) throw rekeyThrow;
+    nativeRekey.apply(this, args);
+    return rekeyMarker;
+  };
+  Object.defineProperty(stations, 'rekeyWaiting', { configurable: true, writable: true, value: forward });
+  const rekeyObserved = observeNetwork(f.g);
+  try {
+    f.ta.cargo.set('throw-probe', { from: f.A.id, alight: f.H.id, dest: f.B.id, count: 2, day: f.g.day }); f.ta.load = 2;
+    f.ta.serveStation(f.H, 0.03);
+    const call = stations.rekeyWaiting as unknown as (...args: unknown[]) => unknown, before = save(f.g);
+    check(call.call(stations, f.H, extra) === rekeyMarker && rekeys === 1 && rekeyArgs,
+      'observer rekey: native delegate this/all arguments/return are forwarded exactly once');
+    check(save(f.g) === before, 'observer rekey: forwarding a native no-op changes no saved state');
+    failRekey = true; let caught: unknown;
+    try { call.call(stations, f.H, extra); } catch (e) { caught = e; }
+    check(caught === rekeyThrow && rekeys === 2 && rekeyArgs, 'observer rekey: original throw identity propagates once without retry');
+    check(save(f.g) === before, 'observer rekey: throwing delegate leaves the native queue/world untouched');
+    check(board(f.tb, f.H) === 2 && rekeyObserved.counters.confirmedRailTransfers === 0,
+      'observer rekey: an incomplete throwing rekey does not restore guessed provenance');
+  } finally {
+    rekeyObserved.dispose();
+    check(stations.rekeyWaiting === forward, 'observer rekey: disposal restores the original own delegate');
+    if (descriptor) Object.defineProperty(stations, 'rekeyWaiting', descriptor);
+    else delete (stations as unknown as { rekeyWaiting?: unknown }).rekeyWaiting;
+  }
+  check(stations.rekeyWaiting === nativeRekey, 'observer rekey: forwarding fixture restores native inherited method');
 }
 
 function snapshots() {
@@ -258,6 +385,6 @@ function natural() {
 if (process.argv.some(a => a.startsWith('--compare=')) && (!process.argv.includes('--natural') || !process.argv.includes('--balanced'))) throw Error('--compare requires --natural --balanced');
 if (process.argv.some(a => a.startsWith('--snapshots='))) snapshots();
 else if (process.argv.includes('--natural')) natural();
-else { classificationChecks(); movementChecks(); forwardingChecks(); neutralityChecks(); }
+else { classificationChecks(); rekeyChecks(); movementChecks(); forwardingChecks(); neutralityChecks(); }
 console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;
