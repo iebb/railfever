@@ -20,7 +20,7 @@ import { patternStops } from './patterns';
 import { bezFromTangents, bezDeriv, tAtS } from './geom';
 import { SAVE_TREES, type Tree } from './world';
 import { railPartMode } from './stations';
-import { platformChoices } from './rail-platforms';
+import { platformChoicesForStock } from './rail-platforms';
 import { plannedSet } from './demand';
 
 /** Local native turnout survey supplied by the existing two-network planner. */
@@ -187,13 +187,17 @@ export function throughOpeningCall(g: Game, path: number[], owner: number, cars:
   return -1;
 }
 /** A through call continues forward on one incoming/outgoing physical platform.
- * Reversing at an intermediate stop is not a substitute for a connected timetable. */
+ * Reversing at an intermediate stop is not a substitute for a connected timetable.
+ * Qualify the proposed consist even when no matching paid stock exists yet. */
+export function throughPlatformProof(g: Game, path: number[], owner: number, cars: VehicleModel[]): boolean {
+  const line = { id: -1, owner, kind: 'rail', stops: outAndBack(path), vehicles: [] } as unknown as Line;
+  const proposed = { owner, rule: consistRule(cars), length: cars.reduce((n, m) => n + m.length + .1, 0) };
+  return line.stops.every((_, i) => platformChoicesForStock(g, line, 0, i, proposed).length > 0);
+}
 function throughPlatforms(g: Game, path: number[], owner: number, cars: VehicleModel[], context?: ThroughQuoteContext): boolean {
   const key = JSON.stringify([path, owner, modelKey(cars)]);
   if (context?.platforms.has(key)) return context.platforms.get(key)!;
-  const stock = g.vehicles.trains().find(t => t.owner === owner && modelKey(t.cars) === modelKey(cars));
-  const line = { id: -1, owner, kind: 'rail', stops: outAndBack(path), vehicles: stock ? [stock.id] : [] } as unknown as Line;
-  const fits = line.stops.every((_, i) => platformChoices(g, line, 0, i).length > 0);
+  const fits = throughPlatformProof(g, path, owner, cars);
   context?.platforms.set(key, fits); return fits;
 }
 function cycle(g: Game, cars: VehicleModel[], legs: { length: number; cap: number }[], extraCap = Infinity) {
