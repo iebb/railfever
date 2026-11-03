@@ -18,6 +18,7 @@ import { flatGame, station, endNode, loco, depotFor, runTrains, check, fmt, buil
 import { buildRoadDepot } from '../src/game/routing';
 import { applyEarthworks, DRY_MIN, EARTHWORKS, LOCK } from '../src/game/terraform';
 import { bezLine } from '../src/game/geom';
+import { terrainFit } from './terrainfit';
 
 const T0 = performance.now();
 const road = (g: Game, x0: number, z0: number, x1: number, z1: number) => build(g, free(g, x0, z0), free(g, x1, z1), roadOpts(0, 'road'), 'road');
@@ -44,13 +45,22 @@ const lineOf = (g: Game, kind: 'rail' | 'road', stops: Station[]) => { const l =
     if (protectedGround.has(k) && w.lock[k] & LOCK.formation && Math.abs(w.h[k] - y) > 0.005) movedLocked++;
     setVertex(x, z, y);
   };
-  const S = station(g, 100, 100, 0, 12, 2, 0, { fixedY: 3.4, buildingSide: 1 });
+  // This higher station cannot share the retained rail's ground grid cells. Refuse the original site
+  // atomically, then exercise legal levelling one unit farther away, with the same height and neighbour.
+  const unchanged = JSON.stringify(serialize(g));
+  const unsafe = g.stations.planRail(100, 100, 0, 12, 2, 0, { fixedY: 3.4, buildingSide: 1 });
+  check(!unsafe.ok && /Too close to track at another height/.test(unsafe.error ?? '')
+    && !!g.stations.commitRail(unsafe, 0) && JSON.stringify(serialize(g)) === unchanged,
+    'unsupported adjacent station refuses planning and construction without any saved mutation');
+  const S = station(g, 101, 100, 0, 12, 2, 0, { fixedY: 3.4, buildingSide: 1 });
   w.setVertex = setVertex;
   check(!!S && protectedGround.size > 0 && movedLocked === 0, `station levelling never writes into another track's locked formation (${movedLocked} writes)`);
   check([...protectedGround].every(([k, h]) => Math.abs(w.h[k] - h) < 0.005), 'neighbouring formation heights stay exact');
   if (S) {
+    const fit = terrainFit(g);
+    check(fit.station === 0 && fit.covered === 0 && fit.floating === 0, 'lawful raised station and retained rail fit the terrain across their actual widths');
     check(!g.stations.removeStation(S.id), 'levelled station removed');
-    check(!(w.lock[w.vi(100, 100)] & LOCK.formation) && [...protectedGround.keys()].every((k) => w.lock[k] & LOCK.formation), 'removal releases the old site and repairs the remaining formation locks');
+    check(!(w.lock[w.vi(101, 100)] & LOCK.formation) && [...protectedGround.keys()].every((k) => w.lock[k] & LOCK.formation), 'removal releases the old site and repairs the remaining formation locks');
     const p = { x: 0, y: 0, z: 0 };
     let misfits = 0;
     for (let s = 0; s <= e.len; s += 0.5) {
@@ -256,15 +266,27 @@ let saveGame: Game | null = null;
   const bd = buildRoadDepot(g, 75, 100, 0);
   check(bd >= 0, 'bus depot');
   const bl = lineOf(g, 'road', [B1, B2]);
-  const buses = [0, 1].map(() => g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id) as RoadVehicle);
-  for (let i = 0; i < 8 * 40; i++) g.update(0.25);
+  // Two operating buses continuously occupy the long parent road edge. On a disposable native copy,
+  // retain the original occupied worksite and establish that its access-street refusal is atomic.
+  const busy = deserialize(serialize(g));
+  const busyBuses = [0, 1].map(() => busy.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id));
+  check(busyBuses.every(v => v instanceof RoadVehicle), 'native busy-road control funds its two buses');
+  for (let i = 0; i < 8 * 40; i++) busy.update(0.25);
+  const busyPlan = busy.stations.planRail(128, 104, Math.PI / 2, 8, 2, 0), unchanged = JSON.stringify(serialize(busy));
+  check(busyPlan.ok && busy.stations.commitRail(busyPlan, 0) === 'Vehicle in the way'
+    && JSON.stringify(serialize(busy)) === unchanged, 'occupied native access street refuses station construction without any saved mutation');
   const plan = g.stations.planRail(128, 104, Math.PI / 2, 8, 2, 0);
   // (since 2.9 the intermediate transfer walk is half the shorter endpoint walk, 49 m between a station and a bus stop:
   // a stop within 80 m of the station joins it, one beyond is not linked either; merging it stays possible below)
   check(!plan.join && !plan.links.includes(B1), `a stop just beyond the 80 m join distance is not linked: the transfer walk is ${fmt(g.stations.linkRange(B1, B1) * 10, 0)} m at most`);
   const sid = g.stations.nextId;
-  g.stations.commitRail(plan, 0);
+  // Fund the access split while the worksite is clear, then dispatch and warm up the original service.
+  const error = g.stations.commitRail(plan, 0);
+  check(!error, `native transfer station and access street commit before dispatch (${error ?? 'ok'})`);
   const S = g.stations.get(sid)!;
+  if (!S) process.exit(1);
+  const buses = [0, 1].map(() => g.vehicles.buyRoad(bd, MODEL_BY_ID.get('bus_c')!, bl.id) as RoadVehicle);
+  for (let i = 0; i < 8 * 40; i++) g.update(0.25);
   check(!S.links.includes(B1.id) && !B1.links.includes(S.id), 'no passage either way');
   check(g.stations.canMerge(S.id, B2.id) !== null && g.stations.canMerge(S.id, B1.id) === null, 'canMerge: only the near stop');
   B1.waiting.clear(); B1.waitingTotal = 0;

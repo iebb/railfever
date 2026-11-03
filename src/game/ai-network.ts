@@ -82,16 +82,17 @@ import { recomputeLocks } from './terraform';
 import { pickTrain } from './ai';
 import { walkingCatchment, planWalkingCatchment, stopWalkingCatchment, entrancePlanCatchment, extraAccessCatchment, pedestrianRoad, walkWeight, coverOf, type WalkingCatchment } from './catchment';
 import { distToRect } from './world';
-import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
+import { growTask, copyGrowCursor, growLine, probeUrbanGrowth, resumeUrbanGrowthProbe, type UrbanGrowthProbe, type UrbanGrowthQuote, type GrowCursor, type GrowHost } from './ai-grow';
 import { throughTask, throughCandidates, throughMiddleLines, copyThroughCursor, type ThroughCursor, type ThroughHost } from './ai-through';
 import { hubTask, hubPairs, copyHubCursor, type HubCursor, type HubHost } from './ai-hub';
 import { worksOn } from './route-works';
+import { infillCandidate, infillCallsFit, infillPlanFits, type InfillRouteCache } from './ai-infill-fit';
 
 // ============================================================================ optional primitives (feature-detected)
 
 interface PlanLike { ok: boolean; error?: string; cost: number }
 interface ConnPlan extends PlanLike { proposal: Proposal | null; turnouts: { edge: number; s: number; x: number; z: number }[] }
-interface OnTrackPlanLike extends PlanLike { station: { x: number; z: number; angle: number; length: number } | null }
+type OnTrackPlanLike = Trackops.OnTrackPlan;
 interface FinishLike { signals: number; crossovers: number; cost: number; error?: string }
 /** Track and station operations of trackops.ts / stations.ts this module uses when they are there. */
 interface NetOps {
@@ -432,12 +433,24 @@ export function saveNetwork(g: Game): NetworkSave {
 /** Old saves have no aiNetwork field and keep the initial, company-staggered schedule. */
 export function loadNetwork(g: Game, data?: NetworkSave): void {
   if (data?.version !== 1 || !Array.isArray(data.companies)) return;
+  // AI task graphs have already rebound native rail/managed identities. Restore serialization order without
+  // replacing those objects: a replacement here would turn an unchanged restored hub or line into a stale input.
+  const orderFields = (record: Record<string, unknown>, keys: string[], keepRest = false) => {
+    const own = Object.getOwnPropertyDescriptors(record), order = keepRest ? [...new Set([...keys, ...Object.keys(record)])] : keys;
+    const entries = order.map(key => {
+      const property = own[key];
+      if (property && !('value' in property)) throw new Error('Invalid native planner field accessor');
+      return [key, property?.value] as const;
+    });
+    for (const key of Object.keys(record)) delete record[key];
+    for (const [key, value] of entries) Object.defineProperty(record, key, { value, enumerable: true, configurable: true, writable: true });
+  };
   if (data.stationWorks) g.stations.loadWorks(data.stationWorks);
   for (const [sid, keys] of data.stationFields ?? []) {
     const st = g.stations.get(sid), r = st?.rail;
     if (st && r) {
       const record = r as unknown as Record<string, unknown>;
-      st.rail = Object.fromEntries(keys.map((key) => [key, record[key]])) as unknown as NonNullable<Station['rail']>;
+      orderFields(record, keys);
     }
   }
   // Road-change detection compares warm walking entries with later street edits. Rebuild those derived
@@ -459,7 +472,7 @@ export function loadNetwork(g: Game, data?: NetworkSave): void {
       const info = lines?.get(id);
       if (!info) continue;
       const record = info as unknown as Record<string, unknown>;
-      lines!.set(id, { ...Object.fromEntries(keys.map((key) => [key, record[key]])), ...info } as unknown as ManagedLine);
+      orderFields(record, keys, true);
     }
   }
   for (const [id, state] of data.companies) {
@@ -488,11 +501,11 @@ export function networkDaily(ai: AIController, reviewExpansion = false): boolean
 export function finishNetworkReview(ai: AIController): void { planners.get(ai)?.finishReview(); }
 
 /** A chooser's bounded city growth quote uses the same host and native saved build task. */
-export function* previewUrbanGrowth(ai: AIController, lineId: number): Generator<void, UrbanGrowthQuote | null> {
+export function* previewUrbanGrowth(ai: AIController, lineId: number, cursor?: UrbanGrowthProbe): Generator<void, UrbanGrowthQuote | null> {
   if (ai.disposed) return null;
   let p = planners.get(ai);
   if (!p) { p = new NetPlanner(ai); planners.set(ai, p); }
-  return yield* p.previewUrbanGrowth(lineId);
+  return yield* p.previewUrbanGrowth(lineId, cursor);
 }
 export function queueUrbanGrowth(ai: AIController, quote: UrbanGrowthQuote): boolean {
   if (ai.disposed) return false;
@@ -860,9 +873,9 @@ class NetPlanner {
 
   start(task: Task): void { this.job = { task, items: null, cursor: 0, done: 0 }; }
 
-  *previewUrbanGrowth(lineId: number): Generator<void, UrbanGrowthQuote | null> {
-    if (this.job) return null;
-    return yield* probeUrbanGrowth(this.growHost(), lineId);
+  *previewUrbanGrowth(lineId: number, cursor?: UrbanGrowthProbe): Generator<void, UrbanGrowthQuote | null> {
+    if (this.job && (!cursor || cursor.stage === 'init')) return null;
+    return yield* (cursor ? resumeUrbanGrowthProbe(this.growHost(), lineId, cursor) : probeUrbanGrowth(this.growHost(), lineId));
   }
   queueUrbanGrowth(quote: UrbanGrowthQuote): boolean {
     const line = this.g.lines.get(quote.line);
@@ -2315,7 +2328,7 @@ class NetPlanner {
   private accessBuildingValue(st: Station, plan: StationPlan): number {
     const g = this.g, w = g.world;
     const current = new Set(g.stations.catchmentBuildings(st)), removed = new Set(plan.demolish);
-    const after = new Set(planWalkingCatchment(g, plan).buildings.keys());
+    const after = new Set(planWalkingCatchment(g, plan, plan.links).buildings.keys());
     // Merged road stops still give access to the platforms after a building change.
     for (const p of st.stops) for (const id of stopWalkingCatchment(g, p.edge, p.s, w.net.edges.get(p.edge)?.tram ? 'tram' : 'bus').buildings.keys()) after.add(id);
     for (const id of removed) after.delete(id);
@@ -4277,7 +4290,7 @@ class NetPlanner {
   }
 
   /** Add a new through station to every own line whose route between consecutive stops now runs through it. */
-  private addToLines(stationId: number, before: Map<number, [number, number][]>): Line[] {
+  private addToLines(stationId: number, before: Map<number, [number, number][]>, proved = false): Line[] {
     const g = this.g, net = g.world.net, out: Line[] = [];
     const st = g.stations.get(stationId);
     if (!st?.rail) return out;
@@ -4287,8 +4300,12 @@ class NetPlanner {
       if (!l || l.owner !== this.me) continue;
       for (const [a, b] of pairs) {
         if (a === stationId || b === stationId) continue;
-        const r = routeBetween(g, a, b, l.owner);
-        if (!r || !r.some((id) => own.has(id) || net.edges.get(id)?.station === stationId)) continue;
+        if (!proved) {
+          const r = routeBetween(g, a, b, l.owner);
+          if (!r || !r.some((id) => own.has(id) || net.edges.get(id)?.station === stationId)) continue;
+        }
+        const candidate = infillCandidate(l, a, b, stationId);
+        if (!candidate || !infillCallsFit(g, candidate)) { this.considered('station.consistFit'); continue; }
         if (this.insertStop(l, a, b, stationId)) { this.localOnly(l, stationId); out.push(l); }
         break;
       }
@@ -4316,9 +4333,16 @@ class NetPlanner {
    * Insert a through station into own track at (edge, s), trying a little either way along `steps` (edge, s)
    * where the plan fails (straight level track needed). Returns the new station id or -1 ('busy': -2).
    */
-  private *insertAt(spots: { e: number; s: number }[], length: number, why: string, maxCost: number, opts: { tracks?: number; mode?: import('./stations').RailMode; accept?: (p: OnTrackPlanLike) => boolean } = {}): Generator<void, number> {
+  private *insertAt(spots: { e: number; s: number }[], length: number, why: string, maxCost: number, opts: { tracks?: number; mode?: import('./stations').RailMode; accept?: (p: OnTrackPlanLike) => boolean;
+    calls?: Map<number, [number, number][]>; required?: number[] } = {}): Generator<void, number> {
     const g = this.g, me = this.me;
     if (!OPS.planStationOnTrack || !OPS.commitStationOnTrack) return -1;
+    // This generator is drained synchronously. Route answers never cross a commit or work unit.
+    const routes: InfillRouteCache = new Map();
+    const ready = opts.calls && new Map([...opts.calls].filter(([id]) => {
+      const l = g.lines.get(id); return l && infillCallsFit(g, l);
+    }));
+    if (opts.required?.some(id => !ready?.has(id))) return -1;
     let firstErr = '';
     for (let i = 0; i < spots.length; i++) {
       const sp = spots[i];
@@ -4327,10 +4351,23 @@ class NetPlanner {
       if (i % 3 === 2) yield;
       if (!plan.ok) { this.considered('station.site'); firstErr ||= plan.error ?? ''; continue; }
       if (opts.accept && !opts.accept(plan)) { this.considered('station.catchmentOrSpacing'); firstErr ||= 'catchment, spacing or value'; continue; }
+      const admitted = new Map<number, [number, number][]>(), station = plan.station?.join?.id ?? g.stations.nextId;
+      if (ready) for (const [id, pairs] of ready) {
+        const l = g.lines.get(id); if (!l) continue;
+        const safe = pairs.filter(([a, b]) => {
+          const candidate = infillCandidate(l, a, b, station);
+          return candidate && infillPlanFits(g, plan, candidate, station, routes);
+        });
+        if (safe.length) admitted.set(id, safe);
+      }
+      if (opts.required?.some(id => !admitted.has(id))) { this.considered('station.consistFit'); firstErr ||= 'no full-consist platform and onward route'; continue; }
       if (plan.cost > maxCost || !this.canSpend(plan.cost * 1.1, 0.3)) { this.considered('station.paybackOrFunds'); firstErr ||= `too expensive (${Math.round(plan.cost / 1000)}k)`; continue; }
       const res = OPS.commitStationOnTrack(g, plan);
+      routes.clear();
       if (res.error === 'busy') return -2;
-      if (res.station < 0 || !g.stations.get(res.station)) { firstErr ||= res.error ?? ''; continue; }
+      if (res.error != null) { this.note(`${why}: ${res.error}`); return -1; }
+      if (res.station < 0 || !g.stations.get(res.station)) { this.note(`${why}: ${res.error ?? 'station construction failed'}`); return -1; }
+      if (opts.calls) { opts.calls.clear(); for (const [id, pairs] of admitted) opts.calls.set(id, pairs); }
       return res.station;
     }
     if (firstErr) this.note(`${why}: ${firstErr}`);
@@ -4424,13 +4461,14 @@ class NetPlanner {
       };
       // A one-train single-track service needs a halt, not a new passing station. The planner retains
       // existing parallel tracks; add another platform only when several trains need to pass here.
-      const id = yield* this.insertAt(spots, platform, `no station site in ${town?.name ?? 'town'} on ${l.name}`, maxCost, { tracks: l.vehicles.length > 1 ? 2 : 1, mode, accept });
+      const id = yield* this.insertAt(spots, platform, `no station site in ${town?.name ?? 'town'} on ${l.name}`, maxCost, { tracks: l.vehicles.length > 1 ? 2 : 1, mode, accept, calls: before, required: [l.id] });
       if (id === -2) { this.careFor('ins' + l.id, 15); continue; }
       // (no site fits: each try plans up to 36 sites, and sites seldom open up within months; look again later)
       if (id < 0) { this.careFor('ins' + l.id, 540); continue; }
       const st = g.stations.get(id)!;
       this.roadAccess(st);
-      const served = this.addToLines(id, before);
+      const served = this.addToLines(id, before, true);
+      if (!served.includes(l)) { this.considered('insert.unserved'); this.note(`${st.name}: no safe full-consist call on ${l.name}`); return; }
       this.bump('netInserted');
       this.note(`station ${st.name} on ${served.map((x) => x.name).join(', ') || l.name} (${servedPop} residents beyond the stations' reach)`);
       this.news(`opens ${st.name} station on ${l.name}.`, st.x, st.z);

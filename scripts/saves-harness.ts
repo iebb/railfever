@@ -12,7 +12,8 @@ export function loadFonts() { return Promise.resolve(); }
 export function cashPitch(_amount: number) { return 1; }
 export class Renderer {
   controls: any = { followPosition: null, smoothDistance: 1, focusInto: (v: any) => v, jumpTo() {} };
-  camera = {}; night = false; simMs = 0;
+  vehicles = { setTrackedVehicleIds(_ids: readonly number[]) {} };
+  camera = {}; night = false; simMs = 0; uiMs = 0; audioMs = 0; loopMs = 0;
   constructor(_app: HTMLElement) {}
   loadSettings() {} setGame(_g: any) {} frame() {}
 }

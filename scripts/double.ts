@@ -11,6 +11,7 @@ import type { Game } from '../src/game/game';
 import type { Station } from '../src/game/stations';
 import { checkReservations } from './lib';
 import { flatGame, station, endNode, newTrack, loco, depotFor, runTrains, reach, check, fmt, build, free, railOpts, nodeSnap, done } from './stationlib';
+import { terrainFit } from './terrainfit';
 
 const T0 = performance.now();
 
@@ -152,9 +153,20 @@ let saved: { g: Game; trains: Train[] } | null = null;
   const singleCost = (p1?.cost ?? 0) + (p2?.cost ?? 0);
   console.log(`  cost: second track ${fmt(plan.cost / 1e6, 2)}M vs first ${fmt(singleCost / 1e6, 2)}M`);
   check(plan.cost < singleCost * 0.85, 'the second track is cheaper than the first (shared formation and structures)');
+  // A partial batch must keep the retained railway seated and refund only its new debits. Intermediate
+  // nodes are future joints, so neither grading nor locks may temporarily treat them as flat dead ends.
+  const cancelled = deserialize(serialize(g)), money = cancelled.economy.money, retained = [...cancelled.world.net.edges.keys()];
+  let accepted = 0;
+  const refusal = commitDoubleTrack(cancelled, structuredClone(plan), true, {}, () => ++accepted <= 2);
+  const cancelledFit = terrainFit(cancelled);
+  check(!!refusal.error && cancelled.economy.money === money && cancelled.world.net.edges.size === retained.length
+    && retained.every(id => cancelled.world.net.edges.has(id)), 'cancelled partial doubling refunds its debits and preserves all original rails');
+  check(cancelledFit.covered === 0 && cancelledFit.floating === 0 && cancelledFit.station === 0, 'cancelled partial doubling leaves original physical formation support intact');
   const res = commitDoubleTrack(g, plan);
   console.log(`  built: ${res.edges.length} edges, ${res.signals} signals, ${res.crossovers} crossovers, ${res.error ?? ''} ${res.finishError ?? ''}`);
   check(!res.error && !res.finishError && res.signals >= 6 && res.crossovers === 4, 'doubled and made directional');
+  const fit = terrainFit(g);
+  check(fit.covered === 0 && fit.floating === 0 && fit.station === 0, 'all native parallel chunks and original track remain supported through ridge and river');
   const lineEdges = newTrack(g, e0);
   const structs = lineEdges.filter((id) => net.edges.get(id)!.sections.length).length;
   check(structs >= 4, `parallel bridge / tunnel sections on the new track (${structs} edges with structures)`);

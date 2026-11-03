@@ -3,7 +3,7 @@
 import type { Game } from './game';
 import type { Town } from './towns';
 import type { NEdge } from './network';
-import { availableModels, VehicleModel } from './vehicle-types';
+import { availableModels, VehicleModel, MODEL_BY_ID } from './vehicle-types';
 import { addTramTracks, removeTramTracks, roadPath, tramUsable, depotSize, type DepotPlan } from './build-ops';
 import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
@@ -21,6 +21,21 @@ export interface TramProject {
   stops: [number, number, number][];
   depot: number;
   line: number;
+  /** Added when native tram planning became resumable. Older records contain only cleanup assets. */
+  continuation?: { version: 1; status: string; reason: string; result: 'running' | 'done' | 'failed'; task: TramTask | null };
+}
+
+interface TramRoute {
+  edges: number[]; len: number; pts: { x: number; z: number; edge: number; s: number }[];
+  stops: { x: number; z: number }[]; score: number;
+}
+/** Every value carried across a work boundary is plain saved state; no generator locals decide construction. */
+interface TramTask {
+  stage: 'axis' | 'ends' | 'path' | 'points' | 'sites' | 'score' | 'quote' | 'tracks' | 'stops' | 'stop-build' | 'depot-site' | 'depot-build' | 'line' | 'vehicles';
+  model: string; routes: TramRoute[]; route?: TramRoute; fresh: number[]; nTrams: number; cost: number; ids: number[]; at: number; bought: number;
+  survey?: { mx: number; mz: number; length: number; angles: number[]; angle: number; side: number; factor: number;
+    ends: ({ x: number; y: number; z: number } | null)[]; edges: number[]; pts: TramRoute['pts']; stops: TramRoute['stops']; wants: number[]; want: number; offset: number };
+  depot?: { lo: number; hi: number; end: number; k: number; side: number; x?: number; z?: number; angle?: number; plan?: DepotPlan };
 }
 
 /** Best tram model for a town of this size in this year. */
@@ -40,7 +55,7 @@ export class TramPlanner {
   status = 'idle';
   /** why the last project failed */
   reason = '';
-  private job: Generator<void, boolean> | null = null;
+  private task: TramTask | null = null;
   private result: 'running' | 'done' | 'failed' = 'done';
 
   constructor(private game: Game, private companyId: number) {}
@@ -67,7 +82,7 @@ export class TramPlanner {
 
   /** Could a tram project start now? (trams in service this year, money, a town without our trams) */
   available(): boolean {
-    if (this.job) return false;
+    if (this.task) return false;
     const model = pickTram(this.game.year);
     if (!model) return false;
     if (this.funds() < model.cost * 2 + 1_200_000) return false;
@@ -76,28 +91,29 @@ export class TramPlanner {
 
   /** Start a tram project in the best candidate town; false if there is none. */
   start(townId?: number): boolean {
-    if (this.job) return false;
+    if (this.task) return false;
     const candidates = this.candidates();
     const town = townId === undefined ? candidates[0] : candidates.find(t => t.id === townId);
     if (!town || !pickTram(this.game.year, town.pop)) return false;
     this.project = { town: town.id, edges: [], stations: [], stops: [], depot: -1, line: -1 };
+    this.status = `planning trams in ${town.name}`;
     this.reason = '';
     this.result = 'running';
-    this.job = this.build(town);
+    this.task = { stage: 'axis', model: '', routes: [], fresh: [], nTrams: 0, cost: 0, ids: [], at: 0, bought: 0 };
     return true;
   }
 
   /** Run up to `budget` work units. */
   step(budget: number): 'running' | 'done' | 'failed' {
-    if (!this.job) return this.result;
+    if (!this.task) return this.result;
     for (let k = 0; k < budget; k++) {
-      let r: IteratorResult<void, boolean>;
-      try { r = this.job.next(); } catch (e) { r = { done: true, value: false }; this.reason = 'error: ' + String((e as Error)?.message ?? e); }
-      if (r.done) {
-        this.job = null;
-        this.result = r.value ? 'done' : 'failed';
-        if (!r.value && this.project) this.failed().set(this.companyId + ':' + this.project.town, this.game.day + 720);
-        this.status = r.value ? 'done' : 'failed: ' + this.reason;
+      let done: boolean | undefined;
+      try { done = this.work(); } catch (e) { done = false; this.reason = 'error: ' + String((e as Error)?.message ?? e); }
+      if (done !== undefined) {
+        this.task = null;
+        this.result = done ? 'done' : 'failed';
+        if (!done && this.project) this.failed().set(this.companyId + ':' + this.project.town, this.game.day + 720);
+        this.status = done ? 'done' : 'failed: ' + this.reason;
         return this.result;
       }
     }
@@ -106,14 +122,26 @@ export class TramPlanner {
 
   /** Remove whatever the current (unfinished or failed) project built. */
   cleanup() {
-    this.job = null;
+    this.task = null;
     if (this.project && this.result !== 'done') TramPlanner.abandon(this.game, this.companyId, this.project);
     this.project = null;
     this.result = 'done';
   }
 
-  /** What the current project built so far (persist it to clean up after loading a game mid-project). */
-  record(): TramProject | null { return this.project ? { ...this.project, edges: [...this.project.edges], stations: [...this.project.stations], stops: this.project.stops.map((s) => [...s] as [number, number, number]) } : null; }
+  /** Detached native continuation and its cleanup provenance. Merely saving never advances the planner. */
+  record(): TramProject | null {
+    return this.project ? { ...structuredClone(this.project), continuation: { version: 1, status: this.status,
+      reason: this.reason, result: this.result, task: structuredClone(this.task) } } : null;
+  }
+
+  restore(record: TramProject): boolean {
+    const c = record.continuation;
+    if (!c || c.version !== 1) return false;
+    if (!this.game.towns.list[record.town] || c.result === 'running' && !c.task) throw new Error('Invalid tram continuation');
+    const { continuation, ...project } = structuredClone(record);
+    this.project = project; this.status = c.status; this.reason = c.reason; this.result = c.result; this.task = structuredClone(c.task);
+    return true;
+  }
 
   /** Remove the assets of a tram project (vehicles, line, depot, stops, tracks). */
   static abandon(g: Game, owner: number, p: TramProject) {
@@ -135,119 +163,196 @@ export class TramPlanner {
   // ---------------------------------------------------------------- the job
   private fail(why: string): boolean { this.reason = why; return false; }
 
-  private *build(T: Town): Generator<void, boolean> {
-    const g = this.game, owner = this.companyId, net = g.world.net, p = this.project!;
-    this.status = `planning trams in ${T.name}`;
-    const model = pickTram(g.year, T.pop);
-    if (!model) return this.fail('no trams in service');
-    // ---- route: along the town's main axis (population weighted), through the centre, on its streets
-    const routes = yield* this.routes(T);
-    if (!routes.length) return this.fail('no street route through the centre');
-    const route = routes[0];
-    yield;
-    // ---- money: tracks, stops, depot, vehicles
-    const fresh = route.edges.filter((id) => !net.edges.get(id)?.tram);
-    let trackLen = 0;
-    for (const id of fresh) trackLen += net.edges.get(id)!.len;
-    const nTrams = Math.max(2, Math.min(5, Math.round(route.len / 22)));
-    const cost = trackLen * TRAM.costPerUnit + route.stops.length * 30_000 + 200_000 + nTrams * model.cost;
-    // ---- the forecast (ai-bus.ts): riders shared with every served stop near the route, tram fares, against the works,
-    // trams, running and upkeep (a copy of another company's trams in the same streets does not pay)
-    const quote = yield* tramRouteValue(g, owner, route.stops, trackLen, model, nTrams);
-    if (!pays(quote)) return this.fail(`forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`);
-    const e = this.eco;
-    while (e.money < cost + 300_000 && e.borrow()) { /* borrow in steps */ }
-    if (e.money < cost) return this.fail('too expensive');
-    this.status = `building trams in ${T.name}`;
-    // ---- tracks
-    const usable = (id: number) => { const ed = net.edges.get(id); return !!ed && tramUsable(g, ed, owner); };
-    const r = addTramTracks(g, fresh.filter((id) => !usable(id)), owner);
-    if (r.error && r.changed === 0 && fresh.some((id) => !usable(id))) return this.fail('tracks: ' + r.error);
-    for (const id of fresh) if (net.edges.get(id)?.tramOwner === owner) p.edges.push(id);
-    if (!route.edges.every(usable)) return this.fail('tracks: ' + (r.error ?? 'not laid'));
-    yield;
-    // ---- stops
-    const ids: number[] = [];
-    for (const s of route.stops) {
-      yield;
-      const before = g.stations.nextId;
-      if (g.stations.commitBusStop(s.x, s.z, owner)) continue;
-      let sid = -1, bd = Infinity;
-      for (const st of g.stations.map.values()) if (st.owner === owner) for (const q of st.stops) { const dd = Math.hypot(q.x - s.x, q.z - s.z); if (dd < bd) { bd = dd; sid = st.id; } }
-      if (sid < 0) continue;
-      if (g.stations.nextId > before) p.stations.push(before); else p.stops.push([sid, s.x, s.z]);
-      if (!ids.includes(sid)) ids.push(sid);
-      yield;
-    }
-    if (ids.length < 3) return this.fail('stops could not be built');
-    // ---- depot near one end of the route
-    const dep = yield* tramDepotGen(g, route.pts, ids, owner);
-    if (dep < 0) return this.fail('no depot site');
-    p.depot = dep;
-    yield;
-    // ---- line (out and back) and trams
-    const line = g.lines.create('tram', owner);
-    p.line = line.id;
-    line.stops = [...ids, ...ids.slice(1, -1).reverse()];
-    let bought = 0;
-    for (let i = 0; i < nTrams; i++) { if (typeof g.vehicles.buyRoad(dep, model, line.id) !== 'string') bought++; yield; }
-    if (!bought) return this.fail('could not buy trams');
-    this.status = `opened trams in ${T.name}`;
-    return true;
+  private nextRoute(t: TramTask) {
+    const s = t.survey!;
+    s.angle++; s.side = 0; s.factor = 1; s.ends = []; s.edges = []; s.pts = []; s.stops = []; s.wants = []; s.want = 0; s.offset = 0;
+    t.stage = 'ends';
   }
 
-  /** Candidate tram routes through the centre: edges, length, sampled path points and stop sites. */
-  private *routes(T: Town): Generator<void, { edges: number[]; len: number; pts: { x: number; z: number; edge: number; s: number }[]; stops: { x: number; z: number }[]; score: number }[]> {
-    const g = this.game, net = g.world.net, owner = this.companyId;
-    // population-weighted principal axis of the town
-    let sw = 0, mx = 0, mz = 0;
-    const R = Math.max(20, Math.min(T.radius, 60));
-    const blds = g.world.buildingsNear(T.x, T.z, R).filter((b) => b.pop > 0 && Math.hypot(b.x - T.x, b.z - T.z) <= R);
-    for (const b of blds) { sw += b.pop; mx += b.x * b.pop; mz += b.z * b.pop; }
-    if (sw <= 0) return [];
-    mx /= sw; mz /= sw;
-    let cxx = 0, cxz = 0, czz = 0;
-    for (const b of blds) { const dx = b.x - mx, dz = b.z - mz; cxx += dx * dx * b.pop; cxz += dx * dz * b.pop; czz += dz * dz * b.pop; }
-    const th = 0.5 * Math.atan2(2 * cxz, cxx - czz);
-    const L = Math.max(30, Math.min(95, T.radius * 1.3));
-    const out: { edges: number[]; len: number; pts: { x: number; z: number; edge: number; s: number }[]; stops: { x: number; z: number }[]; score: number }[] = [];
-    for (const a of [th, th + Math.PI / 2, th + Math.PI / 4, th - Math.PI / 4]) {
-      const ux = Math.cos(a), uz = Math.sin(a);
-      const ends: ({ x: number; y: number; z: number } | null)[] = [];
-      for (const sg of [-1, 1]) {
-        let end: { x: number; y: number; z: number } | null = null;
-        // the street point nearest to the axis end (falling back towards the centre)
-        for (let f = 1; f >= 0.45; f -= 0.1) {
-          const x = mx + ux * sg * L * 0.5 * f, z = mz + uz * sg * L * 0.5 * f;
-          const ne = net.nearestEdge(x, z, 6, 'road', (e) => e.depot < 0 && e.station < 0 && e.type === 'street');
-          yield;
-          if (ne) { end = { x: 0, y: 0, z: 0 }; net.pointAt(ne.edge, ne.s, end); break; }
-        }
-        ends.push(end);
-      }
-      yield;
-      if (!ends[0] || !ends[1]) continue;
-      const direct = Math.hypot(ends[1].x - ends[0].x, ends[1].z - ends[0].z);
-      if (direct < 20) continue;
-      const edges = roadPath(g, ends[0].x, ends[0].z, ends[1].x, ends[1].z, direct * 2.2);
-      yield;
-      if (!edges || edges.length < 2) continue;
-      // tracks of other companies on the way must be usable (access), company roads must be ours
-      if (edges.some((id) => { const e = net.edges.get(id)!; return (e.tram && !tramUsable(g, e, owner)) || (e.owner >= 0 && !g.canUse(owner, e.owner)); })) continue;
-      const pts = pathPoints(g, edges);
-      yield;
-      if (pts.length < 2) continue;
-      const len = pts.length - 1;
-      if (len > direct * 1.7 + 10) continue;
-      const stops = yield* tramStopSitesGen(g, pts, owner);
-      if (stops.length < 3) continue;
-      // people in the stops' catchment (each counted once) per unit of new track
-      const pop = g.stations.popInShapes(stops.map((s) => stopCatchShape(s.x, s.z, true)));
-      out.push({ edges, len, pts, stops, score: pop / (40 + len) });
-      yield;
-    }
-    return out.sort((p, q) => q.score - p.score);
+  private nextDepot(t: TramTask) {
+    const d = t.depot!;
+    if (++d.side >= 2) { d.side = 0; d.k += 2; }
+    if (d.k >= Math.min(d.hi - d.lo - 2, 40)) { d.end++; d.k = 2; }
+    delete d.plan; t.stage = 'depot-site';
   }
+
+  /** One native search or construction unit. Loading only restores this cursor; it never executes a unit. */
+  private work(): boolean | undefined {
+    const t = this.task!, p = this.project!, g = this.game, owner = this.companyId, net = g.world.net;
+    const T = g.towns.list[p.town];
+    if (!T) return this.fail('town no longer exists');
+    if (t.stage === 'axis') {
+      this.status = `planning trams in ${T.name}`;
+      const model = pickTram(g.year, T.pop);
+      if (!model) return this.fail('no trams in service');
+      t.model = model.id;
+      const R = Math.max(20, Math.min(T.radius, 60));
+      // Growth reindexes building cells. Canonical input order makes both resumed and future surveys
+      // independent of that disposable index's insertion history, including floating-point sums.
+      const blds = g.world.buildingsNear(T.x, T.z, R)
+        .filter(b => b.pop > 0 && Math.hypot(b.x - T.x, b.z - T.z) <= R).sort((a, b) => a.id - b.id);
+      let sw = 0, mx = 0, mz = 0;
+      for (const b of blds) { sw += b.pop; mx += b.x * b.pop; mz += b.z * b.pop; }
+      if (sw <= 0) return this.fail('no street route through the centre');
+      mx /= sw; mz /= sw;
+      let cxx = 0, cxz = 0, czz = 0;
+      for (const b of blds) { const dx = b.x - mx, dz = b.z - mz; cxx += dx * dx * b.pop; cxz += dx * dz * b.pop; czz += dz * dz * b.pop; }
+      const th = .5 * Math.atan2(2 * cxz, cxx - czz);
+      t.survey = { mx, mz, length: Math.max(30, Math.min(95, T.radius * 1.3)), angles: [th, th + Math.PI / 2, th + Math.PI / 4, th - Math.PI / 4],
+        angle: 0, side: 0, factor: 1, ends: [], edges: [], pts: [], stops: [], wants: [], want: 0, offset: 0 };
+      t.stage = 'ends'; return;
+    }
+    if (t.stage === 'ends') {
+      const s = t.survey!;
+      if (s.angle >= s.angles.length) {
+        t.routes.sort((a, b) => b.score - a.score);
+        if (!t.routes.length) return this.fail('no street route through the centre');
+        t.route = t.routes[0];
+        t.fresh = t.route.edges.filter(id => !net.edges.get(id)?.tram);
+        const trackLen = t.fresh.reduce((sum, id) => sum + (net.edges.get(id)?.len ?? 0), 0);
+        t.nTrams = Math.max(2, Math.min(5, Math.round(t.route.len / 22)));
+        const model = MODEL_BY_ID.get(t.model)!;
+        t.cost = trackLen * TRAM.costPerUnit + t.route.stops.length * 30_000 + 200_000 + t.nTrams * model.cost;
+        t.stage = 'quote'; return;
+      }
+      if (s.side >= 2) { t.stage = 'path'; return; }
+      if (s.factor < .45) { s.ends.push(null); s.side++; s.factor = 1; return; }
+      const a = s.angles[s.angle], sign = s.side ? 1 : -1;
+      const x = s.mx + Math.cos(a) * sign * s.length * .5 * s.factor, z = s.mz + Math.sin(a) * sign * s.length * .5 * s.factor;
+      const near = net.nearestEdge(x, z, 6, 'road', e => e.depot < 0 && e.station < 0 && e.type === 'street');
+      if (near) { const end = { x: 0, y: 0, z: 0 }; net.pointAt(near.edge, near.s, end); s.ends.push(end); s.side++; s.factor = 1; }
+      else s.factor -= .1;
+      return;
+    }
+    if (t.stage === 'path') {
+      const s = t.survey!, a = s.ends[0], b = s.ends[1];
+      if (!a || !b) { this.nextRoute(t); return; }
+      const direct = Math.hypot(b.x - a.x, b.z - a.z);
+      if (direct < 20) { this.nextRoute(t); return; }
+      const edges = roadPath(g, a.x, a.z, b.x, b.z, direct * 2.2);
+      if (!edges || edges.length < 2 || edges.some(id => { const e = net.edges.get(id); return !e || e.tram && !tramUsable(g, e, owner) || e.owner >= 0 && !g.canUse(owner, e.owner); })) {
+        this.nextRoute(t); return;
+      }
+      s.edges = edges; t.stage = 'points'; return;
+    }
+    if (t.stage === 'points') {
+      const s = t.survey!, a = s.ends[0]!, b = s.ends[1]!;
+      s.pts = pathPoints(g, s.edges);
+      if (s.pts.length < 2 || s.pts.length - 1 > Math.hypot(b.x - a.x, b.z - a.z) * 1.7 + 10) { this.nextRoute(t); return; }
+      for (let at = 3; at < s.pts.length - 3; at += 12) s.wants.push(at);
+      if (s.pts.length - 4 - (s.wants.at(-1) ?? 0) > 6) s.wants.push(s.pts.length - 4);
+      t.stage = 'sites'; return;
+    }
+    if (t.stage === 'sites') {
+      const s = t.survey!, offsets = [0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5];
+      if (s.want >= s.wants.length) { t.stage = 'score'; return; }
+      if (s.offset >= offsets.length) { s.offset = 0; s.want++; return; }
+      const i = Math.round(s.wants[s.want] + offsets[s.offset++]);
+      if (i < 1 || i >= s.pts.length - 1) return;
+      const q = s.pts[i], plan = g.stations.planBusStop(q.x, q.z, owner);
+      if (!plan.ok || plan.edge?.id !== q.edge || s.stops.some(v => Math.hypot(v.x - q.x, v.z - q.z) < 6)) return;
+      s.stops.push({ x: q.x, z: q.z }); s.want++; s.offset = 0; return;
+    }
+    if (t.stage === 'score') {
+      const s = t.survey!;
+      if (s.stops.length >= 3) {
+        const pop = g.stations.popInShapes(s.stops.map(q => stopCatchShape(q.x, q.z, true)));
+        t.routes.push({ edges: s.edges, len: s.pts.length - 1, pts: s.pts, stops: s.stops, score: pop / (40 + s.pts.length - 1) });
+      }
+      this.nextRoute(t); return;
+    }
+    const route = t.route!, model = MODEL_BY_ID.get(t.model);
+    if (!model) return this.fail('tram model no longer exists');
+    if (t.stage === 'quote') {
+      // The forecast is a pure, bounded query. Publish its decision in this ordinary work unit, not during load.
+      const trackLen = t.fresh.reduce((sum, id) => sum + (net.edges.get(id)?.len ?? 0), 0);
+      const quote = runGen(tramRouteValue(g, owner, route.stops, trackLen, model, t.nTrams));
+      if (!pays(quote)) return this.fail(`forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`);
+      while (this.eco.money < t.cost + 300_000 && this.eco.borrow()) { /* borrow in steps */ }
+      if (this.eco.money < t.cost) return this.fail('too expensive');
+      this.status = `building trams in ${T.name}`; t.stage = 'tracks';
+    }
+    if (t.stage === 'tracks') {
+      const usable = (id: number) => { const e = net.edges.get(id); return !!e && tramUsable(g, e, owner); };
+      const laid = addTramTracks(g, t.fresh.filter(id => !usable(id)), owner);
+      if (laid.error && laid.changed === 0 && t.fresh.some(id => !usable(id))) return this.fail('tracks: ' + laid.error);
+      for (const id of t.fresh) if (net.edges.get(id)?.tramOwner === owner) p.edges.push(id);
+      if (!route.edges.every(usable)) return this.fail('tracks: ' + (laid.error ?? 'not laid'));
+      t.stage = 'stops'; t.at = 0; return;
+    }
+    if (t.stage === 'stops') {
+      if (t.at < route.stops.length) {
+        // Native stop construction yields both before committing a site and after a successful commit.
+        t.stage = 'stop-build'; return;
+      }
+      if (t.ids.length < 3) return this.fail('stops could not be built');
+      const at = t.ids.map(id => {
+        const st = g.stations.get(id), q = st?.stops[0] ?? st;
+        if (!q) return -1;
+        let best = -1, distance = Infinity;
+        route.pts.forEach((p, i) => { const d = Math.hypot(p.x - q.x, p.z - q.z); if (d < distance) { distance = d; best = i; } });
+        return best;
+      }).filter(i => i >= 0);
+      t.depot = { lo: at.length ? Math.min(...at) : 0, hi: at.length ? Math.max(...at) : route.pts.length - 1, end: 0, k: 2, side: 0 };
+      if (Math.min(t.depot.hi - t.depot.lo - 2, 40) <= 2) return this.fail('no depot site');
+      t.stage = 'depot-site'; return;
+    }
+    if (t.stage === 'stop-build') {
+      const q = route.stops[t.at++], before = g.stations.nextId;
+      t.stage = 'stops';
+      if (g.stations.commitBusStop(q.x, q.z, owner)) { t.stage = t.at < route.stops.length ? 'stop-build' : 'stops'; return; }
+      let sid = -1, best = Infinity;
+      for (const st of g.stations.map.values()) if (st.owner === owner) for (const stop of st.stops) {
+        const d = Math.hypot(stop.x - q.x, stop.z - q.z); if (d < best) { best = d; sid = st.id; }
+      }
+      if (sid < 0) return;
+      if (g.stations.nextId > before) p.stations.push(before); else p.stops.push([sid, q.x, q.z]);
+      if (!t.ids.includes(sid)) t.ids.push(sid);
+      return;
+    }
+    if (t.stage === 'depot-site') {
+      const d = t.depot!;
+      if (d.end >= 2 || Math.min(d.hi - d.lo - 2, 40) <= 2) return this.fail('no depot site');
+      const i = d.end ? d.hi - d.k : d.lo + d.k, q = route.pts[i], next = route.pts[Math.min(route.pts.length - 1, i + 1)], prev = route.pts[Math.max(0, i - 1)];
+      const tx = next.x - prev.x, tz = next.z - prev.z, length = Math.hypot(tx, tz) || 1, side = d.side ? -1 : 1;
+      const nx = -tz / length * side, nz = tx / length * side, off = .5 + .9 + depotSize('tram').d / 2;
+      d.x = q.x + nx * off; d.z = q.z + nz * off; d.angle = Math.atan2(-nx, -nz);
+      d.plan = g.depots.plan('tram', d.x!, d.z!, d.angle!, owner);
+      // The native quote's demolition set comes from the disposable building index too.
+      // Persist and execute its physical removals in ID order, independent of cell insertion history.
+      d.plan.demolish.sort((a, b) => a - b);
+      t.stage = 'depot-build'; return;
+    }
+    if (t.stage === 'depot-build') {
+      const d = t.depot!, plan = d.plan!;
+      if (!plan.ok || plan.demolish.some(id => (g.world.buildings.get(id)?.pop ?? 0) > 30) || plan.demolish.length > 2 || roadDepotAtDeadEnd(g, plan, true, owner)) {
+        this.nextDepot(t); if (d.end >= 2) return this.fail('no depot site'); return;
+      }
+      const id = g.depots.nextId;
+      if (!g.depots.commit('tram', plan, owner)) {
+        const depot = g.depots.get(id);
+        if (depot && roadDepotReaches(g, depot, t.ids[0])) { p.depot = id; t.stage = 'line'; return; }
+        if (depot) g.depots.remove(id);
+      }
+      this.nextDepot(t); if (d.end >= 2) return this.fail('no depot site'); return;
+    }
+    if (t.stage === 'line') {
+      const line = g.lines.create('tram', owner);
+      p.line = line.id; line.stops = [...t.ids, ...t.ids.slice(1, -1).reverse()];
+      // As in native construction, the draft and its first purchase belong to one work unit.
+      if (typeof g.vehicles.buyRoad(p.depot, model, p.line) !== 'string') t.bought++;
+      // Even a failed first purchase leaves a canonical empty draft until the next failure unit.
+      g.lines.rebuild();
+      t.stage = 'vehicles'; t.at = 1; return;
+    }
+    if (t.stage === 'vehicles') {
+      if (t.at++ < t.nTrams) { if (typeof g.vehicles.buyRoad(p.depot, model, p.line) !== 'string') t.bought++; return; }
+      if (!t.bought) return this.fail('could not buy trams');
+      this.status = `opened trams in ${T.name}`; return true;
+    }
+    return this.fail('Invalid tram construction stage');
+  }
+
 }
 
 /**

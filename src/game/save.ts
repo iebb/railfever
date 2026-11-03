@@ -25,6 +25,7 @@ import { saveNetwork, loadNetwork } from './ai-network';
 import { saveRouteWorks, loadRouteWorks } from './route-works';
 import { migrateElectricTrains } from './migrate';
 import { stationMailJSON, restoreStationMail, restoreMail, restoreMailQueue } from './mail';
+import { withPlannerInputCapture, withPlannerInputRestore } from './ai-task-inputs';
 
 const VERSION = 3;
 /** Catchment/transfer parameters changed: old saved populations refresh at the next native boundary. */
@@ -276,6 +277,7 @@ function f32enc(a: Float32Array): string {
 }
 function f32dec(s: string): Float32Array {
   const u8 = unb64(s);
+  if (u8.length % 4) throw new Error('Invalid float chunk');
   const n = u8.length >> 2, out = new Float32Array(n);
   const dst = new Uint8Array(out.buffer);
   for (let i = 0; i < n; i++) for (let b = 0; b < 4; b++) dst[i * 4 + b] = u8[b * n + i];
@@ -364,6 +366,10 @@ function depotSeg(g: Game, dp: Depot, length: number): TSeg | null {
 // ------------------------------------------------------------------------------ serialize
 
 function serializeState(g: Game, world: any, binaryProfiles = false): any {
+  const captured = withPlannerInputCapture(g, () => serializeStateWithoutPlannerInputs(g, world, binaryProfiles));
+  return captured.inputs ? { ...captured.value, aiPlannerInputs: captured.inputs } : captured.value;
+}
+function serializeStateWithoutPlannerInputs(g: Game, world: any, binaryProfiles = false): any {
   const w = g.world, net = w.net;
   const edges = [...net.edges.values()];
   const profiles = binaryProfiles ? new Float32Array(edges.reduce((n, e) => n + e.prof.length, 0)) : null;
@@ -445,26 +451,58 @@ export function deserialize(d: any): Game {
   const why = saveIncompatibility({ version: d.version, game: d.game });
   if (why || d.version === undefined) throw new Error(why ?? 'Not a Railfever save');
   const wd = d.world;
-  const w = new World(wd.size);
-  let tr: Float32Array;
+  if (!wd || !Number.isSafeInteger(wd.size) || wd.size <= 0 || !Number.isSafeInteger((wd.size + 1) ** 2))
+    throw new Error('Invalid world size');
+  // Older single-record saves must be complete too: typed-array set/subarray otherwise silently
+  // zero-filled missing terrain and locks, or discarded trailing data, permanently changing the map.
+  let legacy: { h: Float32Array; lock: Uint8Array; trees: Float32Array } | undefined;
+  let chunks: { h: Uint8Array[]; lock: Uint8Array[]; trees: Uint8Array[] } | undefined;
+  const vertices = (wd.size + 1) ** 2;
   if (d.version === 2) {
-    w.h.set(f32dec(wd.h).subarray(0, w.h.length));
-    w.lock.set(unb64(wd.lock).subarray(0, w.lock.length));
-    tr = f32dec(wd.trees);
+    legacy = { h: f32dec(wd.h), lock: unb64(wd.lock), trees: f32dec(wd.trees) };
+    if (legacy.h.length !== vertices) throw new Error('Incomplete heightmap');
+    if (legacy.lock.length !== vertices) throw new Error('Incomplete lock grid');
+    if (legacy.trees.length % 5) throw new Error('Invalid tree chunk');
   } else {
     if (wd.encoding !== 'predict32-chunks' || wd.vertices !== SAVE_VERTICES || wd.treeChunk !== TREE_CHUNK)
       throw new Error('Unsupported world chunk encoding');
-    const floats = (x: string | Uint8Array, stride = 0) => codec.unpackFloats(typeof x === 'string' ? unb64(x) : x, stride);
+    const decode = (parts: unknown, width: number): Uint8Array[] => {
+      if (!Array.isArray(parts)) throw new Error('Invalid world chunks');
+      return parts.map((part) => {
+        const bytes = typeof part === 'string' ? unb64(part) : part;
+        if (!(bytes instanceof Uint8Array)) throw new Error('Invalid world chunk');
+        if (bytes.length % width) throw new Error(width === 20 ? 'Invalid tree chunk' : 'Invalid float chunk');
+        return bytes;
+      });
+    };
+    chunks = { h: decode(wd.h, 4), lock: decode(wd.lock, 1), trees: decode(wd.trees, 20) };
+    const count = (parts: Uint8Array[], width: number) => parts.reduce((sum, a) => sum + a.length / width, 0);
+    // Check the supplied data before allocating the declared world or tree array. A small corrupt
+    // header must not turn an otherwise recoverable import failure into a browser out-of-memory crash.
+    if (count(chunks.h, 4) !== vertices) throw new Error('Incomplete heightmap');
+    if (count(chunks.lock, 1) !== vertices) throw new Error('Incomplete lock grid');
+    if (!Number.isSafeInteger(wd.treeCount) || wd.treeCount < 0 || count(chunks.trees, 20) !== wd.treeCount)
+      throw new Error('Incomplete trees');
+  }
+  const w = new World(wd.size);
+  let tr: Float32Array;
+  if (legacy) {
+    w.h.set(legacy.h);
+    w.lock.set(legacy.lock);
+    tr = legacy.trees;
+  } else {
+    const floats = (x: Uint8Array, stride = 0) => codec.unpackFloats(x, stride);
     let at = 0;
-    for (const chunk of wd.h) { const a = floats(chunk, w.size + 1); w.h.set(a, at); at += a.length; }
+    for (const chunk of chunks!.h) { const a = floats(chunk, w.size + 1); w.h.set(a, at); at += a.length; }
     if (at !== w.h.length) throw new Error('Incomplete heightmap');
     at = 0;
-    for (const chunk of wd.lock) { const a = typeof chunk === 'string' ? unb64(chunk) : chunk; w.lock.set(a, at); at += a.length; }
+    for (const chunk of chunks!.lock) { w.lock.set(chunk, at); at += chunk.length; }
     if (at !== w.lock.length) throw new Error('Incomplete lock grid');
     tr = new Float32Array(wd.treeCount * 5);
     at = 0;
-    for (const chunk of wd.trees) {
+    for (const chunk of chunks!.trees) {
       const a = floats(chunk), n = a.length / 5;
+      if (!Number.isInteger(n)) throw new Error('Invalid tree chunk');
       for (let i = 0; i < n; i++) for (let f = 0; f < 5; f++) tr[(at + i) * 5 + f] = a[f * n + i];
       at += n;
     }
@@ -699,7 +737,11 @@ export function deserialize(d: any): Game {
     catch (e) { console.warn('Save load: canonicalizeLines failed', e); }
   }
   // AI companies (an interrupted project is cleaned up now that stations, lines and vehicles exist)
-  try { g.restoreAIs(d); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  try { withPlannerInputRestore(g, d.aiPlannerInputs, () => g.restoreAIs(d)); } catch (e) { console.warn('Save load: restoreAIs failed', e); }
+  // Legacy project cleanup can remove stations, passages and roads after the first share-cache prime.
+  // Those are real input edits, even when the saved world had no population update pending. Retain
+  // that work before loadNetwork aligns disposable road versions and the second prime consumes it.
+  const restoredPopulationPending = populationPending || g.stations.catchmentInputsChanged() || g.stations.catchmentPopulationPending;
   // New saves preserve pending/current access metadata while the AI warms derived walking entries.
   const protectNetworkWarm = typeof d.catchmentAccessCurrent === 'boolean', networkAccessVersion = S.accessVersion;
   if (protectNetworkWarm) S.accessVersion = net.version;
@@ -710,7 +752,7 @@ export function deserialize(d: any): Game {
   // Prime only derived memberships with saved access; do not refresh pending access while loading.
   S.accessVersion = net.version;
   if (!(d.catchmentEmptyCold === true && g.stations.map.size === 0 && d.catchMaxB === 0))
-    g.stations.restoreCatchmentShares(d.catchMaxB, populationPending);
+    g.stations.restoreCatchmentShares(d.catchMaxB, restoredPopulationPending);
   S.accessVersion = !catchmentRulesChanged && d.catchmentAccessCurrent === true ? savedAccessVersion : accessVersion;
   // (after the cold share-out primes above, which would clear it)
   g.stations.accessRoadsOwed = d.catchmentAccessRoads === true;

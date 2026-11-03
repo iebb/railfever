@@ -113,6 +113,110 @@ const geometry = (t: Train) => [0, t.length / 2, t.length].map(d => {
   const p = { x: 0, y: 0, z: 0 }; const s = t.pointBehind(d, p); return { p, e: s?.seg.e, dir: s?.seg.dir };
 });
 
+function observe(f: Fixture, label: string, capability?: 'depot' | 'further') {
+  const { g, a, b } = f, trains = [a, b, ...(f.following ?? [])], days = f.following?.length ? 600 : 300;
+  const start = g.tick;
+  const replays: Game[] = [], phases = new Set<string>();
+  let lastCheckpoint = g.tick, lastRequest = -1, requested = 0;
+  const requester = capability === 'depot' ? a : capability === 'further' ? f.following![1] : undefined;
+  // A fair automatic scheduler need not choose the long depot train or need a further refuge. These forks
+  // issue actual guarded retreat requests as external inputs; never force waiting ages, routes or reservations.
+  const request = () => {
+    if (!capability) return;
+    let train: Train | undefined, others: Train[] = [];
+    if (capability === 'depot' && requested === 0) { train = a; others = [b]; }
+    if (capability === 'further') {
+      const follower = f.following![1];
+      if (requested === 0) { train = follower; others = [a, b]; }
+      if (requested === 1) { train = b; others = [a]; }
+      const cycle = requested === 2 && follower.backoff ? deadlockCycles(g, 0).find(c => c.includes(follower)) : undefined;
+      if (cycle) { train = follower; others = cycle.filter(t => t !== follower); }
+    }
+    if (!train || train.state !== 'waiting' || train.speed > 0.01) return;
+    const before = saved(g), moved = train.breakDeadlock(others);
+    if (!moved) check(saved(g) === before, `${label}: a refused native request preserves waiting age and route`);
+    for (const loaded of replays) {
+      const t = loaded.vehicles.get(train.id) as Train;
+      check(t.breakDeadlock(others.map(v => loaded.vehicles.get(v.id) as Train)) === moved,
+        `${label}: saved native request has the same guarded result`);
+    }
+    if (moved) { requested++; lastRequest = g.tick; }
+  };
+  const checkpoint = (phase: string) => {
+    if (phases.has(phase)) return;
+    phases.add(phase); lastCheckpoint = g.tick;
+    const snapshot = saved(g), loaded = deserialize(JSON.parse(snapshot));
+    check(saved(loaded) === snapshot, `${label}: exact ${phase} save round trip`);
+    replays.push(loaded);
+  };
+  checkpoint('deadlock');
+  let firstRecovery = -1, replayError = '', physicalError = '';
+  const visits = new Map<number, number>(), lastCall = new Map<number, number>(), prev = new Map<number, string>();
+  for (let i = 0; i < days * TICKS_PER_DAY; i++) {
+    const before = trains.map(t => ({ onMap: t.onMap, center: geometry(t)[1].p }));
+    request();
+    g.stepTick();
+    for (const loaded of replays) loaded.stepTick();
+    if (!replayError) {
+      const ref = dynamic(g), geo = JSON.stringify(trains.map(geometry));
+      for (const loaded of replays) {
+        const actual = dynamic(loaded);
+        if (actual !== ref || JSON.stringify(trains.map(t => geometry(loaded.vehicles.get(t.id) as Train))) !== geo
+          || (g.tick % TICKS_PER_DAY === 0 && saved(loaded) !== saved(g))) {
+          replayError = `tick ${g.tick}`;
+          let at = 0; while (at < Math.min(ref.length, actual.length) && ref[at] === actual[at]) at++;
+          console.log(`  replay mismatch at ${g.tick}, save ${replays.indexOf(loaded)}, JSON offset ${at}:\n    ${ref.slice(Math.max(0, at - 100), at + 140)}\n    ${actual.slice(Math.max(0, at - 100), at + 140)}`);
+          break;
+        }
+      }
+    }
+    const occupied = new Map<number, number>();
+    for (const [j, t] of trains.entries()) {
+      if (t.state === 'loading' && prev.get(t.id) !== 'loading') { visits.set(t.id, (visits.get(t.id) ?? 0) + 1); lastCall.set(t.id, g.tick); }
+      prev.set(t.id, t.state);
+      const p = geometry(t)[1].p, old = before[j];
+      if (t.onMap && old.onMap && Math.hypot(p.x - old.center.x, p.y - old.center.y, p.z - old.center.z) > t.maxSpeed * TICK + 0.02) physicalError ||= `position jump at tick ${g.tick}`;
+      for (const e of t.occupiedEdges()) {
+        if ((occupied.has(e) && occupied.get(e) !== t.id) || g.vehicles.getRes(e) !== t.id) physicalError ||= `occupied track collision/unreserved edge ${e} at tick ${g.tick}`;
+        occupied.set(e, t.id);
+      }
+    }
+    const retreat = trains.find(t => t.backoff);
+    if (retreat) {
+      if (firstRecovery < 0) {
+        firstRecovery = g.tick;
+        if (f.following?.length) check(f.following.includes(retreat), `${label}: a following train clears the blocked retreat first`);
+      }
+      checkpoint('reserved retreat');
+      if (retreat.speed > 0.05) checkpoint('moving retreat');
+      if (retreat.segs.some(s => s.e < 0 && s.dir < 0)) checkpoint('reverse depot track');
+      if (retreat.state === 'waiting' || retreat.state === 'depot') checkpoint('yield hold');
+    }
+    if (trains.some(t => t.backoff && t.status === 'Moving aside to free the path')) checkpoint('further refuge');
+    if (firstRecovery >= 0 && !retreat) checkpoint('resumed service');
+    const witnessed = capability === 'depot' ? phases.has('reverse depot track') : phases.has('further refuge');
+    if (capability && requested === (capability === 'depot' ? 1 : 3) && witnessed
+      && phases.has('resumed service') && !retreat && requester && (lastCall.get(requester.id) ?? -1) > lastRequest && g.tick - lastCheckpoint >= 60 / TICK) break;
+  }
+  const counts = trains.map(t => visits.get(t.id) ?? 0);
+  if (!capability) {
+    check(firstRecovery >= 0 && firstRecovery - start <= Math.ceil(40 / TICK) + 3 * TICKS_PER_DAY + 1, `${label}: automatic resolution starts within 40 seconds plus three days`);
+    check(counts.every(n => n >= 2), `${label}: every train resumes service within ${days} days`);
+  } else check(requested === (capability === 'depot' ? 1 : 3) && !!requester && (lastCall.get(requester.id) ?? -1) > lastRequest,
+    `${label}: guarded native requests complete and actual service resumes`);
+  if (capability) {
+    check(!trains.some(t => t.backoff) && g.tick - lastCheckpoint >= 60 / TICK,
+      `${label}: all retreats finish with at least 60 seconds of replay after the last checkpoint`);
+    console.log(`  request tick ${lastRequest}, requester call tick ${requester ? lastCall.get(requester.id) : -1}, checkpoint tick ${lastCheckpoint}, final tick ${g.tick}`);
+  }
+  check(!replayError, `${label}: exact replay at every tick from all checkpoints (${replayError || replays.length + ' saves'})`);
+  check(!physicalError && checkReservations(g).length === 0, `${label}: physical movement, exclusive occupancy and consistent reservations (${physicalError || 'OK'})`);
+  check(phases.has('moving retreat') && phases.has('yield hold') && phases.has('resumed service'), `${label}: replay covers movement, yielding and resumed service`);
+  if (capability === 'depot') check(phases.has('reverse depot track'), `${label}: replay includes backing physically into the depot`);
+  if (capability === 'further') check(phases.has('further refuge'), `${label}: a yielded train can move to a further refuge when its hold forms another cycle`);
+  console.log(`  arrivals ${counts.join('/')}; recovery after ${firstRecovery < 0 ? 'never' : ((firstRecovery - start) * TICK).toFixed(2) + ' s'}; ${replays.length} replay checkpoints [${[...phases].join(', ')}]`);
+}
+
 function run(f: Fixture, label: string, inDepot = false) {
   const { g, a, b } = f, trains = [a, b, ...(f.following ?? [])], days = f.following?.length ? 600 : 300;
   let cycle = false;
@@ -123,7 +227,7 @@ function run(f: Fixture, label: string, inDepot = false) {
   check(cycle && a.owner !== b.owner, `${label}: two operators form a real reservation cycle`);
   if (!cycle) return;
   if (inDepot) check(trains.some(t => t.segs[t.tailInfo().seg].e < 0), `${label}: a train's tail is still inside its depot`);
-  const start = g.tick, json = saved(g);
+  const json = saved(g);
   console.log(`${label}: cycle on day ${g.day}; ${trains.map(t => `${t.id} waits for ${t.blockedBy}`).join(', ')}`);
 
   const decision = deserialize(JSON.parse(json)), decision2 = deserialize(JSON.parse(json));
@@ -149,68 +253,13 @@ function run(f: Fixture, label: string, inDepot = false) {
   ga.blockedBy = 0;
   check(deadlockCycles(graph, 0).some(c => c.some(t => t.id === a.id) && c.some(t => t.id === b.id)), `${label}: live wait graph ignores stale blockedBy`);
 
-  const replays: Game[] = [], phases = new Set<string>();
-  const checkpoint = (phase: string) => {
-    if (phases.has(phase)) return;
-    phases.add(phase);
-    const snapshot = saved(g), loaded = deserialize(JSON.parse(snapshot));
-    check(saved(loaded) === snapshot, `${label}: exact ${phase} save round trip`);
-    replays.push(loaded);
-  };
-  checkpoint('deadlock');
-  let firstRecovery = -1, replayError = '', physicalError = '';
-  const visits = new Map<number, number>(), prev = new Map<number, string>();
-  for (let i = 0; i < days * TICKS_PER_DAY; i++) {
-    const before = trains.map(t => ({ onMap: t.onMap, center: geometry(t)[1].p }));
-    g.stepTick();
-    for (const loaded of replays) loaded.stepTick();
-    if (!replayError) {
-      const ref = dynamic(g), geo = JSON.stringify(trains.map(geometry));
-      for (const loaded of replays) {
-        const actual = dynamic(loaded);
-        if (actual !== ref || JSON.stringify(trains.map(t => geometry(loaded.vehicles.get(t.id) as Train))) !== geo
-          || (g.tick % TICKS_PER_DAY === 0 && saved(loaded) !== saved(g))) {
-          replayError = `tick ${g.tick}`;
-          let at = 0; while (at < Math.min(ref.length, actual.length) && ref[at] === actual[at]) at++;
-          console.log(`  replay mismatch at ${g.tick}, save ${replays.indexOf(loaded)}, JSON offset ${at}:\n    ${ref.slice(Math.max(0, at - 100), at + 140)}\n    ${actual.slice(Math.max(0, at - 100), at + 140)}`);
-          break;
-        }
-      }
-    }
-    const occupied = new Map<number, number>();
-    for (const [j, t] of trains.entries()) {
-      if (t.state === 'loading' && prev.get(t.id) !== 'loading') visits.set(t.id, (visits.get(t.id) ?? 0) + 1);
-      prev.set(t.id, t.state);
-      const p = geometry(t)[1].p, old = before[j];
-      if (t.onMap && old.onMap && Math.hypot(p.x - old.center.x, p.y - old.center.y, p.z - old.center.z) > t.maxSpeed * TICK + 0.02) physicalError ||= `position jump at tick ${g.tick}`;
-      for (const e of t.occupiedEdges()) {
-        if ((occupied.has(e) && occupied.get(e) !== t.id) || g.vehicles.getRes(e) !== t.id) physicalError ||= `occupied track collision/unreserved edge ${e} at tick ${g.tick}`;
-        occupied.set(e, t.id);
-      }
-    }
-    const retreat = trains.find(t => t.backoff);
-    if (retreat) {
-      if (firstRecovery < 0) {
-        firstRecovery = g.tick;
-        if (f.following?.length) check(f.following.includes(retreat), `${label}: a following train clears the blocked retreat first`);
-      }
-      checkpoint('reserved retreat');
-      if (retreat.speed > 0.05) checkpoint('moving retreat');
-      if (retreat.segs.some(s => s.e < 0 && s.dir < 0)) checkpoint('reverse depot track');
-      if (retreat.state === 'waiting' || retreat.state === 'depot') checkpoint('yield hold');
-    }
-    if (trains.some(t => t.backoff && t.status === 'Moving aside to free the path')) checkpoint('further refuge');
-    if (firstRecovery >= 0 && !retreat) checkpoint('resumed service');
+  observe(f, label);
+  if (inDepot || f.following?.length) {
+    const fork = deserialize(JSON.parse(json));
+    const capability: Fixture = { g: fork, a: fork.vehicles.get(a.id) as Train, b: fork.vehicles.get(b.id) as Train,
+      following: f.following?.map(t => fork.vehicles.get(t.id) as Train) };
+    observe(capability, label + ' guarded capability', inDepot ? 'depot' : 'further');
   }
-  const counts = trains.map(t => visits.get(t.id) ?? 0);
-  check(firstRecovery >= 0 && firstRecovery - start <= Math.ceil(40 / TICK) + 3 * TICKS_PER_DAY + 1, `${label}: automatic resolution starts within 40 seconds plus three days`);
-  check(counts.every(n => n >= 2), `${label}: every train resumes service within ${days} days`);
-  check(!replayError, `${label}: exact replay at every tick from all checkpoints (${replayError || replays.length + ' saves'})`);
-  check(!physicalError && checkReservations(g).length === 0, `${label}: physical movement, exclusive occupancy and consistent reservations (${physicalError || 'OK'})`);
-  check(phases.has('moving retreat') && phases.has('yield hold') && phases.has('resumed service'), `${label}: replay covers movement, yielding and resumed service`);
-  if (inDepot) check(phases.has('reverse depot track'), `${label}: replay includes backing physically into the depot`);
-  if (f.following?.length) check(phases.has('further refuge'), `${label}: a yielded train can move to a further refuge when its hold forms another cycle`);
-  console.log(`  arrivals ${counts.join('/')}; recovery after ${firstRecovery < 0 ? 'never' : ((firstRecovery - start) * TICK).toFixed(2) + ' s'}; ${replays.length} replay checkpoints`);
 }
 
 run(fixture(), 'junction platform');

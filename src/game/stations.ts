@@ -4,9 +4,9 @@
 import type { Game } from './game';
 import { RAIL, ROAD_TYPES, WATER_Y, TRACK_TYPES, trackTypeOf, WALK_TRIP_INTENSITY } from './constants';
 import { bezLine, bezPoint } from './geom';
-import { NEdge, Section } from './network';
-import { applyEarthworks, repairFormations, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
-import { distToRect, Building } from './world';
+import { Network, NEdge, Section } from './network';
+import { applyEarthworks, repairFormations, formationSupportError, FormationCorePreparation, previewDemolition, EARTHWORKS, LOCK, DRY_MIN } from './terraform';
+import { World, distToRect, Building } from './world';
 import { rectsOverlap, Town, FLOOR_H } from './towns';
 import { hash2 } from './rng';
 import { planEdge, commitProposal, Snap, Proposal } from './construction';
@@ -1387,6 +1387,24 @@ export class Stations {
     // A joined stop station keeps its id: commit (nearbyComplex) never links it to a consecutive stop of its lines,
     // so the plan must not promise that passage either.
     if (plan.join) { const j = plan.join.id; plan.links = plan.links.filter((o) => !this.consecutiveStops(j, o.id)); }
+    const formationDemolish = new Set<number>();
+    if (level === 'ground') {
+      // Collect formation clearance before forecasting support: these houses and their locks will be gone.
+      const reach = 0.32 + EARTHWORKS.corePad + 1.42;
+      for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
+        const pt = pose(off, s), px = pt.x, pz = pt.z;
+        if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
+        for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) { demolish.add(b.id); formationDemolish.add(b.id); }
+      }
+    }
+    const ignoreFormations = new Set(opts.ignoreEdges);
+    if (ign !== undefined) for (const e of w.net.edges.values()) if (e.station === ign) ignoreFormations.add(e.id);
+    const stationFormations = level !== 'ground' ? [] : opts.alignment ? opts.alignment.tracks.flatMap(t => t.pieces.map(p => ({ kind: 'rail' as const, type: 'standard', bez: p.curve, prof: new Float32Array(p.profile), sections: [] })))
+      : [...layout.trackOffsets, ...layout.throughOffsets].map(off => {
+        const a = pose(off, -length / 2), b = pose(off, length / 2);
+        return { kind: 'rail' as const, type: 'standard', bez: bezLine(a.x, a.z, b.x, b.z), prof: new Float32Array(Math.max(2, Math.ceil(length) + 1)).fill(plan.y), sections: [] };
+      });
+    let formationPreparation: FormationCorePreparation | undefined;
     // road access: a road at the forecourt, else an access street to a road within reach (other building sites
     // are tried when the best one gets none)
     const bc = (plan as StationPlan & { buildingCands?: BuildingCand[] }).buildingCands;
@@ -1395,11 +1413,12 @@ export class Stations {
       const chosen = bc[0], reach = styleOf(plan.style).placement === 'none' ? NO_BUILDING_REACH : 0.9;
       search: for (const c of bc.slice(0, 6)) {
         if (c.road > ACCESS_REACH) continue;
+        const candidateDemolition = [...demolish].filter(id => c === chosen || !chosen.dem.has(id) || c.dem.has(id) || formationDemolish.has(id)).concat([...c.dem]);
         // either forecourt of a concourse station will do (the one with the road becomes the main one)
         for (const [f1, f2] of c.fc2 ? [[c.fc, c.fc2], [c.fc2, c.fc]] : [[c.fc, undefined]]) {
           const swap = () => {
             if (c !== chosen) {
-              for (const id of chosen.dem) if (!c.dem.has(id)) demolish.delete(id);
+              for (const id of chosen.dem) if (!c.dem.has(id) && !formationDemolish.has(id)) demolish.delete(id);
               for (const id of c.dem) demolish.add(id);
             }
             plan.building = c.b; plan.forecourt = f1!; plan.forecourt2 = f2 ?? null;
@@ -1408,11 +1427,15 @@ export class Stations {
         }
         for (const [f1, f2] of c.fc2 ? [[c.fc, c.fc2], [c.fc2, c.fc]] : [[c.fc, undefined]]) {
           plan.building = c.b;
-          const acc = this.planAccessStreet(f1!.x, f1!.z, plan, owner, c.end);
+          const acc = this.planAccessStreet(f1!.x, f1!.z, plan, owner, c.end, [], undefined, ACCESS_REACH,
+            p => !stationFormations.length || !formationSupportError(previewDemolition(w, [...candidateDemolition, ...p.demolish]), [...stationFormations, ...p.tracks.map(t => ({ ...t, kind: 'road' as const, type: p.opts.type }))], ignoreFormations,
+              undefined, undefined, undefined, formationPreparation ??= new FormationCorePreparation()));
           plan.building = chosen.b;
+          // A road surveyed before the platforms exist must fit their prospective terrain too. Keep trying
+          // the other forecourts when this path cannot share their grid cells safely.
           if (acc) {
             if (c !== chosen) {
-              for (const id of chosen.dem) if (!c.dem.has(id)) demolish.delete(id);
+              for (const id of chosen.dem) if (!c.dem.has(id) && !formationDemolish.has(id)) demolish.delete(id);
               for (const id of c.dem) demolish.add(id);
             }
             plan.building = c.b; plan.forecourt = f1!; plan.forecourt2 = f2 ?? null;
@@ -1423,13 +1446,11 @@ export class Stations {
       }
     }
     if (level === 'ground') {
-      // A rail formation reaches all the grid cells under its ballast. Houses sharing those cells must be
-      // cleared when it is regraded, including outside the platform rectangle and along through tracks.
-      const reach = 0.32 + EARTHWORKS.corePad + 1.42;
-      for (const off of [...layout.trackOffsets, ...layout.throughOffsets]) for (let s = -length / 2; s <= length / 2 + 0.001; s += 0.5) {
-        const pt = pose(off, s), px = pt.x, pz = pt.z;
-        if (Math.abs(plan.y - 0.1 - w.heightAt(px, pz)) <= 0.1) continue;
-        for (const b of w.buildingsNear(px, pz, reach)) if (distToRect(px, pz, b.x, b.z, b.angle, b.w / 2, b.d / 2) < reach) demolish.add(b.id);
+      if (plan.ok) {
+        const access = plan.access?.tracks.map(t => ({ ...t, kind: 'road' as const, type: plan.access!.opts.type })) ?? [];
+        const error = formationSupportError(previewDemolition(w, [...demolish, ...(plan.access?.demolish ?? [])]), [...stationFormations, ...access], ignoreFormations,
+          undefined, undefined, undefined, formationPreparation ??= new FormationCorePreparation());
+        if (error) failp(error);
       }
     }
     plan.demolish = [...demolish];
@@ -1508,7 +1529,7 @@ export class Stations {
    * Access street from a station forecourt to a nearby road: not through the station, and clear of the lead
    * corridors beyond both platform ends (where the line and its throat go).
    */
-  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; y?: number; angle: number; length: number; alignment?: RailStationAlignment; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH): Proposal | null {
+  private planAccessStreet(fx: number, fz: number, plan: { x: number; z: number; y?: number; angle: number; length: number; alignment?: RailStationAlignment; layout: { width: number }; footprint: Rect; building: Rect }, owner: number, headEnd?: number, extra: Rect[] = [], side?: number, reach = ACCESS_REACH, accept?: (proposal: Proposal) => boolean): Proposal | null {
     const g = this.game, net = g.world.net;
     const ax = Math.sin(plan.angle), az = Math.cos(plan.angle);
     const LEAD = 26, half = plan.layout.width / 2 + 1.2;
@@ -1542,12 +1563,26 @@ export class Stations {
       if (best) cands.push({ e, ...best });
     }
     cands.sort((a, b) => a.d - b.d);
+    // Adjacent road edges can snap to the same joint. Keep the original candidate order/budget,
+    // but survey identical roads only once within this immutable synchronous access quote.
+    const proposals = new Map<string, Proposal>();
+    // Reject only roads which the unchanged downstream curve exclusion would discard.
+    const curveClear = nativeAccessCurveContext(g.world, keepOut) ? (bez: Parameters<typeof bezPoint>[0]) => {
+      for (let i = 1; i <= 24; i++) {
+        bezPoint(bez, i / 24, p);
+        if (Math.hypot(p.x - fx, p.z - fz) > 0.7 && blocked(p.x, p.z, 0.45)) return false;
+      }
+      return true;
+    } : undefined;
     for (const c of cands.slice(0, 6)) {
       let end: Snap;
       if (c.s < 0.8 || c.s > c.e.len - 0.8) { const n = net.nodes.get(c.s < 0.8 ? c.e.a : c.e.b)!; end = { kind: 'node', x: n.x, z: n.z, y: n.y, node: n.id }; }
       else { net.pointAt(c.e, c.s, p); end = { kind: 'edge', x: p.x, z: p.z, y: p.y, edge: c.e.id, s: c.s }; }
       const start: Snap = { kind: 'free', x: fx, z: fz, y: g.world.heightAt(fx, fz) };
-      const prop = planEdge(g, start, end, { kind: 'road', type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto', owner });
+      const opts = { kind: 'road' as const, type: 'street', tracks: 1, heightOffset: 0, crossing: 'auto' as const, owner };
+      const key = JSON.stringify([start, end, opts]);
+      let prop = proposals.get(key);
+      if (!prop) { prop = planEdge(g, start, end, opts, curveClear); proposals.set(key, prop); }
       if (!prop.ok) continue;
       // (an entrance's street is walked: at ground level from its door, no cutting below the ground into a tunnel)
       if (side && prop.tracks.some((t) => t.sections.length || Math.abs(t.prof[0] - start.y) > 0.3)) continue;
@@ -1557,7 +1592,7 @@ export class Stations {
         bezPoint(tp.bez, i / 24, p);
         if (Math.hypot(p.x - fx, p.z - fz) > 0.7 && blocked(p.x, p.z, 0.45)) hit = true;
       }
-      if (!hit) return prop;
+      if (!hit && (!accept || accept(prop))) return prop;
     }
     return null;
   }
@@ -1830,13 +1865,15 @@ export class Stations {
     if (!plan.ok) return plan.error ?? 'Cannot build';
     const co = g.company(owner);
     if (!co.economy.canAfford(plan.cost)) return 'Not enough money';
+    // Access and platform formations were surveyed together. Commit the priced street before the platforms
+    // reshape its terrain; a changed/busy connection must fail before charging or creating the station.
+    if (plan.access) { const error = commitProposal(g, plan.access); if (error) return error; }
     const accessCost = plan.access ? plan.access.cost : 0;
     co.economy.spend(plan.cost - accessCost, 'construction');
     for (const id of plan.demolish) g.towns.demolishBuilding(id);
     const join = plan.join && this.map.get(plan.join.id) === plan.join ? plan.join : null;
     const st = join ?? this.create(plan.x, plan.z, owner);
     this.buildRailPart(st, plan, owner);
-    if (plan.access && plan.access.ok) commitProposal(g, plan.access);
     for (const o of plan.links) if (this.map.get(o.id) === o && !this.canLink(st.id, o.id) && this.nearbyComplex(st, o)) this.addLink(st, o);
     this.autoLinkNearby(st);
     this.accessVersion = -1;
@@ -2514,6 +2551,10 @@ export class Stations {
     const stop = st.stops[idx];
     if (!stop) return;
     st.stops.splice(idx, 1);
+    if (!st.rail && st.stops.length) {
+      st.x = st.stops.reduce((sum, p) => sum + p.x, 0) / st.stops.length;
+      st.z = st.stops.reduce((sum, p) => sum + p.z, 0) / st.stops.length;
+    }
     const e = this.game.world.net.edges.get(stop.edge);
     if (e) this.game.world.net.markEdge(e);
     if (!st.stops.length && !st.rail) this.deleteStation(st.id);
@@ -2595,6 +2636,43 @@ export class Stations {
       if (this.consecutiveStops(x, y) || this.gap(p, q) > Math.min(autoLinkRange(this.mode(p), this.mode(q)), this.linkRange(p, q))) return false;
     }
     return true;
+  }
+
+  /** Direct passages a single new rail facility would gain at commit. Keep the explicit own
+   * passages first, then the native automatic order; an admitted complex can exclude a later one.
+   * This local view never inserts a station or changes existing links/operating permissions. */
+  prospectiveRailLinks(plan: StationPlan): Station[] {
+    if (!plan.ok) return [];
+    const joined = plan.join && this.map.get(plan.join.id) === plan.join ? plan.join : null;
+    const future = { ...(joined ?? { id: this.nextId, stops: [], links: [] }),
+      x: plan.x, z: plan.z, rail: this.partOf(plan, [], []), links: [...(joined?.links ?? [])] } as Station;
+    if (planWalkScale(plan) !== 1) future.city = true; else delete future.city;
+    const extra = new Map<number, number[]>(), accepted: Station[] = [];
+    const get = (id: number) => id === future.id ? future : this.map.get(id);
+    const complex = (id: number) => {
+      const out = [id], seen = new Set(out);
+      for (let i = 0; i < out.length; i++) for (const next of [...(get(out[i])?.links ?? []), ...(extra.get(out[i]) ?? [])])
+        if (!seen.has(next) && get(next)) { seen.add(next); out.push(next); }
+      return out;
+    };
+    const admit = (st: Station) => {
+      if (st.id === future.id || future.links.includes(st.id) || this.gap(future, st) > this.linkRange(future, st)) return;
+      const left = complex(future.id), right = complex(st.id);
+      if (left.some(id => right.includes(id))) return;
+      for (const x of left) for (const y of right) {
+        const a = get(x)!, b = get(y)!;
+        if (this.consecutiveStops(x, y) || this.gap(a, b) > Math.min(autoLinkRange(this.mode(a), this.mode(b)), this.linkRange(a, b))) return;
+      }
+      future.links.push(st.id);
+      const reverse = extra.get(st.id) ?? []; reverse.push(future.id); extra.set(st.id, reverse);
+      accepted.push(st);
+    };
+    for (const st of plan.links) if (this.map.get(st.id) === st) admit(st);
+    const automatic = [...this.map.values()].filter(st => st.id !== future.id && st.rail && !future.links.includes(st.id))
+      .map(st => ({ st, gap: this.gap(future, st) })).sort((a, b) => a.gap - b.gap || a.st.id - b.st.id);
+    for (const candidate of automatic)
+      if (!(candidate.gap > Math.min(autoLinkRange(this.mode(future), this.mode(candidate.st)), this.linkRange(future, candidate.st)))) admit(candidate.st);
+    return accepted;
   }
 
   /** Nearby rail platforms are one public interchange, retaining their separate track groups and owners. */
@@ -4254,3 +4332,25 @@ export function stationCapacity(g: Game, stationId: number): StationCapacity | n
 export function relocateStation(g: Game, stationId: number, plan: StationPlan): string | null { return g.stations.relocate(stationId, plan); }
 
 export { ROAD_TYPES };
+
+
+// Literal reader behavior is retained for custom evaluators/getters; no answer survives this invocation.
+const accessWorldPrototype = Object.getOwnPropertyDescriptors(World.prototype);
+const accessNetworkPrototype = Object.getOwnPropertyDescriptors(Network.prototype);
+function nativeAccessCurveContext(w: World, areas: Rect[]) {
+  const native = (value: object, prototype: object, descriptors: PropertyDescriptorMap) => {
+    if (Object.getPrototypeOf(value) !== prototype) return false;
+    const own = Object.getOwnPropertyDescriptors(value), current = Object.getOwnPropertyDescriptors(prototype);
+    const keys = Reflect.ownKeys(descriptors);
+    if (Reflect.ownKeys(current).length !== keys.length) return false;
+    for (const key of Reflect.ownKeys(own)) if (!('value' in own[key as string])) return false;
+    for (const key of keys) {
+      const expected = descriptors[key as string], actual = current[key as string], override = Object.getOwnPropertyDescriptor(value, key);
+      if (!actual || actual.value !== expected.value || actual.get !== expected.get || actual.set !== expected.set
+        || override && (!('value' in expected) || override.value !== expected.value)) return false;
+    }
+    return true;
+  };
+  return native(w, World.prototype, accessWorldPrototype) && native(w.net, Network.prototype, accessNetworkPrototype)
+    && areas.every(r => Object.getPrototypeOf(r) === Object.prototype && Object.values(Object.getOwnPropertyDescriptors(r)).every(d => 'value' in d));
+}

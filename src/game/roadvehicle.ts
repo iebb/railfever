@@ -56,8 +56,15 @@ function slowZones(c: Curve3, base: number): [number, number, number][] {
 }
 
 const BRAKE = 0.3;
+export const ROAD_BRAKE = BRAKE;
 const G = 0.981;
 const brakeTo = (dist: number) => Math.sqrt(2 * BRAKE * Math.max(0, dist));
+
+/** Native traction and grade acceleration (units/s²), before the minimum uphill crawl. */
+export function roadAcceleration(power: number, mass: number, speed: number, grade: number): number {
+  const tract = Math.min(1.6, power / (mass * Math.max(3, speed * 10)));
+  return (tract - 0.02) / 10 - G * grade;
+}
 
 export function laneTrim(g: Game, e: NEdge): [number, number] {
   const net = g.world.net;
@@ -219,7 +226,7 @@ export function findRoadRoute(g: Game, edge: NEdge, dir: number, target: number,
 }
 
 /** Position of a station's stop along a lane segment (or -1). */
-function stopPosOnLane(g: Game, seg: RSeg, stationId: number): number {
+export function stopPosOnLane(g: Game, seg: RSeg, stationId: number): number {
   const st = g.stations.get(stationId);
   if (!st || seg.kind !== 'lane') return -1;
   let best = -1;
@@ -691,8 +698,7 @@ export class RoadVehicle extends Vehicle {
       this.grade = this.length > 0.1 ? (A.y - B.y) / this.length : 0;
     }
     const P = this.model ? this.model.power : 80, M = this.model ? this.model.weight + this.load * 0.075 + (this.mailLoad ? this.mailLoad * MAIL_UNIT_T : 0) : 1.4;
-    const tract = Math.min(1.6, P / (M * Math.max(3, v * 10)));
-    const acc = (tract - 0.02) / 10 - G * this.grade;
+    const acc = roadAcceleration(P, M, v, this.grade);
     if (v < vt) this.speed = Math.min(vt, v + Math.max(acc, 0.01) * dt);
     else this.speed = Math.max(vt, v - BRAKE * 1.6 * dt);
     if (this.speed < 0) this.speed = 0;

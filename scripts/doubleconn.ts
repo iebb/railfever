@@ -3,16 +3,20 @@
 import { writeFileSync, readFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import { Game } from '../src/game/game';
+import { AIController } from '../src/game/ai';
 import { Train, lineCongestion, depotServes } from '../src/game/train';
 import { initialTrackChoice, layInitialDoubleTrack, type InitialTrackTraffic } from '../src/game/ai-initial-track';
 import { lineIsDouble, trackIsDouble, upgradeRoute } from '../src/game/dualtrack';
 import { planDoubleTrack, commitDoubleTrack, planConnection, commitConnection, connectStationThroat } from '../src/game/trackops';
 import { buildDepotOnLine } from '../src/game/routing';
-import { routeBetween, saveNetwork, networkPlanner } from '../src/game/ai-network';
+import { routeBetween, saveNetwork, networkPlanner, networkProfile, scheduleNetworkTask } from '../src/game/ai-network';
 import { autoSignalLine } from '../src/game/signals';
 import { serialize, deserialize } from '../src/game/save';
 import { station, endNode, nodeSnap, railOpts, build, check, done, depotFor, loco, runTrains } from './stationlib';
-import { checkReservations } from './lib';
+import { checkReservations, free } from './lib';
+import { linearStops } from '../src/game/lines';
+import { MODEL_BY_ID } from '../src/game/vehicle-types';
+import { controlledOpeningWorld } from './opening-fixtures';
 
 if (!process.argv[1]?.endsWith('doubleconn.mjs')) throw new Error('bundle as doubleconn.mjs');
 const traffic: InitialTrackTraffic = { revenue: 6_000_000, boardings: 120_000, seats: 100_000, trains: 4,
@@ -186,13 +190,19 @@ function openingDirections() {
 
 /** Exercise the real opening job when no depot builder can supply a usable site. */
 function failedOpening() {
-  const g = Game.create({ size: 512, seed: 11, towns: 13, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 3 });
-  g.aiAcquisitions = false;
-  const ai = g.ais[0] as any;
+  // Keep this injected depot failure independent of whether a natural survey reaches construction.
+  // The ordinary native quote, financing and rail job still have to accept and build the corridor.
+  const f = controlledOpeningWorld(), { g } = f, ai = f.ai as any;
   ai.depotNearLine = ai.depotSwitch = function* () { return -1; };
-  while (g.day < 720 && !ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations'))) g.stepTick();
+  ai.advanceRailDepotSearch = () => ({ done: true, value: -1 });
+  check(!AIController.forceBuild && ai.startProject('rail', [0, 1]), 'a native paying railway starts before the depot fault');
+  try {
+    for (let tick = 0; tick < 2400 && ai.busy; tick++) {
+      const phase = g.tick % g.ticksPerDay; ai.work(phase, phase + 1); g.stepTick();
+    }
+  } finally { f.restore(); }
   check(ai.log.some((text: string) => text.includes('abandoned: no depot site that serves both stations')),
-    'natural railway job reaches a failed depot opening');
+    'the bounded native railway job reaches its failed depot opening');
   check(ai.stats.doubled === 0 && ![...ai.lines.values()].some((info: any) => info.kind === 'rail')
     && !g.lines.all().some(l => l.owner === ai.companyId && l.kind === 'rail'),
     'failed depot opening pays no initial pair and retains no phantom railway');
@@ -251,22 +261,117 @@ function openingNatural() {
   check(funded > 0, 'affected natural worlds exercise funded initial-pair decisions');
 }
 
-/** A pending curve-search cursor survives saving through its completion, with normal train traffic. */
-function midconnectReplay() {
-  // Ordinary rail-focused survey settings naturally supply several funded services for the saved search.
-  let g = Game.create({ size: 512, seed: 5, towns: 12, hilliness: 'hilly', water: 'medium', startYear: 1985,
+/** The search samples native plain-track quarters; distant mainlines cannot supply a saved curve cursor. */
+function midconnectDistance(g: Game, ids: number[]): number {
+  const net = g.world.net, pieces = ids.map(id => {
+    const line = g.lines.get(id);
+    const stops = line ? linearStops(line.stops) : null;
+    return line && stops ? stops.slice(1).flatMap((stop, i) => routeBetween(g, stops[i], stop, line.owner) ?? [])
+      .map(id => net.edges.get(id)!).filter(e => e && e.station < 0 && e.depot < 0 && g.stations.throughStationOf(e.id) < 0) : [];
+  });
+  let distance = Infinity;
+  const a = { x: 0, y: 0, z: 0 }, b = { x: 0, y: 0, z: 0 };
+  for (const x of pieces[0] ?? []) for (const y of pieces[1] ?? [])
+    for (const u of [0.25, 0.5, 0.75]) for (const v of [0.25, 0.5, 0.75]) {
+      net.pointAt(x, x.len * u, a); net.pointAt(y, y.len * v, b);
+      distance = Math.min(distance, Math.hypot(a.x - b.x, a.z - b.z));
+    }
+  return distance;
+}
+
+/** Observe the original economic survey without requiring its independently selected routes to be neighbours. */
+function midconnectNatural() {
+  const g = Game.create({ size: 512, seed: 5, towns: 12, hilliness: 'hilly', water: 'medium', startYear: 1985,
     aiConfigs: Array.from({ length: 3 }, () => ({ focus: { rail: 2.5, road: 1.2, tram: 0.5 } })) });
   g.aiAcquisitions = false;
-  const observation = openingObserver(g);
-  let saved = false;
+  const observation = openingObserver(g), before = networkProfile.decisions['midconnect.scheduled'] ?? 0;
+  let cursorGeometry = true, cursors = 0;
   while (g.day < 1200) {
     g.stepTick(); observation.tick();
+    if (g.ais.some(ai => networkPlanner(ai)?.task === 'midconnect'))
+      for (const [, state] of saveNetwork(g).companies) for (const item of state.job?.items ?? []) if (item.midconnect) {
+        cursors++; cursorGeometry &&= midconnectDistance(g, item.ids) <= 90;
+      }
+  }
+  observation.verdict('midconnect natural opening');
+  const reviews = (networkProfile.decisions['midconnect.scheduled'] ?? 0) - before;
+  check(reviews > 0 && !g.ais.some(ai => ai.log.some(s => /error:|network work .*failed/.test(s))),
+    'original 1200-day natural map executes scheduled connector reviews without AI errors');
+  check(cursorGeometry, 'natural searches never invent a midconnect cursor beyond the native 90u reach');
+  const rails = g.lines.all().filter(l => l.kind === 'rail'), distances: number[] = [];
+  for (const a of rails) for (const b of rails) if (a.id < b.id) distances.push(midconnectDistance(g, [a.id, b.id]));
+  console.log(`  natural midconnect reviews ${reviews}, cursor ticks ${cursors}, sampled distances ${distances.map(d => d.toFixed(1)).join('/')}`);
+}
+
+/** Paid native assets, with enough nearby segments to exercise a bounded, saved search before economic rejection. */
+function midconnectFixture(): Game | null {
+  const g = Game.create({ size: 384, seed: 7, towns: 0, hilliness: 'flat', water: 'low', startYear: 1990, aiCompanies: 1 });
+  g.aiEnabled = false; g.aiAcquisitions = false; g.world.h.fill(3); g.world.heightsVersion++;
+  const ai = g.ais[0], eco = g.company(ai.companyId).economy, cash = eco.money, loan = eco.loan;
+  const cars = [MODEL_BY_ID.get('diesel_a')!, MODEL_BY_ID.get('coach_steel')!], lines: number[] = [];
+  for (const z of [150, 190]) {
+    const A = station(g, 30, z, Math.PI / 2, 6, 2, ai.companyId), B = station(g, 150, z, Math.PI / 2, 6, 2, ai.companyId);
+    check(!!A && !!B, 'saved-search fixture buys two native two-platform mainline stations');
+    if (!A || !B) return null;
+    const front = endNode(g, A, 1, true), back = endNode(g, B, 1, false), zz = g.world.net.nodes.get(front)!.z;
+    const end = g.world.net.nodes.get(back)!;
+    let snap = nodeSnap(g, front, 'rail');
+    for (const x of [70, 110, end.x]) {
+      const to = x === end.x ? nodeSnap(g, back, 'rail') : free(g, x, zz);
+      const proposal = build(g, snap, to, railOpts(ai.companyId), 'saved-search native trunk');
+      check(!!proposal, 'saved-search trunk segment is quoted and paid through native construction');
+      if (!proposal) return null;
+      const node = x === end.x ? back : g.world.net.nearestNode(x, zz, 0.1, 'rail')?.id;
+      if (node === undefined) { check(false, 'paid trunk segment supplies its real next endpoint'); return null; }
+      snap = nodeSnap(g, node, 'rail');
+    }
+    const l = g.lines.create('rail', ai.companyId); l.stops = [A.id, B.id]; lines.push(l.id);
+    g.stations.refreshAccess(true); g.lines.rebuild();
+    const throats = [A, B].map(st => connectStationThroat(g, st.id, ai.companyId));
+    check(throats.every(t => t.connected > 0 && t.failed.length === 0),
+      'saved-search paid native throats connect both platform tracks to the trunk');
+    const depot = depotFor(g, A, B, ai.companyId), yard = g.depots.get(depot);
+    const train = g.vehicles.buyTrain(depot, cars, l.id);
+    check(!!yard && yard.owner === ai.companyId && depotServes(g, yard, A.id, B.id, cars) >= 0
+      && typeof train !== 'string' && train.owner === ai.companyId && l.vehicles.includes(train.id),
+      'saved-search fixture buys compatible stock from a serving owned physical depot');
+    check(!!routeBetween(g, A.id, B.id, ai.companyId) && !!routeBetween(g, B.id, A.id, ai.companyId),
+      'saved-search paid railway routes between both native platforms in both directions');
+    if (!yard || typeof train === 'string') return null;
+  }
+  const paid = -(eco.current.construction + eco.current.vehicles);
+  check(paid > 0 && cash - eco.money === paid && eco.money >= 0 && eco.loan === loan,
+    'saved-search stations, track, depots and trains use the untouched starting balance and real charges');
+  const beforeGeometry = JSON.stringify(serialize(g)), distance = midconnectDistance(g, lines);
+  check(distance >= 14 && distance <= 90 && Number.isFinite(distance),
+    'saved-search paid mainlines meet the native connector distance precondition');
+  check(JSON.stringify(serialize(g)) === beforeGeometry, 'native route and connector-distance preconditions are read-only');
+  check(g.ais.every(ai => !(ai as any).project) && g.lines.all().every(l => l.owner === ai.companyId),
+    'saved-search fixture has no unrelated construction or foreign-title bypass');
+  console.log(`  saved-search paid capital ${Math.round(paid)}, cash ${Math.round(eco.money)}, loan ${eco.loan}`);
+  // No synthetic population or fare uplift: normal zero-demand economics must decline a new connector.
+  ai.state.cooldown = 100;
+  scheduleNetworkTask(ai, 'midconnect', 0);
+  g.aiEnabled = true;
+  return g;
+}
+
+/** A pending scheduled search survives saving through completion, with normal paid train traffic. */
+function midconnectReplay() {
+  midconnectNatural();
+  const fixture = midconnectFixture();
+  if (!fixture) return;
+  let g = fixture;
+  const scheduled = networkProfile.decisions['midconnect.scheduled'] ?? 0;
+  let saved = false;
+  while (g.day < 18) {
+    g.stepTick();
     const idle = g.ais.every(ai => !(ai as any).project);
     if (idle && g.ais.some(ai => networkPlanner(ai)?.task === 'midconnect')
       && saveNetwork(g).companies.some(([, state]) => state.job?.items?.some(i => i.midconnect))) { saved = true; break; }
   }
-  observation.verdict('midconnect natural opening');
-  check(saved, 'natural map supplies a saved midconnect search without unrelated construction');
+  check(saved && (networkProfile.decisions['midconnect.scheduled'] ?? 0) > scheduled,
+    'ordinary scheduled work initializes a bounded cursor on the nearby paid native mainlines');
   if (!saved) return;
   // Project evaluators are legacy unsaved generators. Isolate the actual saved network request in an
   // ordinary loaded branch; retain every company, physical asset, train, demand field and network job.
@@ -283,6 +388,8 @@ function midconnectReplay() {
   // Eighteen saved days inhibit new project selection for the unchanged sixteen-day replay window.
   for (const ai of g.ais) ai.state.cooldown = Math.max(ai.state.cooldown, 18);
   const snapshot = JSON.stringify(serialize(g)), loaded = deserialize(JSON.parse(snapshot));
+  const construction = g.company(g.ais[0].companyId).economy.current.construction,
+    purchases = g.company(g.ais[0].companyId).economy.current.vehicles, assetLines = g.lines.all().map(l => l.id);
   const before = JSON.parse(nativeSave), allowed = JSON.parse(snapshot);
   allowed.ais.forEach((ai: any, i: number) => { ai.state.cooldown = before.ais[i].state.cooldown; });
   check(JSON.stringify(allowed) === nativeSave, 'only explicit saved controller cooldowns change before replay');
@@ -303,6 +410,12 @@ function midconnectReplay() {
   // Other companies may begin a new search during replay; completion belongs to the saved requests.
   check(exact && requests.every(r => r.retired >= 0),
     'saved midconnect search completes with exact replay of 640 fixed ticks');
+  check(g.company(g.ais[0].companyId).economy.current.construction === construction
+    && g.company(g.ais[0].companyId).economy.current.vehicles === purchases
+    && JSON.stringify(g.lines.all().map(l => l.id)) === JSON.stringify(assetLines),
+    'zero native demand completes the search without buying an uneconomic connector or train');
+  check(g.vehicles.trains().every(t => t.owner === g.ais[0].companyId && t.onMap && t.state !== 'noroute')
+    && checkReservations(g).length === 0, 'paid native trains keep running during cursor replay without route or reservation faults');
   console.log(`  saved midconnect requests ${JSON.stringify(requests)}`);
   if (subsequent.size) console.log(`  subsequent midconnect requests ${JSON.stringify([...subsequent.values()])}`);
   console.log(`  midconnect replay ${day} -> ${g.day}, exact ${exact}`);

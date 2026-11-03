@@ -7,7 +7,7 @@
 import { Game } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { createHash } from 'node:crypto';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { pathToFileURL } from 'node:url';
 import assert from 'node:assert/strict';
 import { bezLine } from '../src/game/geom';
@@ -115,7 +115,7 @@ function checkHooks() {
   console.log(`Hook/trigger checks: ${checks} exact full comparisons; purchase/sale, population, eligibility, geometry, region boundaries, complexes, roads, terrain, load and bulk fallback passed.`);
 }
 
-const main = process.argv[1]?.endsWith('/catchperf.mjs') && import.meta.url === pathToFileURL(process.argv[1]).href;
+const main = process.argv[1]?.endsWith('/catchperf.mjs') && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (main && !baseline && !timingOnly) checkHooks();
 if (main && !process.argv.includes('--hooks-only')) for (const { seed, size } of cases) {
   console.log(`Creating seed ${seed}, ${size} map, 3 AIs; ${years} years${timingOnly ? ' (timing)' : ''}`);

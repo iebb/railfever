@@ -45,7 +45,8 @@ function summary(r: CompanyReport) {
 function fixture() {
   const g = Game.create({ size: 384, seed: 23, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: 2 });
   g.economy.money = 40_000_000;
-  const pr = placeAndConnect(g, 60, 150, 0, new Set(), 1, () => {});
+  const pr = placeAndConnect(g, 60, 150, 0, new Set(), 1, () => {})
+    ?? placeAndConnect(g, 150, 240, 0, new Set(), 1, () => {});
   if (!pr) throw new Error('fixture player railway');
   const dep = depotBehind(g, pr.A, pr.B, 0), line = g.lines.create('rail', 0);
   line.stops = [pr.A.id, pr.B.id];

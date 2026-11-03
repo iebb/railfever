@@ -63,6 +63,15 @@ export function upgradeRoute(g: Game, a: number, b: number, user: number): numbe
 export function trackIsDouble(g: Game, id: number, user: number): boolean {
   const net = g.world.net, e = net.edges.get(id);
   if (!e || e.kind !== 'rail' || e.depot >= 0) return false;
+  const continuation = (other: number) => {
+    if (other === id) return true;
+    const o = net.edges.get(other);
+    if (!o || o.kind !== 'rail' || o.depot >= 0 || !g.canUse(user, o.owner)) return false;
+    const node = [e.a, e.b].find(n => o.a === n || o.b === n);
+    if (node === undefined) return false;
+    const a = net.leaveDir(e, node), b = net.leaveDir(o, node);
+    return a.x * b.x + a.z * b.z < -0.94;
+  };
   const p = { x: 0, y: 0, z: 0 }, d = { x: 0, y: 0, z: 0 }, q = { x: 0, y: 0, z: 0 }, t = { x: 0, y: 0, z: 0 };
   const K = Math.max(1, Math.ceil(e.len / 2));
   for (let i = 0; i < K; i++) {
@@ -75,7 +84,9 @@ export function trackIsDouble(g: Game, id: number, user: number): boolean {
       if (near.d < 0.25) {
         // Distinct station/junction leads may swap sides at a protected diamond. Unlike a loop's merge, the
         // two rails remain separate here and reserve only the actual conflicting crossing movement.
-        const diamond = [...net.crossings.values()].some((c) => c.kind === 'diamond' && ((c.e1 === id && c.e2 === o.id) || (c.e2 === id && c.e1 === o.id)) && Math.hypot(c.x - p.x, c.z - p.z) < 5);
+        // A signal split can put the diamond just onto the preceding piece of this same formation.
+        // Its existing crossing window follows that immediate straight continuation, not unrelated branches.
+        const diamond = [...net.crossings.values()].some((c) => c.kind === 'diamond' && ((c.e1 === o.id && continuation(c.e2)) || (c.e2 === o.id && continuation(c.e1))) && Math.hypot(c.x - p.x, c.z - p.z) < 5);
         if (!diamond) continue;
       }
       net.pointAt(o, near.s, q, t);

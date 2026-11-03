@@ -434,6 +434,8 @@ export class Renderer {
     this.worldGroup.clear();
     if (this.terrain) this.terrain.dispose();
     if (this.objects) this.objects.dispose();
+    // Tool previews and map layers own GPU buffers/materials even after their group is detached.
+    if (this.overlay) this.overlay.dispose();
     this.vehicles.dispose();
     this.terrain = new TerrainView(game.world);
     applyClouds(this.terrain.material);

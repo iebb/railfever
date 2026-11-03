@@ -22,10 +22,87 @@ export interface CorridorReply {
   expanded: number;
 }
 
+/** Exact, JSON-safe continuation of an already-started coarse search. Unknown states remain implicit
+ * Infinity/-1/zero, and discovered Float32 values retain their exact numeric values after JSON loading. */
+export interface CorridorKernelState {
+  version: 1;
+  dimensions: [number, number, number];
+  cells: number[];
+  states: number[];
+  heap: { f: number[]; v: number[] };
+  parallel: number[] | null;
+  expanded: number;
+  state: 'running' | 'done' | 'failed';
+  path: P2[] | null;
+}
+
+/** A private immutable save payload; the runtime frontier remains authoritative. */
+export interface PackedCorridorKernelState extends Omit<CorridorKernelState, 'dimensions' | 'cells' | 'states' | 'heap' | 'parallel'> {
+  packed: Uint8Array;
+}
+export interface CorridorFrontierView {
+  dimensions: [number, number, number]; cells: number[]; info: Uint8Array; height: Float32Array;
+  states: number[]; cost: Float32Array; parent: Int32Array; closed: Uint8Array;
+  heap: { f: number[]; v: number[] }; parallel: number[] | null; parallelValues: Uint8Array | null;
+}
+
+/** Self-contained for the inline worker too. Counts and all numeric fields have explicit little-endian widths. */
+export function corridorFrontierCodec() {
+  const MAGIC = 0x46524331, VERSION = 1, LITTLE_ENDIAN = 0x4c45, HEADER = 48;
+  const sizeOf = (cells: number, states: number, heap: number, parallel: number) => HEADER + cells * 9 + states * 13 + heap * 12 + parallel * 5;
+  function pack(v: CorridorFrontierView): Uint8Array {
+    const nc = v.cells.length, ns = v.states.length, nh = v.heap.v.length, np = v.parallel?.length ?? 0;
+    const length = sizeOf(nc, ns, nh, np);
+    if (![nc, ns, nh, np].every(n => Number.isInteger(n) && n >= 0 && n < 0xffffffff)
+      || !Number.isSafeInteger(length) || length > 0x7fffffff || nh !== v.heap.f.length) throw new Error('Invalid frontier dimensions');
+    const bytes = new Uint8Array(length), d = new DataView(bytes.buffer);
+    d.setUint32(0, MAGIC, true); d.setUint16(4, VERSION, true); d.setUint16(6, LITTLE_ENDIAN, true);
+    v.dimensions.forEach((x, i) => d.setFloat64(8 + i * 8, x, true));
+    [nc, ns, nh, v.parallel === null ? 0xffffffff : np].forEach((n, i) => d.setUint32(32 + i * 4, n, true));
+    let at = HEADER;
+    for (const i of v.cells) { d.setUint32(at, i, true); d.setUint8(at + 4, v.info[i]); d.setFloat32(at + 5, v.height[i], true); at += 9; }
+    for (const i of v.states) { d.setUint32(at, i, true); d.setFloat32(at + 4, v.cost[i], true); d.setInt32(at + 8, v.parent[i], true); d.setUint8(at + 12, v.closed[i]); at += 13; }
+    for (let i = 0; i < nh; i++) { d.setFloat64(at, v.heap.f[i], true); d.setInt32(at + 8, v.heap.v[i], true); at += 12; }
+    for (const i of v.parallel ?? []) { d.setUint32(at, i, true); d.setUint8(at + 4, v.parallelValues![i]); at += 5; }
+    return bytes;
+  }
+  function unpack(packed: PackedCorridorKernelState): CorridorKernelState {
+    const bytes = packed.packed;
+    if (packed.version !== 1 || Object.getPrototypeOf(bytes) !== Uint8Array.prototype || bytes.byteLength < HEADER) throw new Error('Invalid packed frontier');
+    if (!Number.isSafeInteger(packed.expanded) || packed.expanded < 0 || !['running', 'done', 'failed'].includes(packed.state))
+      throw new Error('Invalid packed frontier progress');
+    const d = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    if (d.getUint32(0, true) !== MAGIC || d.getUint16(4, true) !== VERSION || d.getUint16(6, true) !== LITTLE_ENDIAN)
+      throw new Error('Incompatible packed frontier');
+    const dimensions = [0, 1, 2].map(i => d.getFloat64(8 + i * 8, true)) as [number, number, number];
+    if (!dimensions.every(x => Number.isFinite(x) && x > 0) || !Number.isInteger(dimensions[1]) || !Number.isInteger(dimensions[2]))
+      throw new Error('Invalid packed frontier dimensions');
+    const nc = d.getUint32(32, true), ns = d.getUint32(36, true), nh = d.getUint32(40, true), parallelCount = d.getUint32(44, true);
+    const np = parallelCount === 0xffffffff ? 0 : parallelCount;
+    if (sizeOf(nc, ns, nh, np) !== bytes.byteLength) throw new Error('Invalid packed frontier counts');
+    const N = dimensions[1] * dimensions[1], S = N * 8 * dimensions[2];
+    if (!Number.isSafeInteger(N) || !Number.isSafeInteger(S) || nc > N || ns > S || np > N * 4) throw new Error('Invalid packed frontier bounds');
+    const cells: number[] = [], states: number[] = [], heap = { f: [] as number[], v: [] as number[] }, parallel = parallelCount === 0xffffffff ? null : [] as number[];
+    let at = HEADER;
+    for (let k = 0; k < nc; k++) { const i = d.getUint32(at, true); if (i >= N) throw new Error('Invalid frontier cell'); cells.push(i, d.getUint8(at + 4), d.getFloat32(at + 5, true)); at += 9; }
+    for (let k = 0; k < ns; k++) {
+      const i = d.getUint32(at, true), parent = d.getInt32(at + 8, true);
+      if (i >= S || parent < -1 || parent >= S) throw new Error('Invalid frontier state');
+      states.push(i, d.getFloat32(at + 4, true), parent, d.getUint8(at + 12)); at += 13;
+    }
+    for (let k = 0; k < nh; k++) { const i = d.getInt32(at + 8, true); if (i < 0 || i >= S) throw new Error('Invalid frontier heap'); heap.f.push(d.getFloat64(at, true)); heap.v.push(i); at += 12; }
+    for (let k = 0; k < np; k++) { const i = d.getUint32(at, true); if (i >= N * 4) throw new Error('Invalid frontier parallel cell'); parallel!.push(i, d.getUint8(at + 4)); at += 5; }
+    return { version: 1, dimensions, cells, states, heap, parallel, expanded: packed.expanded, state: packed.state, path: packed.path };
+  }
+  return { pack, unpack };
+}
+
 /** Identical Float32 costs, heap tie order and budget accounting in workers and synchronous fallback. */
-export function createCorridorKernel(snapshot: CorridorSnapshot) {
+export function createCorridorKernel(snapshot: CorridorSnapshot, continuation?: CorridorKernelState | PackedCorridorKernelState,
+  codecFactory: typeof corridorFrontierCodec = corridorFrontierCodec) {
   const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
   const MIN_RUN = 2, FIELD_CELL = 16;
+  const frontierCodec = codecFactory();
   class Heap {
     f: number[] = []; v: number[] = [];
     get size() { return this.v.length; }
@@ -90,6 +167,10 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
     readonly n: number;
     private info: Uint8Array;   // per vertex: 1 known, 2 water, 4 building, 8 network, 16 forbidden
     private hgt: Float32Array;
+    private knownCells: number[] = [];
+    private knownStates: number[] = [];
+    private knownParallel: number[] = [];
+    private packedBytes: Uint8Array | null = null;
     private gcost: Float32Array;
     private parent: Int32Array;
     private closed: Uint8Array;
@@ -136,8 +217,46 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
       DIRS.forEach(([dx, dz], i) => { if ((dx * to.tx + dz * to.tz) / Math.hypot(dx, dz) > 0.64) this.goalDirs.add(i); });
       const h0 = nearestDir(from.tx, from.tz);
       const st = (s0 * 8 + h0) * this.runs + 1;
-      this.gcost[st] = 0;
+      this.gcost[st] = 0; this.knownStates.push(st);
       this.heap.push(st, this.heur(s0));
+    }
+
+    /** Copy the actual frontier, never rerun earlier slices against a newer world. */
+    record(): CorridorKernelState {
+      const cells: CorridorKernelState['cells'] = [], states: CorridorKernelState['states'] = [];
+      for (const i of this.knownCells) cells.push(i, this.info[i], this.hgt[i]);
+      for (const i of this.knownStates)
+        states.push(i, this.gcost[i], this.parent[i], this.closed[i]);
+      const parallel: CorridorKernelState['parallel'] = this.par ? [] : null;
+      if (this.par) for (const i of this.knownParallel) parallel!.push(i, this.par[i]);
+      return { version: 1, dimensions: [this.C, this.n, this.runs], cells, states,
+        heap: { f: [...this.heap.f], v: [...this.heap.v] }, parallel, expanded: this.expanded,
+        state: this.state, path: this.path?.map(p => ({ ...p })) ?? null };
+    }
+
+    /** Derived bytes are private and immutable. Public record() copies are never cached. */
+    packedRecord(): PackedCorridorKernelState {
+      this.packedBytes ??= frontierCodec.pack({ dimensions: [this.C, this.n, this.runs], cells: this.knownCells, info: this.info,
+        height: this.hgt, states: this.knownStates, cost: this.gcost, parent: this.parent, closed: this.closed,
+        heap: this.heap, parallel: this.par ? this.knownParallel : null, parallelValues: this.par });
+      return { version: 1, packed: this.packedBytes, expanded: this.expanded, state: this.state, path: this.path?.map(p => ({ ...p })) ?? null };
+    }
+
+    restore(input: CorridorKernelState | PackedCorridorKernelState) {
+      this.packedBytes = null;
+      const saved = 'packed' in input ? frontierCodec.unpack(input) : input;
+      if (saved.version !== 1 || saved.dimensions[0] !== this.C || saved.dimensions[1] !== this.n || saved.dimensions[2] !== this.runs)
+        throw new Error('Incompatible corridor continuation');
+      this.info.fill(0); this.hgt.fill(0); this.gcost.fill(Infinity); this.parent.fill(-1); this.closed.fill(0);
+      this.knownCells = []; this.knownStates = []; this.knownParallel = [];
+      for (let k = 0; k < saved.cells.length; k += 3) { const i = saved.cells[k]; this.knownCells.push(i); this.info[i] = saved.cells[k + 1]; this.hgt[i] = saved.cells[k + 2]; }
+      for (let k = 0; k < saved.states.length; k += 4) { const i = saved.states[k]; this.knownStates.push(i); this.gcost[i] = saved.states[k + 1]; this.parent[i] = saved.states[k + 2]; this.closed[i] = saved.states[k + 3]; }
+      this.heap.f = [...saved.heap.f]; this.heap.v = [...saved.heap.v];
+      this.par = saved.parallel ? new Uint8Array(this.n * this.n * 4) : null;
+      if (saved.parallel) for (let k = 0; k < saved.parallel.length; k += 2) { const i = saved.parallel[k]; this.knownParallel.push(i); this.par![i] = saved.parallel[k + 1]; }
+      this.field = this.par ? this.snapshot.field ?? null : null;
+      this.expanded = saved.expanded; this.state = saved.state;
+      this.path = saved.path?.map(p => ({ ...p })) ?? null;
     }
 
     private vertex(x: number, z: number) {
@@ -178,12 +297,13 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
         const t = Math.max(0, Math.min(1, ((cx - a.x0) * dx + (cz - a.z0) * dz) / l2));
         if (Math.hypot(a.x0 + dx * t - cx, a.z0 + dz * t - cz) < a.r) { f |= 16; break; }
       }
-      this.info[v] = f;
+      this.info[v] = f; this.knownCells.push(v);
       return f;
     }
 
     /** Run up to `budget` expansions; returns the state. */
     step(budget: number): 'running' | 'done' | 'failed' {
+      this.packedBytes = null;
       return this.expand(budget);
     }
 
@@ -226,6 +346,7 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
           if (this.opts.parallel && this.alongside(v, di)) c += d * this.opts.parallel;
           const nc = this.gcost[s] + c;
           if (nc >= this.gcost[ns]) continue;
+          if (!Number.isFinite(this.gcost[ns])) this.knownStates.push(ns);
           this.gcost[ns] = nc;
           this.parent[ns] = s;
           this.heap.push(ns, nc + this.heur(v));
@@ -245,6 +366,7 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
       if (!this.par) { this.par = new Uint8Array(this.n * this.n * 4); this.field = this.snapshot.field!; }
       const k = v * 4 + (di & 3);
       if (!this.par[k]) {
+        this.knownParallel.push(k);
         const [dx, dz] = DIRS[di], l = Math.hypot(dx, dz);
         this.par[k] = parallelRailAt(this.field!, (v % this.n) * this.C, Math.floor(v / this.n) * this.C, dx / l, dz / l) ? 2 : 1;
       }
@@ -274,5 +396,7 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
       this.state = 'done';
     }
   }
-  return new Kernel(snapshot);
+  const kernel = new Kernel(snapshot);
+  if (continuation) kernel.restore(continuation);
+  return kernel;
 }

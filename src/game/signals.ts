@@ -466,7 +466,9 @@ function planAutoSignals(g: Game, E: Set<number>, owner: number, spacing: number
         const side = leaveSide(q.edge, q.dir, nid);
         if (net.signalFor(n, side) > 0) fw++; else bw++;
       }
-      const dirs = fw && !bw ? [1] : bw && !fw ? [-1] : fw && bw ? [] : [1, -1];
+      // A two-way single section must be acquired through its next passing place, including the
+      // crossing resource. Interior approach signals let opposing trains enter and trap each other.
+      const dirs = fw && !bw ? [1] : bw && !fw ? [-1] : [];
       for (const dir of dirs) {
         const at = u - dir * 2.5;
         if (at <= 0.7 || at >= chain.len - 0.7) continue;

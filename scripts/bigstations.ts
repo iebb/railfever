@@ -81,7 +81,15 @@ const connectedAt = (g: Game, st: Station, front: boolean) => g.stations.trackEn
   check(stylesFor('ground', 1, 1900).some((s) => s.id === 'brick') && !stylesFor('ground', 1, 1900).some((s) => s.id === 'concourse' || s.id === 'terminal'), 'styles by era and size');
   check(defaultStationStyle(2020, 2, 'ground', 'mainline', 9000) === 'concourse' && defaultStationStyle(1890, 2, 'ground', 'mainline', 3000) === 'brick' && defaultStationStyle(2000, 2, 'ground', 'lightrail', 20000) === 'shelter' && defaultStationStyle(2000, 2, 'underground', 'metro', 9000) === 'none', 'default styles');
   const built: Station[] = [];
-  for (const p of plans) { const id = g.stations.nextId; check(!g.stations.commitRail(p, 0), `${p.style} built`); built.push(g.stations.get(id)!); }
+  for (const p of plans) {
+    // Earlier access streets split the common road. Keep the up-front style comparisons above, then quote each
+    // actual build against its current road connections rather than reusing removed edge IDs.
+    const fresh = g.stations.planRail(p.x, p.z, p.angle, p.length, p.tracks, 0, { style: p.style, fixedY: p.y });
+    check(fresh.ok && fresh.style === p.style && fresh.roadAccess, `${p.style} planned against the current network`);
+    const id = g.stations.nextId, error = g.stations.commitRail(fresh, 0);
+    check(!error, `${p.style} built (${error ?? 'ok'})`);
+    built.push(g.stations.get(id)!);
+  }
   check(built.every((s, i) => s.rail!.style === ids[i] && s.roadAccess), 'built with their styles and road access');
   // the concourse station: either side gives access
   const cs = built[5];

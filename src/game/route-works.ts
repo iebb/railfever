@@ -95,6 +95,9 @@ const DEPOT_DAYS = 5, FLEET_DAYS = 6, FINISH_DAYS = 4, MAIN_STATION_DAYS = 8;
 const MAX_WAIT = 180;
 /** A city railway's depot may take a block or two (ai.ts URBAN_DEPOT_POP). */
 const URBAN_DEPOT_POP = 600;
+/** Conventional main-line trains use the same gentle grades as newly opened AI railways. */
+const MAINLINE_GRADE = 0.035;
+const MAINLINE_PROFILE_GRADE = MAINLINE_GRADE / TRACK_TYPES.standard.maxGrade * 0.85;
 
 // ============================================================================ planning
 
@@ -103,6 +106,16 @@ const fail = (base: Pick<UpgradeQuote, 'line' | 'owner' | 'mode' | 'level'>, err
 
 /** Works under way on a line (or null). */
 export function worksOn(g: Game, lineId: number): RouteWorks | null { return g.routeWorks.find((w) => w.line === lineId) ?? null; }
+
+/** Junctions, signals and other works may split our track between daily construction steps, including after loading. */
+export function splitRouteWorks(g: Game, old: number, a: number, b: number) {
+  for (const w of g.routeWorks) for (const d of w.built.debits) {
+    for (const edges of [d.edges, d.tram]) {
+      const at = edges?.indexOf(old) ?? -1;
+      if (at >= 0) edges!.splice(at, 1, a, b);
+    }
+  }
+}
 
 /** The line's buses (the owner's road vehicles on it), the seats they have and what they fetch. */
 function busesOf(g: Game, l: Line, owner: number) {
@@ -155,11 +168,13 @@ export function* routeUpgradeGen(g: Game, lineId: number, owner: number, mode: U
 }
 
 /** A city railway along a bus line as planned, with its station plans and the price of its links (the AI's valuation). */
-export function* cityRailPlanGen(g: Game, lineId: number, owner: number, mode: 'lightrail' | 'metro', level: UpgradeLevel): Generator<void, CityRailPlan> {
+export function* cityRailPlanGen(g: Game, lineId: number, owner: number, mode: 'lightrail' | 'metro', level: UpgradeLevel, cursor?: CityRailPlanCursor): Generator<void, CityRailPlan> {
+  if (cursor?.line) return yield* resumeCityRailQuote(g, cursor.line, owner, mode, level, cursor);
   const base = { line: lineId, owner, mode, level };
   const block = upgradeBlock(g, lineId, owner);
   if (block) return { quote: fail(base, block), plans: [], links: 0 };
   if (!upgradeModes(g, lineId).includes(mode)) return { quote: fail(base, 'In one town only'), plans: [], links: 0 };
+  if (cursor) { cursor.line = g.lines.get(lineId)!; return yield* resumeCityRailQuote(g, cursor.line, owner, mode, level, cursor); }
   return yield* cityRailQuote(g, g.lines.get(lineId)!, owner, mode, level);
 }
 export interface CityRailPlan { quote: UpgradeQuote; plans: StationPlan[]; links: number }
@@ -300,70 +315,131 @@ function completionCost(stations: number, len: number, level: UpgradeLevel): num
  * line, units of the year; as many as the buses' seats and a third more.
  */
 function* cityRailQuote(g: Game, l: Line, owner: number, mode: 'lightrail' | 'metro', lv: UpgradeLevel): Generator<void, CityRailPlan> {
+  const c = newCityRailPlanCursor();
+  c.line = l;
+  return yield* resumeCityRailQuote(g, l, owner, mode, lv, c);
+}
+
+
+export interface CityRailPlanCursor {
+  line?: Line; state?: ReturnType<typeof cityRailQuoteSetup>;
+  stage: 'init' | 'station' | 'stationCheck' | 'link' | 'linkCheck' | 'yard' | 'yardCheck' | 'finish' | 'done';
+  k: number; plans: StationPlan[]; links: number; len: number;
+  station?: { found: StationPlan | null; why: string };
+  link?: ReturnType<typeof plannedLink>;
+  order?: number[]; yardIndex: number; distances?: number[]; distance: number; track: number;
+  yard?: (SideYard & { rank: number }) | null;
+  pendingYard?: { y: SideYard | null; w: number; index: number };
+  result?: CityRailPlan;
+}
+export const newCityRailPlanCursor = (): CityRailPlanCursor => ({ stage: 'init', k: 0, plans: [], links: 0, len: 0,
+  yardIndex: 0, distance: 0, track: 0 });
+
+function cityRailQuoteSetup(g: Game, l: Line, owner: number, mode: 'lightrail' | 'metro', lv: UpgradeLevel) {
   const base = { line: l.id, owner, mode, level: lv };
   const none = (why: string): CityRailPlan => ({ quote: fail(base, why), plans: [], links: 0 });
   const route = routeOf(g, l)!;
-  if (route.loop) return none('Loop line: trams only');
+  if (route.loop) return { result: none('Loop line: trams only') };
   const stations = route.path.map((id) => g.stations.get(id)!), townId = stations[0].townId;
   const unit = cityRailUnit(g.year, mode, mode === 'metro' ? 12 : 7);
-  if (!unit) return none(mode === 'metro' ? 'No metro trains yet' : 'No light-rail trains yet');
+  if (!unit) return { result: none(mode === 'metro' ? 'No metro trains yet' : 'No light-rail trains yet') };
   const PL = cityRailPlatform(g.year, mode);
   const end = PL + Math.max(TRACK_TYPES.electric.minRadius * 2 + 2, 18), mid = PL + 6;
   const pts = stations.map((st) => st.stops[0] ?? st);
   const targets = railTargets(pts, end, mid);
-  if (targets.length < 2) return none('Too short for rail');
-  const plans: StationPlan[] = [];
-  for (const [k, t] of targets.entries()) {
-    const p = pts[t.at], prev = targets[k - 1] ? pts[targets[k - 1].at] : null, next = targets[k + 1] ? pts[targets[k + 1].at] : null;
-    const ax = (next ? next.x : p.x) - (prev ? prev.x : p.x), az = (next ? next.z : p.z) - (prev ? prev.z : p.z);
-    const a0 = Math.atan2(ax, az), ux = Math.sin(a0), uz = Math.cos(a0);
-    const gap = k === 1 || k === targets.length - 1 ? end - 0.5 : mid;
-    let found: StationPlan | null = null, why = '';
-    search: for (const [along, across] of SHIFTS) for (const da of TURNS) {
-      const x = p.x + ux * along + uz * across, z = p.z + uz * along - ux * across;
-      const pl = citySitePlan(g, owner, townId, mode, PL, x, z, a0 + da, lv, plans[k - 1]);
-      if (!pl || typeof pl === 'string') { if (pl) why = pl; continue; }
-      if (k && Math.hypot(pl.x - plans[k - 1].x, pl.z - plans[k - 1].z) < gap) continue;
-      found = pl; break search;
+  if (targets.length < 2) return { result: none('Too short for rail') };
+  return { input: { route, stations, townId, unit, PL, end, mid, pts, targets } };
+}
+
+/** Pure native proposal work, with exactly the station, link and yard boundaries of cityRailQuote. */
+function* resumeCityRailQuote(g: Game, l: Line, owner: number, mode: 'lightrail' | 'metro', lv: UpgradeLevel, c: CityRailPlanCursor): Generator<void, CityRailPlan> {
+  const base = { line: l.id, owner, mode, level: lv };
+  const none = (why: string): CityRailPlan => ({ quote: fail(base, why), plans: [], links: 0 });
+  if (c.stage === 'init') {
+    c.state = cityRailQuoteSetup(g, l, owner, mode, lv);
+    if (c.state.result) { c.result = c.state.result; c.stage = 'done'; return c.result; }
+    c.stage = 'station';
+  }
+  if (c.stage === 'done') return c.result!;
+  const { route, stations, townId, unit, PL, end, mid, pts, targets } = c.state!.input!, plans = c.plans;
+  while (c.stage !== 'done') {
+    if (c.stage === 'station') {
+      if (c.k >= targets!.length) { c.k = 0; c.stage = 'link'; continue; }
+      const k = c.k, t = targets![k];
+      const p = pts[t.at], prev = targets![k - 1] ? pts[targets![k - 1].at] : null, next = targets![k + 1] ? pts[targets![k + 1].at] : null;
+      const ax = (next ? next.x : p.x) - (prev ? prev.x : p.x), az = (next ? next.z : p.z) - (prev ? prev.z : p.z);
+      const a0 = Math.atan2(ax, az), ux = Math.sin(a0), uz = Math.cos(a0);
+      const gap = k === 1 || k === targets.length - 1 ? end - 0.5 : mid;
+      let found: StationPlan | null = null, why = '';
+      search: for (const [along, across] of SHIFTS) for (const da of TURNS) {
+        const x = p.x + ux * along + uz * across, z = p.z + uz * along - ux * across;
+        const pl = citySitePlan(g, owner, townId, mode, PL, x, z, a0 + da, lv, plans[k - 1]);
+        if (!pl || typeof pl === 'string') { if (pl) why = pl; continue; }
+        if (k && Math.hypot(pl.x - plans[k - 1].x, pl.z - plans[k - 1].z) < gap) continue;
+        found = pl; break search;
+      }
+      c.station = { found, why }; c.stage = 'stationCheck'; yield;
     }
-    yield;
-    if (!found) return none(`No ${lv} station site at ${stations[t.at].name}${why ? ': ' + why : ''}`);
-    plans.push(found);
-  }
-  let links = 0, len = 0;
-  for (let i = 0; i + 1 < plans.length; i++) {
-    let pj = plannedLink(g, plans[i], plans[i + 1], owner);
-    if (!pj.ok && lv === 'ground') pj = plannedLink(g, plans[i], plans[i + 1], owner, true);
-    yield;
-    if (!pj.ok) return none(`No track ${stations[targets[i].at].name} – ${stations[targets[i + 1].at].name}: ${pj.errors[0] ?? 'blocked'}`);
-    links += pj.cost; len += pj.stats.len / 2;
-  }
-  // the depot beside the line: a siding off a running track, the termini's links first (ai.ts urbanWork's yard search)
-  const lat = stationLayout(2, 0, 'middle', 'side').trackOffsets;
-  const D = Math.max(5, Math.min(12, Math.sqrt(60 * Math.abs(lat[1] - lat[0]) * Math.min(1, TRACK_TYPES.electric.minRadius / 12)) + 2));
-  const n = plans.length, order = [...new Set([0, n - 2, ...Array.from({ length: Math.max(0, n - 1) }, (_, i) => i)])].filter((i) => i >= 0 && i + 1 < n);
-  let yard: (SideYard & { rank: number }) | null = null;
-  for (const index of order) {
-    if (yard && index !== 0 && index !== n - 2) break;
-    for (const d of sideYardDistances(plans, index, 2 * D + 4)) for (const track of [0, plans[index].layout.trackOffsets.length - 1]) {
+    if (c.stage === 'stationCheck') {
+      const t = targets![c.k], { found, why } = c.station!;
+      if (!found) { c.result = none(`No ${lv} station site at ${stations![t.at].name}${why ? ': ' + why : ''}`); c.stage = 'done'; break; }
+      plans.push(found); delete c.station; c.k++; c.stage = 'station'; continue;
+    }
+    if (c.stage === 'link') {
+      if (c.k + 1 >= plans.length) {
+        const n = plans.length;
+        c.order = [...new Set([0, n - 2, ...Array.from({ length: Math.max(0, n - 1) }, (_, i) => i)])].filter(i => i >= 0 && i + 1 < n);
+        c.yard = null; c.stage = 'yard'; continue;
+      }
+      let pj = plannedLink(g, plans[c.k], plans[c.k + 1], owner);
+      if (!pj.ok && lv === 'ground') pj = plannedLink(g, plans[c.k], plans[c.k + 1], owner, true);
+      c.link = pj; c.stage = 'linkCheck'; yield;
+    }
+    if (c.stage === 'linkCheck') {
+      const pj = c.link!;
+      if (!pj.ok) {
+        c.result = none(`No track ${stations![targets![c.k].at].name} – ${stations![targets![c.k + 1].at].name}: ${pj.errors[0] ?? 'blocked'}`);
+        c.stage = 'done'; break;
+      }
+      c.links += pj.cost; c.len += pj.stats.len / 2; delete c.link; c.k++; c.stage = 'link'; continue;
+    }
+    if (c.stage === 'yard') {
+      const n = plans.length, index = c.order![c.yardIndex];
+      if (index === undefined || c.yard && index !== 0 && index !== n - 2) { c.stage = 'finish'; continue; }
+      if (!c.distances) {
+        const lat = stationLayout(2, 0, 'middle', 'side').trackOffsets;
+        const D = Math.max(5, Math.min(12, Math.sqrt(60 * Math.abs(lat[1] - lat[0]) * Math.min(1, TRACK_TYPES.electric.minRadius / 12)) + 2));
+        c.distances = sideYardDistances(plans, index, 2 * D + 4); c.distance = c.track = 0;
+      }
+      if (c.distance >= c.distances.length) { c.yardIndex++; delete c.distances; continue; }
+      const d = c.distances[c.distance], track = c.track === 0 ? 0 : plans[index].layout.trackOffsets.length - 1;
       const w = runningSideOf(plans, index, track);
       const y = planProspectiveSideDepot(g, owner, plans, index, track, d, w, lv, 'electric', undefined, undefined, undefined, URBAN_DEPOT_POP);
-      yield;
+      c.pendingYard = { y, w, index }; c.stage = 'yardCheck'; yield;
+    }
+    if (c.stage === 'yardCheck') {
+      const { y, w, index } = c.pendingYard!, n = plans.length;
       const rank = y ? y.cost * (w === (index < (n - 1) / 2 ? 1 : -1) ? 1 : 1.15) : Infinity;
-      if (y && (!yard || rank < yard.rank)) yard = { ...y, rank };
+      if (y && (!c.yard || rank < c.yard.rank)) c.yard = { ...y, rank };
+      delete c.pendingYard; if (++c.track >= 2) { c.track = 0; c.distance++; } c.stage = 'yard'; continue;
+    }
+    if (c.stage === 'finish') {
+      const yard = c.yard;
+      if (!yard) { c.result = none('No depot site beside the line'); c.stage = 'done'; break; }
+      const links = c.links, len = c.len, n = plans.length;
+      const { rank: _, ...side } = yard;
+      const buses = busesOf(g, l, owner);
+      const vehicles = Math.max(2, Math.min(6, Math.ceil(buses.seats * 4 / 3 / Math.max(1, unit!.capacity))));
+      const stationCost = plans.reduce((a, p) => a + p.cost, 0), works = links + completionCost(n, len, lv);
+      const q: UpgradeQuote = { ...base, ok: true, cars: [unit!.id], vehicles, track: works, stations: stationCost, depot: side.cost,
+        fleet: vehicles * unit!.cost, resale: buses.resale, cost: 0, trackLength: len, days: 0, yard: side,
+        sites: plans.map((p, k) => siteOf(p, targets![k].stops.map((i) => route!.path[i]))), path: plans.map((p) => ({ x: p.x, z: p.z })) };
+      q.cost = q.track + q.stations + q.depot + q.fleet - q.resale;
+      q.days = daysOf(q);
+      c.result = { quote: q, plans, links }; c.stage = 'done';
     }
   }
-  if (!yard) return none('No depot site beside the line');
-  const { rank: _, ...side } = yard;
-  const buses = busesOf(g, l, owner);
-  const vehicles = Math.max(2, Math.min(6, Math.ceil(buses.seats * 4 / 3 / Math.max(1, unit.capacity))));
-  const stationCost = plans.reduce((a, p) => a + p.cost, 0), works = links + completionCost(n, len, lv);
-  const q: UpgradeQuote = { ...base, ok: true, cars: [unit.id], vehicles, track: works, stations: stationCost, depot: side.cost,
-    fleet: vehicles * unit.cost, resale: buses.resale, cost: 0, trackLength: len, days: 0, yard: side,
-    sites: plans.map((p, k) => siteOf(p, targets[k].stops.map((i) => route.path[i]))), path: plans.map((p) => ({ x: p.x, z: p.z })) };
-  q.cost = q.track + q.stations + q.depot + q.fleet - q.resale;
-  q.days = daysOf(q);
-  return { quote: q, plans, links };
+  return c.result!;
 }
 
 /** Where a planned or built main-line station's platform track `k` ends towards `to`, and the way out there. */
@@ -384,7 +460,7 @@ function mainRoute(g: Game, a: { x: number; z: number; y: number; angle: number;
     { x0: eb.x - eb.tx * 4, z0: eb.z - eb.tz * 4, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 },
   ];
   return { plan: runGen(routeGen(g, from, to, { kind: 'rail', owner, tracks: 1, y0: a.y, y1: b.y, pre: [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }],
-    post: [{ x: eb.x, z: eb.z, tx: -eb.tx, tz: -eb.tz }], avoid, exclude, retries: 3 })), ea, eb };
+    post: [{ x: eb.x, z: eb.z, tx: -eb.tx, tz: -eb.tz }], avoid, exclude, gradeMargin: MAINLINE_PROFILE_GRADE, retries: 3 })), ea, eb };
 }
 
 /**
@@ -658,7 +734,8 @@ function mainLink(g: Game, w: RouteWorks, A: Station, B: Station): string | null
   const ea = trackEnd(a, c, 0), eb = trackEnd(c, a, 0), saved = w.quote.ways?.[0];
   let way: OPoint[] | null = null, prof: ChainProfile | null = null;
   if (saved?.length) {
-    const p = chainProfile(g, [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }, ...saved], 1, A.rail!.y, B.rail!.y, 'rail', own);
+    const p = chainProfile(g, [{ x: ea.x, z: ea.z, tx: ea.tx, tz: ea.tz }, ...saved], 1, A.rail!.y, B.rail!.y, 'rail', own,
+      false, undefined, 'standard', MAINLINE_PROFILE_GRADE);
     if (p && !routeConflictAt(g, p, 'rail', 1, own)) { way = saved; prof = p; }
   }
   if (!way || !prof) {
@@ -669,7 +746,7 @@ function mainLink(g: Game, w: RouteWorks, A: Station, B: Station): string | null
   }
   const estimate = estimateChainCost(prof, 1, 'rail', 'standard').cost;
   if (!fund(g, me, estimate * 1.2 + 200_000)) return 'wait';
-  const opts: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me };
+  const opts: BuildOptions = { kind: 'rail', type: 'standard', tracks: 1, heightOffset: 0, crossing: 'auto', owner: me, designGrade: MAINLINE_GRADE };
   return recordWorks(g, me, b, () => {
     const res = buildChain(g, a0, way!, opts, b0, prof);
     if (!res.ok) return `track ${A.name} – ${B.name}: ${res.error ?? 'blocked'}`;

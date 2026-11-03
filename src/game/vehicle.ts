@@ -216,10 +216,14 @@ export abstract class Vehicle {
       const chargedChange = changing && !g.stations.isSameStationComplex(st.id, next ? boardingAt : c.dest);
       f *= transferFareFactor((c.transfers ?? 0) + (chargedChange ? c.count : 0), c.count);
       income += f;
-      if (c.dest === st.id) {
-        st.arrivedMonth += c.count;
+      // Routing tables omit journeys consisting only of walking. After a paid ride, that omitted
+      // remainder may still finish at another existing part of this public station complex.
+      const destination = c.dest === st.id ? st
+        : !hop && g.stations.isSameStationComplex(st.id, c.dest) ? g.stations.get(c.dest) : undefined;
+      if (destination) {
+        destination.arrivedMonth += c.count;
         this.delivered += c.count;
-        const town = g.towns.list[st.townId];
+        const town = g.towns.list[destination.townId];
         if (town) town.passTransMonth += c.count;
       } else {
         // changing here: they wait for their next leg, each with one change of vehicle more

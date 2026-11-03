@@ -195,6 +195,17 @@ export interface Company {
   code?: string;
 }
 
+/** The current owner of a retired company's outstanding receipts and bills. */
+export function successorCompanyId(companies: readonly Company[], id: number): number {
+  // Every merger retires one company. The company count covers every valid chain and bounds malformed saves.
+  for (let n = 0; n < companies.length; n++) {
+    const company = companies[id];
+    if (!company?.defunct || company.boughtBy === undefined) break;
+    id = company.boughtBy;
+  }
+  return id;
+}
+
 /** Company colours: the player first, then fifteen AI rivals. Keep existing colours stable for saves. */
 export const COMPANY_COLORS = ['#e8a33d', '#3d8be8', '#d6453d', '#47b36b', '#9a5fd6', '#22b8c2', '#e0609e', '#8a96a8',
   '#8ac926', '#6a5acd', '#c2185b', '#00897b', '#d4d4d8', '#a86b32', '#ed7544', '#b3cfed'];

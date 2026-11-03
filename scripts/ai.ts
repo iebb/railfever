@@ -4,21 +4,14 @@ import { Game } from '../src/game/game';
 import { fmtMoney } from '../src/game/economy';
 import { Train } from '../src/game/train';
 import { AIController } from '../src/game/ai';
-import { fails, check, fmt, checkReservations, checkNaN } from './lib';
+import { fails, check, fmt, checkReservations, checkNaN, observeAITiming } from './lib';
 AIController.profile = process.argv.includes('--profile');
 
 const seed = Number(process.argv[2] ?? 7), YEARS = Number(process.argv[3] ?? 5), SIZE = Number(process.argv[4] ?? 384), NAI = Number(process.argv[5] ?? 3);
 const T0 = performance.now();
 const g = Game.create({ size: SIZE, seed, towns: Math.round(SIZE / 38), hilliness: 'hilly', water: 'medium', startYear: 1980, aiCompanies: NAI });
 console.log(`map ${SIZE} seed ${seed}: ${g.towns.list.length} towns, pop ${g.towns.list.reduce((a, t) => a + t.pop, 0)}, ${g.ais.length} AI companies, gen ${fmt(performance.now() - T0, 0)} ms`);
-// time the AI work per day
-const aiTime = g.ais.map(() => ({ t: 0, n: 0, max: 0, peak: '' }));
-g.ais.forEach((ai, i) => {
-  // daily() picks projects; work() runs the project's units spread over the day (max: the slowest call)
-  const f = ai.daily.bind(ai), w = ai.work.bind(ai);
-  ai.daily = () => { const t = performance.now(); f(); const dt = performance.now() - t; aiTime[i].t += dt; aiTime[i].n++; if (dt > aiTime[i].max) { aiTime[i].max = dt; aiTime[i].peak = `daily: ${g.day} ${ai.state.phase}`; } };
-  ai.work = (f0: number, f1: number) => { const t = performance.now(); w(f0, f1); const dt = performance.now() - t; aiTime[i].t += dt; if (dt > aiTime[i].max) { aiTime[i].max = dt; aiTime[i].peak = `work: ${g.day} ${ai.state.phase}`; } };
-});
+const aiTime = observeAITiming(g);
 let errors = 0;
 const origWarn = console.warn;
 console.warn = (...a: unknown[]) => { errors++; origWarn('WARN', ...a); };

@@ -6,7 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { resolve } from 'node:path';
 const build = process.argv[2];
 assert(build, 'pass the absolute path to dist/railfever.html');
-const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true, args: ['--enable-unsafe-swiftshader'] });
+const browser = await chromium.launch({ executablePath: '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', headless: true, args: ['--mute-audio'] });
 const failures: string[] = [];
 const dbRecords = (page: Page) => page.evaluate(async () => {
   const db = await new Promise<IDBDatabase>((resolve, reject) => {

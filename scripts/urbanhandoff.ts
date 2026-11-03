@@ -6,23 +6,30 @@ import {Game} from '../src/game/game';
 import {serialize,deserialize} from '../src/game/save';
 import {railPartMode} from '../src/game/stations';
 import {TRACK_TYPES} from '../src/game/constants';
+import {pickTrain} from '../src/game/ai';
+import {consistRule,ruleAllows} from '../src/game/train';
 import {check,done} from './stationlib';
-const g=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
-  aiConfigs:[{startMoney:60_000_000,focus:{rail:.2,road:0,tram:3}}]});g.aiAcquisitions=false;
+const world=()=>{const w=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
+  aiConfigs:[{startMoney:60_000_000,focus:{rail:.2,road:0,tram:3}}]});w.aiAcquisitions=false;return w;};
+const g=world();
 const a:any=g.ais[0];
 let sawChooser=false;
 while(g.day<650&&!a.project?.urbanLayout){g.stepTick();sawChooser||=a.state.phase==='evaluating projects';}
 check(sawChooser&&!!a.project?.urbanLayout,'ordinary native chooser selects a city-layout handoff');
 if(!a.project?.urbanLayout){done();process.exit(1);}
-const hint=a.project.urbanLayout,selected=JSON.stringify(serialize(g)),at=g.day;
+const hint=a.project.urbanLayout,selected=JSON.stringify(serialize(g)),at=g.day,atTick=g.tick;
 console.log(`  native ${a.project.kind} handoff ${g.towns.list[a.project.towns[0]].name} day${at}: ${hint.targets.length} stops`);
 check(a.project.kind==='lightrail'&&a.project.towns[0]===1,'native selected cohort is Dorminster light rail');
 check(!('quote' in hint)&&!('plans' in hint)&&hint.interchanges.every((id:unknown)=>typeof id==='number'),'handoff stores layout/IDs, without old price or station plans');
 check(!a.urbanTask&&!a.urbanSurvey&&a.project.stations.length===0,'selected handoff is saved before construction work');
 let twin=deserialize(JSON.parse(selected));
 check(JSON.stringify(serialize(twin))===selected,'selected handoff immediate full roundtrip');
-function replay(label:string){let exact=true;for(let i=0;i<640;i++){g.stepTick();twin.stepTick();if(JSON.stringify(serialize(g))!==JSON.stringify(serialize(twin)))exact=false;}check(exact,label+' full state is exact at every one of640 ticks');}
-replay('selected handoff');
+function replay(label:string,live=g){let exact=true;for(let i=0;i<640;i++){live.stepTick();twin.stepTick();if(JSON.stringify(serialize(live))!==JSON.stringify(serialize(twin)))exact=false;}check(exact,label+' full state is exact at every one of640 ticks');}
+// Since 2.9 the handoff builds within days of its selection, inside a 640-tick replay. The selection is
+// replayed on a second live world, regenerated to the same tick, so g stops at the partial construction.
+{const live=world();while(live.tick<atTick)live.stepTick();
+ check(JSON.stringify(serialize(live))===selected,'regenerated live world reaches the identical selected handoff');
+ replay('selected handoff',live);}
 while(g.day<at+120&&!(a.project?.stations.length>0))g.stepTick();
 check(!!a.urbanTask?.fromHandoff&&a.project?.stations.length>0,'handoff reaches actual native station construction');
 const during=JSON.stringify(serialize(g));twin=deserialize(JSON.parse(during));
@@ -38,8 +45,10 @@ console.log(`  opens/runs day${g.day}; ${line?.vehicles.length??0} actual trains
 // Stale ownership/removed-interchange hints use the same ordinary full survey, before any spend.
 {
  const h=deserialize(JSON.parse(selected)),b:any=h.ais[0],p=b.project;
+ // A chooser can finish just before midnight; allow one complete fixed-step day for its next work slot.
+ const deadline=h.tick+h.ticksPerDay;
  p.urbanLayout.interchanges=[Number.MAX_SAFE_INTEGER];h.stepTick();
- while(h.day<at+1&&!b.urbanSurvey)h.stepTick();
+ while(h.tick<deadline&&!b.urbanSurvey)h.stepTick();
  check(!!b.urbanSurvey&&!b.urbanTask&&p.stations.length===0,'missing native interchange rejects stale hint and starts full saved survey');
  const hh={...hint,interchanges:[...g.stations.map.values()].find(s=>!!s.rail)?.id===undefined?[]:[...g.stations.map.values()].filter(s=>!!s.rail).slice(0,1).map(s=>s.id)};
  const st=hh.interchanges.length?g.stations.get(hh.interchanges[0]):undefined;
@@ -86,39 +95,75 @@ console.log(`  opens/runs day${g.day}; ${line?.vehicles.length??0} actual trains
  while(h.day<at+720&&b.project){h.stepTick();fallback||=!!b.urbanSurvey;}
  check(fallback&&JSON.stringify(own())===before&&b.eco.loan<=loan,'lost funding rejects/reforecasts without rail construction assets or new borrowing');
 }
-// Replacing/removing a station during a suspended native railway job must abandon cleanly.
-for(const change of ['part','identity','owner'] as const){
+// The paid urban platforms are too short for an ordinary main-line opening consist. Reject
+// before suspension; these are not a valid fixture for changing a retained main-line hub later.
+{
  const h=deserialize(JSON.parse(JSON.stringify(serialize(g)))),b:any=h.ais[0];b.cancelJob();
  const hub=[...h.stations.map.values()].find(s=>s.owner===b.companyId&&!!s.rail)!;
- check(!!hub&&b.startProject('rail',[hub.townId,2],hub.id),'native suspended hub fixture starts '+change);
- const job=b.job;let threw=false;
- try{
-  check(!job.next().done,'native hub job yields before spending '+change);
-  const funds=b.eco.money,loan=b.eco.loan,rail=hub.rail,owner=hub.owner;
-  if(change==='part')hub.rail=null;
-  if(change==='identity')h.stations.map.set(hub.id,{...hub});
-  if(change==='owner')hub.owner=0;
-  check(job.next().done,'changed suspended hub abandons ordinary job '+change);
-  check(b.eco.money===funds&&b.eco.loan===loan,'changed suspended hub spends/borrows nothing '+change);
-  check(!b.errorLogged&&b.log.some((s:string)=>s.includes('station or track access changed')),'changed suspended hub is a native rejection without AI exception '+change);
-  hub.rail=rail;hub.owner=owner;h.stations.map.set(hub.id,hub);
- }catch(e){threw=true;console.log('  suspended hub exception',change,String(e));}
- check(!threw,'suspended hub never dereferences stale rail '+change);
+ check(!!hub&&railPartMode(hub.rail!)==='lightrail'&&hub.rail!.length===4,'native paid urban hub retains its four-unit platforms');
+ check(!!hub&&b.startProject('rail',[hub.townId,2],hub.id),'native short urban hub trial starts');
+ const funds=b.eco.money,loan=b.eco.loan;
+ const assets=()=>{const d=serialize(h);return JSON.stringify({net:d.net,stations:d.stations,depots:d.depots,lines:d.lines,vehicles:d.vehicles});};
+ const before=assets();
+ check(b.job.next().done,'native ordinary main-line trial rejects the short urban hub before yielding');
+ check(b.eco.money===funds&&b.eco.loan===loan&&assets()===before,'short urban hub rejection spends/borrows nothing and changes no assets');
+ check(!b.errorLogged&&b.log.some((s:string)=>s.includes('existing station platforms cannot take opening stock')),'short urban hub rejection retains the native full-stock reason');
 }
-// An actual native mainline hub is also rechecked after the chooser's own suspension.
+// An actual native ordinary-rail hub is also rechecked after the chooser's own suspension.
 {
  const h=Game.create({size:640,seed:21,towns:14,hilliness:'flat',water:'low',startYear:1990,
   aiConfigs:[{startMoney:60_000_000,focus:{rail:2,road:.3,tram:1.5}},{startMoney:60_000_000,focus:{rail:2,road:.3,tram:1.5}}]});h.aiAcquisitions=false;
- while(h.day<250)h.stepTick();
- const b:any=h.ais[0];b.cancelJob();const nativeHub=b.hubFor;let retained:any=null;
- b.hubFor=function(...args:any[]){const st=nativeHub.apply(this,args);if(st)retained=st;return st;};
+ // Since 2.9 a rival remembers the railways it abandoned, and its early hubs come and go as lines grow: from day
+ // 200, wait for a rival whose chooser reaches a hub (a station with free ends toward a town not yet tried or linked).
+ const T=h.towns.list,linked=(A:number,B:number)=>h.lines.all().some(l=>l.kind==='rail'&&[A,B].every(t=>l.stops.some(id=>h.stations.get(id)?.townId===t)));
+ const hubReady=(ai:any)=>T.some(A=>T.some(B=>{const d=Math.hypot(A.x-B.x,A.z-B.z);
+  return A!==B&&A.pop>=250&&B.pop>=250&&d>=60&&d<=250&&!ai.isFailed(ai.pairKey(A.id,B.id))&&!linked(A.id,B.id)&&!!ai.hubFor(A,B);}));
+ while(h.day<720&&(h.day<200||h.tick%h.ticksPerDay!==0||!h.ais.some(hubReady)))h.stepTick();
+ const b:any=h.ais.find(hubReady)??h.ais[0];b.cancelJob();const nativeHub=b.hubFor;let retained:any=null;
+ let encounter:{company:number;towns:[number,number];hub:number;platform:number;coaches:number}|null=null,checkpoint:string|null=null;
+ b.hubFor=function(...args:any[]){const st=nativeHub.apply(this,args);
+  // Keep the first actual ordinary lookup, without changing any returned station or chooser decision.
+  if(st&&args[2]&&!encounter&&T[args[0]?.id]===args[0]&&T[args[1]?.id]===args[1]){
+   retained=st;encounter={company:this.companyId,towns:[args[0].id,args[1].id],hub:st.id,platform:args[2].platform,coaches:args[2].coaches};}
+  return st;};
  const chooser=b.chooseProject();let reached=false,threw=false;
  try{for(let i=0;i<4000;i++){const r=chooser.next();if(r.done)break;if(retained){reached=true;break;}}
-  if(retained){const rail=retained.rail,funds=b.eco.money,loan=b.eco.loan;retained.rail=null;
+  if(retained){checkpoint=JSON.stringify(serialize(h));const rail=retained.rail,funds=b.eco.money,loan=b.eco.loan;retained.rail=null;
    try{chooser.next();}finally{retained.rail=rail;}
    check(b.eco.money===funds&&b.eco.loan===loan,'resumed chooser invalid hub spends/borrows nothing');}
  }catch(e){threw=true;console.log('  suspended chooser exception',String(e));}
  finally{chooser.return(undefined);b.hubFor=nativeHub;}
  check(reached&&!threw,'resumed chooser skips a real native hub whose rail part changed');
+ const chosen=encounter as {company:number;towns:[number,number];hub:number;platform:number;coaches:number}|null;
+ check(!!checkpoint&&!!chosen&&chosen.towns.every(id=>Number.isInteger(id)&&!!T[id]),'native ordinary hub encounter retains its actual town pair and physical checkpoint');
+ if(checkpoint&&chosen){
+  const control=deserialize(JSON.parse(checkpoint)),hub=control.stations.get(chosen.hub)!;
+  const [A,B]=chosen.towns.map(id=>control.towns.list[id]);
+  const cars=pickTrain(control.year,Math.min(chosen.platform,hub.rail!.length),Math.hypot(A.x-B.x,A.z-B.z)*1.3,chosen.coaches);
+  const length=cars?.reduce((n,c)=>n+c.length+.1,0),rule=cars?consistRule(cars):null;
+  const fits=length!==undefined&&!!rule&&control.stations.railTrackGroups(hub).some(group=>group.length+1e-6>=length+.05
+   &&group.steps.every(step=>{const edge=control.world.net.edges.get(step.edge);return !!edge&&control.canUse(chosen.company,edge.owner)&&ruleAllows(rule,edge);}));
+  check(hub.townId===A.id&&!!hub.rail&&fits,'native ordinary encounter has full opening stock, platform body, rule and operator access');
+  console.log(`  suspended ordinary hub ${hub.id} towns${chosen.towns.join('-')} day${control.day}: ${length}u stock, ${hub.rail!.length}u ${railPartMode(hub.rail!)} platforms`);
+  // Reuse this same native encounter for each stale-target case; no new world/search/window.
+  for(const change of ['part','identity','owner'] as const){
+   const h=deserialize(JSON.parse(checkpoint)),b:any=h.aiOf(chosen.company)!;b.cancelJob();
+   const hub=h.stations.get(chosen.hub)!;
+   check(!!hub&&b.startProject('rail',chosen.towns,hub.id),'native suspended hub fixture starts '+change);
+   const job=b.job;let threw=false;
+   try{
+    check(!job.next().done,'native hub job yields before spending '+change);
+    const funds=b.eco.money,loan=b.eco.loan,rail=hub.rail,owner=hub.owner;
+    if(change==='part')hub.rail=null;
+    if(change==='identity')h.stations.map.set(hub.id,{...hub});
+    if(change==='owner')hub.owner=0;
+    check(job.next().done,'changed suspended hub abandons ordinary job '+change);
+    check(b.eco.money===funds&&b.eco.loan===loan,'changed suspended hub spends/borrows nothing '+change);
+    check(!b.errorLogged&&b.log.some((s:string)=>s.includes('station or track access changed')),'changed suspended hub is a native rejection without AI exception '+change);
+    hub.rail=rail;hub.owner=owner;h.stations.map.set(hub.id,hub);
+   }catch(e){threw=true;console.log('  suspended hub exception',change,String(e));}
+   check(!threw,'suspended hub never dereferences stale rail '+change);
+  }
+ }
 }
 done();

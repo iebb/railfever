@@ -7,7 +7,7 @@ import { Game, TICKS_PER_DAY } from '../src/game/game';
 import { serialize, deserialize } from '../src/game/save';
 import { pickCoach, pickBus, type AIController } from '../src/game/ai';
 import {
-  roadForecast, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townsOnTheWay, planTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownLine, planExtensions, routeOf, worth, pays,
+  roadForecast, roadPath, roadDriving, roadScore, roadOptions, tramUpgradeValue, coachUpgrades, stopSites, townRoutes, townsOnTheWay, planTramUpgrade, roadPlanJob, roadMarket, moreValue, planCoach, planTownCandidates, planTownLine, planExtensions, routeOf, worth, pays, lineEconomics,
   type BusHost, type RoadPlan, type ProjectOption,
 } from '../src/game/ai-bus';
 import type { Town } from '../src/game/towns';
@@ -18,6 +18,78 @@ import { fails, check, fmt, depotBehind, connectStations, townPairs, checkReserv
 import { findRailPair } from '../src/game/routing';
 import type { Station } from '../src/game/stations';
 import { planRouteUpgrade, startRouteWorks, worksOn } from '../src/game/route-works';
+import { nativeRoadItinerary, evaluateNativeRoadCycle } from '../src/game/road-physics';
+import { bezLine } from '../src/game/geom';
+import { addTramTracks } from '../src/game/build-ops';
+
+/** Search budgets are decision inputs: broad and narrow surveys cannot share a derived answer. */
+function boundedRoadReads() {
+  const g = Game.create({ size: 128, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980 });
+  g.world.h.fill(4); g.world.heightsVersion++;
+  const net = g.world.net, nodes = [[20, 20], [100, 20], [100, 100]].map(([x, z]) => net.addNode('road', x, 4, z));
+  for (let i = 0; i < 2; i++) {
+    const a = nodes[i], b = nodes[i + 1];
+    net.addEdge('road', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(81).fill(4), [], 'street', -1);
+  }
+  const saved = serialize(g), a = { x: 25, z: 20 }, b = { x: 100, z: 95 };
+  const narrow = roadPath(deserialize(saved), a, b, 80, 40), broad = roadPath(deserialize(saved), a, b, 80, 1000);
+  check(narrow === null && !!broad && broad.length > 40, 'native survey has distinct narrow and broad physical reach');
+  check(JSON.stringify(roadPath(g, a, b, 80, 1000)) === JSON.stringify(broad) && roadPath(g, a, b, 80, 40) === narrow,
+    'broad then narrow surveys exactly match their cold answers');
+  const reverse = deserialize(saved);
+  check(roadPath(reverse, a, b, 80, 40) === narrow && JSON.stringify(roadPath(reverse, a, b, 80, 1000)) === JSON.stringify(broad),
+    'narrow then broad surveys exactly match their cold answers');
+  const nearA = { x: 25.001, z: 20 }, nearB = { x: 25.004, z: 20 }, to = { x: 75, z: 20 };
+  const coldA = roadPath(deserialize(saved), nearA, to, 80, 1000), coldB = roadPath(deserialize(saved), nearB, to, 80, 1000);
+  check(nearA.x.toFixed(2) === nearB.x.toFixed(2) && !!coldA && !!coldB && Math.abs(coldA.length - coldB.length) > 1e-6,
+    'nearby native points on the same street have distinct cold route lengths despite sharing rounded coordinates');
+  const warmA = roadPath(g, nearA, to, 80, 1000), warmB = roadPath(g, nearB, to, 80, 1000);
+  check(JSON.stringify(warmA) === JSON.stringify(coldA) && JSON.stringify(warmB) === JSON.stringify(coldB),
+    'near-coordinate surveys match cold route lengths in forward order');
+  check(roadPath(g, nearA, to, 80, 1000) === warmA, 'identical full-precision inputs still reuse their derived answer');
+  const nearReverse = deserialize(saved);
+  check(JSON.stringify(roadPath(nearReverse, nearB, to, 80, 1000)) === JSON.stringify(coldB)
+    && JSON.stringify(roadPath(nearReverse, nearA, to, 80, 1000)) === JSON.stringify(coldA),
+    'near-coordinate surveys match cold route lengths in reverse order');
+  check(JSON.stringify(serialize(g)) === JSON.stringify(saved), 'bounded road survey reads leave saved state unchanged');
+}
+
+/** A future tram quote uses precisely the paid lawful graph, without publishing construction into the world. */
+function futureTramQuotes() {
+  const g = Game.create({ size: 128, seed: 3, towns: 0, hilliness: 'flat', water: 'low', startYear: 1980, aiCompanies: 1 });
+  g.aiEnabled = false; g.world.h.fill(4); g.world.heightsVersion++;
+  g.companies[1].economy.money = 1e9;
+  const net = g.world.net, a = net.addNode('road', 20, 4, 60), b = net.addNode('road', 110, 4, 60);
+  const edge = net.addEdge('road', a.id, b.id, bezLine(a.x, a.z, b.x, b.z), new Float32Array(91).fill(4), [], 'street', -1);
+  const ids: number[] = [];
+  for (const x of [45, 85]) {
+    check(g.stations.commitBusStop(x, 60, 1) === null, 'future tram fixture has native committed stops');
+    ids.push(g.stations.nextId - 1);
+  }
+  const line = g.lines.create('road', 1); line.stops = ids; line.loop = false;
+  const quote = planTramUpgrade(g, line.id, 1);
+  check(quote.ok && !!quote.model && quote.trackCost > 0, 'future tram streets have a valid paid construction quote');
+  if (!quote.ok || !quote.model) return;
+  const target = { ...line, kind: 'tram' as const }, before = JSON.stringify(serialize(g));
+  check(evaluateNativeRoadCycle(g, target, quote.model) === null, 'committed stops without tracks do not invent a current tram route');
+  const future = evaluateNativeRoadCycle(g, target, quote.model, undefined, 1, quote.fresh);
+  const itinerary = nativeRoadItinerary(g, target, undefined, 1, quote.fresh);
+  check(!!future && !!itinerary && itinerary.legs.every(l => l.parts.every(p => quote.edges.includes(p.seg.e))),
+    'future native tram driving includes only the paid streets, including approach and U-turn connectors');
+  check(evaluateNativeRoadCycle(g, target, quote.model, undefined, 1, quote.fresh) === future, 'unchanged future graph reuses its physical quote');
+  check(evaluateNativeRoadCycle(g, target, quote.model, undefined, 1, []) === null, 'removing priced fresh streets invalidates the future graph quote');
+  check(evaluateNativeRoadCycle(g, target, quote.model) === null, 'future quote never leaks into an existing-service quote');
+  const cold = deserialize(serialize(g));
+  check(JSON.stringify(evaluateNativeRoadCycle(cold, target, quote.model, undefined, 1, quote.fresh)) === JSON.stringify(future), 'cold future quote gives identical physical timing');
+  check(JSON.stringify(serialize(g)) === before, 'future graph, cold and current quotes leave saved construction and simulation untouched');
+  const built = addTramTracks(g, quote.fresh, 1);
+  check(!built.error && built.changed > 0 && JSON.stringify(evaluateNativeRoadCycle(g, target, quote.model)) === JSON.stringify(future),
+    'paid future timing equals the actual native graph after construction');
+  edge.tramOwner = 0; net.touchEdge(edge); g.setAccessPolicy(0, 'auto-reject');
+  check(evaluateNativeRoadCycle(g, target, quote.model, undefined, 1, quote.fresh) === null, 'future street IDs cannot override existing foreign tram access');
+  delete edge.tram; delete edge.tramOwner; edge.owner = 0; net.touchEdge(edge);
+  check(evaluateNativeRoadCycle(g, target, quote.model, undefined, 1, quote.fresh) === null, 'future street IDs cannot override foreign road access');
+}
 
 const seed = Number(process.argv[2] ?? 7);
 const drain = <T>(gen: Generator<void, T>): T => { let r = gen.next(); while (!r.done) r = gen.next(); return r.value; };
@@ -86,6 +158,8 @@ function railway(g: Game, owner: number, exclude: Set<number>): { A: Station; B:
 }
 
 function run() {
+  boundedRoadReads();
+  futureTramQuotes();
   const g = world();
   g.aiEnabled = false;
   const [A, B] = g.ais, hA = hostOf(A), hB = hostOf(B);
@@ -152,10 +226,19 @@ function run() {
       }
       days(g, 180);
       const P = pr.TA, bus = pickBus(g.year, Math.max(P.pop, 1500))!;
-      const plan = drain(planTownLine(hA, P, bus));
-      console.log(`  ${P.name} (${P.pop}): ${plan?.why ?? 'no line'}`);
+      const best = drain(planTownLine(hA, P, bus)), candidates = drain(planTownCandidates(hA, P, bus));
+      const atInterchange = (s: RoadPlan['sites'][number]) => g.stations.complex(s.station?.id ?? -1).includes(pr.A.id) || (s.links ?? []).includes(pr.A.id);
+      const score = (p: RoadPlan) => roadScore(p.revenue, p.yearly, p.outlay);
+      const plan = candidates.filter(p => pays(p) && p.sites.some(atInterchange)).sort((a, b) => score(b) - score(a))[0];
+      check(!!best && pays(best) && candidates.filter(pays).every(p => score(best) >= score(p) - 1e-9), 'unrestricted town planning retains the greatest economic value');
+      console.log(`  ${P.name} (${P.pop}): ${plan?.why ?? 'no paying feeder'}; unrestricted ${best?.why ?? 'no line'} (scores ${plan ? fmt(score(plan), 3) : '-'} / ${best ? fmt(score(best), 3) : '-'})`);
+      const geometric = townRoutes(P, drain(stopSites(g, A.companyId, P.x, P.z, P.radius + 6, P.id))).find(r => r.why === 'feeder');
+      if (plan && geometric && !roadDriving(g, geometric.stops, bus, false)) {
+        check(plan.sites.length < geometric.stops.length && !!roadDriving(g, plan.sites, bus, false)
+          && plan.sites.every((s, i) => s === geometric.stops[i] || dist(s, geometric.stops[i]) < 1e-6), 'unroutable feeder tail retains its connected paid prefix');
+      }
       const atRail = plan?.sites.findIndex((s) => g.stations.complex(s.station?.id ?? -1).includes(pr.A.id) || (s.links ?? []).includes(pr.A.id)) ?? -1;
-      check(!!plan && pays(plan) && atRail >= 0, `the best bus line in ${P.name} serves ${pr.A.name} and pays`);
+      check(!!plan && pays(plan) && atRail >= 0, `a priced bus feeder in ${P.name} serves ${pr.A.name} and pays`);
       if (plan && atRail >= 0) {
         // the same stops without the change to the trains: the transfers are what the feeder adds
         const f = drain(roadForecast(g, A.companyId, plan.sites, { model: bus, vehicles: plan.vehicles, loop: !!plan.loop }));
@@ -214,7 +297,14 @@ function run() {
     check(!!plan, `a town line for ${T.name}`);
     if (plan) {
       // a short start: its first stops only, then the extensions compete with a new line
-      const short: RoadPlan = { ...plan, sites: plan.sites.slice(0, 3), loop: false, vehicles: 2, revenue: Infinity };
+      // Changing the quoted stops and fleet changes both receipts and costs. Price that actual short
+      // service; retaining the full line's yearly cost would reject a lawful two-bus start.
+      const sites = plan.sites.slice(0, 3), vehicles = 2;
+      const forecast = drain(roadForecast(g, A.companyId, sites, { model: bus, vehicles, loop: false, purpose: 'city' }));
+      const economics = lineEconomics(g, A.companyId, forecast, sites, bus, vehicles);
+      check(Number.isFinite(economics.revenue) && pays(economics), 'the native three-stop, two-bus start pays its actual construction and operating costs');
+      const short: RoadPlan = { ...plan, sites, loop: false, vehicles, ...economics,
+        why: `short start in ${T.name}: ${Math.round(economics.revenue / 1000)}k/year against ${Math.round(economics.yearly / 1000)}k` };
       console.log('  ' + build(A, short));
       LT = [...g.lines.map.values()].find((l) => l.owner === A.companyId && l.kind === 'road' && townsOf(g, l).length === 1 && townsOf(g, l)[0] === T.id);
       check(!!LT, `A runs a town line in ${T.name}`);

@@ -1,4 +1,4 @@
-// Saved, bounded reviews of licensed urban pairs and own / foreign / own rail services.
+// Saved, bounded reviews of licensed rail pairs and own / foreign / own services.
 import type { Game } from './game';
 import type { AIController } from './ai';
 import type { Line } from './lines';
@@ -20,7 +20,7 @@ import { patternStops } from './patterns';
 import { bezFromTangents, bezDeriv, tAtS } from './geom';
 import { SAVE_TREES, type Tree } from './world';
 import { railPartMode } from './stations';
-import { platformChoices } from './rail-platforms';
+import { platformChoicesForStock } from './rail-platforms';
 import { plannedSet } from './demand';
 
 /** Local native turnout survey supplied by the existing two-network planner. */
@@ -29,7 +29,7 @@ export interface ThroughLink {
   d: number; left: number[]; right: number[]; value: number; la: boolean; lb: boolean;
 }
 interface Choice { path: number[]; links: ThroughLink[]; score: number; cars: string[]; reuse?: number }
-export interface ThroughCursor { at: number; signature: string; best?: Choice; trials?: number[][][] }
+export interface ThroughCursor { at: number; stock?: number; signature: string; best?: Choice; trials?: number[][][] }
 export interface ThroughItem { ids: number[]; through?: ThroughCursor }
 export const copyThroughCursor = (c: ThroughCursor): ThroughCursor => ({ ...c, ...(c.best ? { best: {
   ...c.best, path: [...c.best.path], cars: [...c.best.cars], links: c.best.links.map(copyLink),
@@ -93,14 +93,18 @@ export function throughCandidates(h: ThroughHost, middleIds: number[]): number[]
     if (!b || b.owner === h.me || !h.g.canUse(h.me, b.owner)) continue;
     const nearby = own.filter(a => near(a, b)), selected = new Set(h.selectSides(b.id, nearby.map(l => l.id)));
     const sides = nearby.filter(l => selected.has(l.id));
-    // A city railway can continue over one open foreign route without owning another
-    // outer trunk first. Its local fleet and the foreign timetable remain separate.
-    for (const a of sides) if (urban(h.g, a) || urban(h.g, b)) {
+    const cityPair = (a: Line) => urban(h.g, a) || urban(h.g, b);
+    // Preserve the original city-pair and complete-chain review order.
+    for (const a of sides) if (cityPair(a)) {
       const ids = [a.id, b.id]; if (!h.cared(keyOf(ids))) out.push(ids);
     }
     for (let i = 0; i < sides.length; i++) for (let j = i + 1; j < sides.length; j++) {
       const ids = [sides[i].id, b.id, sides[j].id];
       if (!h.cared(keyOf(ids))) out.push(ids);
+    }
+    // An owned railway can continue over one open foreign route regardless of station style.
+    for (const a of sides) if (!cityPair(a)) {
+      const ids = [a.id, b.id]; if (!h.cared(keyOf(ids))) out.push(ids);
     }
   }
   return out;
@@ -183,13 +187,17 @@ export function throughOpeningCall(g: Game, path: number[], owner: number, cars:
   return -1;
 }
 /** A through call continues forward on one incoming/outgoing physical platform.
- * Reversing at an intermediate stop is not a substitute for a connected timetable. */
+ * Reversing at an intermediate stop is not a substitute for a connected timetable.
+ * Qualify the proposed consist even when no matching paid stock exists yet. */
+export function throughPlatformProof(g: Game, path: number[], owner: number, cars: VehicleModel[]): boolean {
+  const line = { id: -1, owner, kind: 'rail', stops: outAndBack(path), vehicles: [] } as unknown as Line;
+  const proposed = { owner, rule: consistRule(cars), length: cars.reduce((n, m) => n + m.length + .1, 0) };
+  return line.stops.every((_, i) => platformChoicesForStock(g, line, 0, i, proposed).length > 0);
+}
 function throughPlatforms(g: Game, path: number[], owner: number, cars: VehicleModel[], context?: ThroughQuoteContext): boolean {
   const key = JSON.stringify([path, owner, modelKey(cars)]);
   if (context?.platforms.has(key)) return context.platforms.get(key)!;
-  const stock = g.vehicles.trains().find(t => t.owner === owner && modelKey(t.cars) === modelKey(cars));
-  const line = { id: -1, owner, kind: 'rail', stops: outAndBack(path), vehicles: stock ? [stock.id] : [] } as unknown as Line;
-  const fits = line.stops.every((_, i) => platformChoices(g, line, 0, i).length > 0);
+  const fits = throughPlatformProof(g, path, owner, cars);
   context?.platforms.set(key, fits); return fits;
 }
 function cycle(g: Game, cars: VehicleModel[], legs: { length: number; cap: number }[], extraCap = Infinity) {
@@ -203,8 +211,13 @@ function cycle(g: Game, cars: VehicleModel[], legs: { length: number; cap: numbe
 function stocks(h: ThroughHost, ls: Line[], path: number[]): VehicleModel[][] {
   const out = new Map<string, VehicleModel[]>(), min = Math.min(...path.map(id => h.g.stations.get(id)?.rail?.length ?? 0));
   for (const l of ls.filter(l => l.owner === h.me)) for (const id of l.vehicles) {
-    const t = h.g.vehicles.get(id); if (!(t instanceof Train) || t.owner !== h.me || !t.capacity || t.mailCapacity) continue;
-    if (t.length <= min - 0.4) out.set(modelKey(t.cars), [...t.cars].sort((a, b) => Number(b.kind === 'loco') - Number(a.kind === 'loco')));
+    const t = h.g.vehicles.get(id); if (!(t instanceof Train) || t.owner !== h.me || !t.capacity) continue;
+    // Quote a new passenger train even when the local service also carries mail. Its
+    // existing vans and service stay in place; no mail receipts finance the new stock.
+    const cars = t.cars.filter(m => !(m.kind === 'wagon' && (m.mail ?? 0) > 0 && !m.capacity));
+    if (cars.some(m => (m.mail ?? 0) > 0)) continue;
+    const length = cars.reduce((n, m) => n + m.length + .1, 0);
+    if (length <= min - 0.4) out.set(modelKey(cars), [...cars].sort((a, b) => Number(b.kind === 'loco') - Number(a.kind === 'loco')));
   }
   return [...out.values()].sort((a, b) => a.reduce((n, m) => n + m.cost, 0) - b.reduce((n, m) => n + m.cost, 0));
 }
@@ -273,13 +286,18 @@ export function* throughTask(h: ThroughHost, item: ThroughItem): Generator<void,
   const g = h.g, ls = item.ids.map(id => g.lines.map.get(id)), key = keyOf(item.ids);
   const finish = (why: string) => { delete item.through; h.careFor(key, 180); h.considered('through.' + why); };
   if (![2, 3].includes(ls.length) || ls.some(l => !l || !pathOf(l)) || ls[0]!.owner !== h.me || ls.length === 3 && ls[2]!.owner !== h.me
-    || ls[1]!.owner === h.me || !g.canUse(h.me, ls[1]!.owner) || ls.length === 2 && !ls.some(l => urban(g, l!))) { finish('invalid'); return; }
+    || ls[1]!.owner === h.me || !g.canUse(h.me, ls[1]!.owner)) { finish('invalid'); return; }
   const lines = ls as Line[], sig = signature(g, lines, h.me), c = item.through ??= { at: 0, signature: sig };
   if (c.signature !== sig) { finish('changed'); return; }
   const trials = c.trials ??= throughTrials(g, lines);
   if (c.at < trials.length) {
-    const [pa, pb, pc = []] = trials[c.at++];
-    const initial = concat(pa, pb, pc), stock = stocks(h, lines, initial)[0]; if (!stock || lines.some(l => h.room(l) < 1)) return;
+    const [pa, pb, pc = []] = trials[c.at];
+    const initial = concat(pa, pb, pc), options = stocks(h, lines, initial), stock = options[c.stock ?? 0];
+    c.stock = (c.stock ?? 0) + 1;
+    if (c.stock >= options.length) { c.at++; delete c.stock; }
+    // A cheap incompatible consist must not hide a legal alternative. Keep each
+    // direction/consist quote in its own saved work unit.
+    if (!stock || lines.some(l => h.room(l) < 1)) return;
     const ab = boundary(h, lines[0], lines[1], pa, pb, stock), bc = lines.length === 3 ? boundary(h, lines[1], lines[2], pb, pc, stock) : null;
     if (ab === false || bc === false) return;
     let path = initial;

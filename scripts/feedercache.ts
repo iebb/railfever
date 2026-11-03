@@ -55,10 +55,10 @@ const poolJSON = (p: any[]) => JSON.stringify(p.map(s => ({ pop: s.pop, regions:
 const g = Game.create({ size: 384, seed: 7, towns: 10, hilliness: 'flat', water: 'low', startYear: 1990,
   aiConfigs: [{ startMoney: 60_000_000, focus: { rail: 2, road: .3, tram: 1.5 } }] });
 g.aiEnabled = false; g.aiAcquisitions = false; g.vehicles.ambientEnabled = false; g.economy.money = 100_000_000;
-// User rule (2.10): walking reach halved again, so station sites near small towns hold far fewer residents and the
-// 65-140 search now settles on Weyden (850) - Sunham, below the 1500 feeder cutoff this test needs at A. Reaching to
-// 150 picks Wilmere (1627) - Weyton Vale, an eligible feeder town as under 2.9 (Wilmere - Shelminster).
-const pair = placeAndConnect(g, 65, 150, 0, new Set(), 1, () => {});
+// The native 65..150 search now selects Weyden (858), below the unchanged 1500 feeder cutoff. Use the longer
+// native corridor range, which supplies Oldthorpe and its street-connected lots; eligibility is checked below
+// before any cache or forecast result is compared. Construction, demolition and population stay native.
+const pair = placeAndConnect(g, 150, 220, 0, new Set(), 1, () => {});
 check(pair, 'generated native railway construction succeeds');
 if (!pair) process.exit(1);
 const { A, B, TA } = pair, depot = depotBehind(g, A, B), line = g.lines.create('rail', 0);
@@ -98,6 +98,52 @@ const initialWalkCalls = walkCalls;
 for (let i = 0; i < 20; i++) d.feederPools(sites, covered);
 check(walkCalls === initialWalkCalls, 'repeated pool queries reuse the merged geometry without walking or merging access maps');
 parity('warm');
+
+// Changing a timetable must rebuild its weights, not the same eligible lot geometry. Keep a zero-quality
+// first site lazy until it becomes useful; a later first-positive site still keeps the literal claim order.
+const nativeSiteWalk = d.feederSiteWalk, nativeRegion = d.regionOf, qualities = sites.map(s => s.quality);
+let preparedWalks = 0, preparedRegions = 0;
+d.feederSiteWalk = function(s: any) { preparedWalks++; return nativeSiteWalk.call(this, s); };
+d.regionOf = function(b: any) { preparedRegions++; return nativeRegion.call(this, b); };
+site.quality = 0;
+let prepared = d.claimFeederPools(sites, covered);
+check(preparedWalks > 0 && preparedRegions > 0, 'positive native feeder sites prepare actual eligible lots and regions');
+for (const quality of [.2, .9, .35]) {
+  const walks = preparedWalks, regions = preparedRegions;
+  rival.quality = quality;
+  prepared = d.claimFeederPools(sites, covered);
+  check(preparedWalks === walks && preparedRegions === regions, 'different quality reuses only the prepared native lot geometry');
+  check(poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+    'changed quality recomputes exact literal weights, totals and region order');
+}
+const beforePositive = preparedWalks; site.quality = .6;
+prepared = d.claimFeederPools(sites, covered);
+check(preparedWalks === beforePositive + 1 && prepared[0].pop > 0,
+  'first positive quality prepares the previously excluded site lazily');
+check(poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+  'new first-positive site retains native claim insertion and floating-point order');
+const nativeIds = [...d.feederSiteWalk(site).keys()];
+for (const id of nativeIds.slice(0, 5)) d.claimFeederPools(sites, new Set([id]));
+const beforeEvicted = preparedWalks; d.claimFeederPools(sites, covered);
+check(preparedWalks > beforeEvicted, 'bounded preparation contexts evict and rebuild an earlier covered-set query');
+const many = Array.from({ length: 300 }, () => site);
+d.claimFeederPools(many, covered);
+const beforeLarge = preparedWalks; d.claimFeederPools(many, covered);
+check(preparedWalks > beforeLarge, 'an oversized preparation is not retained between reads');
+let attempts = 0, preparationThrew = false;
+d.regionOf = function(b: any) {
+  if (++attempts === 2) throw new Error('deliberate preparation interruption');
+  return nativeRegion.call(this, b);
+};
+try { d.claimFeederPools(sites, covered); } catch { preparationThrew = true; }
+const interruptedWalks = preparedWalks;
+prepared = d.claimFeederPools(sites, covered);
+check(preparationThrew && preparedWalks > interruptedWalks
+  && poolJSON(prepared) === poolJSON(previousPools.call(d, sites, covered)),
+  'interrupted preparation publishes no partial rows and retries exactly with the same reader');
+sites.forEach((s, i) => { s.quality = qualities[i]; });
+d.feederSiteWalk = nativeSiteWalk; d.regionOf = nativeRegion;
+parity('after quality-independent preparation');
 const inherited: any = Object.create(d), parentWalk = d.feederSiteWalk(site), beforePreview = walkCalls;
 check(JSON.stringify([...inherited.feederSiteWalk(site)]) === JSON.stringify([...parentWalk])
   && inherited.feederSiteWalk(site) !== parentWalk && walkCalls > beforePreview,
@@ -221,6 +267,31 @@ check(d.feederSiteWalk(site) !== retained, 'bounded site cache evicts and recomp
 // Full forecasts use native fares, headways, routed coverage and mutable outputs.
 const forecast = (h = 140, kmh = 120) => g.demand.forecastLine([A, B], 'mainline', kmh, h, 0, line.id);
 forecast();
+// Vehicle movement leaves eligible feeder lot geometry unchanged. Keep weighted pools tick-local,
+// but reuse their ordered geometry across native ticks, recomputing every quality-dependent sum.
+g.flushNetworkChanges(); g.lines.flushCatchment();
+const movementWalk = d.feederSiteWalk, movementRegion = d.regionOf;
+let movementWalks = 0, movementRegions = 0;
+d.feederSiteWalk = function(s: any) { movementWalks++; return movementWalk.call(this, s); };
+d.regionOf = function(b: any) { movementRegions++; return movementRegion.call(this, b); };
+d.claimFeederPools(sites, covered);
+const movementEpoch = () => `${d.version}:${d.feederGeometryKey()}:${g.world.lotVersions.version}`;
+const unchangedEpoch = movementEpoch();
+let reusedTicks = 0;
+for (let tick = 0; tick < 12; tick++) {
+  g.stepTick();
+  const before = JSON.stringify(serialize(g)), walks = movementWalks, regions = movementRegions;
+  const variant = sites.map((s, i) => ({ ...s, quality: .2 + (tick + i) % 7 / 10 }));
+  const pools = d.claimFeederPools(variant, covered);
+  check(movementEpoch() === unchangedEpoch && movementWalks === walks && movementRegions === regions,
+    'native movement reuses eligible geometry while quality changes at tick ' + g.tick);
+  check(poolJSON(pools) === poolJSON(previousPools.call(d, variant, covered)),
+    'movement and changing quality preserve literal weighted claims at tick ' + g.tick);
+  check(JSON.stringify(serialize(g)) === before, 'movement-time geometry reads preserve the full save');
+  reusedTicks++;
+}
+d.feederSiteWalk = movementWalk; d.regionOf = movementRegion;
+check(reusedTicks === 12, 'geometry reuse is exercised across twelve native simulation ticks');
 g.aiEnabled = true;
 const urbanTown = [...g.towns.list].sort((a, b) => b.pop - a.pop)[0];
 check(g.ais[0].startProject('lightrail', [urbanTown.id]), 'funded native AI city project starts before the saved replay');

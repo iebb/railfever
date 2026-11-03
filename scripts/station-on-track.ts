@@ -82,6 +82,25 @@ for(const level of ['ground','elevated','underground'] as const){
   check(Math.abs(g.companyAssets(1).track-ownerAssets)<.5&&Math.abs(g.maintenanceOf(1)-ownerMaint)<.01,`${level}: removal leaves inherited assets and upkeep intact`);
   console.log(`  ${level}: arcs=${lengths.map(n=>n.toFixed(4)).join('/')} cost=${p.cost} facilityUpkeep=${loaded.stationMaintenance(loaded.stations.get(st.id)!)} bend=${deviation.toFixed(3)}`);
 }
+// Nearby companion seeds can lie beyond the platform end when signal work fragments a curved pair.
+// Survey enough of the companion chain to cover the clicked centre and both platform ends.
+{
+  const {g,rail}=fixture('ground',2),net=g.world.net;
+  const centre={x:0,y:0,z:0};net.pointAt(rail[0],rail[0].len/2,centre);
+  check(plan(g,rail[0],2).ok,'intact curved pair accepts a native platform before signal splits');
+  for(const original of rail){
+    let e=original;
+    while(e.len>3.2){const split=net.splitEdge(e.id,3)!;e=split.e2;}
+  }
+  const hit=net.nearestEdge(centre.x,centre.z,.1,'rail',e=>e.owner===1)!;
+  const before=json(g),p=planStationOnTrack(g,hit.edge.id,hit.s,{length:20,tracks:2,reuseTrack:true,style:'modern'},0);
+  check(p.ok&&p.station!.alignment!.tracks.every(t=>t.pieces.length>5),`fragmented curved companion retains the complete platform (${p.error??'ok'})`);
+  check(json(g)===before,'fragmented curved companion survey preserves the complete save');
+  // Access can change after a successful survey; a rejected commit must not spend or split anything.
+  g.blockCompany(1,0);
+  const denied=json(g),rejected=commitStationOnTrack(g,p);
+  check(!!rejected.error&&json(g)===denied,'fragmented curved companion rejects revoked access without mutation');
+}
 // Deleting a middle fragment must not advertise the disconnected pieces as one usable platform.
 {
   const {g,rail}=fixture(),p=plan(g,rail[0]),r=commitStationOnTrack(g,p),st=g.stations.get(r.station)!,net=g.world.net;

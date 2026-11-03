@@ -1,6 +1,6 @@
 // Speculative coarse search cache. Replies can save CPU but never control the simulation's work clock.
 import type { Game } from './game';
-import { createCorridorKernel, type CorridorReply, type CorridorSnapshot } from './planning-corridor';
+import { createCorridorKernel, corridorFrontierCodec, type CorridorReply, type CorridorSnapshot } from './planning-corridor';
 
 export interface CorridorWorkerStats {
   active: boolean; jobs: number; completed: number; pending: number; hits: number; fallback: number;
@@ -39,7 +39,9 @@ function runtime(g: Game): Runtime {
 
 /** Embedded code, including every helper: the standalone file needs no worker URL or imports. */
 export function corridorWorkerSource(): string {
-  return `const kernelFactory = (${createCorridorKernel.toString()});
+  // Pass the codec explicitly: minification may rename its module binding in the factory's default argument.
+  return `const frontierCodecFactory = (${corridorFrontierCodec.toString()});
+    const kernelFactory = (${createCorridorKernel.toString()});
     let terrain = null;
     self.onmessage = ({data}) => {
       if (data.kind === 'terrain') { terrain = data; return; }
@@ -47,7 +49,7 @@ export function corridorWorkerSource(): string {
       try {
         if (!terrain || terrain.terrainId !== data.snapshot.terrainId) throw Error('Corridor terrain revision unavailable');
         const start = performance.now();
-        const result = kernelFactory({...data.snapshot, h: terrain.h, lock: terrain.lock}).run(data.budget);
+        const result = kernelFactory({...data.snapshot, h: terrain.h, lock: terrain.lock}, undefined, frontierCodecFactory).run(data.budget);
         self.postMessage({id: data.id, result, computeMs: performance.now() - start});
       } catch (e) { self.postMessage({id: data.id, error: String(e && e.message || e)}); }
     };`;
@@ -90,10 +92,10 @@ export function consumeCorridorWorkerLaunch(g: Game): boolean {
 }
 export function corridorWorkerStats(g: Game): Readonly<CorridorWorkerStats> { return runtime(g).stats; }
 
-export function requestCorridor(g: Game, snapshot: CorridorSnapshot, budget: number): CorridorJob {
+export function requestCorridor(g: Game, snapshot: CorridorSnapshot, budget: number, launch = true): CorridorJob {
   const r = runtime(g), id = ++r.nextId;
   const job: CorridorJob = { snapshot, budget, index: 0, reply: null, kernel: null, runtime: r, id, cancelled: false };
-  const worker = getWorker(r);
+  const worker = launch ? getWorker(r) : null;
   // The cache is optional: bound queued speculation while many rivals start projects together.
   if (!worker || r.jobs.size >= 4) return job;
   const start = performance.now();

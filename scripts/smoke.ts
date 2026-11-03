@@ -456,13 +456,14 @@ check(g.world.buildings.size > bld0, 'new buildings appeared');
   console.log(`perf: ${fmt((performance.now() - t) / 30, 2)} ms per game day with ${g.vehicles.map.size} company vehicles + ${g.vehicles.ambient.length} town cars (see scripts/perf.ts for the 512-map stress test)`);
 }
 
-// The general railway fixture excludes tiny towns. Keep seed 11's tiny-village railway as its own passenger
-// control, without extending the two-year observation or substituting larger towns.
+// The general railway fixture excludes tiny towns. Keep seed 11's village passenger control, using
+// actual entrances for its walking catchment (the platform centre misses connected homes). Retain
+// the same ten-person minimum, both tiny villages, and the original two-year delivery assertion.
 if (seed === 11) {
   const h = Game.create({ size: 384, seed, towns: 10, hilliness: 'hilly', water: 'medium', startYear: 1980 });
   h.aiEnabled = false; h.economy.money = 80_000_000;
   const larger = new Set(h.towns.list.filter((t) => t.pop >= 500).map((t) => t.id));
-  const tiny = placeAndConnect(h, 60, 150, 0, larger, 1, () => {}) ?? placeAndConnect(h, 150, 240, 0, larger, 1, () => {});
+  const tiny = placeAndConnect(h, 60, 150, 0, larger, 1, () => {}, true) ?? placeAndConnect(h, 150, 240, 0, larger, 1, () => {}, true);
   check(!!tiny, 'seed 11: a railway between two tiny villages connects');
   if (tiny) {
     const populations = [tiny.TA.pop, tiny.TB.pop];

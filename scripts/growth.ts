@@ -5,8 +5,13 @@
 // npx esbuild scripts/growth.ts --bundle --platform=node --format=esm --outfile=$S/growth.mjs && node $S/growth.mjs [seeds] [years] [size]
 //   [--ai=3] [--year=1950] [--out=runs.json: dump the monthly samples] [--report=runs.json,...: report earlier dumps only]
 //   [--check-report: run checks on dumps] [--legacy-activity: compare the original 30-day cohort]
-import { readFileSync, writeFileSync } from 'node:fs';
+//   [--parallel: run at most two native worlds concurrently, then check their combined samples]
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Game } from '../src/game/game';
+import { serialize } from '../src/game/save';
 import type { Station } from '../src/game/stations';
 import { townService, GROWTH_ACTIVE_DAYS } from '../src/game/towns';
 import { MODEL_BY_ID } from '../src/game/vehicle-types';
@@ -41,14 +46,18 @@ const opt = (k: string) => argv.find((a) => a.startsWith(`--${k}=`))?.slice(k.le
 const seeds = (pos[0] ?? '7,23').split(',').map(Number);
 const YEARS = Number(pos[1] ?? 20), SIZE = Number(pos[2] ?? 768), NAI = Number(opt('ai') ?? 3);
 const START = Number(opt('year') ?? 1950);
+// Optional native checkpoints make late failures reproducible without another twenty-year run.
+const snapshots = opt('snapshots');
+if (snapshots) mkdirSync(snapshots, { recursive: true });
 // Diagnostic comparison with the original 30-day activity cohort; normal checks follow townService.
 const legacyActivity = argv.includes('--legacy-activity');
 const defaultTowns = (size: number) => Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2)));
 
 /** One seed: AI companies build their networks; monthly samples of every town. */
-function simulate(seed: number): Run {
+function simulate(seed: number, created?: (townCount: number) => void): Run {
   const T0 = performance.now();
   const g = Game.create({ size: SIZE, seed, towns: defaultTowns(SIZE), hilliness: 'hilly', water: 'medium', startYear: START, aiCompanies: NAI });
+  created?.(g.towns.list.length);
   const genMs = performance.now() - T0;
   // passengers who gave up waiting, counted independently of the game's counters (the queue cap: trimWaiting)
   const lostSt = new Map<number, number>(), lostTown = new Map<number, number>();
@@ -98,6 +107,7 @@ function simulate(seed: number): Run {
       yGen += town.passGenLast;
     }
     lostSt.clear(); lostTown.clear(); calls.clear();
+    if (snapshots && g.day % 720 === 0) writeFileSync(join(snapshots, `seed-${seed}-day-${g.day}.json`), JSON.stringify(serialize(g)));
     if (g.day % 360 === 0) {
       const y: Year = { year: START + g.day / 360 - 1, gen: yGen, lost: yLost, ms: yMs, ticks: yTicks, ambient: g.vehicles.ambient.length, vehicles: g.vehicles.map.size, pop: g.towns.list.reduce((a, t) => a + t.pop, 0) };
       yearly.push(y);
@@ -234,13 +244,109 @@ function report(runs: Run[], checks: boolean) {
   if (p !== undefined && u !== undefined) check(p > u, 'poorly served towns grow faster than unserved ones');
 }
 
-// --report=a.json,b.json: report earlier dumps; --check-report also runs history and report assertions.
-const reportOnly = opt('report');
-const checkReport = argv.includes('--check-report');
-if (!reportOnly || checkReport) historyChecks();
-const runs: Run[] = reportOnly ? reportOnly.split(',').flatMap((f) => JSON.parse(readFileSync(f, 'utf8')) as Run[]) : seeds.map(simulate);
-const out = opt('out');
-if (out && !reportOnly) writeFileSync(out, JSON.stringify(runs));
-report(runs, !reportOnly || checkReport);
-console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
-process.exitCode = fails.length ? 1 : 0;
+/** Only complete native samples from the requested worker can enter the combined report. */
+function workerRun(value: unknown, seed: number): Run | null {
+  if (!value || typeof value !== 'object') return null;
+  const envelope = value as { version?: number; start?: number; ai?: number; actualTownCount?: number; failures?: unknown; run?: Run };
+  const r = envelope.run;
+  // The native loop completes whole days, including the final day of a fractional horizon.
+  const days = Math.max(0, Math.ceil(YEARS * 360));
+  const finite = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+  if (envelope.version !== 1 || envelope.start !== START || envelope.ai !== NAI ||
+      !Array.isArray(envelope.failures) || !envelope.failures.every((f) => typeof f === 'string') ||
+      !r || r.seed !== seed || r.size !== SIZE || r.years !== YEARS ||
+      !Number.isInteger(envelope.actualTownCount) || envelope.actualTownCount! < 0 || envelope.actualTownCount! > defaultTowns(SIZE) ||
+      !Array.isArray(r.towns) || r.towns.length !== envelope.actualTownCount ||
+      !Array.isArray(r.yearly) || r.yearly.length !== Math.floor(days / 360)) return null;
+  const ids = new Set<number>();
+  for (const t of r.towns) {
+    if (!t || !Number.isInteger(t.id) || t.id !== ids.size || ids.has(t.id) || typeof t.name !== 'string' ||
+        typeof t.profile !== 'string' || !finite(t.pop0) || !Array.isArray(t.months) || t.months.length !== Math.floor(days / 30)) return null;
+    ids.add(t.id);
+    for (const m of t.months) if (!m || !['pop', 'act', 'act90', 'catch', 'gen', 'trans', 'lost', 'boarded', 'rating', 'calls', 'score', 'speed']
+      .every((k) => finite(m[k as keyof Month]))) return null;
+  }
+  for (const [i, y] of r.yearly.entries()) if (!y || y.year !== START + i ||
+    !['gen', 'lost', 'ms', 'ticks', 'ambient', 'vehicles', 'pop'].every((k) => finite(y[k as keyof Year]))) return null;
+  return r;
+}
+
+/** Workers share this exact bundle; only the parent runs history and cross-world assertions. */
+async function parallelRuns(): Promise<Run[] | null> {
+  // Checkpoint callers retain raw worker evidence even if a gate kills the parent mid-run.
+  const scratch = mkdtempSync(join(snapshots ?? tmpdir(), snapshots ? 'workers-' : 'railfever-growth-workers-'));
+  const results: { code: number | null; signal: string | null; error?: string }[] = [];
+  let next = 0;
+  try {
+    async function worker() {
+      while (next < seeds.length) {
+        const i = next++, output = join(scratch, `${i}.json`), log = join(scratch, `${i}.log`);
+        const args = [process.argv[1], String(seeds[i]), String(YEARS), String(SIZE), `--ai=${NAI}`, `--year=${START}`, `--growth-worker=${output}`];
+        if (snapshots) args.push(`--snapshots=${snapshots}`);
+        if (legacyActivity) args.push('--legacy-activity');
+        console.log(`growth worker seed ${seeds[i]} starting; native log ${log}; report ${output}`);
+        const fd = openSync(log, 'w');
+        try {
+          results[i] = await new Promise((resolve) => {
+            const child = spawn(process.execPath, args, { stdio: ['ignore', fd, fd] });
+            let error: string | undefined;
+            child.on('error', (e) => { error = e.message; });
+            child.on('close', (code, signal) => resolve({ code, signal, error }));
+          });
+        } catch (e) {
+          results[i] = { code: null, signal: null, error: String(e) };
+        } finally { closeSync(fd); }
+        const result = results[i];
+        console.log(`growth worker seed ${seeds[i]} finished (exit ${result.code}, signal ${result.signal ?? 'none'}${result.error ? `, ${result.error}` : ''})`);
+      }
+    }
+    // A worker setup failure must not abandon its still-running sibling.
+    const settled = await Promise.allSettled(Array.from({ length: Math.min(2, seeds.length) }, () => worker()));
+    for (const result of settled) if (result.status === 'rejected') check(false, `native worker setup failed: ${String(result.reason)}`);
+    const runs: Run[] = [];
+    // Replay all native output in the original seed order, including failed workers' diagnostics.
+    for (const [i, seed] of seeds.entries()) {
+      try { process.stdout.write(readFileSync(join(scratch, `${i}.log`), 'utf8')); }
+      catch (e) { check(false, `seed ${seed}: native worker log unavailable: ${String(e)}`); }
+      const status = results[i] ?? { code: null, signal: null, error: 'worker did not start' };
+      check(status.code === 0 && !status.signal && !status.error,
+        `seed ${seed}: native worker completed (exit ${status.code}, signal ${status.signal ?? 'none'}${status.error ? `, ${status.error}` : ''})`);
+      let run: Run | null = null;
+      try {
+        const value = JSON.parse(readFileSync(join(scratch, `${i}.json`), 'utf8'));
+        run = workerRun(value, seed);
+        check(Array.isArray(value.failures) && value.failures.length === 0, `seed ${seed}: native worker counter checks passed`);
+      } catch (e) { console.log(`  seed ${seed}: unreadable worker report: ${String(e)}`); }
+      check(run !== null, `seed ${seed}: complete native worker report matches the requested world`);
+      if (run) runs.push(run);
+    }
+    return runs.length === seeds.length ? runs : null;
+  } finally {
+    // Never remove caller-owned checkpoints or retained timeout/failure evidence.
+    if (!snapshots) rmSync(scratch, { recursive: true, force: true });
+    else console.log(`Native growth worker evidence retained in ${scratch}`);
+  }
+}
+
+const workerOutput = opt('growth-worker');
+if (workerOutput) {
+  if (seeds.length !== 1) throw new Error('A native growth worker requires exactly one seed');
+  let actualTownCount = -1;
+  const run = simulate(seeds[0], (count) => { actualTownCount = count; });
+  writeFileSync(workerOutput, JSON.stringify({ version: 1, start: START, ai: NAI, actualTownCount, failures: fails, run }));
+  process.exitCode = fails.length ? 1 : 0;
+} else {
+  // --report=a.json,b.json: report earlier dumps; --check-report also runs history and report assertions.
+  const reportOnly = opt('report');
+  const checkReport = argv.includes('--check-report');
+  if (!reportOnly || checkReport) historyChecks();
+  const runs: Run[] | null = reportOnly ? reportOnly.split(',').flatMap((f) => JSON.parse(readFileSync(f, 'utf8')) as Run[]) :
+    argv.includes('--parallel') ? await parallelRuns() : seeds.map(simulate);
+  const out = opt('out');
+  if (runs) {
+    if (out && !reportOnly) writeFileSync(out, JSON.stringify(runs));
+    report(runs, !reportOnly || checkReport);
+  } else console.log('Combined report unavailable: at least one native world report is incomplete.');
+  console.log(fails.length ? `\n${fails.length} FAILURES` : '\nALL CHECKS PASSED');
+  process.exitCode = fails.length ? 1 : 0;
+}

@@ -16,11 +16,12 @@ import type { Vehicle, MailGroup } from './vehicle';
 import type { Hop, Line } from './lines';
 import type { Town } from './towns';
 import { RNG } from './rng';
+import { successorCompanyId } from './economy';
 import { GEN_RATE, type ForecastSite } from './demand';
 import { MAIL_PER_PAX, MAIL_ERA, MAIL_STATION, MAIL_FEEDER, MAIL_CAPTURE, WALK_TRIP_INTENSITY } from './constants';
 import { simNow, mailFare, mailTripFactor, transferWalkTime } from './fares';
 import { boarding, servesStation, patternHeadways, linePatterns, mailFleet, TRANSFER_PENALTY_S } from './patterns';
-import { readWalkingCatchment, planWalkingCatchment, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, type WalkingCatchment } from './catchment';
+import { readWalkingCatchment, planWalkingCatchment, walkWeight, coverOf, walkClaimShares, prospectiveWalkGroups, forecastRailLinks, type WalkingCatchment } from './catchment';
 
 /**
  * A leg mail has been carried on: the vehicle, its line and its owner then, and the straight-line distance (units)
@@ -155,9 +156,8 @@ function cargoGroup(alight: number, dest: number, count: number, from: number, j
 
 /** Receipts go to the vehicle's owner, else the recorded operator (a bought company: its buyer); the line is a legacy fallback. */
 function payee(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number): number {
-  let who = v ? v.owner : g.companies[owner] ? owner : line ? line.owner : owner;
-  for (let k = 0; k < 8 && g.companies[who]?.defunct && g.companies[who].boughtBy !== undefined; k++) who = g.companies[who].boughtBy!;
-  return who;
+  const who = v ? v.owner : g.companies[owner] ? owner : line ? line.owner : owner;
+  return successorCompanyId(g.companies, who);
 }
 /** Book a share of mail receipts: the company ('mailIncome'), the vehicle, its line (total and mail part), the AI's rail ledger. */
 function book(g: Game, v: Vehicle | undefined, line: Line | undefined, owner: number, amount: number) {
@@ -647,7 +647,7 @@ export class MailModel {
    */
   forecastPops(points: MailPoint[], headway: number, line?: Line): number[] {
     const g = this.g, extra = headway > 0 ? 1 / headway : 0;
-    const prospective = prospectiveWalkGroups(g, points);
+    const railLinks = forecastRailLinks(g, points), prospective = prospectiveWalkGroups(g, points, railLinks);
     const keys = points.map((p, i) => ('id' in p ? p.id : 'join' in p && p.join ? p.join.id : -1 - i));
     const own = new Set(keys.filter(id => id >= 0));
     const sites: AllocSite[] = [];
@@ -661,7 +661,7 @@ export class MailModel {
       added.add(keys[i]);
       if ('id' in p) { if (reachable(p)) sites.push(this.site(p, this.feederQuality(p, line, extra))); return; }
       const townId = 'townId' in p ? p.townId : g.towns.nearest(p.x, p.z)?.id ?? -1;
-      const walk = 'walk' in p ? p.walk.buildings : planWalkingCatchment(g, p).buildings;
+      const walk = 'walk' in p ? p.walk.buildings : planWalkingCatchment(g, p, railLinks.get(p)).buildings;
       const access = 'access' in p && p.access ? p.access.tracks.flatMap((t) => [t.start, t.end]) : undefined;
       sites.push({ key: keys[i], townId, walk, quality: feederQualityOf(extra, g.towns.list[townId]?.pop ?? 0), feeders: () => g.demand.feederReachAt(p, access, MAIL_FEEDER.reach) });
     });

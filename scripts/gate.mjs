@@ -1,0 +1,194 @@
+// Full headless release gate. Each invocation owns its checkout, processes and log directory.
+import { spawn, spawnSync } from 'node:child_process';
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { loadavg, tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { createRequire } from 'node:module';
+
+const active = new Set();
+let interrupted = false;
+function stop(child) {
+  try {
+    if (process.platform === 'win32') child.kill('SIGKILL');
+    else process.kill(-child.pid, 'SIGKILL');
+  } catch { /* The process may already have finished. */ }
+}
+for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => {
+  interrupted = true;
+  for (const child of active) stop(child);
+});
+function git(args, cwd) {
+  const r = spawnSync('git', args, { cwd, encoding: 'utf8' });
+  if (r.status !== 0) throw new Error(r.stderr?.trim() || r.error?.message || `git ${args[0]} failed`);
+  return r.stdout.trim();
+}
+function command(program, args, cwd, log, seconds = 1800) {
+  if (interrupted) { writeFileSync(log, 'Gate interrupted.\n'); return Promise.resolve(130); }
+  return new Promise((done) => {
+    const fd = openSync(log, 'w');
+    const child = spawn(program, args, { cwd, stdio: ['ignore', fd, fd], detached: process.platform !== 'win32' });
+    closeSync(fd);
+    active.add(child);
+    let timedOut = false;
+    const timer = setTimeout(() => { timedOut = true; stop(child); }, seconds * 1000);
+    child.on('error', (error) => { writeFileSync(log, `${error.stack}\n`, { flag: 'a' }); });
+    child.on('close', (code) => {
+      clearTimeout(timer); active.delete(child);
+      if (timedOut) writeFileSync(log, `\nGate timed out after ${seconds}s.\n`, { flag: 'a' });
+      done(interrupted ? 130 : timedOut ? 124 : code ?? 1);
+    });
+  });
+}
+const excluded = new Map([
+  ...['lib', 'stationlib', 'saves-harness', 'linegrow-fixtures', 'opening-fixtures', 'sectionlib', 'section-structurelib', 'network-observer'].map((n) => [n, 'shared test helper']),
+  ['saves-ui', 'browser/Chrome integration, run separately'],
+  ...['perf', 'perfbench', 'scale', 'huge-displays'].map((n) => [n, 'manual benchmark']),
+]);
+let root, scratch, work, added = false;
+let failed = false;
+try {
+  root = git(['rev-parse', '--show-toplevel'], process.cwd());
+  const require = createRequire(join(root, 'package.json'));
+  // These checks are mandatory; missing test dependencies must never silently reduce coverage.
+  for (const dependency of ['esbuild', 'jsdom', 'fake-indexeddb']) {
+    try { require.resolve(dependency); }
+    catch { throw new Error(`Missing required headless dependency ${dependency}; run npm ci before validation.`); }
+  }
+  const { build } = require('esbuild');
+  const ref = process.argv[2] || 'HEAD';
+  const shardArg = process.argv.slice(4).find(a => a.startsWith('--shard='));
+  const shardMatch = shardArg?.match(/^--shard=([1-9]\d*)\/([1-9]\d*)$/);
+  if (process.argv.length > 5 || process.argv.slice(4).some(a => a !== shardArg) || shardArg && !shardMatch)
+    throw new Error('Usage: gate.mjs [ref] [logs] [--shard=index/count]');
+  const shard = shardMatch ? { index: Number(shardMatch[1]), count: Number(shardMatch[2]) } : { index: 1, count: 1 };
+  if (shard.index > shard.count || shard.count > 16) throw new Error('Invalid gate shard; use 1 <= index <= count <= 16.');
+  const outputParent = resolve(root, process.argv[3] || '.gate');
+  mkdirSync(outputParent, { recursive: true });
+  const logs = mkdtempSync(join(outputParent, 'run-'));
+  scratch = mkdtempSync(join(tmpdir(), 'rf-gate-'));
+  work = join(scratch, 'checkout');
+  git(['worktree', 'add', '--detach', work, ref], root);
+  added = true;
+  symlinkSync(join(root, 'node_modules'), join(work, 'node_modules'), 'junction');
+  symlinkSync(join(root, 'node_modules'), join(logs, 'node_modules'), 'junction');
+  console.log(`ref ${git(['log', '--oneline', '-1'], work)}; load: ${loadavg().map((n) => n.toFixed(2)).join(' ')}; logs: ${logs}`);
+  for (const [name, args] of [['typecheck', ['run', 'typecheck']], ['build', ['run', 'build']]]) {
+    const rc = await command('npm', args, work, join(logs, `${name}.log`));
+    console.log(`${name}: ${rc === 0 ? 'ok' : `FAILED rc=${rc}`} (see ${name}.log)`);
+    if (rc !== 0) failed = true;
+  }
+  const scripts = readdirSync(join(work, 'scripts')).filter((f) => f.endsWith('.ts')).map((f) => f.slice(0, -3)).sort();
+  for (const name of scripts) if (excluded.has(name)) console.log(`skip ${name}: ${excluded.get(name)}`);
+  const jobs = scripts.filter((n) => !excluded.has(n) && !['ai', 'catchperf', 'savesize', 'companies'].includes(n)).flatMap((script) => {
+    switch (script) {
+      case 'smoke': return [7, 11, 23].map((n) => ({ name: `smoke${n}`, script, args: [String(n)] }));
+      case 'replay': return [7, 23].map((n) => ({ name: `replay${n}`, script, args: [String(n)] }));
+      case 'road-controller-replay': return [
+        'bus', 'coach', 'road', 'market-bus', 'market-coach', 'selector', 'plan-join', 'plan-extend', 'plan-upgrade',
+      ].map((kind) => ({ name: `${script}-${kind}`, script, args: [`--case=${kind}`] }));
+      case 'growth': return [{ name: script, script, args: ['--parallel'] }];
+      case 'ainet': return [{ name: script, script, args: ['scenarios'] }];
+      case 'migrate': return [{ name: script, script, args: [join(work, 'scripts/fixtures/saves')] }];
+      case 'switches': return [[], ['--memory'], ['--resume']].map((args) => ({ name: `switches${args[0] || ''}`, script, args }));
+      default: return [{ name: script, script, args: [] }];
+    }
+  });
+  // Report focused contract failures before long native-world sweeps occupy both workers.
+  // Every job still runs with the same seeds, horizons, assertions and timeout.
+  const sweeps = new Set(['aijobs', 'aimail', 'aiplan', 'airail', 'capacity-frequency', 'cargoroute',
+    'citylines', 'companies', 'deadlock', 'depots', 'doubleconn', 'economy', 'entrances', 'entrancecache',
+    'growth', 'growthcap', 'linegrow', 'platforms', 'replay', 'smoke', 'terrain-fit', 'throughcap',
+    'townfit', 'uipure', 'urban', 'urbanecon', 'urbanhandoff', 'urban-staging', 'urbantrunks',
+    'ai-selection', 'ai-selection-quotes', 'rail-continuation', 'hsr-continuation', 'road-project-continuation',
+    'road-controller-replay', 'road-build-variants', 'road-project-cancellation', 'road-cleanup-titles',
+    'share-continuation', 'crosscity-continuation']);
+  jobs.sort((a, b) => Number(sweeps.has(a.script)) - Number(sweeps.has(b.script)));
+  const inventory = [...jobs.map(j => j.name), ...['companies', 'savesize', 'ai', 'catchperf'].filter(n => scripts.includes(n))];
+  const assigned = new Set(inventory.filter((_, i) => i % shard.count === shard.index - 1));
+  const coverage = { revision: git(['rev-parse', 'HEAD'], work), shard, inventory, assigned: [...assigned], completed: [] };
+  const coverageFile = join(logs, 'coverage.json');
+  writeFileSync(coverageFile, JSON.stringify(coverage, null, 2));
+  console.log(`shard ${shard.index}/${shard.count}: ${assigned.size}/${inventory.length} checks; coverage: ${coverageFile}`);
+  async function run({ name, script, args }) {
+    const dir = join(logs, name), log = join(logs, `${name}.log`);
+    mkdirSync(dir);
+    const start = Date.now();
+    const options = {
+      absWorkingDir: work, entryPoints: [`scripts/${script}.ts`], bundle: true, platform: 'node', format: 'esm',
+      outfile: join(dir, `${script}.mjs`), external: ['jsdom', 'fake-indexeddb'], logLevel: 'silent',
+    };
+    if (script === 'switches') {
+      const canonicalWork = realpathSync(work);
+      const adapters = new Set(['render/renderer', 'ui/ui', 'ui/fonts', 'audio/engine'].map((n) => join(canonicalWork, `src/${n}.ts`)));
+      options.plugins = [{ name: 'save-ui-adapters', setup(b) {
+        b.onResolve({ filter: /^\./ }, (a) => {
+          const file = resolve(a.resolveDir, a.path);
+          if (adapters.has(file) || adapters.has(`${file}.ts`)) return { path: join(canonicalWork, 'scripts/saves-harness.ts') };
+        });
+      } }];
+      options.loader = { '.css': 'empty', '.woff': 'empty', '.woff2': 'empty' };
+    }
+    let rc;
+    const diagnostics = script === 'headway' ? [`--snapshots=${join(dir, 'worlds')}`, `--json=${join(dir, 'report.json')}`]
+      : script === 'growth' ? [`--snapshots=${join(dir, 'worlds')}`, `--out=${join(dir, 'report.json')}`]
+      : script === 'growthcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--checkpoint=${join(dir, 'investment.json')}`]
+      : script === 'throughcap' ? [`--diagnostics=${join(dir, 'worlds')}`, `--json=${join(dir, 'report.json')}`] : [];
+    try { await build(options); rc = await command(process.execPath, [`${script}.mjs`, ...args, ...diagnostics], dir, log); }
+    catch (error) { writeFileSync(log, `${error.stack}\n`); rc = 1; }
+    const output = readFileSync(log, 'utf8');
+    const summary = output.split('\n').filter((l) => /ALL CHECKS PASSED|ALL INVARIANTS HELD|ALL PASSED|ALL \d+ .*PASSED|^PASS|PURITY PASSED|checks passed|\d+ FAILURES?|FAIL/.test(l)).at(-1)?.slice(0, 140) || '';
+    const result = `${name}: ${rc === 0 ? 'ok' : `FAILED rc=${rc}`} (${((Date.now() - start) / 1000).toFixed(1)}s) ${summary}`;
+    writeFileSync(join(logs, `${name}.res`), `${result}\n`);
+    coverage.completed.push({ name, rc });
+    writeFileSync(coverageFile, JSON.stringify(coverage, null, 2));
+    console.log(result);
+    if (rc !== 0) console.log(output.split('\n').filter(l => /FAIL|Error|Exception|Assertion|Gate timed out/.test(l))
+      .slice(-30).map(l => l.slice(0, 1500)).join('\n'));
+    return { rc, output };
+  }
+  // Two workers take the next independent check when ready, so a long simulation cannot leave
+  // half the battery waiting behind it. Timing-sensitive tests run after both workers finish.
+  let nextJob = 0;
+  // Run long endurance and frame-time checks without the queue competing for CPU. Growth
+  // owns at most two native child worlds; its full combined assertions and deadline remain intact.
+  const isolated = new Set(['airail', 'growth', 'linegrow', 'tram-planner-parity']);
+  const selected = jobs.filter(j => assigned.has(j.name) && !isolated.has(j.name));
+  const lanes = await Promise.allSettled([0, 1].map(async () => {
+    while (nextJob < selected.length && !interrupted) if ((await run(selected[nextJob++])).rc !== 0) failed = true;
+  }));
+  for (const lane of lanes) if (lane.status === 'rejected') throw lane.reason;
+  for (const job of jobs.filter(j => assigned.has(j.name) && isolated.has(j.name)))
+    if (!interrupted && (await run(job)).rc !== 0) failed = true;
+  // The company audit also runs a child world. Keep its two-world budget separate from the queue.
+  if (assigned.has('companies') && !interrupted && (await run({ name: 'companies', script: 'companies', args: [] })).rc !== 0) failed = true;
+  // Save capture has frame-time budgets as well as integrity assertions. Measure those after the
+  // simulation workers exit so unrelated map generation and garbage collection cannot distort them.
+  if (assigned.has('savesize') && !interrupted && (await run({ name: 'savesize', script: 'savesize', args: [] })).rc !== 0) failed = true;
+  if (assigned.has('ai') && !interrupted) {
+    const timingOnly = ({ rc, output }) => {
+      const failures = output.split('\n').filter((l) => l.includes('FAIL:'));
+      return rc === 1 && failures.length > 0 && failures.every((l) => l.includes('stays sliced') || l.includes('AI time per day < 5 ms')) && !/\b(?:Error|Exception):/.test(output);
+    };
+    let result = await run({ name: 'ai', script: 'ai', args: ['23', '3', '512', '3'] });
+    if (result.rc !== 0 && timingOnly(result)) {
+      console.log('ai: timing-only failures; rerunning once (original log preserved)');
+      result = await run({ name: 'ai-rerun', script: 'ai', args: ['23', '3', '512', '3'] });
+      if (result.rc !== 0 && timingOnly(result)) console.log(`ai: repeated timing-only failure at load ${loadavg().map((n) => n.toFixed(2)).join(' ')}; both logs retained for diagnosis`);
+      if (result.rc !== 0) failed = true;
+    } else if (result.rc !== 0) failed = true;
+  }
+  if (assigned.has('catchperf') && !interrupted && (await run({ name: 'catchperf', script: 'catchperf', args: [] })).rc !== 0) failed = true;
+  if ([...assigned].some(name => !coverage.completed.some(r => r.name === name))) failed = true;
+  if (interrupted) failed = true;
+} catch (error) {
+  console.error(error.stack); failed = true;
+} finally {
+  // Only remove the checkout created by this invocation. Never prune or touch shared worktrees.
+  if (added) {
+    try { git(['worktree', 'remove', '--force', work], root); }
+    catch (error) { console.error(`Cleanup failed; checkout retained at ${work}: ${error.message}`); failed = true; }
+  }
+  if (scratch && (!added || !work || !existsSync(work))) rmSync(scratch, { recursive: true, force: true });
+}
+console.log(`GATE: ${failed ? 'FAIL' : 'PASS'}`);
+process.exitCode = interrupted ? 130 : failed ? 1 : 0;

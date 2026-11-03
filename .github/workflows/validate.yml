@@ -1,0 +1,59 @@
+name: Validate game
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  headless:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Run full headless gate
+        run: npm run gate -- HEAD "$RUNNER_TEMP/railfever-gate" --shard=${{ matrix.shard }}/4
+      - name: Upload check coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-coverage-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: ${{ runner.temp }}/railfever-gate/**/coverage.json
+          if-no-files-found: error
+          retention-days: 7
+      - name: Upload failed check logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gate-logs-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.shard }}
+          path: |
+            ${{ runner.temp }}/railfever-gate/**/*.log
+            ${{ runner.temp }}/railfever-gate/**/*.res
+            ${{ runner.temp }}/railfever-gate/**/*.json
+            !${{ runner.temp }}/railfever-gate/**/node_modules/**
+          if-no-files-found: ignore
+          retention-days: 7
+  gate:
+    if: always()
+    needs: headless
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require every headless shard
+        env:
+          RESULT: ${{ needs.headless.result }}
+        run: test "$RESULT" = success

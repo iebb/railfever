@@ -214,14 +214,40 @@ export class WindowManager {
 
   /** Tab bar under the header; clicking a tab re-renders the window. */
   setTabs(w: Win, tabs: [string, string][], render: () => void) {
+    // refreshAll renders children into a temporary body; panel semantics belong to the live window.
+    const panel = w.el.querySelector('.win-body') ?? w.body;
+    if (!tabs.length) {
+      w.tabsEl.replaceChildren(); w.tabsEl.style.display = 'none'; w.tabsEl.dataset.sig = ''; w.tab = '';
+      panel.removeAttribute('role'); panel.removeAttribute('aria-labelledby');
+      return;
+    }
     if (!w.tab || !tabs.some(([t]) => t === w.tab)) w.tab = tabs[0][0];
+    const panelId = `win-${w.id}-panel`, tabId = (t: string) => `win-${w.id}-tab-${t}`;
+    panel.id = panelId;
+    panel.setAttribute('role', 'tabpanel');
+    panel.setAttribute('aria-labelledby', tabId(w.tab));
     const sig = tabs.map(([t, l]) => t + ':' + l).join('|') + '#' + w.tab;
     if (w.tabsEl.dataset.sig === sig) return;
     w.tabsEl.dataset.sig = sig;
     w.tabsEl.style.display = '';
-    w.tabsEl.replaceChildren(...tabs.map(([t, label]) => h('button', {
+    const activate = (t: string) => {
+      if (w.tab === t) return;
+      const focused = w.tabsEl.contains(document.activeElement);
+      w.tab = t; w.last = undefined; render();
+      // Rendering replaces the tab buttons. Keep keyboard focus in the tab bar after activation.
+      if (focused) (w.tabsEl.querySelector('[aria-selected="true"]') as HTMLElement | null)?.focus({ preventScroll: true });
+    };
+    w.tabsEl.replaceChildren(...tabs.map(([t, label], i) => h('button', {
       class: 'tab' + (t === w.tab ? ' on' : ''), role: 'tab', 'aria-selected': t === w.tab ? 'true' : 'false',
-      onclick: () => { if (w.tab === t) return; w.tab = t; w.last = undefined; render(); },
+      id: tabId(t), 'aria-controls': panelId,
+      tabindex: t === w.tab ? '0' : '-1',
+      onclick: () => activate(t),
+      onkeydown: (e: KeyboardEvent) => {
+        const at = e.key === 'ArrowRight' ? (i + 1) % tabs.length : e.key === 'ArrowLeft' ? (i + tabs.length - 1) % tabs.length
+          : e.key === 'Home' ? 0 : e.key === 'End' ? tabs.length - 1 : -1;
+        if (at < 0 || e.altKey || e.ctrlKey || e.metaKey) return;
+        e.preventDefault(); e.stopPropagation(); activate(tabs[at][0]);
+      },
     }, label)));
   }
 
@@ -250,8 +276,12 @@ export class WindowManager {
       const real = w.body;
       const tmp = document.createElement('div');
       w.body = tmp;
-      try { w.refresh(); } catch (e) { console.error(e); }
-      w.body = real;
+      let complete = false;
+      try { w.refresh(); complete = true; }
+      catch (e) { console.error(e); }
+      finally { w.body = real; }
+      // A failed renderer must not replace usable controls with partial markup. A refresh may also close/reopen it.
+      if (!complete || this.wins.get(w.id) !== w) continue;
       const html = tmp.innerHTML;
       if (html === w.last) continue;
       w.last = html;

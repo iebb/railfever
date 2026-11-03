@@ -62,7 +62,11 @@ const near = (a: number, b: number, eps = 1e-6) => Math.abs(a - b) < eps;
   const built: [Station, string][] = [];
   for (const [p, tt] of [[pm, 'metro'], [pl, 'lightrail'], [pe, 'electric']] as const) {
     const id = g.stations.nextId;
-    check(!g.stations.commitRail(p, 0), `${tt} station built`);
+    // Earlier facilities can split the shared access road. Re-survey each unchanged site against
+    // that actual road graph before committing its priced access connection.
+    const current = g.stations.planRail(p.x, p.z, p.angle, p.length, p.tracks, 0, { trackType: p.trackType, mode: p.mode });
+    const err = g.stations.commitRail(current, 0);
+    check(!err, `${tt} station built (${err ?? 'ok'})`);
     built.push([g.stations.get(id)!, tt]);
   }
   const net = g.world.net;

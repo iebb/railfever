@@ -17,7 +17,7 @@ import { connectStationThroat, finishDoubleTrack, planStationOnTrack, commitStat
 import { autoSignalLine } from '../src/game/signals';
 import { planEdge, commitProposal } from '../src/game/construction';
 import { serialize, deserialize } from '../src/game/save';
-import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask, networkDaily } from '../src/game/ai-network';
+import { runNetworkTask, networkPlanner, networkProfile, scheduleNetworkTask, networkDaily, networkItem } from '../src/game/ai-network';
 import { terminusOf, outerEnd, planTerminusYard, planProspectiveTerminusYard, buildTerminusYard, cityStationSpacing, lineTrackAt } from '../src/game/ai-grow';
 import { Train } from '../src/game/train';
 import { depotUpkeep } from '../src/game/build-ops';
@@ -349,7 +349,20 @@ if (run('nopay')) {
 }
 
 if (run('busy')) {
-  console.log('busy: occupied depot leads keep their assets and retry on a saved short deadline');
+  console.log('busy: legacy construction-derived fleet bids keep occupied depot leads and retry on a saved short deadline');
+  // Saves predating standalone fleet surveys contain only ext/fill options. Preserve that construction
+  // compatibility premise: an occupied lead blocks geometry changes, while new no-works fleet bids
+  // can lawfully queue in their unchanged depot (covered separately by fleet-investment.ts).
+  const legacyLoaded = new WeakSet<AIController>(), legacySetup = new WeakSet<AIController>();
+  const legacySurvey = (g: Game, ai: AIController) => {
+    if (legacyLoaded.has(ai) && !legacySetup.has(ai)) return;
+    const cursor = networkItem(ai)?.grow;
+    if (cursor?.at !== 1 || !cursor.opts?.some(o => o.kind === 'fleet')) return;
+    cursor.opts = cursor.opts.filter(o => o.kind !== 'fleet');
+    legacyLoaded.add(ai); // Only this loaded survey is legacy; every future survey uses current options.
+    const data = JSON.stringify(serialize(g));
+    check(JSON.stringify(serialize(deserialize(JSON.parse(data)))) === data, 'busy: original ext/fill-only survey save round-trips exactly');
+  };
   const {g,ai,line,depot}=presholm('east','old',6,4500);
   check(g.vehicles.buyTrain(depot,[M('lrv_b')],line.id) instanceof Train,'busy: a real departure occupies the old depot approach');
   const construction=ai.eco.thisYear.construction,stations=g.stations.map.size;
@@ -357,12 +370,13 @@ if (run('busy')) {
   g.aiEnabled=true;scheduleNetworkTask(ai,'extend',0);
   const until=g.day+100;
   while(g.day<until) {
-    g.stepTick();replay?.stepTick();
+    g.stepTick();replay?.stepTick();legacySurvey(g,ai);if(replay)legacySurvey(replay,replay.aiOf(ai.companyId)!);
     if(g.tick%g.ticksPerDay)continue;
     const data=serialize(g).aiNetwork, state=data?.companies.find(([id])=>id===ai.companyId)?.[1];
     const cursors=state?.job?.items?.flatMap(i=>i.grow?[i.grow]:[])??[];
     if(!flag&&cursors.some(c=>c.encounteredBusy&&!c.best)) {
       flag=true;const frozen=JSON.stringify(serialize(g));replay=deserialize(JSON.parse(frozen));
+      legacyLoaded.add(replay.aiOf(ai.companyId)!);
       check(JSON.stringify(serialize(replay))===frozen,'busy: saved occupied-approach decision round-trips exactly');
       check(g.stations.map.size===stations&&ai.eco.thisYear.construction===construction,
         'busy: blocked preflight keeps stations, lead, depot and paid construction unchanged');
@@ -385,7 +399,7 @@ if (run('busy')) {
   poor.g.aiEnabled=true;scheduleNetworkTask(poor.ai,'extend',0);
   let economicDeadline=false;const stop=poor.g.day+30;
   while(poor.g.day<stop&&!economicDeadline) {
-    poor.g.stepTick();if(poor.g.tick%poor.g.ticksPerDay)continue;
+    poor.g.stepTick();legacySurvey(poor.g,poor.ai);if(poor.g.tick%poor.g.ticksPerDay)continue;
     const state=serialize(poor.g).aiNetwork?.companies.find(([id])=>id===poor.ai.companyId)?.[1];
     const care=state?.care.find(([key])=>key==='grow'+poor.line.id)?.[1];
     if(care!==undefined){economicDeadline=true;check(care===poor.g.day+360,'busy: unchanged losing district keeps the economic year-long cooldown');}
@@ -400,14 +414,19 @@ if (run('busy')) {
   const selected=presholm('east','old',6,1200),sg=selected.g,sa=selected.ai;
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],null);
   sg.vehicles.buyTrain(selected.depot,[M('lrv_b')],selected.line.id);
+  // Prepare a genuine old-version pending bid under its ext/fill-only survey, then permanently
+  // leave that setup mode. The saved bid and all subsequent retries run with current options.
+  legacySetup.add(sa);
   sg.aiEnabled=true;scheduleNetworkTask(sa,'extend',0);
   let chosen=false;const limit=sg.day+150;
   while(sg.day<limit&&!chosen) {
-    runDays(sg,1);
+    runDays(sg,1,()=>legacySurvey(sg,sa));
     const state=serialize(sg).aiNetwork?.companies.find(([id])=>id===sa.companyId)?.[1];
-    chosen=state?.job?.items?.some(i=>!!i.grow?.best?.fleet&&i.grow.at>(i.grow.opts?.length??0))??false;
+    chosen=state?.job?.items?.some(i=>!!i.grow?.best?.fleet&&i.grow.at>(i.grow.opts?.length??0)
+      &&i.grow.opts?.[i.grow.best.opt]?.kind!=='fleet')??false;
   }
-  check(chosen,'busy: an ordinary survey reaches a saved feasible fleet-first purchase');
+  legacySetup.delete(sa);
+  check(chosen,'busy: native legacy ext/fill surveys reach a genuine saved feasible fleet-first purchase');
   if(chosen) {
     // (the saved job waits while the trains run their timetable, until one leaving or entering the depot occupies its
     // approach: the purchase phase then meets it, whatever day the survey finished on)
@@ -419,6 +438,7 @@ if (run('busy')) {
     for(let k=0;k<60*TICKS_PER_DAY&&!approach();k++)sg.stepTick();
     check(approach(),'busy: a running departure occupies the same approach by the purchase phase');
     const frozen=JSON.stringify(serialize(sg)),copy=deserialize(JSON.parse(frozen));
+    legacyLoaded.add(copy.aiOf(sa.companyId)!);
     const assets=()=>JSON.stringify({money:sa.eco.money,loan:sa.eco.loan,construction:sa.eco.thisYear.construction,
       vehicles:sa.eco.thisYear.vehicles,rails:[...sg.world.net.edges.keys()],stations:[...sg.stations.map.keys()],
       depots:[...sg.depots.map.keys()],fleet:[...sg.vehicles.map.keys()]});
@@ -438,10 +458,10 @@ if (run('busy')) {
       quarter=state?.care.find(([key])=>key==='grow'+selected.line.id)?.[1]===sg.day+90
         &&state?.next.find(([task])=>task==='extend')?.[1]===sg.day+90;
     };
-    for(let k=0;k<640;k++) {sg.stepTick();copy.stepTick();paidQuarter();exact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy));}
+    for(let k=0;k<640;k++) {sg.stepTick();copy.stepTick();legacySurvey(sg,sa);legacySurvey(copy,copy.aiOf(sa.companyId)!);paidQuarter();exact&&=JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy));}
     check(exact,'busy: selected-option retry and resulting fleet replay exactly for 640 ticks');
     for(let day=0;day<60&&!sa.log.some(s=>/fleet-only investment/.test(s));day++) {
-      runDays(sg,1,paidQuarter);runDays(copy,1);
+      runDays(sg,1,()=>{legacySurvey(sg,sa);paidQuarter();});runDays(copy,1,()=>legacySurvey(copy,copy.aiOf(sa.companyId)!));
       check(JSON.stringify(serialize(sg))===JSON.stringify(serialize(copy)),
         'busy: saved retry remains exact through its next affordable fleet review');
     }

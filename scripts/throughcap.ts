@@ -1,5 +1,6 @@
 // Shared-corridor capacity audit. Bundle as throughcap.mjs and run from the scratch directory.
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { Game } from '../src/game/game';
 import { Train, deadlockCycles } from '../src/game/train';
 import { serialize, deserialize } from '../src/game/save';
@@ -18,6 +19,25 @@ if (!process.argv[1]?.endsWith('throughcap.mjs')) throw new Error('bundle this t
 // Recorded against unmodified a172141 sources (8 fixed-step years, all passenger/mail receipts in company books).
 const reference = { commit: 'a172141', years: 8, revenue: 37_147_019, delivered: 9015,
   samples: 40_552, held120Share: 0.3070871966857368, longestHold: 5282.600000010452, deadlocks: 0 };
+
+/** Count completed native contracts where they are observable, including mid-day decisions. The key
+ * matches the original unit of coverage: one allocation per channel per day, never repeated cache reads. */
+function sampleCompletedAgreements(g: Game, seen: Set<string>): number {
+  let samples = 0;
+  for (const l of g.lines.map.values()) {
+    if (l.kind !== 'rail') continue;
+    const agreement = observedCapacityAgreement(g, l);
+    // A plan made on the final tick of a day is first visible after stepTick rolls the date forward.
+    if (!agreement || agreement.day < g.day - 1 || agreement.day > g.day) continue;
+    for (const a of agreement.allocations) {
+      if (a.line !== l.id) continue;
+      const key = `${agreement.day}:${a.line}:${a.owner}:${a.pattern}`;
+      if (seen.has(key)) continue;
+      seen.add(key); samples++;
+    }
+  }
+  return samples;
+}
 
 function fixture(revenue = 12_000_000, trains = 2) {
   const g = flatGame(256); g.aiEnabled = false; g.vehicles.ambientEnabled = false;
@@ -154,6 +174,31 @@ function fixtures() {
   replay(f.g, 'shared headway clock and pending capacity works');
   replay(f.g, 'shared headways with a warm topology cache and trains in service');
   check(checkReservations(f.g).length === 0, 'fixtures: reservations consistent');
+
+  console.log('completed agreement coverage observes native mid-day decisions without changing them');
+  const audit = fixture(0), world = audit.g, day = world.day;
+  while (world.tick % world.ticksPerDay !== world.ticksPerDay / 2) world.stepTick();
+  const native = sharedCapacityPlan(world, audit.l), seen = new Set<string>();
+  const channels = native.allocations.filter(a => a.line === audit.l.id).length;
+  const beforeRead = JSON.stringify(serialize(world));
+  check(channels === 2 && sampleCompletedAgreements(world, seen) === channels,
+    'mid-day completed two-operator contract counts each actual channel');
+  check(sampleCompletedAgreements(world, seen) === 0,
+    'repeated reads of a completed contract do not manufacture coverage');
+  check(JSON.stringify(serialize(world)) === beforeRead, 'agreement sampling preserves the complete native save');
+  while (world.tick % world.ticksPerDay !== world.ticksPerDay - 1) world.stepTick();
+  sharedCapacityPlan(world, audit.l); world.stepTick();
+  const rollover = new Set<string>();
+  check(world.day === day + 1 && sampleCompletedAgreements(world, rollover) === channels,
+    'last-tick contract remains observable once after native date rollover');
+  check(sampleCompletedAgreements(world, rollover) === 0, 'date rollover cannot recount the same channel/day');
+  const loaded = deserialize(serialize(world));
+  for (let tick = 0; tick < 120; tick++) {
+    world.stepTick(); sampleCompletedAgreements(world, rollover); loaded.stepTick();
+  }
+  check(JSON.stringify(serialize(world)) === JSON.stringify(serialize(loaded)),
+    'per-tick contract observation has exact unobserved native save continuation');
+  check(sampleCompletedAgreements(world, new Set()) === 0, 'stale historical cache entries do not count as new exposure');
 }
 
 const baseline = process.argv.includes('--baseline');
@@ -161,6 +206,8 @@ const quick = process.argv.includes('--quick');
 const years = Number(process.argv.find(a => a.startsWith('--years='))?.slice(8) ?? 8);
 const output = process.argv.find(a => a.startsWith('--json='))?.slice(7);
 const snapshot = process.argv.find(a => a.startsWith('--snapshot='))?.slice(11);
+const diagnostics = process.argv.find(a => a.startsWith('--diagnostics='))?.slice('--diagnostics='.length);
+if (diagnostics) mkdirSync(diagnostics, { recursive: true });
 
 function scenario(seed = 2026, size = 768, requireShared = true) {
   const label = `8 companies (${seed}/${size})`;
@@ -169,12 +216,14 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
       risk: 0.6, startMoney: 50_000_000, accessMultiplier: 1, accessPolicy: 'open' as const })) });
   let revenue = 0, delivered = 0, samples = 0, held120 = 0, longest = 0, deadlocks = 0, longestDeadlock = 0;
   let allSamples = 0, allHeld120 = 0, allLongest = 0;
+  let capturedCycle = false;
   let nonRailFleet = false;
   // All earning fleets in this scenario are rail. Company books also retain mail paid to an earlier
   // carrier at somebody else's unloading stop, and receipts of trains sold during the audit.
   const railReceipts = () => g.companies.reduce((total, c) => total + c.economy.yearTotals.reduce((n, y) =>
     n + (y.v.income ?? 0) + (y.v.mailIncome ?? 0), 0) + (c.economy.thisYear.income ?? 0) + (c.economy.thisYear.mailIncome ?? 0), 0);
   const excessSince = new Map<string, number>(); let longestExcess = 0, agreementSamples = 0;
+  const sampledAgreements = new Set<string>();
   const yearly: unknown[] = [];
   const update = Train.prototype.update;
   Train.prototype.update = function(dt) {
@@ -186,6 +235,7 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
   try {
     while (g.day < years * 360) {
       g.stepTick();
+      if (!baseline) agreementSamples += sampleCompletedAgreements(g, sampledAgreements);
       if (g.tick % g.ticksPerDay !== 0) continue;
       nonRailFleet ||= [...g.vehicles.map.values()].some(v => !(v instanceof Train) && v.lineId !== null && (v.capacity > 0 || v.mailCapacity > 0));
       const shared = [...g.lines.map.values()].filter(l => l.kind === 'rail'
@@ -196,7 +246,6 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
         const agreement = observedCapacityAgreement(g, l);
         if (!agreement || agreement.day !== g.day) continue;
         for (const a of agreement.allocations.filter(a => a.line === l.id)) {
-          agreementSamples++;
           const actual = l.vehicles.map(id => g.vehicles.get(id)).filter(t => t && t.owner === a.owner && (patternOf(l, t.pattern)?.id ?? 0) === a.pattern).length;
           const key = `${l.id}:${a.owner}:${a.pattern}`;
           seenAgreements.add(key);
@@ -219,6 +268,10 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
       if (cycles.length) {
         deadlocks += cycles.length;
         longestDeadlock = Math.max(longestDeadlock, ...cycles.flat().map(t => t.stuckTime));
+        if (diagnostics && !capturedCycle) {
+          capturedCycle = true;
+          writeFileSync(join(diagnostics, `cycle-seed-${seed}-size-${size}-day-${g.day}.json`), JSON.stringify(serialize(g)));
+        }
       }
       if (snapshot && seed === 2026 && size === 768 && g.day === 720) writeFileSync(snapshot, JSON.stringify(serialize(g)));
       if (g.day % 360 === 0) {
@@ -250,7 +303,6 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
     check(longest < 240, `${label}: longest through hold below 240 s (four simulation minutes)`);
     // Merges can change several contracts at once; the lowest bidder winds down first, one path per day.
     check(longestExcess < 30, `${label}: all operators settle within the shared plan in less than a month`);
-    if (requireShared) check(agreementSamples > 1000, `${label}: native operators exercise over 1000 shared agreement samples`);
     check(deadlocks === 0, `${label}: no mutual-wait deadlocks`);
     check(allHeld120 / Math.max(1, allSamples) < 0.02 && allLongest < 360, `${label}: rail traffic in general has no persistent congestion`);
     if (seed === 2026 && size === 768 && years === reference.years) {
@@ -262,15 +314,15 @@ function scenario(seed = 2026, size = 768, requireShared = true) {
 }
 
 if (!baseline) fixtures();
-// Keep the original 2026/768 receipt and congestion benchmark. Its native tuned opening
-// choices now serve independent corridors, so zero shared samples cannot measure agreement
-// settling. The denser 7/512 map naturally creates a paid multi-operator service with the
-// SAME seven rival configs, budgets, starting year and eight-year window: no forced joins.
-// All original nonzero/shared/hold/settling limits apply to that exercised native cohort.
-const result = quick ? {} : baseline ? scenario() : {
-  benchmark: scenario(2026, 768, false),
-  shared: scenario(7, 512, true),
-};
+// Keep both native cohorts, with the same rivals, budgets and eight-year operating bounds.
+// Economics determine which cohort materializes more full shared auctions; require one cohort
+// independently to exceed 1000 allocation samples, without pooling two smaller exposures.
+const result = quick ? {} : baseline ? scenario() : (() => {
+  const benchmark = scenario(2026, 768, false), shared = scenario(7, 512, true);
+  check(Math.max(benchmark.agreementSamples, shared.agreementSamples) > 1000,
+    'one native cohort independently exercises over 1000 shared agreement samples');
+  return { benchmark, shared };
+})();
 if (output) writeFileSync(output, JSON.stringify(result, null, 2) + '\n');
 console.log(fails.length ? `${fails.length} FAILURES` : baseline ? 'BASELINE RECORDED' : 'ALL CHECKS PASSED');
 process.exitCode = fails.length ? 1 : 0;

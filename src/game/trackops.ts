@@ -619,7 +619,7 @@ export function planDoubleTrack(g: Game, edgeIds: number[], side: 1 | -1, owner:
   net.withTemporaryNodes('rail', pts.map((p) => ({ x: p.x, y: p.y, z: p.z, dx: -p.tx, dz: -p.tz })), owner, (tmp) => {
     for (let k = 0; k + 1 < pts.length; k++) {
       const mid = offAt((pts[k].u + pts[k + 1].u) / 2);
-      const prop = planEdge(g, plan.reuse![k] ?? nodeSnapOf(g, tmp[k].id), plan.reuse![k + 1] ?? nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps), infrastructureOwner: net.edges.get(sampleAt(S, mid.u).edge)!.owner, junctionUpgrade: complete, junctionWindows: plan.junctionWindows, crossing: options.flying ? 'over' : 'auto' }));
+      const prop = planEdge(g, plan.reuse![k] ?? nodeSnapOf(g, tmp[k].id), plan.reuse![k + 1] ?? nodeSnapOf(g, tmp[k + 1].id), railOpts(owner, { type: lineType(g, plan.steps), infrastructureOwner: net.edges.get(sampleAt(S, mid.u).edge)!.owner, junctionUpgrade: complete, junctionWindows: plan.junctionWindows, crossing: options.flying ? 'over' : 'auto', bridgeApproaches: options.flying }));
       if (complete && plan.reuse![k] && plan.reuse![k + 1] && twinAt(mid)) { plan.skipped!.push(k); prop.ok = true; prop.errors = []; prop.cost = 0; prop.tracks = []; }
       plan.proposals.push(prop);
       if (!prop.ok) fail(`New track (${m10(pts[k].u)}-${m10(pts[k + 1].u)} m of ${m10(U)} m): ${prop.errors[0] ?? 'cannot build'}`);
@@ -729,6 +729,9 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       return net.addNode('rail', p.x, p.y, p.z, -p.tx, -p.tz, net.edges.get(sample.edge)!.owner).id;
     });
     if (nodes.includes(-1)) return rollback('Existing second track changed, plan again');
+    // These are intermediate joints of one quoted rail, not temporary dead ends. Grade and lock their
+    // final formation without a one-unit flat cap; a later failure rolls the new batch back together.
+    const continued = new Set(nodes);
     const first = net.nodes.get(nodes[0])!;
     const dropNodes = () => { for (const id of nodes) { const n = net.nodes.get(id); if (n && !n.edges.length) net.removeNode(id); } };
     for (let k = 0; k + 1 < pts.length; k++) {
@@ -736,9 +739,9 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       let ok = false;
       for (const extra of (plan.flying ? [{ crossing: 'over' as const }] : [{}, { crossing: 'level' as const }, { crossing: 'over' as const }, { crossing: 'under' as const }])) {
         const sample = sampleAt(original, (pts[k].u + pts[k + 1].u) / 2);
-        const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, main), infrastructureOwner: net.edges.get(sample.edge)!.owner, junctionUpgrade: plan.complete, junctionWindows: plan.junctionWindows, ...extra }));
+        const prop = planEdge(g, nodeSnapOf(g, nodes[k]), nodeSnapOf(g, nodes[k + 1]), railOpts(owner, { type: lineType(g, main), infrastructureOwner: net.edges.get(sample.edge)!.owner, junctionUpgrade: plan.complete, junctionWindows: plan.junctionWindows, bridgeApproaches: plan.flying, ...extra }));
         if (!prop.ok || (consent && !consent(prop)) || money0 - eco.money + prop.cost > (opts.maxFormationSpend ?? Infinity)
-          || commitProposal(g, prop)) continue;
+          || commitProposal(g, prop, continued)) continue;
         ok = true;
         break;
       }
@@ -749,13 +752,16 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
     const nodePt = (id: number, t: { tx: number; tz: number }): SPt => { const n = net.nodes.get(id)!; return { x: n.x, z: n.z, y: n.y, tx: t.tx, tz: t.tz, node: id }; };
     const mainPt = (u: number): SPt => { const q = sampleAt(sampleSteps(g, main), u); return { x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, edge: q.edge, s: q.s }; };
     const last = pts[pts.length - 1];
-    const targetPt = (end: DoubleEnd, t: { tx: number; tz: number }): SPt => {
+    const targetPt = (end: DoubleEnd, t: { tx: number; tz: number }): SPt | null => {
       if (end.kind === 'platform') return nodePt(end.node, t);
       if (end.kind === 'track') {
         const q = end.snap!, n = net.nearestNode(q.x, q.z, 0.08, 'rail');
         if (n) return nodePt(n.id, t);
-        const e = net.nearestEdge(q.x, q.z, 0.08, 'rail')!;
-        return { ...t, x: q.x, z: q.z, y: q.y, edge: e.edge.id, s: e.s };
+        // The planner accepts the companion lead up to 0.12 from the offset end point (endOf), and the lead
+        // may have been split since; it is found the same way, or the plan is stale.
+        const e = net.nearestEdge(q.x, q.z, 0.08, 'rail') ?? net.nearestEdge(q.x, q.z, 0.12, 'rail', (e) => e.station < 0 && e.depot < 0
+          && !main.some((s) => s.edge === e.id) && !g.trackUpgradeError(owner, e.owner));
+        return e ? { ...t, x: q.x, z: q.z, y: q.y, edge: e.edge.id, s: e.s } : null;
       }
       return mainPt(end.u);
     };
@@ -767,9 +773,11 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       })];
     })]);
     const formationLeft = () => (opts.maxFormationSpend ?? Infinity) - (money0 - eco.money);
-    const r1 = plan.joined?.[1] ? { error: null } : connectS(g, owner, nodePt(cur, last), targetPt(plan.end, last), allowed(), false, undefined, net.nodes.get(cur)!.owner, plan.complete, undefined, formationLeft());
+    const endPt = plan.joined?.[1] ? null : targetPt(plan.end, last);
+    const r1 = plan.joined?.[1] ? { error: null } : endPt ? connectS(g, owner, nodePt(cur, last), endPt, allowed(), false, undefined, net.nodes.get(cur)!.owner, plan.complete, undefined, formationLeft()) : { error: 'the track changed, plan again' };
     if (r1.error) { const r = rollback(`End connection: ${r1.error}`); dropNodes(); return r; }
-    const r2 = plan.joined?.[0] ? { error: null } : connectS(g, owner, targetPt(plan.start, pts[0]), nodePt(first.id, pts[0]), allowed(), false, undefined, first.owner, plan.complete, undefined, formationLeft());
+    const startPt = plan.joined?.[0] ? null : targetPt(plan.start, pts[0]);
+    const r2 = plan.joined?.[0] ? { error: null } : startPt ? connectS(g, owner, startPt, nodePt(first.id, pts[0]), allowed(), false, undefined, first.owner, plan.complete, undefined, formationLeft()) : { error: 'the track changed, plan again' };
     if (r2.error) { const r = rollback(`Start connection: ${r2.error}`); dropNodes(); return r; }
   } finally {
     untrack();
@@ -1459,7 +1467,7 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
     const throat = (u: number) => (!!zs0 && (kindAt(true) === 'station' || kindAt(true) === 'depot') && u < zs0.z0) || (!!ze0 && (kindAt(false) === 'station' || kindAt(false) === 'depot') && u > ze0.z1);
     for (const [ti, L] of lists.entries()) for (const st of L) for (const nid of [startNode(g, st), endNode(g, st)]) {
       const n = net.nodes.get(nid);
-      if (!n || !n.signal || n.edges.length !== 2 || n.edges.some((id) => net.edges.get(id)!.station >= 0)) continue;
+      if (!n || !n.signal || n.edges.length < 2 || n.edges.some((id) => net.edges.get(id)!.station >= 0)) continue;
       if (n.edges.some((id) => g.trackUpgradeError(owner, net.edges.get(id)!.owner))) continue;
       const u = SA[nearestSample(SA, n.x, n.z).i].u;
       // Finishing a loop on the other side can reverse the original track's running direction. Its old
@@ -1467,7 +1475,9 @@ export function finishDoubleTrack(g: Game, edgeIds: number[], owner: number, opt
       const e = net.edges.get(st.edge)!, dir = st.dir * ((ti === 0 ? !bForward : bForward) ? 1 : -1);
       const side = net.sideAt(e, nid) * ((dir > 0 ? e.a : e.b) === nid ? 1 : -1);
       const opposed = n.signal >= 2 && !n.signalPass && net.signalFor(n, side) < 0;
-      if (!opposed && !zones.some((z) => u > z.z0 - 0.8 && u < z.z1 + 0.8) && !(throat(u) && n.signal >= 2 && !n.signalPass)) continue;
+      // A new lead can consume a former plain-track signal. At a switch its block guard
+      // floods every turnout arm, including opposing platforms; finalise only after formation succeeds.
+      if (n.edges.length === 2 && !opposed && !zones.some((z) => u > z.z0 - 0.8 && u < z.z1 + 0.8) && !(throat(u) && n.signal >= 2 && !n.signalPass)) continue;
       n.signal = 0; delete n.signalKind; delete n.signalPass;
       g.world.markObjArea(n.x - 2, n.z - 2, n.x + 2, n.z + 2);
       net.version++;

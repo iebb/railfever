@@ -24,7 +24,7 @@ import { trackMaintenance, billTrackWear } from './opcosts';
 import { MailModel } from './mail';
 import { observeRailCapacity } from './ai-capacity';
 import { capacityRouteBetween } from './rail-capacity-routes';
-import { stepRouteWorks, type RouteWorks } from './route-works';
+import { stepRouteWorks, splitRouteWorks, type RouteWorks } from './route-works';
 import { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP, accessChargeEstimate, accessFullCost, accessReplacementCost, accessItemKey, migrateAccessMultiplier, type AccessItem } from './access-cost';
 export { DEFAULT_ACCESS_MULTIPLIER, MAX_ACCESS_MULTIPLIER, ACCESS_CAP } from './access-cost';
 
@@ -98,6 +98,8 @@ if (Math.abs(DAY_SECONDS / TICK - TICKS_PER_DAY) > 1e-9) throw new Error('DAY_SE
 export const MAX_FRAME_SECONDS = 8 * TICK;
 /** Tick of the day of the AI companies' shared-path reviews (half a day after their other daily decisions). */
 const SHARED_CAPACITY_TICK = TICKS_PER_DAY / 2;
+/** Gameplay recovery eligibility; an in-flight scan retains its saved threshold. */
+const DEADLOCK_RECOVERY_WAIT = 10;
 /** A frame may release fewer ticks when simulation work is expensive. */
 const FRAME_BUDGET_MS = 20;
 
@@ -215,6 +217,7 @@ export class Game {
     this.accessMult[PLAYER] = DEFAULT_ACCESS_MULTIPLIER;
     // metered usage follows edges that are split
     this.world.net.onSplit.push((old, e1, e2) => {
+      splitRouteWorks(this, old.id, e1.id, e2.id);
       for (const k of [0, 1]) {
         const u = this.usage.get(old.id * 4 + k);
         if (!u) continue;
@@ -779,6 +782,9 @@ export class Game {
     const err = this.shares.canMerge(buyer, target);
     if (err) return err;
     const b = this.companies[buyer], t = this.companies[target];
+    // A partner's half-built project still owns paid work on this company's land. Cancel it while both
+    // investors and their original ownership exist, so removals and refunds precede the takeover transfer.
+    for (const ai of this.ais) if (ai.companyId !== target) ai.partnerAcquired(target);
     // the target's AI stops (a half-built project is removed first)
     for (const ai of this.ais) if (ai.companyId === target) ai.dispose();
     this.ais = this.ais.filter((a) => a.companyId !== target);
@@ -934,8 +940,9 @@ export class Game {
     if (this.tick % TICKS_PER_DAY === 0) {
       this.onNewDay();
     }
-    // Start a complete scan every three days and finish it in bounded fixed-tick slices.
-    if (this.deadlockScan || (this.tick % TICKS_PER_DAY === 0 && this.day % 3 === 0)) resolveDeadlocks(this, 40, DEADLOCK_WORK);
+    // Start daily; finish the complete saved scan in bounded fixed-tick slices.
+    if (this.deadlockScan || this.tick % TICKS_PER_DAY === 0)
+      resolveDeadlocks(this, this.deadlockScan?.minWait ?? DEADLOCK_RECOVERY_WAIT, DEADLOCK_WORK);
     if (this.tick % TICKS_PER_DAY === 0) {
       if (this.day % DAYS_PER_MONTH === 0) {
         this.onNewMonth();

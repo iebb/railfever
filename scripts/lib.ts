@@ -2,7 +2,7 @@
 import { Game } from '../src/game/game';
 import { findSnap, planEdge, commitProposal, BuildOptions, Snap, Proposal } from '../src/game/construction';
 import { toggleSignal } from '../src/game/build-ops';
-import { finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
+import { connectStationThroat, finishDoubleTrack, WORKS_HOLD } from '../src/game/trackops';
 import type { Town } from '../src/game/towns';
 import type { Station } from '../src/game/stations';
 import { Train, CROSS_BASE, findRailRoute, railNext, depotReaches } from '../src/game/train';
@@ -15,6 +15,36 @@ import {
 export const fails: string[] = [];
 export function check(cond: any, msg: string) { if (!cond) { fails.push(msg); console.log('  FAIL: ' + msg); } }
 export const fmt = (x: number, d = 1) => x.toFixed(d);
+
+type AIEntry = 'daily' | 'work' | 'sharedCapacityDaily' | 'monthly';
+export interface AITiming {
+  t: number; n: number; max: number; peak: string;
+  calls: Record<AIEntry, number>;
+}
+
+/** Observe every AI entry point used by Game without changing arguments or scheduling. Only daily()
+ * advances the denominator; scheduled capacity reviews and monthly management are part of that cost. */
+export function observeAITiming(g: Game, now: () => number = () => performance.now()): AITiming[] {
+  return g.ais.map(ai => {
+    const timing: AITiming = { t: 0, n: 0, max: 0, peak: '', calls: { daily: 0, work: 0, sharedCapacityDaily: 0, monthly: 0 } };
+    const measure = <T>(entry: AIEntry, run: () => T): T => {
+      const start = now();
+      try { return run(); }
+      finally {
+        const elapsed = now() - start;
+        timing.t += elapsed; timing.calls[entry]++;
+        if (entry === 'daily') timing.n++;
+        if (elapsed > timing.max) { timing.max = elapsed; timing.peak = `${entry}: ${g.day} ${ai.state.phase}`; }
+      }
+    };
+    const daily = ai.daily.bind(ai), work = ai.work.bind(ai), shared = ai.sharedCapacityDaily.bind(ai), monthly = ai.monthly.bind(ai);
+    ai.daily = (...args: Parameters<typeof daily>) => measure('daily', () => daily(...args));
+    ai.work = (...args: Parameters<typeof work>) => measure('work', () => work(...args));
+    ai.sharedCapacityDaily = (...args: Parameters<typeof shared>) => measure('sharedCapacityDaily', () => shared(...args));
+    ai.monthly = (...args: Parameters<typeof monthly>) => measure('monthly', () => monthly(...args));
+    return timing;
+  });
+}
 
 export function railOpts(owner = 0, tracks = 1, extra: Partial<BuildOptions> = {}): BuildOptions {
   return { kind: 'rail', type: 'standard', tracks, heightOffset: 0, crossing: 'auto', owner, ...extra };
@@ -77,11 +107,13 @@ export function connectStations(g: Game, A: Station, B: Station, owner = 0, trac
   log(`  chain: ok=${res.ok} ${res.error ?? ''} edges=${res.edges} len=${fmt(res.built)} bridges=${res.bridges} tunnels=${res.tunnels} cost=${Math.round(res.cost)}`);
   for (const n of res.notes ?? []) log('   ' + n);
   if (!res.ok) return { ...fail, len: res.built };
-  // switches: track 1 joins the leads 14 units out
-  const s1 = edgeSnapAt(g, 'rail', a0.x + fA.x * 14, a0.z + fA.z * 14);
-  build(g, nodeSnap(g, endA(1), 'rail'), s1, railOpts(owner), 'throat A');
-  const s2 = edgeSnapAt(g, 'rail', b0.x + fB.x * 14, b0.z + fB.z * 14);
-  build(g, nodeSnap(g, endB(1), 'rail'), s2, railOpts(owner), 'throat B');
+  for (const st of [A, B]) {
+    const throat = connectStationThroat(g, st.id, owner);
+    if (throat.failed.length) {
+      log(`  throat ${st.name}: ${throat.failed.join(', ')}`);
+      return { ...fail, len: res.built };
+    }
+  }
   return { ok: true, len: res.built, bridges: res.bridges, tunnels: res.tunnels, minR: al.minR };
 }
 
@@ -201,7 +233,7 @@ export function townPairs(g: Game, minD: number, maxD: number, exclude: Set<numb
 }
 
 /** Place a pair of 2-track stations for a rail link (feasible heights, good catchment, free leads). */
-export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16, skipPairs: Set<string> = new Set()): { A: Station; B: Station; TA: Town; TB: Town } | null {
+export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), length = 16, skipPairs: Set<string> = new Set(), nativeCatchment = false): { A: Station; B: Station; TA: Town; TB: Town } | null {
   for (const [TA, TB] of townPairs(g, minD, maxD, exclude)) {
     if (skipPairs.has(TA.id + ':' + TB.id)) continue;
     const pr = findRailPair(g, TA, TB, { tracks: 2, length, owner, front: 22 });
@@ -210,24 +242,27 @@ export function placeStationPair(g: Game, minD: number, maxD: number, owner = 0,
     if (g.stations.commitRail(pr.a, owner)) continue;
     const A = g.stations.get(ia)!;
     // the second plan may conflict now; re-plan it at the same spot
-    const pb = g.stations.planRail(pr.b.x, pr.b.z, pr.b.angle, length, 2, owner);
+    const pb = g.stations.planRail(pr.b.x, pr.b.z, pr.b.angle, length, 2, owner, { fixedY: pr.b.y });
     const ib = g.stations.nextId;
     if (!pb.ok || g.stations.commitRail(pb, owner)) { g.stations.removeStation(A.id); continue; }
     const B = g.stations.get(ib)!;
-    // both stations within reach of their towns' houses (a line between two fields carries nobody); 10 residents
-    // since the walking limits were halved after 2.9 (a quarter of the area; it was 40)
-    if (sitePop(g, A.x, A.z, 16) < 10 || sitePop(g, B.x, B.z, 16) < 10) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
+    // The centre-point walk is a cheap general-fixture screen. Village controls can use actual
+    // entrances; both retain ten residents, and service tests still require delivered passengers.
+    if (nativeCatchment) { g.flushNetworkChanges(); g.stations.recomputeCatchment(); }
+    const popA = nativeCatchment ? A.catchPop : sitePop(g, A.x, A.z, 16);
+    const popB = nativeCatchment ? B.catchPop : sitePop(g, B.x, B.z, 16);
+    if (popA < 10 || popB < 10) { g.stations.removeStation(B.id); g.stations.removeStation(A.id); continue; }
     return { A, B, TA, TB };
   }
   return null;
 }
 
 /** A connected rail link: station pairs are tried until one connects (failed attempts are removed again). */
-export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log):
+export function placeAndConnect(g: Game, minD: number, maxD: number, owner = 0, exclude: Set<number> = new Set(), tracks = 1, log: (s: string) => void = console.log, nativeCatchment = false):
   { A: Station; B: Station; TA: Town; TB: Town; con: ReturnType<typeof connectStations> } | null {
   const skip = new Set<string>();
   for (let attempt = 0; attempt < 10; attempt++) {
-    const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip);
+    const pr = placeStationPair(g, minD, maxD, owner, exclude, 16, skip, nativeCatchment);
     if (!pr) return null;
     const e0 = g.world.net.nextEdge;
     const con = connectStations(g, pr.A, pr.B, owner, tracks, log);

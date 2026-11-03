@@ -10,7 +10,7 @@ import type { VehicleModel } from './vehicle-types';
 import type { Vec3Like } from './geom';
 import { PLATFORM_PASS_KMH, holdForOvertake, holdForSpacing, noteSpacingDeparture, nextStopIndex, stopsAt } from './patterns';
 import { trackPassage } from './opcosts';
-import { platformPreference } from './rail-platforms';
+import { platformPreference, platformFlowCosts } from './rail-platforms';
 
 /** Reservation ids >= CROSS_BASE are crossings (diamond / level). */
 export const CROSS_BASE = 50_000_000;
@@ -252,8 +252,10 @@ export interface RailRouteTarget {
   group?: number; preferred?: number; length?: number; direction?: 1 | -1;
   /** A service arrival must also be able to leave this platform for its next served station. */
   onward?: number;
-  /** Auto breaks geometry ties; an explicit manual preference accepts a modest legal detour. */
+  /** Auto prices opposing platform flows; an explicit manual choice accepts a modest legal detour. */
   manual?: boolean;
+  /** Actual opposing running-path exposure at each candidate platform. */
+  flowCosts?: ReadonlyMap<number, number>;
   /** Contiguous target-platform path already held before the route's initial frontier. */
   prefix?: { edge: number; dir: number; length: number };
 }
@@ -351,16 +353,20 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
     const n = net.nodes.get(d > 0 ? e.b : e.a)!;
     return Math.hypot(n.x - tx, n.z - tz) * 0.98;
   };
-  const cost = (e: NEdge, d: number) => {
+  const cost = (e: NEdge, d: number, previousOwner = 0) => {
     let c = e.len;
-    const r = V.getRes(e.id);
-    if (!ignoreOccupancy && r && r !== selfId) c += 40;
+    if (!ignoreOccupancy) {
+      const r = V.getRes(e.id);
+      // Plain subdivisions share one obstruction; signals and turnouts start independently controlled paths.
+      if (r && r !== selfId && r !== previousOwner) c += 40;
+    }
     // (passing a station: its through tracks rather than a platform track another train may want to stop at)
     if (e.station >= 0 && e.station !== target) c += 25;
     if (exit && !g.canUse(owner, e.owner)) c += 200 + e.len * 4;
-    // Prefer the saved platform, but a reserved platform costs more than a legal free alternative.
+    // Geometry, actual occupancy and opposing flows price Auto arrivals; preferences never bypass reservations.
     const group = ends.get(key(e.id, d));
     if (group !== undefined && platform.preferred !== undefined && group !== platform.preferred) c += platform.manual ? 12 : 1e-4;
+    if (group !== undefined && !platform.manual) c += platform.flowCosts?.get(group) ?? 0;
     return c;
   };
   const push = (e: NEdge, d: number, gc: number, parent: number) => {
@@ -392,7 +398,12 @@ export function findRailRoute(g: Game, start: Cont[], target: number, owner: num
       return { conts, cost: NG[i] };
     }
     if (++n > maxExpand) break;
-    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge, c.dir), i);
+    let previousOwner = 0;
+    if (!ignoreOccupancy) {
+      const node = net.nodes.get(d > 0 ? e.b : e.a)!;
+      if (!node.signal && node.edges.filter(id => net.edges.get(id)?.kind === 'rail').length === 2) previousOwner = V.getRes(e.id);
+    }
+    for (const c of railNext(g, e, d, owner, exit, rule)) push(c.edge, c.dir, NG[i] + cost(c.edge, c.dir, previousOwner), i);
   }
   return null;
 }
@@ -619,6 +630,11 @@ export class Train extends Vehicle {
   }
 
   private extensionEnd(): number {
+    const held = this.segs[this.segs.length - 1], first = this.pending[0];
+    // The depot mouth is a safe holding boundary. Reserve its stub before asking for the running line,
+    // so an emerging train can queue and acquire a brief free path without fouling unreserved track.
+    if (held?.e === -1 && held.dir > 0 && first && this.pending.length > 1
+      && this.game.world.net.edges.get(first.e)?.depot === held.depot) return 1;
     const st = this.game.stations.get(this.routeTarget), last = this.pending[this.pending.length - 1];
     const platform = st && last ? this.game.stations.railTrackGroups(st).find(q => q.steps.some(s => s.edge === last.e)) : undefined;
     const edges = new Set(platform?.steps.map(s => s.edge));
@@ -973,7 +989,8 @@ export class Train extends Vehicle {
     this.routeTarget = target.id;
     const rule = this.rule;
     const savedPlatform = this.line ? platformPreference(this.line, this.pattern, this.stopIndex) : undefined;
-    const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length };
+    const platform: RailRouteTarget = { preferred: savedPlatform?.group, manual: savedPlatform?.manual, length: this.length,
+      ...(this.line && !savedPlatform?.manual ? { flowCosts: platformFlowCosts(g, this.line, this.pattern, this.stopIndex) } : {}) };
     if (this.line) platform.onward = this.line.stops[nextStopIndex(this.line, this.pattern, this.stopIndex)];
     const last = this.segs[this.segs.length - 1];
     const group = last && g.stations.railTrackGroups(target).find(q => q.steps.some(s => s.edge === last.e));
@@ -1321,7 +1338,9 @@ export class Train extends Vehicle {
 export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: VehicleModel[]): boolean {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return false;
-  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000, false, cars ? consistRule(cars) : null);
+  const length = cars?.reduce((n, c) => n + c.length, 0) ?? 0;
+  return !!findRailRoute(g, [{ edge: stub, dir: 1 }], stationId, dp.owner, -1, 80000, false,
+    cars ? consistRule(cars) : null, true, { length });
 }
 
 /**
@@ -1332,14 +1351,13 @@ export function depotReaches(g: Game, dp: Depot, stationId: number, cars?: Vehic
 export function depotServes(g: Game, dp: Depot, a: number, b: number, cars?: VehicleModel[]): number {
   const stub = g.world.net.edges.get(dp.edge);
   if (!stub) return -1;
-  const rule = cars ? consistRule(cars) : null;
+  const rule = cars ? consistRule(cars) : null, length = cars?.reduce((n, c) => n + c.length, 0) ?? 0;
   for (const [x, y] of [[a, b], [b, a]]) {
-    const r = findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule);
-    const lc = r?.conts[r.conts.length - 1];
-    if (!lc) continue;
-    // on the way it came in, or turning back off the platform (past the one-way signal at its end, as trains do)
-    if (findRailRoute(g, railNext(g, lc.edge, lc.dir, dp.owner, false, rule), y, dp.owner, -1, 80000, false, rule)
-      || findRailRoute(g, railNext(g, lc.edge, -lc.dir, dp.owner, false, rule, lc.edge.station >= 0), y, dp.owner, -1, 80000, false, rule)) return x;
+    // Search all fitting arrival platforms with the runtime's actual-tail reversal and onward fit rules.
+    // A cheaper dead-end platform must not hide a lawful alternative; transient reservations do not change
+    // whether a depot can serve the line, and departure still acquires its normal reservations in operation.
+    if (findRailRoute(g, [{ edge: stub, dir: 1 }], x, dp.owner, -1, 80000, false, rule, true,
+      { length, onward: y })) return x;
   }
   return -1;
 }
@@ -1494,7 +1512,8 @@ export function deadlockCycles(g: Game, minWait = 20): Train[][] {
 function recoverCycles(g: Game, cycles: Train[][]): boolean {
   let any = false;
   for (const cyc of cycles) {
-    const order = [...cyc].sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id);
+    // The shorter waiter yields so the longest-blocked service retains right of way.
+    const order = [...cyc].sort((a, b) => a.stuckTime - b.stuckTime || a.id - b.id);
     const queued = new Set(order.map(t => t.id));
     for (let i = 0; i < order.length; i++) {
       const t = order[i], blockers = new Set<number>();
@@ -1578,8 +1597,9 @@ function scanDeadlocks(g: Game, minWait: number, budget: number): boolean {
     if (!s.recovery) {
       const ids = s.groups.pop();
       if (!ids) { g.deadlockScan = null; return false; }
+      // Match synchronous recovery: moving aside must not penalize the longest waiter.
       const order = ids.map(id => g.vehicles.get(id)).filter((t): t is Train => t instanceof Train)
-        .sort((a, b) => b.stuckTime - a.stuckTime || a.id - b.id).map(t => t.id);
+        .sort((a, b) => a.stuckTime - b.stuckTime || a.id - b.id).map(t => t.id);
       s.recovery = { cycle: ids, order, next: 0 };
     }
     const recovery = s.recovery, cycle = recovery.cycle.map(id => g.vehicles.get(id))
