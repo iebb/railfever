@@ -13,8 +13,9 @@ import type { Line } from '../src/game/lines';
 import { fails, check, fmt, placeAndConnect, depotBehind, Train, checkNaN, checkReservations } from './lib';
 
 if (!process.argv[1]?.endsWith('aimail.mjs')) throw new Error('bundle this test as aimail.mjs');
-// (2.7: seed 23's AIs build no railway in six years whose mail forecast pays for vans; seed 5's do)
-const seeds = (process.argv[2] ?? '7,5').split(',').map(Number);
+// (2.7: seed 23's AIs build no railway in six years whose mail forecast pays for vans; 2.11: seed 5's central
+// elevated openings fail clearance and leave no mail-paying railway either; seed 11's do)
+const seeds = (process.argv[2] ?? '7,11').split(',').map(Number);
 const YEARS = 6;
 const saved = (g: Game) => JSON.stringify(serialize(g));
 const seats = (t: Train) => t.cars.filter((m) => m.capacity > 0).length;

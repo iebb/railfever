@@ -1,6 +1,8 @@
 // Stop insertion preserves a short-turn's physical termini on a directional shared railway.
 import { Game } from '../src/game/game';
+import { bezLine } from '../src/game/geom';
 import type { Line } from '../src/game/lines';
+import type { Town } from '../src/game/towns';
 import { linePatterns, patternStops, stopsAt } from '../src/game/patterns';
 import { platformChoices, platformPreference, setPlatformPreference } from '../src/game/rail-platforms';
 import { serialize, deserialize } from '../src/game/save';
@@ -38,11 +40,50 @@ remap([1, 2, 3], [false, true, true], [1, 2, 4, 3],
 remap([1, 2, 3], [true, false, true], [1, 4, 2, 3],
   [true, true, false, true], 'full-span rapid insertions retain their old default', false);
 
-const g = Game.create({ size: 512, seed: 5, towns: 12, hilliness: 'hilly', water: 'medium', startYear: 1985,
-  aiConfigs: [{ activeness: 0.25, risk: 0.1 }, { activeness: 2, risk: 0.9, startMoney: 8_000_000 },
-    { focus: { rail: 3, road: 0.2, tram: 0.2 } }, { focus: { rail: 0, road: 3, tram: 0 } },
-    { focus: { rail: 0, road: 0.3, tram: 3 } }] });
-g.aiAcquisitions = false;
+function road(g: Game, x0: number, z0: number, x1: number, z1: number) {
+  const net = g.world.net, a = net.nearestNode(x0, z0, 0.01, 'road') ?? net.addNode('road', x0, 4, z0, 0, 0, -1);
+  const b = net.nearestNode(x1, z1, 0.01, 'road') ?? net.addNode('road', x1, 4, z1, 0, 0, -1);
+  const len = Math.hypot(x1 - x0, z1 - z0);
+  net.addEdge('road', a.id, b.id, bezLine(x0, z0, x1, z1), new Float32Array(Math.ceil(len) + 1).fill(4), [], 'street', -1);
+}
+function addTown(g: Game, name: string, x: number, z: number, pop: number, width: number, height: number): Town {
+  const t: Town = { id: g.towns.list.length, name, x, z, angle: 0, pop, radius: Math.max(width, height) * 0.6,
+    buildings: new Set(), nextGrowthDay: 1e9, hasChurch: false, passGenMonth: 0, passTransMonth: 0,
+    passGenLast: 0, passTransLast: 0, served: 0 };
+  g.towns.list.push(t);
+  const xs = Array.from({ length: Math.floor(width / 8) + 1 }, (_, i) => x - width / 2 + i * 8);
+  const zs = Array.from({ length: Math.floor(height / 8) + 1 }, (_, i) => z - height / 2 + i * 8 + 4);
+  for (const rz of zs) for (let i = 1; i < xs.length; i++) road(g, xs[i - 1], rz, xs[i], rz);
+  for (const rx of xs) for (let i = 1; i < zs.length; i++) {
+    if (zs[i - 1] < z && zs[i] > z) continue;
+    road(g, rx, zs[i - 1], rx, zs[i]);
+  }
+  const lots: { x: number; z: number; angle: number }[] = [];
+  for (const rz of zs) for (let rx = x - width / 2 + 2; rx < x + width / 2; rx += 4) {
+    if (Math.abs(rz + 1.1 - z) < 4) continue;
+    lots.push({ x: rx, z: rz + 1.1, angle: Math.PI });
+  }
+  let remaining = pop;
+  lots.forEach((p, i) => {
+    const count = Math.ceil(remaining / (lots.length - i)); remaining -= count;
+    const b = g.world.addBuilding({ townId: t.id, ...p, w: 1.4, d: 1.4, type: 4, floors: 8, pop: count, seed: i, y: 4, built: 0 });
+    t.buildings.add(b.id);
+  });
+  return t;
+}
+const g = Game.create({ size: 512, seed: 5, towns: 0, hilliness: 'flat', water: 'none', startYear: 1995 });
+g.world.h.fill(4); g.world.heightsVersion++; g.aiAcquisitions = false;
+addTown(g, 'Carlhurst', 240, 320, 5200, 32, 32);
+addTown(g, 'Glencliff', 100, 320, 5000, 32, 32);
+addTown(g, 'Chalport', 388, 368, 5400, 112, 56);
+addTown(g, 'Westmoor', 60, 40, 6000, 64, 48);
+addTown(g, 'Northport', 220, 40, 5800, 64, 48);
+g.player.hqTown = 3; g.demand.rebuild();
+g.addAICompany({ activeness: 0.5, risk: 0.8, startMoney: 20_000_000, focus: { rail: 4, road: 0, tram: 0 } });
+g.addAICompany({ activeness: 3.0, risk: 1.0, startMoney: 35_000_000, accessPolicy: 'open', focus: { rail: 4, road: 0, tram: 0 } });
+g.addAICompany({ activeness: 1.5, risk: 0.8, startMoney: 12_000_000, accessPolicy: 'open', focus: { rail: 4, road: 0, tram: 0 } });
+g.company(1).hqTown = 3; g.company(2).hqTown = 0; g.company(3).hqTown = 1;
+g.ais[0].state.cooldown = 44; g.ais[1].state.cooldown = 0; g.ais[2].state.cooldown = 32;
 let line: Line | undefined, beforeStops: number[] = [], pid = -1, manual: { station: number; group: number } | undefined;
 let inserted = -1, insertionDay = -1;
 while (g.day < 500) {
@@ -71,7 +112,8 @@ if (line && inserted >= 0) {
   check(g.company(2).economy.yearTotals.reduce((n, y) => n + y.v.construction, g.company(2).economy.thisYear.construction) < 0,
     'the native operator paid actual construction costs');
   check(JSON.stringify(p.stops) === '[true,true,false,false,false,true]', 'native partner short-turn retains its old physical terminus');
-  check(linePatterns(l).find(p => p.id === 0)!.stops.every(Boolean), 'the full-through service still serves the new station');
+  // (2.10+ joinLines places Local (through) at linePatterns(l)[0] while preserving keep's original pattern id 0)
+  check(linePatterns(l)[0]!.stops.every(Boolean), 'the full-through service still serves the new station');
   check(!l.platforms?.some(q => q.pattern === pid && q.station === inserted), 'short-turn has no phantom platform call at the excluded new facility');
   const savedManual = l.platforms?.find(q => q.pattern === pid && q.station === manual?.station && q.occurrence === 1);
   check(!!savedManual?.manual && savedManual.group === manual?.group, 'manual platform preference follows its repeated occurrence across insertion');

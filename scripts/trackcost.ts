@@ -12,7 +12,7 @@ const w = g.world;
 // rolling hills around height 4, a ridge (tunnel) at x = 95 and a river valley (bridge) at x = 140
 for (let z = 0; z <= w.size; z++) for (let x = 0; x <= w.size; x++) {
   let h = 4 + Math.sin(x * 0.21) * 0.7 + Math.sin(z * 0.17 + x * 0.05) * 0.5;
-  h += Math.max(0, 8 - Math.abs(x - 95) * 0.7);
+  h += Math.max(0, 8.2 - Math.abs(x - 95) * 0.7);
   if (Math.abs(x - 140) < 8) h = Math.min(h, -1 + Math.abs(x - 140) * 0.45);
   w.h[w.vi(x, z)] = h;
 }

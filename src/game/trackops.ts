@@ -749,13 +749,13 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
     const nodePt = (id: number, t: { tx: number; tz: number }): SPt => { const n = net.nodes.get(id)!; return { x: n.x, z: n.z, y: n.y, tx: t.tx, tz: t.tz, node: id }; };
     const mainPt = (u: number): SPt => { const q = sampleAt(sampleSteps(g, main), u); return { x: q.x, z: q.z, y: q.y, tx: q.tx, tz: q.tz, edge: q.edge, s: q.s }; };
     const last = pts[pts.length - 1];
-    const targetPt = (end: DoubleEnd, t: { tx: number; tz: number }): SPt => {
-      if (end.kind === 'platform') return nodePt(end.node, t);
+    const targetPt = (end: DoubleEnd, t: { tx: number; tz: number }): SPt | null => {
+      if (end.kind === 'platform') return net.nodes.has(end.node) ? nodePt(end.node, t) : null;
       if (end.kind === 'track') {
         const q = end.snap!, n = net.nearestNode(q.x, q.z, 0.08, 'rail');
         if (n) return nodePt(n.id, t);
-        const e = net.nearestEdge(q.x, q.z, 0.08, 'rail')!;
-        return { ...t, x: q.x, z: q.z, y: q.y, edge: e.edge.id, s: e.s };
+        const e = net.nearestEdge(q.x, q.z, 0.08, 'rail');
+        return e ? { ...t, x: q.x, z: q.z, y: q.y, edge: e.edge.id, s: e.s } : null;
       }
       return mainPt(end.u);
     };
@@ -767,9 +767,13 @@ export function commitDoubleTrack(g: Game, plan: DoublePlan, finish = true, opts
       })];
     })]);
     const formationLeft = () => (opts.maxFormationSpend ?? Infinity) - (money0 - eco.money);
-    const r1 = plan.joined?.[1] ? { error: null } : connectS(g, owner, nodePt(cur, last), targetPt(plan.end, last), allowed(), false, undefined, net.nodes.get(cur)!.owner, plan.complete, undefined, formationLeft());
+    const endTarget = plan.joined?.[1] ? null : targetPt(plan.end, last);
+    if (!plan.joined?.[1] && !endTarget) { const r = rollback('The track changed, plan again'); dropNodes(); return r; }
+    const r1 = plan.joined?.[1] ? { error: null } : connectS(g, owner, nodePt(cur, last), endTarget!, allowed(), false, undefined, net.nodes.get(cur)!.owner, plan.complete, undefined, formationLeft());
     if (r1.error) { const r = rollback(`End connection: ${r1.error}`); dropNodes(); return r; }
-    const r2 = plan.joined?.[0] ? { error: null } : connectS(g, owner, targetPt(plan.start, pts[0]), nodePt(first.id, pts[0]), allowed(), false, undefined, first.owner, plan.complete, undefined, formationLeft());
+    const startTarget = plan.joined?.[0] ? null : targetPt(plan.start, pts[0]);
+    if (!plan.joined?.[0] && !startTarget) { const r = rollback('The track changed, plan again'); dropNodes(); return r; }
+    const r2 = plan.joined?.[0] ? { error: null } : connectS(g, owner, startTarget!, nodePt(first.id, pts[0]), allowed(), false, undefined, first.owner, plan.complete, undefined, formationLeft());
     if (r2.error) { const r = rollback(`Start connection: ${r2.error}`); dropNodes(); return r; }
   } finally {
     untrack();

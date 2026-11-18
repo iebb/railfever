@@ -185,13 +185,15 @@ async function boot() {
   const hilliness = (terrain === 'flat' || terrain === 'hilly' || terrain === 'mountainous' ? terrain : 'hilly') as NewGameOptions['hilliness'];
   const wp = params.get('water');
   const water = (wp === 'low' || wp === 'medium' || wp === 'high' ? wp : 'medium') as NewGameOptions['water'];
-  const aiCompanies = Math.max(0, Math.min(MAX_AI, Math.round(num('ai', 1))));
+  const autoMode = params.has('auto') || params.has('watch');
+  const aiCompanies = Math.max(0, Math.min(MAX_AI, Math.round(num('ai', autoMode ? 4 : 1))));
   // ?aistyle=balanced|cautious|aggressive|rail|bus|tram|mixed, ?airail=0..100 (the rivals' average rail share; 50 = even)
-  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? 'balanced', aiCompanies, undefined, Math.max(0, Math.min(100, num('airail', 50))) / 100, seed);
-  // the autosave (IndexedDB) becomes the current game unless ?new asks for a fresh map
+  const startMoney = autoMode ? num('money', 8) * 1_000_000 : undefined;
+  const aiConfigs = aiConfigsFor(params.get('aistyle') ?? (autoMode ? 'mixed' : 'balanced'), aiCompanies, startMoney, Math.max(0, Math.min(100, num('airail', autoMode ? 55 : 50))) / 100, seed);
+  // the autosave (IndexedDB) becomes the current game unless ?new or ?auto/?watch asks for a fresh map
   showLoading('Loading…');
   await slotsReady;
-  const auto = params.has('new') ? undefined : listSlots().find((s) => s.slot === 'autosave');
+  const auto = (params.has('new') || (autoMode && !params.has('resume'))) ? undefined : listSlots().find((s) => s.slot === 'autosave');
   let resumed = false;
   if (auto) {
     showLoading('Loading your game…');
@@ -208,7 +210,7 @@ async function boot() {
     showLoading(genText(size));
     await new Promise<void>((r) => afterPaint(r));
     try {
-      setGame(Game.create({ size, seed, towns, hilliness, water, startYear: num('year', 1950), aiCompanies, aiConfigs }));
+      setGame(Game.create({ size, seed, towns, hilliness, water, startYear: num('year', autoMode ? 1965 : 1950), startMoney, aiCompanies, aiConfigs }));
     } catch (e) {
       console.error(e);
       ui.toast('World generation failed: ' + (e as Error).message, 'bad');
@@ -216,6 +218,16 @@ async function boot() {
   }
   hideLoading();
   requestAnimationFrame(loop);
+  if (game && (autoMode || params.has('speed'))) {
+    const sp = [1, 2, 4, 8].includes(num('speed', autoMode ? 2 : 1)) ? num('speed', autoMode ? 2 : 1) : 2;
+    ui.setSpeed(sp);
+  }
+  if (autoMode && game) {
+    played = true;
+    ui.setAutoCam(true, true);
+    ui.toast(`Autonomous mode — watching ${aiCompanies} AI compan${aiCompanies === 1 ? 'y' : 'ies'} (press Z for camera)`, 'info');
+    return;
+  }
   if (params.has('nointro') || !game) { played = true; return; }
   ui.showTitle({ resumed: resumed && auto ? { saved: auto.saved } : undefined });
 }

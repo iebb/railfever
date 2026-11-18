@@ -74,6 +74,11 @@ export class UI {
   private linePathSig = new Map<number, string>();
   lineBroken = new Map<number, [number, number][]>();
   following: number | null = null;
+  autoCam = false;
+  private autoCamTimer = 0;
+  private autoCamIndex = 0;
+  private autoCamNews: { x: number; z: number; at: number } | null = null;
+  private autoCamPauseUntil = 0;
   titleOpen = false;
   /** left column holding the checklist, the map view card and the minimap */
   leftCol!: HTMLDivElement;
@@ -140,6 +145,11 @@ export class UI {
     this.toastBox.replaceChildren();
     this.floatLayer.replaceChildren(); this.floats = []; this.incomeAcc.clear();
     this.following = null;
+    this.autoCam = false;
+    this.autoCamTimer = 0;
+    this.autoCamNews = null;
+    this.autoCamPauseUntil = 0;
+    this.hud.syncAutoCam();
     this.catchmentStation = -1;
     this.linePathSig.clear();
     this.lineBroken.clear();
@@ -234,6 +244,7 @@ export class UI {
     else if (lk === 'h') this.minimap.toggle();
     else if (lk === 'p') this.mapModes.toggle('demand');
     else if (lk === 'o') this.mapModes.toggle('catchment');
+    else if (lk === 'z') this.setAutoCam(!this.autoCam);
     else if (k === 'F1') { e.preventDefault(); this.openHelp(); }
     else if (lk === 'g') { const u = (this.renderer.terrain.uniforms as unknown as { uGrid?: { value: number } }).uGrid; if (u) u.value = u.value ? 0 : 1; }
   };
@@ -275,6 +286,7 @@ export class UI {
     this.mapModes.update(dt);
     this.updateLinePaths();
     this.updateStationLabels(dt);
+    this.updateAutoCam(dt);
     // follow a vehicle when the camera has no follow mode of its own
     if (this.following != null) {
       const v = g.vehicles.get(this.following);
@@ -475,6 +487,7 @@ export class UI {
       return;
     }
     if (n.kind === 'ai' && !this.game.aiEnabled) return;
+    if (n.kind === 'ai' && n.x !== undefined && n.z !== undefined) this.autoCamNews = { x: n.x, z: n.z, at: performance.now() };
     // news chimes are throttled (AI companies report often at high speed); bad news always sounds
     const now = performance.now();
     if (!this.titleOpen && (n.kind === 'bad' || now - this.lastNewsSfx > 2500)) {
@@ -484,6 +497,61 @@ export class UI {
     const el = h('div', { class: 'toast news ' + n.kind }, h('span', { class: 'news-date' }, newsDate(this.game, n)), h('span', null, n.text));
     if (n.x !== undefined) { el.classList.add('link'); el.addEventListener('click', () => this.centerOn(n.x!, n.z!)); }
     this.pushToast(el, 6000);
+  }
+
+  /** Toggle the autonomous camera director (purely read-only; follows active trains, builds and towns). */
+  setAutoCam(on: boolean, silent = false) {
+    this.autoCam = on;
+    this.autoCamTimer = 0;
+    this.autoCamPauseUntil = 0;
+    this.hud.syncAutoCam();
+    if (!on && this.following !== null) {
+      (this.renderer.controls as unknown as FollowCam).follow = null;
+      this.following = null;
+    }
+    if (!silent) this.toast(on ? 'Autonomous camera on (press Z to stop)' : 'Autonomous camera off', 'info');
+  }
+
+  private updateAutoCam(dt: number) {
+    if (!this.autoCam || this.titleOpen || !this.game) return;
+    if (this.tools && this.tools.tool !== 'inspect') return;
+    const ctrl = this.renderer.controls;
+    const now = performance.now();
+    if (ctrl.keys.size > 0) { this.autoCamPauseUntil = now + 10000; return; }
+    if (now < this.autoCamPauseUntil) return;
+    ctrl.yaw += dt * (this.following !== null ? 0.05 : 0.07);
+    const followed = this.following !== null ? this.game.vehicles.get(this.following) : undefined;
+    if (this.following !== null && (!followed || followed.state === 'depot')) this.autoCamTimer = 0;
+    this.autoCamTimer -= dt;
+    if (this.autoCamTimer > 0) return;
+    this.autoCamTimer = 18;
+    // 1. Recent AI construction/opening news with map coordinates
+    if (this.autoCamNews && now - this.autoCamNews.at < 15000) {
+      this.centerOn(this.autoCamNews.x, this.autoCamNews.z, 38);
+      this.autoCamNews = null;
+      return;
+    }
+    // 2. Active on-map vehicles (prefer trains and loaded services, cycling across the fleet)
+    const active = [...this.game.vehicles.map.values()].filter((v) => v.state !== 'depot' && v.lineId != null);
+    if (active.length) {
+      active.sort((a, b) => Number(b.kind === 'train') - Number(a.kind === 'train') || b.load - a.load || a.id - b.id);
+      const pool = active.slice(0, Math.min(active.length, 16));
+      const pick = pool[this.autoCamIndex++ % pool.length];
+      this.follow(pick);
+      return;
+    }
+    // 3. Before the first vehicles leave their depots, tour stations or major towns
+    const stations = [...this.game.stations.map.values()];
+    if (stations.length) {
+      const st = stations[this.autoCamIndex++ % stations.length];
+      this.centerOn(st.x, st.z, 36);
+      return;
+    }
+    const towns = [...this.game.towns.list].sort((a, b) => b.pop - a.pop);
+    if (towns.length) {
+      const t = towns[this.autoCamIndex++ % Math.min(towns.length, 6)];
+      this.centerOn(t.x, t.z, 46);
+    }
   }
 
   /** Play a sound effect (world events pass x/z for positional sound). */

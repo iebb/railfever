@@ -19,16 +19,18 @@ import { distToRect } from './world';
 import { planEdge, commitProposal, findSnap, BuildOptions, Snap, Proposal, fitCurve, structureFactor, curveSpeed, SHARED_TRACK } from './construction';
 import { Train, depotReaches, depotServes, consistRule, findRailRoute, railNext, lineCongestion, lineCompatibility, platformDepartureFrontiers } from './train';
 import { RoadVehicle, roadDepotReaches } from './roadvehicle';
+import type { Vehicle } from './vehicle';
+import { offloadPassengers, vehicleModelIds, sameModels } from './vehicles';
 import { RNG } from './rng';
 import { Economy, loanLimit } from './economy';
 import { availableModels, VehicleModel, MODEL_BY_ID, carriesMail } from './vehicle-types';
-import { estimateLegFare, estimateLegTime } from './fares';
+import { estimateLegFare, estimateLegTime, speedFactor, tripFactor, refTime } from './fares';
 import { plannedSet, type ForecastSite } from './demand';
 import { walkSitePop, walkLimit, planWalkingCatchment, walkingCatchment, walkingPopulation, pointWalkingCatchment, pedestrianRoad, stopSiteWalkingCatchment } from './catchment';
-import { suggestExpress, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
+import { suggestExpress, suggestShortTurn, addPattern, setVehiclePattern, canonicalizeLines } from './patterns';
 import * as Patterns from './patterns';
 import { platformPreference, platformChoices } from './rail-platforms';
-import { estimateVehicleYear, trackBasePerUnit, YEAR_S } from './opcosts';
+import { estimateVehicleYear, trackBasePerUnit, YEAR_S, AGE_WEAR_START } from './opcosts';
 import { endTangent, bezFromTangents, bezMinRadius, bezPoint, arcTable, tAtS } from './geom';
 import { DRY_MIN, TUNNEL_LINING, applyEarthworks } from './terraform';
 import { TramPlanner } from './ai-tram';
@@ -1403,6 +1405,8 @@ export interface LineInfo {
   mailLook?: number;
   /** rail: day the line's depot was last checked to serve it (rehomeLineDepots); -1 after the track was doubled */
   depotLook?: number;
+  /** day the line's rolling stock was last evaluated for fleet modernization */
+  modernizeLook?: number;
 }
 
 /** A place on a station's approach track where a new line can join it (see approachJunctions). */
@@ -2167,7 +2171,7 @@ export class AIController {
     // Compare affordable stages of a city railway: a small light-rail-style opening first, or a subway where the
     // capacity repays the tunnels over their discounted civil life. Both are ordinary rail (one catchment, fare and forecast model;
     // the style picks track, level, platforms and spacing). Preview uses real pedestrian routes, never a town fraction.
-    const pricedOpening = own.length === 0 && opts.some((o) => o.score > 0 && o.viable !== false && (!operating.size && hq !== undefined ? o.towns.includes(hq) : true) && considers(
+    const pricedOpening = own.length === 0 && !cor && opts.some((o) => o.score > 0 && o.viable !== false && (!operating.size && hq !== undefined ? o.towns.includes(hq) : true) && considers(
       o.kind === 'rail' || o.kind === 'share' || o.kind === 'hsr' || o.kind === 'crosscity' ? focus.rail : focus.road));
     // Start from already priced openings. Later selections compare one detailed city opportunity,
     // rather than blocking every route behind a survey of every town and construction style.
@@ -2939,17 +2943,26 @@ export class AIController {
     const use = sts.map((s) => s.pickupLast + s.arrivedLast).sort((a, b) => a - b);
     const low = use[Math.floor((use.length - 1) / 4)], top = use[use.length - 1];
     if (!(top > 0) || top < Math.max(1, low) * 3) return false;
-    const sug = suggestExpress(g, l);
+    const exp = suggestExpress(g, l);
+    const sug = exp ?? (vs.length >= 4 ? suggestShortTurn(g, l) : null);
     if (!sug) return false;
+    const isShort = !exp;
     const np = addPattern(g, l.id, sug.kind, sug.stops, sug.name);
     if (!np) return false;
+    if (isShort && l.kind === 'rail' && Patterns.patternStops(l, np.id).some((idx) => !platformChoices(g, l, np.id, idx).length)) {
+      Patterns.removePattern(g, l.id, np.id);
+      return false;
+    }
     let n = 0;
-    vs.forEach((v, i) => { if (i % 2 === 1 && !setVehiclePattern(g, v.id, np.id)) n++; });
+    const step = isShort ? 3 : 2;
+    vs.forEach((v, i) => { if (i % step === 1 && !setVehiclePattern(g, v.id, np.id)) n++; });
+    if (!n) { Patterns.removePattern(g, l.id, np.id); return false; }
     info.express = g.day;
     this.stats.express++;
     const skipped = sug.stops.filter((x) => !x).length;
-    this.note(`${l.name}: ${np.name} pattern (${n} trains, passing ${skipped} stops)`);
-    g.postNews(`${this.name} runs ${np.name.toLowerCase()} trains on ${l.name}, skipping quieter stations.`, 'ai');
+    this.note(`${l.name}: ${np.name} pattern (${n} trains, ${isShort ? 'short-turning before' : 'passing'} ${skipped} stops)`);
+    g.postNews(isShort ? `${this.name} adds short-turn service (${np.name}) on ${l.name}.`
+      : `${this.name} runs ${np.name.toLowerCase()} trains on ${l.name}, skipping quieter stations.`, 'ai');
     return true;
   }
 
@@ -3361,7 +3374,7 @@ export class AIController {
     const avoid = [avoidA, { x0: frontB.x - fb.x * lenB, z0: frontB.z - fb.z * lenB, x1: to.x + to.tx * 4, z1: to.z + to.tz * 4, r: 4 }];
     const start: OPoint = { x: frontA.x, z: frontA.z, tx: fa.x, tz: fa.z };
     // one station where lines meet: where B's main-line station (ours, or an open network's) already serves most
-    // of the new station's passengers, the line joins that station's track at a junction on its approach instead
+    // of the new station's passengers, the line joins that station's approach track at a junction on its approach instead
     // (a station of its own only when no junction works)
     let join: { S: Station; J: JunctionSite } | null = null;
     let plan: RoutePlan | string = preferredRoute ?? 'no route';
@@ -5883,7 +5896,7 @@ export class AIController {
     else if (!this.job && e.money > 3_000_000 * (0.6 + c.risk) && e.loan > 0) { while (e.money > 2_000_000 && e.loan > 0 && e.repay()) { /* */ } }
     this.adoptLines();
     if (this.railPolicy.deepTrouble) this.recoverCash();
-    let grew = false;
+    let grew = false, modernized = false;
     for (const [lid, info] of [...this.lines].sort(([a], [b]) => this.railPolicy.lossOrder(a, b))) {
       const l = g.lines.get(lid);
       // (a line merged into another as a service pattern: lines.get follows the redirect to the other line, which is
@@ -5976,6 +5989,7 @@ export class AIController {
       const grow = Math.sqrt(act);
       if (!vs.length || g.day - (info.lastSold ?? -1e9) < 180) continue;
       const young = g.day - info.opened < 360;
+      if (!modernized && !young && l.incomeLast >= l.costLast * 0.95 && this.modernizeFleet(l, info, vs)) { modernized = true; continue; }
       if (!young && l.incomeLast < l.costLast * 1.2 + 10_000) continue;
       let waiting = 0;
       for (const sid of l.stops) { const st = g.stations.get(sid); if (st) for (const w of st.waiting.values()) if (w.line === lid) waiting += w.count; }
@@ -6117,6 +6131,154 @@ export class AIController {
     return done;
   }
 
+  /**
+   * Stage rolling-stock modernization on a mature solvent line when operating savings (age maintenance surcharge,
+   * energy/electric traction) plus speed/crowding uplift pay back net trade-in outlay over the fleet horizon.
+   */
+  private modernizeFleet(l: Line, info: LineInfo, vs: Vehicle[]): boolean {
+    const g = this.game, e = this.eco;
+    const rule = l.replace?.[this.companyId];
+    if ((rule && rule.minAge <= 0) || g.day - (info.modernizeLook ?? -1e9) < 360) return false;
+    if (info.kind === 'rail' && this.mailPolicy.hasPending(vs as Train[])) return false;
+    const wired = (info.electric ?? -1) > 0;
+    const wantWire = info.kind === 'rail' && !info.urban && wired
+      && vs.some((v) => v instanceof Train && v.madeUp[0]?.kind === 'loco' && v.madeUp[0].traction !== 'electric');
+    const avgAge = vs.reduce((s, v) => s + v.age, 0) / vs.length;
+    if (!wantWire && avgAge < AGE_WEAR_START + 4) return false;
+    info.modernizeLook = g.day;
+    const v0 = vs.reduce((a, b) => (b.age > a.age ? b : a), vs[0]);
+    const cands: VehicleModel[][] = [];
+    if (info.kind === 'rail' && v0 instanceof Train) {
+      const sts = [...new Set(l.stops)].map((sid) => g.stations.get(sid)).filter((s): s is Station => !!s?.rail);
+      if (sts.length < 2) return false;
+      const platform = Math.min(...sts.map((s) => s.rail!.length));
+      const lead = v0.madeUp[0];
+      if (lead?.kind === 'emu') {
+        if (info.urban) {
+          const u = this.urbanUnit(info.urban, platform);
+          if (u) cands.push([u]);
+        } else {
+          const wantHsr = !!info.hsr || v0.madeUp.some((m) => m.id.startsWith('hsr_'));
+          const pool = availableModels(g.year, 'emu', false).filter((m) => (wantHsr ? m.id.startsWith('hsr_') : m.id.startsWith('emu_')) && m.length <= platform - 0.4);
+          for (const m of pool) {
+            const count = Math.max(1, Math.min(v0.madeUp.length, Math.floor((platform - 0.3) / (m.length + 0.1))));
+            cands.push(Array<VehicleModel>(count).fill(m));
+          }
+        }
+      } else {
+        const coaches = Math.max(1, v0.madeUp.filter((c) => c.kind === 'wagon' && !carriesMail(c)).length);
+        const wagons = availableModels(g.year, 'wagon', false);
+        const bestVan = availableModels(g.year, 'wagon', true).sort((a, b) => b.speed - a.speed || (b.mail ?? 0) - (a.mail ?? 0))[0] ?? null;
+        const upVans = (base: VehicleModel[] | null): VehicleModel[] | null => {
+          const r = keepMailVans(v0, base, platform);
+          if (!r || !bestVan) return r;
+          const out = r.map((m) => (m.kind === 'wagon' && carriesMail(m) && bestVan.speed > m.speed ? bestVan : m));
+          while (out.reduce((s, m) => s + m.length + 0.1, 0) + 0.05 > platform) {
+            let at = out.length - 1;
+            while (at >= 0 && !(out[at].kind === 'wagon' && !carriesMail(out[at]))) at--;
+            if (at < 0 || out.filter((m) => m.capacity > 0).length <= 1) return null;
+            out.splice(at, 1);
+          }
+          return out;
+        };
+        if (wagons.length) {
+          const hasMail = v0.madeUp.some(carriesMail);
+          const availPlat = platform - mailVanLength(v0);
+          for (const loco of availableModels(g.year, 'loco')) {
+            if (!wired && loco.traction === 'electric') continue;
+            const effSpeed = hasMail && bestVan ? Math.min(loco.speed, bestVan.speed) : loco.speed;
+            const fastW = wagons.filter((w) => w.speed >= effSpeed);
+            const wag = [...(fastW.length ? fastW : wagons)].sort((a, b) =>
+              b.capacity / (b.cost + modelYearCost(b, g.year) * 8) - a.capacity / (a.cost + modelYearCost(a, g.year) * 8))[0];
+            const n = Math.max(1, Math.min(coachesFitting(availPlat, loco, wag), coaches));
+            const built = upVans([loco, ...Array<VehicleModel>(n).fill(wag)]);
+            if (built?.length) cands.push(built);
+          }
+        }
+        if (wired && !v0.madeUp.some(carriesMail)) {
+          for (const emu of availableModels(g.year, 'emu', false)) {
+            if (emu.id.startsWith('emu_') && emu.length <= platform - 0.4 && emu.capacity >= v0.capacity * 0.85) cands.push([emu]);
+          }
+        }
+      }
+    } else if (v0 instanceof RoadVehicle && v0.model) {
+      if (info.kind === 'tram') {
+        for (const m of availableModels(g.year, 'tram')) cands.push([m]);
+      } else {
+        const pop = Math.max(...info.towns.map((id) => g.towns.list[id]?.pop ?? 3000), 3000);
+        const m = v0.model.style === 'coach' ? pickCoach(g.year) : pickBus(g.year, pop);
+        if (m) cands.push([m]);
+      }
+    }
+    if (!cands.length) return false;
+    const stops = l.stops.map((sid) => g.stations.get(sid)).filter((s): s is Station => !!s);
+    if (stops.length < 2) return false;
+    const roundHops = stops.length === 2 ? 2 : stops.length;
+    let roundUnits = 0;
+    for (let i = 0; i < stops.length; i++) {
+      const a = stops[i], b = stops[(i + 1) % stops.length];
+      roundUnits += Math.hypot(b.x - a.x, b.z - a.z);
+    }
+    const hopDist = Math.max(10, roundUnits / Math.max(1, roundHops));
+    const hopUnits = hopDist * 1.15;
+    const oldModels = v0 instanceof Train ? v0.madeUp : v0 instanceof RoadVehicle && v0.model ? [v0.model] : [];
+    if (!oldModels.length) return false;
+    const capKmh = info.kind === 'bus' ? (v0 instanceof RoadVehicle && v0.model?.style === 'coach' ? 100 : 50) : info.kind === 'tram' ? 60 : Infinity;
+    const oldYr = estimateVehicleYear(oldModels, hopUnits, g.year, 0.5, capKmh, avgAge + 3);
+    const oldHopS = YEAR_S / Math.max(0.1, oldYr.trips);
+    const oldHeadway = (roundHops * oldHopS) / Math.max(1, vs.length);
+    const oldKmh = (hopUnits * UNIT_M) / 1000 / (oldHopS / 3600);
+    const oldLegS = estimateLegTime(hopDist, oldKmh, oldHeadway, 1.15);
+    const refS = refTime(hopDist);
+    const oldElastic = speedFactor(hopDist, oldLegS) * tripFactor(oldLegS, refS);
+    const lineRev = Math.max(0, l.incomeLast);
+    const paxRev = Math.max(0, l.incomeLast - (l.mail?.incomeLast ?? 0));
+    let waiting = 0;
+    for (const sid of new Set(l.stops)) { const st = g.stations.get(sid); if (st) for (const w of st.waiting.values()) if (w.line === l.id) waiting += w.count; }
+    const oldSeats = oldModels.reduce((s, m) => s + m.capacity, 0);
+    const oldCap = oldYr.trips * oldSeats;
+    const horizon = 13 + 4 * this.config.risk;
+    const shared = info.kind === 'rail' && usesSharedRail(g, l);
+
+    let best: { cand: VehicleModel[]; same: boolean; unitCost: number; netOutlay: number; surplus: number } | null = null;
+    for (const cand of cands) {
+      if (!cand.length) continue;
+      const candIds = cand.map((c) => c.id), same = sameModels(vehicleModelIds(v0), candIds);
+      if (same && (avgAge < 22 || rule?.minAge === 22)) continue;
+      if (shared && !sharedTrainAllowed(g, l, this.companyId, cand, v0.pattern)) continue;
+      const targetVs = same ? vs.filter((v) => v.age >= 22) : vs;
+      if (!targetVs.length) continue;
+      const newYr = estimateVehicleYear(cand, hopUnits, g.year, 0.5, capKmh, 0);
+      const newHopS = YEAR_S / Math.max(0.1, newYr.trips);
+      const newHeadway = (roundHops * newHopS) / Math.max(1, vs.length);
+      const newKmh = (hopUnits * UNIT_M) / 1000 / (newHopS / 3600);
+      const newLegS = estimateLegTime(hopDist, newKmh, newHeadway, 1.15);
+      const revRatio = (speedFactor(hopDist, newLegS) * tripFactor(newLegS, refS)) / Math.max(0.05, oldElastic);
+      const opSaving = (oldYr.total - newYr.total) * vs.length;
+      const newCap = newYr.trips * cand.reduce((s, m) => s + m.capacity, 0);
+      const speedDelta = !same
+        ? (revRatio >= 1.02 ? lineRev * Math.min(0.6, (revRatio - 1) * 0.75) : revRatio < 0.98 ? lineRev * Math.max(-0.5, (revRatio - 1) * 0.75) : 0)
+        : 0;
+      const capGain = !same && newCap > oldCap * 1.05 && waiting > Math.max(10, oldSeats * 0.5)
+        ? paxRev * Math.min(0.3, (newCap / Math.max(1, oldCap) - 1) * 0.35)
+        : 0;
+      const unitCost = cand.reduce((s, m) => s + m.cost, 0);
+      const netOutlay = targetVs.reduce((s, v) => s + Math.max(0, unitCost - g.vehicles.resaleValue(v)), 0);
+      if (this.available() < netOutlay + 350_000) continue;
+      const netDeprec = Math.max(0, netOutlay - targetVs.length * unitCost * 0.2);
+      const scale = targetVs.length / vs.length;
+      const annualGain = (opSaving + speedDelta + capGain) * scale - netOutlay * e.interestRate * 0.5;
+      const surplus = annualGain * horizon - netDeprec;
+      if (surplus > (best?.surplus ?? 0)) best = { cand, same, unitCost, netOutlay, surplus };
+    }
+    if (!best) return false;
+    if (e.money < best.unitCost && !this.borrowFor(Math.max(best.unitCost, best.netOutlay))) return false;
+    const res = g.vehicles.setLineReplace(l.id, this.companyId, best.cand, best.same ? 22 : 0);
+    if (typeof res === 'string') return false;
+    this.note(`modernizing ${l.name} to ${best.cand[0].name}${best.cand.length > 1 ? ` (${best.cand.length} cars)` : ''}`);
+    return true;
+  }
+
   /** Trains waiting to be replaced by longer ones: replaced when they stand at a platform. */
   private replaceTrains() {
     this.mailPolicy.step();
@@ -6142,9 +6304,10 @@ export class AIController {
       if (call < 0) { g.vehicles.sell(nt.id); continue; }
       nt.stopIndex = call;
       this.mailPolicy.replaced(t, nt);
-      const name = t.name;
-      // The replacement starts at its depot: mail aboard waits here with its journey intact.
-      if (t.mailLoad > 0) offloadMail(g, t, t.mailLoad, g.stations.get(t.atStation) ?? null);
+      const name = t.name, st = g.stations.get(t.atStation) ?? null;
+      // The replacement starts at its depot: passengers and mail aboard wait here with their journeys intact.
+      if (t.load > 0) offloadPassengers(g, t, t.load, st);
+      if (t.mailLoad > 0) offloadMail(g, t, t.mailLoad, st);
       g.vehicles.sell(t.id);
       this.stats.vehicles++; this.stats.sold++;
       this.note(`lengthened ${name} to ${cars.filter((c) => c.capacity > 0).length} coaches on ${l.name}`);

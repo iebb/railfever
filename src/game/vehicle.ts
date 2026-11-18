@@ -90,6 +90,8 @@ export abstract class Vehicle {
   opSec = 0; opDist = 0; opJ = 0; opBrakeJ = 0; opMark = -1; opLastSt = -1;
   /** last month's operating costs (opcosts.ts) */
   opLast: OpCost | null = null;
+  /** Staged replacement consist/model ids to apply at the next station stop or depot (saved when present). */
+  replaceWith?: string[];
 
   constructor(protected game: Game, id: number) {
     this.id = id;
@@ -244,8 +246,11 @@ export abstract class Vehicle {
       }
       g.onIncome(income, this, st);
     }
-    // mail: off (delivered, or waiting for its next leg), then on; handling a unit of mail takes 1.5 x a passenger
+    // mail: off (delivered, or waiting for its next leg), then any staged replacement, then boarding
     const mailOff = this.mailCargo.size ? unloadMail(g, this, st) : 0;
+    const wasOnMap = !!(this as unknown as { onMap?: boolean }).onMap;
+    g.vehicles.applyArrivalReplace(this, st);
+    if (wasOnMap && !(this as unknown as { onMap?: boolean }).onMap) return 0;
     moved += this.boardStation(st);
     const mailMoved = mailOff + (this.mailCapacity > 0 ? loadMail(g, this, st) : 0);
     return 2.0 + (mailMoved > 0 ? Math.max(moved * perPax, mailMoved * perPax * 1.5) : moved * perPax);

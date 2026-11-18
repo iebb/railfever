@@ -82,6 +82,20 @@ export function showTitle(o: TitleOpts) {
       g && o.resumed ? btn('play', 'Continue', o.resumed.saved ? `${g.dateString()} · saved ${ago(o.resumed.saved)}` : g.dateString(), () => close(), true) : null,
       g && !o.resumed ? btn('play', 'Play this map', `${g.towns.list.length} towns · ${g.options.startYear}`, () => close(), true) : null,
       btn('plus', 'New game', '', () => openCard()),
+      btn('eye', 'Watch AI', '4 rivals · autonomous', async () => {
+        const seed = Math.floor(Math.random() * 99999) || 1;
+        const size = DEFAULT_MAP_SIZE, towns = defaultTowns(size), money = 8_000_000;
+        const started = await (ui.app.newGame({
+          size, towns, hilliness: 'hilly', water: 'medium', startYear: 1965, seed, startMoney: money,
+          aiCompanies: 4, aiConfigs: aiConfigsFor('mixed', 4, money, 0.55, seed),
+        }) as unknown as Promise<boolean>);
+        if (started) {
+          close(false);
+          ui.setSpeed(2);
+          ui.setAutoCam(true, true);
+          ui.toast('Autonomous mode — watching 4 AI companies (press Z for camera)', 'info');
+        }
+      }),
       btn('save', 'Load game', '', () => { close(false); openSaveLoad(ui, 'load'); }),
       btn('settings', 'Settings', '', () => { close(); openSettings(ui); })),
     h('div', { class: 'title-foot' }, 'Offline in your browser'),

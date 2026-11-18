@@ -303,6 +303,7 @@ function baseOf(v: Vehicle) {
     spacing: v.spacing,
     // mail aboard and delivered (only once the vehicle has carried mail: other saves are as before)
     ...(v.mailCargo.size || v.mailLoad || v.mailDelivered ? { mail: [...v.mailCargo.values()].map((c) => ({ ...c })), mailLoad: v.mailLoad, mailDelivered: v.mailDelivered } : {}),
+    ...(v.replaceWith?.length ? { replaceWith: [...v.replaceWith] } : {}),
   };
 }
 /** Energy counters a train's physics keeps between the monthly charges (if it has them). */
@@ -323,6 +324,7 @@ function restoreBase(g: Game, v: Vehicle, d: any) {
   v.opLast = d.opLast ? { ...d.opLast } : null;
   if (Array.isArray(d.mail)) restoreMail(g, v, d.mail);
   v.mailLoad = Number(d.mailLoad) || 0; v.mailDelivered = Number(d.mailDelivered) || 0;
+  if (Array.isArray(d.replaceWith) && d.replaceWith.length) v.replaceWith = d.replaceWith.map(String);
   if (Array.isArray(d.phys)) {
     const p = v as unknown as Record<string, number>;
     ['tractionJ', 'regenJ', 'auxJ', 'km', 'hours'].forEach((k, i) => { p[k] = Number(d.phys[i]) || 0; });

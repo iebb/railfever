@@ -351,6 +351,44 @@ export function suggestExpress(g: Game, l: Line): ServicePattern | null {
   return { id, name: PATTERN_LABEL[c.kind === 'local' ? 'rapid' : c.kind], kind: c.kind === 'local' ? 'rapid' : c.kind, stops: flags, ids: [...l.stops] };
 }
 
+/**
+ * Suggested short-turn pattern for a non-loop line of 5+ stations where a contiguous inner section carries
+ * disproportionately heavier demand than the outer tail(s) (rail turning stations must have 2+ tracks).
+ */
+export function suggestShortTurn(g: Game, l: Line): ServicePattern | null {
+  const r = lineRoute(l);
+  const n = r.stations.length;
+  if (r.loop || n < 5) return null;
+  const sts = r.stations.map((id) => g.stations.get(id)).filter((s): s is Station => !!s);
+  if (sts.length !== n) return null;
+  const load = sts.map((s) => s.catchPop * 0.5 + 4 * (s.pickupLast + s.arrivedLast) + 8 * s.waitingTotal);
+  const total = load.reduce((a, b) => a + b, 0);
+  let bestA = -1, bestB = -1, bestScore = 0;
+  for (let a = 0; a < n; a++) {
+    if (l.kind === 'rail' && a > 0 && (sts[a].rail?.tracks ?? 0) < 2) continue;
+    let innerSum = 0;
+    for (let b = a; b < n; b++) {
+      innerSum += load[b];
+      const len = b - a + 1;
+      if (len < 2 || len > n - 2) continue;
+      if (l.kind === 'rail' && b < n - 1 && (sts[b].rail?.tracks ?? 0) < 2) continue;
+      const innerMean = innerSum / len;
+      const outerMean = (total - innerSum) / (n - len);
+      if (innerMean < Math.max(120, outerMean * 2.2)) continue;
+      const sc = (innerMean / Math.max(25, outerMean)) * Math.sqrt(len);
+      if (sc > bestScore) { bestScore = sc; bestA = a; bestB = b; }
+    }
+  }
+  if (bestA < 0) return null;
+  const flags = l.stops.map((_, i) => {
+    const at = r.turn > 0 && i > r.turn ? l.stops.length - i : i;
+    return at >= bestA && at <= bestB;
+  });
+  if (linePatterns(l).some((p) => p.stops.length === flags.length && p.stops.every((x, i) => (x !== false) === flags[i]))) return null;
+  const id = (l.patterns ?? []).reduce((m, p) => Math.max(m, p.id + 1), 1);
+  return { id, name: patternName(g, l, flags, 'local'), kind: 'local', stops: flags, ids: [...l.stops] };
+}
+
 // ------------------------------------------------------------------------------ timetables and routing
 /** Straight-line distance between two stations (units). */
 function sdist(g: Game, a: number, b: number): number {

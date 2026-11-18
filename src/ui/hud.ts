@@ -161,6 +161,7 @@ export class Hud {
   private moreTracks = false;
   private accessBtn: HTMLButtonElement;
   private accessBadge: HTMLSpanElement;
+  private autoCamBtn: HTMLButtonElement;
   private sAccess = -1;
   private saveHide = 0;
   private trayHide = 0;
@@ -216,9 +217,11 @@ export class Hud {
     this.mapBtns.demand = h('button', { class: 'hbtn chrome', 'data-tip': 'Demand view', 'data-key': 'P', 'data-sfx': 'none', 'aria-label': 'Demand view', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('demand') }, icon('demand', 19));
     this.mapBtns.signals = h('button', { class: 'hbtn chrome', 'data-tip': 'Signal blocks', 'data-sfx': 'none', 'aria-label': 'Signal blocks', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('signals') }, icon('signal', 19));
     this.mapBtns.catchment = h('button', { class: 'hbtn chrome', 'data-tip': 'Catchment areas', 'data-key': 'O', 'data-sfx': 'none', 'aria-label': 'Catchment areas', 'aria-pressed': 'false', onclick: () => ui.mapModes.toggle('catchment') }, icon('catchment', 19));
+    this.autoCamBtn = h('button', { class: 'hbtn chrome', 'data-tip': 'Autonomous camera', 'data-key': 'Z', 'aria-label': 'Autonomous camera', 'aria-pressed': 'false', onclick: () => ui.setAutoCam(!ui.autoCam) }, icon('eye', 19));
     R.appendChild(h('div', { class: 'hud hud-tr' },
       this.saveEl,
       this.fpsEl,
+      this.autoCamBtn,
       this.mapBtns.lines,
       this.mapBtns.demand,
       this.mapBtns.catchment,
@@ -278,6 +281,13 @@ export class Hud {
   syncMapButtons() {
     const m = this.ui.mapModes?.mode ?? 'none';
     for (const [k, b] of Object.entries(this.mapBtns)) { b.classList.toggle('on', k === m); b.setAttribute('aria-pressed', k === m ? 'true' : 'false'); }
+  }
+
+  /** Highlight the autonomous camera button when active. */
+  syncAutoCam() {
+    const on = !!this.ui.autoCam;
+    this.autoCamBtn.classList.toggle('on', on);
+    this.autoCamBtn.setAttribute('aria-pressed', on ? 'true' : 'false');
   }
 
   /** Volume button state from the audio settings. */

@@ -491,6 +491,7 @@ export class RoadVehicle extends Vehicle {
     const dp: Depot | undefined = g.depots.get(this.depotId);
     if (!dp) { this.status = 'Depot missing'; return; }
     if (!this.line || this.line.stops.length < 1) { this.status = 'In depot (no line)'; return; }
+    g.vehicles.applyArrivalReplace(this, null);
     if (g.vehicles.waitForSpacingRelease(this)) return;
     const stub = g.world.net.edges.get(dp.edge);
     if (!stub) return;
@@ -614,10 +615,10 @@ export class RoadVehicle extends Vehicle {
   private meterTram(seg: RSeg, distance: number) {
     if (!this.isTram || !(distance > 0)) return;
     const net = this.game.world.net, e = net.edges.get(seg.e);
-    if (e?.tram) this.game.recordTrackUse(this.owner, e, seg.kind === 'conn' ? distance / 2 : distance, true);
+    if (e?.tram) this.game.recordTrackUse(this.owner, e, seg.kind === 'conn' ? distance / 2 : distance, true, this.id);
     if (seg.kind === 'conn') {
       const from = net.edges.get(seg.from);
-      if (from?.tram) this.game.recordTrackUse(this.owner, from, distance / 2, true);
+      if (from?.tram) this.game.recordTrackUse(this.owner, from, distance / 2, true, this.id);
     }
   }
 

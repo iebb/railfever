@@ -145,6 +145,8 @@ export class Game {
   private accessMult: Record<number, number> = {};
   /** usage this month: item key (rail edge id*4, tram tracks id*4+1, station id*4+2) -> amount by company id */
   private usage = new Map<number, number[]>();
+  /** per-vehicle usage this month on each item key -> amount by vehicle id (for Vehicle.opLast.trackFees) */
+  private usageVeh = new Map<number, Map<number, number>>();
   /** Legacy saved roster of owners with an agreement; all owner traffic is metered from month start. */
   private metered = new Set<number>();
   options: NewGameOptions;
@@ -215,13 +217,23 @@ export class Game {
     this.accessMult[PLAYER] = DEFAULT_ACCESS_MULTIPLIER;
     // metered usage follows edges that are split
     this.world.net.onSplit.push((old, e1, e2) => {
+      const f = old.len > 0 ? e1.len / old.len : 0.5;
       for (const k of [0, 1]) {
         const u = this.usage.get(old.id * 4 + k);
-        if (!u) continue;
-        this.usage.delete(old.id * 4 + k);
-        const f = old.len > 0 ? e1.len / old.len : 0.5;
-        this.usage.set(e1.id * 4 + k, u.map((x) => x * f));
-        this.usage.set(e2.id * 4 + k, u.map((x) => x * (1 - f)));
+        if (u) {
+          this.usage.delete(old.id * 4 + k);
+          this.usage.set(e1.id * 4 + k, u.map((x) => x * f));
+          this.usage.set(e2.id * 4 + k, u.map((x) => x * (1 - f)));
+        }
+        const uv = this.usageVeh.get(old.id * 4 + k);
+        if (uv) {
+          this.usageVeh.delete(old.id * 4 + k);
+          for (const [edgeKey, part] of [[e1.id * 4 + k, f], [e2.id * 4 + k, 1 - f]] as [number, number][]) {
+            let mv = this.usageVeh.get(edgeKey);
+            if (!mv) { mv = new Map(); this.usageVeh.set(edgeKey, mv); }
+            for (const [vid, amt] of uv) mv.set(vid, (mv.get(vid) ?? 0) + amt * part);
+          }
+        }
       }
     });
   }
@@ -602,23 +614,28 @@ export class Game {
   accessUsage(item: AccessItem): readonly number[] { return this.usage.get(accessItemKey(item)) ?? []; }
 
   /** Metering: a vehicle of `user` travelled `units` on a rail edge (or its tram tracks). Own usage counts too. */
-  recordTrackUse(user: number, e: NEdge, units: number, tram = false) {
+  recordTrackUse(user: number, e: NEdge, units: number, tram = false, vehId = -1) {
     const owner = tram ? e.tramOwner ?? -1 : e.owner;
     if (owner < 0 || user < 0 || e.depot >= 0 || !(units > 0) || !Number.isFinite(units)) return;
     if (owner !== user && !this.accessKeys.has(user * 4096 + owner)) this.openAccess(user, owner);
-    this.addUsage(e.id * 4 + (tram ? 1 : 0), user, units);
+    this.addUsage(e.id * 4 + (tram ? 1 : 0), user, units, vehId);
   }
   /** Metering: a vehicle stops at a station (called when it serves the station). */
   recordStop(v: Vehicle, st: Station) {
     if (st.owner < 0 || v.owner < 0) return;
     if (st.owner !== v.owner && !this.accessKeys.has(v.owner * 4096 + st.owner)) this.openAccess(v.owner, st.owner);
-    this.addUsage(st.id * 4 + 2, v.owner, 1);
+    this.addUsage(st.id * 4 + 2, v.owner, 1, v.id);
   }
-  private addUsage(key: number, user: number, x: number) {
+  private addUsage(key: number, user: number, x: number, vehId = -1) {
     let a = this.usage.get(key);
     if (!a) { a = []; this.usage.set(key, a); }
     while (a.length <= user) a.push(0);
     a[user] += x;
+    if (vehId >= 0) {
+      let mv = this.usageVeh.get(key);
+      if (!mv) { mv = new Map(); this.usageVeh.set(key, mv); }
+      mv.set(vehId, (mv.get(vehId) ?? 0) + x);
+    }
   }
   /** Yearly maintenance of one rail or road edge (as in maintenanceOf). */
   edgeMaintenance(e: NEdge): number {
@@ -660,12 +677,22 @@ export class Game {
         for (let i = 0; i < arr.length; i++) if (i !== owner) su += arr[i];
         if (!(su > 0)) continue;
         const cost = this.accessFullCost(item);
+        const vehMap = this.usageVeh.get(key);
         for (let i = 0; i < arr.length; i++) {
           if (i === owner || !(arr[i] > 0)) continue;
           const k = i * 4096 + owner, sh = shares.get(k) ?? { u: 0, c: 0 };
           sh.u += (cost * arr[i]) / (uo + su); sh.c += cost;
           shares.set(k, sh);
-          this.payAccess(i, owner, this.accessChargeEstimate(i, owner, [item], arr[i] / (uo + su)) / 12);
+          const fee = this.accessChargeEstimate(i, owner, [item], arr[i] / (uo + su)) / 12;
+          this.payAccess(i, owner, fee);
+          const payer = this.companies[i];
+          if (vehMap && fee > 0 && payer && !payer.defunct) {
+            for (const [vid, vu] of vehMap) {
+              if (!(vu > 0)) continue;
+              const veh = this.vehicles.get(vid);
+              if (veh?.opLast && veh.owner === i) veh.opLast.trackFees = (veh.opLast.trackFees ?? 0) + (fee * vu) / arr[i];
+            }
+          }
         }
       }
       for (const [k, sh] of shares) {
@@ -674,6 +701,7 @@ export class Game {
       }
     }
     this.usage.clear();
+    this.usageVeh.clear();
     this.metered = new Set(this.access.map((a) => a.owner));
     return wear;
   }
@@ -1117,6 +1145,7 @@ export class Game {
       accessMult: { ...this.accessMult },
       accessEarned: JSON.parse(JSON.stringify(this.accessEarned)),
       accessUsage: [...this.usage].map(([k, u]) => [k, [...u]]),
+      ...(this.usageVeh.size ? { accessUsageVeh: [...this.usageVeh].map(([k, mv]) => [k, [...mv]]) } : {}),
       accessMetered: [...this.metered],
       aiAcquisitions: this.aiAcquisitions,
       accessRequests: this.accessRequests.map((q) => ({ ...q })),
@@ -1157,6 +1186,7 @@ export class Game {
     this.accessEarned = {};
     if (d.accessEarned) for (const [k, v] of Object.entries(d.accessEarned as Record<string, { lastMonth: number; total: number }>)) this.accessEarned[Number(k)] = { lastMonth: v.lastMonth ?? 0, total: v.total ?? 0 };
     this.usage = new Map(((d.accessUsage ?? []) as [number, number[]][]).map(([k, u]) => [k, u.map((x) => Number(x) || 0)]));
+    this.usageVeh = new Map(((d.accessUsageVeh ?? []) as [number, [number, number][]][]).map(([k, pairs]) => [k, new Map(pairs.map(([vid, x]) => [Number(vid), Number(x) || 0]))]));
     this.metered = new Set(d.accessMetered ?? this.access.map((a) => a.owner));
     this.aiAcquisitions = d.aiAcquisitions ?? true;
     this.demandSaved = !!d.demand && this.demand.load(d.demand);

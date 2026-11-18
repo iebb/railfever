@@ -22,7 +22,7 @@ for (const off of [5, -5, 10, -10, 15, -15]) {
 const id = g.stations.nextId, error = plan.ok ? g.stations.commitRail(plan, ai.companyId) : plan.error;
 if (error) throw new Error(error);
 const hub = g.stations.get(id)!; hub.townId = B.id;
-// A rival coach route already serves the small towns. The quick railway quote shares their unchanged demand.
+// Rival coach routes already serve the small towns; with 2.10's 3.2x trip intensity two rival lines make the railway capital-negative.
 const stops = [B, C].map((town) => {
   let stop = -1;
   for (let dx = -10; dx <= 10 && stop < 0; dx += 2) for (let dz = -10; dz <= 10 && stop < 0; dz += 2)
@@ -30,7 +30,8 @@ const stops = [B, C].map((town) => {
   if (stop < 0) throw new Error(`No coach stop in ${town.name}`);
   g.stations.get(stop)!.townId = town.id; return stop;
 });
-const coach = g.lines.create('bus', 0); coach.stops = stops; g.lines.rebuild();
+for (let k = 0; k < 2; k++) { const coach = g.lines.create('bus', 0); coach.stops = stops; }
+g.lines.rebuild();
 check(ai.hubFor(B, C) === hub, 'losing continuation has a real owned hub with free platform ends');
 check(ai.hubFor(B, g.towns.list[7]) === hub, 'funded continuation uses the same real hub');
 const before = serialize(g);

@@ -7,7 +7,7 @@ import type { Vehicle } from '../game/vehicle';
 import { PLAYER } from '../game/game';
 import { h, icon, add, section } from './dom';
 import {
-  linePatterns, lineRoute, setPatterns, addPattern, removePattern, setVehiclePattern, suggestExpress, patternHeadways,
+  linePatterns, lineRoute, setPatterns, addPattern, removePattern, setVehiclePattern, suggestExpress, suggestShortTurn, patternHeadways,
   vehiclesByPattern, classifyFlags, patternName, PATTERN_KINDS, PATTERN_LABEL, PatternKind, ServicePattern,
 } from '../game/patterns';
 import { badgeOn, badgeEl } from './lineid';
@@ -117,6 +117,7 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
       : '● stop · │ pass · faint: beyond terminus'));
   if (mine) {
     const sug = suggestExpress(g, l);
+    const stSug = suggestShortTurn(g, l);
     add(body, h('div', { class: 'btns' },
       h('button', { class: 'btn', disabled: !sug, 'data-tip': sug ? 'Termini, interchanges and busy stations' : 'Needs 4+ stations, including quieter stops', onclick: () => {
         const current = g.lines.get(l.id);
@@ -126,6 +127,14 @@ export function servicesTab(ui: UI, l: Line, body: HTMLElement, after: () => voi
         if (p) { ui.sound('toggle', { pitch: 1.15 }); ui.toast(`${p.name} added; assign vehicles in Vehicles.`, 'good'); }
         after();
       } }, icon('services', 16), sug ? `Add ${PATTERN_LABEL[sug.kind]}` : 'Add express'),
+      h('button', { class: 'btn', disabled: !stSug, 'data-tip': stSug ? `${stSug.name}: turn back before quieter outer stops` : 'Needs 5+ stations with a much busier inner trunk', onclick: () => {
+        const current = g.lines.get(l.id);
+        const fresh = current ? suggestShortTurn(g, current) : null;
+        if (!current || !fresh) { ui.toast('No short-turn available', 'info'); after(); return; }
+        const p = addPattern(g, current.id, 'local', fresh.stops, nameFor(ui, current, 'local', fresh.stops));
+        if (p) { ui.sound('toggle', { pitch: 1.15 }); ui.toast(`${p.name} added; assign vehicles in Vehicles.`, 'good'); }
+        after();
+      } }, icon('services', 16), 'Add short-turn'),
       h('button', { class: 'btn', 'data-tip': 'All stops; omit end stations for a short-turn', onclick: () => {
         const flags = l.stops.map(() => true);
         const p = addPattern(g, l.id, 'local', flags, nameFor(ui, l, 'local', flags));

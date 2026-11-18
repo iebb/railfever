@@ -167,6 +167,8 @@ function sweep(g: Game, label: string) {
     show(`line ${l.id}`, () => openLine(ui, l.id));
     if (l.owner === PLAYER) {
       const body = ui.wm.get('line-' + l.id)!.body as unknown as DomElement;
+      const rep = body.querySelectorAll('button').find((b) => b.textContent === 'Replace fleet…');
+      if (rep) show(`replace fleet modal ${l.id}`, () => rep.click());
       const join = body.querySelectorAll('button').find((b) => b.textContent === (l.kind === 'rail' ? 'Join with line…' : 'Connect with line…'));
       assert.ok(join); show(`join preview ${l.id}`, () => join.click());
       // the route upgrade planner: plans (and previews) every mode it offers without building anything
