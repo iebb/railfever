@@ -73,7 +73,11 @@ export interface Line {
   growth?: Record<string, GrowthObservation>;
   /** mail carried (loaded) this / last month and its income this / last year (a part of incomeYear); from the line's first mail on */
   mail?: LineMail;
+  /** Per-operator staged fleet replacement or age-based auto-replace rule (minAge 0 = replace now at stops/depot). */
+  replace?: Record<number, LineReplaceRule>;
 }
+
+export interface LineReplaceRule { cars: string[]; minAge: number }
 
 export interface GrowthObservation {
   day: number; signature: string; forecast: number;
@@ -775,8 +779,13 @@ export class Lines {
   /** A line changes hands (company buyout): new number for the buyer, colour kept unless it clashes. */
   transfer(l: Line, owner: number) {
     if (l.owner === owner) return;
+    const prev = l.owner;
     l.owner = owner;
     if (l.operators) l.operators = l.operators.filter((o) => o !== owner);
+    if (l.replace?.[prev]) {
+      if (!l.replace[owner]) l.replace[owner] = l.replace[prev];
+      delete l.replace[prev];
+    }
     l.num = this.freeNumber(l.kind, owner, l.id);
     if (l.kind === 'rail' && l.code && this.codeTaken(l.code, owner, l.id)) l.code = this.freeCode(l);
     if (l.autoColor) {
@@ -797,6 +806,7 @@ export class Lines {
     l.kind = kind;
     l.num = this.freeNumber(kind, l.owner, l.id);
     delete l.spacing;
+    delete l.replace;
     if (l.autoColor) l.color = this.pickColor(kind, l.owner, l.id);
     if (l.autoName) { l.name = this.autoNameOf(l); this.autoText.set(l.id, l.name); }
     this.ensureCode(l);
@@ -1131,6 +1141,7 @@ export class Lines {
     if (Array.isArray(d.operators)) l.operators = [...d.operators];
     if (Array.isArray(d.patterns)) l.patterns = d.patterns.map((p: ServicePattern) => ({ ...p, stops: [...p.stops], ...(p.ids ? { ids: [...p.ids] } : {}) }));
     if (Array.isArray(d.platforms)) l.platforms = d.platforms.map((p: RailPlatformCall) => ({ ...p }));
+    if (d.replace) l.replace = Object.fromEntries(Object.entries(d.replace as Record<string, LineReplaceRule>).map(([k, r]) => [Number(k), { cars: [...(r.cars ?? [])], minAge: Number(r.minAge) || 0 }]));
     return l;
   }
 }

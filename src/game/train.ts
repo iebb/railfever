@@ -1074,6 +1074,7 @@ export class Train extends Vehicle {
     const dp = g.depots.get(this.depotId);
     if (!dp) { this.status = 'Depot missing'; return; }
     if (!this.line || this.line.stops.length < 1) { this.status = 'In depot (no line)'; return; }
+    g.vehicles.applyArrivalReplace(this, null);
     if (g.vehicles.waitForSpacingRelease(this)) return;
     for (const v of g.vehicles.trains()) {
       if (v !== this && v.segs.some((s) => s.depot === dp.id)) { this.status = 'Waiting to leave depot'; return; }
@@ -1125,7 +1126,7 @@ export class Train extends Vehicle {
       this.resetSpacing();
       this.state = 'loading';
       this.loadTimer = this.serveStation(st, 0.03);
-      this.status = 'Loading at ' + st.name;
+      if (this.onMap) this.status = 'Loading at ' + st.name;
     } else {
       this.planRoute(true);
     }

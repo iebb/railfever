@@ -3,7 +3,9 @@ import type { Game } from './game';
 import { Vehicle } from './vehicle';
 import { Train, CROSS_BASE, lineCompatibility, consistRule, type TSeg } from './train';
 import { RoadVehicle, RSeg, makeLaneSeg, connsConflict } from './roadvehicle';
-import { VehicleModel } from './vehicle-types';
+import { VehicleModel, MODEL_BY_ID } from './vehicle-types';
+import { KMH_TO_UPS } from './constants';
+import type { Line } from './lines';
 import { RNG } from './rng';
 import { curvePoint, type Curve3, type NEdge, type Crossing } from './network';
 import { closestOnPolyline, type Vec3Like } from './geom';
@@ -13,6 +15,16 @@ import { simNow } from './fares';
 import { offloadMail } from './mail';
 import type { Station } from './stations';
 import { sharedRailSpacing } from './rail-headways';
+
+/** Canonical model ids of a vehicle (made-up order for trains, single model for road/tram). */
+export function vehicleModelIds(v: Vehicle): string[] {
+  if (v instanceof Train) return v.madeUp.map((c) => c.id);
+  const rv = v as RoadVehicle;
+  return rv.model ? [rv.model.id] : [];
+}
+export function sameModels(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((x, i) => x === b[i]);
+}
 
 /** Cars added and removed between two consists (by model, as multisets). */
 export function consistDiff(from: VehicleModel[], to: VehicleModel[]): { added: VehicleModel[]; removed: VehicleModel[] } {
@@ -29,7 +41,7 @@ export function consistDiff(from: VehicleModel[], to: VehicleModel[]): { added: 
  * Take `count` passengers off a vehicle at station `st` (a shorter consist): they wait there for their next leg (their
  * waiting time kept), or are lost without a station or route.
  */
-function offloadPassengers(g: Game, v: Vehicle, count: number, st: Station | null) {
+export function offloadPassengers(g: Game, v: Vehicle, count: number, st: Station | null) {
   let left = Math.ceil(count);
   for (const [k, c] of [...v.cargo]) {
     if (left <= 0) break;
@@ -655,6 +667,174 @@ export class Vehicles {
     if (t.load > t.capacity) offloadPassengers(g, t, t.load - t.capacity, st);
     if (t.mailLoad > t.mailCapacity) offloadMail(g, t, t.mailLoad - t.mailCapacity, st);
     return null;
+  }
+
+  /** Validate whether `v` can be replaced by `cars` (consist rules, line compatibility, and optional net trade-in cost). */
+  replaceValidate(v: Vehicle, cars: VehicleModel[], checkMoney = true): string | null {
+    const g = this.game;
+    if (v instanceof Train) {
+      const emu = cars.length > 0 && cars[0].kind === 'emu';
+      if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
+      if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu' || c.kind === 'bus' || c.kind === 'tram')) return 'Multiple units cannot couple with other cars';
+      if (v.lineId != null) { const why = lineCompatibility(g, v.lineId, cars); if (why) return why; }
+    } else {
+      if (cars.length !== 1) return 'Select one vehicle model';
+      const tram = (v as RoadVehicle).isTram || v.line?.kind === 'tram';
+      if (cars[0].kind !== (tram ? 'tram' : 'bus')) return tram ? 'Select a tram model' : 'Select a bus or coach model';
+    }
+    if (checkMoney) {
+      const net = cars.reduce((s, c) => s + c.cost, 0) - this.resaleValue(v);
+      if (net > 0 && !g.company(v.owner).economy.canAfford(net)) return 'Not enough money';
+    }
+    return null;
+  }
+
+  /**
+   * Replace `v` immediately (in depot or while loading at `st`), trading in its resale value against `cars`, keeping
+   * service pattern and passengers/mail up to the new capacity (excess offloaded at `st`). Null = OK.
+   */
+  replaceNow(v: Vehicle, cars: VehicleModel[], st: Station | null = null): string | null {
+    const err = this.replaceValidate(v, cars, true);
+    if (err) return err;
+    const g = this.game, eco = g.company(v.owner).economy;
+    const cost = cars.reduce((s, c) => s + c.cost, 0), resale = this.resaleValue(v);
+    if (v instanceof Train) {
+      if (v.onMap && (v.state !== 'loading' || v.atStation < 0)) return 'Stop train in depot or at a platform';
+      const len = cars.reduce((s, c) => s + c.length + 0.1, 0);
+      const platformPath = v.onMap ? v.platformResizePath(len, consistRule(cars)) : null;
+      const dp = g.depots.get(v.depotId);
+      if (v.onMap && !platformPath && (!dp || dp.kind !== 'rail')) return 'Train does not fit on platform and has no rail depot';
+      if (resale > 0) eco.earn(resale, 'vehicles');
+      if (cost > 0) eco.spend(cost, 'vehicles', true);
+      const station = st ?? (v.onMap && v.atStation >= 0 ? g.stations.get(v.atStation) ?? null : null);
+      if (!v.onMap || platformPath) {
+        if (platformPath) v.reservePlatformResize(platformPath);
+        v.value = cost;
+        v.boughtDay = g.day;
+        v.cars = v.runsBackward ? [...cars].reverse() : [...cars];
+        delete v.replaceWith;
+        g.lines.rebuild(false);
+        if (v.load > v.capacity) offloadPassengers(g, v, v.load - v.capacity, station);
+        if (v.mailLoad > v.mailCapacity) offloadMail(g, v, v.mailLoad - v.mailCapacity, station);
+      } else {
+        v.destroy();
+        v.segs = []; v.pending = []; v.atStation = -1; v.speed = 0;
+        v.state = 'depot'; v.retryTimer = 0; v.status = 'Replaced in depot';
+        v.homeX = dp!.x; v.homeZ = dp!.z;
+        v.value = cost; v.boughtDay = g.day; v.cars = [...cars];
+        delete v.replaceWith;
+        g.lines.rebuild(false);
+        if (v.load > 0) offloadPassengers(g, v, v.load, station);
+        if (v.mailLoad > 0) offloadMail(g, v, v.mailLoad, station);
+      }
+    } else {
+      const rv = v as RoadVehicle;
+      if (rv.onMap && rv.state !== 'loading') return 'Stop vehicle in depot or at a stop';
+      const m = cars[0];
+      if (resale > 0) eco.earn(resale, 'vehicles');
+      if (m.cost > 0) eco.spend(m.cost, 'vehicles', true);
+      rv.model = m;
+      rv.value = m.cost;
+      rv.boughtDay = g.day;
+      rv.cruise = m.speed * KMH_TO_UPS;
+      delete rv.replaceWith;
+      g.lines.rebuild(false);
+      if (rv.load > rv.capacity) offloadPassengers(g, rv, rv.load - rv.capacity, st);
+      if (rv.mailLoad > rv.mailCapacity) offloadMail(g, rv, rv.mailLoad - rv.mailCapacity, st);
+    }
+    this.tidyLineReplace(v.line, v.owner);
+    return null;
+  }
+
+  /** Replace a single vehicle immediately if in depot/loading, or stage replacement for its next stop. */
+  orderVehicleReplace(v: Vehicle, cars: VehicleModel[]): 'replaced' | 'queued' | string {
+    const err = this.replaceValidate(v, cars, false);
+    if (err) return err;
+    const g = this.game;
+    const onMap = v instanceof Train ? v.onMap : (v as RoadVehicle).onMap;
+    if (!onMap || (v.state === 'loading' && (!(v instanceof Train) || v.atStation >= 0))) {
+      const st = v instanceof Train && v.atStation >= 0 ? g.stations.get(v.atStation) ?? null
+        : onMap ? v.targetStation() : null;
+      const nowErr = this.replaceNow(v, cars, st);
+      if (!nowErr) return 'replaced';
+      return nowErr;
+    }
+    v.replaceWith = cars.map((c) => c.id);
+    return 'queued';
+  }
+
+  /** Set or clear an operator's fleet replacement / auto-replace rule on `lineId` (`minAge === 0` = replace fleet now). */
+  setLineReplace(lineId: number, owner: number, cars: VehicleModel[] | null, minAge = 0): { replaced: number; queued: number } | string {
+    const g = this.game, l = g.lines.get(lineId);
+    if (!l) return 'No such line';
+    if (!cars) {
+      if (l.replace?.[owner]) {
+        delete l.replace[owner];
+        if (!Object.keys(l.replace).length) delete l.replace;
+      }
+      for (const vid of l.vehicles) { const v = this.map.get(vid); if (v && v.owner === owner) delete v.replaceWith; }
+      return { replaced: 0, queued: 0 };
+    }
+    if (l.kind === 'rail') {
+      const emu = cars.length > 0 && cars[0].kind === 'emu';
+      if (!cars.length || (!emu && cars[0].kind !== 'loco')) return 'A train needs a locomotive';
+      if (emu ? cars.some((c) => c.kind !== 'emu') : cars.some((c) => c.kind === 'emu' || c.kind === 'bus' || c.kind === 'tram')) return 'Multiple units cannot couple with other cars';
+      const why = lineCompatibility(g, l.id, cars);
+      if (why) return why;
+    } else {
+      if (cars.length !== 1 || cars[0].kind !== (l.kind === 'tram' ? 'tram' : 'bus')) return l.kind === 'tram' ? 'Select a tram model' : 'Select a bus or coach model';
+    }
+    const age = Math.max(0, Math.round(minAge)), ids = cars.map((c) => c.id);
+    (l.replace ??= {})[owner] = { cars: ids, minAge: age };
+    let replaced = 0, queued = 0;
+    for (const vid of l.vehicles) {
+      const v = this.map.get(vid);
+      if (!v || v.owner !== owner) continue;
+      delete v.replaceWith;
+      if (age <= 0 && sameModels(vehicleModelIds(v), ids)) continue;
+      if (v.age < age) { queued++; continue; }
+      const onMap = v instanceof Train ? v.onMap : (v as RoadVehicle).onMap;
+      if (!onMap || (v.state === 'loading' && (!(v instanceof Train) || v.atStation >= 0))) {
+        const st = v instanceof Train && v.atStation >= 0 ? g.stations.get(v.atStation) ?? null : onMap ? v.targetStation() : null;
+        if (!this.replaceNow(v, cars, st)) { replaced++; continue; }
+      }
+      queued++;
+    }
+    this.tidyLineReplace(l, owner);
+    return { replaced, queued };
+  }
+
+  /** Clear a one-shot (`minAge === 0`) line replacement rule once all vehicles of `owner` on `l` match it. */
+  tidyLineReplace(l: Line | null, owner: number) {
+    const rule = l?.replace?.[owner];
+    if (!l || !rule || rule.minAge > 0) return;
+    const pending = l.vehicles.some((id) => {
+      const v = this.map.get(id);
+      return !!v && v.owner === owner && !sameModels(vehicleModelIds(v), rule.cars);
+    });
+    if (!pending) {
+      delete l.replace![owner];
+      if (!Object.keys(l.replace!).length) delete l.replace;
+    }
+  }
+
+  /** Called at station arrival (after unloading, before boarding) and before leaving a depot. */
+  applyArrivalReplace(v: Vehicle, st: Station | null): boolean {
+    const cur = vehicleModelIds(v);
+    let ids: string[] | undefined;
+    if (v.replaceWith?.length) {
+      if (sameModels(cur, v.replaceWith)) delete v.replaceWith;
+      else ids = v.replaceWith;
+    }
+    if (!ids) {
+      const rule = v.line?.replace?.[v.owner];
+      if (rule && v.age >= rule.minAge && (rule.minAge > 0 || !sameModels(cur, rule.cars))) ids = rule.cars;
+      else if (rule && rule.minAge <= 0) this.tidyLineReplace(v.line, v.owner);
+    }
+    if (!ids?.length) return false;
+    const cars = ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m);
+    if (cars.length !== ids.length) { delete v.replaceWith; return false; }
+    return this.replaceNow(v, cars, st) === null;
   }
 
   resaleValue(v: Vehicle) {

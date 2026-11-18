@@ -44,6 +44,14 @@ export const WEAR_RATE = 0.25;
 export const TRACK_BASE_SHARE = 0.75;
 /** Minimum base maintenance relative to plain track; wired aliases share catenary upkeep. */
 export const TRACK_TYPE_FACTOR: Record<string, number> = { standard: 1, electric: 1.25, highspeed: 1.25, metro: 1.25, lightrail: 1.25 };
+/** Service age (years) after which overhaul and wear maintenance begins to rise. */
+export const AGE_WEAR_START = 12;
+export const AGE_WEAR_RATE = 0.035;
+export const AGE_WEAR_MAX = 0.85;
+/** Maintenance multiplier for a vehicle `age` years old (1 up to 12 years, rising smoothly up to +85%). */
+export function ageMaintFactor(age: number): number {
+  return age <= AGE_WEAR_START ? 1 : 1 + Math.min(AGE_WEAR_MAX, (age - AGE_WEAR_START) * AGE_WEAR_RATE);
+}
 
 type Source = 'electric' | 'diesel' | 'steam';
 /** Price / wage indices by year (1980 = 1), interpolated. */
@@ -241,7 +249,11 @@ export function calibration(models: VehicleModel[]): Calib {
 
 // ------------------------------------------------------------------------------ per-vehicle usage and monthly costs
 /** A month's operating costs of one vehicle (also kept as `Vehicle.opLast` for the UI). */
-export interface OpCost { overhead: number; crew: number; energy: number; maint: number; total: number; km: number; kwh: number; hours: number }
+export interface OpCost {
+  overhead: number; crew: number; energy: number; maint: number; total: number; km: number; kwh: number; hours: number;
+  /** Own-network track wear and foreign track/station access fees incurred by this vehicle last month (billed at company level). */
+  trackWear?: number; trackFees?: number;
+}
 
 /** The models of a vehicle (train cars, or the bus / tram model). */
 export function modelsOf(v: Vehicle): VehicleModel[] {
@@ -283,7 +295,7 @@ export function vehicleMonth(g: Game, v: Vehicle): OpCost {
   const u = takeUsage(g, v, c);
   const overhead = (OVERHEAD_SHARE * c.running) / MONTHS_PER_YEAR;
   const crew = (crewCount(c, year) * CREW_PER_YEAR * eraIndex('wage', year) * u.sec) / YEAR_S;
-  const maint = MAINT_PER_CAR_KM * c.carUnits * maintSpeed(c.vmax) * u.km + cal.timeMaintPerS * u.sec;
+  const maint = (MAINT_PER_CAR_KM * c.carUnits * maintSpeed(c.vmax) * u.km + cal.timeMaintPerS * u.sec) * ageMaintFactor(v.age);
   const en = energyCost(c, u.wheelJ, u.brakeJ, u.auxJ, year);
   const total = overhead + crew + maint + en.cost;
   return { overhead, crew, energy: en.cost, maint, total, km: u.km, kwh: en.kwh, hours: u.sec / 3600 };
@@ -354,12 +366,15 @@ export function passageWear(c: Consist, loadPax: number, units: number, kmh: num
   const loadUnits = c.axles > 0 ? (loadPax * PAX_T) / 16 : 0;
   return WEAR_RATE * units * (c.axleUnits + loadUnits) * wearSpeed(kmh);
 }
-interface OpsState { wear: Map<number, number>; wearOwner: Map<number, number>; wearUsers: Map<number, number[]>; lastWear: Record<number, number> }
+interface OpsState {
+  wear: Map<number, number>; wearOwner: Map<number, number>; wearUsers: Map<number, number[]>;
+  wearVeh: Map<number, Map<number, number>>; lastWear: Record<number, number>;
+}
 const states = new WeakMap<Game, OpsState>();
 function state(g: Game): OpsState {
   let s = states.get(g);
   if (!s) {
-    s = { wear: new Map(), wearOwner: new Map(), wearUsers: new Map(), lastWear: {} };
+    s = { wear: new Map(), wearOwner: new Map(), wearUsers: new Map(), wearVeh: new Map(), lastWear: {} };
     states.set(g, s);
     const st = s;
     // wear follows edges that are split
@@ -377,6 +392,13 @@ function state(g: Game): OpsState {
         const use = st.wearUsers.get(edge) ?? [];
         for (let i = 0; i < users.length; i++) use[i] = (use[i] ?? 0) + users[i] * part;
         st.wearUsers.set(edge, use);
+      }
+      const vehs = st.wearVeh.get(old.id);
+      st.wearVeh.delete(old.id);
+      if (vehs) for (const [edge, part] of [[e1.id, f], [e2.id, 1 - f]]) {
+        let mv = st.wearVeh.get(edge);
+        if (!mv) { mv = new Map(); st.wearVeh.set(edge, mv); }
+        for (const [vid, amt] of vehs) mv.set(vid, (mv.get(vid) ?? 0) + amt * part);
       }
     });
   }
@@ -399,7 +421,12 @@ export function trackPassage(g: Game, t: Vehicle & { cars: VehicleModel[]; speed
   while (users.length <= t.owner) users.push(0);
   if (t.owner >= 0) users[t.owner] += w;
   s.wearUsers.set(e.id, users);
-  g.recordTrackUse(t.owner, e, units);
+  if (w > 0 && t.id >= 0) {
+    let mv = s.wearVeh.get(e.id);
+    if (!mv) { mv = new Map(); s.wearVeh.set(e.id, mv); }
+    mv.set(t.id, (mv.get(t.id) ?? 0) + w);
+  }
+  g.recordTrackUse(t.owner, e, units, false, t.id);
 }
 
 /** Track wear recorded this month on an edge (money). */
@@ -422,8 +449,16 @@ export function billTrackWear(g: Game, reimburse?: (user: number, owner: number,
     last[owner] = (last[owner] ?? 0) + w;
     const users = s.wearUsers.get(id) ?? [];
     for (let user = 0; user < users.length; user++) if (user !== owner && users[user] > 0) reimburse?.(user, owner, users[user]);
+    const vehs = s.wearVeh.get(id);
+    if (vehs) for (const [vid, vw] of vehs) {
+      if (!(vw > 0)) continue;
+      const veh = g.vehicles.get(vid);
+      if (!veh?.opLast) continue;
+      if (veh.owner === owner) veh.opLast.trackWear = (veh.opLast.trackWear ?? 0) + vw;
+      else if (g.companies[veh.owner] && !g.companies[veh.owner].defunct) veh.opLast.trackFees = (veh.opLast.trackFees ?? 0) + vw;
+    }
   }
-  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.lastWear = last;
+  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.wearVeh = new Map(); s.lastWear = last;
   return out;
 }
 /** Track wear each company paid last month. */
@@ -462,7 +497,7 @@ export interface YearEstimate { total: number; overhead: number; crew: number; m
  * `load` share of seats; speed capped by `capKmh`): for route evaluation (AI) and the UI. `trackWearPerUnit` is the
  * wear one such vehicle causes per unit of its track per year (billed to the track owner).
  */
-export function estimateVehicleYear(models: VehicleModel[], hopUnits: number, year = 1980, load = 0.5, capKmh = Infinity): YearEstimate {
+export function estimateVehicleYear(models: VehicleModel[], hopUnits: number, year = 1980, load = 0.5, capKmh = Infinity, age = 0): YearEstimate {
   const cal = calibration(models), c = cal.consist;
   const dM = Math.max(10, hopUnits * UNIT_M * (c.road ? 1.3 : 1.15));
   const hop = hopEstimate(c, dM, c.seats * load, Math.min(capKmh, typicalCap(c)));
@@ -471,7 +506,7 @@ export function estimateVehicleYear(models: VehicleModel[], hopUnits: number, ye
   const km = (trips * dM) / 1000;
   const overhead = OVERHEAD_SHARE * c.running;
   const crew = crewCount(c, year) * CREW_PER_YEAR * eraIndex('wage', year);
-  const maint = MAINT_PER_CAR_KM * c.carUnits * maintSpeed(c.vmax) * km + cal.timeMaintPerS * YEAR_S;
+  const maint = (MAINT_PER_CAR_KM * c.carUnits * maintSpeed(c.vmax) * km + cal.timeMaintPerS * YEAR_S) * ageMaintFactor(age);
   const energy = energyCost(c, hop.wheelJ * trips, hop.brakeJ * trips, c.auxKw * 1000 * YEAR_S, year).cost;
   const trackWearPerUnit = c.road ? 0 : (passageWear(c, c.seats * load, 1, (hop.vPeak * 3.6) * 0.8) * trips * dM) / UNIT_M / Math.max(1, hopUnits);
   return { total: overhead + crew + maint + energy, overhead, crew, maint, energy, km, trips, trackWearPerUnit };
@@ -479,13 +514,18 @@ export function estimateVehicleYear(models: VehicleModel[], hopUnits: number, ye
 
 // ------------------------------------------------------------------------------ save
 /** Track wear of the month so far (save games). */
-export function saveOps(g: Game): { wear: [number, number, number][]; wearUsers: [number, number[]][]; lastWear: Record<number, number> } {
+export function saveOps(g: Game): { wear: [number, number, number][]; wearUsers: [number, number[]][]; wearVeh?: [number, [number, number][]][]; lastWear: Record<number, number> } {
   const s = state(g);
-  return { wear: [...s.wear].map(([id, w]) => [id, w, s.wearOwner.get(id) ?? -1]), wearUsers: [...s.wearUsers].map(([id, u]) => [id, [...u]]), lastWear: { ...s.lastWear } };
+  return {
+    wear: [...s.wear].map(([id, w]) => [id, w, s.wearOwner.get(id) ?? -1]),
+    wearUsers: [...s.wearUsers].map(([id, u]) => [id, [...u]]),
+    ...(s.wearVeh.size ? { wearVeh: [...s.wearVeh].map(([id, mv]) => [id, [...mv]]) } : {}),
+    lastWear: { ...s.lastWear },
+  };
 }
 export function loadOps(g: Game, d: any) {
   const s = state(g);
-  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.lastWear = {};
+  s.wear = new Map(); s.wearOwner = new Map(); s.wearUsers = new Map(); s.wearVeh = new Map(); s.lastWear = {};
   if (!d) return;
   for (const [id, w, o] of (d.wear ?? []) as [number, number, number][]) { s.wear.set(id, Number(w) || 0); s.wearOwner.set(id, o); }
   if (d.wearUsers) for (const [id, u] of d.wearUsers as [number, number[]][]) s.wearUsers.set(id, u.map(x => Number(x) || 0));
@@ -493,6 +533,9 @@ export function loadOps(g: Game, d: any) {
     // Legacy meters counted reference-wear units; recover operator wear from their proportions.
     const edge = g.world.net.edges.get(id), use = edge ? g.accessUsage(edge) : [], total = use.reduce((n, x) => n + x, 0);
     if (total > 0) s.wearUsers.set(id, use.map(x => w * x / total));
+  }
+  if (d.wearVeh) for (const [id, pairs] of d.wearVeh as [number, [number, number][]][]) {
+    s.wearVeh.set(id, new Map(pairs.map(([vid, x]) => [Number(vid), Number(x) || 0])));
   }
   if (d.lastWear) for (const [k, v] of Object.entries(d.lastWear)) s.lastWear[Number(k)] = Number(v) || 0;
 }

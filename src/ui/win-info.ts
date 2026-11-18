@@ -28,7 +28,8 @@ import { styleOf, stylesFor } from '../game/station-styles';
 import { badgeEl, badgeOn, badgeRow, stationBadges, lineTag } from './lineid';
 import { memo, expandPlan, commitExpand } from './win-ops';
 import { linePatterns, patternStops, setVehiclePattern, PATTERN_LABEL } from '../game/patterns';
-import type { OpCost } from '../game/opcosts';
+import { AGE_WEAR_START, ageMaintFactor, type OpCost } from '../game/opcosts';
+import { vehicleModelIds, sameModels } from '../game/vehicles';
 import { patBadge } from './win-services';
 import { field, seg } from './dom';
 import { servedColor, hexCss } from './mapmodes';
@@ -643,17 +644,20 @@ export function openEdge(ui: UI, id: number) {
 }
 
 // ------------------------------------------------------------------ vehicles
+export function consistDesc(ids: readonly string[]): string {
+  const models = ids.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m);
+  if (!models.length) return '—';
+  if (models.length === 1 && models[0].kind !== 'emu') return models[0].name;
+  const loco = models.filter((c) => c.kind === 'loco');
+  const wn = new Map<string, number>();
+  for (const w of models) if (w.kind === 'wagon') wn.set(w.name, (wn.get(w.name) ?? 0) + 1);
+  const units = new Map<string, number>();
+  for (const c of models) if (c.kind === 'emu') units.set(c.name, (units.get(c.name) ?? 0) + 1);
+  return [loco.length > 1 ? `${loco.length}× ${loco[0].name}` : loco[0]?.name, ...[...wn.entries()].map(([n, c]) => `${c}× ${n}`), ...[...units.entries()].map(([n, c]) => `${c}× ${n}`)].filter(Boolean).join(' + ');
+}
+
 export function vehicleDesc(v: Vehicle): string {
-  if (v instanceof Train) {
-    // as made up (locomotive, mail vans, coaches), whichever way round the train stands
-    const cars = v.madeUp;
-    const loco = cars.filter((c) => c.kind === 'loco');
-    const wn = new Map<string, number>();
-    for (const w of cars) if (w.kind === 'wagon') wn.set(w.name, (wn.get(w.name) ?? 0) + 1);
-    const units = new Map<string, number>();
-    for (const c of cars) if (c.kind === 'emu') units.set(c.name, (units.get(c.name) ?? 0) + 1);
-    return [loco.length > 1 ? `${loco.length}× ${loco[0].name}` : loco[0]?.name, ...[...wn.entries()].map(([n, c]) => `${c}× ${n}`), ...[...units].map(([n, c]) => `${c}× ${n}`)].filter(Boolean).join(' + ');
-  }
+  if (v instanceof Train) return consistDesc(v.madeUp.map((c) => c.id));
   return (v as RoadVehicle).model?.name ?? 'Car';
 }
 
@@ -692,6 +696,8 @@ export function openVehicle(ui: UI, id: number) {
     const load = v2.capacity ? v2.load / v2.capacity : 0;
     const room = v2.mailCapacity;
     const compat = v2 instanceof Train ? railWarning(ui, v2.cars, v2.line, v2.depotId) : null;
+    const ageWear = ageMaintFactor(v2.age);
+    const upg = mine ? upgradeOption(ui, v2) : null;
     add(win.body,
       h('div', { class: 'tiles' },
         tile(`${v2.speedKmh.toFixed(0)}`, `km/h of ${v2.maxSpeedKmh}`),
@@ -699,16 +705,18 @@ export function openVehicle(ui: UI, id: number) {
         v2.capacity > 0 || room <= 0 ? tile(`${v2.load}/${v2.capacity}`, 'Passengers', '', bar(load, 'var(--info)')) : null,
         room > 0 ? tile(fmtMailLoad(v2.mailLoad, room), 'Mail', 'mail', bar(v2.mailLoad / room, 'var(--mail)')) : null,
         tile(fmtMoney(v2.profitYear), 'Profit this year', v2.profitYear < 0 ? 'neg' : 'pos'),
-        tile(`${v2.age.toFixed(1)}`, 'Years old')),
+        tile(`${v2.age.toFixed(1)}`, ageWear > 1.005 ? `Years (+${Math.round((ageWear - 1) * 100)}% maint)` : 'Years old')),
       // what it is doing now, then what to do with it; the service settings and the bills below
       ui.kv('Status', v2.status),
+      v2.replaceWith?.length ? ui.kv('Queued upgrade', h('span', { class: 'inline' }, consistDesc(v2.replaceWith) + ' at next stop',
+        mine ? h('button', { class: 'btn sm ghost', onclick: () => { delete v2.replaceWith; after(); } }, 'Cancel') : null)) : null,
       target ? h('div', { class: 'kv' }, h('span', { class: 'k' }, 'Next stop'), h('span', { class: 'v' }, ui.stationLink(target.id))) : null,
       v2 instanceof Train && Math.abs(v2.grade) > 0.004 ? ui.kv('Gradient', fmtPct(v2.grade, 1)) : null,
       compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
       h('div', { class: 'btns' },
         h('button', { class: 'btn' + (ui.following === id ? ' on' : ''), onclick: () => { if (ui.following === id) ui.centerOn(...ui.posOf(v2)); else ui.follow(v2); win.last = undefined; render(); } }, icon('target', 16), ui.following === id ? 'Following' : 'Follow'),
         v2.line ? h('button', { class: 'btn', onclick: () => ui.openLine(v2.lineId!) }, icon('lines', 16), 'Line') : null,
-        mine && upgradeOption(ui, v2) ? h('button', { class: 'btn', title: upgradeOption(ui, v2)!.label, onclick: () => upgradeVehicle(ui, v2) }, icon('up', 16), 'Upgrade') : null,
+        upg ? h('button', { class: 'btn', 'data-tip': `${upg.label} · net ${fmtMoney(upg.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v2))}`, onclick: () => upgradeVehicle(ui, v2, after) }, icon('up', 16), 'Upgrade') : null,
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
       section('Service'),
@@ -828,20 +836,20 @@ function mailVanControl(ui: UI, t: Train, after: () => void): HTMLElement | null
 
 /** No annualisation or aggregate company fees: show the vehicle's own last monthly bill. */
 function vehicleCosts(v: Vehicle): HTMLElement {
-  const last = v.opLast as (Partial<OpCost> & { trackFees?: number; trackWear?: number }) | null | undefined;
+  const last = v.opLast;
   const out = h('div', null, section('Last month’s operating costs'));
   if (!last) { add(out, h('div', { class: 'muted station-advice' }, 'Available after first monthly bill.')); return out; }
   const money = (x: number | undefined) => typeof x === 'number' && isFinite(x) ? fmtMoneyFull(x) : '—';
+  const fees = last.trackFees ?? 0, wear = last.trackWear ?? 0;
   add(out, h('div', { class: 'costgrid' },
     h('span', null, 'Energy & fuel'), h('span', null, money(last.energy)),
     h('span', null, 'Crew wages'), h('span', null, money(last.crew)),
     h('span', null, 'Vehicle maintenance'), h('span', null, money(last.maint)),
     h('span', null, 'Vehicle overheads'), h('span', null, money(last.overhead)),
     h('span', null, 'Vehicle operating total'), h('span', null, money(last.total)),
-    h('span', null, 'Track access fees'), h('span', null, money(last.trackFees)),
-    typeof last.trackWear === 'number' ? [h('span', null, 'Track wear'), h('span', null, money(last.trackWear))] : null));
-  // TODO: OpCost needs per-vehicle trackFees; fees and track wear are currently billed at company level.
-  if (typeof last.trackFees !== 'number') add(out, h('div', { class: 'muted station-advice' }, 'Track fees / wear: company bill in Finances; no per-vehicle fees'));
+    h('span', null, 'Track access fees'), h('span', null, money(fees)),
+    v.kind === 'train' || wear > 0 ? [h('span', null, 'Track wear (own track)'), h('span', null, money(wear))] : null));
+  if (fees > 0 || wear > 0) add(out, h('div', { class: 'muted station-advice' }, 'Track fees & wear are billed to company finances.'));
   const use: string[] = [];
   if (typeof last.km === 'number' && isFinite(last.km)) use.push(`${last.km.toFixed(1)} km`);
   if (typeof last.kwh === 'number' && isFinite(last.kwh)) use.push(`${fmtInt(last.kwh)} kWh`);
@@ -850,51 +858,81 @@ function vehicleCosts(v: Vehicle): HTMLElement {
   return out;
 }
 
-/** The newest equivalent vehicle, if better than the current one. */
-function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: string } | null {
-  const year = ui.game.year;
+/** The newest compatible equivalent vehicle or consist, if better than the current one (or overhauling aged stock). */
+export function upgradeOption(ui: UI | Game, v: Vehicle): { cars: VehicleModel[]; label: string } | null {
+  const g = 'world' in ui ? ui : ui.game, year = g.year, aged = v.age >= AGE_WEAR_START + 3;
+  const u = { game: g } as UI;
   if (v instanceof Train) {
-    // passenger coaches are replaced by the newest; mail vans stay as they are (behind the locomotive)
+    const made = v.madeUp;
+    if (!made.length) return null;
+    const minP = v.line ? Math.min(...v.line.stops.map((sid) => g.stations.get(sid)?.rail?.length ?? Infinity)) : Infinity;
+    if (made[0].kind === 'emu') {
+      const cur = made[0], n = made.length;
+      const prefix = cur.id.startsWith('metro') ? 'metro' : cur.id.startsWith('lrv') ? 'lrv' : cur.id.startsWith('hsr') ? 'hsr' : 'emu';
+      const uFamily = (m: VehicleModel) => carriesMail(m) === carriesMail(cur) && mailOnlyModel(m) === mailOnlyModel(cur) && m.id.startsWith(prefix);
+      const cands = availableModels(year, 'emu').filter((m) => uFamily(m) && n * (m.length + CAR_GAP) <= minP + 1e-6 && (!v.line || !railWarning(u, Array<VehicleModel>(n).fill(m), v.line, v.depotId)));
+      const best = cands[cands.length - 1];
+      if (!best || (best.id === cur.id ? !aged : best.speed <= cur.speed && best.capacity <= cur.capacity && (best.mail ?? 0) <= (cur.mail ?? 0))) return null;
+      const cars = Array<VehicleModel>(n).fill(best);
+      return { cars, label: consistDesc(cars.map((c) => c.id)) };
+    }
     const coach = (c: VehicleModel) => c.kind === 'wagon' && !carriesMail(c);
-    const locos = availableModels(year, 'loco'), wagons = availableModels(year, 'wagon', false);
-    const loco = locos[locos.length - 1], wagon = wagons[wagons.length - 1];
-    const cur = v.cars.find((c) => c.kind === 'loco');
-    const curW = v.cars.find(coach);
-    if (!loco || !cur || (loco.speed <= cur.speed && (!wagon || !curW || wagon.capacity <= curW.capacity))) return null;
-    const n = v.cars.filter(coach).length, vans = v.cars.filter((c) => c.kind === 'wagon' && carriesMail(c));
-    const w = wagon ?? curW;
-    if (!w && n) return null;
-    return { cars: [loco, ...vans, ...(w ? Array<VehicleModel>(n).fill(w) : [])], label: `${loco.name}${vans.length ? ` + ${vans.length}× mail van` : ''}${n && w ? ` + ${n}× ${w.name}` : ''}` };
+    const curLoco = made.find((c) => c.kind === 'loco');
+    if (!curLoco) return null;
+    const nLoco = made.filter((c) => c.kind === 'loco').length;
+    const curVans = made.filter((c) => c.kind === 'wagon' && carriesMail(c));
+    const latestVan = availableModels(year, 'wagon', true).at(-1);
+    const nCoach = made.filter(coach).length;
+    const curW = made.find(coach);
+    const wagons = availableModels(year, 'wagon', false);
+    const w = wagons[wagons.length - 1] ?? curW;
+    if (!w && nCoach) return null;
+    const vansFit = curVans.length && latestVan ? Array<VehicleModel>(curVans.length).fill(latestVan) : curVans;
+    const chooseVans = (m: VehicleModel) => {
+      const upgraded = [...Array<VehicleModel>(nLoco).fill(m), ...vansFit, ...(w ? Array<VehicleModel>(nCoach).fill(w) : [])];
+      if (upgraded.reduce((s, c) => s + c.length + CAR_GAP, 0) <= minP + 1e-6) return vansFit;
+      return curVans;
+    };
+    const locos = availableModels(year, 'loco').filter((m) => {
+      const cand = [...Array<VehicleModel>(nLoco).fill(m), ...chooseVans(m), ...(w ? Array<VehicleModel>(nCoach).fill(w) : [])];
+      return cand.reduce((s, c) => s + c.length + CAR_GAP, 0) <= minP + 1e-6 && (!v.line || !railWarning(u, cand, v.line, v.depotId));
+    });
+    const loco = locos[locos.length - 1];
+    if (!loco) return null;
+    const vans = chooseVans(loco);
+    const cand = [...Array<VehicleModel>(nLoco).fill(loco), ...vans, ...(w ? Array<VehicleModel>(nCoach).fill(w) : [])];
+    const same = sameModels(made.map((c) => c.id), cand.map((c) => c.id));
+    const vanBetter = vans.length > 0 && curVans.length > 0 && (vans[0].mail ?? 0) > (curVans[0].mail ?? 0);
+    if (same ? !aged : loco.speed <= curLoco.speed && loco.power <= curLoco.power && !vanBetter && (!w || !curW || w.capacity <= curW.capacity)) return null;
+    return { cars: cand, label: consistDesc(cand.map((c) => c.id)) };
   }
   const rv = v as RoadVehicle;
-  // the same family: passenger buses, postbuses or mail vans and trucks
-  const family = (m: VehicleModel) => !rv.model || (carriesMail(m) === carriesMail(rv.model) && mailOnlyModel(m) === mailOnlyModel(rv.model));
-  const buses = availableModels(year, rv.model?.kind === 'tram' ? 'tram' : 'bus').filter(family);
+  if (!rv.model) return null;
+  const isCoach = (m: VehicleModel) => m.kind === 'bus' && /coach/.test(m.style ?? '');
+  const family = (m: VehicleModel) => carriesMail(m) === carriesMail(rv.model!) && mailOnlyModel(m) === mailOnlyModel(rv.model!) && isCoach(m) === isCoach(rv.model!);
+  const buses = availableModels(year, rv.model.kind === 'tram' ? 'tram' : 'bus').filter(family);
   const best = buses[buses.length - 1];
-  if (!rv.model || !best || best.id === rv.model.id || best.intro <= rv.model.intro) return null;
+  if (!best || (best.id === rv.model.id ? !aged : best.intro <= rv.model.intro && best.speed <= rv.model.speed && best.capacity <= rv.model.capacity)) return null;
   return { cars: [best], label: best.name };
 }
 
-function upgradeVehicle(ui: UI, v: Vehicle) {
+function upgradeVehicle(ui: UI, v: Vehicle, after?: () => void) {
   const g = ui.game;
   const opt = upgradeOption(ui, v);
   if (!opt) return;
-  const kind = vehicleKind(v);
-  const cur = (v as Train | RoadVehicle).depotId;
-  const dId = g.depots.get(cur) ? cur : findDepot(ui, kind, v.line);
-  if (dId == null) { ui.toast('No replacement depot available', 'bad'); return; }
-  const cost = opt.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v);
-  const error = (!g.company(v.owner).economy.canAfford(cost) ? 'Not enough money' : v.line ? g.lines.operateError(v.line, v.owner) : null)
-    ?? (kind === 'rail' ? railWarning(ui, opt.cars, v.line, dId) : null);
-  if (error) { ui.toast(error, 'bad'); return; }
-  if (!confirm(`Replace ${v.name} with ${opt.label}? Net cost ${fmtMoney(cost)}.`)) return;
-  const lineId = v.lineId;
-  g.vehicles.sell(v.id);
-  const r = kind === 'rail' ? g.vehicles.buyTrain(dId, opt.cars, lineId) : g.vehicles.buyRoad(dId, opt.cars[0], lineId);
-  if (typeof r === 'string') { ui.toast(r, 'bad'); return; }
-  ui.wm.close('veh-' + v.id);
-  ui.toast(`${r.name} replaces ${v.name}`, 'good');
-  openVehicle(ui, r.id);
+  const net = opt.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v);
+  if (!confirm(`Replace ${v.name} with ${opt.label}? Net trade-in ${fmtMoney(net)}.`)) return;
+  const res = g.vehicles.orderVehicleReplace(v, opt.cars);
+  if (res === 'replaced') {
+    ui.sound('purchase');
+    ui.toast(`${v.name} upgraded to ${opt.label}`, 'good');
+  } else if (res === 'queued') {
+    ui.sound('toggle');
+    ui.toast(`${v.name}: upgrades to ${opt.label} at next stop`, 'info');
+  } else {
+    ui.toast(res, 'bad');
+  }
+  after?.();
 }
 
 // ------------------------------------------------------------------ depot / purchase
@@ -1168,3 +1206,149 @@ export function findDepot(ui: UI, kind: LineKind, line: Line | null | undefined,
     return null;
   }, 3000);
 }
+
+/** Fleet replacement & age-based auto-replace composer for a line's player-owned vehicles. */
+export function openLineReplace(ui: UI, lineId: number) {
+  const g = ui.game, initial = g.lines.get(lineId);
+  if (!initial || !g.lines.canOperate(initial, PLAYER)) return;
+  const kind = initial.kind, rail = kind === 'rail', meta = KIND_META[kind];
+  const win = ui.wm.open('line-replace-' + lineId, 'Replace fleet', { width: 470, icon: meta.icon, color: initial.color, sub: initial.name, cls: 'purchase-info' });
+  const year = g.year;
+  const locos = availableModels(year, 'loco'), emus = availableModels(year, 'emu'), buses = availableModels(year, kind === 'tram' ? 'tram' : 'bus');
+  const wagons = availableModels(year, 'wagon', false), vans = availableModels(year, 'wagon', true);
+  const pax = (list: VehicleModel[]) => list.filter((m) => !carriesMail(m));
+  const lastOf = (list: VehicleModel[]) => pax(list)[pax(list).length - 1] ?? list[list.length - 1];
+  const firstOwn = initial.vehicles.map((id) => g.vehicles.get(id)).find((v) => v?.owner === PLAYER);
+  const existing = initial.replace?.[PLAYER];
+  const seedIds = existing?.cars ?? (firstOwn ? (upgradeOption(ui, firstOwn)?.cars.map((c) => c.id) ?? vehicleModelIds(firstOwn)) : []);
+  const seedModels = seedIds.map((id) => MODEL_BY_ID.get(id)).filter((m): m is VehicleModel => !!m);
+  const seedUnit = seedModels[0]?.kind === 'emu' ? seedModels[0] : undefined;
+  const seedLoco = seedModels.find((m) => m.kind === 'loco');
+  const seedVan = seedModels.find((m) => m.kind === 'wagon' && carriesMail(m));
+  const seedWagon = seedModels.find((m) => m.kind === 'wagon' && !carriesMail(m));
+  const state = {
+    minAge: String(existing?.minAge ?? 0),
+    train: (seedUnit ? 'unit' : emus.length && !seedLoco && initial.stops.some((sid) => { const r = g.stations.get(sid)?.rail; return r && railPartMode(r) !== 'mainline'; }) ? 'unit' : 'hauled') as 'hauled' | 'unit',
+    loco: seedLoco?.id ?? locos[locos.length - 1]?.id ?? '',
+    locoN: Math.max(1, seedModels.filter((m) => m.kind === 'loco').length || 1),
+    wagon: seedWagon?.id ?? lastOf(wagons)?.id ?? '',
+    count: seedModels.length && seedLoco ? seedModels.filter((m) => m.kind === 'wagon' && !carriesMail(m)).length : 3,
+    van: seedVan?.id ?? vans[vans.length - 1]?.id ?? '',
+    vanN: seedModels.filter((m) => m.kind === 'wagon' && carriesMail(m)).length,
+    unit: seedUnit?.id ?? lastOf(emus)?.id ?? '',
+    unitN: Math.max(1, seedUnit ? seedModels.length : 1),
+    bus: (!rail && seedModels[0]?.id) || lastOf(buses)?.id || '',
+  };
+  let selectedCars: VehicleModel[] = [];
+  const render = () => {
+    const l = g.lines.get(lineId);
+    if (!l || !g.lines.canOperate(l, PLAYER)) { win.close(); return; }
+    win.sub.textContent = l.name;
+    const scroll = win.body.scrollTop;
+    clear(win.body);
+    const modelRow = (m: VehicleModel, selected: boolean, onSel: () => void) => {
+      const pick = () => { onSel(); render(); };
+      return h('div', { class: 'model' + (selected ? ' sel' : ''), role: 'radio', tabindex: 0, 'aria-label': m.name, 'aria-checked': selected ? 'true' : 'false', onclick: pick,
+        onkeydown: (e: KeyboardEvent) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); pick(); } } },
+        h('div', { class: 'mname' }, h('span', null, m.name), h('span', { class: 'mcost' }, fmtMoney(m.cost))),
+        h('div', { class: 'mstats' },
+          h('span', null, icon('speed', 13), `${m.speed} km/h`),
+          m.capacity ? h('span', null, icon('people', 13), `${m.capacity}${m.kind === 'emu' ? ' / unit' : ''}`) : null,
+          m.mail ? h('span', { class: 'mstat-mail' }, icon('mail', 13), `${fmtMail(m.mail)}`) : null,
+          m.power ? h('span', null, `${m.power} kW`) : null,
+          h('span', null, icon('length', 13), `${Math.round(m.length * 10)} m`),
+          h('span', null, `${fmtMoney(m.running)}/yr base`)),
+        h('div', { class: 'mtags' },
+          m.kind === 'emu' ? h('span', { class: 'mtag' }, `${m.unitCars ?? 1} cars / unit`) : null,
+          m.traction !== 'none' ? h('span', { class: 'mtag' }, m.traction === 'electric' ? icon('bolt', 12) : null, m.traction) : null));
+    };
+    add(win.body, field('When', seg([['0', 'Now (at stops)'], ['15', 'At 15 yrs'], ['20', 'At 20 yrs'], ['25', 'At 25 yrs']], state.minAge, (v) => { state.minAge = v; render(); }),
+      state.minAge === '0' ? 'Vehicles trade in as they call at stations or depots; passengers stay aboard.' : `Auto-replaces vehicles on ${l.name} once they reach ${state.minAge} years.`));
+    if (rail) {
+      if (emus.length) add(win.body, field('Train type', seg([['hauled', 'Locomotive + coaches'], ['unit', 'Multiple units']], state.train, (v) => { state.train = v; render(); })));
+      if (state.train === 'unit') {
+        add(win.body, section('Multiple units'));
+        for (const m of emus) add(win.body, modelRow(m, state.unit === m.id, () => (state.unit = m.id)));
+        add(win.body, field('Units', stepper(String(state.unitN), () => { state.unitN = Math.max(1, state.unitN - 1); render(); }, () => { state.unitN = Math.min(4, state.unitN + 1); render(); })));
+      } else {
+        add(win.body, section('Locomotive'));
+        for (const m of locos) add(win.body, modelRow(m, state.loco === m.id, () => (state.loco = m.id)));
+        add(win.body, section('Coaches'));
+        for (const m of wagons) add(win.body, modelRow(m, state.wagon === m.id, () => (state.wagon = m.id)));
+        if (vans.length) {
+          add(win.body, section('Mail vans', 'behind the locomotive'));
+          for (const m of vans) add(win.body, modelRow(m, state.vanN > 0 && state.van === m.id, () => { state.van = m.id; if (!state.vanN) state.vanN = 1; }));
+        }
+        add(win.body, h('div', { class: 'inline wrap composer-steps', style: 'margin-top:10px' },
+          h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Locomotives'), stepper(String(state.locoN), () => { state.locoN = Math.max(1, state.locoN - 1); render(); }, () => { state.locoN = Math.min(2, state.locoN + 1); render(); })),
+          vans.length ? h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Mail vans'), stepper(String(state.vanN), () => { state.vanN = Math.max(0, state.vanN - 1); if (!state.vanN && !state.count) state.count = 1; render(); }, () => { state.vanN = Math.min(MAX_VANS, state.vanN + 1); render(); })) : null,
+          h('div', { class: 'opt' }, h('span', { class: 'opt-l' }, 'Coaches'), stepper(String(state.count), () => { state.count = Math.max(state.vanN > 0 ? 0 : 1, state.count - 1); render(); }, () => { state.count = Math.min(14, state.count + 1); render(); }))));
+      }
+    } else {
+      const isCoach = (m: VehicleModel) => kind === 'road' && /coach/.test(m.style ?? '');
+      const paxB = buses.filter((m) => !carriesMail(m));
+      const city = paxB.filter((m) => !isCoach(m)), coaches = paxB.filter(isCoach);
+      const mailB = buses.filter(carriesMail);
+      add(win.body, section(coaches.length || mailB.length ? 'City buses' : 'Model'));
+      for (const m of city) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id)));
+      if (coaches.length) { add(win.body, section('Long-distance coaches')); for (const m of coaches) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id))); }
+      if (mailB.length) { add(win.body, section('Postbuses & mail trucks')); for (const m of mailB) add(win.body, modelRow(m, state.bus === m.id, () => (state.bus = m.id))); }
+    }
+    const loco = MODEL_BY_ID.get(state.loco), wagon = MODEL_BY_ID.get(state.wagon), van = MODEL_BY_ID.get(state.van), unit = MODEL_BY_ID.get(state.unit), bus = MODEL_BY_ID.get(state.bus);
+    const nVans = van && vans.includes(van) ? state.vanN : 0;
+    const cars: VehicleModel[] = rail
+      ? state.train === 'unit' ? (unit ? Array<VehicleModel>(state.unitN).fill(unit) : [])
+        : (loco ? [...Array<VehicleModel>(state.locoN).fill(loco), ...(van ? Array<VehicleModel>(nVans).fill(van) : []), ...(wagon ? Array<VehicleModel>(nVans ? state.count : Math.max(1, state.count)).fill(wagon) : [])] : [])
+      : bus ? [bus] : [];
+    selectedCars = cars;
+    const unitCost = cars.reduce((s, c) => s + c.cost, 0);
+    const cap = cars.reduce((s, c) => s + c.capacity, 0);
+    const spd = cars.length ? Math.min(...cars.map((c) => c.speed)) : 0;
+    const len = cars.reduce((s, c) => s + c.length + CAR_GAP, 0);
+    const ownVs = l.vehicles.map((id) => g.vehicles.get(id)).filter((v): v is Vehicle => !!v && v.owner === PLAYER);
+    const minAge = Number(state.minAge) || 0;
+    const ids = cars.map((c) => c.id);
+    const dueNow = ownVs.filter((v) => v.age >= minAge && (minAge > 0 || !sameModels(vehicleModelIds(v), ids)));
+    const netNow = dueNow.reduce((s, v) => s + (unitCost - g.vehicles.resaleValue(v)), 0);
+    const compat = rail && cars.length ? lineCompatibility(g, l.id, cars) : null;
+    let warn = '';
+    let minP = Infinity;
+    if (rail) {
+      let minName = '';
+      for (const sid of l.stops) { const st = g.stations.get(sid); if (st?.rail && st.rail.length < minP) { minP = st.rail.length; minName = st.name; } }
+      if (isFinite(minP) && len > minP) warn = `Train ${Math.round(len * 10)} m > ${minName} platforms ${Math.round(minP * 10)} m.`;
+    }
+    add(win.body,
+      section('Fleet summary', `${ownVs.length} own vehicle${ownVs.length === 1 ? '' : 's'}`),
+      h('div', { class: 'summary' },
+        tile(fmtMoney(unitCost), 'Price / vehicle'),
+        tile(fmtMoney(netNow), `${dueNow.length} due now (net)`),
+        tile(String(cap), 'Passengers'),
+        tile(String(spd), 'km/h'),
+        rail ? tile(`${Math.round(len * 10)} m`, isFinite(minP) ? `of ${Math.round(minP * 10)} m` : 'Length', warn ? 'neg' : '') : null),
+      warn ? h('div', { class: 'warn' }, icon('warning', 16), warn) : null,
+      compat ? h('div', { class: 'alert warn' }, icon('warning', 16), h('div', { class: 'alert-b' }, h('b', null, 'Compatibility'), h('div', null, compat))) : null,
+      h('div', { class: 'btns right buybar' },
+        l.replace?.[PLAYER] ? h('button', { class: 'btn', onclick: () => {
+          g.vehicles.setLineReplace(l.id, PLAYER, null);
+          ui.toast('Replacement rule cleared', 'info');
+          ui.wm.get('line-' + l.id)?.refresh?.();
+          win.close();
+        } }, 'Clear rule') : null,
+        h('button', { class: 'btn primary', disabled: !cars.length || !!compat, onclick: () => {
+          const res = g.vehicles.setLineReplace(l.id, PLAYER, selectedCars, Number(state.minAge) || 0);
+          if (typeof res === 'string') { ui.toast(res, 'bad'); return; }
+          ui.sound('purchase');
+          const ageN = Number(state.minAge) || 0;
+          ui.toast(ageN > 0
+            ? `Auto-replace at ${ageN} yrs set (${res.replaced} upgraded now)`
+            : res.queued > 0 ? `${res.replaced} upgraded now, ${res.queued} at next stop` : `${res.replaced} upgraded`, 'good');
+          ui.wm.get('line-' + l.id)?.refresh?.();
+          win.close();
+        } }, icon('up', 16), minAge > 0 ? `Auto-replace at ${minAge} yrs` : `Replace fleet (${dueNow.length})`)));
+    if (scroll) win.body.scrollTop = scroll;
+  };
+  win.refresh = render;
+  render();
+}
+

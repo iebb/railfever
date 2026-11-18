@@ -11,7 +11,7 @@ import type { Line } from '../game/lines';
 import type { Station } from '../game/stations';
 import type { Game } from '../game/game';
 import { availableModels } from '../game/vehicle-types';
-import { findDepot } from './win-info';
+import { findDepot, consistDesc, openLineReplace } from './win-info';
 import { chart } from './charts';
 import { fmtPct, fmtAccessFactor, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail, fmtSets } from './format';
 import type { Vehicle } from '../game/vehicle';
@@ -21,7 +21,9 @@ import { demandView } from '../game/demand';
 import { getFilter, validateFilter, lineMatches, vehicleMatches, filterBar, modeCounts, lineSymbol, lineMode, vehicleMode, MODE_META, badgeOn, badgeEl, LineMode } from './lineid';
 import { congestionOf, congestionPanel, compatPanel, routePanel, routeInfo, sharedPanel, faresPanel, decommission } from './win-ops';
 import { servicesTab, patternSelect, stopDots } from './win-services';
-import { subsetOf, linePatterns, canJoinLines, joinLines } from '../game/patterns';
+import { subsetOf, linePatterns, canJoinLines, joinLines, setVehiclePattern } from '../game/patterns';
+import { AGE_WEAR_START } from '../game/opcosts';
+import { vehicleModelIds, sameModels } from '../game/vehicles';
 import { stopsWithInserted, replaceLineStops, type StopPlace } from '../game/line-edit';
 import { platformChoices, platformPreference, setPlatformPreference } from '../game/rail-platforms';
 import { openRouteUpgrade, worksPanel } from './win-upgrade';
@@ -349,23 +351,39 @@ export function openLine(ui: UI, id: number) {
       servicesTab(ui, l, win.body, rerender);
     } else if (win.tab === 'vehicles') {
       add(win.body, congestionPanel(ui, l, rerender));
+      const rule = operates ? l.replace?.[PLAYER] : undefined;
+      if (rule) {
+        const pending = l.vehicles.filter((vid) => {
+          const v = g.vehicles.get(vid);
+          return !!v && v.owner === PLAYER && !sameModels(vehicleModelIds(v), rule.cars);
+        }).length;
+        add(win.body, h('div', { class: 'alert info' }, icon('up', 16), h('div', { class: 'alert-b' },
+          h('b', null, rule.minAge > 0 ? `Auto-replace at ${rule.minAge} yrs` : `Replacing fleet (${pending} left)`),
+          h('div', { class: 'inline wrap' }, consistDesc(rule.cars),
+            h('button', { class: 'btn sm ghost', onclick: () => openLineReplace(ui, l.id) }, 'Edit'),
+            h('button', { class: 'btn sm ghost', onclick: () => { g.vehicles.setLineReplace(l.id, PLAYER, null); rerender(); } }, 'Cancel')))));
+      }
       const vl = h('div', { class: 'list' });
       for (const vid of l.vehicles) {
         const v = g.vehicles.get(vid);
         if (!v) continue;
         const ps = patternSelect(ui, l, v, rerender);
+        const aged = v.age > AGE_WEAR_START ? ` · ${Math.floor(v.age)}y` : '';
+        const upgTag = v.replaceWith?.length ? ' · ↑ stop' : '';
         vl.appendChild(h('div', { class: 'row link', onclick: () => ui.openVehicle(vid) },
           h('span', null, v.name),
           v.owner !== PLAYER ? ui.ownerTag(v.owner) : null,
           ps ? h('span', { onclick: (e: Event) => e.stopPropagation() }, ps) : null,
-          h('span', { class: 'muted' }, v.status),
+          h('span', { class: 'muted' }, v.status + aged + upgTag),
           h('span', { class: 'num' }, loadText(v))));
       }
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
+      const hasOwn = l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER);
       if (operates) add(win.body, h('div', { class: 'btns' },
         h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), `Add ${meta.vehicle}`),
-        l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER) ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
+        hasOwn ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null,
+        hasOwn || rule ? h('button', { class: 'btn', 'data-tip': 'Replace vehicles at stops or set auto-replace age', onclick: () => openLineReplace(ui, l.id) }, icon('up', 16), 'Replace fleet…') : null));
       add(win.body, sharedPanel(ui, l, rerender));
     } else {
       // load factors now (on board / room) of the passengers and of the mail
@@ -469,7 +487,10 @@ function cloneLast(ui: UI, l: Line) {
   if (dp == null) { ui.toast('No depot available', 'bad'); return; }
   // (as made up: locomotive, mail vans, coaches, whichever way round the original stands)
   const r = v instanceof Train ? g.vehicles.buyTrain(dp, v.madeUp, l.id) : g.vehicles.buyRoad(dp, (v as RoadVehicle).model!, l.id);
-  if (typeof r === 'string') ui.toast(r, 'bad'); else { ui.toast(`${r.name} purchased`, 'good'); ui.sound('purchase'); }
+  if (typeof r === 'string') { ui.toast(r, 'bad'); return; }
+  if (v.pattern !== undefined) setVehiclePattern(g, r.id, v.pattern);
+  ui.toast(`${r.name} purchased`, 'good');
+  ui.sound('purchase');
 }
 
 // ------------------------------------------------------------------ lists
