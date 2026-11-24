@@ -163,84 +163,169 @@ class RouteHeap {
   }
 }
 
-interface RouteNode { best: number; first: { line: number; alight: number } | null; rode: boolean; walked: boolean; arrival: number | undefined }
-
 /**
- * First hops of the cheapest journeys from `src` over the routing graph (Dijkstra; transfers cost
- * TRANSFER_PENALTY_S, plus PLATFORM_CHANGE_S unless walked): Map(dest -> hop) for every station reached riding a line.
+ * Routing tables from each source over a routing graph: Map(source -> Map(dest -> first hop)), filled into `out`.
+ * Uses dense-indexed flat typed arrays for Dijkstra to avoid per-node Map/object allocations while preserving
+ * exact relaxation order, tie-breaking, and floating-point costs.
  */
-function routeFrom(edges: Map<number, RouteEdge[]>, src: number, open: RouteHeap,
-  sameComplex: (a: number, b: number) => boolean = () => false): Map<number, Hop> {
-  const table = new Map<number, Hop>();
-  // One record per reached station (insertion order = first relaxation, as the former per-field maps had):
-  // best cost, first hop, did the best path ride a line, did it arrive on foot, where it last alighted.
-  const state = new Map<number, RouteNode>([[src, { best: 0, first: null, rode: false, walked: false, arrival: undefined }]]);
-  open.clear();
-  open.push(0, src);
-  while (open.size) {
-    const c = open.top(), u = open.pop(), su = state.get(u)!;
-    if (c > su.best) continue;
-    // Every outgoing ride has the same transfer at this popped node. First boarding and walking
-    // edges need no complex query; compute the penalty lazily for the first outgoing ride only.
-    let transfer: number | undefined;
-    for (const e of edges.get(u) ?? []) {
-      if (e.line !== WALK_LINE && su.rode && transfer === undefined)
-        transfer = (sameComplex(su.arrival ?? u, u) ? 0 : TRANSFER_PENALTY_S) + (su.walked ? 0 : PLATFORM_CHANGE_S);
-      const nc = c + e.cost + (e.line === WALK_LINE ? 0 : transfer ?? 0);
-      let sv = state.get(e.to);
-      if (nc < (sv ? sv.best : Infinity)) {
-        if (!sv) { sv = { best: nc, first: null, rode: false, walked: false, arrival: undefined }; state.set(e.to, sv); }
-        sv.best = nc;
-        sv.first = u === src ? { line: e.line, alight: e.to } : su.first!;
-        sv.rode = su.rode || e.line !== WALK_LINE;
-        sv.walked = e.line === WALK_LINE;
-        sv.arrival = e.line === WALK_LINE ? su.arrival ?? u : e.to;
-        open.push(nc, e.to);
-      }
-    }
-  }
-  // lines serving the same first leg about as well as the best one (parallel lines share the passengers)
-  const legs = new Map<number, { line: number; cost: number }[]>();
-  for (const e of edges.get(src) ?? []) {
-    let a = legs.get(e.to);
-    if (!a) { a = []; legs.set(e.to, a); }
-    const o = a.find((x) => x.line === e.line);
-    if (o) o.cost = Math.min(o.cost, e.cost); else a.push({ line: e.line, cost: e.cost });
-  }
-  for (const [d, sd] of state) {
-    const f = sd.first;
-    if (!f || d === src || !sd.rode) continue;
-    const hop: Hop = { line: f.line, alight: f.alight, cost: sd.best };
-    const leg = legs.get(f.alight);
-    if (leg && leg.length > 1) {
-      const own = leg.find((x) => x.line === f.line);
-      const lim = (own ? own.cost : Math.min(...leg.map((x) => x.cost))) * 1.15 + 10;
-      const alt = leg.filter((x) => x.line !== f.line && x.cost <= lim).map((x) => x.line);
-      if (alt.length) hop.lines = [f.line, ...alt];
-    }
-    table.set(d, hop);
-  }
-  return table;
-}
-
-/** Routing tables from each source over a routing graph: Map(source -> Map(dest -> first hop)), filled into `out`. */
 export function routeTables(edges: Map<number, RouteEdge[]>, sources: Iterable<number>, out = new Map<number, Map<number, Hop>>(),
-  nativeComplex?: (a: number, b: number) => boolean): Map<number, Map<number, Hop>> {
+  nativeComplex?: (a: number, b: number) => boolean, complexesReady = false): Map<number, Map<number, Hop>> {
   const open = new RouteHeap();
   // Membership is a pure snapshot for this synchronous table build. Cache ordered pairs locally,
   // including false answers; the next build observes any link/combined-platform change immediately.
-  const membership = new Map<number, Map<number, boolean>>();
-  const native = nativeComplex ? (a: number, b: number) => {
-    let row = membership.get(a);
-    const found = row?.get(b);
-    if (found !== undefined) return found;
-    const value = !!nativeComplex(a, b);
-    if (!row) { row = new Map(); membership.set(a, row); }
-    row.set(b, value);
-    return value;
-  } : undefined;
-  const sameComplex = transferComplexes(edges, native);
-  for (const src of sources) out.set(src, routeFrom(edges, src, open, sameComplex));
+  let sameComplex: (a: number, b: number) => boolean;
+  if (complexesReady && nativeComplex) {
+    sameComplex = nativeComplex;
+  } else {
+    const membership = new Map<number, Map<number, boolean>>();
+    const native = nativeComplex ? (a: number, b: number) => {
+      let row = membership.get(a);
+      const found = row?.get(b);
+      if (found !== undefined) return found;
+      const value = !!nativeComplex(a, b);
+      if (!row) { row = new Map(); membership.set(a, row); }
+      row.set(b, value);
+      return value;
+    } : undefined;
+    sameComplex = transferComplexes(edges, native);
+  }
+  const srcList = Array.isArray(sources) ? sources : [...sources];
+  if (!srcList.length) return out;
+  // Map all station ids in the graph (and requested sources) to dense indices 0..V-1.
+  const idToIdx = new Map<number, number>();
+  const idxToIdList: number[] = [];
+  const intern = (id: number): number => {
+    let idx = idToIdx.get(id);
+    if (idx === undefined) { idx = idxToIdList.length; idToIdx.set(id, idx); idxToIdList.push(id); }
+    return idx;
+  };
+  let edgeCount = 0;
+  for (const [u, es] of edges) {
+    intern(u);
+    edgeCount += es.length;
+    for (let i = 0; i < es.length; i++) intern(es[i].to);
+  }
+  for (let i = 0; i < srcList.length; i++) intern(srcList[i]);
+  const V = idxToIdList.length;
+  const idxToId = Int32Array.from(idxToIdList);
+  const adjStart = new Int32Array(V + 1);
+  const adjTo = new Int32Array(edgeCount);
+  const adjLine = new Int32Array(edgeCount);
+  const adjCost = new Float64Array(edgeCount);
+  let pos = 0;
+  for (let u = 0; u < V; u++) {
+    adjStart[u] = pos;
+    const es = edges.get(idxToId[u]);
+    if (es) {
+      for (let i = 0; i < es.length; i++) {
+        const e = es[i];
+        adjTo[pos] = idToIdx.get(e.to)!;
+        adjLine[pos] = e.line;
+        adjCost[pos] = e.cost;
+        pos++;
+      }
+    }
+  }
+  adjStart[V] = pos;
+
+  // Scratch arrays reused across all sources; reset only touched indices after each run.
+  const best = new Float64Array(V);
+  best.fill(Infinity);
+  const firstLine = new Int32Array(V);
+  const firstAlight = new Int32Array(V);
+  // flags: bit 1 = rode, bit 2 = walked, bit 4 = hasFirst, bit 8 = hasArrival
+  const flags = new Uint8Array(V);
+  const arrival = new Int32Array(V);
+  const reached = new Int32Array(V);
+
+  for (let s = 0; s < srcList.length; s++) {
+    const src = srcList[s], srcIdx = idToIdx.get(src)!;
+    const table = new Map<number, Hop>();
+    let reachedCount = 0;
+    best[srcIdx] = 0;
+    flags[srcIdx] = 0;
+    reached[reachedCount++] = srcIdx;
+    open.clear();
+    open.push(0, srcIdx);
+    while (open.size) {
+      const c = open.top(), u = open.pop();
+      if (c > best[u]) continue;
+      const fu = flags[u], uRode = (fu & 1) !== 0;
+      const start = adjStart[u], end = adjStart[u + 1];
+      // Every outgoing ride has the same transfer at this popped node. First boarding and walking
+      // edges need no complex query; compute the penalty lazily for the first outgoing ride only.
+      let transfer = -1;
+      for (let i = start; i < end; i++) {
+        const line = adjLine[i];
+        let nc = c + adjCost[i];
+        if (line !== WALK_LINE && uRode) {
+          if (transfer < 0) {
+            const uId = idxToId[u];
+            const arrId = (fu & 8) ? arrival[u] : uId;
+            transfer = (sameComplex(arrId, uId) ? 0 : TRANSFER_PENALTY_S) + ((fu & 2) ? 0 : PLATFORM_CHANGE_S);
+          }
+          nc += transfer;
+        }
+        const v = adjTo[i];
+        if (nc < best[v]) {
+          if (best[v] === Infinity) reached[reachedCount++] = v;
+          best[v] = nc;
+          if (u === srcIdx) {
+            firstLine[v] = line;
+            firstAlight[v] = idxToId[v];
+          } else {
+            firstLine[v] = firstLine[u];
+            firstAlight[v] = firstAlight[u];
+          }
+          const walked = line === WALK_LINE;
+          const rode = uRode || !walked;
+          flags[v] = (rode ? 1 : 0) | (walked ? 2 : 0) | 4 | 8;
+          arrival[v] = walked ? ((fu & 8) ? arrival[u] : idxToId[u]) : idxToId[v];
+          open.push(nc, v);
+        }
+      }
+    }
+    // lines serving the same first leg about as well as the best one (parallel lines share the passengers)
+    const legs = new Map<number, { line: number; cost: number }[]>();
+    const sStart = adjStart[srcIdx], sEnd = adjStart[srcIdx + 1];
+    for (let i = sStart; i < sEnd; i++) {
+      const toId = idxToId[adjTo[i]], line = adjLine[i], cost = adjCost[i];
+      let a = legs.get(toId);
+      if (!a) { a = []; legs.set(toId, a); }
+      let found = false;
+      for (let j = 0; j < a.length; j++) {
+        if (a[j].line === line) { if (cost < a[j].cost) a[j].cost = cost; found = true; break; }
+      }
+      if (!found) a.push({ line, cost });
+    }
+    for (let k = 0; k < reachedCount; k++) {
+      const v = reached[k];
+      const fv = flags[v];
+      const cost = best[v];
+      best[v] = Infinity;
+      flags[v] = 0;
+      if (v === srcIdx || !(fv & 4) || !(fv & 1)) continue;
+      const fLine = firstLine[v], fAlight = firstAlight[v];
+      const hop: Hop = { line: fLine, alight: fAlight, cost };
+      const leg = legs.get(fAlight);
+      if (leg && leg.length > 1) {
+        let ownCost = Infinity, minCost = Infinity;
+        for (let j = 0; j < leg.length; j++) {
+          const lc = leg[j].cost;
+          if (lc < minCost) minCost = lc;
+          if (leg[j].line === fLine) ownCost = lc;
+        }
+        const lim = (ownCost < Infinity ? ownCost : minCost) * 1.15 + 10;
+        let alt: number[] | undefined;
+        for (let j = 0; j < leg.length; j++) {
+          if (leg[j].line !== fLine && leg[j].cost <= lim) (alt ??= [fLine]).push(leg[j].line);
+        }
+        if (alt) hop.lines = alt;
+      }
+      table.set(idxToId[v], hop);
+    }
+    out.set(src, table);
+  }
   return out;
 }
 
@@ -1040,15 +1125,17 @@ export class Lines {
     const served = new Set<number>(), apart = new Set<number>();
     for (const [from, arr] of medges) for (const e of arr) if (e.line !== WALK_LINE) { served.add(find(from)); if (own.has(e.line)) apart.add(find(from)); }
     for (const [from, arr] of edges) for (const e of arr) if (e.line !== WALK_LINE && !carrying.has(e.line)) apart.add(find(from));
-    const open = new RouteHeap();
     // The same transfer rule as the passenger tables a complex shares: no external penalty inside one station complex.
     const stations = g.stations, sameComplex = transferComplexes(medges, (a, b) => stations.isSameStationComplex(a, b));
+    const needed: number[] = [];
     for (const src of medges.keys()) {
       const root = find(src);
       if (!served.has(root)) continue;
       const shared = apart.has(root) ? undefined : this.routing.get(src);
-      this.mailRouting.set(src, shared ?? routeFrom(medges, src, open, sameComplex));
+      if (shared) this.mailRouting.set(src, shared);
+      else needed.push(src);
     }
+    if (needed.length) routeTables(medges, needed, this.mailRouting, sameComplex, true);
   }
 
   /** Vehicles of a line that carry a cargo (passengers: all but the mail-only ones). */

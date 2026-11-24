@@ -530,37 +530,59 @@ export type MailPoint = Station | StationPlan | ForecastSite;
  */
 function allocateMail(g: Game, sites: AllocSite[]): Map<number, number> {
   const B = g.world.buildings, out = new Map<number, number>();
-  const groups = new Map(sites.map(s => [s.key, s.group ?? g.stations.catchmentGroup(s.key)]));
-  const reach = new Map<number, [number, number][]>();
-  for (const s of sites) for (const [bid, w] of s.walk) {
-    const list = reach.get(bid), e: [number, number] = [s.key, walkWeight(w.distance)];
-    if (list) list.push(e); else reach.set(bid, [e]);
+  const groups = new Map<number, number>();
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i];
+    groups.set(s.key, s.group ?? g.stations.catchmentGroup(s.key));
   }
-  for (const bid of [...reach.keys()].sort((a, b) => a - b)) {
-    const b = B.get(bid);
+  const reach = new Map<number, { key: number; group: number; weight: number }[]>();
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i], key = s.key, group = groups.get(key)!;
+    for (const [bid, w] of s.walk) {
+      const list = reach.get(bid), e = { key, group, weight: walkWeight(w.distance) };
+      if (list) list.push(e); else reach.set(bid, [e]);
+    }
+  }
+  const reachBids = [...reach.keys()].sort((a, b) => a - b);
+  for (let bi = 0; bi < reachBids.length; bi++) {
+    const bid = reachBids[bi], b = B.get(bid);
     if (!b || b.pop <= 0) continue;
     const list = reach.get(bid)!;
-    const shares = walkClaimShares(list.map(([key, weight]) => ({ group: groups.get(key)!, weight })));
     // (walkers post at WALK_TRIP_INTENSITY, as they travel: the shorter walks after 2.9; the feeders below do not)
     const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * WALK_TRIP_INTENSITY;
-    list.forEach(([key], i) => out.set(key, (out.get(key) ?? 0) + mail * shares[i]));
+    if (list.length === 1) {
+      const e = list[0], share = e.weight > 0 ? coverOf(e.weight) : 0;
+      out.set(e.key, (out.get(e.key) ?? 0) + mail * share);
+    } else {
+      const shares = walkClaimShares(list);
+      for (let i = 0; i < list.length; i++) {
+        const key = list[i].key;
+        out.set(key, (out.get(key) ?? 0) + mail * shares[i]);
+      }
+    }
   }
   // mail feeders: the town's buildings no site reaches on foot, by road from the railway stations with frequent mail
   // trains to other towns (the car feeders' geometry: demand.ts feederReach)
-  const F = MAIL_FEEDER, claims = new Map<number, { sum: number; q: number; list: [number, number][] }>();
-  for (const s of sites) {
+  const F = MAIL_FEEDER, claims = new Map<number, { sum: number; q: number; keys: number[]; weights: number[] }>();
+  for (let i = 0; i < sites.length; i++) {
+    const s = sites[i];
     if (!(s.quality > 0)) continue;
+    const q = s.quality, key = s.key, tid = s.townId;
     for (const [bid, d] of s.feeders()) {
       if (reach.has(bid)) continue;
       const b = B.get(bid);
-      if (!b || b.pop <= 0 || b.townId !== s.townId) continue;
-      const w = s.quality / (1 + d / F.decay), c = claims.get(bid);
-      if (c) { c.sum += w; c.q = Math.max(c.q, s.quality); c.list.push([s.key, w]); } else claims.set(bid, { sum: w, q: s.quality, list: [[s.key, w]] });
+      if (!b || b.pop <= 0 || b.townId !== tid) continue;
+      const w = q / (1 + d / F.decay), c = claims.get(bid);
+      if (c) { c.sum += w; if (q > c.q) c.q = q; c.keys.push(key); c.weights.push(w); }
+      else claims.set(bid, { sum: w, q, keys: [key], weights: [w] });
     }
   }
-  for (const bid of [...claims.keys()].sort((a, b) => a - b)) {
-    const b = B.get(bid)!, c = claims.get(bid)!, mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * F.share * c.q;
-    for (const [key, w] of c.list) out.set(key, (out.get(key) ?? 0) + (mail * w) / c.sum);
+  const claimBids = [...claims.keys()].sort((a, b) => a - b);
+  for (let bi = 0; bi < claimBids.length; bi++) {
+    const bid = claimBids[bi], b = B.get(bid)!, c = claims.get(bid)!;
+    const mail = b.pop * (MAIL_TYPE_WEIGHT[b.type] ?? 1) * F.share * c.q;
+    const keys = c.keys, weights = c.weights, invSum = 1 / c.sum;
+    for (let i = 0; i < keys.length; i++) out.set(keys[i], (out.get(keys[i]) ?? 0) + mail * weights[i] * invSum);
   }
   return out;
 }

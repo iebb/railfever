@@ -39,20 +39,25 @@ export const coverOf = (best: number) => Math.min(1, best / FULL_COVER_WEIGHT);
 
 /** One building claim per public station, then split that claim among its physical serving members. */
 export function walkClaimShares(claims: { group: number; weight: number }[]): number[] {
+  if (claims.length === 0) return [];
+  if (claims.length === 1) return [claims[0].weight > 0 ? coverOf(claims[0].weight) : 0];
   const groups = new Map<number, { best: number; sum: number }>();
   let best = 0;
-  for (const c of claims) {
+  for (let i = 0; i < claims.length; i++) {
+    const c = claims[i];
     const group = groups.get(c.group);
-    if (group) { group.best = Math.max(group.best, c.weight); group.sum += c.weight; }
+    if (group) { if (c.weight > group.best) group.best = c.weight; group.sum += c.weight; }
     else groups.set(c.group, { best: c.weight, sum: c.weight });
-    best = Math.max(best, c.weight);
+    if (c.weight > best) best = c.weight;
   }
   let sum = 0; for (const group of groups.values()) sum += group.best;
   const cover = coverOf(best);
-  return claims.map(c => {
-    const group = groups.get(c.group)!;
-    return sum > 0 && group.sum > 0 ? group.best / sum * cover * (c.weight / group.sum) : 0;
-  });
+  const out = new Array<number>(claims.length);
+  for (let i = 0; i < claims.length; i++) {
+    const c = claims[i], group = groups.get(c.group)!;
+    out[i] = sum > 0 && group.sum > 0 ? group.best / sum * cover * (c.weight / group.sum) : 0;
+  }
+  return out;
 }
 
 /** Prospective public identity from admitted plan joins/passages; physical stop IDs and route order stay intact. */

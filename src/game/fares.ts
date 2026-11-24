@@ -171,7 +171,8 @@ export function carTime(d: number, centre = 0): number {
 export function refTime(d: number, centre = 0): number {
   const w = walkTime(d), c = carTime(d, centre);
   if (!(w > 0)) return 1;
-  return Math.pow(Math.pow(w, -4) + Math.pow(c, -4), -0.25);
+  const w2 = w * w, c2 = c * c;
+  return 1 / Math.sqrt(Math.sqrt(1 / (w2 * w2) + 1 / (c2 * c2)));
 }
 
 /** Effective distance (units) for the fare: d^2 / (d + SHORT_HOP), tapering gently beyond TAPER_FROM. */
