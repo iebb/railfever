@@ -26,9 +26,9 @@ function ago(t: number): string {
 }
 
 /** Default number of towns for a map size (scaled with the area). */
-export function defaultTowns(size: number) { return Math.max(3, Math.min(40, Math.round(3.2 * (size / 384) ** 2))); }
+export function defaultTowns(size: number) { return Math.max(3, Math.min(56, Math.round(3.2 * (size / 384) ** 2))); }
 /** Map size presets (world units; 1 unit = 10 m). */
-export const MAP_SIZES: [number, string, string][] = [[512, 'S', '5.1 km'], [768, 'M', '7.7 km'], [1024, 'L', '10.2 km'], [1536, 'XL', '15.4 km']];
+export const MAP_SIZES: [number, string, string][] = [[512, 'S', '5.1 km'], [768, 'M', '7.7 km'], [1024, 'L', '10.2 km'], [1536, 'XL', '15.4 km'], [2048, 'XXL', '20.5 km']];
 export const DEFAULT_MAP_SIZE = 768;
 
 const ERAS: [number, string, string][] = [[1900, '1900', 'Steam age'], [1930, '1930', 'Express steam'], [1950, '1950', 'Diesel age'], [1980, '1980', 'Intercity'], [2005, '2005', 'High speed']];
@@ -101,7 +101,7 @@ export function showTitle(o: TitleOpts) {
     card = c;
     const render = () => {
       c.replaceChildren();
-      const towns = h('input', { type: 'range', min: '3', max: '64', value: String(st.towns), class: 'range', 'aria-label': 'Towns' }) as HTMLInputElement;
+      const towns = h('input', { type: 'range', min: '3', max: '80', value: String(st.towns), class: 'range', 'aria-label': 'Towns' }) as HTMLInputElement;
       const tv = h('span', { class: 'stp-v' }, String(st.towns));
       towns.addEventListener('input', () => { st.towns = Number(towns.value); tv.textContent = towns.value; });
       const prefWord = (v: number) => (v === 50 ? 'Even' : `${v}% rail`);

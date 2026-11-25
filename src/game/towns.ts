@@ -434,11 +434,12 @@ export class Towns {
     // soften the terrain around town centres (hill towns only flatten their top)
     sites.forEach((site, i) => {
       const tier = tierOf(i);
-      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? 26 : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
+      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? 32 : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
     });
     // all towns first, so each claims its land (see owner) before any of them is laid out
     const layouts: TownLayout[] = [];
     const axes: { angle: number; ratio: number; coast: boolean; rough: number }[] = [];
+    const cityBoost = Math.max(1, Math.min(1.5, s / 768));
     sites.forEach((site, i) => {
       const tier = tierOf(i), isCity = tier === 'city';
       const town: Town = {
@@ -447,8 +448,10 @@ export class Towns {
         passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, passLostMonth: 0, passLostLast: 0, served: 0,
       };
       this.list.push(town);
-      // fewer but larger towns (9g): every tier 35 % larger than before
-      const size = 1.35 * (tier === 'city' ? (i === 0 ? 3000 + rng.int(1500) : 2000 + rng.int(1800)) : tier === 'town' ? 600 + rng.int(1400) : 150 + rng.int(350));
+      // major cities scale into larger metropolises (especially on larger maps)
+      const size = 1.35 * (tier === 'city'
+        ? (i === 0 ? (4500 + rng.int(2500)) * cityBoost : (2800 + rng.int(2400)) * cityBoost)
+        : tier === 'town' ? 700 + rng.int(1600) : 150 + rng.int(350));
       this.plan.set(town, Math.max(120, Math.round(size * land)));
       town.claim = this.plan.get(town)!;
       // growth profile and layout from size and terrain
@@ -784,7 +787,7 @@ export class Towns {
   /** Planned extent (in rings from the centre) for a population (more for sprawling towns). */
   plannedRing(pop: number, town?: Town): number {
     const sprawl = town ? this.profileOf(town).sprawl : 1;
-    return Math.max(1, Math.min(9, Math.ceil((Math.sqrt(Math.max(1, pop) / 120) / 2) * sprawl)));
+    return Math.max(1, Math.min(14, Math.ceil((Math.sqrt(Math.max(1, pop) / 120) / 2) * sprawl)));
   }
 
   private memo(g: TownGrid) {
