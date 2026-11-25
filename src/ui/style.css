@@ -370,6 +370,10 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .linehead b { flex: 1; font: 700 var(--fs-20)/1.1 var(--font-display); letter-spacing: 0.03em; }
 .tbl { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
 .tbl th { text-align: left; padding: 7px 8px; font: 600 var(--fs-11)/1 var(--font-display); letter-spacing: var(--tr-caps-s); text-transform: uppercase; color: var(--text-3); border-bottom: 1px solid var(--hairline-2); white-space: nowrap; }
+.tbl th.sort { cursor: pointer; user-select: none; transition: color 0.12s; }
+.tbl th.sort:hover, .tbl th.sort.on { color: var(--text); }
+.qfilter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: var(--sp-2); }
+.issues-btn { color: var(--warn); }
 .tbl td { padding: 8px; white-space: nowrap; }
 .tbl tr:nth-child(even) td { background: rgba(255, 255, 255, 0.03); }
 .tbl td.ellip { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }

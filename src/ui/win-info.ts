@@ -708,6 +708,7 @@ export function openVehicle(ui: UI, id: number) {
       h('div', { class: 'btns' },
         h('button', { class: 'btn' + (ui.following === id ? ' on' : ''), onclick: () => { if (ui.following === id) ui.centerOn(...ui.posOf(v2)); else ui.follow(v2); win.last = undefined; render(); } }, icon('target', 16), ui.following === id ? 'Following' : 'Follow'),
         v2.line ? h('button', { class: 'btn', onclick: () => ui.openLine(v2.lineId!) }, icon('lines', 16), 'Line') : null,
+        mine ? h('button', { class: 'btn', 'data-tip': `Buy an identical ${v2 instanceof Train ? 'train' : 'vehicle'} (${fmtMoney(v2 instanceof Train ? v2.madeUp.reduce((s, c) => s + c.cost, 0) : (v2 as RoadVehicle).model?.cost ?? 0)})`, 'data-sfx': 'none', onclick: () => cloneVehicle(ui, v2) }, icon('copy', 16), 'Clone') : null,
         mine && upgradeOption(ui, v2) ? h('button', { class: 'btn', title: upgradeOption(ui, v2)!.label, onclick: () => upgradeVehicle(ui, v2) }, icon('up', 16), 'Upgrade') : null,
         mine ? h('button', { class: 'btn danger', onclick: () => { const val = g.vehicles.resaleValue(v2); if (confirm(`Sell ${v2.name} for ${fmtMoney(val)}?`)) { g.vehicles.sell(v2.id); ui.sound('cash', { pitch: cashPitch(val) }); win.close(); } } }, icon('tag', 16), 'Sell') : null,
       ),
@@ -850,8 +851,30 @@ function vehicleCosts(v: Vehicle): HTMLElement {
   return out;
 }
 
+/** True when a vehicle needs player attention: no route, stopped, or losing money after its first year. */
+export function vehicleHasIssue(v: Vehicle): boolean {
+  return v.state === 'noroute' || v.state === 'stopped' || (v.age >= 1 && v.profitYear < 0);
+}
+
+/** Buy an identical copy of a player vehicle (same consist/model, line and service pattern). */
+export function cloneVehicle(ui: UI, v: Vehicle, openAfter = false): Vehicle | null {
+  const g = ui.game;
+  if (v.owner !== PLAYER) return null;
+  const kind = vehicleKind(v);
+  const cur = (v as Train | RoadVehicle).depotId;
+  const dId = g.depots.get(cur)?.owner === PLAYER ? cur : findDepot(ui, kind, v.line);
+  if (dId == null) { ui.toast('No depot available', 'bad'); return null; }
+  const r = v instanceof Train ? g.vehicles.buyTrain(dId, v.madeUp, v.lineId) : g.vehicles.buyRoad(dId, (v as RoadVehicle).model!, v.lineId);
+  if (typeof r === 'string') { ui.toast(r, 'bad'); return null; }
+  if (v.line && v.pattern) setVehiclePattern(g, r.id, v.pattern);
+  ui.sound('purchase');
+  ui.toast(`${r.name} cloned from ${v.name}`, 'good');
+  if (openAfter) openVehicle(ui, r.id);
+  return r;
+}
+
 /** The newest equivalent vehicle, if better than the current one. */
-function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: string } | null {
+export function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: string } | null {
   const year = ui.game.year;
   if (v instanceof Train) {
     // passenger coaches are replaced by the newest; mail vans stay as they are (behind the locomotive)
@@ -875,6 +898,51 @@ function upgradeOption(ui: UI, v: Vehicle): { cars: VehicleModel[]; label: strin
   return { cars: [best], label: best.name };
 }
 
+/** Upgradable player vehicles from `vs` that have a valid depot and pass route/compatibility checks. */
+export function upgradeSummary(ui: UI, vs: Vehicle[]): { items: { v: Vehicle; opt: { cars: VehicleModel[]; label: string }; cost: number; depot: number }[]; totalCost: number } {
+  const g = ui.game;
+  const items: { v: Vehicle; opt: { cars: VehicleModel[]; label: string }; cost: number; depot: number }[] = [];
+  let totalCost = 0;
+  for (const v of vs) {
+    if (v.owner !== PLAYER) continue;
+    const opt = upgradeOption(ui, v);
+    if (!opt) continue;
+    const kind = vehicleKind(v);
+    const cur = (v as Train | RoadVehicle).depotId;
+    const depot = g.depots.get(cur)?.owner === PLAYER ? cur : findDepot(ui, kind, v.line);
+    if (depot == null) continue;
+    if (v.line && g.lines.operateError(v.line, PLAYER)) continue;
+    if (kind === 'rail' && railWarning(ui, opt.cars, v.line, depot)) continue;
+    const cost = opt.cars.reduce((s, c) => s + c.cost, 0) - g.vehicles.resaleValue(v);
+    items.push({ v, opt, cost, depot });
+    totalCost += cost;
+  }
+  return { items, totalCost };
+}
+
+/** Batch-replace every upgradable player vehicle in `vs`, preserving each vehicle's line and service pattern. */
+export function upgradeFleet(ui: UI, vs: Vehicle[], scopeLabel: string, done?: () => void) {
+  const g = ui.game;
+  const { items, totalCost } = upgradeSummary(ui, vs);
+  if (!items.length) { ui.toast('No vehicles to upgrade', 'info'); return; }
+  if (!g.economy.canAfford(totalCost)) { ui.toast(`Need ${fmtMoney(totalCost)} to upgrade ${items.length}`, 'bad'); return; }
+  if (!confirm(`Upgrade ${items.length} vehicle${items.length === 1 ? '' : 's'} ${scopeLabel}? Net cost ${fmtMoney(totalCost)}.`)) return;
+  let upgraded = 0;
+  for (const { v, opt, depot } of items) {
+    if (!g.vehicles.get(v.id)) continue;
+    const kind = vehicleKind(v), lineId = v.lineId, pattern = v.pattern;
+    g.vehicles.sell(v.id);
+    const r = kind === 'rail' ? g.vehicles.buyTrain(depot, opt.cars, lineId) : g.vehicles.buyRoad(depot, opt.cars[0], lineId);
+    if (typeof r !== 'string') {
+      if (r.line && pattern) setVehiclePattern(g, r.id, pattern);
+      ui.wm.close('veh-' + v.id);
+      upgraded++;
+    }
+  }
+  if (upgraded) { ui.sound('purchase'); ui.toast(`Upgraded ${upgraded} vehicle${upgraded === 1 ? '' : 's'}`, 'good'); }
+  done?.();
+}
+
 function upgradeVehicle(ui: UI, v: Vehicle) {
   const g = ui.game;
   const opt = upgradeOption(ui, v);
@@ -888,10 +956,11 @@ function upgradeVehicle(ui: UI, v: Vehicle) {
     ?? (kind === 'rail' ? railWarning(ui, opt.cars, v.line, dId) : null);
   if (error) { ui.toast(error, 'bad'); return; }
   if (!confirm(`Replace ${v.name} with ${opt.label}? Net cost ${fmtMoney(cost)}.`)) return;
-  const lineId = v.lineId;
+  const lineId = v.lineId, pattern = v.pattern;
   g.vehicles.sell(v.id);
   const r = kind === 'rail' ? g.vehicles.buyTrain(dId, opt.cars, lineId) : g.vehicles.buyRoad(dId, opt.cars[0], lineId);
   if (typeof r === 'string') { ui.toast(r, 'bad'); return; }
+  if (r.line && pattern) setVehiclePattern(g, r.id, pattern);
   ui.wm.close('veh-' + v.id);
   ui.toast(`${r.name} replaces ${v.name}`, 'good');
   openVehicle(ui, r.id);
