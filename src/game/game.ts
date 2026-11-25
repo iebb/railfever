@@ -42,6 +42,10 @@ export interface NewGameOptions {
   /** Uniform, fully borrowed starting balance for the player and every initial rival. */
   startMoney?: number;
   playerName?: string;
+  /** Start with the player's company managed by AI (Watch AI mode). */
+  watchAI?: boolean;
+  /** Optional AI config when the player's company is managed by AI at game start. */
+  playerAI?: boolean | Partial<AIConfig>;
 }
 
 export type NewsKind = 'info' | 'good' | 'bad' | 'vehicle' | 'ai';
@@ -243,14 +247,128 @@ export class Game {
     g.refreshAccess();
     const n = Math.max(0, Math.min(MAX_AI_COMPANIES, Math.max(opts.aiCompanies ?? 0, opts.aiConfigs?.length ?? 0)));
     for (let i = 0; i < n; i++) g.addAICompany({ ...opts.aiConfigs?.[i], ...(opts.startMoney !== undefined ? { startMoney: g.economy.initialLoan } : {}) });
+    if (opts.watchAI || opts.playerAI) {
+      const pCfg = typeof opts.playerAI === 'object' ? opts.playerAI : opts.aiConfigs?.[0];
+      g.setCompanyAI(PLAYER, true, pCfg, true);
+      if (opts.watchAI) g.speed = 4;
+    }
     g.vehicles.manageAmbient();
-    g.postNews(`Welcome to Railfever; F1 opens Help.`, 'info');
+    g.postNews(opts.watchAI ? 'Watch AI mode: all companies are managed by AI. Take over any company from Companies (C).' : 'Welcome to Railfever; F1 opens Help.', 'info');
     return g;
   }
 
   /** Companies still in business (bought ones are kept for their ids but hidden). */
   get activeCompanies(): Company[] { return this.companies.filter((c) => !c.defunct); }
-  canAddAI(): boolean { return this.companies.filter((c) => c.ai && !c.defunct).length < MAX_AI_COMPANIES; }
+  canAddAI(): boolean { return this.companies.filter((c) => c.id !== PLAYER && c.ai && !c.defunct).length < MAX_AI_COMPANIES; }
+
+  /** Toggle AI autopilot on any active company (including the player's own company). */
+  setCompanyAI(id: number, enabled: boolean, config?: Partial<AIConfig>, silent = false): boolean {
+    const co = this.companies[id];
+    if (!co || co.defunct) return false;
+    const existing = this.aiOf(id);
+    if (enabled) {
+      const cfg = normalizeAIConfig({ ...existing?.config, ...config });
+      co.ai = true;
+      if (existing) {
+        existing.config = cfg;
+      } else {
+        this.ais.push(new AIController(this, id, cfg));
+      }
+      this.refreshAccess();
+      if (!silent && id === PLAYER) this.postNews(`${co.name} is now managed by AI.`, 'info');
+      return true;
+    }
+    for (const ai of this.ais) if (ai.companyId === id) ai.dispose();
+    this.ais = this.ais.filter((a) => a.companyId !== id);
+    co.ai = false;
+    this.refreshAccess();
+    if (!silent && id === PLAYER) this.postNews(`You took manual control of ${co.name}.`, 'good');
+    return true;
+  }
+
+  /**
+   * Switch player control to another active company by swapping its slot with PLAYER (0).
+   * The taken-over company becomes manually controlled; the previous player company becomes an AI rival
+   * when `keepPreviousAsAI` is true.
+   */
+  takeOverCompany(targetId: number, keepPreviousAsAI = true): string | null {
+    const a = PLAYER, b = targetId;
+    if (b === a) return 'Already controlling this company';
+    const ca = this.companies[a], cb = this.companies[b];
+    if (!ca || !cb || ca.defunct || cb.defunct) return 'No such active company';
+    const swapId = (id: number) => (id === a ? b : id === b ? a : id);
+    const prevPlayerCfg = this.aiOf(a)?.config;
+    // Stop active AI controllers on both companies (cleaning any half-built staged project cleanly).
+    for (const ai of this.ais) if (ai.companyId === a || ai.companyId === b) ai.dispose();
+    this.ais = this.ais.filter((ai) => ai.companyId !== a && ai.companyId !== b);
+    // Swap company records and keep id === array index.
+    this.companies[a] = cb; cb.id = a;
+    this.companies[b] = ca; ca.id = b;
+    for (const co of this.companies) if (co.boughtBy === a || co.boughtBy === b) co.boughtBy = swapId(co.boughtBy);
+    // Swap infrastructure, stations, depots, vehicles, lines, route works.
+    const w = this.world, net = w.net;
+    for (const e of net.edges.values()) {
+      let hit = false;
+      if (e.owner === a || e.owner === b) { e.owner = swapId(e.owner); hit = true; }
+      if (e.tramOwner === a || e.tramOwner === b) { e.tramOwner = swapId(e.tramOwner); hit = true; }
+      if (hit) net.markEdge(e);
+    }
+    for (const n of net.nodes.values()) if (n.owner === a || n.owner === b) n.owner = swapId(n.owner);
+    for (const st of this.stations.map.values()) {
+      if (st.owner !== a && st.owner !== b) continue;
+      st.owner = swapId(st.owner);
+      w.markObjArea(st.x - 20, st.z - 20, st.x + 20, st.z + 20);
+    }
+    for (const d of this.depots.map.values()) {
+      if (d.owner !== a && d.owner !== b) continue;
+      d.owner = swapId(d.owner);
+      w.markObjArea(d.x - 4, d.z - 4, d.x + 4, d.z + 4);
+    }
+    for (const v of this.vehicles.map.values()) if (v.owner === a || v.owner === b) v.owner = swapId(v.owner);
+    for (const l of this.lines.map.values()) {
+      if (l.owner === a || l.owner === b) l.owner = swapId(l.owner);
+      if (l.operators?.length) l.operators = l.operators.map(swapId);
+      if (l.capacity?.works && (l.capacity.works.owner === a || l.capacity.works.owner === b)) l.capacity.works.owner = swapId(l.capacity.works.owner);
+    }
+    for (const rw of this.routeWorks) if (rw.owner === a || rw.owner === b) rw.owner = swapId(rw.owner);
+    // Swap track access agreements, requests, blocks, usage, policies, multipliers and earnings.
+    for (const ag of this.access) { ag.user = swapId(ag.user); ag.owner = swapId(ag.owner); }
+    for (const rq of this.accessRequests) { rq.user = swapId(rq.user); rq.owner = swapId(rq.owner); }
+    const swapRec = <T>(rec: Record<number, T>): Record<number, T> => {
+      const out: Record<number, T> = {};
+      for (const [k, v] of Object.entries(rec)) out[swapId(Number(k))] = v;
+      return out;
+    };
+    this.allowAccess = swapRec(this.allowAccess);
+    this.accessMult = swapRec(this.accessMult);
+    this.accessPolicies = swapRec(this.accessPolicies);
+    this.accessEarned = swapRec(this.accessEarned);
+    const nextBlocked: Record<number, number[]> = {};
+    for (const [k, list] of Object.entries(this.blocked)) nextBlocked[swapId(Number(k))] = list.map(swapId);
+    this.blocked = nextBlocked;
+    for (const u of this.usage.values()) {
+      while (u.length <= Math.max(a, b)) u.push(0);
+      const tmp = u[a]; u[a] = u[b]; u[b] = tmp;
+    }
+    const nextMetered = new Set<number>();
+    for (const m of this.metered) nextMetered.add(swapId(m));
+    this.metered = nextMetered;
+    this.shares.swapCompanies(a, b);
+    // Player now manually controls company `a` (formerly `b`); company `b` (formerly `a`) optionally runs under AI.
+    this.companies[a].ai = false;
+    this.companies[b].ai = keepPreviousAsAI;
+    if (keepPreviousAsAI) this.ais.push(new AIController(this, b, normalizeAIConfig(prevPlayerCfg)));
+    this.rebuildAccessKeys();
+    this.refreshAccess();
+    this.assetCache.clear();
+    this.lostSince.clear();
+    this.firstArrival.clear();
+    for (const st of this.stations.map.values()) if (st.owner === PLAYER) this.firstArrival.add(st.id);
+    this.lines.rebuild();
+    this.onNetworkChanged();
+    this.postNews(`You took over ${this.companies[a].name}!`, 'good');
+    return null;
+  }
 
   /** Add an AI competitor (up to MAX_AI_COMPANIES active ones); throws when there are already that many. */
   addAICompany(config: Partial<AIConfig> = {}, name?: string, color?: string): Company {

@@ -374,6 +374,27 @@ kbd { display: inline-flex; align-items: center; justify-content: center; min-wi
 .tbl th.sort:hover, .tbl th.sort.on { color: var(--text); }
 .qfilter { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: var(--sp-2); }
 .issues-btn { color: var(--warn); }
+.ai-chip { width: auto; padding: 0 10px; gap: 5px; color: var(--accent); font: 700 var(--fs-12)/1 var(--font-display); letter-spacing: 0.04em; }
+.line-diagram { position: relative; margin: var(--sp-2) 0; padding: 10px 8px 8px; border-radius: var(--r); background: rgba(255, 255, 255, 0.03); border: 1px solid var(--hairline); overflow-x: auto; }
+.ld-track { display: flex; align-items: flex-start; gap: 2px; min-width: max-content; position: relative; }
+.ld-stop { position: relative; flex: 1 0 64px; max-width: 96px; display: flex; flex-direction: column; align-items: center; text-align: center; gap: 4px; }
+.ld-stop::before { content: ''; position: absolute; top: 24px; left: 0; right: 0; height: 4px; background: var(--c, var(--accent)); opacity: 0.85; z-index: 0; }
+.ld-stop:first-child::before { left: 50%; }
+.ld-stop:last-child::before { right: 50%; }
+.ld-vehs { height: 16px; display: flex; gap: 2px; align-items: center; justify-content: center; }
+.ld-veh { padding: 1px 4px; border-radius: 9px; border: 1px solid var(--c, var(--accent)); background: var(--surface-solid); color: var(--text); cursor: pointer; display: inline-flex; align-items: center; }
+.ld-veh:hover { background: var(--c, var(--accent)); color: #0d1219; }
+.ld-dot { position: relative; z-index: 1; width: 12px; height: 12px; border-radius: 50%; border: 2.5px solid var(--c, var(--accent)); background: var(--surface-solid); cursor: pointer; padding: 0; transition: transform 0.12s; }
+.ld-dot.xfer { width: 16px; height: 16px; margin-top: -2px; border-width: 3px; box-shadow: 0 0 0 2px var(--surface-solid), 0 0 0 3.5px rgba(255, 255, 255, 0.5); }
+.ld-dot.hot { border-color: var(--warn); }
+.ld-dot:hover { transform: scale(1.22); }
+.ld-wait { position: absolute; top: -7px; left: 10px; min-width: 15px; padding: 0 3px; border-radius: 7px; background: var(--raised-3); color: var(--text); font: 700 9px/13px var(--font-display); pointer-events: none; }
+.ld-wait.hot { background: var(--warn); color: #0d1219; }
+.ld-name { font-size: 10px; line-height: 1.2; color: var(--text-2); max-width: 82px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ld-xfers { display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; }
+.ld-xf { padding: 0; border: 0; background: none; cursor: pointer; opacity: 0.9; }
+.ld-xf:hover { opacity: 1; transform: scale(1.1); }
+.ld-loop { position: absolute; top: 4px; right: 6px; display: inline-flex; align-items: center; gap: 3px; font-size: 10px; color: var(--text-3); }
 .tbl td { padding: 8px; white-space: nowrap; }
 .tbl tr:nth-child(even) td { background: rgba(255, 255, 255, 0.03); }
 .tbl td.ellip { max-width: 180px; overflow: hidden; text-overflow: ellipsis; }

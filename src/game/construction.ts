@@ -171,10 +171,10 @@ export interface Proposal {
  * against ground track with its usual earthworks, about 1.25x bare track). Rail bridges cost 3.8–5.6x,
  * shallow tunnels 4.5–6.5x and deep tunnels 6.5–9.7x. These common civil prices let short city services
  * repay the same track as conventional trains; neither station mode nor wire changes the multiplier.
- * Roads retain their bridge 3.5–5x, shallow tunnel 4–6x and deep tunnel 6.5–9x prices.
+ * Roads use bridge 8–12x, shallow tunnel 4–6x and deep tunnel 6.5–9x prices.
  */
 export function structureFactor(kind: NetKind, type: 'bridge' | 'tunnel', h: number): number {
-  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 3.8 + 1.8 * k : 3.5 + 1.5 * k; }
+  if (type === 'bridge') { const k = Math.min(4, Math.max(0, h - 1.1)) / 4; return kind === 'rail' ? 3.8 + 1.8 * k : 8 + 4 * k; }
   if (h < 2) { const k = Math.min(1, Math.max(0, h - 1)); return kind === 'rail' ? 4.5 + 2 * k : 4 + 2 * k; }
   const k = Math.min(6, h - 2) / 6;
   return kind === 'rail' ? 6.5 + 3.2 * k : 6.5 + 2.5 * k;

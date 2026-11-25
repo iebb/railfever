@@ -219,7 +219,8 @@ export function createCorridorKernel(snapshot: CorridorSnapshot) {
           let c = d;
           const dh = Math.abs(this.hgt[v] - hu);
           c += (dh * 2 + Math.max(0, dh - grade * d) * 14) * sc;
-          if (f & 2) c += d * 4.5;
+          const wc = this.opts.waterCost ?? 4.5;
+          if (f & 2) c += d * wc;
           if (f & 4) c += 22 * bcost;
           if (f & 8) c += 9;
           if (dt) c += C * 0.8;

@@ -100,6 +100,8 @@ export interface CorridorOpts {
   avoid?: { x0: number; z0: number; x1: number; z1: number; r: number }[];
   /** weight of slopes (1 = default); higher follows the contours more closely */
   slopeCost?: number;
+  /** extra cost per unit over water (default 4.5); higher steers corridors around water to avoid bridges */
+  waterCost?: number;
   /** extra cost per unit of running alongside existing rail (any owner: 3–30 units off, similar heading) */
   parallel?: number;
   /** which rail counts as running alongside: conventional track (default) or high-speed track (an HSR may run beside
@@ -304,7 +306,7 @@ export class CorridorSearch {
     const n = this.n, C = this.C;
     const railGrade = this.opts.type ? (TRACK_TYPES[this.opts.type] ?? TRACK_TYPES.standard).maxGrade * Math.min(1, Math.max(0.1, this.opts.gradeMargin ?? 0.85)) : 0.03;
     const grade = this.opts.kind === 'rail' ? railGrade : 0.07;
-    const bcost = this.opts.buildingCost ?? 1, sc = this.opts.slopeCost ?? 1;
+    const bcost = this.opts.buildingCost ?? 1, sc = this.opts.slopeCost ?? 1, wc = this.opts.waterCost ?? 4.5;
     const maxExpand = this.opts.maxExpand ?? 250000;
     while (budget-- > 0) {
       if (!this.heap.size) { this.state = 'failed'; return this.state; }
@@ -332,7 +334,7 @@ export class CorridorSearch {
         let c = d;
         const dh = Math.abs(this.hgt[v] - hu);
         c += (dh * 2 + Math.max(0, dh - grade * d) * 14) * sc;
-        if (f & 2) c += d * 4.5;
+        if (f & 2) c += d * wc;
         if (f & 4) c += 22 * bcost;
         if (f & 8) c += 9;
         if (dt) c += C * 0.8;
@@ -900,7 +902,7 @@ export interface RouteOpts {
   /** oriented points before / after the corridor (e.g. station fronts), part of the profile; `post` also of the way */
   pre?: OPoint[]; post?: OPoint[];
   avoid?: CorridorOpts['avoid'];
-  buildingCost?: number; lead?: number; slopeCost?: number; maxExpand?: number;
+  buildingCost?: number; lead?: number; slopeCost?: number; waterCost?: number; maxExpand?: number;
   rmax?: number; rgood?: number; minR?: number;
   exclude?: Set<number>; roadJunctions?: boolean;
   /** corridor searches after the first, each keeping away from where the previous route failed */
@@ -938,7 +940,7 @@ export function* routeGen(g: Game, from: OPoint, to: OPoint, o: RouteOpts, budge
     const lead = Math.min(o.lead ?? 10, Math.max(2, Math.hypot(to.x - from.x, to.z - from.z) / 3));
     let path: P2[] | null = [{ x: from.x, z: from.z }, { x: to.x, z: to.z }], expanded = 0;
     if (attempt >= 0) {
-      const opts: CorridorOpts = { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength };
+      const opts: CorridorOpts = { kind: o.kind, owner: o.owner, avoid: [...(o.avoid ?? []), ...extra], buildingCost: o.buildingCost, lead, slopeCost: o.slopeCost, waterCost: o.waterCost, maxExpand: o.maxExpand, parallel: o.parallel, trackClass: o.trackClass, cell: o.cell, type: o.type, gradeMargin: o.gradeMargin, minR: wideCurves ? minR : undefined, approachLength: o.approachLength };
       if (o.sliced && o.kind === 'rail') {
         const result = yield* plannedCorridor(g, from, to, opts, budget);
         path = result.path; expanded = result.expanded;

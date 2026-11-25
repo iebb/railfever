@@ -96,7 +96,7 @@ export function showTitle(o: TitleOpts) {
 
   function openCard() {
     if (card) return;
-    const st = { size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', rail: 50, money: 5, seed: Math.floor(Math.random() * 99999) };
+    const st = { mode: 'play' as 'play' | 'watch', size: DEFAULT_MAP_SIZE, towns: defaultTowns(DEFAULT_MAP_SIZE), hilliness: 'hilly' as NewGameOptions['hilliness'], water: 'medium' as NewGameOptions['water'], year: 1950, ai: 1, style: 'balanced', rail: 50, money: 5, seed: Math.floor(Math.random() * 99999) };
     const c = h('div', { class: 'ng-card glass' });
     card = c;
     const render = () => {
@@ -113,17 +113,24 @@ export function showTitle(o: TitleOpts) {
       const era = ERAS.find(([y]) => y === st.year);
       const money = h('input', { type: 'number', min: '0', max: '1000', step: 'any', required: true, value: String(st.money), class: 'input', style: 'width:110px', 'aria-label': 'Starting balance in millions' }) as HTMLInputElement;
       money.addEventListener('input', () => { st.money = money.valueAsNumber; });
+      const watch = st.mode === 'watch';
+      const showAiOpts = watch || st.ai > 0;
       add(c,
         h('div', { class: 'ng-title' }, 'New game'),
+        field('Mode', seg<'play' | 'watch'>([['play', 'Play'], ['watch', 'Watch AI']], st.mode, (v) => {
+          st.mode = v;
+          if (v === 'watch' && st.ai < 1) st.ai = 2;
+          render();
+        }), watch ? 'All companies run by AI · take over any company anytime' : undefined),
         field('Map size', seg(MAP_SIZES, st.size, (v) => { st.size = v; st.towns = defaultTowns(v); render(); }), `${(st.size / 100).toFixed(1)} × ${(st.size / 100).toFixed(1)} km${st.size >= 1024 ? ' · large maps: a few seconds to generate' : ''}`),
         field('Towns', h('div', { class: 'inline', style: 'flex:1' }, towns, tv)),
         field('Terrain', seg([['flat', 'Flat'], ['hilly', 'Hilly'], ['mountainous', 'Mountains']], st.hilliness, (v) => { st.hilliness = v; render(); })),
         field('Water', seg([['low', 'Little'], ['medium', 'Some'], ['high', 'Lots']], st.water, (v) => { st.water = v; render(); })),
         field('Start year', seg(ERAS.map(([y, l]) => [y, l] as [number, string]), st.year, (v) => { st.year = v; render(); }), era?.[2]),
-        field('Competitors', stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(MAX_AI, st.ai + 1); render(); })),
-        st.ai ? field('Style', seg([['cautious', 'Cautious'], ['balanced', 'Balanced'], ['aggressive', 'Aggressive'], ['mixed', 'Mixed']], st.style, (v) => { st.style = v; render(); }),
+        field(watch ? 'Other AI companies' : 'Competitors', stepper(String(st.ai), () => { st.ai = Math.max(0, st.ai - 1); render(); }, () => { st.ai = Math.min(MAX_AI, st.ai + 1); render(); })),
+        showAiOpts ? field('Style', seg([['cautious', 'Cautious'], ['balanced', 'Balanced'], ['aggressive', 'Aggressive'], ['mixed', 'Mixed']], st.style, (v) => { st.style = v; render(); }),
           st.style === 'mixed' ? 'Rail barons, bus operators, tram builders…' : AI_PRESETS.find((p) => p.id === st.style)?.hint) : null,
-        st.ai ? field('Bus – Rail', h('div', { class: 'inline', style: 'flex:1' }, h('span', { class: 'muted' }, 'Bus'), railPref, h('span', { class: 'muted' }, 'Rail'), rv), st.ai > 1 ? 'Each rival varies · average as set' : undefined) : null,
+        showAiOpts ? field('Bus – Rail', h('div', { class: 'inline', style: 'flex:1' }, h('span', { class: 'muted' }, 'Bus'), railPref, h('span', { class: 'muted' }, 'Rail'), rv), (st.ai + (watch ? 1 : 0)) > 1 ? 'Each AI varies · average as set' : undefined) : null,
         field('Starting balance', h('div', { class: 'inline' }, money, '$M'), 'Every company · fully borrowed'),
         field('Seed', h('div', { class: 'inline' }, seed, h('button', { class: 'ibtn', 'data-tip': 'Random seed', 'aria-label': 'Random seed', onclick: () => { st.seed = Math.floor(Math.random() * 99999); seed.value = String(st.seed); } }, icon('dice', 18)))),
         h('div', { class: 'btns right' },
@@ -131,10 +138,13 @@ export function showTitle(o: TitleOpts) {
           h('button', { class: 'btn primary lg', onclick: async () => {
             if (!money.reportValidity()) return;
             const nt = Math.min(st.towns, Math.round((st.size * st.size) / 3000));
+            const allConfigs = aiConfigsFor(st.style, st.ai + (watch ? 1 : 0), st.money * 1_000_000, st.rail / 100, st.seed || 1);
+            const playerAI = watch ? allConfigs[0] : undefined;
+            const aiConfigs = watch ? allConfigs.slice(1) : allConfigs;
             // The shell returns success after confirmation, preservation, and world creation.
-            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, startMoney: st.money * 1_000_000, aiCompanies: st.ai, aiConfigs: aiConfigsFor(st.style, st.ai, st.money * 1_000_000, st.rail / 100, st.seed || 1) }) as unknown as Promise<boolean>);
+            const started = await (ui.app.newGame({ size: st.size, towns: nt, hilliness: st.hilliness, water: st.water, startYear: st.year, seed: st.seed || 1, startMoney: st.money * 1_000_000, aiCompanies: st.ai, aiConfigs, watchAI: watch, playerAI }) as unknown as Promise<boolean>);
             if (started) close(false);
-          } }, icon('play', 18), 'Start')),
+          } }, icon('play', 18), watch ? 'Watch AI' : 'Start')),
       );
     };
     render();

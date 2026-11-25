@@ -299,6 +299,7 @@ export function openLine(ui: UI, id: number) {
     const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
     if (win.tab === 'stops') {
       add(win.body, worksPanel(ui, l.id, rerender), congestionPanel(ui, l, rerender, () => { win.tab = 'vehicles'; rerender(); }), compatPanel(ui, l, rerender));
+      if (l.stops.length >= 2) add(win.body, lineDiagram(ui, l));
       // a line inside another line's route becomes one of its services when editing ends (UPDATE 9k)
       const sup = editing && l.stops.length >= 2 ? subsetOf(g, l) : null;
       if (sup) add(win.body, h('div', { class: 'alert info' }, icon('info', 16), h('div', { class: 'alert-b' }, 'These stops lie on ', h('b', null, sup.name), ': becomes a short-turn or skip-stop service when finished.')));
@@ -621,4 +622,49 @@ export function openTowns(ui: UI) {
 function paxTile(el: HTMLElement, l: Line): HTMLElement {
   if (l.passLast > 0 && l.icPassLast !== undefined) el.setAttribute('data-tip', fmtSets(l.passLast, l.icPassLast));
   return el;
+}
+
+/**
+ * Schematic transit strip map (Mini Metro / Cities in Motion style): horizontal stop line with double-ring
+ * interchange nodes, live vehicle pips, crowding counters, and clickable connecting-line chips.
+ */
+function lineDiagram(ui: UI, l: Line): HTMLElement {
+  const g = ui.game;
+  const isLoop = g.lines.isLoop(l);
+  // Group live vehicles by their current target stop index along l.stops.
+  const vehAt = new Map<number, Vehicle[]>();
+  for (const vid of l.vehicles) {
+    const v = g.vehicles.get(vid);
+    if (!v) continue;
+    const idx = Math.max(0, Math.min(l.stops.length - 1, v.stopIndex));
+    let arr = vehAt.get(idx); if (!arr) vehAt.set(idx, arr = []);
+    arr.push(v);
+  }
+  const nodes = l.stops.map((sid, i) => {
+    const st = g.stations.get(sid);
+    let waiting = 0;
+    if (st) for (const wg of st.waiting.values()) if (wg.line === l.id) waiting += wg.count;
+    const crowded = waiting >= 40 || (st ? st.lostLast > 10 : false);
+    const others = st ? g.lines.linesAt(sid).filter((o) => o.id !== l.id) : [];
+    const linked = st ? st.links.flatMap((lid) => g.lines.linesAt(lid)).filter((o) => o.id !== l.id && !others.some((x) => x.id === o.id)) : [];
+    const xfers = [...others, ...linked].slice(0, 4);
+    const isXfer = xfers.length > 0;
+    const vs = vehAt.get(i) ?? [];
+    return h('div', { class: 'ld-stop' },
+      vs.length ? h('div', { class: 'ld-vehs' }, vs.slice(0, 3).map((v) =>
+        h('button', { class: 'ld-veh', style: `--c:${l.color}`, 'data-tip': `${v.name} · ${v.status} · ${v.load}/${v.capacity}`, onclick: () => ui.openVehicle(v.id) },
+          icon(MODE_META[lineMode(g, l)].icon, 11)))) : h('div', { class: 'ld-vehs' }),
+      h('button', {
+        class: 'ld-dot' + (isXfer ? ' xfer' : '') + (crowded ? ' hot' : ''),
+        style: `--c:${l.color}`,
+        'data-tip': `${st?.name ?? `#${sid}`}${waiting ? ` · ${fmtInt(waiting)} waiting` : ''}${isXfer ? ` · ${xfers.length} transfer${xfers.length > 1 ? 's' : ''}` : ''}`,
+        onclick: () => { if (st) ui.centerOn(st.x, st.z); ui.openStation(sid); },
+      }, waiting > 0 ? h('span', { class: 'ld-wait' + (crowded ? ' hot' : '') }, waiting > 99 ? '99+' : String(Math.round(waiting))) : null),
+      h('span', { class: 'ld-name', title: st?.name ?? `#${sid}` }, st?.name ?? `#${sid}`),
+      xfers.length ? h('div', { class: 'ld-xfers' }, xfers.map((o) =>
+        h('button', { class: 'ld-xf', style: `--c:${o.color}`, 'data-tip': `Transfer to ${o.name}`, onclick: () => openLine(ui, o.id) }, lineSymbol(g, o, 'sm')))) : null);
+  });
+  return h('div', { class: 'line-diagram', style: `--c:${l.color}` },
+    h('div', { class: 'ld-track' }, ...nodes),
+    isLoop ? h('div', { class: 'ld-loop', 'data-tip': 'Loop line' }, icon('loop', 12), 'Loop') : null);
 }
