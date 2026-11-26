@@ -435,7 +435,7 @@ export class Towns {
     const cityBoost = s <= 512 ? 1 : Math.min(2.2, 1 + (s - 512) / 768);
     sites.forEach((site, i) => {
       const tier = tierOf(i);
-      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? Math.round(26 + 6 * Math.min(1, cityBoost - 1)) : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
+      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? Math.round(26 + 16 * Math.min(1, cityBoost - 1)) : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
     });
     // all towns first, so each claims its land (see owner) before any of them is laid out
     const layouts: TownLayout[] = [];
@@ -498,6 +498,7 @@ export class Towns {
       while (town.pop < target && guard++ < 20000 && misses < 40) misses = this.growStep(town, rng, 0, target) ? 0 : misses + 1;
       this.altBudget = Infinity;
       this.closeDeadEnds(town);
+      this.closeDeadEnds(town);
     }
     this.plan.clear();
     this.tidyBridgeEnds();
@@ -555,7 +556,7 @@ export class Towns {
   makeGrid(town: Town, rng: RNG, target: number, layout: TownLayout = 'grid'): TownGrid {
     const prof = this.profileOf(town);
     const ax = this.terrainAxis(town.x, town.z, 14 + Math.sqrt(Math.max(200, target)) * 0.35, rng.next() * Math.PI);
-    const n = 10;
+    const n = target >= 5000 ? 12 : 10;
     const scale = prof.block * (layout === 'organic' ? 0.85 : layout === 'hill' ? 0.9 : 1);
     const bu = (8 + rng.next() * 4) * scale, bv = (6 + rng.next() * 3) * scale;
     const big = target > 2500;
@@ -571,7 +572,7 @@ export class Towns {
       gv[n - k] = gv[n - k + 1] - bv * core * vary();
     }
     const g: TownGrid = { ox: town.x, oz: town.z, angle: ax.angle, n, gu, gv, failed: [], plaza: false, layout, omit: [] };
-    if (layout === 'grid') this.warpGrid(g, rng, bu, bv);
+    if (layout === 'grid') this.warpGrid(g, rng, bu, bv, target);
     else if (layout === 'organic') this.warpOrganic(g, rng, target);
     else if (layout === 'radial') this.radialPoints(g, rng, bv * 1.1, null);
     else if (layout === 'hill') this.radialPoints(g, rng, bv * 1.1, town);
@@ -585,7 +586,7 @@ export class Towns {
    * degrees and bend gently (smooth low-frequency displacement of the lattice points, different for every
    * line, plus a slight twist growing outwards), and a few cross streets are left out (T junctions).
    */
-  private warpGrid(g: TownGrid, rng: RNG, bu: number, bv: number) {
+  private warpGrid(g: TownGrid, rng: RNG, bu: number, bv: number, target = 0) {
     const n = g.n, sa = Math.sin(g.angle), ca = Math.cos(g.angle);
     const ph = [0, 0, 0].map(() => rng.next() * Math.PI * 2), fr = [0, 0, 0, 0].map(() => 0.3 + rng.next() * 0.3);
     const au = 0.1 * bu, av = 0.11 * bv, twist = (rng.next() - 0.5) * 0.08;
@@ -602,7 +603,7 @@ export class Towns {
       pts.push(g.ox + x, g.oz + z);
     }
     g.pts = pts;
-    this.omitSome(g, 0.07, 2, ph[2]);
+    this.omitSome(g, target >= 4000 ? 0.02 : 0.07, target >= 4000 ? 3 : 2, ph[2]);
   }
 
   /**
@@ -1099,7 +1100,7 @@ export class Towns {
     if (tn < 0) {
       const h0 = w.heightAt(from.x, from.z);
       const cands: { x: number; z: number; c: number }[] = [];
-      for (const f of [0.13, 0.25]) for (let a = 0; a < 6; a++) {
+      for (const f of [0.1, 0.16]) for (let a = 0; a < 6; a++) {
         const ang = (a / 6) * Math.PI * 2 + 0.25;
         const x = to.x + Math.cos(ang) * f * L, z = to.z + Math.sin(ang) * f * L;
         if (w.heightAt(x, z) < WATER_Y + 0.2) continue;
@@ -1113,7 +1114,7 @@ export class Towns {
         if (r === 'ok') { this.moveLatticePoint(g, ti, tj, c.x, c.z); return 'ok'; }
       }
     }
-    for (const off of [0.2, -0.2, 0.34, -0.34]) {
+    for (const off of [0.1, -0.1]) {
       const m = { x: (from.x + to.x) / 2 - uz * off * L, z: (from.z + to.z) / 2 + ux * off * L };
       if (this.owner(m.x, m.z) !== town) continue;
       const r = this.tryBent(from, m, to);
@@ -1287,13 +1288,11 @@ export class Towns {
       // not into a neighbour's land
       const p = this.latticePoint(g, i, j), q = this.latticePoint(g, i2, j2);
       if (this.owner((p.x + q.x) / 2, (p.z + q.z) / 2) !== town) continue;
-      cands.push({ i, j, dir, score: (a && b ? 3 : 0) - ring * 1.5 + rng.next() * 1.5 });
+      const closes = a && b && this.closesBlock(g, i, j, dir);
+      cands.push({ i, j, dir, score: (closes ? 10 : a && b ? 4 : 0) - ring * 1.5 + rng.next() * 0.9 });
     }
     cands.sort((p, q) => q.score - p.score);
-    const top = cands.slice(0, 10);
-    for (const c of top) if (this.closesBlock(g, c.i, c.j, c.dir)) c.score += 6;
-    top.sort((p, q) => q.score - p.score);
-    for (const c of top.slice(0, 4)) if (this.buildLattice(town, c.i, c.j, c.dir, day)) return true;
+    for (const c of cands.slice(0, 6)) if (this.buildLattice(town, c.i, c.j, c.dir, day)) return true;
     return false;
   }
 
