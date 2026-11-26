@@ -11,7 +11,7 @@ import type { Line } from '../game/lines';
 import type { Station } from '../game/stations';
 import type { Game } from '../game/game';
 import { availableModels } from '../game/vehicle-types';
-import { findDepot } from './win-info';
+import { findDepot, vehicleHasIssue, upgradeSummary, upgradeFleet } from './win-info';
 import { chart } from './charts';
 import { fmtPct, fmtAccessFactor, KIND_META, fmtMail, fmtMailLoad, tonnes, lineCarriesMail, fmtSets } from './format';
 import type { Vehicle } from '../game/vehicle';
@@ -29,6 +29,27 @@ import { worksOn } from '../game/route-works';
 
 /** Where the stops clicked on the map go, per line being edited (linegrow): at the end (as before), first, where they fit, after a stop. */
 const insertPlace = new Map<number, StopPlace>();
+
+interface SortState<K extends string> { key: K | null; dir: 1 | -1 }
+const linesSort: SortState<'name' | 'stops' | 'veh' | 'pax' | 'profit'> = { key: null, dir: -1 };
+const vehSort: SortState<'name' | 'line' | 'status' | 'age' | 'load' | 'profit'> = { key: 'profit', dir: -1 };
+const townsSort: SortState<'name' | 'pop' | 'trans'> = { key: 'pop', dir: -1 };
+let vehQuickFilter: 'all' | 'issues' | 'upgradable' = 'all';
+
+function sortTh<K extends string>(label: string, key: K, state: SortState<K>, onChange: () => void, right = false, tip?: string, defaultDir: 1 | -1 = -1): HTMLElement {
+  const active = state.key === key;
+  const arrow = active ? (state.dir > 0 ? ' ▲' : ' ▼') : '';
+  return h('th', {
+    class: (right ? 'r ' : '') + 'sort' + (active ? ' on' : ''),
+    'data-tip': tip,
+    'aria-sort': active ? (state.dir > 0 ? 'ascending' : 'descending') : 'none',
+    onclick: () => {
+      if (state.key === key) state.dir = state.dir > 0 ? -1 : 1;
+      else { state.key = key; state.dir = defaultDir; }
+      onChange();
+    },
+  }, label + arrow);
+}
 
 /**
  * A vehicle's load in lists (compact): passengers "12/56", mail only "2.4/6 t", both "12/56 · 2.4 t" (the mail part
@@ -73,7 +94,23 @@ export function openLines(ui: UI) {
     }
     // lines with mail show "pax · mail t" last month
     const anyMail = lines.some((l) => lineCarriesMail(g, l));
-    const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Line'), h('th', { class: 'r' }, 'Stops'), h('th', { class: 'r' }, 'Veh.'), h('th', { class: 'r', 'data-tip': anyMail ? 'Passengers · mail (tonnes) last month' : undefined }, anyMail ? 'Pax · mail/mo' : 'Pax/mo'), h('th', { class: 'r' }, 'Profit (yr)')));
+    const resort = () => { win.last = undefined; render(); };
+    if (linesSort.key) {
+      const k = linesSort.key, d = linesSort.dir;
+      lines.sort((a, b) => {
+        if (k === 'name') return d * a.name.localeCompare(b.name);
+        if (k === 'stops') return d * (a.stops.length - b.stops.length);
+        if (k === 'veh') return d * (a.vehicles.length - b.vehicles.length);
+        if (k === 'pax') return d * (a.passLast - b.passLast);
+        return d * ((a.incomeYear - a.costYear) - (b.incomeYear - b.costYear));
+      });
+    }
+    const tbl = h('table', { class: 'tbl' }, h('tr', null,
+      sortTh('Line', 'name', linesSort, resort, false, undefined, 1),
+      sortTh('Stops', 'stops', linesSort, resort, true),
+      sortTh('Veh.', 'veh', linesSort, resort, true),
+      sortTh(anyMail ? 'Pax · mail/mo' : 'Pax/mo', 'pax', linesSort, resort, true, anyMail ? 'Passengers · mail (tonnes) last month' : undefined),
+      sortTh('Profit (yr)', 'profit', linesSort, resort, true)));
     for (const l of lines) {
       const profit = l.incomeYear - l.costYear;
       const cong = congestionOf(g, l.id);
@@ -262,6 +299,7 @@ export function openLine(ui: UI, id: number) {
     const editing = ui.tools.tool === 'line-edit' && ui.tools.lineEditId === l.id;
     if (win.tab === 'stops') {
       add(win.body, worksPanel(ui, l.id, rerender), congestionPanel(ui, l, rerender, () => { win.tab = 'vehicles'; rerender(); }), compatPanel(ui, l, rerender));
+      if (l.stops.length >= 2) add(win.body, lineDiagram(ui, l));
       // a line inside another line's route becomes one of its services when editing ends (UPDATE 9k)
       const sup = editing && l.stops.length >= 2 ? subsetOf(g, l) : null;
       if (sup) add(win.body, h('div', { class: 'alert info' }, icon('info', 16), h('div', { class: 'alert-b' }, 'These stops lie on ', h('b', null, sup.name), ': becomes a short-turn or skip-stop service when finished.')));
@@ -350,22 +388,27 @@ export function openLine(ui: UI, id: number) {
     } else if (win.tab === 'vehicles') {
       add(win.body, congestionPanel(ui, l, rerender));
       const vl = h('div', { class: 'list' });
+      const lineVs: Vehicle[] = [];
       for (const vid of l.vehicles) {
         const v = g.vehicles.get(vid);
         if (!v) continue;
+        lineVs.push(v);
         const ps = patternSelect(ui, l, v, rerender);
         vl.appendChild(h('div', { class: 'row link', onclick: () => ui.openVehicle(vid) },
           h('span', null, v.name),
           v.owner !== PLAYER ? ui.ownerTag(v.owner) : null,
           ps ? h('span', { onclick: (e: Event) => e.stopPropagation() }, ps) : null,
           h('span', { class: 'muted' }, v.status),
-          h('span', { class: 'num' }, loadText(v))));
+          h('span', { class: 'num' }, loadText(v)),
+          h('span', { class: 'num ' + (v.profitYear < 0 ? 'neg' : 'pos') }, fmtMoney(v.profitYear))));
       }
       if (!l.vehicles.length) vl.appendChild(h('div', { class: 'pad' }, 'No vehicles.'));
       add(win.body, section('Vehicles', String(l.vehicles.length)), vl);
+      const upg = operates ? upgradeSummary(ui, lineVs) : { items: [], totalCost: 0 };
       if (operates) add(win.body, h('div', { class: 'btns' },
         h('button', { class: 'btn primary', onclick: () => ui.openPurchase(l.kind, null, l.id) }, icon('plus', 16), `Add ${meta.vehicle}`),
-        l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER) ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null));
+        l.vehicles.some((x) => g.vehicles.get(x)?.owner === PLAYER) ? h('button', { class: 'btn', onclick: () => cloneLast(ui, l) }, icon('copy', 16), 'Clone last') : null,
+        upg.items.length ? h('button', { class: 'btn', disabled: !g.economy.canAfford(upg.totalCost), 'data-tip': `Replace ${upg.items.length} older ${upg.items.length === 1 ? meta.vehicle : 'vehicles'} with newest stock`, 'data-sfx': 'none', onclick: () => upgradeFleet(ui, lineVs, `on ${l.name}`, rerender) }, icon('up', 16), `Upgrade ${upg.items.length} · ${fmtMoney(upg.totalCost)}`) : null));
       add(win.body, sharedPanel(ui, l, rerender));
     } else {
       // load factors now (on board / room) of the passengers and of the mail
@@ -473,28 +516,65 @@ function cloneLast(ui: UI, l: Line) {
 }
 
 // ------------------------------------------------------------------ lists
-export function openVehicles(ui: UI) {
+export function openVehicles(ui: UI, preset?: 'all' | 'issues' | 'upgradable') {
   const g = ui.game;
-  const win = ui.wm.open('vehicles', 'Vehicles', { width: 600, icon: 'vehicles', color: 'var(--accent)' });
+  if (preset) vehQuickFilter = preset;
+  const win = ui.wm.open('vehicles', 'Vehicles', { width: 650, icon: 'vehicles', color: 'var(--accent)' });
   const f = getFilter('vehicles');
   const render = () => {
     validateFilter(g, f);
     clear(win.body);
     const all = g.vehicles.all();
-    const vs = all.filter((v) => vehicleMatches(g, v, f)).sort((a, b) => b.profitYear - a.profitYear);
+    const base = all.filter((v) => vehicleMatches(g, v, f));
+    const upg = upgradeSummary(ui, base);
+    const upgIds = new Set(upg.items.map((x) => x.v.id));
+    const issueCount = base.filter(vehicleHasIssue).length;
+    if (vehQuickFilter === 'issues' && !issueCount) vehQuickFilter = 'all';
+    if (vehQuickFilter === 'upgradable' && !upg.items.length) vehQuickFilter = 'all';
+    const vs = vehQuickFilter === 'issues' ? base.filter(vehicleHasIssue)
+      : vehQuickFilter === 'upgradable' ? base.filter((v) => upgIds.has(v.id))
+      : base.slice();
+    const loadRatio = (v: Vehicle) => v.capacity > 0 ? v.load / v.capacity : v.mailCapacity > 0 ? v.mailLoad / v.mailCapacity : 0;
+    const k = vehSort.key ?? 'profit', d = vehSort.dir;
+    vs.sort((a, b) => {
+      if (k === 'name') return d * a.name.localeCompare(b.name);
+      if (k === 'line') return d * (a.line?.name ?? '').localeCompare(b.line?.name ?? '');
+      if (k === 'status') return d * a.status.localeCompare(b.status);
+      if (k === 'age') return d * (a.age - b.age);
+      if (k === 'load') return d * (loadRatio(a) - loadRatio(b));
+      return d * (a.profitYear - b.profitYear);
+    });
     const mine = all.filter((v) => v.owner === PLAYER);
-    const count = (k: LineKind) => mine.filter((v) => (v.line?.kind ?? (v.kind === 'train' ? 'rail' : (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road')) === k).length;
+    const count = (kind: LineKind) => mine.filter((v) => (v.line?.kind ?? (v.kind === 'train' ? 'rail' : (v as RoadVehicle).model?.kind === 'tram' ? 'tram' : 'road')) === kind).length;
     win.sub.textContent = `${count('rail')} trains · ${count('road')} buses · ${count('tram')} trams`;
     const counts: Partial<Record<LineMode, number>> = {};
     for (const v of all) if (vehicleMatches(g, v, { hidden: [], company: f.company })) { const m = vehicleMode(g, v); counts[m] = (counts[m] ?? 0) + 1; }
-    add(win.body, filterBar(g, f, counts, () => { win.last = undefined; render(); }));
+    const resort = () => { win.last = undefined; render(); };
+    add(win.body, filterBar(g, f, counts, resort));
+    if (issueCount > 0 || upg.items.length > 0) {
+      const chip = (id: 'all' | 'issues' | 'upgradable', label: string, tip?: string) =>
+        h('button', { class: 'btn sm' + (vehQuickFilter === id ? ' on' : ''), 'data-tip': tip, onclick: () => { vehQuickFilter = id; resort(); } }, label);
+      add(win.body, h('div', { class: 'qfilter' },
+        chip('all', `All (${base.length})`),
+        issueCount ? chip('issues', `Issues (${issueCount})`, 'No route, stopped, or losing money after 1 yr') : null,
+        upg.items.length ? chip('upgradable', `Upgradable (${upg.items.length})`, 'Newer stock available') : null,
+        h('span', { class: 'spacer' }),
+        upg.items.length ? h('button', { class: 'btn sm', disabled: !g.economy.canAfford(upg.totalCost), 'data-tip': `Upgrade ${upg.items.length} filtered vehicles`, 'data-sfx': 'none', onclick: () => upgradeFleet(ui, base, 'in this view', resort) }, icon('up', 14), `Upgrade ${upg.items.length} · ${fmtMoney(upg.totalCost)}`) : null));
+    }
     if (!vs.length) { add(win.body, h('div', { class: 'pad' }, mine.length ? 'No vehicles match the filter.' : 'Build a depot → buy a train, bus or tram.')); return; }
-    const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Vehicle'), h('th', null, 'Line'), h('th', null, 'Status'), h('th', { class: 'r' }, 'Load'), h('th', { class: 'r' }, 'Profit (yr)')));
+    const tbl = h('table', { class: 'tbl' }, h('tr', null,
+      sortTh('Vehicle', 'name', vehSort, resort, false, undefined, 1),
+      sortTh('Line', 'line', vehSort, resort, false, undefined, 1),
+      sortTh('Status', 'status', vehSort, resort, false, undefined, 1),
+      sortTh('Age', 'age', vehSort, resort, true),
+      sortTh('Load', 'load', vehSort, resort, true),
+      sortTh('Profit (yr)', 'profit', vehSort, resort, true)));
     for (const v of vs.slice(0, 300)) {
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => ui.openVehicle(v.id) },
         h('td', { class: 'ellip' }, v.owner !== PLAYER ? h('span', { class: 'swatch', style: `background:${g.company(v.owner).color}` }) : null, v.name),
         h('td', { class: 'ellip' }, v.line ? h('span', { class: 'inline', style: 'gap:6px' }, lineSymbol(g, v.line, 'sm'), h('span', { class: 'ltag-n' }, v.line.name)) : '—'),
         h('td', { class: 'ellip ' + (v.state === 'noroute' || v.state === 'stopped' ? 'neg' : 'muted') }, v.status),
+        h('td', { class: 'r muted' }, `${v.age.toFixed(1)}y`),
         h('td', { class: 'r' }, loadText(v)),
         h('td', { class: 'r ' + (v.profitYear < 0 ? 'neg' : 'pos') }, fmtMoney(v.profitYear))));
     }
@@ -506,16 +586,27 @@ export function openVehicles(ui: UI) {
 
 export function openTowns(ui: UI) {
   const g = ui.game;
-  const win = ui.wm.open('towns', 'Towns', { width: 400, icon: 'towns', color: '#eef2f7' });
+  const win = ui.wm.open('towns', 'Towns', { width: 420, icon: 'towns', color: '#eef2f7' });
   const render = () => {
     clear(win.body);
     const total = g.towns.list.reduce((s, t) => s + t.pop, 0);
     win.sub.textContent = `${g.towns.list.length} towns · ${fmtInt(total)} residents`;
-    const tbl = h('table', { class: 'tbl' }, h('tr', null, h('th', null, 'Town'), h('th', { class: 'r' }, 'Population'), h('th', { class: 'r' }, 'Transported')));
-    for (const t of [...g.towns.list].sort((a, b) => b.pop - a.pop)) {
-      const pct = t.passGenLast ? Math.min(1, t.passTransLast / t.passGenLast) : 0;
+    const resort = () => { win.last = undefined; render(); };
+    const pctOf = (t: (typeof g.towns.list)[number]) => t.passGenLast ? Math.min(1, t.passTransLast / t.passGenLast) : 0;
+    const list = [...g.towns.list];
+    const k = townsSort.key ?? 'pop', d = townsSort.dir;
+    list.sort((a, b) => {
+      if (k === 'name') return d * a.name.localeCompare(b.name);
+      if (k === 'trans') return d * (pctOf(a) - pctOf(b));
+      return d * (a.pop - b.pop);
+    });
+    const tbl = h('table', { class: 'tbl' }, h('tr', null,
+      sortTh('Town', 'name', townsSort, resort, false, undefined, 1),
+      sortTh('Population', 'pop', townsSort, resort, true),
+      sortTh('Transported', 'trans', townsSort, resort, true)));
+    for (const t of list) {
       tbl.appendChild(h('tr', { class: 'clickable', onclick: () => { ui.centerOn(t.x, t.z); ui.openTown(t.id); } },
-        h('td', null, t.name, t.served ? h('span', { class: 'pos' }, ' ▲') : ''), h('td', { class: 'r' }, fmtInt(t.pop)), h('td', { class: 'r' }, fmtPct(pct))));
+        h('td', null, t.name, t.served ? h('span', { class: 'pos' }, ' ▲') : ''), h('td', { class: 'r' }, fmtInt(t.pop)), h('td', { class: 'r' }, fmtPct(pctOf(t)))));
     }
     add(win.body, tbl);
     if (g.towns.list.length > 1) {
@@ -531,4 +622,49 @@ export function openTowns(ui: UI) {
 function paxTile(el: HTMLElement, l: Line): HTMLElement {
   if (l.passLast > 0 && l.icPassLast !== undefined) el.setAttribute('data-tip', fmtSets(l.passLast, l.icPassLast));
   return el;
+}
+
+/**
+ * Schematic transit strip map (Mini Metro / Cities in Motion style): horizontal stop line with double-ring
+ * interchange nodes, live vehicle pips, crowding counters, and clickable connecting-line chips.
+ */
+function lineDiagram(ui: UI, l: Line): HTMLElement {
+  const g = ui.game;
+  const isLoop = g.lines.isLoop(l);
+  // Group live vehicles by their current target stop index along l.stops.
+  const vehAt = new Map<number, Vehicle[]>();
+  for (const vid of l.vehicles) {
+    const v = g.vehicles.get(vid);
+    if (!v) continue;
+    const idx = Math.max(0, Math.min(l.stops.length - 1, v.stopIndex));
+    let arr = vehAt.get(idx); if (!arr) vehAt.set(idx, arr = []);
+    arr.push(v);
+  }
+  const nodes = l.stops.map((sid, i) => {
+    const st = g.stations.get(sid);
+    let waiting = 0;
+    if (st) for (const wg of st.waiting.values()) if (wg.line === l.id) waiting += wg.count;
+    const crowded = waiting >= 40 || (st ? st.lostLast > 10 : false);
+    const others = st ? g.lines.linesAt(sid).filter((o) => o.id !== l.id) : [];
+    const linked = st ? st.links.flatMap((lid) => g.lines.linesAt(lid)).filter((o) => o.id !== l.id && !others.some((x) => x.id === o.id)) : [];
+    const xfers = [...others, ...linked].slice(0, 4);
+    const isXfer = xfers.length > 0;
+    const vs = vehAt.get(i) ?? [];
+    return h('div', { class: 'ld-stop' },
+      vs.length ? h('div', { class: 'ld-vehs' }, vs.slice(0, 3).map((v) =>
+        h('button', { class: 'ld-veh', style: `--c:${l.color}`, 'data-tip': `${v.name} · ${v.status} · ${v.load}/${v.capacity}`, onclick: () => ui.openVehicle(v.id) },
+          icon(MODE_META[lineMode(g, l)].icon, 11)))) : h('div', { class: 'ld-vehs' }),
+      h('button', {
+        class: 'ld-dot' + (isXfer ? ' xfer' : '') + (crowded ? ' hot' : ''),
+        style: `--c:${l.color}`,
+        'data-tip': `${st?.name ?? `#${sid}`}${waiting ? ` · ${fmtInt(waiting)} waiting` : ''}${isXfer ? ` · ${xfers.length} transfer${xfers.length > 1 ? 's' : ''}` : ''}`,
+        onclick: () => { if (st) ui.centerOn(st.x, st.z); ui.openStation(sid); },
+      }, waiting > 0 ? h('span', { class: 'ld-wait' + (crowded ? ' hot' : '') }, waiting > 99 ? '99+' : String(Math.round(waiting))) : null),
+      h('span', { class: 'ld-name', title: st?.name ?? `#${sid}` }, st?.name ?? `#${sid}`),
+      xfers.length ? h('div', { class: 'ld-xfers' }, xfers.map((o) =>
+        h('button', { class: 'ld-xf', style: `--c:${o.color}`, 'data-tip': `Transfer to ${o.name}`, onclick: () => openLine(ui, o.id) }, lineSymbol(g, o, 'sm')))) : null);
+  });
+  return h('div', { class: 'line-diagram', style: `--c:${l.color}` },
+    h('div', { class: 'ld-track' }, ...nodes),
+    isLoop ? h('div', { class: 'ld-loop', 'data-tip': 'Loop line' }, icon('loop', 12), 'Loop') : null);
 }

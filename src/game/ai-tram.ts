@@ -9,7 +9,7 @@ import { roadDepotReaches } from './roadvehicle';
 import { TRAM } from './constants';
 import { stopCatchShape } from './stations';
 import { runGen, roadDepotAtDeadEnd } from './routing';
-import { tramRouteValue, pays } from './ai-bus';
+import { tramRouteValue, townRouteShadowed, pays } from './ai-bus';
 
 /** What a tram project built (for clean-up of failed or interrupted projects). */
 export interface TramProject {
@@ -143,18 +143,30 @@ export class TramPlanner {
     // ---- route: along the town's main axis (population weighted), through the centre, on its streets
     const routes = yield* this.routes(T);
     if (!routes.length) return this.fail('no street route through the centre');
-    const route = routes[0];
     yield;
-    // ---- money: tracks, stops, depot, vehicles
-    const fresh = route.edges.filter((id) => !net.edges.get(id)?.tram);
-    let trackLen = 0;
-    for (const id of fresh) trackLen += net.edges.get(id)!.len;
-    const nTrams = Math.max(2, Math.min(5, Math.round(route.len / 22)));
-    const cost = trackLen * TRAM.costPerUnit + route.stops.length * 30_000 + 200_000 + nTrams * model.cost;
-    // ---- the forecast (ai-bus.ts): riders shared with every served stop near the route, tram fares, against the works,
-    // trams, running and upkeep (a copy of another company's trams in the same streets does not pay)
-    const quote = yield* tramRouteValue(g, owner, route.stops, trackLen, model, nTrams);
-    if (!pays(quote)) return this.fail(`forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`);
+    // ---- money & forecast: try candidate axes in order so a rival's corridor yields to a distinct axis
+    let route: typeof routes[number] | null = null;
+    let fresh: number[] = [];
+    let nTrams = 2, cost = 0, lastFail = 'no viable route';
+    for (const cand of routes) {
+      const f = cand.edges.filter((id) => !net.edges.get(id)?.tram);
+      let trackLen = 0, sharedLen = 0;
+      for (const id of cand.edges) {
+        const ed = net.edges.get(id);
+        if (!ed) continue;
+        if (!ed.tram) trackLen += ed.len;
+        else if (ed.tramOwner !== owner) sharedLen += ed.len;
+      }
+      const n = Math.max(2, Math.min(5, Math.round(cand.len / 22)));
+      const c = trackLen * TRAM.costPerUnit + cand.stops.length * 30_000 + 200_000 + n * model.cost;
+      // ---- the forecast (ai-bus.ts): riders shared with every served stop near the route, tram fares, against the works,
+      // trams, running and upkeep (shared rival track still carries access cost so it is never a free lunch)
+      const quote = yield* tramRouteValue(g, owner, cand.stops, trackLen + sharedLen * 0.5, model, n);
+      if (!pays(quote)) { lastFail = `forecast ${Math.round(quote.revenue / 1000)}k/year below ${Math.round(quote.yearly / 1000)}k`; continue; }
+      route = cand; fresh = f; nTrams = n; cost = c;
+      break;
+    }
+    if (!route) return this.fail(lastFail);
     const e = this.eco;
     while (e.money < cost + 300_000 && e.borrow()) { /* borrow in steps */ }
     if (e.money < cost) return this.fail('too expensive');
@@ -239,8 +251,13 @@ export class TramPlanner {
       if (pts.length < 2) continue;
       const len = pts.length - 1;
       if (len > direct * 1.7 + 10) continue;
+      // reject corridors where another company already laid tram tracks along much of the route
+      let rivalTramLen = 0;
+      for (const id of edges) { const ed = net.edges.get(id); if (ed?.tram && ed.tramOwner !== owner) rivalTramLen += ed.len; }
+      if (rivalTramLen / Math.max(1, len) >= 0.4) continue;
       const stops = yield* tramStopSitesGen(g, pts, owner);
       if (stops.length < 3) continue;
+      if (townRouteShadowed(g, owner, stops, 'tram')) continue;
       // people in the stops' catchment (each counted once) per unit of new track
       const pop = g.stations.popInShapes(stops.map((s) => stopCatchShape(s.x, s.z, true)));
       out.push({ edges, len, pts, stops, score: pop / (40 + len) });

@@ -65,9 +65,11 @@ export class Vehicles {
   private res = new Map<number, number>();
   /** level crossings currently closed for road traffic */
   crossingClosed = new Set<number>();
+  private laneOcc: (Occ | undefined)[] = [];
   private occ = new Map<number, Occ>();
   private occUsed: Occ[] = [];
   /** vehicles inside a junction (on a connector) per node */
+  private nodeOccArr: (Occ | undefined)[] = [];
   private nodeOcc = new Map<number, Occ>();
   private nodeUsed: Occ[] = [];
   private rng = new RNG(4242);
@@ -298,11 +300,36 @@ export class Vehicles {
   }
 
   // ---------------------------------------------------------------- road spatial hash
-  private pushOcc(map: Map<number, Occ>, used: Occ[], k: number, v: RoadVehicle, start: number) {
+  private pushOccMap(map: Map<number, Occ>, used: Occ[], k: number, v: RoadVehicle, start: number) {
     let o = map.get(k);
     if (!o) { o = { v: [], s: [], n: 0 }; map.set(k, o); }
     if (o.n === 0) used.push(o);
     o.v[o.n] = v; o.s[o.n] = start; o.n++;
+  }
+  private pushOccSeg(s: RSeg, v: RoadVehicle, start: number) {
+    if (s.kind === 'lane' && s.e >= 0 && s.e < 65536) {
+      const k = s.e * 2 + (s.dir > 0 ? 1 : 0);
+      let o = this.laneOcc[k];
+      if (!o) { o = { v: [], s: [], n: 0 }; this.laneOcc[k] = o; }
+      if (o.n === 0) this.occUsed.push(o);
+      o.v[o.n] = v; o.s[o.n] = start; o.n++;
+      return;
+    }
+    this.pushOccMap(this.occ, this.occUsed, segKey(s), v, start);
+  }
+  private getOccSeg(s: RSeg): Occ | undefined {
+    if (s.kind === 'lane' && s.e >= 0 && s.e < 65536) return this.laneOcc[s.e * 2 + (s.dir > 0 ? 1 : 0)];
+    return this.occ.get(segKey(s));
+  }
+  private pushNodeOcc(node: number, v: RoadVehicle) {
+    if (node >= 0 && node < 65536) {
+      let o = this.nodeOccArr[node];
+      if (!o) { o = { v: [], s: [], n: 0 }; this.nodeOccArr[node] = o; }
+      if (o.n === 0) this.nodeUsed.push(o);
+      o.v[o.n] = v; o.s[o.n] = 0; o.n++;
+      return;
+    }
+    this.pushOccMap(this.nodeOcc, this.nodeUsed, node, v, 0);
   }
 
   private addOcc(v: RoadVehicle) {
@@ -310,13 +337,14 @@ export class Vehicles {
     if (!seg) return;
     const L = v.length;
     // start of the occupied stretch = rear of the body along the segment (negative: it extends further back)
-    this.pushOcc(this.occ, this.occUsed, segKey(seg), v, v.pos - L);
-    if (seg.kind === 'conn') this.pushOcc(this.nodeOcc, this.nodeUsed, seg.node, v, 0);
+    this.pushOccSeg(seg, v, v.pos - L);
+    if (seg.kind === 'conn') this.pushNodeOcc(seg.node, v);
     let rem = L - v.pos;
-    for (let i = 0; i < v.trail.length && rem > 0; i++) {
-      const t = v.trail[i];
-      this.pushOcc(this.occ, this.occUsed, segKey(t), v, t.len - rem);
-      if (i === 0 && t.kind === 'conn') this.pushOcc(this.nodeOcc, this.nodeUsed, t.node, v, 0);
+    const trail = v.trail;
+    for (let i = 0; i < trail.length && rem > 0; i++) {
+      const t = trail[i];
+      this.pushOccSeg(t, v, t.len - rem);
+      if (i === 0 && t.kind === 'conn') this.pushNodeOcc(t.node, v);
       rem -= t.len;
     }
   }
@@ -326,13 +354,14 @@ export class Vehicles {
 
   /** Rebuild the per-lane occupancy (once per tick). */
   private rebuildOcc() {
-    for (const o of this.occUsed) o.n = 0;
-    for (const o of this.nodeUsed) o.n = 0;
+    for (let i = 0; i < this.occUsed.length; i++) this.occUsed[i].n = 0;
+    for (let i = 0; i < this.nodeUsed.length; i++) this.nodeUsed[i].n = 0;
     this.occUsed.length = 0;
     this.nodeUsed.length = 0;
     if (this.occ.size > 20000) this.occ.clear();
     for (const v of this.map.values()) if (v instanceof RoadVehicle) this.addOcc(v);
-    for (const v of this.ambient) this.addOcc(v);
+    const amb = this.ambient;
+    for (let i = 0; i < amb.length; i++) this.addOcc(amb[i]);
   }
 
   private tA = { x: 0, y: 0, z: 0 };
@@ -343,7 +372,7 @@ export class Vehicles {
     const seg = v.seg;
     if (!seg) return Infinity;
     let best = Infinity;
-    let o = this.occ.get(segKey(seg));
+    let o = this.getOccSeg(seg);
     if (o) for (let i = 0; i < o.n; i++) {
       if (o.v[i] === v) continue;
       const gap = o.s[i] - v.pos;
@@ -353,7 +382,7 @@ export class Vehicles {
     const ahead = v.ahead;
     for (let k = 0; k < ahead.length && k < 3 && d <= look; k++) {
       const s = ahead[k];
-      o = this.occ.get(segKey(s));
+      o = this.getOccSeg(s);
       if (o) for (let i = 0; i < o.n; i++) {
         if (o.v[i] === v) continue;
         const gap = d + o.s[i];
@@ -372,10 +401,10 @@ export class Vehicles {
     } else if (v instanceof RoadVehicle && v.seg) {
       let s = v.seg, rear = v.pos - v.length, k = 0;
       while (true) {
-        const list = this.occ.get(segKey(s));
+        const list = this.getOccSeg(s), sk = segKey(s);
         if (list) for (let i = 0; i < list.n; i++) {
           const o = list.v[i];
-          if (o === v || !o.seg || segKey(o.seg) !== segKey(s) || o.state === 'loading' || o.speed >= 0.05) continue;
+          if (o === v || !o.seg || segKey(o.seg) !== sk || o.state === 'loading' || o.speed >= 0.05) continue;
           const gap = rear - o.pos;
           if (gap >= -0.05 && gap < 0.8) return true;
         }
@@ -412,7 +441,7 @@ export class Vehicles {
 
   /** May v enter connector c (no conflicting vehicle inside the junction)? */
   junctionFree(v: RoadVehicle, c: RSeg): boolean {
-    const list = this.nodeOcc.get(c.node);
+    const list = c.node >= 0 && c.node < 65536 ? this.nodeOccArr[c.node] : this.nodeOcc.get(c.node);
     if (!list) return true;
     for (let i = 0; i < list.n; i++) {
       const o = list.v[i];
@@ -430,7 +459,7 @@ export class Vehicles {
   roadBusyNear(eid: number, x: number, z: number, r: number): boolean {
     const a = this.tA, b = this.tB;
     for (let k = eid * 2; k <= eid * 2 + 1; k++) {
-      const list = this.occ.get(k);
+      const list = eid >= 0 && eid < 65536 ? this.laneOcc[k] : this.occ.get(k);
       if (!list) continue;
       for (let i = 0; i < list.n; i++) {
         const v = list.v[i];

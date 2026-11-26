@@ -143,7 +143,7 @@ export function openCompetitors(ui: UI) {
       const cfg = co.ai ? aiConfigOf(g, co.id) : null;
       const hq = g.headquartersOf(co.id);
       tbl.appendChild(h('tr', null,
-        h('td', { class: 'ellip' }, ui.ownerTag(co.id), co.id === PLAYER ? h('span', { class: 'muted' }, ' you') : cfg ? h('span', { class: 'muted' }, ' ' + (presetOf(cfg)?.name ?? 'Custom')) : null),
+        h('td', { class: 'ellip' }, ui.ownerTag(co.id), co.id === PLAYER ? h('span', { class: 'muted' }, co.ai ? ' you · AI' : ' you') : cfg ? h('span', { class: 'muted' }, ' ' + (presetOf(cfg)?.name ?? 'Custom')) : null),
         h('td', null, hq ? h('button', { class: 'btn sm', 'data-tip': 'Show headquarters city',
           'aria-label': `Headquarters of ${co.name}: ${hq.name}`, onclick: () => { ui.centerOn(hq.x, hq.z); ui.openTown(hq.id); } }, hq.name) : '–'),
         h('td', { class: 'company-ownership', title: ownershipLabel(g, co.id) }, ownershipLabel(g, co.id)),
@@ -153,8 +153,26 @@ export function openCompetitors(ui: UI) {
         h('td', null, String(hd.vehicles)),
         h('td', null, String(hd.stations)),
         h('td', null, String(hd.lines)),
-        h('td', null, co.ai ? h('span', { class: 'rowbtns' },
+        h('td', null, co.id === PLAYER ? h('span', { class: 'rowbtns' },
+          co.ai ? h('button', { class: 'ibtn sm', 'data-tip': 'AI settings', 'aria-label': `AI settings of ${co.name}`, onclick: () => openAIConfig(ui, PLAYER) }, icon('settings', 15)) : null,
+          h('button', { class: 'btn sm' + (co.ai ? ' on' : ''), 'data-tip': co.ai ? 'Stop AI autopilot and resume manual control' : 'Let AI build and manage your company', onclick: () => {
+            g.setCompanyAI(PLAYER, !co.ai);
+            ui.sound('toggle', { pitch: co.ai ? 1.1 : 0.9 });
+            win.last = undefined; render();
+          } }, icon('robot', 14), co.ai ? 'AI on' : 'Run by AI'))
+          : co.ai ? h('span', { class: 'rowbtns' },
           h('button', { class: 'ibtn sm', 'data-tip': 'AI settings', 'aria-label': `AI settings of ${co.name}`, onclick: () => openAIConfig(ui, co.id) }, icon('settings', 15)),
+          h('button', { class: 'btn sm', 'data-tip': `Switch control to ${co.name}; your current company will be managed by AI`, 'aria-label': `Take over ${co.name}`, onclick: () => {
+            if (!confirm(`Take over ${co.name}? Your current company (${g.player.name}) will be managed by AI.`)) return;
+            const err = g.takeOverCompany(co.id, true);
+            if (err) { ui.toast(err, 'bad'); return; }
+            ui.hud.refreshCompany();
+            const newHq = g.headquartersOf(PLAYER);
+            if (newHq) ui.centerOn(newHq.x, newHq.z);
+            ui.sound('purchase');
+            ui.toast(`Now playing as ${g.player.name}`, 'good');
+            win.last = undefined; render();
+          } }, 'Take over'),
           h('button', { class: 'btn sm', 'aria-label': `Invest in ${co.name}`, onclick: () => openInvest(ui, co.id) }, 'Invest')) : null)));
     }
     const gone = g.companies.filter((c) => c.defunct);
@@ -269,7 +287,7 @@ export function openAIConfig(ui: UI, id: number | null) {
         () => { st.cfg.startMoney = Math.max(1_000_000, st.cfg.startMoney - 1_000_000); render(); },
         () => { st.cfg.startMoney = Math.min(50_000_000, st.cfg.startMoney + 1_000_000); render(); }), 'Entire amount is a loan'),
       h('div', { class: 'btns right' },
-        co ? h('button', { class: 'btn ghost', onclick: () => openInvest(ui, co.id) }, icon('money', 16), 'Invest…') : null,
+        co && co.id !== PLAYER ? h('button', { class: 'btn ghost', onclick: () => openInvest(ui, co.id) }, icon('money', 16), 'Invest…') : null,
         h('span', { class: 'spacer' }),
         h('button', { class: 'btn ghost', onclick: () => win.close() }, 'Cancel'),
         co

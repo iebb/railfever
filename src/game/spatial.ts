@@ -92,21 +92,32 @@ export class SpatialGrid {
   /** Unique ids whose box intersects the query box (in the order of the first cell they appear in). */
   query(x0: number, z0: number, x1: number, z1: number): number[] {
     const out: number[] = [];
-    const c = this.cell;
+    const c = this.cell, cols = this.cols;
     const qx0 = Math.floor(x0 / c), qz0 = Math.floor(z0 / c), qx1 = Math.floor(x1 / c), qz1 = Math.floor(z1 / c);
-    for (let cz = qz0; cz <= qz1; cz++) for (let cx = qx0; cx <= qx1; cx++) {
-      const a = this.cells.get(this.key(cx, cz));
-      if (!a) continue;
-      for (const entry of a) {
-        const b = entry.box;
-        if (b[0] > x1 || b[2] < x0 || b[1] > z1 || b[3] < z0) continue;
-        // an object spanning several cells is reported from the first of them inside the query (no set needed)
-        // box() and cell retain their writable legacy API. Reuse the insertion coordinates only
-        // while those inputs match; direct edits keep the original query's first-cell semantics.
-        const cached = c === entry.cell && b[0] === entry.x0 && b[1] === entry.z0;
-        const bx = cached ? entry.cx : Math.floor(b[0] / c), bz = cached ? entry.cz : Math.floor(b[1] / c);
-        if (cx !== Math.max(bx, qx0) || cz !== Math.max(bz, qz0)) continue;
-        out.push(entry.id);
+    if (qx0 === qx1 && qz0 === qz1) {
+      const a = this.cells.get(qz0 * cols + qx0);
+      if (a) for (let i = 0, len = a.length; i < len; i++) {
+        const entry = a[i], b = entry.box;
+        if (b[0] <= x1 && b[2] >= x0 && b[1] <= z1 && b[3] >= z0) out.push(entry.id);
+      }
+      return out;
+    }
+    for (let cz = qz0; cz <= qz1; cz++) {
+      const row = cz * cols;
+      for (let cx = qx0; cx <= qx1; cx++) {
+        const a = this.cells.get(row + cx);
+        if (!a) continue;
+        for (let i = 0, len = a.length; i < len; i++) {
+          const entry = a[i], b = entry.box;
+          if (b[0] > x1 || b[2] < x0 || b[1] > z1 || b[3] < z0) continue;
+          // an object spanning several cells is reported from the first of them inside the query (no set needed)
+          // box() and cell retain their writable legacy API. Reuse the insertion coordinates only
+          // while those inputs match; direct edits keep the original query's first-cell semantics.
+          const cached = c === entry.cell && b[0] === entry.x0 && b[1] === entry.z0;
+          const bx = cached ? entry.cx : Math.floor(b[0] / c), bz = cached ? entry.cz : Math.floor(b[1] / c);
+          if (cx !== (bx > qx0 ? bx : qx0) || cz !== (bz > qz0 ? bz : qz0)) continue;
+          out.push(entry.id);
+        }
       }
     }
     return out;

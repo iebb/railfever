@@ -181,7 +181,7 @@ const ENTRANCE_MAX = 6;
 /** Candidate entrance places valued (walking catchments) per work unit; the winner is built in the unit after the last. */
 const ENTRANCE_VALUATIONS = 4;
 /** Residents a new station must newly cover (beyond the other stations' catchment) to be inserted. */
-const INSERT_POP: Record<string, number> = { mainline: 650, metro: 900, lightrail: 450 };
+const INSERT_POP: Record<string, number> = { mainline: 400, metro: 600, lightrail: 350 };
 
 /** Counters (in AIController.stats, saved with it): the ones ai.ts declares and this module's own. */
 type NetStat = 'grown' | 'merged' | 'paired' | 'connections' | 'stubs' | 'netDecommissioned' | 'netRetired' | 'netInserted' | 'netInterchanges'
@@ -2148,7 +2148,7 @@ class NetPlanner {
       else if (pm[pm.length - 1] === path[path.length - 1]) np = [...pm, ...path.slice(0, -1).reverse()];
       else if (pm[0] === path[path.length - 1]) np = [...path, ...pm.slice(1)];
       else if (pm[0] === path[0]) np = [...path.slice(1).reverse(), ...pm];
-      if (!np || new Set(np).size !== np.length || np.length > 7) continue;
+      if (!np || new Set(np).size !== np.length || np.length > 14) continue;
       const moved = this.fleet(l).ours;
       this.setStops(m, outAndBack(np));
       for (const vid of moved) g.vehicles.get(vid)?.setLine(m.id);

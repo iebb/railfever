@@ -651,7 +651,8 @@ export class RoadVehicle extends Vehicle {
           this.pos = Math.max(this.pos, s.stopAt); this.speed = 0; this.arrive(); return;
         }
       }
-      for (const c of s.crossings) {
+      if (V.crossingClosed.size && s.crossings.length) for (let ci = 0; ci < s.crossings.length; ci++) {
+        const c = s.crossings[ci];
         const dist = d + c.pos;
         // The front has already passed this crossing: let its trailing body clear.
         if (dist < 0 || dist > look + 1 || !V.crossingClosed.has(c.id)) continue;

@@ -563,7 +563,7 @@ export class UI {
   openLine(id: number) { lines.openLine(this, id); }
   editLine(id: number) { lines.editLine(this, id); }
   addStopToLine(lineId: number, stationId: number) { lines.addStopToLine(this, lineId, stationId); }
-  openVehicles() { lines.openVehicles(this); }
+  openVehicles(preset?: 'all' | 'issues' | 'upgradable') { lines.openVehicles(this, preset); }
   openTowns() { lines.openTowns(this); }
   openFinances() { this.checklist.financesSeen(); company.openFinances(this); }
   openCompetitors() { company.openCompetitors(this); }

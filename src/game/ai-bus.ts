@@ -431,6 +431,43 @@ function shadowed(g: Game, owner: number, sites: RoadSite[], replacing: number):
   return rivalNear(g, owner, a, b, replacing);
 }
 
+/**
+ * A within-town bus or tram route whose stops duplicate an existing active urban line of another company
+ * (or of the same kind for this company). Prevents two companies from cloning the exact same street corridor
+ * while still allowing complementary or perpendicular lines in the same town.
+ */
+export function townRouteShadowed(
+  g: Game, owner: number, stops: { x: number; z: number }[], kind: 'road' | 'tram', replacing = -1, radius = 12,
+): boolean {
+  if (stops.length < 2) return false;
+  for (const l of g.lines.map.values()) {
+    if (l.id === replacing || l.stops.length < 2) continue;
+    if (l.kind !== 'road' && l.kind !== 'tram') continue;
+    if (l.vehicles.length === 0) continue;
+    if (l.owner === owner && l.kind !== kind) continue;
+    const pts: { x: number; z: number }[] = [];
+    const seen = new Set<number>();
+    for (const sid of l.stops) {
+      if (seen.has(sid)) continue;
+      seen.add(sid);
+      const st = g.stations.get(sid);
+      if (st) pts.push(st);
+    }
+    if (pts.length < 2) continue;
+    let hitCand = 0;
+    for (const s of stops) {
+      if (pts.some((p) => Math.hypot(p.x - s.x, p.z - s.z) <= radius)) hitCand++;
+    }
+    if (hitCand / stops.length < 0.55) continue;
+    let hitLine = 0;
+    for (const p of pts) {
+      if (stops.some((s) => Math.hypot(p.x - s.x, p.z - s.z) <= radius)) hitLine++;
+    }
+    if (hitLine / pts.length >= 0.5) return true;
+  }
+  return false;
+}
+
 /** Trips a month between two towns (both ways), from the regional demand model (as the AI's town demand pairs them). */
 function pairTrips(g: Game, a: number, b: number): number {
   const r = reads(g), nt = g.towns.list.length;
@@ -1162,6 +1199,7 @@ export function* planTownLine(h: BusHost, T: Town, model: VehicleModel): Generat
   const g = h.g, sites = yield* stopSites(g, h.me, T.x, T.z, T.radius + 6, T.id);
   let best: RoadPlan | null = null, bestScore = -Infinity;
   for (const r of townRoutes(T, sites)) {
+    if (townRouteShadowed(g, h.me, r.stops, 'road')) continue;
     const probe = roadTimetable(g, r.stops, model, r.loop);
     // a frequent service or a sparser one: whichever earns more on its outlay
     const fleets = [...new Set([fleetFor(probe.cycle, TOWN_HEADWAY, r.loop ? 6 : 5), fleetFor(probe.cycle, 2 * TOWN_HEADWAY, 4)])];

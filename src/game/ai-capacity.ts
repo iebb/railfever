@@ -58,8 +58,15 @@ function quoteEpoch(g: Game): string {
     + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}:${g.stations.walkVersion}:`
     + g.companies.map(c => g.accessMultiplier(c.id)).join(',');
 }
+/** State epoch for native forecastLine quotes (depends only on network/demand/catchment/access versions, not day/tick). */
+function forecastEpoch(g: Game): string {
+  return `${g.year}:${capacityTopologyKey(g)}:${g.lines.version}:${g.demand.version}:`
+    + `${g.stations.catchVersion}:${g.world.lotVersions.version}:${g.world.net.roadVersions.version}:${g.world.heightsVersion}:${g.stations.walkVersion}:`
+    + `${g.world.net.version}:${g.world.nextBuildingId}:${g.world.buildings.size}:${g.vehicles.map.size}:`
+    + g.companies.map(c => g.accessMultiplier(c.id)).join(',');
+}
 function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
-  const epoch = quoteEpoch(g);
+  const epoch = forecastEpoch(g);
   let memo = forecastMemo.get(g);
   if (!memo || memo.epoch !== epoch) { memo = { epoch, quotes: new Map() }; forecastMemo.set(g, memo); }
   const stock = fleet(g, c.line).map(t => `${t.id}/${t.pattern}/${t.cars.map(m => `${m.id},${m.capacity},${m.speed}`).join(';')}`).join('|');
@@ -68,7 +75,7 @@ function nativeQuote(g: Game, c: Channel, headway: number, kmh: number) {
   const sites = c.native!.path.map(id => g.stations.get(id)!);
   const f = g.demand.forecastLine(sites, railPartMode(sites[0].rail!), kmh, headway, c.line.owner, c.line.id, undefined, 'rail', plannedSet(g, sites));
   const value = { revenue: f.revenue, boardings: f.boardings, peak: Math.max(1, ...f.legLoads) };
-  if (memo.quotes.size >= 256) memo.quotes.clear();
+  if (memo.quotes.size >= 1024) memo.quotes.clear();
   memo.quotes.set(key, value); return value;
 }
 

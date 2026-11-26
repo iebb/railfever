@@ -20,6 +20,7 @@ import { styleOf } from '../game/station-styles';
 import { audio } from '../audio/engine';
 import { onStorageMode, storageMode } from '../game/storage';
 import { exportSave } from './win-menu';
+import { vehicleHasIssue } from './win-info';
 
 interface Cat { id: string; label: string; icon: string; color: string; tip: string; keys: string; tools?: ToolId[]; actions?: [string, string, string, string][] }
 
@@ -162,6 +163,11 @@ export class Hud {
   private accessBtn: HTMLButtonElement;
   private accessBadge: HTMLSpanElement;
   private sAccess = -1;
+  private issuesBtn: HTMLButtonElement;
+  private issuesBadge: HTMLSpanElement;
+  private sIssues = -1;
+  private aiChip: HTMLButtonElement;
+  private sPlayerAi = -1;
   private saveHide = 0;
   private trayHide = 0;
   private drawer: HTMLDivElement | null = null;
@@ -182,7 +188,14 @@ export class Hud {
     this.plateDelta = h('span', { class: 'plate-delta' });
     const plate = h('button', { class: 'plate chrome', 'data-tip': 'Finances', 'data-key': 'I', 'aria-label': 'Finances', onclick: () => ui.openFinances() },
       this.plateChip, h('span', { class: 'plate-txt' }, this.plateName, this.plateMoney), this.plateDelta);
-    R.appendChild(h('div', { class: 'hud hud-tl' }, plate));
+    this.aiChip = h('button', { class: 'hbtn chrome ai-chip', 'data-tip': 'AI runs your company · Click to take manual control', 'aria-label': 'Stop AI autopilot', onclick: () => {
+      ui.game.setCompanyAI(PLAYER, false);
+      ui.sound('toggle', { pitch: 0.9 });
+      ui.toast(`Manual control of ${ui.game.player.name}`, 'good');
+      ui.wm.get('competitors')?.refresh?.();
+    } }, icon('robot', 17), h('span', null, 'AI'));
+    this.aiChip.style.display = 'none';
+    R.appendChild(h('div', { class: 'hud hud-tl' }, plate, this.aiChip));
     // clock & speed
     this.dateEl = h('span', { class: 'clock-date' });
     const speeds: [string, number, string][] = [['pause', 0, 'Pause'], ['play', 1, 'Normal speed'], ['', 2, 'Fast 2×'], ['', 4, 'Faster 4×'], ['', 8, 'Fastest 8×']];
@@ -209,6 +222,9 @@ export class Hud {
     });
     this.volRange.addEventListener('change', () => { audio.saveSettings(); this.ui.sound('click'); });
     this.vol = h('div', { class: 'vol chrome' }, this.volBtn, h('div', { class: 'vol-slider' }, this.volRange));
+    this.issuesBadge = h('span', { class: 'badge' });
+    this.issuesBtn = h('button', { class: 'hbtn chrome issues-btn', 'data-tip': 'Vehicle issues', 'aria-label': 'Vehicle issues', onclick: () => ui.openVehicles('issues') }, icon('warning', 18), this.issuesBadge);
+    this.issuesBtn.style.display = 'none';
     this.accessBadge = h('span', { class: 'badge' });
     this.accessBadge.style.display = 'none';
     this.accessBtn = h('button', { class: 'hbtn chrome', 'data-tip': 'Track access', 'data-key': 'K', 'aria-label': 'Track access', onclick: () => ui.openTrackAccess() }, icon('key', 19), this.accessBadge);
@@ -219,6 +235,7 @@ export class Hud {
     R.appendChild(h('div', { class: 'hud hud-tr' },
       this.saveEl,
       this.fpsEl,
+      this.issuesBtn,
       this.mapBtns.lines,
       this.mapBtns.demand,
       this.mapBtns.catchment,
@@ -317,6 +334,15 @@ export class Hud {
     this.plateName.textContent = co.name;
   }
 
+  refreshCompany() {
+    const co = this.ui.game.player;
+    this.plateChip.style.setProperty('--c', co.color);
+    this.plateName.textContent = co.name;
+    this.sMoney = '';
+    this.deltaBase = NaN;
+    this.sAccess = this.sIssues = this.sPlayerAi = -1;
+  }
+
   // ------------------------------------------------------------------ per frame
   update(dt: number) {
     const g = this.ui.game;
@@ -327,6 +353,19 @@ export class Hud {
       this.accessBadge.textContent = String(nReq);
       this.accessBadge.style.display = nReq ? '' : 'none';
       this.accessBtn.dataset.tip = nReq ? `Track access · ${nReq} request${nReq > 1 ? 's' : ''} waiting` : 'Track access';
+    }
+    let nIssues = 0;
+    for (const v of g.vehicles.map.values()) if (v.owner === PLAYER && vehicleHasIssue(v)) nIssues++;
+    if (nIssues !== this.sIssues) {
+      this.sIssues = nIssues;
+      this.issuesBadge.textContent = String(nIssues);
+      this.issuesBtn.style.display = nIssues ? '' : 'none';
+      this.issuesBtn.dataset.tip = `${nIssues} vehicle${nIssues === 1 ? '' : 's'} need attention (no route, stopped, or losing money)`;
+    }
+    const pAi = g.player.ai ? 1 : 0;
+    if (pAi !== this.sPlayerAi) {
+      this.sPlayerAi = pAi;
+      this.aiChip.style.display = pAi ? '' : 'none';
     }
     const money = g.economy.money;
     const sm = fmtMoneyFull(money);

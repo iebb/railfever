@@ -171,6 +171,27 @@ export class Shares {
     }
   }
 
+  /** Exchange two company ids in all shareholding, dividend and subsidiary records (used when taking over a company). */
+  swapCompanies(a: number, b: number) {
+    if (a === b) return;
+    const swapId = (id: number) => (id === a ? b : id === b ? a : id);
+    const swapRec = (rec: Record<number, number>) => {
+      const out: Record<number, number> = {};
+      for (const [k, v] of Object.entries(rec)) out[swapId(Number(k))] = v;
+      return out;
+    };
+    const next: Record<number, ShareState> = {};
+    for (const [k, s] of Object.entries(this.states)) {
+      next[swapId(Number(k))] = {
+        shareholders: swapRec(s.shareholders),
+        dividendsLastYear: swapRec(s.dividendsLastYear),
+        ...(s.subsidiaryOf !== undefined ? { subsidiaryOf: swapId(s.subsidiaryOf) } : {}),
+        ...(s.dividendYear !== undefined ? { dividendYear: s.dividendYear } : {}),
+      };
+    }
+    this.states = next;
+  }
+
   /** Called before economies close the year. Snapshot every payout first: holdings/order cannot compound it. */
   payDividends(year: number) {
     const payments: { target: number; amounts: Record<number, number> }[] = [];
