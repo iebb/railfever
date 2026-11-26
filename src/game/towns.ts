@@ -432,14 +432,14 @@ export class Towns {
     const tierOf = (i: number): 'city' | 'town' | 'village' => i < nCity ? 'city' : sites[i].hill ? 'town'
       : i >= sites.length - nHill - nVillage ? 'village' : 'town';
     // soften the terrain around town centres (hill towns only flatten their top)
+    const cityBoost = s <= 512 ? 1 : Math.min(2.2, 1 + (s - 512) / 768);
     sites.forEach((site, i) => {
       const tier = tierOf(i);
-      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? 32 : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
+      this.flatten(site.x, site.z, site.hill ? 8 : tier === 'city' ? Math.round(26 + 6 * Math.min(1, cityBoost - 1)) : tier === 'town' ? 22 : 16, site.hill ? 0.6 : 0.75);
     });
     // all towns first, so each claims its land (see owner) before any of them is laid out
     const layouts: TownLayout[] = [];
     const axes: { angle: number; ratio: number; coast: boolean; rough: number }[] = [];
-    const cityBoost = Math.max(1, Math.min(1.5, s / 768));
     sites.forEach((site, i) => {
       const tier = tierOf(i), isCity = tier === 'city';
       const town: Town = {
@@ -448,10 +448,10 @@ export class Towns {
         passGenMonth: 0, passTransMonth: 0, passGenLast: 0, passTransLast: 0, passLostMonth: 0, passLostLast: 0, served: 0,
       };
       this.list.push(town);
-      // major cities scale into larger metropolises (especially on larger maps)
+      // major cities scale into larger metropolises on medium, large, XL and XXL maps
       const size = 1.35 * (tier === 'city'
-        ? (i === 0 ? (4500 + rng.int(2500)) * cityBoost : (2800 + rng.int(2400)) * cityBoost)
-        : tier === 'town' ? 700 + rng.int(1600) : 150 + rng.int(350));
+        ? (i === 0 ? (3000 + rng.int(1500)) * cityBoost : (2000 + rng.int(1800)) * cityBoost)
+        : tier === 'town' ? 600 + rng.int(1400) : 150 + rng.int(350));
       this.plan.set(town, Math.max(120, Math.round(size * land)));
       town.claim = this.plan.get(town)!;
       // growth profile and layout from size and terrain
